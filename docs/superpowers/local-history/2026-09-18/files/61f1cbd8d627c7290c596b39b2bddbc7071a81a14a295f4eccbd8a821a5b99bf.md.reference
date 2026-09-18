@@ -1,0 +1,38 @@
+# C1 implementation report
+
+Only `core/pit_optimizer_v5/memory.py` was edited. `ExperimentRecordV5._validate_post_validation_identity` now requires empty actual changed symbols only for the conjunction of `exact_duplicate` status and parent-equal policy identity. Every other post-validation record retains exact template-symbol equality. Exact identity type, valid policy/validation prerequisites, complete identity validation/derivation and downstream status/evidence checks are unchanged.
+
+Preimage SHA-256: `99e084eeff284d39a651e899e9562780e2581eb936ce7ff1f3f0542ed7b523aa`.
+
+Final memory.py SHA-256: `37e3a04791d827edd0e5fe99e1d62cb9997163f66954f99727177248f8949d76`.
+
+## Static decision table
+
+| Existing source case | Corrected invariant result |
+| --- | --- |
+| Exact duplicate, parent-equal policy, empty actual symbols | Permitted by the changed-symbol guard; complete identity and evidence checks still apply. |
+| Exact duplicate, parent-equal policy, nonempty actual symbols | Rejected by the changed-symbol guard. |
+| Exact duplicate, different policy | No exemption; even if declared symbols match, the complete status/evidence guard rejects the different policy. |
+| Changed-policy non-duplicate, exact declared symbols | Original behavior preserved. |
+| Changed-policy non-duplicate, empty or mismatched symbols | Rejected. |
+| Pre-validation invalid, including rendering rejection | Unchanged separate `_validate_invalid_identity` path. |
+| Duplicate-only or mixed batch record construction | Both constructors retain actual validation, identity and evidence; the existing critic requirement remains exact for other testable candidates. |
+
+This table is source reasoning only. No candidate, record, event or synthetic case was constructed or executed for it.
+
+## Source trace
+
+`StructuralTemplateV5` continues requiring a nonempty declared edit scope. The concrete validator derives actual symbols from before/after source bundles. Runtime requires empty actual symbols for a parent-identical revision, marks it `exact_duplicate`, and returns before quick screening; `QuickScreenCandidateV5` therefore keeps its declared-symbol equality guard unchanged.
+
+Runtime `_expected_records` and the concrete production record factory each pass `candidate.validation` unchanged to `ExperimentRecordV5`; artifact decoding also invokes that common constructor. The corrected invariant therefore applies to both independent factories and decoding without any field, encoding, identity, payload union or schema change. `_verify_finalized_candidate_origin` still compares record validation exactly with the durable validation stage and checks the exact-duplicate semantic outcome. No fabricated critic or performance evidence is introduced.
+
+## Executed implementer checks
+
+- `python -B -m ruff check core/pit_optimizer_v5/memory.py`: all checks passed. An initial direct `ruff` command could not resolve an executable; module invocation succeeded without installation.
+- In-memory `compile` of the final source bytes: passed; no import or candidate execution.
+- Exact-preimage diff inspection: one narrow hunk in the authorized method. The `git diff --no-index --check` output contained no whitespace diagnostics; it returned 1 with an existing mixed-line-ending warning and a source difference.
+- Static AST comparison: only `ExperimentRecordV5._validate_post_validation_identity` changed; removing that method from both parsed source trees yields identical remaining ASTs. No AST case was executed.
+
+The parent controller owns fresh evaluator identity, protected-source hash and historical-artifact checks, saved separately in this package. This report does not claim those checks were executed by the implementer. The new positive exact-duplicate branch remains statically reviewed and unexecuted because no actual positive C1 record is available in the architect's bounded inventory.
+
+C1 awaits principal review. B4c and campaign work remain outside this implementation.

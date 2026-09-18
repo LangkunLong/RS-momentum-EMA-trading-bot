@@ -1,0 +1,47 @@
+## Spec Compliance
+
+❌ Overall, Task 4 is not compliant with the sealed optimizer contract.
+
+- ✅ Schema-v1 implementation bodies and readers are preserved; the only removed line is the old narrow `dataclass` import, replaced by an expanded import.
+- ✅ The v2 response parsers reject duplicate/unknown keys and enforce list, text, enum, and canonical byte caps. The Decimal ranking, holdout gate, create-only manifest writer, and identity-only locked ledger are well implemented.
+- ❌ Authorization accounting, source ancestry/patch bounds, runtime identity cross-links, hidden-data exclusion, and fixed-baseline ranking are not enforced by the closed contracts.
+- ⚠️ The focused suite passes because it encodes some of the noncompliant behavior: it treats 416k input tokens as the plan total and accepts a run authorization window unrelated to the manifest requirement.
+
+## Strengths
+
+- `core/pit_optimization_contract.py:193` and the three artifact parsers provide strong duplicate-key rejection, exact top-level keys, canonical text, unique bounded lists, and independent response-byte checks.
+- `core/pit_optimization_contract.py:526` seals the manifest's role order, model, scope digest, fold/PIT identity, immutable constraints, and candidate-bounds relationships; `core/pit_optimization_contract.py:1079` writes canonical JSON create-only and verifies its digest.
+- `core/pit_optimizer_evaluation.py:175` uses `Decimal(str(value))` with half-even 0.01-point quantization; `core/pit_optimizer_evaluation.py:216` implements strict median/worst/lower-drawdown ordering and the per-fold trade floor; `core/pit_optimizer_evaluation.py:267` implements the exact 0.10-point/three-trade completeness gate with no Sharpe condition.
+- `core/pit_optimizer_evaluation.py:485`, `core/pit_optimizer_evaluation.py:630`, and `core/pit_optimizer_evaluation.py:670` keep source/run/candidate metadata out of the uniqueness key, reserve under an exclusive lock before recording an outcome, preserve failed reservations, and keep outcomes metric-free.
+
+## Issues
+
+### Critical
+
+1. `core/pit_optimization_contract.py:623` authorizes only `sum(max_input_tokens)` and never includes `max_output_tokens`. The six inputs total 416,000 and the six outputs total 32,000, so the required ceiling is exactly 448,000, not 32,000 of spare capacity. As written, a directly constructed manifest can inflate output budgets beyond authorization and still validate. `tests/test_pit_optimizer_v2.py:607` enshrines the same incorrect interpretation. Sum each call's maximum input plus maximum output and require the first canary total to equal 448,000.
+
+2. `core/pit_optimization_contract.py:921` accepts only a small caller-supplied readiness subset, and `core/pit_optimization_contract.py:983` reads policy bytes from any absolute `source_root` without verifying that repository's clean HEAD/tree fingerprint against `source_head` and `source_fingerprint_sha256`. Those unrelated values are then sealed together at `core/pit_optimization_contract.py:1055`. The passing fixture demonstrates the gap with a non-Git synthetic source root and fabricated source identity at `tests/test_pit_optimizer_v2.py:758`. Load the complete authenticated schema-v1 readiness and verify the actual source-root HEAD/tree identity before hashing the initial policy files.
+
+3. `core/pit_optimization_contract.py:1227` validates a `PolicySourceBundle` only against its own hashes, closed path list, and total size. It never receives the authorized `PolicySourceScope`, proves descent from the initial hashes, verifies that the cumulative diff produces the supplied file texts, or counts files/hunks/changed lines. `AuthorInput.validate_artifact` at `core/pit_optimization_contract.py:2326` checks only the hypothesis ID, so it also does not enforce `candidate_bounds`. An arbitrary in-scope file body or over-bound patch can therefore become provider context. Add a controller-owned bundle factory/validator that applies a bounds-valid cumulative diff from the authenticated initial sources, verifies exact resulting hashes, materializes the next-iteration bundle, and returns the closed `next_context_oversize` result before incumbent acceptance.
+
+4. `PitOptimizerGateConfig.validate` cross-links only baseline, PIT bundle, and effective-policy identities at `core/pit_optimization_contract.py:703`. Parity and readiness are checked only against their independently supplied config digests at `core/pit_optimization_contract.py:692` and `core/pit_optimization_contract.py:742`, and the run window is only syntax-checked at `core/pit_optimization_contract.py:763`; none is required to equal the corresponding manifest field or `authorization_requirement.window_id`. `tests/test_pit_optimizer_v2.py:1050` explicitly supplies `window_live`, different from the generated manifest window, and expects validation to pass. Deserialize and fully validate the closed manifest, cross-link readiness/parity, and require the exact authorized window before permitting source transmission.
+
+5. `CandidateComparisonSummary` accepts any two `FoldAggregateSummary` objects at `core/pit_optimization_contract.py:2181`, and `CriticInput` accepts that summary at `core/pit_optimization_contract.py:2358`. A `hidden_1` aggregate can therefore be serialized into provider context, directly violating structural hidden-data omission. The test at `tests/test_pit_optimizer_v2.py:393` only searches a normal sample serialization for forbidden strings; it does not prove such construction is impossible. Require the exact sealed discovery identities (`discovery_1`, `discovery_2`) and derive provider comparisons from ledger-marked discovery folds rather than trusting caller labels.
+
+### Important
+
+1. Manifest construction does not render or size the actual worst iteration-2 messages. `core/pit_optimization_contract.py:609` checks only that declared dynamic caps are below broad hard constants and that the small static schema fits; role inputs independently permit 112 KiB, 96 KiB, and 24 KiB at `core/pit_optimization_contract.py:2294`, `core/pit_optimization_contract.py:2323`, and `core/pit_optimization_contract.py:2369`, while the sealed call budgets are 80,000, 76,000, and 24,000 bytes. The test at `tests/test_pit_optimizer_v2.py:979` merely rechecks the declared arithmetic. Render the complete actual source/evidence/history/artifact envelopes and reject any manifest whose bytes exceed its per-call section or token cap.
+
+2. `discovery_score_from_folds` trusts the caller-provided `excess_total_return_pp` at `core/pit_optimizer_evaluation.py:231`; it has no original-baseline identity or candidate-minus-baseline computation. `CandidateComparisonSummary` at `core/pit_optimization_contract.py:2175` likewise accepts a score that need not match its folds. Incumbent-relative or fabricated excess can therefore drive ranking despite the fixed-baseline rule. Compute excess from authenticated candidate and original-baseline fold aggregates, and recompute/validate every supplied score.
+
+3. Failure codes are lexically validated but not closed. `CandidateValidationSummary` accepts any identifier at `core/pit_optimization_contract.py:2161`, and ledger outcomes do the same at `core/pit_optimizer_evaluation.py:593`; there is no sealed enum or implemented `next_context_oversize` path. Define the closed validation/outcome code set and enforce flag/code consistency in both provider summaries and ledger outcomes.
+
+4. The tests do not honestly exercise the highest-risk guarantees. The source-size test builds an ad hoc dictionary instead of a scope-validated production bundle at `tests/test_pit_optimizer_v2.py:948`; hidden omission is a substring check at `tests/test_pit_optimizer_v2.py:393`; and ledger atomicity is tested only sequentially at `tests/test_pit_optimizer_v2.py:1211`. Add negative mutations for output-token inflation, mismatched readiness/parity/window IDs, hidden-fold injection, arbitrary/non-descendant source text, all four patch bounds, next-context overflow, fixed-baseline mismatch, and two concurrent reservations of the same identity.
+
+### Minor
+
+1. `InvestigatorInput.__post_init__` dereferences `self.source_bundle.policy_interface_version` at `core/pit_optimization_contract.py:2266` before its type check at line 2272; `AuthorInput` repeats this at lines 2315 and 2321. Malformed boundary input raises `AttributeError` instead of the contract's controlled `ValueError`. Validate nested object types before dereferencing them.
+
+## Assessment
+
+Task quality: **Needs fixes**. The objective, holdout, canonical serialization, and ledger core are strong, but the current authorization, identity, source-descendant, patch-bound, and hidden-data gaps are release-blocking for a model-authored optimizer.

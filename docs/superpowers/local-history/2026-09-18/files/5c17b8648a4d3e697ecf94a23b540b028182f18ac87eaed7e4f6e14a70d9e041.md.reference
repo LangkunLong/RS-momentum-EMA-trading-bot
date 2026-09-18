@@ -1,0 +1,96 @@
+# Task 8A Report: V5 Runtime Event and Evaluator Contracts
+
+## Scope
+
+Task 8A changed only the four approved V5 source modules plus the package export surface:
+
+- `core/pit_optimizer_v5/memory.py`
+- `core/pit_optimizer_v5/artifacts.py`
+- `core/pit_optimizer_v5/contracts.py`
+- `core/pit_optimizer_v5/evaluator.py`
+- `core/pit_optimizer_v5/__init__.py` (exports only)
+
+No provider, Docker, replay, market-data, orchestration, V2-V4, authorization, or test-file code was
+changed or invoked.
+
+## Durable pre-experiment round outcomes
+
+- Added the closed campaign-level `round_outcome` event and frozen `RoundOutcomePayloadV5`, whose
+  authority is exactly one of `NoNovelHypothesisAuthorityV5`,
+  `NoveltyExhaustedAuthorityV5`, or `CriticUnavailableAuthorityV5`.
+- No generic artifact-ref bag remains. Each variant binds only its relevant named identities:
+  discovery/search-state transition and parent authority, exact request/evidence/attempt/artifact or
+  selection identities, and—for critic unavailability—the exact attempted experiment batch plus
+  tagged per-experiment pre-critic evidence identities. The closed tagged evidence kinds reject
+  unrelated evidence and episode ordinals on non-episode facts.
+- Novelty exhaustion embeds an ordered, non-duplicated set of no-novel parent authorities and proves
+  their exact search-state chain. Critic-unavailable requires a nonempty real experiment batch and
+  requires its retained evidence to cover exactly that batch.
+- Canonical artifact decoding uses this closed union and rejects cross-status, extra, or missing
+  authority fields. The old blind authentication of untyped child references was removed; Task 8B
+  must persist and decode the named typed objects whose canonical digests these authorities bind.
+- Recovery recognizes at most one terminal outcome, requires it to be the final chain event, returns
+  it directly, and schedules no further local steps. The repository rejects any append after a
+  durable terminal outcome.
+- Experiment-record and checkpoint/archive code is unchanged. A critic-unavailable outcome therefore
+  cannot manufacture a post-critic `ExperimentRecordV5` or alter promotion authority.
+
+## Unified policy revision identity and V3 worker boundary
+
+- `EvaluatorContractV5` now pins `baseline_policy_revision_sha256` separately from the retained
+  `baseline_source_bundle_sha256` source-artifact authority used by search reconstruction.
+- `PitPanelEvaluatorV5` requires the exact authenticated `PolicyRevisionIdentityV5` at construction,
+  verifies it against the evaluator contract, and emits its `.sha256` for baseline evidence.
+- Candidate evaluation and `CandidateWorkerBindingV5` now also carry the complete typed policy
+  revision. Candidate trusted-runtime and immutable-constraint authority must match the baseline;
+  evidence identity is always the revision `.sha256`, never a raw source-bundle digest.
+- The evaluator is V3-only: exact interface version 3, all six decision methods including
+  `evaluate_add_on`, and `close`. Baseline factories now return `BaselineWorkerBindingV5`, symmetric
+  with candidate bindings, and the evaluator rejects any binding whose full
+  `PolicyRevisionIdentityV5` differs from the claimed baseline before simulation.
+- The default in-process baseline factory hashes the exact four loaded editable source files and
+  requires them to equal the claimed revision source map before returning its identity-bearing V3
+  binding. Per-scenario single-worker allocation, mismatch close, reuse rejection, and
+  simulator-owned normal close behavior remain intact.
+
+## Trusted evaluator source closure
+
+`EVALUATOR_SOURCE_PATHS_V5` now contains 45 canonical files. In addition to the reached V3
+contract/adapter/feature stack, the review closure adds the actually executed market-regime and
+entry-contract modules, settings and engine policy, data-client helpers, CANSLIM A/C/I/N/S logic,
+earnings tracing, and the CANSLIM/config package initializers. Fiscal/group RS,
+PIT industry/provenance/universe logic, V2 parity policy implementations, V3 package bootstrap, and
+the V5 revision/scope contracts remain covered. The four editable V3 policy modules remain outside
+the trusted runtime set because their exact bytes are authenticated separately by
+`PolicyRevisionIdentityV5`.
+
+## Direct deterministic verification
+
+The initial local direct fake smoke reported `task8a-direct-smoke-ok`; the focused review smoke
+reported `task8a-review-direct-smoke-ok` and covered:
+
+- all three round-outcome constructions and status bindings;
+- canonical closed-authority artifact encode/decode/load round trips, extra/cross-status field
+  rejection, terminal recovery, post-terminal chain rejection, and absence of experiment-record
+  writes;
+- exact V3 worker acceptance plus V2 and missing-`evaluate_add_on` rejection;
+- candidate and baseline binding to the complete policy revision, rejection and close of a
+  mismatched baseline binding, and rejection of an identity-free baseline factory;
+- rejection of a raw digest in place of the baseline revision; and
+- exact trusted source-map construction and required V3 source membership.
+
+Final verification passed fresh module compilation, Ruff check/format, package and module export
+integrity, forbidden-coupling search, trusted 45-file source-map reconstruction, and
+`git diff --check`. The commit hooks also passed Ruff, whitespace, end-of-file, YAML, and merge-marker
+checks. Existing tests were neither added, changed, nor run, per the explicit override.
+
+## Task 8B boundary
+
+Task 8A exposes only pure contracts and recovery facts. Before enabling any provider call, Task 8B
+must add typed create-only persistence and typed load/verification for the exact `RoleRequestV5`,
+completion result, `RoleAttemptFactsV5`, terminal settlement receipt, and parsed role artifact. It
+must add a role-completion event/recovery step that binds those decoded objects so a restart cannot
+repeat an already-settled provider attempt. Generic `append_input` is not sufficient for this
+authority. Runtime orchestration must then choose when to emit a terminal outcome, prove every named
+digest against those typed objects, and leave archive/checkpoint promotion unchanged when critic
+authorization is unavailable.

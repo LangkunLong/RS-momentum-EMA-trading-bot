@@ -1,0 +1,53 @@
+"""Bounded data-only entitlement diagnosis; never persist credentials or raw errors."""
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+import re
+import urllib.error
+import urllib.request
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+def main():
+    keys = {}
+    for line in Path(r'C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.env').read_text(encoding='utf-8-sig').splitlines():
+        match = re.match(r'\s*(FMP_API_KEY|ALPACA_API_KEY|ALPACA_SECRET_KEY)\s*=\s*(.*?)\s*$', line)
+        if match:
+            keys[match[1]] = match[2].strip().strip('\"').strip("'")
+    opener = urllib.request.build_opener(NoRedirect())
+    requests = [
+        ('fmp_profile', 'https://financialmodelingprep.com/stable/profile?symbol=AAPL', {'apikey': keys['FMP_API_KEY']}),
+        ('fmp_historical_nasdaq', 'https://financialmodelingprep.com/stable/historical-nasdaq-constituent', {'apikey': keys['FMP_API_KEY']}),
+        ('alpaca_sip_daily', 'https://data.alpaca.markets/v2/stocks/SPY/bars?timeframe=1Day&start=2020-01-02T00%3A00%3A00Z&end=2020-01-04T00%3A00%3A00Z&feed=sip&adjustment=all&limit=10', {'APCA-API-KEY-ID': keys['ALPACA_API_KEY'], 'APCA-API-SECRET-KEY': keys['ALPACA_SECRET_KEY']}),
+    ]
+    records = []
+    for label, url, headers in requests:
+        record = {'request': label, 'url_without_credentials': url, 'retrieved_at_utc': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')}
+        try:
+            with opener.open(urllib.request.Request(url, headers={**headers, 'Accept': 'application/json', 'User-Agent': 'PIT-V5-Local-Data-Acquisition/1.0'}), timeout=25) as response:
+                raw = response.read(1_048_577)
+                record['http_status'] = response.status
+            if len(raw) > 1_048_576 or any(secret.encode() in raw for secret in keys.values() if secret):
+                raise ValueError('bounded secret-free response check failed')
+            value = json.loads(raw)
+            record['json_shape'] = type(value).__name__
+            record['rows'] = len(value) if isinstance(value, list) else len(value.get('bars') or []) if isinstance(value, dict) else None
+        except urllib.error.HTTPError as error:
+            raw = error.read(65536)
+            message = raw.decode('utf-8', errors='replace').lower()
+            record['http_status'] = error.code
+            record['error_signals'] = {word: word in message for word in ('premium', 'subscription', 'upgrade', 'restricted', 'invalid', 'api key', 'limit', 'payment')}
+            record['error_body_persisted'] = False
+        except Exception as error:
+            record['error_type'] = type(error).__name__
+        records.append(record)
+        print(json.dumps(record, sort_keys=True), flush=True)
+    destination = Path.cwd()/'.artifacts/pit-optimizer-v5/data/acquisition/access-diagnosis-20260907.json'
+    with destination.open('x', encoding='utf-8', newline='\n') as stream:
+        json.dump({'schema_version': 1, 'requests': records, 'raw_errors_or_credentials_persisted': False}, stream, indent=2, sort_keys=True)
+        stream.write('\n')
+
+if __name__ == '__main__':
+    main()

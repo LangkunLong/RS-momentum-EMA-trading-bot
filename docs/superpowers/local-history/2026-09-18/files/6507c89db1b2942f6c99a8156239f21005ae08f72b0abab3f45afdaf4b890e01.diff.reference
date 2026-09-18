@@ -1,0 +1,2975 @@
+# Review package: 5cebaf9..696980b
+
+## Commits
+696980b fix: close optimizer consumption and finalization fences
+
+## Files changed
+ agent_loop.py                       | 483 ++++++++++++++++++++++++-------
+ core/pit_optimizer_authorization.py | 430 +++++++++++++++++++++++++++-
+ tests/test_pit_optimizer_v2.py      | 553 +++++++++++++++++++++++++++++++++---
+ 3 files changed, 1313 insertions(+), 153 deletions(-)
+
+## Diff
+diff --git a/agent_loop.py b/agent_loop.py
+index cae9f1b..00f1a4c 100644
+--- a/agent_loop.py
++++ b/agent_loop.py
+@@ -1546,41 +1546,50 @@ def freeze_pricing_record(
+     elif isinstance(value, Mapping):
+         try:
+             raw_rates = (value["prompt"], value["completion"])
+         except KeyError as exc:
+             raise ConfigurationError(
+                 "optimizer pricing must contain prompt and completion rates"
+             ) from exc
+     else:
+         raise ConfigurationError("optimizer pricing must be an exact rate mapping")
+ 
+-    def exact_decimal(raw: object) -> Decimal:
+-        if isinstance(raw, bool) or isinstance(raw, float):
++    def exact_decimal(raw: object, *, allow_legacy_float: bool = False) -> Decimal:
++        if isinstance(raw, bool):
+             raise ConfigurationError("optimizer pricing must use exact numeric values")
+-        if isinstance(raw, Decimal):
++        if isinstance(raw, float) and allow_legacy_float:
++            # Pricing is the legacy normalized public contract.  ``repr`` is the
++            # canonical, round-trippable spelling of its finite binary float.
++            parsed = Decimal(repr(raw))
++        elif isinstance(raw, float):
++            raise ConfigurationError("optimizer pricing must use exact numeric values")
++        elif isinstance(raw, Decimal):
+             parsed = raw
+         elif type(raw) is int:
+             parsed = Decimal(raw)
+         elif isinstance(raw, str) and raw == raw.strip() and raw:
+             if re.fullmatch(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?", raw) is None:
+                 raise ConfigurationError("optimizer pricing text is not canonical")
+             try:
+                 parsed = Decimal(raw)
+             except InvalidOperation as exc:
+                 raise ConfigurationError("optimizer pricing is not numeric") from exc
+         else:
+             raise ConfigurationError("optimizer pricing must use exact numeric values")
+         if not parsed.is_finite() or parsed < 0:
+             raise ConfigurationError("optimizer pricing rates must be finite non-negative")
+         return parsed
+ 
+-    prompt, completion = (exact_decimal(raw) for raw in raw_rates)
++    prompt, completion = (
++        exact_decimal(raw, allow_legacy_float=isinstance(value, Pricing))
++        for raw in raw_rates
++    )
+     return FrozenModelPricing.from_rates(
+         model=model,
+         prompt_per_million=prompt,
+         completion_per_million=completion,
+     )
+ 
+ 
+ def conservative_call_cost_usd(
+     *,
+     rendered_prompt_bytes: int,
+@@ -1592,23 +1601,33 @@ def conservative_call_cost_usd(
+     from core.pit_optimizer_authorization import FrozenModelPricing
+ 
+     if (
+         type(rendered_prompt_bytes) is not int
+         or rendered_prompt_bytes < 0
+         or type(max_output_tokens) is not int
+         or max_output_tokens <= 0
+         or not isinstance(pricing, FrozenModelPricing)
+     ):
+         raise ConfigurationError("optimizer conservative pricing inputs are invalid")
++    try:
++        snapshot = FrozenModelPricing.from_rates(
++            model=pricing.model,
++            prompt_per_million=pricing.prompt_per_million,
++            completion_per_million=pricing.completion_per_million,
++        )
++    except (TypeError, ValueError) as exc:
++        raise ConfigurationError("optimizer pricing snapshot is invalid") from exc
++    if snapshot.pricing_sha256 != pricing.pricing_sha256:
++        raise ConfigurationError("optimizer pricing snapshot digest differs")
+     return (
+-        Decimal(rendered_prompt_bytes) * pricing.prompt_per_million
+-        + Decimal(max_output_tokens) * pricing.completion_per_million
++        Decimal(rendered_prompt_bytes) * snapshot.prompt_per_million
++        + Decimal(max_output_tokens) * snapshot.completion_per_million
+     ) / Decimal(1_000_000)
+ 
+ 
+ def preflight_pit_optimizer_call(
+     *,
+     static_bytes: bytes,
+     dynamic_bytes: bytes,
+     call_budget: "PitOptimizerCallBudget",
+     lease: "AuthorizationRunLease",
+     pricing: "FrozenModelPricing",
+@@ -1623,35 +1642,45 @@ def preflight_pit_optimizer_call(
+     )
+ 
+     if (
+         type(static_bytes) is not bytes
+         or type(dynamic_bytes) is not bytes
+         or not isinstance(call_budget, PitOptimizerCallBudget)
+         or not isinstance(lease, AuthorizationRunLease)
+         or not isinstance(pricing, FrozenModelPricing)
+     ):
+         raise ConfigurationError("optimizer call preflight inputs are invalid")
+-    if call_budget.model != pricing.model:
++    try:
++        pricing_snapshot = FrozenModelPricing.from_rates(
++            model=pricing.model,
++            prompt_per_million=pricing.prompt_per_million,
++            completion_per_million=pricing.completion_per_million,
++        )
++    except (TypeError, ValueError) as exc:
++        raise AuthorizationError("frozen pricing snapshot is invalid") from exc
++    if pricing_snapshot.pricing_sha256 != pricing.pricing_sha256:
++        raise AuthorizationError("frozen pricing snapshot digest differs")
++    if call_budget.model != pricing_snapshot.model:
+         raise AuthorizationError("frozen pricing model mismatch")
+-    if lease.frozen_pricing_sha256 != pricing.pricing_sha256:
++    if lease.frozen_pricing_sha256 != pricing_snapshot.pricing_sha256:
+         raise AuthorizationError("frozen pricing identity drift")
+     if len(static_bytes) > call_budget.max_static_input_bytes:
+         raise BudgetExceededError("static input byte cap exceeded")
+     if len(dynamic_bytes) > call_budget.max_dynamic_input_bytes:
+         raise BudgetExceededError("dynamic input byte cap exceeded")
+     prompt_bytes = len(static_bytes) + len(dynamic_bytes)
+     if prompt_bytes > call_budget.max_input_tokens:
+         raise BudgetExceededError("conservative input-token cap exceeded")
+     cost = conservative_call_cost_usd(
+         rendered_prompt_bytes=prompt_bytes,
+         max_output_tokens=call_budget.max_output_tokens,
+-        pricing=pricing,
++        pricing=pricing_snapshot,
+     )
+     if cost > Decimal(str(call_budget.max_usd)):
+         raise BudgetExceededError("per-call USD cap exceeded")
+     return cost
+ 
+ 
+ @dataclass(frozen=True)
+ class BudgetReservation:
+     """One conservative pre-call reservation."""
+ 
+@@ -1938,20 +1967,38 @@ class BudgetLedger:
+             request_started,
+         )
+ 
+         # The call already started: authoritative overage stays committed before
+         # fail-closed termination, and uncertainty retains the full reservation.
+         if self.reserved_usd > self.max_usd:
+             raise BudgetExceededError("provider reported cost exceeds the hard USD budget")
+         if self.reserved_tokens > self.max_tokens:
+             raise BudgetExceededError("provider reported tokens exceed the hard token budget")
+ 
++    def verify_pit_optimizer_reconciliation(
++        self,
++        reservation: PitOptimizerBudgetReservation,
++        usage: Usage,
++        *,
++        request_started: bool,
++    ) -> None:
++        """Verify an exact in-memory reconciliation after an interrupted return."""
++
++        if (
++            self._pit_optimizer_reconciliations.get(reservation.reservation_id)
++            != (usage, request_started)
++            or reservation.reservation_id in self._pit_optimizer_reservations
++        ):
++            raise ConfigurationError(
++                "optimizer budget reconciliation postcondition is absent"
++            )
++
+     def reconcile(
+         self,
+         reservation: BudgetReservation,
+         usage: Usage,
+         *,
+         window: BudgetWindow | None = None,
+     ) -> None:
+         """Replace a reservation with authoritative cost, retaining it when the cost is missing."""
+         if usage.cost_usd is None:
+             charged = reservation.amount_usd
+@@ -2778,20 +2825,21 @@ class OpenRouterGateway:
+         self.app_name = app_name
+         self.timeout_seconds = timeout_seconds
+         self.max_attempts = max_attempts
+         self._pricing_cache: dict[str, Pricing] = {}
+         self._generation_loader_is_builtin = generation_loader is None and client is None
+         self._generation_loader = generation_loader
+         self._generation_sleeper = generation_sleeper
+         self.authorization_ledger = authorization_ledger
+         self.audit_trail = audit_trail
+         self._pit_optimizer_frozen_pricing: "FrozenModelPricing | None" = None
++        self._pit_optimizer_frozen_pricing_commitment: str | None = None
+         self._pit_optimizer_frozen_manifest_sha256: str | None = None
+         self._pit_optimizer_frozen_authorization_ledger: object | None = None
+ 
+     def _get_client(self) -> Any:
+         """Construct the SDK client lazily, only after configuration has succeeded."""
+         if self._client is None:
+             from openai import OpenAI
+ 
+             headers: dict[str, str] = {}
+             if self.app_url:
+@@ -2967,43 +3015,54 @@ class OpenRouterGateway:
+ 
+     def freeze_pit_optimizer_pricing(
+         self,
+         *,
+         model: str,
+         wall_deadline: float,
+         monotonic: Callable[[], float],
+     ) -> "FrozenModelPricing":
+         """Load and freeze the sole R1 price identity without constructing the SDK."""
+ 
+-        from core.pit_optimizer_authorization import AuthorizationError
++        from core.pit_optimizer_authorization import AuthorizationError, FrozenModelPricing
+ 
+         if (
+             model != REASONER_MODEL
+             or type(wall_deadline) not in {int, float}
+             or not math.isfinite(wall_deadline)
+             or not callable(monotonic)
+         ):
+             raise ConfigurationError("optimizer pricing freeze inputs are invalid")
+         if _remaining_wall_seconds(float(wall_deadline), monotonic) <= 0:
+             raise BudgetExceededError("PIT optimizer pricing deadline reached")
+         frozen = self._pit_optimizer_frozen_pricing
+         if (
+             frozen is not None
+             and self._pit_optimizer_frozen_authorization_ledger
+             is not self.authorization_ledger
+         ):
+             frozen = None
+             self._pit_optimizer_frozen_pricing = None
++            self._pit_optimizer_frozen_pricing_commitment = None
+             self._pit_optimizer_frozen_manifest_sha256 = None
+             self._pit_optimizer_frozen_authorization_ledger = None
+         if frozen is not None:
+-            if frozen.model != model:
++            verified = FrozenModelPricing.from_rates(
++                model=frozen.model,
++                prompt_per_million=frozen.prompt_per_million,
++                completion_per_million=frozen.completion_per_million,
++            )
++            if (
++                frozen.model != model
++                or verified.pricing_sha256 != frozen.pricing_sha256
++                or verified.pricing_sha256
++                != self._pit_optimizer_frozen_pricing_commitment
++            ):
+                 raise AuthorizationError("frozen pricing model mismatch")
+             return frozen
+         remaining = _remaining_wall_seconds(float(wall_deadline), monotonic)
+         try:
+             if self._pricing_loader_is_builtin:
+                 value = self.pricing_loader(
+                     model,
+                     timeout_seconds=min(
+                         DEFAULT_TIMEOUT_SECONDS,
+                         self.timeout_seconds,
+@@ -3013,29 +3072,67 @@ class OpenRouterGateway:
+             else:
+                 value = self.pricing_loader(model)
+         except Exception as exc:
+             if _remaining_wall_seconds(float(wall_deadline), monotonic) <= 0:
+                 raise BudgetExceededError("PIT optimizer pricing deadline reached") from exc
+             raise
+         if _remaining_wall_seconds(float(wall_deadline), monotonic) <= 0:
+             raise BudgetExceededError("PIT optimizer pricing deadline reached")
+         frozen = freeze_pricing_record(model, value)
+         self._pit_optimizer_frozen_pricing = frozen
++        self._pit_optimizer_frozen_pricing_commitment = frozen.pricing_sha256
+         ledger = self.authorization_ledger
+         self._pit_optimizer_frozen_authorization_ledger = ledger
+         self._pit_optimizer_frozen_manifest_sha256 = (
+             ledger.manifest.sha256
+             if ledger is not None and hasattr(ledger, "manifest")
+             else None
+         )
+         return frozen
+ 
++    def _verified_pit_optimizer_pricing_snapshot(
++        self,
++        supplied: "FrozenModelPricing",
++        lease: "AuthorizationRunLease",
++    ) -> "FrozenModelPricing":
++        """Copy and reauthenticate the exact live rates consumed by preflight."""
++
++        from core.pit_optimizer_authorization import (
++            AuthorizationError,
++            AuthorizationRunLease,
++            FrozenModelPricing,
++        )
++
++        if not isinstance(supplied, FrozenModelPricing) or not isinstance(
++            lease, AuthorizationRunLease
++        ):
++            raise AuthorizationError("optimizer frozen pricing contract is invalid")
++        live = self._pit_optimizer_frozen_pricing
++        if live is None or supplied is not live:
++            raise AuthorizationError("gateway run-local frozen pricing is required")
++        try:
++            snapshot = FrozenModelPricing.from_rates(
++                model=live.model,
++                prompt_per_million=live.prompt_per_million,
++                completion_per_million=live.completion_per_million,
++            )
++        except (TypeError, ValueError) as exc:
++            raise AuthorizationError("gateway frozen pricing snapshot is invalid") from exc
++        if (
++            snapshot.pricing_sha256 != live.pricing_sha256
++            or snapshot.pricing_sha256
++            != self._pit_optimizer_frozen_pricing_commitment
++            or snapshot.pricing_sha256 != lease.frozen_pricing_sha256
++        ):
++            raise AuthorizationError("gateway frozen pricing commitment differs")
++        return snapshot
++
+     @staticmethod
+     def _pit_optimizer_audit_state(role: str) -> "LoopState":
+         return {
+             "investigator": LoopState.CALL_INVESTIGATOR,
+             "author": LoopState.CALL_AUTHOR,
+             "critic": LoopState.CALL_CRITIC,
+         }[role]
+ 
+     def _pit_optimizer_record(
+         self,
+@@ -3096,62 +3193,97 @@ class OpenRouterGateway:
+         self,
+         *,
+         budget_reservation: PitOptimizerBudgetReservation,
+         authorization_reservation: "AuthorizationCallReservation",
+         authorization_lease: "AuthorizationRunLease",
+         facts: "PitOptimizerProviderFacts",
+         usage: Usage,
+         payload_sha256: str | None = None,
+         terminal_code: str | None = None,
+     ) -> None:
+-        """Reconcile both ledgers, persist terminal audit, then close failures."""
++        """Publish budget, terminal audit, then the authorization transition."""
+ 
+         from core.pit_optimizer_authorization import AuthorizationError
+ 
+         expected_overage = False
++        first_postpublication_error: BaseException | None = None
+         try:
+             self.ledger.reconcile_pit_optimizer(
+                 budget_reservation,
+                 usage,
+                 request_started=facts.request_started,
+             )
+-        except BudgetExceededError:
+-            if facts.outcome != "budget_exceeded":
+-                raise
+-            expected_overage = True
++        except BaseException as error:
++            try:
++                self.ledger.verify_pit_optimizer_reconciliation(
++                    budget_reservation,
++                    usage,
++                    request_started=facts.request_started,
++                )
++            except BaseException as verification_error:
++                raise error from verification_error
++            if isinstance(error, BudgetExceededError) and facts.outcome == "budget_exceeded":
++                expected_overage = True
++            else:
++                first_postpublication_error = error
++        provider_record = self._pit_optimizer_record(
++            facts,
++            authorization_reservation,
++        )
++        try:
++            _provider_path, terminal_audit_sha256 = self.audit_trail.write_provider_call(
++                provider_record,
++                payload_sha256=payload_sha256,
++            )
++        except BaseException as error:
++            try:
++                terminal_audit_sha256 = self.audit_trail.verify_provider_call(
++                    provider_record,
++                    payload_sha256=payload_sha256,
++                )
++            except BaseException as verification_error:
++                raise error from verification_error
++            if first_postpublication_error is None:
++                first_postpublication_error = error
+         try:
+             self.authorization_ledger.reconcile_call(
+                 authorization_reservation,
+                 facts,
+-            )
+-        except AuthorizationError as exc:
+-            if facts.outcome != "budget_exceeded" or "overage was committed" not in str(
+-                exc
+-            ):
+-                raise
+-            expected_overage = True
+-        self.audit_trail.write_provider_call(
+-            self._pit_optimizer_record(facts, authorization_reservation),
+-            payload_sha256=payload_sha256,
+-        )
+-        if facts.outcome != "accepted" or terminal_code is not None or expected_overage:
+-            self.authorization_ledger.close_run_lease(
+-                authorization_lease,
++                terminal_audit_sha256=terminal_audit_sha256,
+                 terminal_code=(
+                     terminal_code
+-                    or (
+-                        "budget_exhausted"
+-                        if facts.outcome == "budget_exceeded"
+-                        else "failed"
+-                    )
++                    or ("budget_exhausted" if expected_overage else None)
+                 ),
+             )
++        except BaseException as error:
++            try:
++                self.authorization_ledger.verify_reconciliation(
++                    authorization_reservation,
++                    facts,
++                    terminal_audit_sha256=terminal_audit_sha256,
++                    terminal_code=(
++                        terminal_code
++                        or ("budget_exhausted" if expected_overage else None)
++                    ),
++                )
++            except BaseException as verification_error:
++                raise error from verification_error
++            if (
++                isinstance(error, AuthorizationError)
++                and facts.outcome == "budget_exceeded"
++                and "overage was committed" in str(error)
++            ):
++                expected_overage = True
++            elif first_postpublication_error is None:
++                first_postpublication_error = error
++        if first_postpublication_error is not None:
++            raise first_postpublication_error
+ 
+     def request_pit_optimizer_once(
+         self,
+         role: str,
+         dynamic_input: object,
+         parser: Callable[[str], PayloadT],
+         *,
+         call_budget: "PitOptimizerCallBudget",
+         authorization_lease: "AuthorizationRunLease",
+         frozen_pricing: "FrozenModelPricing",
+@@ -3162,21 +3294,20 @@ class OpenRouterGateway:
+ 
+         from core.pit_optimization_contract import (
+             AuthorArtifact,
+             AuthorInput,
+             CriticArtifact,
+             CriticInput,
+             InvestigatorArtifact,
+             InvestigatorInput,
+             PIT_OPTIMIZER_V2_SYSTEM_PROMPTS,
+             PitOptimizerCallBudget,
+-            authenticate_policy_source_bundle,
+             pit_optimizer_response_format,
+         )
+         from core.pit_optimizer_authorization import (
+             AuthorizationError,
+             AuthorizationCallReservation,
+             AuthorizationLedger,
+             AuthorizationRunLease,
+             FrozenModelPricing,
+             PitOptimizerProviderFacts,
+             PitOptimizerRoleCall,
+@@ -3204,71 +3335,66 @@ class OpenRouterGateway:
+             if not callable(parser):
+                 raise ConfigurationError("optimizer provider parser must be callable")
+             raise ConfigurationError("optimizer provider call inputs are invalid")
+         if not isinstance(self.authorization_ledger, AuthorizationLedger):
+             raise ConfigurationError("optimizer authorization ledger is required")
+         if not isinstance(self.audit_trail, AuditTrail):
+             raise ConfigurationError("optimizer audit trail is required")
+         manifest = self.authorization_ledger.manifest
+         if authorization_lease.run_manifest_sha256 != manifest.sha256:
+             raise AuthorizationError("authorization lease run manifest mismatch")
+-        if dynamic_input.run_manifest_sha256 != manifest.sha256:
+-            raise AuthorizationError("optimizer role input run manifest mismatch")
+         if (
+             self._pit_optimizer_frozen_pricing is None
+             or frozen_pricing is not self._pit_optimizer_frozen_pricing
+             or self._pit_optimizer_frozen_manifest_sha256 != manifest.sha256
+             or self._pit_optimizer_frozen_authorization_ledger
+             is not self.authorization_ledger
+         ):
+             raise AuthorizationError("gateway run-local frozen pricing is required")
+-        if authorization_lease.frozen_pricing_sha256 != frozen_pricing.pricing_sha256:
+-            raise AuthorizationError("lease-bound frozen pricing identity drift")
+-        if (
+-            dynamic_input.immutable_constraint_ids
+-            != manifest.immutable_constraint_ids
+-        ):
+-            raise AuthorizationError("optimizer role input differs from run manifest")
+-        if role in {"investigator", "author"}:
+-            if (
+-                dynamic_input.policy_interface_version
+-                != manifest.policy_interface_version
+-                or dynamic_input.candidate_bounds != manifest.candidate_bounds
+-            ):
+-                raise AuthorizationError("optimizer source input differs from run manifest")
+-            try:
+-                authenticate_policy_source_bundle(
+-                    scope=manifest.policy_source_scope,
+-                    bundle=dynamic_input.source_bundle,
+-                )
+-            except ValueError as exc:
+-                raise AuthorizationError(
+-                    "policy source bundle differs from authorized scope"
+-                ) from exc
++        pricing_snapshot = self._verified_pit_optimizer_pricing_snapshot(
++            frozen_pricing,
++            authorization_lease,
++        )
++        role_snapshot = self.authorization_ledger.capture_controller_role_input(
++            dynamic_input,
++            call_budget,
++        )
+         if _remaining_wall_seconds(float(wall_deadline), monotonic) <= 0:
+             raise BudgetExceededError("PIT optimizer wall deadline reached")
++        recaptured_role = self.authorization_ledger.capture_controller_role_input(
++            dynamic_input,
++            call_budget,
++        )
++        if recaptured_role.canonical_bytes != role_snapshot.canonical_bytes:
++            raise AuthorizationError("optimizer role input changed after authentication")
++        recaptured_pricing = self._verified_pit_optimizer_pricing_snapshot(
++            frozen_pricing,
++            authorization_lease,
++        )
++        if recaptured_pricing != pricing_snapshot:
++            raise AuthorizationError("optimizer frozen pricing changed after authentication")
+ 
+         response_format = pit_optimizer_response_format(role)
+         static_bytes = PIT_OPTIMIZER_V2_SYSTEM_PROMPTS[role].encode("utf-8")
+         static_bytes += json.dumps(
+             response_format,
+             sort_keys=True,
+             separators=(",", ":"),
+             ensure_ascii=False,
+         ).encode("utf-8")
+-        dynamic_bytes = dynamic_input.canonical_json_bytes()
++        dynamic_bytes = role_snapshot.canonical_bytes
+         conservative_cost = preflight_pit_optimizer_call(
+             static_bytes=static_bytes,
+             dynamic_bytes=dynamic_bytes,
+             call_budget=call_budget,
+             lease=authorization_lease,
+-            pricing=frozen_pricing,
++            pricing=pricing_snapshot,
+         )
+         budget_reservation: PitOptimizerBudgetReservation | None = None
+         authorization_reservation: AuthorizationCallReservation | None = None
+         audit_sha256 = hashlib.sha256(
+             f"{manifest.sha256}:{call_budget.call_index}:reserved".encode("utf-8")
+         ).hexdigest()
+         possibly_sent = False
+         response_received = False
+         returned_model: str | None = None
+         finish_reason: str | None = None
+@@ -3296,21 +3422,21 @@ class OpenRouterGateway:
+             usage: Usage | None,
+         ) -> PitOptimizerProviderFacts:
+             assert authorization_reservation is not None
+             complete = usage is not None
+             return PitOptimizerProviderFacts(
+                 call_index=call_budget.call_index,
+                 iteration=call_budget.iteration,
+                 role=role,
+                 requested_model=REASONER_MODEL,
+                 returned_model=returned_model,
+-                frozen_pricing_sha256=frozen_pricing.pricing_sha256,
++                frozen_pricing_sha256=pricing_snapshot.pricing_sha256,
+                 outcome=outcome,
+                 request_started=request_started,
+                 response_received=response_received,
+                 finish_reason=finish_reason,
+                 response_schema_valid=response_schema_valid,
+                 accounting_complete=complete,
+                 prompt_tokens=usage.prompt_tokens if usage is not None else None,
+                 completion_tokens=(
+                     usage.completion_tokens if usage is not None else None
+                 ),
+@@ -3334,30 +3460,57 @@ class OpenRouterGateway:
+         ) -> None:
+             nonlocal finalized
+             nonlocal pending_facts, pending_usage, pending_payload_sha256
+             nonlocal pending_terminal_code
+             assert budget_reservation is not None
+             assert authorization_reservation is not None
+             pending_facts = facts
+             pending_usage = usage
+             pending_payload_sha256 = payload_sha256
+             pending_terminal_code = terminal_code
+-            self._finalize_pit_optimizer_call(
+-                budget_reservation=budget_reservation,
+-                authorization_reservation=authorization_reservation,
+-                authorization_lease=authorization_lease,
+-                facts=facts,
+-                usage=usage,
+-                payload_sha256=payload_sha256,
+-                terminal_code=terminal_code,
+-            )
+-            finalized = True
++            try:
++                self._finalize_pit_optimizer_call(
++                    budget_reservation=budget_reservation,
++                    authorization_reservation=authorization_reservation,
++                    authorization_lease=authorization_lease,
++                    facts=facts,
++                    usage=usage,
++                    payload_sha256=payload_sha256,
++                    terminal_code=terminal_code,
++                )
++            except BaseException:
++                try:
++                    self.ledger.verify_pit_optimizer_reconciliation(
++                        budget_reservation,
++                        usage,
++                        request_started=facts.request_started,
++                    )
++                    terminal_audit_sha256 = self.audit_trail.verify_provider_call(
++                        self._pit_optimizer_record(
++                            facts,
++                            authorization_reservation,
++                        ),
++                        payload_sha256=payload_sha256,
++                    )
++                    self.authorization_ledger.verify_reconciliation(
++                        authorization_reservation,
++                        facts,
++                        terminal_audit_sha256=terminal_audit_sha256,
++                        terminal_code=terminal_code,
++                    )
++                except BaseException:
++                    pass
++                else:
++                    finalized = terminal_code is not None or facts.outcome != "accepted"
++                raise
++            else:
++                finalized = True
+ 
+         try:
+             budget_reservation = self.ledger.reserve_pit_optimizer(
+                 rendered_prompt_bytes=len(static_bytes) + len(dynamic_bytes),
+                 max_output_tokens=call_budget.max_output_tokens,
+                 conservative_cost_usd=conservative_cost,
+             )
+             authorization_reservation = self.authorization_ledger.reserve_call(
+                 authorization_lease,
+                 call_budget,
+@@ -3553,38 +3706,36 @@ class OpenRouterGateway:
+                     response_received=True,
+                     returned_model=returned_model,
+                     finish_reason=finish_reason,
+                     response_schema_valid=False,
+                     usage=usage,
+                 )
+                 finalize(facts, usage)
+                 raise ResponseValidationError(
+                     "optimizer parser returned the wrong artifact type"
+                 )
+-            validator = getattr(dynamic_input, "validate_artifact", None)
+-            if validator is not None:
+-                try:
+-                    validator(completion.payload)
+-                except ValueError as exc:
+-                    facts = provider_facts(
+-                        outcome="schema_invalid",
+-                        request_started=True,
+-                        response_received=True,
+-                        returned_model=returned_model,
+-                        finish_reason=finish_reason,
+-                        response_schema_valid=False,
+-                        usage=usage,
+-                    )
+-                    finalize(facts, usage)
+-                    raise ResponseValidationError(
+-                        "optimizer artifact differs from its input"
+-                    ) from exc
++            try:
++                role_snapshot.validate_artifact(completion.payload)
++            except ValueError as exc:
++                facts = provider_facts(
++                    outcome="schema_invalid",
++                    request_started=True,
++                    response_received=True,
++                    returned_model=returned_model,
++                    finish_reason=finish_reason,
++                    response_schema_valid=False,
++                    usage=usage,
++                )
++                finalize(facts, usage)
++                raise ResponseValidationError(
++                    "optimizer artifact differs from its input"
++                ) from exc
+             facts = provider_facts(
+                 outcome="accepted",
+                 request_started=True,
+                 response_received=True,
+                 returned_model=completion.model,
+                 finish_reason=finish_reason,
+                 response_schema_valid=True,
+                 usage=usage,
+             )
+             payload_digest = hashlib.sha256(
+@@ -3641,31 +3792,50 @@ class OpenRouterGateway:
+                             ),
+                             returned_model=(returned_model if possibly_sent else None),
+                             finish_reason=(finish_reason if possibly_sent else None),
+                             response_schema_valid=False,
+                             usage=None if possibly_sent else zero_usage,
+                         )
+                         pending_usage = Usage()
+                         pending_terminal_code = outer_terminal_code
+                     elif pending_terminal_code is None:
+                         pending_terminal_code = outer_terminal_code
+-                    for _attempt in range(2):
+-                        try:
+-                            finalize(
+-                                pending_facts,
+-                                pending_usage,
+-                                payload_sha256=pending_payload_sha256,
+-                                terminal_code=pending_terminal_code,
++                    try:
++                        finalize(
++                            pending_facts,
++                            pending_usage,
++                            payload_sha256=pending_payload_sha256,
++                            terminal_code=pending_terminal_code,
++                        )
++                    except BaseException as cleanup_error:
++                        # Either the exact terminal postcondition was verified by
++                        # ``finalize`` or the durable active reservation remains
++                        # the fail-closed recovery fence.  Preserve ``original``.
++                        if not finalized:
++                            try:
++                                durable_fence = (
++                                    self.authorization_ledger.recover_active_reservation(
++                                        authorization_lease,
++                                        call_budget,
++                                    )
++                                )
++                            except BaseException:
++                                durable_fence = None
++                            if durable_fence != authorization_reservation:
++                                original.add_note(
++                                    "optimizer cleanup could not verify its durable "
++                                    "authorization fence; do not reuse the lease"
++                                )
++                            original.add_note(
++                                "optimizer cleanup preserved the original exception "
++                                f"after {type(cleanup_error).__name__}"
+                             )
+-                            break
+-                        except BaseException:
+-                            continue
+             raise
+ 
+     def preload_pricing(
+         self,
+         roles: Sequence[str] = ("orchestrator", "reasoner", "coder"),
+         *,
+         wall_deadline: float | None = None,
+         monotonic: Callable[[], float] = time.monotonic,
+     ) -> None:
+         """Load and freeze one price record per selected role model before paid calls."""
+@@ -11306,20 +11476,129 @@ class AuditTrail:
+                 and item.get("details") == details
+                 for item in self._events
+             ):
+                 self.append_event(state, event, details)
+         except Exception as exc:
+             raise ProviderCallAuditError(
+                 PitProviderFailurePhase.TERMINAL_AUDIT_WRITE
+             ) from exc
+         return path, digest
+ 
++    def verify_provider_call(
++        self,
++        record: ProviderCallRecord,
++        *,
++        payload_sha256: str | None = None,
++    ) -> str:
++        """Verify the immutable record and its exact terminal event without writing."""
++
++        if not isinstance(record, ProviderCallRecord):
++            raise AuditError("provider call audit requires a validated record")
++        if record.outcome == "accepted":
++            if payload_sha256 is None or _SHA256_RE.fullmatch(payload_sha256) is None:
++                raise AuditError(
++                    "accepted provider call requires a validated payload digest"
++                )
++        elif payload_sha256 is not None:
++            raise AuditError(
++                "rejected provider call cannot bind a validated payload digest"
++            )
++        path = self.run_root / f"provider-call-{record.call_index:04d}.json"
++        primitive = _sanitize_audit_value(asdict(record), self._known_secrets)
++        try:
++            if not path.is_file() or path.is_symlink():
++                raise AuditError("provider call audit record is absent")
++            if json.loads(path.read_bytes()) != primitive:
++                raise AuditError("provider call audit record differs")
++            digest = _file_sha256(path)
++        except AuditError:
++            raise
++        except Exception as exc:
++            raise AuditError("provider call audit record is invalid") from exc
++        state = {
++            "orchestrator": LoopState.CALL_ORCHESTRATOR,
++            "reasoner": LoopState.CALL_REASONER,
++            "coder": LoopState.CALL_CODER,
++            "investigator": LoopState.CALL_INVESTIGATOR,
++            "author": LoopState.CALL_AUTHOR,
++            "critic": LoopState.CALL_CRITIC,
++        }[record.role]
++        details: dict[str, object] = {
++            "call_index": record.call_index,
++            "role": record.role,
++            "outcome": record.outcome,
++            "artifact_sha256": digest,
++        }
++        if record.protocol_failure_code is not None:
++            details["protocol_failure_code"] = record.protocol_failure_code.value
++        if payload_sha256 is not None:
++            details["payload_sha256"] = payload_sha256
++        if record.schema_version == 2 and record.role in {
++            "investigator",
++            "author",
++            "critic",
++        }:
++            details.update(
++                {
++                    "iteration": record.iteration,
++                    "request_started": record.request_started,
++                    "response_received": record.response_received,
++                    "locally_accounted": record.locally_accounted,
++                    "authoritative_spend_known": record.authoritative_spend_known,
++                    "exposure_basis": record.exposure_basis,
++                    "maximum_exposure_usd": record.maximum_exposure_usd,
++                    "maximum_exposure_tokens": record.maximum_exposure_tokens,
++                    "frozen_pricing_sha256": record.frozen_pricing_sha256,
++                    "ledger_snapshot": asdict(record.ledger_snapshot),
++                }
++            )
++            if record.retained_reservation_usd is not None:
++                details["retained_reservation_usd"] = (
++                    record.retained_reservation_usd
++                )
++                details["retained_reservation_tokens"] = (
++                    record.retained_reservation_tokens
++                )
++        elif record.schema_version == 2:
++            details.update(
++                {
++                    "failure_phase": record.failure_phase.value,
++                    "request_started": record.request_started,
++                    "response_received": record.response_received,
++                    "locally_accounted": record.locally_accounted,
++                    "authoritative_spend_known": record.authoritative_spend_known,
++                    "exposure_basis": record.exposure_basis,
++                    "maximum_exposure_usd": record.maximum_exposure_usd,
++                    "maximum_exposure_tokens": record.maximum_exposure_tokens,
++                    "ledger_snapshot": asdict(record.ledger_snapshot),
++                }
++            )
++            if record.retained_reservation_usd is not None:
++                details["retained_reservation_usd"] = (
++                    record.retained_reservation_usd
++                )
++                details["retained_reservation_tokens"] = (
++                    record.retained_reservation_tokens
++                )
++        event = {
++            "accepted": "provider_call_accepted",
++            "failed": "provider_call_failed",
++        }.get(record.outcome, "provider_call_rejected")
++        if not any(
++            item.get("event") == event
++            and item.get("state") == state.value
++            and item.get("details") == details
++            for item in self._events
++        ):
++            raise AuditError("provider call terminal audit event is absent")
++        return digest
++
+     def write_provider_evidence(
+         self, evidence: ProviderGateEvidence, *, name: str = "provider-evidence"
+     ) -> tuple[Path, str]:
+         """Persist the exact closed facts disclosed to model roles for this run."""
+         if not isinstance(evidence, ProviderGateEvidence) or evidence.provider_safe is not True:
+             raise AuditError("provider evidence audit requires validated closed evidence")
+         payload = asdict(evidence)
+         if len(_canonical_json_bytes(payload)) > _MAX_PROVIDER_EVIDENCE_BYTES:
+             raise AuditError("provider evidence exceeds the closed byte limit")
+         if _AUDIT_NAME_RE.fullmatch(name) is None:
+diff --git a/core/pit_optimizer_authorization.py b/core/pit_optimizer_authorization.py
+index e12b039..766eba1 100644
+--- a/core/pit_optimizer_authorization.py
++++ b/core/pit_optimizer_authorization.py
+@@ -14,25 +14,32 @@ import hashlib
+ import json
+ import math
+ import os
+ from pathlib import Path
+ import re
+ from typing import Iterator, Sequence
+ 
+ from core.pit_optimization_contract import (
+     AuthorizationRequirement,
+     AuthorArtifact,
++    AuthorInput,
+     CriticArtifact,
++    CriticInput,
+     InvestigatorArtifact,
++    InvestigatorInput,
+     OPTIMIZER_V2_ROLES,
++    PatchBounds,
+     PitOptimizerCallBudget,
+     PitOptimizerRunManifest,
++    PolicySourceBundle,
++    PolicySourceRecord,
++    authenticate_policy_source_bundle,
+ )
+ import core.pit_optimization_contract as _contract
+ 
+ 
+ _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+ _ID_RE = re.compile(r"[a-z][a-z0-9_.-]{0,127}")
+ _MODEL_RE = re.compile(
+     r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}/[A-Za-z0-9][A-Za-z0-9._:-]{0,127}"
+ )
+ _UNSAFE_APPROVAL_RE = re.compile(
+@@ -416,20 +423,65 @@ class PitOptimizerRoleCall:
+             self.plan.call_index,
+             self.plan.iteration,
+             self.plan.role,
+             self.plan.model,
+         ):
+             raise ValueError("optimizer role call facts differ from plan")
+         if self.facts.outcome != "accepted" or not self.facts.response_schema_valid:
+             raise ValueError("optimizer role call requires accepted provider facts")
+ 
+ 
++@dataclass(frozen=True, slots=True)
++class AuthenticatedRoleInputSnapshot:
++    """One controller-originated role input, closed over its exact wire bytes."""
++
++    role: str
++    iteration: int
++    canonical_bytes: bytes
++    expected_hypothesis_id: str | None = None
++    source_bundle: PolicySourceBundle | None = None
++    candidate_bounds: PatchBounds | None = None
++
++    def validate_artifact(
++        self,
++        artifact: InvestigatorArtifact | AuthorArtifact | CriticArtifact,
++    ) -> None:
++        """Validate response relationships only against the authenticated snapshot."""
++
++        expected_type = {
++            "investigator": InvestigatorArtifact,
++            "author": AuthorArtifact,
++            "critic": CriticArtifact,
++        }[self.role]
++        if not isinstance(artifact, expected_type):
++            raise ValueError("optimizer response has an invalid type")
++        if self.role == "author":
++            assert isinstance(artifact, AuthorArtifact)
++            if artifact.hypothesis_id != self.expected_hypothesis_id:
++                raise ValueError("author hypothesis differs from investigator")
++            assert self.source_bundle is not None
++            assert self.candidate_bounds is not None
++            _resulting_texts, stats = _contract._apply_unified_diff(
++                {record.path: record.text for record in self.source_bundle.files},
++                artifact.unified_diff,
++                bounds=self.candidate_bounds,
++            )
++            if stats.paths != artifact.changed_paths:
++                raise ValueError(
++                    "author changed paths differ from candidate unified diff"
++                )
++        elif self.role == "critic":
++            assert isinstance(artifact, CriticArtifact)
++            if artifact.hypothesis_id != self.expected_hypothesis_id:
++                raise ValueError("critic hypothesis differs from its input")
++
++
+ def require_authorized_policy_source_scope(
+     manifest: PitOptimizerRunManifest,
+     requirement: AuthorizationRequirement,
+     window: OperatorAuthorizationWindow,
+ ) -> str:
+     """Authenticate one window against the exact manifest policy-source scope."""
+ 
+     if not isinstance(manifest, PitOptimizerRunManifest):
+         raise AuthorizationError("authorization manifest is invalid")
+     if not isinstance(requirement, AuthorizationRequirement):
+@@ -488,29 +540,215 @@ class AuthorizationLedger:
+             or not candidate.parent.is_dir()
+             or candidate.parent.is_symlink()
+             or candidate.is_symlink()
+         ):
+             raise AuthorizationError("authorization ledger path is invalid")
+         if not isinstance(manifest, PitOptimizerRunManifest):
+             raise AuthorizationError("authorization ledger manifest is invalid")
+         self._path = candidate.resolve()
+         self._lock_path = self._path.with_suffix(self._path.suffix + ".lock")
+         self._manifest = manifest
++        # Strong references make object identity a bounded, live controller
++        # capability.  Reopening the ledger intentionally loses these
++        # process-local capabilities and therefore fails closed.
++        self._role_input_capabilities: dict[
++            int,
++            tuple[object, int, bytes],
++        ] = {}
+         with _authorization_file_lock(self._lock_path):
+             self._read_records()
+ 
+     @property
+     def manifest(self) -> PitOptimizerRunManifest:
+         """Return the immutable manifest authenticated by this ledger instance."""
+ 
+         return self._manifest
+ 
++    def _snapshot_role_input(
++        self,
++        dynamic_input: object,
++        plan: PitOptimizerCallBudget,
++    ) -> AuthenticatedRoleInputSnapshot:
++        """Capture first, then authenticate provenance from those exact bytes."""
++
++        expected_types = {
++            "investigator": InvestigatorInput,
++            "author": AuthorInput,
++            "critic": CriticInput,
++        }
++        if (
++            not isinstance(plan, PitOptimizerCallBudget)
++            or not isinstance(dynamic_input, expected_types.get(plan.role, ()))
++        ):
++            raise AuthorizationError("optimizer role input contract is invalid")
++        try:
++            canonical_bytes = dynamic_input.canonical_json_bytes()
++            primitive = json.loads(
++                canonical_bytes,
++                object_pairs_hook=_reject_duplicate_keys,
++            )
++        except (AttributeError, TypeError, ValueError, json.JSONDecodeError) as exc:
++            raise AuthorizationError("optimizer role input snapshot is invalid") from exc
++        if (
++            not isinstance(primitive, dict)
++            or canonical_bytes
++            != json.dumps(
++                primitive,
++                sort_keys=True,
++                separators=(",", ":"),
++                allow_nan=False,
++                ensure_ascii=False,
++            ).encode("utf-8")
++        ):
++            raise AuthorizationError("optimizer role input snapshot is not canonical")
++        if (
++            primitive.get("schema_version") != 2
++            or primitive.get("iteration") != plan.iteration
++            or primitive.get("run_manifest_sha256") != self._manifest.sha256
++            or primitive.get("immutable_constraint_ids")
++            != list(self._manifest.immutable_constraint_ids)
++        ):
++            raise AuthorizationError("optimizer role input differs from run manifest")
++
++        source_bundle: PolicySourceBundle | None = None
++        candidate_bounds: PatchBounds | None = None
++        expected_hypothesis_id: str | None = None
++        if plan.role in {"investigator", "author"}:
++            if (
++                primitive.get("policy_interface_version")
++                != self._manifest.policy_interface_version
++                or primitive.get("candidate_bounds")
++                != self._manifest.candidate_bounds.to_primitive()
++            ):
++                raise AuthorizationError(
++                    "optimizer source input differs from run manifest"
++                )
++            source = primitive.get("source_bundle")
++            try:
++                if not isinstance(source, dict) or set(source) != {
++                    "policy_interface_version",
++                    "cumulative_diff_sha256",
++                    "cumulative_diff",
++                    "files",
++                }:
++                    raise ValueError("policy source snapshot keys are invalid")
++                files = source.get("files")
++                if not isinstance(files, list):
++                    raise ValueError("policy source snapshot files are invalid")
++                source_records: list[PolicySourceRecord] = []
++                for item in files:
++                    if not isinstance(item, dict) or set(item) != {
++                        "path",
++                        "sha256",
++                        "declared_symbols",
++                        "text",
++                    }:
++                        raise ValueError("policy source record snapshot is invalid")
++                    declared_symbols = item.get("declared_symbols")
++                    if not isinstance(declared_symbols, list):
++                        raise ValueError("policy source symbols snapshot is invalid")
++                    source_records.append(
++                        PolicySourceRecord(
++                            path=item.get("path"),
++                            sha256=item.get("sha256"),
++                            declared_symbols=tuple(declared_symbols),
++                            text=item.get("text"),
++                        )
++                    )
++                source_bundle = PolicySourceBundle(
++                    policy_interface_version=source.get(
++                        "policy_interface_version"
++                    ),
++                    cumulative_diff_sha256=source.get(
++                        "cumulative_diff_sha256"
++                    ),
++                    cumulative_diff=source.get("cumulative_diff"),
++                    files=tuple(source_records),
++                    _controller_seal=_contract._POLICY_SOURCE_BUNDLE_SEAL,
++                )
++                if source_bundle.to_primitive() != source:
++                    raise ValueError("policy source snapshot differs after rebuild")
++                authenticate_policy_source_bundle(
++                    scope=self._manifest.policy_source_scope,
++                    bundle=source_bundle,
++                )
++                bounds = primitive.get("candidate_bounds")
++                if not isinstance(bounds, dict):
++                    raise ValueError("candidate bounds snapshot is invalid")
++                candidate_bounds = PatchBounds(**bounds)
++            except (TypeError, ValueError) as exc:
++                raise AuthorizationError(
++                    "policy source bundle differs from authorized scope"
++                ) from exc
++            if plan.role == "author":
++                investigator = primitive.get("investigator")
++                if not isinstance(investigator, dict):
++                    raise AuthorizationError(
++                        "optimizer author input provenance is invalid"
++                    )
++                expected_hypothesis_id = investigator.get("hypothesis_id")
++        elif plan.role == "critic":
++            expected_hypothesis_id = primitive.get("hypothesis_id")
++
++        if expected_hypothesis_id is not None and not isinstance(
++            expected_hypothesis_id, str
++        ):
++            raise AuthorizationError("optimizer role input provenance is invalid")
++        return AuthenticatedRoleInputSnapshot(
++            role=plan.role,
++            iteration=plan.iteration,
++            canonical_bytes=canonical_bytes,
++            expected_hypothesis_id=expected_hypothesis_id,
++            source_bundle=source_bundle,
++            candidate_bounds=candidate_bounds,
++        )
++
++    def bind_controller_role_input(
++        self,
++        dynamic_input: object,
++        plan: PitOptimizerCallBudget,
++    ) -> AuthenticatedRoleInputSnapshot:
++        """Register the exact live object produced by the trusted controller."""
++
++        snapshot = self._snapshot_role_input(dynamic_input, plan)
++        key = id(dynamic_input)
++        prior = self._role_input_capabilities.get(key)
++        capability = (dynamic_input, plan.call_index, snapshot.canonical_bytes)
++        if prior is not None and prior != capability:
++            raise AuthorizationError("optimizer role input capability changed")
++        if prior is None and len(self._role_input_capabilities) >= len(
++            self._manifest.call_budgets
++        ):
++            raise AuthorizationError("optimizer role input capabilities are exhausted")
++        self._role_input_capabilities[key] = capability
++        return snapshot
++
++    def capture_controller_role_input(
++        self,
++        dynamic_input: object,
++        plan: PitOptimizerCallBudget,
++    ) -> AuthenticatedRoleInputSnapshot:
++        """Reauthenticate an exact snapshot against a live controller capability."""
++
++        snapshot = self._snapshot_role_input(dynamic_input, plan)
++        capability = self._role_input_capabilities.get(id(dynamic_input))
++        if (
++            capability is None
++            or capability[0] is not dynamic_input
++            or capability[1] != plan.call_index
++            or capability[2] != snapshot.canonical_bytes
++        ):
++            raise AuthorizationError(
++                "optimizer role input provenance is not controller authenticated"
++            )
++        return snapshot
++
+     @staticmethod
+     def _record_digest(record: dict[str, object]) -> str:
+         preimage = dict(record)
+         preimage.pop("record_sha256", None)
+         return hashlib.sha256(_canonical_json_bytes(preimage)).hexdigest()
+ 
+     def _read_records(self) -> list[dict[str, object]]:
+         if not self._path.exists():
+             return []
+         if self._path.is_symlink() or not self._path.is_file():
+@@ -650,22 +888,34 @@ class AuthorizationLedger:
+                 active_reservations[reservation.lease_id] = reservation
+             elif record_type == "reconciliation":
+                 expected = expected_common | {
+                     "reservation_id",
+                     "provider_facts",
+                     "charged_calls",
+                     "charged_tokens",
+                     "charged_usd",
+                     "charge_basis",
+                 }
+-                if set(value) != expected:
++                if frozenset(value) not in {
++                    frozenset(expected),
++                    frozenset(expected | {"terminal_audit_sha256"}),
++                }:
+                     raise AuthorizationError("authorization reconciliation keys are invalid")
++                terminal_audit_sha256 = value.get("terminal_audit_sha256")
++                if terminal_audit_sha256 is not None:
++                    try:
++                        _require_digest(
++                            terminal_audit_sha256,
++                            "authorization terminal audit SHA-256",
++                        )
++                    except ValueError as exc:
++                        raise AuthorizationError(str(exc)) from exc
+                 reservation_id = value.get("reservation_id")
+                 match = next(
+                     (
+                         (lease_id, reservation)
+                         for lease_id, reservation in active_reservations.items()
+                         if reservation.reservation_id == reservation_id
+                     ),
+                     None,
+                 )
+                 if match is None:
+@@ -1269,20 +1519,92 @@ class AuthorizationLedger:
+         ]
+ 
+     @staticmethod
+     def _reconciled_ids(records: Sequence[dict[str, object]]) -> set[str]:
+         return {
+             str(item["reservation_id"])
+             for item in records
+             if item.get("record_type") == "reconciliation"
+         }
+ 
++    @staticmethod
++    def _terminal_code_for_reconciliation(
++        provider_facts: PitOptimizerProviderFacts,
++        requested_terminal_code: str | None,
++    ) -> str | None:
++        if requested_terminal_code not in {
++            None,
++            "failed",
++            "cancelled",
++            "budget_exhausted",
++        }:
++            raise AuthorizationError(
++                "authorization reconciliation terminal code is invalid"
++            )
++        if requested_terminal_code is not None:
++            return requested_terminal_code
++        if provider_facts.outcome == "accepted":
++            return None
++        if provider_facts.outcome == "budget_exceeded":
++            return "budget_exhausted"
++        return "failed"
++
++    @classmethod
++    def _verify_reconciliation_records(
++        cls,
++        records: Sequence[dict[str, object]],
++        reservation: AuthorizationCallReservation,
++        provider_facts: PitOptimizerProviderFacts,
++        terminal_audit_sha256: str,
++        terminal_code: str | None,
++    ) -> None:
++        reconciliation = next(
++            (
++                item
++                for item in records
++                if item.get("record_type") == "reconciliation"
++                and item.get("reservation_id") == reservation.reservation_id
++            ),
++            None,
++        )
++        if (
++            reconciliation is None
++            or reconciliation.get("provider_facts") != asdict(provider_facts)
++            or reconciliation.get("terminal_audit_sha256")
++            != terminal_audit_sha256
++        ):
++            raise AuthorizationError(
++                "authorization reconciliation postcondition is absent"
++            )
++        expected_close = cls._terminal_code_for_reconciliation(
++            provider_facts,
++            terminal_code,
++        )
++        close = next(
++            (
++                item
++                for item in records
++                if item.get("record_type") == "lease_close"
++                and item.get("lease_id") == reservation.lease_id
++            ),
++            None,
++        )
++        if expected_close is None:
++            if close is not None:
++                raise AuthorizationError(
++                    "authorization accepted reconciliation was terminally closed"
++                )
++        elif close is None or close.get("terminal_code") != expected_close:
++            raise AuthorizationError(
++                "authorization terminal reconciliation is not closed"
++            )
++
+     @staticmethod
+     def _charged_totals(
+         records: Sequence[dict[str, object]],
+         reservation_records: Sequence[dict[str, object]],
+     ) -> tuple[int, int, Decimal]:
+         reservation_ids = {
+             str(item["reservation"]["reservation_id"])
+             for item in reservation_records
+         }
+         calls = 0
+@@ -1324,20 +1646,34 @@ class AuthorizationLedger:
+             records = self._read_records()
+             stored_lease = self._lease_from_records(records, lease)
+             if any(
+                 item.get("record_type") == "lease_close"
+                 and item.get("lease_id") == lease.lease_id
+                 for item in records
+             ):
+                 raise AuthorizationError("authorization lease is closed")
+             reservations = self._reservation_records(records, lease.lease_id)
+             reconciled = self._reconciled_ids(records)
++            reservation_ids = {
++                str(item["reservation"].get("reservation_id"))
++                for item in reservations
++            }
++            if any(
++                item.get("record_type") == "reconciliation"
++                and item.get("reservation_id") in reservation_ids
++                and isinstance(item.get("provider_facts"), dict)
++                and item["provider_facts"].get("outcome") != "accepted"
++                for item in records
++            ):
++                raise AuthorizationError(
++                    "authorization lease has a terminal reconciliation"
++                )
+             if any(
+                 item["reservation"].get("reservation_id") not in reconciled
+                 for item in reservations
+             ):
+                 raise AuthorizationError("authorization lease has an active call reservation")
+             next_offset = len(reservations)
+             if next_offset >= len(self._manifest.call_budgets):
+                 raise AuthorizationError("authorization planned calls are exhausted")
+             expected = self._manifest.call_budgets[next_offset]
+             if plan != expected:
+@@ -1365,27 +1701,41 @@ class AuthorizationLedger:
+             self._append_records(
+                 records,
+                 [{"record_type": "reservation", "reservation": asdict(reservation)}],
+             )
+             return reservation
+ 
+     def reconcile_call(
+         self,
+         reservation: AuthorizationCallReservation,
+         provider_facts: PitOptimizerProviderFacts,
++        *,
++        terminal_audit_sha256: str,
++        terminal_code: str | None = None,
+     ) -> None:
+-        """Replace one reservation with authoritative or conservatively retained usage."""
++        """Publish reconciliation and any terminal lease close as one transaction."""
+ 
+         if not isinstance(reservation, AuthorizationCallReservation) or not isinstance(
+             provider_facts, PitOptimizerProviderFacts
+         ):
+             raise AuthorizationError("authorization reconciliation contracts are invalid")
++        try:
++            _require_digest(
++                terminal_audit_sha256,
++                "authorization terminal audit SHA-256",
++            )
++        except ValueError as exc:
++            raise AuthorizationError(str(exc)) from exc
++        effective_terminal_code = self._terminal_code_for_reconciliation(
++            provider_facts,
++            terminal_code,
++        )
+         overage = False
+         with _authorization_file_lock(self._lock_path):
+             records = self._read_records()
+             reservation_record = next(
+                 (
+                     item
+                     for item in records
+                     if item.get("record_type") == "reservation"
+                     and isinstance(item.get("reservation"), dict)
+                     and item["reservation"].get("reservation_id")
+@@ -1403,25 +1753,62 @@ class AuthorizationLedger:
+                 raise AuthorizationError("authorization reservation record is invalid") from exc
+             if stored_reservation != reservation:
+                 raise AuthorizationError("authorization reservation identity mismatch")
+             if reservation.reservation_id in self._reconciled_ids(records):
+                 existing = next(
+                     item
+                     for item in records
+                     if item.get("record_type") == "reconciliation"
+                     and item.get("reservation_id") == reservation.reservation_id
+                 )
+-                if existing.get("provider_facts") == asdict(provider_facts):
++                if (
++                    existing.get("provider_facts") != asdict(provider_facts)
++                    or existing.get("terminal_audit_sha256")
++                    != terminal_audit_sha256
++                ):
++                    raise AuthorizationError(
++                        "authorization reservation reconciliation differs "
++                        "from prior facts"
++                    )
++                prior_close = next(
++                    (
++                        item
++                        for item in records
++                        if item.get("record_type") == "lease_close"
++                        and item.get("lease_id") == reservation.lease_id
++                    ),
++                    None,
++                )
++                if effective_terminal_code is not None and prior_close is None:
++                    if provider_facts.outcome != "accepted":
++                        raise AuthorizationError(
++                            "authorization terminal reconciliation is not closed"
++                        )
++                    self._append_records(
++                        records,
++                        [
++                            {
++                                "record_type": "lease_close",
++                                "lease_id": reservation.lease_id,
++                                "terminal_code": effective_terminal_code,
++                            }
++                        ],
++                    )
+                     return
+-                raise AuthorizationError(
+-                    "authorization reservation reconciliation differs from prior facts"
++                self._verify_reconciliation_records(
++                    records,
++                    reservation,
++                    provider_facts,
++                    terminal_audit_sha256,
++                    terminal_code,
+                 )
++                return
+             lease_record = next(
+                 item
+                 for item in records
+                 if item.get("record_type") == "lease_open"
+                 and isinstance(item.get("lease"), dict)
+                 and item["lease"].get("lease_id") == reservation.lease_id
+             )
+             lease = AuthorizationRunLease(**lease_record["lease"])
+             if reservation.call_index > len(self._manifest.call_budgets):
+                 raise AuthorizationError("authorization reservation call index is invalid")
+@@ -1474,38 +1861,67 @@ class AuthorizationLedger:
+                 charged_usd = Decimal(str(reservation.reserved_usd))
+                 charge_basis = "retained_reservation"
+             primitive = {
+                 "record_type": "reconciliation",
+                 "reservation_id": reservation.reservation_id,
+                 "provider_facts": asdict(provider_facts),
+                 "charged_calls": charged_calls,
+                 "charged_tokens": charged_tokens,
+                 "charged_usd": float(charged_usd),
+                 "charge_basis": charge_basis,
++                "terminal_audit_sha256": terminal_audit_sha256,
+             }
+-            self._append_records(records, [primitive])
+-
+             reservations = self._reservation_records(records, lease.lease_id)
+             prior_calls, prior_tokens, prior_usd = self._charged_totals(
+                 records,
+                 reservations,
+             )
+             overage = (
+                 charged_tokens > reservation.reserved_tokens
+                 or charged_usd > Decimal(str(reservation.reserved_usd))
+                 or prior_calls + charged_calls > lease.max_calls
+                 or prior_tokens + charged_tokens > lease.max_tokens
+                 or prior_usd + charged_usd > Decimal(str(lease.max_usd))
+             )
++            primitives = [primitive]
++            if effective_terminal_code is not None:
++                primitives.append(
++                    {
++                        "record_type": "lease_close",
++                        "lease_id": lease.lease_id,
++                        "terminal_code": effective_terminal_code,
++                    }
++                )
++            self._append_records(records, primitives)
+         if overage:
+             raise AuthorizationError("authoritative provider overage was committed")
+ 
++    def verify_reconciliation(
++        self,
++        reservation: AuthorizationCallReservation,
++        provider_facts: PitOptimizerProviderFacts,
++        *,
++        terminal_audit_sha256: str,
++        terminal_code: str | None = None,
++    ) -> None:
++        """Verify the exact durable postcondition after an interrupted publication."""
++
++        with _authorization_file_lock(self._lock_path):
++            records = self._read_records()
++            self._verify_reconciliation_records(
++                records,
++                reservation,
++                provider_facts,
++                terminal_audit_sha256,
++                terminal_code,
++            )
++
+     def recover_active_reservation(
+         self,
+         lease: AuthorizationRunLease,
+         plan: PitOptimizerCallBudget,
+     ) -> AuthorizationCallReservation | None:
+         """Recover the one durable active reservation after an interrupted reserve call."""
+ 
+         if not isinstance(lease, AuthorizationRunLease) or not isinstance(
+             plan, PitOptimizerCallBudget
+         ):
+diff --git a/tests/test_pit_optimizer_v2.py b/tests/test_pit_optimizer_v2.py
+index 611231e..bf49d04 100644
+--- a/tests/test_pit_optimizer_v2.py
++++ b/tests/test_pit_optimizer_v2.py
+@@ -2793,20 +2793,21 @@ def test_pit_optimizer_v2_reconciled_grant_remaining_is_scoped_to_new_manifest(
+         ledger.reconcile_call(
+             reservation,
+             _task6_provider_facts(
+                 reservation,
+                 pricing,
+                 prompt_tokens=10,
+                 completion_tokens=5,
+                 total_tokens=15,
+                 cost_usd=0.001,
+             ),
++            terminal_audit_sha256="b" * 64,
+         )
+     ledger.close_run_lease(lease, terminal_code="early_stop")
+ 
+     second_requirement = replace(
+         v2_manifest.authorization_requirement,
+         window_id="window-second-authenticated-run",
+     )
+     second_manifest = replace(
+         v2_manifest,
+         run_id="run_second_authenticated_optimizer",
+@@ -2935,20 +2936,57 @@ def _task6_provider_facts(
+         prompt_tokens=prompt_tokens,
+         completion_tokens=completion_tokens,
+         total_tokens=total_tokens,
+         cost_usd=cost_usd,
+         retained_reservation_tokens=retained_tokens,
+         retained_reservation_usd=retained_usd,
+         audit_sha256="a" * 64,
+     )
+ 
+ 
++def test_pit_optimizer_v2_terminal_reconciliation_fences_reopened_lease(
++    tmp_path: Path,
++    v2_manifest: contract.PitOptimizerRunManifest,
++) -> None:
++    """Break caught: a crash after terminal reconcile could unlock plan two."""
++    from core.pit_optimizer_authorization import AuthorizationError, AuthorizationLedger
++
++    authorization, ledger_path, lease, pricing = _task6_open_lease(
++        tmp_path,
++        v2_manifest,
++    )
++    reservation = authorization.reserve_call(lease, v2_manifest.call_budgets[0])
++    facts = _task6_provider_facts(
++        reservation,
++        pricing,
++        outcome="schema_invalid",
++        schema_valid=False,
++    )
++
++    authorization.reconcile_call(
++        reservation,
++        facts,
++        terminal_audit_sha256="b" * 64,
++    )
++    reopened = AuthorizationLedger(ledger_path, v2_manifest)
++
++    with pytest.raises(AuthorizationError, match="(?:terminal|closed)"):
++        reopened.reserve_call(lease, v2_manifest.call_budgets[1])
++
++    records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
++    assert [record["record_type"] for record in records[-2:]] == [
++        "reconciliation",
++        "lease_close",
++    ]
++    assert records[-1]["terminal_code"] == "failed"
++
++
+ @pytest.mark.parametrize(
+     "changes",
+     (
+         {"response_received": False, "returned_model": None},
+         {"finish_reason": "non_stop"},
+         {"returned_model": "other/model"},
+     ),
+ )
+ def test_pit_optimizer_v2_accepted_facts_are_fully_closed(
+     changes: dict[str, object],
+@@ -3037,21 +3075,25 @@ def test_pit_optimizer_v2_completed_requires_exact_authoritative_plan(
+     tmp_path: Path,
+     v2_manifest: contract.PitOptimizerRunManifest,
+ ) -> None:
+     """Break caught: a partial accepted prefix could be relabeled completed."""
+     from core.pit_optimizer_authorization import AuthorizationError
+ 
+     ledger, ledger_path, lease, pricing = _task6_open_lease(tmp_path, v2_manifest)
+     with pytest.raises(AuthorizationError, match="completed"):
+         ledger.close_run_lease(lease, terminal_code="completed")
+     first = ledger.reserve_call(lease, v2_manifest.call_budgets[0])
+-    ledger.reconcile_call(first, _task6_provider_facts(first, pricing))
++    ledger.reconcile_call(
++        first,
++        _task6_provider_facts(first, pricing),
++        terminal_audit_sha256="b" * 64,
++    )
+ 
+     with pytest.raises(AuthorizationError, match="completed"):
+         ledger.close_run_lease(lease, terminal_code="completed")
+ 
+     ledger.close_run_lease(lease, terminal_code="early_stop")
+     records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
+     assert records[-1]["terminal_code"] == "early_stop"
+ 
+ 
+ def test_pit_optimizer_v2_completed_accepts_only_full_ordered_plan(
+@@ -3065,38 +3107,39 @@ def test_pit_optimizer_v2_completed_accepts_only_full_ordered_plan(
+         ledger.reconcile_call(
+             reservation,
+             _task6_provider_facts(
+                 reservation,
+                 pricing,
+                 prompt_tokens=10,
+                 completion_tokens=5,
+                 total_tokens=15,
+                 cost_usd=0.001,
+             ),
++            terminal_audit_sha256="b" * 64,
+         )
+ 
+     ledger.close_run_lease(lease, terminal_code="completed")
+     records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
+     assert records[-1]["terminal_code"] == "completed"
+ 
+ 
+ @pytest.mark.parametrize("nonaccepted_outcome", ["schema_invalid", "uncertain_accounting"])
+ def test_pit_optimizer_v2_nonaccepted_full_plan_cannot_be_completed(
+     tmp_path: Path,
+     v2_manifest: contract.PitOptimizerRunManifest,
+     nonaccepted_outcome: str,
+ ) -> None:
+     """Break caught: call count alone could conceal a rejected or uncertain role."""
+     from core.pit_optimizer_authorization import AuthorizationError
+ 
+-    ledger, _ledger_path, lease, pricing = _task6_open_lease(tmp_path, v2_manifest)
+-    for index, plan in enumerate(v2_manifest.call_budgets):
++    ledger, ledger_path, lease, pricing = _task6_open_lease(tmp_path, v2_manifest)
++    for index, plan in enumerate(v2_manifest.call_budgets[:3]):
+         reservation = ledger.reserve_call(lease, plan)
+         if index == 2 and nonaccepted_outcome == "uncertain_accounting":
+             facts = _task6_provider_facts(
+                 reservation,
+                 pricing,
+                 outcome="uncertain_accounting",
+                 response_received=False,
+                 schema_valid=False,
+                 accounting_complete=False,
+                 prompt_tokens=None,
+@@ -3116,24 +3159,33 @@ def test_pit_optimizer_v2_nonaccepted_full_plan_cannot_be_completed(
+                     else "accepted"
+                 ),
+                 schema_valid=not (
+                     index == 2 and nonaccepted_outcome == "schema_invalid"
+                 ),
+                 prompt_tokens=10,
+                 completion_tokens=5,
+                 total_tokens=15,
+                 cost_usd=0.001,
+             )
+-        ledger.reconcile_call(reservation, facts)
++        ledger.reconcile_call(
++            reservation,
++            facts,
++            terminal_audit_sha256="b" * 64,
++        )
+ 
+-    with pytest.raises(AuthorizationError, match="completed"):
++    with pytest.raises(AuthorizationError, match="closed"):
++        ledger.reserve_call(lease, v2_manifest.call_budgets[3])
++    with pytest.raises(AuthorizationError, match="already closed"):
+         ledger.close_run_lease(lease, terminal_code="completed")
++    records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
++    assert records[-1]["record_type"] == "lease_close"
++    assert records[-1]["terminal_code"] == "failed"
+ 
+ 
+ def test_pit_optimizer_v2_budget_reservation_is_exact_sequential_and_released(
+     tmp_path: Path,
+     v2_manifest: contract.PitOptimizerRunManifest,
+ ) -> None:
+     """Break caught: future calls or a second active call could be pre-reserved."""
+     from core.pit_optimizer_authorization import AuthorizationError
+ 
+     ledger, ledger_path, lease, pricing = _task6_open_lease(tmp_path, v2_manifest)
+@@ -3144,21 +3196,25 @@ def test_pit_optimizer_v2_budget_reservation_is_exact_sequential_and_released(
+     assert first.call_index == 1
+     assert first.iteration == 1
+     assert first.role == "investigator"
+     assert first.reserved_tokens == (
+         first_plan.max_input_tokens + first_plan.max_output_tokens
+     )
+     assert first.reserved_usd == pytest.approx(first_plan.max_usd)
+     with pytest.raises(AuthorizationError, match="active call reservation"):
+         ledger.reserve_call(lease, second_plan)
+ 
+-    ledger.reconcile_call(first, _task6_provider_facts(first, pricing))
++    ledger.reconcile_call(
++        first,
++        _task6_provider_facts(first, pricing),
++        terminal_audit_sha256="b" * 64,
++    )
+     second = ledger.reserve_call(lease, second_plan)
+     assert (second.call_index, second.role) == (2, "author")
+ 
+     records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
+     assert [item["record_type"] for item in records[-3:]] == [
+         "reservation",
+         "reconciliation",
+         "reservation",
+     ]
+     reconciliation = records[-2]
+@@ -3184,28 +3240,34 @@ def test_pit_optimizer_v2_provider_call_overage_is_committed_before_rejection(
+         pricing,
+         outcome="budget_exceeded",
+         schema_valid=True,
+         prompt_tokens=over_tokens,
+         completion_tokens=0,
+         total_tokens=over_tokens,
+         cost_usd=plan.max_usd + 0.01,
+     )
+ 
+     with pytest.raises(AuthorizationError, match="authoritative provider overage"):
+-        ledger.reconcile_call(reservation, facts)
++        ledger.reconcile_call(
++            reservation,
++            facts,
++            terminal_audit_sha256="b" * 64,
++        )
+ 
+     records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
+-    committed = records[-1]
++    committed = records[-2]
+     assert committed["record_type"] == "reconciliation"
+     assert committed["charged_calls"] == 1
+     assert committed["charged_tokens"] == over_tokens
+     assert committed["charged_usd"] == pytest.approx(plan.max_usd + 0.01)
++    assert records[-1]["record_type"] == "lease_close"
++    assert records[-1]["terminal_code"] == "budget_exhausted"
+ 
+ 
+ def test_pit_optimizer_v2_provider_call_uncertain_retains_one_full_reservation(
+     tmp_path: Path,
+     v2_manifest: contract.PitOptimizerRunManifest,
+ ) -> None:
+     """Break caught: post-send uncertainty could release allowance or continue the run."""
+     from core.pit_optimizer_authorization import AuthorizationError
+ 
+     ledger, ledger_path, lease, pricing = _task6_open_lease(tmp_path, v2_manifest)
+@@ -3219,21 +3281,25 @@ def test_pit_optimizer_v2_provider_call_uncertain_retains_one_full_reservation(
+         schema_valid=False,
+         accounting_complete=False,
+         prompt_tokens=None,
+         completion_tokens=None,
+         total_tokens=None,
+         cost_usd=None,
+         retained_tokens=reservation.reserved_tokens,
+         retained_usd=reservation.reserved_usd,
+     )
+ 
+-    ledger.reconcile_call(reservation, facts)
++    ledger.reconcile_call(
++        reservation,
++        facts,
++        terminal_audit_sha256="b" * 64,
++    )
+     ledger.close_run_lease(lease, terminal_code="failed")
+ 
+     records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
+     retained = records[-2]
+     assert retained["record_type"] == "reconciliation"
+     assert retained["charged_calls"] == 1
+     assert retained["charged_tokens"] == reservation.reserved_tokens
+     assert retained["charged_usd"] == pytest.approx(reservation.reserved_usd)
+     assert retained["charge_basis"] == "retained_reservation"
+     assert records[-1]["record_type"] == "lease_close"
+@@ -3254,21 +3320,25 @@ def test_pit_optimizer_v2_provider_call_failure_before_send_commits_no_spend(
+         outcome="failed_before_send",
+         request_started=False,
+         response_received=False,
+         schema_valid=False,
+         prompt_tokens=0,
+         completion_tokens=0,
+         total_tokens=0,
+         cost_usd=0.0,
+     )
+ 
+-    ledger.reconcile_call(reservation, facts)
++    ledger.reconcile_call(
++        reservation,
++        facts,
++        terminal_audit_sha256="b" * 64,
++    )
+     ledger.close_run_lease(lease, terminal_code="failed")
+ 
+     records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
+     released = records[-2]
+     assert released["record_type"] == "reconciliation"
+     assert released["charged_calls"] == 0
+     assert released["charged_tokens"] == 0
+     assert released["charged_usd"] == pytest.approx(0.0)
+     assert released["charge_basis"] == "before_send_release"
+ 
+@@ -3286,20 +3356,21 @@ def test_pit_optimizer_v2_budget_reservation_cannot_start_seventh_call(
+         ledger.reconcile_call(
+             reservation,
+             _task6_provider_facts(
+                 reservation,
+                 pricing,
+                 prompt_tokens=10,
+                 completion_tokens=5,
+                 total_tokens=15,
+                 cost_usd=0.001,
+             ),
++            terminal_audit_sha256="b" * 64,
+         )
+ 
+     with pytest.raises(AuthorizationError, match="planned calls are exhausted"):
+         ledger.reserve_call(lease, v2_manifest.call_budgets[0])
+ 
+ 
+ def test_pit_optimizer_v2_call_preflight_uses_lease_bound_frozen_pricing() -> None:
+     """Break caught: a paid call could start above its sealed per-call USD cap."""
+     from agent_loop import (
+         BudgetExceededError,
+@@ -3683,58 +3754,73 @@ def _task6_gateway_context(
+         ledger_path,
+         lease,
+         pricing,
+         budget,
+         audit,
+         client,
+         gateway,
+     )
+ 
+ 
++def _task6_bind_role_input(
++    authorization: object,
++    plan: contract.PitOptimizerCallBudget,
++    role_input: object,
++) -> object:
++    """Model the controller-origin capability handoff to the paid boundary."""
++
++    authorization.bind_controller_role_input(role_input, plan)  # type: ignore[attr-defined]
++    return role_input
++
++
+ def test_pit_optimizer_v2_exact_one_cent_preflight_has_zero_effects(
+     tmp_path: Path,
+     v2_manifest: contract.PitOptimizerRunManifest,
+ ) -> None:
+     """Prove exact $0.010000 conservative cost rejects a $0.009999 sealed cap."""
+     import agent_loop
+ 
+     first_plan = replace(
+         v2_manifest.call_budgets[0],
+         max_usd=0.009999,
+     )
+     call_budgets = (first_plan, *v2_manifest.call_budgets[1:])
+     manifest = replace(
+         v2_manifest,
+         call_budgets=call_budgets,
+     )
+     (
+-        _authorization,
++        authorization,
+         ledger_path,
+         lease,
+         pricing,
+         budget,
+         audit,
+         client,
+         gateway,
+     ) = _task6_gateway_context(
+         tmp_path,
+         manifest,
+         grant_id="grant-exact-one-cent",
+         outcomes=[_task6_fake_response(_canonical_text(_investigator_payload()))],
+         prompt_rate=Decimal("0"),
+         completion_rate=Decimal("2.5"),
+     )
+ 
+     with pytest.raises(agent_loop.BudgetExceededError, match="per-call USD"):
+         gateway.request_pit_optimizer_once(
+             "investigator",
+-            _task6_manifest_investigator_input(manifest),
++            _task6_bind_role_input(
++                authorization,
++                first_plan,
++                _task6_manifest_investigator_input(manifest),
++            ),
+             _task6_investigator_parser,
+             call_budget=first_plan,
+             authorization_lease=lease,
+             frozen_pricing=pricing,
+             wall_deadline=10.0,
+             monotonic=lambda: 1.0,
+         )
+ 
+     assert client.completions.calls == []
+     assert budget.calls == 0
+@@ -3813,20 +3899,79 @@ def test_pit_optimizer_v2_gateway_rejects_equal_shaped_foreign_source_pre_effect
+             monotonic=lambda: 1.0,
+         )
+ 
+     assert client.completions.calls == []
+     assert budget.calls == 0
+     assert audit._events == []
+     records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
+     assert not any(record["record_type"] == "reservation" for record in records)
+ 
+ 
++def test_pit_optimizer_v2_request_clock_cannot_swap_authenticated_source_bytes(
++    tmp_path: Path,
++    v2_manifest: contract.PitOptimizerRunManifest,
++) -> None:
++    """Break caught: a callback could swap source after auth but before capture."""
++    from core.pit_optimizer_authorization import AuthorizationError
++
++    (
++        authorization,
++        ledger_path,
++        lease,
++        pricing,
++        budget,
++        audit,
++        client,
++        gateway,
++    ) = _task6_gateway_context(
++        tmp_path,
++        v2_manifest,
++        grant_id="grant-callback-source-swap",
++        outcomes=[_task6_fake_response(_canonical_text(_investigator_payload()))],
++    )
++    role_input = _task6_manifest_investigator_input(v2_manifest)
++    authorization.bind_controller_role_input(
++        role_input,
++        v2_manifest.call_budgets[0],
++    )
++    foreign = _task6_manifest_source_bundle(
++        v2_manifest,
++        alternate_same_size=True,
++    )
++    clock_calls = 0
++
++    def mutating_clock() -> float:
++        nonlocal clock_calls
++        clock_calls += 1
++        if clock_calls == 1:
++            object.__setattr__(role_input, "source_bundle", foreign)
++        return 1.0
++
++    with pytest.raises(AuthorizationError, match="(?:policy source|role input)"):
++        gateway.request_pit_optimizer_once(
++            "investigator",
++            role_input,
++            _task6_investigator_parser,
++            call_budget=v2_manifest.call_budgets[0],
++            authorization_lease=lease,
++            frozen_pricing=pricing,
++            wall_deadline=10.0,
++            monotonic=mutating_clock,
++        )
++
++    assert client.completions.calls == []
++    assert budget.calls == 0
++    assert audit._events == []
++    records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
++    assert not any(record["record_type"] == "reservation" for record in records)
++
++
+ def test_pit_optimizer_v2_gateway_rejects_foreign_author_source_pre_effect(
+     tmp_path: Path,
+     v2_manifest: contract.PitOptimizerRunManifest,
+ ) -> None:
+     """Break caught: the author role could transmit source outside the leased scope."""
+     import agent_loop
+     from core.pit_optimizer_authorization import AuthorizationError
+ 
+     authorization, ledger_path, window = _task6_authorized_ledger(
+         tmp_path,
+@@ -3856,21 +4001,25 @@ def test_pit_optimizer_v2_gateway_rejects_foreign_author_source_pre_effect(
+     )
+     lease = authorization.open_run_lease(
+         window_id=window.window_id,
+         authorization_requirement_sha256=(
+             v2_manifest.authorization_requirement.sha256
+         ),
+         run_manifest_sha256=v2_manifest.sha256,
+         frozen_pricing_sha256=pricing.pricing_sha256,
+     )
+     first = authorization.reserve_call(lease, v2_manifest.call_budgets[0])
+-    authorization.reconcile_call(first, _task6_provider_facts(first, pricing))
++    authorization.reconcile_call(
++        first,
++        _task6_provider_facts(first, pricing),
++        terminal_audit_sha256="b" * 64,
++    )
+     before_records = len(ledger_path.read_bytes().splitlines())
+ 
+     with pytest.raises(AuthorizationError, match="policy source"):
+         gateway.request_pit_optimizer_once(
+             "author",
+             _task6_manifest_author_input(
+                 v2_manifest,
+                 source_bundle=_task6_manifest_source_bundle(
+                     v2_manifest,
+                     alternate_same_size=True,
+@@ -3934,20 +4083,21 @@ def test_pit_optimizer_v2_gateway_rejects_cross_run_critic_summary_pre_effect(
+             v2_manifest.authorization_requirement.sha256
+         ),
+         run_manifest_sha256=v2_manifest.sha256,
+         frozen_pricing_sha256=pricing.pricing_sha256,
+     )
+     for plan in v2_manifest.call_budgets[:2]:
+         reservation = authorization.reserve_call(lease, plan)
+         authorization.reconcile_call(
+             reservation,
+             _task6_provider_facts(reservation, pricing),
++            terminal_audit_sha256="b" * 64,
+         )
+     before_records = len(ledger_path.read_bytes().splitlines())
+ 
+     with pytest.raises(AuthorizationError, match="run manifest"):
+         gateway.request_pit_optimizer_once(
+             "critic",
+             _task6_manifest_critic_input(
+                 v2_manifest,
+                 run_manifest_sha256="f" * 64,
+             ),
+@@ -3961,20 +4111,78 @@ def test_pit_optimizer_v2_gateway_rejects_cross_run_critic_summary_pre_effect(
+             wall_deadline=10.0,
+             monotonic=lambda: 1.0,
+         )
+ 
+     assert client.completions.calls == []
+     assert budget.calls == 0
+     assert audit._events == []
+     assert len(ledger_path.read_bytes().splitlines()) == before_records
+ 
+ 
++def test_pit_optimizer_v2_gateway_rejects_relabeled_foreign_critic_capability(
++    tmp_path: Path,
++    v2_manifest: contract.PitOptimizerRunManifest,
++) -> None:
++    """Break caught: a foreign critic package could relabel only its digest tag."""
++    from core.pit_optimizer_authorization import AuthorizationError
++
++    (
++        authorization,
++        ledger_path,
++        lease,
++        pricing,
++        budget,
++        audit,
++        client,
++        gateway,
++    ) = _task6_gateway_context(
++        tmp_path,
++        v2_manifest,
++        grant_id="grant-relabeled-critic",
++        outcomes=[_task6_fake_response(_canonical_text(_critic_payload()))],
++    )
++    for plan in v2_manifest.call_budgets[:2]:
++        reservation = authorization.reserve_call(lease, plan)
++        authorization.reconcile_call(
++            reservation,
++            _task6_provider_facts(reservation, pricing),
++            terminal_audit_sha256="b" * 64,
++        )
++    foreign_manifest = replace(v2_manifest, run_id="pit-optimizer-foreign")
++    foreign_input = _task6_manifest_critic_input(foreign_manifest)
++    relabeled = replace(
++        foreign_input,
++        run_manifest_sha256=v2_manifest.sha256,
++    )
++    before_records = len(ledger_path.read_bytes().splitlines())
++
++    with pytest.raises(AuthorizationError, match="(?:provenance|role input)"):
++        gateway.request_pit_optimizer_once(
++            "critic",
++            relabeled,
++            lambda raw: contract.CriticArtifact.from_json(
++                raw,
++                max_total_bytes=contract.MAX_CRITIC_ARTIFACT_BYTES,
++            ),
++            call_budget=v2_manifest.call_budgets[2],
++            authorization_lease=lease,
++            frozen_pricing=pricing,
++            wall_deadline=10.0,
++            monotonic=lambda: 1.0,
++        )
++
++    assert client.completions.calls == []
++    assert budget.calls == 0
++    assert audit._events == []
++    assert len(ledger_path.read_bytes().splitlines()) == before_records
++
++
+ def test_pit_optimizer_v2_authenticates_current_descendant_from_exact_scope() -> None:
+     """Break caught: current source could claim ancestry from hashes it did not descend from."""
+ 
+     initial = _source_bundle()
+     scope = _source_scope(initial)
+     initial_texts = {record.path: record.text for record in initial.files}
+     current_texts = dict(initial_texts)
+     current_texts["core/strategy_policy/entry.py"] = current_texts[
+         "core/strategy_policy/entry.py"
+     ].replace("return None", "return snapshot")
+@@ -4053,20 +4261,101 @@ def test_pit_optimizer_v2_frozen_pricing_digest_commits_to_exact_decimal_rates()
+     assert pricing.pricing_sha256 == expected_digest
+     with pytest.raises(ValueError, match="digest"):
+         replace(pricing, prompt_per_million=Decimal("0"))
+     with pytest.raises(ConfigurationError, match="pricing"):
+         freeze_pricing_record(
+             contract.PIT_OPTIMIZER_R1_MODEL,
+             {"prompt": True, "completion": Decimal("2")},
+         )
+ 
+ 
++@pytest.mark.parametrize("mutate_from_clock", [False, True])
++def test_pit_optimizer_v2_gateway_reauthenticates_live_cached_pricing_rates(
++    tmp_path: Path,
++    v2_manifest: contract.PitOptimizerRunManifest,
++    mutate_from_clock: bool,
++) -> None:
++    """Break caught: cached rates could mutate while retaining their old digest."""
++    from core.pit_optimizer_authorization import AuthorizationError
++
++    (
++        authorization,
++        ledger_path,
++        lease,
++        pricing,
++        budget,
++        audit,
++        client,
++        gateway,
++    ) = _task6_gateway_context(
++        tmp_path,
++        v2_manifest,
++        grant_id=f"grant-live-pricing-{str(mutate_from_clock).lower()}",
++        outcomes=[_task6_fake_response(_canonical_text(_investigator_payload()))],
++        prompt_rate=Decimal("1000000"),
++        completion_rate=Decimal("1000000"),
++    )
++    mutated = False
++
++    def mutate_rates() -> None:
++        nonlocal mutated
++        if not mutated:
++            mutated = True
++            object.__setattr__(pricing, "prompt_per_million", Decimal("0"))
++            object.__setattr__(pricing, "completion_per_million", Decimal("0"))
++
++    if not mutate_from_clock:
++        mutate_rates()
++
++    def clock() -> float:
++        if mutate_from_clock:
++            mutate_rates()
++        return 1.0
++
++    role_input = _task6_manifest_investigator_input(v2_manifest)
++    authorization.bind_controller_role_input(
++        role_input,
++        v2_manifest.call_budgets[0],
++    )
++
++    with pytest.raises(AuthorizationError, match="frozen pricing"):
++        gateway.request_pit_optimizer_once(
++            "investigator",
++            role_input,
++            _task6_investigator_parser,
++            call_budget=v2_manifest.call_budgets[0],
++            authorization_lease=lease,
++            frozen_pricing=pricing,
++            wall_deadline=10.0,
++            monotonic=clock,
++        )
++
++    assert client.completions.calls == []
++    assert budget.calls == 0
++    assert audit._events == []
++    records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
++    assert not any(record["record_type"] == "reservation" for record in records)
++
++
++def test_pit_optimizer_v2_freeze_accepts_advertised_pricing_value() -> None:
++    """Break caught: the advertised legacy Pricing input became impossible to freeze."""
++    from agent_loop import Pricing, freeze_pricing_record
++
++    frozen = freeze_pricing_record(
++        contract.PIT_OPTIMIZER_R1_MODEL,
++        Pricing(prompt_per_million=1.0, completion_per_million=2.0),
++    )
++
++    assert frozen.prompt_per_million == Decimal("1.0")
++    assert frozen.completion_per_million == Decimal("2.0")
++
++
+ def test_pit_optimizer_v2_builtin_pricing_json_preserves_exact_decimal(
+     monkeypatch: pytest.MonkeyPatch,
+ ) -> None:
+     """Break caught: JSON numeric rates could round through binary float before freezing."""
+     import agent_loop
+ 
+     class PricingResponse:
+         def __enter__(self) -> "PricingResponse":
+             return self
+ 
+@@ -4390,21 +4679,25 @@ def test_pit_optimizer_v2_keyboard_interrupt_finalizes_by_provider_phase(
+     elif phase == "sdk_construction":
+         monkeypatch.setattr(
+             gateway,
+             "_get_client",
+             lambda: (_ for _ in ()).throw(KeyboardInterrupt(phase)),
+         )
+ 
+     with pytest.raises(KeyboardInterrupt, match=phase):
+         gateway.request_pit_optimizer_once(
+             "investigator",
+-            _task6_manifest_investigator_input(v2_manifest),
++            _task6_bind_role_input(
++                authorization,
++                v2_manifest.call_budgets[0],
++                _task6_manifest_investigator_input(v2_manifest),
++            ),
+             _task6_investigator_parser,
+             call_budget=v2_manifest.call_budgets[0],
+             authorization_lease=lease,
+             frozen_pricing=pricing,
+             wall_deadline=10.0,
+             monotonic=lambda: 1.0,
+         )
+ 
+     records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
+     assert records[-2]["record_type"] == "reconciliation"
+@@ -4441,39 +4734,43 @@ def test_pit_optimizer_v2_unexpected_runtime_error_retains_uncertain_call(
+         parser = _task6_investigator_parser
+     else:
+         outcomes = [
+             _task6_fake_response(_canonical_text(_investigator_payload()))
+         ]
+ 
+         def parser(_raw: str) -> contract.InvestigatorArtifact:
+             raise RuntimeError(failure_phase)
+ 
+     (
+-        _authorization,
++        authorization,
+         ledger_path,
+         lease,
+         pricing,
+         budget,
+         audit,
+         client,
+         gateway,
+     ) = _task6_gateway_context(
+         tmp_path,
+         v2_manifest,
+         grant_id=f"grant-runtime-{failure_phase.replace('_', '-')}",
+         outcomes=outcomes,
+     )
+ 
+     with pytest.raises(RuntimeError, match=failure_phase):
+         gateway.request_pit_optimizer_once(
+             "investigator",
+-            _task6_manifest_investigator_input(v2_manifest),
++            _task6_bind_role_input(
++                authorization,
++                v2_manifest.call_budgets[0],
++                _task6_manifest_investigator_input(v2_manifest),
++            ),
+             parser,
+             call_budget=v2_manifest.call_budgets[0],
+             authorization_lease=lease,
+             frozen_pricing=pricing,
+             wall_deadline=10.0,
+             monotonic=lambda: 1.0,
+         )
+ 
+     records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
+     assert records[-2]["charge_basis"] == "retained_reservation"
+@@ -4483,21 +4780,21 @@ def test_pit_optimizer_v2_unexpected_runtime_error_retains_uncertain_call(
+     assert len(client.completions.calls) == 1
+     assert (audit.run_root / "provider-call-0001.json").is_file()
+ 
+ 
+ @pytest.mark.parametrize(
+     "phase",
+     (
+         "budget_reconciliation",
+         "authorization_reconciliation",
+         "terminal_audit",
+-        "lease_close",
++        "authorization_terminal_transition",
+     ),
+ )
+ def test_pit_optimizer_v2_keyboard_interrupt_during_finalizer_is_retryable(
+     tmp_path: Path,
+     v2_manifest: contract.PitOptimizerRunManifest,
+     monkeypatch: pytest.MonkeyPatch,
+     phase: str,
+ ) -> None:
+     """Break caught: finalizer cancellation could publish stale facts or misclose the lease."""
+     (
+@@ -4527,81 +4824,214 @@ def test_pit_optimizer_v2_keyboard_interrupt_during_finalizer_is_retryable(
+             return operation(*args, **kwargs)  # type: ignore[operator]
+ 
+         return wrapped
+ 
+     if phase == "budget_reconciliation":
+         monkeypatch.setattr(
+             budget,
+             "reconcile_pit_optimizer",
+             interrupt_once(budget.reconcile_pit_optimizer),
+         )
+-    elif phase == "authorization_reconciliation":
++    elif phase in {
++        "authorization_reconciliation",
++        "authorization_terminal_transition",
++    }:
++        if phase == "authorization_terminal_transition":
++            parser = lambda _raw: object()
+         monkeypatch.setattr(
+             authorization,
+             "reconcile_call",
+             interrupt_once(authorization.reconcile_call),
+         )
+     elif phase == "terminal_audit":
+         monkeypatch.setattr(
+             audit,
+             "write_provider_call",
+             interrupt_once(audit.write_provider_call),
+         )
+-    else:
+-        parser = lambda _raw: object()
+-        monkeypatch.setattr(
+-            authorization,
+-            "close_run_lease",
+-            interrupt_once(authorization.close_run_lease),
+-        )
+-
+     with pytest.raises(KeyboardInterrupt, match=phase):
+         gateway.request_pit_optimizer_once(
+             "investigator",
+-            _task6_manifest_investigator_input(v2_manifest),
++            _task6_bind_role_input(
++                authorization,
++                v2_manifest.call_budgets[0],
++                _task6_manifest_investigator_input(v2_manifest),
++            ),
+             parser,  # type: ignore[arg-type]
+             call_budget=v2_manifest.call_budgets[0],
+             authorization_lease=lease,
+             frozen_pricing=pricing,
+             wall_deadline=10.0,
+             monotonic=lambda: 1.0,
+         )
+ 
+     records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
+     reconciliation = next(
+         record for record in records if record["record_type"] == "reconciliation"
+     )
+-    expected_outcome = "schema_invalid" if phase == "lease_close" else "accepted"
++    expected_outcome = (
++        "schema_invalid"
++        if phase == "authorization_terminal_transition"
++        else "accepted"
++    )
+     assert reconciliation["charge_basis"] == "authoritative"
+     assert reconciliation["provider_facts"]["outcome"] == expected_outcome
+     assert records[-1]["record_type"] == "lease_close"
+     assert records[-1]["terminal_code"] == "cancelled"
+     provider_record = json.loads(
+         (audit.run_root / "provider-call-0001.json").read_bytes()
+     )
+     assert provider_record["outcome"] == expected_outcome
+     assert budget.calls == 1
+     assert budget.incomplete_accounting_calls == 0
+     assert budget.reserved_tokens == budget.total_tokens
+     assert len(client.completions.calls) == 1
+ 
+ 
++def test_pit_optimizer_v2_terminal_audit_keeps_next_plan_fenced(
++    tmp_path: Path,
++    v2_manifest: contract.PitOptimizerRunManifest,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Break caught: authorization reconciliation unlocked before terminal audit."""
++    from core.pit_optimizer_authorization import AuthorizationError
++
++    (
++        authorization,
++        _ledger_path,
++        lease,
++        pricing,
++        _budget,
++        audit,
++        _client,
++        gateway,
++    ) = _task6_gateway_context(
++        tmp_path,
++        v2_manifest,
++        grant_id="grant-reentrant-audit-fence",
++        outcomes=[_task6_fake_response(_canonical_text(_investigator_payload()))],
++    )
++    original_write = audit.write_provider_call
++    rejected: list[bool] = []
++
++    def write_while_reserving(*args: object, **kwargs: object) -> object:
++        try:
++            authorization.reserve_call(lease, v2_manifest.call_budgets[1])
++        except AuthorizationError:
++            rejected.append(True)
++        else:
++            rejected.append(False)
++        return original_write(*args, **kwargs)
++
++    monkeypatch.setattr(audit, "write_provider_call", write_while_reserving)
++    gateway.request_pit_optimizer_once(
++        "investigator",
++        _task6_bind_role_input(
++            authorization,
++            v2_manifest.call_budgets[0],
++            _task6_manifest_investigator_input(v2_manifest),
++        ),
++        _task6_investigator_parser,
++        call_budget=v2_manifest.call_budgets[0],
++        authorization_lease=lease,
++        frozen_pricing=pricing,
++        wall_deadline=10.0,
++        monotonic=lambda: 1.0,
++    )
++
++    assert rejected == [True]
++    next_reservation = authorization.reserve_call(
++        lease,
++        v2_manifest.call_budgets[1],
++    )
++    assert next_reservation.call_index == 2
++
++
++def test_pit_optimizer_v2_postpublication_finalizer_failure_is_verified_once(
++    tmp_path: Path,
++    v2_manifest: contract.PitOptimizerRunManifest,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Break caught: repeated post-publication failure could abandon finalization."""
++    (
++        authorization,
++        ledger_path,
++        lease,
++        pricing,
++        budget,
++        audit,
++        client,
++        gateway,
++    ) = _task6_gateway_context(
++        tmp_path,
++        v2_manifest,
++        grant_id="grant-postpublication-finalizer",
++        outcomes=[_task6_fake_response(_canonical_text(_investigator_payload()))],
++    )
++    original_reconcile = authorization.reconcile_call
++    publications = 0
++
++    def reconcile_then_interrupt(*args: object, **kwargs: object) -> None:
++        nonlocal publications
++        original_reconcile(*args, **kwargs)
++        publications += 1
++        raise KeyboardInterrupt("postpublication-finalizer")
++
++    def exploding_parser(_raw: str) -> contract.InvestigatorArtifact:
++        raise RuntimeError("original-parser-error")
++
++    monkeypatch.setattr(
++        authorization,
++        "reconcile_call",
++        reconcile_then_interrupt,
++    )
++
++    with pytest.raises(RuntimeError, match="original-parser-error"):
++        gateway.request_pit_optimizer_once(
++            "investigator",
++            _task6_bind_role_input(
++                authorization,
++                v2_manifest.call_budgets[0],
++                _task6_manifest_investigator_input(v2_manifest),
++            ),
++            exploding_parser,
++            call_budget=v2_manifest.call_budgets[0],
++            authorization_lease=lease,
++            frozen_pricing=pricing,
++            wall_deadline=10.0,
++            monotonic=lambda: 1.0,
++        )
++
++    assert publications == 1
++    assert len(client.completions.calls) == 1
++    assert budget.calls == 1
++    assert budget.incomplete_accounting_calls == 1
++    assert len(list(audit.run_root.glob("provider-call-*.json"))) == 1
++    assert audit._events[-1]["event"] == "provider_call_rejected"
++    records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
++    assert [record["record_type"] for record in records[-2:]] == [
++        "reconciliation",
++        "lease_close",
++    ]
++    assert records[-1]["terminal_code"] == "failed"
++
++
+ def test_pit_optimizer_v2_deadline_expiry_after_start_intent_sends_nothing(
+     tmp_path: Path,
+     v2_manifest: contract.PitOptimizerRunManifest,
+     monkeypatch: pytest.MonkeyPatch,
+ ) -> None:
+     """Break caught: stale pre-audit remaining time could start a request after deadline."""
+     import agent_loop
+ 
+     (
+-        _authorization,
++        authorization,
+         ledger_path,
+         lease,
+         pricing,
+         budget,
+         audit,
+         client,
+         gateway,
+     ) = _task6_gateway_context(
+         tmp_path,
+         v2_manifest,
+@@ -4619,21 +5049,25 @@ def test_pit_optimizer_v2_deadline_expiry_after_start_intent_sends_nothing(
+         result = original_append(state, event, details)
+         if event == "provider_call_started":
+             clock.now = 11.0
+         return result
+ 
+     monkeypatch.setattr(audit, "append_event", advance_after_start)
+ 
+     with pytest.raises(agent_loop.BudgetExceededError, match="wall deadline"):
+         gateway.request_pit_optimizer_once(
+             "investigator",
+-            _task6_manifest_investigator_input(v2_manifest),
++            _task6_bind_role_input(
++                authorization,
++                v2_manifest.call_budgets[0],
++                _task6_manifest_investigator_input(v2_manifest),
++            ),
+             _task6_investigator_parser,
+             call_budget=v2_manifest.call_budgets[0],
+             authorization_lease=lease,
+             frozen_pricing=pricing,
+             wall_deadline=10.0,
+             monotonic=lambda: clock.now,
+         )
+ 
+     assert client.completions.calls == []
+     assert budget.calls == 0
+@@ -4682,41 +5116,45 @@ def test_pit_optimizer_v2_gateway_freezes_pricing_once_without_sdk_or_role_call(
+ 
+ 
+ def test_pit_optimizer_v2_gateway_preflight_has_zero_mutable_or_sdk_effects(
+     tmp_path: Path,
+     v2_manifest: contract.PitOptimizerRunManifest,
+ ) -> None:
+     """Break caught: an over-budget role call could reserve, audit, or transmit first."""
+     from agent_loop import BudgetExceededError
+ 
+     (
+-        _authorization,
++        authorization,
+         ledger_path,
+         lease,
+         pricing,
+         budget_ledger,
+         audit,
+         client,
+         gateway,
+     ) = _task6_gateway_context(
+         tmp_path,
+         v2_manifest,
+         grant_id="grant-preflight-zero",
+         outcomes=[],
+         prompt_rate=Decimal("1000000"),
+         completion_rate=Decimal("1000000"),
+     )
+ 
+     with pytest.raises(BudgetExceededError, match="per-call USD"):
+         gateway.request_pit_optimizer_once(
+             "investigator",
+-            _task6_manifest_investigator_input(v2_manifest),
++            _task6_bind_role_input(
++                authorization,
++                v2_manifest.call_budgets[0],
++                _task6_manifest_investigator_input(v2_manifest),
++            ),
+             _task6_investigator_parser,
+             call_budget=v2_manifest.call_budgets[0],
+             authorization_lease=lease,
+             frozen_pricing=pricing,
+             wall_deadline=10.0,
+             monotonic=lambda: 1.0,
+         )
+ 
+     assert client.completions.calls == []
+     assert budget_ledger.calls == 0
+@@ -4725,71 +5163,76 @@ def test_pit_optimizer_v2_gateway_preflight_has_zero_mutable_or_sdk_effects(
+     assert not any(item["record_type"] == "reservation" for item in records)
+ 
+ 
+ def test_pit_optimizer_v2_gateway_sends_one_all_r1_call_without_healing(
+     tmp_path: Path,
+     v2_manifest: contract.PitOptimizerRunManifest,
+ ) -> None:
+     """Break caught: the isolated wrapper could retry, route Qwen, or heal output."""
+     plan = v2_manifest.call_budgets[0]
+     (
+-        _authorization,
++        authorization,
+         ledger_path,
+         lease,
+         pricing,
+         _budget,
+         audit,
+         client,
+         gateway,
+     ) = _task6_gateway_context(
+         tmp_path,
+         v2_manifest,
+         grant_id="grant-accepted-call",
+         outcomes=[_task6_fake_response(_canonical_text(_investigator_payload()))],
+     )
+ 
++    role_input = _task6_manifest_investigator_input(v2_manifest)
++    snapshot = authorization.bind_controller_role_input(role_input, plan)
+     result = gateway.request_pit_optimizer_once(
+         "investigator",
+-        _task6_manifest_investigator_input(v2_manifest),
++        role_input,
+         _task6_investigator_parser,
+         call_budget=plan,
+         authorization_lease=lease,
+         frozen_pricing=pricing,
+         wall_deadline=10.0,
+         monotonic=lambda: 1.0,
+     )
+ 
+     assert result.plan == plan
+     assert isinstance(result.payload, contract.InvestigatorArtifact)
+     assert result.facts.outcome == "accepted"
+     assert result.facts.iteration == 1
+     assert len(client.completions.calls) == 1
+     sent = client.completions.calls[0]
+     assert sent["model"] == "deepseek/deepseek-r1"
+     assert sent["max_tokens"] == plan.max_output_tokens
++    assert sent["messages"][1]["content"] == snapshot.canonical_bytes.decode("utf-8")
+     assert sent["stream"] is False
+     assert sent["extra_body"] == {"provider": {"require_parameters": True}}
+     records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
+     assert [item["record_type"] for item in records[-2:]] == [
+         "reservation",
+         "reconciliation",
+     ]
+     assert [item["event"] for item in audit._events] == [
+         "provider_call_reserved",
+         "provider_call_started",
+         "provider_call_accepted",
+     ]
+-    audit_payload = json.loads(
+-        (audit.run_root / "provider-call-0001.json").read_text(encoding="utf-8")
+-    )
++    provider_path = audit.run_root / "provider-call-0001.json"
++    audit_payload = json.loads(provider_path.read_text(encoding="utf-8"))
+     assert (audit_payload["iteration"], audit_payload["role"]) == (1, "investigator")
+     assert audit_payload["frozen_pricing_sha256"] == pricing.pricing_sha256
++    assert records[-1]["terminal_audit_sha256"] == hashlib.sha256(
++        provider_path.read_bytes()
++    ).hexdigest()
+     assert "causal_rationale" not in audit_payload
+     assert "source_bundle" not in audit_payload
+ 
+ 
+ def test_pit_optimizer_v2_role_profile_is_all_r1_without_legacy_drift() -> None:
+     """Break caught: a v2 role could inherit Qwen or alter the general loop profile."""
+     from agent_loop import (
+         CODER_MODEL,
+         ORCHESTRATOR_MODEL,
+         REASONER_MODEL,
+@@ -4853,21 +5296,25 @@ def test_pit_optimizer_v2_lazy_sdk_is_fake_and_sets_max_retries_zero(
+     )
+     lease = authorization.open_run_lease(
+         window_id=window.window_id,
+         authorization_requirement_sha256=v2_manifest.authorization_requirement.sha256,
+         run_manifest_sha256=v2_manifest.sha256,
+         frozen_pricing_sha256=pricing.pricing_sha256,
+     )
+ 
+     gateway.request_pit_optimizer_once(
+         "investigator",
+-        _task6_manifest_investigator_input(v2_manifest),
++        _task6_bind_role_input(
++            authorization,
++            v2_manifest.call_budgets[0],
++            _task6_manifest_investigator_input(v2_manifest),
++        ),
+         _task6_investigator_parser,
+         call_budget=v2_manifest.call_budgets[0],
+         authorization_lease=lease,
+         frozen_pricing=pricing,
+         wall_deadline=10.0,
+         monotonic=lambda: 1.0,
+     )
+ 
+     assert len(sdk_arguments) == 1
+     assert sdk_arguments[0]["max_retries"] == 0
+@@ -4922,20 +5369,26 @@ def test_pit_optimizer_v2_gateway_accounts_all_three_r1_roles_in_order(
+         client,
+         gateway,
+     ) = _task6_gateway_context(
+         tmp_path,
+         v2_manifest,
+         grant_id="grant-all-three-roles",
+         outcomes=[
+             _task6_fake_response(_canonical_text(payload)) for payload in responses
+         ],
+     )
++    for plan, role_input in zip(
++        v2_manifest.call_budgets[:3],
++        inputs,
++        strict=True,
++    ):
++        authorization.bind_controller_role_input(role_input, plan)
+ 
+     results = tuple(
+         gateway.request_pit_optimizer_once(
+             plan.role,
+             role_input,
+             parser,
+             call_budget=plan,
+             authorization_lease=lease,
+             frozen_pricing=pricing,
+             wall_deadline=10.0,
+@@ -4985,40 +5438,44 @@ def test_pit_optimizer_v2_gateway_terminal_failures_close_without_retry(
+     v2_manifest: contract.PitOptimizerRunManifest,
+     outcome: object,
+     provider_outcome: str,
+     error_type: str,
+     charge_basis: str,
+ ) -> None:
+     """Break caught: malformed/uncertain calls could leak a reservation or retry."""
+     import agent_loop
+ 
+     (
+-        _authorization,
++        authorization,
+         ledger_path,
+         lease,
+         pricing,
+         _budget,
+         audit,
+         client,
+         gateway,
+     ) = _task6_gateway_context(
+         tmp_path,
+         v2_manifest,
+         grant_id=f"grant-terminal-{provider_outcome.replace('_', '-')}",
+         outcomes=[outcome],
+     )
+ 
+     expected_error = getattr(agent_loop, error_type)
+     with pytest.raises(expected_error):
+         gateway.request_pit_optimizer_once(
+             "investigator",
+-            _task6_manifest_investigator_input(v2_manifest),
++            _task6_bind_role_input(
++                authorization,
++                v2_manifest.call_budgets[0],
++                _task6_manifest_investigator_input(v2_manifest),
++            ),
+             _task6_investigator_parser,
+             call_budget=v2_manifest.call_budgets[0],
+             authorization_lease=lease,
+             frozen_pricing=pricing,
+             wall_deadline=10.0,
+             monotonic=lambda: 1.0,
+         )
+ 
+     assert len(client.completions.calls) == 1
+     records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
+@@ -5031,21 +5488,21 @@ def test_pit_optimizer_v2_gateway_terminal_failures_close_without_retry(
+ 
+ def test_pit_optimizer_v2_gateway_sdk_failure_releases_both_reservations(
+     tmp_path: Path,
+     v2_manifest: contract.PitOptimizerRunManifest,
+     monkeypatch: pytest.MonkeyPatch,
+ ) -> None:
+     """Break caught: local SDK construction could be misreported as paid spend."""
+     import agent_loop
+ 
+     (
+-        _authorization,
++        authorization,
+         ledger_path,
+         lease,
+         pricing,
+         budget_ledger,
+         _audit,
+         _client,
+         gateway,
+     ) = _task6_gateway_context(
+         tmp_path,
+         v2_manifest,
+@@ -5054,21 +5511,25 @@ def test_pit_optimizer_v2_gateway_sdk_failure_releases_both_reservations(
+     )
+     monkeypatch.setattr(
+         gateway,
+         "_get_client",
+         lambda: (_ for _ in ()).throw(RuntimeError("synthetic SDK failure")),
+     )
+ 
+     with pytest.raises(agent_loop.GatewayError):
+         gateway.request_pit_optimizer_once(
+             "investigator",
+-            _task6_manifest_investigator_input(v2_manifest),
++            _task6_bind_role_input(
++                authorization,
++                v2_manifest.call_budgets[0],
++                _task6_manifest_investigator_input(v2_manifest),
++            ),
+             _task6_investigator_parser,
+             call_budget=v2_manifest.call_budgets[0],
+             authorization_lease=lease,
+             frozen_pricing=pricing,
+             wall_deadline=10.0,
+             monotonic=lambda: 1.0,
+         )
+ 
+     assert (budget_ledger.calls, budget_ledger.reserved_tokens) == (0, 0)
+     assert budget_ledger.committed_usd == pytest.approx(0.0)
+@@ -5080,21 +5541,21 @@ def test_pit_optimizer_v2_gateway_sdk_failure_releases_both_reservations(
+ 
+ def test_pit_optimizer_v2_gateway_commits_authoritative_per_call_overage(
+     tmp_path: Path,
+     v2_manifest: contract.PitOptimizerRunManifest,
+ ) -> None:
+     """Break caught: an over-cap provider response could be released before rejection."""
+     import agent_loop
+ 
+     plan = v2_manifest.call_budgets[0]
+     (
+-        _authorization,
++        authorization,
+         ledger_path,
+         lease,
+         pricing,
+         _budget,
+         _audit,
+         _client,
+         gateway,
+     ) = _task6_gateway_context(
+         tmp_path,
+         v2_manifest,
+@@ -5103,21 +5564,25 @@ def test_pit_optimizer_v2_gateway_commits_authoritative_per_call_overage(
+             _task6_fake_response(
+                 _canonical_text(_investigator_payload()),
+                 cost=plan.max_usd + 0.01,
+             )
+         ],
+     )
+ 
+     with pytest.raises(agent_loop.BudgetExceededError, match="per-call"):
+         gateway.request_pit_optimizer_once(
+             "investigator",
+-            _task6_manifest_investigator_input(v2_manifest),
++            _task6_bind_role_input(
++                authorization,
++                plan,
++                _task6_manifest_investigator_input(v2_manifest),
++            ),
+             _task6_investigator_parser,
+             call_budget=plan,
+             authorization_lease=lease,
+             frozen_pricing=pricing,
+             wall_deadline=10.0,
+             monotonic=lambda: 1.0,
+         )
+ 
+     records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
+     assert records[-2]["provider_facts"]["outcome"] == "budget_exceeded"

@@ -1,0 +1,2084 @@
+diff --git a/core/pit_optimizer_v5/artifacts.py b/core/pit_optimizer_v5/artifacts.py
+index a4bba23..7fb803d 100644
+--- a/core/pit_optimizer_v5/artifacts.py
++++ b/core/pit_optimizer_v5/artifacts.py
+@@ -711,20 +711,22 @@ def _decode_identity(kind: object, value: object) -> ExperimentIdentityV5 | PreV
+ 
+ def _decode_experiment_record(value: object) -> ExperimentRecordV5:
+     keys = {
+         "schema_version",
+         "experiment_id",
+         "experiment_identity_kind",
+         "experiment_identity",
+         "round_index",
+         "parent_revision_sha256",
+         "parent_semantic_fingerprint_sha256",
++        "pit_data_scope",
++        "semantic_mode",
+         "hypothesis",
+         "template",
+         "template_sha256",
+         "variant_assignment",
+         "policy_revision",
+         "semantic_fingerprint",
+         "status",
+         "validation",
+         "quick_evidence",
+         "discovery_episodes",
+@@ -749,20 +751,22 @@ def _decode_experiment_record(value: object) -> ExperimentRecordV5:
+     ref_values = primitive["artifact_refs"]
+     critic_ref_value = primitive["critic_artifact_ref"]
+     if type(episode_values) is not list or type(ref_values) is not list:
+         raise ArtifactSchemaFailureV5()
+     return ExperimentRecordV5(
+         experiment_id=primitive["experiment_id"],  # type: ignore[arg-type]
+         experiment_identity=_decode_identity(primitive["experiment_identity_kind"], primitive["experiment_identity"]),
+         round_index=primitive["round_index"],  # type: ignore[arg-type]
+         parent_revision_sha256=primitive["parent_revision_sha256"],  # type: ignore[arg-type]
+         parent_semantic_fingerprint_sha256=primitive["parent_semantic_fingerprint_sha256"],  # type: ignore[arg-type]
++        pit_data_scope=primitive["pit_data_scope"],
++        semantic_mode=primitive["semantic_mode"],
+         hypothesis=_decode_dataclass(HypothesisV5, primitive["hypothesis"]),
+         template=template,
+         template_sha256=primitive["template_sha256"],  # type: ignore[arg-type]
+         variant_assignment=assignment,
+         policy_revision=(None if policy_value is None else _decode_policy_revision(policy_value)),
+         semantic_fingerprint=(None if semantic_value is None else _decode_semantic_fingerprint(semantic_value)),
+         status=primitive["status"],  # type: ignore[arg-type]
+         validation=_decode_dataclass(ValidationResultV5, primitive["validation"]),
+         quick_evidence=(None if quick_value is None else _decode_dataclass(PanelEvaluationV5, quick_value)),
+         discovery_episodes=tuple(_decode_dataclass(EpisodeEvaluationV5, item) for item in episode_values),
+@@ -854,24 +858,32 @@ def _decode_round_payload(expected_kind: str, value: object) -> RoundEventPayloa
+                 if item["semantic_fingerprint"] is None
+                 else _decode_semantic_fingerprint(item["semantic_fingerprint"])
+             ),
+             failure_code=item["failure_code"],  # type: ignore[arg-type]
+             failure_ref=(
+                 None if item["failure_ref"] is None else _decode_dataclass(ArtifactRefV5, item["failure_ref"])
+             ),
+             episode_ordinal=item["episode_ordinal"],  # type: ignore[arg-type]
+         )
+     if expected_kind == "quick_evidence":
+-        item = _exact_keys(body, {"experiment_id", "semantic_fingerprint", "evaluation"})
++        item = _exact_keys(
++            body, {"experiment_id", "semantic_fingerprint", "evaluation", "pit_data_scope", "semantic_mode"}
++        )
+         return QuickEvidencePayloadV5(
+             experiment_id=item["experiment_id"],  # type: ignore[arg-type]
+-            semantic_fingerprint=_decode_semantic_fingerprint(item["semantic_fingerprint"]),
++            semantic_fingerprint=(
++                None
++                if item["semantic_fingerprint"] is None
++                else _decode_semantic_fingerprint(item["semantic_fingerprint"])
++            ),
++            pit_data_scope=item["pit_data_scope"],
++            semantic_mode=item["semantic_mode"],
+             evaluation=_decode_dataclass(PanelEvaluationV5, item["evaluation"]),
+         )
+     if expected_kind == "episode_evidence":
+         item = _exact_keys(body, {"experiment_id", "episode"})
+         return EpisodeEvidencePayloadV5(
+             experiment_id=item["experiment_id"],  # type: ignore[arg-type]
+             episode=_decode_dataclass(EpisodeEvaluationV5, item["episode"]),
+         )
+     if expected_kind == "candidate_execution":
+         return _decode_dataclass(CandidateExecutionAuthorityV5, body)
+@@ -1396,20 +1408,22 @@ class LocalArtifactRepositoryV5:
+                     completion.outcome != "accepted"
+                     or not package.accepted
+                     or package.call.campaign_id != manifest.campaign_id
+                     or package.call.round_index != closed_round.round_index
+                 ):
+                     raise ArtifactSchemaFailureV5(completion.request_ref)
+             intents = tuple(item for item in payloads if type(item) is RoundIntentPayloadV5)
+             if len(intents) != 1 or any(
+                 item.record.parent_revision_sha256 != intents[0].parent_revision_sha256
+                 or item.record.parent_semantic_fingerprint_sha256 != intents[0].parent_semantic_fingerprint_sha256
++                or item.record.pit_data_scope != intents[0].pit_data_scope
++                or item.record.semantic_mode != intents[0].semantic_mode
+                 or item.record.hypothesis != intents[0].hypothesis
+                 or item.record.experiment_identity.discovery_plan_sha256 != intents[0].discovery_plan_sha256
+                 or item.record.template != packages[1].artifact
+                 for item in current
+             ):
+                 raise ArtifactSchemaFailureV5(closed_round.event_refs[-1])
+             critic = packages[-1].artifact
+             if type(critic) is not CriticArtifactV5 or any(
+                 item.record.critic_artifact_ref is None
+                 or item.record.critic_artifact_ref.sha256 != critic.sha256
+diff --git a/core/pit_optimizer_v5/cli.py b/core/pit_optimizer_v5/cli.py
+index 55f0206..39e93bc 100644
+--- a/core/pit_optimizer_v5/cli.py
++++ b/core/pit_optimizer_v5/cli.py
+@@ -291,20 +291,21 @@ class CampaignAuthoritiesV5:
+         validate_campaign_manifest_bindings_v5(
+             self.manifest,
+             panel_plan=self.panel_plan,
+             evaluator_contract=self.evaluator_contract,
+         )
+         validate_sandbox_profile_resources_v5(self.sandbox_profile, self.manifest.resources)
+         if (
+             self.manifest.baseline_authority_ref.sha256 != canonical_sha256_v5(self.baseline)
+             or self.manifest.sandbox_profile_ref.sha256 != self.sandbox_profile.sha256
+             or self.manifest.pit_data_scope != self.baseline.pit_data_scope
++            or self.manifest.semantic_mode != self.baseline.semantic_mode
+         ):
+             raise ValueError("V5 campaign authority identity differs from the manifest")
+ 
+ 
+ def _exact_production_host_adapter_graph_v5(
+     candidate: object,
+     adapter_config: ProductionAdapterConfigV5,
+     *,
+     repository: LocalArtifactRepositoryV5,
+     authorities: CampaignAuthoritiesV5,
+@@ -1148,20 +1149,25 @@ def build_parser_v5() -> argparse.ArgumentParser:
+     build_manifest.add_argument("--max-tunable-axes", type=int, default=4)
+     build_manifest.add_argument("--max-variants-per-template", type=int, default=12)
+     build_manifest.add_argument("--max-discovery-survivors-per-template", type=int, default=6)
+     build_manifest.add_argument("--archive-capacity", type=int, default=8)
+     build_manifest.add_argument("--max-feedback-rounds", type=int, default=10)
+     build_manifest.add_argument(
+         "--pit-data-scope",
+         choices=("production", "development_sp500_v2"),
+         default="production",
+     )
++    build_manifest.add_argument(
++        "--semantic-mode",
++        choices=("required", "disabled_development"),
++        default="required",
++    )
+     build_manifest.add_argument("--deny-full-source-escape", action="store_true")
+     build_manifest.add_argument("--investigator-memory-max-bytes", type=int, default=96 * 1024)
+     build_manifest.add_argument("--max-parallel-evaluations", type=int, default=2)
+     build_manifest.add_argument("--evaluation-cpu-limit", type=Decimal, default=Decimal("1"))
+     build_manifest.add_argument("--evaluation-memory-mib", type=int, default=1024)
+     build_manifest.add_argument("--evaluation-pid-limit", type=int, default=32)
+     build_manifest.add_argument("--evaluation-output-limit-bytes", type=int, default=64 * 1024 * 1024)
+     build_manifest.add_argument("--policy-method-timeout-seconds", type=int, default=1)
+     build_manifest.add_argument("--worker-startup-timeout-seconds", type=int, default=30)
+     build_manifest.add_argument("--role-call-timeout-seconds", type=int, default=180)
+@@ -1488,20 +1494,21 @@ def _manifest_projection_v5(
+     manifest = authenticated.manifest
+     provider = manifest.provider
+     return {
+         "schema_version": 5,
+         "status": status,
+         "manifest_ref": authenticated.manifest_ref.to_primitive(),
+         "campaign_id": manifest.campaign_id,
+         "target_pct": manifest.target.to_text(),
+         "source_commit": manifest.source_commit,
+         "pit_data_scope": manifest.pit_data_scope,
++        "semantic_mode": manifest.semantic_mode,
+         "provider": (
+             None
+             if provider is None
+             else {
+                 "model": provider.model,
+                 "maximum_role_calls": provider.maximum_role_calls,
+                 "maximum_total_tokens": provider.maximum_total_tokens,
+                 "maximum_output_tokens_per_role": provider.maximum_output_tokens_per_role,
+                 "maximum_usd": provider.maximum_usd,
+                 "automatic_retries": provider.automatic_retries,
+@@ -1544,20 +1551,21 @@ def dispatch_manifest_cli_v5(
+                 evaluator_contract_ref=_manifest_ref_argument_v5(namespace, "evaluator-contract"),
+                 baseline_authority_ref=_manifest_ref_argument_v5(namespace, "baseline-authority"),
+                 panel_plan_ref=_manifest_ref_argument_v5(namespace, "panel-plan"),
+                 sandbox_profile_ref=_manifest_ref_argument_v5(namespace, "sandbox-profile"),
+                 policy_scope_path=namespace.policy_scope_output_path,
+                 manifest_path=namespace.output_path,
+                 search=_manifest_search_capabilities_v5(namespace),
+                 provider=_manifest_provider_capabilities_v5(namespace),
+                 resources=_manifest_resource_capabilities_v5(namespace),
+                 pit_data_scope=namespace.pit_data_scope,
++                semantic_mode=namespace.semantic_mode,
+             )
+             projection = _manifest_projection_v5(authenticated, status="created")
+         else:
+             authenticated = authenticate_campaign_manifest_v5(
+                 repository=repository,
+                 manifest_ref=ArtifactRefV5(
+                     namespace.manifest_path,
+                     namespace.manifest_sha256,
+                 ),
+             )
+diff --git a/core/pit_optimizer_v5/contracts.py b/core/pit_optimizer_v5/contracts.py
+index 6015be1..9d28b99 100644
+--- a/core/pit_optimizer_v5/contracts.py
++++ b/core/pit_optimizer_v5/contracts.py
+@@ -1031,20 +1031,30 @@ class ResourceCapabilitiesV5:
+         for item in fields(self):
+             if item.name in {"max_parallel_evaluations", "evaluation_cpu_limit"}:
+                 continue
+             _count(getattr(self, item.name), item.name.replace("_", " "), positive=True)
+         if self.round_wall_timeout_seconds < self.discovery_episode_timeout_seconds:
+             raise ValueError("round wall timeout is shorter than one discovery episode")
+         if self.campaign_wall_timeout_seconds < self.round_wall_timeout_seconds:
+             raise ValueError("campaign wall timeout is shorter than one round")
+ 
+ 
++def validate_semantic_mode_v5(pit_data_scope: str, semantic_mode: str) -> None:
++    """Authorize semantic absence only for explicitly scoped development."""
++    if pit_data_scope not in {"production", "development_sp500_v2"}:
++        raise ValueError("semantic PIT data scope is invalid")
++    if semantic_mode not in {"required", "disabled_development"}:
++        raise ValueError("semantic mode is invalid")
++    if semantic_mode == "disabled_development" and pit_data_scope != "development_sp500_v2":
++        raise ValueError("disabled semantics require development PIT data scope")
++
++
+ @dataclass(frozen=True, slots=True)
+ class CampaignManifestV5:
+     schema_version: Literal[5]
+     campaign_id: str
+     target: AnnualizedReturnTargetV5
+     search: SearchCapabilitiesV5
+     provider: ProviderCapabilitiesV5 | None
+     resources: ResourceCapabilitiesV5
+     artifact_root: Literal[".artifacts/pit-optimizer-v5"]
+     execution_profile_ref: ArtifactRefV5
+@@ -1052,22 +1062,24 @@ class CampaignManifestV5:
+     baseline_authority_ref: ArtifactRefV5
+     panel_plan_ref: ArtifactRefV5
+     policy_scope_ref: ArtifactRefV5
+     baseline_policy_revision_ref: ArtifactRefV5
+     sandbox_profile_ref: ArtifactRefV5
+     source_commit: str
+     apply: Literal[False]
+     qualification_allowed: Literal[False]
+     full_replay_allowed: Literal[False]
+     pit_data_scope: Literal["production", "development_sp500_v2"] = "production"
++    semantic_mode: Literal["required", "disabled_development"] = "required"
+ 
+     def __post_init__(self) -> None:
++        validate_semantic_mode_v5(self.pit_data_scope, self.semantic_mode)
+         if type(self.schema_version) is not int or self.schema_version != 5:
+             raise ValueError("campaign manifest schema must be V5")
+         _text(self.campaign_id, "campaign ID")
+         if type(self.target) is not AnnualizedReturnTargetV5:
+             raise ValueError("campaign target is invalid")
+         if type(self.search) is not SearchCapabilitiesV5:
+             raise ValueError("campaign search capabilities are invalid")
+         if self.provider is not None and type(self.provider) is not ProviderCapabilitiesV5:
+             raise ValueError("campaign provider capabilities are invalid")
+         if self.pit_data_scope not in {"production", "development_sp500_v2"}:
+@@ -2049,11 +2061,12 @@ __all__ = [
+     "evaluator_source_map_v5",
+     "evaluator_source_sha256",
+     "initial_friction_grid_v5",
+     "investigator_hypothesis_schema_bounds_v5",
+     "sandbox_profile_from_manifest_v5",
+     "selected_scenario",
+     "validate_campaign_evidence_v5",
+     "validate_campaign_manifest_bindings_v5",
+     "validate_episode_plan_panel_v5",
+     "validate_sandbox_profile_resources_v5",
++    "validate_semantic_mode_v5",
+ ]
+diff --git a/core/pit_optimizer_v5/manifest.py b/core/pit_optimizer_v5/manifest.py
+index bbd6277..9a156bc 100644
+--- a/core/pit_optimizer_v5/manifest.py
++++ b/core/pit_optimizer_v5/manifest.py
+@@ -349,23 +349,23 @@ def _authenticated_object_v5(artifact: AuthenticatedArtifactV5, label: str) -> d
+ 
+ 
+ def _require_explicit_pit_data_scope_v5(
+     artifact: AuthenticatedArtifactV5,
+     *,
+     label: str,
+ ) -> None:
+     """Diagnose pre-scope authorities without rewriting authenticated bytes."""
+ 
+     value = _authenticated_object_v5(artifact, label)
+-    if "pit_data_scope" not in value:
++    if "pit_data_scope" not in value or "semantic_mode" not in value:
+         raise ManifestAuthenticationFailureV5(
+-            f"{label} predates explicit pit_data_scope; retain the old artifact and rebuild "
++            f"{label} predates explicit pit_data_scope/semantic_mode; retain the old artifact and rebuild "
+             "the manifest graph with new content-addressed references before typed loading"
+         )
+ 
+ 
+ def _primitive_artifact_ref_v5(value: object, label: str) -> ArtifactRefV5:
+     if type(value) is not dict or set(value) != {"relative_path", "sha256"}:
+         raise ValueError(f"{label} reference is invalid")
+     try:
+         return ArtifactRefV5(value["relative_path"], value["sha256"])  # type: ignore[arg-type]
+     except (TypeError, ValueError) as exc:
+@@ -591,20 +591,21 @@ def build_campaign_manifest_v5(
+     evaluator_contract_ref: ArtifactRefV5,
+     baseline_authority_ref: ArtifactRefV5,
+     panel_plan_ref: ArtifactRefV5,
+     sandbox_profile_ref: ArtifactRefV5,
+     policy_scope_path: str,
+     manifest_path: str,
+     search: SearchCapabilitiesV5 | None = None,
+     provider: ProviderCapabilitiesV5 | None = None,
+     resources: ResourceCapabilitiesV5 | None = None,
+     pit_data_scope: Literal["production", "development_sp500_v2"] = "production",
++    semantic_mode: Literal["required", "disabled_development"] = "required",
+ ) -> AuthenticatedCampaignManifestV5:
+     """Create and reauthenticate one discovery-only campaign manifest."""
+ 
+     for path in (policy_scope_path, manifest_path):
+         ArtifactRefV5(path, "0" * 64)
+     if policy_scope_path == manifest_path:
+         raise ValueError("policy scope and manifest paths must be distinct")
+     resolved_search = SearchCapabilitiesV5() if search is None else search
+     resolved_resources = ResourceCapabilitiesV5() if resources is None else resources
+     if type(resolved_search) is not SearchCapabilitiesV5:
+@@ -619,22 +620,22 @@ def build_campaign_manifest_v5(
+         raise ValueError("manifest resource capabilities are invalid")
+ 
+     execution, evaluator, baseline, panel_plan, sandbox = _authenticate_build_dependencies_v5(
+         repository=repository,
+         execution_profile_ref=execution_profile_ref,
+         evaluator_contract_ref=evaluator_contract_ref,
+         baseline_authority_ref=baseline_authority_ref,
+         panel_plan_ref=panel_plan_ref,
+         sandbox_profile_ref=sandbox_profile_ref,
+     )
+-    if baseline.pit_data_scope != pit_data_scope:
+-        raise ValueError("manifest PIT data scope differs from baseline authority")
++    if (baseline.pit_data_scope, baseline.semantic_mode) != (pit_data_scope, semantic_mode):
++        raise ValueError("manifest PIT data scope or semantic mode differs from baseline authority")
+     _validate_precomposition_bindings_v5(
+         target=target,
+         source_snapshot=source_snapshot,
+         execution_profile_ref=execution_profile_ref,
+         execution_profile=execution,
+         evaluator_contract_ref=evaluator_contract_ref,
+         evaluator_contract=evaluator,
+         baseline_authority_ref=baseline_authority_ref,
+         baseline_authority=baseline,
+         panel_plan_ref=panel_plan_ref,
+@@ -674,20 +675,21 @@ def build_campaign_manifest_v5(
+         baseline_authority_ref=baseline_authority_ref,
+         panel_plan_ref=panel_plan_ref,
+         policy_scope_ref=policy_scope_ref,
+         baseline_policy_revision_ref=baseline_revision_ref,
+         sandbox_profile_ref=sandbox_profile_ref,
+         source_commit=source_snapshot.source_commit,
+         apply=False,
+         qualification_allowed=False,
+         full_replay_allowed=False,
+         pit_data_scope=pit_data_scope,
++        semantic_mode=semantic_mode,
+     )
+     manifest_ref = repository.create_typed_artifact(manifest_path, manifest)
+     return authenticate_campaign_manifest_v5(repository=repository, manifest_ref=manifest_ref)
+ 
+ 
+ def authenticate_campaign_manifest_v5(
+     *,
+     repository: ManifestRepositoryV5,
+     manifest_ref: ArtifactRefV5,
+ ) -> AuthenticatedCampaignManifestV5:
+@@ -777,20 +779,21 @@ def authenticate_campaign_manifest_v5(
+         pit_data_scope=manifest.pit_data_scope,
+     )
+     if (
+         manifest_ref.sha256 != manifest.sha256
+         or manifest.source_commit != policy_scope.source_commit
+         or manifest.baseline_policy_revision_ref != baseline.policy_revision_ref
+         or policy_scope.baseline_policy_revision_ref != baseline.policy_revision_ref
+         or baseline_revision != baseline.policy_revision
+         or source_bundle != baseline.source_bundle
+         or manifest.pit_data_scope != baseline.pit_data_scope
++        or manifest.semantic_mode != baseline.semantic_mode
+         or policy_scope.full_source_escape_allowed != manifest.search.allow_full_source_escape
+         or manifest.apply is not False
+         or manifest.qualification_allowed is not False
+         or manifest.full_replay_allowed is not False
+     ):
+         raise ManifestAuthenticationFailureV5("campaign manifest authorities differ")
+     return AuthenticatedCampaignManifestV5(
+         manifest_ref=manifest_ref,
+         graph=graph,
+         manifest=manifest,
+diff --git a/core/pit_optimizer_v5/memory.py b/core/pit_optimizer_v5/memory.py
+index e49255d..4a21860 100644
+--- a/core/pit_optimizer_v5/memory.py
++++ b/core/pit_optimizer_v5/memory.py
+@@ -21,20 +21,21 @@ from core.pit_optimizer_v5.contracts import (
+     ArtifactRefV5,
+     CampaignEvidenceV5,
+     CriticReviewV5,
+     EpisodeEvaluationV5,
+     HypothesisV5,
+     PanelEvaluationV5,
+     ValidationResultV5,
+     canonical_json_bytes_v5,
+     canonical_primitive_v5,
+     canonical_sha256_v5,
++    validate_semantic_mode_v5,
+ )
+ from core.pit_optimizer_v5.probes import SemanticFingerprintV5
+ from core.pit_optimizer_v5.provider import RoleNameV5, RoleOutcomeV5
+ 
+ 
+ ExperimentStatusV5 = Literal[
+     "invalid",
+     "exact_duplicate",
+     "behavioral_equivalent",
+     "sibling_equivalent",
+@@ -66,20 +67,21 @@ RoundOutcomeKindV5 = Literal[
+ ]
+ CandidateStageV5 = Literal["validation", "semantic_probe", "quick_evaluation", "discovery_evaluation"]
+ CandidateStageOutcomeV5 = Literal[
+     "validation_valid",
+     "validation_invalid",
+     "validation_failed",
+     "exact_duplicate",
+     "behavioral_equivalent",
+     "sibling_equivalent",
+     "behaviorally_distinct",
++    "semantic_skipped_development",
+     "semantic_probe_failed",
+     "quick_evaluation_failed",
+     "discovery_evaluation_failed",
+ ]
+ CandidateStageFailureCodeV5 = Literal[
+     "validation_execution_failed",
+     "semantic_probe_failed",
+     "quick_evaluation_failed",
+     "discovery_evaluation_failed",
+ ]
+@@ -159,20 +161,21 @@ _CANDIDATE_STAGE_INDEX = {
+ }
+ _CANDIDATE_STAGE_OUTCOMES = frozenset(
+     {
+         "validation_valid",
+         "validation_invalid",
+         "validation_failed",
+         "exact_duplicate",
+         "behavioral_equivalent",
+         "sibling_equivalent",
+         "behaviorally_distinct",
++        "semantic_skipped_development",
+         "semantic_probe_failed",
+         "quick_evaluation_failed",
+         "discovery_evaluation_failed",
+     }
+ )
+ _CANDIDATE_STAGE_FAILURE_CODES = frozenset(
+     {
+         "validation_execution_failed",
+         "semantic_probe_failed",
+         "quick_evaluation_failed",
+@@ -336,62 +339,67 @@ def _template_artifact_primitive(template: StructuralTemplateV5) -> dict[str, ob
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class ExperimentRecordV5:
+     """One final, immutable outcome for every intended local experiment."""
+ 
+     experiment_id: str
+     experiment_identity: ExperimentIdentityLikeV5
+     round_index: int
+     parent_revision_sha256: str
+-    parent_semantic_fingerprint_sha256: str
++    parent_semantic_fingerprint_sha256: str | None
+     hypothesis: HypothesisV5
+     template: StructuralTemplateV5
+     template_sha256: str
+     variant_assignment: VariantAssignmentV5
+     policy_revision: PolicyRevisionIdentityV5 | None
+     semantic_fingerprint: SemanticFingerprintV5 | None
+     status: ExperimentStatusV5
+     validation: ValidationResultV5
+     quick_evidence: PanelEvaluationV5 | None
+     discovery_episodes: tuple[EpisodeEvaluationV5, ...]
+     campaign_evidence: CampaignEvidenceV5 | None
+     target_gap_pct: Decimal | None
+     critic_review: CriticReviewV5 | None
+     artifact_refs: tuple[ArtifactRefV5, ...]
+     critic_artifact_ref: ArtifactRefV5 | None = None
++    pit_data_scope: Literal["production", "development_sp500_v2"] = "production"
++    semantic_mode: Literal["required", "disabled_development"] = "required"
+ 
+     def __post_init__(self) -> None:
+         _digest(self.experiment_id, "experiment ID")
+         _count(self.round_index, "experiment round", positive=True)
+         _digest(self.parent_revision_sha256, "parent revision SHA-256")
+-        _digest(
+-            self.parent_semantic_fingerprint_sha256,
+-            "parent semantic fingerprint SHA-256",
+-        )
++        validate_semantic_mode_v5(self.pit_data_scope, self.semantic_mode)
++        if (self.parent_semantic_fingerprint_sha256 is None) != (self.semantic_mode == "disabled_development"):
++            raise ValueError("parent fingerprint differs from semantic mode")
++        if self.parent_semantic_fingerprint_sha256 is not None:
++            _digest(self.parent_semantic_fingerprint_sha256, "parent semantic fingerprint SHA-256")
+         if type(self.hypothesis) is not HypothesisV5:
+             raise ValueError("experiment hypothesis must use the V5 schema")
+         if type(self.template) is not StructuralTemplateV5:
+             raise ValueError("experiment template must use the V5 schema")
+         if type(self.variant_assignment) is not VariantAssignmentV5:
+             raise ValueError("experiment assignment must use the V5 schema")
+         _digest(self.template_sha256, "experiment template SHA-256")
+         if self.template_sha256 != self.template.sha256:
+             raise ValueError("experiment template digest differs from its contents")
+         if self.template.parent_revision_sha256 != self.parent_revision_sha256:
+             raise ValueError("experiment template differs from its parent revision")
+         if self.template.hypothesis_id != self.hypothesis.hypothesis_id:
+             raise ValueError("experiment template differs from its hypothesis")
+         if self.status not in _STATUSES:
+             raise ValueError("experiment status is invalid")
+         if type(self.validation) is not ValidationResultV5:
+             raise ValueError("experiment validation must use the V5 schema")
++        if self.semantic_mode == "disabled_development" and self.semantic_fingerprint is not None:
++            raise ValueError("disabled semantics cannot carry a fingerprint")
+         if self.semantic_fingerprint is not None and type(self.semantic_fingerprint) is not SemanticFingerprintV5:
+             raise ValueError("experiment semantic fingerprint is invalid")
+         if self.quick_evidence is not None and type(self.quick_evidence) is not PanelEvaluationV5:
+             raise ValueError("experiment quick evidence is invalid")
+         if type(self.discovery_episodes) is not tuple or any(
+             type(item) is not EpisodeEvaluationV5 for item in self.discovery_episodes
+         ):
+             raise ValueError("experiment discovery evidence is invalid")
+         episode_keys = tuple((item.episode_ordinal, item.episode_id) for item in self.discovery_episodes)
+         if episode_keys != tuple(sorted(set(episode_keys))):
+@@ -495,40 +503,40 @@ class ExperimentRecordV5:
+                     and self.semantic_fingerprint.fingerprint_sha256 != self.parent_semantic_fingerprint_sha256
+                 )
+                 or self.quick_evidence is not None
+                 or self.discovery_episodes
+                 or self.campaign_evidence is not None
+                 or self.target_gap_pct is not None
+             ):
+                 raise ValueError("behaviorally equivalent experiment evidence is inconsistent")
+         elif self.status == "quick_rejected":
+             if (
+-                self.semantic_fingerprint is None
++                (self.semantic_fingerprint is None and self.semantic_mode == "required")
+                 or self.quick_evidence is None
+                 or self.discovery_episodes
+                 or self.campaign_evidence is not None
+                 or self.target_gap_pct is not None
+             ):
+                 raise ValueError("quick-rejected experiment evidence is inconsistent")
+         elif self.status == "zero_trade":
+             if (
+-                self.semantic_fingerprint is None
++                (self.semantic_fingerprint is None and self.semantic_mode == "required")
+                 or self.quick_evidence is None
+                 or len(self.discovery_episodes) != 4
+                 or self.campaign_evidence is None
+                 or self.campaign_evidence.closed_trades != 0
+                 or self.target_gap_pct is None
+             ):
+                 raise ValueError("zero-trade experiment requires complete zero-activity evidence")
+         elif self.status == "evaluated":
+             if (
+-                self.semantic_fingerprint is None
++                (self.semantic_fingerprint is None and self.semantic_mode == "required")
+                 or self.quick_evidence is None
+                 or len(self.discovery_episodes) != 4
+                 or self.campaign_evidence is None
+                 or self.target_gap_pct is None
+             ):
+                 raise ValueError("evaluated experiment requires complete campaign evidence")
+         elif self.status in {"timed_out", "cancelled", "evaluation_failed"}:
+             if self.campaign_evidence is not None or self.target_gap_pct is not None:
+                 raise ValueError("interrupted experiment cannot carry completed campaign scoring")
+         if (
+@@ -572,20 +580,22 @@ class ExperimentRecordV5:
+             else "post_validation"
+         )
+         return {
+             "schema_version": 5,
+             "experiment_id": self.experiment_id,
+             "experiment_identity_kind": identity_kind,
+             "experiment_identity": self.experiment_identity.to_primitive(),
+             "round_index": self.round_index,
+             "parent_revision_sha256": self.parent_revision_sha256,
+             "parent_semantic_fingerprint_sha256": self.parent_semantic_fingerprint_sha256,
++            "pit_data_scope": self.pit_data_scope,
++            "semantic_mode": self.semantic_mode,
+             "hypothesis": canonical_primitive_v5(self.hypothesis),
+             "template": _template_artifact_primitive(self.template),
+             "template_sha256": self.template_sha256,
+             "variant_assignment": _assignment_artifact_primitive(self.variant_assignment),
+             "policy_revision": (None if self.policy_revision is None else self.policy_revision.to_primitive()),
+             "semantic_fingerprint": (
+                 None if self.semantic_fingerprint is None else self.semantic_fingerprint.to_primitive()
+             ),
+             "status": self.status,
+             "validation": canonical_primitive_v5(self.validation),
+@@ -604,30 +614,33 @@ class ExperimentRecordV5:
+         return canonical_json_bytes_v5(self.to_primitive())
+ 
+     @property
+     def sha256(self) -> str:
+         return canonical_sha256_v5(self.to_primitive())
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class RoundIntentPayloadV5:
+     parent_revision_sha256: str
+-    parent_semantic_fingerprint_sha256: str
++    parent_semantic_fingerprint_sha256: str | None
+     hypothesis: HypothesisV5
+     discovery_plan_sha256: str
++    pit_data_scope: Literal["production", "development_sp500_v2"] = "production"
++    semantic_mode: Literal["required", "disabled_development"] = "required"
+ 
+     def __post_init__(self) -> None:
+         _digest(self.parent_revision_sha256, "round-intent parent revision")
+-        _digest(
+-            self.parent_semantic_fingerprint_sha256,
+-            "round-intent parent fingerprint",
+-        )
++        validate_semantic_mode_v5(self.pit_data_scope, self.semantic_mode)
++        if (self.parent_semantic_fingerprint_sha256 is None) != (self.semantic_mode == "disabled_development"):
++            raise ValueError("parent fingerprint differs from semantic mode")
++        if self.parent_semantic_fingerprint_sha256 is not None:
++            _digest(self.parent_semantic_fingerprint_sha256, "round-intent parent fingerprint")
+         if type(self.hypothesis) is not HypothesisV5:
+             raise ValueError("round-intent hypothesis is invalid")
+         _digest(self.discovery_plan_sha256, "round-intent discovery plan")
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class RoleCompletionPayloadV5:
+     """Authenticated durable terminal package for one fixed round role."""
+ 
+     campaign_id: str
+@@ -724,20 +737,21 @@ class CandidateStageResultPayloadV5:
+         if self.outcome not in _CANDIDATE_STAGE_OUTCOMES:
+             raise ValueError("candidate-stage outcome is invalid")
+         expected_stage = {
+             "validation_valid": "validation",
+             "validation_invalid": "validation",
+             "validation_failed": "validation",
+             "exact_duplicate": "semantic_probe",
+             "behavioral_equivalent": "semantic_probe",
+             "sibling_equivalent": "semantic_probe",
+             "behaviorally_distinct": "semantic_probe",
++            "semantic_skipped_development": "semantic_probe",
+             "semantic_probe_failed": "semantic_probe",
+             "quick_evaluation_failed": "quick_evaluation",
+             "discovery_evaluation_failed": "discovery_evaluation",
+         }[self.outcome]
+         if self.stage != expected_stage:
+             raise ValueError("candidate-stage outcome differs from its stage")
+ 
+         validation_outcomes = {"validation_valid", "validation_invalid", "validation_failed"}
+         semantic_outcomes = {"behavioral_equivalent", "sibling_equivalent", "behaviorally_distinct"}
+         failure_outcomes = {
+@@ -775,26 +789,31 @@ class CandidateStageResultPayloadV5:
+             ordinal = _count(self.episode_ordinal, "failed discovery episode ordinal", positive=True)
+             if ordinal > 4:
+                 raise ValueError("failed discovery episode ordinal is outside the fixed panel")
+         elif self.episode_ordinal is not None:
+             raise ValueError("only discovery failure can carry an episode ordinal")
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class QuickEvidencePayloadV5:
+     experiment_id: str
+-    semantic_fingerprint: SemanticFingerprintV5
++    semantic_fingerprint: SemanticFingerprintV5 | None
+     evaluation: PanelEvaluationV5
++    pit_data_scope: Literal["production", "development_sp500_v2"] = "production"
++    semantic_mode: Literal["required", "disabled_development"] = "required"
+ 
+     def __post_init__(self) -> None:
+         _digest(self.experiment_id, "quick-evidence experiment ID")
+-        if type(self.semantic_fingerprint) is not SemanticFingerprintV5:
++        validate_semantic_mode_v5(self.pit_data_scope, self.semantic_mode)
++        if (self.semantic_fingerprint is None) != (self.semantic_mode == "disabled_development"):
++            raise ValueError("quick fingerprint differs from semantic mode")
++        if self.semantic_fingerprint is not None and type(self.semantic_fingerprint) is not SemanticFingerprintV5:
+             raise ValueError("quick-evidence semantic fingerprint is invalid")
+         if type(self.evaluation) is not PanelEvaluationV5:
+             raise ValueError("quick-evidence panel is invalid")
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class EpisodeEvidencePayloadV5:
+     experiment_id: str
+     episode: EpisodeEvaluationV5
+ 
+@@ -1240,21 +1259,25 @@ def round_event_payload_primitive_v5(
+             "semantic_fingerprint": (
+                 None if payload.semantic_fingerprint is None else payload.semantic_fingerprint.to_primitive()
+             ),
+             "failure_code": payload.failure_code,
+             "failure_ref": None if payload.failure_ref is None else payload.failure_ref.to_primitive(),
+             "episode_ordinal": payload.episode_ordinal,
+         }
+     elif isinstance(payload, QuickEvidencePayloadV5):
+         body = {
+             "experiment_id": payload.experiment_id,
+-            "semantic_fingerprint": payload.semantic_fingerprint.to_primitive(),
++            "semantic_fingerprint": (
++                None if payload.semantic_fingerprint is None else payload.semantic_fingerprint.to_primitive()
++            ),
++            "pit_data_scope": payload.pit_data_scope,
++            "semantic_mode": payload.semantic_mode,
+             "evaluation": canonical_primitive_v5(payload.evaluation),
+         }
+     elif isinstance(payload, EpisodeEvidencePayloadV5):
+         body = {
+             "experiment_id": payload.experiment_id,
+             "episode": canonical_primitive_v5(payload.episode),
+         }
+     else:
+         body = canonical_primitive_v5(payload)
+     if not isinstance(body, dict):
+@@ -1431,20 +1454,22 @@ class RoundRecoveryV5:
+ 
+     @property
+     def terminal_outcome(self) -> RoundOutcomePayloadV5 | None:
+         return next((item for item in self.payloads if isinstance(item, RoundOutcomePayloadV5)), None)
+ 
+ 
+ def _validate_candidate_stage_chain_v5(
+     events: tuple[RoundEventV5, ...],
+     payloads: tuple[RoundEventPayloadV5, ...],
+ ) -> None:
++    intents = tuple(item for item in payloads if isinstance(item, RoundIntentPayloadV5))
++    semantic_disabled = len(intents) == 1 and intents[0].semantic_mode == "disabled_development"
+     states: dict[str, str] = {}
+     fingerprints: dict[str, SemanticFingerprintV5] = {}
+     episode_ordinals: dict[str, set[int]] = {}
+     execution_keys: set[CandidateExecutionKeyV5] = set()
+     critic_complete = False
+     for event, payload in zip(events, payloads, strict=True):
+         if isinstance(payload, RoleCompletionPayloadV5) and payload.role == "critic":
+             critic_complete = True
+             continue
+         if (
+@@ -1461,24 +1486,24 @@ def _validate_candidate_stage_chain_v5(
+             and critic_complete
+         ):
+             raise ValueError("candidate work cannot follow critic completion")
+         experiment_id = event.experiment_id
+         if isinstance(payload, CandidateExecutionAuthorityV5):
+             assert experiment_id is not None
+             if payload.key in execution_keys:
+                 raise ValueError("candidate execution authority is duplicated")
+             state = states.get(experiment_id)
+             if payload.key.stage == "semantic_probe":
+-                if state != "validated":
+-                    raise ValueError("candidate semantic-probe execution is out of order")
++                if semantic_disabled or state != "validated":
++                    raise ValueError("candidate semantic-probe execution is out of order or disabled")
+             elif payload.key.stage == "quick_evaluation":
+-                if state != "distinct":
++                if state not in {"distinct", "semantic_skipped"}:
+                     raise ValueError("candidate quick execution is out of order")
+             elif state not in {"quick", "episodes"}:
+                 raise ValueError("candidate discovery execution is out of order")
+             execution_keys.add(payload.key)
+             continue
+         if isinstance(payload, RenderedVariantPayloadV5):
+             assert experiment_id is not None
+             if experiment_id in states:
+                 raise ValueError("rendered candidate is duplicated")
+             states[experiment_id] = "rendered"
+@@ -1487,42 +1512,58 @@ def _validate_candidate_stage_chain_v5(
+         if isinstance(payload, CandidateStageResultPayloadV5):
+             assert experiment_id is not None
+             state = states.get(experiment_id)
+             if payload.stage == "validation":
+                 if state != "rendered":
+                     raise ValueError("candidate validation is duplicated or out of order")
+                 states[experiment_id] = "validated" if payload.outcome == "validation_valid" else "terminal"
+             elif payload.stage == "semantic_probe":
+                 if state != "validated":
+                     raise ValueError("candidate semantic result is duplicated or out of order")
+-                if payload.outcome == "behaviorally_distinct":
++                if semantic_disabled and payload.outcome not in {"exact_duplicate", "semantic_skipped_development"}:
++                    raise ValueError("disabled semantics cannot carry semantic execution outcomes")
++                if payload.outcome == "semantic_skipped_development":
++                    if (
++                        not semantic_disabled
++                        or CandidateExecutionKeyV5(experiment_id, "semantic_probe", None) in execution_keys
++                    ):
++                        raise ValueError("semantic skip lacks explicit development authority")
++                    states[experiment_id] = "semantic_skipped"
++                elif payload.outcome == "behaviorally_distinct":
++                    if semantic_disabled:
++                        raise ValueError("disabled semantics cannot carry behavioral evidence")
+                     assert payload.semantic_fingerprint is not None
+                     fingerprints[experiment_id] = payload.semantic_fingerprint
+                     states[experiment_id] = "distinct"
+                 else:
+                     states[experiment_id] = "terminal"
+             elif payload.stage == "quick_evaluation":
+-                if state != "distinct":
++                if state not in {"distinct", "semantic_skipped"}:
+                     raise ValueError("candidate quick failure is duplicated or out of order")
+                 states[experiment_id] = "terminal"
+             elif payload.stage == "discovery_evaluation":
+                 if state not in {"quick", "episodes"}:
+                     raise ValueError("candidate discovery failure is duplicated or out of order")
+                 assert payload.episode_ordinal is not None
+                 if payload.episode_ordinal in episode_ordinals[experiment_id]:
+                     raise ValueError("candidate discovery failure duplicates completed evidence")
+                 states[experiment_id] = "terminal"
+             continue
+         if isinstance(payload, QuickEvidencePayloadV5):
+             assert experiment_id is not None
+-            if states.get(experiment_id) != "distinct":
++            if states.get(experiment_id) not in {"distinct", "semantic_skipped"}:
+                 raise ValueError("candidate quick evidence is duplicated or out of order")
++            if not intents or (payload.pit_data_scope, payload.semantic_mode) != (
++                intents[0].pit_data_scope,
++                intents[0].semantic_mode,
++            ):
++                raise ValueError("quick semantic mode differs from round intent")
+             if payload.semantic_fingerprint != fingerprints.get(experiment_id):
+                 raise ValueError("candidate quick evidence differs from its durable semantic result")
+             states[experiment_id] = "quick"
+             continue
+         if isinstance(payload, EpisodeEvidencePayloadV5):
+             assert experiment_id is not None
+             if states.get(experiment_id) not in {"quick", "episodes"}:
+                 raise ValueError("candidate episode evidence is duplicated or out of order")
+             ordinal = payload.episode.episode_ordinal
+             if ordinal in episode_ordinals[experiment_id] or len(episode_ordinals[experiment_id]) >= 4:
+diff --git a/core/pit_optimizer_v5/production_runtime.py b/core/pit_optimizer_v5/production_runtime.py
+index 5baa7f9..ab52da7 100644
+--- a/core/pit_optimizer_v5/production_runtime.py
++++ b/core/pit_optimizer_v5/production_runtime.py
+@@ -39,20 +39,21 @@ from core.pit_optimizer_v5.contracts import (
+     selected_scenario,
+     canonical_sha256_v5,
+ )
+ from core.pit_optimizer_v5.memory import (
+     CleanupResultPayloadV5,
+     ExperimentRecordV5,
+     NoNovelHypothesisAuthorityV5,
+     NoveltyExhaustedAuthorityV5,
+     RoleCompletionPayloadV5,
+     RoundOutcomePayloadV5,
++    RoundIntentPayloadV5,
+     SchedulingCursorV5,
+     PreValidationInvalidExperimentIdentityV5,
+     ResourceLeasePayloadV5,
+     StoredExperimentRecordV5,
+     is_testable_experiment_status_v5,
+     reduce_experiment_journal_v5,
+     project_investigator_memory_v5,
+ )
+ from core.pit_optimizer_v5.policy_scope import EDITABLE_POLICY_PATHS_V5
+ from core.pit_optimizer_v5.probes import (
+@@ -165,23 +166,29 @@ def _parent_fingerprint(
+ ):
+     if parent.origin == "baseline":
+         fingerprint = inputs.baseline.semantic_fingerprint
+     else:
+         matches = tuple(
+             stored.record.semantic_fingerprint
+             for stored in projection.stored_records
+             if stored.reference == parent.experiment_record_ref
+             and stored.record.policy_revision == parent.policy_revision
+         )
+-        if len(matches) != 1 or matches[0] is None:
++        if len(matches) != 1:
+             raise ValueError("archive parent semantic authority is unavailable")
+         fingerprint = matches[0]
++    if (parent.pit_data_scope, parent.semantic_mode) != (inputs.manifest.pit_data_scope, inputs.manifest.semantic_mode):
++        raise ValueError("parent semantic mode differs from manifest")
++    if fingerprint is None:
++        if inputs.manifest.semantic_mode != "disabled_development" or parent.semantic_fingerprint_sha256 is not None:
++            raise ValueError("parent semantic authority is unavailable")
++        return None
+     if fingerprint.fingerprint_sha256 != parent.semantic_fingerprint_sha256:
+         raise ValueError("parent semantic authority differs from scheduling identity")
+     return fingerprint
+ 
+ 
+ class LocalCandidateBaseOperationsV5:
+     """Concrete authenticated source, materialization, and validation boundary."""
+ 
+     def __init__(
+         self,
+@@ -1012,21 +1019,25 @@ class LocalRoleRequestFactoryV5:
+             evaluations.append(
+                 ExperimentEvaluationAggregateV5(
+                     candidate.experiment_id,
+                     candidate.status,  # type: ignore[arg-type]
+                     tuple(scenarios),
+                 )
+             )
+ 
+         for candidate in candidates:
+             fingerprint = candidate.semantic_fingerprint
+-            if fingerprint is None:
++            if inputs.manifest.semantic_mode == "disabled_development":
++                if fingerprint is not None or parent_fingerprint is not None:
++                    raise ValueError("disabled semantics cannot carry critic fingerprints")
++                continue
++            if fingerprint is None or parent_fingerprint is None:
+                 raise ValueError("testable critic candidate lacks semantic evidence")
+             comparison = classify_semantic_fingerprints_v5(parent_fingerprint, fingerprint)
+             evidence_id = evidence.add(
+                 "semantic.differing_decision_count",
+                 len(comparison.differing_probe_ids),
+             )
+             semantic_rows.append(
+                 ExperimentSemanticDifferenceAggregateV5(
+                     candidate.experiment_id,
+                     parent_fingerprint.fingerprint_sha256,
+@@ -1068,20 +1079,21 @@ class LocalRoleRequestFactoryV5:
+             )
+             for candidate in candidates
+         )
+         return build_role_request_v5(
+             role="critic",
+             role_input=CriticRoleInputV5(
+                 tuple(evaluations),
+                 predictions,
+                 tuple(semantic_rows),
+                 tuple(failures),
++                semantic_evidence_unavailable=inputs.manifest.semantic_mode == "disabled_development",
+             ),
+             issued_evidence=evidence.build(),
+             expected_binding=RoleBindingV5(
+                 decision.parent.policy_identity_sha256,
+                 decision.hypothesis.hypothesis_id,
+                 experiment_ids,
+                 inputs.panel_plan.discovery_plan_sha256,
+             ),
+             schema_authority=role_schema_authority_from_manifest_v5(
+                 role="critic",
+@@ -1205,20 +1217,22 @@ class CanonicalExperimentRecordFactoryV5:
+                         None
+                         if campaign is None
+                         else expected_target_gap_pct_v5(
+                             target=inputs.manifest.target,
+                             campaign_cagr=campaign.campaign_cagr_pct,
+                         )
+                     ),
+                     reviews[candidate.experiment_id] if testable else None,
+                     candidate.artifact_refs,
+                     critic_ref if testable else None,
++                    pit_data_scope=inputs.manifest.pit_data_scope,
++                    semantic_mode=inputs.manifest.semantic_mode,
+                 )
+             )
+         return tuple(records)
+ 
+ 
+ class LocalArchiveReducerFactoryV5:
+     def __init__(self, repository: LocalArtifactRepositoryV5) -> None:
+         if type(repository) is not LocalArtifactRepositoryV5:
+             raise ValueError("archive reducer repository is invalid")
+         self._repository = repository
+@@ -1274,20 +1288,22 @@ class LocalArchiveReducerFactoryV5:
+                 StoredExperimentRecordV5(reference, self._repository.load_experiment(reference))
+                 for reference in checkpoint.record_refs
+             )
+         )
+         return CandidateArchiveReducerV5(
+             inputs.panel_plan,
+             inputs.evaluator_contract,
+             inputs.manifest.target,
+             self._authorities(records),
+             inputs.manifest.search.archive_capacity,
++            pit_data_scope=inputs.manifest.pit_data_scope,
++            semantic_mode=inputs.manifest.semantic_mode,
+         )
+ 
+     def verify_projection(
+         self,
+         *,
+         manifest: CampaignManifestV5,
+         panel_plan: CampaignPanelPlanV5,
+         evaluator_contract: EvaluatorContractV5,
+     ) -> SearchStateV5:
+         """Authenticate the committed checkpoint/archive without repairing either file."""
+@@ -1311,20 +1327,22 @@ class LocalArchiveReducerFactoryV5:
+                 )
+                 for reference in checkpoint.record_refs
+             )
+         )
+         reducer = CandidateArchiveReducerV5(
+             panel_plan,
+             evaluator_contract,
+             manifest.target,
+             self._authorities(records),
+             manifest.search.archive_capacity,
++            pit_data_scope=manifest.pit_data_scope,
++            semantic_mode=manifest.semantic_mode,
+         )
+         baseline = self._repository.load_typed_artifact(
+             manifest.baseline_authority_ref, value_type=BaselineParentAuthorityV5
+         )
+         self._scheduling_history(manifest, panel_plan, evaluator_contract, baseline, records, reducer)
+         if checkpoint is None:
+             return reducer.initial()
+         state = reduce_experiment_journal_v5(
+             tuple(item.record for item in records),
+             reducer,
+@@ -1336,32 +1354,40 @@ class LocalArchiveReducerFactoryV5:
+         )
+         raw = canonical_json_bytes_v5(snapshot.to_primitive())
+         archive_ref = ArtifactRefV5("archive.json", checkpoint.archive_sha256)
+         authenticated = self._repository.authenticate(archive_ref)
+         if authenticated.content != raw:
+             raise ValueError("archive projection differs from checkpoint authority")
+         return state
+ 
+     def _scheduling_history(self, manifest, panel_plan, evaluator_contract, baseline, records, reducer):
+         """Fold terminal cursors and checkpoint-owned records in chronological order."""
++        if (baseline.pit_data_scope, baseline.semantic_mode) != (manifest.pit_data_scope, manifest.semantic_mode):
++            raise ValueError("scheduling baseline semantic mode differs from manifest")
+         state = reducer.initial()
+         chain = ()
+         history = {}
+         prior_records = []
+         stopped = False
+         for round_index in range(1, manifest.search.max_feedback_rounds + 1):
+             history[round_index] = (state, chain)
+             events = self._repository.load_round_events(campaign_id=manifest.campaign_id, round_index=round_index)
+             current_records = tuple(item for item in records if item.record.round_index == round_index)
+             payloads = tuple(
+                 self._repository.load_round_payload(item.payload_ref, expected_kind=item.event_kind) for item in events
+             )
++            if any(
++                (item.pit_data_scope, item.semantic_mode) != (manifest.pit_data_scope, manifest.semantic_mode)
++                for item in payloads
++                if type(item) is RoundIntentPayloadV5
++            ):
++                raise ValueError("scheduling history semantic mode differs from manifest")
+             terminals = tuple(item for item in payloads if type(item) is RoundOutcomePayloadV5)
+             if stopped:
+                 if events or current_records:
+                     raise ValueError("scheduling history advances past an unfinished or exhausted round")
+                 continue
+             if current_records:
+                 if state.next_round_index != round_index or terminals:
+                     raise ValueError("checkpoint records conflict with terminal scheduling authority")
+                 for item in sorted(current_records, key=lambda item: item.record.experiment_id):
+                     state = reducer.apply(state, item.record)
+@@ -1462,20 +1488,22 @@ class LocalArchiveReducerFactoryV5:
+                 }.values(),
+                 key=lambda item: item.experiment_id,
+             )
+         )
+         return CandidateArchiveReducerV5(
+             inputs.panel_plan,
+             inputs.evaluator_contract,
+             inputs.manifest.target,
+             authorities,
+             inputs.manifest.search.archive_capacity,
++            pit_data_scope=inputs.manifest.pit_data_scope,
++            semantic_mode=inputs.manifest.semantic_mode,
+         )
+ 
+ 
+ class SystemMonotonicClockV5:
+     def monotonic(self) -> float:
+         return float(time.monotonic())
+ 
+ 
+ class ControllerCancellationV5:
+     def __init__(self) -> None:
+diff --git a/core/pit_optimizer_v5/provider.py b/core/pit_optimizer_v5/provider.py
+index 9684027..774ac90 100644
+--- a/core/pit_optimizer_v5/provider.py
++++ b/core/pit_optimizer_v5/provider.py
+@@ -1214,22 +1214,27 @@ class ExperimentFailureAggregateV5:
+             raise ValueError("failure aggregate stage differs from its code")
+         _evidence_id_tuple(self.evidence_ids, "failure aggregate evidence", required=True)
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class CriticRoleInputV5:
+     evaluation_summaries: tuple[ExperimentEvaluationAggregateV5, ...]
+     predictions: tuple[ExperimentPredictionAggregateV5, ...]
+     semantic_differences: tuple[ExperimentSemanticDifferenceAggregateV5, ...]
+     typed_failures: tuple[ExperimentFailureAggregateV5, ...]
++    semantic_evidence_unavailable: bool = False
+ 
+     def __post_init__(self) -> None:
++        if type(self.semantic_evidence_unavailable) is not bool:
++            raise ValueError("critic semantic availability is invalid")
++        if self.semantic_evidence_unavailable and self.semantic_differences:
++            raise ValueError("unavailable semantics cannot carry differences")
+         expected_types = (
+             (self.evaluation_summaries, ExperimentEvaluationAggregateV5),
+             (self.predictions, ExperimentPredictionAggregateV5),
+             (self.semantic_differences, ExperimentSemanticDifferenceAggregateV5),
+             (self.typed_failures, ExperimentFailureAggregateV5),
+         )
+         for values, expected in expected_types:
+             if type(values) is not tuple or any(type(item) is not expected for item in values):
+                 raise ValueError("critic role input contains an invalid aggregate section")
+             ids = tuple(item.experiment_id for item in values)
+@@ -1356,20 +1361,22 @@ def _validate_role_input(
+         _validate_hypothesis_text(hypothesis)
+     else:
+         if type(role_input) is not CriticRoleInputV5:
+             raise ValueError("critic input must use its closed V5 schema")
+         for label, values in (
+             ("evaluation summaries", role_input.evaluation_summaries),
+             ("predictions", role_input.predictions),
+             ("semantic differences", role_input.semantic_differences),
+             ("typed failures", role_input.typed_failures),
+         ):
++            if label == "semantic differences" and role_input.semantic_evidence_unavailable:
++                continue
+             if tuple(item.experiment_id for item in values) != binding.experiment_ids:
+                 raise ValueError(f"critic {label} differs from the complete experiment batch")
+         _scan_aggregate_value(canonical_primitive_v5(role_input))
+     _evidence_id_tuple(issued_ids, "issued role evidence", required=True)
+     citations = _role_citation_sequence(role_input)
+     _evidence_id_tuple(citations, "role citation sequence", required=True)
+     if citations != issued_ids:
+         raise ValueError("role citations must exactly match issued evidence order")
+ 
+ 
+diff --git a/core/pit_optimizer_v5/runtime.py b/core/pit_optimizer_v5/runtime.py
+index a38f6db..de194fc 100644
+--- a/core/pit_optimizer_v5/runtime.py
++++ b/core/pit_optimizer_v5/runtime.py
+@@ -66,20 +66,21 @@ from core.pit_optimizer_v5.memory import (
+     is_testable_experiment_status_v5,
+ )
+ from core.pit_optimizer_v5.probes import (
+     BEHAVIORAL_EQUIVALENT_ON_SUITE_V1,
+     SemanticFingerprintV5,
+     classify_semantic_fingerprints_v5,
+ )
+ from core.pit_optimizer_v5.provider import (
+     ControllerRoleResponsePendingV5,
+     ControllerRoleTerminalAuthorityV5,
++    CriticRoleInputV5,
+     ExistingPersistedRoleRequestV5,
+     FreshPersistedRoleRequestV5,
+     FixtureRoleTerminalAuthorityV5,
+     LedgerRoleTerminalAuthorityV5,
+     LedgerBackedRoleInvokerV5,
+     PersistedRoleRequestV5,
+     RecoverableRoleInvokerV5,
+     RoleCallKeyV5,
+     RoleInvocationPackageV5,
+     RoleNameV5,
+@@ -408,22 +409,25 @@ class FeedbackRoundInputV5:
+             raise ValueError("feedback-round authority is invalid")
+         _positive(self.round_index, "feedback round")
+         _digest(self.owner_token_sha256, "feedback-round owner token")
+         if self.round_index > self.manifest.search.max_feedback_rounds:
+             raise ValueError("feedback round exceeds manifest capacity")
+         validate_campaign_manifest_bindings_v5(
+             self.manifest,
+             panel_plan=self.panel_plan,
+             evaluator_contract=self.evaluator_contract,
+         )
+-        if self.manifest.pit_data_scope != self.baseline.pit_data_scope:
+-            raise ValueError("feedback-round PIT data scope differs from baseline authority")
++        if (self.manifest.pit_data_scope, self.manifest.semantic_mode) != (
++            self.baseline.pit_data_scope,
++            self.baseline.semantic_mode,
++        ):
++            raise ValueError("feedback-round PIT data scope or semantic mode differs from baseline authority")
+ 
+     @property
+     def campaign_id(self) -> str:
+         return self.manifest.campaign_id
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class FeedbackRoundResultV5:
+     status: RuntimeStatusV5
+     campaign_id: str
+@@ -864,20 +868,44 @@ class _Journal:
+         self._persistence = persistence
+         self.events = list(
+             persistence.load_round_events(
+                 campaign_id=inputs.campaign_id,
+                 round_index=inputs.round_index,
+             )
+         )
+         self.payloads = [
+             persistence.load_round_payload(event.payload_ref, expected_kind=event.event_kind) for event in self.events
+         ]
++        for payload in self.payloads:
++            if isinstance(payload, (RoundIntentPayloadV5, QuickEvidencePayloadV5)) and (
++                payload.pit_data_scope,
++                payload.semantic_mode,
++            ) != (inputs.manifest.pit_data_scope, inputs.manifest.semantic_mode):
++                raise ValueError("recovery semantic mode differs from runtime manifest")
++            if isinstance(payload, CandidateStageResultPayloadV5):
++                if (
++                    payload.outcome == "semantic_skipped_development"
++                    and inputs.manifest.semantic_mode != "disabled_development"
++                ):
++                    raise ValueError("required semantics cannot resume a skipped stage")
++                if (
++                    inputs.manifest.semantic_mode == "disabled_development"
++                    and payload.stage == "semantic_probe"
++                    and payload.outcome not in {"exact_duplicate", "semantic_skipped_development"}
++                ):
++                    raise ValueError("disabled semantics cannot resume semantic execution")
++            if (
++                isinstance(payload, CandidateExecutionAuthorityV5)
++                and payload.key.stage == "semantic_probe"
++                and inputs.manifest.semantic_mode == "disabled_development"
++            ):
++                raise ValueError("disabled semantics cannot resume a semantic lease")
+ 
+     def role_completion(self, role: RoleNameV5) -> RoleCompletionPayloadV5 | None:
+         matches = tuple(
+             payload
+             for payload in self.payloads
+             if isinstance(payload, RoleCompletionPayloadV5) and payload.role == role
+         )
+         if len(matches) > 1:
+             raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result", role=role))
+         return None if not matches else matches[-1]
+@@ -1042,20 +1070,25 @@ class _Runtime:
+         self,
+         request: RoleRequestV5,
+         *,
+         role: RoleNameV5,
+         parent: ParentCandidateV5,
+         hypothesis_id: str | None,
+         experiment_ids: tuple[str, ...],
+     ) -> None:
+         if type(request) is not RoleRequestV5 or request.role != role:
+             raise _RuntimeAbort(RuntimeFailureV5(role, "invalid_dependency_result", role=role))  # type: ignore[arg-type]
++        if role == "critic" and (
++            type(request.role_input) is not CriticRoleInputV5
++            or request.role_input.semantic_evidence_unavailable != (self.inputs.manifest.semantic_mode == "disabled_development")
++        ):
++            raise _RuntimeAbort(RuntimeFailureV5("critic", "invalid_dependency_result", role="critic"))
+         binding = request.expected_binding
+         if (
+             binding.parent_revision_sha256 != parent.policy_identity_sha256
+             or binding.hypothesis_id != hypothesis_id
+             or binding.experiment_ids != experiment_ids
+             or binding.discovery_plan_sha256 != self.inputs.panel_plan.discovery_plan_sha256
+         ):
+             raise _RuntimeAbort(RuntimeFailureV5(role, "invalid_dependency_result", role=role))  # type: ignore[arg-type]
+ 
+     def _complete_role(
+@@ -2006,127 +2039,155 @@ class _Runtime:
+                 semantic_ref = semantic_event.payload_ref
+             elif semantic_stage.outcome == "exact_duplicate":
+                 semantic_ref = self.journal.payload_reference(semantic_stage)
+             else:
+                 raise _RuntimeAbort(
+                     RuntimeFailureV5("recovery", "invalid_dependency_result", experiment_id=identity.sha256)
+                 )
+             return replace(candidate, artifact_refs=self._artifact_refs(candidate.artifact_refs, (semantic_ref,)))
+ 
+         semantic_stage = self._candidate_stage(identity.sha256, "semantic_probe")
+-        if semantic_stage is not None:
+-            semantic_ref = self.journal.payload_reference(semantic_stage)
+-            if semantic_stage.outcome == "semantic_probe_failed":
+-                return self._recover_candidate_failure(candidate, semantic_stage)
+-            if semantic_stage.outcome not in {"behavioral_equivalent", "sibling_equivalent", "behaviorally_distinct"}:
+-                raise _RuntimeAbort(
+-                    RuntimeFailureV5("recovery", "invalid_dependency_result", experiment_id=identity.sha256)
+-                )
+-            assert semantic_stage.semantic_fingerprint is not None
+-            fingerprint = semantic_stage.semantic_fingerprint
+-            sibling_duplicate = fingerprint.fingerprint_sha256 in self._seen_semantic_fingerprints
+-            if (semantic_stage.outcome == "sibling_equivalent") != sibling_duplicate:
++        if self.inputs.manifest.semantic_mode == "disabled_development":
++            if semantic_stage is None:
++                semantic_ref = self.journal.append(
++                    CandidateStageResultPayloadV5(
++                        experiment_id=identity.sha256,
++                        stage="semantic_probe",
++                        stage_index=2,
++                        outcome="semantic_skipped_development",
++                    ),
++                    experiment_id=identity.sha256,
++                ).payload_ref
++            elif semantic_stage.outcome == "semantic_skipped_development":
++                semantic_ref = self.journal.payload_reference(semantic_stage)
++            else:
+                 raise _RuntimeAbort(
+                     RuntimeFailureV5("recovery", "invalid_dependency_result", experiment_id=identity.sha256)
+                 )
+             candidate = replace(
+                 candidate,
+-                semantic_fingerprint=fingerprint,
+-                status=(
+-                    semantic_stage.outcome
+-                    if semantic_stage.outcome in {"behavioral_equivalent", "sibling_equivalent"}
+-                    else "quick_ready"
+-                ),
++                status="quick_ready",
+                 artifact_refs=self._artifact_refs(candidate.artifact_refs, (semantic_ref,)),
+             )
+-            if candidate.status in {"behavioral_equivalent", "sibling_equivalent"}:
+-                return candidate
+         else:
+-            probe_deadline = self._deadline("semantic_probe", self.inputs.manifest.resources.mechanics_timeout_seconds)
+-            try:
+-                if isinstance(self.dependencies.candidates, LeaseAwareCandidateRuntimeV5):
+-                    execution_key = CandidateExecutionKeyV5(
+-                        identity.sha256,
+-                        "semantic_probe",
+-                        None,
++            if semantic_stage is not None:
++                semantic_ref = self.journal.payload_reference(semantic_stage)
++                if semantic_stage.outcome == "semantic_probe_failed":
++                    return self._recover_candidate_failure(candidate, semantic_stage)
++                if semantic_stage.outcome not in {
++                    "behavioral_equivalent",
++                    "sibling_equivalent",
++                    "behaviorally_distinct",
++                }:
++                    raise _RuntimeAbort(
++                        RuntimeFailureV5("recovery", "invalid_dependency_result", experiment_id=identity.sha256)
+                     )
+-                    execution = self._existing_execution(execution_key)
+-                    if execution is None:
+-                        fingerprint = self.dependencies.candidates.fingerprint_registered(
+-                            materialized,
+-                            deadline=probe_deadline,
+-                            execution_key=execution_key,
+-                            register_execution=self._register_execution,
++                assert semantic_stage.semantic_fingerprint is not None
++                fingerprint = semantic_stage.semantic_fingerprint
++                sibling_duplicate = fingerprint.fingerprint_sha256 in self._seen_semantic_fingerprints
++                if (semantic_stage.outcome == "sibling_equivalent") != sibling_duplicate:
++                    raise _RuntimeAbort(
++                        RuntimeFailureV5("recovery", "invalid_dependency_result", experiment_id=identity.sha256)
++                    )
++                candidate = replace(
++                    candidate,
++                    semantic_fingerprint=fingerprint,
++                    status=(
++                        semantic_stage.outcome
++                        if semantic_stage.outcome in {"behavioral_equivalent", "sibling_equivalent"}
++                        else "quick_ready"
++                    ),
++                    artifact_refs=self._artifact_refs(candidate.artifact_refs, (semantic_ref,)),
++                )
++                if candidate.status in {"behavioral_equivalent", "sibling_equivalent"}:
++                    return candidate
++            else:
++                probe_deadline = self._deadline(
++                    "semantic_probe", self.inputs.manifest.resources.mechanics_timeout_seconds
++                )
++                try:
++                    if isinstance(self.dependencies.candidates, LeaseAwareCandidateRuntimeV5):
++                        execution_key = CandidateExecutionKeyV5(
++                            identity.sha256,
++                            "semantic_probe",
++                            None,
+                         )
++                        execution = self._existing_execution(execution_key)
++                        if execution is None:
++                            fingerprint = self.dependencies.candidates.fingerprint_registered(
++                                materialized,
++                                deadline=probe_deadline,
++                                execution_key=execution_key,
++                                register_execution=self._register_execution,
++                            )
++                        else:
++                            fingerprint = self.dependencies.candidates.recover_fingerprint_registered(
++                                materialized,
++                                deadline=probe_deadline,
++                                authority=execution,
++                            )
+                     else:
+-                        fingerprint = self.dependencies.candidates.recover_fingerprint_registered(
++                        fingerprint = self.dependencies.candidates.fingerprint(
+                             materialized,
+                             deadline=probe_deadline,
+-                            authority=execution,
+                         )
+-                else:
+-                    fingerprint = self.dependencies.candidates.fingerprint(
+-                        materialized,
+-                        deadline=probe_deadline,
++                    if type(fingerprint) is not SemanticFingerprintV5:
++                        raise TypeError
++                    comparison = classify_semantic_fingerprints_v5(
++                        self.inputs.baseline.semantic_fingerprint
++                        if parent.origin == "baseline"
++                        else self._parent_fingerprint(parent, materialized, probe_deadline),
++                        fingerprint,
+                     )
+-                if type(fingerprint) is not SemanticFingerprintV5:
+-                    raise TypeError
+-                comparison = classify_semantic_fingerprints_v5(
+-                    self.inputs.baseline.semantic_fingerprint
+-                    if parent.origin == "baseline"
+-                    else self._parent_fingerprint(parent, materialized, probe_deadline),
+-                    fingerprint,
++                except _RuntimeAbort:
++                    raise
++                except BaseException:
++                    failed = self._record_candidate_failure(
++                        candidate,
++                        stage="semantic_probe",
++                        outcome="semantic_probe_failed",
++                        code="semantic_probe_failed",
++                    )
++                    self._check_finished(probe_deadline, experiment_id=identity.sha256)
++                    return failed
++                semantic_outcome: CandidateStageOutcomeV5 = (
++                    "behavioral_equivalent"
++                    if comparison.classification == BEHAVIORAL_EQUIVALENT_ON_SUITE_V1
++                    else "sibling_equivalent"
++                    if fingerprint.fingerprint_sha256 in self._seen_semantic_fingerprints
++                    else "behaviorally_distinct"
+                 )
+-            except _RuntimeAbort:
+-                raise
+-            except BaseException:
+-                failed = self._record_candidate_failure(
++                semantic_event = self.journal.append(
++                    CandidateStageResultPayloadV5(
++                        experiment_id=identity.sha256,
++                        stage="semantic_probe",
++                        stage_index=2,
++                        outcome=semantic_outcome,
++                        semantic_fingerprint=fingerprint,
++                    ),
++                    experiment_id=identity.sha256,
++                )
++                candidate = replace(
+                     candidate,
+-                    stage="semantic_probe",
+-                    outcome="semantic_probe_failed",
+-                    code="semantic_probe_failed",
++                    semantic_fingerprint=fingerprint,
++                    status=(
++                        semantic_outcome
++                        if semantic_outcome in {"behavioral_equivalent", "sibling_equivalent"}
++                        else "quick_ready"
++                    ),
++                    artifact_refs=self._artifact_refs(candidate.artifact_refs, (semantic_event.payload_ref,)),
+                 )
+                 self._check_finished(probe_deadline, experiment_id=identity.sha256)
+-                return failed
+-            semantic_outcome: CandidateStageOutcomeV5 = (
+-                "behavioral_equivalent"
+-                if comparison.classification == BEHAVIORAL_EQUIVALENT_ON_SUITE_V1
+-                else "sibling_equivalent"
+-                if fingerprint.fingerprint_sha256 in self._seen_semantic_fingerprints
+-                else "behaviorally_distinct"
+-            )
+-            semantic_event = self.journal.append(
+-                CandidateStageResultPayloadV5(
+-                    experiment_id=identity.sha256,
+-                    stage="semantic_probe",
+-                    stage_index=2,
+-                    outcome=semantic_outcome,
+-                    semantic_fingerprint=fingerprint,
+-                ),
+-                experiment_id=identity.sha256,
+-            )
+-            candidate = replace(
+-                candidate,
+-                semantic_fingerprint=fingerprint,
+-                status=(
+-                    semantic_outcome
+-                    if semantic_outcome in {"behavioral_equivalent", "sibling_equivalent"}
+-                    else "quick_ready"
+-                ),
+-                artifact_refs=self._artifact_refs(candidate.artifact_refs, (semantic_event.payload_ref,)),
+-            )
+-            self._check_finished(probe_deadline, experiment_id=identity.sha256)
+-            if candidate.status in {"behavioral_equivalent", "sibling_equivalent"}:
+-                return candidate
+-
+-        self._seen_semantic_fingerprints.add(fingerprint.fingerprint_sha256)
++                if candidate.status in {"behavioral_equivalent", "sibling_equivalent"}:
++                    return candidate
+ 
++            self._seen_semantic_fingerprints.add(fingerprint.fingerprint_sha256)
+         quick_failure = self._candidate_stage(identity.sha256, "quick_evaluation")
+         if quick_failure is not None:
+             if quick_failure.outcome != "quick_evaluation_failed":
+                 raise _RuntimeAbort(
+                     RuntimeFailureV5("recovery", "invalid_dependency_result", experiment_id=identity.sha256)
+                 )
+             return self._recover_candidate_failure(candidate, quick_failure)
+         existing_quick = self._existing_payload(identity.sha256, QuickEvidencePayloadV5)
+         if existing_quick is not None:
+             if type(existing_quick) is not QuickEvidencePayloadV5 or existing_quick.experiment_id != identity.sha256:
+@@ -2181,25 +2242,26 @@ class _Runtime:
+             raise
+         except BaseException:
+             failed = self._record_candidate_failure(
+                 candidate,
+                 stage="quick_evaluation",
+                 outcome="quick_evaluation_failed",
+                 code="quick_evaluation_failed",
+             )
+             self._check_finished(quick_deadline, experiment_id=identity.sha256)
+             return failed
+-        assert candidate.semantic_fingerprint is not None
+         quick_event = self.journal.append(
+             QuickEvidencePayloadV5(
+                 experiment_id=identity.sha256,
+                 semantic_fingerprint=candidate.semantic_fingerprint,
++                pit_data_scope=self.inputs.manifest.pit_data_scope,
++                semantic_mode=self.inputs.manifest.semantic_mode,
+                 evaluation=quick,
+             ),
+             experiment_id=identity.sha256,
+         )
+         self._check_finished(quick_deadline, experiment_id=identity.sha256)
+         return replace(
+             candidate,
+             quick_evidence=quick,
+             artifact_refs=self._artifact_refs(candidate.artifact_refs, (quick_event.payload_ref,)),
+         )
+@@ -2255,20 +2317,22 @@ class _Runtime:
+             )
+             for variant in variants
+         )
+         quick_candidates = tuple(
+             QuickScreenCandidateV5(
+                 template=template,
+                 variant=item.materialized.variant,
+                 validation=item.validation,
+                 semantic_fingerprint=item.semantic_fingerprint,
+                 parent_semantic_fingerprint_sha256=parent.semantic_fingerprint_sha256,
++                pit_data_scope=self.inputs.manifest.pit_data_scope,
++                semantic_mode=self.inputs.manifest.semantic_mode,
+                 quick_evidence=item.quick_evidence,
+             )
+             for item in candidates
+             if item.status == "quick_ready"
+         )
+         deadline = self._deadline("survivor_selection", self.inputs.manifest.resources.round_wall_timeout_seconds)
+         try:
+             survivors = select_manifest_discovery_survivors_v5(
+                 candidates=quick_candidates,
+                 capabilities=self.inputs.manifest.search,
+@@ -2536,20 +2600,22 @@ class _Runtime:
+             for candidate in candidates:
+                 testable = is_testable_experiment_status_v5(candidate.status)
+                 campaign = candidate.campaign_evidence
+                 records.append(
+                     ExperimentRecordV5(
+                         experiment_id=candidate.experiment_id,
+                         experiment_identity=candidate.experiment_identity,
+                         round_index=self.inputs.round_index,
+                         parent_revision_sha256=parent.policy_identity_sha256,
+                         parent_semantic_fingerprint_sha256=parent.semantic_fingerprint_sha256,
++                        pit_data_scope=self.inputs.manifest.pit_data_scope,
++                        semantic_mode=self.inputs.manifest.semantic_mode,
+                         hypothesis=decision.hypothesis,
+                         template=template,
+                         template_sha256=template.sha256,
+                         variant_assignment=candidate.materialized.variant.assignment,
+                         policy_revision=(
+                             None
+                             if type(candidate.experiment_identity) is PreValidationInvalidExperimentIdentityV5
+                             else candidate.materialized.variant.policy_revision
+                         ),
+                         semantic_fingerprint=candidate.semantic_fingerprint,
+@@ -2732,20 +2798,22 @@ class _Runtime:
+             )
+             return self._terminal_result(novelty)
+         if type(novelty) is not ScheduledHypothesisV5 or novelty.parent != parent:
+             raise _RuntimeAbort(RuntimeFailureV5("novelty", "invalid_dependency_result"))
+         decision = novelty
+         state_after_novelty = record_novelty_attempt_v5(projection.state, decision)
+         self._round_intent(
+             RoundIntentPayloadV5(
+                 parent_revision_sha256=parent.policy_identity_sha256,
+                 parent_semantic_fingerprint_sha256=parent.semantic_fingerprint_sha256,
++                pit_data_scope=self.inputs.manifest.pit_data_scope,
++                semantic_mode=self.inputs.manifest.semantic_mode,
+                 hypothesis=decision.hypothesis,
+                 discovery_plan_sha256=self.inputs.panel_plan.discovery_plan_sha256,
+             )
+         )
+ 
+         author_request = self.dependencies.requests.author_request(
+             self.inputs,
+             projection,
+             decision,
+             investigator,
+diff --git a/core/pit_optimizer_v5/search.py b/core/pit_optimizer_v5/search.py
+index 4059cc8..acf5ddc 100644
+--- a/core/pit_optimizer_v5/search.py
++++ b/core/pit_optimizer_v5/search.py
+@@ -15,20 +15,21 @@ from core.pit_optimizer_v5.contracts import (
+     ArtifactRefV5,
+     CampaignEvidenceV5,
+     CampaignPanelPlanV5,
+     EpisodeEvaluationV5,
+     EvaluatorContractV5,
+     HypothesisV5,
+     canonical_primitive_v5,
+     canonical_sha256_v5,
+     selected_scenario,
+     validate_campaign_evidence_v5,
++    validate_semantic_mode_v5,
+ )
+ from core.pit_optimizer_v5.memory import ExperimentRecordV5, StoredExperimentRecordV5
+ from core.pit_optimizer_v5.probes import SemanticFingerprintV5
+ 
+ 
+ CAMPAIGN_CAGR_QUANTUM_V5 = Decimal("0.000001")
+ TARGET_GAP_QUANTUM_V5 = Decimal("0.01")
+ DEFAULT_ARCHIVE_CAPACITY_V5 = 8
+ PRIMARY_MECHANISMS_V5 = (
+     "entry",
+@@ -728,22 +729,25 @@ def hypothesis_novelty_key_v5(
+ 
+ @dataclass(frozen=True, slots=True)
+ class CandidateArchiveReducerV5:
+     """Task-5-compatible deterministic reconstruction of complete search state."""
+ 
+     discovery_plan: CampaignPanelPlanV5
+     evaluator_contract: EvaluatorContractV5
+     target: AnnualizedReturnTargetV5
+     authorities: tuple[ArchiveRecordAuthorityV5, ...]
+     capacity: int = DEFAULT_ARCHIVE_CAPACITY_V5
++    pit_data_scope: Literal["production", "development_sp500_v2"] = "production"
++    semantic_mode: Literal["required", "disabled_development"] = "required"
+ 
+     def __post_init__(self) -> None:
++        validate_semantic_mode_v5(self.pit_data_scope, self.semantic_mode)
+         if (
+             type(self.discovery_plan) is not CampaignPanelPlanV5
+             or type(self.evaluator_contract) is not EvaluatorContractV5
+             or type(self.target) is not AnnualizedReturnTargetV5
+         ):
+             raise ValueError("archive reducer authorities are invalid")
+         if (
+             self.target.sha256 != self.discovery_plan.target_sha256
+             or self.discovery_plan.pit_bundle_ref.sha256 != self.evaluator_contract.pit_bundle_sha256
+             or self.discovery_plan.prices_provenance_ref.sha256 != self.evaluator_contract.prices_provenance_sha256
+@@ -765,20 +769,22 @@ class CandidateArchiveReducerV5:
+             attempted_novelty_keys=(),
+         )
+ 
+     def apply(
+         self,
+         state: SearchStateV5,
+         record: ExperimentRecordV5,
+     ) -> SearchStateV5:
+         if type(state) is not SearchStateV5 or type(record) is not ExperimentRecordV5:
+             raise ValueError("archive reducer inputs are invalid")
++        if (record.pit_data_scope, record.semantic_mode) != (self.pit_data_scope, self.semantic_mode):
++            raise ArchiveAuthorityMismatchV5()
+         if state.archive.capacity != self.capacity:
+             raise ValueError("archive reducer state capacity changed")
+         if record.experiment_identity.discovery_plan_sha256 != self.discovery_plan.discovery_plan_sha256:
+             raise ArchiveAuthorityMismatchV5()
+         authority = next(
+             (item for item in self.authorities if item.experiment_id == record.experiment_id),
+             None,
+         )
+         transition = transition_archive_from_record_v5(
+             archive=state.archive,
+@@ -803,36 +809,40 @@ class CandidateArchiveReducerV5:
+             raise ValueError("archive reducer state is invalid")
+         return state.to_primitive()
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class BaselineParentAuthorityV5:
+     """Authenticated external baseline, deliberately outside archive capacity."""
+ 
+     policy_revision: PolicyRevisionIdentityV5
+     policy_revision_ref: ArtifactRefV5
+-    semantic_fingerprint: SemanticFingerprintV5
++    semantic_fingerprint: SemanticFingerprintV5 | None
+     campaign: CampaignEvidenceV5
+     source_bundle: SourceBundleV5
+     source_bundle_ref: ArtifactRefV5
+     pit_data_scope: Literal["production", "development_sp500_v2"] = "production"
++    semantic_mode: Literal["required", "disabled_development"] = "required"
+ 
+     def __post_init__(self) -> None:
+         if (
+             type(self.policy_revision) is not PolicyRevisionIdentityV5
+             or type(self.policy_revision_ref) is not ArtifactRefV5
+-            or type(self.semantic_fingerprint) is not SemanticFingerprintV5
++            or (self.semantic_fingerprint is not None and type(self.semantic_fingerprint) is not SemanticFingerprintV5)
+             or type(self.campaign) is not CampaignEvidenceV5
+             or type(self.source_bundle) is not SourceBundleV5
+             or type(self.source_bundle_ref) is not ArtifactRefV5
+         ):
+             raise ValueError("baseline parent authority is invalid")
++        validate_semantic_mode_v5(self.pit_data_scope, self.semantic_mode)
++        if (self.semantic_fingerprint is None) != (self.semantic_mode == "disabled_development"):
++            raise ValueError("baseline fingerprint differs from semantic mode")
+         if self.pit_data_scope not in {"production", "development_sp500_v2"}:
+             raise ValueError("baseline parent PIT data scope is invalid")
+         if (
+             self.policy_revision_ref.sha256 != self.policy_revision.sha256
+             or self.source_bundle_ref.sha256 != self.source_bundle.sha256
+             or not _source_bundle_matches_revision(
+                 self.source_bundle,
+                 self.policy_revision,
+             )
+             or self.campaign.policy_identity_sha256 != self.policy_revision.sha256
+@@ -842,36 +852,39 @@ class BaselineParentAuthorityV5:
+ 
+ ParentOriginV5 = Literal["baseline", "archive"]
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class ParentCandidateV5:
+     """One reconstructible scheduling parent with explicit ancestry authority."""
+ 
+     origin: ParentOriginV5
+     policy_revision: PolicyRevisionIdentityV5
+-    semantic_fingerprint_sha256: str
++    semantic_fingerprint_sha256: str | None
+     campaign_cagr_pct: Decimal
+     source_bundle_ref: ArtifactRefV5
+     experiment_record_ref: ArtifactRefV5 | None
+     primary_mechanism: PrimaryMechanismV5 | None
+     admitted_round: int | None
++    pit_data_scope: Literal["production", "development_sp500_v2"] = "production"
++    semantic_mode: Literal["required", "disabled_development"] = "required"
+ 
+     def __post_init__(self) -> None:
+         if self.origin not in {"baseline", "archive"}:
+             raise ValueError("parent candidate origin is invalid")
+         if type(self.policy_revision) is not PolicyRevisionIdentityV5:
+             raise ValueError("parent candidate policy revision is invalid")
+-        _digest(
+-            self.semantic_fingerprint_sha256,
+-            "parent semantic fingerprint",
+-        )
++        validate_semantic_mode_v5(self.pit_data_scope, self.semantic_mode)
++        if (self.semantic_fingerprint_sha256 is None) != (self.semantic_mode == "disabled_development"):
++            raise ValueError("parent fingerprint differs from semantic mode")
++        if self.semantic_fingerprint_sha256 is not None:
++            _digest(self.semantic_fingerprint_sha256, "parent semantic fingerprint")
+         score = _finite_decimal(self.campaign_cagr_pct, "parent campaign CAGR")
+         if score != score.quantize(
+             CAMPAIGN_CAGR_QUANTUM_V5,
+             rounding=ROUND_HALF_EVEN,
+         ):
+             raise ValueError("parent campaign CAGR is not at evaluator precision")
+         if type(self.source_bundle_ref) is not ArtifactRefV5:
+             raise ValueError("parent source reference is invalid")
+         if self.origin == "baseline":
+             if (
+@@ -891,20 +904,22 @@ class ParentCandidateV5:
+     @property
+     def policy_identity_sha256(self) -> str:
+         return self.policy_revision.sha256
+ 
+     @property
+     def selected_parent_record_ref(self) -> ArtifactRefV5 | None:
+         return self.experiment_record_ref
+ 
+     def to_primitive(self) -> dict[str, object]:
+         return {
++            "pit_data_scope": self.pit_data_scope,
++            "semantic_mode": self.semantic_mode,
+             "origin": self.origin,
+             "policy_revision": self.policy_revision.to_primitive(),
+             "semantic_fingerprint_sha256": self.semantic_fingerprint_sha256,
+             "campaign_cagr_pct": canonical_primitive_v5(self.campaign_cagr_pct),
+             "source_bundle_ref": self.source_bundle_ref.to_primitive(),
+             "experiment_record_ref": (
+                 None if self.experiment_record_ref is None else self.experiment_record_ref.to_primitive()
+             ),
+             "primary_mechanism": self.primary_mechanism,
+             "admitted_round": self.admitted_round,
+@@ -926,58 +941,65 @@ def baseline_parent_candidate_v5(
+         raise CampaignAuthorityMismatch()
+     score = verified_campaign_cagr_pct(
+         campaign=authority.campaign,
+         discovery_plan=discovery_plan,
+         evaluator_contract=evaluator_contract,
+         policy_identity_sha256=authority.policy_revision.sha256,
+     )
+     return ParentCandidateV5(
+         origin="baseline",
+         policy_revision=authority.policy_revision,
+-        semantic_fingerprint_sha256=(authority.semantic_fingerprint.fingerprint_sha256),
++        semantic_fingerprint_sha256=(
++            None if authority.semantic_fingerprint is None else authority.semantic_fingerprint.fingerprint_sha256
++        ),
+         campaign_cagr_pct=score,
+         source_bundle_ref=authority.source_bundle_ref,
+         experiment_record_ref=None,
+         primary_mechanism=None,
+         admitted_round=None,
++        pit_data_scope=authority.pit_data_scope,
++        semantic_mode=authority.semantic_mode,
+     )
+ 
+ 
+ def archive_parent_from_record_v5(
+     *,
+     entry: ArchiveEntryV5,
+     stored_record: StoredExperimentRecordV5,
+ ) -> ParentCandidateV5:
+     """Resolve an archive parent through its checkpoint-authorized record."""
+ 
+     if type(entry) is not ArchiveEntryV5 or type(stored_record) is not StoredExperimentRecordV5:
+         raise ValueError("archive parent inputs are invalid")
+     record = stored_record.record
+     if (
+         stored_record.reference != entry.experiment_record_ref
+         or record.status != "evaluated"
+         or record.policy_revision != entry.policy_revision
+-        or record.semantic_fingerprint is None
+         or record.campaign_evidence != entry.campaign
+         or record.hypothesis.primary_mechanism != entry.primary_mechanism
+         or entry.source_bundle_ref not in record.artifact_refs
+     ):
+         raise ArchiveAuthorityMismatchV5()
+     return ParentCandidateV5(
+         origin="archive",
+         policy_revision=entry.policy_revision,
+-        semantic_fingerprint_sha256=(record.semantic_fingerprint.fingerprint_sha256),
++        semantic_fingerprint_sha256=(
++            None if record.semantic_fingerprint is None else record.semantic_fingerprint.fingerprint_sha256
++        ),
+         campaign_cagr_pct=entry.campaign_cagr_pct,
+         source_bundle_ref=entry.source_bundle_ref,
+         experiment_record_ref=entry.experiment_record_ref,
+         primary_mechanism=entry.primary_mechanism,
+         admitted_round=entry.admitted_round,
++        pit_data_scope=record.pit_data_scope,
++        semantic_mode=record.semantic_mode,
+     )
+ 
+ 
+ __all__ = [
+     "ArchiveAdmissionOutcomeV5",
+     "ArchiveAuthorityMismatchV5",
+     "ArchiveCapacityInsufficientV5",
+     "ArchiveEntryV5",
+     "ArchiveFailureV5",
+     "ArchiveRecordAuthorityV5",
+diff --git a/core/pit_optimizer_v5/selection.py b/core/pit_optimizer_v5/selection.py
+index b2dbc2f..bdb2877 100644
+--- a/core/pit_optimizer_v5/selection.py
++++ b/core/pit_optimizer_v5/selection.py
+@@ -14,20 +14,21 @@ from core.pit_optimizer_v5.contracts import (
+     CampaignPanelPlanV5,
+     EpisodeEvaluationV5,
+     EpisodePlanV5,
+     EvaluatorContractV5,
+     HypothesisV5,
+     InvestigatorArtifactV5,
+     PanelEvaluationV5,
+     SearchCapabilitiesV5,
+     ValidationResultV5,
+     selected_scenario,
++    validate_semantic_mode_v5,
+ )
+ from core.pit_optimizer_v5.memory import StoredExperimentRecordV5
+ from core.pit_optimizer_v5.probes import SemanticFingerprintV5
+ from core.pit_optimizer_v5.search import (
+     PRIMARY_MECHANISMS_V5,
+     ArchiveEntryV5,
+     BaselineParentAuthorityV5,
+     CandidateArchiveV5,
+     ParentCandidateV5,
+     SearchStateV5,
+@@ -110,38 +111,43 @@ def _assignment_matches_template(candidate: "QuickScreenCandidateV5") -> bool:
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class QuickScreenCandidateV5:
+     """Pre-critic candidate evidence used only for compute-budget selection."""
+ 
+     template: StructuralTemplateV5
+     variant: RenderedVariantV5
+     validation: ValidationResultV5
+     semantic_fingerprint: SemanticFingerprintV5 | None
+-    parent_semantic_fingerprint_sha256: str
++    parent_semantic_fingerprint_sha256: str | None
+     quick_evidence: PanelEvaluationV5 | None
++    pit_data_scope: Literal["production", "development_sp500_v2"] = "production"
++    semantic_mode: Literal["required", "disabled_development"] = "required"
+ 
+     def __post_init__(self) -> None:
+         if (
+             type(self.template) is not StructuralTemplateV5
+             or type(self.variant) is not RenderedVariantV5
+             or type(self.validation) is not ValidationResultV5
+         ):
+             raise ValueError("quick-screen candidate components are invalid")
+         if self.semantic_fingerprint is not None and type(self.semantic_fingerprint) is not SemanticFingerprintV5:
+             raise ValueError("quick-screen semantic fingerprint is invalid")
+         if self.quick_evidence is not None and type(self.quick_evidence) is not PanelEvaluationV5:
+             raise ValueError("quick-screen panel evidence is invalid")
+-        _digest(
+-            self.parent_semantic_fingerprint_sha256,
+-            "quick-screen parent fingerprint",
+-        )
++        validate_semantic_mode_v5(self.pit_data_scope, self.semantic_mode)
++        if (self.parent_semantic_fingerprint_sha256 is None) != (self.semantic_mode == "disabled_development"):
++            raise ValueError("quick-screen parent fingerprint differs from semantic mode")
++        if self.semantic_mode == "disabled_development" and self.semantic_fingerprint is not None:
++            raise ValueError("disabled semantics cannot carry a fingerprint")
++        if self.parent_semantic_fingerprint_sha256 is not None:
++            _digest(self.parent_semantic_fingerprint_sha256, "quick-screen parent fingerprint")
+         if not _assignment_matches_template(self):
+             raise ValueError("quick-screen assignment differs from its template")
+         if self.validation.valid and (self.validation.changed_symbols != self.template.changed_symbols):
+             raise ValueError("quick-screen validation differs from its template")
+         if self.quick_evidence is not None and (
+             self.quick_evidence.policy_identity_sha256 != self.variant.policy_revision.sha256
+         ):
+             raise ValueError("quick-screen evidence differs from its policy")
+ 
+     @property
+@@ -160,21 +166,21 @@ class QuickScreenCandidateV5:
+         return (
+             self.semantic_fingerprint is not None
+             and self.semantic_fingerprint.fingerprint_sha256 != self.parent_semantic_fingerprint_sha256
+         )
+ 
+     @property
+     def is_eligible(self) -> bool:
+         return (
+             self.validation.valid
+             and self.variant.policy_revision.sha256 != self.template.parent_revision_sha256
+-            and self.is_behaviorally_distinct
++            and (self.is_behaviorally_distinct or self.semantic_mode == "disabled_development")
+             and self.quick_evidence is not None
+         )
+ 
+     @property
+     def policy_identity_sha256(self) -> str:
+         return self.variant.policy_revision.sha256
+ 
+ 
+ def _quick_cagr_pct(
+     *,
+@@ -227,20 +233,25 @@ def _deduplicate_quick_candidates(
+     candidates: tuple[QuickScreenCandidateV5, ...],
+ ) -> tuple[QuickScreenCandidateV5, ...]:
+     by_policy: dict[str, QuickScreenCandidateV5] = {}
+     for candidate in candidates:
+         identity = candidate.policy_identity_sha256
+         prior = by_policy.get(identity)
+         if prior is not None and prior != candidate:
+             raise QuickCandidateConflictV5()
+         by_policy[identity] = candidate
+ 
++    if any(item.semantic_mode == "disabled_development" for item in by_policy.values()):
++        if any(item.semantic_mode != "disabled_development" for item in by_policy.values()):
++            raise QuickCandidateConflictV5()
++        return tuple(by_policy.values())
++
+     # A suite-local behavior is screened only once. Prefer the declared default
+     # within its behavior group, otherwise the canonical policy identity.
+     by_fingerprint: dict[str, QuickScreenCandidateV5] = {}
+     for candidate in sorted(
+         by_policy.values(),
+         key=lambda item: (
+             not item.is_declared_default,
+             item.policy_identity_sha256,
+         ),
+     ):
+@@ -441,20 +452,25 @@ def parent_schedule_v5(
+     parents = tuple(
+         archive_parent_from_record_v5(
+             entry=entry,
+             stored_record=_stored_record_for_entry(
+                 entry=entry,
+                 stored_records=stored_records,
+             ),
+         )
+         for entry in archive_order
+     )
++    if any(
++        (parent.pit_data_scope, parent.semantic_mode) != (baseline.pit_data_scope, baseline.semantic_mode)
++        for parent in parents
++    ):
++        raise ParentSelectionFailureV5()
+     offset = (state.next_round_index - 1) % len(parents)
+     return parents[offset:] + parents[:offset]
+ 
+ 
+ def select_parent_v5(
+     *,
+     state: SearchStateV5,
+     baseline: BaselineParentAuthorityV5,
+     discovery_plan: CampaignPanelPlanV5,
+     evaluator_contract: EvaluatorContractV5,
+diff --git a/docs/pit-optimizer-v5-operations.md b/docs/pit-optimizer-v5-operations.md
+index 6df1814..2947151 100644
+--- a/docs/pit-optimizer-v5-operations.md
++++ b/docs/pit-optimizer-v5-operations.md
+@@ -1,19 +1,19 @@
+ # PIT optimizer V5 production operations
+ 
+ The production entry point is `python -B -m core.pit_optimizer_v5.cli` on the Windows host. Run it from the repository checkout containing these commands. `prepare-production` and `render-command` do not call a model or evaluate a candidate. `run`, `resume`, `run-campaign`, and `resume-campaign` can call the manifest-authorized provider and run the pinned Docker evaluator.
+ 
+ ## Required campaign inputs
+ 
+ Start with a real, authenticated discovery manifest and every artifact it references. The manifest fixes the source commit, baseline, discovery panels, evaluator, sandbox image, provider limits, and resource limits. Setup does not invent these artifacts or modify the manifest. A separately persisted adapter configuration supplies the local host paths and adapter identities.
+ 
+-Current manifests and baseline-parent authorities must contain an explicit `pit_data_scope`. The Python constructor default preserves source-call compatibility; it is not a migration for persisted JSON because typed artifact decoding requires exact keys. Pre-scope bytes remain readable and content-authenticatable under their original references, but typed manifest or parent loading reports that the graph must be rebuilt. Retain those artifacts unchanged, create a replacement manifest and parent with explicit scope, and use the newly computed content-addressed references throughout the rebuilt graph. Never edit old bytes in place or reuse their digests for re-emitted content.
++Current manifests and baseline-parent authorities must contain explicit `pit_data_scope` and `semantic_mode` fields. The Python constructor default preserves source-call compatibility; it is not a migration for persisted JSON because typed artifact decoding requires exact keys. Pre-scope or pre-mode bytes remain readable and content-authenticatable under their original references, but typed manifest or parent loading reports that the graph must be rebuilt. Retain those artifacts unchanged, create a replacement manifest and parent with explicit scope and semantic mode, and use the newly computed content-addressed references throughout the rebuilt graph. Never edit old bytes in place or reuse their digests for re-emitted content.
+ 
+ The source, workspace, data, output, and control directories must already exist and be mutually disjoint. For example, use sibling directories under `C:\pit-v5`, with a clean source checkout at `C:\pit-v5\source`. The data directory must contain exactly `pit_bundle.sqlite3` and `prices_provenance.json`, matching the manifest's evaluator digests. Keep the artifact repository outside the data directory. Git and Docker must be installed; their paths can be discovered from `PATH` or supplied explicitly.
+ 
+ Preparation checks the clean source commit and policy bytes, hashes the two data files without querying market or held-out domains, and constructs the actual production adapters to capture their identities. It does not start Docker or check daemon/image readiness. Before execution, make the manifest-pinned image available locally and configure `OPENROUTER_API_KEY` in the launch environment. The runtime uses the pinned image with pulling disabled.
+ 
+ If no real manifest exists yet, first complete the upstream data and panel work. The baseline input descriptor must reference the real evaluator contract, execution profile, sandbox profile, discovery panel plan, baseline policy revision, source bundle, policy scope, evaluator source, identity transitions, and resource capabilities. `prepare-baseline-inputs` authenticates that complete exact-path graph before publishing the descriptor create-only. It performs no evaluation, Docker action, provider call, directory scan, or held-out panel read. A provisional single-panel evaluation does not establish the full baseline or discovery campaign authority.
+ 
+ ## Prepare and capture the baseline
+ 
+ The recommended `--compose-source` mode derives the source bundle, baseline policy revision, policy scope, and evaluator contract. It pins a clean checkout at the declared commit and binds the derived identities to the authenticated sandbox runtime, immutable-constraints configuration, execution profile, evaluator source map, transition contract, resources, and discovery panel plan. The final V3 PIT bundle, prices provenance, and six development panels must already be reachable from that plan.
+@@ -164,10 +164,51 @@ checkpoint. Resume with the same repository and inputs after writing the file.
+ The first bytes found for that exact call are sealed create-only in the repository;
+ all later recovery reads those sealed bytes. A malformed or mismatched submitted
+ response therefore remains a truthful failed terminal attempt and cannot be
+ silently replaced by editing the input file.
+ 
+ This path records exact zero external-provider usage. It is controller-authored
+ development input, distinct from deterministic synthetic fixtures, and it does
+ not run an automatic external-model campaign. Production provider-free execution
+ continues to require fixture authority, while paid production continues to require
+ ledger authority.
++
++
++## Explicit development semantic skip
++
++The manifest defaults to `semantic_mode="required"`. `build-manifest` accepts
++`--semantic-mode disabled_development` only with
++`--pit-data-scope development_sp500_v2` and no provider configuration. The
++baseline scheduling parent must carry the same scope and mode. Production and
++fixture compositions remain semantic-required; development scope alone does
++not disable probes.
++
++In disabled mode the baseline, scheduling parent, round intent, experiment
++record, and quick evidence preserve unavailable semantic fingerprints as `None`.
++The nullable durable contracts persist their scope and mode. Source/AST validation
++and exact policy duplicate checks still run. Each valid nonduplicate candidate
++journals one `semantic_skipped_development` outcome at the semantic stage,
++without executing probes or obtaining a semantic execution lease. Recovery
++requires the same manifest mode, rejects semantic leases in disabled mode, and
++rejects skipped stages in required mode. Old JSON graphs are not migrated or
++filled with placeholder hashes; retain them unchanged and build new explicit
++content-addressed graphs.
++
++Quick screening retains canonical source identity and conflict checks, but
++skips parent/sibling fingerprint grouping in disabled mode. Eligibility for real
++bounded discovery is separate from behavioral distinctness: source differences
++are not behavioral evidence. A zero-trade quick evaluation can continue to the
++bounded discovery budget. Four complete zero-activity episodes remain a real
++`zero_trade` record and cannot enter the profitable archive. All normal panel,
++policy, evaluator, scenario, resource, and lifecycle bindings remain enforced.
++The critic receives actual available reports with
++`semantic_evidence_unavailable=true` and an empty semantic-difference section;
++no probe traces or novelty claims are invented. Archive replay and next-parent
++selection retain the same scope/mode. Skipping equivalence checks can cause
++redundant real candidate evaluations.
++
++This contract increment does not compose or demonstrate a development loop.
++Before real execution, rebuild the matching evaluator image (the manifest
++contract module is image-covered), obtain four authenticated real parent windows
++with gross/base/stress evidence, and compose the existing feedback runtime with
++the provider-free controller role adapter. Apply, qualification, and full replay
++remain disabled.

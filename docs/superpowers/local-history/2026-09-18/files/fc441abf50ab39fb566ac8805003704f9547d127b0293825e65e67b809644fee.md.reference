@@ -1,0 +1,11 @@
+# Campaign 05 failure
+
+The actual campaign is terminal failed, with cleanup complete. Investigator and author HTTP requests returned and were accounted: 2 calls, 8,438 tokens, $0.04007. No candidate evaluation, critic, or completed feedback round occurred. Never restart or resume this campaign.
+
+The unmodified saved author response reproduces `ValueError: source operation replacement must be non-empty UTF-8/LF source ending in LF` in `candidate_ir._source_text`. Its replacement function lacks its final newline. The provider-facing schema currently requires only a nonempty string for this source, so it allows responses that the local parser rejects. The earlier qualified-symbol and investigator-mode repairs worked on this actual response.
+
+The response remains immutable; no repaired response was imported or replayed. Root is auditing role contract omissions and repairing generation guidance. No evaluator source change or rebuild is needed for provider-only schema guidance.
+
+Campaigns 03-05 consumed all three authorized attempts: 5 calls, 19,117 tokens, $0.095955 reported. Seven call slots and 876,883 tokens remain within the allowance, but no further campaign attempt is authorized. Local diagnosis and preparation can continue; a new paid campaign requires extending that attempt limit.
+
+Static review also found strategy-semantic concerns: the author moved the cash override between market/regime checks and broadly removed fundamental and RS gates. Matching the dataclass interface is not proof of preserving the intended market behavior or CAN SLIM strategy. This failed response must not be promoted or silently repaired into an evaluated candidate.

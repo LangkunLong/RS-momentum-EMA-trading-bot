@@ -1,0 +1,611 @@
+# Review package: 9d05777383e54e54dda36c341ed2587f4543c0cb..3481c73bee373114737f8be714af67900a0af1b2
+
+## Commits
+3481c73 fix: bind qualification evidence to panel identity
+
+## Files changed
+ core/pit_optimizer_evaluation.py | 128 ++++++++++++++++++++++++++++++++++++---
+ core/pit_policy_parity.py        |   1 +
+ tests/test_pit_optimizer_v2.py   | 103 +++++++++++++++++++++++++++++--
+ tests/test_pit_policy_parity.py  |   1 +
+ 4 files changed, 217 insertions(+), 16 deletions(-)
+
+## Diff
+diff --git a/core/pit_optimizer_evaluation.py b/core/pit_optimizer_evaluation.py
+index 71054d8..5c816b0 100644
+--- a/core/pit_optimizer_evaluation.py
++++ b/core/pit_optimizer_evaluation.py
+@@ -948,44 +948,79 @@ def _target_from_primitive(value: object) -> AnnualizedReturnTarget:
+         metric_id=value["metric_id"],  # type: ignore[arg-type]
+         formula_id=value["formula_id"],  # type: ignore[arg-type]
+         basis=value["basis"],  # type: ignore[arg-type]
+         target_pct=Decimal(value["target_pct"]),  # type: ignore[arg-type]
+         milestones_pct=tuple(Decimal(item) for item in value["milestones_pct"]),  # type: ignore[union-attr]
+         precision_pct=Decimal(value["precision_pct"]),  # type: ignore[arg-type]
+     )
+ 
+ 
+ def _allocation_rule_from_primitive(value: object) -> PanelAllocationRuleV1:
+-    if not isinstance(value, dict):
+-        raise ValueError("panel allocation rule artifact is invalid")
++    expected_keys = {
++        "quick_count",
++        "discovery_count",
++        "qualification_count",
++        "algorithm_id",
++        "remainder",
++        "affiliation_bitset_order",
++        "panel_allocation_order",
++        "apportionment_id",
++    }
++    if not isinstance(value, dict) or set(value) != expected_keys:
++        raise ValueError("panel allocation rule artifact keys are invalid")
+     primitive = dict(value)
+     primitive["affiliation_bitset_order"] = tuple(
+         tuple(item) for item in primitive.get("affiliation_bitset_order", ())
+     )
+     primitive["panel_allocation_order"] = tuple(
+         primitive.get("panel_allocation_order", ())
+     )
+     return PanelAllocationRuleV1(**primitive)  # type: ignore[arg-type]
+ 
+ 
+ def _allocation_from_primitive(value: object) -> PanelStratumAllocation:
+-    if not isinstance(value, dict):
+-        raise ValueError("panel stratum allocation artifact is invalid")
++    expected_keys = {
++        "source_affiliations",
++        "eligible_count",
++        "quick_count",
++        "discovery_count",
++        "qualification_count",
++        "unallocated_count",
++    }
++    if not isinstance(value, dict) or set(value) != expected_keys:
++        raise ValueError("panel stratum allocation artifact keys are invalid")
+     primitive = dict(value)
+     primitive["source_affiliations"] = tuple(
+         primitive.get("source_affiliations", ())
+     )
+     return PanelStratumAllocation(**primitive)  # type: ignore[arg-type]
+ 
+ 
+ def _discovery_panel_plan_from_primitive(value: object) -> DiscoveryPanelPlan:
+-    if not isinstance(value, dict) or value.get("schema_version") != 4:
++    expected_keys = {
++        "schema_version",
++        "plan_kind",
++        "pit_bundle_sha256",
++        "prices_provenance_sha256",
++        "partition_seed_sha256",
++        "qualification_retirement_domain_id",
++        "qualification_ledger_snapshot_sha256",
++        "target",
++        "allocation_rule",
++        "stratum_allocations",
++        "quick_panel",
++        "discovery_panel",
++        "qualification_plan_sha256",
++    }
++    if not isinstance(value, dict) or set(value) != expected_keys:
++        raise ValueError("discovery panel plan keys are invalid")
++    if value.get("schema_version") != 4:
+         raise ValueError("discovery panel plan is not schema-v4")
+     primitive = dict(value)
+     primitive["target"] = _target_from_primitive(primitive.get("target"))
+     primitive["allocation_rule"] = _allocation_rule_from_primitive(
+         primitive.get("allocation_rule")
+     )
+     primitive["stratum_allocations"] = tuple(
+         _allocation_from_primitive(item)
+         for item in primitive.get("stratum_allocations", ())
+     )
+@@ -994,37 +1029,64 @@ def _discovery_panel_plan_from_primitive(value: object) -> DiscoveryPanelPlan:
+     )
+     primitive["discovery_panel"] = _evaluation_panel_from_primitive(
+         primitive.get("discovery_panel")
+     )
+     return DiscoveryPanelPlan(**primitive)  # type: ignore[arg-type]
+ 
+ 
+ def _qualification_panel_plan_from_primitive(
+     value: object,
+ ) -> QualificationPanelPlan:
+-    if not isinstance(value, dict) or value.get("schema_version") != 4:
++    expected_keys = {
++        "schema_version",
++        "plan_kind",
++        "pit_bundle_sha256",
++        "prices_provenance_sha256",
++        "partition_seed_sha256",
++        "qualification_retirement_domain_id",
++        "qualification_ledger_snapshot_sha256",
++        "target",
++        "allocation_rule",
++        "stratum_allocations",
++        "qualification_panel",
++    }
++    if not isinstance(value, dict) or set(value) != expected_keys:
++        raise ValueError("qualification panel plan keys are invalid")
++    if value.get("schema_version") != 4:
+         raise ValueError("qualification panel plan is not schema-v4")
+     primitive = dict(value)
+     primitive["target"] = _target_from_primitive(primitive.get("target"))
+     primitive["allocation_rule"] = _allocation_rule_from_primitive(
+         primitive.get("allocation_rule")
+     )
+     primitive["stratum_allocations"] = tuple(
+         _allocation_from_primitive(item)
+         for item in primitive.get("stratum_allocations", ())
+     )
+     primitive["qualification_panel"] = _evaluation_panel_from_primitive(
+         primitive.get("qualification_panel")
+     )
+     return QualificationPanelPlan(**primitive)  # type: ignore[arg-type]
+ 
+ 
++_PANEL_PUBLICATION_KEYS = {
++    "schema_version",
++    "publication_kind",
++    "qualification_plan_sha256",
++    "discovery_plan_sha256",
++    "qualification_ledger_snapshot_sha256",
++    "quick_count",
++    "discovery_count",
++    "qualification_count",
++}
++
++
+ def load_discovery_panel_plan(
+     path: Path,
+     *,
+     require_publication: bool = True,
+ ) -> DiscoveryPanelPlan:
+     resolved = Path(path).resolve()
+     if resolved.is_symlink() or not resolved.is_file():
+         raise ValueError("discovery panel plan must be a regular file")
+     raw = resolved.read_bytes()
+     try:
+@@ -1042,26 +1104,35 @@ def load_discovery_panel_plan(
+         try:
+             publication = json.loads(
+                 marker_raw,
+                 object_pairs_hook=_reject_duplicate_record_keys,
+             )
+         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+             raise ValueError("panel publication marker JSON is invalid") from exc
+         if (
+             not isinstance(publication, dict)
+             or marker_raw != _canonical_json_bytes(publication)
++            or set(publication) != _PANEL_PUBLICATION_KEYS
+             or publication.get("schema_version") != 4
+             or publication.get("publication_kind") != "panel_plans"
+             or publication.get("discovery_plan_sha256")
+             != hashlib.sha256(raw).hexdigest()
+             or publication.get("qualification_plan_sha256")
+             != plan.qualification_plan_sha256
++            or publication.get("qualification_ledger_snapshot_sha256")
++            != plan.qualification_ledger_snapshot_sha256
++            or publication.get("quick_count")
++            != plan.allocation_rule.quick_count
++            or publication.get("discovery_count")
++            != plan.allocation_rule.discovery_count
++            or publication.get("qualification_count")
++            != plan.allocation_rule.qualification_count
+         ):
+             raise ValueError("panel publication marker identity differs")
+     return plan
+ 
+ 
+ def load_qualification_panel_plan(
+     path: Path,
+     *,
+     require_publication: bool = True,
+ ) -> QualificationPanelPlan:
+@@ -1084,49 +1155,66 @@ def load_qualification_panel_plan(
+         try:
+             publication = json.loads(
+                 marker_raw,
+                 object_pairs_hook=_reject_duplicate_record_keys,
+             )
+         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+             raise ValueError("panel publication marker JSON is invalid") from exc
+         if (
+             not isinstance(publication, dict)
+             or marker_raw != _canonical_json_bytes(publication)
++            or set(publication) != _PANEL_PUBLICATION_KEYS
+             or publication.get("schema_version") != 4
+             or publication.get("publication_kind") != "panel_plans"
+             or publication.get("qualification_plan_sha256")
+             != hashlib.sha256(raw).hexdigest()
++            or publication.get("qualification_ledger_snapshot_sha256")
++            != plan.qualification_ledger_snapshot_sha256
++            or publication.get("quick_count")
++            != plan.allocation_rule.quick_count
++            or publication.get("discovery_count")
++            != plan.allocation_rule.discovery_count
++            or publication.get("qualification_count")
++            != plan.allocation_rule.qualification_count
++            or not isinstance(publication.get("discovery_plan_sha256"), str)
++            or re.fullmatch(
++                r"[0-9a-f]{64}",
++                publication["discovery_plan_sha256"],
++            )
++            is None
+         ):
+             raise ValueError("panel publication marker identity differs")
+     return plan
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class PanelAggregateSummary:
+     panel_id: str
++    panel_sha256: str
+     starting_equity: float
+     ending_equity: float
+     elapsed_calendar_days: int
+     portfolio_annualized_return_pct: Decimal
+     total_return_pct: float
+     benchmark_return_pct: float
+     max_drawdown_pct: float
+     sharpe_ratio: float
+     closed_trades: int
+     turnover_pct: float
+     average_exposure_pct: float
+     entry_funnel: tuple[AggregateMetric, ...]
+     exit_attribution: tuple[AggregateMetric, ...]
+ 
+     def __post_init__(self) -> None:
+         if self.panel_id not in _PANEL_PURPOSES:
+             raise ValueError("panel aggregate identity is invalid")
++        _require_digest(self.panel_sha256, "panel aggregate panel SHA-256")
+         for name in (
+             "starting_equity",
+             "ending_equity",
+             "total_return_pct",
+             "benchmark_return_pct",
+             "max_drawdown_pct",
+             "sharpe_ratio",
+             "turnover_pct",
+             "average_exposure_pct",
+         ):
+@@ -1221,28 +1309,33 @@ class DiscoveryPanelComparison:
+             target_gap_pp=(target.target_pct - candidate).quantize(
+                 _OBJECTIVE_QUANTUM,
+                 rounding=ROUND_HALF_EVEN,
+             ),
+             strictly_improves_champion=candidate > champion,
+         )
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class QualificationDecision:
++    qualification_panel_sha256: str
+     candidate_cagr_pct: Decimal
+     baseline_cagr_pct: Decimal
+     target_pct: Decimal
+     evaluation_complete: bool
+     integrity_complete: bool
+     qualified: bool
+ 
+     def __post_init__(self) -> None:
++        _require_digest(
++            self.qualification_panel_sha256,
++            "qualification panel SHA-256",
++        )
+         for name in ("candidate_cagr_pct", "baseline_cagr_pct", "target_pct"):
+             value = getattr(self, name)
+             if (
+                 not isinstance(value, Decimal)
+                 or not value.is_finite()
+                 or value != value.quantize(_OBJECTIVE_QUANTUM, rounding=ROUND_HALF_EVEN)
+             ):
+                 raise ValueError(f"qualification {name} is invalid")
+         if self.target_pct != AnnualizedReturnTarget.production().target_pct:
+             raise ValueError("qualification target differs from the active target")
+@@ -1254,37 +1347,52 @@ class QualificationDecision:
+             and self.candidate_cagr_pct >= self.target_pct
+             and self.candidate_cagr_pct > self.baseline_cagr_pct
+         )
+         if self.qualified is not expected:
+             raise ValueError("qualification decision differs from the closed return gate")
+ 
+     @classmethod
+     def from_result(
+         cls,
+         *,
+-        candidate_cagr_pct: object,
+-        baseline_cagr_pct: object,
++        candidate_evidence: PanelAggregateSummary,
++        baseline_evidence: PanelAggregateSummary,
++        qualification_panel: EvaluationPanelSpec,
+         target: AnnualizedReturnTarget,
+         evaluation_complete: bool,
+         integrity_complete: bool,
+     ) -> "QualificationDecision":
+         if not isinstance(target, AnnualizedReturnTarget):
+             raise ValueError("qualification target is invalid")
+-        candidate = _objective_decimal(candidate_cagr_pct, "qualification candidate CAGR")
+-        baseline = _objective_decimal(baseline_cagr_pct, "qualification baseline CAGR")
++        if (
++            not isinstance(candidate_evidence, PanelAggregateSummary)
++            or not isinstance(baseline_evidence, PanelAggregateSummary)
++            or not isinstance(qualification_panel, EvaluationPanelSpec)
++            or qualification_panel.purpose != "qualification"
++            or candidate_evidence.panel_id != "qualification"
++            or baseline_evidence.panel_id != "qualification"
++            or candidate_evidence.panel_sha256 != qualification_panel.sha256
++            or baseline_evidence.panel_sha256 != qualification_panel.sha256
++        ):
++            raise ValueError(
++                "candidate and baseline evidence must bind the same qualification panel"
++            )
++        candidate = candidate_evidence.portfolio_annualized_return_pct
++        baseline = baseline_evidence.portfolio_annualized_return_pct
+         qualified = (
+             evaluation_complete is True
+             and integrity_complete is True
+             and candidate >= target.target_pct
+             and candidate > baseline
+         )
+         return cls(
++            qualification_panel_sha256=candidate_evidence.panel_sha256,
+             candidate_cagr_pct=candidate,
+             baseline_cagr_pct=baseline,
+             target_pct=target.target_pct,
+             evaluation_complete=evaluation_complete,
+             integrity_complete=integrity_complete,
+             qualified=qualified,
+         )
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+diff --git a/core/pit_policy_parity.py b/core/pit_policy_parity.py
+index 97bea25..cae8dcc 100644
+--- a/core/pit_policy_parity.py
++++ b/core/pit_policy_parity.py
+@@ -1343,20 +1343,21 @@ def build_panel_evidence_v4(
+         str(
+             production_equity_cagr_pct(
+                 equity[0].equity,
+                 equity[-1].equity,
+                 elapsed_days,
+             )
+         )
+     ).quantize(Decimal("0.01"), rounding=ROUND_HALF_EVEN)
+     aggregate = PanelAggregateSummary(
+         panel_id=panel.purpose,
++        panel_sha256=panel.sha256,
+         starting_equity=equity[0].equity,
+         ending_equity=equity[-1].equity,
+         elapsed_calendar_days=elapsed_days,
+         portfolio_annualized_return_pct=portfolio_cagr,
+         total_return_pct=float(result.total_return_pct),
+         benchmark_return_pct=float(result.benchmark_return_pct),
+         max_drawdown_pct=float(result.max_drawdown_pct),
+         sharpe_ratio=float(result.sharpe_ratio),
+         closed_trades=len(closed_trades),
+         turnover_pct=turnover_pct,
+diff --git a/tests/test_pit_optimizer_v2.py b/tests/test_pit_optimizer_v2.py
+index 08bd7b9..984d560 100644
+--- a/tests/test_pit_optimizer_v2.py
++++ b/tests/test_pit_optimizer_v2.py
+@@ -8744,20 +8744,21 @@ def test_objective_is_absolute_panel_cagr_quantized_and_strict_on_ties() -> None
+     assert target == evaluation.AnnualizedReturnTarget(
+         metric_id="portfolio_annualized_return_pct",
+         formula_id="production_equity_cagr_365_calendar_days_v1",
+         basis="absolute",
+         target_pct=Decimal("10.00"),
+         milestones_pct=(Decimal("10.00"), Decimal("20.00"), Decimal("50.00")),
+         precision_pct=Decimal("0.01"),
+     )
+     candidate = evaluation.PanelAggregateSummary(
+         panel_id="discovery",
++        panel_sha256="e" * 64,
+         starting_equity=100.0,
+         ending_equity=121.0,
+         elapsed_calendar_days=730,
+         portfolio_annualized_return_pct=Decimal("10.00"),
+         total_return_pct=21.0,
+         benchmark_return_pct=40.0,
+         max_drawdown_pct=-99.0,
+         sharpe_ratio=-5.0,
+         closed_trades=0,
+         turnover_pct=0.0,
+@@ -8911,20 +8912,55 @@ def test_panel_allocator_is_lineage_stratified_disjoint_and_capacity_closed(
+         output_root=partial,
+         qualification_plan=qualification_plan,
+         discovery_plan=discovery_plan,
+     )
+     assert evaluation.load_discovery_panel_plan(
+         partial / "discovery-plan.json"
+     ) == discovery_plan
+     assert evaluation.load_qualification_panel_plan(
+         partial / "qualification-plan.json"
+     ) == qualification_plan
++    incomplete_discovery = discovery_plan.to_primitive()
++    del incomplete_discovery["allocation_rule"]["algorithm_id"]
++    incomplete_discovery_path = tmp_path / "incomplete-discovery-plan.json"
++    incomplete_discovery_path.write_bytes(_canonical_file_bytes(incomplete_discovery))
++    with pytest.raises(ValueError, match="allocation rule artifact keys"):
++        evaluation.load_discovery_panel_plan(
++            incomplete_discovery_path,
++            require_publication=False,
++        )
++    incomplete_qualification = qualification_plan.to_primitive()
++    del incomplete_qualification["stratum_allocations"][0]["unallocated_count"]
++    incomplete_qualification_path = tmp_path / "incomplete-qualification-plan.json"
++    incomplete_qualification_path.write_bytes(
++        _canonical_file_bytes(incomplete_qualification)
++    )
++    with pytest.raises(ValueError, match="stratum allocation artifact keys"):
++        evaluation.load_qualification_panel_plan(
++            incomplete_qualification_path,
++            require_publication=False,
++        )
++    extra_plan_key = discovery_plan.to_primitive()
++    extra_plan_key["qualification_panel"] = {}
++    extra_plan_path = tmp_path / "extra-key-discovery-plan.json"
++    extra_plan_path.write_bytes(_canonical_file_bytes(extra_plan_key))
++    with pytest.raises(ValueError, match="discovery panel plan keys"):
++        evaluation.load_discovery_panel_plan(
++            extra_plan_path,
++            require_publication=False,
++        )
++    publication_path = partial / "publication.json"
++    publication = json.loads(publication_path.read_bytes())
++    publication["unexpected"] = True
++    publication_path.write_bytes(_canonical_file_bytes(publication))
++    with pytest.raises(ValueError, match="publication marker"):
++        evaluation.load_discovery_panel_plan(partial / "discovery-plan.json")
+     parsed = evaluation._manifest_cli_parser().parse_args(
+         [
+             "build-panel-plans",
+             "--pit-bundle",
+             str(tmp_path / "pit.sqlite3"),
+             "--pit-bundle-sha256",
+             "c" * 64,
+             "--prices-provenance",
+             str(tmp_path / "prices.json"),
+             "--start-date",
+@@ -8946,53 +8982,108 @@ def test_panel_allocator_is_lineage_stratified_disjoint_and_capacity_closed(
+             "--output-root",
+             str(tmp_path / "published-panels"),
+         ]
+     )
+     assert parsed.command == "build-panel-plans"
+     assert parsed.partition_seed == "sealed-seed"
+ 
+ 
+ def test_qualification_gate_uses_only_target_integrity_and_same_panel_baseline() -> None:
+     """Break caught: a diagnostic gate or baseline equality could alter qualification."""
++    qualification_panel = evaluation.EvaluationPanelSpec.from_lineages(
++        purpose="qualification",
++        sessions=("2021-01-01", "2023-01-01"),
++        lineages=(
++            evaluation.PanelSecurityLineage(
++                "chain-qualification",
++                ("QUAL",),
++                ("sp500",),
++            ),
++        ),
++    )
++    candidate = evaluation.PanelAggregateSummary(
++        panel_id="qualification",
++        panel_sha256=qualification_panel.sha256,
++        starting_equity=100.0,
++        ending_equity=121.0,
++        elapsed_calendar_days=730,
++        portfolio_annualized_return_pct=Decimal("10.00"),
++        total_return_pct=21.0,
++        benchmark_return_pct=40.0,
++        max_drawdown_pct=-99.0,
++        sharpe_ratio=-5.0,
++        closed_trades=0,
++        turnover_pct=0.0,
++        average_exposure_pct=0.0,
++        entry_funnel=(),
++        exit_attribution=(),
++    )
++    baseline = replace(
++        candidate,
++        ending_equity=118.81,
++        portfolio_annualized_return_pct=Decimal("9.00"),
++    )
+     decision = evaluation.QualificationDecision.from_result(
+-        candidate_cagr_pct=Decimal("10.005"),
+-        baseline_cagr_pct=Decimal("9.99"),
++        candidate_evidence=candidate,
++        baseline_evidence=baseline,
++        qualification_panel=qualification_panel,
+         target=evaluation.AnnualizedReturnTarget.production(),
+         evaluation_complete=True,
+         integrity_complete=True,
+     )
+ 
+     assert decision.candidate_cagr_pct == Decimal("10.00")
++    assert decision.qualification_panel_sha256 == qualification_panel.sha256
+     assert decision.qualified is True
+     assert {
+         "closed_trades",
+         "drawdown",
+         "sharpe",
+         "turnover",
+         "transaction_costs",
+     }.isdisjoint({field.name for field in fields(evaluation.QualificationDecision)})
+     assert evaluation.QualificationDecision.from_result(
+-        candidate_cagr_pct=Decimal("9.99"),
+-        baseline_cagr_pct=Decimal("1.00"),
++        candidate_evidence=replace(
++            candidate,
++            ending_equity=120.978001,
++            portfolio_annualized_return_pct=Decimal("9.99"),
++        ),
++        baseline_evidence=replace(
++            baseline,
++            ending_equity=102.01,
++            portfolio_annualized_return_pct=Decimal("1.00"),
++        ),
++        qualification_panel=qualification_panel,
+         target=evaluation.AnnualizedReturnTarget.production(),
+         evaluation_complete=True,
+         integrity_complete=True,
+     ).qualified is False
+     assert evaluation.QualificationDecision.from_result(
+-        candidate_cagr_pct=Decimal("10.00"),
+-        baseline_cagr_pct=Decimal("10.00"),
++        candidate_evidence=candidate,
++        baseline_evidence=candidate,
++        qualification_panel=qualification_panel,
+         target=evaluation.AnnualizedReturnTarget.production(),
+         evaluation_complete=True,
+         integrity_complete=True,
+     ).qualified is False
++    with pytest.raises(ValueError, match="same qualification panel"):
++        evaluation.QualificationDecision.from_result(
++            candidate_evidence=candidate,
++            baseline_evidence=replace(baseline, panel_sha256="0" * 64),
++            qualification_panel=qualification_panel,
++            target=evaluation.AnnualizedReturnTarget.production(),
++            evaluation_complete=True,
++            integrity_complete=True,
++        )
+     with pytest.raises(ValueError, match="qualification decision"):
+         evaluation.QualificationDecision(
++            qualification_panel_sha256=qualification_panel.sha256,
+             candidate_cagr_pct=Decimal("10.00"),
+             baseline_cagr_pct=Decimal("9.00"),
+             target_pct=Decimal("10.00"),
+             evaluation_complete=True,
+             integrity_complete=True,
+             qualified=False,
+         )
+ 
+ 
+ def _validation_identity(fold: FoldSpec, suffix: str) -> evaluation.ValidationWindowIdentity:
+diff --git a/tests/test_pit_policy_parity.py b/tests/test_pit_policy_parity.py
+index a23d0e3..15aa629 100644
+--- a/tests/test_pit_policy_parity.py
++++ b/tests/test_pit_policy_parity.py
+@@ -478,20 +478,21 @@ def test_legacy_fold_and_panel_evidence_embed_production_aggregates() -> None:
+     assert dict((item.metric_id, item.value) for item in evidence.aggregate.exit_attribution) == {"end_of_test": 1}
+     panel = EvaluationPanelSpec.from_lineages(
+         purpose="discovery",
+         sessions=fold.sessions,
+         lineages=(
+             PanelSecurityLineage("chain_aaa", ("AAA",), ("sp500",)),
+         ),
+     )
+     panel_evidence = parity.build_panel_evidence_v4(panel=panel, result=result)
+     assert panel_evidence["policy_interface_version"] == 2
++    assert panel_evidence["aggregate"]["panel_sha256"] == panel.sha256
+     assert panel_evidence["aggregate"]["portfolio_annualized_return_pct"] == "0.00"
+ 
+ 
+ def test_legacy_capture_evaluates_only_discovery_and_seals_hidden_calendar(tmp_path: Path) -> None:
+     """Break caught: reference capture evaluated hidden data or omitted its sealed boundary."""
+     closures = {"2021-07-05", "2021-09-06", "2021-11-25", "2021-12-24", "2022-01-17", "2022-02-21"}
+     sessions = tuple(
+         value.date().isoformat()
+         for value in pd.bdate_range("2021-06-25", "2022-03-11")
+         if value.date().isoformat() not in closures

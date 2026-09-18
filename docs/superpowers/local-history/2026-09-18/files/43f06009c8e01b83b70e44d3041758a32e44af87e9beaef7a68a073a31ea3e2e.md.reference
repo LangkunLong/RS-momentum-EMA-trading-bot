@@ -1,0 +1,66 @@
+# Increment C-a — historical executor verification diagnosis
+
+Status: Increment C-a completed. Independent review accepted the diagnosis; both requested design corrections passed scoped re-review. The revised design is the proposed implementation handoff, beginning with H1. B4c source acceptance is retained. Production implementation and campaign readiness remain unapproved. No production correction has been implemented.
+
+## Current evidence
+
+The actual runtime-04 full summary still fails with `V5CliFailure(artifact_graph_invalid)` caused by `ValueError(container execution reservation is foreign)`. The failure reaches `LocalContainerExecutorV5._load_reservation(repair=False)`, with the original command digest matching and the executor digest differing. This reproduces the B4c principal result in this session without changing environment, source, records or authority.
+
+The actual06 full summary returns successfully and reports the historical failed campaign, with lifecycle/evaluated-feedback/rejected counts 0/0/0. All 27 fields match the saved B4c principal `summarize` result, comparing Decimal fields numerically. No extra provider call or evaluation occurred.
+
+| Round | Original executor digest | Current executor digest |
+| --- | --- | --- |
+| runtime-04 round 1 | 2849cde885cc8bdde38230bc77ecd17163db42db1b071cc5a8a4212ce4601444 | a72e22fc6deeb4b23f65d82ef32abb148fea4ea6db5efecf26c4391e31605bb9 |
+| runtime-04 round 2 | bae808e474cf877d4ac47641a02f7f1f5c01d2c0e6e21640b9aa9524d9e88c95 | ee5f5909728d6eda5a3cb6cc9b25e630debddecd5b6f6cde21766014941184ca |
+
+Current executor digests were recomputed from the exact source-defined identity payload and equal the constructed executor properties. No component substitution was used to force a match.
+
+## Component findings
+
+The comparison covers all ten original journal-indexed executions, five in each round. Existing typed loaders used `repair=False`; owner data came from real journal/reservation/launch authority. `authenticate_output_history` and `authenticate_lease_history` were called on existing records. These component checks are not a successful full historical-execution verification.
+
+| Component | Observation | Limit |
+| --- | --- | --- |
+| Manifest/profile/repository | Original launch manifest/config authenticate against the same manifest and root; mount authority reconstructs exactly | No relocation or archive migration claim |
+| Owner/command/request | All ten agree with launch owner, derived round lease, journal authority and command hash | No invented owner or command |
+| Workspace/mount | Workspace histories are retired; output histories authenticate against those workspace identities | Does not replace phase/output/role verification |
+| Docker executable | Saved control records match the current full executable-file identity digest | No Docker daemon call or image inventory inspection |
+| Control directory | All ten saved control identities match using the same hash encoding; transaction directories are absent as recorded | Directory absence alone does not establish historical completion |
+| Cleanup bindings | Saved reservation/control/cleanup/absence records agree on original executor and owner | Full phase-prefix, output and cleanup verifier remains blocked upstream |
+| Control environment | Only the current six-entry tuple and per-entry digests were captured | No original tuple/component digests established; no values printed or changed |
+| Runtime contract | Current literal was read from the executor constructor and included in exact current recomputation | Original launch-bound host contract preimage has not yet been established |
+
+The evidence excludes several proposed explanations, including a different current Docker file identity, mount identity or control-directory identity for these records. It does **not** isolate PATH or prove environmental drift as the sole cause. The original environment and host-contract preimage remain necessary to reproduce the original whole-executor digest.
+
+## Verifier seam
+
+The subagent trace and a separate principal typed read both authenticate the per-round config anchors. Round 1's config SHA is `64b620c9add71ae02877d0126b81cf1ff6f5f452b4ffd1385c289124a83cca69`; round 2's is `df2264692b1ce5a673122366c8f5b341c963cd58206151981f0d0ccf5d50a180`. Each config's stored executor matches all five reservations for its round. Both round/started records agree after removing only start time, and both owners agree with the original campaign launch. These original config references provide an independent historical anchor, rather than trusting a reservation's own digest.
+
+The manifest's policy source commit contains the same runtime-contract literal as current source, but does not bind the executed host module set. That source observation corroborates contract stability; it does not prove the missing original host/environment preimage.
+
+`summary.py:265` calls `authenticate_development_history_v5`. That function loads the original campaign launch/config and calls `_verify_local_run` (`development_preparation.py:394–409`). `_verify_resource_history` constructs a fresh executor (`cli.py:943–979`). The constructor binds six current process environment entries and a current runtime-contract literal into executor identity (`production_sandbox.py:1505–1559`). `_load_reservation` then requires equality with the historical digest (`production_sandbox.py:1813–1829`).
+
+This binds historical reporting to current execution authority. The live guard is correct to reject a foreign executor; the correction must give historical reporting a distinct, authenticated read authority. Removing the guard or overriding an executor object's identity would also affect launch, recovery and cleanup and is unacceptable.
+
+## Preservation and execution record
+
+The 18 B4c recorded source hashes are unchanged. The complete 56-file evaluator source map recomputes to `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4`.
+
+Before/after snapshots match all 579 files under runtime-04 and all 83 files under actual06. State-index preflight checked 175 and 3 entries respectively. The evidence JSON contains the exact file inventories and hashes. No original file was repaired or rewritten.
+
+One initial preflight stopped before invoking a summary because ordinary Windows path access failed at 260 characters. Extended paths proved the index existed; the diagnostic reader was corrected. One initial control-root observation compared two different encodings and is explicitly superseded by `component-comparison-corrected.json`. It is not evidence of directory drift. A subsequent component-only pass covered both rounds; neither summary was rerun for that correction. An import error in that component helper occurred before archive access and was corrected.
+
+No tests were read, created or run; no synthetic records/events/candidates, credential reads, external calls, evaluations, campaign operations, production changes or commits occurred. New files are diagnostic scripts, reports and metadata in this package plus the scoped SDD ledger.
+
+## Evidence map
+
+- `current-verifier-evidence.json`: actual returned summary/failure chain, hashes and first component observation; its control-root comparison is superseded as above.
+- `component-comparison-corrected.json`: ten execution comparisons with the correct control-record encoding and exact current executor-payload recomputation.
+- `actual06-current-comparison.json`: same-command comparison of all 27 summary fields.
+- `authority-trace-report.md`: independent subagent trace of the original launch and per-round authority; final conclusions must account for this report.
+- `principal-round-config-anchors.json`: separate principal typed authentication of both round configs and their equality with all ten reservation executor digests.
+- `final-preservation-check.json`: final archive/source/HEAD/branch and in-memory diagnostic compilation check.
+- `historical-verification-design.md`: narrow proposed correction and implementation checkpoints.
+- `independent-review.md`, `design-correction-report.md`, and `independent-rereview.md`: full-package review, two bounded documentation corrections, and both findings resolved with no new important issues.
+
+Increment C-a ends with this finding/design. C-b readiness, C-c paid-run preparation and the original two-evaluated-round milestone are not claimed complete.

@@ -1,0 +1,20 @@
+# Independent Task 3 review
+
+Findings: No actionable findings in the Task 3 source change.
+
+Spec compliance: PASS
+
+Task quality: PASS
+
+Reviewed the complete Task 3 brief, implementation report and review diff first, then compared the actual `summary.py` against its captured preimage and inspected its unchanged surrounding logic. The actual diff matches the supplied review diff and contains only the required field, validation, computation and return-keyword additions.
+
+- The three integer fields are appended after `evaluation_mode`, default to zero, and preserve every existing positional field. They participate in the existing `type(value) is not int or value < 0` validation, which also rejects booleans. The single new consistency guard matches all five specified comparisons and the exact required error string.
+- The new computation follows checkpoint-record loading through `repository.load_experiment` and the successful return of `verify_projection`. Static inspection of `load_experiment` confirms canonical-content authentication plus critic and render-rejection binding validation; projection verification authenticates the committed archive without repairing it. There is no exception suppression or alternate unauthenticated source for the new counts.
+- Lifecycle progress uses a set of checkpoint-record round indexes filtered by the existing successful-cleanup payload map. Several records in a round count once; rejection-only and duplicate-only record rounds qualify after cleanup; a terminal round without checkpoint records does not qualify.
+- Evaluated feedback intersects completed record rounds with round indexes from the unchanged `evaluated` selection, which requires both evaluated status and non-null campaign evidence. Multiple evaluated candidates count as one round, and an evaluated record awaiting successful cleanup does not yet contribute feedback progress.
+- Rejections count individual checkpoint records only when status is invalid and the failure code is exactly `policy_source_unbounded_or_stateful`. Cleanup is deliberately absent from this predicate, so committed rejections still count while cleanup is pending. Ordinary invalid records and terminal failures without checkpoint records do not contribute.
+- All existing status/readiness/terminal rules, summary arguments, evaluated-experiment selection, performance selection, failure taxonomy, role/token/cost aggregation, cleanup aggregation, schema validation and canonical serialization delegation are unchanged relative to the preimage. The additive dataclass fields supply the authorized three new summary keys; there is no durable-schema or historical-artifact rewrite in this diff.
+
+The preimage SHA-256 is `4eaef3424a6043a5ce0aeef60bf0a8abe444d4a24588d93d26804d44a3127258`; the reviewed source SHA-256 is `e4ccb8a2077ca28d2ece2e541839265b3f08218e1b66e93b635772e600270865`. Both match the implementation report. Git emitted an ordinary CRLF advisory during the read-only diff; it does not change the reviewed semantics.
+
+Verification was limited to static source/diff inspection and file hashing. No tests, synthetic inputs, probes, event/record execution, wrappers, model/API/credential/evaluator/campaign calls, commits, pushes or deployments were performed. This review's only write is this report. Whole-worktree preservation outside Task 3 is not inferred from its one-file preimage diff.

@@ -1,0 +1,46 @@
+# Nasdaq-100 public acquisition report
+
+Status: raw evidence acquired and reconciled where supported; no membership CSV/provenance pair emitted. This is not V5 data admission.
+
+## Acquired evidence
+
+The ignored directory `.artifacts/pit-optimizer-v5/data/acquisition/raw/nasdaq-public/` contains 16 successful public source downloads, their original HTTP response bytes, and create-only receipt JSON files with requested/final URL, retrieval timestamp, content type, byte count, SHA256, and available HTTP metadata. `acquisition-manifest.json` records every receipt and confirms all successful source byte lengths and hashes were recomputed and matched. Initial sandbox proxy failures and two `ir.nasdaq.com` PDF timeouts are preserved separately as failed receipts; they are not counted as acquired documents. Public Nasdaq HTML versions supplied the primary amendment evidence successfully.
+
+Key sources:
+
+- Historical membership table: [Wikipedia revision1371960136](https://en.wikipedia.org/w/index.php?title=Historical_components_of_the_Nasdaq-100&oldid=1371960136), SHA256 `4a67fdef4ed6bdd3f39a17f6a2e8bdf3936de89f01cc69ed57ecfee0d8f256dc`.
+- Contemporaneous anchor: [Nasdaq-100 revision997991401](https://en.wikipedia.org/w/index.php?title=Nasdaq-100&oldid=997991401), identified by saved Wikipedia API lookup as edited `2021-01-03T06:22:02Z`. The article body explicitly dates its membership table to the December21 2020 open. It contains102 tickers, including historical FB/FISV and distinct GOOG/GOOGL and FOX/FOXA. SHA256 `4e478f7895cd4f6b5a1f07e876012755e35979e29ef731849ca51add937d8193`.
+- [Nasdaq December2020 reconstitution release](https://www.nasdaq.com/press-release/annual-changes-to-the-nasdaq-100-index-2020-12-11), supporting the anchor's recent changes, not independently a complete constituent roster.
+- Frozen current-component [revision1368915166](https://en.wikipedia.org/w/index.php?title=List_of_NASDAQ-100_companies&oldid=1368915166), used solely as an endpoint cross-check, never as the historical seed or classification source.
+- [Nasdaq2025 retrospective PDF](https://indexes.nasdaqomx.com/docs/202601%20NDX%20Reconstitution%20and%20Performance%20Highlights.pdf) and corresponding official article, preserving conflicting SOLS dates.
+- Contemporaneous primary Nasdaq notices for the four corrections below and SOLS/GRAL trading corporate actions.
+- [HKEX-filed iShares Nasdaq100 ETF2024 interim report](https://www1.hkexnews.hk/listedco/listconews/sehk/2024/0830/2024083001668.pdf), which reports a GRAIL holding. Fund holdings corroborate a missing event investigation, but are not a substitute for index-effective dates.
+
+Wikipedia oldid URLs pin article revisions. Rendered navigation templates may reflect later state; extraction uses only the identified body tables and excludes navigation and classification fields. The anchor's generic-download receipt conservatively sets `url_is_revision_pinned:false`; its actual oldid URL and separately acquired revision metadata pin revision997991401. Official dated article/PDF URLs are not represented as server-immutable: exact local response bytes and hashes provide the immutable snapshot.
+
+## Resolved corrections
+
+`correction-evidence-ledger.json` links each adaptation to local primary source bytes:
+
+1. Fiserv removal on June7 2023 must use **FISV**, not the later NYSE ticker FI shown by Wikipedia. [Nasdaq GEHC replacement notice](https://www.nasdaq.com/press-release/ge-healthcare-technologies-inc.-to-join-the-nasdaq-100-indexr-beginning-june-7-2023) explicitly identifies departing Nasdaq:FISV.
+2. TTWO addition and SGEN removal take effect **December18 2023**, not Wikipedia's December14 acquisition-closing date. [Nasdaq's December12 amendment](https://www.nasdaq.com/press-release/update%3A-annual-changes-to-the-nasdaq-100r-index-2023-12-12) sets both changes before the December18 open.
+3. ANSS removal is **July28 2025** together with TRI replacement, not Wikipedia's July17 corporate-acquisition date. [Contemporaneous Nasdaq replacement release](https://www.nasdaq.com/press-release/thomson-reuters-corp-join-nasdaq-100-indexr-beginning-july-28-2025-2025-07-18) establishes the index date; the Nasdaq retrospective agrees. Index membership may outlast exchange trading; this does not manufacture post-delisting prices.
+4. Add the omitted **FB-to-META June9 2022** ticker transition. [Nasdaq ECA2022-125](https://www.nasdaqtrader.com/TraderNews.aspx?id=ECA2022-125) establishes the same ClassA CUSIP30303M102 and effective ticker date. This ledger is evidence, not an approved price identity map.
+
+## Reconciliation result and limits
+
+`anchor-candidate-extraction.json` preserves the102-symbol anchor candidate. `history-table-extraction-not-admitted.json` preserves dated source claims and their cited URLs. There are89 source event claims within January4 2021 through December31 2025. Applying only the four supported adaptations results in91 event claims, with no membership-state errors, and101 members at year-end2025. Independently reversing post-2025 source events from the frozen current table yields the identical101-symbol endpoint, with no reverse-state errors or set differences.
+
+These diagnostics establish internal state/endpoint consistency only. SOLS source dates remain unresolved diagnostic claims. A temporary member added and removed between endpoints leaves no endpoint discrepancy; the missing GRAIL interval demonstrates why this check cannot prove completeness. No current classification was backfilled, no share classes were collapsed, and no acquired company's price history was spliced into its acquirer.
+
+## Exact remaining blockers
+
+1. **SOLS index dates:** Wikipedia says October30-November6 2025; the official Nasdaq retrospective says October20-November10. [Nasdaq ECA2025-559](https://www.nasdaqtrader.com/TraderNews.aspx?id=ECA2025-559) and Honeywell's October16 release establish SOLSV when-issued trading from October20 and SOLS regular-way trading from October30. These settle trading-symbol timing but do not establish whether NDX included the when-issued security or establish the index-removal effective date. The retrospective's use of SOLS on October20 cannot be silently treated as the dated provider ticker. A contemporaneous NDX corporate-action bulletin or dated official index files spanning these dates are still required.
+2. **GRAIL transient omission:** Wikipedia's2024 table has no GRAL or GRALV entry/exit. [Nasdaq ECA2024-262](https://www.nasdaqtrader.com/TraderNews.aspx?id=ECA2024-262) establishes when-issued GRALV from June12 and regular-way GRAL from June25. The official index-tracking fund report corroborates a GRAIL holding at June30. Searches found secondary removal reports published July4, and a non-primary ETF tracker showing a July8 removal, which are insufficient to select the NDX effective date. Need a contemporaneous index bulletin or official dated NDX constituents/corporate-action records covering June12-July8 2024. No dates have been invented from those leads.
+3. **Unenumerated omissions:** Resolving these two transients would improve the history, but absence of additional transient omissions has not been authenticated by a complete primary event history. A complete official event record or dated constituent archive covering2021-2025 remains the strongest actionable input. The102-name contemporaneous secondary anchor also merits independent primary roster comparison before final source admission.
+
+The Nasdaq weighting-page full-history login and FMP paywall were not bypassed. No purchase, login, remote storage, model-role invocation, optimizer/evaluation/baseline/heldout/replay, or trading action occurred. No tests were read, added, modified, or run. No tracked source was edited. Normalizer `_source_rows` and `_validate_source_provenance` were read to understand admission requirements but not invoked because an admissible pair was not emitted. Hash integrity and pure data-state reconciliation are the only executed validations. Price coverage and reviewed identities remain downstream work.
+
+## Reproducibility
+
+Ignored campaign helpers are `nasdaq-acquisition-download.py`, `nasdaq-acquisition-supplement.py`, `nasdaq-acquisition-ticker-evidence.py`, and `nasdaq-acquisition-audit.py`. Downloads and derived artifacts use exclusive create-only writes and refuse to overwrite existing evidence. Re-execution should use fresh output names or a separate acquisition directory; existing raw evidence must remain unchanged. Independent review was requested from the existing V5 reviewer.

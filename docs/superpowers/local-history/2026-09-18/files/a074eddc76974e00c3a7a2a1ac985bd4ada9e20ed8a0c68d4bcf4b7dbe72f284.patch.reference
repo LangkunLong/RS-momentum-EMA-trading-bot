@@ -1,0 +1,42 @@
+diff --git a/.artifacts/pit-optimizer-v5/development/luna-recovery-a/production_runtime.py.preimage b/core/pit_optimizer_v5/production_runtime.py
+index ab52da7..38588fb 100644
+--- a/.artifacts/pit-optimizer-v5/development/luna-recovery-a/production_runtime.py.preimage
++++ b/core/pit_optimizer_v5/production_runtime.py
+@@ -120,6 +120,26 @@ from core.pit_optimizer_v5.workspace import (
+ )
+ 
+ 
++_INVESTIGATOR_ENTRY_COUNTS_V5 = (
++    "stage.evaluated_rows",
++    "stage.buy_signal_count",
++    "stage.market_pass",
++    "stage.breakout_pass",
++    "stage.buy_zone_pass",
++    "stage.technical_score_pass",
++    "stage.rs_pass",
++    "stage.entry_block_current_growth_below_threshold",
++    "stage.entry_block_current_growth_unavailable",
++    "stage.entry_block_annual_growth_below_threshold",
++    "stage.entry_block_annual_growth_unavailable",
++    "stage.entry_block_rs_score_below_threshold",
++    "stage.entry_block_rs_score_unavailable",
++    "stage.entry_block_composite_score_below_threshold",
++    "stage.entry_block_composite_score_unavailable",
++    "episode.discovery.entries_executed",
++)
++
++
+ class _EvidenceBuilderV5:
+     def __init__(self, role: Literal["investigator", "author", "critic"]) -> None:
+         self._role = role
+@@ -592,6 +612,10 @@ class LocalRoleRequestFactoryV5:
+                     evidence.add(f"{prefix}.average_exposure_pct", report.average_exposure_pct),
+                 )
+             )
++            counts = {item.metric_id: item.count for item in report.entry_funnel}
++            for metric_id in _INVESTIGATOR_ENTRY_COUNTS_V5:
++                if metric_id in counts:
++                    evaluator_ids.append(evidence.add(f"{prefix}.entry.{metric_id}", counts[metric_id]))
+ 
+         families: list[ArchiveFamilyAggregateV5] = []
+         for mechanism in PRIMARY_MECHANISMS_V5:

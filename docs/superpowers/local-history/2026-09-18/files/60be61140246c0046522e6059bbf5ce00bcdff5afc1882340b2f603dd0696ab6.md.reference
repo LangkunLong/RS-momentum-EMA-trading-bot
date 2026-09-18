@@ -1,0 +1,259 @@
+# Task 2 review package
+
+Base commit: 515cb1e50d051e2ee4253603608f2fd3920004bc
+Head commit: same commit; uncommitted isolated path diff
+
+```diff
+warning: in the working copy of 'core/pit_data.py', LF will be replaced by CRLF the next time Git touches it
+ core/pit_data.py | 67 +++++++++++++++++++++++++++++++++++++++++++++-----------
+ 1 file changed, 54 insertions(+), 13 deletions(-)
+warning: in the working copy of 'core/pit_data.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/core/pit_data.py b/core/pit_data.py
+index 478e751..22f93e2 100644
+--- a/core/pit_data.py
++++ b/core/pit_data.py
+@@ -34,20 +34,21 @@ import re
+ import sqlite3
+ from dataclasses import dataclass
+ from datetime import date, datetime
+ from itertools import groupby
+ from pathlib import Path
+ from types import MappingProxyType
+ from typing import Any, Iterable, Mapping
+ 
+ import pandas as pd
+ 
++from core.canslim.earnings_trace import PIT_PUBLIC_DATES_ATTR
+ from core.leader_evaluation import PointInTimeUniverse
+ 
+ _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+ _REQUIRED_TABLES = {"dataset_metadata", "membership", "price", "fundamentals"}
+ _REQUIRED_PRICE_COLUMNS = {
+     "trade_date",
+     "ticker",
+     "open",
+     "high",
+     "low",
+@@ -659,50 +660,58 @@ class PITDataBundle:
+     ) -> pd.DataFrame:
+         frame = self._query_prices(tickers, start_date, end_date)
+         if frame.empty:
+             return pd.DataFrame()
+         return (
+             frame.pivot(index="trade_date", columns="ticker", values="Close")
+             .sort_index()
+             .sort_index(axis=1)
+         )
+ 
+-    def fundamentals_as_of(self, symbol: str, as_of_date: pd.Timestamp | datetime) -> dict[str, Any]:
++    def fundamentals_as_of(
++        self,
++        symbol: str,
++        as_of_date: pd.Timestamp | datetime,
++        *,
++        include_provenance: bool = False,
++    ) -> dict[str, Any]:
+         """Return only fundamental records publicly available by *as_of_date*."""
+ 
+         ticker = _canonical_ticker(symbol)
+         if pd.Timestamp(as_of_date) > self.data_cutoff:
+             raise ValueError("requested fundamental date exceeds point-in-time bundle cutoff")
+         cutoff = pd.Timestamp(as_of_date).date().isoformat()
+         rows = self._connection.execute(
+             "SELECT ticker, statement_type, period_end, public_date, basic_eps, diluted_eps, "
+             "total_revenue, net_income, common_stock, total_stockholders_equity, "
+             "shares_outstanding, held_percent_institutions, institution_count, "
+             "prev_institution_count FROM fundamentals "
+             "WHERE ticker = ? AND public_date <= ? ORDER BY public_date, period_end",
+             (ticker, cutoff),
+         ).fetchall()
+         records = [dict(row) for row in rows]
+         for record in records:
+             if record["statement_type"] not in _STATEMENT_TYPES:
+                 raise ValueError("fundamentals statement_type is invalid")
+-        return self._fundamental_snapshot(records)
++        return self._fundamental_snapshot(records, include_provenance=include_provenance)
+ 
+     def iter_fundamental_state_boundaries(
+         self,
+         date_bounds: Mapping[
+             str,
+             tuple[
+                 pd.Timestamp | datetime | date,
+                 pd.Timestamp | datetime | date,
+             ],
+         ],
++        *,
++        include_provenance: bool = False,
+     ) -> Iterable[tuple[str, date, dict[str, Any]]]:
+         """Yield exact as-of snapshots at each requested ticker's state boundaries.
+ 
+         The first boundary is the inclusive start-date snapshot with all earlier
+         filings folded into it. Later boundaries are distinct public dates, with
+         every row sharing a date applied atomically. A right-inclusive lookup can
+         therefore reproduce ``fundamentals_as_of`` anywhere inside each range
+         without evaluating unobservable pre-range intermediate states.
+         """
+ 
+@@ -747,76 +756,106 @@ class PITDataBundle:
+             start, end = bounds[ticker]
+             history: list[dict[str, Any]] = []
+             baseline_emitted = False
+             for public_date, visible_rows in groupby(
+                 ticker_rows,
+                 key=lambda row: date.fromisoformat(str(row["public_date"])),
+             ):
+                 if public_date > end:
+                     break
+                 if public_date > start and not baseline_emitted:
+-                    yield ticker, start, self._fundamental_snapshot(history)
++                    yield ticker, start, self._fundamental_snapshot(
++                        history, include_provenance=include_provenance
++                    )
+                     baseline_emitted = True
+                 boundary_rows = [dict(row) for row in visible_rows]
+                 for record in boundary_rows:
+                     if record["statement_type"] not in _STATEMENT_TYPES:
+                         raise ValueError("fundamentals statement_type is invalid")
+                 history.extend(boundary_rows)
+                 if public_date > start:
+-                    yield ticker, public_date, self._fundamental_snapshot(history)
++                    yield ticker, public_date, self._fundamental_snapshot(
++                        history, include_provenance=include_provenance
++                    )
+             if not baseline_emitted:
+-                yield ticker, start, self._fundamental_snapshot(history)
++                yield ticker, start, self._fundamental_snapshot(
++                    history, include_provenance=include_provenance
++                )
+ 
+     @classmethod
+-    def _fundamental_snapshot(cls, records: list[dict[str, Any]]) -> dict[str, Any]:
++    def _fundamental_snapshot(
++        cls, records: list[dict[str, Any]], *, include_provenance: bool = False
++    ) -> dict[str, Any]:
+         return {
+-            "quarterly_income": cls._statement_frame(records, "quarterly"),
+-            "annual_income": cls._statement_frame(records, "annual"),
+-            "balance_sheet": cls._statement_frame(records, "balance"),
++            "quarterly_income": cls._statement_frame(
++                records, "quarterly", include_provenance=include_provenance
++            ),
++            "annual_income": cls._statement_frame(
++                records, "annual", include_provenance=include_provenance
++            ),
++            "balance_sheet": cls._statement_frame(
++                records, "balance", include_provenance=include_provenance
++            ),
+             "company_info": cls._company_info(records),
+         }
+ 
+     @staticmethod
+-    def _statement_frame(records: list[dict[str, Any]], statement_type: str) -> pd.DataFrame:
++    def _statement_frame(
++        records: list[dict[str, Any]],
++        statement_type: str,
++        *,
++        include_provenance: bool = False,
++    ) -> pd.DataFrame:
+         selected = [record for record in records if record["statement_type"] == statement_type]
+         if not selected:
+-            return pd.DataFrame()
++            frame = pd.DataFrame()
++            if include_provenance:
++                frame.attrs[PIT_PUBLIC_DATES_ATTR] = {}
++            return frame
+         # ``DataFrame`` otherwise turns both a SQLite NULL and a supplied NaN
+         # into NaN.  Preserve the former only: NULL means unavailable; a NaN
+         # must reach the fact-cache numeric validator and fail closed.
+         selected = [
+             {
+                 **record,
+                 **{
+                     column: _SQLITE_NULL if record.get(column) is None else record.get(column)
+                     for column in _FUNDAMENTAL_COLUMN_MAP
+                 },
+             }
+             for record in selected
+         ]
+         frame = pd.DataFrame(selected)
+         frame["period_end"] = pd.to_datetime(frame["period_end"], errors="raise")
+         frame["public_date"] = pd.to_datetime(frame["public_date"], errors="raise")
+         frame = frame.sort_values(["period_end", "public_date"], kind="stable").drop_duplicates(
+             subset=["period_end"], keep="last"
+         )
++        selected_period_public_dates = list(
++            zip(frame["period_end"], frame["public_date"])
++        )
+         frame = frame.set_index("period_end")[list(_FUNDAMENTAL_COLUMN_MAP)]
+         frame = frame.rename(columns=_FUNDAMENTAL_COLUMN_MAP).transpose()
+         frame = frame.astype(object)
+         for index in frame.index:
+             for column in frame.columns:
+                 if frame.at[index, column] is _SQLITE_NULL:
+                     frame.at[index, column] = None
+         # Keep all-NaN rows: they are malformed numeric inputs, not unavailable
+         # SQLite NULLs, and must be rejected by downstream validation.
+         frame = frame.loc[~frame.apply(lambda row: all(value is None for value in row), axis=1)]
+         frame = frame.sort_index(axis="columns")
++        if include_provenance:
++            frame.attrs[PIT_PUBLIC_DATES_ATTR] = {
++                pd.Timestamp(period_end).date().isoformat(): pd.Timestamp(public_date).date().isoformat()
++                for period_end, public_date in selected_period_public_dates
++            }
+         return frame
+ 
+     @staticmethod
+     def _company_info(records: list[dict[str, Any]]) -> dict[str, Any]:
+         result: dict[str, Any] = {
+             "shares_outstanding": None,
+             "held_percent_institutions": None,
+             "institution_count": None,
+             "prev_institution_count": None,
+         }
+@@ -866,21 +905,21 @@ class PITDataBundle:
+             )
+             for public_date, boundary_rows in groupby(
+                 rows,
+                 key=lambda row: str(row["public_date"]),
+             )
+         )
+         state = _FundamentalsProviderState(
+             boundaries=boundaries,
+             next_boundary_index=0,
+             visible_records=[],
+-            snapshot=self._fundamental_snapshot([]),
++            snapshot=self._fundamental_snapshot([], include_provenance=False),
+             latest_as_of=as_of,
+         )
+         cache[ticker] = state
+         return state
+ 
+     def fundamentals_provider(self, symbol: str, as_of_date: pd.Timestamp) -> dict[str, Any]:
+         """Return strict as-of facts while reusing forward-only ticker state.
+ 
+         A portfolio evaluates a ticker in chronological order far more often than
+         its public fundamental state changes.  Cache the immutable history once,
+@@ -904,16 +943,18 @@ class PITDataBundle:
+         while candidate_next_boundary_index < len(state.boundaries):
+             public_date, boundary_rows = state.boundaries[candidate_next_boundary_index]
+             if public_date > cutoff:
+                 break
+             for record in boundary_rows:
+                 if record["statement_type"] not in _STATEMENT_TYPES:
+                     raise ValueError("fundamentals statement_type is invalid")
+             candidate_records.extend(boundary_rows)
+             candidate_next_boundary_index += 1
+         if candidate_next_boundary_index != state.next_boundary_index:
+-            candidate_snapshot = self._fundamental_snapshot(candidate_records)
++            candidate_snapshot = self._fundamental_snapshot(
++                candidate_records, include_provenance=False
++            )
+             state.visible_records = candidate_records
+             state.next_boundary_index = candidate_next_boundary_index
+             state.snapshot = candidate_snapshot
+         state.latest_as_of = as_of
+         return state.snapshot
+
+```
+

@@ -1,0 +1,11 @@
+# Scoped Docker 29 exited-network review
+
+**PASS.** No concrete finding in the narrow exited-network compatibility change. Spec and quality pass for this scope.
+
+Read `docker29-exited-report.md`, the changed parser/lifecycle source and the saved stopped inspection's network object. The saved object retains a valid none-network NetworkID while EndpointID, SandboxID and SandboxKey are empty, with no addresses or ports. Source SHA-256 independently matches `8912da187371efd6e01b7fd5a25775ba880dd53ad0db768bed59e0aafbdb8d7d`.
+
+The parser's sole new partial-identity allowance requires a valid retained NetworkID, empty EndpointID and both sandbox fields empty. Existing exact none-network membership, unknown-field rejection, digest validation, and empty address/routing/port checks remain. `_network_lifecycle` recognizes that representation as detached/empty only when status is exited. For created it is neither fully empty nor an authorized detached state and is rejected; for running it is not private and is rejected. Other partial identity combinations remain rejected.
+
+The retained NetworkID remains in the normalized network object and therefore its attestation. Only the namespace lifecycle classification becomes empty. This fits the existing private-to-empty exited transition handling and previously reviewed cleanup recovery without authorizing a live network attachment, restarting a container or rewriting the frozen failure.
+
+Earlier OOM and cleanup changes were not reopened. No tests were read, written or run; no probes, application imports/execution, Docker, network, agents, staging or commits occurred. Only this report was written. This is static review, not a successful actual inspection or cleanup claim; the controller owns those next actions.

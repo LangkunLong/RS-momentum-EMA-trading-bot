@@ -1,0 +1,11 @@
+# Campaign02: provider rejected the first request
+
+User approved the fresh campaign and prelaunch authority/source/wrapper hashes passed. Actual elevated exec36733 exited1. The first investigator call raised OpenAI SDK BadRequestError with HTTP400 at the HTTP request boundary. No candidate or evaluator ran; no author, critic or checkpoint was produced. Cleanup completed and the process sleep guard was restored. The campaign is terminal; do not restart or resume it.
+
+The bounded diagnostic in run-01-stderr.txt establishes HTTP400. It contains no provider message, so the specific rejected field is not proven. The local role ledger conservatively records one attempt and18497 reserved tokens, with zero unconfirmed cost. Do not claim these are actual provider tokens or proof of no charge.
+
+Inspection found provider compatibility issues in the canonical schema: uniqueItems is emitted for string/evidence arrays; author schemas also emit oneOf with const-tagged literal variants. The proposed repair separates the outbound provider schema from the full canonical local authority, retaining local value/uniqueness/binding validation. The shared projection must be used by both the actual gateway and saved review body; prospective accounting must cover both representations without reducing old bounds. No controller/evaluator result is to be fabricated or rebound.
+
+Official references consulted: https://developers.openai.com/api/docs/guides/structured-outputs (strict subset, anyOf), https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/structured-outputs (Azure-specific unsupported keyword table including uniqueItems). The latter does not prove the exact OpenRouter upstream rejection. The compatibility change remains a hypothesis until the next authorized real request succeeds.
+
+The evaluator runtime/image/data/baselines remain valid because provider.py, agent_loop.py and operator preparation helpers are outside the evaluator source closure. Two-round success and the final detailed Luna handoff remain outstanding.

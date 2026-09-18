@@ -1,0 +1,61 @@
+# Final production fix wave
+
+## Scope and boundaries
+
+- Work only in `C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-implementation`.
+- Required clean base HEAD: `adcda5f27ce31e1a545a2e7694cfa67bb0cf3f8c`.
+- Modify production code only. Do not add or modify tests, docs, manifests, or ignored readiness evidence.
+- Do not call a provider or pricing endpoint, start Docker, open hidden data, evaluate a real candidate, run replay, record a grant, push, or merge.
+- Preserve schema-v3 calls/tokens authority, audit-only USD, zero provider retries, `apply=false`, legacy USD routes, and the deliberate rounded-stop risk clamp.
+- Commit the production fix and write an ignored implementation report. Do not amend prior commits.
+
+## Fix A — fail-closed intermediate candidate cleanup
+
+The controller currently swaps incumbent state, invokes intermediate disposal, ignores the returned cleanup observation, and drops the workspace handle. The registry also removes the capability before calling the disposer. A failed or incomplete intermediate disposal can therefore be unreachable at finalization while `cleanup_complete` is reported true.
+
+Required behavior:
+
+1. Keep validation authority and cleanup authority separate. Once disposal begins, the workspace must no longer resolve for validate/apply, but the registry must retain an internal cleanup-only capability until a complete `PitOptimizerCleanup` is observed.
+2. Permit finalization to retry/verify an incomplete or raising cleanup through that internal cleanup-only entry; a successfully completed capability must not be disposed twice.
+3. Validate every intermediate disposal result. Durably accumulate every observation in `_RunState.cleanup_observations`.
+4. Retain every incomplete retired workspace in controller state for final cleanup. An incomplete/invalid/raising intermediate cleanup must terminate fail-closed as `sandbox_integrity_failure`, not continue the optimizer.
+5. Final cleanup must visit unique iteration, incumbent, and pending-retired workspaces, attempt all of them, and compute the returned aggregate across every cleanup observation from the entire run. Any incomplete removal, unstopped worker, source modification, or finalization failure makes `cleanup_complete=false` and prevents a normal terminal result.
+6. Preserve source cleanup checks and one-way untrusted workspace authority.
+
+Primary file: `core/pit_optimizer_controller.py`.
+
+## Fix B — shell-safe emitted v3 commands and authenticated Python
+
+The active v3 prepare/canary commands are text intended for `cmd.exe /c`, but `subprocess.list2cmdline` alone does not escape cmd metacharacters. The prepare command also emits literal `python`, allowing PATH substitution.
+
+Required behavior:
+
+1. Use an authenticated absolute interpreter path derived from `sys.executable`; require it to be an existing regular non-link file before rendering.
+2. Centralize v3 command rendering in a shared production helper used by both `core/pit_optimization_contract.py` prepare output and `agent_loop.py` canary output.
+3. Retain the existing textual command/output contract for compatibility, but reject every argument containing NUL, CR/LF, a double quote, or any cmd metacharacter (`&|<>^()%!`) before `subprocess.list2cmdline` is called. The actual approved local paths/image must still render.
+4. Require a nonempty bounded argv of exact strings and an absolute first argument. No shell execution is added by this change.
+5. Do not change legacy command routes unless they directly import the shared renderer.
+
+Primary files: `core/pit_optimization_contract.py`, `agent_loop.py` (a tiny shared module is acceptable if it materially reduces duplication).
+
+## Fix C — canonical schema-v3 usage recovery
+
+Schema-v3 recovery accepts a nested `usage` mapping that can omit default-valued keys. First restore normalizes it, while the second restore compares canonical current state to the original noncanonical mapping and loses idempotence.
+
+Required behavior:
+
+- Before restoration, require the nested usage mapping to have the exact canonical `Usage` key set and primitive representation used by the durable record. Reject noncanonical mappings fail-closed. Preserve canonical retry idempotence and legacy behavior.
+
+Primary file: `agent_loop.py`.
+
+## Verification
+
+- `git diff --check`.
+- Compile only changed production modules.
+- Run a bounded provider-free in-memory smoke for cleanup aggregation, command rendering with the real approved paths plus rejection of representative metacharacters, and canonical recovery retry. Do not create or edit test files.
+- Re-run the existing Task 5 provider-free production composition only if it can be invoked without provider/network/Docker/hidden activity and without overwriting its retained proof; otherwise report why it was not rerun.
+- Confirm tracked/staged status contains only the intended production files before commit and is clean after commit.
+
+## Report
+
+Write `.superpowers/sdd/2026-08-28-pit-optimizer-audit-only-usd/final-fix-report.md` with files, checks, exact aggregate outcomes, and commit. Do not expose secrets, provider contents, raw hashes, or image digests.

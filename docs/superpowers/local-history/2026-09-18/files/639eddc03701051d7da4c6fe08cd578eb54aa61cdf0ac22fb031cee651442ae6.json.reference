@@ -1,0 +1,12 @@
+{
+  "source_hashes": {
+    "core/pit_optimizer_v5/provider.py": "44549ac69bb68773414de0496c6de42aa682f78b9a045e0ea17dbda27295a3fe",
+    "agent_loop.py": "d0c853112097f959b8cb42ee831003eb82a2dfe89afd29e2828763b8191c518f",
+    ".superpowers/sdd/2026-09-04-pit-optimizer-v5-campaign/prepare-provider-development.py": "e6796c9e110ba6dfafb0109347f440427a5adaeb2c21e36ee3af202bec2c887b"
+  },
+  "root_source_review": "pass",
+  "independent_source_review": "pass",
+  "runtime_unchanged": true,
+  "tests_run": false,
+  "provider_calls": 0
+}

@@ -1,0 +1,48 @@
+# PIT optimizer V5 status - September7,2026
+
+Campaign06 is terminal failed after candidate rendering. Both model role responses passed parsing. No provider-driven candidate has reached evaluation; the two evaluated feedback rounds and final post-completion Luna handoff remain outstanding.
+
+## Latest actual execution
+
+The user explicitly authorized OpenRouter strategy-source/aggregate-evidence requests. Automatic approval review then allowed the exact reviewed launch. Session5015 exited1 with cleanup complete and idle-sleep protection restored. No live campaign remains.
+
+Campaign06 used2 calls,8596 tokens,$0.04234. The unchanged accepted author uses reflection and a generator expression. Rendering on the authenticated four-file parent reproduces SourceFileV5 AST rejection: V5 policy AST contains an unbounded or stateful construct. This occurs before materialization/evaluation. The response was neither changed nor replayed into a campaign.
+
+Evidence: provider-runtime-06/terminal-verification.json, FAILURE-REPORT.md, actual-render-failure.txt and run-01-result.json. Never restart/resume06 or poll terminal session5015.
+
+## Budget and previous attempts
+
+| Campaign | Terminal result | Calls | Tokens | Reported USD |
+| --- | --- | ---: | ---: | ---: |
+| provider-runtime-01 | Transport failure; original exception unavailable |1|18497 reserved|unconfirmed|
+| provider-runtime-02 | Investigator HTTP400 |1|18497 reserved|unconfirmed|
+| provider-runtime-03 | Author bare symbol name |2|8115|0.036675|
+| provider-runtime-04 | Investigator selected disabled source mode |1|2564|0.01921|
+| provider-runtime-05 | Author source missing final newline |2|8438|0.04007|
+| provider-runtime-06 | Accepted author rejected by AST during rendering |2|8596|0.04234|
+
+All are terminal with cleanup complete. Campaigns03-06 total7 calls,27713 tokens,$0.138295 reported. Five calls and868287 tokens remain. The approved replacement requires at least six calls; it is ineligible. No07 launch is currently authorized. Earlier pending-approval/ready06 notes are historical.
+
+## Next engineering work
+
+Stop isolated paid retries. First expose existing authenticated entry-funnel counts to investigator, which currently sees only four headline metrics per baseline episode. Next represent known source rejection as its own durable event and invalid-experiment record, allowing bounded later-round learning without fabricating valid source, evaluations or critics. Existing validation_invalid events cannot be reused before rendered_variant; replay requires that predecessor.
+
+Preparatory documents: docs/superpowers/plans/2026-09-07-pit-optimizer-v5-recovery-design.md and 2026-09-07-pit-optimizer-v5-luna-recovery.md. The latter gives detailed steps and a ready-to-paste Luna prompt. First session is IncrementA only, then principal-architect review. These are recovery documents, not the requested final post-success handoff. User creates the new session manually.
+
+No runtime repair has been implemented after06; only diagnosis and these documents were written. Existing wire guidance remains at provider.py SHAd9b17d62a6c8b485ba6ae6abb22a9e87f9d908b3c96409ba6e21f86eb691e937. Earlier scoped Ruff/compile and independent review passed; no tests or synthetic probes were run.
+
+## Fixed evaluator and data
+
+Runtime005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4; image pit-optimizer-v5-evaluator@sha256:4e85b19aa8c135362ae8796e4d33a410ec5af650d296c358ae6a7737d5b05b6a. Use evaluator/sandbox-profile-development-005064e57e80.json. Quick and four parent discovery baselines are complete, authenticated and cleaned; all had zero trades/return. They remain usable because the evaluator source has not changed.
+
+Development S&P500 data bundle SHA cf729b47d762ae86287bb8a87c28a1664e7475c74ef1aca736fbc240111349de remains provisional. Full Nasdaq/Russell membership and authenticated production prices/fundamentals/industry inputs remain incomplete. Vendor inquiries were submitted; no purchase or mailbox follow-up occurred. No performance, promotion, deployment or held-out claim is justified by these campaign failures.
+
+
+## Increment A architect review
+
+Increment A is implemented and APPROVED. Only production_runtime.py changed: closed16-counter investigator projection, with64 actual parent counts verified in80-item future preview. Evaluator identity unchanged; no external execution. Review in luna-recovery-a/architect-review.md. Next manual Luna session implements B1 only, then returns for architect review before journal/runtime changes. The paid campaign and two-evaluated-round milestone remain incomplete.
+
+
+## B1 architect review
+
+B1 rendering outcomes are implemented and APPROVED at SHA a74a513b42bb65e8c68492ee342dab9c049939e4d11dee2c09365425c69e65dd. Actual06 response/artifact and closed rejection independently verified; strict renderer preserves its original error. IncrementA and evaluator identity unchanged. Next manual Luna session: B2 only, then architect review before B3/B4. No new paid campaign authorization; the two evaluated rounds remain incomplete.

@@ -1,0 +1,29 @@
+# Task 3 Re-review 1
+
+Review target: `e10e4a5..e435217` (`e435217be5b4850e9f260462a79946a391984128`).
+
+## Finding Verdicts
+
+- **ADDRESSED — fixed allocation ceilings.** `core/backtest_engine.py:3329-3330` now sets `maximum_position_risk_fraction=0.01` and `maximum_stop_fraction=0.08` unconditionally before allocation-decision validation. No direct-entry or injected-client compatibility condition remains. `tests/test_backtest_engine.py:1175-1201` parametrizes both formerly permitted unsafe inputs and expects the appropriate `ValueError`.
+
+- **ADDRESSED — over-capacity must not evict.** `core/backtest_engine.py:2693-2700` keeps the portfolio full at `>= limit`, but enables eviction only at `== limit`. Signal truncation independently admits an eviction candidate only when the current holding count equals the capacity limit (`core/backtest_engine.py:2863-2873`). The regression at `tests/test_backtest_engine.py:960-1005` exercises both `_evaluate_signals()` and `_enter_position()` with two holdings and `CapacityDecision(1, True)`, asserting no candidate, no liquidation/transaction, and `entry_rejected_capacity`.
+
+- **ADDRESSED — interface-validation cleanup.** Interface assignment and validation are inside `try` at `core/backtest_engine.py:1732-1735`; `client.close()` and `_policy_client` clearing are guaranteed by nested `finally` blocks at `core/backtest_engine.py:1749-1753`. `tests/test_backtest_engine.py:85-116` covers both a mismatched version and a raising `interface_version` property, asserting one close and a cleared run-local client.
+
+- **Controller-approved causality fixture normalization confirmed.** The fix diff changes only five constructor risk/stop values in `tests/test_backtest_open_causality.py` (`199-200`, `278-279`, `326-327`, `361-362`, `394-395`). It does not alter causal inputs or assertions: the existing assertions remain, including no same-day-exit funding (`297-301`), same-day stop observation (`343-347`), sizing (`383-385`), and causal eviction price/selection (`422-426`). This does not weaken production safety; the values are now within the immutable production ceilings.
+
+## New Breakage in Fix Diff
+
+None found. The range changes only the intended production guard paths and their focused regressions. The stricter ceiling behavior deliberately invalidates obsolete fixture configurations, and the controller-authorized fixture-only updates preserve the underlying causal assertions.
+
+## Report Evidence
+
+Confirmed that `task-3-report.md` includes each covering RED/GREEN command and exact output for the ceiling, over-capacity, and lifecycle fixes; narrow engine slices; the five-fixture causality command; and the exact focused Task 3 gate, recorded as `153 passed, 2 warnings` after commit `e435217`. This re-review did not rerun the broad suite, per scope; the report output is recorded evidence, not independently reproduced here.
+
+## Out-of-Scope Observations
+
+None. The three changed files are within the stated fix scope. Final real-fold parity remains deliberately deferred to Task 9.
+
+## Verdict
+
+**APPROVE — all three findings are addressed; no new breakage was found in the supplied fix diff.**

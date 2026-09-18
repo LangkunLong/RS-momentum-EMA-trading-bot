@@ -1,0 +1,74 @@
+# Evaluator-truth Task 6 repair report
+
+Status: DONE. Source repair and direct local verification completed; production capture prerequisites remain absent and were not inspected or exercised.
+
+## Commit and scope
+
+- Worktree: `C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.worktrees\pit-optimizer-v5-architecture`.
+- Branch: `codex/pit-optimizer-v5-architecture`.
+- Base: `3b5666e6f30c4031a80a04e1915efa99ed5b39a4`.
+- Fix: `5cb81b78435c519bcfd14bd5ba5303d8e465c43a` — `fix: authenticate baseline edges exactly and mount canonical policy overlays`.
+- Changed source files: `core/pit_optimizer_v5/artifacts.py`, `core/pit_optimizer_v5/baseline.py`, `core/pit_optimizer_v5/readiness.py`.
+- Commit size: 87 insertions, 26 deletions across those three source files.
+- The controller's seven-line `progress.md` change remains unstaged. Neither brief nor report was staged.
+
+## Decisions
+
+1. Added `LocalArtifactRepositoryV5.authenticate_exact` and `load_evaluation_panel_spec_exact`. Both retain canonical-path confinement and digest authentication, while missing references fail at their exact paths. Existing JSON `authenticate` and legacy panel callers retain their relocation diagnostics. Raw graph edges already use the exact stream authenticator and remain unchanged.
+2. Switched every baseline JSON graph/root/profile caller, both baseline panel-loading paths, and the pending authority wrapper to exact authentication. Domain parsing still follows the complete graph pass; only structural reference decoding selects the closed graph beforehand. No downstream manifest or baseline-parent contract/serialization changes were made.
+3. Each transport invocation now creates an owned `policy` child next to its owned input/output/config directories. It writes the authenticated `inputs.source` UTF-8 LF bytes with create-only primitives, verifies bytes and digest after opening, and holds the existing deny-write/delete file pins until container cleanup. All four candidate mounts refer to those flat overlay files and are read-only. The actual policy checkout is never written.
+4. Revalidate overlay pins before container creation and after receiving output. Keep network disabled, root filesystem read-only, image pull disabled, bounded resources, fresh invocation names, and existing source guards. Release pins before exact owned-tree removal. Cleanup attempts continue after a failed resource close, and container/removal/close failures cannot report clean completion.
+5. Direct Windows verification exposed a consequential metadata issue in the reused readiness pin: Python 3.13 `lstat` and `fstat` can return different `ctime` values on the same newly written file. The narrowly scoped support repair retains full separate path and descriptor metadata snapshots, explicitly requires matching `(st_dev, st_ino)`, and rechecks each view before and after hashing. It does not omit timestamps or relax inode identity. The existing production opener binds before/opened/after file identity and holds Windows `FILE_SHARE_READ` pins that deny writes and deletes.
+
+## Direct verification
+
+No tests were read, added, modified, or run. Temporary direct verification used only synthetic files under this worktree's owned `.baseline-fix-scratch` directory and trusted in-process fakes. External command calls were replaced before invoking the relevant composition. No provider, Docker, market-data, real V5 artifact, secret, or credential operation occurred.
+
+Final direct command: `py -3.13 -B .baseline-fix-scratch/proof.py` — exit 0. The final scratch driver SHA-256 before removal was `ed4c0cbbcec9b1f8befe1e28ffefe8489f4c7f4f15225961d990b5f9422f8429d`.
+
+### Exact-edge composition
+
+- Built an entirely synthetic closed JSON capture-input/authority graph with a panel-plan owner, six serialized newline-bearing panel leaves, opaque bundle/provenance leaves, and an unrelated sealed sentinel. Used the real `LocalArtifactRepositoryV5` reader/authenticators.
+- Guarded `os.scandir`, `os.listdir`, and `_find_digest` to raise on any call; logged exact JSON reads and rejected any sealed-sentinel read. Missing JSON/panel checks completed without a scan or unrelated read.
+- Removed the input JSON, panel-plan JSON, execution-profile JSON, and one raw serialized panel edge in turn. Each missing edge was rejected through real `authenticate_baseline_inputs_v5`, `verify_baseline_v5`, and `capture_baseline_v5` composition. A forbidden `_inputs` marker proved the missing graph never reached domain parsing, and a forbidden worker factory proved no worker allocation occurred.
+- Restored all synthetic edges and exercised the successful complete `_graph` pass.
+- Removed runtime-source and resource JSON edges separately through real `build_sandbox_profile_v5`; each failed exactly. Restored both and successfully composed one synthetic sandbox profile locally.
+- Exercised real `BaselineSandboxWorkerV5.evaluate` with a missing serialized panel and forbidden transport. It failed in the exact panel loader before transport.
+- Wrong JSON and serialized-panel digests failed before `_decode_dataclass`, which was guarded against invocation.
+
+### Canonical overlay and cleanup
+
+- Constructed four valid synthetic `SourceFileV5` modules and a synthetic CRLF checkout. Used the actual `capture_readiness_source_v5` normalization/identity logic, actual directory capabilities and actual Windows file pins; only trusted-executable inspection and literal Git metadata responses were faked. No Git repository or worktree was materialized.
+- The real readiness guard produced the expected LF source snapshot from CRLF files. Across real `_LocalBaselineTransportV5._run` composition with a fake `_invoke`, every candidate mount contained exactly its authenticated canonical UTF-8 LF bytes, all four mounts were read-only, and all source paths were inside the owned overlay. Network-none, read-only root, and pull-never argv requirements were checked.
+- Actual attempts to open mounted policy files for writing failed with `PermissionError` while pins were held. Actual deletion of a pinned synthetic file was also denied.
+- Seven transport cases passed: probe-like success, panel/data-mount success, partial materialization write failure, pin failure after a prior file was pinned, corrupted materialized bytes, container-create failure, and container-cleanup failure.
+- Every case removed its exact owned invocation tree; no invocation children remained. Materialization/pin/corruption failures invoked no fake container command. Ambiguous create failure attempted exact-name cleanup. Container cleanup failure raised and `close()` reported false. The synthetic checkout remained byte-for-byte CRLF in every case.
+- Content-free pin observation: Python 3.13 path/descriptor metadata differed only in `ctime`. Detached path/descriptor identity snapshots, a replaced-path metadata fake, and a mutated byte-stream fake all failed revalidation. No weakening of pin identity was needed.
+
+### Source checks and normal hooks
+
+- `py -3.13 -B -c "import core.pit_optimizer_v5.baseline; print('baseline import OK')"` — passed.
+- `py -3.13 -B -c "from pathlib import Path; paths = ('baseline.py', 'artifacts.py', 'readiness.py'); [compile((Path('core/pit_optimizer_v5') / p).read_bytes(), p, 'exec') for p in paths]; print('in-memory compile OK: 3 source modules')"` — passed, no bytecode output.
+- `py -3.13 -B -m core.pit_optimizer_v5.cli --help` — passed, baseline/profile subcommands present, no runtime action.
+- `py -3.13 -B -m ruff check core/pit_optimizer_v5/baseline.py core/pit_optimizer_v5/artifacts.py core/pit_optimizer_v5/readiness.py` — all checks passed.
+- `py -3.13 -B -m ruff format --check core/pit_optimizer_v5/baseline.py core/pit_optimizer_v5/readiness.py` — both already formatted.
+- Formatting inspection of `artifacts.py` identified only two unrelated existing formatting differences, at the critic-reference and archive-schema conditions; these were left untouched. The changed code in that file did not need formatting.
+- `git diff --check` — passed. Source search found no remaining relocating JSON/panel calls or working-checkout policy mounts in `baseline.py`.
+- `git diff --quiet HEAD -- core/pit_optimizer_v5/artifacts.py core/pit_optimizer_v5/baseline.py core/pit_optimizer_v5/readiness.py` — passed after commit. `git diff --cached --name-only` was empty. Remaining tracked diff was exactly the controller's seven additions.
+- Normal commit hooks: Ruff passed; trailing whitespace passed; end-of-file fixer passed; merge-conflict check passed; YAML skipped because no matching files. Hooks briefly stashed and restored the controller's unstaged ledger change. No hook was bypassed and no `WinError 4551` recurred.
+
+## Environment and iteration notes
+
+The shell's advertised `C:\Python314\python.exe` was not directly invocable. Bundled Python could not import the complete package because `plotly` was absent and also lacked Ruff. No dependencies were installed. Existing Python 3.13 successfully imported the module and supplied Ruff; all final direct verification used it with `-B`.
+
+Initial direct scratch iterations corrected synthetic fixture serialization, the evaluator-owned output path, and required policy snapshot arguments/public exports. The first actual overlay run then exposed the Windows metadata mismatch described above, which drove the consequential readiness source fix. Final direct checks ran successfully after that fix.
+
+The first source-only stage/commit attempt was blocked by the filesystem boundary: `Unable to create .../.git/worktrees/pit-optimizer-v5-architecture/index.lock: Permission denied`. An authorized elevated retry staged only the three source files and committed with normal hooks. This was a filesystem permission boundary, not a hook or automatic-review rejection.
+
+## Self-review, cleanup, and limitations
+
+Reviewed the focused diff for exact-path call coverage, raw-edge handling, pending-authority forwarding, canonical LF mount paths, identity binding, pin lifetime, partial materialization, cleanup ordering, and preservation of manifest/parent bytes. No unrelated source refactor was introduced.
+
+Owned scratch cleanup completed after a resolved absolute path check against this exact worktree using `Remove-Item -LiteralPath $ownedScratch -Recurse -Force`; only `.baseline-fix-scratch` was removed. The command verified absence afterward and printed `Owned synthetic scratch removed; containment verified` with exit 0. Final `git status --short` showed only the controller's modified `progress.md`; the index was empty and `git diff --check` passed. The durable brief and this report remain in place and unstaged (ignored by Git). No source bytecode was generated by the direct runs.
+
+This is source-first verification. It does not certify an actual evaluator image, real baseline capture, real panels or bundles, market results, or production Docker behavior. Complete successful baseline capture/repeat semantics remain those of the original implementation; the repair directly exercised graph failure boundaries, successful graph/profile composition, panel loading failure, and real transport overlay composition with synthetic fakes. No tests, provider/network calls, Docker actions, replay, confirmation, qualification, worktree materialization, push, merge, uploads, or improved-return claims were made.

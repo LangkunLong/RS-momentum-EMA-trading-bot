@@ -1,0 +1,24 @@
+# Independent C1 source review
+
+No production findings. The one-method correction matches the principal C1 instruction and is ready for principal review; this review does not approve B4b, B4c, or campaign work.
+
+## Checked evidence
+
+- Independently read the C1 prompt, B4b principal review/verification, latest plan decision, exact preimage and current affected source paths.
+- Exact preimage SHA-256: `99e084eeff284d39a651e899e9562780e2581eb936ce7ff1f3f0542ed7b523aa`. Final memory.py SHA-256: `37e3a04791d827edd0e5fe99e1d62cb9997163f66954f99727177248f8949d76`.
+- The exact-preimage source diff has one narrow hunk. Independent static AST comparison reports only `ExperimentRecordV5._validate_post_validation_identity` changed; removing that method leaves identical whole-module ASTs. Fields, serialization, other invariants and all other memory functions are preserved.
+- Independently recomputed all eight source hashes listed in the B4b principal verification. Only memory.py differs from that checkpoint. In particular runtime.py remains `d834eae8e3e120355b4479c77f87ebe46519a0b82a52cc072abe1dab60943aec` and artifacts.py remains `2bab516e4945976d9bf6bb356934289cd14d9b87c25088521a043c8ac5cfa2c2`. Candidate IR, contracts, production runtime, rendering and provider match their protected hashes.
+
+## Invariant and consumer review
+
+The empty-symbol expectation requires both exact_duplicate status and equality of experiment policy revision SHA with parent SHA. A parent-identical duplicate with nonempty actual symbols fails strictly. A changed-policy duplicate cannot use empty symbols because the template declaration remains nonempty; even matching declared symbols cannot bypass the preserved exact_duplicate status check requiring the actual policy revision to equal its parent. Every other post-validation status retains exact declared-symbol equality.
+
+Exact identity type and valid policy/validation prerequisites precede the comparison. Complete policy identity binding and full experiment identity derivation still follow it, preventing a false identity field from creating an exemption. The status/evidence chain is unchanged, including absence of duplicate fingerprint, quick, episode, campaign and target-gap evidence. The unchanged common constructor independently prohibits critic fields for untestable statuses and requires complete critic binding for testable statuses.
+
+StructuralTemplateV5 retains its nonempty declared edit scope. Production validation derives actual symbols from source before/after. Runtime requires empty actual symbols for parent identity, marks exact_duplicate, and returns before screening; screening selects quick_ready candidates and keeps its strict symbol equality. Both runtime `_expected_records` and the concrete factory pass actual candidate validation into the common record constructor. Decoding also constructs ExperimentRecordV5. Finalized-origin verification still compares the record validation exactly with its durable stage and requires matching exact_duplicate semantic outcome. Invalid/render-rejected records retain their separate invalid identity path. Duplicate-only and mixed batches retain the actual evidence and existing testable-candidate critic requirements.
+
+## Verification limits
+
+This reviewer executed read-only source reads, hashing, a source diff and static AST comparison only. No new record, event, wrapper, candidate, positive C1 branch, lifecycle, finalizer, synthetic case or test was executed. The controller owns the separate Ruff, compilation, evaluator identity and historical-artifact verification results. A positive archived C1 example is unavailable in the principal's bounded record inventory, so positive-branch behavior remains statically reviewed and unexecuted.
+
+A documentation-only correction was sent to the controller: the initial progress ledger used `ValidationReportV5` instead of `ValidationResultV5`, and should distinguish the initial exact-type check from the later complete identity binding. This does not affect the source disposition.

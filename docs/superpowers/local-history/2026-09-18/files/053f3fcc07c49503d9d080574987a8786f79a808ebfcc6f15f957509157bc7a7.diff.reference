@@ -1,0 +1,111 @@
+diff --git ".artifacts\\pit-optimizer-v5\\development\\increment-c-campaign-proposal\\admission-p2\\review-freeze-01\\campaign_admission.py" "core\\pit_optimizer_v5\\campaign_admission.py"
+index fd60a35..d76240e 100644
+--- ".artifacts\\pit-optimizer-v5\\development\\increment-c-campaign-proposal\\admission-p2\\review-freeze-01\\campaign_admission.py"
++++ "core\\pit_optimizer_v5\\campaign_admission.py"
+@@ -3,13 +3,13 @@
+ from __future__ import annotations
+ 
+ import re
++import time
+ from dataclasses import dataclass, fields, replace
+ from decimal import Context, Decimal, ROUND_CEILING, localcontext
+ from typing import TYPE_CHECKING, Literal
+ 
+ from core.pit_optimizer_v5.artifacts import (
+     ArtifactMissingV5,
+-    ArtifactRepositoryFailureV5,
+     LocalArtifactRepositoryV5,
+ )
+ from core.pit_optimizer_v5.contracts import (
+@@ -550,13 +550,10 @@ def _round_state_belongs_to_campaign_v5(
+     )
+     if directly_selected:
+         return True
+-    try:
+-        config = repository.load_typed_artifact(
+-            value.adapter_config_ref,
+-            value_type=ProviderDevelopmentAdapterConfigV5,
+-        )
+-    except ArtifactRepositoryFailureV5:
+-        return False
++    config = repository.load_typed_artifact(
++        value.adapter_config_ref,
++        value_type=ProviderDevelopmentAdapterConfigV5,
++    )
+     return config.campaign_manifest_sha256 == manifest.sha256
+ 
+ 
+@@ -882,7 +879,13 @@ def _load_live_role_prefix_v5(
+             for payload in completed.payloads
+             if type(payload) is RoundOutcomePayloadV5
+         )
+-        if not round_records and len(round_outcomes) != 1:
++        if round_outcomes and (
++            len(round_outcomes) != 1
++            or round_outcomes[0].outcome != "no_novel_hypothesis"
++            or bool(round_records)
++        ):
++            raise ValueError("campaign admission prior round has a stopping outcome")
++        if not round_records and not round_outcomes:
+             raise ValueError("campaign admission prior round lacks committed settlement")
+ 
+     current_events = repository.load_round_events(
+@@ -911,6 +914,8 @@ def _load_live_role_prefix_v5(
+             raise ValueError("campaign admission replay request differs")
+     elif role_position != len(current_entries) + 1:
+         raise ValueError("campaign admission request skips the current role prefix")
++    elif any(not package.accepted for _payload, package in current_entries):
++        raise ValueError("campaign admission current role predecessor was not accepted")
+ 
+     current_records = tuple(record for record in records if record.round_index == round_index)
+     current_settled = bool(current_records) or any(
+@@ -946,6 +951,7 @@ def _load_live_role_prefix_v5(
+         expected_tail_position = len(current_entries) + 1
+         if (
+             current_settled
++            or any(not package.accepted for _payload, package in current_entries)
+             or expected_tail_position > 3
+             or tail_call.campaign_id != manifest.campaign_id
+             or tail_call.round_index != round_index
+@@ -1119,11 +1125,6 @@ def require_live_role_admission_v5(
+         round_index=round_index,
+         owner_token_sha256=owner_token_sha256,
+     )
+-    _require_live_round_deadline_v5(
+-        manifest=manifest,
+-        authority=authority,
+-        now_epoch_ms=now_epoch_ms,
+-    )
+     prefix = _load_live_role_prefix_v5(
+         repository=repository,
+         manifest=manifest,
+@@ -1142,6 +1143,16 @@ def require_live_role_admission_v5(
+     )
+     if decision != "admit":
+         raise ValueError(f"campaign role is not admitted: {decision}")
++    _require_live_round_deadline_v5(
++        manifest=manifest,
++        authority=authority,
++        now_epoch_ms=now_epoch_ms,
++    )
++    _require_live_round_deadline_v5(
++        manifest=manifest,
++        authority=authority,
++        now_epoch_ms=time.time_ns() // 1_000_000,
++    )
+ 
+ 
+ __all__ = [
+diff --git ".artifacts\\pit-optimizer-v5\\development\\increment-c-campaign-proposal\\admission-p2\\review-freeze-01\\production_provider.py" "core\\pit_optimizer_v5\\production_provider.py"
+index a13535b..30e6336 100644
+--- ".artifacts\\pit-optimizer-v5\\development\\increment-c-campaign-proposal\\admission-p2\\review-freeze-01\\production_provider.py"
++++ "core\\pit_optimizer_v5\\production_provider.py"
+@@ -861,6 +861,8 @@ class LocalRoleAuthorizationLedgerV5:
+                     exact_request != role_request
+                     or call.campaign_id != self._manifest.campaign_id
+                     or call.role != request.role
++                    or call.attempt_kind != request.attempt_kind
++                    or call.attempt_index != request.attempt_index
+                     or call.role_position != {"investigator": 1, "author": 2, "critic": 3}[call.role]
+                     or call.attempt_kind != "primary"
+                     or call.attempt_index != 1

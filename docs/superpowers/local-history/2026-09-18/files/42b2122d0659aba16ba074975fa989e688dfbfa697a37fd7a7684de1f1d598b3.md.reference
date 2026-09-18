@@ -1,0 +1,133 @@
+# SDD ledger — plan: docs/superpowers/plans/2026-08-27-model-authored-pit-optimizer.md
+
+## Setup
+
+- Workspace: `C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-implementation`
+- Branch: `codex/pit-optimizer-implementation`
+- Starting commit: `753a620`
+- Spec reachable: `docs/superpowers/specs/2026-08-27-model-authored-pit-optimizer-design.md`
+- Resource policy: one implementer or reviewer subagent at a time; reconcile the child before dispatching the next; focused tests only; no provider calls, long replay, upload, push, or cloud task.
+- Stale-work audit: no live child agents and no running Docker containers. One low-CPU Python process could not be classified because Windows denied command-line inspection, so it was left untouched.
+
+## Preflight consistency scan
+
+| Tasks | Producer → consumer / shared surface | Finding |
+|---|---|---|
+| 1 → 3 | Pure policy contracts and baseline functions → simulator adapters; shared `strategy_policy` files/tests | Consistent: Task 3 preserves Task 1 behavior and adds runtime integration. |
+| 1 → 5 | Three candidate-editable policy modules and immutable contracts → candidate validator/worker | Consistent: Task 5 confines edits to the Task 1 surface and keeps runtime protected. |
+| 1 → 9 | Policy package → compile and focused verification | Consistent. |
+| 2 → 3 | Fold warmup/reference and `backtest_engine.py` → baseline-policy routing and final parity | Consistent: reference is captured before routing and verified only at final HEAD. |
+| 2 → 4 | `FoldManifest`/parity types in `pit_optimizer_evaluation.py` → schema-v2 manifest/objective | Consistent. |
+| 2 → 7 | Independent folds/parity evidence → controller readiness and evaluation | Consistent. |
+| 2 → 8 | Evaluation module and parity identities → CLI/readiness | Consistent. |
+| 2 → 9 | Reference artifact → final provider-free parity attestation | Consistent; only the two declared discovery folds replay. |
+| 3 → 5 | `strategy_policy/runtime.py` and client protocol → JSON-lines candidate client | Consistent: Task 5 extends the same trusted adapter without exposing engine authority. |
+| 3 → 7 | Per-run policy client factory → discovery/hidden evaluation services | Consistent. |
+| 3 → 9 | Simulator extraction → regression/parity verification | Consistent. |
+| 4 → 5 | Shared `PatchBounds`, role schemas, source scope, and v2 tests → candidate confinement | Consistent. |
+| 4 → 6 | Call budgets/authorization requirement and shared contract/tests → provider accounting | Consistent. |
+| 4 → 7 | Objective, holdout decision, ledger, evaluation types/tests → incumbent controller | Consistent. |
+| 4 → 8 | Gate/manifest/contracts/evaluation/tests → CLI and readiness | Consistent. |
+| 4 → 9 | Manifest/objective/ledger → final focused verification | Consistent. |
+| 5 → 6 | Bounded role/source package and `agent_loop.py` → one-shot R1 call path | Consistent. |
+| 5 → 7 | Candidate capability, worker, and identity → controller services | Consistent: controller receives inert workspace handles only. |
+| 5 → 8 | `agent_loop.py` and v2 tests → live-service wiring | Consistent. |
+| 5 → 9 | Worker/candidate confinement → synthetic Docker smoke and compile checks | Consistent. |
+| 6 → 7 | Frozen pricing, authorization lease, call reconciliation → controller role service | Consistent. |
+| 6 → 8 | Provider/accounting route in `agent_loop.py` and contracts/tests → canary dispatch | Consistent. |
+| 6 → 9 | Zero-retry accounting → provider-free handoff verification | Consistent; Task 9 issues no paid call. |
+| 7 → 8 | Controller/result/readiness and shared files/tests → CLI/summary | Consistent. |
+| 7 → 9 | Artifact/finalization state machine → final verification | Consistent. |
+| 8 → 9 | Exact prepare command and closed summary → unexecuted canary handoff | Consistent. |
+| Task 1 self-check | Tests first; five pure entry points; listed files match implementation and commit commands | Internally consistent. |
+| Task 2 self-check | Warmup boundary, reference capture, discovery-only replay, listed files/commands | Internally consistent. |
+| Task 3 self-check | Client factory, capacity carrier, exits, parity, listed tests/commit | Internally consistent. |
+| Task 4 self-check | Closed schemas, manifest, Decimal objective, exposure ledger, listed files/tests | Internally consistent. |
+| Task 5 self-check | Git-derived diffs, AST purity, capability registry, worker protocol, listed files/tests | Internally consistent. |
+| Task 6 self-check | Exact source authorization, frozen pricing, one-shot lease, zero retries, listed files/tests | Internally consistent. |
+| Task 7 self-check | Three-role iterations, mandatory critic, incumbent state, hidden boundary, cleanup order | Internally consistent. |
+| Task 8 self-check | Phase-first dispatch, provider-free prepare, closed summary, legacy coexistence | Internally consistent. |
+| Task 9 self-check | Focused compile/tests, exactly one final parity replay, prepare only, no canary execution | Internally consistent. |
+
+Preflight result: no task-to-task or task-internal conflict found against the approved specification or Global Constraints.
+
+## Baseline verification
+
+- Command: `python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_backtest_custom_strategy_contract.py tests/test_task11_effective_policy_contract.py tests/test_backtest_open_causality.py`
+- Result: 38 passed in 1.60s.
+- Pre-existing output noise: PytestConfigWarning for unsupported `cache_dir` and a websockets legacy DeprecationWarning. These precede implementation and are not attributed to Task 1.
+
+## Task progress
+
+- Task 1: fix round 1/5 (1 addressed, 0 open — inherited mutable `__dict__` closed; commits `7a59244..205ad2d`).
+- Task 1: complete (commits `753a620..205ad2d`, review clean).
+- Ruling: Task 2 reads the existing readiness JSON and sealed PIT SQLite bundle from the original checkout by absolute read-only path, while writing its new reference artifact inside this implementation worktree — this avoids duplicating a 68 MB sealed input and avoids writing Task 2 output outside the isolated workspace — if the capture implementation incorrectly assumes all inputs share the output root, it will require a small path-boundary correction.
+- Ruling: Task 2 may perform exactly one corrected reference-capture retry after a regression-tested fix binds the simulator cadence to the authenticated effective policy — the first attempt evaluated only the two discovery folds, failed closed on a deterministic default-cadence identity mismatch, and wrote no artifact — the cost if wrong is one extra two-fold provider-free replay; there is no third attempt and no hidden/provider/Docker execution.
+- Task 2: review found one Critical and three Important fail-closed gaps; fix round 1/5 started from `032a430`. No additional capture/replay is permitted during the fix; the existing successful reference must pass stricter metadata-only loading afterward.
+- Task 2: fix round 1/5 (4 addressed, 0 open — later-descendant gate, full readiness authentication, source-race check, and evidence cross-links; commits `032a430..1d7fb1c`).
+- Task 2: minor (deferred): pre-existing `canary_rejects_readiness_or_sealed_input_mutation_before_another_call` fixture/error-regex mismatch; Task 2 diff did not cause it.
+- Task 2: complete (commits `205ad2d..1d7fb1c`, review clean; successful reference retained unchanged and metadata-validated).
+- Task 3: review found one Critical and two Important engine-boundary gaps; fix round 1/5 started from `e10e4a5`.
+- Task 3: minor (deferred): `byte_stable` regression uses shallow copies of mutable `Trade` objects and may miss in-place mutation; final review must triage deep/serialized comparison coverage.
+- Ruling: Task 3 may minimally normalize the five unsafe allocation fixtures in `tests/test_backtest_open_causality.py` to values within the fixed 1% risk and 8% stop ceilings, without changing their causal assertions — the specification's immutable safety limits override the plan file's verify-only label for that test file — the cost if wrong is masking a legacy-compatibility expectation, which the final review must detect from the isolated fixture-only diff.
+- Task 3: fix round 1/5 (3 addressed, 0 open — fixed safety ceilings, over-capacity block, and interface-failure cleanup; commits `e10e4a5..e435217`).
+- Task 3: complete (commits `1d7fb1c..e435217`, review clean; one deferred minor remains for final triage).
+- Task 4: review found five Critical and four Important contract/authentication gaps; fix round 1/5 started from `89bdea5`.
+- Task 4: minor (deferred): nested source-bundle type checks dereference before validation and may raise `AttributeError` rather than controlled `ValueError`; final review must triage.
+- Task 4: fix round 1/5 (6 addressed, 3 open — insertion-only diff application, discovery-proof identity completeness, and maximum-envelope sizing; commits `89bdea5..5526e02`).
+- Task 4: fix round 2/5 (2 addressed, 1 open — canonical maximum-envelope sizing under permitted non-ASCII escaping; commits `5526e02..9115cdb`).
+- Task 4: fix round 3/5 (1 addressed, 0 open — raw UTF-8 canonicalization, unsafe-control closure, true byte-constrained maxima, and exact prospective next-role sizing; commits `9115cdb..b2eb01c`).
+- Task 4: complete (commits `e435217..b2eb01c`, review clean; one deferred minor remains for final triage).
+- Task 5: review found five Important and three Minor candidate-confinement gaps; fix round 1/5 started from `e815b24` (statelessness/determinism, complete feedback context, identity authentication, constant/path manifest compatibility, owned-container cleanup, strict scalar/path/test hardening).
+- Task 5: fix round 1/5 (five original findings addressed; three Important and two Minor remain — AST alias/rebind mutation, early worker ownership/error precedence, pre-return apply rollback, exact identity value contract, and residual negative/report coverage; commits `e815b24..278d41b`).
+- Task 5: fix round 2/5 (AST alias/rebind, pre-return rollback, nine-field identity, structural negatives, and early ownership mostly addressed; two Important and two Minor remain — full-ID absence/status verification, active-primary cleanup evidence, real candidate cross-worker evidence, and exact-name `.append` grammar; commits `278d41b..7bbb4b3`).
+- Task 5: fix round 3/5 (full-ID absence/status handling, ordinary active-primary evidence, executing cross-runtime determinism, and exact-name `.append` addressed; one Important remains — secondary evidence construction must be non-throwing, bounded, and value-free; commits `7bbb4b3..38c4bde`).
+- Task 5: fix round 4/5 (bounded value-free note construction addressed; one Important cleanup regression remains — malformed capability result fields must be normalized inside the shield without replacing the primary or skipping later actions; commits `38c4bde..f343790`).
+- Task 5: fix round 5/5 (final hostile capability-result normalization addressed with no open findings; commits `f343790..822241a`).
+- Task 5: complete (commits `b2eb01c..822241a`, review clean).
+- Task 6: review found two Critical, four Important, and two Minor authorization/accounting gaps; fix round 1/5 started from `458ba55` (manifest-to-wire source binding, immutable gateway-frozen pricing, all-exit reconciliation, final deadline check, closed accepted/completed states, crash-atomic grant/window persistence, parser preflight, and evidence corrections).
+- Task 6: fix round 1/5 (deadline, closed accepted/completed states, atomic grant/window, parser preflight, and stable-object source/pricing checks addressed; two Critical, one Important, and two Minor remain — exact transmitted snapshot/provenance, live pricing reauthentication, durable terminal fence, advertised Pricing compatibility, and report metadata; commits `458ba55..5cebaf9`).
+- Task 6: fix round 2/5 (exact source-byte capture, live pricing reauthentication, nonaccepted terminal fence, and Pricing compatibility addressed; two Critical, two Important, and one Minor remain — unforgeable predecessor-bound role capability, canonical call-plan snapshot, terminal-event receipt/restart recovery, accepted post-publication state, and report claims; commits `5cebaf9..696980b`).
+- Task 6: fix round 3/5 (canonical plan snapshot, genuine sequential lineage, both audit digests, partial-tail replay, and accepted post-publication semantics addressed; one Critical, two Important, and two Minor remain — gateway-owned receipt authority, semantic cross-ledger lifecycle replay, true fresh-BudgetLedger recovery with terminal code, synchronized bind issuance, and report accuracy; commits `696980b..1f3040d`).
+- Task 6: fix round 4/5 (specialized lifecycle authority, genuine fresh restore, terminal codes, and synchronized role registry addressed; one Critical, three Important, and one Minor remain — generic audit namespace/event bypass, verify-before-budget-restore order, private single-read evidence identity, exact LoopState replay, and report accuracy; commits `1f3040d..ae5d837`).
+- Task 6: fix round 5/5 (public namespace/event overlap, verify-before-restore, protected single-read evidence, and exact LoopState replay addressed; zero Critical, two Important, and one Minor remain — durable terminal package commitment, start-event/commitment cancellation accounting, and lifecycle-state report wording; commits `ae5d837..f66abea`).
+- Task 6: paused at the subagent-driven-development five-round ceiling; Task 7 not started because it consumes Task 6's paid-call lifecycle boundary.
+- Ruling: Task 6A is a separately authorized remediation task, not a sixth Task 6 fix round — the user explicitly authorized it after the SDD breaker, and its scope is isolated to the two remaining load-bearing lifecycle findings plus their report correction — the cost if wrong is one bounded extra implementation/review loop before Task 7.
+- Task 6A: started from `f66abea` (trusted terminal-package commitment, conservative start-commitment cleanup, and lifecycle-state report correction; fake/temp-only, no external effects).
+- Task 6A: implementation committed as `b503460`; exact focused suite `235 passed, 518 deselected`, dedicated regressions `2 passed`, static gates clean; independent task review started over `f66abea..b503460`.
+- Task 6A: complete (commits `f66abea..b503460`, review clean; 0 Critical, 0 Important, 0 Minor).
+- Task 6: complete through separately authorized Task 6A remediation (commits `822241a..b503460`, final lifecycle gate clean).
+- Task 7: started from `b503460` (provider-free incumbent controller, incremental artifacts, hidden boundary, and cleanup; one fresh implementer, fake/temp-only, no external effects).
+- Task 7: implementation committed as `f6124bc`; complete controller suite `271 passed`, focused static gates clean; independent task review started over `b503460..f6124bc`.
+- Task 7: review found three Critical, four Important, and one Minor controller-boundary gaps; fix round 1/5 started from `f6124bc` (failed/uncertain accounting, durable decision/holdout ordering, complete-plan context handling, iteration-directory durability, intermediate-link confinement, hidden evidence/ledger binding, and missing focused branch coverage).
+- Task 7: minor (deferred): malformed candidate factory output can escape exact disposal before private-registry ownership transfer; final review must triage guarded pre-registration disposal.
+- Task 7: fix round 1/5 (five blockers addressed, two Important open — race-safe component-relative artifact mutation and genuinely executable nested-link/leak-sentinel coverage; commits `f6124bc..cd7a459`).
+- Task 7: fix round 2/5 implementation committed as `35614fb` (held-capability no-follow mutation and executable race/leak coverage); scoped re-review started over `cd7a459..35614fb`.
+- Task 7: fix round 2/5 (two addressed, zero open — held-capability artifact mutation and probative containment/leak coverage; commits `cd7a459..35614fb`).
+- Task 7: minor (deferred): a just-opened child directory capability can leak if parent-directory synchronization raises before the capability is appended to the owned list; final review must triage append-before-sync or local exception cleanup.
+- Task 7: complete (commits `b503460..35614fb`, review clean; two deferred Minors remain for final triage).
+- Task 8: started from `35614fb` (schema-v2 CLI/readiness/live-service composition, closed summary, mocked integration, and one bounded synthetic worker smoke; no provider/replay effects).
+- Ruling: Task 8 derives the schema-v2 readiness artifact path as `<artifact_root>/<manifest.run_id>.readiness.json` and authenticates it with the explicit readiness digest instead of adding an unspecified free-form readiness-path flag — the brief seals artifact root, manifest run ID, and readiness identity but names no separate path flag; derivation avoids another caller-controlled path — the cost if wrong is a small CLI compatibility correction before Task 9.
+- Ruling: Task 8 may make the minimal file-scope expansion to `core/pit_optimizer_authorization.py` for a public read-only `AuthorizationLedger.authenticate_window(...)` seam — exact window/scope authentication must precede pricing, while coupling the service builder to private journal records would make the trusted boundary fragile — the cost if wrong is one additive public method and its focused fake/temp contract test.
+- Ruling: Task 8 may run exactly one corrective synthetic Docker smoke after the first bounded smoke exposed a duplicate-Python argv bug and proved complete cleanup — the plan requires the fixed worker path to be smoke-verified, the first attempt made no decision/provider/replay/network effect, and the rerun keeps identical foreground/network-none/resource/cleanup limits — the cost if wrong is one additional short local container invocation; no third attempt is permitted.
+- Task 8: implementation committed as `cbbc9c9`; mocked/legacy suite `358 passed, 2 skipped, 524 deselected`, static gates clean, two bounded Docker attempts cleaned completely; independent review started over `35614fb..cbbc9c9` with the post-smoke fake-only cleanup/environment verification limitation disclosed.
+- Task 8: review found one Critical, four Important, and one Minor integration/CLI gaps; fix round 1/5 started from `cbbc9c9` (production determinism identity, pre-resolution link rejection, exact canary ceilings, foreign-route flag rejection, and real-production-composition mocked integration).
+- Task 8: minor (deferred): Docker smoke assertions use upper bounds instead of exact 256 MiB/1 CPU/32 PID/tmpfs confinement; the next separately authorized live smoke must tighten and exercise exact inspection assertions.
+- Task 8: fix round 1/5 implementation committed as `284b04f` (full fold-evidence identity, pre-resolution path topology checks, exact closed canary plan, v2 option exclusivity, and actual production-composition mocked canary); scoped re-review started over `cbbc9c9..284b04f`.
+- Task 8: fix round 1/5 (all five original findings addressed; one new Important remains — production source authentication invokes ambient `PATH` Git instead of the explicitly configured Git capability; commits `cbbc9c9..284b04f`).
+- Task 8: fix round 2/5 (configured-Git capability is threaded through both production prepare and canary source authentication; zero Critical/Important findings; commits `284b04f..5eb00d5`).
+- Task 8: complete (commits `35614fb..5eb00d5`, review approved; previously deferred Docker assertion Minor and disclosed live-smoke limitations remain for final triage). Reviewer sandbox could not independently reach two positive paths because of host temp-directory permissions, while the implementation environment recorded `411 passed, 4 skipped`; both fail-closed cases passed independently. The two exact task-owned inaccessible reviewer temp directories were ownership-repaired, removed, and verified absent.
+- Ruling: Task 9 authenticates `codex/pit-optimizer-implementation` as the final source root and uses the original checkout only for sealed local input artifacts — the implementation was intentionally kept local and never merged into the original verification checkout, so using the plan's literal original `--source-root` would authenticate the wrong HEAD — the cost if wrong is a provider-free manifest/preparation rerun after correcting only local ignored outputs; no paid call or hidden evaluation is permitted.
+- Task 9: started from clean committed `5eb00d5` (compile, two focused suites, exactly one final two-fold provider-free parity, local manifest, provider-free prepare/readiness inspection, and unexecuted canary handoff only).
+- Task 9: first managed-sandbox verification attempt blocked before parity (`compileall`/`py_compile` clean; architecture `460 passed, 46 failed, 4 skipped`; optimizer selection `96 passed, 4 failed`) because fresh Windows `0o700` audit/controller directories became inaccessible to the creating sandboxed process. No provider, Docker, replay, parity, manifest, prepare, hidden, or apply effect occurred.
+- Ruling: Task 9 may make one correctly configured verification attempt outside the managed filesystem sandbox — a minimal same-Python probe reproduced `WinError 5` inside the sandbox at `Path.resolve(strict=True)` immediately after creating a private directory, while the identical probe resolved and atomically wrote outside the sandbox; this isolates the prior red suites to the sandbox ACL layer — the cost if wrong is one architecture-suite and one optimizer-selection-suite execution, still provider-free and Docker-free, before the parity gate.
+- Task 9: corrected outside-sandbox gates passed (`506 passed, 4 skipped` architecture; `100 passed, 489 deselected` optimizer selection), then the single permitted final parity attempt failed closed before attestation with `rounded loss exceeds recommended risk budget`; manifest/prepare/readiness/canary were not launched and all hygiene gates remained clean.
+- Task 9 diagnosis: the legacy engine sizes from the unrounded 8% stop but stores a nearest-cent stop; 7 of 12 sealed discovery BUYs round adversely, so exact legacy evidence conflicts with the literal zero-overrun 1% risk ceiling. No honest implementation can preserve both. Recommended remediation is an engine-owned post-round quantity/notional clamp plus explicit versioned local baseline/reference resealing; parity-preserving half-tick tolerance requires weakening the written safety contract.
+- User ruling: choose the strict post-rounding risk ceiling and version/reseal the local baseline/reference artifacts; do not weaken the written safety contract to preserve legacy cent-rounding overruns.
+- Task 9A: started from clean committed `5eb00d5` (one focused adverse-cent-rounding regression, engine-owned quantity/notional clamp, provider-free local artifact reseal only; no provider, Docker, hidden evaluation, or long replay).
+- Task 9A: implementation committed as `da7fd86` (derive the cent-rounded stop before sizing, clamp quantity against both risk ceilings using actual rounded loss, recompute notional, and cover adverse/exact/favorable rounding); focused entry/policy slice passed 11 tests, and independent review plus randomized risk probes found no Critical/Important findings.
+- Task 9A: tracked evidence note committed as `aa680d7`; corrected two-fold provider-free parity was captured and verified under the local `pit-policy-parity-v4` artifact version, with no hidden-fold evaluation. Windows Application Control blocked the merge-conflict hook only; diff checks and the bounded verification gates passed.
+- Task 9B: manifest source-policy digest bug fixed and committed as `f29d69f`; the manifest now uses the authoritative effective-engine-policy digest, with focused regression and independent review clean.
+- Task 9B: final-source parity/readiness lineage was resealed at committed HEAD `7560be2`; current-source v6 manifest was built with six all-R1 calls, two iterations, 448000-token and USD 0.40 ceilings, `apply=false`, and the sealed candidate bounds. No provider call, grant, pricing lookup, Docker run, hidden evaluation, or replay was launched.
+- Task 9B: first v6 prepare failed closed before controller initialization because its controller-temp parent was under a dotenv-bearing repository ancestor; no run records or provider effects were created. A dedicated system-temp parent passed the same elevated local preflight, and the exact provider-free prepare then succeeded, writing schema-v2 readiness under `.worktrees/pit-optimizer-v6-runs` and emitting an inert canary command.
+- Task 9B: readiness inspection found two discovery exposure records, no provider/accounting records, no hidden result, source unchanged, and cleanup complete. Historical local optimizer artifacts contain 19 role-call attempt records across eight runs (17 accepted, 1 rejected, 2 failed); this v6 prepare consumed zero calls and zero spend. The canary remains unexecuted and the full-window replay remains gated on a qualifying subset candidate.

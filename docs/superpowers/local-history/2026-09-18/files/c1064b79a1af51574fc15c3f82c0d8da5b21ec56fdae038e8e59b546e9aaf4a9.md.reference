@@ -1,0 +1,34 @@
+# P3 scoped fix round 1 independent review
+
+**Final P3 spec verdict: PASS. Final P3 quality verdict: APPROVE.** Important I1 is resolved; no additional finding arose from the two-line correction or its focused callers/status flow. These verdicts explicitly combine the prior full P3 review with this independent delta review; they are not a repeated broad P3 review or P4/combined approval.
+
+## Prior authority and exact correction
+
+The prior full report, `review-freeze-01/independent-review.md`, SHA-256 `eebf5303ae554d1a30e78b7956bb38a5dd23d5b36894030ed7156bcb03dc0294`, identified only I1: original-deadline precedence was missing before settled policy success. Its remaining scope assessment and evidence limitations are carried forward. The report read at `independent-review.md` independently hashes identically to that retained report.
+
+Read the complete frozen `review-freeze-02/fix-round-1.diff` once, then focused frozen operations source for original deadline construction, the shared boundary, four consumers, and final status. Independently confirmed that removing exactly one occurrence of the two inserted CRLF lines from freeze-02 operations reproduces freeze-01 source text exactly. Frozen source hashes establish the retained byte identities. No broader task diff was reread; its hash was verified for provenance only.
+
+## I1 resolved and focused breakage assessment
+
+- `review-freeze-02/operations.py:680-686` retains the original persisted campaign start and configured duration when deriving the operational monotonic deadline. This expression is unchanged; the correction neither restarts nor extends the deadline.
+- `operations.py:707-715` authenticates immutable settled facts first, then returns `campaign_deadline_exhausted` when the original operational deadline has expired, before evaluating the target/reserve decision at `:716`. It therefore handles an already-expired resume and expiry during heavy fact authentication. Integrity failures still propagate before deadline/target handling. Clock access stays in the operational closure; shared admission source is byte-identical.
+- Reused settlements consume this decision at `operations.py:763-767`; newly completed settlements consume it at `:967-971`. Both retain the deadline reason and break, including when the current round is the final permitted iteration. Neither can convert this returned reason into the target result. Pre-config and pre-start consumers at `:792-798` and `:890-896` accept the same reason and preserve their existing additional checks.
+- `operations.py:985-988` maps only `max_feedback_rounds` and `evaluated_feedback_target_reached` to outer `completed`, so the new deadline result remains outer `stopped`. The old summary call/readiness/count formulas are unchanged. No synthetic outcome or record is introduced.
+- Legacy absence returns at `operations.py:705-706` before the added clock check. The exact two-line scope and unchanged CLI/admission bytes preserve the prior reviewed contracts and immutable call paths. No new breakage was identified within this delta.
+
+## Independently verified frozen authority
+
+| Artifact | SHA-256 |
+| --- | --- |
+| Freeze-01 operations preimage | `3ef1ee11918ed9367af338c06628a336558e3b5bd136811ca477793385a1c4b5` |
+| Freeze-02 operations | `02249f02dfad345ef3b6cca59a378f5bc0a211517427991f4c661158e9883942` |
+| Freeze-02 CLI, unchanged | `cf127dba9914911e51b7c9a7bf907ed3208aaffa8fb81184e30b1a0e7debae74` |
+| Freeze-02 admission, unchanged | `e6b3a9b5362df18d670acd65469e4f4667247743fb93f803ce26041f1cb0dc38` |
+| `fix-round-1.diff`, 752 bytes | `801a77e9a51815c3daace0e96a6dcb994075cd105f6a738203dd533fed9e6d72` |
+| Updated `actual-task.diff`, 50915 bytes | `7a3cbfea048d6243ad7e81a9cb689dca1df863cda5be84b1ff75999f838fb974` |
+| `task-report.md` | `faf0712a24eb5ee7454ab32b2187a843fd0ae24e8e673589380073bdf4c20d5e` |
+| `static-verification.txt` | `0245eb005080c6aa0ce8c81de7975990596857ffb0dca4ea2c2a7312e5b64181` |
+
+These values match freeze-02 `authority.json` and the principal's freeze. Task/static reports were complete and read before approval. They record scoped Ruff PASS, in-memory compile PASS, and source/AST ordering PASS without warnings. Those execution results are implementer evidence, not independently repeated here. Independently checked the exact insertion and newline census: 1082 CRLF, zero bare LF.
+
+No tests were read, created, modified or run. No source imports, runtime/probes, synthetic inputs, actual historical readers/summaries, credentials/environment values, providers/APIs, Docker/evaluation/campaign execution, production edits, Git mutation or archive edits occurred. Only this report and the separately requested P4 preparation map were written. Archive/evaluator preservation and dynamic positive-policy behavior were not revalidated here. P4 and final combined source review remain required before a separately static-reviewed actual historical collector; this approval does not execute or authorize paid work.

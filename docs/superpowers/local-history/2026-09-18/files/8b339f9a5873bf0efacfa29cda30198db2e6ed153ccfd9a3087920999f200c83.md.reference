@@ -1,0 +1,139 @@
+# Task 6 Report: Transparent CAGR and Multi-Candidate Search
+
+## Outcome
+
+Task 6 is implemented in the two approved pure-domain files:
+
+- `core/pit_optimizer_v5/search.py`
+- `core/pit_optimizer_v5/selection.py`
+
+No test file or existing source file was added or modified. The implementation does not import or
+invoke provider, CLI, Git, Docker, subprocess, filesystem-repository, replay, or market-data
+adapters.
+
+## Scoring and authority
+
+- Campaign CAGR is recomputed from exactly four committed discovery ordinals. Input execution order
+  is canonicalized by ordinal, while missing/duplicate ordinals and any episode ID/date/panel mismatch
+  fail with typed search errors.
+- Every discovery panel must bind the supplied `EvaluatorContractV5`, its sandbox, the selected
+  `base` scenario, and the complete declared gross/base/stress grid. Scenario tuple position does not
+  choose the objective.
+- Exact Decimal endpoint ratios are compounded under a fixed precision-40 local context, annualized
+  over the sum of episode elapsed days, and quantized with half-even rounding to the V5 evaluator's
+  six-decimal metric precision. Ambient Decimal context cannot affect ranking.
+- `verified_campaign_cagr_pct` calls the existing campaign validator and rejects a stored CAGR that
+  differs from recomputation. The plan's PIT/prices identities must equal the evaluator contract.
+- Archive transitions also bind the annualized-return target digest to the panel plan and recompute
+  the two-decimal target gap. They never accept a free caller score.
+
+The brief's illustrative two-argument scorer was corrected to require
+`EvaluatorContractV5`; without it, selected-base and evaluator authority cannot be proven.
+
+## Archive and reconstruction
+
+- `ArchiveEntryV5`, `CandidateArchiveV5`, `SearchStateV5`, and typed transition/failure records are
+  frozen, canonical, and strict. Archive entries require nonzero closed-trade activity.
+- Default capacity is eight. Selection protects the global CAGR leader and one leader from each
+  present primary-mechanism family, deduplicates those protections, then fills by descending CAGR,
+  earlier admitted round, and canonical policy identity. An impossible family/capacity combination
+  fails closed.
+- `zero_trade` final records traverse the same source, record, campaign, evaluator, and target
+  authentication as evaluated records, then produce typed `zero_activity` without admission.
+- Direct entry ranking is private. The public transition consumes a final `ExperimentRecordV5` and
+  `ArchiveRecordAuthorityV5`, authenticates the record reference, requires the source-bundle
+  reference in the record, binds exact source bytes to the policy revision, and only then admits.
+- `CandidateArchiveReducerV5` implements Task 5's generic reducer boundary. It receives the approved
+  authenticated experiment-ID to record/source binding set, folds records deterministically, and
+  reconstructs archive, attempted novelty keys, and next authored round. Reversed caller input gives
+  the same projection because Task 5 canonicalizes journal order.
+
+## Quick selection and scheduling
+
+- `QuickScreenCandidateV5` is a pre-critic pure type; Task 5 final experiment records are not abused
+  as pre-discovery state. Only validated, non-exact-duplicate, parent-distinct fingerprints with
+  policy-bound quick evidence are eligible.
+- Quick evidence is restricted to the evaluator's selected base scenario and committed quick panel.
+  Its endpoint CAGR is rederived and must equal the report. The unique declared default assignment is
+  selected first even with zero quick trades; remaining behaviorally distinct variants are selected
+  by descending quick CAGR and canonical policy identity, with a manifest-cap wrapper and no weighted
+  score.
+- The baseline is an explicit authenticated external `BaselineParentAuthorityV5`, never an archive
+  entry. Exact source bytes, revision reference, fingerprint, campaign evidence, and evaluator
+  baseline-source digest are bound. It is the sole parent/champion when the archive is empty or no
+  candidate strictly improves it; `selected_parent_record_ref` is then null.
+- Once an archive candidate beats baseline, the reconstructible parent order is global leader,
+  fixed-order family leaders, then remaining ranked entries, deduplicated and rotated by round. Every
+  archive parent resolves an authenticated evaluated `StoredExperimentRecordV5` and carries its
+  non-null record reference for Task 5 ancestry.
+- Discovery execution order rotates by `(round_index - 1) % 4`; persisted evidence is separately
+  canonicalized to ordinals 1 through 4.
+
+## Novelty and terminal outcomes
+
+- Novelty keys are domain-separated controller hashes over parent revision, mechanism, causal claim,
+  author instructions, and metric-sorted predictions. Model-supplied hypothesis ID, rank, evidence
+  IDs, and any claimed key are excluded.
+- `select_novel_hypothesis_v5` requires manifest `SearchCapabilitiesV5`, validates exact ranked
+  cardinality, skips attempted or duplicate semantic keys, and returns the first novel hypothesis.
+- `NoNovelHypothesisV5`, `ScheduledHypothesisV5`, and `NoveltyExhaustedV5` are closed typed outcomes.
+  No-novel advancement requires every ranked key to have been attempted. Terminal classification
+  derives the complete reconstructible parent schedule internally and requires one ordered no-novel
+  outcome for every unique parent; a subset cannot claim exhaustion.
+
+## Verification
+
+Direct in-memory smokes, with no provider/Docker/replay/data access, passed:
+
+1. `TASK6_CAGR_SMOKE_OK`: exact 10.000000 compounded CAGR, rotated episode input, base selection by
+   ID under reordered scenarios, complete-grid/evaluator authentication, stable ambient Decimal
+   context, and typed incomplete/panel/scenario failures.
+2. `TASK6_SEARCH_SMOKE_OK`: capacity eight, all five family leaders, deterministic reversed-input
+   reduction, typed insufficient capacity, baseline fallback, strict-improvement champion, rotated
+   record-backed parents, zero-trade quick default, manifest cap, episode rotation/canonicalization,
+   novelty rank skipping, no-novel advancement, and full-parent exhaustion.
+3. `TASK6_POST_AUDIT_SMOKE_OK`: authenticated `zero_trade -> zero_activity`, target/plan authority,
+   evaluator-bound baseline source, manifest novelty cardinality, complete-schedule exhaustion, and
+   closed direct-admission bypass.
+4. `TASK6_NOVELTY_AUTHORITY_SMOKE_OK`: no-novel advancement was revalidated against the complete
+   manifest-ranked artifact and terminal exhaustion rederived the full authoritative parent/artifact
+   set; partial coverage failed typed.
+5. Independent read-only smoke coverage also passed 2%-per-episode compounding (`8.243216`), rotated
+   ordering, all typed scoring failures, quick/default rules, canonical archive ordering, family
+   protection, capacity failure, and revision-conflict failure.
+6. Existing stable compatibility suite:
+   `python -B -m pytest tests/test_pit_optimizer_subset_reference.py tests/test_pit_optimizer_holdout.py tests/test_strategy_policy.py -q --no-cov`
+   — `47 passed` (only the existing websockets deprecation and sandbox-denied pytest-cache warnings).
+7. The planned `tests/test_pit_optimizer_v5_domain.py` does not exist at this HEAD; under the user
+   override no replacement test was created.
+8. Ruff check, Ruff format verification, Python compilation, and diff checks passed for both files.
+
+## Review disposition and deferred integration
+
+An independent read-only source review found direct-admission, zero-trade authentication,
+target/plan, and manifest-cardinality gaps; all were corrected within the two-file boundary. Its
+suggestion to keep rotating regressing archive entries conflicts with the controller's explicit
+baseline ruling, so baseline remains the sole schedulable champion while every archive candidate
+regresses.
+
+One real persistence gap is intentionally deferred to Task 8 under the controller's ruling: Task 5's
+closed six-kind event union and record-only archive checkpoint cannot durably encode a
+`no_novel_hypothesis` round because no experiment exists. Task 8 must add a memory-adapter authority
+for that typed no-experiment round outcome; it must not fabricate an `ExperimentRecordV5` or overload
+cleanup semantics. Task 6 provides the pure outcome and transition but does not expand Task 5 files.
+
+## Review correction
+
+The scoped Task 6 review identified two quick-stage authority bypasses, both corrected in
+`selection.py` without changing campaign, archive, scheduling, novelty, or reducer behavior:
+
+- quick selection now rejects a panel plan unless its authenticated PIT-bundle and
+  prices-provenance digests exactly match the evaluator contract, before eligibility filtering or
+  ranking;
+- the arbitrary integer-cap implementation is private. The sole exported quick selector remains
+  `select_manifest_discovery_survivors_v5`, requires `SearchCapabilitiesV5`, and derives its bound
+  only from `max_discovery_survivors_per_template`.
+
+`TASK6_QUICK_AUTHORITY_REWORK_SMOKE_OK` covered independent PIT and prices mismatches, typed failure
+before ranking even for an empty candidate tuple, absence of the old raw public API, exact manifest
+cap enforcement, descending quick CAGR for remaining slots, and declared-default preservation.

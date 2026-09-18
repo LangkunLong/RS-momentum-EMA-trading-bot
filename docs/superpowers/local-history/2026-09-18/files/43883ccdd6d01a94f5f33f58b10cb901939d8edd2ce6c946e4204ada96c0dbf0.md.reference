@@ -1,0 +1,77 @@
+# Final production fix wave report
+
+## Status
+
+PASS
+
+- Required clean base and linked-worktree branch were confirmed before edits.
+- Production commit: `b62411b` (`Harden PIT optimizer cleanup commands and recovery`).
+- No tests, tracked documentation, manifests, retained readiness evidence, trading-policy code, or rounded-stop clamp were changed.
+- No provider/pricing/network/Docker/hidden/replay/grant/canary activity occurred.
+
+## Production files
+
+- `agent_loop.py`
+- `core/pit_optimization_contract.py`
+- `core/pit_optimizer_command.py` (new shared v3 renderer)
+- `core/pit_optimizer_controller.py`
+
+## Implemented fixes
+
+### Cleanup authority and whole-run aggregation
+
+- Candidate validation and cleanup capabilities now use distinct private registry entries.
+- Beginning disposal irreversibly revokes validation/apply authority while retaining cleanup-only authority until a complete cleanup is observed.
+- Intermediate cleanup results are validated and accumulated in `_RunState.cleanup_observations`.
+- Incomplete, invalid, raising, or source-modifying intermediate cleanup terminates as `sandbox_integrity_failure`; incomplete workspaces remain in `pending_retired_workspaces` for final retry.
+- Final cleanup visits unique iteration, incumbent, and pending-retired workspaces and aggregates every cleanup observation from the whole run.
+- Completed capabilities are removed from cleanup authority and are not disposed twice.
+- The production disposer can verify an already-absent candidate after a post-removal failure while preserving capability authentication and source rechecks.
+
+### Shell-safe schema-v3 commands
+
+- Both active v3 prepare/canary renderers use one shared production helper.
+- The interpreter is the exact absolute `sys.executable`, accepted only when it exists as a regular non-link file.
+- Rendering requires a nonempty bounded argv of exact strings and an absolute executable.
+- NUL, CR, LF, double quote, and all required `cmd.exe` metacharacters are rejected before `subprocess.list2cmdline`.
+- Legacy command rendering was not changed.
+
+### Canonical schema-v3 Usage recovery
+
+- Every nested recovery `usage` value must be the exact dataclass key set and exact primitive emitted by durable `asdict(Usage)` serialization.
+- Missing default-valued keys and other noncanonical shapes are rejected before ledger restoration.
+- Canonical retry restoration remains idempotent.
+
+## Verification outcomes
+
+- `git diff --check`: PASS before staging.
+- `git diff --cached --check`: PASS for the exact four-file staged set.
+- Changed-module compilation: PASS for all four production modules.
+- Provider-free in-memory smoke: PASS.
+  - cleanup attempts: 2;
+  - cleanup observations: 2;
+  - first observation incomplete, final retry complete;
+  - whole-run aggregate complete: false;
+  - validation authority revoked: true;
+  - completed capability disposed only once: true;
+  - real retained approved local paths/image rendered: true;
+  - forbidden command argument classes rejected: 13 of 13;
+  - canonical recovery retries: 2;
+  - noncanonical recovery with one omitted default key rejected: true.
+- Existing provider-free Task 5 production composition: PASS in a new ignored proof root; retained `proof-g` was untouched.
+  - available pricing: 2 iterations, 6 accepted calls, authoritative USD 2.4, hidden calls 0, cleanup complete;
+  - unavailable pricing: 2 iterations, 6 accepted calls, authoritative USD 2.4, hidden calls 0, cleanup complete;
+  - harness assertions reported zero provider/network, Docker, hidden-evaluator, and full-replay activity.
+  - the first sandboxed invocation could not complete under the secure Windows filesystem handles; the approved filesystem-unsandboxed retry passed. The final authority-map refinement was followed by a fresh compile and cleanup/command/recovery smoke rather than another full proof run.
+- Commit hooks: ruff, whitespace, end-of-file, and merge-conflict checks PASS; YAML check was not applicable.
+- Post-commit tracked/staged status: clean.
+
+## Preserved contracts
+
+- Schema-v3 six-call / 448,000-token authority, audit-only USD, provider retries zero, and `apply=false` remain unchanged.
+- Hidden isolation, discovery-only termination, legacy routes, and external one-way workspace validation remain unchanged.
+- Source cleanup verification remains active.
+
+## Residual risk
+
+- Permanent regression tests remain deferred by explicit operator direction. Confidence is based on the bounded in-memory edge-case smoke, changed-module compilation, commit hooks, and the provider-free production-composition proof.

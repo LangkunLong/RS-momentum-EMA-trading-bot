@@ -1,0 +1,1017 @@
+# Task 4 Fix Round 1 Exact Review Package
+
+This is the complete current Task 4 implementation relative to HEAD after fix round 1.
+Compare it against `task-4-review-package.md` (pre-fix), `task-4-review.md`, and `task-4-report.md`.
+
+```diff
+warning: in the working copy of 'core/backtest_engine.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'pit_baseline.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/core/backtest_engine.py b/core/backtest_engine.py
+index 1df8ecb..32ec8d7 100644
+--- a/core/backtest_engine.py
++++ b/core/backtest_engine.py
+@@ -48,6 +48,11 @@ from core.canslim.c_current_earnings import evaluate_c
+ from core.canslim.i_institutional import evaluate_i
+ from core.industry_group import get_top_groups, load_industry_map
+ from core.data_client import clear_session_cache, fetch_bulk_ohlcv
++from core.engine_policy import (
++    build_effective_engine_policy,
++    effective_engine_policy_sha256,
++    validate_inert_request_compatibility,
++)
+ from core.index_ticker_fetcher import get_all_index_tickers, get_sp500_tickers
+ from core.momentum_analysis import calculate_rs_snapshot
+ from core.pit_data import PITDataBundle, PriceIdentityTransitionContract
+@@ -89,6 +94,19 @@ DEFAULT_BULK_PRICE_FETCH_THRESHOLD = 25
+ BENCHMARK = "SPY"
+ 
+ 
++_INERT_REQUEST_POLICY_SOURCES = {
++    "min_rs_score": "core.canslim.entry_contract.MIN_RS_SCORE",
++    "min_canslim_score": "core.canslim.entry_contract.MIN_COMPOSITE_SCORE",
++    "min_technical_score": "core.canslim.entry_contract.evaluate_entry_contract",
++    "position_size_pct": "core.backtest_engine.PortfolioSimulator._enter_position",
++    "take_profit_pct": "config.settings.SCALE_OUT_TIERS",
++    "scale_out_fraction": "config.settings.SCALE_OUT_TIERS",
++    "min_c_a_growth": (
++        "core.canslim.entry_contract.MIN_CURRENT_GROWTH_and_MIN_ANNUAL_GROWTH"
++    ),
++}
++
++
+ def _period_for_date_range(start_date: pd.Timestamp, end_date: pd.Timestamp, buffer_days: int = 120) -> str:
+     days = max((end_date - start_date).days + buffer_days, 35)
+     if days <= 35:
+@@ -612,6 +630,29 @@ class CanslimStrategy:
+         fundamental_provider: Optional[Callable[[str, pd.Timestamp], dict[str, Any]]] = None,
+         require_proper_base: bool = False,
+     ) -> None:
++        validate_inert_request_compatibility(
++            {
++                "min_rs_score": min_rs_score,
++                "min_canslim_score": min_canslim_score,
++                "min_technical_score": min_technical_score,
++                "min_c_a_growth": min_c_a_growth,
++            },
++            {
++                "min_rs_score": MIN_RS_SCORE,
++                "min_canslim_score": MIN_COMPOSITE_SCORE,
++                "min_technical_score": DEFAULT_MIN_TECHNICAL_SCORE,
++                "min_c_a_growth": DEFAULT_MIN_C_A_GROWTH,
++            },
++            {
++                name: _INERT_REQUEST_POLICY_SOURCES[name]
++                for name in (
++                    "min_rs_score",
++                    "min_canslim_score",
++                    "min_technical_score",
++                    "min_c_a_growth",
++                )
++            },
++        )
+         self.min_c_a_growth = min_c_a_growth
+         self.requested_min_rs_score = _finite_signal_number(min_rs_score)
+         self.requested_min_canslim_score = _finite_signal_number(min_canslim_score)
+@@ -1150,6 +1191,7 @@ def _portfolio_checkpoint_fingerprint(
+     simulator: "PortfolioSimulator",
+     strategy_identity: Optional[dict[str, Any]] = None,
+ ) -> str:
++    simulator._verify_effective_engine_policy()
+     config = {
+         "schema_version": _PORTFOLIO_CHECKPOINT_SCHEMA,
+         "bundle_sha256": bundle_sha256,
+@@ -1195,6 +1237,7 @@ def _portfolio_checkpoint_fingerprint(
+         "stagnation_threshold_pct": simulator.stagnation_threshold_pct,
+         "breakeven_trigger_pct": simulator.breakeven_trigger_pct,
+         "enable_eviction": simulator.enable_eviction,
++        "effective_engine_policy_sha256": simulator._effective_engine_policy_sha256,
+     }
+     return hashlib.sha256(_checkpoint_bytes(config)).hexdigest()
+ 
+@@ -1277,6 +1320,35 @@ class PortfolioSimulator:
+         pit_bundle: Optional[PITDataBundle] = None,
+         identity_transition_contract: Optional[PriceIdentityTransitionContract] = None,
+     ) -> None:
++        validate_inert_request_compatibility(
++            {
++                "min_rs_score": min_rs_score,
++                "min_canslim_score": min_canslim_score,
++                "min_technical_score": min_technical_score,
++                "position_size_pct": position_size_pct,
++                "take_profit_pct": take_profit_pct,
++                "scale_out_fraction": scale_out_fraction,
++            },
++            {
++                "min_rs_score": MIN_RS_SCORE,
++                "min_canslim_score": MIN_COMPOSITE_SCORE,
++                "min_technical_score": DEFAULT_MIN_TECHNICAL_SCORE,
++                "position_size_pct": DEFAULT_POSITION_SIZE_PCT,
++                "take_profit_pct": DEFAULT_TAKE_PROFIT_PCT,
++                "scale_out_fraction": DEFAULT_SCALE_OUT_FRACTION,
++            },
++            {
++                name: _INERT_REQUEST_POLICY_SOURCES[name]
++                for name in (
++                    "min_rs_score",
++                    "min_canslim_score",
++                    "min_technical_score",
++                    "position_size_pct",
++                    "take_profit_pct",
++                    "scale_out_fraction",
++                )
++            },
++        )
+         self.initial_capital = initial_capital
+         self.max_positions = max_positions
+         self.position_size_pct = position_size_pct
+@@ -1340,6 +1412,14 @@ class PortfolioSimulator:
+             self.strategy.fundamental_provider = pit_bundle.fundamentals_provider
+         self.benchmark_symbol = benchmark_symbol
+         self.enable_eviction = enable_eviction
++        group_defaults = get_top_groups.__defaults__
++        if group_defaults is None or len(group_defaults) != 2:
++            raise ValueError("industry group policy defaults are unavailable")
++        self.industry_group_top_n = group_defaults[0]
++        self.industry_group_min_size = group_defaults[1]
++        self.industry_group_filter_enabled = bool(
++            not technical_only and pit_bundle is None
++        )
+ 
+         self._equity: float = initial_capital
+         self._open_positions: Dict[str, Trade] = {}
+@@ -1354,6 +1434,62 @@ class PortfolioSimulator:
+         self._strict_pit_pattern_histories: dict[str, _PreparedPatternHistory] = {}
+         self._strict_pit_history_frames: dict[str, pd.DataFrame] = {}
+         self._strict_pit_base_policy = BasePolicy.canonical_v1()
++        self._capture_effective_engine_policy()
++
++    def _live_inert_request_contract(
++        self,
++    ) -> tuple[dict[str, object], dict[str, object], dict[str, str]]:
++        requests: dict[str, object] = {
++            "min_rs_score": self.min_rs_score,
++            "min_canslim_score": self.min_canslim_score,
++            "min_technical_score": self.min_technical_score,
++            "position_size_pct": self.position_size_pct,
++            "take_profit_pct": self.take_profit_pct,
++            "scale_out_fraction": self.scale_out_fraction,
++        }
++        compatibility_values: dict[str, object] = {
++            "min_rs_score": MIN_RS_SCORE,
++            "min_canslim_score": MIN_COMPOSITE_SCORE,
++            "min_technical_score": DEFAULT_MIN_TECHNICAL_SCORE,
++            "position_size_pct": DEFAULT_POSITION_SIZE_PCT,
++            "take_profit_pct": DEFAULT_TAKE_PROFIT_PCT,
++            "scale_out_fraction": DEFAULT_SCALE_OUT_FRACTION,
++        }
++        if not self._strategy_was_injected:
++            requests["min_c_a_growth"] = getattr(
++                self.strategy, "min_c_a_growth", None
++            )
++            compatibility_values["min_c_a_growth"] = DEFAULT_MIN_C_A_GROWTH
++        sources = {
++            name: _INERT_REQUEST_POLICY_SOURCES[name]
++            for name in requests
++        }
++        return requests, compatibility_values, sources
++
++    def _capture_effective_engine_policy(self) -> None:
++        """Capture the complete live policy at an official execution boundary."""
++
++        validate_inert_request_compatibility(*self._live_inert_request_contract())
++        policy = build_effective_engine_policy(self)
++        digest = effective_engine_policy_sha256(policy)
++        self._effective_engine_policy = policy
++        self._effective_engine_policy_sha256 = digest
++
++    def _verify_effective_engine_policy(self) -> str:
++        """Fail closed if live execution policy diverged from the run snapshot."""
++
++        validate_inert_request_compatibility(*self._live_inert_request_contract())
++        live_policy = build_effective_engine_policy(self)
++        live_digest = effective_engine_policy_sha256(live_policy)
++        stored_policy = self._effective_engine_policy
++        stored_digest = self._effective_engine_policy_sha256
++        if (
++            live_policy != stored_policy
++            or live_digest != stored_digest
++            or effective_engine_policy_sha256(stored_policy) != stored_digest
++        ):
++            raise ValueError("effective engine policy changed after run start")
++        return live_digest
+ 
+     def run(
+         self,
+@@ -1373,6 +1509,7 @@ class PortfolioSimulator:
+             raise ValueError("checkpoint_every_days must be positive")
+         if resume and checkpoint_path is None:
+             raise ValueError("resume requires checkpoint_path")
++        self._capture_effective_engine_policy()
+         self._equity = self.initial_capital
+         self._open_positions = {}
+         self._trades = []
+@@ -1515,7 +1652,11 @@ class PortfolioSimulator:
+             return SimulationResult()
+ 
+         self._configure_strict_pit_pattern_cache(ticker_ohlcv)
+-        self._ticker_industry = {} if self.technical_only or self.pit_bundle is not None else load_industry_map(tickers)
++        self._ticker_industry = (
++            load_industry_map(tickers)
++            if self.industry_group_filter_enabled
++            else {}
++        )
+         if checkpoint_state is not None:
+             next_day_index = int(checkpoint_state["next_day_index"])
+             if next_day_index < 0 or next_day_index > len(trading_days):
+@@ -1571,6 +1712,7 @@ class PortfolioSimulator:
+ 
+         total_days = len(trading_days)
+         for day_idx, eval_date in enumerate(trading_days[next_day_index:], start=next_day_index):
++            self._verify_effective_engine_policy()
+             signal_start = len(self._signal_rows)
+             outcome_start = len(self._entry_outcomes)
+             transaction_start = len(self._transactions)
+@@ -1901,6 +2043,7 @@ class PortfolioSimulator:
+         end_ts: pd.Timestamp,
+         requested_entry_floors: tuple[float | None, float | None] | None = None,
+     ) -> dict[str, Any]:
++        self._verify_effective_engine_policy()
+         requested_min_rs_score, requested_min_canslim_score = (
+             requested_entry_floors
+             if requested_entry_floors is not None
+@@ -1948,7 +2091,11 @@ class PortfolioSimulator:
+             "stagnation_days": self.stagnation_days,
+             "stagnation_threshold_pct": self.stagnation_threshold_pct,
+             "breakeven_trigger_pct": self.breakeven_trigger_pct,
+-            "industry_group_top_n": settings.INDUSTRY_GROUP_TOP_N,
++            "industry_group_filter_enabled": self.industry_group_filter_enabled,
++            "industry_group_top_n": self.industry_group_top_n,
++            "industry_group_min_size": self.industry_group_min_size,
++            "effective_engine_policy": self._effective_engine_policy,
++            "effective_engine_policy_sha256": self._effective_engine_policy_sha256,
+             "start_date": str(start_ts.date()),
+             "end_date": str(end_ts.date()),
+         }
+@@ -1970,6 +2117,7 @@ class PortfolioSimulator:
+         completed: bool = False,
+         result_config: Optional[dict[str, Any]] = None,
+     ) -> dict[str, Any]:
++        self._verify_effective_engine_policy()
+         payload: dict[str, Any] = {
+             "schema_version": _PORTFOLIO_CHECKPOINT_SCHEMA,
+             "fingerprint": fingerprint,
+@@ -2006,6 +2154,7 @@ class PortfolioSimulator:
+         outputs: dict[str, list[Any]],
+         benchmark: str,
+     ) -> SimulationResult:
++        self._verify_effective_engine_policy()
+         if not checkpoint.get("completed") or "result_config" not in checkpoint:
+             raise ValueError("portfolio checkpoint does not contain a completed result")
+         if checkpoint.get("entry_outcome_schema_version") != ENTRY_ATTEMPT_OUTCOME_SCHEMA_VERSION:
+@@ -2205,12 +2354,22 @@ class PortfolioSimulator:
+         if self.pit_bundle is not None:
+             rs_eligible = self.pit_bundle.members_at(eval_date) - {self.benchmark_symbol.upper()}
+         rs_snapshot = _calculate_rs_snapshot(all_closes, eval_date, eligible_tickers=rs_eligible)
+-        top_groups = get_top_groups(rs_snapshot, self._ticker_industry)
++        top_groups = get_top_groups(
++            rs_snapshot,
++            self._ticker_industry,
++            top_n=self.industry_group_top_n,
++            min_size=self.industry_group_min_size,
++        )
+         for ticker in tickers:
+             if ticker in self._open_positions or ticker not in ticker_ohlcv:
+                 continue
+             ticker_group = self._ticker_industry.get(ticker)
+-            if top_groups and ticker_group is not None and ticker_group not in top_groups:
++            if (
++                self.industry_group_filter_enabled
++                and top_groups
++                and ticker_group is not None
++                and ticker_group not in top_groups
++            ):
+                 continue
+ 
+             entry_facts = None
+diff --git a/pit_baseline.py b/pit_baseline.py
+index 2c25ba1..4c9094e 100644
+--- a/pit_baseline.py
++++ b/pit_baseline.py
+@@ -34,6 +34,7 @@ from core.canslim.entry_contract import (
+     MIN_RS_SCORE,
+     MIN_VOLUME_RATIO,
+ )
++from core.engine_policy import effective_engine_policy_sha256
+ from core.leader_basket import LeaderBasketConfig, LeaderBasketResult, LeaderBasketSimulator
+ from core.leader_evaluation import (
+     LeaderIdentityContract,
+@@ -1470,7 +1471,22 @@ def run_baseline(
+                     "rejection_counts": reconciliation["rejection_counts"],
+                 },
+             }
++            policy_verifier = getattr(portfolio, "_verify_effective_engine_policy", None)
++            if not callable(policy_verifier):
++                raise ValueError("portfolio lacks effective engine policy verification")
++            live_effective_policy_digest = policy_verifier()
+             active_config = json.loads(json.dumps(result.config, allow_nan=False))
++            effective_policy = active_config.get("effective_engine_policy")
++            effective_policy_digest = active_config.get("effective_engine_policy_sha256")
++            if not isinstance(effective_policy, dict):
++                raise ValueError("active CANSLIM configuration lacks effective engine policy")
++            if not isinstance(effective_policy_digest, str) or (
++                effective_engine_policy_sha256(effective_policy) != effective_policy_digest
++                or live_effective_policy_digest != effective_policy_digest
++            ):
++                raise ValueError("effective engine policy digest mismatch before publication")
++            summary["effective_engine_policy"] = effective_policy
++            summary["effective_engine_policy_sha256"] = effective_policy_digest
+             diagnostics = json.loads(json.dumps(result.execution_diagnostics, allow_nan=False))
+             frames = {
+                 "five_year_leaders.csv": five_year_leaders_frame(leaders),
+@@ -1526,6 +1542,8 @@ def run_baseline(
+                     for key, value in vars(args).items()
+                 },
+                 "canslim_config": active_config,
++                "effective_engine_policy": effective_policy,
++                "effective_engine_policy_sha256": effective_policy_digest,
+                 "execution_diagnostics": diagnostics,
+                 "entry_attempt_outcome_schema_version": (
+                     ENTRY_ATTEMPT_OUTCOME_SCHEMA_VERSION
+
+warning: in the working copy of 'core/engine_policy.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/core/engine_policy.py b/core/engine_policy.py
+new file mode 100644
+index 0000000..ee6f22c
+--- /dev/null
++++ b/core/engine_policy.py
+@@ -0,0 +1,667 @@
++"""Canonical, JSON-safe description of effective backtest engine policy."""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import math
++from enum import StrEnum
++from numbers import Real
++from typing import Mapping, Protocol
++
++from config import settings
++from core.canslim.entry_contract import (
++    MAX_BUY_ZONE_EXTENSION,
++    MIN_ANNUAL_GROWTH,
++    MIN_COMPOSITE_SCORE,
++    MIN_CURRENT_GROWTH,
++    MIN_RS_SCORE,
++    MIN_VOLUME_RATIO,
++)
++
++
++class PolicyClassification(StrEnum):
++    """Closed classification vocabulary for behavior-bearing policy fields."""
++
++    CAUSAL_INVARIANT = "causal_invariant"
++    ACTIVE_TUNABLE_POLICY = "active_tunable_policy"
++    ACTIVE_FIXED_POLICY = "active_fixed_policy"
++    ADVISORY_OR_UNSUPPORTED = "advisory_or_unsupported"
++
++
++class _SimulatorPolicy(Protocol):
++    max_positions: object
++    position_size_pct: object
++    position_risk_pct: object
++    stop_loss_pct: object
++    ma_exit_period: object
++    ma_consecutive: object
++    signal_every_n_days: object
++    min_canslim_score: object
++    min_rs_score: object
++    min_technical_score: object
++    require_bullish_market: object
++    use_stateful_regime_gate: object
++    cash_deployment_threshold_pct: object
++    technical_only: object
++    take_profit_pct: object
++    scale_out_fraction: object
++    stagnation_days: object
++    stagnation_threshold_pct: object
++    breakeven_trigger_pct: object
++    require_proper_base: object
++    enable_eviction: object
++    industry_group_filter_enabled: object
++    industry_group_top_n: object
++    industry_group_min_size: object
++    _strategy_was_injected: bool
++    strategy: object
++
++
++def _canonical_json_bytes(value: object) -> bytes:
++    return json.dumps(
++        value,
++        sort_keys=True,
++        separators=(",", ":"),
++        allow_nan=False,
++    ).encode("utf-8")
++
++
++def _field(
++    value: object,
++    classification: PolicyClassification,
++    source: str,
++    *,
++    optimizer_candidate: bool,
++) -> dict[str, object]:
++    """Create one canonical policy leaf and reject unsafe values."""
++
++    if not isinstance(classification, PolicyClassification):
++        raise TypeError("classification must be a PolicyClassification")
++    if not isinstance(source, str) or not source:
++        raise ValueError("policy field source must be a non-empty string")
++    if not isinstance(optimizer_candidate, bool):
++        raise TypeError("optimizer_candidate must be a bool")
++    try:
++        normalized_value = json.loads(_canonical_json_bytes(value).decode("utf-8"))
++    except (TypeError, ValueError, OverflowError) as exc:
++        raise ValueError("policy field value must be JSON-safe") from exc
++    return {
++        "value": normalized_value,
++        "classification": classification.value,
++        "source": source,
++        "optimizer_candidate": optimizer_candidate,
++    }
++
++
++def validate_inert_request_compatibility(
++    requests: Mapping[str, object],
++    compatibility_values: Mapping[str, object],
++    policy_sources: Mapping[str, str],
++) -> None:
++    """Fail closed when a caller asks an inert field to change behavior."""
++
++    if set(requests) != set(compatibility_values) or set(requests) != set(policy_sources):
++        raise ValueError("inert request compatibility specification is incomplete")
++    for name, requested in requests.items():
++        expected = compatibility_values[name]
++        source = policy_sources[name]
++        valid_number = isinstance(requested, Real) and not isinstance(requested, bool)
++        expected_number = isinstance(expected, Real) and not isinstance(expected, bool)
++        compatible = bool(
++            valid_number
++            and expected_number
++            and math.isfinite(float(requested))
++            and math.isfinite(float(expected))
++            and math.isclose(
++                float(requested),
++                float(expected),
++                rel_tol=0.0,
++                abs_tol=1e-12,
++            )
++        )
++        if not compatible:
++            raise ValueError(
++                f"inert field {name!r} accepts only compatibility value {expected!r}; "
++                f"actual policy source is {source}"
++            )
++
++
++def _causal_invariant_fields(
++    simulator: _SimulatorPolicy,
++) -> dict[str, dict[str, object]]:
++    del simulator
++    invariant = PolicyClassification.CAUSAL_INVARIANT
++    return {
++        "technical_fact_cutoff": _field(
++            "completed_session_only",
++            invariant,
++            "core.trading_sessions.history_through_exact_session",
++            optimizer_candidate=False,
++        ),
++        "entry_execution_timing": _field(
++            "next_session_open",
++            invariant,
++            "core.backtest_engine.PortfolioSimulator._enter_position",
++            optimizer_candidate=False,
++        ),
++        "next_open_buy_zone_revalidation": _field(
++            True,
++            invariant,
++            "core.backtest_engine.PortfolioSimulator._enter_position",
++            optimizer_candidate=False,
++        ),
++        "fundamental_visibility": _field(
++            "public_on_or_before_evaluation_session",
++            invariant,
++            "core.pit_data.PITDataBundle.fundamentals_as_of",
++            optimizer_candidate=False,
++        ),
++        "cash_and_no_leverage_constraint": _field(
++            True,
++            invariant,
++            "core.backtest_engine.PortfolioSimulator._enter_position",
++            optimizer_candidate=False,
++        ),
++    }
++
++
++def _entry_policy_fields(
++    simulator: _SimulatorPolicy,
++) -> dict[str, dict[str, object]]:
++    fixed = PolicyClassification.ACTIVE_FIXED_POLICY
++    tunable = PolicyClassification.ACTIVE_TUNABLE_POLICY
++    invariant = PolicyClassification.CAUSAL_INVARIANT
++    return {
++        "min_current_growth": _field(
++            MIN_CURRENT_GROWTH,
++            fixed,
++            "core.canslim.entry_contract.MIN_CURRENT_GROWTH",
++            optimizer_candidate=True,
++        ),
++        "min_annual_growth": _field(
++            MIN_ANNUAL_GROWTH,
++            fixed,
++            "core.canslim.entry_contract.MIN_ANNUAL_GROWTH",
++            optimizer_candidate=True,
++        ),
++        "min_rs_score": _field(
++            MIN_RS_SCORE,
++            fixed,
++            "core.canslim.entry_contract.MIN_RS_SCORE",
++            optimizer_candidate=True,
++        ),
++        "min_entry_composite_score": _field(
++            MIN_COMPOSITE_SCORE,
++            fixed,
++            "core.canslim.entry_contract.MIN_COMPOSITE_SCORE",
++            optimizer_candidate=True,
++        ),
++        "min_volume_ratio": _field(
++            MIN_VOLUME_RATIO,
++            fixed,
++            "core.canslim.entry_contract.MIN_VOLUME_RATIO",
++            optimizer_candidate=True,
++        ),
++        "max_buy_zone_extension": _field(
++            MAX_BUY_ZONE_EXTENSION,
++            fixed,
++            "core.canslim.entry_contract.MAX_BUY_ZONE_EXTENSION",
++            optimizer_candidate=True,
++        ),
++        "technical_facts": _field(
++            "completed_session_close_volume_and_pivot",
++            invariant,
++            "core.canslim.entry_contract.build_entry_facts",
++            optimizer_candidate=False,
++        ),
++        "proper_base_required": _field(
++            simulator.require_proper_base,
++            tunable,
++            "core.backtest_engine.PortfolioSimulator.require_proper_base",
++            optimizer_candidate=False,
++        ),
++        "technical_only": _field(
++            simulator.technical_only,
++            tunable,
++            "core.backtest_engine.PortfolioSimulator.technical_only",
++            optimizer_candidate=False,
++        ),
++        "signal_every_n_days": _field(
++            simulator.signal_every_n_days,
++            tunable,
++            "core.backtest_engine.PortfolioSimulator.signal_every_n_days",
++            optimizer_candidate=True,
++        ),
++        "industry_group_filter_enabled": _field(
++            simulator.industry_group_filter_enabled,
++            tunable,
++            "core.backtest_engine.PortfolioSimulator.industry_group_filter_enabled",
++            optimizer_candidate=True,
++        ),
++        "industry_group_filter_mode": _field(
++            (
++                "provider_rs_top_groups_when_rankable"
++                if simulator.industry_group_filter_enabled
++                else "disabled"
++            ),
++            tunable,
++            "core.backtest_engine.PortfolioSimulator.industry_group_filter_enabled",
++            optimizer_candidate=True,
++        ),
++        "industry_group_top_n": _field(
++            simulator.industry_group_top_n,
++            fixed,
++            "core.industry_group.get_top_groups.top_n",
++            optimizer_candidate=True,
++        ),
++        "industry_group_min_size": _field(
++            simulator.industry_group_min_size,
++            fixed,
++            "core.industry_group.get_top_groups.min_size",
++            optimizer_candidate=True,
++        ),
++    }
++
++
++def _scoring_policy_fields(
++    simulator: _SimulatorPolicy,
++) -> dict[str, dict[str, object]]:
++    fixed = PolicyClassification.ACTIVE_FIXED_POLICY
++    tunable = PolicyClassification.ACTIVE_TUNABLE_POLICY
++    invariant = PolicyClassification.CAUSAL_INVARIANT
++    strategy_type = type(simulator.strategy)
++    strategy_identity = {
++        "module": str(strategy_type.__module__),
++        "qualname": str(strategy_type.__qualname__),
++    }
++    fields: dict[str, dict[str, object]] = {
++        "strategy_mode": _field(
++            "injected_custom" if simulator._strategy_was_injected else "built_in_canslim",
++            tunable,
++            "core.backtest_engine.PortfolioSimulator._strategy_was_injected",
++            optimizer_candidate=False,
++        ),
++        "strategy_identity": _field(
++            strategy_identity,
++            tunable,
++            "core.engine_policy.type(strategy).__module___and___qualname__",
++            optimizer_candidate=False,
++        ),
++        "strategy_output_contract": _field(
++            "evaluate_market_and_evaluate_symbol_then_engine_reapplies_canonical_entry_contract",
++            invariant,
++            "core.backtest_engine.PortfolioSimulator._canonicalize_signal_row",
++            optimizer_candidate=False,
++        ),
++    }
++    for name in (
++        "TRADING_DAYS_PER_QUARTER",
++        "RS_Q1_WEIGHT",
++        "RS_Q2_WEIGHT",
++        "RS_Q3_WEIGHT",
++        "RS_Q4_WEIGHT",
++        "RS_PERCENTILE_MULTIPLIER",
++        "RS_PERCENTILE_MIN",
++    ):
++        fields[name.lower()] = _field(
++            getattr(settings, name),
++            fixed,
++            f"config.settings.{name}",
++            optimizer_candidate=True,
++        )
++    fields["rs_annualization_trading_days"] = _field(
++        252,
++        fixed,
++        "core.momentum_analysis.calculate_rs_snapshot",
++        optimizer_candidate=True,
++    )
++    fields["rs_minimum_history_sessions"] = _field(
++        60,
++        fixed,
++        "core.momentum_analysis.calculate_rs_snapshot",
++        optimizer_candidate=True,
++    )
++    if simulator._strategy_was_injected:
++        return fields
++    fields.update({
++        "current_earnings_metric_family_priority": _field(
++            ["diluted_eps", "basic_eps", "net_income"],
++            invariant,
++            "core.canslim.c_current_earnings._find_earnings_row",
++            optimizer_candidate=False,
++        ),
++        "annual_earnings_metric_family_priority": _field(
++            ["diluted_eps", "basic_eps", "net_income"],
++            invariant,
++            "core.canslim.a_annual_earnings._find_earnings_row",
++            optimizer_candidate=False,
++        ),
++        "non_m_entry_composite": _field(
++            "weighted_C_A_N_S_L_I_renormalized_to_100_excluding_M",
++            fixed,
++            "backtest._compute_entry_composite_score",
++            optimizer_candidate=True,
++        ),
++        "institutional_data_reweighting": _field(
++            "when_I_is_unavailable_set_I_to_0_and_renormalize_remaining_weights",
++            fixed,
++            "backtest._active_canslim_weights",
++            optimizer_candidate=True,
++        ),
++    })
++    for component in "CANSLIM":
++        fields[f"component_weight_{component.lower()}"] = _field(
++            getattr(settings, f"CANSLIM_WEIGHT_{component}"),
++            fixed,
++            f"config.settings.CANSLIM_WEIGHT_{component}",
++            optimizer_candidate=True,
++        )
++    for name in (
++        "C_GROWTH_TARGET",
++        "C_GROWTH_WEIGHT",
++        "C_CONSISTENCY_WEIGHT",
++        "C_ACCELERATION_WEIGHT",
++        "A_GROWTH_TARGET",
++        "A_ROE_TARGET",
++        "A_MIN_YEARS_GROWTH",
++        "A_GROWTH_WEIGHT",
++        "A_CONSISTENCY_WEIGHT",
++        "A_ROE_WEIGHT",
++        "N_REVENUE_GROWTH_WEIGHT",
++        "N_PROXIMITY_TO_HIGH_WEIGHT",
++        "N_REVENUE_GROWTH_TARGET",
++        "S_VOLUME_SURGE_THRESHOLD",
++        "S_POWER_GAP_LOOKBACK",
++        "S_PEG_MIN_PROXIMITY",
++        "S_FLOAT_WEIGHT",
++        "S_UP_DOWN_VOL_WEIGHT",
++        "S_SURGE_BREAKOUT_WEIGHT",
++        "S_POWER_GAP_WEIGHT",
++        "I_LEVEL_WEIGHT",
++        "I_TREND_WEIGHT",
++    ):
++        fields[name.lower()] = _field(
++            getattr(settings, name),
++            fixed,
++            f"config.settings.{name}",
++            optimizer_candidate=True,
++        )
++    fields["s_breakout_proximity"] = _field(
++        0.95,
++        fixed,
++        "backtest._evaluate_technical_at_date",
++        optimizer_candidate=True,
++    )
++    return fields
++
++
++def _market_policy_fields(
++    simulator: _SimulatorPolicy,
++) -> dict[str, dict[str, object]]:
++    tunable = PolicyClassification.ACTIVE_TUNABLE_POLICY
++    fixed = PolicyClassification.ACTIVE_FIXED_POLICY
++    fields = {
++        "require_bullish_market": _field(
++            simulator.require_bullish_market,
++            tunable,
++            "core.backtest_engine.PortfolioSimulator.require_bullish_market",
++            optimizer_candidate=True,
++        ),
++        "use_stateful_regime_gate": _field(
++            simulator.use_stateful_regime_gate,
++            tunable,
++            "core.backtest_engine.PortfolioSimulator.use_stateful_regime_gate",
++            optimizer_candidate=True,
++        ),
++        "market_evaluator_mode": _field(
++            "injected_custom" if simulator._strategy_was_injected else "built_in_evaluate_m",
++            tunable,
++            "core.backtest_engine.PortfolioSimulator.strategy.evaluate_market",
++            optimizer_candidate=False,
++        ),
++        "stateful_bootstrap_ema_period": _field(
++            200,
++            fixed,
++            "core.canslim.m_market_direction.MarketRegimeTracker.bootstrap",
++            optimizer_candidate=True,
++        ),
++    }
++    stateful_names = (
++        "M_DISTRIBUTION_LOOKBACK",
++        "M_DISTRIBUTION_MIN_DECLINE",
++        "M_MAX_DISTRIBUTION_DAYS",
++        "M_REGIME_PRESSURE_DIST_DAYS",
++        "M_FOLLOW_THROUGH_MIN_PCT",
++        "M_FOLLOW_THROUGH_MIN_DAY",
++    )
++    for name in stateful_names:
++        fields[f"stateful_{name.lower()}"] = _field(
++            getattr(settings, name),
++            fixed,
++            f"config.settings.{name}",
++            optimizer_candidate=True,
++        )
++    if simulator._strategy_was_injected:
++        return fields
++    fields["market_trend_ema_periods"] = _field(
++        [21, 50, 200],
++        fixed,
++        "core.canslim.m_market_direction.evaluate_m",
++        optimizer_candidate=True,
++    )
++    evaluator_names = (
++        "M_PRICE_ABOVE_200EMA_WEIGHT",
++        "M_EMA_ALIGNMENT_WEIGHT",
++        "M_50EMA_RISING_WEIGHT",
++        "M_PRICE_ABOVE_21EMA_WEIGHT",
++        "M_BULLISH_THRESHOLD",
++        "M_50EMA_RISING_LOOKBACK",
++        "M_DISTRIBUTION_WEIGHT",
++        "M_FOLLOW_THROUGH_WEIGHT",
++    )
++    for name in evaluator_names:
++        fields[name.lower()] = _field(
++            getattr(settings, name),
++            fixed,
++            f"config.settings.{name}",
++            optimizer_candidate=True,
++        )
++    return fields
++
++
++def _capacity_and_sizing_fields(
++    simulator: _SimulatorPolicy,
++) -> dict[str, dict[str, object]]:
++    tunable = PolicyClassification.ACTIVE_TUNABLE_POLICY
++    invariant = PolicyClassification.CAUSAL_INVARIANT
++    return {
++        "max_positions": _field(
++            simulator.max_positions,
++            tunable,
++            "core.backtest_engine.PortfolioSimulator.max_positions",
++            optimizer_candidate=True,
++        ),
++        "max_positions_mode": _field(
++            "uncapped" if simulator.max_positions is None else "capped",
++            tunable,
++            "core.backtest_engine.PortfolioSimulator.max_positions",
++            optimizer_candidate=True,
++        ),
++        "eviction_enabled": _field(
++            simulator.enable_eviction,
++            tunable,
++            "core.backtest_engine.PortfolioSimulator.enable_eviction",
++            optimizer_candidate=True,
++        ),
++        "cash_deployment_threshold_pct": _field(
++            simulator.cash_deployment_threshold_pct,
++            tunable,
++            "core.backtest_engine.PortfolioSimulator.cash_deployment_threshold_pct",
++            optimizer_candidate=True,
++        ),
++        "effective_position_sizing_formula": _field(
++            "portfolio_equity * position_risk_pct / stop_loss_pct",
++            invariant,
++            "core.backtest_engine.PortfolioSimulator._enter_position",
++            optimizer_candidate=False,
++        ),
++        "position_risk_pct": _field(
++            simulator.position_risk_pct,
++            tunable,
++            "core.backtest_engine.PortfolioSimulator.position_risk_pct",
++            optimizer_candidate=True,
++        ),
++        "sizing_stop_loss_pct": _field(
++            simulator.stop_loss_pct,
++            tunable,
++            "core.backtest_engine.PortfolioSimulator.stop_loss_pct",
++            optimizer_candidate=True,
++        ),
++    }
++
++
++def _exit_policy_fields(
++    simulator: _SimulatorPolicy,
++) -> dict[str, dict[str, object]]:
++    tunable = PolicyClassification.ACTIVE_TUNABLE_POLICY
++    fixed = PolicyClassification.ACTIVE_FIXED_POLICY
++    return {
++        "stop_loss_pct": _field(
++            simulator.stop_loss_pct,
++            tunable,
++            "core.backtest_engine.PortfolioSimulator.stop_loss_pct",
++            optimizer_candidate=True,
++        ),
++        "breakeven_trigger_pct": _field(
++            simulator.breakeven_trigger_pct,
++            tunable,
++            "core.backtest_engine.PortfolioSimulator.breakeven_trigger_pct",
++            optimizer_candidate=True,
++        ),
++        "ema_period": _field(
++            simulator.ma_exit_period,
++            tunable,
++            "core.backtest_engine.PortfolioSimulator.ma_exit_period",
++            optimizer_candidate=True,
++        ),
++        "ema_consecutive_closes_below": _field(
++            simulator.ma_consecutive,
++            tunable,
++            "core.backtest_engine.PortfolioSimulator.ma_consecutive",
++            optimizer_candidate=True,
++        ),
++        "stagnation_days": _field(
++            simulator.stagnation_days,
++            tunable,
++            "core.backtest_engine.PortfolioSimulator.stagnation_days",
++            optimizer_candidate=True,
++        ),
++        "stagnation_threshold_pct": _field(
++            simulator.stagnation_threshold_pct,
++            tunable,
++            "core.backtest_engine.PortfolioSimulator.stagnation_threshold_pct",
++            optimizer_candidate=True,
++        ),
++        "early_winner_rule": _field(
++            {
++                "trigger_gain_pct": 0.20,
++                "trigger_within_trading_days_inclusive": 15,
++                "effect": "suppress_tiered_scale_outs_only_while_flag_is_active",
++                "flag_clear_timing": "start_of_processing_when_days_held_greater_than_or_equal_to_40",
++                "exits_remaining_active": [
++                    "hard_stop",
++                    "stagnation",
++                    "protective_stop",
++                    "ema",
++                ],
++            },
++            fixed,
++            "core.backtest_engine.PortfolioSimulator._check_exits",
++            optimizer_candidate=True,
++        ),
++        "scale_out_tiers": _field(
++            settings.SCALE_OUT_TIERS,
++            fixed,
++            "config.settings.SCALE_OUT_TIERS",
++            optimizer_candidate=True,
++        ),
++    }
++
++
++def _unsupported_request_fields(
++    simulator: _SimulatorPolicy,
++) -> dict[str, dict[str, object]]:
++    unsupported = PolicyClassification.ADVISORY_OR_UNSUPPORTED
++    fields = {
++        "min_rs_score": _field(
++            simulator.min_rs_score,
++            unsupported,
++            "core.canslim.entry_contract.MIN_RS_SCORE",
++            optimizer_candidate=True,
++        ),
++        "min_canslim_score": _field(
++            simulator.min_canslim_score,
++            unsupported,
++            "core.canslim.entry_contract.MIN_COMPOSITE_SCORE",
++            optimizer_candidate=True,
++        ),
++        "min_technical_score": _field(
++            simulator.min_technical_score,
++            unsupported,
++            "core.canslim.entry_contract.evaluate_entry_contract",
++            optimizer_candidate=True,
++        ),
++        "position_size_pct": _field(
++            simulator.position_size_pct,
++            unsupported,
++            "core.backtest_engine.PortfolioSimulator._enter_position",
++            optimizer_candidate=True,
++        ),
++        "take_profit_pct": _field(
++            simulator.take_profit_pct,
++            unsupported,
++            "config.settings.SCALE_OUT_TIERS",
++            optimizer_candidate=True,
++        ),
++        "scale_out_fraction": _field(
++            simulator.scale_out_fraction,
++            unsupported,
++            "config.settings.SCALE_OUT_TIERS",
++            optimizer_candidate=True,
++        ),
++    }
++    if not simulator._strategy_was_injected:
++        fields["min_c_a_growth"] = _field(
++            getattr(simulator.strategy, "min_c_a_growth"),
++            unsupported,
++            "core.canslim.entry_contract.MIN_CURRENT_GROWTH_and_MIN_ANNUAL_GROWTH",
++            optimizer_candidate=True,
++        )
++    return fields
++
++
++def build_effective_engine_policy(simulator: _SimulatorPolicy) -> dict[str, object]:
++    """Build an immutable-by-convention policy snapshot from initialized settings."""
++
++    policy: dict[str, object] = {
++        "schema_version": 1,
++        "strategy_basis": "CANSLIM-derived",
++        "optimization_objective_owner": "multi_agent_backtest_loop",
++        "optimization_objective": "maximize_return_and_minimize_drawdown",
++        "optimization_executed_by_this_build": False,
++        "causal_invariants": _causal_invariant_fields(simulator),
++        "entry_policy": _entry_policy_fields(simulator),
++        "scoring_policy": _scoring_policy_fields(simulator),
++        "market_policy": _market_policy_fields(simulator),
++        "capacity_and_sizing_policy": _capacity_and_sizing_fields(simulator),
++        "exit_policy": _exit_policy_fields(simulator),
++        "unsupported_requests": _unsupported_request_fields(simulator),
++    }
++    return json.loads(_canonical_json_bytes(policy).decode("utf-8"))
++
++
++def effective_engine_policy_sha256(policy: Mapping[str, object]) -> str:
++    """Return the SHA-256 digest of canonical UTF-8 policy JSON."""
++
++    return hashlib.sha256(_canonical_json_bytes(policy)).hexdigest()
+
+```
+

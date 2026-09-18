@@ -1,0 +1,16 @@
+# Scoped sell-quantity precision review
+
+**PASS.** No concrete finding in the evidence-backed closing-quantity exception. Spec and quality pass for this scope.
+
+Read the appended `real-sell-quantity-report.md`, the affected validator and downstream checks, and the actual `development/runs/narrower-quantity-diagnostic-244f746cbf6e-01/console.log`. Source SHA-256 independently matches `ba350e2bcc71c9fd67d48419d7f24ae6c15ee53e89f575b4398e9aa80bcc3f35`.
+
+The actual diagnostic identifies fill 2 with sell 297.4124892723657, reconstructed open 297.41248927236568 and excess 2E-14, both normalizing to 297.412489. The recorded closing quantity is zero and the preceding recorded quantity equals the sold float. That evidence supports the narrow mismatch being addressed, rather than a general oversell tolerance.
+
+- The exception requires an apparent excess, explicit exit action, zero recorded quantity_after, exact equality when both quantities are converted to float, and equality under the existing six-decimal quantization. It does not replace the guard with a fixed absolute or relative epsilon.
+- First-fill SELL remains rejected by the independent index-zero condition. Ordinary scale-outs, nonzero closing paths, distinct float values and distinct quantized quantities cannot use the exception. Existing finite positive quantity validation remains upstream.
+- Decimal subtraction remains unchanged and may retain a tiny negative remainder. Acceptance still requires its quantization to be zero through both the expected-action and recorded-path comparisons; merely occupying the same quantization cell is not sufficient to bypass these downstream checks. End-of-episode zero quantity and aggregate bought/sold reconciliation remain required.
+- No fill is dropped, quantity clipped, missing transition inserted or price/cash reconciliation altered. Existing fill/path count, ordering, duplicate, action, session, reason and endpoint checks continue to apply. This does not authorize missing fills or a material oversell outside the existing evidence precision.
+
+This is static review, not evidence of a successful rerun. The change is in the evaluator closure and requires controller-owned rebuild/reseal followed by the real same-candidate evaluation. The prior failed output remains unchanged.
+
+No tests were read, created or run. No probes, application imports/execution, Docker, network, agents, staging or commits occurred. Only this review report was written.

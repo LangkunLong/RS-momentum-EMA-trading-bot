@@ -1,0 +1,1651 @@
+diff --git a/.superpowers/sdd/2026-09-04-pit-optimizer-v5-campaign/development-composition-report.md b/.superpowers/sdd/2026-09-04-pit-optimizer-v5-campaign/development-composition-report.md
+new file mode 100644
+index 0000000..280a0ab
+--- /dev/null
++++ b/.superpowers/sdd/2026-09-04-pit-optimizer-v5-campaign/development-composition-report.md
+@@ -0,0 +1,68 @@
++# Development campaign composition increment
++
++Base: a068e0aed40ecbe5e0078924071f374e7809b8c2. Scoped source is development_preparation.py, cli.py, operations.py, and production_workspace.py under core/pit_optimizer_v5. This report is the fifth scoped file. Implementation commit is pending: HEAD remains a068e0aed40ecbe5e0078924071f374e7809b8c2. The five scoped files are staged for controller review. Automatic approval review rejected the scoped hooks-disabled commit, stating that disabling hooks could bypass security checks and explicit user authorization for that bypass was not established. No workaround was attempted; controller must resolve the authorization before committing.
++
++## Implemented behavior
++
++Development uses the existing FeedbackRoundInputV5/dependencies, shared private `_run_campaign_v5`, and existing run_feedback_round_v5. The production provider wrapper still requires production scope and its real ledger/gateway graph. DevelopmentAdapterConfigV5 contains actual constructed host identities, seven explicit host paths, an absolute response directory, and policy_only export mode; there are no paid provider fields. Factories and standalone verify-run/summarize select the explicit disabled development scope. Standalone run/resume remain production operations; development uses run-campaign/resume-campaign.
++
++Policy export queries only the four exact EDITABLE_POLICY_PATHS_V5 from the declared immutable commit. It checks complete/unique membership and regular blob modes before reading bytes, then uses existing owned-directory writes. The mode and allowlist bind driver identity; recovery reconstructs that mode. Full production export and its existing identity encoding are unchanged. Development source bootstrap verifies the supplied immutable commit and four blobs, without requiring host HEAD equal the older policy commit or inspecting unrelated worktree changes.
++
++Preparation authenticates four actual canonical request/output pairs, exact round-trip output bytes, development scope, episode IDs development-discovery-1..4, ordinals, one policy/evaluator/sandbox/execution/method/startup authority, gross/base/stress, and base selection. It authenticates the repository data bytes against the contract and compares actual policy source bytes to the immutable four Git blobs. Canonical campaign aggregation checks four unique panel identities and disjoint planned dates. Explicit evaluator_contract_sha256 and sandbox_profile_sha256 pin the intended rebuilt authorities. Nothing is published until all four real outputs and source/data checks pass. Original request/output bytes are preserved in create-only content-keyed binary artifacts and a parent-provenance sidecar; imported panel reference text can differ because identity is checked by content/dates. The baseline uses genuine absent semantic fingerprints and disabled_development.
++
++Without a supplied panel_plan_ref, preparation creates a local plan from the actual four requests and authenticated quick panel. The unused mechanics slot references actual quick content under a distinct development-mechanics-unexecuted episode ID and purpose quick: the existing panel schema only permits quick/discovery/qualification. Two content-hashed local descriptors explicitly state confirmation/qualification executed=false and capability_enabled=false. No final held-out plan or evidence is read or claimed. With a supplied plan ref, existing plan panels are authenticated by normal manifest validation and canonical campaign checks; no replacement plan/descriptors are created.
++
++Pending controller results return status=pending_controller_response, role/call/request refs, original campaign and round start times, deadline, and exact original resume command before cleanup gating. They do not close a round, advance it, or retire a live workspace. Resume also permits an investigator request preceding the first journal event; it retains the already persisted round start. A previous development round's cleanup no longer falsely requires a later pending round's live resources to be retired. Each completed round still authenticates its own durable retirement evidence. Production aggregate cleanup checks remain unchanged. Response submission never changes a deadline.
++
++Controller imports authenticate the original stored call/request and campaign/round launch, check discovery binding and the envelope's exact keys/call/request identities, validate through parse_and_bind_role_artifact, then seal original response bytes using append_controller_role_response. A different existing response cannot be overwritten. Verification accepts only ControllerRoleTerminalAuthorityV5 under explicit disabled development and reconstructs the terminal package from sealed bytes; production paid ledger authentication remains separate.
++
++## Concrete operator interface
++
++Run from this worktree with the actual Python executable. PowerShell variables below are operator inputs, not fabricated digests. `$runtime` is the absolute `.artifacts/pit-optimizer-v5/development/runtime` directory in this worktree. `$inputFile` is an absolute JSON file with exactly the preparation function fields:
++
++```json
++{
++  "source_root": "ABSOLUTE_GIT_WORKTREE",
++  "source_commit": "0985d9bae74162ec1da8a7268bd54e47f21b0b85",
++  "git_executable": "ABSOLUTE_GIT_EXECUTABLE",
++  "campaign_id": "OPERATOR_CAMPAIGN_ID",
++  "target_pct": "OPERATOR_ACTUAL_TARGET",
++  "quick_panel_ref": {"relative_path": "panels/specs/quick.json", "sha256": "ACTUAL_QUICK_DIGEST"},
++  "evaluator_contract_sha256": "ACTUAL_REBUILT_CONTRACT_DIGEST",
++  "sandbox_profile_sha256": "54339696b4f67a85d462512001dc6c391a9d3554e63a76394493fad4bd54e584",
++  "parent_results": [
++    {"request_path": "ABSOLUTE_REAL_REQUEST_1", "output_path": "ABSOLUTE_REAL_OUTPUT_1"},
++    {"request_path": "ABSOLUTE_REAL_REQUEST_2", "output_path": "ABSOLUTE_REAL_OUTPUT_2"},
++    {"request_path": "ABSOLUTE_REAL_REQUEST_3", "output_path": "ABSOLUTE_REAL_OUTPUT_3"},
++    {"request_path": "ABSOLUTE_REAL_REQUEST_4", "output_path": "ABSOLUTE_REAL_OUTPUT_4"}
++  ],
++  "output_prefix": "campaigns/OPERATOR_CAMPAIGN_ID",
++  "caps": {
++    "quick_timeout_seconds": 600,
++    "discovery_episode_timeout_seconds": 600,
++    "round_wall_timeout_seconds": 7200,
++    "campaign_wall_timeout_seconds": 14400
++  }
++}
++```
++
++Optional panel_plan_ref has the ordinary relative_path/sha256 shape. No quick result is needed or imported. Quick remains context for the real candidate stage, not fabricated parent evidence. Physical caps are derived from the actual sandbox profile; method/startup bounds come from the matching parent request. Search is fixed to 2 rounds, 1 hypothesis, 1 axis, 1 variant, 1 survivor, archive capacity 2, 96 KiB memory, no full source escape, and 1 simultaneous evaluation. The four explicit wall timeout fields are typed resource inputs so a controller-approved future bound can be authored before launching a new campaign; existing launch timestamps never refresh.
++
++```powershell
++python -B -m core.pit_optimizer_v5.cli import-development --artifact-root $runtime --input-file $inputFile --validate-only
++python -B -m core.pit_optimizer_v5.cli import-development --artifact-root $runtime --input-file $inputFile
++python -B -m core.pit_optimizer_v5.cli prepare-development --artifact-root $runtime --manifest-path $manifestPath --manifest-sha256 $manifestSha --source-root $sourceRoot --workspace-root $workspaceRoot --data-root $dataRoot --output-root $outputRoot --control-root $controlRoot --git-executable $gitExe --docker-executable $dockerExe --response-directory $responses --output-path $configPath
++python -B -m core.pit_optimizer_v5.cli run-campaign --artifact-root $runtime --manifest-path $manifestPath --manifest-sha256 $manifestSha --adapter-config-path $configPath --adapter-config-sha256 $configSha --owner-token-sha256 $owner
++python -B -m core.pit_optimizer_v5.cli controller-request --artifact-root $runtime --manifest-path $manifestPath --manifest-sha256 $manifestSha --request-path $pendingRequestPath --request-sha256 $pendingRequestArtifactSha
++python -B -m core.pit_optimizer_v5.cli controller-response --artifact-root $runtime --manifest-path $manifestPath --manifest-sha256 $manifestSha --request-path $pendingRequestPath --request-sha256 $pendingRequestArtifactSha --response-file $absoluteResponseFile
++python -B -m core.pit_optimizer_v5.cli resume-campaign --artifact-root $runtime --manifest-path $manifestPath --manifest-sha256 $manifestSha --adapter-config-path $configPath --adapter-config-sha256 $configSha --owner-token-sha256 $owner
++python -B -m core.pit_optimizer_v5.cli verify-run --artifact-root $runtime --manifest-path $manifestPath --manifest-sha256 $manifestSha --adapter-config-path $configPath --adapter-config-sha256 $configSha
++```
++
++Setup emits actual config ref, generated/passed owner, resource/search caps and rendered resume command. Save those values unchanged. All source/workspace/data/output/control directories, response directory, and Git/Docker executables must exist. Data root contains exactly pit_bundle.sqlite3 and prices_provenance.json. Controller-request prints the authenticated request envelope; request artifact SHA differs from the semantic request_sha256 carried inside that envelope. Response file must contain schema_version=5, artifact_type=controller_role_response, the actual call_key_sha256 and semantic request_sha256, and response (the existing role response object). Import/request/response commands call no provider or evaluator. Pending campaign exits 0 and has no completed summary.
++
++## Static evidence and remaining work
++
++Source-only self-review covered canonical panel writes (the dedicated newline-bearing panel writer), nullable fingerprints, config derivation and later-round reconstruction, no-event investigator resume, pending before cleanup, exact sealed response reconstruction, production wrapper/export strictness, and source allowlist completeness. Scoped Ruff passes on all four changed Python modules. In-memory compile passes on those four sources. CLI help was exercised for prepare-development, import-development, and controller-response. No tests were read, created, changed, or run; no synthetic probes, full Git-tree exports, Docker/network/provider calls, pushes/uploads, or operator/data artifact mutations were performed by this implementation task.
++
++Controller's original 15-session parent attempt failed because the real simulator requires 30 sessions. Controller replaced it with four 30-session windows (2021-01-04..2021-02-16, 2021-02-17..2021-03-30, 2021-03-31..2021-05-12, 2021-05-13..2021-06-24), same 32 observed lineages. Old discovery-1..4 files must not seed this import. Use the actual corrected discovery30 request/output pairs once all complete. The controller rebuilt runtime b24bebd9870c78084666491cd0b6c926a8e0b88b258e7ffb11c923e6eda275b5 and confirmed these four changed host modules are excluded from its image closure. No manifest or real campaign was executed by this task. Independent review, all four actual parent results, real controller-authored responses, actual candidate quick/discovery work, records/checkpoints/cleanup, and round-2 feedback evidence remain controller-owned.
+diff --git a/core/pit_optimizer_v5/cli.py b/core/pit_optimizer_v5/cli.py
+index 39e93bc..1329f79 100644
+--- a/core/pit_optimizer_v5/cli.py
++++ b/core/pit_optimizer_v5/cli.py
+@@ -356,20 +356,21 @@ def _exact_production_host_adapter_graph_v5(
+         and mount_factory.repository is repository
+         and _windows_paths_equal_v5(mount_factory.data_root, adapter_config.data_root)
+         and _windows_paths_equal_v5(mount_factory.output_root, adapter_config.output_root)
+         and executor.mount_factory is mount_factory
+         and executor.manifest is authorities.manifest
+         and executor.sandbox_profile is authorities.sandbox_profile
+         and executor.owner is candidate.owner
+         and executor.repository is repository
+         and _windows_paths_equal_v5(executor.docker_executable, adapter_config.docker_executable)
+         and _windows_paths_equal_v5(executor.control_root, adapter_config.control_root)
++        and driver.export_mode == getattr(adapter_config, "export_mode", "full")
+         and driver.repository is repository
+         and driver.owner is candidate.owner
+         and driver.source_commit == authorities.manifest.source_commit
+         and driver.roots == WorkspaceRootsV5(adapter_config.source_root, adapter_config.workspace_root)
+         and _windows_paths_equal_v5(driver.git_executable, adapter_config.git_executable)
+         and base.base_identity_sha256 == adapter_config.candidate_base_identity_sha256
+         and driver.driver_identity_sha256 == adapter_config.workspace_driver_identity_sha256
+         and mount_factory.mount_identity_sha256 == adapter_config.mount_factory_identity_sha256
+         and executor.executor_identity_sha256 == adapter_config.container_executor_identity_sha256
+     )
+@@ -543,61 +544,95 @@ def _compose_production_round_from_paths_v5(
+     provider_capabilities = authorities.manifest.provider
+     if (
+         authorities.manifest.pit_data_scope != "production"
+         or authorities.baseline.pit_data_scope != "production"
+         or provider_capabilities is None
+         or provider_capabilities.automatic_retries != 0
+         or provider_capabilities.schema_repair_calls != 0
+     ):
+         raise V5CliFailure("production_provider_invalid")
+     try:
+-        owner = WorkspaceOwnerV5(
+-            authorities.manifest.campaign_id,
+-            round_index,
+-            owner_token_sha256,
+-            _controller_lease_id_v5(
+-                manifest_sha256=authorities.manifest.sha256,
+-                round_index=round_index,
+-                owner_token_sha256=owner_token_sha256,
+-            ),
+-        )
+         ledger = LocalRoleAuthorizationLedgerV5(
+             repository=repository,
+             manifest=authorities.manifest,
+         )
+         gateway = OpenRouterOneShotJsonCompletionV5(
+             ledger=ledger,
+             api_key_environment_variable=api_key_environment_variable,
+         )
+         role_runner = AuthorizedRoleRunnerV5(
+             capabilities=provider_capabilities,
+             provider=GatewayCompletionProviderV5(gateway),
+             lifecycle=ledger,
+         )
+         invoker = LedgerBackedRoleInvokerV5(
+             runner=role_runner,
+             reconciler=ledger,
+         )
+     except (OSError, RuntimeError, TypeError, ValueError) as exc:
+         raise V5CliFailure("production_provider_invalid") from exc
++    return _compose_round_from_paths_v5(
++        repository=repository,
++        authorities=authorities,
++        round_index=round_index,
++        owner_token_sha256=owner_token_sha256,
++        source_root=source_root,
++        workspace_root=workspace_root,
++        data_root=data_root,
++        output_root=output_root,
++        control_root=control_root,
++        git_executable=git_executable,
++        docker_executable=docker_executable,
++        invoker=invoker,
++        export_mode="full",
++    )
++
++
++def _compose_round_from_paths_v5(
++    *,
++    repository: LocalArtifactRepositoryV5,
++    authorities: CampaignAuthoritiesV5,
++    round_index: int,
++    owner_token_sha256: str,
++    source_root: str,
++    workspace_root: str,
++    data_root: str,
++    output_root: str,
++    control_root: str,
++    git_executable: str,
++    docker_executable: str,
++    invoker: object,
++    export_mode: str,
++) -> ProductionRoundCompositionV5:
+     try:
++        owner = WorkspaceOwnerV5(
++            authorities.manifest.campaign_id,
++            round_index,
++            owner_token_sha256,
++            _controller_lease_id_v5(
++                manifest_sha256=authorities.manifest.sha256,
++                round_index=round_index,
++                owner_token_sha256=owner_token_sha256,
++            ),
++        )
+         clock = SystemMonotonicClockV5()
+         roots = WorkspaceRootsV5(
+             source_root,
+             workspace_root,
+         )
+         driver = LocalGitWorkspaceDriverV5(
+             roots=roots,
+             source_commit=authorities.manifest.source_commit,
+             git_executable=Path(git_executable),
+             repository=repository,
+             owner=owner,
++            export_mode=export_mode,
+         )
+         materializer = GitCandidateMaterializerV5(
+             roots=roots,
+             driver=driver,
+             token_factory=lambda: secrets.token_hex(32),
+         )
+         mount_factory = LocalSandboxMountFactoryV5(
+             manifest=authorities.manifest,
+             evaluator_contract=authorities.evaluator_contract,
+             sandbox_profile=authorities.sandbox_profile,
+@@ -775,27 +810,37 @@ class ProductionV5CommandServices:
+                     adapter_config,
+                     round_index,
+                     tuple(leases),
+                     executions,
+                     tuple(cleanups),
+                     tuple(successful_keys),
+                 )
+             )
+             if cleanups:
+                 last_cleanup = cleanups[-1]
+-        if last_cleanup is not None and last_cleanup.cleanup_complete and not all(resource_cleanup_states):
++        # A prior development round's cleanup does not retire a pending later round.
++        if (
++            authorities.manifest.pit_data_scope != "development_sp500_v2"
++            and last_cleanup is not None
++            and last_cleanup.cleanup_complete
++            and not all(resource_cleanup_states)
++        ):
+             raise V5CliFailure("artifact_graph_invalid")
+         checkpoint = repository.load_checkpoint()
+         if checkpoint is not None:
+             tuple(repository.load_experiment(reference) for reference in checkpoint.record_refs)
+         if authorities.manifest.provider is None:
+-            if packages:
++            if authorities.manifest.pit_data_scope == "development_sp500_v2":
++                from core.pit_optimizer_v5.development_preparation import authenticate_controller_packages_v5
++
++                authenticate_controller_packages_v5(repository, authorities.manifest, tuple(packages))
++            elif packages:
+                 raise V5CliFailure("production_provider_invalid")
+         else:
+             try:
+                 ledger = LocalRoleAuthorizationLedgerV5(
+                     repository=repository,
+                     manifest=authorities.manifest,
+                 )
+                 ledger.authenticate_role_invocations(tuple(packages))
+             except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                 raise V5CliFailure("production_provider_invalid") from exc
+@@ -863,20 +908,21 @@ class ProductionV5CommandServices:
+                     round_index=round_index,
+                     owner_token_sha256=token,
+                 ),
+             )
+             driver = LocalGitWorkspaceDriverV5(
+                 roots=WorkspaceRootsV5(config.source_root, config.workspace_root),
+                 source_commit=authorities.manifest.source_commit,
+                 git_executable=Path(config.git_executable),
+                 repository=repository,
+                 owner=owner,
++                export_mode=getattr(config, "export_mode", "full"),
+             )
+             workspace_states = tuple(driver.authenticate_lease_history(item) for item in leases)
+             retired = tuple(state.lifecycle == "retired" for state in workspace_states)
+             cleaned: tuple[bool, ...] = ()
+             if executions:
+                 mounts = LocalSandboxMountFactoryV5(
+                     manifest=authorities.manifest,
+                     evaluator_contract=authorities.evaluator_contract,
+                     sandbox_profile=authorities.sandbox_profile,
+                     owner=owner,
+@@ -975,20 +1021,36 @@ class ProductionV5CommandServices:
+                 repository=repository,
+                 manifest=authenticated.manifest,
+                 command=request.command,
+                 readiness_code="completed" if completed else "runtime_failed",
+             )
+             if not completed:
+                 raise V5CliFailure("runtime_failed", exit_code=1, summary=summary)
+             return summary
+         authorities = self._authorities(repository, request.manifest_ref)
+         if request.command in {"verify-run", "summarize"}:
++            if (
++                authorities.manifest.pit_data_scope == "development_sp500_v2"
++                and authorities.manifest.semantic_mode == "disabled_development"
++            ):
++                from core.pit_optimizer_v5.development_preparation import load_development_config_v5
++
++                if request.adapter_config_ref is None:
++                    raise V5CliFailure("production_config_missing")
++                config = load_development_config_v5(repository, authorities, request.adapter_config_ref)
++                self._verify_local_run(repository, authorities, config)
++                return summarize_repository_v5(
++                    repository=repository,
++                    manifest=authorities.manifest,
++                    command=request.command,
++                    readiness_code="verified" if request.command == "verify-run" else "ready",
++                )
+             if authorities.manifest.provider is None:
+                 from core.pit_optimizer_v5.fixture_runtime import verify_fixture_run_v5
+ 
+                 if request.adapter_config_ref is not None:
+                     raise V5CliFailure("production_config_invalid")
+                 authenticate_campaign_manifest_v5(repository=repository, manifest_ref=request.manifest_ref)
+                 verify_fixture_run_v5(repository=repository, manifest=authorities.manifest)
+                 return summarize_repository_v5(
+                     repository=repository,
+                     manifest=authorities.manifest,
+@@ -1081,38 +1143,51 @@ def build_parser_v5() -> argparse.ArgumentParser:
+         command = commands.add_parser(name, allow_abbrev=False)
+         command.add_argument("--artifact-root", required=True)
+         command.add_argument("--manifest-path", required=True)
+         command.add_argument("--manifest-sha256", required=True)
+         if name in {"run", "resume"}:
+             command.add_argument("--round-index", required=True, type=int)
+             command.add_argument("--owner-token-sha256", required=True)
+         if name in {"run", "resume", "verify-run", "summarize"}:
+             command.add_argument("--adapter-config-path")
+             command.add_argument("--adapter-config-sha256")
+-    for name in ("prepare-production", "run-campaign", "resume-campaign"):
++    for name in ("prepare-production", "prepare-development", "run-campaign", "resume-campaign"):
+         command = commands.add_parser(name, allow_abbrev=False)
+         command.add_argument("--artifact-root", required=True)
+         command.add_argument("--manifest-path", required=True)
+         command.add_argument("--manifest-sha256", required=True)
+-        command.add_argument("--owner-token-sha256", required=name != "prepare-production")
+-        if name == "prepare-production":
++        command.add_argument("--owner-token-sha256", required=not name.startswith("prepare-"))
++        if name.startswith("prepare-"):
+             for root in ("source", "workspace", "data", "output", "control"):
+                 command.add_argument(f"--{root}-root", required=True)
+             command.add_argument("--git-executable", help="Git executable; defaults to discovery on PATH")
+             command.add_argument("--docker-executable", help="Docker executable; defaults to discovery on PATH")
++            if name == "prepare-development":
++                command.add_argument("--response-directory", required=True)
+             command.add_argument("--round-index", type=int, default=1)
+             command.add_argument(
+                 "--output-path", required=True, help="Adapter config path relative to the artifact root"
+             )
+         else:
+             command.add_argument("--adapter-config-path", required=True)
+             command.add_argument("--adapter-config-sha256", required=True)
++    for name in ("import-development", "controller-request", "controller-response"):
++        command = commands.add_parser(name, allow_abbrev=False)
++        command.add_argument("--artifact-root", required=True)
++        if name == "import-development":
++            command.add_argument("--input-file", required=True)
++            command.add_argument("--validate-only", action="store_true")
++        else:
++            for option in ("manifest-path", "manifest-sha256", "request-path", "request-sha256"):
++                command.add_argument("--" + option, required=True)
++            if name == "controller-response":
++                command.add_argument("--response-file", required=True)
+     initialize = commands.add_parser("init-stage-ledgers", allow_abbrev=False)
+     _add_panel_data_arguments_v5(initialize)
+     initialize.add_argument("--confirmation-ledger-path", required=True)
+     initialize.add_argument("--qualification-ledger-path", required=True)
+     build = commands.add_parser("build-panels", allow_abbrev=False)
+     _add_panel_data_arguments_v5(build)
+     build.add_argument("--start-date", required=True)
+     build.add_argument("--end-date", required=True)
+     build.add_argument("--partition-seed", required=True)
+     build.add_argument("--target-pct", required=True)
+@@ -1932,24 +2007,28 @@ def dispatch_baseline_cli_v5(
+     return exit_code
+ 
+ 
+ def dispatch_v5_cli(
+     argv: Sequence[str],
+     *,
+     services: V5CommandServices | None = None,
+     emit: Callable[[str], None] = print,
+ ) -> int:
+     """Parse and dispatch one command; dependency construction stays outside parsing."""
+-    if argv and argv[0] in {"prepare-production", "run-campaign", "resume-campaign"}:
++    if argv and argv[0] in {"prepare-production", "prepare-development", "run-campaign", "resume-campaign"}:
+         from core.pit_optimizer_v5.operations import dispatch_production_operations_cli_v5
+ 
+         return dispatch_production_operations_cli_v5(argv, emit=emit)
++    if argv and argv[0] in {"import-development", "controller-request", "controller-response"}:
++        from core.pit_optimizer_v5.development_preparation import dispatch_development_cli_v5
++
++        return dispatch_development_cli_v5(argv, emit=emit)
+     if argv and argv[0] in _BASELINE_COMMANDS:
+         return dispatch_baseline_cli_v5(argv, emit=emit)
+     if argv and argv[0] in _PANEL_COMMANDS:
+         return dispatch_panel_cli_v5(argv, emit=emit)
+     if argv and argv[0] in _MANIFEST_COMMANDS:
+         return dispatch_manifest_cli_v5(argv, emit=emit)
+     if argv and argv[0] in _CONFIRMATION_COMMANDS:
+         return dispatch_confirmation_cli_v5(argv, emit=emit)
+     if argv and argv[0] in _QUALIFICATION_COMMANDS:
+         return dispatch_qualification_cli_v5(argv, emit=emit)
+diff --git a/core/pit_optimizer_v5/development_preparation.py b/core/pit_optimizer_v5/development_preparation.py
+new file mode 100644
+index 0000000..93c81fc
+--- /dev/null
++++ b/core/pit_optimizer_v5/development_preparation.py
+@@ -0,0 +1,641 @@
++"""Host-only development composition, authenticated imports, and controller exchange."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, fields, replace
++import hashlib
++import json
++from pathlib import Path
++import subprocess
++
++from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5
++from core.pit_optimizer_v5.contracts import ArtifactRefV5, canonical_json_bytes_v5, canonical_sha256_v5
++from core.pit_optimizer_v5.controller_roles import FileBackedControllerRoleInvokerV5, _decode_unique_json
++from core.pit_optimizer_v5.manifest import PolicySourceSnapshotV5, _sanitized_git_environment_v5
++from core.pit_optimizer_v5.policy_scope import EDITABLE_POLICY_PATHS_V5
++from core.pit_optimizer_v5.provider import (
++    ControllerRoleTerminalAuthorityV5,
++    ExistingPersistedRoleRequestV5,
++    parse_and_bind_role_artifact,
++)
++
++PATH_FIELDS = (
++    "source_root",
++    "workspace_root",
++    "data_root",
++    "output_root",
++    "control_root",
++    "git_executable",
++    "docker_executable",
++)
++
++
++def require_development_v5(manifest):
++    if (
++        manifest.pit_data_scope != "development_sp500_v2"
++        or manifest.semantic_mode != "disabled_development"
++        or manifest.provider is not None
++        or manifest.apply
++        or manifest.qualification_allowed
++        or manifest.full_replay_allowed
++    ):
++        raise ValueError("explicit provider-free, semantic-disabled development manifest required")
++
++
++@dataclass(frozen=True, slots=True)
++class DevelopmentAdapterConfigV5:
++    schema_version: int
++    campaign_manifest_sha256: str
++    repository_root_identity_sha256: str
++    candidate_base_identity_sha256: str
++    workspace_driver_identity_sha256: str
++    mount_factory_identity_sha256: str
++    container_executor_identity_sha256: str
++    source_root: str
++    workspace_root: str
++    data_root: str
++    output_root: str
++    control_root: str
++    git_executable: str
++    docker_executable: str
++    response_directory: str
++    export_mode: str = "policy_only"
++
++    def __post_init__(self):
++        from core.pit_optimizer_v5.cli import _canonical_windows_path_v5, _DIGEST
++
++        if type(self.schema_version) is not int or self.schema_version != 5 or self.export_mode != "policy_only":
++            raise ValueError("development config schema/export mode invalid")
++        for field in fields(self):
++            value = getattr(self, field.name)
++            if field.name.endswith("sha256") and (type(value) is not str or not _DIGEST.fullmatch(value)):
++                raise ValueError("development config identity invalid")
++        for field in (*PATH_FIELDS, "response_directory"):
++            _canonical_windows_path_v5(getattr(self, field), field)
++
++
++@dataclass(frozen=True, slots=True)
++class DevelopmentRoundCompositionV5:
++    inputs: object
++    dependencies: object
++
++    def validate_for(self, *, repository, authorities, round_index, owner_token_sha256, adapter_config):
++        from core.pit_optimizer_v5.cli import (
++            _exact_production_host_adapter_graph_v5,
++            LocalRoleRequestFactoryV5,
++            SelectionNoveltyResolverV5,
++            CanonicalExperimentRecordFactoryV5,
++            LocalArchiveReducerFactoryV5,
++            SystemMonotonicClockV5,
++            ControllerCancellationV5,
++            CompositeOwnedCleanupV5,
++        )
++        from core.pit_optimizer_v5.runtime import FeedbackRoundInputV5, FeedbackRoundDependenciesV5
++
++        require_development_v5(authorities.manifest)
++        if (
++            type(adapter_config) is not DevelopmentAdapterConfigV5
++            or authorities.baseline.pit_data_scope != "development_sp500_v2"
++            or authorities.baseline.semantic_mode != "disabled_development"
++            or self.inputs
++            != FeedbackRoundInputV5(
++                authorities.manifest,
++                authorities.panel_plan,
++                authorities.evaluator_contract,
++                authorities.baseline,
++                round_index,
++                owner_token_sha256,
++            )
++            or type(self.dependencies) is not FeedbackRoundDependenciesV5
++            or self.dependencies.persistence is not repository
++            or type(self.dependencies.invoker) is not FileBackedControllerRoleInvokerV5
++            or self.dependencies.invoker._repository is not repository
++            or self.dependencies.invoker._response_directory != Path(adapter_config.response_directory)
++            or not _exact_production_host_adapter_graph_v5(
++                self.dependencies.candidates, adapter_config, repository=repository, authorities=authorities
++            )
++        ):
++            raise ValueError("development adapter graph differs from its authority")
++        if (
++            type(self.dependencies.requests) is not LocalRoleRequestFactoryV5
++            or self.dependencies.requests.repository is not repository
++            or self.dependencies.requests.manifest is not authorities.manifest
++            or type(self.dependencies.novelty) is not SelectionNoveltyResolverV5
++            or type(self.dependencies.records) is not CanonicalExperimentRecordFactoryV5
++            or type(self.dependencies.archive_reducers) is not LocalArchiveReducerFactoryV5
++            or self.dependencies.archive_reducers.repository is not repository
++            or type(self.dependencies.clock) is not SystemMonotonicClockV5
++            or type(self.dependencies.cancellation) is not ControllerCancellationV5
++            or type(self.dependencies.cleanup) is not CompositeOwnedCleanupV5
++        ):
++            raise ValueError("development shared runtime dependencies are invalid")
++        candidate = self.dependencies.candidates
++        cleanup = self.dependencies.cleanup
++        if (
++            candidate.owner.round_index != round_index
++            or candidate.owner.owner_token_sha256 != owner_token_sha256
++            or cleanup.owner is not candidate.owner
++            or cleanup.materializer is not candidate.base_operations.materializer
++            or cleanup.executor is not candidate.panel_evaluator.evaluator.executor
++            or cleanup.clock is not self.dependencies.clock
++        ):
++            raise ValueError("development cleanup/owner differs from runtime")
++
++
++def compose_development_round_v5(*, repository, authorities, response_directory, **kwargs):
++    from core.pit_optimizer_v5.cli import _compose_round_from_paths_v5
++
++    require_development_v5(authorities.manifest)
++    invoker = FileBackedControllerRoleInvokerV5(
++        repository=repository, manifest=authorities.manifest, response_directory=Path(response_directory)
++    )
++    composed = _compose_round_from_paths_v5(
++        repository=repository, authorities=authorities, invoker=invoker, export_mode="policy_only", **kwargs
++    )
++    return DevelopmentRoundCompositionV5(composed.inputs, composed.dependencies)
++
++
++class DevelopmentRoundFactoryV5:
++    def __init__(self, *, adapter_config_ref, adapter_config):
++        if type(adapter_config) is not DevelopmentAdapterConfigV5 or adapter_config_ref.sha256 != canonical_sha256_v5(
++            adapter_config
++        ):
++            raise ValueError("development factory config identity invalid")
++        self.adapter_config = adapter_config
++
++    def compose_round(self, *, repository, authorities, round_index, owner_token_sha256, adapter_config):
++        if (
++            adapter_config != self.adapter_config
++            or adapter_config.campaign_manifest_sha256 != authorities.manifest.sha256
++            or adapter_config.repository_root_identity_sha256 != repository.root_identity_sha256
++        ):
++            raise ValueError("development factory authority mismatch")
++        result = compose_development_round_v5(
++            repository=repository,
++            authorities=authorities,
++            round_index=round_index,
++            owner_token_sha256=owner_token_sha256,
++            **{name: getattr(adapter_config, name) for name in (*PATH_FIELDS, "response_directory")},
++        )
++        result.validate_for(
++            repository=repository,
++            authorities=authorities,
++            round_index=round_index,
++            owner_token_sha256=owner_token_sha256,
++            adapter_config=adapter_config,
++        )
++        return result
++
++
++def load_development_config_v5(repository, authorities, reference):
++    require_development_v5(authorities.manifest)
++    config = repository.load_typed_artifact(reference, value_type=DevelopmentAdapterConfigV5)
++    if (
++        config.campaign_manifest_sha256 != authorities.manifest.sha256
++        or config.repository_root_identity_sha256 != repository.root_identity_sha256
++    ):
++        raise ValueError("development configuration authority mismatch")
++    return config
++
++
++def capture_development_policy_v5(*, source_root, git_executable, expected_source_commit):
++    """Read only immutable four-file blobs; host HEAD may advance independently."""
++    import re
++
++    root, executable = Path(source_root), Path(git_executable)
++    if (
++        not root.is_absolute()
++        or not executable.is_absolute()
++        or not re.fullmatch("[0-9a-f]{40}", expected_source_commit)
++    ):
++        raise ValueError("explicit absolute Git/source paths and immutable commit required")
++
++    def git(*args):
++        return subprocess.run(
++            (str(executable), "-C", str(root), *args),
++            check=True,
++            shell=False,
++            stdin=subprocess.DEVNULL,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
++            timeout=30,
++            env=_sanitized_git_environment_v5(),
++        ).stdout
++
++    if (
++        git("rev-parse", "--verify", expected_source_commit + "^{commit}").decode("ascii").strip()
++        != expected_source_commit
++    ):
++        raise ValueError("source commit identity differs")
++    tree = git("ls-tree", "-rz", "--full-tree", expected_source_commit, "--", *EDITABLE_POLICY_PATHS_V5)
++    members = []
++    for entry in tree.split(b"\0"):
++        if not entry:
++            continue
++        metadata, path = entry.split(b"\t", 1)
++        mode, kind, _ = metadata.split(b" ")
++        if mode not in {b"100644", b"100755"} or kind != b"blob":
++            raise ValueError("development source requires regular policy blobs")
++        members.append(path.decode("utf-8"))
++    if len(members) != 4 or set(members) != set(EDITABLE_POLICY_PATHS_V5):
++        raise ValueError("immutable policy membership differs")
++    sources = {
++        path: git("show", "--no-ext-diff", "--no-textconv", f"{expected_source_commit}:{path}")
++        for path in EDITABLE_POLICY_PATHS_V5
++    }
++    return PolicySourceSnapshotV5.from_tracked_bytes(
++        source_commit=expected_source_commit, source_by_path=sources
++    ), sources
++
++
++def _authenticate_controller_request(repository, manifest, reference):
++    from core.pit_optimizer_v5.operations import CampaignLaunchV5, CampaignRoundLaunchV5
++    from core.pit_optimizer_v5.contracts import CampaignPanelPlanV5
++
++    require_development_v5(manifest)
++    call, request = repository._load_role_request_entry(reference)
++    launch = repository.load_typed_state(namespace="campaign-launch", key=manifest.sha256, value_type=CampaignLaunchV5)
++    round_key = canonical_sha256_v5({"campaign_manifest_sha256": manifest.sha256, "round_index": call.round_index})
++    started = repository.load_typed_state(
++        namespace="campaign-round-started", key=round_key, value_type=CampaignRoundLaunchV5
++    )
++    if (
++        call.campaign_id != manifest.campaign_id
++        or call.round_index > manifest.search.max_feedback_rounds
++        or launch is None
++        or launch.manifest_ref.sha256 != manifest.sha256
++        or started is None
++        or started.started_epoch_ms is None
++        or started.owner_token_sha256 != launch.owner_token_sha256
++    ):
++        raise ValueError("controller call lacks manifest-bound campaign/round launch")
++    plan = repository.load_typed_artifact(manifest.panel_plan_ref, value_type=CampaignPanelPlanV5)
++    if request.expected_binding.discovery_plan_sha256 != plan.discovery_plan_sha256:
++        raise ValueError("controller request discovery binding differs")
++    return ExistingPersistedRoleRequestV5(reference, call, request)
++
++
++def authenticate_controller_packages_v5(repository, manifest, packages):
++    require_development_v5(manifest)
++    for package in packages:
++        if type(package.terminal_authority) is not ControllerRoleTerminalAuthorityV5:
++            raise ValueError("development accepts only controller terminal provenance")
++        reference = ArtifactRefV5(
++            f"roles/requests/{package.call.sha256}.json",
++            hashlib.sha256(repository._read_relative(f"roles/requests/{package.call.sha256}.json")).hexdigest(),
++        )
++        persisted = _authenticate_controller_request(repository, manifest, reference)
++        if (
++            persisted.call != package.call
++            or persisted.request != package.request
++            or repository.load_controller_role_response(call=package.call) is None
++        ):
++            raise ValueError("controller package request/response unavailable")
++        invoker = FileBackedControllerRoleInvokerV5(
++            repository=repository, manifest=manifest, response_directory=Path.cwd()
++        )
++        if invoker.reconcile_once(persisted) != package:
++            raise ValueError("controller package differs from exact sealed response")
++
++
++def prepare_development_campaign_v5(
++    *,
++    repository,
++    source_root,
++    source_commit,
++    git_executable,
++    campaign_id,
++    target_pct,
++    quick_panel_ref,
++    parent_results,
++    output_prefix,
++    evaluator_contract_sha256,
++    sandbox_profile_sha256,
++    caps,
++    validate_only=False,
++    panel_plan_ref=None,
++):
++    """Authenticate four actual pairs before publishing any campaign authority."""
++    from decimal import Decimal
++    from core.pit_optimizer_v5.candidate_ir import SourceBundleV5, SourceFileV5
++    from core.pit_optimizer_v5.container_protocol import (
++        decode_panel_execution_request_v5,
++        decode_panel_execution_output_v5,
++        panel_execution_output_bytes_v5,
++    )
++    from core.pit_optimizer_v5.contracts import (
++        AnnualizedReturnTargetV5,
++        CampaignPanelPlanV5,
++        EpisodePlanV5,
++        EpisodeEvaluationV5,
++        CampaignEvidenceV5,
++        ResourceCapabilitiesV5,
++        SearchCapabilitiesV5,
++        selected_scenario,
++        validate_campaign_evidence_v5,
++    )
++    from core.pit_optimizer_v5.manifest import build_campaign_manifest_v5
++    from core.pit_optimizer_v5.search import BaselineParentAuthorityV5, campaign_cagr_pct
++
++    if not repository.root.is_absolute() or len(parent_results) != 4:
++        raise ValueError("absolute repository and four real parent pairs required")
++    ArtifactRefV5(output_prefix + "/manifest.json", "0" * 64)
++    pairs = []
++    for ordinal, item in enumerate(parent_results, 1):
++        paths = (Path(item["request_path"]), Path(item["output_path"]))
++        if any(not path.is_absolute() or not path.is_file() or path.is_symlink() for path in paths):
++            raise ValueError(f"parent {ordinal} requires absolute regular request/output files")
++        request_raw, output_raw = (path.read_bytes() for path in paths)
++        request = decode_panel_execution_request_v5(request_raw)
++        output = decode_panel_execution_output_v5(output_raw)
++        if (
++            request.pit_data_scope != "development_sp500_v2"
++            or request.episode.episode_ordinal != ordinal
++            or request.episode.episode_id != f"development-discovery-{ordinal}"
++            or panel_execution_output_bytes_v5(request=request, evaluation=output.evaluation) != output_raw
++        ):
++            raise ValueError(f"parent {ordinal} request/output identity differs")
++        pairs.append((request, output, request_raw, output_raw))
++    first = pairs[0][0]
++    if any(
++        (
++            request.evaluator_contract,
++            request.sandbox_profile,
++            request.execution_profile,
++            request.policy_revision,
++            request.policy_method_timeout_seconds,
++            request.worker_startup_timeout_seconds,
++        )
++        != (
++            first.evaluator_contract,
++            first.sandbox_profile,
++            first.execution_profile,
++            first.policy_revision,
++            first.policy_method_timeout_seconds,
++            first.worker_startup_timeout_seconds,
++        )
++        for request, _, _, _ in pairs
++    ):
++        raise ValueError("parent executions do not share one exact evaluator/policy/resource authority")
++    contract, profile = first.evaluator_contract, first.sandbox_profile
++    if contract.sha256 != evaluator_contract_sha256 or profile.sha256 != sandbox_profile_sha256:
++        raise ValueError("parent executions differ from explicitly selected evaluator/sandbox identities")
++    if (
++        tuple(item.scenario_id for item in contract.friction_grid) != ("gross", "base", "stress")
++        or contract.selection_scenario_id != "base"
++    ):
++        raise ValueError("development parent requires gross/base/stress and base selection")
++    snapshot, sources = capture_development_policy_v5(
++        source_root=source_root, git_executable=git_executable, expected_source_commit=source_commit
++    )
++    bundle = SourceBundleV5(tuple(SourceFileV5(path, raw.decode("utf-8")) for path, raw in sources.items()))
++    if (
++        snapshot.editable_source_sha256 != first.policy_revision.editable_source_sha256
++        or bundle.sha256 != contract.baseline_source_bundle_sha256
++        or first.policy_revision.sha256 != contract.baseline_policy_revision_sha256
++    ):
++        raise ValueError("immutable policy bytes differ from actual parent/evaluator")
++    data_refs = (
++        ArtifactRefV5("data/pit_bundle.sqlite3", contract.pit_bundle_sha256),
++        ArtifactRefV5("data/prices_provenance.json", contract.prices_provenance_sha256),
++    )
++    for reference in data_refs:
++        repository.authenticate_raw_artifact(reference)
++    quick = repository.load_evaluation_panel_spec(quick_panel_ref)
++    if quick.purpose != "quick":
++        raise ValueError("quick reference must identify the actual quick panel")
++    target = AnnualizedReturnTargetV5(Decimal(target_pct))
++    # Unused local descriptors carry truthful content identities, no held-out authority or evaluation.
++    local_descriptors = {
++        name: {
++            "schema_version": 5,
++            "pit_data_scope": "development_sp500_v2",
++            "purpose": name,
++            "executed": False,
++            "capability_enabled": False,
++            "quick_panel_sha256": quick.sha256,
++        }
++        for name in ("confirmation", "qualification")
++    }
++    # Existing panel schema permits quick/discovery/qualification only. Reuse actual quick
++    # content for the disabled mechanics slot, without claiming mechanics execution.
++    mechanics = quick
++    mechanics_ref = quick_panel_ref
++
++    def episode(panel, reference, name, ordinal=None):
++        return EpisodePlanV5(
++            name,
++            ordinal,
++            panel.purpose,
++            panel.start_date,
++            panel.end_date,
++            tuple(row.security_lineage_id for row in panel.lineages),
++            reference,
++        )
++
++    planned = tuple(
++        replace(
++            request.episode,
++            panel_ref=ArtifactRefV5(f"{output_prefix}/panels/discovery-{index}.json", request.panel.sha256),
++        )
++        for index, (request, _, _, _) in enumerate(pairs, 1)
++    )
++    plan = CampaignPanelPlanV5(
++        5,
++        *data_refs,
++        canonical_sha256_v5(
++            {"scope": "development_sp500_v2", "panels": tuple(item.panel_ref.sha256 for item in planned)}
++        ),
++        target.sha256,
++        episode(mechanics, mechanics_ref, "development-mechanics-unexecuted"),
++        episode(quick, quick_panel_ref, "development-quick"),
++        planned,
++        canonical_sha256_v5(local_descriptors["confirmation"]),
++        canonical_sha256_v5(local_descriptors["qualification"]),
++    )
++    if panel_plan_ref is not None:
++        plan = repository.load_typed_artifact(panel_plan_ref, value_type=CampaignPanelPlanV5)
++        # Imported path text may differ; actual content identity/dates remain mandatory below.
++    episodes = tuple(
++        EpisodeEvaluationV5(
++            request.episode.episode_id, index, request.episode.start_date, request.episode.end_date, output.evaluation
++        )
++        for index, (request, output, _, _) in enumerate(pairs, 1)
++    )
++    evidence = CampaignEvidenceV5(
++        plan.discovery_plan_sha256,
++        episodes,
++        campaign_cagr_pct(episodes=episodes, discovery_plan=plan, evaluator_contract=contract),
++        sum(selected_scenario(item.evaluation).report.closed_trades for item in episodes),
++    )
++    validate_campaign_evidence_v5(
++        evidence, panel_plan=plan, evaluator_contract=contract, policy_identity_sha256=first.policy_revision.sha256
++    )
++    resources = ResourceCapabilitiesV5(
++        max_parallel_evaluations=1,
++        evaluation_cpu_limit=profile.cpu_limit,
++        evaluation_memory_mib=profile.memory_limit_mib,
++        evaluation_pid_limit=profile.pid_limit,
++        evaluation_output_limit_bytes=profile.output_limit_bytes,
++        policy_method_timeout_seconds=first.policy_method_timeout_seconds,
++        worker_startup_timeout_seconds=first.worker_startup_timeout_seconds,
++        quick_timeout_seconds=600,
++        discovery_episode_timeout_seconds=600,
++        round_wall_timeout_seconds=7200,
++        campaign_wall_timeout_seconds=14400,
++    )
++    expected_cap_names = {
++        "quick_timeout_seconds",
++        "discovery_episode_timeout_seconds",
++        "round_wall_timeout_seconds",
++        "campaign_wall_timeout_seconds",
++    }
++    if type(caps) is not dict or set(caps) != expected_cap_names:
++        raise ValueError("caps must explicitly supply quick, discovery, round and campaign timeouts")
++    resources = replace(resources, **caps)
++    search = SearchCapabilitiesV5(
++        hypotheses_per_investigator=1,
++        max_tunable_axes=1,
++        max_variants_per_template=1,
++        max_discovery_survivors_per_template=1,
++        archive_capacity=2,
++        max_feedback_rounds=2,
++        investigator_memory_max_bytes=96 * 1024,
++        allow_full_source_escape=False,
++    )
++    if validate_only:
++        return {
++            "status": "validated",
++            "resources": resources,
++            "search": search,
++            "parent_policy_sha256": first.policy_revision.sha256,
++            "campaign_cagr_pct": evidence.campaign_cagr_pct,
++        }
++
++    def create(name, value):
++        path = output_prefix + "/" + name + ".json"
++        return (
++            repository._create_only(path, value)
++            if type(value) is dict
++            else repository.create_typed_artifact(path, value)
++        )
++
++    # All real outputs and immutable source/data identities passed before the first write.
++    provenance = []
++    for index, (request, _output, request_raw, output_raw) in enumerate(pairs, 1):
++        refs = tuple(
++            repository.append_binary_state(
++                namespace="development-parent-originals", key=hashlib.sha256(raw).hexdigest(), content=raw
++            )
++            for raw in (request_raw, output_raw)
++        )
++        provenance.append(
++            {"episode_id": request.episode.episode_id, "original_request_ref": refs[0], "original_output_ref": refs[1]}
++        )
++        if panel_plan_ref is None:
++            repository.create_evaluation_panel_spec(f"{output_prefix}/panels/discovery-{index}.json", request.panel)
++    if panel_plan_ref is None:
++        for name, descriptor in local_descriptors.items():
++            create(name + "-unexecuted", descriptor)
++        panel_plan_ref = create("panel-plan", plan)
++    create("parent-provenance", {"schema_version": 5, "pairs": tuple(provenance)})
++    source_ref = create("source-bundle", bundle)
++    policy_ref = create("policy-revision", first.policy_revision)
++    baseline = BaselineParentAuthorityV5(
++        first.policy_revision,
++        policy_ref,
++        None,
++        evidence,
++        bundle,
++        source_ref,
++        "development_sp500_v2",
++        "disabled_development",
++    )
++    baseline_ref = create("baseline-parent", baseline)
++    return build_campaign_manifest_v5(
++        repository=repository,
++        campaign_id=campaign_id,
++        target=target,
++        source_snapshot=snapshot,
++        execution_profile_ref=create("execution-profile", first.execution_profile),
++        evaluator_contract_ref=create("evaluator-contract", contract),
++        baseline_authority_ref=baseline_ref,
++        panel_plan_ref=panel_plan_ref,
++        sandbox_profile_ref=create("sandbox-profile", profile),
++        policy_scope_path=output_prefix + "/policy-scope.json",
++        manifest_path=output_prefix + "/manifest.json",
++        search=search,
++        resources=resources,
++        provider=None,
++        pit_data_scope="development_sp500_v2",
++        semantic_mode="disabled_development",
++    )
++
++
++def dispatch_development_cli_v5(argv, *, emit=print):
++    from core.pit_optimizer_v5.manifest import authenticate_campaign_manifest_v5
++
++    from core.pit_optimizer_v5.cli import build_parser_v5
++
++    args = build_parser_v5().parse_args(argv)
++    try:
++        repository = LocalArtifactRepositoryV5(Path(args.artifact_root))
++        if args.command == "import-development":
++            path = Path(args.input_file)
++            if not path.is_absolute():
++                raise ValueError("import input file must be absolute")
++            inputs = json.loads(path.read_text(encoding="utf-8-sig"))
++            inputs["quick_panel_ref"] = ArtifactRefV5(**inputs["quick_panel_ref"])
++            if inputs.get("panel_plan_ref") is not None:
++                inputs["panel_plan_ref"] = ArtifactRefV5(**inputs["panel_plan_ref"])
++            result = prepare_development_campaign_v5(repository=repository, validate_only=args.validate_only, **inputs)
++            if not args.validate_only:
++                result = {
++                    "status": "prepared",
++                    "manifest_ref": result.manifest_ref,
++                    "resources": result.manifest.resources,
++                    "search": result.manifest.search,
++                }
++        else:
++            authenticated = authenticate_campaign_manifest_v5(
++                repository=repository, manifest_ref=ArtifactRefV5(args.manifest_path, args.manifest_sha256)
++            )
++            reference = ArtifactRefV5(args.request_path, args.request_sha256)
++            persisted = _authenticate_controller_request(repository, authenticated.manifest, reference)
++            if args.command == "controller-request":
++                emit(repository.authenticate(reference).content.decode("utf-8"))
++                return 0
++            path = Path(args.response_file)
++            if not path.is_absolute() or not path.is_file() or path.is_symlink():
++                raise ValueError("response file must be an absolute regular file")
++            with path.open("rb") as stream:
++                raw = stream.read(4 * 1024 * 1024 + 1)
++            envelope = _decode_unique_json(raw)
++            if (
++                set(envelope) != {"schema_version", "artifact_type", "call_key_sha256", "request_sha256", "response"}
++                or envelope["schema_version"] != 5
++                or envelope["artifact_type"] != "controller_role_response"
++                or envelope["call_key_sha256"] != persisted.call.sha256
++                or envelope["request_sha256"] != persisted.request.sha256
++                or type(envelope["response"]) is not dict
++            ):
++                raise ValueError("response envelope differs from original persisted call")
++            parse_and_bind_role_artifact(
++                request=persisted.request, response_text=json.dumps(envelope["response"], ensure_ascii=False)
++            )
++            response_ref = repository.append_controller_role_response(call=persisted.call, content=raw)
++            result = {
++                "status": "response_imported",
++                "response_ref": response_ref,
++                "request_ref": reference,
++                "role": persisted.call.role,
++                "round_index": persisted.call.round_index,
++            }
++        emit("PIT_OPTIMIZER_V5_DEVELOPMENT=" + canonical_json_bytes_v5(result).decode("utf-8"))
++        return 0
++    except (OSError, RuntimeError, TypeError, ValueError) as exc:
++        emit(
++            "PIT_OPTIMIZER_V5_DEVELOPMENT="
++            + canonical_json_bytes_v5({"status": "failed", "diagnostic": str(exc)}).decode("utf-8")
++        )
++        return 2
+diff --git a/core/pit_optimizer_v5/operations.py b/core/pit_optimizer_v5/operations.py
+index 285511b..4cb5e0e 100644
+--- a/core/pit_optimizer_v5/operations.py
++++ b/core/pit_optimizer_v5/operations.py
+@@ -20,20 +20,28 @@ from core.pit_optimizer_v5.cli import (
+     ProductionV5CommandServices,
+     _compose_production_round_from_paths_v5,
+     build_parser_v5,
+ )
+ from core.pit_optimizer_v5.contracts import ArtifactRefV5, canonical_json_bytes_v5, canonical_sha256_v5
+ from core.pit_optimizer_v5.manifest import (
+     AuthenticatedCampaignManifestV5,
+     authenticate_campaign_manifest_v5,
+     capture_clean_policy_snapshot_v5,
+ )
++from core.pit_optimizer_v5.development_preparation import (
++    DevelopmentAdapterConfigV5,
++    DevelopmentRoundFactoryV5,
++    capture_development_policy_v5,
++    compose_development_round_v5,
++    load_development_config_v5,
++    require_development_v5,
++)
+ from core.pit_optimizer_v5.memory import CleanupResultPayloadV5, RoundOutcomePayloadV5
+ from core.pit_optimizer_v5.runtime import reconcile_existing_paid_roles_v5, run_feedback_round_v5
+ from core.pit_optimizer_v5.summary import summarize_repository_v5
+ 
+ 
+ _PATH_FIELDS = (
+     "source_root",
+     "workspace_root",
+     "data_root",
+     "output_root",
+@@ -108,159 +116,211 @@ def _existing_path(value: str | None, *, name: str, executable: bool = False) ->
+     return str(path)
+ 
+ 
+ def _derive_config(
+     *,
+     repository: LocalArtifactRepositoryV5,
+     authenticated: AuthenticatedCampaignManifestV5,
+     round_index: int,
+     owner_token_sha256: str,
+     paths: dict[str, str],
+-) -> ProductionAdapterConfigV5:
++) -> ProductionAdapterConfigV5 | DevelopmentAdapterConfigV5:
+     authorities = _authorities(authenticated)
++    development = authenticated.manifest.pit_data_scope == "development_sp500_v2"
++    composer = compose_development_round_v5 if development else _compose_production_round_from_paths_v5
+     try:
+-        composition = _compose_production_round_from_paths_v5(
++        composition = composer(
+             repository=repository,
+             authorities=authorities,
+             round_index=round_index,
+             owner_token_sha256=owner_token_sha256,
+             **paths,
+         )
+     except (OSError, RuntimeError, TypeError, ValueError) as exc:
+         detail = str(exc.__cause__ or exc)
+         raise ProductionOperationFailureV5(
+-            "Cannot compose the local production adapters: "
++            "Cannot compose the local campaign adapters: "
+             + detail
+-            + ". Supply a provider-enabled manifest with zero automatic retries/schema repairs, "
++            + ". Supply an authenticated scope-appropriate manifest, "
+             "existing disjoint source/workspace/data/output/control directories, and real Git/Docker executables"
+         ) from exc
+     candidate = composition.dependencies.candidates
+     base = candidate.base_operations
+-    gateway = composition.dependencies.invoker.runner.completion_provider.gateway
+-    config = ProductionAdapterConfigV5(
++    provider_fields = {}
++    if not development:
++        gateway = composition.dependencies.invoker.runner.completion_provider.gateway
++        provider_fields = dict(
++            gateway_identity_sha256=gateway.gateway_identity_sha256,
++            ledger_identity_sha256=gateway.ledger_identity_sha256,
++            audit_store_identity_sha256=gateway.audit_store_identity_sha256,
++        )
++    config_type = DevelopmentAdapterConfigV5 if development else ProductionAdapterConfigV5
++    config = config_type(
+         schema_version=5,
+         campaign_manifest_sha256=authenticated.manifest.sha256,
+         repository_root_identity_sha256=repository.root_identity_sha256,
+-        gateway_identity_sha256=gateway.gateway_identity_sha256,
+-        ledger_identity_sha256=gateway.ledger_identity_sha256,
+-        audit_store_identity_sha256=gateway.audit_store_identity_sha256,
++        **provider_fields,
+         candidate_base_identity_sha256=base.base_identity_sha256,
+         workspace_driver_identity_sha256=base.materializer.driver.driver_identity_sha256,
+         mount_factory_identity_sha256=candidate.mount_factory.mount_identity_sha256,
+         container_executor_identity_sha256=candidate.panel_evaluator.evaluator.executor.executor_identity_sha256,
+         **paths,
+     )
+     composition.validate_for(
+         repository=repository,
+         authorities=authorities,
+         round_index=round_index,
+         owner_token_sha256=owner_token_sha256,
+         adapter_config=config,
+     )
+     return config
+ 
+ 
+-def prepare_production_adapter_config_v5(
++def _prepare_adapter_config_v5(
+     *,
+     repository: LocalArtifactRepositoryV5,
+     authenticated: AuthenticatedCampaignManifestV5,
+     output_path: str,
+     source_root: str,
+     workspace_root: str,
+     data_root: str,
+     output_root: str,
+     control_root: str,
+     git_executable: str | None = None,
+     docker_executable: str | None = None,
+     round_index: int = 1,
+     owner_token_sha256: str | None = None,
++    response_directory: str | None = None,
+ ) -> dict[str, object]:
+     """Verify local resources and save actual adapter identities without execution."""
+     ArtifactRefV5(output_path, "0" * 64)
++    if authenticated.manifest.pit_data_scope == "development_sp500_v2" and round_index != 1:
++        raise ProductionOperationFailureV5("development setup requires original round 1 configuration")
+     token = _owner_token(secrets.token_hex(32) if owner_token_sha256 is None else owner_token_sha256)
+     paths = {
+         "source_root": _existing_path(source_root, name="source root"),
+         "workspace_root": _existing_path(workspace_root, name="workspace root"),
+         "data_root": _existing_path(data_root, name="data root"),
+         "output_root": _existing_path(output_root, name="output root"),
+         "control_root": _existing_path(control_root, name="control root"),
+         "git_executable": _existing_path(git_executable, name="git", executable=True),
+         "docker_executable": _existing_path(docker_executable, name="docker", executable=True),
+     }
++    development = authenticated.manifest.pit_data_scope == "development_sp500_v2"
++    if development:
++        require_development_v5(authenticated.manifest)
++        paths["response_directory"] = _existing_path(response_directory, name="response directory")
+     data = Path(paths["data_root"])
+     expected = {
+         "pit_bundle.sqlite3": authenticated.evaluator_contract.pit_bundle_sha256,
+         "prices_provenance.json": authenticated.evaluator_contract.prices_provenance_sha256,
+     }
+     if set(item.name for item in data.iterdir()) != set(expected):
+         raise ProductionOperationFailureV5(
+             "The data root must contain exactly pit_bundle.sqlite3 and prices_provenance.json from this manifest"
+         )
+     for name, digest in expected.items():
+         path = data / name
+         if not path.is_file() or path.is_symlink():
+             raise ProductionOperationFailureV5(f"The data resource must be a regular file: {path}")
+         with path.open("rb") as handle:
+             actual = hashlib.file_digest(handle, "sha256").hexdigest()
+         if actual != digest:
+             raise ProductionOperationFailureV5(f"Data digest mismatch for {path}; supply the manifest-bound file")
+     try:
+-        snapshot = capture_clean_policy_snapshot_v5(
++        capture = capture_development_policy_v5 if development else capture_clean_policy_snapshot_v5
++        snapshot = capture(
+             source_root=Path(paths["source_root"]),
+             git_executable=Path(paths["git_executable"]),
+             expected_source_commit=authenticated.manifest.source_commit,
+         )
++        if development:
++            snapshot = snapshot[0]
+     except (OSError, RuntimeError, ValueError) as exc:
+         raise ProductionOperationFailureV5(
+-            "Use a clean source checkout at manifest.source_commit with the authenticated baseline policy files"
++            "Supply the manifest commit and its authenticated four policy blobs"
++            if development
++            else "Use a clean source checkout at manifest.source_commit with the authenticated baseline policy files"
+         ) from exc
+     if snapshot.editable_source_sha256 != authenticated.policy_scope.editable_source_sha256:
+         raise ProductionOperationFailureV5("Source policy files differ from the authenticated manifest policy scope")
+     config = _derive_config(
+         repository=repository,
+         authenticated=authenticated,
+         round_index=round_index,
+         owner_token_sha256=token,
+         paths=paths,
+     )
+     reference = repository.create_typed_artifact(output_path, config)
+     return {
+         "schema_version": 5,
+         "status": "prepared",
+         "manifest_ref": authenticated.manifest_ref,
+         "adapter_config_ref": reference,
+         "round_index": round_index,
+         "owner_token_sha256": token,
+         "provider_executed": False,
+         "evaluation_executed": False,
++        "resources": authenticated.manifest.resources,
++        "search": authenticated.manifest.search,
++        "resume_command": render_production_command_v5(
++            repository=repository,
++            authenticated=authenticated,
++            artifact_root=repository.root,
++            adapter_config_ref=reference,
++            round_index=round_index,
++            owner_token_sha256=token,
++            command="resume-campaign" if round_index == 1 else "resume",
++        ),
+     }
+ 
+ 
++def prepare_production_adapter_config_v5(**kwargs):
++    if kwargs["authenticated"].manifest.pit_data_scope != "production":
++        raise ProductionOperationFailureV5("production setup requires production manifest")
++    return _prepare_adapter_config_v5(**kwargs)
++
++
++def prepare_development_adapter_config_v5(**kwargs):
++    require_development_v5(kwargs["authenticated"].manifest)
++    return _prepare_adapter_config_v5(**kwargs)
++
++
++def _scope_adapters(authenticated):
++    if authenticated.manifest.pit_data_scope == "development_sp500_v2":
++        require_development_v5(authenticated.manifest)
++        return load_development_config_v5, DevelopmentRoundFactoryV5
++    return ProductionV5CommandServices._adapter_config, ProductionRoundFactoryV5
++
++
+ def render_production_command_v5(
+     *,
+     repository: LocalArtifactRepositoryV5,
+     authenticated: AuthenticatedCampaignManifestV5,
+     artifact_root: Path,
+     adapter_config_ref: ArtifactRefV5,
+     round_index: int,
+     owner_token_sha256: str,
+     command: str = "run",
+ ) -> dict[str, object]:
+     """Return argv plus a PowerShell command after verifying the local adapter graph."""
+     if command not in {"run", "resume", "run-campaign", "resume-campaign"}:
+         raise ProductionOperationFailureV5("The rendered command must be run, resume, run-campaign, or resume-campaign")
++    if authenticated.manifest.pit_data_scope == "development_sp500_v2" and not command.endswith("campaign"):
++        raise ProductionOperationFailureV5("development uses run-campaign or resume-campaign")
+     if command.endswith("campaign") and round_index != 1:
+         raise ProductionOperationFailureV5("Campaign launch uses the round 1 configuration and owner")
+     token = _owner_token(owner_token_sha256)
+     authorities = _authorities(authenticated)
+-    config = ProductionV5CommandServices._adapter_config(repository, authorities, adapter_config_ref)
+-    composition = ProductionRoundFactoryV5(adapter_config_ref=adapter_config_ref, adapter_config=config).compose_round(
++    load_config, factory = _scope_adapters(authenticated)
++    config = load_config(repository, authorities, adapter_config_ref)
++    composition = factory(adapter_config_ref=adapter_config_ref, adapter_config=config).compose_round(
+         repository=repository,
+         authorities=authorities,
+         round_index=round_index,
+         owner_token_sha256=token,
+         adapter_config=config,
+     )
+     composition.validate_for(
+         repository=repository,
+         authorities=authorities,
+         round_index=round_index,
+@@ -297,39 +357,40 @@ def render_production_command_v5(
+         "round_index": round_index,
+         "owner_token_sha256": token,
+         "argv": tuple(argv),
+         "working_directory": str(Path(__file__).resolve().parents[2]),
+         "powershell_command": "& " + " ".join("'" + arg.replace("'", "''") + "'" for arg in argv),
+         "provider_executed": False,
+         "evaluation_executed": False,
+     }
+ 
+ 
+-def run_production_campaign_v5(
++def _run_campaign_v5(
+     *,
+     repository: LocalArtifactRepositoryV5,
+     authenticated: AuthenticatedCampaignManifestV5,
+     adapter_config_ref: ArtifactRefV5,
+     owner_token_sha256: str,
+     resume: bool = False,
+     emit_round: Callable[[dict[str, object]], None] | None = None,
+ ) -> dict[str, object]:
+     """Run existing rounds sequentially under the original persisted campaign deadline."""
+     manifest = authenticated.manifest
+     authorities = _authorities(authenticated)
+     token = _owner_token(owner_token_sha256)
+-    config = ProductionV5CommandServices._adapter_config(repository, authorities, adapter_config_ref)
++    load_config, factory = _scope_adapters(authenticated)
++    config = load_config(repository, authorities, adapter_config_ref)
+     key = manifest.sha256
+     with repository.adapter_state_transition(namespace="campaign-launch", key=key):
+         # Recheck the original round's identities even on resume, so deriving a
+         # later owner-bound config cannot quietly accept changed host resources.
+-        first = ProductionRoundFactoryV5(adapter_config_ref=adapter_config_ref, adapter_config=config).compose_round(
++        first = factory(adapter_config_ref=adapter_config_ref, adapter_config=config).compose_round(
+             repository=repository,
+             authorities=authorities,
+             round_index=1,
+             owner_token_sha256=token,
+             adapter_config=config,
+         )
+         first.validate_for(
+             repository=repository,
+             authorities=authorities,
+             round_index=1,
+@@ -424,21 +485,28 @@ def run_production_campaign_v5(
+                     reason = "provider_budget_exhausted"
+                     break
+                 round_config = (
+                     config
+                     if round_index == 1
+                     else _derive_config(
+                         repository=repository,
+                         authenticated=authenticated,
+                         round_index=round_index,
+                         owner_token_sha256=token,
+-                        paths={field: getattr(config, field) for field in _PATH_FIELDS},
++                        paths={
++                            field: getattr(config, field)
++                            for field in (
++                                (*_PATH_FIELDS, "response_directory")
++                                if type(config) is DevelopmentAdapterConfigV5
++                                else _PATH_FIELDS
++                            )
++                        },
+                     )
+                 )
+                 round_ref = (
+                     adapter_config_ref
+                     if round_index == 1
+                     else repository.create_typed_artifact(
+                         f"campaigns/{key}/adapter-config-round-{round_index}.json",
+                         round_config,
+                     )
+                 )
+@@ -450,32 +518,30 @@ def run_production_campaign_v5(
+                 or entry.started_epoch_ms is not None
+             ):
+                 raise ProductionOperationFailureV5("Persisted round ownership differs from campaign launch")
+             started = repository.load_typed_state(
+                 namespace="campaign-round-started", key=round_key, value_type=CampaignRoundLaunchV5
+             )
+             if started is not None and (
+                 started.started_epoch_ms is None or replace(started, started_epoch_ms=None) != entry
+             ):
+                 raise ProductionOperationFailureV5("Persisted round start differs from its configuration")
+-            if started is not None and not events:
++            if started is not None and not events and type(config) is not DevelopmentAdapterConfigV5:
+                 raise ProductionOperationFailureV5(
+                     "Round start was persisted but no round journal exists; inspect provider reservations before recovery. "
+                     "The campaign will not silently restart this uncertain round"
+                 )
+             if time.monotonic() >= deadline and not events:
+                 reason = "campaign_deadline_exhausted"
+                 break
+-            round_config = ProductionV5CommandServices._adapter_config(
+-                repository, authorities, entry.adapter_config_ref
+-            )
+-            composition = ProductionRoundFactoryV5(
++            round_config = load_config(repository, authorities, entry.adapter_config_ref)
++            composition = factory(
+                 adapter_config_ref=entry.adapter_config_ref,
+                 adapter_config=round_config,
+             ).compose_round(
+                 repository=repository,
+                 authorities=authorities,
+                 round_index=round_index,
+                 owner_token_sha256=entry.owner_token_sha256,
+                 adapter_config=round_config,
+             )
+             composition.validate_for(
+@@ -505,20 +571,43 @@ def run_production_campaign_v5(
+                 "round_index": round_index,
+                 "status": result.status,
+                 "reused": False,
+                 "adapter_config_ref": entry.adapter_config_ref,
+                 "failure": result.failure,
+                 "cleanup_failure": result.cleanup_failure,
+             }
+             rounds.append(row)
+             if emit_round is not None:
+                 emit_round(row)
++            if result.status == "awaiting_controller_response":
++                return {
++                    "schema_version": 5,
++                    "status": "pending_controller_response",
++                    "reason": "pending_controller_response",
++                    "pending": result.pending_controller_role,
++                    "round_index": round_index,
++                    "rounds": tuple(rounds),
++                    "manifest_ref": authenticated.manifest_ref,
++                    "started_epoch_ms": launch.started_epoch_ms,
++                    "round_started_epoch_ms": started.started_epoch_ms,
++                    "deadline_epoch_ms": launch.started_epoch_ms
++                    + manifest.resources.campaign_wall_timeout_seconds * 1000,
++                    "resume_command": render_production_command_v5(
++                        repository=repository,
++                        authenticated=authenticated,
++                        artifact_root=repository.root,
++                        adapter_config_ref=adapter_config_ref,
++                        round_index=1,
++                        owner_token_sha256=token,
++                        command="resume-campaign",
++                    ),
++                }
+             if result.cleanup is None or not result.cleanup.cleanup_complete or result.cleanup_failure is not None:
+                 reason = "cleanup_incomplete"
+                 break
+             if result.status not in {"completed", "no_novel_hypothesis"}:
+                 reason = result.status
+                 break
+         # Defer the complete ledger/journal check until pending runtime recovery
+         # has had its opportunity to reconcile a paid reservation.
+         ProductionV5CommandServices._verify_local_run(repository, authorities, config)
+         summary = summarize_repository_v5(
+@@ -534,58 +623,80 @@ def run_production_campaign_v5(
+             "status": "completed" if reason == "max_feedback_rounds" else "stopped",
+             "reason": reason,
+             "manifest_ref": authenticated.manifest_ref,
+             "rounds": tuple(rounds),
+             "started_epoch_ms": launch.started_epoch_ms,
+             "deadline_epoch_ms": launch.started_epoch_ms + manifest.resources.campaign_wall_timeout_seconds * 1000,
+             "summary": summary,
+         }
+ 
+ 
++def run_production_campaign_v5(**kwargs):
++    if kwargs["authenticated"].manifest.pit_data_scope != "production":
++        raise ProductionOperationFailureV5("production run requires production manifest")
++    return _run_campaign_v5(**kwargs)
++
++
++def run_development_campaign_v5(**kwargs):
++    require_development_v5(kwargs["authenticated"].manifest)
++    return _run_campaign_v5(**kwargs)
++
++
+ def dispatch_production_operations_cli_v5(argv: Sequence[str], *, emit: Callable[[str], None] = print) -> int:
+     try:
+         args = build_parser_v5().parse_args(tuple(argv))
+         repository = LocalArtifactRepositoryV5(Path(args.artifact_root))
+         authenticated = authenticate_campaign_manifest_v5(
+             repository=repository,
+             manifest_ref=ArtifactRefV5(args.manifest_path, args.manifest_sha256),
+         )
+-        if args.command == "prepare-production":
+-            result = prepare_production_adapter_config_v5(
++        if args.command in {"prepare-production", "prepare-development"}:
++            prepare = (
++                prepare_development_adapter_config_v5
++                if args.command == "prepare-development"
++                else prepare_production_adapter_config_v5
++            )
++            result = prepare(
+                 repository=repository,
+                 authenticated=authenticated,
+                 output_path=args.output_path,
+                 round_index=args.round_index,
+                 owner_token_sha256=args.owner_token_sha256,
+                 **{field: getattr(args, field) for field in _PATH_FIELDS},
++                **({"response_directory": args.response_directory} if args.command == "prepare-development" else {}),
+             )
+         else:
+-            result = run_production_campaign_v5(
++            run = (
++                run_development_campaign_v5
++                if authenticated.manifest.pit_data_scope == "development_sp500_v2"
++                else run_production_campaign_v5
++            )
++            result = run(
+                 repository=repository,
+                 authenticated=authenticated,
+                 adapter_config_ref=ArtifactRefV5(args.adapter_config_path, args.adapter_config_sha256),
+                 owner_token_sha256=args.owner_token_sha256,
+                 resume=args.command == "resume-campaign",
+                 emit_round=lambda row: emit("PIT_OPTIMIZER_V5_ROUND=" + canonical_json_bytes_v5(row).decode("utf-8")),
+             )
+         emit("PIT_OPTIMIZER_V5_OPERATIONS=" + canonical_json_bytes_v5(result).decode("utf-8"))
+         return (
+             1 if result.get("reason") in {"failed", "runtime_failed", "cleanup_incomplete", "critic_unavailable"} else 0
+         )
+     except SystemExit:
+         raise
+     except (OSError, RuntimeError, TypeError, ValueError) as exc:
+         diagnostic = (
+             str(exc)
+             if type(exc) is ProductionOperationFailureV5
+             else (
+-                "Cannot authenticate or use the supplied production resources. Verify the artifact root, manifest/config "
++                "Cannot authenticate or use the supplied campaign resources. Verify the artifact root, manifest/config "
+                 "paths and SHA-256 digests, and the saved round owner. " + str(exc)
+             )
+         )
+         emit(
+             "PIT_OPTIMIZER_V5_OPERATIONS="
+             + canonical_json_bytes_v5(
+                 {
+                     "schema_version": 5,
+                     "status": "failed",
+                     "reason": "production_operation_failed",
+diff --git a/core/pit_optimizer_v5/production_workspace.py b/core/pit_optimizer_v5/production_workspace.py
+index c2a4160..7092a74 100644
+--- a/core/pit_optimizer_v5/production_workspace.py
++++ b/core/pit_optimizer_v5/production_workspace.py
+@@ -340,32 +340,36 @@ class LocalGitWorkspaceDriverV5(GitWorkspaceDriverV5):
+     """Exact concrete driver; Git and mutation occur only in runtime methods."""
+ 
+     def __init__(
+         self,
+         *,
+         roots: WorkspaceRootsV5,
+         source_commit: str,
+         git_executable: Path,
+         repository: LocalArtifactRepositoryV5,
+         owner: WorkspaceOwnerV5,
++        export_mode: str = "full",
+     ) -> None:
+         if os.name != "nt":
+             raise RuntimeError("the concrete V5 Git workspace adapter requires Windows handle authority")
+         if (
+             type(roots) is not WorkspaceRootsV5
+             or re.fullmatch(r"[0-9a-f]{40}", source_commit) is None
+             or type(repository) is not LocalArtifactRepositoryV5
+             or type(owner) is not WorkspaceOwnerV5
+             or not isinstance(git_executable, Path)
+             or not git_executable.is_absolute()
+         ):
+             raise ValueError("local Git workspace configuration is invalid")
++        if export_mode not in {"full", "policy_only"}:
++            raise ValueError("invalid workspace export mode")
++        self._export_mode = export_mode
+         executable_identity = _hash_regular_file(git_executable)
+         source_path, source_info = _canonical_link_free_directory(roots.source_root)
+         workspace_path, workspace_info = _canonical_link_free_directory(roots.workspace_root)
+         if _roots_overlap(str(source_path), str(workspace_path)):
+             raise ValueError("local Git workspace roots are not disjoint")
+         self._roots = roots
+         self._source_commit = source_commit
+         self._git_executable = git_executable
+         self._git_identity = executable_identity
+         self._source_identity = _metadata_identity(source_info)
+@@ -379,23 +383,32 @@ class LocalGitWorkspaceDriverV5(GitWorkspaceDriverV5):
+                 "source_commit": source_commit,
+                 "git_executable_identity": executable_identity,
+                 "source_root": (_windows_key(str(source_path)), source_info.st_dev, source_info.st_ino),
+                 "workspace_root": (
+                     _windows_key(str(workspace_path)),
+                     workspace_info.st_dev,
+                     workspace_info.st_ino,
+                 ),
+                 "repository_root_identity_sha256": repository.root_identity_sha256,
+                 "owner_sha256": owner.sha256,
++                **(
++                    {"export_mode": export_mode, "export_paths": EDITABLE_POLICY_PATHS_V5}
++                    if export_mode == "policy_only"
++                    else {}
++                ),
+             }
+         )
+ 
++    @property
++    def export_mode(self) -> str:
++        return self._export_mode
++
+     @property
+     def driver_identity_sha256(self) -> str:
+         return self._driver_identity_sha256
+ 
+     @property
+     def roots(self) -> WorkspaceRootsV5:
+         return self._roots
+ 
+     @property
+     def source_commit(self) -> str:
+@@ -543,38 +556,41 @@ class LocalGitWorkspaceDriverV5(GitWorkspaceDriverV5):
+             raise WorkspaceDriverBoundaryErrorV5("driver_failed") from None
+ 
+     def _export_commit(self, source: Path, target_root: Path, target_identity: tuple[int, int]) -> None:
+         raw_tree = self._run_git(
+             source,
+             "ls-tree",
+             "-rz",
+             "-r",
+             "--full-tree",
+             self._source_commit,
++            *(("--", *EDITABLE_POLICY_PATHS_V5) if self.export_mode == "policy_only" else ()),
+             output_limit=32 * 1024 * 1024,
+         )
+         entries: list[tuple[tuple[str, ...], str]] = []
+         for raw_entry in raw_tree.split(b"\0"):
+             if not raw_entry:
+                 continue
+             try:
+                 metadata, raw_path = raw_entry.split(b"\t", 1)
+                 mode, kind, _object_id = metadata.decode("ascii", errors="strict").split(" ")
+             except (UnicodeError, ValueError):
+                 raise WorkspaceDriverBoundaryErrorV5("driver_failed") from None
+             parts = _closed_tracked_path(raw_path)
+             if kind != "blob" or mode not in {"100644", "100755"}:
+                 raise WorkspaceDriverBoundaryErrorV5("driver_failed")
+             entries.append((parts, mode))
+         paths = tuple("/".join(parts) for parts, _mode in entries)
+         if len(set(paths)) != len(paths):
+             raise WorkspaceDriverBoundaryErrorV5("driver_failed")
++        if self.export_mode == "policy_only" and set(paths) != set(EDITABLE_POLICY_PATHS_V5):
++            raise WorkspaceDriverBoundaryErrorV5("driver_failed")
+         entries.sort(key=lambda item: "/".join(item[0]))
+         owned_directories: dict[tuple[str, ...], tuple[int, int]] = {(): target_identity}
+         for parts, _mode in entries:
+             relative = "/".join(parts)
+             content = self._run_git(
+                 source,
+                 "show",
+                 f"{self._source_commit}:{relative}",
+             )
+             try:

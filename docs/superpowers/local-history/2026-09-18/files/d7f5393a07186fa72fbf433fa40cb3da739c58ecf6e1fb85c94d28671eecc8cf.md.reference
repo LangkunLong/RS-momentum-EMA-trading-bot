@@ -1,0 +1,84 @@
+# Proposed completed-history verifier — Increment C-a decision package
+
+Disposition: proposed for principal review, not implemented. The scope is local historical reporting. It grants no execution capability, ownership transfer, campaign readiness or new paid-call budget.
+
+## Decision
+
+Preserve `LocalContainerExecutorV5`'s current identity guards. Add a separate, explicitly selected verifier for completed historical development rounds, bound to each original `CampaignRoundLaunchV5.adapter_config_ref`. The expected executor digest must come from that authenticated original config, not be taken from the reservation being checked.
+
+The original launch's config covers round 1; later rounds have independently saved configs. A single campaign-level config must not be used as every round's executor authority. The independent authority trace must confirm these config references and equality against the real reservations before implementation begins.
+
+This prerequisite is now confirmed by `authority-trace-report.md` and the separate principal read in `principal-round-config-anchors.json`: both round configs authenticate, and their respective executor digests match all ten reservations. Missing original environment/host preimages remain separate, explicit limits.
+
+The available original config digest pins the executor provenance expected on historical records without reconstructing its process environment. It cannot prove the exact host implementation or environment that ran, or establish that today's process has the same execution authority. The two meanings remain separate in API types and call paths.
+
+## Checkpoint H1: resolve immutable historical round authority
+
+Expected source scope: `development_preparation.py` and a new host-only `historical_verification.py`. No runtime behavior activation yet.
+
+1. Authenticate the manifest using the exact `CampaignLaunchV5.manifest_ref`, then load that campaign launch with `repair=False` and require manifest equality.
+2. Derive each round key using the existing canonical manifest/round mapping. Load `campaign-round` and `campaign-round-started` as `CampaignRoundLaunchV5`, both with `repair=False`. Require exact entry equality after removing only `started_epoch_ms`, require a positive start, the expected round number and the original campaign owner token. Require the first round's config reference to equal the campaign launch's reference.
+3. Load each referenced development config through the existing typed config authority check, including manifest and repository-root identity. Require source/workspace/data/output/control/tool paths, export mode and controller/provider-specific settings to agree with the original campaign config; only legitimately round-derived identity fields may differ. Do not read credential values.
+4. Derive the exact `WorkspaceOwnerV5` from the authenticated campaign/round/token and existing controller-lease derivation. Require all resource events, execution authorities and reservations to bind that owner. Reconstruct read-only workspace/mount adapters and require their identities to match the round's saved config. Their existing historical authentication methods remain mandatory.
+5. Return a frozen internal authority containing manifest, round, owner, exact config reference and expected executor/workspace/mount digests. Do not expose an override field on `LocalContainerExecutorV5`, and do not issue `OwnedLeaseV5`, execution reservations or opaque operational capabilities.
+
+Checkpoint result: explicit authority graph and real round-1/round-2 config verification. No tests or fabricated authority under the retained restrictions.
+
+## Checkpoint H2: verify completed historical execution records
+
+Expected source scope: `historical_verification.py`. If sharing pure predicates requires changes to `production_sandbox.py`, submit the exact extraction design before that source change; `_load_reservation` and all live capability/foreign-owner guards must remain byte-identical. Avoid maintaining an unchecked copy of the security-sensitive phase verifier.
+
+The reader consumes the H1 authority and actual journal execution index. All state reads use `repair=False`; no adapter transition locks, orphan repair, subprocesses, environment reads, Docker commands, cleanup or reconciliation are permitted. It cannot construct a live executor and cannot replace an executor digest on an existing object.
+
+The supported historical interpretation is the exact recognized serialized V5 evidence model: canonical typed record schemas, the closed saved command grammar and digest, the defined phase-prefix/lifecycle transitions, and the terminal/output/control/cleanup bindings listed below. The per-round config pins the expected executor provenance for those records. Acceptance does **not** reconstruct or prove equality of the unsaved historical `control_environment` tuple, runtime-contract literal, or host helper bytes. There is no inferred contract selector. Unknown schema revisions, noncanonical or extra/missing fields, unrecognized command/phase/output forms, or evidence whose meaning is ambiguous under these named V5 rules fail closed.
+
+Required checks, with the same failure behavior as their existing counterparts:
+
+| Evidence | Required binding |
+| --- | --- |
+| Reservation | Expected executor from original round config; exact owner, command and request; canonical argv command digest; deterministic container/control names; output-mount identity; exact two derived lease IDs and journal lease payloads |
+| Workspace and output mount | Existing lease retirement and output-history checks; exact source identity belongs to the journaled workspace; saved round config agrees with current pinned non-environment identities |
+| Panel input | Existing semantic-probe absence rule or exact panel request, evaluator/profile, quick/discovery purpose and episode ordinal |
+| Phases and container identity | All records bind the config-pinned executor and command; exact valid prefix of launch/create/start/collect; immutable container identity, lifecycle, network and state-attestation transitions |
+| Terminal/output | Expected executor, command, request and output mount; collected evidence where required; successful outputs for journaled success keys; bounded byte count and exact binary-state reference/content digest |
+| Cleanup/control | Both durable container-absent and cleanup records with expected executor/owner; correct same-encoding control-root identity; original control creation/readiness and tool identity; actual transaction-directory absence; exact cleanup counts and workspace retirement |
+| Campaign/record/roles | Existing round journal fold, role-package/paid-ledger authentication, checkpoint records, archive projection, finalizer and cleanup semantics remain mandatory |
+
+The completed-history reader accepts only an already settled round with successful durable cleanup. Settled means committed checkpoint record(s) or an authenticated terminal outcome; round 2's deadline failure must remain a failed outcome, not a second evaluated round. Missing, incomplete, foreign, unsupported, or semantically ambiguous serialized evidence fails closed. Exact historical host-contract equality is outside the claim; no automatic migration, digest rebinding, or guessed selector is allowed.
+
+This initial design retains current local workspace/data/output/control/tool identity checks. It does not support moved archives, changed Docker executables or missing resource roots. It also does not prove the exact historical environment or reconstruct live execution attestation from a digest.
+
+## Checkpoint H3: explicit summary integration
+
+Expected source scope: `summary.py`, `development_preparation.py`, and the reviewed historical module. Initial delivery need not change the CLI.
+
+Add an explicit keyword to `summarize_repository_v5`, for example `verification_scope="current_runtime" | "completed_history"`, defaulting to the current behavior. Require `completed_history` to be used with `command="summarize"` and the existing supported development scope; do not select it merely from a caught ownership exception. Route that explicit request through the new completed-history authority/reader, while retaining ordinary journal/record/role/projection authentication and unchanged summary fields/count calculations.
+
+The completed-history selection must carry a strict read-only policy through the entire transitive role-authentication path; a separate archive preflight is insufficient because a missing-index race can occur after preflight. The implementation must provide narrowly named existing-only entry points with these boundaries:
+
+1. Controller history: propagate `repair=False` from the completed-history entry point through `authenticate_controller_packages_v5` and `_authenticate_controller_request` to both `campaign-launch` and `campaign-round-started` reads (`development_preparation.py:344-390`). Do not call `FileBackedControllerRoleInvokerV5.reconcile_once`, because it reaches `_sealed`, whose absent-response branch calls `append_controller_role_response` (`controller_roles.py:95-108,179-185`; `artifacts.py:2808-2832`). Add an existing-only controller authenticator that loads the sealed response once with `load_controller_role_response`, requires it to exist, and applies the same pure envelope/binding/terminal derivation to those supplied bytes. Absence at that read fails; it never falls back to the response directory or append path.
+2. Paid history: route completed history through a dedicated paid-history authentication entry point rather than the operational ledger lifecycle. Its reviewed allow-list is the immutable package loader (`artifacts.py:2924-2936`), `LocalRoleAuthorizationLedgerV5._load_verified`/terminal-fact classification and `authenticate_role_invocations` predicates (`production_provider.py:330-430,512-570`), and the read-only repository loaders for ledger records, unique requests, and provider responses (`artifacts.py:2256-2273,2275-2350,2648-2685`). Reservation, settle, recovery, provider invocation, append, and migration-write paths are unreachable. If these predicates are extracted, operational authentication and the new read-only entry point must share them rather than maintain divergent copies.
+3. Repository state: every state loader reachable from completed history must receive `repair=False` at the call itself. Missing authority indexes fail at the observed read. No `recover_typed_state_index`, append/create API, adapter transition, or mutation-capable reconciliation object is reachable. Existing live callers retain their current defaults.
+
+Default callers, `run`, `resume`, `verify-run`, campaign budget accounting and cleanup continue to use current runtime authority. A new historical summary must not silently alter those call paths. A CLI flag or separate command can be considered later as a separate bounded change; it is not needed for the local direct-API verification milestone.
+
+Required permitted verification after implementation:
+
+1. Scoped exact source diff/AST review, Ruff and in-memory compilation. Statically enumerate every call reachable from the completed-history entry point and require all state reads to pass `repair=False`; require the controller existing-only and paid-history allow-lists above to contain no write-capable fallback. This source check, not preflight, establishes the nonmutation boundary. Recompute the complete evaluator map; stop if any covered source changed. No tests or synthetic evidence.
+2. Authenticate both original round configs and all actual runtime-04 execution histories. Invoke the full summary once with explicit completed-history scope; compare old returned values and new counts against real immutable baselines, preserving command-label and Decimal-format distinctions.
+3. Confirm runtime-04 still has one evaluated feedback round, round 2's deadline failure, complete recorded cleanup and counts 1/1/0. Confirm actual06 remains failed with counts 0/0/0 and no invented rejected records.
+4. Compare all original archive hashes before/after and all protected source hashes. Review default/live guard call sites statically; do not invoke a live campaign or create synthetic foreign reservations for coverage.
+5. Record unexecuted negative and operational branches honestly. A successful historical read is not proof that a fresh campaign is ready or that positive rejection/duplicate paths ran.
+
+## Rejected approaches
+
+- Replacing the stored executor digest, changing process environment until a digest happens to match, or guessing the original PATH.
+- Removing `_load_reservation`'s foreign-executor guard, adding an unchecked override, monkeypatching an executor, or calling repair/recovery to normalize the archive.
+- Trusting the reservation's own executor digest without the original round config anchor.
+- Treating schema version 5 or the manifest policy commit as proof of the unsaved historical host runtime contract.
+- Reusing controller `reconcile_once`, an operational paid-ledger lifecycle, or a preflight-only check as the completed-history write boundary.
+- Using the new reader implicitly in `run`/`resume`/`verify-run` or treating lifecycle completion as evaluated feedback.
+
+## Exit and next step
+
+Increment C-a delivers this reviewable design and the authenticated diagnosis. After the principal accepts the exact H1/H2 boundaries, implement H1 alone with a subagent and return its source/evidence package before H2. Retain the current prohibition on tests, synthetic artifacts, external calls, campaigns and commits. C-b readiness consolidation follows only after the historical summary requirement has actually passed.

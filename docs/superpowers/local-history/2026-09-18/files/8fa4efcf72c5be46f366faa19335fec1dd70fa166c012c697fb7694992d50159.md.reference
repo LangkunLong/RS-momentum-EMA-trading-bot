@@ -1,0 +1,34 @@
+# C-c preparation driver independent static review — final freeze 04
+
+Specification verdict: **PASS**. Quality verdict: **APPROVE**.
+
+I explicitly approve the exact driver SHA-256 `2ca91a126701fdbd692c79181a6ef28a1dc9d4d81dc6a54b102b1f04e91ff5be` for principal actual preparation only, using the reviewed `C:/WINDOWS/py.EXE -3.13 -B` invocation and all fixed source, readiness, tool, input, path, and review gates. This does not authorize a paid launch. The actual prepared package still requires independent artifact/launch review and a separate fresh user paid grant.
+
+## Exact final evidence
+
+- `prepare_c_c_campaign.py`: 57,121 bytes, SHA-256 `2ca91a126701fdbd692c79181a6ef28a1dc9d4d81dc6a54b102b1f04e91ff5be`.
+- `implementation-report.md`: 8,738 bytes, SHA-256 `b12110a9915933e015ad95ff2fc26d4dc18dfaef9c4367db8216ccaa0280b0b3`.
+- `fix-03.diff`: 18,384 bytes, SHA-256 `2e03f318c3fb6a226b828d46a95f21580dbe991400a97bb253c7b6aa02d6e499`.
+- All three independently matched their exact retained `review-freeze-04-exact` copies, sizes, and hashes.
+- Principal finding `windows-long-path-preflight-finding.md`: SHA-256 `2a87c254726cc52cac1069cb8b8997195c27f2885ff59318a965929962ce64e2`, independently matched.
+- The prior final review is retained at `review-freeze-03-exact/independent-review.md`, independently hash-checked as `6145afb050e8de8ffee725d22ea5da46888012b139dede3f86be407644e8877d`. It approved driver `3ca3a90c81380b99532d5fd79dda18de14a2d49700ac20dbfb06425ef0c8d2da` after the interpreter correction and incorporates the earlier full review and I1/M1 resolution.
+
+## Scoped long-path correction
+
+The retained `actual-start-02-preflight-failure.json` records the original-parent-blob check failing inside preflight before project imports. The principal finding records the intact 264-character logical path, 7,473 exact bytes, expected content hash, regular non-reparse metadata, and absent fresh roots. That evidence supports correcting filesystem spelling without changing the artifact or its authority.
+
+The Windows conversion follows the existing convention in `core/pit_optimizer_artifacts.py:482-488`: retain an existing extended prefix, convert UNC spelling to the extended UNC form, and prefix the absolute drive path otherwise. Conversion occurs at filesystem-call boundaries; logical Path values remain the inputs to native repositories, resource/tool identities, containment checks, relative refs, and reports. None of the original dependency refs, expected hashes, native preparation/config/owner inputs, policy/caps, or renderer arguments changed.
+
+The complete fix diff and necessary native convention were reviewed. Exact reads now use extended-path lstat/open/fstat, require regular non-link/non-reparse files, compare device/inode across opening and reading, and retain the original content-hash comparison. Alias inspection remains lstat-only and still makes no alias content-hash claim. Directory validation walks the logical absolute components and rejects link/reparse entries before returning the unprefixed logical path.
+
+Fresh-root creation, directory enumeration, existence checks, destination parent creation, and exclusive writes now use extended disk paths. O_CREAT/O_EXCL, full write/fsync/close handling, existing-root rejection, logical containment checks, and fresh-root emptiness checks remain. The added parent and post-write regular-file checks preserve fail-closed behavior; no overwrite, truncation, rename, deletion, or missing-file bypass is introduced.
+
+Snapshot traversal now explicitly enumerates every directory with extended-path scandir, recurses into directories, hashes regular files through the guarded reader, and rejects links/reparse points and other non-regular entries. Keys remain sorted logical relative paths. Thus long files remain covered by both before/after snapshots instead of being silently omitted. Source and readiness checks use the same exact reader. The fixed principal finding is authenticated by the existing pre-import review gate.
+
+AST inspection found only the filesystem helpers, their callers, and finding/report additions shown in the scoped diff; no function was removed. The corrected driver parses as an AST. No new finding arose. Earlier import fixes, truthful environment reporting, launcher/native-interpreter distinction, source/readiness gates, exact import inventory, native fresh preparation, preview-only request construction, and absence of operational invocation remain supported by the retained reviews and unchanged portions.
+
+## Authority and limits
+
+This verdict relies on the retained full bounded review and previous focused resolutions plus this long-path-only review. It does not repeat broader native-source or historical/readiness review. The protected source review remains `4e4991b0dfcdcfe980b2bd2655ba5bf88af6300c956c179d2e258014dd1fef4b`, the 22-file source authority remains `d896bce97945b9438bed6f4837fd16213530338563e3bbd728eafaa8a9fbbe09`, and independent readiness remains `50cd6d863fb3f6235af3a47fcf90fe4d21a5425c8852055b470abe9c95634f3a`.
+
+This is static approval, not proof of a successful retry, actual preparation, positive enrolled admission, or paid execution. No driver/project source import or execution, tests, synthetic path probes, native reader/summary invocation, Git/Docker command, provider/API/evaluation/campaign activity, credential/environment-value access, or archive mutation was performed. Only retained evidence, source/diff, AST, and hashes were inspected. Preserve this final report for its execution-gate hash; actual preparation results require separate review.

@@ -1,0 +1,57 @@
+# Task 11 Engine-Fidelity Observability — Final Handoff
+
+## Outcome
+
+COMPLETE. The engine now exposes the actual behavior-bearing strategy surface, binds it to fresh and resumed results, and provides aggregate-only point-in-time C/A provenance for the sealed Task 11 replay. This phase did not optimize the strategy, change trading decisions, select parameters, download data, regenerate a cache, or run a backtest.
+
+CANSLIM is the strategy basis and initial policy family, not an immutable optimization objective. The effective policy assigns the later `maximize_return_and_minimize_drawdown` objective to the multi-agent backtest loop. Supported CANSLIM-derived thresholds, weights, gates, metric priorities, and portfolio/exit rules may be loosened or tightened there; PIT causality, next-session execution, source integrity, deterministic accounting, and truthful observability remain invariants.
+
+## Final review
+
+The first whole-tree senior review found 0 Critical, 5 Important, and 0 Minor issues. All five were fixed. The frozen post-fix senior re-review passed with 0 Critical, 0 Important, and 0 Minor findings. Focused engine, sealed-I/O, and final C-trace reviews also passed with no findings.
+
+## Sealed artifact diagnosis
+
+The canonical offline artifact command exited 0 and preserved the sealed funnel:
+
+- 2023–2025: 375,703 evaluated symbol-days; 8,439 technical setups; 1,926 C passes; 627 conditional A passes; 238 RS passes; 173 composite-qualified/attempted; 131 executions; 42 next-open buy-zone rejections.
+- Zero cash, capacity, invalid-price, invalid-risk, missing-data, and already-open rejections.
+- Average cash 67.60512426994353%; average open holdings 2.821656050955414; maximum open holdings 8.
+- Full 2021–2025: 233 qualified/attempted; 176 executions; 57 next-open buy-zone rejections; average cash 74.8482727176575%.
+- Profile remains `fidelity_incomplete`, not optimal or full strict CANSLIM, because production PIT institutional and industry-leadership evidence is incomplete.
+
+## Final C/A provenance reconciliation
+
+The full authenticated offline command exited 0 after checking every fixed cohort row:
+
+- C: 8,439 checked = 1,926 pass + 5,712 finite below threshold + 801 unavailable.
+- Conditional A: 1,926 checked = 627 pass + 1,136 finite below threshold + 163 unavailable.
+- Scalar mismatches: 0. Availability mismatches: 0. Source-chain identities verified: 6/6.
+- C unavailable reasons: 511 negative prior, 232 no visible observation, 41 nonfinite current value, 17 zero prior.
+- C public-date visibility: 8,207 both visible, 232 neither visible.
+- A unavailable reasons: 155 negative prior, 8 insufficient annual history; visibility 1,918 both visible and 8 current-only.
+
+The 41 corrected C rows explain previously hidden matched observations whose current value was missing/nonfinite. Legacy C scores/growth and the entry funnel did not change.
+
+## Effective engine policy
+
+Direct no-fetch audit exited 0:
+
+- SHA-256: `77baf710830c3f69caf463b8ae8b4fc0da808f855fbd1b16bd4bdc8ad9de052d`.
+- 128 leaves: 86 active fixed, 25 active tunable, 8 advisory/unsupported, 9 causal invariant.
+- 108 future optimizer candidates.
+- Actual risk sizing formula and the 10%/15%/20% scale-out tiers at 25% each are exposed.
+- Unsupported/inert changes reject before data access.
+- PIT/technical-only industry filtering rejects unless a causal as-of industry source exists.
+- Completed checkpoint `result_config` policy and digest must equal the live verified policy.
+- Built-in PIT, normal provider, technical-only, and opaque custom-strategy fundamental attestations are distinct and truthful.
+
+## Structural verification
+
+The canonical `py_compile` command for all eleven Task 11 production modules/CLIs exited 0. `git diff --check` reported no whitespace errors; only repository LF-to-CRLF notices appeared. `git status --short` remained the expected 13-file Task 11 scope: seven tracked modifications and six intended untracked implementation/specification files.
+
+No pytest/unit tests were added or run. Formal regression tests remain intentionally deferred until the user explicitly ends the build phase.
+
+## Git and external-state boundary
+
+Nothing was staged, committed, pushed, merged, reset, stashed, deleted, or cleaned. No network/provider/plugin access, dataset download, cache refresh, optimizer operation, or sealed-artifact mutation occurred.

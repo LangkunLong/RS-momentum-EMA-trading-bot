@@ -1,0 +1,29 @@
+## Spec Compliance
+
+Partially compliant. The authenticated V4 parity path loads the contract from the supplied provenance, verifies the provenance and canonical identity map against the plan/bundle, and injects the exact object into its simulator. The V5 constructor hashes the actual provenance file, verifies both claimed and canonical contract identities against `EvaluatorContractV5`, and stores the exact object passed to each scenario simulator before worker construction. Optional V4 evidence fields preserve the pre-existing evidence shape for callers that omit the contract.
+
+The V4 agent-loop audit path does not meet the required sealed run-manifest provenance path handling: it normalizes the manifest path before testing it for a link and has no containment/traversal policy for relative or absolute manifest values.
+
+## Strengths
+
+- `core/pit_policy_parity.py:1573-1595` loads and canonicalizes the transition contract before evaluation, then `:1521-1546` supplies that same object to `PortfolioSimulator` and panel evidence.
+- `core/pit_optimizer_v5/evaluator.py:262-285` verifies the actual provenance-file digest and canonical loaded identity before a worker or simulator is created; `:401-409` injects `self._transition_contract` into every scenario simulator.
+- `core/pit_policy_parity.py:1392-1413` emits provenance/transition identities only when an authenticated caller supplies a contract, retaining the legacy evidence primitive unchanged otherwise. `:1617-1629` and `:1677-1693` add the new identity only to newly generated reference/attestation artifacts.
+
+## Issues
+
+### Critical
+
+- `agent_loop.py:21082-21089` — The provenance path read from the sealed baseline run manifest is resolved before `is_symlink()` is checked. `Path.resolve()` follows a symlink, so the subsequent check is necessarily against the target rather than the manifest-selected link. A relative `..` value (or any absolute value) also resolves without a boundary check against `config.source_root` or the authenticated baseline-run location. This permits a sealed manifest path to traverse to an arbitrary duplicate-digest provenance file and defeats the required sealed run-manifest path/link traversal guard before the worker/simulator boundary. Validate raw path components and every existing component for link/reparse points before resolution; establish and enforce the intended base/containment rule; then hash the resolved regular file.
+
+### Important
+
+None.
+
+### Minor
+
+None.
+
+## Assessment
+
+Do not accept Task 5 as fully compliant until the V4 run-manifest provenance resolver rejects links/reparse points and traversal outside its authenticated root before resolving/loading the file. No reported checks were rerun; the task explicitly waived test edits.

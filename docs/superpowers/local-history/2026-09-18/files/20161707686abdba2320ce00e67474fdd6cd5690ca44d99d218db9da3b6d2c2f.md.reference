@@ -1,0 +1,83 @@
+# Increment C-a — original saved authority trace
+
+Status: completed, read-only. This trace found an authenticated per-round executor authority that is independent of each reservation: `CampaignRoundLaunchV5.adapter_config_ref`. Both saved round configs authenticate and their executor digests match all ten real runtime-04 reservations. The original process-environment preimage was not saved, so the historical executor composite cannot be reproduced from launch metadata alone. No correction was implemented.
+
+## Scope and method
+
+The traced repository is:
+
+`C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-v5-architecture/.artifacts/pit-optimizer-v5/development/runtime-04`
+
+The only campaign inspected was `development-controller-two-rounds-20260907-04`. No summary, campaign, evaluation, reconciliation, cleanup, Docker command, external call, test, credential or environment-value read occurred. State reads used `repair=False`; old artifacts were unchanged. The inspected typed paths are read-only at `artifacts.py:1914-1974,2571-2599`; manifest graph authentication is at `manifest.py:699-744`.
+
+## Saved launch authority
+
+The requested manifest reference authenticated as a provider-free `CampaignManifestV5` graph:
+
+- `campaigns/development-controller-two-rounds-20260907-04/manifest.json`
+- checked SHA-256: `8fcae0423117f3a234e64391c277bd7efe5cbb775ff61ec879d8cbeb5659d37c`
+- campaign: `development-controller-two-rounds-20260907-04`
+- source commit: `0985d9bae74162ec1da8a7268bd54e47f21b0b85`
+- scope/mode: `development_sp500_v2` / `disabled_development`
+- provider: absent
+- maximum feedback rounds: 2
+
+The manifest-keyed `CampaignLaunchV5` authenticated through its authority and typed value:
+
+| Edge | Relative path | Checked SHA-256 |
+| --- | --- | --- |
+| launch authority | `adapter-state-authority/campaign-launch/8fcae0423117f3a234e64391c277bd7efe5cbb775ff61ec879d8cbeb5659d37c.json` | `ac24b278513077f5c6f6051b8e8f73932c99a319c13736354f6e42f5505885ba` |
+| launch value | `adapter-state/campaign-launch/8fcae0423117f3a234e64391c277bd7efe5cbb775ff61ec879d8cbeb5659d37c.json` | `9f43afa9eef8d38fbb3dec817a81aca626233bf296629024a732bf839c56b87d` |
+| launch adapter config | `campaigns/development-controller-two-rounds-20260907-04/adapter-config.json` | `64b620c9add71ae02877d0126b81cf1ff6f5f452b4ffd1385c289124a83cca69` |
+
+The launch manifest reference equals the requested reference. Its owner-token digest binds both rounds; the token value was not read. `CampaignLaunchV5` is at `operations.py:62-73`; `authenticate_development_history_v5` follows launch → manifest → config → `_verify_local_run` at `development_preparation.py:394-409`.
+
+The adapter config authenticated as canonical `DevelopmentAdapterConfigV5`; its stored repository-root identity is `60c5ae51e6e3ac5d93ed38fe3d005f4b706bf5d1fac9f0baa2a36e6d43a0f32f`, equal to the repository identity observed by the typed reader. `load_development_config_v5` enforces the manifest and repository-root bindings (`core/pit_optimizer_v5/development_preparation.py:283-291`).
+
+The typed config saves the architecture worktree as source root; sibling `pit-v5-controller-runtime-20260907-04` workspace/output/control/response roots; `pit-v5-controller-runtime-20260907/data`; `C:\Program Files\Git\bin\git.exe`; Docker Desktop's `resources\bin\docker.exe`; and `policy_only`. `campaign-launch-input.json` (SHA `db0f6940e85c023c13a7ee2eac3ae2e03ddb50853cd31ed120c1fd7496fde448`) and `operator-paths.json` (SHA `91ee4f145f16d9ca4428d94408c0821eea8e8a676a4ec2b176a5dff148bc6c49`) repeat command/path metadata but are hash-only evidence, not typed authority.
+
+## Per-round config authority
+
+`CampaignRoundLaunchV5` explicitly stores `round_index`, `adapter_config_ref`, owner-token digest, and optional start time (`core/pit_optimizer_v5/operations.py:77-90`). Round 1 reuses the launch config; later rounds derive and create a new typed config before appending the `campaign-round` state (`core/pit_optimizer_v5/operations.py:494-521`). The started state must equal that entry except for its positive start time (`core/pit_optimizer_v5/operations.py:528-566`).
+
+Both `campaign-round` and `campaign-round-started` loaded as `CampaignRoundLaunchV5` with `repair=False`. In each round, replacing only `started_epoch_ms` with `None` makes the started record exactly equal to the round entry; their config references and owner-token digests are equal.
+
+| Round | Canonical round key | Started-state authority SHA-256 | Started-state value SHA-256 | Config reference and SHA-256 | Config executor SHA-256 | Derived owner SHA-256 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | `5cbf1d915bb46327a58664f8eacc68665535a04cbbac11d008af4061167ccea6` | `5ae39a6851d3a20720731b2cca1a6a9134fbe3a579e082503076ee966ad790dd` | `1a1cdb4465383ea82564bd8aa13b9d5be8fbc51ecf9934f6b9cdfa94ad54a84d` | `campaigns/development-controller-two-rounds-20260907-04/adapter-config.json`, `64b620c9add71ae02877d0126b81cf1ff6f5f452b4ffd1385c289124a83cca69` | `2849cde885cc8bdde38230bc77ecd17163db42db1b071cc5a8a4212ce4601444` | `48b0999875d58081fa6be760557313073eca225b7b8013458f4a2a80acb81e9c` |
+| 2 | `0c4ffb2ab01e9e76f421524bffec22553cb9eea628384e230d91725106d5452f` | `511ec657ba842554a792c2544d7d61db2a56c7f394ac973dc1825d95e1601fa4` | `65e831d7c3081918dd7c7af3d0a60d82d560640821f77c3cbf7ebdeff92b5a89` | `campaigns/8fcae0423117f3a234e64391c277bd7efe5cbb775ff61ec879d8cbeb5659d37c/adapter-config-round-2.json`, `df2264692b1ce5a673122366c8f5b341c963cd58206151981f0d0ccf5d50a180` | `bae808e474cf877d4ac47641a02f7f1f5c01d2c0e6e21640b9aa9524d9e88c95` | `e39530ed70377e5e4739a79d5d1f9623d279e68e65cf081572dc2361ade32997` |
+
+The configs have equal schema, manifest, repository identity, paths, response directory and export mode. Their owner-derived mount identities are `576be6ab...` and `14784ae2...`; their executor identities are shown above.
+
+All five reservations per round authenticate. Each stored executor equals its round config executor; each owner equals the canonically derived manifest/round/owner/controller-lease owner; each command digest equals its state key. The config is therefore independent authority for the reservation executor digest.
+
+## Why the current verifier fails
+
+`_verify_local_run` walks round events and calls `_verify_resource_history` with the one campaign-level adapter config (`core/pit_optimizer_v5/cli.py:791-842`). `_verify_resource_history` then constructs a fresh owner, workspace driver, mount factory, and `LocalContainerExecutorV5` from today's host context (`core/pit_optimizer_v5/cli.py:882-982`). It does not resolve each saved `CampaignRoundLaunchV5.adapter_config_ref` for historical execution verification.
+
+The executor constructor includes the manifest, profile, owner, mount factory, Docker executable file identity, control-directory identity, repository identity, a six-name process-environment tuple, and an inline runtime-contract literal in one canonical digest (`core/pit_optimizer_v5/production_sandbox.py:1480-1556`). `_load_reservation` rejects any saved record whose executor digest differs from that newly constructed digest, even when the command key matches (`core/pit_optimizer_v5/production_sandbox.py:1813-1829`). `authenticate_execution_history` reaches that guard using `repair=False` before its deeper journal checks (`core/pit_optimizer_v5/production_sandbox.py:4004-4040`).
+
+Fresh current executors are `a72e22fc6deeb4b23f65d82ef32abb148fea4ea6db5efecf26c4391e31605bb9` and `ee5f5909728d6eda5a3cb6cc9b25e630debddecd5b6f6cde21766014941184ca`; both differ from saved authority. Principal component evidence reports command/request/owner/output/mount/control/Docker/cleanup agreement for all ten, but this trace does not claim full historical authentication.
+
+## Saved components versus unavailable original context
+
+| Executor identity component | Saved independent evidence | Result and limit |
+| --- | --- | --- |
+| manifest and sandbox profile | Typed launch manifest graph and per-round configs | Authenticated and manifest-bound. |
+| repository root | Per-round typed configs | Saved identity equals the currently opened repository identity; relocation is not supported. |
+| owner | Campaign launch plus both round entry/started states | Both derived owners equal every typed reservation owner. No owner value was invented. |
+| candidate/workspace/mount identities | Each round's typed adapter config | Exact per-round digests are available and differ only with round-derived authority; current non-environment comparisons corroborate them. |
+| executor identity | Each round's typed adapter config, then repeated across five reservations and control/cleanup records | Exact historical expected digest is independently anchored for each round. This proves which saved identity the records must carry, not that today's process has that identity. |
+| Docker executable | Typed config saves its path; control records save file-identity evidence | Current component evidence matches. The typed config does not expose the executable tuple preimage separately. |
+| control root | Typed config path plus saved control records | Same-encoding comparison matches. `_directory_identity` and `_control_root_identity` are different encodings and must not be compared directly. |
+| process environment | No launch/config/state artifact in runtime-04 saves the six key/value tuple or per-entry original digests | Original values and tuple digest are unavailable. No PATH-drift conclusion is justified. |
+| runtime contract | Not stored as a separately referenced launch/config artifact | The literal can be inspected in source, but the saved executor digest is one-way and does not reveal its preimage. |
+| host Python command wrapper | `campaign-launch-input.json` and stdout wrappers | Hash-only local evidence, not typed semantic authentication and not part of the executor composite. |
+
+The manifest source commit is policy-source authority, not a hash of the host executor implementation. The local Git object for `0985d9bae74162ec1da8a7268bd54e47f21b0b85` contains `production_sandbox.py` with the same executor domain and runtime-contract literal as current source. Static extraction gives runtime-contract canonical SHA-256 `415b2b882444d65bd7461ca177def7e7b1036c53e6f719d48089a320e9af067c` in both versions. This is corroboration only: the launch does not bind the host helper bytes, and `development_preparation.py` is absent from that commit, so the commit cannot prove the exact working-tree module set that executed the campaign.
+
+## Architectural consequence
+
+The saved authority supports a completed-history verifier: authenticate each round's config reference, use its executor digest as expected authority, derive the saved owner, and retain existing record checks with `repair=False`. Keep `_load_reservation` unchanged. Historical mode should be explicit and summary-only, with no live capability or implicit fallback.
+
+The remaining unresolved evidence is the original process-environment tuple and an independently launch-bound host runtime-contract/helper preimage. Those are unnecessary for identifying the historical expected executor when the per-round typed config is accepted as the completed-history authority, but they remain unavailable for reproducing the old whole-executor digest in today's process. Campaign readiness is therefore not established by this trace.

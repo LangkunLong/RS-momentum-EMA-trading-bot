@@ -1,0 +1,315 @@
+# Task 3 fix round 1 scoped review package
+
+Fix base: pre-fix snapshots after initial Task 3 review
+Head: current uncommitted Task 3 files
+
+## core/pit_diagnosis/task11_ca_provenance.py
+
+```diff
+warning: in the working copy of '.superpowers/sdd/2026-08-26-task11-engine-fidelity-observability/task-3-fix1-before-task11_ca_provenance.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'core/pit_diagnosis/task11_ca_provenance.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/.superpowers/sdd/2026-08-26-task11-engine-fidelity-observability/task-3-fix1-before-task11_ca_provenance.py b/core/pit_diagnosis/task11_ca_provenance.py
+index bc80aeb..f05ea8d 100644
+--- a/.superpowers/sdd/2026-08-26-task11-engine-fidelity-observability/task-3-fix1-before-task11_ca_provenance.py
++++ b/core/pit_diagnosis/task11_ca_provenance.py
+@@ -153,41 +153,42 @@ def diagnose_task11_ca_provenance(
+         for source in (
+             manifest_source,
+             signal_source,
+             bundle_source,
+             provenance_source,
+             fundamentals_source,
+             audit_source,
+         )
+     }
+ 
+-    with PITDataBundle(
+-        bundle_source.path, expected_sha256=authority.bundle_sha256
+-    ) as bundle:
+-        _require_bundle_source_chain(bundle)
+-        rows_by_symbol = _read_fixed_cohort(signal_source)
+-        date_bounds = {
+-            symbol: (
+-                min(row.signal_date for row in rows),
+-                max(row.signal_date for row in rows),
++    with _authenticated_bundle_copy(bundle_source) as bundle_copy:
++        with PITDataBundle(
++            bundle_copy, expected_sha256=authority.bundle_sha256
++        ) as bundle:
++            _require_bundle_source_chain(bundle)
++            rows_by_symbol = _read_fixed_cohort(signal_source)
++            date_bounds = {
++                symbol: (
++                    min(row.signal_date for row in rows),
++                    max(row.signal_date for row in rows),
++                )
++                for symbol, rows in rows_by_symbol.items()
++            }
++            c_aggregates = _new_gate_aggregates()
++            a_aggregates = _new_gate_aggregates()
++            reconciliation = _reconcile_boundaries(
++                bundle,
++                date_bounds,
++                rows_by_symbol,
++                c_aggregates,
++                a_aggregates,
+             )
+-            for symbol, rows in rows_by_symbol.items()
+-        }
+-        c_aggregates = _new_gate_aggregates()
+-        a_aggregates = _new_gate_aggregates()
+-        reconciliation = _reconcile_boundaries(
+-            bundle,
+-            date_bounds,
+-            rows_by_symbol,
+-            c_aggregates,
+-            a_aggregates,
+-        )
+ 
+     _require_expected_counts(c_aggregates, a_aggregates, reconciliation)
+     payload: dict[str, object] = {
+         "schema_version": TASK11_CA_PROVENANCE_SCHEMA_VERSION,
+         "diagnosis_scope": "task11_ca_provenance_not_strategy_optimization",
+         "profile": _render_profile(canonical_profile),
+         "source_chain": _render_source_chain(verified_sources),
+         "window": {"start": _WINDOW_START.isoformat(), "end": _WINDOW_END.isoformat()},
+         "reconciliation": _render_reconciliation(reconciliation),
+         "c": _render_gate_aggregates(c_aggregates),
+@@ -673,21 +674,24 @@ def _required_mapping(
+     value = mapping.get(key)
+     if not isinstance(value, Mapping):
+         raise ValueError(f"{label} {key} must be a JSON object")
+     return value
+ 
+ 
+ def _location(mapping: Mapping[str, Any], key: str, label: str) -> Path:
+     value = mapping.get(key)
+     if not isinstance(value, str) or not value or "\x00" in value:
+         raise ValueError(f"{label} {key} must be a non-empty file location")
+-    return Path(value).resolve()
++    # ``abspath`` normalizes a lexical location without dereferencing symlinks or
++    # junctions.  The subsequent component walk must see the location exactly as
++    # the authenticated manifest named it.
++    return Path(os.path.abspath(value))
+ 
+ 
+ def _required_digest(mapping: Mapping[str, Any], key: str, label: str) -> str:
+     value = mapping.get(key)
+     if (
+         not isinstance(value, str)
+         or len(value) != 64
+         or any(character not in "0123456789abcdef" for character in value)
+     ):
+         raise ValueError(f"{label} {key} must be a lowercase SHA-256 digest")
+@@ -755,38 +759,98 @@ def _require_columns(
+     fieldnames: list[str] | None, required: frozenset[str], label: str
+ ) -> None:
+     if fieldnames is None or len(fieldnames) != len(set(fieldnames)):
+         raise ValueError(f"{label} has an invalid CSV header")
+     if not required.issubset(fieldnames):
+         raise ValueError(f"{label} omits required C/A reconciliation fields")
+ 
+ 
+ @contextmanager
+ def _verified_byte_snapshot(source: _SealedSource) -> Iterator[BinaryIO]:
+-    _regular_nonreparse_file(source.path, f"sealed Task 11 {source.name}")
+     digest = hashlib.sha256()
+     try:
+-        with source.path.open("rb") as input_handle:
++        with _bound_regular_input(
++            source.path, f"sealed Task 11 {source.name}"
++        ) as input_handle:
+             with tempfile.SpooledTemporaryFile(
+                 max_size=_SPOOL_MEMORY_LIMIT_BYTES, mode="w+b"
+             ) as snapshot_handle:
+                 while block := input_handle.read(1024 * 1024):
+                     digest.update(block)
+                     snapshot_handle.write(block)
+                 if digest.hexdigest() != source.expected_sha256:
+                     raise ValueError(f"sealed Task 11 {source.name} changed before parsing")
+                 snapshot_handle.seek(0)
+                 yield snapshot_handle
+     except OSError as exc:
+         raise ValueError(f"sealed Task 11 {source.name} cannot be snapshotted") from exc
+ 
+ 
++@contextmanager
++def _authenticated_bundle_copy(source: _SealedSource) -> Iterator[Path]:
++    """Yield a private immutable-by-construction copy of one authenticated bundle.
++
++    SQLite never receives the manifest pathname.  The source is copied through a
++    descriptor bound to the checked lexical path, the copied bytes are hashed,
++    and only the unshared random temporary pathname is passed to ``PITDataBundle``.
++    Mutating or replacing the original after this point cannot affect lazy reads.
++    """
++
++    digest = hashlib.sha256()
++    copied_path: Path | None = None
++    workspace_parent = Path(os.path.abspath(Path(__file__))).parents[2]
++    workspace_metadata = _nonreparse_path_metadata(
++        workspace_parent, "trusted Task 11 workspace temp parent"
++    )
++    if not stat.S_ISDIR(workspace_metadata.st_mode):
++        raise ValueError("trusted Task 11 workspace temp parent must be a directory")
++    try:
++        with tempfile.NamedTemporaryFile(
++            mode="w+b",
++            prefix=".task11-ca-provenance-",
++            suffix=".sqlite3",
++            dir=workspace_parent,
++            delete=False,
++        ) as output_handle:
++            copied_path = Path(output_handle.name)
++            with _bound_regular_input(
++                source.path, f"sealed Task 11 {source.name}"
++            ) as input_handle:
++                while block := input_handle.read(1024 * 1024):
++                    digest.update(block)
++                    output_handle.write(block)
++                output_handle.flush()
++                os.fsync(output_handle.fileno())
++        if digest.hexdigest() != source.expected_sha256:
++            raise ValueError(f"sealed Task 11 {source.name} changed before copying")
++        _regular_nonreparse_file(
++            copied_path, "authenticated temporary Task 11 PIT bundle"
++        )
++        # Keep a bound guard descriptor open for the entire SQLite lifetime. On
++        # platforms that allow replacement of an open file, the post-yield
++        # identity/stability check fails before any payload can be returned.
++        with _bound_regular_input(
++            copied_path, "authenticated temporary Task 11 PIT bundle"
++        ):
++            yield copied_path
++    except OSError as exc:
++        raise ValueError("sealed Task 11 PIT bundle cannot be copied") from exc
++    finally:
++        if copied_path is not None and copied_path.exists():
++            if copied_path.parent != workspace_parent:
++                raise ValueError("temporary Task 11 bundle cleanup escaped its parent")
++            _regular_nonreparse_file(
++                copied_path, "temporary Task 11 bundle cleanup file"
++            )
++            copied_path.unlink()
++
++
+ def _verify_snapshot(source: _SealedSource) -> None:
+     with _verified_byte_snapshot(source):
+         pass
+ 
+ 
+ def _load_json(source: _SealedSource) -> Mapping[str, Any]:
+     try:
+         with _verified_byte_snapshot(source) as snapshot_handle:
+             value = json.loads(
+                 snapshot_handle.read(),
+@@ -807,24 +871,73 @@ def _verified_csv_reader(source: _SealedSource) -> Iterator[csv.DictReader]:
+         text_handle = io.TextIOWrapper(snapshot_handle, encoding="utf-8", newline="")
+         try:
+             yield csv.DictReader(text_handle)
+         except UnicodeDecodeError as exc:
+             raise ValueError(f"sealed Task 11 {source.name} is not valid UTF-8 CSV") from exc
+         finally:
+             text_handle.detach()
+ 
+ 
+ def _regular_nonreparse_file(path: Path, label: str) -> Path:
+-    value = Path(path)
+-    try:
+-        metadata = os.lstat(value)
+-    except OSError as exc:
+-        raise ValueError(f"{label} must be a regular non-reparse file") from exc
+-    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+-    is_reparse = bool(
+-        reparse_flag
+-        and int(getattr(metadata, "st_file_attributes", 0) or 0) & reparse_flag
+-    )
+-    if not value.is_file() or value.is_symlink() or is_reparse:
++    value = Path(os.path.abspath(path))
++    metadata = _nonreparse_path_metadata(value, label)
++    if not stat.S_ISREG(metadata.st_mode):
+         raise ValueError(f"{label} must be a regular non-reparse file")
+     return value
+ 
++
++def _nonreparse_path_metadata(path: Path, label: str) -> os.stat_result:
++    """Validate every lexical component without dereferencing a reparse point."""
++
++    if not path.is_absolute():
++        raise ValueError(f"{label} must have an absolute lexical location")
++    parts = path.parts
++    if not parts:
++        raise ValueError(f"{label} must have a valid lexical location")
++    current = Path(parts[0])
++    final_metadata: os.stat_result | None = None
++    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
++    for index, part in enumerate(parts):
++        if index:
++            current /= part
++        try:
++            metadata = os.lstat(current)
++        except OSError as exc:
++            raise ValueError(f"{label} must have regular non-reparse components") from exc
++        is_reparse = bool(
++            reparse_flag
++            and int(getattr(metadata, "st_file_attributes", 0) or 0) & reparse_flag
++        )
++        if stat.S_ISLNK(metadata.st_mode) or is_reparse:
++            raise ValueError(f"{label} must have regular non-reparse components")
++        if index < len(parts) - 1 and not stat.S_ISDIR(metadata.st_mode):
++            raise ValueError(f"{label} parent components must be directories")
++        final_metadata = metadata
++    if final_metadata is None:
++        raise ValueError(f"{label} must have a valid lexical location")
++    return final_metadata
++
++
++@contextmanager
++def _bound_regular_input(path: Path, label: str) -> Iterator[BinaryIO]:
++    """Open a lexical regular file and prove the handle still names that file."""
++
++    value = _regular_nonreparse_file(path, label)
++    try:
++        with value.open("rb") as handle:
++            opened_metadata = os.fstat(handle.fileno())
++            path_metadata = _nonreparse_path_metadata(value, label)
++            if not stat.S_ISREG(opened_metadata.st_mode) or not os.path.samestat(
++                opened_metadata, path_metadata
++            ):
++                raise ValueError(f"{label} changed while it was opened")
++            yield handle
++            final_opened_metadata = os.fstat(handle.fileno())
++            final_path_metadata = _nonreparse_path_metadata(value, label)
++            if (
++                not os.path.samestat(final_opened_metadata, final_path_metadata)
++                or opened_metadata.st_size != final_opened_metadata.st_size
++                or opened_metadata.st_mtime_ns != final_opened_metadata.st_mtime_ns
++            ):
++                raise ValueError(f"{label} changed while it was read")
++    except OSError as exc:
++        raise ValueError(f"{label} cannot be opened as a bound regular file") from exc
+
+```
+## pit_diagnosis.py
+
+```diff
+warning: in the working copy of '.superpowers/sdd/2026-08-26-task11-engine-fidelity-observability/task-3-fix1-before-pit_diagnosis.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'pit_diagnosis.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/.superpowers/sdd/2026-08-26-task11-engine-fidelity-observability/task-3-fix1-before-pit_diagnosis.py b/pit_diagnosis.py
+index 88bba4c..38eafaa 100644
+--- a/.superpowers/sdd/2026-08-26-task11-engine-fidelity-observability/task-3-fix1-before-pit_diagnosis.py
++++ b/pit_diagnosis.py
+@@ -782,11 +782,10 @@ def main(argv: Sequence[str] | None = None) -> int:
+             print(json.dumps(verify_diagnosis_run(args.run_dir), sort_keys=True))
+             return 0
+     except Exception as exc:
+         print(f"PIT diagnosis failed closed: {exc}", file=sys.stderr)
+         return 1
+     raise AssertionError("unreachable command")
+ 
+ 
+ if __name__ == "__main__":
+     raise SystemExit(main())
+-
+
+```
+

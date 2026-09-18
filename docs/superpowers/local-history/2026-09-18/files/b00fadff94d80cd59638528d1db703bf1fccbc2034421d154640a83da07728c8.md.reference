@@ -1,0 +1,270 @@
+### Task 1: Define the Pure Strategy-Policy Contract and Baseline Functions
+
+**Files:**
+
+- Create: core/strategy_policy/__init__.py
+- Create: core/strategy_policy/contracts.py
+- Create: core/strategy_policy/entry.py
+- Create: core/strategy_policy/risk.py
+- Create: core/strategy_policy/exit.py
+- Create: tests/test_strategy_policy.py
+
+**Interfaces:**
+
+- Produces: POLICY_INTERFACE_VERSION; frozen snapshot/decision dataclasses; StrategyPolicyClient protocol; five pure baseline entry points.
+- Consumes: trusted precomputed scalar facts only. It performs no I/O, imports no simulator/data module, and owns no mutable state.
+
+**Exact public interfaces:**
+
+    POLICY_INTERFACE_VERSION = 1
+
+    StrategyPolicyClient.interface_version: int
+    StrategyPolicyClient.evaluate_entry(
+        snapshot: EntrySnapshot
+    ) -> EntryDecision
+    StrategyPolicyClient.recommend_capacity(
+        snapshot: CapacitySnapshot
+    ) -> CapacityDecision
+    StrategyPolicyClient.recommend_allocation(
+        snapshot: AllocationSnapshot
+    ) -> AllocationDecision
+    StrategyPolicyClient.select_eviction(
+        snapshot: EvictionSnapshot
+    ) -> EvictionDecision
+    StrategyPolicyClient.evaluate_exit(
+        snapshot: ExitSnapshot
+    ) -> ExitDecision
+    StrategyPolicyClient.close() -> None
+    StrategyPolicyClientFactory = Callable[[], StrategyPolicyClient]
+
+    entry.evaluate_entry(snapshot: EntrySnapshot) -> EntryDecision
+    risk.recommend_capacity(snapshot: CapacitySnapshot) -> CapacityDecision
+    risk.recommend_allocation(
+        snapshot: AllocationSnapshot
+    ) -> AllocationDecision
+    risk.select_eviction(snapshot: EvictionSnapshot) -> EvictionDecision
+    exit.evaluate_exit(snapshot: ExitSnapshot) -> ExitDecision
+
+**Exact snapshot and decision fields:**
+
+    EntrySnapshot(
+        technical_only: bool,
+        require_proper_base: bool,
+        c_score: float | None,
+        a_score: float | None,
+        n_score: float | None,
+        s_score: float | None,
+        l_score: float | None,
+        i_score: float | None,
+        m_score: float | None,
+        current_growth: float | None,
+        annual_growth: float | None,
+        rs_score: float | None,
+        canslim_score: float | None,
+        entry_composite_score: float | None,
+        technical_score: float | None,
+        institutional_data_available: bool,
+        event_close: float | None,
+        prior_close: float | None,
+        event_volume: float | None,
+        prior_average_volume_50: float | None,
+        pivot: float | None,
+        volume_ratio: float | None,
+        extension: float | None,
+        price_advanced: bool,
+        has_volume_surge: bool,
+        in_buy_zone: bool,
+        technical_eligible: bool,
+        technical_blocking_reasons: tuple[str, ...],
+        has_power_gap_today: bool,
+        require_bullish_market: bool,
+        market_is_bullish: bool,
+        cash_deployment_override: bool,
+        use_stateful_regime_gate: bool,
+        regime_allows_entries: bool,
+        market_regime: str,
+        distribution_days: int,
+        follow_through: bool,
+    )
+    EntryDecision(
+        qualified: bool,
+        market_permitted: bool,
+        rank: tuple[float | None, float | None],
+        blocking_codes: tuple[str, ...],
+    )
+    CapacitySnapshot(
+        configured_max_positions: int | None,
+        maximum_policy_positions: int,
+        open_position_count: int,
+        eligible_signal_count: int,
+        cash_fraction: float,
+        configured_eviction_enabled: bool,
+    )
+    CapacityDecision(
+        max_positions: int | None,
+        eviction_enabled: bool,
+    )
+    AllocationSnapshot(
+        portfolio_equity_at_entry_open: float,
+        cash_before_transition: float,
+        projected_cash_after_eviction: float,
+        gross_exposure_before: float,
+        projected_gross_exposure_after_eviction: float,
+        entry_open: float,
+        pending_entries_remaining: int,
+        capacity_is_uncapped: bool,
+        configured_position_risk_pct: float,
+        configured_stop_loss_pct: float,
+        maximum_position_risk_fraction: float,
+        maximum_stop_fraction: float,
+        canslim_score: float | None,
+        rs_score: float | None,
+    )
+    AllocationDecision(
+        risk_fraction: float,
+        stop_distance_fraction: float,
+        notional_fraction_cap: float | None,
+    )
+    EvictionPosition(
+        slot: int,
+        entry_price: float,
+        causal_execution_price: float | None,
+        rs_score: float,
+    )
+    EvictionSnapshot(
+        capacity_is_finite: bool,
+        capacity_is_full: bool,
+        eviction_enabled: bool,
+        candidate_rs_score: float,
+        positions: tuple[EvictionPosition, ...],
+    )
+    EvictionDecision(slot: int | None)
+    ExitSnapshot(
+        entry_price: float,
+        original_qty: float,
+        remaining_qty: float,
+        stop_price: float,
+        realized_pnl: float,
+        canslim_score: float,
+        rs_score: float,
+        days_held: int,
+        peak_close: float,
+        breakeven_armed: bool,
+        ema_trailing_active: bool,
+        scale_out_tier: int,
+        early_winner_hold: bool,
+        current_high: float,
+        current_low: float,
+        current_close: float,
+        history_session_count: int,
+        ema_today: float | None,
+        consecutive_closes_below_ema: bool,
+        protective_stop_candidates: tuple[float, ...],
+        stop_loss_pct: float,
+        breakeven_trigger_pct: float,
+        ema_period: int,
+        ema_consecutive: int,
+        stagnation_days: int,
+        stagnation_threshold_pct: float,
+        scale_out_tiers: tuple[tuple[float, float], ...],
+        early_winner_gain_pct: float,
+        early_winner_trigger_days: int,
+        early_winner_release_days: int,
+    )
+    ExitAction(
+        kind: str,
+        trigger_gain_fraction: float | None,
+        fraction_of_original_quantity: float | None,
+        reason: str,
+    )
+    ExitDecision(
+        actions: tuple[ExitAction, ...],
+        next_stop_price: float | None,
+        early_winner_hold: bool,
+        scale_out_tier: int,
+        breakeven_armed: bool,
+        ema_trailing_active: bool,
+    )
+
+No Trade object, date, symbol, path, DataFrame, history, bundle, or callback crosses this boundary. CapacityDecision.max_positions is either None or an exact positive int no greater than maximum_policy_positions; returning a finite value below the current holding count blocks new admission but never forces liquidation. Baseline capacity returns configured_max_positions, preserving max_positions=None. A non-None notional_fraction_cap is finite and in (0, 1]. ExitAction.kind is exactly scale_out or close: scale_out permits only take_profit_scale_out, requires a positive finite trigger fraction present in scale_out_tiers, requires trusted current_high to have crossed entry_price * (1 + trigger_gain_fraction), and requires a fraction of original quantity in (0, 1]; the validated sum cannot exceed remaining quantity. close permits time_stop, ma_violation, or policy_exit and has no trigger/fraction. Scale-out actions precede at most one final close. The engine derives every execution price. Hard-stop detection and fill remain mandatory engine work before the policy call. protective_stop_candidates is the sorted unique tuple of trusted current stop plus the engine-derived breakeven and EMA candidates that are causally available; next_stop_price is either None or exactly one member no lower than current stop. This preserves the existing case where a causal EMA ratchet is above current close without allowing a candidate to invent a price.
+
+- [ ] **Step 1: Write failing closed-contract tests.** Instantiate every snapshot/decision, round-trip canonical JSON, and reject unknown keys, bool-as-number, NaN/Infinity, mutable collections, invalid market-regime/action/reason enums, candidate-supplied fill prices, and oversized tuples. Assert no contract field can carry a date, symbol, path, DataFrame, callback, or mutable collection.
+
+  Start with this literal closed-type anchor and extend the same table across all ten contracts:
+
+  ```python
+  def test_entry_decision_is_closed_and_bool_strict():
+      with pytest.raises(TypeError):
+          EntryDecision(
+              qualified=True,
+              market_permitted=True,
+              rank=(1.0, 2.0),
+              blocking_codes=(),
+              symbol="AAPL",
+          )
+      with pytest.raises(ValueError, match="qualified"):
+          EntryDecision(
+              qualified=1,
+              market_permitted=True,
+              rank=(1.0, 2.0),
+              blocking_codes=(),
+          )
+  ```
+- [ ] **Step 2: Run the focused test and confirm import failures.**
+
+      python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_strategy_policy.py
+
+  Expected: collection fails because core.strategy_policy does not exist.
+- [ ] **Step 3: Implement only contracts.py and exports.** Use frozen=True and slots=True dataclasses, closed enum validators, tuple-only collection fields, and canonical serializers. Run `python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_strategy_policy.py`; expected failures now name the five missing pure functions rather than contract imports.
+- [ ] **Step 4: Implement entry.py.** Reproduce full-mode C/A/RS/composite/technical gating, technical-only bypass semantics, institutional-unavailable score handling, market/regime permission, and baseline rank (canslim_score, rs_score). Add parity cases for technical_only and missing institutional data, then run `python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_strategy_policy.py -k "entry"`; expected: entry cases pass while unimplemented risk/exit cases still fail.
+- [ ] **Step 5: Implement risk.py capacity and eviction.** Baseline recommend_capacity returns the configured limit, including None; finite limits must be exact positive ints within maximum_policy_positions. Baseline select_eviction ignores missing causal prices, requires lower candidate RS, prefers underwater positions, then selects minimum RS with stable slot-order ties. Run `python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_strategy_policy.py -k "capacity or eviction"`; expected: those cases pass.
+
+  ```python
+  def recommend_capacity(snapshot: CapacitySnapshot) -> CapacityDecision:
+      return CapacityDecision(
+          max_positions=snapshot.configured_max_positions,
+          eviction_enabled=snapshot.configured_eviction_enabled,
+      )
+
+  def select_eviction(snapshot: EvictionSnapshot) -> EvictionDecision:
+      eligible = tuple(
+          position
+          for position in snapshot.positions
+          if position.causal_execution_price is not None
+          and position.rs_score < snapshot.candidate_rs_score
+      )
+      underwater = tuple(
+          position
+          for position in eligible
+          if position.causal_execution_price < position.entry_price
+      )
+      pool = underwater or eligible
+      if not snapshot.capacity_is_finite or not snapshot.capacity_is_full:
+          return EvictionDecision(slot=None)
+      if not snapshot.eviction_enabled or not pool:
+          return EvictionDecision(slot=None)
+      selected = min(pool, key=lambda position: (position.rs_score, position.slot))
+      return EvictionDecision(slot=selected.slot)
+  ```
+- [ ] **Step 6: Implement risk.py allocation recommendation.** Baseline returns configured risk/stop and no extra notional cap. Test the uncapped multi-signal input and finite-capacity input; actual cash, gross exposure, rounded stop, and loss-at-stop enforcement remain trusted engine work in Task 3. Run `python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_strategy_policy.py -k "allocation"`; expected: allocation cases pass.
+
+  ```python
+  def recommend_allocation(snapshot: AllocationSnapshot) -> AllocationDecision:
+      return AllocationDecision(
+          risk_fraction=snapshot.configured_position_risk_pct,
+          stop_distance_fraction=snapshot.configured_stop_loss_pct,
+          notional_fraction_cap=None,
+      )
+  ```
+- [ ] **Step 7: Implement exit.py.** Reproduce early-winner activation/release, crossed tiers, stagnation, protective-stop ratchet, and EMA close ordering after the engine-owned hard-stop precheck. Test multiple tiers in one bar, reject an uncrossed tier, test a final close, and require next_stop_price to be one trusted protective_stop_candidates member without any policy-provided fill price. Run `python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_strategy_policy.py -k "exit"`; expected: exit cases pass.
+- [ ] **Step 8: Run the focused policy file to green.**
+
+      python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_strategy_policy.py
+
+- [ ] **Step 9: Commit the isolated policy boundary.**
+
+      git add core/strategy_policy tests/test_strategy_policy.py
+      git commit -m "feat: define pure strategy policy boundary"
+
+---
+

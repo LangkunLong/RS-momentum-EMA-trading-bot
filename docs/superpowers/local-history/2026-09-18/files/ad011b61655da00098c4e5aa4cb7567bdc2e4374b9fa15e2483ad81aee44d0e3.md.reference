@@ -1,0 +1,32 @@
+# Learning/Search Task 6 Re-review
+
+## Spec Compliance
+
+APPROVED.
+
+The focused correction closes both quick-stage authority bypasses without changing default preservation or deterministic ranking.
+
+## Strengths
+
+- `_validate_quick_authorities_v5` now requires both the panel plan's PIT-bundle digest and prices-provenance digest to equal the evaluator contract before selection can proceed (`selection.py:214-225`). The private selector invokes this before eligibility filtering or ranking (`selection.py:255-275`), while the existing quick evidence checks for evaluator, sandbox, policy, panel, dates, selected `base`, singleton base scenario, and recomputed CAGR remain intact (`selection.py:179-211`).
+- The arbitrary integer-cap implementation is now private (`_select_discovery_survivors_v5`), and the sole exported survivor selector requires `SearchCapabilitiesV5` and derives `maximum` from `max_discovery_survivors_per_template` (`selection.py:253-322`, `selection.py:733-746`).
+- Default-zero-trade behavior is unchanged: eligibility does not depend on trade count, the unique declared default is placed first, and remaining behaviorally distinct candidates retain descending quick CAGR plus canonical policy-identity ordering (`selection.py:158-176`, `selection.py:288-304`).
+- No campaign, archive, parent scheduling, novelty, reducer, provider, evaluator-execution, or runtime behavior was added or changed.
+
+## Issues
+
+### Critical
+
+None.
+
+### Important
+
+None.
+
+### Minor
+
+None.
+
+## Assessment
+
+The repair is narrow and fail-closed. Quick ranking now uses a single consistent plan/evaluator data authority, and callers cannot bypass the manifest-derived survivor cap through an exported raw selector. Task 6 is ready to proceed.

@@ -1,0 +1,100 @@
+# Task 3B Brief — Explicit Alpaca SIP Price Backfill
+
+## Context
+
+Task 3 is complete and independently re-reviewed at `2e01492`. Its confined exporter correctly rejects the approved cache because it covers only `536,586 / 631,965 = 84.90755026%` active member/trading-day pairs and SPY begins on `2021-04-22`.
+
+Public archive research was rejected as the production member-price source: a four-source public blend reached only `96.44996163%`, carried current-constituent bias and undocumented upstream transformations, and uploader-selected licenses did not establish upstream redistribution rights.
+
+A read-only probe through the repository's existing Alpaca market-data credentials proved the simpler explicit path:
+
+- provider/feed: Alpaca Markets SIP consolidated feed;
+- adjustment/timeframe: `SPLIT`, `1Day`;
+- exact request window: `2020-01-01` through `2025-12-31` inclusive;
+- deterministic groups/chunks of at most 100 canonical membership symbols, plus SPY;
+- explicit canonical-to-provider request aliases `BF-B -> BF.B` and `BRK-B -> BRK.B`, with canonical hyphenated symbols restored on output;
+- the original 591-symbol snapshot probe returned valid bars for all symbols; the reviewed PIT membership now contains 606 historical identities and requires per-identity acquisition;
+- SPY supplied `1,508 / 1,508` sessions;
+- cache-missing increment: 93,448 pairs;
+- direct cache + SIP result: `630,034 / 631,965 = 99.69444510%`, leaving 1,931 gaps and passing the 98% gate;
+- no orders, account endpoints, or repository writes occurred in the probe.
+
+This is an explicit licensed-provider snapshot, never a silent fallback. The existing cache remains row-authoritative after its share scale is proven and, where necessary, normalized to the `2025-12-31` cutoff basis; SIP may only fill missing `(trade_date, ticker)` rows.
+
+## Scope
+
+Suggested files (adapt names if a smaller coherent boundary is clearer):
+
+- Modify: `export_pit_prices.py`
+- Create: `core/alpaca_pit_backfill.py`
+- Modify: `docs/superpowers/specs/2026-08-21-five-year-public-pit-baseline-design.md`
+- Modify: `docs/superpowers/plans/2026-08-21-five-year-public-pit-baseline.md`
+- Create/modify focused price-export tests only after the functional run succeeds
+
+Do not change trading strategy behavior, the backtest engine, membership logic, SEC logic, or the normalized `prices.csv` header.
+
+## Required implementation
+
+1. Make backfill operator-explicit. Add a CLI mode/flag that clearly requests Alpaca SIP backfill. The cache-only path must remain unchanged and fail closed at its current coverage result. There is no implicit live-provider fallback.
+
+2. Keep provider access host-side and read-only. Use only Alpaca historical stock-bars APIs; never instantiate or call trading/order/account clients. Resolve credentials through the repository's existing aliases without printing or persisting secrets, account identifiers, headers, or raw exceptions.
+
+3. Require consolidated SIP. The deliverable must reject an IEX fallback because IEX-only volume would materially understate CANSLIM volume-surge inputs. Use `TimeFrame.Day`, the exact inclusive window, and deterministic chunks of at most 100 requested symbols. Bind every response to the requested chunk. Acquire both `Adjustment.SPLIT` and `Adjustment.RAW`: RAW is calibration-only, never a wholesale replacement series.
+
+   Track a separate, hash-pinned `config/pit_price_identity_map.csv`; do not infer price continuity from membership prose. Each reviewed identity row records canonical/provider symbols, identity-valid `asof`, admitted start/end, price chain, continuity kind, warm-up predecessor, factor anchor, and primary evidence. Same-issuer successor rows may retain provider-mapped predecessor history solely for indicator warm-up and must match predecessor overlaps. `VIAC/PARA` share a price chain; `PSKY` is a separate reset chain beginning `2025-08-07` with no predecessor warm-up.
+
+   Current SPLIT history can include splits after the `2025-12-31` PIT cutoff (confirmed for CRWD's July 2026 4:1 split), while the frozen cache uses the earlier share scale. Derive each reviewed price chain's cumulative post-cutoff split factor from the stable suffix of its manifest-declared terminal factor anchor, then apply it to every identity in that chain. Unmapped symbols may use their own cutoff tail. A chain ending before cutoff must prove unity or have explicit reviewed corporate-action evidence. The suffix must contain at least five sessions and stops before an earlier ratio regime; this permits a legitimate near-cutoff in-window split such as NOW's 5:1 split effective 2025-12-17. Transform SPLIT OHLC by multiplying that factor and SPLIT volume by dividing it before overlap validation/merge. This preserves in-window split adjustment while removing later splits. Require finite positive near-split factors, sufficient matching suffix dates, factor and inverse-volume stability, and fail closed when calibration cannot be proved. Record chain factors/counts/digest and both request sets in provenance. Pin each reviewed identity's `asof`/bounds from the price manifest; use the cutoff for unmapped symbols. Group deterministically by `asof`, bind both membership-map and price-manifest digests, preserve only manifest-approved earlier same-issuer history for warm-up, and clip after identity end. `asof` is symbol-identity mapping, not the adjustment cutoff.
+
+4. Use explicit symbol aliases only:
+
+```text
+BF-B -> BF.B
+BRK-B -> BRK.B
+```
+
+Restore canonical membership symbols before validation/output. Reject unexpected symbols and ambiguous/duplicate alias results.
+
+5. Validate every provider row before merging: requested symbol, date in range, expected SPY trading day, finite positive OHLC, nonnegative finite volume, monotonic per symbol, and no duplicate canonical `(trade_date,ticker)`. Require valid SPY OHLCV for the complete evaluation/warm-up calendar.
+
+6. Preserve source precedence on one universal cutoff basis. For each symbol with cache/provider overlap, compare the cache against both the cutoff-normalized SIP candidate and the current-SPLIT SIP candidate. If the cache matches the cutoff candidate, retain it unchanged. If it instead matches current SPLIT, transform cache OHLC by the proved cutoff factor and cache volume by its inverse, then require the transformed overlap to match the cutoff candidate. If neither classification is proved, fail closed. Merge the normalized cache rows as primary and let only cutoff-normalized SIP rows fill absent `(trade_date,ticker)` keys; never average or overwrite. Symbols without cache overlap use cutoff-normalized SIP, never current SPLIT. Record the per-symbol basis classification, transformations, counts, and digest. Fetch the full membership union plus SPY so pre-membership warm-up history is available; coverage is still measured only on active membership/trading-day pairs.
+
+7. Add a bounded overlap audit before publication. Record content-free counts and price/volume relative-difference summaries between the normalized cache and cutoff-normalized SIP overlaps, and fail closed on clear scale/corporate-action incompatibility. Do not weaken the existing OHLCV invariants to accommodate a source mismatch. This explicitly handles the observed mixed cache capture basis: CRWD cache matched the cutoff/raw scale before its July 2026 4:1 split, while AMCR cache matched current SPLIT after its January 2026 1-for-5 reverse split.
+
+8. Publish a reproducible normalized provider snapshot alongside the merged output (for example `alpaca_sip_snapshot.csv`) and bind its SHA-256 in `prices_provenance.json`. Publish atomically/no-clobber using the hardened Task 3 boundary. The normalized snapshot must contain market data only, no credentials/provider headers/account metadata.
+
+9. Keep exact outputs and provenance:
+
+- `prices.csv` with `trade_date,ticker,open,high,low,close,volume`;
+- `spy_trading_days.csv`;
+- `prices_provenance.json`;
+- normalized SIP snapshot sidecar and its digest.
+
+Set source kind exactly `existing_hash_pinned_cache_plus_alpaca_sip_snapshot`. Record cache SHA, retrieval UTC, request date range, feed, adjustment, timeframe, requested/returned symbol counts, chunk count, alias map, source-row counts, fill counts, remaining gaps, all output digests, and coverage. Do not claim the member prices are public data.
+
+10. Preserve the gates: full SPY `2020-01-01..2025-12-31`, at least 98% active member/trading-day closes, no overwrite, no partial final/staging artifacts on failure, source cache byte-identical, and no worker/container residue.
+
+11. Update the design and plan truthfully: membership and SEC inputs remain public; prices are the approved hash-pinned cache plus an explicit licensed Alpaca SIP snapshot because the cache and reviewed public archives failed coverage. Record the exact measured public-source failure rather than deleting the original rationale.
+
+## Execution order
+
+Honor the user's priority: make the real end-to-end price export work first. Run one functional export against the exact membership artifact and approved cache. Inspect the emitted coverage/provenance and confirm the ordinary CSVs exist. Only after functional success, add/run narrowly focused checks for provider validation, source precedence, aliasing, no-trading boundary, atomic rollback, and fail-closed coverage. Broad repository tests remain Task 7.
+
+## Completion evidence
+
+- One real functional run with `>=98%` exact active-member coverage and full SPY coverage.
+- Exact final counts/digests and remaining-gap distribution.
+- Cache SHA unchanged before/after.
+- No orders/account endpoints.
+- No secret/account/header leakage.
+- No partial/staging artifacts or owned worker containers.
+- Focused checks, Ruff, compile, and `git diff --check` after functional success.
+- Update `.superpowers/sdd/2026-08-21-five-year-public-pit-baseline/task-3b-report.md`.
+- Commit all Task 3B code/docs with a clear message and leave the worktree clean.
+
+## Global constraints
+
+- No strategy optimization or trading-engine changes.
+- No weakening of PIT/coverage/date/no-overwrite gates.
+- No public Kaggle member-price blend in production.
+- No provider call outside the explicit acquisition command.
+- No broad unit-test diversion before the functional export.

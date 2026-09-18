@@ -1,0 +1,121 @@
+# Development evaluator compatibility review
+
+Reviewed commit `9af42dffead6827d8412748309b3863a4a5e59da` against base
+`e54498b755818e9bdba08c36704ef9ca359e71de` on 2026-09-07.
+
+**Source verdict: ready for the controller's explicit development execution.**
+No Critical, Important, or Minor actionable regression was found in this change.
+This is a source-readiness assessment, not evidence that the end-to-end optimizer
+loop has completed or that production V5 is ready.
+
+## Scope and method
+
+Read the development brief, implementation report, exact commit diff, and direct
+non-test dependencies needed to resolve compatibility questions. The reviewed
+source files matched the commit; the only working-tree modification observed
+before this report was the controller's progress ledger. Production recovery
+changes in `core/pit_optimizer_v5/operations.py` and
+`core/pit_optimizer_v5/runtime.py` were excluded.
+
+No tests were read, created, modified, or run. No Docker or provider calls,
+subagents, source changes, commits, or branch changes were performed. The exact
+reviewed source/doc diff passed `git diff --check`. Implementation compilation,
+Ruff, and real-data helper results are reported evidence from the implementer,
+not independently rerun checks by this reviewer.
+
+## Source evidence
+
+- **Explicit request scope and output binding.**
+  `core/pit_optimizer_v5/container_protocol.py:60` defaults to `production`;
+  `:75` rejects unsupported scopes and `:77` rejects development with baseline
+  capture or any purpose outside quick/discovery. The complete request is hashed
+  at `:129`, and output includes that input hash at `:283`. Changing the scope
+  changes the canonical input identity. The simulator also records the scope in
+  configuration (`core/backtest_engine.py:3588`) and fixed causal engine identity
+  (`core/engine_policy.py:195`); the evaluator verifies result scope at
+  `core/pit_optimizer_v5/evaluator.py:628`.
+
+- **Same V3 worker, engine, fills, and report route.**
+  `core/pit_optimizer_v5/container_entry.py:162` still constructs the existing
+  `PolicyWorkerSessionV5`, wrapped by `JsonLinePolicyClient` with interface V3 at
+  `:174`. It passes request scope to `PitPanelEvaluatorV5` at `:255`, selects the
+  existing `summarize_panel_result` at `:253`, and calls `evaluate_candidate` at
+  `:258`. `core/pit_optimizer_v5/evaluator.py:540` instantiates the existing
+  simulator with its execution profile, friction scenario, transition contract,
+  and scope; `:552` runs it, `:562` validates its result, and `:568` invokes the
+  existing report builder. The report continues to reconcile observations,
+  fills, episodes, and policy outcomes at
+  `core/pit_optimizer_v5/diagnostics.py:743`.
+
+- **Production boundaries remain strict.**
+  `core/pit_optimizer_v5/evaluator.py:392` requires schema 3 for production and
+  exactly schema 2 for development. Development rejects baseline policy
+  authority at `:328`, and candidate-only evaluators cannot call baseline
+  evaluation at `:440`. Direct evaluation also rejects development held-out
+  purposes at `:487`. The container retains its baseline schema-3 check at
+  `core/pit_optimizer_v5/container_entry.py:238`. The simulator checks schema
+  against explicit scope before entering its normal run at
+  `core/backtest_engine.py:2460`. Production CLI/preparation/authorization source
+  files are absent from this commit's diff.
+
+- **Unavailable facts remain absent, including the approved partial RS case.**
+  `core/industry_group.py:77` validates requested symbols; schema-2 development
+  checks its cutoff and returns no classifications at `:78`. Entry industry RS
+  is therefore `None` (`core/pit_feature_snapshot.py:99`), sector RS stays `None`
+  (`:126`), and unavailable holding RS is preserved through `.get` (`:176`).
+  `core/backtest_engine.py:3924` assigns held notionals to `unclassified`, with
+  sectors also unclassified at `:3927`. Current-provider industry loading remains
+  disabled for PIT bundles at `core/backtest_engine.py:2293` and `:2708`.
+  `core/pit_feature_snapshot.py:240` relaxes required RS coverage only for schema
+  2 after the explicit development/schema guard at `:197`; schema 3 still
+  requires the complete active union. Every supplied RS still passes finite,
+  boolean, and range checks in `core/canslim/l_leader_laggard.py:31`. This matches
+  the controller-approved BBWI omission, without inventing scores or history.
+
+- **Causal features and authenticated legacy holding identities.**
+  `core/pit_feature_snapshot.py:202` retains the bundle cutoff, `:215` retains
+  entry membership, `:246` validates completed-session history, and `:111` reads
+  as-of fundamentals. Existing legacy affiliations are used through
+  `core/pit_data.py:1075`. For holdings, `core/pit_feature_snapshot.py:219` checks
+  both transition provenance digests against bundle metadata, invokes the real
+  `PriceIdentityTransitionContract.resolve_open_holding` at `:227`, and rejects
+  an unresolved ticker mismatch at `:233`. The evaluator obtains that contract
+  from the bundle loader and checks its identities at
+  `core/pit_optimizer_v5/evaluator.py:374`. The unchanged resolver rejects unknown
+  identities and unsupported admitted-date boundaries at `core/pit_data.py:227`.
+  The engine's normal transfer path remains in place at
+  `core/backtest_engine.py:5670`.
+
+- **Useful bounded failure output and accurate documentation.**
+  `core/pit_optimizer_v5/container_entry.py:278` caps and normalizes exception
+  text, redacts URLs and common credential assignments, and `:286` selects only
+  the final source filename/line. It emits the stage and exception class at
+  `:292`, then returns failure code 3 at `:295`; it does not dump locals,
+  environment, source lines, or worker transcripts. Canonical output is built
+  only after successful evaluation at `:268`. The separate development document
+  explains scope selection, image/request regeneration, missing facts, and
+  provisional readiness limits (`docs/pit-optimizer-v5-development.md:9`, `:28`,
+  `:42`, `:74`). Regenerating old serialized requests is an intentional documented
+  compatibility consequence, not an unnoticed production default change.
+
+## Findings
+
+- **Critical:** None.
+- **Important:** None.
+- **Minor:** None.
+
+## End-to-end execution verdict
+
+**Pending; not established by this review.** At assignment time, the original
+image run had failed before simulation and the controller's exact-source image
+build was running. The real schema-2 bundle and implementer's helper results
+support source readiness, including 505 active members / 504 causal RS scores,
+missing BBWI RS, absent classifications, and real identity transitions. They do
+not prove that the full V3 worker/simulator/report/output sequence has succeeded.
+
+Proceed with the controller's authorized development request and rebuilt image.
+Accept integration completion only from a successful request-bound container
+output and reconciled report for that execution. Any later execution result
+should be recorded separately. Even a successful development run does not
+establish production baseline, held-out, classification-feature, or
+three-universe readiness.

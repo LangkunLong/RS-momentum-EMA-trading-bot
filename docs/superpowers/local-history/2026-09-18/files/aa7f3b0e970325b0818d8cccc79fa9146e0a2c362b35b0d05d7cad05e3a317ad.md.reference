@@ -1,0 +1,91 @@
+# Task 8 report — five-year public PIT baseline documentation
+
+## Outcome
+
+Documented the completed immutable public 2021--2025 PIT baseline in
+`README.md` and `docs/pit-baseline-data-provenance.md`. No production code,
+tests, strategy configuration, data artifact, provider state, or trading state
+was changed.
+
+## Ground truth used
+
+The documentation was derived from the completed run directory:
+
+```text
+.artifacts/pit-baseline/run-20260823e/run-20260823T071322Z-8ca8242dd67d
+```
+
+Specifically, `run_manifest.json`, `coverage.json`, `summary.json`, and
+`report.md` were read as the authoritative record. The preserved bundle digest
+is `8ca8242dd67db30d456a2b1861f7e7399f8ca418079738ab150d4e44865763c5`.
+
+## Documentation delivered
+
+- README now identifies the completed run as a preserved logic-verification
+  baseline, links the decision record, records the exact bundle digest and run
+  directory, and states that `--allow-incomplete-fundamentals` prevents use as
+  a fully coverage-gated performance verdict.
+- The provenance record distinguishes network-required acquisition from
+  offline-only build, digest verification, and replay. It records the pinned
+  membership revision, SEC archive and cache hashes, operational commands,
+  preservation rules, and the resumed checkpoint location.
+- Known MVP limitations are explicit: cache-primary prices with explicit SIP
+  backfill, absent institutional history, excluded ambiguous corporate actions,
+  and public reconstructed membership rather than a licensed constituent
+  master.
+- Findings appear under exactly the four required classifications: data coverage
+  defects; CANSLIM signal-logic gaps; execution/cash-deployment gaps; and
+  strategy performance gaps. The record prohibits parameter optimization until
+  data coverage and execution reconciliation are satisfactory.
+
+## Recorded baseline facts
+
+- Complete run; 99.97104270% price coverage; 503--506 active members; and
+  100% CIK resolution-or-explicitly-closed exclusions.
+- Evaluated quarterly-plus-annual strict-PIT fundamentals: 80.20768935% versus
+  the 90% gate, deliberately published only with
+  `--allow-incomplete-fundamentals`.
+- Unchanged CANSLIM: 1.37670379% total return, 76.33736906% average cash, 174
+  closed trades, and 42.52873563% win rate.
+- Independent leader basket: 65.05507789%; SPY: 84.79009134%; top-100
+  signal/execution recall: 40%/40%; rolling recall: 0.25%; zero cash and
+  capacity blocks.
+
+## Validation
+
+- `python fetch_sp500_membership.py --help`,
+  `python fetch_sec_pit_fundamentals.py --help`, `python export_pit_prices.py
+  --help`, `python build_pit_bundle.py --help`, `python verify_pit_bundle.py
+  --help`, and `python pit_baseline.py --help`: passed without network access.
+- `git diff --check`: passed.
+
+The pre-existing modification to
+`.superpowers/sdd/2026-08-21-five-year-public-pit-baseline/progress.md` was
+left untouched and is not part of the Task 8 commit.
+
+## Commit
+
+Amended as `e77e3ec docs: record five-year PIT baseline provenance`.
+
+## Fix round 1
+
+Review evidence corrected the provenance record without code, tests, data, or
+network changes.
+
+- The recorded completed-run `pit_baseline.py` invocation now contains the
+  manifest's exact `--resume-checkpoint`
+  `.artifacts/pit-baseline/checkpoint-migrations/portfolio-382c119/portfolio_checkpoint.json`.
+  It is explicitly labelled historical evidence because its output root already
+  exists; a separate fresh-replay example uses a new root and omits that
+  checkpoint unless it belongs to the new run.
+- SEC acquisition is now correctly stated as the manifest-recorded
+  `manual_browser_download` of the two official archives, followed by byte-size
+  and SHA-256 verification. The document no longer calls a command with
+  sensitive/operator-local substitutions the exact completed-run transcript.
+- The price-export command uses the manifest's immutable non-secret worker
+  image: `localhost/rs-agent-loop@sha256:7ecfb4ebb3b327940bef347e4c82e82fb4a0e8b40fc63b92b2536fe8c83acf1c`.
+
+Fix-round validation: document assertions verified the checkpoint, manual SEC
+acquisition marker, both archive hashes, sandbox image, fresh-replay warning,
+and exactly four required finding headings; `python pit_baseline.py --help` and
+`git diff --check` passed.

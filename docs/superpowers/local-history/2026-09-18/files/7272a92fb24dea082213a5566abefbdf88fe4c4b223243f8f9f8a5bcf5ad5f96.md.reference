@@ -1,0 +1,164 @@
+# P4 historical compliance preparation notes
+
+Status: read-only production preparation. P3 remains the sole production writer. These notes authorize no production edit, historical execution, test activity, synthetic evidence, campaign operation, provider access, or Git mutation.
+
+## Authority reviewed
+
+- Design: `docs/superpowers/specs/2026-09-08-pit-optimizer-v5-campaign-admission-design.md`.
+- Plan: `docs/superpowers/plans/2026-09-08-pit-optimizer-v5-campaign-admission.md`, especially P4.
+- Stable completed-history preimage: `principal-preimages/development_preparation.py`, SHA-256 `e7f7e2c0d6c4b66eefd31b031cc18cf53f3924a013b39a318d613ccff75b72f8`, 42987 bytes.
+- Stable historical-resource preimage: `principal-preimages/historical_verification.py`, SHA-256 `978c0bd83ddbafecc9ef388420c23634429f32a5f6473eef441c09db4c6c521b`, 93049 bytes.
+- Approved P2 admission preimage: `../admission-p3/principal-preimages/campaign_admission.py`, SHA-256 `c42b07adc2d14fd00300acf2c76fb15669cade0ad4b149d7d92cbe9666c88d5e`.
+- `campaign_admission.py` is not a P4 preimage yet. Capture it only after P3 is frozen and independently approved. Do not base implementation on the moving production file.
+
+No `AGENTS.md` was present in the worktree or its checked ancestors. No test file was read, created, modified, or run.
+
+## Existing completed-history call path
+
+The stable public entry is `development_preparation.authenticate_completed_development_history_v5(repository, manifest) -> None`. Its caller-visible contract is authentication by exception and an exact `None` return. Preserve that contract so old summary shapes and counts remain byte-for-byte unaffected.
+
+Its authenticated order is:
+
+1. Require exact `LocalArtifactRepositoryV5` and `CampaignManifestV5` types and the existing development manifest restrictions.
+2. Load the original `campaign-launch` state at the manifest key with `repair=False`; authenticate the manifest from the launch reference and require exact manifest equality.
+3. Derive original authorities and load the original adapter config selected by the launch.
+4. Run `_existing_round_state_v5`, which enumerates launch/start value-and-authority state plus event directories across the full manifest round cap. It rejects missing launch/start/event halves and unfinished future publication.
+5. For every observed round, run `authenticate_historical_round_v5` and `authenticate_completed_historical_round_resources_v5`, then bind each result back to the same authenticated manifest, campaign launch, original config reference, and original config value.
+6. Load the checkpoint and records, require all record rounds to be observed, and require every observed round to have either checkpoint records or one authenticated terminal outcome.
+7. Run `_authenticate_completed_history_census_v5`. It binds all selected role requests, candidate execution payloads, workspace reservations, mount reservations, and execution reservations to the completed journals and rejects unjournaled or foreign selected state.
+8. Authenticate all role packages through the controller-history path or the paid-role history path selected by the original manifest/config.
+9. Verify the complete archive projection with `repair=False`.
+
+Only after step 9 may optional admission-policy discovery or compliance execute. The policy path must consume the already authenticated data facts; it must not call the public completed-history entry recursively and must not substitute a smaller policy-specific census for steps 1-9.
+
+`historical_verification.authenticate_historical_round_v5` authenticates the original launch/config/owner, the matching pre-start round configuration and started copy, journal payloads, workspace history, and candidate execution resources. `authenticate_completed_historical_round_resources_v5` additionally requires retired workspaces, complete execution facts, successful execution-index membership, and a successful cleanup with exact owned-resource counts. `_authenticate_completed_history_census_v5` returns the authenticated `RoleInvocationPackageV5` sequence in logical round/event order; this is the correct request corpus for envelope verification.
+
+## P4 composition boundary
+
+Refactor the body of `authenticate_completed_development_history_v5` into one private helper that returns an immutable, data-only authenticated-history aggregate after projection verification. The aggregate should contain only facts already established by the existing path:
+
+- authenticated manifest and original campaign launch;
+- original provider development config and its reference;
+- ordered observed/configured/started round indices;
+- ordered `CompletedHistoricalRoundResourcesV5` values;
+- authenticated checkpoint records;
+- ordered authenticated role packages from the full census.
+
+The existing public entry calls this helper, then performs optional policy discovery/compliance, discards any report, and still returns `None`. A legacy archive with no enrollment therefore follows the same authentication path and exposes the same result as before.
+
+The explicit expected-policy entry belongs in `campaign_admission.py`:
+
+```python
+def authenticate_campaign_policy_compliance_v5(
+    *,
+    repository: LocalArtifactRepositoryV5,
+    manifest: CampaignManifestV5,
+    expected_policy_ref: ArtifactRefV5,
+) -> CampaignPolicyComplianceV5: ...
+```
+
+It invokes the private original-history helper once, then the same private data-only policy composition with `expected_policy_ref`. The caller-supplied reference is only a mandatory pin for `load_campaign_admission_v5`; it supplies no authority absent the persisted binding and policy bytes. Missing enrollment, missing state half, mismatched reference, or contradictory original identity is a hard failure.
+
+Use a local import at the completed-history integration point to avoid the existing module dependency from `campaign_admission.py` to development config definitions. Do not introduce a top-level reciprocal import.
+
+## P3 dependency and no-duplication rule
+
+After P3 approval, inspect its captured `campaign_admission.py` preimage and reuse its immutable settled-boundary data composition. P4 must not duplicate P3's census of selected launch/round state, evaluated-round/critic proof, or authenticated cumulative ledger usage. The reusable layer must accept already authenticated history facts and return data only; it must not require an operation object, request factory, ledger writer, current clock, nonce, recovery path, or callback.
+
+If P3 leaves that composition embedded in `operations.py`, extract only the pure read-only portion into `campaign_admission.py` while preserving the approved P3 call sites and behavior. Do not call `_run_campaign_v5`, construct production command services, or use an operational reader from historical verification.
+
+The P2 preimage already supplies the reusable primitives:
+
+- `load_campaign_admission_v5(..., expected_policy_ref=...)` performs value/index-union enrollment census with `repair=False`, exact policy authentication, and original manifest/config/owner/root binding.
+- `require_role_envelope_v5` checks the exact persisted `RoleRequestV5` via `prospective_role_usage_v5` without truncation or substitution.
+- `campaign_boundary_decision_v5` implements target and reserve decisions from exact nonnegative counters and conservative `Decimal` cost.
+- The P2 live prefix shows the approved ledger-reader components: immutable identity derivation, `_load_verified_role_ledger_v5`, `_authenticate_role_invocations_v5`, and cumulative receipt fields. Historical P4 must use the frozen P3 shared boundary interface around these components, rather than the request-specific live helper.
+
+## Compliance algorithm
+
+Given the completed-history aggregate and optional or expected policy reference:
+
+1. Discover enrollment only after original history and projection authentication. With no expected reference and no enrollment, return `None` internally. With an expected reference, absence is failure.
+2. Require the binding/policy manifest reference, adapter config reference, owner digest, and repository-root identity to equal the already authenticated original values. Do not accept a reloaded alternative launch/config as replacement authority.
+3. Require a paid provider development config. Authenticate the complete role ledger through the approved immutable shared reader and bind the ordered packages from the original census to its reservations and terminals.
+4. Apply `require_role_envelope_v5` to every actual persisted paid request/package. A recorded provider overage remains an authenticated historical fact; the prospective request envelope is the admission claim and must not rewrite terminal classification or actual usage.
+5. Require configured and started rounds to be the contiguous logical prefix `1..N`. The base reader has already rejected unfinished launch/start/event publication; policy compliance additionally rejects gaps and any selected policy-related foreign state exposed by the shared P3 census.
+6. Check every stored round start epoch against the original campaign launch: `campaign_launch.started_epoch_ms <= round_started.started_epoch_ms < campaign_launch.started_epoch_ms + campaign_wall_timeout_seconds * 1000`. No current time is read. There is no stored event/cleanup/checkpoint publication epoch from which to prove a stronger ordering.
+7. For each fresh started round `i`, reconstruct only the fully authenticated prefix before `i`: prior attempted rounds, distinct evaluated prior rounds with committed records and an accepted authenticated critic, and cumulative external attempts/tokens/USD from the last terminal receipt before round `i` (zero for round 1). Require `campaign_boundary_decision_v5(...) == "admit"`. Reject a start after the target was already met or after the milestone reserve was insufficient.
+8. Do not subtract current-round usage when deciding whether its author or critic was admitted. Historical fresh-round compliance is decided at the prior settled prefix; all three current-round requests are separately envelope-checked.
+9. Compute final actual counters from all authenticated completed rounds and the final terminal receipt, then return the final policy decision. A final `"admit"` is possible when an existing higher-precedence terminal outcome ended the campaign; do not reinterpret that outcome. `"evaluated_feedback_target_reached"` and `"insufficient_milestone_reserve"` remain policy decisions, not synthetic round outcomes.
+
+Use distinct evaluated round indices, not record/variant counts. An evaluated round requires at least one `status == "evaluated"` record with campaign evidence plus the one accepted critic whose artifact digest matches every evaluated record's critic reference, following the approved P2/P3 rule.
+
+## Data-only report
+
+Add one new frozen, slots data class without changing any existing serialized class or digest domain. A bounded report shape is:
+
+```python
+@dataclass(frozen=True, slots=True)
+class CampaignPolicyComplianceV5:
+    policy_ref: ArtifactRefV5
+    manifest_ref: ArtifactRefV5
+    configured_round_indices: tuple[int, ...]
+    started_epoch_ms_by_round: tuple[tuple[int, int], ...]
+    evaluated_feedback_round_indices: tuple[int, ...]
+    attempted_rounds: int
+    external_attempts: int
+    total_tokens: int
+    cost_usd: Decimal
+    final_decision: Literal[
+        "admit",
+        "evaluated_feedback_target_reached",
+        "insufficient_milestone_reserve",
+    ]
+    logical_prefix_eligibility: Literal["verified"]
+    temporal_evidence_scope: Literal[
+        "stored_campaign_launch_and_round_start_epochs_only"
+    ]
+    global_publication_timestamps: Literal["unavailable"]
+```
+
+The exact frozen P3 boundary type may justify small naming changes, but the report must expose the policy pin, actual distinct evaluated rounds, actual usage, final decision, verified logical-prefix scope, stored epoch scope, and unavailable global publication timestamps. It must contain no repository, callable, adapter, capability, nonce, clock, migration, or mutable collection. It is returned only and is not persisted into an old archive.
+
+Do not claim that a round's event, cleanup, checkpoint, or critic bytes existed before the next round configuration/start publication. Those cross-file publication timestamps/links are absent. The defensible claim is that each admitted round is eligible against the authenticated logical prior-round prefix and that the persisted campaign/round start epochs fit the original campaign deadline.
+
+## File scope for authorized implementation
+
+- `core/pit_optimizer_v5/campaign_admission.py`: add the report and private/public data-only compliance composition, reusing frozen P3 boundary facts.
+- `core/pit_optimizer_v5/development_preparation.py`: narrow private-helper extraction plus post-projection optional policy discovery; preserve the old public signature and `None` result.
+- `core/pit_optimizer_v5/historical_verification.py`: change only if a focused immutable aggregate/extraction is needed to pass already authenticated facts without duplication. Do not refactor resource verification.
+- P4 evidence/readiness documents only after source review authorizes those steps.
+
+No existing dataclass fields/defaults, canonical primitives, SHA-256 formulas, namespaces, summary fields/counts, launch/config/owner/deadline identities, or archived bytes may change.
+
+## Static verification required before freeze
+
+- Capture the approved P3 `campaign_admission.py` preimage and hashes before editing.
+- Inspect the narrow source diff and protected definitions; prove old serialized class definitions and digest expressions are unchanged.
+- Audit every `load_typed_state` transitively reachable from both historical public entries. Every call must pass `repair=False`; no `recover_typed_state_index`, state write, artifact write, migration, or repair path may be reachable.
+- Audit the new historical call graph for absence of operational services, runtime/request factory/ledger writer construction, provider/API calls, environment reads, nonce generation, and wall/monotonic clock reads.
+- Prove policy discovery occurs after the original full round/resource/request/execution/reservation census, role-history authentication, and projection verification.
+- Prove legacy absence retains the exact public return and that the summary caller receives no new fields.
+- Prove explicit expected-policy absence/mismatch fails and the same authenticated-history helper is called once without public recursion.
+- Prove every persisted enrolled request is envelope-checked, every started round is checked at its prior logical prefix, and final report counters come from authenticated ledger/record facts.
+- Run only scoped Ruff, in-memory `compile(...)`, AST/source/diff/hash inspection. Do not import modules as a probe, invoke test discovery, read tests, run tests, create synthetic requests/results, or execute a repository reader against fabricated or real campaign evidence during this implementation phase.
+
+Actual immutable archive summaries remain deferred until P1-P4 source review approval and a separately reviewed collector package. At that later gate, run each original archive exactly once, compare the prior 23/27 fields and counts, and prove all 662 archive files plus the 56 evaluator files remain unchanged. Do not attach an admission binding to either old archive.
+
+## Handoff gate
+
+Implementation can begin only after P3 is frozen, its independent review passes, and the principal explicitly authorizes P4 production writing. At that point the implementer must first capture the approved P3 admission preimage, reconcile these notes to P3's final data-only boundary interface, and keep the production diff within the file scope above.
+
+## Frozen P3 interface addendum
+
+Interface snapshot inspected read-only: `../admission-p3/review-freeze-01/campaign_admission.py`, SHA-256 `e6b3a9b5362df18d670acd65469e4f4667247743fb93f803ce26041f1cb0dc38`. P3 independent review is still pending; this addendum maps reuse only and is not a P3 spec or quality review.
+
+The freeze adds `_CampaignRoundStateCensusV5` and `_CampaignBoundaryFactsV5`. `_load_campaign_round_state_census_v5(...)` authenticates the policy-selected manifest, original launch/config/owner, contiguous launches/starts, first-round config identity, round config equivalence, and every stored start epoch against the original campaign deadline. P4 should call this once after its original completed-history pipeline and require its returned manifest, launch, config, launch indices, and start indices to equal the already authenticated history aggregate. Its `launches` and `starts` supply the report's configured-round and stored-epoch fields.
+
+`_load_campaign_boundary_facts_v5(...)` authenticates a live settled global frontier and returns evaluated count, attempted count, cumulative attempts/tokens/USD, observed starts, and an optional pre-start round. Reuse its fact meanings, `_role_packages_v5`, `_evaluated_round_indices_v5`, the approved immutable ledger readers, and `campaign_boundary_decision_v5`. Do not invoke the loader retrospectively for each historical round: it requires `next_round_index` to follow every round presently observed, re-runs resource/projection/request/ledger authentication, and intentionally rejects a prior stopping outcome. Once later rounds exist it cannot represent an earlier archive prefix, and using it would duplicate the completed-history authority rather than compose from it.
+
+P4 therefore needs one focused private pure-prefix helper in `campaign_admission.py`, alongside the frozen loader, that accepts the already authenticated P4 rounds/records/packages plus one already authenticated ledger sequence and a prefix end. It should return `_CampaignBoundaryFactsV5` with the same counter semantics and separately expose the evaluated round indices needed by the compliance report. For historical prefix `i`, use only rounds, packages, and terminal receipts with round index `< i`; set attempted rounds and observed starts to `1..i-1`; do not infer a historical pre-start publication or feed later durable state into that prefix. The final completed prefix uses all authenticated rounds. No current time, request object, fake pre-start state, or recursive public authentication is needed.
+
+The P4 aggregate must retain the census-returned start records because `_CampaignBoundaryFactsV5` contains no epochs, and it must retain evaluated indices because that type contains only their count. These are focused report inputs, not reasons to alter either frozen P3 dataclass or its live callers. The completed-history path already rejects unfinished publication, so enrolled completed compliance requires no final `prestart_round_index`; the report must continue to state that cross-file global publication timestamps are unavailable.
+
+Production editing remains unauthorized until P3 passes independent review and the principal explicitly opens P4.

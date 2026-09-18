@@ -1,0 +1,15 @@
+## Finding Verdict
+
+**Resolved.** `agent_loop.py:21034-21117` now binds a manifest provenance value to `config.source_root` before evaluation. `_v4_prices_provenance_path` rejects a relative path containing lexical `..` (`:21071-21075`), rejects an absolute path not lexically below that root (`:21061-21069`), and walks the root-selected components with `lstat`, rejecting symlinks, Windows reparse points/junctions, missing paths, non-directory intermediates, and non-regular leaves (`:21079-21103`). It then uses strict resolution and rechecks resolved containment (`:21105-21117`). `_evaluate_v4_panel` calls this guard before hashing, PIT bundle/transition loading, candidate worker construction, or simulator construction (`:21165-21172`, `:21186-21225`).
+
+## New Breakage
+
+None found in the fix-only diff. Valid relative manifest paths remain rooted at `config.source_root`; valid in-root absolute paths remain accepted; the resolved regular file is still passed unchanged to the existing digest and contract checks.
+
+## Out-of-Scope
+
+The prior V4 contract wiring, parity evidence, V5 preflight/object injection, historical artifact compatibility, and transition lifecycle were not re-reviewed; this pass was limited to the former sealed-path finding and regressions introduced by `8769fb7`.
+
+## Verdict
+
+Accept the critical-finding remediation. No focused follow-up issue.

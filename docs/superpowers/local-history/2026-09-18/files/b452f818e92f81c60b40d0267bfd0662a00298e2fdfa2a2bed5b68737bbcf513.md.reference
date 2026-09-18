@@ -1,0 +1,15 @@
+# Approved campaign 01: terminal failure
+
+The actual elevated launch (exec session 78233) exited 1. Its first investigator attempt ended in transport_failure, then the campaign stopped. No author, candidate, evaluator, critic, completed round or checkpoint was produced. Cleanup is complete and the idle-sleep request was restored. Never restart or resume this terminal campaign.
+
+Evidence: run-01-result.json, roles/attempts/investigator/5b152d43cc4989a0a0c1a03e44f3b4da840f2ad26fd99df646dbcfdb79d6b0ac.json, authorization/development-provider-two-rounds-20260907-01/terminals/78eecbdd551bae75e35f786f393cc254cb7a46c710bd6f26a25b890facaad4cc.json. The attempt records one possibly started call, no persisted response/request ID, 18,497 conservative reserved tokens, and $0 conservative cost. These are not confirmed model usage or proof of no charge.
+
+Root cause remains undetermined: provider.py collapsed every exception from complete_once into TRANSPORT without preserving the exception. The same path includes local validation/import/SDK setup, HTTP request, accounting extraction and response persistence. Missing persisted response does not distinguish these cases.
+
+Read-only checks: SDK openai 2.24.0 and httpx 0.28.1 import successfully; GET /key HTTP200, zero daily usage and no per-key cap; GET /credits HTTP200, total credits25 and usage6.480485129. No further completion call was made. No credentials were printed or saved.
+
+Added observational diagnostics to provider.py only. Allowed exception classes/codes and repository stack positions are emitted to stderr without arbitrary text, bodies, headers or locals; emission failure cannot interrupt original settlement. Scoped Ruff, in-memory compilation and independent review passed. Evaluator closure remains 005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4. This is not a verified fix for the unknown original error.
+
+The proposed provider-runtime-02 package reuses the authenticated image, data and baselines. It needs a fresh external-call grant because campaign01 is terminal and the proposed six additional calls exceed its original six-call scope when counted together. Do not treat approval of campaign01 as approval of campaign02. No automatic retry or receipt alteration.
+
+The requested two-round success and final Luna implementation handoff remain incomplete. The principal architect retains responsibility for diagnosing the next actual result and delivering that handoff after completion.

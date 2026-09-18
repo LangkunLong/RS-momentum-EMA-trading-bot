@@ -1,0 +1,57 @@
+### Task 6: Materialize All Three Policy Sources as One Candidate
+
+**Files:**
+
+- Modify: `core/pit_optimizer_candidate.py`
+- Modify: `core/pit_optimization_contract.py`
+- Modify: `tests/test_pit_optimizer_v2.py`
+- Modify: `tests/test_pit_optimizer_loop.py`
+
+**Interfaces:**
+
+- Produces:
+
+  ```python
+  def validate_candidate_sources(
+      *,
+      authenticated_base_root: Path,
+      candidate_root: Path,
+      replacement_sources: Mapping[str, str],
+      git: object,
+      source_commit: str,
+      policy_interface_version: int,
+      immutable_constraints_sha256: str,
+      discovery_panel_plan_sha256: str,
+      parent_identity_sha256: str,
+  ) -> tuple[CandidateIdentity, str]:
+      ...
+  ```
+
+- [ ] **Step 1: Retain the AST/no-I/O validator and extend only its typed-contract allowlist.**
+
+  Permit imports of `MarketContextV1`/`BenchmarkContextV1` through the established contract module. Do not permit new filesystem, network, process, time, randomness, reflection, dynamic import, mutation, or unordered-set behavior.
+
+- [ ] **Step 2: Validate the full replacement map before writing.**
+
+  Require the exact canonical key set, validate text encoding/line endings/final newline, parse/compile each file, snapshot all prior bytes, and reject a no-op bundle. No candidate worker or evaluator may see partially replaced files.
+
+- [ ] **Step 3: Publish the candidate only after all checks pass.**
+
+  Write only inside the disposable candidate checkout, validate all three ASTs and declared exports, run `git diff --check`, reject file-mode/out-of-scope changes, derive the cumulative diff locally, and build identities from all three file hashes, parent identity, source commit, interface, immutable constraints, and discovery panel plan. Restore all original bytes on every failure.
+
+- [ ] **Step 4: Keep old diff ingestion only for old artifact authentication.**
+
+  Remove `materialize_author_candidate_diff`, patch reanchoring, `PatchBounds`, and diff-size enforcement from the v4 call path. Do not delete helpers still needed to read/reconstruct schema-v3 evidence.
+
+- [ ] **Step 5: Rewrite existing candidate cases in place and verify.**
+
+  Convert current full-source/diff-bound tests to exact three-path atomicity, parent binding, rollback, local diff derivation, and no-I/O assertions. Do not add test functions.
+
+  ```powershell
+  python -B -m compileall -q core/pit_optimizer_candidate.py core/pit_optimization_contract.py
+  python -B -m ruff check core/pit_optimizer_candidate.py core/pit_optimization_contract.py --no-cache
+  python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py tests/test_pit_optimizer_loop.py -k "candidate or author or atomic or rollback or ast"
+  git add core/pit_optimizer_candidate.py core/pit_optimization_contract.py tests/test_pit_optimizer_v2.py tests/test_pit_optimizer_loop.py
+  git commit -m "feat: validate atomic three-file strategy candidates"
+  ```
+

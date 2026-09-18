@@ -1,0 +1,29 @@
+# Task 5 independent review
+
+**Spec compliance: ❌**  
+**Task quality: Not approved**
+
+Reviewed exactly `75ddddbb5d794f7c09b5644bb94c6e126e06f0e9..f7a7c103fc54e3e00bb5bd007f18b8a700fbc51c`; no code was changed and no unit/broad tests were run.
+
+Issue counts: **1 Important, 2 Minor**.
+
+## Findings
+
+1. **Important — zero-input rolling recall no longer has the required zero-denominator behavior.**  
+   Evidence: [`core/pit_baseline_report.py:583`](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-fundamental-corrections/core/pit_baseline_report.py:583)-[`590`](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-fundamental-corrections/core/pit_baseline_report.py:590) requires `buy_signal`, `signal_date`, and `symbol` before it can return a population. The replaced helper explicitly returned `0.0` when `labels` or `signal_log` was empty. Consequently, `rolling_label_recall_summary((), pd.DataFrame())` now raises `ValueError` rather than returning both raw/all and PIT-exposed zero-count, `0.0%` populations. This violates the zero-denominator functional-probe requirement and regresses the retained `rolling_label_recall_pct` compatibility helper at [`628`](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-fundamental-corrections/core/pit_baseline_report.py:628).  
+   Required correction: preserve empty-input semantics. Return correctly shaped zero populations for no labels, and treat an empty signal log as zero signals (while still validating the required columns when a non-empty log is supplied). Add the focused probe case using `labels=()` and `pd.DataFrame()`.
+
+2. **Minor — reporting-only task contains a large unrelated formatting rewrite.**  
+   Evidence: the supplied package reports 500 insertions/385 deletions across the two files, while the new behavior is confined to the recall helpers and reporting paths. It reformats unrelated entry reconciliation and baseline validation code, for example [`core/pit_baseline_report.py:318`](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-fundamental-corrections/core/pit_baseline_report.py:318) onward and [`pit_baseline.py:343`](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-fundamental-corrections/pit_baseline.py:343) onward. This conflicts with the binding reporting/schema-only scope and obscures behavioral review.  
+   Required correction: restore formatting-only changes outside the recall/summary/report/manifest paths, leaving the Task 5 functional diff narrowly scoped.
+
+3. **Minor — ⚠ focused functional-probe evidence is not independently auditable from the review package.**  
+   Evidence: only the two production files changed; the task report states expected mixed-exposure, alias, successor-reset, zero-denominator, and JSON results, but contains neither the executed probe nor its output. The diff therefore cannot verify Task 5 Step 4’s functional probe.  
+   Required correction: append a concise reproducible probe command/script and its captured assertions/output to the task ledger/report (without running the deferred unit or broad suites).
+
+## Confirmed from the diff
+
+- Five-year raw/all and `member_at_start=True` summaries expose denominators, signal/execution numerators, and correctly denominator-based percentages through [`core/pit_baseline_report.py:236`](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-fundamental-corrections/core/pit_baseline_report.py:236)-[`271`](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-fundamental-corrections/core/pit_baseline_report.py:271).
+- Rolling output contains signal-only raw/all and `member_at_evaluation=True` PIT populations; no rolling execution attribution is introduced at [`core/pit_baseline_report.py:573`](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-fundamental-corrections/core/pit_baseline_report.py:573)-[`624`](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-fundamental-corrections/core/pit_baseline_report.py:624).
+- Same-issuer aliases remain grouped and non-continuous identities remain singleton aliases at [`pit_baseline.py:792`](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-fundamental-corrections/pit_baseline.py:792)-[`805`](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-fundamental-corrections/pit_baseline.py:805).
+- Summary, prose report, and manifest consume the same recall object; legacy aliases have explicit mappings at [`pit_baseline.py:1377`](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-fundamental-corrections/pit_baseline.py:1377)-[`1405`](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-fundamental-corrections/pit_baseline.py:1405) and [`1498`](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-fundamental-corrections/pit_baseline.py:1498).

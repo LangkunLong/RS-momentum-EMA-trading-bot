@@ -1,0 +1,10 @@
+{
+  "core/pit_optimizer_v5/contracts.py": "b4bc7248613aadf2eba31c97b20c1cf70e12aa36a73c7967a8a3d5c4541a2232",
+  "core/pit_optimizer_v5/manifest.py": "4ef2e406b60b05c999f3fe885b837908afc56e7310fd88e98bc43bdf6b081256",
+  "core/pit_optimizer_v5/development_preparation.py": "3d7bd9789b88a2812af9fb51aa1ede6b4aa08e3380a03a6114d87b100d8e9252",
+  "core/pit_optimizer_v5/cli.py": "af588b29c97e9022f5694351ea771af8edde23bf6ad3b9acedcb9433b2eb8824",
+  "core/pit_optimizer_v5/operations.py": "ca54c521eb071ef11a8ee9b77065c21e0f648d73983839b96596cb4228e4149a",
+  "core/pit_optimizer_v5/runtime.py": "e93966957602079652c9fdded837c4df6d0abdf0a022f4412d1438d42faf9816",
+  "core/pit_optimizer_v5/summary.py": "99f62b286ec4ed0304f8f958106153ead977f8b1bbba7ab8bd1154655aa3dd6f",
+  "core/pit_optimizer_v5/provider.py": "92464acd2b5bf1c7432aeecdcec47d96ec520877e7dc7af5ca700832b4790520"
+}

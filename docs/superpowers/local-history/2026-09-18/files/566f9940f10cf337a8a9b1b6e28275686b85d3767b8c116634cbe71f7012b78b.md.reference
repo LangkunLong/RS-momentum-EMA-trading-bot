@@ -1,0 +1,44 @@
+# H3c completed-state enumeration
+
+Read-only design; no historical archive was inspected or executed. Scope includes `operations.py`, relevant repository readers, and principal-authorized reservation schema/publication snippets in `production_sandbox.py`; moving H2 verification bodies were not read.
+
+## Meaning of complete
+
+Use `_run_campaign_v5`'s existing settled definition: checkpoint-owned record(s) **or** a `RoundOutcomePayloadV5`, plus the final successful cleanup. A failed terminal is settled, not an evaluated round. Unlike its operational loop, historical enumeration must not stop at the first reused failure or rely on events to discover launches. Inspect the complete selected campaign before accepting any result. No invocation of `_run_campaign_v5`, reconciliation, clock comparison, or recovery is needed.
+
+A genuinely absent future round has no round entry, start, events, checkpoint records, role requests, paid reservations, candidate execution payloads or execution reservations attributable to it. An entry without a start is durable prepared/unstarted state; a start without events is pending/uncertain state, including the operational controller-specific resumable case. Both fail `completed_history`. A campaign launch with no settled round is not completed history. Empty future slots need no fabricated config, round authority or wrapper.
+
+## Existing authority locations and immutable reads
+
+| Authority | Canonical location/key and reader |
+|---|---|
+| Campaign | `adapter-state/campaign-launch/{manifest.sha256}.json`; `load_typed_state(..., CampaignLaunchV5, repair=False)` and authenticated original manifest/config |
+| Round/start | Namespaces `campaign-round` / `campaign-round-started`; key `canonical_sha256_v5({"campaign_manifest_sha256": manifest.sha256, "round_index": n})`; `CampaignRoundLaunchV5`, `repair=False` |
+| Typed-state index | `adapter-state-authority/{namespace}/{key}.json`; existing `load_typed_state` authenticates index/value and raises on orphan index repair when `repair=False` |
+| Events | `events/{campaign_id}/{n:04d}/{sequence:06d}.json`; `load_round_events`, then `load_round_payload`, retaining exact fold/canonical/rejection validation |
+| Role requests | `roles/requests/{call.sha256}.json`; `_load_role_request_entry(reference)` authenticates canonical envelope, call, request and filename |
+| Paid ledger | `authorization/{campaign_id}/reservations/{slot_id}.json`, `terminals/{slot_id}.json`, `responses/{request_sha256}.json`; H3b immutable ledger reader uses `load_role_ledger_records` and response/unique-request loaders |
+| Candidate journal authorities | `payloads/candidate_execution/{payload.sha256}.json`; `verify_candidate_execution_index(campaign_id, round_index)` compares all matching payloads with event-indexed authorities |
+| Container reservations | Namespace `container-reservation`, key `command_sha256`; `ExecutionReservationRecordV5`, whose owner identifies campaign/round; typed read with `repair=False` |
+| Output preparation reservations | Namespace `sandbox-mount-reservation`, key `output_authority_sha256`; `MountReservationRecordV5` carries owner and execution-key digest; typed read with `repair=False` |
+
+Read both round/start keys for **every** `1..max_feedback_rounds`, even with no events. Preserve H1's owner, entry/start/config equality and original round-1 config requirements. `load_checkpoint`/`load_experiment` supply the record side; existing projection scheduling validates chronological stopping and record/terminal conflicts. Future absence does not mean all maximum rounds must have run.
+
+## Narrow enumeration seams
+
+Public repository lookup APIs do not alone enumerate unjournaled requests or typed reservations. Implement narrow private historical census helpers using existing `_names`, `_read_relative`, `load_typed_artifact`/`authenticate`, and `load_typed_state`; no filesystem glob, `Path.exists` shortcut or new mutable adapter is needed. `_names` opens via `_directory(create=False)` and returns sorted names; `_read_relative` preserves pinned-root and regular-file authentication. Catch `ArtifactMissingV5` only for absent census directories; propagate individual observed-entry disappearance/authentication errors.
+
+1. `_existing_round_state_v5(repository, manifest)` reads all expected keys and enumerates the two round namespaces to reject canonically attributable out-of-range entries. For a decoded round value, derive the selected manifest's key using its stored `round_index`; only that matching key identifies the selected campaign. Authenticate selected entries using `repair=False`. Enumerate `events/{campaign_id}` to reject noncanonical or out-of-range round directories; load every in-range round through the existing event reader. Do not infer campaign ownership from an unrelated hash slot.
+2. `_existing_campaign_role_requests_v5(repository, campaign_id)` returns `(reference, call, request)` tuples from the exact request directory and canonical loader. Filter authenticated calls by campaign, require permitted rounds, and compare the complete reference set with journal role-completion request refs. Preserve exact package equality and ordered H3a/H3b checks. An unjournaled request is pending even without a response, ledger reservation, or external attempt. `load_unique_role_request_entry_by_sha256` cannot discover an unknown request. Existing `_verify_finalized_role_requests` demonstrates the census pattern but assumes nonempty completions; do not call it for zero-request rounds or import its successful-finalization requirements.
+3. `_existing_campaign_execution_payloads_v5(repository, campaign_id)` scans the canonical payload directory, authenticates each payload, selects its campaign and rejects out-of-range rounds. Retain `verify_candidate_execution_index` for every in-range round, including empty ones. Never use `load_candidate_execution`, which promotes an orphan with `append_round_event`.
+4. `_existing_reservation_states_v5(repository, *, namespace, value_type)` narrowly supports the two reservation namespaces above. Enumerate the union of value and authority filenames, validate canonical digest keys, then load each observed key with `repair=False`; reject `None`. This catches value-only reservations and authority-only missing values. Select by authenticated owner campaign, reject out-of-range/foreign-round owner bindings, and compare the selected reservation set exactly against H2-authenticated journal execution reservations/output mounts. A foreign token in the selected campaign must fail, not be filtered away. Namespace-wide malformed/orphan records fail closed because they cannot be safely attributed.
+
+The container `reserve` implementation persists `container-reservation` before returning its runtime reservation, so payload-index verification alone misses that pending window. Output preparation similarly persists `sandbox-mount-reservation`; require every selected mount reservation to belong to the authenticated execution set. This is a bounded precursor census, not a scan of every phase/control namespace. H2 still authenticates all phases, cleanup, output, workspace and finalizer evidence for matched executions; this census does not replace those checks.
+
+## Closure and limits
+
+H3b's equality between reservations, terminals and ordered packages rejects unjournaled paid reservations and incomplete settlement. Census role requests first, including zero-execution rounds. Retain the legacy loader's migration-required failure; never migrate. Sealed controller responses are required for completed packages, but no response-directory lookup or append occurs.
+
+runtime04's failed second round remains authenticated settled failure after complete cleanup; counts stay 1/1/0. actual06's zero candidate executions require an empty selected execution/reservation census, while its real paid requests/ledger/packages and failed terminal remain mandatory; counts stay 0/0/0. Neither case needs successful finalization of every planned round.
+
+Every actual typed-state read remains `repair=False`; enumeration is not a preflight permission to use repair defaults later. Directory enumeration is not an atomic cross-file snapshot: retain immutable-loader failures and describe the report as verification of observed completed evidence, with no concurrent-writer guarantee. No speculative inspection of credential values, arbitrary orphan role-artifact files, or unrelated adapter namespaces is proposed. Exact helper placement and malformed-namespace behavior require principal source review before implementation; no negative or operational branches were executed here.

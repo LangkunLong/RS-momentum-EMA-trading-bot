@@ -1,0 +1,28 @@
+# H1 — authenticated original round authority
+
+Worktree: C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-v5-architecture.
+Base HEAD: a068e0aed40ecbe5e0078924071f374e7809b8c2. Preserve all earlier staged/unstaged work.
+
+The user has now explicitly directed the principal to proceed until the full transition plan is finished, using subagents. The principal accepts H1 of the independently reviewed historical-verification design for implementation. This supersedes the prior C-a-only implementation pause. It does not authorize tests, synthetic evidence, external calls, campaigns, credentials, evaluator rebuilds, commits, pushes or deployment.
+
+Read this brief first; then read only Checkpoint H1 and the Decision section in ../increment-c-history-verifier/historical-verification-design.md. That design's corrected semantics/read-only constraints bind this work. Implement H1 only and stop for source review before H2.
+
+## Source scope and API
+
+Add core/pit_optimizer_v5/historical_verification.py. A narrow helper/import change to development_preparation.py is allowed only if needed; prefer leaving it unchanged. All other production files are protected. Do not activate summary/history behavior yet. Do not modify production_sandbox.py, candidate_ir.py, evaluator files, existing runtime guards or role authentication.
+
+Provide authenticate_historical_round_v5(*, repository, manifest, round_index) returning a frozen internal HistoricalRoundAuthorityV5. Keep types precise. The result stores the authenticated manifest/round, original config/reference, derived owner, expected executor/workspace/mount digests and immutable validated resource history as useful for H2. It must not return mutable live adapters, operational leases, execution reservations or capability objects. Future public history entry points must call the authenticator themselves; do not trust an arbitrary caller-constructed dataclass as an authorization boundary.
+
+1. Validate exact repository/manifest types and positive integer round within manifest cap; require existing supported development scope. Load original CampaignLaunchV5 with repair=False using manifest SHA, require its manifest ref equals that manifest, authenticate the manifest graph from the launch ref and require exact manifest equality.
+2. Derive canonical round key from campaign_manifest_sha256 and round_index. Load campaign-round and campaign-round-started as CampaignRoundLaunchV5 with repair=False. Require expected round, original campaign owner digest, positive started time, and equality after removing only started_epoch_ms. Require round 1 config ref equals campaign launch ref. No synthesis for absent state.
+3. Authenticate campaign and round configs with existing load_development_config_v5. Require same concrete config type, all paths, export mode, schema, manifest/root, response directory or provider-specific settings. Only these owner-derived fields may differ by round: candidate_base_identity_sha256, workspace_driver_identity_sha256, mount_factory_identity_sha256, container_executor_identity_sha256. Do not read credentials, current environment or invoke provider composition.
+4. Derive exact WorkspaceOwnerV5 from manifest campaign, round, original token digest, and existing cli._controller_lease_id_v5. Use existing read-only local workspace/mount constructors only (never LocalContainerExecutorV5 or candidate base). Require current workspace/mount identities match saved round config. Read exact real round events and verify_candidate_execution_index; bind every workspace lease and execution/reservation to that owner/campaign/round. Reservations must load with repair=False, match command/request key and saved config executor. Authenticate existing lease history and output history and require source linkage. Do not infer completed-history success yet: H2 owns complete phase/panel/output/control/cleanup predicates and H3 owns role/summary integration.
+5. All reachable state reads in H1 explicitly use repair=False. No recovery/append/transition methods. Typed reads of immutable existing artifacts are permitted. Fail closed on missing/malformed/foreign records.
+
+## Real verification and package
+
+Use only existing real runtime-04 rounds 1 and 2 plus actual06 round 1 if useful (no resource execution there). See ../increment-c-history-verifier/principal-round-config-anchors.json for exact manifest/config/expected executor digests. Do not call summaries or old helper main functions. Capture actual H1 results with compact digest/equality output. Negative branches remain static-only; do not generate inputs or mutate records to exercise them.
+
+Save preimages for any existing source edited, narrow unified diff (new file /dev/null), final source hashes, scoped Ruff via py -3.13 -B -m ruff check, in-memory compile, full 56-file evaluator map/digest, and before/after hashes of the real archives in this fresh package. All old package/evidence files remain immutable. Use extended Windows paths for long files and UTF-8, preserve source byte line endings. No package installs.
+
+Write task-report.md here, under 1,200 words, with implementation, permitted verification, source scope, actual auth results, static-only limitations and any concerns. Self-review the exact code. Do not dispatch subagents or reviewers; principal owns review. Return compact status/report path and stop.

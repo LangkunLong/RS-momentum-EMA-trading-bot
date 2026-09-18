@@ -1,0 +1,45 @@
+# Review package: 149fdc51b087839556f3342936ced31f0c28c8b6..1bb9fb0547ba6436e569e58013bfbf542ef9d19c
+
+## Commits
+1bb9fb0 fix: validate v4 readiness ledger binding
+
+## Files changed
+ agent_loop.py | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+## Diff
+diff --git a/agent_loop.py b/agent_loop.py
+index 1b2825d..807898e 100644
+--- a/agent_loop.py
++++ b/agent_loop.py
+@@ -23402,26 +23402,29 @@ def _pit_optimizer_v4_prepare_lines(
+     if (
+         not isinstance(config, PitOptimizerGateConfigV4)
+         or config.phase != "prepare"
+         or not isinstance(readiness, PitOptimizerReadinessV4)
+         or not isinstance(limits, PitOptimizerLoopLimits)
+         or readiness.manifest.sha256 != config.optimizer_manifest_sha256
+         or readiness.discovery_panel_plan.sha256
+         != config.discovery_panel_plan_sha256
+         or readiness.qualification_panel_plan.sha256
+         != config.qualification_panel_plan_sha256
++        or readiness.discovery_panel_plan.qualification_ledger_snapshot_sha256
++        != config.qualification_ledger_snapshot_sha256
++        or readiness.qualification_panel_plan.qualification_ledger_snapshot_sha256
++        != config.qualification_ledger_snapshot_sha256
+         or not isinstance(readiness.qualification_ledger_head_sha256, str)
+     ):
+         raise ConfigurationError(
+             "prepare output requires authenticated schema-v4 readiness"
+         )
+-    config.validate()
+     manifest = readiness.manifest
+     supplied_readiness = Path(readiness.artifact_path)
+     expected_readiness = config.readiness_artifact.resolve(strict=False)
+     if (
+         not supplied_readiness.is_absolute()
+         or supplied_readiness.is_symlink()
+         or not supplied_readiness.is_file()
+         or supplied_readiness.resolve(strict=False) != expected_readiness
+     ):
+         raise ConfigurationError("PIT optimizer v4 derived readiness path differs")

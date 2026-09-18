@@ -1,0 +1,198 @@
+# Task 4 report — rich causal diagnostics
+
+## Outcome
+
+Implemented the optimizer V5 causal diagnostics/report adapter in the three authorized source
+files. No test file was created or modified, and `evaluator.py` did not require a scope expansion:
+its existing injected `EvaluationReportBuilderV5` accepts `summarize_panel_result` directly.
+
+## Engine evidence
+
+- Added frozen, slotted `PositionEpisode` evidence only to `SimulationResultV5`. Each episode binds
+  a stable local episode ID, entry/exit symbol and session, actual execution prices, causal maximum
+  and minimum completed-bar marks, fill-cash realized return, immutable quantity-change path,
+  add-on count, holding sessions, and terminal exit reason.
+- Completed-bar extrema are updated only in the V5 after-close phase. Opening-gap and next-open
+  exits therefore cannot consume incomplete current-bar highs/lows. Terminal last-close positions
+  include the completed terminal bar before liquidation.
+- Every V5 close path funnels through episode finalization. Terminal liquidation now fails closed
+  if any position or episode state remains because its final price evidence was unavailable.
+- Identity transitions remap the open episode state together with the trade while preserving the
+  entry identity. Fill rows bind to a stable `EpisodeId`, allowing exact per-position cash-flow and
+  quantity reconciliation without ticker guessing.
+- V5 fill rows now carry stop-reference kind and stop price. Gap shortfall is therefore measured
+  from the actual causal gap-open reference rather than reconstructed from later data.
+- Added frozen daily `PortfolioObservationV5` rows containing session cash, close-marked gross
+  long notional, total equity, and O'Neil regime. The engine verifies cash plus gross notional equals
+  the daily equity mark and rewrites the terminal observation after last-close liquidation.
+- Added V5-only policy-intent outcome counts for queued, next-open executed, missing-open delay
+  sessions, stop-preempted, and terminally unexecuted intents. Conservation is checked in the report.
+- Episode state, completed episodes, daily observations, and policy-intent counts round-trip through
+  the schema-V5 checkpoint/state journal. Legacy schema 4 and `SimulationResult` remain untouched.
+
+The current engine has no add-on/pyramiding carrier. Episodes therefore record `add_on_count=0`
+today, while the evidence schema and BUY-fill reconciliation require one initial BUY plus exactly
+the declared number of future add-ons. No synthetic add-on evidence was fabricated.
+
+## Report builder and reconciliation
+
+`core/pit_optimizer_v5/diagnostics.py` provides the exact Task 3 adapter signature:
+
+```python
+summarize_panel_result(*, panel, scenario, result) -> EvaluationReportV5
+```
+
+It populates every `EvaluationReportV5` field:
+
+- net portfolio total/CAGR, cost-restated gross diagnostic CAGR, benchmark total/CAGR, max
+  drawdown, daily Sharpe, closed trades, average exposure/cash, and fill turnover;
+- total friction and exact gross-minus-net return drag;
+- win rate, average win/loss, payoff, expectancy, and median completed holding sessions;
+- exposure-normalized invested-sleeve CAGR estimate and the corresponding idle-cash drag;
+- stop-gap dollar shortfall, transfer count, scale-out opportunity cost, and MFE/MAE quartiles;
+- stage/outcome/regime/episode/source-universe entry funnel counts, exit attribution, and policy
+  intent outcomes;
+- chained regime slices, the panel episode slice, calendar-year slices, and monthly endpoint
+  rolling 12/24/36-month returns whenever sufficient history exists.
+
+All report numerics cross into immutable contracts as finite `Decimal` values. Money is reconciled
+at cents and reported at cents; other report boundaries use deterministic six-decimal precision.
+The net scenario remains the selection evidence. Gross is an explicit cost add-back diagnostic,
+not an alternate selection objective.
+
+The adapter rejects rather than defaults when any of the following evidence differs: authenticated
+panel sessions versus portfolio/benchmark curves; observations versus daily equity; terminal cash
+versus ending equity; scenario identity; fill schema or recomputed `apply_friction` values; fill-row
+costs versus aggregate/config totals; episode IDs, dates, execution prices, quantities, realized
+returns, or closed trades; initial cash plus fill cash versus terminal equity; entry outcomes versus
+engine diagnostic counts; policy-intent conservation; and signal symbol/session versus the panel
+and regime observations. Mathematically undefined trade metrics remain `None` only for genuine
+zero-observation cases.
+
+## Provider projection
+
+Added frozen `RoleEvidenceItemV5` and `RoleEvidenceV5` contracts and
+`to_role_evidence(report)`. The projection:
+
+- contains aggregate scalar, distribution, attribution, slice, latest rolling, and funnel values;
+- uses deterministic semantic evidence IDs and canonical JSON identity;
+- is capped at 96 items and 16 KiB;
+- contains no raw ticker rows, raw per-session rows, local paths, credentials, or provider payloads;
+  rolling evidence is exposed by window rather than by raw end-session date; and
+- truncates only after higher-priority scalar, excursion, exit/policy, slice, and rolling evidence,
+  then bounded funnel evidence.
+
+## Verification evidence
+
+No tests were added or modified, per the controller ruling.
+
+### Existing engine tests
+
+```text
+python -B -m pytest tests/test_backtest_engine.py -q
+55 passed, 2 warnings
+
+python -B -m pytest tests/test_backtest_engine.py -k "policy_exit or stop" -q
+10 passed, 45 deselected, 2 warnings
+```
+
+Warnings were the existing `websockets.legacy` deprecation and the environment's configured
+pytest-cache permission warning.
+
+### Static checks
+
+```text
+python -B -m ruff check core/backtest_engine.py core/pit_optimizer_v5/contracts.py core/pit_optimizer_v5/diagnostics.py
+All checks passed!
+
+python -B -m py_compile core/backtest_engine.py core/pit_optimizer_v5/contracts.py core/pit_optimizer_v5/diagnostics.py
+exit 0
+
+git diff --check
+exit 0 (only Git's CRLF conversion advisory)
+```
+
+Review-fix commit: `91493d7` (`fix: reconcile optimizer v5 quantity paths`). Commit hooks passed
+Ruff, trailing-whitespace, end-of-file, YAML, and merge-conflict checks.
+
+### Direct deterministic engine episode smoke
+
+Two real V5 simulator-internal lifecycles used `apply_friction`, completed-bar marking, and the
+central close method. One closed at 110 after a 120/95 completed range and one at a 90 stop after a
+105/80 range. Both finalized immutable zero-ending quantity paths and one completed holding session:
+
+```text
+[('position-00000001', 9.890054972513749, 1, 120, 95),
+ ('position-00000002', -10.089955022488759, 1, 105, 80)]
+```
+
+### Deterministic winner/loser report smoke
+
+An 800-session provider-free synthetic report used one winner, one loser, two regimes, four
+calendar years, one authenticated ticker transfer, exact base-scenario fills, and explicit terminal
+cash/exposure observations. It also substituted the digest of diagnostics bytes plus one extra byte
+to prove evaluator source identity changes. Output:
+
+```json
+{"cash":"97.963447","drag":"0.001000","expectancy":"-0.099950","exposure":"2.036553","friction":"2.00","holding":"15.000000","mae_min":"-20.039980","mfe_max":"19.940030","mismatch_failed_closed":true,"role_bytes":11706,"role_items":96,"rolling_windows":[12,24,36],"slice_counts":[2,4],"source_sha256":"9f32254a0050d93f8f483dab3ef60b4333b4877470c2b863263c6488d77aba18","stable_role_sha256":"cda346cb87e204fb85af88bc4970f7a5af9ffa0320154a5d92a39a1b857bade1"}
+```
+
+Assertions covered exact expectancy, MFE/MAE, holding median, friction/drag, entry funnel,
+exit attribution, policy outcomes, exposure plus cash equaling 100%, regime/calendar/episode slices,
+12/24/36-month rolling output, stable role IDs/digest, item/byte limits, absence of ticker/session/path
+leakage, source-map resolution and byte sensitivity, cost-mismatch fail closure, and absence of V5
+episode attributes on legacy `SimulationResult`.
+
+A separate no-activity smoke returned genuine `None` for trade/excursion/sleeve metrics, zero idle
+cash drag, and otherwise complete zero-count evidence (`ZERO_ACTIVITY_REPORT_OK`).
+
+## Self-review
+
+- Confirmed the working source diff is restricted to `core/backtest_engine.py`,
+  `core/pit_optimizer_v5/contracts.py`, and the new `core/pit_optimizer_v5/diagnostics.py`.
+- Confirmed `evaluator.py`, all test files, providers, Docker, replay, qualification, push, and merge
+  were untouched.
+- Reviewed every V5 fill/close call site, identity remap, daily/final journal event, checkpoint
+  payload/restore path, report field, and provider projection category.
+- Confirmed `summarize_panel_result` is directly callable by Task 3's report-builder protocol.
+- Commit: `35fe57b` (`feat: explain optimizer v5 portfolio returns`). Commit hooks passed Ruff,
+  trailing-whitespace, end-of-file, YAML, and merge-conflict checks.
+
+## Review fix — exact episode transition reconciliation
+
+The review found that the initial report builder reconciled episode-level buy/sell totals and the
+coarse quantity-path shape, but did not replay each immutable quantity transition against the fill
+rows carrying the same `EpisodeId`. The focused fix remains confined to
+`core/pit_optimizer_v5/diagnostics.py`.
+
+Before any report metrics are produced, diagnostics now preserves fill-log row order and replays
+every episode from zero quantity. Each BUY must map to `entry` or `add_on`; each SELL must map to
+`scale_out` or terminal `exit`; and each path item must agree with its fill's session, reason,
+execution price, and cumulative post-fill quantity. The replay also requires causal panel-session
+order, exact fill/path cardinality, unique fill transitions, a fully closed terminal quantity,
+the declared add-on count, and entry/exit sessions, symbols, execution prices, and exit reason that
+match the first and last fills. Missing, extra, duplicate, reordered, cross-episode, or numerically
+inconsistent transition evidence therefore fails closed before report construction. Reference-price
+integrity continues to be enforced by the preceding friction replay in `_validate_fills`.
+
+Direct provider-free smoke evidence:
+
+```text
+QUANTITY_PATH_RECONCILIATION_OK valid=winner+loser rejected=action,session,price,signed_delta,cumulative,duplicate_fill,reordered_fill,exit_reason
+```
+
+Fresh verification after the fix:
+
+```text
+python -B -m pytest tests/test_backtest_engine.py -k "policy_exit or stop" -q
+10 passed, 45 deselected, 2 warnings
+
+python -B -m ruff check core/backtest_engine.py core/pit_optimizer_v5/contracts.py core/pit_optimizer_v5/diagnostics.py
+All checks passed!
+
+python -B -m py_compile core/backtest_engine.py core/pit_optimizer_v5/contracts.py core/pit_optimizer_v5/diagnostics.py
+exit 0
+
+git diff --check
+exit 0 (only Git's CRLF conversion advisory)
+```

@@ -1,0 +1,35 @@
+"""Start or resume a saved local campaign and preserve create-only console receipts."""
+import argparse
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--root', required=True, type=Path)
+parser.add_argument('--label', required=True)
+parser.add_argument('--start', action='store_true', help='Start a new prepared campaign instead of resuming it')
+args = parser.parse_args()
+root = args.root.resolve()
+if not args.label.replace('-', '').isalnum():
+    raise ValueError('Use a plain receipt label')
+saved = json.loads((root / 'campaign-launch-input.json').read_text())
+command = list(saved['resume_command']['argv'])
+if command[4] != 'resume-campaign':
+    raise ValueError('Saved command must be the original resume command')
+if args.start:
+    command[4] = 'run-campaign'
+out_path = root / (args.label + '-stdout.txt')
+err_path = root / (args.label + '-stderr.txt')
+with out_path.open('x') as out, err_path.open('x') as err:
+    result = subprocess.run(command, stdout=out, stderr=err)
+stdout = out_path.read_text()
+stderr = err_path.read_text()
+print(stdout, flush=True)
+if stderr:
+    print(stderr, file=sys.stderr, flush=True)
+for line in stdout.splitlines():
+    if line.startswith('PIT_OPTIMIZER_V5_OPERATIONS='):
+        with (root / (args.label + '-result.json')).open('x') as stream:
+            json.dump(json.loads(line.split('=', 1)[1]), stream, indent=2)
+sys.exit(result.returncode)

@@ -1,0 +1,56 @@
+# H3 immutable historical summary integration
+
+Design only; no implementation, execution, tests, archive inspection, or historical acceptance claim. Read scope was the five requested modules and `artifacts.py`, expanded by principal authorization to the projection call path in `production_runtime.py`. H1/H2 moving source was not inspected.
+
+## Current path and branch placement
+
+`ProductionV5CommandServices._execute` (`cli.py:1054–1088`) authenticates the requested manifest, checks development scope, loads the explicitly requested development config, calls `_verify_local_run`, then calls `summarize_repository_v5`. `_verify_local_run` folds events, loads role packages, verifies the execution index/resources, loads checkpoint records, authenticates controller packages or constructs the paid ledger, then verifies archive projection. `_verify_resource_history` constructs today's executor when executions exist. Thus the current CLI cannot reach historical reporting merely by changing summary internals: its earlier verification remains live. Leave CLI unchanged; initial historical use is direct API only.
+
+`summary.py` currently aggregates events/packages/checkpoint records, invokes `LocalArchiveReducerFactoryV5.verify_projection`, computes champion and counts, then calls `authenticate_development_history_v5`. That function authenticates the original campaign launch/config but delegates to the same live verifier. There is also a hidden repair before that late branch: projection `_authorities` loads `policy-source` with the default `repair=True`.
+
+Add `verification_scope: Literal["current_runtime", "completed_history"] = "current_runtime"` to `summarize_repository_v5`. Validate the closed value immediately; historical scope requires `command == "summarize"` and `require_development_v5(manifest)`. Before aggregation, historical scope calls `authenticate_completed_development_history_v5(repository, manifest)`. At the existing late development-authentication site call the old authenticator only for current-runtime scope. Every summary projection call uses `repair=verification_scope == "current_runtime"`. No caught-exception selection, executor override, CLI flag, or changes to run/resume/verify-run defaults. Presentation, Decimal handling, status and count formulas can remain unchanged.
+
+## Public historical entry and ordering
+
+Place `authenticate_completed_development_history_v5(repository, manifest) -> None` in `development_preparation.py`, delegating original-config/round resolution and execution authentication to H1/H2 in `historical_verification.py`. It accepts neither caller-supplied historical digests nor operational adapters.
+
+1. Authenticate original launch/config/manifest through H1, including exact manifest equality, each independently saved round config, campaign owner, round-start equality and local identity pins. Run even with zero execution records or zero summary rounds; an explicit historical request must not inherit the current `if rounds_seen` bypass.
+2. Enumerate every permitted round's canonical events and payloads, retaining ordered role packages, resource leases, cleanups, terminal outcomes, and successful semantic/quick/discovery keys exactly as `_verify_local_run` does. Use `verify_candidate_execution_index`, never `load_candidate_execution` (its orphan promotion appends). Bind every resource/execution owner to H1's owner, not a token inferred from events.
+3. Invoke H2 per observed round, including empty execution tuples. Require settled evidence (checkpoint-owned records or authenticated terminal outcome), complete durable cleanup, matching resource counts, retired workspaces, and required successful outputs. No pending later launch/round/request/reservation may disappear behind an earlier cleanup. Unstarted future rounds are not completed rounds; H1 must distinguish their absence from pending durable authority. Require the complete indexed/launch view to agree.
+4. Authenticate all role packages using the provider-specific immutable entry below, even when execution count is zero. Preserve checkpoint record, critic, rendering, scheduling, archive, export and workspace-finalizer checks; resource/finalizer verification remains H1/H2's responsibility. Finally verify projection with `repair=False`. No adapter construction for live execution, cleanup, transition locks, recovery or provider invocation.
+
+## Controller extraction
+
+In `controller_roles.py`, extract the body after `_terminal`'s `_sealed` call into `_classify_controller_response_v5(*, persisted: PersistedRoleRequestV5, reference: ArtifactRefV5, raw: bytes) -> RoleInvocationPackageV5`. Preserve exact envelope keys, byte bound, request/call binding, schema/error classification, zero usage, artifact and terminal authority derivation. `_terminal` only loads through `_sealed` and delegates. Constructor, `_sealed`, `_incoming_path`, `invoke_once`, and `reconcile_once` remain byte-identical.
+
+In `development_preparation.py`, add `repair: bool = True` to `_authenticate_controller_request`, passing it explicitly to both `campaign-launch` and `campaign-round-started` typed reads. Add `authenticate_existing_controller_packages_v5(repository, manifest, packages) -> None`: require controller scope and terminal type; derive/authenticate the request reference as today; call `_authenticate_controller_request(..., repair=False)`; compare exact persisted call/request; load the sealed response once; reject absence; classify those returned bytes directly and require package equality. The existing operational package authenticator can remain unchanged and retains its defaults. The historical path never constructs an invoker, consults `Path.cwd()`/response directory, or calls reconcile. A preliminary existence check followed by reconcile would remain unsafe.
+
+## Paid extraction
+
+In `production_provider.py`, introduce a frozen internal `RoleLedgerReadIdentityV5` containing campaign-manifest, audit-store, ledger and gateway digests. `_role_ledger_read_identity_v5(repository, manifest, *, api_key_environment_variable="OPENROUTER_API_KEY")` derives exact existing domain-separated formulas without nonce, clock, environment lookup or gateway/ledger construction. Historical callers compare all identities against authenticated original provider config; current verification compares the relevant derived identities with existing instance fields.
+
+Extract shared functions, with `identity` denoting that immutable value:
+
+- `_conservative_unreported_usage_v5(manifest, slot)` and `_completion_usage_v5(manifest, response)`.
+- `_derive_reported_terminal_v5(*, manifest, identity, slot, request, response)`.
+- `_verify_terminal_facts_v5(*, repository, manifest, identity, reservation, terminal, request)`.
+- `_load_verified_role_ledger_v5(*, repository, manifest, identity)` returning ordered reservation/terminal tuples.
+- `_authenticate_role_invocations_v5(*, repository, manifest, identity, packages, reservations, terminals)`.
+
+Move the corresponding current method predicates intact, including prospective bounds, deterministic slot/authorization digests, duplicate detection, continuous ordinal/terminal sequences, prior/cumulative accounting, claim deadline, exact response classification, persisted request uniqueness, receipts/artifacts and journal order. Current methods delegate; preserve `LocalRoleAuthorizationLedgerV5.__init__`, gateway constructor, reserve/publish/settle/recovery/lifecycle methods byte-for-byte. Identity formulas retained in constructors are checked by the shared verifier rather than rewriting constructors.
+
+Add `authenticate_paid_role_history_v5(*, repository, manifest, adapter_config, packages) -> None`: validate original config identities, load and verify ledger, then authenticate invocation collection. No ledger instance, `__new__` workaround, capability, nonce or transport. A zero-package collection still requires zero reservations/terminals; actual06's real paid packages must be verified despite zero candidate executions. Failed responses retain their exact recorded failure classification.
+
+## Transitive repository and projection boundary
+
+`artifacts.py` immutable allow-list: `load_round_events` (canonical sequence/fold and rejection-context checks), `load_round_payload`, `load_role_invocation` and its request/attempt/terminal/artifact loaders; unique request loaders; `load_role_provider_response`; `load_role_ledger_records`; `load_checkpoint`; `load_experiment` and critic/render-binding validators; typed/raw/binary authentication. The ledger loader's legacy path authenticates legacy evidence then raises `RoleLedgerMigrationRequiredV5`; it does not migrate. Do not catch this into a writer. `load_binary_state` has no repair parameter and is already read-only. None of these listed loaders internally invokes `load_typed_state`.
+
+Unavoidable extra source change: `production_runtime.py:LocalArchiveReducerFactoryV5.verify_projection` and `_authorities` gain keyword `repair: bool = True`; forward through `_authorities(records, repair=repair)` to its actual `policy-source` read. Preserve source-reference membership and editable-file digests. Constructor, recovery/publication reducers and `_scheduling_history` remain unchanged. Scheduling authenticates immutable events, terminal cursors, parent/exhaustion proofs and checkpoint-owned records; projection rebuilds and compares exact authenticated archive bytes. Never substitute `repository.recover_projection`, which repairs `archive.json` on missing/different content. `recover_round` itself only folds, but adds no needed capability here.
+
+`load_confirmation_champion` and `_verify_finalized_discovery_rounds` are separate immutable confirmation/finalization readers, not reached by current summary. Do not force their all-round successful-finalization requirement onto failed historical development campaigns. Preserve any existing export/finalizer checks reached through H1/H2; no new export or finalization may be synthesized.
+
+## Semantics and verification limits
+
+runtime04 must retain one evaluated feedback round and round 2's deadline failure: counts 1/1/0. actual06 remains failed at 0/0/0 with authentic paid usage. Cleanup alone creates neither checkpoint records nor evaluated/rejected experiments. Missing/foreign/ambiguous evidence, pending state and unsupported serialization fail closed at the actual read. Require `repair=False` at every H1/H2/controller/projection typed-state call; a state-index preflight cannot close a later race.
+
+Before acceptance, principal should enumerate the complete implemented callgraph and review H1/H2's resource/finalizer predicates, exact source diff, compilation and permitted static checks. Historical summaries, archive hashes, positive rejection/duplicate branches, pending/negative cases and operational behavior were not executed here. No claim reconstructs unknown historical host helper bytes, environment or runtime contract.

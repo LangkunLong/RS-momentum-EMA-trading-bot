@@ -1,0 +1,799 @@
+# Review package: 6455d4f1b74cfaf33ea6cdad66d77d129fb29245..4259d33e81525247ecde5913d32c0d6782fe6795
+
+## Commits
+4259d33 fix: isolate PIT references from tradable universes
+
+## Files changed
+ agent_loop.py                                | 12 +++-
+ core/backtest_engine.py                      | 97 ++++++++++++++++++++++++++--
+ core/leader_basket.py                        | 25 ++++---
+ core/pit_diagnosis/fact_cache.py             | 18 ++++--
+ core/pit_optimization.py                     | 28 ++++----
+ pit_baseline.py                              | 12 +++-
+ pit_optimizer_holdout.py                     | 12 +++-
+ tests/test_backtest_engine.py                | 57 ++++++++++++++++
+ tests/test_pit_optimizer_subset_reference.py |  1 +
+ 9 files changed, 222 insertions(+), 40 deletions(-)
+
+## Diff
+diff --git a/agent_loop.py b/agent_loop.py
+index ae75bd2..883d70e 100644
+--- a/agent_loop.py
++++ b/agent_loop.py
+@@ -19689,21 +19689,31 @@ def _build_pit_optimizer_v3_live_run(
+         *,
+         pit_bundle: Path,
+         pit_bundle_sha256: str,
+         baseline_run: Path,
+     ) -> _PitOptimizerEvaluatorData:
+         with PITDataBundle(
+             pit_bundle,
+             expected_sha256=pit_bundle_sha256,
+         ) as bundle:
+             scope = _build_verification_scope(bundle, baseline_run)
+-        universe = tuple(scope["symbols"])
++            tradable_tickers = tuple(scope["symbols"])
++            market_reference_tickers = tuple(bundle.reference_symbols())
++            market_context_universe = tuple(bundle.tradable_symbols())
++        if (
++            set(tradable_tickers).intersection(market_reference_tickers)
++            or not set(tradable_tickers).issubset(market_context_universe)
++        ):
++            raise ConfigurationError("PIT evaluator panel escapes the tradable universe")
++        # The simulator derives context closes from this full authenticated
++        # membership set, while evaluator folds trade only the smaller panel.
++        universe = tradable_tickers
+         probes = (
+             PolicyDeterminismProbe(
+                 "recommend_capacity",
+                 CapacitySnapshot(None, 25, 0, 3, 1.0, False),
+                 CapacitySnapshot(5, 25, 2, 1, 0.5, True),
+             ),
+         )
+ 
+         def evaluate_candidate(
+             candidate_root: Path,
+diff --git a/core/backtest_engine.py b/core/backtest_engine.py
+index 6ef5d8b..9cc94f0 100644
+--- a/core/backtest_engine.py
++++ b/core/backtest_engine.py
+@@ -1399,20 +1399,23 @@ def _read_checkpoint_state(path: Path, *, offset: int, next_day_index: int) -> d
+ 
+ def _portfolio_checkpoint_fingerprint(
+     *,
+     bundle_sha256: Optional[str],
+     code_identity: Optional[str],
+     start_date: pd.Timestamp,
+     end_date: pd.Timestamp,
+     benchmark: str,
+     universe: Iterable[str],
+     simulator: "PortfolioSimulator",
++    tradable_tickers: Iterable[str] | None = None,
++    market_reference_tickers: Iterable[str] | None = None,
++    market_context_universe: Iterable[str] | None = None,
+     strategy_identity: Optional[dict[str, Any]] = None,
+     history_start_date: Optional[pd.Timestamp] = None,
+ ) -> str:
+     simulator._verify_effective_engine_policy()
+     effective_history_start = start_date if history_start_date is None else history_start_date
+     config = {
+         "schema_version": _PORTFOLIO_CHECKPOINT_SCHEMA,
+         "policy_interface_version": POLICY_INTERFACE_VERSION,
+         "bundle_sha256": bundle_sha256,
+         "code_identity": code_identity,
+@@ -1430,20 +1433,40 @@ def _portfolio_checkpoint_fingerprint(
+         ),
+         "identity_request_contracts_sha256": (
+             simulator.identity_transition_contract.request_contracts_sha256
+             if simulator.identity_transition_contract is not None else None
+         ),
+         "start_date": str(start_date.date()),
+         "history_start_date": str(effective_history_start.date()),
+         "end_date": str(end_date.date()),
+         "benchmark": benchmark,
+         "universe": sorted(str(item).upper() for item in universe),
++        "tradable_tickers": sorted(
++            str(item).upper()
++            for item in (tradable_tickers if tradable_tickers is not None else universe)
++        ),
++        "market_reference_tickers": sorted(
++            str(item).upper()
++            for item in (
++                market_reference_tickers
++                if market_reference_tickers is not None
++                else (benchmark,)
++            )
++        ),
++        "market_context_universe": sorted(
++            str(item).upper()
++            for item in (
++                market_context_universe
++                if market_context_universe is not None
++                else universe
++            )
++        ),
+         "initial_capital": simulator.initial_capital,
+         "max_positions": simulator.max_positions,
+         "position_size_pct": simulator.position_size_pct,
+         "position_risk_pct": simulator.position_risk_pct,
+         "stop_loss_pct": simulator.stop_loss_pct,
+         "ma_exit_period": simulator.ma_exit_period,
+         "ma_consecutive": simulator.ma_consecutive,
+         "signal_every_n_days": simulator.signal_every_n_days,
+         "min_canslim_score": MIN_COMPOSITE_SCORE,
+         "min_rs_score": MIN_RS_SCORE,
+@@ -1822,48 +1845,71 @@ class PortfolioSimulator:
+         )
+         history_start = (
+             trade_start
+             if history_start_date is None
+             else pd.Timestamp(history_start_date).normalize()
+         )
+         if history_start > trade_start:
+             raise ValueError("history_start_date must not follow start_date")
+ 
+         if self.pit_bundle is not None:
+-            bundle_symbols = set(self.pit_bundle.symbols())
+-            requested = [str(ticker).upper() for ticker in tickers] or list(self.pit_bundle.symbols())
++            tradable_tickers = tuple(self.pit_bundle.tradable_symbols())
++            market_reference_tickers = tuple(self.pit_bundle.reference_symbols())
++            tradable_set = set(tradable_tickers)
++            reference_set = set(market_reference_tickers)
++            requested = [str(ticker).upper() for ticker in tickers]
++            if reference_set.intersection(requested):
++                raise ValueError(
++                    "point-in-time reference symbols are observation-only and cannot be traded"
++                )
+             tickers = list(
+                 dict.fromkeys(
+-                    ticker for ticker in requested if ticker in bundle_symbols and ticker != benchmark
++                    ticker for ticker in (requested or list(tradable_tickers))
++                    if ticker in tradable_set
+                 )
+             )
+             if not tickers:
+                 raise ValueError("point-in-time bundle has no requested candidate symbols")
+-            all_tickers = list(dict.fromkeys([*tickers, benchmark]))
++            all_tickers = list(
++                dict.fromkeys([*tickers, *market_reference_tickers, benchmark])
++            )
++            market_context_universe = tuple(self.pit_bundle.price_symbols())
++            if set(market_context_universe) != tradable_set.union(reference_set):
++                raise ValueError(
++                    "point-in-time market context must exactly cover tradables and references"
++                )
+         else:
++            tradable_tickers = tuple(dict.fromkeys(str(ticker).upper() for ticker in tickers))
++            market_reference_tickers = (benchmark,)
+             all_tickers = list(dict.fromkeys([*tickers, benchmark]))
+-        universe = list(self.pit_bundle.symbols()) if self.pit_bundle is not None else list(dict.fromkeys([*tickers, *get_sp500_tickers()]))
++            market_context_universe = tuple(
++                dict.fromkeys([*tickers, *get_sp500_tickers(), benchmark])
++            )
++        universe = list(market_context_universe)
+         checkpoint = Path(checkpoint_path).resolve() if checkpoint_path is not None else None
+         progress = Path(progress_log_path).resolve() if progress_log_path is not None else None
+         state_log = checkpoint.with_name("portfolio_state.jsonl") if checkpoint is not None else None
+         strategy_identity = _strategy_checkpoint_identity(
+             self,
+             require_explicit_custom=checkpoint is not None,
+         )
+         fingerprint = _portfolio_checkpoint_fingerprint(
+             bundle_sha256=self.pit_bundle.sha256 if self.pit_bundle is not None else None,
+             code_identity=checkpoint_code_identity,
+             start_date=trade_start,
+             history_start_date=history_start,
+             end_date=end_ts,
+             benchmark=benchmark,
+             universe=all_tickers,
++            tradable_tickers=tradable_tickers,
++            market_reference_tickers=market_reference_tickers,
++            market_context_universe=market_context_universe,
+             simulator=self,
+             strategy_identity=strategy_identity,
+         )
+         checkpoint_state: Optional[dict[str, Any]] = None
+         origin_requested_min_rs_score = self.requested_min_rs_score
+         origin_requested_min_canslim_score = self.requested_min_canslim_score
+         restored_outputs: dict[str, list[Any]] = {
+             "equity": [], "benchmark": [], "transactions": [], "weekly": [], "signals": [],
+             "entry_outcomes": [],
+         }
+@@ -1916,20 +1962,23 @@ class PortfolioSimulator:
+         state_stream = state_log.open("ab") if state_log is not None else None
+         started_at = datetime.now().timestamp()
+         if progress is not None:
+             _append_checkpoint_jsonl(progress, {
+                 "phase": "resumed" if resume else "started",
+                 "fingerprint": fingerprint,
+                 "start_date": str(trade_start.date()),
+                 "history_start_date": str(history_start.date()),
+                 "end_date": str(end_ts.date()),
+                 "universe_count": len(universe),
++                "tradable_ticker_count": len(tradable_tickers),
++                "market_reference_ticker_count": len(market_reference_tickers),
++                "market_context_universe_count": len(market_context_universe),
+             }, sync=True)
+ 
+         if self.pit_bundle is not None:
+             print(f"Reading point-in-time price data for {len(all_tickers)} tickers...")
+             ticker_ohlcv = self.pit_bundle.fetch_price_data(all_tickers, history_start, end_ts)
+         else:
+             print(f"Downloading price data for {len(all_tickers)} tickers...")
+             ticker_ohlcv = self.data_fetcher.fetch_price_data(all_tickers, history_start, end_ts)
+         if benchmark not in ticker_ohlcv:
+             if state_stream is not None:
+@@ -2148,20 +2197,23 @@ class PortfolioSimulator:
+             final_offset = _append_checkpoint_jsonl(state_log, {
+                 "kind": "final",
+                 "transactions": self._transactions[final_transaction_start:],
+             }, stream=state_stream, sync=True)
+         else:
+             final_offset = 0
+         result_config = self._result_config(
+             tickers=tickers,
+             benchmark=benchmark,
+             all_closes=all_closes,
++            tradable_tickers=tradable_tickers,
++            market_reference_tickers=market_reference_tickers,
++            market_context_universe=market_context_universe,
+             start_ts=trade_start,
+             history_start_ts=history_start,
+             end_ts=end_ts,
+             requested_entry_floors=(
+                 origin_requested_min_rs_score,
+                 origin_requested_min_canslim_score,
+             ),
+         )
+         result = SimulationResult(
+             trades=self._trades,
+@@ -2362,39 +2414,68 @@ class PortfolioSimulator:
+         except Exception:
+             # Returning None activates the unmodified exact detector path.
+             return None
+ 
+     def _result_config(
+         self,
+         *,
+         tickers: list[str],
+         benchmark: str,
+         all_closes: pd.DataFrame,
++        tradable_tickers: Iterable[str] | None = None,
++        market_reference_tickers: Iterable[str] | None = None,
++        market_context_universe: Iterable[str] | None = None,
+         start_ts: pd.Timestamp,
+         end_ts: pd.Timestamp,
+         requested_entry_floors: tuple[float | None, float | None] | None = None,
+         history_start_ts: Optional[pd.Timestamp] = None,
+     ) -> dict[str, Any]:
+         self._verify_effective_engine_policy()
+         effective_history_start = start_ts if history_start_ts is None else history_start_ts
+         requested_min_rs_score, requested_min_canslim_score = (
+             requested_entry_floors
+             if requested_entry_floors is not None
+             else (
+                 self.requested_min_rs_score,
+                 self.requested_min_canslim_score,
+             )
+         )
++        effective_tradable_tickers = tuple(
++            str(ticker).upper()
++            for ticker in (tradable_tickers if tradable_tickers is not None else tickers)
++        )
++        effective_market_reference_tickers = tuple(
++            str(ticker).upper()
++            for ticker in (
++                market_reference_tickers
++                if market_reference_tickers is not None
++                else (benchmark,)
++            )
++        )
++        effective_market_context_universe = tuple(
++            str(ticker).upper()
++            for ticker in (
++                market_context_universe
++                if market_context_universe is not None
++                else all_closes.columns
++            )
++        )
+         return {
+             "tickers": tickers,
+             "candidate_universe_count": len(tickers),
+             "rs_universe_count": len(all_closes.columns),
++            "tradable_tickers": list(effective_tradable_tickers),
++            "tradable_ticker_count": len(effective_tradable_tickers),
++            "market_reference_tickers": list(effective_market_reference_tickers),
++            "market_reference_ticker_count": len(effective_market_reference_tickers),
++            "market_context_universe": list(effective_market_context_universe),
++            "market_context_universe_count": len(effective_market_context_universe),
+             "benchmark_symbol": benchmark,
+             "max_positions": self.max_positions,
+             "require_bullish_market": self.require_bullish_market,
+             "use_stateful_regime_gate": self.use_stateful_regime_gate,
+             "cash_deployment_threshold_pct": self.cash_deployment_threshold_pct,
+             "position_size_pct": self.position_size_pct,
+             "position_risk_pct": self.position_risk_pct,
+             "stop_loss_pct": self.stop_loss_pct,
+             "ma_exit_period": self.ma_exit_period,
+             "ma_consecutive": self.ma_consecutive,
+@@ -2783,21 +2864,23 @@ class PortfolioSimulator:
+             self._execution_diagnostics["blocked_by_market_days"] += 1
+         entries_allowed = market_allowed and (
+             not self.use_stateful_regime_gate or regime_allowed
+         )
+         if entries_allowed:
+             self._execution_diagnostics["entries_allowed_days"] += 1
+ 
+         signals: List[dict] = []
+         rs_eligible = None
+         if self.pit_bundle is not None:
+-            rs_eligible = self.pit_bundle.members_at(eval_date) - {self.benchmark_symbol.upper()}
++            rs_eligible = self.pit_bundle.members_at(eval_date).intersection(
++                self.pit_bundle.tradable_symbols()
++            )
+         rs_snapshot = _calculate_rs_snapshot(all_closes, eval_date, eligible_tickers=rs_eligible)
+         top_groups = get_top_groups(
+             rs_snapshot,
+             self._ticker_industry,
+             top_n=self.industry_group_top_n,
+             min_size=self.industry_group_min_size,
+         )
+         for ticker in tickers:
+             if ticker in self._open_positions or ticker not in ticker_ohlcv:
+                 continue
+@@ -4272,21 +4355,21 @@ def run_cli(argv: Optional[List[str]] = None) -> SimulationResult:
+     )
+ 
+     pit_bundle: Optional[PITDataBundle] = None
+     try:
+         if args.pit_bundle:
+             if not args.pit_bundle_sha256:
+                 parser.error("--pit-bundle-sha256 is required with --pit-bundle")
+             pit_bundle = PITDataBundle(
+                 args.pit_bundle, expected_sha256=args.pit_bundle_sha256
+             )
+-            tickers = list(args.tickers or pit_bundle.symbols())
++            tickers = list(args.tickers or pit_bundle.tradable_symbols())
+         else:
+             tickers = _resolve_universe(args.universe, args.tickers)
+             extra = [s for s in settings.EXTRA_SYMBOLS if s not in tickers]
+             if extra:
+                 tickers.extend(extra)
+ 
+         simulator = PortfolioSimulator(
+             initial_capital=args.capital,
+             max_positions=args.max_positions,
+             position_size_pct=args.position_size_pct,
+diff --git a/core/leader_basket.py b/core/leader_basket.py
+index e26c7fe..99939bf 100644
+--- a/core/leader_basket.py
++++ b/core/leader_basket.py
+@@ -150,32 +150,39 @@ class LeaderBasketSimulator:
+         end_date: str | pd.Timestamp,
+         benchmark_symbol: str = "SPY",
+         tickers: Optional[Iterable[str]] = None,
+     ) -> LeaderBasketResult:
+         start = pd.Timestamp(start_date).normalize()
+         end = pd.Timestamp(end_date).normalize()
+         if end < start:
+             raise ValueError("end_date must not precede start_date")
+ 
+         benchmark_symbol = benchmark_symbol.upper()
+-        universe = tuple(
+-            sorted(
+-                {
+-                    str(t).upper()
+-                    for t in (tickers or self.bundle.symbols())
+-                    if str(t).upper() != benchmark_symbol
+-                }
+-            )
++        tradable_tickers = tuple(self.bundle.tradable_symbols())
++        market_reference_tickers = tuple(self.bundle.reference_symbols())
++        requested = (
++            tradable_tickers
++            if tickers is None
++            else tuple(str(ticker).upper() for ticker in tickers)
+         )
++        references = set(market_reference_tickers)
++        if references.intersection(requested):
++            raise ValueError(
++                "leader basket reference symbols are observation-only and cannot be traded"
++            )
++        invalid = set(requested).difference(tradable_tickers)
++        if invalid:
++            raise ValueError("leader basket tickers are not tradable PIT membership symbols")
++        universe = tuple(sorted(set(requested)))
+         if not universe:
+             raise ValueError("leader basket universe cannot contain only the benchmark")
+-        symbols = tuple(dict.fromkeys([*universe, benchmark_symbol]))
++        symbols = tuple(dict.fromkeys([*universe, *market_reference_tickers, benchmark_symbol]))
+         # Pull a pre-window buffer so the first rebalance can rank leaders
+         # using history that predates the evaluation window.  The output
+         # remains clipped to [start, end].
+         history_buffer_days = max(self.config.lookback_days * 2, self.config.min_history_days * 2)
+         data_start = start - pd.Timedelta(days=history_buffer_days)
+         price_data = self.bundle.fetch_price_data(symbols, data_start, end)
+         benchmark = price_data.get(benchmark_symbol)
+         if benchmark is None or benchmark.empty:
+             raise ValueError(f"benchmark {benchmark_symbol} is missing from the PIT bundle")
+         closes = self.bundle.fetch_closes(universe, data_start, end)
+diff --git a/core/pit_diagnosis/fact_cache.py b/core/pit_diagnosis/fact_cache.py
+index 4e092d4..e0dd775 100644
+--- a/core/pit_diagnosis/fact_cache.py
++++ b/core/pit_diagnosis/fact_cache.py
+@@ -368,41 +368,51 @@ class FactCacheBuilder:
+             raise
+         finally:
+             conn.close()
+ 
+     def _after_session(self, session: str) -> None:
+         """A narrow test seam after durable session state has been written."""
+         del session
+ 
+     def _prefetch_prices(self) -> _PrefetchedPrices:
+         warmup = str(getattr(self.bundle, "metadata", {}).get("warmup_start", self.partitions.discovery.start))
+-        symbols = tuple(sorted({str(symbol).upper() for symbol in self.bundle.symbols()}.union({"SPY"})))
++        tradable_tickers = tuple(self.bundle.tradable_symbols())
++        market_reference_tickers = tuple(self.bundle.reference_symbols())
++        symbols = tuple(self.bundle.price_symbols())
+         prices = self.bundle.fetch_price_data(symbols, pd.Timestamp(warmup), pd.Timestamp(self.partitions.locked_evaluation.end))
+         normalized = MappingProxyType({str(symbol).upper(): frame for symbol, frame in prices.items()})
+         prepared = {
+             symbol: _prepare_pattern_history(frame)
+             for symbol, frame in normalized.items()
+-            if symbol != "SPY" and not frame.empty
++            if symbol in tradable_tickers and not frame.empty
+         }
+         self._prepared_pattern_histories = MappingProxyType(prepared)
+-        closes = pd.DataFrame({symbol: frame["Close"] for symbol, frame in normalized.items() if symbol != "SPY"})
++        closes = pd.DataFrame(
++            {
++                symbol: frame["Close"]
++                for symbol, frame in normalized.items()
++                if symbol in tradable_tickers
++            }
++        )
++        if "SPY" not in market_reference_tickers:
++            raise ValueError("PIT diagnosis requires SPY as a sealed market reference")
+         return _PrefetchedPrices(closes=closes, prices=normalized, spy=normalized.get("SPY"))
+ 
+     def _sessions(self, spy: pd.DataFrame | None) -> list[str]:
+         if spy is None or spy.empty:
+             return []
+         all_sessions = [_session_text(item) for item in pd.DatetimeIndex(spy.index)]
+         ranges = (self.partitions.discovery, self.partitions.validation, self.partitions.locked_evaluation)
+         return [session for session in all_sessions if any(partition.start <= session <= partition.end for partition in ranges)]
+ 
+     def _fundamental_states(self, sessions: list[str]) -> dict[str, list[tuple[str, Mapping[str, Any]]]]:
+-        symbols = tuple(symbol for symbol in self.bundle.symbols() if symbol != "SPY")
++        symbols = tuple(self.bundle.tradable_symbols())
+         bounds = {symbol: (pd.Timestamp(sessions[0]), pd.Timestamp(sessions[-1])) for symbol in symbols}
+         result: dict[str, list[tuple[str, Mapping[str, Any]]]] = {symbol: [] for symbol in symbols}
+         for symbol, as_of, snapshot in self.bundle.iter_fundamental_state_boundaries(bounds):
+             text = _session_text(as_of)
+             if text > sessions[-1]:
+                 raise ValueError("future-dated fundamental state")
+             result.setdefault(str(symbol).upper(), []).append((text, snapshot))
+         for states in result.values():
+             states.sort(key=lambda item: item[0])
+         return result
+diff --git a/core/pit_optimization.py b/core/pit_optimization.py
+index b8060cb..08eb36f 100644
+--- a/core/pit_optimization.py
++++ b/core/pit_optimization.py
+@@ -1019,21 +1019,21 @@ def _validate_verification_scope(scope: Mapping[str, object]) -> dict[str, objec
+     if not isinstance(value, dict) or set(value) != _VERIFICATION_SCOPE_KEYS:
+         raise ValueError("optimization verification scope keys are not exact")
+     symbols = value.get("symbols")
+     if (
+         not isinstance(symbols, list)
+         or len(symbols) != _VERIFICATION_SYMBOL_COUNT
+         or len(set(symbols)) != len(symbols)
+         or any(
+             not isinstance(symbol, str)
+             or re.fullmatch(r"[A-Z][A-Z0-9.-]{0,14}", symbol) is None
+-            or symbol == "SPY"
++            or symbol in {"IWM", "QQQ", "SPY"}
+             for symbol in symbols
+         )
+     ):
+         raise ValueError("optimization verification symbols are invalid")
+     if (
+         value.get("benchmark") != "SPY"
+         or value.get("warmup_start") != FULL_START_DATE
+         or value.get("selection")
+         != "sealed_discovery_activity_then_hash_ranked_active_fill"
+         or value.get("session_count") != _VERIFICATION_SESSION_COUNT
+@@ -1094,23 +1094,29 @@ def _build_verification_scope(bundle: object, baseline_run: Path) -> dict[str, o
+     attempts["symbol"] = attempts["symbol"].str.upper()
+     try:
+         attempts["signal_date"] = pd.to_datetime(
+             attempts["signal_date"], errors="raise"
+         ).dt.normalize()
+     except (TypeError, ValueError) as exc:
+         raise ValueError("baseline entry-attempt dates are invalid") from exc
+     first_activity = attempts["signal_date"].min()
+     fetch_closes = getattr(bundle, "fetch_closes", None)
+     members_at = getattr(bundle, "members_at", None)
+-    symbols_method = getattr(bundle, "symbols", None)
+-    if not all(callable(value) for value in (fetch_closes, members_at, symbols_method)):
++    tradable_symbols = getattr(bundle, "tradable_symbols", None)
++    reference_symbols = getattr(bundle, "reference_symbols", None)
++    if not all(callable(value) for value in (fetch_closes, members_at, tradable_symbols, reference_symbols)):
+         raise ValueError("PIT bundle cannot derive a verification scope")
++    market_reference_tickers = tuple(reference_symbols())
++    if "SPY" not in market_reference_tickers:
++        raise ValueError("PIT bundle lacks SPY as a sealed market reference")
++    if set(attempts["symbol"]).intersection(market_reference_tickers):
++        raise ValueError("baseline entry attempts contain non-tradable market references")
+     benchmark = fetch_closes(
+         ["SPY"], pd.Timestamp(FULL_START_DATE), pd.Timestamp(FULL_END_DATE)
+     )
+     if "SPY" not in benchmark:
+         raise ValueError("PIT bundle lacks the verification benchmark")
+     sessions = pd.DatetimeIndex(benchmark["SPY"].dropna().index).normalize()
+     measurement_sessions = sessions[sessions >= first_activity][
+         : 2 * _VERIFICATION_SESSION_COUNT
+     ]
+     if len(measurement_sessions) != 2 * _VERIFICATION_SESSION_COUNT:
+@@ -1122,30 +1128,22 @@ def _build_verification_scope(bundle: object, baseline_run: Path) -> dict[str, o
+     holdout_start = holdout_sessions[0]
+     holdout_end = holdout_sessions[-1]
+     discovery_attempts = attempts.loc[
+         attempts["signal_date"].between(discovery_start, discovery_end)
+     ]
+     attempt_counts = discovery_attempts.groupby("symbol", sort=True).size()
+     ranked_activity = sorted(
+         (str(symbol) for symbol in attempt_counts.index),
+         key=lambda symbol: (-int(attempt_counts[symbol]), symbol),
+     )
+-    active_members = {
+-        str(symbol)
+-        for symbol in members_at(discovery_start)
+-        if str(symbol) != "SPY"
+-    }
+-    available = {
+-        str(symbol)
+-        for symbol in symbols_method()
+-        if str(symbol) != "SPY"
+-    }
++    active_members = {str(symbol) for symbol in members_at(discovery_start)}
++    available = {str(symbol) for symbol in tradable_symbols()}
+     candidate_pool = sorted(active_members & available)
+     closes = fetch_closes(
+         candidate_pool, pd.Timestamp(FULL_START_DATE), holdout_end
+     )
+     minimum_warmup_bars = 100
+     covered = {
+         symbol
+         for symbol in candidate_pool
+         if symbol in closes and int(closes[symbol].count()) >= minimum_warmup_bars
+     }
+@@ -2979,21 +2977,21 @@ def evaluate_full_pit_candidate(
+     """Run the production simulator once and return aggregate-only full/holdout evidence."""
+ 
+     bundle_path = _regular_file(pit_bundle, "candidate PIT bundle")
+     if pit_bundle_sha256 != PIT_BUNDLE_SHA256 or _sha256_file(bundle_path) != pit_bundle_sha256:
+         raise ValueError("candidate PIT bundle identity differs")
+     from core.backtest_engine import PortfolioSimulator
+     from core.engine_policy import effective_engine_policy_sha256
+     from core.pit_data import PITDataBundle
+ 
+     with PITDataBundle(bundle_path, expected_sha256=pit_bundle_sha256) as bundle:
+-        symbols = [symbol for symbol in bundle.symbols() if symbol != "SPY"]
++        symbols = list(bundle.tradable_symbols())
+         simulator = PortfolioSimulator(pit_bundle=bundle, signal_every_n_days=1)
+         result = simulator.run(
+             symbols,
+             start_date=FULL_START_DATE,
+             end_date=FULL_END_DATE,
+             benchmark_symbol="SPY",
+         )
+         if result.config.get("data_mode") != "point_in_time" or (
+             result.config.get("pit_bundle_sha256") != pit_bundle_sha256
+         ):
+@@ -3071,21 +3069,21 @@ def evaluate_verification_pit_candidate(
+     scope = _validate_verification_scope(verification_scope)
+     bundle_path = _regular_file(pit_bundle, "verification PIT bundle")
+     if pit_bundle_sha256 != PIT_BUNDLE_SHA256 or _sha256_file(bundle_path) != pit_bundle_sha256:
+         raise ValueError("verification PIT bundle identity differs")
+     from core.backtest_engine import PortfolioSimulator
+     from core.engine_policy import effective_engine_policy_sha256
+     from core.pit_data import PITDataBundle
+ 
+     with PITDataBundle(bundle_path, expected_sha256=pit_bundle_sha256) as bundle:
+         symbols = list(scope["symbols"])
+-        if not set(symbols).issubset(set(bundle.symbols()) - {"SPY"}):
++        if not set(symbols).issubset(set(bundle.tradable_symbols())):
+             raise ValueError("verification symbols differ from the sealed PIT bundle")
+         simulator = PortfolioSimulator(pit_bundle=bundle, signal_every_n_days=1)
+         result = simulator.run(
+             symbols,
+             start_date=str(scope["warmup_start"]),
+             end_date=str(scope["holdout_end"]),
+             benchmark_symbol=str(scope["benchmark"]),
+         )
+         if result.config.get("data_mode") != "point_in_time" or (
+             result.config.get("pit_bundle_sha256") != pit_bundle_sha256
+diff --git a/pit_baseline.py b/pit_baseline.py
+index 4c9094e..7b84ef0 100644
+--- a/pit_baseline.py
++++ b/pit_baseline.py
+@@ -1308,23 +1308,29 @@ def run_baseline(
+             )
+             union = {event.ticker for event in bundle.membership.events}
+             _, task2 = _load_task2_audit(
+                 bundle=bundle,
+                 union=union,
+                 provenance_path=paths["fundamentals_provenance"],
+                 coverage_path=paths["fundamentals_coverage"],
+                 master_path=paths["security_master"],
+                 exclusions_path=paths["security_master_exclusions"],
+             )
+-            symbols = bundle.symbols()
+-            tickers = [ticker for ticker in symbols if ticker != _BENCHMARK]
+-            closes = bundle.fetch_closes(symbols, pd.Timestamp(_START), pd.Timestamp(_END))
++            tradable_tickers = bundle.tradable_symbols()
++            market_reference_tickers = bundle.reference_symbols()
++            market_context_universe = bundle.price_symbols()
++            if _BENCHMARK not in market_reference_tickers:
++                raise ValueError("PIT baseline benchmark is not a sealed market reference")
++            tickers = list(tradable_tickers)
++            closes = bundle.fetch_closes(
++                market_context_universe, pd.Timestamp(_START), pd.Timestamp(_END)
++            )
+             if _BENCHMARK not in closes or closes[_BENCHMARK].isna().any():
+                 raise ValueError("SPY close calendar is incomplete in the evaluation window")
+             sessions = pd.DatetimeIndex(closes[_BENCHMARK].dropna().index).normalize()
+             leaders = label_five_year_leaders(
+                 closes, bundle.membership, start_date=_START, end_date=_END,
+                 identity_contract=identities, top_n=_LEADERS,
+             )
+             rolling = label_rolling_leaders(
+                 closes, bundle.membership, start_date=_START, end_date=_END,
+                 identity_contract=identities, top_n=_LEADERS,
+diff --git a/pit_optimizer_holdout.py b/pit_optimizer_holdout.py
+index c5d9cb5..e7bc39b 100644
+--- a/pit_optimizer_holdout.py
++++ b/pit_optimizer_holdout.py
+@@ -230,21 +230,31 @@ def _build_hidden_evaluator(
+     )
+     from core.pit_policy_parity import ParityFoldEvidence, build_fold_evidence
+     from core.strategy_policy.contracts import CapacitySnapshot
+     from core.strategy_policy.worker import PolicyDeterminismProbe
+ 
+     manifest = getattr(readiness, "manifest", None)
+     if manifest is None:
+         raise HoldoutPreflightError("optimizer_readiness_invalid")
+     with PITDataBundle(pit_bundle, expected_sha256=manifest.pit_bundle_sha256) as bundle:
+         scope = _build_verification_scope(bundle, baseline_run)
+-    universe = tuple(scope["symbols"])
++        tradable_tickers = tuple(scope["symbols"])
++        market_reference_tickers = tuple(bundle.reference_symbols())
++        market_context_universe = tuple(bundle.tradable_symbols())
++    if (
++        set(tradable_tickers).intersection(market_reference_tickers)
++        or not set(tradable_tickers).issubset(market_context_universe)
++    ):
++        raise HoldoutPreflightError("holdout panel escapes the tradable universe")
++    # The full membership universe remains available to the simulator for
++    # market context; only this deterministic panel can generate trades.
++    universe = tradable_tickers
+     probes = (
+         PolicyDeterminismProbe(
+             "recommend_capacity",
+             CapacitySnapshot(None, 25, 0, 3, 1.0, False),
+             CapacitySnapshot(5, 25, 2, 1, 0.5, True),
+         ),
+     )
+     docker = configure_docker_executable(
+         docker_executable,
+         source_root=repo_root,
+diff --git a/tests/test_backtest_engine.py b/tests/test_backtest_engine.py
+index 5b522af..4778685 100644
+--- a/tests/test_backtest_engine.py
++++ b/tests/test_backtest_engine.py
+@@ -75,20 +75,77 @@ def test_policy_client_factory_creates_and_closes_once_per_run() -> None:
+         with pytest.raises(RuntimeError, match="injected fetch failure"):
+             simulator.run(
+                 ["AAPL"],
+                 start_date="2021-06-25",
+                 end_date="2021-09-20",
+             )
+     assert len({id(client) for client in made}) == 2
+     assert closed == [1, 1]
+     assert simulator._policy_client is None
+ 
++    reference_bundle = SimpleNamespace(
++        tradable_symbols=lambda: ("AAA",),
++        reference_symbols=lambda: ("IWM", "QQQ", "SPY"),
++        price_symbols=lambda: ("AAA", "IWM", "QQQ", "SPY"),
++        fundamentals_provider=None,
++    )
++    for reference in ("IWM", "QQQ", "SPY"):
++        with pytest.raises(ValueError, match="observation-only"):
++            PortfolioSimulator(
++                pit_bundle=reference_bundle,
++                technical_only=True,
++            ).run(
++                ["AAA", reference],
++                start_date="2021-06-25",
++                end_date="2021-09-20",
++            )
++
++    prices = {
++        symbol: _make_ohlcv(n=80, close_value=100.0)
++        for symbol in ("AAA", "IWM", "QQQ", "SPY")
++    }
++
++    def fetch_price_data(symbols, _start, _end):
++        return {symbol: prices[symbol] for symbol in symbols}
++
++    def fetch_closes(symbols, _start, _end):
++        return pd.DataFrame(
++            {symbol: prices[symbol]["Close"] for symbol in symbols}
++        )
++
++    reference_bundle.fetch_price_data = fetch_price_data
++    reference_bundle.fetch_closes = fetch_closes
++    reference_bundle.members_at = lambda _session: frozenset({"AAA"})
++    reference_bundle.sha256 = "a" * 64
++    reference_bundle.data_cutoff = prices["SPY"].index[-1]
++    reference_bundle.manifest = lambda: {}
++    result = PortfolioSimulator(
++        pit_bundle=reference_bundle,
++        technical_only=True,
++        signal_every_n_days=1,
++    ).run(
++        ["AAA"],
++        start_date=str(prices["AAA"].index[0].date()),
++        end_date=str(prices["AAA"].index[-1].date()),
++    )
++
++    assert result.config["tickers"] == ["AAA"]
++    assert result.config["market_reference_tickers"] == ["IWM", "QQQ", "SPY"]
++    assert result.config["market_context_universe_count"] == 4
++    assert set(result.signal_log.get("symbol", pd.Series(dtype=str))) <= {"AAA"}
++    assert {trade.symbol for trade in result.trades} <= {"AAA"}
++    assert all(
++        not set(str(row["Holdings"]).split(",")).intersection({"IWM", "QQQ", "SPY"})
++        for _, row in result.weekly_holdings.iterrows()
++    )
++    assert set(result.transaction_log.get("Ticker", pd.Series(dtype=str))) <= {"AAA"}
++
+ 
+ @pytest.mark.parametrize(
+     ("client_type", "error_type", "message"),
+     [
+         (_MismatchedVersionClient, ValueError, "policy interface version mismatch"),
+         (_RaisingVersionClient, RuntimeError, "injected interface version failure"),
+     ],
+ )
+ def test_policy_client_interface_validation_failure_closes_and_clears(
+     client_type: type[_CountingClient],
+diff --git a/tests/test_pit_optimizer_subset_reference.py b/tests/test_pit_optimizer_subset_reference.py
+index df79509..6b5e2e7 100644
+--- a/tests/test_pit_optimizer_subset_reference.py
++++ b/tests/test_pit_optimizer_subset_reference.py
+@@ -144,20 +144,21 @@ def test_manifest_uses_only_the_fold_manifest_bound_by_the_parity_reference(
+ 
+     attestation, reference = _attested_reference(tmp_path)
+ 
+     folds, universe = _attested_parity_reference_folds(
+         parity_attestation=attestation,
+         parity_reference=reference,
+     )
+ 
+     assert folds == reference.fold_manifest
+     assert universe == reference.universe
++    assert set(universe).isdisjoint({"IWM", "QQQ", "SPY"})
+     with pytest.raises(ValueError, match="fold manifest"):
+         _attested_parity_reference_folds(
+             parity_attestation=replace(
+                 attestation,
+                 discovery_fold_manifest_sha256="5" * 64,
+             ),
+             parity_reference=reference,
+         )
+ 
+ 

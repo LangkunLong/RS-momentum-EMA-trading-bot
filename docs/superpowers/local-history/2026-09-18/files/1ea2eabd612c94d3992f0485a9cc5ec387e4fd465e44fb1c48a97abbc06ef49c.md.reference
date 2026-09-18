@@ -1,0 +1,18 @@
+# Native launch envelope: source-only preparation note
+
+The two existing generic local helpers were inspected as source, not executed. No environment or credential values were read. This is not a fresh launch command or execution approval; exact native CLI arguments, source/config/policy/tool/environment identities and independent review still depend on completed P1-P4 readiness and actual C-c preparation.
+
+- `.superpowers/sdd/2026-09-04-pit-optimizer-v5-campaign/run-with-awake-host.py`: `586275112854b4f4c68a22f13ccb67f7ababd3c3edece50b8989dedb9c7b5eea`
+- `.superpowers/sdd/2026-09-04-pit-optimizer-v5-campaign/run-with-controller-credential.py`: `92ffd23077e0b4f3305b32ec927bd20b4db4e0cfe8331f6c2e196bcf451b05d2`
+
+`run-with-awake-host.py` uses Windows SetThreadExecutionState for the calling thread, forwards the chosen helper and all remaining arguments with runpy.run_path, and restores the thread request in finally. It changes neither PATH nor persistent power settings. It does not prevent lid closure or explicit sleep. AC/lid-open handling remains a launch requirement.
+
+`run-with-controller-credential.py` forwards an arbitrary selected helper and remaining arguments. Its source accepts only the main-checkout .env location, uses the existing controller dotenv parser, requires exactly one consistent OPENROUTER/OPENROUTER_API_KEY value and restores the prior API-key handle in finally. This helper must not execute until the fresh paid-run grant. No credential source was opened during this inspection.
+
+The native CLI source uses absolute core imports and its __main__ guard calls main(). A reviewed runpy-based invocation may therefore route directly through that CLI with the new paired policy flags; the older campaign-specific resume helper does not need to reconstruct campaign operations or be assumed to support the new optional argument. The concrete C-c command must establish the normal workspace import path without changing the six executor-bound control environment values, use the selected actual interpreter consistently with preparation, and preserve native argv exactly. This is a static route, not an executed import-path claim.
+
+Native CLI final output and immutable durable campaign evidence can identify actual progress; an observation timeout must never trigger a second launch. Exact session/log/observation handling is to be pinned in the actual reviewed C-c package. No new operational wrapper, command, campaign root, configuration, policy, request or enrollment was created by this note.
+
+## Frozen native campaign dispatch trace
+
+The approved renderer emits [sys.executable, -B, -m, core.pit_optimizer_v5.cli, command, ...]. The command and all artifact/policy/owner flags therefore begin at argv index 4. In the approved CLI, dispatch_v5_cli immediately delegates run-campaign/resume-campaign argv plus the print emitter to canonical operations.dispatch_production_operations_cli_v5, before the generic request/service class path. Direct CLI-file __main__ forwarding through the existing helpers reaches that same campaign operation with primitive argv, without passing duplicate __main__ dataclass objects into canonical operations. This is a source trace for the campaign command only, not dynamic execution evidence or a claim for every CLI command. Final wrapper command bytes and the complete native argv correspondence still require review in the actual C-c package.

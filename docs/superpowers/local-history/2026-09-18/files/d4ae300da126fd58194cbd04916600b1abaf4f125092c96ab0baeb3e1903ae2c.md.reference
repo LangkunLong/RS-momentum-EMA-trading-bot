@@ -1,0 +1,528 @@
+# Task 3 Report: Sealed Task 11 C/A Provenance Diagnostic
+
+## Status
+
+COMPLETE. The sealed, aggregate-only Task 11 C/A provenance diagnostic and explicit CLI route are implemented. The one authorized real offline reconciliation passed with the exact required cohort/outcome counts and zero mismatches. Both authorized structural checks exited 0.
+
+No tests were added or run, as required by the task brief.
+
+## Files changed
+
+- Created `core/pit_diagnosis/task11_ca_provenance.py`.
+- Modified `pit_diagnosis.py` only to import the diagnostic, add the explicit `diagnose-task11-ca-provenance` parser route, dispatch it, reject non-Task-11 profiles, and emit canonical aggregate JSON.
+- Created this report at `.superpowers/sdd/2026-08-26-task11-engine-fidelity-observability/task-3-report.md`.
+
+All pre-existing dirty changes in `pit_diagnosis.py` and the Task 11A/11B routes were preserved. No other source file was edited.
+
+## Implementation details
+
+### Closed authority and source chain
+
+- Requires `type(profile) is BaselineAuthorityProfile` and exact equality of every canonical `strict-proper-base-task11` profile/authority field.
+- Calls `verify_baseline_run` before reading the signal ledger and independently rechecks the verified snapshot against the canonical authority.
+- Uses authenticated manifest `arguments.pit_bundle` and `arguments.fundamentals_provenance` only as locations.
+- Derives the bundle digest from canonical authority and requires the verified manifest `input_sha256` plus `bundle_metadata` to bind the fixed Task 11 identities.
+- Requires regular non-symlink, non-reparse files.
+- Copies JSON/CSV sources into `tempfile.SpooledTemporaryFile`, hashes the complete byte snapshot before parsing, and rejects mismatches.
+- Verifies the exact sealed hashes:
+  - PIT bundle: `1af306ef1e46797473cd186fc48938ed6694ae25f5943c9f1905b528307cc2eb`
+  - provenance JSON: `52fb676f64f279f6f7b6f119df1fd367e569658b98e313b450b0dee1f5aeb0b6`
+  - fundamentals CSV: `527769d437b1f29b8aac46543fd65c8017d798f9ee6a27a350c448cfe1242b00`
+  - fundamentals audit CSV: `2983e2538de39392e25df99fea93a26073f6bf5d21d87e5411847569b38619b1`
+- Opens only the local SQLite PIT bundle read-only through `PITDataBundle`. It does not import or call provider fallback code and does not open either 1.5 GB SEC archive.
+
+### Fixed cohort and reconciliation
+
+- Streams the authenticated signal ledger and retains only `technical_setup_eligible=True` rows from 2023-01-01 through 2025-12-31.
+- Requires exactly 8,439 unique `(symbol, signal_date)` rows and validates canonical dates, booleans, private symbols, scores, availability, and finite scalars.
+- Builds per-symbol bounds once and calls `iter_fundamental_state_boundaries(date_bounds, include_provenance=True)` once.
+- Performs right-inclusive state lookup with `bisect_right`.
+- Calls `evaluate_c_with_trace` for all 8,439 cohort rows.
+- Calls `evaluate_a_with_trace` only for the 1,926 rows whose reconciled C growth is finite and at least `MIN_CURRENT_GROWTH`.
+- Reconciles score and growth availability/value to the sealed ledger with `rel_tol=0.0` and `abs_tol=1e-12`.
+- Rejects non-finite trace data, unknown enum values, incomplete or future-dated provenance, duplicate/off-boundary state, and any scalar/availability mismatch.
+- Hard-binds the final C/A outcome counts to the sealed expected counts before rendering output.
+
+### Aggregate-only rendering and CLI
+
+- Returns exactly the required seven top-level sections: `schema_version`, `diagnosis_scope`, `profile`, `source_chain`, `window`, `reconciliation`, `c`, and `a`.
+- Implements `_render_profile`, `_render_source_chain`, `_render_reconciliation`, and `_render_gate_aggregates`.
+- Publishes cohort and outcome totals, by-year counts, metric-family-by-outcome counts, unavailable terminal-reason counts, and public-date-pair visibility counts.
+- Adds required `--baseline-run` and `--baseline-profile` arguments. The exact brief command's relative baseline path is accepted.
+- Rejects every profile string except `strict-proper-base-task11` before resolution.
+- Emits one sorted, compact JSON document with `allow_nan=False`; progress is written only to stderr every 500 rows.
+
+## Authorized real offline reconciliation
+
+Command:
+
+```powershell
+python -B pit_diagnosis.py diagnose-task11-ca-provenance --baseline-run ".artifacts/task-11-prefix-replay-20260826T001500Z/run-20260826T002913Z-1af306ef1e46" --baseline-profile strict-proper-base-task11
+```
+
+Exit code: `0`
+
+Measured wall runtime: approximately `300.06 seconds` (about 5 minutes, summed across the command session yields).
+
+Exact stderr progress:
+
+```text
+task11-ca-provenance: reconciled 500/8439 technical rows
+task11-ca-provenance: reconciled 1000/8439 technical rows
+task11-ca-provenance: reconciled 1500/8439 technical rows
+task11-ca-provenance: reconciled 2000/8439 technical rows
+task11-ca-provenance: reconciled 2500/8439 technical rows
+task11-ca-provenance: reconciled 3000/8439 technical rows
+task11-ca-provenance: reconciled 3500/8439 technical rows
+task11-ca-provenance: reconciled 4000/8439 technical rows
+task11-ca-provenance: reconciled 4500/8439 technical rows
+task11-ca-provenance: reconciled 5000/8439 technical rows
+task11-ca-provenance: reconciled 5500/8439 technical rows
+task11-ca-provenance: reconciled 6000/8439 technical rows
+task11-ca-provenance: reconciled 6500/8439 technical rows
+task11-ca-provenance: reconciled 7000/8439 technical rows
+task11-ca-provenance: reconciled 7500/8439 technical rows
+task11-ca-provenance: reconciled 8000/8439 technical rows
+```
+
+Exact reconciled outcome counts from canonical stdout:
+
+- C cohort: `8439`
+  - pass: `1926`
+  - finite below threshold: `5712`
+  - unavailable: `801`
+- Conditional A cohort: `1926`
+  - pass: `627`
+  - finite below threshold: `1136`
+  - unavailable: `163`
+- Scalar rows checked: C `8439`, A `1926`
+- Availability rows checked: C `8439`, A `1926`
+- Mismatch count: `0`
+- Passed: `true`
+
+Additional aggregate stdout counts:
+
+- C by year:
+  - 2023: cohort `2791`, pass `599`, finite below `1890`, unavailable `302`
+  - 2024: cohort `2998`, pass `705`, finite below `2003`, unavailable `290`
+  - 2025: cohort `2650`, pass `622`, finite below `1819`, unavailable `209`
+- A by year:
+  - 2023: cohort `599`, pass `198`, finite below `346`, unavailable `55`
+  - 2024: cohort `705`, pass `220`, finite below `430`, unavailable `55`
+  - 2025: cohort `622`, pass `209`, finite below `360`, unavailable `53`
+- C metric family by outcome:
+  - pass: diluted EPS `1885`, basic EPS `0`, net income `41`, unavailable family `0`
+  - finite below: diluted EPS `5542`, basic EPS `0`, net income `170`, unavailable family `0`
+  - unavailable: diluted EPS `502`, basic EPS `0`, net income `26`, unavailable family `273`
+- A metric family by outcome:
+  - pass: diluted EPS `615`, basic EPS `0`, net income `12`, unavailable family `0`
+  - finite below: diluted EPS `1118`, basic EPS `0`, net income `18`, unavailable family `0`
+  - unavailable: diluted EPS `154`, basic EPS `0`, net income `9`, unavailable family `0`
+- C unavailable reasons: negative prior `511`, no visible observation `273`, zero prior `17`; all other closed unavailable reasons `0`.
+- A unavailable reasons: negative prior `155`, insufficient annual history `8`; all other closed unavailable reasons `0`.
+- C public-date visibility: both `8166`, neither `273`, current-only `0`, prior-only `0`.
+- A public-date visibility: both `1918`, current-only `8`, neither `0`, prior-only `0`.
+
+No output copy was written inside the sealed run.
+
+## Authorized structural checks
+
+Command:
+
+```powershell
+python -B -m py_compile core/pit_diagnosis/task11_ca_provenance.py pit_diagnosis.py
+```
+
+Exit code: `0`
+
+Runtime: `0.2283445 seconds`
+
+Output: none.
+
+Command:
+
+```powershell
+git diff --check -- core/pit_diagnosis/task11_ca_provenance.py pit_diagnosis.py
+```
+
+Exit code: `0`
+
+Runtime: `0.1460858 seconds`
+
+Exact output:
+
+```text
+warning: in the working copy of 'pit_diagnosis.py', LF will be replaced by CRLF the next time Git touches it
+```
+
+The warning is Git line-ending normalization information, not a diff-check error.
+
+## Privacy and source-chain self-review
+
+- The public payload has an explicit recursive guard against keys named `symbol`, `ticker`, `cik`, `accession`, `path`, or `url`, and against non-finite floats.
+- Internal security identifiers are retained only long enough for state lookup and are never passed to a renderer.
+- Source-chain rendering exposes only the six approved logical source names, SHA-256 digests, and `verified: true`; it emits no filesystem paths.
+- Trace metric values, period values, filing records, CIK/accession identities, source URLs, and raw CSV/JSON rows are never rendered.
+- The profile renderer emits only the eight allowed authority/profile fields.
+- The scalar output was canonical JSON and contained only aggregate counts plus approved authority/source identities.
+- The provenance and audit CSVs were authenticated as ephemeral byte snapshots but never parsed into public or diagnostic facts.
+- The implementation imports no portfolio runner, provider, broker, optimizer, or SEC archive reader.
+
+## Constraints observed
+
+- No network access, download, provider call, backtest, cache refresh, optimizer access, test, commit, push, merge, or branch switch occurred.
+- No subagents were spawned.
+- No source files outside the two authorized implementation files were modified.
+- The one authorized real reconciliation was run exactly once.
+
+## Concerns
+
+- `git diff --check` emitted the existing LF-to-CRLF normalization warning for `pit_diagnosis.py`; exit status was 0 and there were no whitespace errors.
+- Verification intentionally did not include tests because the task explicitly prohibited adding or running them.
+- The diagnostic depends on the uncommitted Task 1 trace APIs and Task 2 PIT boundary API already present in the shared dirty worktree, as specified by the brief.
+
+---
+
+## Fix round 1/5: immutable SQLite copy and lexical reparse rejection
+
+### Status
+
+COMPLETE. The Critical SQLite pathname TOCTOU and Important lexical path/reparse findings were fixed in `core/pit_diagnosis/task11_ca_provenance.py` without changing CLI, cohort, scoring, reconciliation, aggregation, or output schemas.
+
+### Root cause and source-boundary fix
+
+- Root cause of the Critical finding: the sealed source pathname was hashed by `PITDataBundle`, then independently reopened by SQLite. The original pathname could therefore be replaced or mutated between authentication and lazy reads.
+- Fix: `_authenticated_bundle_copy` now copies the manifest-named bundle through a bound source descriptor into a randomized `tempfile.NamedTemporaryFile` under the validated repository root. It authenticates the copied bytes before `PITDataBundle` receives the temporary pathname. SQLite never receives the manifest pathname.
+- A bound guard descriptor remains open for the complete SQLite lifetime. On platforms that permit replacement of an open pathname, post-use identity, size, and modification-time validation raises before the diagnostic can return a payload.
+- Cleanup is a narrow single-file `unlink` after validating that the randomized file remains a regular non-reparse child of the trusted repository root. No recursive bundle-copy cleanup target is used and no copy is placed beside the sealed bundle.
+- Root cause of the Important finding: `Path.resolve()` dereferenced the manifest location before `lstat`, hiding whether the named location or a parent was a symlink/junction.
+- Fix: `_location` uses lexical `os.path.abspath` normalization without dereference. `_nonreparse_path_metadata` walks every lexical component with `os.lstat`, rejects symbolic links and Windows reparse points, requires directory parents, and requires a regular final file.
+- `_bound_regular_input` validates the lexical component chain before opening, compares the opened descriptor to the still-named file with `os.path.samestat`, and rechecks identity/size/mtime after use.
+- The same bound-input primitive now protects verified JSON/CSV snapshots as well as the bundle-copy source.
+
+### Focused failure probes
+
+#### Parent link/reparse probe
+
+The first standard symlink probe was supported conditionally as requested but this Windows token did not have symlink privilege.
+
+Command form: inline `python -B -c` creating a randomized workspace-local real directory, attempting `os.symlink(..., target_is_directory=True)`, passing `linked-parent/source.bin` to `_regular_nonreparse_file`, and removing the exact probe tree.
+
+Exit code: `0`
+
+Runtime: `0.9705126 seconds`
+
+Exact output:
+
+```text
+SKIP link/reparse probe unsupported: OSError
+```
+
+The supported Windows junction form was then exercised.
+
+Command form: PowerShell created a randomized workspace-local real directory and `New-Item -ItemType Junction` parent, invoked inline Python against `linked-parent/source.bin`, and removed the exact junction/file/directories individually in `finally` after verifying the probe root was within the workspace.
+
+Exit code: `0`
+
+Runtime: `1.0571443 seconds`
+
+Exact output:
+
+```text
+PASS parent junction rejected: probe source must have regular non-reparse components
+```
+
+#### Authenticated bundle-copy mutation/swap probe
+
+Command form: inline `python -B -c` created a randomized workspace-local source file and `_SealedSource`, entered `_authenticated_bundle_copy`, mutated and replaced the original source, confirmed the copy retained the authenticated bytes, then directly tampered with a fresh authenticated copy and required the guard to block or reject it before context return. Exact temporary files were removed in `finally`.
+
+Exit code: `0`
+
+Runtime: `1.0310693 seconds`
+
+Exact output:
+
+```text
+PASS original mutation/swap cannot alter authenticated bundle copy
+PASS authenticated bundle-copy mutation blocked or rejected before return
+```
+
+### Probe harness notes
+
+- The first inline probe invocation did not start Python because PowerShell rejected nested `-c` quoting. Exit code `1`, runtime `0.1859901 seconds`; this was corrected by passing the same inline code with a PowerShell here-string.
+- Python 3.13 `TemporaryDirectory` created directories with unusable ACLs in both default `%TEMP%` and the workspace under this managed Windows sandbox. Those two harness attempts exited `1` after `0.9732846 seconds` and `0.9705126 seconds` respectively with `PermissionError: [WinError 5] Access is denied` before a link was created.
+- The one exact inaccessible workspace probe directory was verified by name, could not be removed inside the sandbox (`Remove-Item` exit `1`, runtime `0.2447136 seconds`), and was then removed with approved escalation using the same exact non-recursive `Remove-Item -LiteralPath ... -Force` command (exit `0`, runtime `0.1414033 seconds`).
+- These ACL observations drove the final narrower `NamedTemporaryFile` implementation; no failed harness artifact remains in the workspace.
+
+### Structural verification after the fix
+
+Command:
+
+```powershell
+python -B -m py_compile core/pit_diagnosis/task11_ca_provenance.py pit_diagnosis.py
+```
+
+Exit code: `0`
+
+Runtime: `0.2284569 seconds`
+
+Output: none.
+
+Command:
+
+```powershell
+git diff --check -- core/pit_diagnosis/task11_ca_provenance.py pit_diagnosis.py
+```
+
+Exit code: `0`
+
+Runtime: `0.1121467 seconds`
+
+Exact output:
+
+```text
+warning: in the working copy of 'pit_diagnosis.py', LF will be replaced by CRLF the next time Git touches it
+```
+
+The warning is Git line-ending normalization information; there were no diff-check errors.
+
+### Fresh real offline reconciliation after changing the SQLite source boundary
+
+Command (run exactly once in this fix round):
+
+```powershell
+python -B pit_diagnosis.py diagnose-task11-ca-provenance --baseline-run ".artifacts/task-11-prefix-replay-20260826T001500Z/run-20260826T002913Z-1af306ef1e46" --baseline-profile strict-proper-base-task11
+```
+
+Exit code: `0`
+
+Measured wall runtime: approximately `297.92 seconds` (sum of command-session yields).
+
+Exact stderr progress:
+
+```text
+task11-ca-provenance: reconciled 500/8439 technical rows
+task11-ca-provenance: reconciled 1000/8439 technical rows
+task11-ca-provenance: reconciled 1500/8439 technical rows
+task11-ca-provenance: reconciled 2000/8439 technical rows
+task11-ca-provenance: reconciled 2500/8439 technical rows
+task11-ca-provenance: reconciled 3000/8439 technical rows
+task11-ca-provenance: reconciled 3500/8439 technical rows
+task11-ca-provenance: reconciled 4000/8439 technical rows
+task11-ca-provenance: reconciled 4500/8439 technical rows
+task11-ca-provenance: reconciled 5000/8439 technical rows
+task11-ca-provenance: reconciled 5500/8439 technical rows
+task11-ca-provenance: reconciled 6000/8439 technical rows
+task11-ca-provenance: reconciled 6500/8439 technical rows
+task11-ca-provenance: reconciled 7000/8439 technical rows
+task11-ca-provenance: reconciled 7500/8439 technical rows
+task11-ca-provenance: reconciled 8000/8439 technical rows
+```
+
+Exact required reconciliation counts from canonical stdout:
+
+- C cohort: `8439`; pass `1926`; finite below threshold `5712`; unavailable `801`.
+- Conditional A cohort: `1926`; pass `627`; finite below threshold `1136`; unavailable `163`.
+- Scalar rows checked: C `8439`, A `1926`.
+- Availability rows checked: C `8439`, A `1926`.
+- Mismatch count: `0`.
+- Passed: `true`.
+
+All by-year, metric-family, unavailable-reason, public-date visibility, profile, source-chain, and window aggregates were byte-for-byte equivalent in content to the prior successful output. No row identity or filesystem path appeared in stdout, and no output copy was written inside the sealed run.
+
+### Fix-round source-chain and privacy self-review
+
+- The sealed bundle source is validated lexically component-by-component and copied from the descriptor proven to name that checked source.
+- The copy digest must equal the canonical Task 11 bundle digest before SQLite opens it.
+- SQLite reads only the private authenticated copy; later original mutation or replacement cannot alter its observations.
+- The copy remains guarded for identity/size/mtime stability until `PITDataBundle` closes, and any detected tamper raises before payload return.
+- Manifest-provided bundle and provenance locations are never resolved through a symlink/junction before policy validation.
+- Parent-directory symlink/junction components and final-file reparse points are rejected.
+- The public source-chain renderer still publishes only canonical hashes and `verified: true`; the randomized copy name/path is never rendered.
+- Scoring, trace reconciliation, cohorts, aggregate renderers, and privacy guard were unchanged.
+- No tests, subagents, network/provider/archive access, backtest, cache refresh, optimizer access, commit, push, merge, or branch switch occurred.
+
+### Fix-round concerns
+
+- `git diff --check` continues to emit only the pre-existing LF-to-CRLF warning for `pit_diagnosis.py`; exit status is 0.
+- Standard symlink creation was unavailable to the managed Windows token, but the supported and more relevant Windows parent-junction probe passed.
+- The authenticated bundle copy temporarily requires free workspace disk approximately equal to the PIT bundle size; cleanup is a validated narrow single-file unlink after SQLite closes.
+
+---
+
+## Fix round 2/5: immutable bytes-backed PIT bundle
+
+### Status
+
+COMPLETE. The remaining Critical writable-temporary-SQLite finding was removed. Task 3 now parses only a query-only in-memory SQLite database deserialized from the exact authenticated immutable bundle bytes. No temporary SQLite file, pathname guard, or cleanup path remains in the diagnostic.
+
+### `PITDataBundle` constructor design
+
+`core/pit_data.py` now provides:
+
+```python
+PITDataBundle.from_authenticated_bytes(
+    data: bytes, *, expected_sha256: str
+) -> PITDataBundle
+```
+
+Implementation properties:
+
+- Requires `type(data) is bytes`; mutable buffers and bytes subclasses are rejected.
+- Uses the same closed lowercase SHA-256 validator as the path constructor.
+- Hashes the supplied immutable bytes and rejects any mismatch before SQLite initialization.
+- Creates `sqlite3.connect(":memory:")` and calls Python 3.13 `Connection.deserialize(data)`.
+- Sets `row_factory = sqlite3.Row` and `PRAGMA query_only=ON`.
+- Runs schema, metadata, membership, symbol, integrity, and provider-cache initialization through the same `_initialize_connection` method used by the path constructor; validation logic is not duplicated.
+- Closes the SQLite connection on deserialize or shared-initialization failure.
+- Exposes the same `sha256`, metadata, manifest, membership, symbol, price, and fundamental query behavior as a path-backed bundle.
+- Documents and sets `path = None` for the memory-backed variant because SQLite never opens an external file.
+- The path-backed constructor also uses the shared initializer and remains read-only; enabling `query_only` is consistent with its existing `mode=ro` contract.
+
+### Task 3 source-boundary change
+
+- `_authenticated_bundle_copy` and all temporary SQLite file/guard/cleanup logic were deleted.
+- `_authenticated_bundle_bytes` reads the already digest-authenticated spooled source snapshot into an immutable `bytes` object.
+- `diagnose_task11_ca_provenance` constructs the bundle only with `PITDataBundle.from_authenticated_bytes(...)` and deletes its local bytes reference immediately after successful deserialization to reduce retained memory.
+- Lexical manifest-path validation, every-component reparse rejection, bound original-source descriptors, and verified JSON/CSV snapshots remain unchanged.
+- Cohorts, thresholds, trace calls, scalar reconciliation, aggregates, privacy guard, and CLI output are unchanged.
+
+### Structural verification
+
+Command:
+
+```powershell
+python -B -m py_compile core/pit_data.py core/pit_diagnosis/task11_ca_provenance.py pit_diagnosis.py
+```
+
+Exit code: `0`
+
+Runtime: `0.2374505 seconds`
+
+Output: none.
+
+Command:
+
+```powershell
+git diff --check -- core/pit_data.py core/pit_diagnosis/task11_ca_provenance.py pit_diagnosis.py
+```
+
+Exit code: `0`
+
+Runtime: `0.1522637 seconds`
+
+Exact output:
+
+```text
+warning: in the working copy of 'core/pit_data.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'pit_diagnosis.py', LF will be replaced by CRLF the next time Git touches it
+```
+
+These are Git line-ending normalization warnings; there were no diff-check errors.
+
+### Inline path/memory parity probe
+
+Command form: inline `python -B -c` loaded the exact local Task 11 PIT bundle once through the path constructor and once through `from_authenticated_bytes`, then required:
+
+- exact `manifest()` equality;
+- `memory_bundle.path is None`;
+- exact AAPL 2024-06-28 quarterly-income, annual-income, and balance-sheet frame equality;
+- exact provenance-frame attribute equality;
+- exact company-info equality; and
+- `PRAGMA query_only == 1` on the memory connection.
+
+Exit code: `0`
+
+Runtime: `10.1490596 seconds`
+
+Exact output:
+
+```text
+PASS path/memory manifest and representative provenance snapshot parity
+```
+
+The probe used only the verified local bundle. It made no provider, network, archive, backtest, cache, or optimizer call.
+
+### Inline same-size/mtime-restored tamper probe
+
+Command form: inline `python -B -c` created one randomized workspace-local source copy of the exact bundle, captured immutable bytes, constructed a memory bundle, then:
+
+- mutated one byte in the original source copy in place;
+- preserved file size;
+- restored the original nanosecond mtime;
+- required the already-open memory bundle manifest to remain exact;
+- required the AAPL 2024-06-28 provenance snapshot and frame attributes to remain exact; and
+- required a `DELETE FROM membership` attempt to raise `sqlite3.OperationalError` under `query_only`.
+
+The exact single temporary source copy was removed in `finally`; it was never opened by SQLite.
+
+Exit code: `0`
+
+Runtime: `5.2659788 seconds`
+
+Exact output:
+
+```text
+PASS same-size/mtime-restored source tamper cannot alter query-only memory bundle
+```
+
+### Final full offline reconciliation
+
+Command (run exactly once in this fix round):
+
+```powershell
+python -B pit_diagnosis.py diagnose-task11-ca-provenance --baseline-run ".artifacts/task-11-prefix-replay-20260826T001500Z/run-20260826T002913Z-1af306ef1e46" --baseline-profile strict-proper-base-task11
+```
+
+Exit code: `0`
+
+Measured wall runtime: approximately `313.00 seconds` (sum of command-session yields).
+
+Exact stderr progress:
+
+```text
+task11-ca-provenance: reconciled 500/8439 technical rows
+task11-ca-provenance: reconciled 1000/8439 technical rows
+task11-ca-provenance: reconciled 1500/8439 technical rows
+task11-ca-provenance: reconciled 2000/8439 technical rows
+task11-ca-provenance: reconciled 2500/8439 technical rows
+task11-ca-provenance: reconciled 3000/8439 technical rows
+task11-ca-provenance: reconciled 3500/8439 technical rows
+task11-ca-provenance: reconciled 4000/8439 technical rows
+task11-ca-provenance: reconciled 4500/8439 technical rows
+task11-ca-provenance: reconciled 5000/8439 technical rows
+task11-ca-provenance: reconciled 5500/8439 technical rows
+task11-ca-provenance: reconciled 6000/8439 technical rows
+task11-ca-provenance: reconciled 6500/8439 technical rows
+task11-ca-provenance: reconciled 7000/8439 technical rows
+task11-ca-provenance: reconciled 7500/8439 technical rows
+task11-ca-provenance: reconciled 8000/8439 technical rows
+```
+
+Exact required reconciliation counts from canonical stdout:
+
+- C cohort: `8439`; pass `1926`; finite below threshold `5712`; unavailable `801`.
+- Conditional A cohort: `1926`; pass `627`; finite below threshold `1136`; unavailable `163`.
+- Scalar rows checked: C `8439`, A `1926`.
+- Availability rows checked: C `8439`, A `1926`.
+- Mismatch count: `0`.
+- Passed: `true`.
+
+All by-year, metric-family, unavailable-reason, public-date visibility, authority, source-chain, and window aggregates remained identical to the earlier successful canonical output. No private row identity or filesystem path appeared in stdout, and no output copy was written inside the sealed run.
+
+### Fix-round source-chain, lifecycle, and privacy self-review
+
+- The authenticated original bundle is read through the existing lexical non-reparse and bound-descriptor checks into an ephemeral hash-verified snapshot.
+- The exact snapshot is converted to immutable `bytes`; the bytes factory independently checks the canonical digest before deserialization.
+- SQLite receives no external pathname and has no writable bundle file. Same-inode, same-size, mtime-restored changes to the original cannot affect deserialized pages.
+- The live connection is memory-backed and query-only; the tamper probe also demonstrated write rejection.
+- Both path and bytes constructors execute the same validation pipeline and close on failure.
+- The memory-backed bundle's `path=None` never reaches a renderer or public payload.
+- Public source-chain output remains the six canonical source names plus digests and `verified: true`; it does not reveal lexical source paths, memory details, or private records.
+- Scoring/output logic was unchanged, and the final reconciliation reproduced every sealed aggregate exactly.
+- No tests, subagents, network/provider/archive access, backtest, cache refresh, optimizer access, commit, push, merge, or branch switch occurred.
+
+### Fix-round concerns
+
+- The memory-backed route transiently requires memory for both the immutable serialized bytes and SQLite's deserialized database. The local `bundle_bytes` reference is deleted immediately after construction, but peak memory is higher during deserialization.
+- The structural diff check emits only existing LF-to-CRLF normalization warnings for `core/pit_data.py` and `pit_diagnosis.py`; exit status is 0.

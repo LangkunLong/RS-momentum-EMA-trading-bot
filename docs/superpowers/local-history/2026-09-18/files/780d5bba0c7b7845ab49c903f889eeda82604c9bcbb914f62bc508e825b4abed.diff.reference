@@ -1,0 +1,388 @@
+# Review package: 0c1aef43af24aa75c1866f79a53d63ca9143d6e1..149fdc51b087839556f3342936ced31f0c28c8b6
+
+## Commits
+149fdc5 fix: expose schema-v4 optimizer readiness command
+
+## Files changed
+ .gitattributes |   3 +
+ agent_loop.py  | 230 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 230 insertions(+), 3 deletions(-)
+
+## Diff
+diff --git a/.gitattributes b/.gitattributes
+new file mode 100644
+index 0000000..bbe47e6
+--- /dev/null
++++ b/.gitattributes
+@@ -0,0 +1,3 @@
++core/strategy_policy/entry.py text eol=lf
++core/strategy_policy/risk.py text eol=lf
++core/strategy_policy/exit.py text eol=lf
+diff --git a/agent_loop.py b/agent_loop.py
+index 23cade4..1b2825d 100644
+--- a/agent_loop.py
++++ b/agent_loop.py
+@@ -51,36 +51,38 @@ from typing import (
+ 
+ # Keep direct script execution and imports on one module identity.  The
+ # authorization ledger binds its audit trail through ``from agent_loop import
+ # AuditTrail``; without this alias, ``python agent_loop.py`` creates a second
+ # module and the cross-module ``isinstance`` check fails closed at gateway
+ # initialization.
+ if __name__ == "__main__":
+     sys.modules.setdefault("agent_loop", sys.modules[__name__])
+ 
+ if TYPE_CHECKING:
++    from core.pit_optimization import PitOptimizerGateConfigV4
+     from core.pit_optimization_contract import (
+         PitOptimizerCallBudget,
+         PitOptimizerGateConfig,
+     )
+     from core.pit_optimizer_authorization import (
+         AuthorizationCallReservation,
+         AuthorizationLedger,
+         AuthorizationRunLease,
+         OptimizerPricingSnapshot,
+         PitOptimizerProviderFacts,
+         PitOptimizerRoleCall,
+         PitOptimizerRoleAttempt,
+         TerminalAuditReceipt,
+     )
+     from core.pit_optimizer_controller import (
+         PitOptimizerReadiness,
++        PitOptimizerReadinessV4,
+         PitOptimizerResult,
+         PitOptimizerServices,
+     )
+     from core.pit_optimizer_evaluation import DiscoveryScore
+ 
+ MAX_ITERATIONS = 10
+ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+ ORCHESTRATOR_MODEL = "qwen/qwen3-next-80b-a3b-instruct"
+ REASONER_MODEL = "deepseek/deepseek-r1"
+ CODER_MODEL = "qwen/qwen3-coder-next"
+@@ -23338,20 +23340,220 @@ def _pit_optimizer_v4_summary(result: object) -> dict[str, object]:
+             "CLI execution did not return a PitOptimizerResultV4"
+         )
+     summary = dict(result.to_public_artifact())
+     if any("sha256" in key.lower() for key in summary):
+         raise ConfigurationError("optimizer v4 public summary exposed an opaque digest")
+     if summary.get("apply") is not False:
+         raise ConfigurationError("optimizer v4 public summary is not apply=false")
+     return summary
+ 
+ 
++def _pit_optimizer_v4_readiness_summary(
++    result: object,
++) -> dict[str, object]:
++    """Project schema-v4 readiness without exposing opaque identities."""
++
++    from core.pit_optimizer_controller import PitOptimizerReadinessV4
++
++    if not isinstance(result, PitOptimizerReadinessV4):
++        raise ConfigurationError(
++            "CLI execution did not return a PitOptimizerReadinessV4"
++        )
++    return {
++        "schema_version": 4,
++        "phase": "prepare",
++        "status": "ready",
++        "terminal_code": "prepared",
++        "exit_code": 0,
++        "campaign_id": result.manifest.campaign_id,
++        "readiness_artifact": str(result.artifact_path),
++        "discovery_panel": {
++            "quick_lineages": len(result.discovery_panel_plan.quick_panel.lineages),
++            "discovery_lineages": len(
++                result.discovery_panel_plan.discovery_panel.lineages
++            ),
++        },
++        "qualification_panel": {
++            "lineages": len(
++                result.qualification_panel_plan.qualification_panel.lineages
++            ),
++        },
++        "qualification_ledger": {"authenticated": True},
++        "seed_checkpoint_present": result.seed_champion is not None
++        or result.seed_active_branch is not None,
++        "source_modified": False,
++        "cleanup_complete": True,
++    }
++
++
++def _pit_optimizer_v4_prepare_lines(
++    config: PitOptimizerGateConfigV4,
++    readiness: PitOptimizerReadinessV4,
++    limits: PitOptimizerLoopLimits,
++) -> tuple[str, str]:
++    """Render schema-v4 readiness and its exact inert canary command."""
++
++    from core.pit_optimization import PitOptimizerGateConfigV4
++    from core.pit_optimizer_command import (
++        authenticated_python_executable,
++        render_pit_optimizer_v3_command,
++    )
++    from core.pit_optimizer_controller import PitOptimizerReadinessV4
++
++    if (
++        not isinstance(config, PitOptimizerGateConfigV4)
++        or config.phase != "prepare"
++        or not isinstance(readiness, PitOptimizerReadinessV4)
++        or not isinstance(limits, PitOptimizerLoopLimits)
++        or readiness.manifest.sha256 != config.optimizer_manifest_sha256
++        or readiness.discovery_panel_plan.sha256
++        != config.discovery_panel_plan_sha256
++        or readiness.qualification_panel_plan.sha256
++        != config.qualification_panel_plan_sha256
++        or not isinstance(readiness.qualification_ledger_head_sha256, str)
++    ):
++        raise ConfigurationError(
++            "prepare output requires authenticated schema-v4 readiness"
++        )
++    config.validate()
++    manifest = readiness.manifest
++    supplied_readiness = Path(readiness.artifact_path)
++    expected_readiness = config.readiness_artifact.resolve(strict=False)
++    if (
++        not supplied_readiness.is_absolute()
++        or supplied_readiness.is_symlink()
++        or not supplied_readiness.is_file()
++        or supplied_readiness.resolve(strict=False) != expected_readiness
++    ):
++        raise ConfigurationError("PIT optimizer v4 derived readiness path differs")
++    if (
++        readiness.readiness_sha256
++        != hashlib.sha256(supplied_readiness.read_bytes()).hexdigest()
++    ):
++        raise ConfigurationError(
++            "prepare output requires authenticated schema-v4 readiness"
++        )
++    authorization = manifest.authorization_requirement
++    if (
++        config.max_api_calls != authorization.max_calls
++        or config.max_tokens != authorization.max_tokens
++        or config.max_iterations != manifest.max_iterations
++        or limits.max_api_calls != config.max_api_calls
++        or limits.max_tokens != config.max_tokens
++        or limits.max_iterations != config.max_iterations
++        or config.apply is not False
++    ):
++        raise ConfigurationError("PIT optimizer v4 prepare ceilings are invalid")
++    context = (
++        config.source_root,
++        config.permanent_runtime_root,
++        config.git_executable,
++        config.controller_temp_parent,
++        config.artifact_root,
++        config.docker_executable,
++        config.sandbox_image,
++    )
++    if any(value is None for value in context):
++        raise ConfigurationError("PIT optimizer v4 prepare execution context is absent")
++    argv = (
++        authenticated_python_executable(),
++        "-B",
++        str((config.source_root / "agent_loop.py").resolve()),
++        "--repo-root",
++        str(config.source_root),
++        "--permanent-runtime-root",
++        str(config.permanent_runtime_root),
++        "--git-executable",
++        str(config.git_executable),
++        "--controller-temp-parent",
++        str(config.controller_temp_parent),
++        "--artifact-root",
++        str(config.artifact_root),
++        "--docker-executable",
++        str(config.docker_executable),
++        "--sandbox-image",
++        config.sandbox_image,
++        "--gate",
++        "pit_optimizer",
++        "--optimization-phase",
++        "canary",
++        "--baseline-run",
++        str(config.baseline_run),
++        "--pit-bundle",
++        str(config.pit_bundle),
++        "--pit-bundle-sha256",
++        config.pit_bundle_sha256,
++        "--optimizer-manifest",
++        str(config.optimizer_manifest),
++        "--optimizer-manifest-sha256",
++        config.optimizer_manifest_sha256,
++        "--discovery-panel-plan",
++        str(config.discovery_panel_plan),
++        "--discovery-panel-plan-sha256",
++        config.discovery_panel_plan_sha256,
++        "--qualification-panel-plan",
++        str(config.qualification_panel_plan),
++        "--qualification-panel-plan-sha256",
++        config.qualification_panel_plan_sha256,
++        "--qualification-ledger",
++        str(config.qualification_ledger),
++        "--qualification-ledger-snapshot-sha256",
++        config.qualification_ledger_snapshot_sha256,
++        "--readiness-sha256",
++        readiness.readiness_sha256,
++        *(
++            (
++                "--campaign-checkpoint",
++                str(config.campaign_checkpoint),
++                "--campaign-checkpoint-sha256",
++                config.campaign_checkpoint_sha256,
++            )
++            if config.campaign_checkpoint is not None
++            and config.campaign_checkpoint_sha256 is not None
++            else ()
++        ),
++        "--optimizer-authorization-window-id",
++        authorization.window_id,
++        "--optimizer-authorization-requirement-sha256",
++        authorization.sha256,
++        "--authorize-policy-source-transmission",
++        *_pit_optimizer_v3_execution_limit_args(limits),
++    )
++    command = render_pit_optimizer_v3_command(argv)
++    ready = {
++        "schema_version": 4,
++        "phase": "ready",
++        "campaign_id": manifest.campaign_id,
++        "readiness_artifact": str(readiness.artifact_path),
++        "discovery_panel_plan": str(config.discovery_panel_plan),
++        "discovery_panel_plan_sha256": config.discovery_panel_plan_sha256,
++        "qualification_panel_plan": str(config.qualification_panel_plan),
++        "qualification_panel_plan_sha256": config.qualification_panel_plan_sha256,
++        "qualification_ledger": str(config.qualification_ledger),
++        "qualification_ledger_snapshot_sha256": (
++            config.qualification_ledger_snapshot_sha256
++        ),
++        "canary_command": command,
++    }
++    return (
++        "PIT_OPTIMIZER_READY="
++        + json.dumps(
++            ready,
++            sort_keys=True,
++            separators=(",", ":"),
++            ensure_ascii=False,
++            allow_nan=False,
++        ),
++        "PIT_OPTIMIZER_CANARY_COMMAND=" + command,
++    )
++
++
+ def _pit_optimizer_v3_execution_limit_args(
+     limits: PitOptimizerLoopLimits,
+ ) -> tuple[str, ...]:
+     if not isinstance(limits, PitOptimizerLoopLimits):
+         raise ConfigurationError("PIT optimizer execution limits are invalid")
+     return (
+         "--max-api-calls",
+         str(limits.max_api_calls),
+         "--max-tokens",
+         str(limits.max_tokens),
+@@ -23624,40 +23826,46 @@ def main(argv: Sequence[str] | None = None) -> int:
+         parser.error(str(exc))
+     run_id = _new_run_id()
+     try:
+         result = _execute_cli_run(
+             config,
+             docker_executable=docker_executable,
+             sandbox_image=sandbox_image,
+             run_id=run_id,
+             batch_limits=batch_limits,
+         )
+-        from core.pit_optimization import PitOptimizationLoopResult
++        from core.pit_optimization import (
++            PitOptimizationLoopResult,
++            PitOptimizerGateConfigV4,
++        )
+         from core.pit_optimization_contract import PitOptimizerGateConfig
+         from core.pit_optimizer_controller import (
+             PitOptimizerReadiness,
++            PitOptimizerReadinessV4,
+             PitOptimizerResult,
+             PitOptimizerResultV4,
+         )
+         from pit_diagnosis_agent import PitDiagnosisLoopResult
+ 
+         summary = (
+             _proposal_batch_summary(result)
+             if isinstance(result, ProposalBatchResult)
+             else _pit_diagnosis_summary(result)
+             if isinstance(result, PitDiagnosisLoopResult)
+             else _pit_optimization_summary(result)
+             if isinstance(result, PitOptimizationLoopResult)
+             else _pit_optimizer_v3_summary(result)
+             if isinstance(result, PitOptimizerResult)
+             else _pit_optimizer_v4_summary(result)
+             if isinstance(result, PitOptimizerResultV4)
++            else _pit_optimizer_v4_readiness_summary(result)
++            if isinstance(result, PitOptimizerReadinessV4)
+             else {
+                 "schema_version": 3,
+                 "phase": "prepare",
+                 "status": "ready",
+                 "terminal_code": "prepared",
+                 "exit_code": 0,
+                 "run_id": result.manifest.run_id,
+                 "iterations_started": 0,
+                 "iterations_completed": 0,
+                 "valid_evaluations": 0,
+@@ -23686,21 +23894,33 @@ def main(argv: Sequence[str] | None = None) -> int:
+         )
+     except ControllerInitializationError as exc:
+         print(f"agent loop initialization failed: {exc.stage}", file=sys.stderr)
+         return 22
+     except Exception:
+         print("agent loop initialization failed", file=sys.stderr)
+         return 22
+     if isinstance(result, PitOptimizationLoopResult):
+         for line in result.operator_lines:
+             print(line)
+-    if isinstance(result, PitOptimizerReadiness):
++    if isinstance(result, PitOptimizerReadinessV4):
++        if (
++            not isinstance(config.gate, PitOptimizerGateConfigV4)
++            or not isinstance(config.limits, PitOptimizerLoopLimits)
++        ):
++            raise ConfigurationError("PIT optimizer v4 readiness gate is invalid")
++        for line in _pit_optimizer_v4_prepare_lines(
++            config.gate,
++            result,
++            config.limits,
++        ):
++            print(line)
++    elif isinstance(result, PitOptimizerReadiness):
+         if (
+             not isinstance(config.gate, PitOptimizerGateConfig)
+             or not isinstance(config.limits, PitOptimizerLoopLimits)
+         ):
+             raise ConfigurationError("PIT optimizer readiness gate is invalid")
+         for line in _pit_optimizer_v3_prepare_lines(
+             config.gate,
+             result,
+             config.limits,
+         ):
+@@ -23708,15 +23928,19 @@ def main(argv: Sequence[str] | None = None) -> int:
+     print(
+         "AGENT_LOOP_SUMMARY="
+         + json.dumps(
+             summary,
+             sort_keys=True,
+             separators=(",", ":"),
+             ensure_ascii=False,
+             allow_nan=False,
+         )
+     )
+-    return 0 if isinstance(result, PitOptimizerReadiness) else result.exit_code
++    return (
++        0
++        if isinstance(result, (PitOptimizerReadiness, PitOptimizerReadinessV4))
++        else result.exit_code
++    )
+ 
+ 
+ if __name__ == "__main__":
+     raise SystemExit(main())

@@ -1,0 +1,25 @@
+# B3a representation and record-construction architect checkpoint
+
+## Scope and exact source change
+
+B3a changes only `core/pit_optimizer_v5/runtime.py` and `core/pit_optimizer_v5/production_runtime.py`. Exact preimages are in `preimages/`; the final source hashes, preserved-source hashes, scoped-diff hashes, and evaluator result are recorded in `verification.json`.
+
+`RejectedCandidateEvidenceV5` is a separate frozen carrier, not a `CandidateEvidenceV5` subtype. It admits only a pre-validation-invalid identity, matching actual template and assignment, the one closed validation result (`False`, `policy_source_unbounded_or_stateful`, empty changed symbols), and a shape-validated round-event file reference. Its fixed properties supply `invalid` status, the identity-derived experiment ID, and exactly that one event reference. The path checker follows the repository's minimum-width `:04d`/`:06d` convention, allowing wider numeric components without claiming their journal authority.
+
+`CandidateRecordEvidenceV5` is the explicit construction union. The protocol, canonical factory, and independent `_Runtime._expected_records` classify only the two exact carrier types. They preserve input order; derive critic review IDs only from testable materialized `CandidateEvidenceV5` entries; require a complete typed critic pair for those entries; and allow both critic values to be absent only for a nonempty entirely untestable batch. No empty critic artifact is constructed. `_require_exact_records` remains the independent equality gate.
+
+For a rejected carrier, both constructors build the existing `ExperimentRecordV5` with the pre-validation identity, authenticated construction template/parent/hypothesis/round inputs, direct assignment, fixed invalid validation, no policy revision or downstream evidence, empty episodes, no critic fields, and `(rejection_event_ref,)` only. The carrier template must equal the construction template and match its SHA-256. No materialization, source bundle, policy revision, evaluator evidence, candidate handle, lease, container, or execution authority is accessed.
+
+## Event and state boundary
+
+B2 already defines a durable `render_rejected` event. B3a neither appends nor loads one. It only reserves the durable *event-file* reference form (`events/<campaign>/<round>/<sequence>.json`) for a future rejected carrier, preserving the existing serialized `ExperimentRecordV5` schema. B3b must authenticate that reference against the durable rejection event, journal membership, accepted author, campaign/round, predecessor, template, assignment, and identity before any record may be persisted. B4 alone will activate outcome rendering, construction/finalization, recovery, and feedback.
+
+Thus the new rejected-only and mixed record-construction paths are static construction support, not a live state transition or publication path. The current `run`, strict `render_variants` call, materialization/evaluation flow, `_publish`, cleanup, recovery, and investigator projection remain unchanged.
+
+## Verification distinction
+
+Read-only actual06 verification authenticated the manifest graph, accepted author request/artifact, four-file parent and B1 outcome: the unchanged author produces one `RejectedVariantV5` with the closed code, while strict legacy `render_variants` still raises the exact AST ValueError. Actual06 has no durable `render_rejected` event reference, so no B3a carrier or record construction was instantiated and no event was invented. These B3a branches were reviewed statically, not exercised end to end.
+
+Fresh scoped Ruff, in-memory compilation, and diff checking passed. The evaluator identity remains `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4` over 56 covered files. The approved Increment A projection region from `_INVESTIGATOR_ENTRY_COUNTS_V5` through the byte before `CanonicalExperimentRecordFactoryV5` is byte-identical to its preimage (47,615 bytes); its count allowlist hash is also unchanged. The initial internal task review found the event-path-width issue and missing recorded preservation evidence; fix round 1 and the scoped re-review are clean.
+
+No tests were read, created, changed, or run. No synthetic probes/events, model/API calls, credential reads, candidate evaluations, campaign actions, commits, pushes, or deployment occurred. B3b and B4 remain unimplemented. Stop here for architect review.

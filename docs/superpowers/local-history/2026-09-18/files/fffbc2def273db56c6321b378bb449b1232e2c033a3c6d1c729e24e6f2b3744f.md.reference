@@ -1,0 +1,53 @@
+# B3a implementation report
+
+## Changed symbols
+
+- `RejectedCandidateEvidenceV5` is a frozen, pre-materialization rejection carrier with exact type, identity, closed-validation, and round-event-reference shape checks. Its fixed properties expose `experiment_id`, `status == "invalid"`, and exactly one rejection event artifact reference.
+- `CandidateRecordEvidenceV5` explicitly unions normal and rejected carriers.
+- `ExperimentRecordFactoryV5.build_records`, `_Runtime._expected_records`, and `CanonicalExperimentRecordFactoryV5.build_records` now use that union and optional paired critic inputs.
+- The independent expected and concrete constructors both classify exact carrier types, require critic evidence for testable normal candidates, allow no critic only for nonempty no-testable batches, and construct invalid rejected records without materialization or downstream evidence.
+
+## Static reasoning
+
+Rejected-only construction uses an empty internal review mapping and no critic object. Mixed construction derives review IDs only from testable `CandidateEvidenceV5` entries in input order; rejected entries get no review or critic reference. The normal materialized branch retains mandatory critic bindings for every testable status. Rejected records bind the carrier identity, assignment, template, parent semantic authority, fixed invalid validation, and only the durable-event reference; `ExperimentRecordV5` remains the schema/invariant authority. The carrier can validate only the canonical `events/<campaign>/<round>/<sequence>.json` reference shape. B3b must authenticate journal membership and related authority before any persistence.
+
+The runtime call path, publication, recovery, renderer activation, and serialized record schema were not changed. No candidate was materialized, evaluated, persisted, or sent to a model/API during this work.
+
+## Source hashes
+
+Starting B2-approved hashes:
+
+- `runtime.py`: `6b034be041e555ba6dacab7d8de83d6733e6e020125d5696be0bae3e9bd8c8e2`
+- `production_runtime.py`: `0e0dbb7e5dcac8ebd4716dbbaa124c83f1d3e79aec24f41e09976b8acdc8102b`
+
+Final hashes:
+
+- `runtime.py`: `d331fd540b84a8bad160bd2dd85dc4a01803362511668503411eb7f44abd17df` (after fix round 1)
+- `production_runtime.py`: `78da0dc5efcf5cf94541a465e0a3c212221c843dade07f680ddc5e1508fdc476`
+
+The supplied preimages were left untouched. The approved Increment A projection/count changes in `production_runtime.py` were not edited; only imports and the canonical record factory were changed there.
+
+## Non-test verification
+
+Commands run:
+
+- `python -B -c "from pathlib import Path; ... compile(...) ..."` for in-memory compilation of the two changed modules; completed successfully without bytecode output.
+- `python -B -m ruff check core/pit_optimizer_v5/runtime.py core/pit_optimizer_v5/production_runtime.py`; passed.
+- `git diff --check -- core/pit_optimizer_v5/runtime.py core/pit_optimizer_v5/production_runtime.py`; completed with only existing LF-to-CRLF warnings.
+- `Get-FileHash` for both changed source files.
+
+No tests, synthetic probes, event construction, runtime calls, or external APIs were run.
+
+## Concerns
+
+The new rejection/record branches are statically reviewed only: no existing authenticated rejection event was available or fabricated, so no end-to-end execution was performed. Persistence and durable event authentication intentionally remain for B3b.
+
+## Fix round 1
+
+Adjusted only `RejectedCandidateEvidenceV5`'s round-event path shape check. The round directory now accepts a digit component of at least four characters and the sequence filename accepts at least six digits before `.json`, matching the repository's minimum-width formatting for values beyond `9999`/`999999`. Event membership and positivity remain deferred to B3b.
+
+Allowed static verification actually run:
+
+- `python -B -m ruff check core/pit_optimizer_v5/runtime.py`; passed.
+- In-memory `compile(...)` of `core/pit_optimizer_v5/runtime.py`; completed successfully without bytecode output.
+- `git diff --check -- core/pit_optimizer_v5/runtime.py`; completed with only the existing LF-to-CRLF warning.

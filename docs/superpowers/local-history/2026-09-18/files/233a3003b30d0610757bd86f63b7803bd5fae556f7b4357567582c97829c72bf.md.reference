@@ -1,0 +1,39 @@
+### Finding Verdicts
+
+1. **ADDRESSED — Important Finding 5.**
+
+   Original finding (verbatim): **Important — Intermediate symlink/reparse-point escape is possible in the artifact store (`core/pit_optimizer_artifacts.py:159`).**
+
+   Impact: `_target()` performs lexical containment checks, calls `parent.mkdir(...)`, and rejects only the final parent if `parent.is_symlink()`. An existing intermediate component such as `iterations` can be a symlink/reparse point; `mkdir` and the later open then follow it outside the artifact root before the controller's post-write resolved-path check can object. That violates the closed artifact layout and can create files outside the run root.
+
+   Repair: walk every path component without following links/reparse points (prefer directory handles and relative create-only opens), or resolve and prove containment before any mutation while also defending against replacement races. Add a nested intermediate-link escape test on supported platforms.
+
+   Round 2 evidence: POSIX acquisition now walks each component with `O_DIRECTORY | O_NOFOLLOW` and retains every descriptor (`core/pit_optimizer_artifacts.py:236`, `core/pit_optimizer_artifacts.py:257`); final create, unlink, and replace operations are relative to the held parent descriptor (`core/pit_optimizer_artifacts.py:191`, `core/pit_optimizer_artifacts.py:200`, `core/pit_optimizer_artifacts.py:378`). Windows acquisition opens each component as a reparse point for inspection, rejects link/reparse metadata, compares pre/post identities, and withholds delete sharing while the entire chain is held (`core/pit_optimizer_artifacts.py:66`, `core/pit_optimizer_artifacts.py:87`, `core/pit_optimizer_artifacts.py:100`, `core/pit_optimizer_artifacts.py:161`). Direct helpers and incremental-store writes keep that capability alive through create or atomic replacement (`core/pit_optimizer_artifacts.py:387`, `core/pit_optimizer_artifacts.py:434`, `core/pit_optimizer_artifacts.py:459`, `core/pit_optimizer_artifacts.py:584`). The parameterized deterministic test injects the replacement at the former final-open/temp-open gap for create-only JSON, replaceable JSON, and replaceable diff, proves the injection occurred, and checks exact in-root/detached/outside effects (`tests/test_pit_optimizer_loop.py:744`, `tests/test_pit_optimizer_loop.py:796`, `tests/test_pit_optimizer_loop.py:831`, `tests/test_pit_optimizer_loop.py:865`). This closes the pathname check/open replacement race required by the finding.
+
+2. **ADDRESSED — Important Finding 7.**
+
+   Original finding (verbatim): **Important — The changed tests do not exercise several prescribed branches and the report overstates their coverage (`tests/test_pit_optimizer_loop.py:1042`, `tests/test_pit_optimizer_loop.py:1358`, `tests/test_pit_optimizer_loop.py:1622`, `tests/test_pit_optimizer_loop.py:1807`).**
+
+   Impact: the two-iteration test monkeypatches validation, evaluation, and decision rather than exercising the actual incumbent loop; the next-context test injects a ready-made invalid outcome rather than triggering the source/context helper; stop tests omit context preflight; hidden tests use unbound callbacks and prove neither ledger outcome nor independent resets; and the “exact fields/no secret paths” test checks dataclass field names rather than serialized key sets and leakage across every public artifact. Artifact tests also omit decision/holdout fsync failures and intermediate-link escapes. These gaps allowed the three critical defects above to coexist with the reported green suite.
+
+   Repair: add focused fake/temp-only state-machine tests for the actual two-iteration path, every safe candidate failure class and critic call, complete-plan context exhaustion, failed/uncertain accounting, decision/holdout durability failures, hidden identity/reset/ledger binding, exact artifact/result key sets and leak sentinels, and nested-link containment.
+
+   Round 2 evidence: the containment race now executes rather than merely installing a link, as shown above. The actual two-iteration test constructs three distinct synthetic boundary markers, inserts the candidate marker into each ignored temporary candidate (`tests/test_pit_optimizer_loop.py:1682`, `tests/test_pit_optimizer_loop.py:1688`), places the raw marker alongside each provider-envelope content and parses only the closed payload (`tests/test_pit_optimizer_loop.py:1754`, `tests/test_pit_optimizer_loop.py:1763`), and observes the approval marker inside the lease-opening boundary (`tests/test_pit_optimizer_loop.py:1888`). It asserts six raw, one approval, and two candidate observations (`tests/test_pit_optimizer_loop.py:1932`), then scans every file beneath the run artifact root together with canonical public-result bytes and proves all three injected markers absent (`tests/test_pit_optimizer_loop.py:2032`). The implementer report precisely names the two focused commands, combined command, full command, and recorded outputs, including the distinct legacy symlink skip and execution of all three race cases (`task-7-report.md:632`, `task-7-report.md:660`, `task-7-report.md:684`, `task-7-report.md:691`, `task-7-report.md:705`, `task-7-report.md:716`, `task-7-report.md:719`). Per instruction, those reported executions were not rerun in this re-review.
+
+### New Breakage in the Fix Diff
+
+No new Critical or Important breakage was found.
+
+- **Minor (non-blocking) — a newly opened child-directory capability can leak if parent-directory synchronization fails during creation (`core/pit_optimizer_artifacts.py:340`, `core/pit_optimizer_artifacts.py:354`).** Both platform branches open the child, call `_sync_directory_access(access)`, and append the child handle/descriptor only afterward (`core/pit_optimizer_artifacts.py:341`, `core/pit_optimizer_artifacts.py:355`). If that sync raises, `_acquire_directory` closes only capabilities already stored on `access`, leaving the just-opened child capability unclosed; on POSIX this consumes a descriptor, and an injected Windows failure can retain a no-delete-share handle until process exit. Append before sync or close the local capability in an exception path. This does not reopen the Critical/Important review loop.
+
+### Out-of-Scope Observations
+
+- The five findings already marked addressed in Fix Round 1 were not re-reviewed.
+- The original deferred Minor pre-registration capability-ownership finding was not reopened.
+- No issue entirely outside the Round 2 fix diff was investigated or found for this report.
+
+### Verdict
+
+**PASS.** Fix Round 2 addresses both open Important findings. Open blocking findings: **0 Critical, 0 Important**. The one new Minor failure-path resource leak above is non-blocking and does not reopen the loop.
+
+Exact resource/effect statement: This scoped re-review read the four requested local artifacts, the exact 1,051-line Round 2 fix package once in non-overlapping chunks as the primary view, and only focused current-line slices of the two changed files needed to verify the open findings and new-diff behavior. I ran no test and treated all implementer test claims as recorded but unverified execution evidence. I made no provider/OpenRouter/network/live-pricing/real-SDK/Docker/replay/parity/backtest/permanent-ledger/background call or mutation; exposed no prompt, strategy source, provider content, credential, key, header, real approval content, or hidden data; and did not modify tracked files, the index, HEAD, the branch, or the operator worktree. The sole durable effect was creation of this ignored `task-7-rereview-2.md` report.

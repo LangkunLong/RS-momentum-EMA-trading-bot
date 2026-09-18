@@ -1,0 +1,20 @@
+# SDD ledger — plan: .artifacts/pit-optimizer-v5/development/luna-recovery-b4a/next-luna-prompt-b4b.md
+
+## Preflight interface and constraint scan
+
+| Scope/task | Produces | Consumes/preserves | Finding |
+| --- | --- | --- | --- |
+| Runtime no-testable completion | nonempty untestable candidates reach existing common record/checkpoint/cleanup finalization with `critic=None` | B3a union record construction, B3b publication guard, B4a exact critic filter | Clean: only the decision-point abort is replaced; paid critic failure for a testable batch remains terminal. |
+| Finalized event/record authority | exact closed event chain and one-to-one record-to-origin mapping | B2 fold/rejection context, B3b record validator, accepted author template, bounded assignment enumeration | Clean: materialized validation-invalid records must bind to rendered assignment plus validation stage, not a rejected event or rendered ID equality. |
+| Completion/recovery audit | existing checkpoint-owned records and cleanup retry behavior | `_completed_result`, `_adopt_completed_projection`, `_recover_projection`, `_cleanup`, archive reducer | Clean: only a concrete invariant defect may justify a narrow adjustment; scheduling, feedback, and deadlines remain outside B4b. |
+| B4c boundary | no feedback/history projection edit | finalized lifecycle state produced by B4b | Clean: invalid-hypothesis feedback/history exposition remains deferred. |
+
+Ruling: use the B4b artifact package as the ledger and exact-preimage review surface instead of the generic SDD commit/range workflow — the user forbids commits and requires exact source preimages/diffs; if wrong, generic commit metadata is absent but the principal-required scoped authority diff remains available.
+
+Ruling: do not create, read, change, or run tests despite generic TDD/baseline guidance — the approved B4b prompt expressly prohibits tests and permits static review plus existing archived artifacts only; if wrong, static review may miss runtime defects, which are deliberately deferred to an authorized campaign/review checkpoint.
+
+Task B4b: in progress (runtime preimage 097b5c1e67e2f4c2852a8033e1a3f30d14254f0e2d18b4a899589d555e61d1f3; artifacts preimage 33a124043338d834fe3b60508b533c777df5c4fefbbdfb52ac812ab5eda0ca4f; no commits permitted)
+
+Task B4b: architect-review hold (code-quality review clean; strict completion requirement has C1 decision pending)
+
+Ruling: retain fail-closed behavior for a parent-identical exact duplicate whose actual validation has no changed symbols — `StructuralTemplateV5` requires nonempty declared symbols, `_initial_candidate` requires empty actual symbols for parent-identical bytes, and `ExperimentRecordV5` requires both to match. Do not alter a durable validation result, invent rejection authority, or modify protected schemas in B4b. If wrong, a reachable untestable exact-duplicate batch remains unable to publish until a separately authorized invariant correction; this is surfaced to the principal architect rather than hidden.

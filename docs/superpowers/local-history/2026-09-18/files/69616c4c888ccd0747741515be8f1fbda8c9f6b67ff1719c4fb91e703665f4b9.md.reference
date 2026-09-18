@@ -1,0 +1,19 @@
+# Next Luna session: B4c only
+
+Work in C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.worktrees\pit-optimizer-v5-architecture.
+
+C1 has passed principal review and B4b's C1 hold is cleared.
+
+Read:
+1. .artifacts/pit-optimizer-v5/development/luna-recovery-c1/principal-architect-review.md
+2. .artifacts/pit-optimizer-v5/development/luna-recovery-c1/principal-architect-verification.json
+3. docs/superpowers/plans/2026-09-07-pit-optimizer-v5-b4c-feedback.md
+4. The linked recovery design and latest recovery-plan decision.
+
+Implement the complete bounded B4c plan in that file. Only production_runtime.py and summary.py may change. Add the one authenticated cumulative closed rendering-rejection metric and the three precisely defined operator counts. Preserve the approved entry-funnel projection, all existing authority/evidence semantics, retained novelty/history, and evaluator identity.
+
+Create the review package .artifacts/pit-optimizer-v5/development/luna-recovery-b4c with exact preimages, scoped diffs, final hashes, static history/accounting review, real historical-summary before/after comparisons and verification limits.
+
+No tests may be read, written or run. No synthetic inputs/probes/events/records/wrappers, credentials, API/model calls, candidate evaluations, campaign launch/resume, evaluator rebuild, commits, pushes or deployment. Do not create another task automatically. Keep historical campaign artifacts unchanged.
+
+Return the B4c architect checkpoint and stop. Do not begin Increment C or a campaign. The two real evaluated feedback rounds remain unfinished. Report positive branches as static-only when no authenticated real record exists; do not create evidence merely to execute a branch.

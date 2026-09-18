@@ -1,0 +1,87 @@
+# Task 5 Re-review — Fix Round 3 of 5
+
+**Range:** `7bbb4b39cb9cfd4dde4c09849d27e483ee8bdccb..38c4bde5ac1ec1da2a0414f6a431f48a987bf074`  
+**Verdict:** **NEEDS FIXES**  
+**Open findings:** Critical 0, Important 1, Minor 0
+
+This was a read-only review except for this requested artifact. The full Fix Round 3 report and 778-line scoped review package were read. No provider, network, pricing, replay, real Docker, background process, subagent, or broad suite was used.
+
+## Finding Verdicts
+
+| Re-review 2 finding | Verdict | Evidence |
+|---|---|---|
+| Important — typed nonzero/timeout daemon actions plus full-ID-only absence | **ADDRESSED** | `agent_loop.py:4589-4627` now retains exception, timeout, and nonzero results for kill/wait/rm, continues every later action, and requires a successful empty query filtered only by the already-authorized full ID. The 3-action × 2-status matrix at `tests/test_agent_loop.py:614-666` models Docker filters and proves rm failure leaves the ID observable. The inspect-mismatch integration at lines 1751-1795 proves the expected label cannot hide it. |
+| Important — active-primary secondary cleanup evidence | **NOT ADDRESSED for the full `BaseException` contract** | Ordinary protocol `ValueError` and `KeyboardInterrupt` now retain rm/absence evidence through `PolicyWorkerSession.close` at `agent_loop.py:4788-4813`, and explicit close still raises its generic `SandboxError`. However the recorder used by every primary path can itself replace that primary and embeds unbounded raw error text. See Important 1. |
+| Minor — actual candidate execution across two fresh isolated runtimes | **ADDRESSED** | `_task5_executing_candidate_process` at `tests/test_agent_loop.py:539-599` reads the packaged candidate bytes, creates new namespace dictionaries on each invocation, executes all three candidate modules, and dispatches the real candidate functions. Bootstrap plus real request decode and response encode enforce digest/HMAC/sequence/method/type binding. The integration at lines 1902-1966 starts two separate process fixtures, proves the edited packaged risk policy returns literal `CapacityDecision(3, True)`, and compares canonical JSON. It intentionally shares trusted contract classes with the controller, as the report states. |
+| Minor — exact-name `.append` grammar | **ADDRESSED** | `core/pit_optimizer_candidate.py:423-433` now requires `node.func.value` itself to be an authorized `ast.Name`; nested subscript/attribute receivers reject. The baseline exact-name list append remains valid, and the focused baseline test passed. |
+
+## New Breakage
+
+### Important 1 — secondary-note construction can replace the active primary and disclose raw host details
+
+**Requirement:** Cleanup faults must never replace an active candidate/controller `BaseException`. Secondary evidence must remain safe, bounded controller metadata rather than an arbitrary exception serialization.
+
+**Evidence:** `_record_policy_secondary_errors` at `agent_loop.py:4630-4639` evaluates `str(error)` through the f-string and calls the virtual `primary.add_note(...)` without a shield. It is invoked from acquired-session cleanup at lines 4807-4810 and failed-start cleanup at lines 5255-5259. Either operation may raise before the original `raise` executes.
+
+Two tiny synchronous reproducers confirmed both failure mechanisms:
+
+```text
+BrokenStringError.__str__ -> RuntimeError("secondary stringification failed")
+raised= RuntimeError secondary stringification failed
+primary_notes= ()
+
+BrokenNotePrimary.add_note -> RuntimeError("add_note failed")
+```
+
+The raw-message interpolation also exposes values that the cleanup capability puts in a standard exception. A `subprocess.TimeoutExpired` secondary produced this note verbatim:
+
+```text
+policy daemon cleanup secondary failure: TimeoutExpired: Command '['C:/host/private/docker.exe', 'start', '--attach', '<full-id>']' timed out after 5 seconds
+```
+
+That is a realistic `Popen.wait(timeout=5)` failure from `_cleanup_unowned_policy_process`; it leaks the host engine path/argv/full container ID into traceback-rendered notes. It also contradicts the codebase's closed, value-free failure convention and `task-5-report.md:599`, which claims the original primary always remains.
+
+**Required fix:** Make evidence recording non-throwing and value-safe. Do not interpolate arbitrary secondary exception text. Capture controller-owned phase/action/reason codes when each cleanup operation fails, plus at most a safe exception type. Use `BaseException.add_note(primary, safe_note)` rather than virtual dispatch, bound the note, and shield the attachment itself so a note failure can never escape. Preserve timeout versus nonzero using closed values such as `kill_timeout` / `kill_nonzero`, not raw stderr, argv, paths, IDs, or exception messages.
+
+**Exact RED tests:**
+
+1. During an integrated malformed-protocol primary, make a cleanup action raise an exception whose `__str__` raises. Require the original `ValueError` type/message, all later cleanup actions, and a safe bounded note with no secondary text.
+2. Raise a `KeyboardInterrupt` subclass whose `add_note` override raises, inject an rm/absence failure, and require that exact cancellation primary to remain raised. Calling `BaseException.add_note` unbound should bypass the override; attachment failure must still be shielded.
+3. Use `subprocess.TimeoutExpired` with sentinel engine path/container ID/secret strings as a cleanup secondary. Render the traceback notes and assert none of the sentinels appear while a closed timeout/action code does.
+
+## Requirement Coverage
+
+| Area | Result |
+|---|---|
+| Daemon targeting and absence | Meets. Create output or exact fresh name+owner discovery establishes the full-ID cleanup authority; final observation uses that ID alone. |
+| Independent cleanup and explicit close | Meets for action ordering and ordinary errors. Typed action failures continue through rm/query; explicit close raises when any action or absence proof fails. |
+| Active-primary preservation | **Blocked by Important 1.** Standard errors are attached, but arbitrary `BaseException` formatting/attachment can replace the primary. |
+| Candidate AST and baseline compatibility | Meets. The exact-name append grammar matches the report and current policy sources. |
+| Cross-runtime candidate determinism evidence | Meets at the intended fake-isolated level. It executes packaged candidate functions in fresh namespaces through authenticated protocol framing without claiming real Docker isolation. |
+| Candidate identity, canonical path order, and Task 4 contracts | No regression observed. The round changes no Task 4 schema/seal/path code; constant/reverse ordering and exact nine-field identity tests passed. |
+
+## Test / Report Audit
+
+- Narrow verification: **16 passed**. It covered the full daemon action-status matrix, protocol and cancellation primary evidence, inspect-label mismatch with live-ID observation, explicit-close errors, two executing candidate runtimes, current baseline AST, constant/reverse canonical ordering, and nine-field identity. Only the pre-existing unknown `cache_dir` warning appeared.
+- The daemon fake now honestly honors name/label/ID filters and distinguishes exceptions, nonzero results, and timeouts.
+- The executing fake does not call packaged `worker_main`, but it does what the corrected claim says: it compiles packaged candidate bytes into separate namespace dictionaries and crosses the real authenticated envelope codec. Its use of shared trusted contract definitions is explicit and necessary for exact typed decisions.
+- `tests/test_agent_loop.py:1142-1153` currently requires raw injected cleanup messages in notes. That assertion should be replaced with closed action/reason evidence and negative sentinel-leak checks.
+- Report lines 490-505 correctly narrow earlier overclaims. Line 599 remains too strong until note construction itself cannot throw or expose arbitrary text.
+- The implementer's 156-test focused command was not broadly rerun. `git status --short --untracked-files=all` and `git diff --check` were clean before writing this artifact.
+
+## Resource / Cleanup Audit
+
+- Kill, wait, rm, and final full-ID query are independently attempted in order. Exceptions, typed timeouts, and nonzero statuses are retained; absence requires a successful empty ID-only result.
+- Session cleanup still handles local process/streams, reader threads, daemon, and private package tree before recording evidence. The open defect is evidence handling after those attempts, not skipped resource actions.
+- Full-ID targeting remains authorized: production construction follows trusted create output or unique exact name+256-bit-owner discovery; inspect remains mandatory before attach.
+- No real process/container was started. The executing runtime and Docker control are synchronous in-memory fakes.
+
+## Out-of-Scope Observations
+
+- The fake runtime deliberately reuses the controller's trusted contract classes rather than importing the copied package's contract module. This keeps protocol type identity exact while candidate module globals remain fresh. Real interpreter/container isolation remains deferred and is not claimed.
+- Python exception notes are normally internal, but traceback formatters display them. Future optimizer/audit integration must continue consuming closed failure codes rather than persisting formatted tracebacks or arbitrary notes.
+- Real Docker lifecycle and replay/parity remain intentionally deferred.
+
+## Final Verdict
+
+**NEEDS FIXES — Critical 0, Important 1, Minor 0.** Fix Round 3 closes full-ID absence, typed daemon status handling, ordinary active-primary evidence, real candidate execution across two fresh fake runtimes, and the exact-name append grammar. It is not ready until secondary evidence creation is guaranteed never to replace the primary or disclose raw host/capability values.

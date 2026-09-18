@@ -1,0 +1,36 @@
+# Task 1 review — V5 closed learning/search contracts
+
+**Result: APPROVED**
+
+Reviewed `2f62f3c..a4d5ecf` against `task-1-brief.md` and the Task 1 report.  The
+diff is limited to the two authorized V5 files; V2–V4 are untouched.  Ruff and
+`git diff --check` pass.
+
+## Resolved finding
+
+### [P1] Reject overlapping discovery plans at campaign-plan construction
+
+Commit `7fbcda0` resolves the earlier P1.  A shared interval validator now runs
+from `CampaignPanelPlanV5.__post_init__` before a discovery-plan digest can be
+issued, and independently from `CampaignEvidenceV5.__post_init__` before
+scoring.  It rejects overlapping, shared-boundary, reverse-chronological, and
+ordinal-unsorted discovery input; it accepts strictly adjacent intervals (for
+example, `2024-01-01..2024-01-10` followed by
+`2024-01-11..2024-01-20`) under inclusive-date semantics.
+
+Targeted direct smoke: `DISCOVERY_PLAN_INTERVAL_REVIEW_OK
+adjacent=accepted rejected=overlap,shared,reverse,unsorted`.  Ruff and
+`git diff --check a4d5ecf 7fbcda0` also pass.
+
+## Verified scope
+
+- The V5 target identity is two-decimal, positive, canonical, and independent
+  of `AnnualizedReturnTarget.production()`.
+- Search, provider, and resource defaults match the brief, including zero
+  retries/schema repairs and two parallel evaluations.
+- Artifact references are canonical relative POSIX values; filesystem checks
+  are deferred to the typed artifact-graph boundary, without constructor reads.
+- Panel/evaluator/policy/scenario bindings, role cardinality/ranks, issued
+  evidence references, and critic experiment-batch bindings are implemented.
+- No V4 production-target imports are introduced, and the diff changes no
+  V2–V4 source files.

@@ -1,0 +1,15 @@
+# B3a scoped re-review
+
+Spec Compliance: PASS
+
+Task Quality: PASS
+
+Findings: none. Both findings in `task-review.md` are addressed; this re-review supersedes its verdicts for the final source and evidence package below.
+
+The event-reference shape check now requires at least four round digits and at least six sequence digits. Static inspection confirms that repository-formatted positive values wider than those minimum widths are accepted. The four-component `events` path, numeric components, `.json` suffix, exact `ArtifactRefV5` type, and existing canonical safe-component validation remain enforced. The carrier remains only a shape boundary: durable membership and exact event/campaign/round authority still belong to B3b. No new actionable defect was found in this change.
+
+`verification.json` now records the evaluator identity before and after as `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4`, with 56 covered files, alongside preserved source hashes and scoped check results. It also records exact approved-A projection/count preservation. Independent read-only hashing during this re-review confirms the entire region from `_INVESTIGATOR_ENTRY_COUNTS_V5 = (` to immediately before `class CanonicalExperimentRecordFactoryV5:` is 47,615 identical bytes in the approved preimage and current source, with SHA-256 `11e952e9c75573844ec5de81c4f9b21c84de432373de929cb031dc8182fd65a8`. That region contains both the count allowlist and request projection.
+
+Current source hashes match the final package: runtime `d331fd540b84a8bad160bd2dd85dc4a01803362511668503411eb7f44abd17df`; production runtime `78da0dc5efcf5cf94541a465e0a3c212221c843dade07f680ddc5e1508fdc476`. Both reviewed scoped patch hashes match `verification.json`. The remaining B3a diff is unchanged from the original static review: separate immutable carrier, aligned independent constructors and critic contracts, with no runtime activation, persistence, serialization, or B3b/B4 changes.
+
+This re-review inspected only scoped source/artifacts and performed read-only hashing. It did not independently rerun evaluator-map computation, compilation, or Ruff, and did not execute the carrier/record branches. No tests, synthetic inputs/events, external calls, credentials, candidate evaluations, campaign actions, production edits, commits, pushes, or deployments were used. Only this re-review artifact was written. B3b/B4 and end-to-end rejection behavior remain outside this approval.

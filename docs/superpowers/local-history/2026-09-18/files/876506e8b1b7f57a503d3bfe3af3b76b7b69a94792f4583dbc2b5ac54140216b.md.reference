@@ -1,0 +1,27 @@
+# H2a independent spec and quality review
+
+Spec: **PASS**. Quality: **approved**. No actionable findings.
+
+## Reviewed scope
+
+Reviewed `h2a-task-brief.md`, the pure-helper and live-order sections of `extraction-design.md`, `h2a-task-report.md`, the complete sealed `h2a-source.diff`, supplied static verification and preservation results, and Ruff/compile/diff-check outputs. Scoped source reads resolved the behavior of eager scalar argument derivations and inspected the control checker surrounding its changed block. This review concerns H2a only; it does not assess older branch work or require H2b/H3 activation.
+
+## Spec and behavior assessment
+
+The nine helpers accept explicit immutable records and scalar/tuple/byte facts. Optional reservation, panel, phase, identity, terminal, cleanup, and created/ready records retain the original absence semantics. Helpers contain no executor capture, callback, mutable context, filesystem access, or operational capability.
+
+Reservation and panel predicates retain condition order and messages. The container-name argument is now evaluated eagerly, but its unchanged implementation at `production_sandbox.py:1844` only formats the already-authorized command string. The eagerly read evaluator-contract property at line 970 only returns its stored immutable contract. Neither introduces optional-record dereferencing or a new observable failure in the supported live path.
+
+The phase helper preserves prefix validation before identity matching, followed by creation/collection lifecycle checks and the exact exited-state/network-transition rule. Terminal success requirements, terminal binding, binary length, cleanup equality/dependency, and returned cleanup-presence behavior match the preimage. Record loading, foreign-executor checks, and binary loading remain at their original live positions.
+
+Control readiness remains before the existing `try` at line 4092. At lines 4112–4126, root hashing requires creation and matching executor/command; transaction hashing additionally requires matching root; Docker hashing additionally requires matching transaction. Therefore missing creation still reaches the original readiness `ValueError` without evaluating transaction fields. Optional derived digests are only uncomputed where an earlier binding predicate must fail. Completion root hashing at lines 4136–4142 occurs only after the original completed-branch presence/absence guards can pass; its unused empty-string value is never compared on another branch. Completed-control error precedence and return behavior are preserved.
+
+The active-control branches from line 4153 onward and exception wrapping are unchanged in the sealed diff. No historical caller, command interpreter, summary activation, schema, authorization gate, or launch/recovery/cleanup operation was introduced or altered.
+
+## Evidence and limits
+
+The supplied AST/byte evidence reports exactly two changed existing methods, nine added helpers, 115 other protected definitions unchanged, and all ten record schemas unchanged. The narrow diff supports these boundaries, including unchanged schema decorators and surrounding source. Its lexical effect-call comparison supports load-order preservation; the independent branch review above supplies the short-circuit analysis that a lexical comparison alone cannot prove.
+
+Supplied Ruff, Python 3.13 in-memory compilation, and scoped diff check passed. Preservation evidence reports unchanged 56-file evaluator maps and unchanged real runtime-04 and provider-runtime-06 archives, including extended-path assertions, file/byte counts, and matching before/after digests. No contradictory evidence was found.
+
+No tests were read, run, or created. No synthetic records, execution probes, campaigns, summaries, external calls, production source edits, commits, or subagents were used. Runtime equivalence remains a static-review conclusion within the authorized verification limits; no broader execution or historical-verification result is claimed.

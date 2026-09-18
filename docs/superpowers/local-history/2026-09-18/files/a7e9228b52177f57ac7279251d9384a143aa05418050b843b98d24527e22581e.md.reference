@@ -1,0 +1,132 @@
+# Task 1 Report — Three-Universe Membership Domain
+
+## Outcome
+
+Implemented the closed schema-V3 S&P 500, Nasdaq-100, and Russell 2000 membership domain on branch
+`codex/pit-optimizer-v5-architecture` from accepted base `8769fb7`.
+
+Source changes are limited to:
+
+- `core/pit_universe_v3.py` (new)
+- `core/pit_data.py` (modified)
+
+No test files, provider integrations, market-data inputs, bundle artifacts, qualification state, replay
+surfaces, or deployment surfaces were changed.
+
+## Implementation
+
+### Closed membership domain
+
+- Added exact `UNIVERSE_IDS = frozenset({"sp500", "nasdaq100", "russell2000"})`.
+- Added frozen/slotted `UniverseMembershipEventV3` and `PointInTimeUniverseV3` records.
+- Enforced canonical lineage IDs, exact universe IDs, boolean membership values, tuple event storage,
+  unique/canonical event ordering, real state transitions, and removal-only-after-add semantics.
+- Modelled state by `(security_lineage_id, universe_id)`, then derived the active opportunity set from
+  the deduplicated lineage union. A security in two universes therefore appears once while retaining
+  both affiliations.
+- Exposed ticker-compatible `members_at()` / `affiliations_at()` and lineage-native
+  `lineages_at()` / `lineage_affiliations_at()` / `ticker_for_lineage_at()` / `all_lineage_ids()` /
+  `all_tickers()` APIs.
+- Required the exact `PriceIdentityTransitionContract` type. Membership lineage bindings must equal
+  the non-reference price-identity lineage set; SPY, QQQ, and IWM are rejected as membership
+  identities.
+- Ticker resolution uses admitted identity bounds plus authenticated transition boundaries. It fails
+  closed unless exactly one ticker identity is active for the lineage at the queried instant.
+- Added transition graph checks for canonical order, lineage continuity, and ambiguous repeated
+  predecessor/successor boundaries.
+
+### PITDataBundle schema dispatch
+
+- Added schema version `3` as an explicit opt-in reader path with `membership_v3` schema dispatch.
+- Added a backwards-compatible optional `prices_provenance` keyword to path-backed and
+  authenticated-bytes constructors. Schema V3 requires it; V1/V2 do not.
+- Schema V3 authenticates the complete prices provenance, identity-contract digest, exact identity
+  set, and explicit canonical `price_identity_transitions` rows before constructing
+  `PointInTimeUniverseV3`.
+- Schema V3 never infers ticker transitions from membership additions/removals. The existing V1/V2
+  inference branch remains separate.
+- Added bundle-level `affiliations_at()` and `security_lineages_at()` compatibility APIs.
+- Kept all three reference symbols price-only and excluded from tradables/fundamentals/membership.
+- Removed the legacy S&P-only 495–510 active-count rule from the V3 integrity path only.
+- Extended manifest coverage queries to read `membership_v3` without changing legacy table reads.
+- Extended canonical ticker validation to support the required later identity example `DUAL2`.
+
+## Verification Evidence
+
+All verification used in-memory synthetic objects/SQLite bytes or existing tests; it created no
+market-data or bundle artifacts.
+
+1. Comprehensive direct domain smoke: **passed** (`comprehensive-domain-smoke: ok`). Covered:
+   overlapping S&P/Nasdaq membership; S&P-only removal leaving Nasdaq active; Russell membership;
+   same-lineage `DUAL -> DUAL2`; full affiliations; duplicate, noncanonical-order, unknown-universe,
+   and removal-without-add rejection; zero-active and two-active ticker rejection.
+2. Schema-V3 authenticated in-memory bundle smoke: **passed** (`schema-v3-bundle-smoke: ok`). Covered
+   membership dispatch, explicit transition authentication, bundle-level affiliation/lineage APIs,
+   post-transition ticker resolution, missing-provenance failure, and rejection when explicit
+   transition rows are absent (no inference fallback).
+3. Schema-V1/V2 in-memory compatibility smoke: **passed** (`schema-v1-v2-smoke: ok`). Both versions
+   opened without the V3 provenance keyword, retained their membership behavior, and returned the
+   legacy S&P affiliation adapter.
+4. `python -B -m pytest tests/test_pit_data.py -q`: **7 passed**. Existing warnings were limited to
+   dependency deprecation/resource warnings and a sandbox-denied pytest cache write.
+5. `python -B -m py_compile core/pit_universe_v3.py core/pit_data.py`: **passed**.
+6. `python -B -m ruff check core/pit_universe_v3.py core/pit_data.py`: **passed** (`All checks passed!`).
+7. `git diff --check`: **passed**; Git emitted only the existing Windows LF-to-CRLF notice.
+
+## Self-review
+
+- Confirmed only the two authorized source paths are included in the source commit.
+- Confirmed membership union is lineage-derived rather than list concatenation.
+- Confirmed affiliation removal is scoped to one universe and does not retire other affiliations.
+- Confirmed transition rows are provenance-authenticated and explicit for V3.
+- Confirmed V1/V2 initialization and inference remain on their prior branches.
+- Confirmed no reference symbol can enter membership through a lineage alias.
+- Confirmed no tests or data/artifacts were written.
+
+## Commit
+
+`476a688` — `feat: add PIT three-universe membership domain`
+
+## Compatibility follow-up
+
+The Task 1 review found that the shared ticker validator had been widened for the V3 `DUAL2`
+example, unintentionally changing legacy validation. The follow-up restores `_canonical_ticker()` to
+its exact pre-Task-1 character set and adds `_canonical_ticker_v3()` for schema-V3-only identity,
+explicit-transition, and bundle-query paths. V1/V2 membership, price-symbol loading, provenance
+validation, and inferred-transition construction remain on the legacy validator. The legacy unbound
+`_query_prices()` test surface also retains its original validator fallback.
+
+Follow-up verification:
+
+- Direct validator compatibility smoke: passed. It proved V1/V2 membership, price, and provenance
+  reject digit-bearing tickers with the base error; V3 accepts `DUAL2` and resolves `DUAL -> DUAL2`;
+  provenance rejects noncanonical raw case/whitespace; both validators reject unsupported `_`, `/`,
+  and `:` punctuation.
+- `python -B -m pytest tests/test_pit_data.py -q`: 7 passed.
+- `python -B -m py_compile core/pit_data.py core/pit_universe_v3.py`: passed.
+- `python -B -m ruff check core/pit_data.py core/pit_universe_v3.py`: passed.
+- `git diff --check`: passed with only the Windows line-ending notice.
+
+Follow-up commit: `c4da6a4` — `fix: isolate schema-v3 ticker validation`
+
+## Resolver-isolation follow-up
+
+The rereview identified one remaining content-based schema inference inside
+`PriceIdentityTransitionContract.resolve_open_holding()`. The resolver no longer inspects identity
+keys. The original method explicitly applies the legacy validator, while the new
+`resolve_open_holding_v3()` method explicitly applies schema-V3 ticker syntax and delegates to the
+same transition-resolution implementation. `PointInTimeUniverseV3.ticker_for_lineage_at()` now
+routes its final identity check through the explicit V3 resolver.
+
+Follow-up verification:
+
+- Direct explicit-resolver smoke: passed. The same directly constructed contract rejects `DUAL2`
+  through `resolve_open_holding()`, accepts it only through `resolve_open_holding_v3()`, preserves
+  `DUAL -> DUAL2` on the transition date, and keeps V3 universe membership on `DUAL2` afterward.
+- Both resolver surfaces rejected unsupported `_`, `/`, and `:` punctuation.
+- `python -B -m pytest tests/test_pit_data.py -q`: 7 passed.
+- `python -B -m py_compile core/pit_data.py core/pit_universe_v3.py`: passed.
+- `python -B -m ruff check core/pit_data.py core/pit_universe_v3.py`: passed.
+- `git diff --check`: passed with only the Windows line-ending notice.
+
+Resolver-isolation commit: `2f8f84c` — `fix: make schema-v3 identity resolution explicit`

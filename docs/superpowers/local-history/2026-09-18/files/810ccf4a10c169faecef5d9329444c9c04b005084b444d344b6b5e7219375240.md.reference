@@ -1,0 +1,61 @@
+### Task 11: Run the Authorized Six-Call Core Canary and Stop
+
+**Files:**
+
+- Local ignored artifacts only under: `$pitCanaryRoot\optimizer\` from Task 10.
+- No tracked source modifications.
+
+**Run contract:**
+
+- Exactly two planned iterations and six planned roles in investigator/author/critic order.
+- DeepSeek R1 for all roles.
+- Maximum 448,000 aggregate input-plus-output tokens for this canary.
+- No enforcing USD ceiling; record actual provider cost.
+- `apply=false`; `provider_retries=0`; exact three editable policy files.
+- Quick panel 12 lineages; discovery panel 48 lineages; qualification remains sealed and unopened.
+- Full replay remains off.
+
+- [ ] **Step 1: Build schema-v4 readiness and a six-call manifest provider-free.**
+
+  Recompute `$pitCanaryRoot` from clean HEAD with the Task 10 formula. Authenticate clean HEAD, bundle, prices provenance, discovery plan, qualification commitment, parity evidence, policy interface, sandbox image, and artifact roots. Size each role's dynamic/response byte budget from the rendered actual three-file source context plus declared reasoning/output token headroom. Render the exact prepare and canary commands; verify neither command contains credentials or an USD limit.
+
+- [ ] **Step 2: Open one finite local authorization window.**
+
+  Bind the exact manifest/source-scope digest, six calls, 448,000 tokens, two iterations, `apply=false`, zero retries, and no USD authority field. The user's standing authorization covers these OpenRouter calls; do not pause for another authorization prompt unless the rendered scope differs from this task.
+
+- [ ] **Step 3: Execute the emitted canary command once.**
+
+  Do not manually reconstruct the command. Run the exact command emitted by readiness so source, panel, call-plan, authorization, and artifact identities remain bound. Do not restart the canary after a terminal transport/accounting/identity/sandbox failure.
+
+- [ ] **Step 4: Audit the complete feedback path.**
+
+  Require evidence that:
+
+  - investigator received the controller-selected parent and discovery-only feedback;
+  - author returned an exact three-file bundle bound to that parent;
+  - the controller validated an atomic candidate and derived its diff locally;
+  - every runtime-valid candidate reached discovery regardless of quick-panel return;
+  - critic received actual validation/performance feedback;
+  - iteration 2 received iteration 1's critic feedback and selected parent;
+  - the highest discovery CAGR is the champion and any branch matches the deterministic transition table;
+  - checkpoint, provider accounting, attempt/skip records, cleanup, and source-cleanliness identities reconcile.
+
+- [ ] **Step 5: Stop before qualification and full replay.**
+
+  Preserve the local checkpoint/champion/branch artifacts. Repeat the exact `git status --porcelain`, Python-process count, and name-only Docker checks from Task 10 Step 5 after the run finalizer. Report baseline and best discovery annualized return, improvement in percentage points, target gap to 10%, role calls/tokens/actual cost, recoverable invalid outcomes/skips, whether the branch persists, and cleanup status. Explicitly report `qualification_started=false`, `full_replay_started=false`, and that S&P-only canary performance is architecture evidence rather than final three-universe qualification.
+
+## Completion Criteria
+
+Implementation is ready for the separate three-universe data/qualification phase only when all of the following are true:
+
+- the regenerated local bundle authenticates SPY, QQQ, and IWM as complete non-tradable references;
+- every policy decision receives causal `MarketContextV1` with baseline parity preserved;
+- schema-v4 authors can change any/all three policy files atomically without patch-size restrictions;
+- a valid candidate travels through quick evaluation, continuous discovery evaluation, critic feedback, and a later iteration;
+- fully accounted schema-invalid role output can advance without retry or ledger corruption;
+- champion and optional branch survive a clean cross-run checkpoint reconstruction;
+- discovery ranking uses only absolute annualized portfolio return;
+- all provider attempts and skips reconcile, disposable resources are cleaned, and tracked source is clean;
+- the canary stops with qualification unopened and the full replay off.
+
+After this plan succeeds, write the separate `three-universe-pit-qualification` plan around exact licensed/authenticated Nasdaq-100 and Russell 2000 historical constituent sources, then run a new campaign and one-use qualification toward the 10% target. The same core loop and metric then support later 20% and 50% target campaigns without another optimizer redesign.

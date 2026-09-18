@@ -1,0 +1,98 @@
+# Task 4 — Propagate schema v3 through controller, artifacts, adapters, and CLI
+
+## Authority and dependency
+
+Read the approved spec:
+`C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-implementation/docs/superpowers/specs/2026-08-28-pit-optimizer-audit-only-usd-design.md`
+
+This task starts only after Task 3 is committed/reviewed. Consume the final v3 contract, authorization, pricing snapshot, resource ledger, and provider facts. Do not modify tests. Do not call a provider, start Docker, open hidden data, push, or upload.
+
+## Production files
+
+- `core/pit_optimizer_controller.py`
+- `core/pit_optimizer_artifacts.py`
+- `core/pit_optimization.py`
+- `agent_loop.py`
+- Narrow dependency correction only: `core/pit_optimization_contract.py` may
+  change the outer readiness schema assertion in `PitOptimizerGateConfig`
+  from 2 to 3. Do not change nested role-input protocol schema versions.
+
+## Required controller and artifact behavior
+
+1. Active readiness, run state/artifacts, accounting artifacts, public result, and serialization use `schema_version=3`.
+2. Use this budget/result shape:
+
+```python
+@dataclass(frozen=True, slots=True)
+class OptimizerBudgetSummary:
+    api_calls: int
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    authoritative_usd: str
+    projected_plan_usd: str | None
+    pricing_status: str
+    retained_reservation_tokens: int
+    incomplete_accounting_calls: int
+    accounting_complete: bool
+```
+
+3. Derive projected plan USD and pricing status only from the bound active/snapshotted v3 lease. Actual authoritative USD comes only from complete provider facts and is a canonical decimal string so summing multiple finite high costs cannot overflow. Preserve incomplete-accounting fail-closed behavior.
+4. Accounting artifacts contain:
+   - `authorized_totals` with exactly calls/tokens;
+   - `reserved_totals` with exactly calls/tokens;
+   - `pricing_advisory` with status/projected_plan_usd;
+   - `actual_totals` including authoritative USD;
+   - an explicit accounting-complete indication.
+   They contain no USD authority, reserved USD, credentials, provider response content, raw hashes, container IDs, raw trades, or hidden identities.
+5. Remove required/charged USD and cost-budget exhaustion from optimizer `_pre_iteration_stop`. Calls/tokens/identity/cancellation/sandbox/audit/accounting remain hard stops.
+6. Discovery canary must finish deterministic incumbent comparison and stop. Do not call hidden evaluation automatically. Result must expose `hidden_validation_opened=False` and `long_replay_eligible=None`; hidden fold remains unopened.
+7. `IncrementalArtifactStore.write_json_artifact` admits the exact schema-v3 optimizer layouts while preserving closed layout checks.
+
+## Active Python entrypoints and CLI
+
+1. Advance active implementation names, without v2 aliases:
+   - `prepare_pit_optimizer_v3`
+   - `load_pit_optimizer_v3_readiness`
+   - `run_pit_optimizer_v3`
+   - `_build_pit_optimizer_v3_config`
+   - `_preauthorize_pit_optimizer_v3_live_run`
+   - `_build_pit_optimizer_v3_live_run`
+   - `_dispatch_pit_optimizer_v3`
+   - `_pit_optimizer_v3_summary`
+   - `_pit_optimizer_v3_prepare_lines`
+   The external CLI gate name remains `pit_optimizer`.
+2. Introduce optimizer-specific limits with no USD field:
+
+```python
+@dataclass(frozen=True)
+class PitOptimizerLoopLimits:
+    max_iterations: int
+    max_api_calls: int
+    max_tokens: int
+    api_timeout_seconds: float
+    child_timeout_seconds: float
+    wall_timeout_seconds: float
+    output_limit_bytes: int
+```
+
+3. Make the parser's global `--max-usd` optional syntactically. Require it for every existing non-`pit_optimizer` route and reject it for `pit_optimizer`. Construct `PitOptimizerLoopLimits` only for the optimizer path and retain `LoopLimits` with enforced USD everywhere else.
+4. Remove optimizer `max_usd` from config, live preauthorization, resource-ledger construction, prepare lines, emitted canary command, summaries, and stop conditions. Do not weaken legacy route cost controls.
+5. Update `core/pit_optimization.py` bottom adapters only; the earlier legacy `PitOptimizationGateConfig` and legacy optimizer remain unchanged.
+6. Update all changed production call sites to the final schema-v3 Task 1–3 interfaces. Preserve exact six calls/448000 tokens/two iterations, `provider_retries=0`, `apply=false`, sealed source/fold/policy identities, one-shot authorization, network-disabled disposable workers, output bounds, cleanup, and public redaction.
+
+## Verification and commit
+
+- Run `python -B -m py_compile agent_loop.py core/pit_optimization.py core/pit_optimizer_artifacts.py core/pit_optimizer_controller.py` plus the already changed contract/authorization/evaluation modules.
+- Run import-only and provider-free construction/summarization smoke checks if practical; no test edits.
+- Run `git diff --check` and self-review legacy CLI USD enforcement and hidden isolation.
+- Commit the four production files plus the authorized one-line outer-readiness
+  validator correction in `core/pit_optimization_contract.py` with subject:
+  `Expose audit-only PIT optimizer v3 flow`.
+
+## Report
+
+Write the detailed report to:
+`C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-implementation/.superpowers/sdd/2026-08-28-pit-optimizer-audit-only-usd/task-4-report.md`
+
+Include behavior changed, verification command/output, files changed, commit, self-review, and concerns. Return only status, commit, one-line verification, concerns, and report path. Do not dispatch subagents.

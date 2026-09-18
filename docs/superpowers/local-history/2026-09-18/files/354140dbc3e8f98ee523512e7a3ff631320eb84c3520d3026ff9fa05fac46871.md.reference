@@ -1,0 +1,40 @@
+# H3c explicit completed-history summary integration
+
+## Scope delivered
+
+Implemented H3c in `historical_verification.py`, `development_preparation.py`, `summary.py`, and only `LocalArchiveReducerFactoryV5._authorities` / `verify_projection` in `production_runtime.py`. No CLI or operational adapter path changed.
+
+`summarize_repository_v5` now has the closed exact-string keyword `verification_scope: Literal["current_runtime", "completed_history"] = "current_runtime"`. It validates the scope before aggregation. Explicit history requires `command == "summarize"` and the supported development manifest, then invokes `authenticate_completed_development_history_v5(repository, manifest)`. The existing late operational development authenticator remains unchanged and is skipped only for explicit history. Summary fields, Decimal arithmetic, counts, status formulas, and current defaults are unchanged. The summary projection forwards `repair=False` for history and `True` for the current default.
+
+`authenticate_completed_development_history_v5` accepts only repository and manifest. It authenticates the original `campaign-launch` with `repair=False`, the exact launched manifest, and original saved config. It enumerates actual started rounds, then directly calls both H1 and H2 for every one and requires H1/H2 equality plus the same independently authenticated original config. Each actual round must have H2-authenticated final successful cleanup and either checkpoint-owned experiment records or one authenticated terminal outcome. At least one settled actual round is required. Failed terminal rounds remain settled and are never counted as evaluated.
+
+Provider-free history sends the complete ordered campaign package tuple to H3a. Paid history sends that same campaign-wide ordered tuple and the H1-authenticated original config to H3b. Empty package collections still enter the applicable authenticator. H3a controller source remains SHA-256 `62f7414dd31a7970d08bcbf7fcc7faaeb19e5ee806cba5363311aef338b15b1f`; H3b provider source remains `6077f0a716fa5d64594f5760d86b00f3b2865b605ca25bf3ab57bed07793b94f`.
+
+## Complete census
+
+Private historical helpers enumerate immutable existing state through `_names`, `_read_relative`, canonical loaders, and `load_typed_state(..., repair=False)`:
+
+- The union of value/index files for both round namespaces is authenticated. Every expected round key from `1..cap` is read even when it has no events. Selected out-of-range round state is rejected. Event round directories must be canonical and in range, and every loaded event must exactly match the requested campaign and round. Entry-only, start-only, empty started journals, and event-only future state fail.
+- Every canonical role-request entry is authenticated. Selected requests must be in range and equal the complete journal request-reference/call/request collection. An unjournaled request fails, including on zero-execution rounds.
+- Every canonical candidate-execution payload is authenticated. `verify_candidate_execution_index` runs for every in-range round, including empty future rounds, and the complete selected payload set must equal the indexed H1 set. No orphan promotion reader is called.
+- The union of value/index keys is authenticated for exactly `workspace-reservation`, `sandbox-mount-reservation`, and `container-reservation`. Keys must equal lease token, output authority, and command digest respectively. Selected owners must equal the H1 round owner. Workspace records match every H1 workspace field and journal payload; mount/container records equal H2 execution records. Extra selected workspace evidence is rejected as unjournaled or unsupported without claiming that the resource is live.
+
+Malformed filenames, value-only/index-only records, observed-entry disappearance, foreign selected owners, pending in-range evidence, and selected out-of-range evidence fail closed. Unrelated authenticated campaign records are not reinterpreted as selected authority. Directory enumeration is an observation of immutable evidence and is not an atomic snapshot or concurrent-writer guarantee.
+
+## Reachable read/write audit
+
+The completed path is:
+
+`summarize(completed_history)` → original launch/manifest/config reads → round/event census → H1 + H2 per actual round → checkpoint/record authentication → full request/execution/reservation census → H3a or H3b over the campaign-wide package tuple → final archive projection with `repair=False` → unchanged summary aggregation → summary projection with `repair=False`.
+
+Direct repository operations are immutable `_names(create=False)`, `_read_relative`, `authenticate_campaign_manifest_v5`, typed artifact/binary/role/round/record/checkpoint loaders, `verify_candidate_execution_index`, and typed-state reads explicitly set to `repair=False`. Through H1/H2, H3c authenticates the saved `export_mode` and driver identity plus the created, ready, and retired workspace records and resource outputs. It does not reach or independently validate a separate confirmation or finalized-discovery reader; the accepted design intentionally excludes confirmation-only successful-finalization requirements. H3a reads existing sealed controller bytes; H3b reads immutable ledger/request/response artifacts and preserves migration-required failure. Projection reads checkpoint records, policy source with the forwarded repair flag, scheduling events, baseline, and exact archive bytes.
+
+The reachable new path contains no append, nonce, transition, recovery, migration, reconcile, provider invocation, operational ledger/gateway/executor construction, callback, environment lookup, or CLI dispatch. It never calls `load_candidate_execution` or `recover_projection`.
+
+## Static and preservation evidence
+
+Exact preimages and the 29,071-byte narrow diff are saved; diff SHA-256 is `b9797a8f6a97875932e9d3c909aa4dc4c1d6223f0231b260d30d2d01813dc242`. Final source hashes are: historical verifier `978c0bd83ddbafecc9ef388420c23634429f32a5f6473eef441c09db4c6c521b`, development preparation `e7f7e2c0d6c4b66eefd31b031cc18cf53f3924a013b39a318d613ccff75b72f8`, summary `bbf96eeece0e5c3aab963e975977f16f703ec5780802869c565558d9f9f588c5`, and production runtime `1a232da79f5ddf0c01e48f39dd94008f6ad3b34ed08af385c3787e4f4555e070`.
+
+Static definition comparison proves only the expected new/changed definitions; every protected existing definition is byte-identical. All 23 historical-verifier typed-state call sites use literal `repair=False`; the new public/census path adds five such sites. The projection policy-source read forwards `repair`. The fixed 56-file evaluator closure is unchanged at `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4`. Scoped Ruff and Python 3.13 in-memory compilation pass; diff whitespace checks pass.
+
+Complete archive maps remain identical: runtime04 is 579 files / 69,994,319 bytes at `1988b37428bcbf647d468ec163b7ca235b99b26b2a7bcee80d7de733e19f8aa9`; actual06 is 83 files / 68,980,002 bytes at `2c411970b0a2d9cdfd2499afa01aed14fa723bb3ae5f4d44baee0d539b923f16`. No summary, test, synthetic case, credential/environment read, provider/API/Docker/external call, campaign, commit, install, or subagent was used. Real historical summary execution remains pending independent source/callgraph approval.

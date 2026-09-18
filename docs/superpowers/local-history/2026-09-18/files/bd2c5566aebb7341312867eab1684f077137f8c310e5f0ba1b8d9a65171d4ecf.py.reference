@@ -1,0 +1,69 @@
+"""Authenticate one actual local development result and remove its stopped container."""
+import argparse
+from datetime import datetime
+import hashlib
+import json
+from pathlib import Path
+import subprocess
+from core.pit_optimizer_v5.container_protocol import decode_panel_execution_output_v5, decode_panel_execution_request_v5, panel_execution_output_bytes_v5
+from core.pit_optimizer_v5.candidate_ir import SourceBundleV5, SourceFileV5
+from core.pit_optimizer_v5.policy_scope import EDITABLE_POLICY_PATHS_V5
+
+parser=argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--run',type=Path,required=True)
+args=parser.parse_args()
+root=Path.cwd().resolve()
+run=args.run.resolve()
+allowed=root/'.artifacts/pit-optimizer-v5/development/runs'
+if run.parent != allowed:
+    raise ValueError('Run must be a direct child of the actual development runs directory')
+digest=lambda value: hashlib.sha256(value).hexdigest()
+raw_request=(run/'request/panel-request.json').read_bytes()
+request=decode_panel_execution_request_v5(raw_request)
+raw=(run/'output/panel-evaluation.json').read_bytes()
+output=decode_panel_execution_output_v5(raw)
+if request.pit_data_scope != 'development_sp500_v2':
+    raise ValueError('Only explicit development runs are supported')
+if output.request_sha256 != request.request_sha256 or output.input_sha256 != request.sha256:
+    raise ValueError('Output request identity differs')
+if panel_execution_output_bytes_v5(request=request,evaluation=output.evaluation) != raw:
+    raise ValueError('Canonical output differs')
+if digest((run/'panel.json').read_bytes()) != request.panel.sha256:
+    raise ValueError('Mounted panel bytes differ')
+if tuple(item.scenario_id for item in output.evaluation.scenarios) != request.scenario_ids:
+    raise ValueError('Scenario output coverage differs')
+if request.panel.purpose == 'discovery' and request.scenario_ids != ('gross','base','stress'):
+    raise ValueError('Discovery must contain the full declared scenario grid')
+for path,expected in request.policy_revision.editable_source_sha256:
+    if digest((run/'policy'/Path(path).name).read_bytes()) != expected:
+        raise ValueError('Mounted source differs: '+path)
+source=SourceBundleV5(tuple(SourceFileV5(path,(run/'policy'/Path(path).name).read_text(encoding='utf-8')) for path in EDITABLE_POLICY_PATHS_V5))
+data=root/'.artifacts/pit-optimizer-v5/development/data/sp500-v2'
+if digest((data/'pit_bundle.sqlite3').read_bytes()) != request.evaluator_contract.pit_bundle_sha256:
+    raise ValueError('Bundle differs')
+if digest((data/'prices_provenance.json').read_bytes()) != request.evaluator_contract.prices_provenance_sha256:
+    raise ValueError('Provenance differs')
+launch=json.loads((run/'launch.json').read_text())
+container_id=(run/'container-id.txt').read_text().strip()
+if len(container_id)!=64 or any(c not in '0123456789abcdef' for c in container_id):
+    raise ValueError('Invalid owned container ID')
+docker=str(Path.home()/'AppData/Local/Programs/DockerDesktop/resources/bin/docker.exe')
+observed=json.loads(subprocess.run([docker,'inspect',container_id],capture_output=True,text=True,check=True,timeout=30).stdout)[0]
+state=observed['State']
+if observed['Id']!=container_id or observed['Name']!='/'+launch['container_name'] or observed['Config']['Image']!=request.sandbox_profile.image_reference:
+    raise ValueError('Fresh container identity differs')
+if launch['image']!=request.sandbox_profile.image_reference or state['Running'] or state['ExitCode']!=0 or state['OOMKilled']:
+    raise ValueError('Container is not a successful terminal execution')
+prior=json.loads((run/'container-state.json').read_text())
+if any(prior[key]!=state[key] for key in ('StartedAt','FinishedAt','ExitCode','OOMKilled')):
+    raise ValueError('Terminal state differs from launcher observation')
+seconds=(datetime.fromisoformat(state['FinishedAt'].replace('Z','+00:00'))-datetime.fromisoformat(state['StartedAt'].replace('Z','+00:00'))).total_seconds()
+record={'record_kind':'authenticated_real_development_panel','run':str(run),'request_sha256':request.request_sha256,'input_sha256':request.sha256,'output_sha256':digest(raw),'source_bundle_sha256':source.sha256,'policy_revision_sha256':request.policy_revision.sha256,'panel_sha256':request.panel.sha256,'episode_id':request.episode.episode_id,'episode_ordinal':request.episode.episode_ordinal,'evaluator_contract_sha256':request.evaluator_contract.sha256,'sandbox_sha256':request.sandbox_profile.sha256,'image_reference':request.sandbox_profile.image_reference,'scenario_ids':request.scenario_ids,'wall_seconds':seconds,'container_id':container_id,'reports':{item.scenario_id:{'closed_trades':item.report.closed_trades,'portfolio_total_return_pct':str(item.report.portfolio_total_return_pct),'portfolio_annualized_return_pct':str(item.report.portfolio_annualized_return_pct)} for item in output.evaluation.scenarios},'canonical_output_and_source_verified':True,'production_authority':False}
+with (run/'verification-record.json').open('x',encoding='utf-8') as stream:
+    stream.write(json.dumps(record,indent=2)+'\n')
+removed=subprocess.run([docker,'rm',container_id],capture_output=True,text=True,check=True,timeout=30).stdout.strip()
+if removed!=container_id:
+    raise ValueError('Docker removal response differs')
+with (run/'cleanup-record.json').open('x',encoding='utf-8') as stream:
+    stream.write(json.dumps({'container_id':container_id,'container_name':launch['container_name'],'image_reference':request.sandbox_profile.image_reference,'terminal_state':state,'removed':True,'forced':False},indent=2)+'\n')
+print(json.dumps(record))

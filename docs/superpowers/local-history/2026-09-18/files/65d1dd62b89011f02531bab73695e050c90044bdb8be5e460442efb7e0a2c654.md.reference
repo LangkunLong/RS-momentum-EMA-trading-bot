@@ -1,0 +1,174 @@
+# Task 4 Report — Adaptive O'Neil Policy Interface V3
+
+## Outcome
+
+Implemented strategy-universe Task 4 on branch `codex/pit-optimizer-v5-architecture` from accepted
+base `ad43db4`.
+
+The source commit is limited exactly to:
+
+- `core/strategy_policy/contracts_v3.py` (new)
+- `core/strategy_policy/adapter_v3.py` (new)
+- `core/strategy_policy/runtime.py` (modified)
+- `core/strategy_policy/worker.py` (modified)
+- `core/strategy_policy/__init__.py` (modified)
+
+No tests, engine code, V3 baseline policy modules, provider/Docker paths, bundle artifacts, replay,
+qualification, deployment, or market-data files were changed.
+
+## Closed V3 contracts
+
+`contracts_v3.py` defines the exact frozen/slotted composition records from the brief:
+
+- `EntrySnapshotV3`
+- `PortfolioFeaturesV3`
+- `CapacitySnapshotV3`
+- `AllocationSnapshotV3`
+- `EvictionPositionV3`
+- `EvictionSnapshotV3`
+- `AddOnSnapshotV3`
+- `AddOnDecisionV3`
+- `ExitSnapshotV3`
+
+Entry, capacity, allocation, eviction, and exit reuse their existing V2 decision records. The new
+add-on contract is the only new decision record.
+
+Every V3 record has strict closed `to_primitive` / `from_primitive` and canonical JSON conversion.
+Decoding rejects unknown, missing, and duplicate fields; noncanonical JSON bytes; unexpected nested
+shapes; booleans in numeric fields; NaN/infinity; invalid counts/quantities; malformed reason codes;
+noncanonical affiliations/exposure tuples; and future market sessions. Exposure keys are sorted and
+unique. Long-only fractions, open risk, position notionals, returns, MFE/MAE, V2 slot identity, and
+base/snapshot composition are cross-checked.
+
+`validate_add_on_decision()` additionally requires declined requests to reserve no risk/notional,
+accepted requests to carry positive risk, optional caps to exceed the current aggregate position,
+available cash, and total risk not to exceed equity. A `None` cap remains valid for an accepted
+request so Task 5 can apply the trusted engine maximum.
+
+## Trusted adapter
+
+`StrategyPolicyAdapterV3` is a scalar-only engine boundary. It exposes builders for all V3 snapshot
+compositions and accepts no bundle, pandas object, raw transaction row, file, or path.
+
+The portfolio builder recomputes fractions from trusted equity/cash/peak-equity, per-position
+notional and risk amounts, pending-entry count, and sector/industry notional mappings. It rejects:
+
+- cash plus gross exposure that does not equal equity;
+- leverage or open risk above equity/gross exposure;
+- mismatched notional/risk position counts; and
+- sector or industry totals that do not equal trusted gross exposure.
+
+Allocation and capacity composition rechecks their V2 cash/gross/pending facts. Eviction builders
+recompute return and notional fractions and preserve the exact V2 slot/base-position set. Add-on and
+exit builders recompute position value, unrealized return, MFE/MAE, remaining cash, and open risk
+from trusted prices, quantities, extrema, and dollar state.
+
+## Runtime and worker negotiation
+
+- `POLICY_INTERFACE_VERSION` remains `2`; V3 is the explicit opt-in
+  `POLICY_INTERFACE_VERSION_V3 = 3`.
+- V3 contracts and the adapter are lazy public exports, so legacy package imports remain on the V2
+  path until a V3 surface is requested.
+- `InProcessPolicyClient` remains the unchanged V2 baseline client.
+- `InProcessPolicyClientV3` imports exactly the four V3 policy modules (`entry`, `risk`, `position`,
+  `exit`), verifies their six required exports, enforces exact snapshot/decision types, and canonical
+  round-trips responses.
+- `JsonLinePolicyClient` selects exact V2 or V3 snapshot types and exposes `evaluate_add_on` only
+  under V3.
+- Worker bootstrap interface version selects a closed five-method V2 map or six-method V3 map.
+  V3 imports exactly the same four modules and emits no ready frame on module/export mismatch.
+- Envelope field sets, JSON canonicalization, line cap, hashes, HMAC chain, and sequence/request
+  bindings are unchanged. `POLICY_METHODS` remains the exact V2 tuple; `POLICY_METHODS_V3` is
+  additive.
+- Unsupported versions, methods, module/export mismatch, wrong payload pairing, unknown fields,
+  and response schema mismatch fail closed.
+
+## Verification evidence
+
+1. Bounded direct V3 smoke: passed (`task4 V3 contracts/adapter/runtime/worker smoke: ok`). It
+   canonical-round-tripped every V3 snapshot, exercised all six methods through both the in-process
+   client and a real JSON-lines worker using four disposable fake V3 modules, and compared their
+   decisions. The disposable package and smoke script were removed.
+2. The same smoke rejected unknown fields, noncanonical JSON, noncanonical affiliations, future
+   sessions, boolean/NaN numerics, zero add-on quantity, invalid declined risk, invalid reason/cap,
+   cash/gross drift, classification-total drift, and an unsupported worker version.
+3. Serialized snapshot inspection found no bundle, DataFrame, transaction, or filesystem value.
+4. `python -B -m pytest tests/test_strategy_policy.py -q`: **41 passed**. Warnings were the existing
+   websockets deprecation and sandbox-denied pytest-cache write only.
+5. Ruff over the exact five source files: passed (`All checks passed!`).
+6. `py_compile` over the exact five source files: passed.
+7. Lazy public exports and version maps were imported directly: V2 has five methods and V3 six.
+8. `git diff --check`: passed with only existing Windows LF-to-CRLF notices.
+
+## Self-review
+
+- Confirmed the nine required records use exact frozen/slotted composition and no V2 record was
+  modified.
+- Confirmed V2's public version, five-method tuple, canonical envelope layout, hashing/HMAC
+  material, and policy implementation dispatch remain unchanged.
+- Confirmed V3 is explicit and rejects a V2 snapshot for a V3 method (and conversely).
+- Confirmed response types are exact, not subclass/permissive matches, and V3 responses canonical
+  round-trip before crossing the trusted runtime boundary.
+- Confirmed feature records remain the authenticated Task 3 types and candidate policy code sees
+  only immutable scalar snapshots.
+- Confirmed adapter accounting is recomputed from engine-owned amounts rather than candidate
+  fractions and rejects leverage/reconciliation drift.
+- Confirmed no test edit, engine wiring, baseline policy, provider, Docker, replay, qualification,
+  push, or merge was performed.
+
+## Commit
+
+`a66a5e8` — `feat: add adaptive ONeil policy interface v3`
+
+## Independent-review fix round
+
+Resolved all three Important findings and the Minor finding from `task-4-review.md` within
+`core/strategy_policy/contracts_v3.py`; the other four authorized source files and all tests remain
+unchanged.
+
+- `PortfolioFeaturesV3` now requires both canonical sector and industry exposure sums to equal
+  gross exposure within the existing canonical tolerance. Empty classifications are valid only for
+  zero gross exposure. This is enforced equally for direct and decoded construction.
+- An accepted add-on's optional explicit aggregate notional cap must be greater than current
+  notional and no greater than current notional plus remaining cash. `None` retains the engine-owned
+  fallback, and risk remains a separately clamped input for Task 5.
+- Add-on and exit MAE are bounded to `[-1, 0]`. Exit MFE must be at least current unrealized return,
+  which also rejects a V2 base whose peak price is below its current close; peak-derived MFE remains
+  exactly reconciled.
+- Generic nested Task 3 feature decoding now admits only exact JSON scalar number types (`int` or
+  `float`, never `bool`) with finite values, exact `int` semantics for `fundamental_age_days`, exact
+  strings for affiliations, and explicit `None`. `Decimal` and other float-coercible objects fail at
+  ingress rather than during later serialization.
+
+Review-fix verification:
+
+1. Bounded direct smoke passed (`task4 review-fix bounded smoke: ok`) for underreported/empty
+   exposures, cap funding boundaries and `None` fallback, MFE/current inconsistency, MAE `-1` and
+   below-`-1`, `Decimal`/bool/infinite nested feature ingress, every V3 canonical round trip, all six
+   V3 runtime/protocol methods, and an unchanged V2 request round trip. The script was removed.
+2. `python -B -m pytest tests/test_strategy_policy.py -q`: **41 passed** with only the existing
+   websockets and sandbox-denied pytest-cache warnings.
+3. Ruff and `py_compile` over the exact five-file Task 4 scope passed.
+4. `git diff --check` passed with only the existing Windows LF-to-CRLF notice.
+
+Review-fix commit: `72ba31e` — `fix: close policy v3 reconciliation gaps`
+
+## Independent-review fix round 2
+
+Closed the remaining zero-gross tolerance edge from `task-4-rereview.md` in
+`core/strategy_policy/contracts_v3.py` only.
+
+`PortfolioFeaturesV3` now applies structural emptiness before numeric tolerance:
+
+- when gross exposure is exactly zero, both sector and industry exposure tuples must be empty;
+- when gross exposure is positive, both tuples must be nonempty; and
+- only positive-gross total reconciliation uses the canonical floating-point tolerance.
+
+The bounded direct smoke passed for exact zero with empty tuples; rejection of `5e-13` sector or
+industry exposure at zero gross; rejection of either empty tuple at positive gross; and intentional
+acceptance/rejection immediately inside/outside the positive-gross tolerance. The disposable script
+was removed. The 41 focused strategy-policy tests, Ruff, `py_compile`, and `git diff --check` also
+passed; warnings remained limited to the existing websockets deprecation, sandbox-denied pytest
+cache, and Windows line-ending notice.
+
+Review-fix-2 commit: `561bd37` — `fix: enforce empty zero-exposure classifications`

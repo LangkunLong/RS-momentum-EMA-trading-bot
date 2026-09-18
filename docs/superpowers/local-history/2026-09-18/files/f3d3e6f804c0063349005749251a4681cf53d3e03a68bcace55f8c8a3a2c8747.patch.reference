@@ -1,0 +1,1170 @@
+diff --git a/core/pit_optimizer_v5/cli.py b/core/pit_optimizer_v5/cli.py
+index dabf2cf..89f9713 100644
+--- a/core/pit_optimizer_v5/cli.py
++++ b/core/pit_optimizer_v5/cli.py
+@@ -492,143 +492,177 @@ class ProductionRoundFactoryV5:
+             or repository.root_identity_sha256 != self.adapter_config.repository_root_identity_sha256
+         ):
+             raise V5CliFailure("production_authority_mismatch")
+-        provider_capabilities = authorities.manifest.provider
+-        if (
+-            provider_capabilities is None
+-            or provider_capabilities.automatic_retries != 0
+-            or provider_capabilities.schema_repair_calls != 0
+-        ):
+-            raise V5CliFailure("production_provider_invalid")
+-        try:
+-            owner = WorkspaceOwnerV5(
+-                authorities.manifest.campaign_id,
+-                round_index,
+-                owner_token_sha256,
+-                _controller_lease_id_v5(
+-                    manifest_sha256=authorities.manifest.sha256,
+-                    round_index=round_index,
+-                    owner_token_sha256=owner_token_sha256,
+-                ),
+-            )
+-            ledger = LocalRoleAuthorizationLedgerV5(
+-                repository=repository,
+-                manifest=authorities.manifest,
+-            )
+-            gateway = OpenRouterOneShotJsonCompletionV5(
+-                ledger=ledger,
+-                api_key_environment_variable=adapter_config.api_key_environment_variable,
+-            )
+-            role_runner = AuthorizedRoleRunnerV5(
+-                capabilities=provider_capabilities,
+-                provider=GatewayCompletionProviderV5(gateway),
+-                lifecycle=ledger,
+-            )
+-            invoker = LedgerBackedRoleInvokerV5(
+-                runner=role_runner,
+-                reconciler=ledger,
+-            )
+-        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+-            raise V5CliFailure("production_provider_invalid") from exc
+-        if (
+-            ledger.ledger_identity_sha256 != adapter_config.ledger_identity_sha256
+-            or ledger.audit_store_identity_sha256 != adapter_config.audit_store_identity_sha256
+-            or gateway.gateway_identity_sha256 != adapter_config.gateway_identity_sha256
+-        ):
+-            raise V5CliFailure("production_provider_invalid")
+-        try:
+-            clock = SystemMonotonicClockV5()
+-            roots = WorkspaceRootsV5(
+-                adapter_config.source_root,
+-                adapter_config.workspace_root,
+-            )
+-            driver = LocalGitWorkspaceDriverV5(
+-                roots=roots,
+-                source_commit=authorities.manifest.source_commit,
+-                git_executable=Path(adapter_config.git_executable),
+-                repository=repository,
+-                owner=owner,
+-            )
+-            materializer = GitCandidateMaterializerV5(
+-                roots=roots,
+-                driver=driver,
+-                token_factory=lambda: secrets.token_hex(32),
+-            )
+-            mount_factory = LocalSandboxMountFactoryV5(
+-                manifest=authorities.manifest,
+-                evaluator_contract=authorities.evaluator_contract,
+-                sandbox_profile=authorities.sandbox_profile,
+-                owner=owner,
+-                workspace_driver=driver,
+-                data_root=Path(adapter_config.data_root),
+-                output_root=Path(adapter_config.output_root),
+-                repository=repository,
+-            )
+-            executor = LocalContainerExecutorV5(
+-                manifest=authorities.manifest,
+-                sandbox_profile=authorities.sandbox_profile,
+-                owner=owner,
+-                mount_factory=mount_factory,
+-                docker_executable=Path(adapter_config.docker_executable),
+-                control_root=Path(adapter_config.control_root),
+-                repository=repository,
+-            )
+-            runtime_evaluator = RuntimeDockerPanelEvaluatorV5(DockerPanelEvaluatorV5(executor=executor, clock=clock))
+-            base = LocalCandidateBaseOperationsV5(
+-                manifest=authorities.manifest,
+-                panel_plan=authorities.panel_plan,
+-                evaluator_contract=authorities.evaluator_contract,
+-                sandbox_profile=authorities.sandbox_profile,
+-                baseline=authorities.baseline,
+-                owner=owner,
++        composition = _compose_production_round_from_paths_v5(
++            repository=repository,
++            authorities=authorities,
++            round_index=round_index,
++            owner_token_sha256=owner_token_sha256,
++            source_root=adapter_config.source_root,
++            workspace_root=adapter_config.workspace_root,
++            data_root=adapter_config.data_root,
++            output_root=adapter_config.output_root,
++            control_root=adapter_config.control_root,
++            git_executable=adapter_config.git_executable,
++            docker_executable=adapter_config.docker_executable,
++            api_key_environment_variable=adapter_config.api_key_environment_variable,
++        )
++        composition.validate_for(
++            repository=repository,
++            authorities=authorities,
++            round_index=round_index,
++            owner_token_sha256=owner_token_sha256,
++            adapter_config=adapter_config,
++        )
++        return composition
++
++
++def _compose_production_round_from_paths_v5(
++    *,
++    repository: LocalArtifactRepositoryV5,
++    authorities: CampaignAuthoritiesV5,
++    round_index: int,
++    owner_token_sha256: str,
++    source_root: str,
++    workspace_root: str,
++    data_root: str,
++    output_root: str,
++    control_root: str,
++    git_executable: str,
++    docker_executable: str,
++    api_key_environment_variable: str = "OPENROUTER_API_KEY",
++) -> ProductionRoundCompositionV5:
++    """Construct real local adapters without invoking a provider, Git, or Docker."""
++    provider_capabilities = authorities.manifest.provider
++    if (
++        provider_capabilities is None
++        or provider_capabilities.automatic_retries != 0
++        or provider_capabilities.schema_repair_calls != 0
++    ):
++        raise V5CliFailure("production_provider_invalid")
++    try:
++        owner = WorkspaceOwnerV5(
++            authorities.manifest.campaign_id,
++            round_index,
++            owner_token_sha256,
++            _controller_lease_id_v5(
++                manifest_sha256=authorities.manifest.sha256,
++                round_index=round_index,
++                owner_token_sha256=owner_token_sha256,
++            ),
++        )
++        ledger = LocalRoleAuthorizationLedgerV5(
++            repository=repository,
++            manifest=authorities.manifest,
++        )
++        gateway = OpenRouterOneShotJsonCompletionV5(
++            ledger=ledger,
++            api_key_environment_variable=api_key_environment_variable,
++        )
++        role_runner = AuthorizedRoleRunnerV5(
++            capabilities=provider_capabilities,
++            provider=GatewayCompletionProviderV5(gateway),
++            lifecycle=ledger,
++        )
++        invoker = LedgerBackedRoleInvokerV5(
++            runner=role_runner,
++            reconciler=ledger,
++        )
++    except (OSError, RuntimeError, TypeError, ValueError) as exc:
++        raise V5CliFailure("production_provider_invalid") from exc
++    try:
++        clock = SystemMonotonicClockV5()
++        roots = WorkspaceRootsV5(
++            source_root,
++            workspace_root,
++        )
++        driver = LocalGitWorkspaceDriverV5(
++            roots=roots,
++            source_commit=authorities.manifest.source_commit,
++            git_executable=Path(git_executable),
++            repository=repository,
++            owner=owner,
++        )
++        materializer = GitCandidateMaterializerV5(
++            roots=roots,
++            driver=driver,
++            token_factory=lambda: secrets.token_hex(32),
++        )
++        mount_factory = LocalSandboxMountFactoryV5(
++            manifest=authorities.manifest,
++            evaluator_contract=authorities.evaluator_contract,
++            sandbox_profile=authorities.sandbox_profile,
++            owner=owner,
++            workspace_driver=driver,
++            data_root=Path(data_root),
++            output_root=Path(output_root),
++            repository=repository,
++        )
++        executor = LocalContainerExecutorV5(
++            manifest=authorities.manifest,
++            sandbox_profile=authorities.sandbox_profile,
++            owner=owner,
++            mount_factory=mount_factory,
++            docker_executable=Path(docker_executable),
++            control_root=Path(control_root),
++            repository=repository,
++        )
++        runtime_evaluator = RuntimeDockerPanelEvaluatorV5(DockerPanelEvaluatorV5(executor=executor, clock=clock))
++        base = LocalCandidateBaseOperationsV5(
++            manifest=authorities.manifest,
++            panel_plan=authorities.panel_plan,
++            evaluator_contract=authorities.evaluator_contract,
++            sandbox_profile=authorities.sandbox_profile,
++            baseline=authorities.baseline,
++            owner=owner,
++            repository=repository,
++            materializer=materializer,
++            mount_factory=mount_factory,
++            probe_evaluator=runtime_evaluator,
++            clock=clock,
++        )
++        candidate = DockerCandidateRuntimeV5(
++            manifest=authorities.manifest,
++            panel_plan=authorities.panel_plan,
++            evaluator_contract=authorities.evaluator_contract,
++            sandbox_profile=authorities.sandbox_profile,
++            owner=owner,
++            base=base,
++            mounts=mount_factory,
++            evaluator=runtime_evaluator,
++        )
++        dependencies = FeedbackRoundDependenciesV5(
++            persistence=repository,
++            invoker=invoker,
++            requests=LocalRoleRequestFactoryV5(
+                 repository=repository,
+-                materializer=materializer,
+-                mount_factory=mount_factory,
+-                probe_evaluator=runtime_evaluator,
+-                clock=clock,
+-            )
+-            candidate = DockerCandidateRuntimeV5(
+                 manifest=authorities.manifest,
+-                panel_plan=authorities.panel_plan,
+-                evaluator_contract=authorities.evaluator_contract,
+-                sandbox_profile=authorities.sandbox_profile,
+-                owner=owner,
+-                base=base,
+-                mounts=mount_factory,
+-                evaluator=runtime_evaluator,
+-            )
+-            dependencies = FeedbackRoundDependenciesV5(
+-                persistence=repository,
+-                invoker=invoker,
+-                requests=LocalRoleRequestFactoryV5(
+-                    repository=repository,
+-                    manifest=authorities.manifest,
+-                ),
+-                novelty=SelectionNoveltyResolverV5(),
+-                candidates=candidate,
+-                records=CanonicalExperimentRecordFactoryV5(),
+-                archive_reducers=LocalArchiveReducerFactoryV5(repository),
+-                clock=clock,
+-                cancellation=ControllerCancellationV5(),
+-                cleanup=CompositeOwnedCleanupV5(
+-                    owner,
+-                    materializer,
+-                    executor,
+-                    clock,
+-                ),
+-            )
+-        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+-            raise V5CliFailure("production_dependency_invalid") from exc
+-        return ProductionRoundCompositionV5(
+-            FeedbackRoundInputV5(
+-                authorities.manifest,
+-                authorities.panel_plan,
+-                authorities.evaluator_contract,
+-                authorities.baseline,
+-                round_index,
+-                owner_token_sha256,
+             ),
+-            dependencies,
++            novelty=SelectionNoveltyResolverV5(),
++            candidates=candidate,
++            records=CanonicalExperimentRecordFactoryV5(),
++            archive_reducers=LocalArchiveReducerFactoryV5(repository),
++            clock=clock,
++            cancellation=ControllerCancellationV5(),
++            cleanup=CompositeOwnedCleanupV5(
++                owner,
++                materializer,
++                executor,
++                clock,
++            ),
+         )
++    except (OSError, RuntimeError, TypeError, ValueError) as exc:
++        raise V5CliFailure("production_dependency_invalid") from exc
++    return ProductionRoundCompositionV5(
++        FeedbackRoundInputV5(
++            authorities.manifest,
++            authorities.panel_plan,
++            authorities.evaluator_contract,
++            authorities.baseline,
++            round_index,
++            owner_token_sha256,
++        ),
++        dependencies,
++    )
+ 
+ 
+ @runtime_checkable
+@@ -1040,6 +1074,24 @@ def build_parser_v5() -> argparse.ArgumentParser:
+         if name in {"run", "resume", "verify-run", "summarize"}:
+             command.add_argument("--adapter-config-path")
+             command.add_argument("--adapter-config-sha256")
++    for name in ("prepare-production", "run-campaign", "resume-campaign"):
++        command = commands.add_parser(name, allow_abbrev=False)
++        command.add_argument("--artifact-root", required=True)
++        command.add_argument("--manifest-path", required=True)
++        command.add_argument("--manifest-sha256", required=True)
++        command.add_argument("--owner-token-sha256", required=name != "prepare-production")
++        if name == "prepare-production":
++            for root in ("source", "workspace", "data", "output", "control"):
++                command.add_argument(f"--{root}-root", required=True)
++            command.add_argument("--git-executable", help="Git executable; defaults to discovery on PATH")
++            command.add_argument("--docker-executable", help="Docker executable; defaults to discovery on PATH")
++            command.add_argument("--round-index", type=int, default=1)
++            command.add_argument(
++                "--output-path", required=True, help="Adapter config path relative to the artifact root"
++            )
++        else:
++            command.add_argument("--adapter-config-path", required=True)
++            command.add_argument("--adapter-config-sha256", required=True)
+     initialize = commands.add_parser("init-stage-ledgers", allow_abbrev=False)
+     _add_panel_data_arguments_v5(initialize)
+     initialize.add_argument("--confirmation-ledger-path", required=True)
+@@ -1116,6 +1168,14 @@ def build_parser_v5() -> argparse.ArgumentParser:
+         command.add_argument("--artifact-root", required=True)
+         command.add_argument("--manifest-path", required=True)
+         command.add_argument("--manifest-sha256", required=True)
++        if name == "render-command":
++            command.add_argument("--adapter-config-path")
++            command.add_argument("--adapter-config-sha256")
++            command.add_argument("--round-index", type=int, default=1)
++            command.add_argument("--owner-token-sha256")
++            command.add_argument(
++                "--execution-command", choices=("run", "resume", "run-campaign", "resume-campaign"), default="run"
++            )
+     confirmation = commands.add_parser("build-confirmation-attempt", allow_abbrev=False)
+     confirmation.add_argument("--artifact-root", required=True)
+     confirmation.add_argument("--attempt-id", required=True)
+@@ -1448,19 +1508,36 @@ def dispatch_manifest_cli_v5(
+             )
+             projection = _manifest_projection_v5(authenticated, status="verified")
+             if namespace.command == "render-command":
+-                rendered = render_discovery_command_v5(
+-                    authenticated=authenticated,
+-                )
++                if (namespace.adapter_config_path is None) != (namespace.adapter_config_sha256 is None):
++                    raise ValueError("Supply both --adapter-config-path and --adapter-config-sha256")
++                if namespace.adapter_config_path is None:
++                    rendered = render_discovery_command_v5(authenticated=authenticated)
++                else:
++                    from core.pit_optimizer_v5.operations import render_production_command_v5
++
++                    if namespace.owner_token_sha256 is None:
++                        raise ValueError("Supply the --owner-token-sha256 returned by prepare-production")
++                    rendered = render_production_command_v5(
++                        repository=repository,
++                        authenticated=authenticated,
++                        artifact_root=artifact_root,
++                        adapter_config_ref=ArtifactRefV5(
++                            namespace.adapter_config_path, namespace.adapter_config_sha256
++                        ),
++                        round_index=namespace.round_index,
++                        owner_token_sha256=namespace.owner_token_sha256,
++                        command=namespace.execution_command,
++                    )
+                 projection["authorization"] = rendered
+         emit("PIT_OPTIMIZER_V5_MANIFEST=" + canonical_json_bytes_v5(projection).decode("utf-8"))
+         return 0
+     except SystemExit:
+         raise
+-    except BaseException:
++    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+         emit(
+             "PIT_OPTIMIZER_V5_MANIFEST="
+             + canonical_json_bytes_v5(
+-                {"schema_version": 5, "status": "failed", "reason": "manifest_command_failed"}
++                {"schema_version": 5, "status": "failed", "reason": "manifest_command_failed", "diagnostic": str(exc)}
+             ).decode("utf-8")
+         )
+         return 2
+@@ -1705,6 +1782,10 @@ def dispatch_v5_cli(
+     emit: Callable[[str], None] = print,
+ ) -> int:
+     """Parse and dispatch one command; dependency construction stays outside parsing."""
++    if argv and argv[0] in {"prepare-production", "run-campaign", "resume-campaign"}:
++        from core.pit_optimizer_v5.operations import dispatch_production_operations_cli_v5
++
++        return dispatch_production_operations_cli_v5(argv, emit=emit)
+     if argv and argv[0] in _BASELINE_COMMANDS:
+         return dispatch_baseline_cli_v5(argv, emit=emit)
+     if argv and argv[0] in _PANEL_COMMANDS:
+diff --git a/core/pit_optimizer_v5/operations.py b/core/pit_optimizer_v5/operations.py
+new file mode 100644
+index 0000000..fb82f38
+--- /dev/null
++++ b/core/pit_optimizer_v5/operations.py
+@@ -0,0 +1,589 @@
++"""Host-only setup and sequential launch wiring for the production V5 runtime."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, replace
++import hashlib
++import os
++from pathlib import Path
++import secrets
++import shutil
++import sys
++import time
++from typing import Callable, Sequence
++
++from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5
++from core.pit_optimizer_v5.cli import (
++    CampaignAuthoritiesV5,
++    ProductionAdapterConfigV5,
++    ProductionRoundFactoryV5,
++    ProductionV5CommandServices,
++    _compose_production_round_from_paths_v5,
++    build_parser_v5,
++)
++from core.pit_optimizer_v5.contracts import ArtifactRefV5, canonical_json_bytes_v5, canonical_sha256_v5
++from core.pit_optimizer_v5.manifest import (
++    AuthenticatedCampaignManifestV5,
++    authenticate_campaign_manifest_v5,
++    capture_clean_policy_snapshot_v5,
++)
++from core.pit_optimizer_v5.memory import CleanupResultPayloadV5, RoundOutcomePayloadV5
++from core.pit_optimizer_v5.runtime import run_feedback_round_v5
++from core.pit_optimizer_v5.summary import summarize_repository_v5
++
++
++_PATH_FIELDS = (
++    "source_root",
++    "workspace_root",
++    "data_root",
++    "output_root",
++    "control_root",
++    "git_executable",
++    "docker_executable",
++)
++
++
++class ProductionOperationFailureV5(ValueError):
++    """Actionable local operator diagnostic; never includes provider responses."""
++
++
++@dataclass(frozen=True, slots=True)
++class CampaignLaunchV5:
++    manifest_ref: ArtifactRefV5
++    adapter_config_ref: ArtifactRefV5
++    owner_token_sha256: str
++    started_epoch_ms: int
++
++    def __post_init__(self) -> None:
++        if type(self.manifest_ref) is not ArtifactRefV5 or type(self.adapter_config_ref) is not ArtifactRefV5:
++            raise ValueError("campaign launch references are invalid")
++        _owner_token(self.owner_token_sha256)
++        if type(self.started_epoch_ms) is not int or self.started_epoch_ms < 1:
++            raise ValueError("campaign start time is invalid")
++
++
++@dataclass(frozen=True, slots=True)
++class CampaignRoundLaunchV5:
++    round_index: int
++    adapter_config_ref: ArtifactRefV5
++    owner_token_sha256: str
++    started_epoch_ms: int | None = None
++
++    def __post_init__(self) -> None:
++        if type(self.round_index) is not int or self.round_index < 1:
++            raise ValueError("campaign launch round is invalid")
++        if type(self.adapter_config_ref) is not ArtifactRefV5:
++            raise ValueError("campaign round config reference is invalid")
++        _owner_token(self.owner_token_sha256)
++        if self.started_epoch_ms is not None and (type(self.started_epoch_ms) is not int or self.started_epoch_ms < 1):
++            raise ValueError("round start time is invalid")
++
++
++def _owner_token(value: str) -> str:
++    if type(value) is not str or len(value) != 64 or any(ch not in "0123456789abcdef" for ch in value):
++        raise ProductionOperationFailureV5("--owner-token-sha256 must contain 64 lowercase hexadecimal characters")
++    return value
++
++
++def _authorities(authenticated: AuthenticatedCampaignManifestV5) -> CampaignAuthoritiesV5:
++    return CampaignAuthoritiesV5(
++        authenticated.manifest,
++        authenticated.panel_plan,
++        authenticated.evaluator_contract,
++        authenticated.baseline_authority,
++        authenticated.sandbox_profile,
++    )
++
++
++def _existing_path(value: str | None, *, name: str, executable: bool = False) -> str:
++    selected = shutil.which(name) if value is None and executable else value
++    if selected is None:
++        raise ProductionOperationFailureV5(
++            f"Install {name} or pass --{name}-executable with its absolute executable path"
++        )
++    path = Path(os.path.abspath(selected))
++    if not (path.is_file() if executable else path.is_dir()):
++        kind = "executable file" if executable else "directory"
++        raise ProductionOperationFailureV5(f"Missing {name} {kind}: {path}. Create or supply the required resource")
++    return str(path)
++
++
++def _derive_config(
++    *,
++    repository: LocalArtifactRepositoryV5,
++    authenticated: AuthenticatedCampaignManifestV5,
++    round_index: int,
++    owner_token_sha256: str,
++    paths: dict[str, str],
++) -> ProductionAdapterConfigV5:
++    authorities = _authorities(authenticated)
++    try:
++        composition = _compose_production_round_from_paths_v5(
++            repository=repository,
++            authorities=authorities,
++            round_index=round_index,
++            owner_token_sha256=owner_token_sha256,
++            **paths,
++        )
++    except (OSError, RuntimeError, TypeError, ValueError) as exc:
++        detail = str(exc.__cause__ or exc)
++        raise ProductionOperationFailureV5(
++            "Cannot compose the local production adapters: "
++            + detail
++            + ". Supply a provider-enabled manifest with zero automatic retries/schema repairs, "
++            "existing disjoint source/workspace/data/output/control directories, and real Git/Docker executables"
++        ) from exc
++    candidate = composition.dependencies.candidates
++    base = candidate.base_operations
++    gateway = composition.dependencies.invoker.runner.completion_provider.gateway
++    config = ProductionAdapterConfigV5(
++        schema_version=5,
++        campaign_manifest_sha256=authenticated.manifest.sha256,
++        repository_root_identity_sha256=repository.root_identity_sha256,
++        gateway_identity_sha256=gateway.gateway_identity_sha256,
++        ledger_identity_sha256=gateway.ledger_identity_sha256,
++        audit_store_identity_sha256=gateway.audit_store_identity_sha256,
++        candidate_base_identity_sha256=base.base_identity_sha256,
++        workspace_driver_identity_sha256=base.materializer.driver.driver_identity_sha256,
++        mount_factory_identity_sha256=candidate.mount_factory.mount_identity_sha256,
++        container_executor_identity_sha256=candidate.panel_evaluator.evaluator.executor.executor_identity_sha256,
++        **paths,
++    )
++    composition.validate_for(
++        repository=repository,
++        authorities=authorities,
++        round_index=round_index,
++        owner_token_sha256=owner_token_sha256,
++        adapter_config=config,
++    )
++    return config
++
++
++def prepare_production_adapter_config_v5(
++    *,
++    repository: LocalArtifactRepositoryV5,
++    authenticated: AuthenticatedCampaignManifestV5,
++    output_path: str,
++    source_root: str,
++    workspace_root: str,
++    data_root: str,
++    output_root: str,
++    control_root: str,
++    git_executable: str | None = None,
++    docker_executable: str | None = None,
++    round_index: int = 1,
++    owner_token_sha256: str | None = None,
++) -> dict[str, object]:
++    """Verify local resources and save actual adapter identities without execution."""
++    ArtifactRefV5(output_path, "0" * 64)
++    token = _owner_token(secrets.token_hex(32) if owner_token_sha256 is None else owner_token_sha256)
++    paths = {
++        "source_root": _existing_path(source_root, name="source root"),
++        "workspace_root": _existing_path(workspace_root, name="workspace root"),
++        "data_root": _existing_path(data_root, name="data root"),
++        "output_root": _existing_path(output_root, name="output root"),
++        "control_root": _existing_path(control_root, name="control root"),
++        "git_executable": _existing_path(git_executable, name="git", executable=True),
++        "docker_executable": _existing_path(docker_executable, name="docker", executable=True),
++    }
++    data = Path(paths["data_root"])
++    expected = {
++        "pit_bundle.sqlite3": authenticated.evaluator_contract.pit_bundle_sha256,
++        "prices_provenance.json": authenticated.evaluator_contract.prices_provenance_sha256,
++    }
++    if set(item.name for item in data.iterdir()) != set(expected):
++        raise ProductionOperationFailureV5(
++            "The data root must contain exactly pit_bundle.sqlite3 and prices_provenance.json from this manifest"
++        )
++    for name, digest in expected.items():
++        path = data / name
++        if not path.is_file() or path.is_symlink():
++            raise ProductionOperationFailureV5(f"The data resource must be a regular file: {path}")
++        with path.open("rb") as handle:
++            actual = hashlib.file_digest(handle, "sha256").hexdigest()
++        if actual != digest:
++            raise ProductionOperationFailureV5(f"Data digest mismatch for {path}; supply the manifest-bound file")
++    try:
++        snapshot = capture_clean_policy_snapshot_v5(
++            source_root=Path(paths["source_root"]),
++            git_executable=Path(paths["git_executable"]),
++            expected_source_commit=authenticated.manifest.source_commit,
++        )
++    except (OSError, RuntimeError, ValueError) as exc:
++        raise ProductionOperationFailureV5(
++            "Use a clean source checkout at manifest.source_commit with the authenticated baseline policy files"
++        ) from exc
++    if snapshot.editable_source_sha256 != authenticated.policy_scope.editable_source_sha256:
++        raise ProductionOperationFailureV5("Source policy files differ from the authenticated manifest policy scope")
++    config = _derive_config(
++        repository=repository,
++        authenticated=authenticated,
++        round_index=round_index,
++        owner_token_sha256=token,
++        paths=paths,
++    )
++    reference = repository.create_typed_artifact(output_path, config)
++    return {
++        "schema_version": 5,
++        "status": "prepared",
++        "manifest_ref": authenticated.manifest_ref,
++        "adapter_config_ref": reference,
++        "round_index": round_index,
++        "owner_token_sha256": token,
++        "provider_executed": False,
++        "evaluation_executed": False,
++    }
++
++
++def render_production_command_v5(
++    *,
++    repository: LocalArtifactRepositoryV5,
++    authenticated: AuthenticatedCampaignManifestV5,
++    artifact_root: Path,
++    adapter_config_ref: ArtifactRefV5,
++    round_index: int,
++    owner_token_sha256: str,
++    command: str = "run",
++) -> dict[str, object]:
++    """Return argv plus a PowerShell command after verifying the local adapter graph."""
++    if command not in {"run", "resume", "run-campaign", "resume-campaign"}:
++        raise ProductionOperationFailureV5("The rendered command must be run, resume, run-campaign, or resume-campaign")
++    if command.endswith("campaign") and round_index != 1:
++        raise ProductionOperationFailureV5("Campaign launch uses the round 1 configuration and owner")
++    token = _owner_token(owner_token_sha256)
++    authorities = _authorities(authenticated)
++    config = ProductionV5CommandServices._adapter_config(repository, authorities, adapter_config_ref)
++    composition = ProductionRoundFactoryV5(adapter_config_ref=adapter_config_ref, adapter_config=config).compose_round(
++        repository=repository,
++        authorities=authorities,
++        round_index=round_index,
++        owner_token_sha256=token,
++        adapter_config=config,
++    )
++    composition.validate_for(
++        repository=repository,
++        authorities=authorities,
++        round_index=round_index,
++        owner_token_sha256=token,
++        adapter_config=config,
++    )
++    argv = [
++        sys.executable,
++        "-B",
++        "-m",
++        "core.pit_optimizer_v5.cli",
++        command,
++        "--artifact-root",
++        str(artifact_root),
++        "--manifest-path",
++        authenticated.manifest_ref.relative_path,
++        "--manifest-sha256",
++        authenticated.manifest_ref.sha256,
++        "--adapter-config-path",
++        adapter_config_ref.relative_path,
++        "--adapter-config-sha256",
++        adapter_config_ref.sha256,
++        "--owner-token-sha256",
++        token,
++    ]
++    if not command.endswith("campaign"):
++        argv.extend(("--round-index", str(round_index)))
++    return {
++        "schema_version": 5,
++        "executable": True,
++        "adapter_composition": "prepared",
++        "manifest_ref": authenticated.manifest_ref,
++        "adapter_config_ref": adapter_config_ref,
++        "round_index": round_index,
++        "owner_token_sha256": token,
++        "argv": tuple(argv),
++        "working_directory": str(Path(__file__).resolve().parents[2]),
++        "powershell_command": "& " + " ".join("'" + arg.replace("'", "''") + "'" for arg in argv),
++        "provider_executed": False,
++        "evaluation_executed": False,
++    }
++
++
++def run_production_campaign_v5(
++    *,
++    repository: LocalArtifactRepositoryV5,
++    authenticated: AuthenticatedCampaignManifestV5,
++    adapter_config_ref: ArtifactRefV5,
++    owner_token_sha256: str,
++    resume: bool = False,
++    emit_round: Callable[[dict[str, object]], None] | None = None,
++) -> dict[str, object]:
++    """Run existing rounds sequentially under the original persisted campaign deadline."""
++    manifest = authenticated.manifest
++    authorities = _authorities(authenticated)
++    token = _owner_token(owner_token_sha256)
++    config = ProductionV5CommandServices._adapter_config(repository, authorities, adapter_config_ref)
++    key = manifest.sha256
++    with repository.adapter_state_transition(namespace="campaign-launch", key=key):
++        # Recheck the original round's identities even on resume, so deriving a
++        # later owner-bound config cannot quietly accept changed host resources.
++        first = ProductionRoundFactoryV5(adapter_config_ref=adapter_config_ref, adapter_config=config).compose_round(
++            repository=repository,
++            authorities=authorities,
++            round_index=1,
++            owner_token_sha256=token,
++            adapter_config=config,
++        )
++        first.validate_for(
++            repository=repository,
++            authorities=authorities,
++            round_index=1,
++            owner_token_sha256=token,
++            adapter_config=config,
++        )
++        launch = repository.load_typed_state(namespace="campaign-launch", key=key, value_type=CampaignLaunchV5)
++        if launch is None:
++            if resume:
++                raise ProductionOperationFailureV5(
++                    "No campaign launch state exists; use run-campaign for a fresh campaign"
++                )
++            if repository.load_checkpoint() is not None or any(
++                repository.load_round_events(campaign_id=manifest.campaign_id, round_index=index)
++                for index in range(1, manifest.search.max_feedback_rounds + 1)
++            ):
++                raise ProductionOperationFailureV5("Campaign already has round state; use its original resume command")
++            # An unjournaled paid reservation also makes a campaign non-fresh.
++            ProductionV5CommandServices._verify_local_run(repository, authorities, config)
++            launch = CampaignLaunchV5(
++                authenticated.manifest_ref, adapter_config_ref, token, time.time_ns() // 1_000_000
++            )
++            repository.append_typed_state(namespace="campaign-launch", key=key, value=launch)
++        elif not resume:
++            raise ProductionOperationFailureV5(
++                "Campaign launch already exists; use resume-campaign with the original config and owner"
++            )
++        if (launch.manifest_ref, launch.adapter_config_ref, launch.owner_token_sha256) != (
++            authenticated.manifest_ref,
++            adapter_config_ref,
++            token,
++        ):
++            raise ProductionOperationFailureV5(
++                "Resume must use the original campaign manifest, adapter config, and owner"
++            )
++        now_ms = time.time_ns() // 1_000_000
++        if now_ms < launch.started_epoch_ms:
++            raise ProductionOperationFailureV5(
++                "Host clock precedes persisted campaign start; correct the clock before resuming"
++            )
++        remaining = manifest.resources.campaign_wall_timeout_seconds - (now_ms - launch.started_epoch_ms) / 1000
++        deadline = time.monotonic() + remaining
++        rounds = []
++        reason = "max_feedback_rounds"
++        for round_index in range(1, manifest.search.max_feedback_rounds + 1):
++            events = repository.load_round_events(campaign_id=manifest.campaign_id, round_index=round_index)
++            payloads = tuple(
++                repository.load_round_payload(item.payload_ref, expected_kind=item.event_kind) for item in events
++            )
++            terminal = next((item for item in payloads if type(item) is RoundOutcomePayloadV5), None)
++            cleanup = next((item for item in reversed(payloads) if type(item) is CleanupResultPayloadV5), None)
++            checkpoint = repository.load_checkpoint()
++            committed = checkpoint is not None and any(
++                repository.load_experiment(ref).round_index == round_index for ref in checkpoint.record_refs
++            )
++            settled = committed or terminal is not None
++            if settled and cleanup is not None and cleanup.cleanup_complete:
++                status = "completed" if committed else terminal.outcome
++                rounds.append({"round_index": round_index, "status": status, "reused": True})
++                if status not in {"completed", "no_novel_hypothesis"}:
++                    reason = status
++                    break
++                continue
++            round_key = canonical_sha256_v5({"campaign_manifest_sha256": key, "round_index": round_index})
++            entry = repository.load_typed_state(
++                namespace="campaign-round", key=round_key, value_type=CampaignRoundLaunchV5
++            )
++            if entry is None:
++                if events:
++                    raise ProductionOperationFailureV5(
++                        "Round journal has no campaign launch record; inspect its original single-round owner/config"
++                    )
++                if time.monotonic() >= deadline:
++                    reason = "campaign_deadline_exhausted"
++                    break
++                usage = summarize_repository_v5(
++                    repository=repository, manifest=manifest, command="summarize", readiness_code="ready"
++                )
++                provider = manifest.provider
++                if provider is not None and (
++                    usage.role_calls >= provider.maximum_role_calls
++                    or usage.total_tokens >= provider.maximum_total_tokens
++                    or (provider.maximum_usd is not None and usage.cost_usd >= provider.maximum_usd)
++                ):
++                    reason = "provider_budget_exhausted"
++                    break
++                round_config = (
++                    config
++                    if round_index == 1
++                    else _derive_config(
++                        repository=repository,
++                        authenticated=authenticated,
++                        round_index=round_index,
++                        owner_token_sha256=token,
++                        paths={field: getattr(config, field) for field in _PATH_FIELDS},
++                    )
++                )
++                round_ref = (
++                    adapter_config_ref
++                    if round_index == 1
++                    else repository.create_typed_artifact(
++                        f"campaigns/{key}/adapter-config-round-{round_index}.json",
++                        round_config,
++                    )
++                )
++                entry = CampaignRoundLaunchV5(round_index, round_ref, token)
++                repository.append_typed_state(namespace="campaign-round", key=round_key, value=entry)
++            if (
++                entry.round_index != round_index
++                or entry.owner_token_sha256 != token
++                or entry.started_epoch_ms is not None
++            ):
++                raise ProductionOperationFailureV5("Persisted round ownership differs from campaign launch")
++            started = repository.load_typed_state(
++                namespace="campaign-round-started", key=round_key, value_type=CampaignRoundLaunchV5
++            )
++            if started is not None and (
++                started.started_epoch_ms is None or replace(started, started_epoch_ms=None) != entry
++            ):
++                raise ProductionOperationFailureV5("Persisted round start differs from its configuration")
++            if started is not None and not events:
++                raise ProductionOperationFailureV5(
++                    "Round start was persisted but no round journal exists; inspect provider reservations before recovery. "
++                    "The campaign will not silently restart this uncertain round"
++                )
++            if time.monotonic() >= deadline and not events:
++                reason = "campaign_deadline_exhausted"
++                break
++            round_config = ProductionV5CommandServices._adapter_config(
++                repository, authorities, entry.adapter_config_ref
++            )
++            composition = ProductionRoundFactoryV5(
++                adapter_config_ref=entry.adapter_config_ref,
++                adapter_config=round_config,
++            ).compose_round(
++                repository=repository,
++                authorities=authorities,
++                round_index=round_index,
++                owner_token_sha256=entry.owner_token_sha256,
++                adapter_config=round_config,
++            )
++            composition.validate_for(
++                repository=repository,
++                authorities=authorities,
++                round_index=round_index,
++                owner_token_sha256=entry.owner_token_sha256,
++                adapter_config=round_config,
++            )
++            now_ms = time.time_ns() // 1_000_000
++            if started is None:
++                started = replace(entry, started_epoch_ms=now_ms)
++                repository.append_typed_state(namespace="campaign-round-started", key=round_key, value=started)
++            if now_ms < started.started_epoch_ms:
++                raise ProductionOperationFailureV5(
++                    "Host clock precedes persisted round start; correct the clock before resuming"
++                )
++            round_remaining = manifest.resources.round_wall_timeout_seconds - (now_ms - started.started_epoch_ms) / 1000
++            round_deadline = min(deadline, time.monotonic() + round_remaining)
++            result = run_feedback_round_v5(
++                composition.inputs,
++                composition.dependencies,
++                campaign_deadline_monotonic=round_deadline,
++            )
++            ProductionV5CommandServices._verify_local_run(repository, authorities, round_config)
++            row = {
++                "round_index": round_index,
++                "status": result.status,
++                "reused": False,
++                "adapter_config_ref": entry.adapter_config_ref,
++                "failure": result.failure,
++                "cleanup_failure": result.cleanup_failure,
++            }
++            rounds.append(row)
++            if emit_round is not None:
++                emit_round(row)
++            if result.cleanup is None or not result.cleanup.cleanup_complete or result.cleanup_failure is not None:
++                reason = "cleanup_incomplete"
++                break
++            if result.status not in {"completed", "no_novel_hypothesis"}:
++                reason = result.status
++                break
++        # Defer the complete ledger/journal check until pending runtime recovery
++        # has had its opportunity to reconcile a paid reservation.
++        ProductionV5CommandServices._verify_local_run(repository, authorities, config)
++        summary = summarize_repository_v5(
++            repository=repository,
++            manifest=manifest,
++            command="resume" if resume else "run",
++            readiness_code="runtime_failed"
++            if reason in {"failed", "runtime_failed", "cleanup_incomplete"}
++            else "completed",
++        )
++        return {
++            "schema_version": 5,
++            "status": "completed" if reason == "max_feedback_rounds" else "stopped",
++            "reason": reason,
++            "manifest_ref": authenticated.manifest_ref,
++            "rounds": tuple(rounds),
++            "started_epoch_ms": launch.started_epoch_ms,
++            "deadline_epoch_ms": launch.started_epoch_ms + manifest.resources.campaign_wall_timeout_seconds * 1000,
++            "summary": summary,
++        }
++
++
++def dispatch_production_operations_cli_v5(argv: Sequence[str], *, emit: Callable[[str], None] = print) -> int:
++    try:
++        args = build_parser_v5().parse_args(tuple(argv))
++        repository = LocalArtifactRepositoryV5(Path(args.artifact_root))
++        authenticated = authenticate_campaign_manifest_v5(
++            repository=repository,
++            manifest_ref=ArtifactRefV5(args.manifest_path, args.manifest_sha256),
++        )
++        if args.command == "prepare-production":
++            result = prepare_production_adapter_config_v5(
++                repository=repository,
++                authenticated=authenticated,
++                output_path=args.output_path,
++                round_index=args.round_index,
++                owner_token_sha256=args.owner_token_sha256,
++                **{field: getattr(args, field) for field in _PATH_FIELDS},
++            )
++        else:
++            result = run_production_campaign_v5(
++                repository=repository,
++                authenticated=authenticated,
++                adapter_config_ref=ArtifactRefV5(args.adapter_config_path, args.adapter_config_sha256),
++                owner_token_sha256=args.owner_token_sha256,
++                resume=args.command == "resume-campaign",
++                emit_round=lambda row: emit("PIT_OPTIMIZER_V5_ROUND=" + canonical_json_bytes_v5(row).decode("utf-8")),
++            )
++        emit("PIT_OPTIMIZER_V5_OPERATIONS=" + canonical_json_bytes_v5(result).decode("utf-8"))
++        return (
++            1 if result.get("reason") in {"failed", "runtime_failed", "cleanup_incomplete", "critic_unavailable"} else 0
++        )
++    except SystemExit:
++        raise
++    except (OSError, RuntimeError, TypeError, ValueError) as exc:
++        diagnostic = (
++            str(exc)
++            if type(exc) is ProductionOperationFailureV5
++            else (
++                "Cannot authenticate or use the supplied production resources. Verify the artifact root, manifest/config "
++                "paths and SHA-256 digests, and the saved round owner. " + str(exc)
++            )
++        )
++        emit(
++            "PIT_OPTIMIZER_V5_OPERATIONS="
++            + canonical_json_bytes_v5(
++                {
++                    "schema_version": 5,
++                    "status": "failed",
++                    "reason": "production_operation_failed",
++                    "diagnostic": diagnostic,
++                }
++            ).decode("utf-8")
++        )
++        return 2
+diff --git a/core/pit_optimizer_v5/runtime.py b/core/pit_optimizer_v5/runtime.py
+index 88cfdc8..dfc8f90 100644
+--- a/core/pit_optimizer_v5/runtime.py
++++ b/core/pit_optimizer_v5/runtime.py
+@@ -865,13 +865,21 @@ class _Journal:
+ 
+ 
+ class _Runtime:
+-    def __init__(self, inputs: FeedbackRoundInputV5, dependencies: FeedbackRoundDependenciesV5) -> None:
++    def __init__(
++        self,
++        inputs: FeedbackRoundInputV5,
++        dependencies: FeedbackRoundDependenciesV5,
++        *,
++        campaign_deadline_monotonic: float | None = None,
++    ) -> None:
+         self.inputs = inputs
+         self.dependencies = dependencies
+         started = dependencies.clock.monotonic()
+         if type(started) is not float or not math.isfinite(started):
+             raise ValueError("runtime clock returned a non-finite monotonic value")
+         self.round_deadline = started + inputs.manifest.resources.round_wall_timeout_seconds
++        if campaign_deadline_monotonic is not None:
++            self.round_deadline = min(self.round_deadline, campaign_deadline_monotonic)
+         self.journal = _Journal(inputs, dependencies.persistence)
+         self.parent: ParentCandidateV5 | None = None
+         self.projection: SearchProjectionV5 | None = None
+@@ -1016,7 +1024,10 @@ class _Runtime:
+             ):
+                 raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result"))
+             self.projection = projection
+-            self._deadline("recovery", self.inputs.manifest.resources.round_wall_timeout_seconds)
++            # Terminal recovery can only return its durable outcome and clean owned
++            # resources; expiration must not strand cleanup behind a new-work gate.
++            if self.journal.terminal_payload() is None:
++                self._deadline("recovery", self.inputs.manifest.resources.round_wall_timeout_seconds)
+         return projection
+ 
+     def _adopt_completed_projection(self, projection: SearchProjectionV5) -> bool:
+@@ -2687,11 +2698,17 @@ class _Runtime:
+ def run_feedback_round_v5(
+     inputs: FeedbackRoundInputV5,
+     dependencies: FeedbackRoundDependenciesV5,
++    *,
++    campaign_deadline_monotonic: float | None = None,
+ ) -> FeedbackRoundResultV5:
+-    """Execute or resume one feedback round without concrete external adapters."""
++    """Execute or resume a round, optionally shortening it to a campaign deadline."""
+ 
+     if type(inputs) is not FeedbackRoundInputV5 or type(dependencies) is not FeedbackRoundDependenciesV5:
+         raise ValueError("feedback-round entry requires exact V5 input and dependencies")
++    if campaign_deadline_monotonic is not None and (
++        type(campaign_deadline_monotonic) is not float or not math.isfinite(campaign_deadline_monotonic)
++    ):
++        raise ValueError("campaign deadline must be a finite monotonic value")
+     runtime: _Runtime | None = None
+ 
+     def bare_failure(failure: RuntimeFailureV5) -> FeedbackRoundResultV5:
+@@ -2735,7 +2752,7 @@ def run_feedback_round_v5(
+             )
+ 
+     try:
+-        runtime = _Runtime(inputs, dependencies)
++        runtime = _Runtime(inputs, dependencies, campaign_deadline_monotonic=campaign_deadline_monotonic)
+         return runtime.run()
+     except _RuntimeAbort as abort:
+         if runtime is None:
+diff --git a/docs/pit-optimizer-v5-operations.md b/docs/pit-optimizer-v5-operations.md
+new file mode 100644
+index 0000000..9dd13ea
+--- /dev/null
++++ b/docs/pit-optimizer-v5-operations.md
+@@ -0,0 +1,94 @@
++# PIT optimizer V5 production operations
++
++The production entry point is `python -B -m core.pit_optimizer_v5.cli` on the Windows host. Run it from the repository checkout containing these commands. `prepare-production` and `render-command` do not call a model or evaluate a candidate. `run`, `resume`, `run-campaign`, and `resume-campaign` can call the manifest-authorized provider and run the pinned Docker evaluator.
++
++## Required campaign inputs
++
++Start with a real, authenticated discovery manifest and every artifact it references. The manifest fixes the source commit, baseline, discovery panels, evaluator, sandbox image, provider limits, and resource limits. Setup does not invent these artifacts or modify the manifest. A separately persisted adapter configuration supplies the local host paths and adapter identities.
++
++The source, workspace, data, output, and control directories must already exist and be mutually disjoint. For example, use sibling directories under `C:\pit-v5`, with a clean source checkout at `C:\pit-v5\source`. The data directory must contain exactly `pit_bundle.sqlite3` and `prices_provenance.json`, matching the manifest's evaluator digests. Keep the artifact repository outside the data directory. Git and Docker must be installed; their paths can be discovered from `PATH` or supplied explicitly.
++
++Preparation checks the clean source commit and policy bytes, hashes the two data files without querying market or held-out domains, and constructs the actual production adapters to capture their identities. It does not start Docker or check daemon/image readiness. Before execution, make the manifest-pinned image available locally and configure `OPENROUTER_API_KEY` in the launch environment. The runtime uses the pinned image with pulling disabled.
++
++If no real manifest exists yet, first complete the upstream data, panel, and baseline work. `capture-baseline` already accepts `--capture-inputs-path` and `--capture-inputs-sha256`, but there is currently no `prepare-baseline-inputs` CLI builder. Its existing `BaselineCaptureInputsV5` must reference the real evaluator contract, execution profile, sandbox profile, discovery panel plan, baseline policy revision, source bundle, policy scope, evaluator source, identity transitions, and resource capabilities. Persist and authenticate those inputs, run the existing baseline capture/verification, and then use `build-manifest`. A provisional single-panel evaluation does not establish the full baseline or discovery campaign authority.
++
++## Prepare the local adapter configuration
++
++These PowerShell commands prompt for the real artifact repository and manifest path. All `*-path` artifact arguments are relative to that repository; host directory arguments are absolute. Substitute the existing host directory paths in `$prepareArgs` if different.
++
++```powershell
++Set-Location 'C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.worktrees\pit-optimizer-v5-architecture'
++$python = (Get-Command python.exe).Source
++$artifactRoot = Read-Host 'Absolute artifact repository directory'
++$manifestPath = Read-Host 'Discovery manifest path relative to the artifact repository'
++$manifestSha = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $artifactRoot $manifestPath)).Hash.ToLowerInvariant()
++$manifestArgs = @('--artifact-root', $artifactRoot, '--manifest-path', $manifestPath, '--manifest-sha256', $manifestSha)
++
++& $python -B -m core.pit_optimizer_v5.cli verify-manifest @manifestArgs
++if ($LASTEXITCODE -ne 0) { throw 'Manifest authentication failed' }
++
++$prepareArgs = @(
++    '--source-root', 'C:\pit-v5\source',
++    '--workspace-root', 'C:\pit-v5\workspaces',
++    '--data-root', 'C:\pit-v5\data',
++    '--output-root', 'C:\pit-v5\output',
++    '--control-root', 'C:\pit-v5\control',
++    '--round-index', '1',
++    '--output-path', 'host/adapter-config-round-1.json'
++)
++$preparedLine = & $python -B -m core.pit_optimizer_v5.cli prepare-production @manifestArgs @prepareArgs
++if ($LASTEXITCODE -ne 0) { $preparedLine; throw 'Production preparation failed' }
++$preparedLine | Set-Content -LiteralPath (Join-Path $artifactRoot 'production-preparation.txt')
++$prepared = ($preparedLine -replace '^PIT_OPTIMIZER_V5_OPERATIONS=', '') | ConvertFrom-Json
++$configArgs = @(
++    '--adapter-config-path', $prepared.adapter_config_ref.relative_path,
++    '--adapter-config-sha256', $prepared.adapter_config_ref.sha256,
++    '--owner-token-sha256', $prepared.owner_token_sha256
++)
++```
++
++To choose executable paths explicitly, add `--git-executable 'C:\Program Files\Git\cmd\git.exe'` and the real `--docker-executable` path to the preparation invocation. Setup emits a generated owner token when omitted. Save its output: the config identities include the round and owner, so changing either requires preparing the corresponding configuration. For a repeated preparation at the same output path, supply the saved `--owner-token-sha256`; an existing different artifact is never overwritten.
++
++## Render and execute
++
++```powershell
++$renderedLine = & $python -B -m core.pit_optimizer_v5.cli render-command @manifestArgs @configArgs --round-index 1 --execution-command run-campaign
++if ($LASTEXITCODE -ne 0) { $renderedLine; throw 'Command rendering failed' }
++$rendered = ($renderedLine -replace '^PIT_OPTIMIZER_V5_MANIFEST=', '') | ConvertFrom-Json
++$rendered.authorization.powershell_command
++
++# This command begins provider and evaluator execution.
++& $python -B -m core.pit_optimizer_v5.cli run-campaign @manifestArgs @configArgs
++```
++
++Rendering returns an `argv` array, working directory, and PowerShell command with literal quoting, the manifest/config digests, and the owner/round values. Execute the displayed command from its stated working directory, or use the explicit invocation above. Without `--adapter-config-path` and `--adapter-config-sha256`, `render-command` retains the manifest-only preview with `executable: false`.
++
++To execute one prepared round instead, use `run @manifestArgs @configArgs --round-index 1`; use `resume` with those same arguments for an existing round. Single-round commands retain their existing behavior. Use campaign commands when the persisted campaign and per-round deadlines must span process restarts.
++
++## Resume and bounded stopping
++
++```powershell
++# In a new shell, reconstruct $manifestArgs from the same manifest and reload:
++$prepared = ((Get-Content -Raw -LiteralPath (Join-Path $artifactRoot 'production-preparation.txt')) -replace '^PIT_OPTIMIZER_V5_OPERATIONS=', '') | ConvertFrom-Json
++$configArgs = @(
++    '--adapter-config-path', $prepared.adapter_config_ref.relative_path,
++    '--adapter-config-sha256', $prepared.adapter_config_ref.sha256,
++    '--owner-token-sha256', $prepared.owner_token_sha256
++)
++& $python -B -m core.pit_optimizer_v5.cli resume-campaign @manifestArgs @configArgs
++
++$verificationArgs = @(
++    '--adapter-config-path', $prepared.adapter_config_ref.relative_path,
++    '--adapter-config-sha256', $prepared.adapter_config_ref.sha256
++)
++& $python -B -m core.pit_optimizer_v5.cli verify-run @manifestArgs @verificationArgs
++& $python -B -m core.pit_optimizer_v5.cli summarize @manifestArgs @verificationArgs
++```
++
++The campaign launcher serializes controllers for the same manifest using the repository's existing state lock. It persists launch/config/start records through the repository's existing create-only state API and calls `run_feedback_round_v5` sequentially. Subsequent rounds use derived configs under `campaigns/<manifest-sha256>/adapter-config-round-N.json`, with unchanged host paths and limits. Checkpoint-owned experiment records and terminal/cleanup journal entries remain the authority for completed work; there is no second optimizer or completion ledger.
++
++Completed rounds with complete cleanup are reused. `no_novel_hypothesis` advances according to the existing scheduler; novelty exhaustion, critic unavailability, runtime failure, incomplete cleanup, exhausted provider budget, or campaign expiry stops the loop. The role ledger still enforces prospective token/cost/call bounds before each paid attempt, including when the remaining budget cannot fund the next request. Such a refusal can surface through the existing runtime failure diagnostics.
++
++Campaign and round start times persist in epoch milliseconds. Resume subtracts elapsed wall time, including downtime, and passes the smaller remaining allowance to the runtime's monotonic deadline. It never resets those allowances or requires a full round's time to remain. This assumes an accurate host wall clock; a clock before a saved start is rejected. Cleanup retains its separate manifest timeout and can finish after the work deadline. Runtime calls remain responsible for honoring their supplied stage deadlines; this is not an external process watchdog.
++
++Resume uses the original config and owner. A round with a saved start but no round journal is reported as uncertain and is not restarted automatically; inspect its paid-request/reservation state using the existing recovery boundary before taking further action. Existing journaled work uses the runtime's reconciliation path. Do not delete launch records or create a new campaign to evade unsettled work or reset budgets. Held-out confirmation, qualification, full replay, and live application remain separate explicit stages.

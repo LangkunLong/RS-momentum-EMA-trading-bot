@@ -1,0 +1,103 @@
+# Next Luna session: B4a runtime rejection routing only
+
+Work in C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.worktrees\pit-optimizer-v5-architecture.
+
+A, B1, corrected B2, B3a and B3b are principal-architect approved. Read the latest recovery plan/design and `.artifacts/pit-optimizer-v5/development/luna-recovery-b3b/principal-architect-review.md` plus `principal-architect-verification.json`.
+
+Implement B4a only, then stop for review. B4a connects the existing rendering outcome, journal payload and rejected carrier inside the runtime. B4b will complete/recover no-testable rounds and update finalized-campaign authority. B4c will project rejection feedback and audit retained hypothesis history. No campaign is to be run in any of this implementation session.
+
+## 1. Confirm scope and preimages
+
+Expected production changes: runtime.py only, in imports, a small journal event-reference helper if needed, _existing_payload's accepted type annotation, a dedicated rejected-candidate helper, _render_and_quick_screen, _evaluate_discovery's union routing, and the minimal explicit candidate-type filtering in run before critic input.
+
+Current runtime SHA: 1c4c4dd2a3c7082982866e6ed820336e5afeb9755b0005fb80e65224bcc0d462.
+
+Confirm all source guards in the principal verification. Save exact runtime.py preimage and a fresh `.artifacts/pit-optimizer-v5/development/luna-recovery-b4a` package. Investigate unexpected changes before editing; preserve other sessions' work.
+
+Do not modify artifacts.py, memory.py, production_runtime.py, rendering.py, provider.py, contracts.py, candidate_ir.py, source/data/image identity, old artifacts, B3a constructors or B3b publication checks.
+
+## 2. Define the rendering outcome dispatch
+
+Use the existing render_variant_outcomes_v5 API at the runtime's _render_and_quick_screen call site, with the same authenticated four-file parent, parent revision, template and manifest maximum. Preserve parent-source validation, exception/fatal-error behavior, nonempty/cap checks, cancellation checks and the existing rendering deadline.
+
+Dispatch each result in the exact returned order:
+- exact RenderedVariantV5 -> existing _initial_candidate unchanged;
+- exact RejectedVariantV5 -> the new rejected-candidate helper;
+- any other type -> existing typed invalid-dependency failure.
+
+Rejections consume their existing bounded variant positions. Do not rerun enumeration, substitute parent sources, alter rejected source bytes, or derive a policy revision for them. The public strict render_variants API stays unchanged in rendering.py; the runtime alone adopts the outcome API.
+
+## 3. Create/recover rejection evidence without materialization
+
+Add a private helper with the actual template, parent, scheduled hypothesis and RejectedVariantV5 outcome as inputs. Return RejectedCandidateEvidenceV5.
+
+Use the accepted author completion already in this runtime's authenticated journal. Require it exists, is accepted, has the artifact reference for this actual template, and belongs to this campaign/round. Load the stored author invocation through persistence.load_role_invocation if necessary to compare the complete template and author hypothesis. Use its actual artifact reference; do not append another author artifact, invent a reference from a template hash alone, or invoke a provider.
+
+Derive the existing pre-validation-invalid identity from the actual parent revision, complete scheduled hypothesis, template, assignment, round index and discovery-plan hash. Create the exact RenderRejectionPayloadV5 with that identity, assignment, accepted-author artifact reference and outcome's closed failure code. B2 remains the authoritative repository check; do not weaken it or duplicate its enumeration.
+
+For a fresh rejection:
+- Confirm no existing conflicting rejection for this identity/assignment in the loaded journal; preserve B2's rendered/rejected conflict checks.
+- Check existing cancellation/deadline authority before new work as appropriate; use the current rendering/round deadline, never a fresh runtime or refreshed timeout.
+- Append the dedicated payload via _Journal.append(..., experiment_id=identity.sha256), which persists the event before the carrier is exposed.
+- Do not append rendered_variant, candidate_stage_result, candidate_execution or resource_lease for it. Do not call _initial_candidate, _materialized_variant, validation, semantic probes, quick evaluation or discovery evaluation.
+
+For an existing rejection:
+- Look it up in the already authenticated journal. Reject duplicates or any differing expected identity/template/typed assignment/author reference/failure code. Compare canonical payload bytes or the existing exact typed/hash bindings where needed; do not rely on Python bool/integer value equivalence for assignment authority.
+- Reuse the existing event and its reference. Do not append another event or paid role, and do not refresh deadlines or reopen terminal history.
+- Corrected B2 already rejects forbidden later candidate work/critic membership. Preserve those checks.
+
+Build the carrier only with the actual identity/template/assignment, ValidationResultV5(False, "policy_source_unbounded_or_stateful", ()), and the durable event-file reference.
+
+## 4. Retrieve the actual event-file reference
+
+The new carrier requires `events/<campaign>/<round>/<sequence>.json`, not event.payload_ref. A minimal _Journal helper can locate the unique event paired with a given payload in its authenticated loaded/just-appended events and derive the canonical repository path plus that actual event's SHA.
+
+Require a unique exact journal match and the current campaign/round. Preserve the existing _Journal.append return type and payload_reference behavior for old callers. Do not derive a reference from a hypothetical sequence, from the payload SHA, or from arbitrary caller-supplied campaign text. Do not add raw filesystem operations or a new persistence schema. B3b will authenticate the durable edge again when the record is persisted.
+
+## 5. Route the explicit union through screening and discovery
+
+The return type of _render_and_quick_screen and input/output of _evaluate_discovery become CandidateRecordEvidenceV5 tuples. Preserve order and exact supported carrier types.
+
+- Build QuickScreenCandidateV5 only from exact materialized CandidateEvidenceV5 entries with quick_ready status.
+- RejectedCandidateEvidenceV5 passes through survivor selection unchanged and can never reach materialized.variant, fingerprint or quick-evidence access.
+- Preserve the existing survivor selection/order/cap behavior for materialized candidates, including batches with no quick-ready candidates; do not invent a default survivor.
+- In _evaluate_discovery, explicitly pass rejected carriers through unchanged before entering materialized-candidate logic. Reject unsupported carrier types. Preserve the full existing CandidateEvidenceV5 discovery/recovery logic, episode ordering and failure handling.
+- In run, form critic_candidates only from exact CandidateEvidenceV5 entries with testable statuses. Keep their existing input order. Rejected IDs must never reach critic_request or _precritic_evidence. Do not widen the critic request protocol to admit rejected carriers.
+
+The complete candidates tuple may retain rejected carriers for B3a's independent record construction and B3b's existing publication boundary in mixed rounds. No changes to those factories or _publish are needed here.
+
+## 6. Preserve the unfinished lifecycle boundary
+
+Leave the existing no_testable_experiments abort in place for this increment. Do not invoke a critic for an empty testable batch, manufacture an empty critic, or claim rejected-only completion now. This temporary failure behavior is intentionally deferred to B4b and is one reason no campaign may be launched from this checkpoint.
+
+Do not change _completed_result, _adopt_completed_projection, _recover_projection, _cleanup, _verify_finalized_discovery_rounds, campaign summaries, role budgeting, or next-investigator feedback. Do not fabricate checkpoints/records during verification. Preserve run's early terminal outcome path so historical terminal actual06 remains terminal after these source changes.
+
+Record the B4b/B4c follow-ups clearly:
+- no-testable candidate record publication/checkpoint/cleanup without a critic;
+- exact finalized-round candidate and role authority for mixed/rejection-only records;
+- resume behavior without duplicate provider work or deadline extension;
+- invalid history retained and closed numeric rejection feedback provided to the next investigator;
+- two rejected lifecycle rounds do not count as two evaluated feedback rounds.
+
+Current _completed_result has no direct critic check; audit it and its callers later, and avoid unnecessary edits based on an assumed requirement.
+
+## 7. Verify without executing a new campaign or rejection event
+
+Run scoped Ruff, in-memory compilation and exact-preimage diff checks. Recompute the 56-file evaluator source identity; it must stay 005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4. Verify every untouched approved source hash and show the precise changed function set.
+
+Allowed actual-input inspection:
+- Authenticate actual06's manifest, prior intent and accepted author package using the existing read-only helpers/constants from prior review packages.
+- Run the unchanged archived author/parent through the approved B1 rendering API, inspect the rejection and derive its invalid identity. These pure local operations are allowed.
+- Authenticate the historical runtime-04 evaluated record using the exact ref/hash in the B3b principal verification, without executing its runtime.
+
+Actual06 has no real rejection event. Do not call the new journaling/runtime helper, _Journal.append, run_feedback_round_v5, record factory/publication, or a provider to manufacture verification evidence. Do not construct fake event references or monkeypatch dependencies. New B4a routing/append/recovery branches must be described as static-reviewed and unexecuted.
+
+Provide a static flow table for: ordinary rendered variant, fresh rejection, matching existing rejection, conflicting existing rejection, mixed output order, no quick-ready survivors, critic filtering, cancellation/deadline, and already-terminal actual06. For each, identify which function handles it and why rejected source cannot be materialized or evaluated. This table is reasoning from source, not fabricated execution evidence.
+
+No tests may be read, created, changed or run. No synthetic probes/events/records, fake responses, model/API calls, credentials, candidate evaluation, campaign launch/resume, evaluator rebuild, commits, pushes or deployment.
+
+## 8. Return the B4a architect checkpoint
+
+Save preimage, narrow implementation diff with usable repo-relative labels, final source hashes, symbol/change list, static flow table, real archived-input inspection, scoped check results, evaluator identity and limits. Preserve all older review files.
+
+Stop before B4b/B4c. The original two real evaluated feedback rounds remain unfinished. This grants local implementation scope only, with no new campaign or external-call budget.

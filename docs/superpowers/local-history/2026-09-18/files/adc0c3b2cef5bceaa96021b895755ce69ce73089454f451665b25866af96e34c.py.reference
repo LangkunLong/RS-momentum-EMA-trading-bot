@@ -1,0 +1,249 @@
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import sys
+from collections import Counter
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+
+from core.backtest_engine import PortfolioSimulator
+from core.pit_data import PITDataBundle
+from core.pit_policy_parity import (
+    _PARITY_SIGNAL_EVERY_N_DAYS,
+    _source_identity,
+    build_fold_evidence,
+    load_parity_reference,
+)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--source-root", required=True, type=Path)
+    parser.add_argument("--reference", required=True, type=Path)
+    parser.add_argument("--pit-bundle", required=True, type=Path)
+    parser.add_argument("--output", required=True, type=Path)
+    args = parser.parse_args()
+    source_root = args.source_root.resolve(strict=True)
+    reference = load_parity_reference(args.reference.resolve(strict=True))
+    bundle_path = args.pit_bundle.resolve(strict=True)
+    output = args.output.resolve(strict=False)
+    if output.exists():
+        raise FileExistsError(output)
+
+    source_before = _source_identity(source_root)
+    original_validate = PortfolioSimulator._validate_entry_transition
+    active_events: list[dict[str, float | bool]] = []
+
+    def instrumented_validate(self, projection, recommendation):
+        risk_ceiling, stop_ceiling = self._entry_projection_safety_limits.get(
+            id(projection),
+            (0.01, 0.08),
+        )
+        if recommendation.risk_fraction > risk_ceiling or recommendation.stop_distance_fraction > stop_ceiling:
+            raise RuntimeError("diagnostic observed an invalid allocation decision")
+        buy_notional = (
+            projection.portfolio_equity_at_entry_open
+            * recommendation.risk_fraction
+            / recommendation.stop_distance_fraction
+        )
+        if recommendation.notional_fraction_cap is not None:
+            buy_notional = min(
+                buy_notional,
+                projection.portfolio_equity_at_entry_open
+                * recommendation.notional_fraction_cap,
+            )
+        engine_cap = self._entry_projection_notional_caps.get(id(projection))
+        if engine_cap is not None:
+            buy_notional = min(buy_notional, engine_cap)
+        legacy_quantity = buy_notional / projection.entry_open
+        rounded_stop = round(
+            projection.entry_open
+            * (1 - recommendation.stop_distance_fraction),
+            2,
+        )
+        unrounded_stop = (
+            projection.entry_open
+            * (1 - recommendation.stop_distance_fraction)
+        )
+        loss_per_share = projection.entry_open - rounded_stop
+        rounded_stop_quantity = min(
+            legacy_quantity,
+            (
+                projection.portfolio_equity_at_entry_open
+                * recommendation.risk_fraction
+                / loss_per_share
+            ),
+            (
+                projection.portfolio_equity_at_entry_open
+                * risk_ceiling
+                / loss_per_share
+            ),
+        )
+        transition = original_validate(self, projection, recommendation)
+        if not math.isclose(
+            transition.quantity,
+            rounded_stop_quantity,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise RuntimeError("current transition quantity differs from the rounded-stop formula")
+        active_events.append(
+            {
+                "cap_active": rounded_stop_quantity < legacy_quantity - 1e-12,
+                "legacy_quantity": legacy_quantity,
+                "current_quantity": transition.quantity,
+                "quantity_reduction": legacy_quantity - transition.quantity,
+                "stop_rounding_relation": (
+                    "rounded_higher"
+                    if rounded_stop > unrounded_stop
+                    else "rounded_lower"
+                    if rounded_stop < unrounded_stop
+                    else "exact"
+                ),
+                "abs_stop_rounding_delta": abs(rounded_stop - unrounded_stop),
+            }
+        )
+        return transition
+
+    fold_results: list[dict[str, object]] = []
+    PortfolioSimulator._validate_entry_transition = instrumented_validate
+    try:
+        with PITDataBundle(bundle_path, expected_sha256=reference.pit_bundle_sha256) as bundle:
+            simulator = PortfolioSimulator(
+                pit_bundle=bundle,
+                benchmark_symbol=reference.fold_manifest.benchmark,
+                signal_every_n_days=_PARITY_SIGNAL_EVERY_N_DAYS,
+            )
+            for fold_index, (fold, reference_evidence) in enumerate(
+                zip(
+                    reference.fold_manifest.discovery_folds,
+                    reference.discovery_evidence,
+                    strict=True,
+                )
+            ):
+                active_events.clear()
+                result = simulator.run(
+                    list(reference.universe),
+                    start_date=fold.start_date,
+                    end_date=fold.end_date,
+                    history_start_date=reference.fold_manifest.warmup_start_date,
+                    benchmark_symbol=reference.fold_manifest.benchmark,
+                )
+                current_evidence = build_fold_evidence(fold=fold, result=result)
+                events = tuple(dict(item) for item in active_events)
+                reference_buys = tuple(
+                    item for item in reference_evidence.transactions if item.action == "BUY"
+                )
+                current_buys = tuple(
+                    item for item in current_evidence.transactions if item.action == "BUY"
+                )
+                if len(events) != len(reference_buys) or len(events) != len(current_buys):
+                    raise RuntimeError("allocation event count differs from BUY transaction count")
+                legacy_matches_reference = 0
+                current_matches_capped = 0
+                differing_buy_count = 0
+                current_lower_count = 0
+                first_differing_buy: dict[str, object] | None = None
+                for buy_ordinal, (event, reference_buy, current_buy) in enumerate(
+                    zip(
+                        events,
+                        reference_buys,
+                        current_buys,
+                        strict=True,
+                    )
+                ):
+                    legacy_matches_reference += int(
+                        math.isclose(
+                            reference_buy.quantity,
+                            round(float(event["legacy_quantity"]), 6),
+                            rel_tol=0.0,
+                            abs_tol=1e-12,
+                        )
+                    )
+                    current_matches_capped += int(
+                        math.isclose(
+                            current_buy.quantity,
+                            round(float(event["current_quantity"]), 6),
+                            rel_tol=0.0,
+                            abs_tol=1e-12,
+                        )
+                    )
+                    if reference_buy.quantity != current_buy.quantity:
+                        differing_buy_count += 1
+                        current_lower_count += int(current_buy.quantity < reference_buy.quantity)
+                        if first_differing_buy is None:
+                            first_differing_buy = {
+                                "buy_ordinal": buy_ordinal,
+                                "current_lower": current_buy.quantity < reference_buy.quantity,
+                                "rounded_stop_cap_active": bool(event["cap_active"]),
+                                "legacy_formula_matches_reference": math.isclose(
+                                    reference_buy.quantity,
+                                    round(float(event["legacy_quantity"]), 6),
+                                    rel_tol=0.0,
+                                    abs_tol=1e-12,
+                                ),
+                                "rounded_stop_formula_matches_current": math.isclose(
+                                    current_buy.quantity,
+                                    round(float(event["current_quantity"]), 6),
+                                    rel_tol=0.0,
+                                    abs_tol=1e-12,
+                                ),
+                                "stop_rounding_relation": event["stop_rounding_relation"],
+                                "abs_stop_rounding_delta": event["abs_stop_rounding_delta"],
+                                "quantity_reduction": event["quantity_reduction"],
+                            }
+                differing_by_action: Counter[str] = Counter()
+                for left, right in zip(
+                    reference_evidence.transactions,
+                    current_evidence.transactions,
+                    strict=True,
+                ):
+                    if left.quantity != right.quantity:
+                        category = right.action if left.action == right.action else "ACTION_MISMATCH"
+                        differing_by_action[category] += 1
+                fold_results.append(
+                    {
+                        "fold_index": fold_index,
+                        "allocation_event_count": len(events),
+                        "rounded_stop_cap_active_count": sum(
+                            int(bool(item["cap_active"])) for item in events
+                        ),
+                        "differing_buy_quantity_count": differing_buy_count,
+                        "differing_buy_current_lower_count": current_lower_count,
+                        "legacy_formula_matches_reference_buy_count": legacy_matches_reference,
+                        "rounded_stop_formula_matches_current_buy_count": current_matches_capped,
+                        "max_quantity_reduction": max(
+                            (float(item["quantity_reduction"]) for item in events),
+                            default=0.0,
+                        ),
+                        "first_differing_buy": first_differing_buy,
+                        "differing_transaction_quantity_by_action": dict(
+                            sorted(differing_by_action.items())
+                        ),
+                    }
+                )
+    finally:
+        PortfolioSimulator._validate_entry_transition = original_validate
+
+    source_after = _source_identity(source_root)
+    if source_after != source_before:
+        raise RuntimeError("reviewed source identity changed during allocation diagnosis")
+    diagnostic = {
+        "schema_version": 1,
+        "discovery_fold_count": 2,
+        "hidden_evaluated": False,
+        "source_identity_stable": True,
+        "folds": fold_results,
+    }
+    with output.open("x", encoding="utf-8", newline="\n") as handle:
+        json.dump(diagnostic, handle, indent=2, sort_keys=True, allow_nan=False)
+        handle.write("\n")
+    print(json.dumps({"allocation_diagnostic_written": True, "hidden_evaluated": False}, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

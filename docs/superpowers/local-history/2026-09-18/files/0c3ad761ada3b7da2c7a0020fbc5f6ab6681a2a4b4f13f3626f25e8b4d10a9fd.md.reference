@@ -1,0 +1,300 @@
+# Task 6A Report: Trusted Terminal Lifecycle Closure
+
+Date: 2026-08-28  
+Branch: `codex/pit-optimizer-implementation`  
+Base: `f66abeaecb24f856504677d776194b1ce2a215e7`  
+Commit: `b5034600d99c40eff13fa2f461808748d07b8e9c`
+
+## Status
+
+Task 6A is complete. The two remaining load-bearing Task 6 lifecycle findings
+are closed, the Fix Round 5 evidence wording is corrected, the prescribed
+fake/temp verification is green, and Task 7 was not started.
+
+## Implementation summary
+
+1. **Trusted terminal-package commitment.** Gateway terminal reconciliation now
+   carries a private `gateway_terminal` commitment inside the same
+   hash-chained AuthorizationLedger reconciliation record. Because
+   `_append_records` publishes the complete ledger image with one atomic replace,
+   there is no durable commitment-only or reconciliation-only intermediate
+   state. The commitment binds:
+
+   - the exact authorization reservation ID, primitive, and primitive digest;
+   - the exact reserved/started gateway lifecycle commitment digest;
+   - the provider-facts digest;
+   - provider-record, budget-recovery, and terminal-event digests;
+   - audit-run and manifest identities;
+   - call index, iteration, and role;
+   - exact usage, charged calls/tokens/USD, and charge basis;
+   - terminal outcome, terminal code, and payload digest.
+
+   Normal publication requires the live gateway lifecycle capability. Audit
+   attachment, receipt verification, restart recovery, and idempotent
+   reconciliation require the trusted terminal commitment and exact package.
+   Restart recovery now restores BudgetLedger only after that verification and
+   verifies the existing atomic reconciliation instead of synthesizing one from
+   audit-local evidence. A crash before the commitment remains fenced and is not
+   auto-resealed.
+
+2. **Conservative durable-start cleanup.** Cleanup now treats a non-null
+   private lifecycle `started_event_sha256` as the conservative request-start
+   boundary before it retries `_ensure_pit_optimizer_reserved_event`. That path
+   retries the exact idempotent AuthorizationLedger start commitment. A one-shot
+   post-commitment interruption therefore finalizes as uncertain/started,
+   retains the exact BudgetLedger reservation, publishes one authorization
+   reconciliation, closes the lease as `cancelled`, and never enters the SDK
+   callable.
+
+3. **Evidence wording.** The Fix Round 5 report now says the tests cover every
+   lifecycle code, one representative public optimizer state, and one
+   cross-role semantic relabel, with remaining state closure established by the
+   shared set/mapping logic. It no longer claims every lifecycle-state or
+   role/state permutation is directly parameterized.
+
+## Files changed
+
+Tracked and committed:
+
+- `core/pit_optimizer_authorization.py`
+- `agent_loop.py`
+- `tests/test_pit_optimizer_v2.py`
+
+Ignored SDD evidence files, intentionally not committed:
+
+- `.superpowers/sdd/2026-08-27-model-authored-pit-optimizer/task-6-report.md`
+- `.superpowers/sdd/2026-08-27-model-authored-pit-optimizer/task-6a-report.md`
+
+`core/pit_optimization_contract.py` and `tests/test_agent_loop.py` required no
+change.
+
+## Strict RED evidence
+
+All product tests below used injected fake clients/responses/pricing and pytest
+temporary paths only.
+
+### RED 1: rewritten terminal package was accepted
+
+Command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "recovery_requires_trusted_terminal_commitment"
+```
+
+The first unprivileged attempt was discarded as product evidence because the
+managed Windows token could not create pytest's atomic temporary audit sibling:
+
+```text
+PermissionError: [Errno 13] Permission denied: ...\.a-...
+agent_loop.AuditError: audit artifact could not be written atomically
+1 failed, 229 deselected, 1 warning in 2.80s
+```
+
+The identical fake/temp command was rerun with the established narrow pytest
+temporary-filesystem permission. Its valid product RED was:
+
+```text
+E       Failed: DID NOT RAISE any of (<class 'agent_loop.AuditError'>, <class 'core.pit_optimizer_authorization.AuthorizationError'>)
+1 failed, 229 deselected, 1 warning in 1.44s
+```
+
+This was the expected failure: current recovery accepted the self-consistent
+rewrite from genuine usage `100/50/150`, `$0.001` to `120/60/180`, `$0.002`.
+The test preserves the genuine reserved and started event bytes, authorization
+reservation identity, and existing reserved/start commitments.
+
+### RED 2: start-commitment interruption diverged the ledgers
+
+Command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "keyboard_interrupt_finalizes_by_provider_phase and start_commitment"
+```
+
+Output:
+
+```text
+E       AssertionError: assert 'gateway_lifecycle' == 'reconciliation'
+1 failed, 230 deselected, 1 warning in 1.41s
+```
+
+This was the expected failure: after the wrapper called the genuine started
+commitment and raised `KeyboardInterrupt("start_commitment")`, the durable
+authorization tail remained at `gateway_lifecycle`; no reconciliation or lease
+close existed.
+
+## GREEN and focused verification
+
+### Individual GREEN 1
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "recovery_requires_trusted_terminal_commitment"
+1 passed, 229 deselected, 1 warning in 1.79s
+```
+
+The rewritten package now rejects before any BudgetLedger restore; the
+authorization ledger bytes do not change, no reconciliation appears, and plan
+2 remains fenced.
+
+### Individual GREEN 2
+
+The first post-fix run reached the desired terminal state but exposed an
+incorrect test expectation: it compared BudgetLedger retention (`8566` tokens)
+to the larger authorization-plan ceiling (`88000 + 4000`). This was a test
+assertion error, not a product failure:
+
+```text
+E       AssertionError: assert 8566 == (88000 + 4000)
+1 failed, 230 deselected, 1 warning in 1.55s
+```
+
+The assertion was corrected to compare against the exact original
+`PitOptimizerBudgetReservation`. The unchanged product behavior then passed:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "keyboard_interrupt_finalizes_by_provider_phase and start_commitment"
+1 passed, 230 deselected, 1 warning in 1.50s
+```
+
+The test proves zero SDK calls; one uncertain/started terminal event; exact
+BudgetLedger reservation retention; one matching authorization reconciliation;
+`cancelled` lease closure; two identical fresh-reopen recovery verifications;
+and both same-plan and successor reservation fencing.
+
+### Final dedicated Task 6A slice
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "recovery_requires_trusted_terminal_commitment or (keyboard_interrupt_finalizes_by_provider_phase and start_commitment)"
+2 passed, 229 deselected, 1 warning in 2.12s
+```
+
+### Compatibility convergence
+
+A five-case normal/committed-restart slice passed after restart fixtures were
+made faithful to the new contract: only fixtures claiming successful recovery
+call the genuine atomic terminal reconciliation before injecting the return
+interruption. Tamper fixtures that model a precommit crash remain uncommitted
+and fail closed.
+
+```text
+5 passed, 226 deselected, 1 warning in 4.39s
+```
+
+The complete interruption matrix, including all six prior phases plus the new
+start-commitment phase, passed:
+
+```text
+7 passed, 224 deselected, 1 warning in 5.34s
+```
+
+The first exact focused-suite run was `234 passed, 1 failed, 518 deselected`.
+The only failure was an existing regex that accepted `audit|lifecycle`, while
+the new earlier fail-closed message said `gateway terminal commitment differs`.
+The message was clarified to `gateway terminal audit commitment differs`; the
+two-case receipt-tamper slice then passed:
+
+```text
+2 passed, 229 deselected, 1 warning in 1.93s
+```
+
+### Final exact Task 6 suite
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py tests/test_pit_optimizer_v2.py -k "pit_optimizer_v2 or call_budget or provider_call or budget_reservation"
+235 passed, 518 deselected, 1 warning in 96.45s (0:01:36)
+```
+
+The warning in pytest runs is the repository's pre-existing
+`PytestConfigWarning: Unknown config option: cache_dir`.
+
+### Final static verification
+
+```text
+python -B -m ruff check agent_loop.py core/pit_optimization_contract.py core/pit_optimizer_authorization.py tests/test_agent_loop.py tests/test_pit_optimizer_v2.py
+All checks passed!
+
+python -B -m py_compile agent_loop.py core/pit_optimization_contract.py core/pit_optimizer_authorization.py tests/test_agent_loop.py tests/test_pit_optimizer_v2.py
+exit 0
+
+git diff --check
+exit 0; Git emitted only the repository's Windows LF-to-CRLF notices.
+```
+
+The commit hooks also passed Ruff, trailing-whitespace, end-of-file, YAML, and
+merge-conflict checks.
+
+## Self-review
+
+- **Atomicity:** the gateway terminal commitment is embedded in the same
+  reconciliation primitive, and reconciliation plus any terminal lease close
+  are appended through one complete-image atomic replace. Replay cannot observe
+  a trusted commitment without its matching authorization transition.
+- **Origin authority:** only the private live gateway lifecycle can create a new
+  terminal commitment. Public reconciliation without that capability can only
+  verify an already committed exact package; it cannot seal active audit-local
+  evidence.
+- **Fail-closed recovery:** terminal verification precedes BudgetLedger restore.
+  Missing or changed commitment data rejects without restoring budget state,
+  reconciling authorization, or unlocking plan 2.
+- **Idempotency:** exact committed packages verify repeatedly without changing
+  AuthorizationLedger bytes. Any changed reservation, lifecycle, provider,
+  budget, terminal, accounting, outcome/code, or payload binding fails.
+- **Conservative start boundary:** the lifecycle's started digest is assigned
+  only after durable start-event publication and before commitment binding.
+  Cleanup promotes that fact before retrying the exact idempotent bind, so a
+  bind-return interruption cannot be mislabeled before-send.
+- **One-shot behavior:** the new phase regression observes zero SDK calls and
+  both plan 1 and plan 2 are fenced after cancelled closure; no replacement
+  request or same-plan retry is possible.
+- **Compatibility:** legacy schema-v1 provider/standalone authorization readers
+  remain unchanged and pass the exact suite. Older schema-v2 optimizer histories
+  without `gateway_terminal` remain structurally readable where required but
+  fail closed at audit attachment/recovery and cannot be auto-resealed.
+- **Mutation check:** removing the terminal-commitment requirement makes the
+  rewrite regression accept; removing the durable-start promotion leaves the
+  authorization tail at `gateway_lifecycle`; changing any required commitment
+  field breaks the normal-path exact mapping or trusted replay verification.
+- **Scope:** no Task 7 orchestration or unrelated refactor was introduced.
+
+## Resource and secrecy evidence
+
+- Every executed provider-path test used `_Task6FakeClient`, fake responses,
+  injected frozen fake pricing, and pytest `tmp_path` audit/ledger roots.
+- No real provider/OpenRouter call, network access, live pricing, real SDK
+  construction, replay/parity run, Docker action, permanent ledger, background
+  process, upload, push, merge, deploy, cloud work, or subagent was used.
+- The durable commitment contains only closed identities, digests, lifecycle,
+  model/accounting, usage/charge, outcome/code, and payload-digest facts.
+- No prompt, strategy source, raw provider response, credential, header, API
+  key, or operator approval content was persisted, printed, or included here.
+- The only elevated actions were the narrow pytest temporary-filesystem access
+  needed for managed Windows atomic audit files and the requested local Git
+  staging/commit metadata writes.
+
+## Commit and worktree state
+
+```text
+b5034600d99c40eff13fa2f461808748d07b8e9c
+fix: bind optimizer terminal lifecycle to authorization
+```
+
+The commit contains exactly the three tracked files listed above. After the
+commit, `git status --short --branch` reports only:
+
+```text
+## codex/pit-optimizer-implementation
+```
+
+The SDD reports are ignored by `.superpowers/sdd/.gitignore` and therefore do
+not affect the clean tracked worktree.
+
+## Concerns
+
+- Live provider/SDK compatibility remains intentionally untested at this safety
+  boundary.
+- Pre-Task-6A schema-v2 optimizer terminal histories lack the new trusted
+  terminal commitment. They deliberately cannot be auto-recovered and require
+  explicit trusted migration or terminal disposition.
+- Verification noise is limited to the pre-existing unknown `cache_dir`
+  warning and Git's Windows LF-to-CRLF notices.
+

@@ -1,0 +1,74 @@
+"""Record exact local acquisition state; absent final inputs remain absent."""
+from datetime import datetime, timezone
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+ROOT = Path.cwd()
+sys.path.insert(0, str(ROOT))
+from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5
+from core.pit_optimizer_v5.contracts import ArtifactRefV5, evaluator_source_map_v5, evaluator_source_sha256
+from normalize_pit_universe_membership import _source_rows, _validate_source_provenance
+
+ARTIFACTS = ROOT / '.artifacts/pit-optimizer-v5'
+DATA = ARTIFACTS / 'data'
+
+def sha(path):
+    with path.open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+def main():
+    expected = [name for universe in ('sp500', 'nasdaq100', 'russell2000') for name in (f'source/{universe}_membership.csv', f'source/{universe}_provenance.json')]
+    expected += [name for kind in ('prices', 'fundamentals', 'industry') for name in (kind + '.csv', kind + '_provenance.json')]
+    files = [{'relative_path': name, 'exists': (DATA / name).is_file(), 'sha256': sha(DATA / name) if (DATA / name).is_file() else None} for name in expected]
+    sp = DATA / 'source/sp500_membership.csv'
+    _validate_source_provenance(universe_id='sp500', membership_path=sp, rows=_source_rows(sp, universe_id='sp500'), provenance=json.loads((DATA / 'source/sp500_provenance.json').read_text()))
+    repo = LocalArtifactRepositoryV5(ARTIFACTS)
+    profile_ref = ArtifactRefV5('evaluator/sandbox-profile.json', '7a9c1e73046f7a00abcb5fc029350ea7e42e5841b179074a5ef43a94f5613483')
+    repo.authenticate_exact(profile_ref)
+    index_ref = ArtifactRefV5('evaluator/image-preparation-index-663f1749ba91.json', '65618a8bb60c50295f1d55468f4abc249f658782e5025fcc5c3ece71383c26df')
+    repo.authenticate_exact(index_ref)
+    runtime_source = evaluator_source_sha256(evaluator_source_map_v5(ROOT))
+    if runtime_source != '5989471897bee94e6886493f71b525c931388e029e6eeaa626abc3678c3e2fd7':
+        raise ValueError('Runtime source changed since image preparation')
+    evidence = [
+        'acquisition/access-diagnosis-20260907.json',
+        'acquisition/raw/local-sp500/membership_provenance.json',
+        'acquisition/raw/sec-bulk/import-provenance.json',
+        'acquisition/raw/sec-sic/acquisition.json',
+        'acquisition/sec-sic-filings-provenance.json',
+        'acquisition/legacy-sp500-sic-seed-coverage.json',
+        'acquisition/raw/alpaca-references/acquisition.json',
+        'acquisition/raw/local-cache/import-provenance.json',
+        'acquisition/raw/nasdaq-public/acquisition-manifest.json',
+        'acquisition/vendor-membership-request.md',
+    ]
+    report = {
+        'schema_version': 1,
+        'record_kind': 'V5_data_and_image_acquisition_preparation_only',
+        'recorded_at_utc': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+        'required_input_files': files,
+        'required_input_files_present': sum(row['exists'] for row in files),
+        'required_input_file_count': len(expected),
+        'sp500_source_pair_validator_passed': True,
+        'three_universe_bundle_ready': False,
+        'evaluator_image_ready': True,
+        'image_reference': 'pit-optimizer-v5-evaluator@sha256:663f1749ba91df9e501e9de705cca83ff1c46305ca5a2ad589380fbe1d9893aa',
+        'sandbox_profile': {'relative_path': profile_ref.relative_path, 'sha256': profile_ref.sha256},
+        'image_preparation_index': {'relative_path': index_ref.relative_path, 'sha256': index_ref.sha256},
+        'runtime_source_sha256': runtime_source,
+        'local_evidence': [{'relative_path': name, 'sha256': sha(DATA / name)} for name in evidence],
+        'acquired_material': {'sp500_membership_events': 711, 'sp500_source_tickers': 606, 'sec_bulk_archives': 2, 'sec_sic_quarters': 25, 'sec_sic_accession_cik_rows': 172551, 'sec_sic_distinct_ciks': 10567, 'reference_price_symbols': ['IWM', 'QQQ', 'SPY'], 'sessions_per_reference': 1508, 'nasdaq_public_source_documents': 16},
+        'remaining_blockers': ['Complete Russell2000 effective daily membership and dated identifiers are not yet obtained.', 'Nasdaq100 SOLS/GRAL transient membership dates and complete event coverage remain unestablished.', 'Full union price/fundamental identities and no-exclusion coverage cannot be sealed before complete membership; old SEC master contains exclusions and seed gaps.', 'Dated SEC SIC material needs complete historical lineage mapping and group-rank composition before final industry admission.'],
+        'vendor_inquiries': {'drafted': True, 'sent': False, 'operator_asked_for_recommendation': True, 'recommendation': 'Request coverage/retention/price quotes only for missing membership; retain existing Alpaca and public SEC sources; purchase only after quote review.', 'explicit_send_approval_received': False},
+        'tests_run': False, 'evaluations_run': False, 'model_provider_calls_run': False, 'remote_uploads_or_pushes': False,
+    }
+    output = DATA / 'acquisition/acquisition-status-20260907.json'
+    with output.open('x', encoding='utf-8', newline='\n') as stream:
+        json.dump(report, stream, indent=2, sort_keys=True)
+        stream.write('\n')
+    print(json.dumps({'status_file': str(output.relative_to(ROOT)), 'sha256': sha(output), 'inputs_present': report['required_input_files_present'], 'image_ready': True, 'bundle_ready': False}), flush=True)
+
+if __name__ == '__main__':
+    main()

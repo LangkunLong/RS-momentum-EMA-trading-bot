@@ -1,0 +1,29 @@
+# Campaign 06: reviewed contract repair and bounded continuation
+
+Prepared 2026-09-07T18:49:57.819262+00:00. No model calls authorized or made by this package.
+
+Campaign05 received two model responses but failed before evaluation: generated source lacked a required final newline. Actual cost was $0.04007 for8,438 tokens. Campaigns03-05 total5 calls,19,117 tokens,$0.095955 reported. All are terminal and cleaned up; never resume them.
+
+The provider-only repair now states source formatting, exact input binding, author ordering, investigator ranks/citations, and critic ordering. It tells the author to preserve market gates and ranking unless explicitly targeted. Shared literal schema references keep all23 archived request schemas within their original conservative token bounds. Canonical identities, parsing and saved responses are unchanged. Independent exact-byte review approved; scoped Ruff and compilation passed; no tests or synthetic probes. The unchanged actual05 source remains rejected. Its market-gate changes also mean it must not be silently repaired into a candidate.
+
+The real CLI confirms05 still failed/readable and06 ready with zero calls. Evaluator source identity 005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4 is unchanged; reuse the digest-pinned image, quick baseline and four discovery baselines. No rebuild or repeated baseline evaluation is needed.
+
+## Proposed authorization
+
+Run prepared06. Permit at most one replacement07 after a known failure and reviewed local repair, only if six calls and448,000 tokens still remain. Stop on first successful two-round campaign or when these conditions cannot be met. Never repeat an uncertain paid outcome or resume a terminal campaign.
+
+This changes the campaign-attempt limit only: the original12-call/896,000-token total remains. Five calls and19,117 tokens are already used, leaving at most **7 calls and876,883 tokens**. Each campaign still allows two rounds, six calls,448,000 tokens and8,192 output tokens per role. Zero automatic retries or schema-repair calls. No hard dollar ceiling; reported cost is audited.
+
+Model remains openai/gpt-5.4 via OpenRouter, with the same compatible upstream routing. Outgoing content remains selected editable policy modules/contracts and bounded aggregate evidence/history; no raw dataset, repository export or credential contents. Existing main-checkout .env OPENROUTER is used only for authentication. Resources remain role300s, round2h, campaign4h, quick600s, discovery window1200s; one evaluator,1CPU,1024MiB,32PIDs,64MiB output. Data, image and development scope are unchanged. No trading, deployment, purchases, held-out qualification or source push.
+
+## Exact package
+
+Manifest: `d90ed717c0d6b34d4cfa6bf7e2dd1f753e68c43b1127b200a66d2a9f930dfdf6`.
+
+Adapter config: `f014d75da82ecc53bc42e9f02572a0e264b35205d2bacba4e8c85b7b3b83f6e7`.
+
+Initial logical body: `e32d61e9ab6ae716e9b8870478481b01b061fd9c1fab353418608665fdea4406`.
+
+`initial-outbound-body.json` contains the initial request; `launch-review.json` records exact argv and source/helper hashes. Later packets depend on actual outputs and the existing request/ledger caps. `continuation-extension-proposal.json` records the proposed allowance; it is not approval.
+
+The final detailed GPT-5.6 Luna implementation plan remains due after actual two-round completion. The user will create the next session manually. These preparations establish no strategy-performance result.

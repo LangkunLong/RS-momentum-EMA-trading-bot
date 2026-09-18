@@ -1,0 +1,16 @@
+# PIT optimizer V5 status — September 8, 2026
+
+Recovery source A through B4c, including the C1 record-invariant correction, is principal-approved. No source defect was identified in the B4c review. No new campaign ran; the original two real evaluated feedback rounds remain incomplete.
+
+Fresh evidence:
+- Evaluator unchanged: 005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4, 56 files.
+- Runtime-04 authenticated record/cleanup derives lifecycle/evaluated-feedback/rejected counts 1/1/0. Full summary is blocked by stored/current executor identity mismatch; matching command digest. Cause component is not yet isolated.
+- Actual06 now returns a full authenticated summary: 0/0/0, terminal rendering/stage_failed, two calls, 8596 tokens, USD0.04234, cleanup complete. All 23 historical non-command summary fields match.
+- New positive render-rejection, exact-duplicate and mixed/no-testable lifecycles remain static-reviewed only.
+- Remaining old grant: five calls/868287 tokens, below the conditional replacement's six-call minimum. No new paid run is authorized.
+- Final production inputs: fresh local check still 2/12 present. Development S&P500 bundle remains available and provisional. Both vendor inquiries were submitted; replies remain unchecked.
+
+Read the detailed transition:
+C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.worktrees\pit-optimizer-v5-architecture\docs\superpowers\plans\2026-09-08-pit-optimizer-v5-transition.md
+
+Next manual principal session starts Increment C-a, read-only historical-verifier diagnosis. This snapshot supersedes earlier source-progress notes; it does not authorize campaign execution, mailbox access or any purchase.

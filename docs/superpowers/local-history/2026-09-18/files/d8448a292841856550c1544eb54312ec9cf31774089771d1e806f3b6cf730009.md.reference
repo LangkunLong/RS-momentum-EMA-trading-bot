@@ -1,0 +1,197 @@
+# Task 4 Report: Immutable Effective Engine Policy and Honest Optimizer Surface
+
+## Status
+
+Complete after fix round 3. The policy now attests the complete optimizer-relevant scoring and
+engine-policy surface for the owned built-in implementation. This is an implementation inventory, not a
+claim that its thresholds are universal CANSLIM constraints. Injected strategies are truthfully scoped to
+the engine-owned envelope plus an optional declared identity; opaque custom internals are explicitly
+unattested.
+
+No entry, signal, score, market, sizing, capacity, or exit decision was tuned. The behavior changes are
+limited to fail-closed rejection of inert requests and fail-closed policy-attestation boundaries.
+
+## Exact effective-policy evidence
+
+- Default effective-policy SHA-256:
+  `744104da98b205d73b827d9ecd90e610dbc9d830eb11adc09b31cc034b3a006a`
+- Schema version: `1`
+- Strategy basis: `CANSLIM-derived`
+- Optimization owner: `multi_agent_backtest_loop`
+- Objective: `maximize_return_and_minimize_drawdown`
+- Optimization executed by this build: `false`
+
+Leaf counts by section:
+
+- `causal_invariants`: 5
+- `entry_policy`: 14
+- `scoring_policy`: 63
+- `market_policy`: 22
+- `capacity_and_sizing_policy`: 7
+- `exit_policy`: 8
+- `unsupported_requests`: 7
+- Total: 126
+
+Leaf counts by classification:
+
+- `active_fixed_policy`: 81
+- `active_tunable_policy`: 25
+- `advisory_or_unsupported`: 8
+- `causal_invariant`: 12
+- Optimizer candidates: 105; non-candidates: 21
+
+## Selected exact built-in fields
+
+Canonical engine-owned entry gates remain active-fixed optimizer candidates: current growth `0.25`,
+annual growth `0.25`, RS `80.0`, non-M composite `70.0`, volume ratio `1.3`, and maximum buy-zone
+extension `0.05`. Signal cadence is `5`. The default provider industry filter is enabled with top `20`
+groups and minimum group size `3`.
+
+The M evaluator/state machine records:
+
+- `<50` rows: score `0.4`, bearish, no latest close.
+- Follow-through search: minimum input `5`, window `30`, rally reset below `-0.01`, rally starts above
+  `0.0`, and follow-through requires higher volume.
+- Evaluator EMAs `[21, 50, 200]` use pandas `adjust=true`. A newly constructed stateful tracker defaults
+  to `correction`; with fewer than `2` history rows bootstrap returns without changing or seeding it.
+  Otherwise bootstrap uses EMA `200` with `adjust=false`: strict latest close above latest EMA selects
+  `confirmed_uptrend`, otherwise `correction`.
+- Bootstrap replays `min(M_DISTRIBUTION_LOOKBACK + 1, len(hist))` rows. It uses the exact distribution
+  predicate, assigns bar indices by `i - replay_row_count + 1` (`2 - replay_row_count` through `0`), and
+  applies seeded thresholds only if the EMA-selected state is not correction. Live entries are allowed in
+  `confirmed_uptrend` and `under_pressure`, and blocked only in `correction`; live distribution,
+  correction-low, rally-undercut, and follow-through transitions are separately bound.
+- All settings-backed distribution/follow-through thresholds, lookbacks, score weights, and bullish
+  threshold are active-fixed optimizer candidates.
+
+The RS/N/S/I inventory records:
+
+- RS requires at least `10` ranked symbols. Standard history is
+  `4 * TRADING_DAYS_PER_QUARTER`; the minimum fallback history is `60`, with
+  `(1 + raw_return) ** (252 / observed_trading_days) - 1`.
+- Technical evaluation requires `60` sessions and uses a `252`-session high window.
+- N revenue score is `clip(revenue_growth / N_REVENUE_GROWTH_TARGET, 0, 2) / 2`, capped to `[0, 1]`.
+  Proximity bands are `0.98`, `0.90`, and `0.75`; the lower-band factor is `0.3`.
+- S power-gap inputs are default lookback `10`, gap `0.02`, and volume `1.5`. Minimum history is
+  `lookback_days + 50`, but the executed half-open baseline slice is exactly
+  `volumes.iloc[-(lookback_days + 50):-(lookback_days + 1)]`, containing `49` observations at the default.
+  The policy also binds the exact
+  50-session up/down-volume defaults, caps and score bands; float thresholds `50/200/500/1000`
+  million with scores `1.0/0.85/0.65/0.4/0.2` and neutral `0.5`; and the volume/breakout `0.5/0.5`
+  split with proximity floor `0.85`.
+- I binds every ownership-level and ownership-trend threshold/formula, neutral unavailable score `0.5`,
+  negative-trend floor `0.1`, and active-component reweighting.
+
+Capacity/sizing and exits remain exact: default positions are uncapped, eviction is enabled, the sizing
+formula is `portfolio_equity * position_risk_pct / stop_loss_pct`, risk is `0.01`, stop loss is `0.08`,
+and scale tiers are `[[0.1, 0.25], [0.15, 0.25], [0.2, 0.25]]`. The early-winner flag from a `0.20`
+gain within `15` held sessions suppresses tiered scale-outs only. Hard stop, stagnation, protective-stop,
+and EMA exits remain active, and the flag clears at the start of processing when `days_held >= 40`.
+
+## Built-in and injected attestation truth
+
+Before each fresh capture, the owned built-in strategy is synchronized from the simulator for
+`technical_only`, `require_bullish_market`, `require_proper_base`, and fundamental-provider mode. The
+default provider marker is `legacy_scored_provider_path`; PIT uses
+`pit_bundle_bound_provider_path`. Verification never synchronizes, so post-capture nested drift fails.
+Provider objects are never serialized or accessed for data.
+
+Built-in capture also requires `strategy is _owned_builtin_strategy`. The same identity relationship is a
+digest-bound invariant leaf, without serializing object IDs. Replacing the strategy with another
+`CanslimStrategy` of the same type rejects before a fresh capture; replacement after capture changes the
+live leaf and fails verification. Injected mode is unaffected.
+
+Injected strategies are not synchronized or introspected. Their Python type is advisory provenance only.
+An optional JSON-safe `effective_policy_identity`, falling back to `checkpoint_identity`, is normalized and
+digest-bound. Without one, policy scope is `engine_owned_envelope_only` and
+`custom_internals_opaque_unattested=true`. With one, scope is
+`engine_owned_envelope_plus_declared_custom_identity`. Two otherwise identical custom strategies declaring
+versions `1` and `2` produced different digests:
+
+- `3082b18be890bb4456c75c69b666328ef3af2a565e2f9d0d59094a1415255118`
+- `901d76dc174c6e513faef87f6275ce75af86ca6240f3b3b80d703fcb7c87fae8`
+
+Custom identity mutation after capture fails verification. Non-JSON-safe identities and raising identity
+callables raise clear `ValueError`s. A minimal opaque custom strategy constructs without
+`min_c_a_growth`.
+
+The output contract is mode-specific: technical-only rebuilds completed-session technical facts but
+bypasses C/A/RS/composite gates; full mode rebuilds technical facts and reapplies the canonical C/A/RS
+non-M composite contract.
+
+## Attestation lifecycle
+
+- Constructor capture supports direct inspection.
+- Official `run()` start synchronizes owned built-in fields and replaces the snapshot before cache clearing
+  or data access, preserving supported pre-run simulator mutations.
+- Verification freshly rebuilds the live object and digest, compares both to the stored object and digest,
+  and independently hashes the stored object. It runs before every session's behavior, checkpoint
+  fingerprint use, checkpoint/result construction, restored-result construction, and PIT publication.
+- Live policy construction reads configuration and declared policy identity only. It does not read mutable
+  portfolio/trade/price/cache/artifact state and does not trigger provider/data access.
+- Canonical hashing remains sorted, compact UTF-8 JSON with `allow_nan=false`.
+
+## Files changed
+
+- Created/updated `core/engine_policy.py`.
+- Modified `core/backtest_engine.py`.
+- Modified `pit_baseline.py`.
+- Updated this report.
+
+No sealed Task 11 artifact or unrelated dirty file was modified.
+
+## Commands and exact output
+
+One direct offline constructor probe used non-fetching injected objects and never called `run()`. It covered
+the exact bootstrap and 49-observation S leaves, same-type built-in replacement before and after capture,
+nested post-capture drift, opaque custom scope, declared identity digest separation/drift, and inert
+rejection before `DataFetcher` construction. Exit code `0`:
+
+```text
+DEFAULT_DIGEST=744104da98b205d73b827d9ecd90e610dbc9d830eb11adc09b31cc034b3a006a
+SECTION_COUNTS={"capacity_and_sizing_policy":7,"causal_invariants":5,"entry_policy":14,"exit_policy":8,"market_policy":22,"scoring_policy":63,"unsupported_requests":7}
+CLASS_COUNTS={"active_fixed_policy":81,"active_tunable_policy":25,"advisory_or_unsupported":8,"causal_invariant":12}
+TOTAL_LEAVES=126
+OPTIMIZER_CANDIDATES=105
+BOOTSTRAP={"constructor_default_regime":"correction","distribution_replay":{"bar_index_formula":"i - replay_row_count + 1","bar_index_range":"2 - replay_row_count through 0","comparison_count":"replay_row_count - 1","daily_change_formula":"(close - previous_close) / previous_close","history_selection":"spy_df.loc[:start_date]","iteration":"i in range(1, replay_row_count)","predicate":"previous_close > 0 and daily_change <= -M_DISTRIBUTION_MIN_DECLINE and volume > previous_volume","row_count":"min(M_DISTRIBUTION_LOOKBACK + 1, len(hist))"},"ema_rule":{"above_result":"confirmed_uptrend","adjust":false,"comparison":"latest_close_strictly_greater_than_latest_ema","otherwise_result":"correction","period":200},"post_seed_rule":{"applies_only_when_ema_regime_is_not_correction":true,"correction_at_or_above":"M_MAX_DISTRIBUTION_DAYS","precedence":["correction","under_pressure"],"under_pressure_at_or_above":"M_REGIME_PRESSURE_DIST_DAYS"},"short_history_rule":{"effect":"return_without_changing_constructor_default_or_seeding_distribution_days","fewer_than_rows":2}}
+POWER_GAP={"default_lookback_days":10,"default_volume_baseline_observations":49,"gap_formula":"(open - prior_close) / prior_close","gap_threshold":0.02,"minimum_history_rows":"lookback_days + 50","search_order":"newest_first","volume_baseline_slice":"volumes.iloc[-(lookback_days + 50):-(lookback_days + 1)]","volume_threshold":1.5}
+CUSTOM_DIGESTS=3082b18be890bb4456c75c69b666328ef3af2a565e2f9d0d59094a1415255118,901d76dc174c6e513faef87f6275ce75af86ca6240f3b3b80d703fcb7c87fae8
+REJECTIONS={"custom_drift":"effective engine policy changed after run start","inert":"inert field 'take_profit_pct' accepts only compatibility value 0.4; actual policy source is config.settings.SCALE_OUT_TIERS","nested":"effective engine policy changed after run start","post_replace":"effective engine policy changed after run start","pre_replace":"owned built-in strategy binding changed before capture"}
+```
+
+Compilation command:
+
+```powershell
+python -B -m py_compile core/engine_policy.py core/backtest_engine.py pit_baseline.py
+```
+
+Exit code `0`; no output.
+
+Diff whitespace command:
+
+```powershell
+git diff --check -- core/engine_policy.py core/backtest_engine.py pit_baseline.py .superpowers/sdd/2026-08-26-task11-engine-fidelity-observability/task-4-report.md
+```
+
+Exit code `0`; only Git's existing LF-to-CRLF working-copy notices were emitted for
+`core/backtest_engine.py` and `pit_baseline.py`.
+
+## Self-review
+
+1. Bootstrap now distinguishes constructor fallback, data-derived starting state, exact replay/indexing, and
+   post-seed thresholds. S records the executed 49-observation slice rather than the explanatory 50-session
+   comment. Both are active-fixed optimizer candidates.
+2. Custom type provenance no longer implies configuration attestation. Declared identities are bound and
+   live-verified; undeclared internals are explicitly opaque and scoped to the engine envelope.
+3. Owned nested built-in state is synchronized only on capture and included in the policy. Built-in object
+   identity is required on capture and independently live-attested, so same-type replacement cannot bypass
+   the nested facts. Verification does not repair drift and therefore fails closed.
+4. Existing run-start/session/checkpoint/result/publication verification and inert-request rejection remain
+   intact. `core/engine_policy.py` has no runtime import from `core/backtest_engine.py`.
+5. No active strategy threshold, formula, weighting, signal, entry, or exit behavior changed.
+
+## Concerns
+
+- Formal tests remain deliberately deferred because this task explicitly forbids adding or running them.
+- No backtest, provider/network access, cache refresh, optimizer operation, or PIT publication was performed.
+- Git's LF-to-CRLF notices are non-blocking; the scoped diff check reports no whitespace errors.

@@ -1,0 +1,15 @@
+# Development scope fix review
+
+Reviewed pinned fix range `cb0019f78da8b93578e6f7050882cca231b5c83f..79d730bb67589f42fd0542d736a6d6fc8be74976` against `development-scope-brief.md`, the original development-scope review, the fix report, the exact supplied fix patch, and the controller ruling.
+
+## Result: PASS — ADDRESSED
+
+The original P1 is addressed through the alternative explicitly allowed by the review. The implementation does not claim that dataclass defaults migrate persisted JSON and does not weaken strict exact-key decoding. Instead, it authenticates the original content-addressed bytes, detects a missing `pit_data_scope` before typed loading of either the campaign manifest or baseline-parent authority, and gives the operator an actionable instruction to retain the old artifact and rebuild the manifest graph with new content-addressed references.
+
+The corrected development report and operations documentation accurately describe the compatibility boundary: pre-scope bytes and their original references remain readable and content-authenticatable, while typed use requires an explicit rebuild. They also prohibit editing old bytes in place or reusing old digests for re-emitted content. This is consistent with the controller ruling and preserves the existing real `PanelExecutionRequestV5`/output wire.
+
+No new breakage was found in the fix-only changes.
+
+## Review constraints
+
+No tests were read, created, modified, or run. No probes, Docker, network, provider calls, source changes, or Git mutations were performed. Review was limited to the supplied campaign artifacts, exact fix patch, and narrow adjacent non-test source needed to verify authentication and typed-loading order.

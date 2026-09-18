@@ -1,0 +1,64 @@
+```diff
+diff --git a/core/pit_optimizer_v5/summary.py b/core/pit_optimizer_v5/summary.py
+--- a/core/pit_optimizer_v5/summary.py
++++ b/core/pit_optimizer_v5/summary.py
+@@ -78,6 +78,9 @@ class OptimizerSummaryV5:
+     qualification_started: bool = False
+     replay_started: bool = False
+     evaluation_mode: Literal["synthetic_fixture", "production", "development_sp500_v2"] = "production"
++    completed_lifecycle_rounds: int = 0
++    evaluated_feedback_rounds: int = 0
++    render_rejected_experiments: int = 0
+ 
+     def __post_init__(self) -> None:
+@@ -98,9 +101,20 @@ class OptimizerSummaryV5:
+             self.evaluated_experiments,
+             self.behaviorally_distinct_variants,
+             self.archive_families,
++            self.completed_lifecycle_rounds,
++            self.evaluated_feedback_rounds,
++            self.render_rejected_experiments,
+         ):
+             if type(value) is not int or value < 0:
+                 raise ValueError("optimizer summary count is invalid")
++        if (
++            self.completed_lifecycle_rounds > self.rounds_seen
++            or self.completed_lifecycle_rounds > self.experiments
++            or self.evaluated_feedback_rounds > self.completed_lifecycle_rounds
++            or self.evaluated_feedback_rounds > self.evaluated_experiments
++            or self.render_rejected_experiments > self.experiments
++        ):
++            raise ValueError("optimizer summary progress counts are inconsistent")
+         if type(self.cost_usd) is not Decimal or not self.cost_usd.is_finite() or self.cost_usd < 0:
+             raise ValueError("optimizer summary cost is invalid")
+@@ -204,6 +218,19 @@ def summarize_repository_v5(
+         panel_plan=panel_plan,
+         evaluator_contract=evaluator_contract,
+     )
++    record_rounds = {record.round_index for record in records}
++    completed_record_rounds = {
++        round_index
++        for round_index in record_rounds
++        if round_index in cleanups and cleanups[round_index].cleanup_complete
++    }
++    evaluated_record_rounds = {record.round_index for record in evaluated}
++    render_rejected_experiments = sum(
++        1
++        for record in records
++        if record.status == "invalid"
++        and record.validation.failure_code == "policy_source_unbounded_or_stateful"
++    )
+     stored = (
+         ()
+         if checkpoint is None
+@@ -292,6 +319,11 @@ def summarize_repository_v5(
+         else "synthetic_fixture"
+         if manifest.provider is None
+         else "production",
++        completed_lifecycle_rounds=len(completed_record_rounds),
++        evaluated_feedback_rounds=len(
++            completed_record_rounds & evaluated_record_rounds
++        ),
++        render_rejected_experiments=render_rejected_experiments,
+     )
+```

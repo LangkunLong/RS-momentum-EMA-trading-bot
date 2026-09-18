@@ -1,0 +1,23 @@
+# Task 2 independent review
+
+## Findings
+
+1. **[P2] Restore the existing episode-loop bytes.** In `core/pit_optimizer_v5/production_runtime.py`, current lines 641–643 (preimage lines 618–620) have LF endings, whereas all three had CRLF endings in the authenticated preimage. These are the existing `for metric_id`, `if metric_id`, and `evaluator_ids.append(...)` lines inside the protected episode body. This violates the brief's explicit requirement that the complete per-episode body remain byte-identical. The visible source text is unchanged, so this is a preservation defect rather than a demonstrated runtime defect. Restore the preimage endings for the protected body without changing the required insertions.
+2. **[P2] Correct the implementation report's preservation claim.** `task-2-report.md` states that the complete per-episode body remains unchanged and that the diff contains only the required insertions. A normal Git diff suppresses the line-ending difference, but the raw source comparison disproves byte preservation. Recheck raw bytes after correction and update the recorded final hash and preservation claim.
+
+Spec compliance: FAIL
+
+Task quality: FAIL
+
+## Static review evidence
+
+- Read the brief, implementation report, and supplied review diff in the requested order. Compared the live source with the authenticated preimage using raw, newline-preserving reads and a static Git diff. No production files were edited by this review.
+- Preimage SHA-256: `78da0dc5efcf5cf94541a465e0a3c212221c843dade07f680ddc5e1508fdc476`. Reviewed source SHA-256: `c33bde295c8d4c01ed05a83580d7b2f9370218df10397f7b68be251ead2ec36d`. Both match the supplied report.
+- The 16-item Increment-A allowlist is exactly preserved. Removing the two required insertions reproduces the preimage only after normalizing carriage returns; raw source equality fails.
+- The helper matches the prescribed logic and literal errors. It reloads/checks the checkpoint, reloads every stored reference, checks record equality, strictly prior round, discovery-plan identity, PIT scope, and semantic mode, then counts only `invalid` records carrying the reserved failure code. There is no catch or fallback that turns repository failures into zero.
+- The unchanged `SearchProjectionV5.__post_init__` binds stored references to checkpoint record references and prohibits records without a checkpoint. The recovery path constructs stored records from those committed references. `StoredExperimentRecordV5` binds record hash/path to its reference. The unchanged `load_experiment` authenticates canonical record content and validates the render-rejection journal/event/payload authority; `load_checkpoint` is read-only. These seams support counting committed, authenticated records.
+- The single new literal failure metric is guarded by a nonzero count and appended after the entire parent-episode loop, before archive-family and history evidence. Existing `evidence.add` calls retain their source text and relative order. The helper is adjacent to `_investigator_parts`; no additional functional changes appear in the preimage-to-current source comparison.
+- The broad worktree already contains unrelated modified files. The task-specific preimage and diff support the two-insertion functional scope in `production_runtime.py`; the current worktree status alone cannot attribute unrelated changes to Task 2.
+- Review used static source, diff, hash, and raw-text inspection only. No tests, synthetic inputs, probes, candidates, records, events, wrappers, requests, API/model/credential/evaluator/campaign calls, commits, pushes, or deployments were performed.
+
+The quality failure concerns the explicit preservation defect and inaccurate verification claim. No additional functional defect was identified in the requested helper or evidence insertion.

@@ -1,0 +1,56 @@
+diff --git a/core/pit_optimizer_v5/artifacts.py b/core/pit_optimizer_v5/artifacts.py
+index 7fb803d..ff448ff 100644
+--- a/core/pit_optimizer_v5/artifacts.py
++++ b/core/pit_optimizer_v5/artifacts.py
+@@ -1325,20 +1325,22 @@ class LocalArtifactRepositoryV5:
+             source = self.load_typed_artifact(source_refs[0], value_type=SourceBundleV5)
+             source_authorities.append(
+                 ArchiveRecordAuthorityV5(item.record.experiment_id, item.reference, source, source_refs[0])
+             )
+         reducer = CandidateArchiveReducerV5(
+             self.load_typed_artifact(manifest.panel_plan_ref, value_type=CampaignPanelPlanV5),
+             self.load_typed_artifact(manifest.evaluator_contract_ref, value_type=EvaluatorContractV5),
+             manifest.target,
+             tuple(sorted(source_authorities, key=lambda item: item.experiment_id)),
+             manifest.search.archive_capacity,
++            pit_data_scope=manifest.pit_data_scope,
++            semantic_mode=manifest.semantic_mode,
+         )
+         state = reduce_experiment_journal_v5(tuple(item.record for item in records), reducer)
+         expected_archive = ArchiveSnapshotV5(final_round, references, reducer.to_primitive(state))
+         if canonical_json_bytes_v5(expected_archive.to_primitive()) != self.authenticate(archive_ref).content:
+             raise ArtifactSchemaFailureV5(archive_ref)
+         if (
+             not state.archive.entries
+             or state.next_round_index != final_round + 1
+             or not records
+             or max(item.record.round_index for item in records) != final_round
+diff --git a/core/pit_optimizer_v5/selection.py b/core/pit_optimizer_v5/selection.py
+index bdb2877..9b7b940 100644
+--- a/core/pit_optimizer_v5/selection.py
++++ b/core/pit_optimizer_v5/selection.py
+@@ -130,22 +130,22 @@ class QuickScreenCandidateV5:
+             or type(self.validation) is not ValidationResultV5
+         ):
+             raise ValueError("quick-screen candidate components are invalid")
+         if self.semantic_fingerprint is not None and type(self.semantic_fingerprint) is not SemanticFingerprintV5:
+             raise ValueError("quick-screen semantic fingerprint is invalid")
+         if self.quick_evidence is not None and type(self.quick_evidence) is not PanelEvaluationV5:
+             raise ValueError("quick-screen panel evidence is invalid")
+         validate_semantic_mode_v5(self.pit_data_scope, self.semantic_mode)
+         if (self.parent_semantic_fingerprint_sha256 is None) != (self.semantic_mode == "disabled_development"):
+             raise ValueError("quick-screen parent fingerprint differs from semantic mode")
+-        if self.semantic_mode == "disabled_development" and self.semantic_fingerprint is not None:
+-            raise ValueError("disabled semantics cannot carry a fingerprint")
++        if (self.semantic_fingerprint is None) != (self.semantic_mode == "disabled_development"):
++            raise ValueError("quick-screen fingerprint differs from semantic mode")
+         if self.parent_semantic_fingerprint_sha256 is not None:
+             _digest(self.parent_semantic_fingerprint_sha256, "quick-screen parent fingerprint")
+         if not _assignment_matches_template(self):
+             raise ValueError("quick-screen assignment differs from its template")
+         if self.validation.valid and (self.validation.changed_symbols != self.template.changed_symbols):
+             raise ValueError("quick-screen validation differs from its template")
+         if self.quick_evidence is not None and (
+             self.quick_evidence.policy_identity_sha256 != self.variant.policy_revision.sha256
+         ):
+             raise ValueError("quick-screen evidence differs from its policy")

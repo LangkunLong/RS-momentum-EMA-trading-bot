@@ -1,0 +1,64 @@
+# Production loop wiring review — 2026-09-07
+
+**Verdict: Needs fixes.** One Important issue prevents reliable recovery of already-paid work after a persisted deadline expires. Setup and command rendering are implemented; production campaign recovery is not yet ready for approval.
+
+Reviewed the exact committed change `29b09a7` → `e54498b755818e9bdba08c36704ef9ca359e71de`, using `loop-wiring-brief.md`, `loop-wiring-report.md`, and `loop-wiring-review.patch`. Relevant unchanged production sources were inspected only to trace the changed setup, composition, persistence, budget, and recovery boundaries. No tests were read, created, modified, or run. No provider or Docker execution occurred. No source code was edited.
+
+## Critical issues
+
+None found.
+
+## Important issues
+
+### I1 — Reconcile paid requests before applying an expired work deadline (P1, confidence 10/10)
+
+**Changed evidence:** `core/pit_optimizer_v5/operations.py:489` calculates remaining round time from the persisted start; lines 490–494 pass the possibly expired deadline into the runtime:
+
+```python
+round_deadline = min(deadline, time.monotonic() + round_remaining)
+result = run_feedback_round_v5(
+    composition.inputs,
+    composition.dependencies,
+    campaign_deadline_monotonic=round_deadline,
+)
+```
+
+The changed guard at `core/pit_optimizer_v5/runtime.py:1029` still applies the work deadline to every nonterminal recovery:
+
+```python
+if self.journal.terminal_payload() is None:
+    self._deadline("recovery", self.inputs.manifest.resources.round_wall_timeout_seconds)
+```
+
+**Concrete failure:** An investigator completion and round intent have been journaled, then the author request is persisted and paid. The controller exits after the provider response or ledger terminal becomes durable but before the author `role_completion` is appended. Restart after the saved round or campaign deadline. The launcher accepts this journaled round and passes its expired deadline into the runtime, which aborts at `runtime.py:1030` before reaching the existing `reconcile_once(persisted)` call at `runtime.py:978`. The abort handler calls `_failure_result` (`runtime.py:2763`), which appends a `runtime_failed` terminal and performs cleanup (`runtime.py:1433`, `runtime.py:1446`, `runtime.py:1459`).
+
+The immediate `_verify_local_run` at `operations.py:496` then calls `ledger.authenticate_role_invocations` (`cli.py:787`). That rejects the paid request because `production_provider.py:514` requires `len(reservations) == len(terminals) == len(packages)`, while the author completion is still absent from the journal. Future campaign resumes reuse the terminal round once cleanup is complete (`operations.py:389`–395), so they never reach reconciliation; final verification at `operations.py:516` fails again. Even a single-round resume sees the terminal and returns it before role reconciliation (`runtime.py:2507`–2528).
+
+This does not create a duplicate paid call, but it makes recoverable paid work permanently unrecoverable through the advertised resume commands and leaves campaign accounting unverifiable. The new allowance for terminal cleanup does not cover this nonterminal paid-request recovery case.
+
+**Required fix:** Reconcile persisted paid requests and journal their existing authoritative completions before new-work deadline gates or terminal-round reuse. Reuse the existing local reconciler: it can settle a saved provider response or an expired unreported claim at `production_provider.py:878`–897 without a fresh provider call. Keep the saved campaign and round deadlines unchanged and prohibit subsequent optimization work once they expire. Preserve pending/unresolved accounting as recoverable state rather than sealing it behind a terminal shortcut. No manifest schema change is needed.
+
+## Minor issues
+
+None found.
+
+## Spec compliance and implementation readiness
+
+| Required outcome | Assessment | Evidence |
+| --- | --- | --- |
+| Construct and persist the existing adapter config from real authenticated authorities and host paths | Implemented. Preparation discovers or accepts Git/Docker paths, checks directories, data hashes and clean source, and derives config identities from actual concrete adapters. It performs no provider call or evaluation. | `operations.py:98`, `operations.py:139`, `operations.py:162`, `operations.py:189`, `operations.py:207`, `operations.py:225`; concrete identities checked at `cli.py:367`–370 and `cli.py:423`–427. |
+| Render a real explicitly configured command and retain manifest-only preview | Implemented. Config, manifest, round and owner are validated; output supplies argv, working directory, and PowerShell literal quoting. Campaign rendering requires the original round-1 config. | `cli.py:1511`–1531; `operations.py:249`–301. |
+| Sequential bounded launch/resume through the existing feedback runtime | Implemented with I1 outstanding. The launcher uses the existing state lock, persists launch and round starts, derives later-round configs, reuses checkpoint/terminal state, and stops on real runtime outcomes and resource limits. | `operations.py:322`, `operations.py:345`–355, `operations.py:377`–439, `operations.py:446`–494, `operations.py:508`–516. |
+| Concise commands and honest separation of preparation from execution | Implemented. Documentation gives actual PowerShell setup/render/run/resume commands and explicitly records upstream manifest/baseline prerequisites. | `docs/pit-optimizer-v5-operations.md:3`, `docs/pit-optimizer-v5-operations.md:13`, `docs/pit-optimizer-v5-operations.md:17`, `docs/pit-optimizer-v5-operations.md:54`, `docs/pit-optimizer-v5-operations.md:70`. |
+
+The campaign does not increase manifest limits. Elapsed campaign and round time includes downtime (`operations.py:373`, `operations.py:489`); the runtime uses the minimum deadline (`runtime.py:880`–882), with the existing separately bounded cleanup allowance. The real ledger still reserves prospective usage before a paid call (`production_provider.py:569`–594), so the summary-based outer budget check is not the sole enforcement boundary.
+
+Completed work is reused, and a saved round start with no journal is explicitly rejected as uncertain (`operations.py:453`–457), as documented. Later-round config creation is safe to retry after a crash before its launch record: the repository's `create_typed_artifact` authenticates identical existing bytes (`artifacts.py:1432`–1454). No additional completion ledger or manifest migration was introduced.
+
+The lazy import under `python -m core.pit_optimizer_v5.cli` was traced specifically. Operations constructs its `CampaignAuthoritiesV5`, `ProductionAdapterConfigV5`, and factory within the canonical `cli` module; the objects crossing from the `__main__` renderer are shared canonical manifest/artifact types. No concrete incompatible exact-class boundary was found, so the duplicate module possibility is not a finding.
+
+## Verification and actual production validation
+
+Independent checks passed: actual `python -B -m core.pit_optimizer_v5.cli` help for `prepare-production`, `render-command`, and `resume-campaign`; in-memory compilation of the three touched Python files; Ruff on those files; and `git diff --check` for the exact committed source/documentation diff. These are source and CLI routing checks, not campaign execution.
+
+**Actual production validation remains unavailable because no real final campaign manifest exists yet.** Successful authenticated preparation, executable command rendering with real authority, a paid feedback round, and a completed production campaign were not demonstrated. That upstream integration dependency is separate from I1 and is not treated as a request for fabricated authority or a new approval gate. After I1 is fixed and genuine baseline/manifest inputs exist, the existing documented production path is the next integration boundary.

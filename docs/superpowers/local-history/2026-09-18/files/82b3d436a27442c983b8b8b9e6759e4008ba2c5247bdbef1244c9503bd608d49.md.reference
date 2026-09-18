@@ -1,0 +1,46 @@
+### Task 7: Make Accounted Role-Output Failures Recoverable
+
+**Files:**
+
+- Modify: `core/pit_optimizer_authorization.py`
+- Modify: `core/pit_optimization_contract.py`
+- Modify: `core/pit_optimizer_artifacts.py`
+- Modify: `agent_loop.py`
+- Modify: `tests/test_pit_optimizer_v2.py`
+- Modify: `tests/test_pit_optimizer_loop.py`
+- Modify: `tests/test_agent_loop.py`
+
+**Interfaces:**
+
+- Produces: `PitOptimizerRoleAttempt`; `AuthorizationPlanSkip`; `AuthorizationLedger.skip_unstarted_plans(...)`; content-free invalid/skip artifacts.
+
+- [ ] **Step 1: Represent an accounted invalid response without calling it accepted.**
+
+  `PitOptimizerRoleAttempt` contains the plan, complete provider facts, and an optional parsed payload. The recoverable variant requires response received, `outcome == "schema_invalid"`, an allowed response-validation code, complete authoritative usage/cost accounting, and `payload is None`. Transport or incomplete/uncertain accounting remains terminal.
+
+- [ ] **Step 2: Add hash-chained settlement for unused plan slots.**
+
+  `AuthorizationPlanSkip` binds call index, iteration, role, triggering invalid call index, reason `predecessor_role_output_invalid`, prior ledger digest, and its own digest. `skip_unstarted_plans` may settle only contiguous, unreserved roles later in the same iteration. It creates no provider reservation and no call/token usage.
+
+- [ ] **Step 3: Advance by settled plan index, not accepted-call count.**
+
+  Change reservation, controller-input binding, lease completion, recovery, and audit verification so every earlier plan is covered by one fully reconciled attempt or one authenticated skip. Schema-invalid attempts count as calls. Skips count as zero calls. Never fabricate an accepted receipt or role artifact.
+
+- [ ] **Step 4: Preserve one-shot gateway behavior.**
+
+  Keep `request_pit_optimizer_once` at zero retries. After durable schema-invalid finalization, surface the content-free facts so the controller can construct `PitOptimizerRoleAttempt`. Provider content is neither retried nor copied into a failure summary.
+
+- [ ] **Step 5: Rewrite existing malformed-output/accounting cases.**
+
+  Update current invalid response, receipt lineage, lease completion, and two-iteration cases in place to prove: invalid investigator skips author/critic and reaches the next investigator; invalid author still reaches critic; invalid critic defaults locally; transport/accounting failures stop. Do not add test functions.
+
+- [ ] **Step 6: Verify and commit.**
+
+  ```powershell
+  python -B -m compileall -q core/pit_optimizer_authorization.py core/pit_optimization_contract.py core/pit_optimizer_artifacts.py agent_loop.py
+  python -B -m ruff check core/pit_optimizer_authorization.py core/pit_optimization_contract.py core/pit_optimizer_artifacts.py agent_loop.py --no-cache
+  python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py tests/test_pit_optimizer_loop.py tests/test_agent_loop.py -k "schema_invalid or malformed or skip or receipt or accounting or retry"
+  git add core/pit_optimizer_authorization.py core/pit_optimization_contract.py core/pit_optimizer_artifacts.py agent_loop.py tests/test_pit_optimizer_v2.py tests/test_pit_optimizer_loop.py tests/test_agent_loop.py
+  git commit -m "fix: recover from accounted optimizer role output"
+  ```
+

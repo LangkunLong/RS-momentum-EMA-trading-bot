@@ -1,0 +1,32 @@
+# Development composition fix re-review
+
+**Spec verdict: PASS for the scoped fixes.** Both prior findings are addressed.
+
+**Quality verdict: PASS for the scoped fixes.** No new concrete breakage identified in the fix diff. This is static source review, not an executed campaign or runtime verification claim.
+
+## Finding disposition
+
+### P1 — ADDRESSED
+
+`core/pit_optimizer_v5/cli.py:1029-1046` now authenticates the campaign manifest before selecting the read-only command authority path. Explicit development scope additionally passes `require_development_v5`, then constructs `CampaignAuthoritiesV5` from the authenticated manifest's actual panel, evaluator, baseline and sandbox fields. The constructor arguments match the declared field order/types. The development config and controller/resource verification branch at lines 1047-1063 is now reachable without entering the production-only loader. Standalone run/resume and non-development authority selection retain that loader and its production boundary.
+
+### P2 — ADDRESSED
+
+`core/pit_optimizer_v5/development_preparation.py:458-476` authenticates the supplied plan identity, both data children and all six mechanics/quick/discovery panel children. It compares the plan target with the supplied target and validates panel hashes, dates, lineage membership and purposes before the validate-only return at line 526 or any create-only writes. The concrete previously reported target-mismatch and missing/mismatched child cases therefore fail during preflight. Generated plans use the corresponding authenticated/in-memory panels through the same binding checks. Resource/profile equality is also checked at line 515. Existing campaign aggregation continues to bind the data and discovery evidence to the evaluator. The checks compare panel content identities rather than requiring imported path text to equal the original request path, preserving the intended import behavior.
+
+## Scope and identity
+
+Read the fix patch, appended implementation report and identity file, then only source context needed to trace these fixes. No tests were read, created, changed or run. No probes, application imports, compilation, CLI execution, Docker, network/provider work, source edits or agent delegation occurred. Only this report was written. No commit was attempted or workaround pursued.
+
+The fix patch SHA-256 was independently confirmed as `83f45cb318379f8aa0ed27d503c7a0650533b08ee83e4d6a09e132401e9fc9ca`, relative to the previously reviewed patch `f738b9879565ed9e55a7546b3ab60638a9b1ea90287b39c73f0fd6aeb1adbaca`. The current four source file SHA-256 values independently match `development-composition-fix-review-identity.json`:
+
+| Source | SHA-256 |
+| --- | --- |
+| `cli.py` | `af588b29c97e9022f5694351ea771af8edde23bf6ad3b9acedcb9433b2eb8824` |
+| `development_preparation.py` | `f182ae344a0a24e50eda1d00bc63a9252023fe7799085cfef42c1fdfbbb8a732` |
+| `operations.py` | `ca54c521eb071ef11a8ee9b77065c21e0f648d73983839b96596cb4228e4149a` |
+| `production_workspace.py` | `4e040d8edae52bab0635af6327601bf62e34011976182a213e925bfdb9f8b115` |
+
+Scoped unstaged source diff is empty. Current staged fixed blobs are `1ba201c1f480cadf7fe945d0cc4688f77f058e49` for cli.py and `11bb4a89251ba6305b1c0bb3639c743e4b688f7d` for development_preparation.py. Operations and workspace staged blob identities are unchanged from the first review. HEAD remains `a068e0aed40ecbe5e0078924071f374e7809b8c2`; no implementation commit exists. Verdicts bind to these commitless staged bytes.
+
+The real parent attempt under the authorized 900-second bound remains controller-owned and active according to the review dispatch. This review does not assert a completed parent set, manifest, actual candidate evaluation, cleanup or two-round feedback result.

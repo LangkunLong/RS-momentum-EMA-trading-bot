@@ -1,0 +1,55 @@
+# Focused V3 worker integration report
+
+## Outcome
+
+Changed only `agent_loop.py`. `PolicyWorkerSession` now captures one exact supported integer
+interface version from its controller-owned bootstrap before starting reader threads and passes that
+stored version explicitly to `DecisionDeterminismGuard.observe()`. No test file was created or
+modified.
+
+Focused commit: `23abab9` (`fix: bind worker determinism to policy interface`).
+
+## Root cause and correction
+
+The authenticated response decoder already selected its contract types through
+`self._bootstrap.interface_version`, but the immediately following determinism observation omitted
+that version. `DecisionDeterminismGuard.observe()` therefore used its legacy default of interface V2
+and rejected valid V3 snapshot/decision pairs after response authentication.
+
+The session now validates the bootstrap field with exact `int` semantics against the public
+supported interface-version set, stores it once as `_policy_interface_version`, and supplies it as
+the explicit keyword on every observation. Unsupported integers and bool/string lookalikes fail
+closed during session construction, before guard creation, reader-thread startup, or any
+observation. Existing bootstrap/ready/request/response envelopes, HMAC and sequence chaining,
+timeouts, cleanup, process ownership, provider/evaluator code, and Docker launch code are unchanged.
+
+## Verification
+
+The user-directed no-test override was honored. Deterministic inline smokes used only authenticated
+worker contract encoders, in-memory queues, fake process streams, a guard spy, and the real
+determinism guard; they did not launch a provider, evaluator, Docker, replay, or market-data path.
+
+- Red reproduction before the edit:
+  `WORKER_V3_INTEGRATION_RED_OK missing_forwarded_interface=1`.
+- Green smoke after the edit:
+  `WORKER_V3_INTEGRATION_GREEN_OK v3=1 v2=1 invalid=4 repeat=2 drift=1`.
+  It proved V3 is forwarded, V2 remains explicit and unchanged, interface values `1`, `4`, `True`,
+  and `"3"` fail closed, two identical V3 decisions are accepted, and a changed third decision is
+  rejected as `candidate_nondeterminism`.
+- The same full smoke was rerun at the completion gate:
+  `WORKER_V3_INTEGRATION_FINAL_SMOKE_OK v3=1 v2=1 invalid=4 repeat=2 drift=1`.
+- `python -B -m pytest tests/test_strategy_policy.py -q --no-cov` — `41 passed`.
+- `python -B -m ruff check agent_loop.py` — `All checks passed!`.
+- `python -B -m py_compile agent_loop.py` — exit code 0.
+- `git diff --check` — exit code 0.
+
+The seven selected legacy worker-protocol pytest cases are not usable compatibility signals at this
+HEAD. Six still construct interface version 1 even though the current worker/runtime supports only
+V2 and V3; the remaining determinism case uses the pre-current `CapacitySnapshot` constructor
+arity. All fail in those stale fixtures before reaching `PolicyWorkerSession.call()`, unchanged by
+this one-file patch. Ruff's whole-file format check also reports the pre-existing large
+`agent_loop.py` would be reformatted, so no broad mechanical rewrite was performed.
+
+Pytest emitted only the repository's existing `websockets.legacy` deprecation and sandbox-denied
+pytest-cache warnings. No provider calls, Docker execution, replay, market-data access, data
+mutation, push, or merge occurred.

@@ -1,0 +1,15 @@
+{
+  "actual_manifest_sha256": "5fafaffb4258986fbc39c049b7d67ec4cc7804490be5a24a932ca7149ea3b561",
+  "actual_allow_full_source_escape": false,
+  "actual_canonical_schema_sha256": "a9da22bc95eac80c1a6c1034da960c4b772991cb1e683ca48c61ebba7fa040ee",
+  "canonical_and_legacy_enum": [
+    "symbol_edits",
+    "full_source_escape"
+  ],
+  "actual_permission_wire_enum": [
+    "symbol_edits"
+  ],
+  "canonical_schema_unchanged": true,
+  "existing_superset_accounting_covers_wire": true,
+  "enabled_true_branch": "source review only; no fabricated enabled case executed"
+}

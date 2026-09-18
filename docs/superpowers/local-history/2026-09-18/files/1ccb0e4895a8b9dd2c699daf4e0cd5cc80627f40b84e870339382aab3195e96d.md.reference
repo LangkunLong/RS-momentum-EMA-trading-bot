@@ -1,0 +1,37 @@
+# Evaluator-truth Task 6 independent repair review
+
+Reviewer: `/root/v5_baseline_review` (fresh independent agent).
+Base: `3b5666e6f30c4031a80a04e1915efa99ed5b39a4`.
+Head: `5cb81b78435c519bcfd14bd5ba5303d8e465c43a`.
+
+Spec Compliance: **PASS within the scoped source review.**
+
+- **Original finding 1 — ADDRESSED.** Exact JSON authentication fails at the named path without relocation search; the exact panel loader hashes raw bytes before decoding. Baseline graph traversal, verification, profile composition, pending-authority verification, and worker panel loading use these interfaces. References: `artifacts.py:1176,2257,2276`; `baseline.py:160,261,303,479,511,603`. The raw graph path remains exact and digest checked (`artifacts.py:3254`).
+- **Original finding 2 — ADDRESSED.** The overlay writes authenticated source bytes, checks both mounted bytes and digest, and retains pins through container cleanup (`baseline.py:699,867,880,900`). Policy mounts remain read-only. Cleanup continues after individual close failures and refuses clean completion when any cleanup fails (`baseline.py:915,925`).
+
+Concrete strengths:
+
+- The change preserves legacy relocation behavior for existing consumers while adding explicit exact interfaces.
+- Shared readiness pinning retains complete independent path/descriptor metadata snapshots, requires matching device/inode identity, and checks metadata around hashing (`readiness.py:104,114`).
+- Existing network-none, read-only root, digest-pinned image invocation, CPU/memory limits, runtime timeout, and bounded output handling are preserved.
+
+Focused unchanged-code checks addressed these concrete risks:
+
+- **Pin weakening:** the production opener verifies before/opened/after identity and uses Windows read-only sharing that denies writes and deletion (`production_fs.py:104,161`).
+- **Noncanonical or incomplete overlay:** source validation rejects CR characters, and the bundle requires the exact ordered four-file scope (`candidate_ir.py:159,1018`).
+- **Indirect relocation:** inspected the exact reader and raw authenticator; neither searches siblings.
+- **Signature regression:** non-test Python call-site searches found the updated sole mount-helper caller and sole readiness-pin constructor.
+
+Changed-file reads beyond the supplied diff completed the cut-off graph traversal, panel decoder, and sandbox argv/authentication helper bodies.
+
+Findings:
+
+- **Critical:** None.
+- **Important:** None.
+- **Minor:** None.
+
+The implementer's reported synthetic executions were not rerun or independently certified. Actual image enforcement, production mounts, full capture, and real evidence cannot be verified from this diff with the inputs/image unavailable. No tests were read or run; no files were modified by the reviewer.
+
+**Task quality: Approved.**
+
+References are relative to this worktree's `core/pit_optimizer_v5` directory. The controller saved this report after receiving the review and independently checked the committed source inventory, compile results, clean source diff, and scratch absence. Runtime limitations remain open prerequisites, not unaddressed source findings.

@@ -1,0 +1,11 @@
+# Controller credential wrapper review
+
+PASS — static review; no actionable scoped finding.
+
+Reviewed `run-with-controller-credential.py` SHA256 `92ffd23077e0b4f3305b32ec927bd20b4db4e0cfe8331f6c2e196bcf451b05d2`, the existing dotenv parser (`agent_loop.py:3404–3444`), and the immediate awake-host/saved-command launcher consumers. No credential file was read and no helper, test, probe, application or provider call was executed.
+
+The main-checkout `.env` selection is compatible with the existing parser's Git-common-directory lookup and no-link validation. The wrapper requires a nonempty selected-file alias and rejects conflicting nonempty values across both supported aliases and the inherited environment. It exposes only the canonical API-key variable for the enclosed launch; errors contain no key values.
+
+The same-thread runpy composition preserves cwd and PATH/PATHEXT. The saved-command launcher's subprocess inherits the temporarily populated environment. Both argv and the previous canonical variable are restored in finally, including SystemExit and ordinary failures. The wrapper neither prints nor writes the key, modifies the credential file, nor starts a provider itself. No persistent environment setting changes occur.
+
+Limits: external-call approval remains an operator prerequisite, not a guard implemented by this wrapper. Invoke through the reviewed runpy-from-checkout arrangement so `agent_loop` resolves from the intended applied checkout; run only the approved saved-command helper. This review does not claim runtime credential validity. Existing dotenv syntax and duplicate-name behavior are inherited unchanged from the established parser.

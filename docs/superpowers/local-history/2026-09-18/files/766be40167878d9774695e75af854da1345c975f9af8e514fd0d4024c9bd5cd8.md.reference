@@ -1,0 +1,729 @@
+# Task 4 Report: Schema-v2 Contracts, Manifest, Objective, and Validation Ledger
+
+## Status
+
+Implemented the schema-v2 optimizer role contracts, policy-source scope, call budgets, run manifest, provider-free subset builder, create-only manifest writer, gate/prepare command, Decimal discovery/holdout objective, and permanent hash-chained validation-exposure ledger. No candidate source was imported or executed. No replay, provider, pricing, Docker, network, upload, push, merge, or cloud action was performed.
+
+Committed as `89bdea5 feat: define PIT optimizer v2 contracts`. The Ruff, trailing-whitespace, EOF, YAML, and merge-conflict pre-commit hooks passed on the successful commit. The first commit attempt was safely stopped after Ruff removed one unused import; the focused suite was rerun green before restaging and retrying.
+
+## Files
+
+- Modified `core/pit_optimization_contract.py`
+  - Preserved the schema-v1 catalog, readers, response schemas, observations, comparisons, and policy-delta behavior.
+  - Added schema-v2 constants, system prompts, closed role artifacts/inputs/summaries, `PatchBounds`, `PitOptimizerCallBudget`, `PolicySourceScope`, `AuthorizationRequirement`, `PitOptimizerRunManifest`, `PitOptimizerGateConfig`, provider-free manifest construction, canonical create-only writing, and prepare-command rendering.
+- Modified `core/pit_optimizer_evaluation.py`
+  - Preserved Task 2 `FoldSpec`, `FoldManifest`, `AggregateMetric`, and `FoldAggregateSummary` identity rules.
+  - Added `DiscoveryScore`, `HoldoutDecision`, fixed-baseline discovery scoring helpers, and the locked hash-chained `ValidationLedger` contracts.
+- Created `tests/test_pit_optimizer_v2.py`
+  - Contains ten behavior-focused tests using only synthetic sources, an inert synthetic SQLite PIT calendar, and local temporary artifacts.
+- Created this ignored evidence report at `.superpowers/sdd/2026-08-27-model-authored-pit-optimizer/task-4-report.md`.
+
+## RED/GREEN evidence by slice
+
+All commands were foreground, one focused command at a time.
+
+### 1. Investigator output closure
+
+RED:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "role_schema"
+FAILED test_role_schema_investigator_output_is_closed_and_bounded
+AttributeError: module 'core.pit_optimization_contract' has no attribute 'InvestigatorArtifact'
+1 failed, 1 warning
+```
+
+GREEN after adding the minimal bounded parser and strict v2 schema:
+
+```text
+1 passed, 1 warning
+```
+
+### 2. Author diff and non-diff caps
+
+RED:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "role_schema_author"
+FAILED test_role_schema_author_output_has_independent_diff_and_metadata_caps
+AttributeError: module 'core.pit_optimization_contract' has no attribute 'AuthorArtifact'
+1 failed, 1 deselected, 1 warning
+```
+
+GREEN after independently enforcing total response, diff, and non-diff metadata caps:
+
+```text
+1 passed, 1 deselected, 1 warning
+```
+
+### 3. Critic advisory-only contract
+
+RED:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "role_schema_critic"
+FAILED test_role_schema_critic_output_is_advisory_closed_and_bounded
+AttributeError: module 'core.pit_optimization_contract' has no attribute 'CriticArtifact'
+1 failed, 2 deselected, 1 warning
+```
+
+GREEN after adding the exact `refine` / `abandon` / `change_family` enum and closed response:
+
+```text
+1 passed, 2 deselected, 1 warning
+```
+
+### 4. Exact bounded provider inputs
+
+RED:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "role_schema_inputs"
+FAILED test_role_schema_inputs_are_exact_bounded_provider_projections
+AttributeError: module 'core.pit_optimization_contract' has no attribute 'PatchBounds'
+1 failed, 3 deselected, 1 warning
+```
+
+GREEN after adding the exact input/summarization/source-bundle dataclasses, canonical serializers, hypothesis continuity, per-summary/history/dynamic caps, and structural hidden-data omissions:
+
+```text
+1 passed, 3 deselected, 1 warning
+```
+
+Later self-review mutation RED for editable-scope escape:
+
+```text
+FAILED test_role_schema_inputs_are_exact_bounded_provider_projections
+Failed: DID NOT RAISE ValueError for unrelated declared symbols
+1 failed, 9 deselected, 1 warning
+```
+
+GREEN after binding all source declarations and investigator/author paths and symbols to the three policy modules:
+
+```text
+1 passed, 9 deselected, 1 warning
+```
+
+### 5. Manifest/source-scope/call-plan identity
+
+RED:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "manifest_identity"
+FAILED test_manifest_identity_binds_scope_budget_order_and_authorization
+AttributeError: module 'core.pit_optimization_contract' has no attribute 'PolicySourceScope'
+1 failed, 4 deselected, 1 warning
+```
+
+The independent arithmetic then caught a test assumption: the six declared per-call input caps total 416,000, while the brief's authorization ceiling is 448,000. The test was corrected to assert both the 416,000 plan and the 448,000 ceiling, consistent with the requirement that planned sums fit within the authorization.
+
+GREEN after canonical digests, exact iteration-major role ordering, hard bounds, and stale-source-scope authorization rejection:
+
+```text
+1 passed, 4 deselected, 1 warning
+```
+
+### 6. Provider-free manifest builder and writer
+
+RED:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "manifest_builder"
+FAILED test_manifest_builder_is_provider_free_canonical_and_source_budgeted
+AttributeError: module 'core.pit_optimization_contract' has no attribute 'build_subset_manifest'
+1 failed, 5 deselected, 1 warning
+```
+
+GREEN after authenticating synthetic readiness/parity/bundle/baseline/source inputs, calendar-only fold sealing, exact prospective iteration-2 source-bundle sizing, fresh run/window IDs, and canonical create-only writing:
+
+```text
+1 passed, 5 deselected, 1 warning
+```
+
+### 7. Gate and prepare command
+
+RED:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "gate_and_prepare"
+FAILED test_gate_and_prepare_command_authenticate_without_granting_authority
+AttributeError: module 'core.pit_optimization_contract' has no attribute 'PitOptimizerGateConfig'
+1 failed, 6 deselected, 1 warning
+```
+
+GREEN after path/digest/ceiling authentication, prepare-phase no-authority checks, and command rendering:
+
+```text
+1 passed, 6 deselected, 1 warning
+```
+
+Self-review found that run-phase `apply` needed to remain bound to the manifest requirement. Mutation RED:
+
+```text
+FAILED test_gate_and_prepare_command_authenticate_without_granting_authority
+Failed: DID NOT RAISE ValueError for run gate apply=True
+1 failed, 9 deselected, 1 warning
+```
+
+GREEN after binding gate `apply` to `AuthorizationRequirement.apply`:
+
+```text
+1 passed, 9 deselected, 1 warning
+```
+
+### 8. Decimal discovery objective and holdout
+
+RED:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "objective or holdout"
+FAILED test_objective_is_quantized_lexicographic_strict_and_trade_eligible
+AttributeError: no attribute 'discovery_score_from_folds'
+FAILED test_holdout_gate_uses_return_trades_and_completeness_without_sharpe
+AttributeError: no attribute 'HoldoutDecision'
+2 failed, 7 deselected, 1 warning
+```
+
+GREEN after half-even `Decimal(str(value))` quantization, midpoint/worst/drawdown ordering, strict improvement, per-fold discovery-trade eligibility, and the no-Sharpe holdout gate:
+
+```text
+2 passed, 7 deselected, 1 warning
+```
+
+### 9. Permanent validation exposure ledger
+
+RED:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "validation_ledger"
+FAILED test_validation_ledger_permanently_consumes_identity_before_outcome
+AttributeError: module 'core.pit_optimizer_evaluation' has no attribute 'ValidationLedger'
+1 failed, 9 deselected, 1 warning
+```
+
+GREEN after locked create/append, immutable identity-only uniqueness, exact exposure kinds, record hash chaining, failed-outcome permanence, and metric-free outcomes:
+
+```text
+1 passed, 9 deselected, 1 warning
+```
+
+## Final focused verification
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "role_schema"
+4 passed, 6 deselected, 1 warning in 0.09s
+
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "manifest or gate or input_budget or policy_source_scope"
+4 passed, 6 deselected, 1 warning in 0.52s
+
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "objective or holdout"
+2 passed, 8 deselected, 1 warning in 0.09s
+
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "validation_ledger"
+1 passed, 9 deselected, 1 warning in 0.10s
+
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py
+10 passed, 1 warning in 0.52s
+```
+
+The warning on every run is the existing repository configuration warning `PytestConfigWarning: Unknown config option: cache_dir`; it is unrelated to Task 4 and there were no test failures or runtime warnings from the new code.
+
+## Canonical-hash, objective, and ledger evidence
+
+- `PolicySourceScope.sha256`, `AuthorizationRequirement.sha256`, and `PitOptimizerRunManifest.sha256` are independently checked in tests using `asdict`, sorted compact JSON, an explicit final newline, and `hashlib.sha256` rather than production helpers.
+- The create-only manifest file bytes are independently rendered the same way and their raw file SHA-256 is asserted equal to `manifest.sha256`.
+- Expanding `PolicySourceScope.max_iterations` changes the digest and the old authorization requirement is rejected before a larger call plan can be considered.
+- The exact synthetic initial source text and canonical source-bundle envelope are measured independently. The worst prospective iteration-2 fixture physically carries one 8-KiB source-growth term and one 8-KiB cumulative-diff term, and its exact canonical UTF-8 bytes remain below 64 KiB. A 32-KiB candidate diff bound is rejected because the complete prospective bundle cannot fit.
+- The static system-message plus response-schema bytes are independently rendered per role and checked with each declared dynamic maximum against the input cap.
+- The two discovery excess values independently quantize to `1.24` and `0.50`; their midpoint is `0.87`, worst is `0.50`, and drawdown contribution is `-4.00`, producing ordering key `(Decimal("0.87"), Decimal("0.50"), Decimal("-4.00"))`.
+- Holdout `0.105` half-even quantizes to `0.10`; with three trades and complete safety/integrity/accounting it is eligible. No Sharpe field exists.
+- Validation consumption keys are independently computed from only `ValidationWindowIdentity` canonical bytes. The stored chain link is asserted, metadata changes cannot reserve the same identity, and a failed hidden outcome remains consumed after reopening the ledger.
+
+## Process and resource cleanup
+
+- No background process or asynchronous session was started, so there was no process to terminate.
+- Every test command completed in the foreground.
+- SQLite connections use context managers and close before assertions complete.
+- Validation lock handles are scoped context managers and are released after each append/read operation.
+- No provider gateway, pricing call, Docker process, replay, candidate worker, or network client was constructed.
+- Temporary synthetic files remain only under pytest-managed task-local artifact roots; no source worktree file was executed or mutated by the builder.
+
+## Self-review
+
+- `git diff --check` reported no whitespace errors. It reported only the repository's Windows line-ending notices for the two modified Python files.
+- A zero-context deletion review showed that schema-v1 implementation bodies have no deletions; only the original `dataclass` import line was expanded.
+- The complete role fields were compared directly against `dataclasses.fields` in tests.
+- Manifest/source/readiness/bundle/baseline/effective-policy/fold/parity identities are cross-checked before manifest return.
+- Gate path hashes and the nested authorization-requirement digest are revalidated from canonical persisted bytes.
+- The builder reads policy source as UTF-8 bytes and never imports it; the synthetic source deliberately raises at module top if execution were attempted.
+- Ledger outcome records have an exact key set and cannot carry performance metrics, trades, or holdings.
+
+## Concerns
+
+- The brief's declared per-call input maxima sum to 416,000, not 448,000. The implementation preserves the exact per-call caps and uses 448,000 as the fresh cumulative authorization ceiling, leaving 32,000 of unused headroom. This interpretation follows the explicit requirement that planned sums be within the ceiling.
+- The existing pytest `cache_dir` configuration warning remains. Task constraints limited verification to the focused Task 4 commands, so no broader schema-v1 or full repository suite was run.
+
+---
+
+# Fix Round 1 — 2026-08-28
+
+## Outcome and files
+
+All five Critical and four Important review findings were addressed in commit `5526e02` (`fix: close PIT optimizer v2 trust boundaries`). The round modified:
+
+- `core/pit_optimization_contract.py`
+- `core/pit_optimizer_evaluation.py`
+- `core/pit_policy_parity.py`
+- `tests/test_pit_optimizer_v2.py`
+
+The prior report concern about 32,000 tokens of unused headroom is superseded: the sealed total now includes every call's input and output maxima and is required to equal exactly 448,000.
+
+## Strict TDD evidence by behavioral slice
+
+### 1. Exact input-plus-output authorization
+
+RED after independently summing 416,000 input and 32,000 output tokens and mutating one output cap:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py::test_manifest_identity_binds_scope_budget_order_and_authorization
+FAILED ... Failed: DID NOT RAISE <class 'ValueError'>
+1 failed, 1 warning in 0.13s
+```
+
+GREEN after charging both token directions, requiring equality with authorization, and sealing the first canary to exactly 448,000:
+
+```text
+1 passed, 1 warning in 0.11s
+```
+
+A second RED mutation increased both a call output and the authorization to 448,001; it passed before the exact first-canary check and then went GREEN after the explicit exact-total rule.
+
+### 2. Hidden-fold structural omission and closed provider codes
+
+RED hidden-fold construction:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py::test_candidate_comparison_structurally_rejects_hidden_fold_identity
+FAILED ... Failed: DID NOT RAISE <class 'ValueError'>
+1 failed, 1 warning in 0.13s
+```
+
+RED arbitrary provider failure code:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py::test_candidate_validation_codes_are_closed_and_match_stage_flags
+FAILED ... Failed: DID NOT RAISE <class 'ValueError'>
+1 failed, 1 warning in 0.13s
+```
+
+GREEN after sealing comparisons behind a controller-only factory, requiring the exact discovery fold pair, requiring a ledger-derived discovery exposure proof, closing validation codes, and enforcing exact stage-flag/code combinations:
+
+```text
+2 passed, 1 warning in 0.09s
+1 passed, 1 warning in 0.09s
+```
+
+### 3. Closed ledger outcomes
+
+RED when an invented ledger failure code was accepted:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py::test_validation_ledger_permanently_consumes_identity_before_outcome
+FAILED ... Failed: DID NOT RAISE <class 'ValueError'>
+1 failed, 1 warning in 0.15s
+```
+
+GREEN after closing the ledger outcome set and enforcing attempted/completed/code consistency:
+
+```text
+1 passed, 1 warning in 0.10s
+```
+
+### 4. Authenticated fixed-baseline objective
+
+RED when the objective API still accepted only caller-supplied excess fields:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py::test_discovery_objective_derives_excess_from_authenticated_fixed_baseline
+FAILED ... TypeError: discovery_score_from_folds() got an unexpected keyword argument 'original_baseline_sha256'
+1 failed, 1 warning in 0.13s
+```
+
+GREEN after deriving each excess from candidate total return minus the authenticated original-baseline total return, independently authenticating the baseline aggregate bytes, and recomputing/rejecting mismatched supplied scores:
+
+```text
+1 passed, 1 warning in 0.09s
+```
+
+### 5. Full schema-v1 readiness and actual Git source identity
+
+RED demonstrated that a fabricated non-repository source identity still built a manifest:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py::test_manifest_builder_rejects_fabricated_non_git_source_identity
+FAILED ... Failed: DID NOT RAISE <class 'ValueError'>
+1 failed, 1 warning in 0.51s
+```
+
+GREEN after the builder delegated to Task 2's complete `_authenticated_readiness`, required `source_root` to be the actual Git toplevel, required a clean committed tree, recomputed HEAD/tree fingerprint, and cross-linked both values to readiness and parity:
+
+```text
+3 passed, 1 warning in 2.01s
+```
+
+The three-case GREEN command covered positive local-Git construction, non-root/fabricated identity rejection, and rejection of the previous incomplete readiness subset.
+
+### 6. Fully reconstructed run gate
+
+RED when a run gate accepted `window_live` instead of the manifest's authorization window:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py::test_gate_and_prepare_command_authenticate_without_granting_authority
+FAILED ... Failed: DID NOT RAISE <class 'ValueError'>
+1 failed, 1 warning in 0.96s
+```
+
+GREEN after reconstructing and validating every nested schema-v2 manifest contract from canonical bytes, then cross-linking the actual parity digest, readiness digest, and exact authorization window:
+
+```text
+1 passed, 1 warning in 0.91s
+```
+
+The same test mutates the manifest's readiness and parity identities independently and proves each mismatch fails before source transmission.
+
+### 7. Controller-owned source descendants and patch bounds
+
+RED before a controller-owned source factory/materializer existed:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py::test_controller_materializes_only_bounds_valid_source_descendants
+FAILED ... AttributeError: module 'core.pit_optimization_contract' has no attribute 'initial_policy_source_bundle'
+1 failed, 1 warning in 0.14s
+```
+
+GREEN after adding sealed initial/bundle factories, a strict unified-diff parser/applicator, exact path/hash/text reproduction, controller-derived cumulative diffs, and pre-provider checks for `max_files`, `max_hunks`, `max_changed_lines`, and `max_diff_bytes`:
+
+```text
+1 passed, 1 warning in 0.11s
+```
+
+The test also proves arbitrary source-body replacement cannot construct a provider bundle, exact cumulative reproduction succeeds for a valid descendant, and a candidate-attributable prospective bundle overflow returns `CandidateValidationSummary(failure_code="next_context_oversize", ...)` with no incumbent bundle.
+
+### 8. Complete worst iteration-2 envelopes
+
+RED with a large-but-source-scope-valid synthetic repository: the builder still sealed a manifest without rendering the actual complete role inputs.
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py::test_manifest_builder_renders_and_rejects_oversized_iteration_two_envelope
+FAILED ... Failed: DID NOT RAISE <class 'ValueError'>
+1 failed, 1 warning in 0.99s
+```
+
+GREEN after rendering complete iteration-2 investigator, author, and critic JSON envelopes carrying prospective source growth, cumulative diff, maximum bounded discovery/rule/history/artifact/comparison content, and checking both dynamic bytes and static-plus-dynamic conservative token bytes against the exact call record:
+
+```text
+2 passed, 1 warning in 1.67s
+```
+
+The companion positive case independently inspects the production-rendered bytes for every iteration-2 role.
+
+### 9. Concurrent permanent consumption
+
+The new two-thread barrier test passed on first execution against the existing lock-and-reread append implementation:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py::test_validation_ledger_atomically_rejects_concurrent_duplicate_reservation
+1 passed, 1 warning in 1.13s
+```
+
+Exactly one reservation succeeds, the other observes permanent consumption, and the ledger contains one canonical consumption record. No production change was needed for this already-correct atomic path.
+
+## Canonical hash, source/auth, objective, and ledger evidence
+
+- Tests independently canonicalize the manifest/scope/authorization and assert the precise 416,000 input + 32,000 output = 448,000 total. Output inflation fails even when input budgets are unchanged; coordinated inflation to 448,001 also fails.
+- Positive builder fixtures are actual temporary Git repositories with committed policy files. HEAD and `git ls-tree -r --full-tree HEAD` SHA-256 are computed independently in the test and must match the builder's Task 2 identity authentication.
+- The prior small readiness subset now fails the full schema-v1 authenticator. Production delegates to Task 2's complete readiness identity graph rather than reproducing a weaker subset.
+- The gate reads canonical manifest bytes, reconstructs `PatchBounds`, `PolicySourceScope`, `FoldSpec`, `FoldManifest`, every call budget, and `AuthorizationRequirement`, invokes all closed constructors, then checks the reconstructed manifest hash before authority checks.
+- Source descendants are sealed objects. The controller authenticates the initial hashes from `PolicySourceScope`, applies the incremental author diff to the current authenticated descendant, derives a fresh cumulative diff from the initial bytes, reapplies it, and compares every resulting file text and hash before returning a provider-capable bundle.
+- Fixed-baseline aggregate SHA-256 is independently derived in tests from compact sorted canonical JSON plus newline. Caller-supplied `excess_total_return_pp` values of `99.0` and `-99.0` are ignored; candidate totals `2.235`/`1.505` minus the original baseline `1.0`/`1.0` still produce objective median `0.87` and worst `0.50`.
+- `CandidateComparisonSummary` cannot be directly constructed and requires a ledger-derived proof for exactly `discovery_1` and `discovery_2`; a `hidden_1` injection is rejected before serialization.
+- Validation and outcome failure codes are finite sets. `next_context_oversize` is implemented with the only consistent all-validation-complete flag state and cannot carry a materialized bundle.
+- The permanent ledger proof is built only from existing discovery consumption records whose bundle, universe, benchmark, sessions hash/count, and bounds match the sealed discovery folds. The concurrent test proves identity-only uniqueness remains atomic.
+
+## Final focused verification
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py
+18 passed, 1 warning in 4.07s
+
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_policy_parity.py -k "readiness_authentication or source_identity"
+3 passed, 20 deselected, 2 warnings in 1.03s
+
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimization_contract.py -k "role_payloads_are_closed or coder_must_reproduce or gate_config_is_fixed"
+3 passed, 50 deselected, 2 warnings in 0.81s
+
+python -B -m ruff check core/pit_optimization_contract.py core/pit_optimizer_evaluation.py core/pit_policy_parity.py tests/test_pit_optimizer_v2.py
+All checks passed!
+```
+
+Warnings are the existing unknown `cache_dir` pytest option and the pre-existing `websockets.legacy` deprecation warning in schema-v1 imports.
+
+## Process cleanup and self-review
+
+- Every command ran one at a time in the foreground. No provider, pricing, Docker, replay/parity capture/verification, worker, network, background process, upload, push, or merge action was run.
+- Temporary Git repositories, SQLite bundles, ledgers, and lock files were confined to pytest-managed task-local roots. All subprocesses were synchronous and exited; SQLite and ledger lock handles are context-managed.
+- `ruff` reported no findings. `git diff --check` reported no whitespace errors, only the repository's Windows LF-to-CRLF notices.
+- The full diff was reviewed for schema-v1 preservation. The only Task 2 behavior change is strengthening `_source_identity` so the supplied root itself must be the Git toplevel; the targeted schema-v1 source/readiness tests remain green.
+- Role schemas retain their exact stored field lists: controller seals are `InitVar`s and are absent from canonical provider JSON. Hidden fold dates, sessions, ledger records, local paths, and proof internals are not fields of `CandidateComparisonSummary` or `CriticInput`.
+- Candidate source is treated only as UTF-8 text. The builder never imports or executes it; the synthetic fixtures retain module-top exceptions to detect accidental execution.
+
+## Concerns
+
+- The repository's existing pytest configuration/deprecation warnings remain unchanged.
+- No broader or long-running suite was run, per the Task 4 resource constraints.
+
+# Fix Round 2 — 2026-08-28
+
+## Scope and files
+
+This round closes the three findings in `task-4-rereview-1.md` without changing schema-v1 readers or executing candidate source.
+
+- `core/pit_optimization_contract.py`: corrected insertion-only unified-diff positioning and new-range validation; required complete discovery proof lineage at comparison release; replaced sample envelopes with cap-derived canonical maximizers; and made candidate materialization size the exact sealed next-role source bundle before returning an incumbent-capable result.
+- `core/pit_optimizer_evaluation.py`: retained both complete `ValidationWindowIdentity` values and the complete `ValidationExposureMetadata` in the sealed ledger proof, including warmup identity and cross-reservation lineage checks.
+- `tests/test_pit_optimizer_v2.py`: added insertion/replacement/deletion regressions, every newly omitted proof-lineage mutation, exact comparison-release mutations, independent cap-boundary measurements, and source-cap-valid fitting/overflowing exact candidate-envelope cases.
+
+## Strict TDD evidence
+
+### 1. Unified-diff zero-old-count semantics
+
+RED reproduced the reported middle insertion defect:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py::test_controller_applies_middle_insertion_only_hunk_at_declared_position
+FAILED ... actual source began with the inserted marker instead of placing it between the declared source lines
+1 failed, 1 warning in 0.16s
+```
+
+The minimal implementation uses `old_start` for a zero-old-count hunk, retains `old_start - 1` for consuming hunks, and validates the new-range start against already emitted output.
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py::test_controller_applies_middle_insertion_only_hunk_at_declared_position
+1 passed, 1 warning in 0.11s
+
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "insertion_only or boundary_insertion or inconsistent_new_range"
+6 passed, 18 deselected, 1 warning in 0.12s
+```
+
+The second command covers insertion at beginning/middle/end, replacement, deletion, and an inconsistent new-range location.
+
+### 2. Complete ledger discovery identity and comparison lineage
+
+RED first proved the ledger-derived proof discarded the authenticated identities and metadata:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py::test_discovery_exposure_proof_retains_complete_identity_and_lineage
+FAILED ... proof.window_identities was absent
+1 failed, 1 warning in 0.17s
+```
+
+After the proof retained both complete window identities and one exact shared metadata record, a second RED proved the comparison factory still did not require the expected lineage:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py::test_candidate_comparison_requires_expected_window_and_metadata_lineage
+FAILED ... TypeError: unexpected keyword argument 'expected_window_identities'
+1 failed, 1 warning in 0.17s
+```
+
+GREEN after binding every `ValidationWindowIdentity` field, including `warmup_contract_sha256`, and requiring equal run/source/baseline/candidate/exposure metadata across both reservations and at comparison release:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "discovery_exposure_proof or candidate_comparison_requires_expected or structurally_rejects_hidden or role_schema_inputs or fixed_baseline"
+11 passed, 21 deselected, 1 warning in 0.21s
+```
+
+Negative cases independently mutate warmup identity and each metadata field: `run_id`, `source_head`, `baseline_policy_sha256`, `candidate_identity_sha256`, and `exposure_kind`. Comparison release also rejects independently mutated expected window identities and expected metadata.
+
+### 3. Cap-derived worst envelopes and exact prospective candidate sizing
+
+RED first proved candidate materialization had no interface for exact next-role constraints/budgets:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py::test_candidate_materialization_rejects_oversized_exact_next_role_envelope
+FAILED ... TypeError: unexpected keyword argument 'immutable_constraint_ids'
+1 failed, 1 warning in 0.17s
+```
+
+After adding the pre-incumbent role check, a precision RED showed that reapplying hypothetical maximum growth to an already materialized candidate falsely rejected a fitting exact bundle:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py::test_candidate_materialization_checks_exact_next_role_envelope
+FAILED ... assert 'next_context_oversize' == None
+1 failed, 1 passed, 1 warning in 0.17s
+```
+
+GREEN uses the exact controller-sealed candidate bundle for the next-role check. The 10,000-byte source case fits; the 45,000-byte source case independently proves its complete source bundle remains within 64 KiB, then receives the closed `next_context_oversize` result solely because the exact next investigator envelope exceeds its call cap:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py::test_candidate_materialization_checks_exact_next_role_envelope
+2 passed, 1 warning in 0.13s
+```
+
+The manifest renderer now deterministically binary-searches maximum canonical escaped content for every capped section used in iteration 2. The positive test parses the rendered JSON and independently recomputes compact sorted UTF-8 bytes, proving each of these lies in `[cap - 1, cap]`: rule summary, baseline discovery, iteration feedback, investigator artifact, author non-diff manifest, and candidate comparison. Complete investigator/author/critic shapes are then checked against their dynamic and static-plus-dynamic token limits. The source-padding negative reaches the intended investigator envelope rather than the source-bundle cap:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py::test_manifest_builder_renders_and_rejects_oversized_iteration_two_envelope
+1 passed, 1 warning in 0.91s
+
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py::test_manifest_builder_is_provider_free_canonical_and_source_budgeted
+1 passed, 1 warning in 1.26s
+```
+
+## Identity, envelope, and fail-closed evidence
+
+- Insertion-only hunks use the unified-diff zero-length range position, while replacement/deletion retain consuming-range semantics. New-range positions are now authenticated against emitted output, so hashes cannot seal source at a different patch location.
+- `DiscoveryExposureProof` carries both exact fold identities, including bundle, universe, benchmark, warmup, sessions digest/count, and endpoints, plus the complete shared reservation metadata. The comparison factory must match independently supplied expected identities and metadata before provider serialization.
+- Worst content uses backslash payloads to account for maximum JSON escaping, not plain hand-sized samples. Tests do not call a production sizing helper when checking section bytes.
+- Candidate materialization first proves controller-derived cumulative descent and the 64-KiB bundle cap, then renders the exact sealed bundle in complete next-role envelopes. Candidate-attributable failure returns no bundle and the closed, flag-consistent `next_context_oversize` validation summary.
+- All of these paths handle source as bounded UTF-8 text only. No import, execution, provider service, or live data service is constructed.
+
+## Final focused verification
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py
+34 passed, 1 warning in 4.36s
+
+python -B -m ruff check core/pit_optimization_contract.py core/pit_optimizer_evaluation.py tests/test_pit_optimizer_v2.py
+All checks passed!
+
+git diff --check
+No whitespace errors; only the repository's Windows LF-to-CRLF notices.
+```
+
+No schema-v1 parity/readiness code was changed in this round, so the allowed narrow schema-v1 tests were not rerun.
+
+## Process cleanup and self-review
+
+- Commands ran singly, synchronously, and in the foreground. No replay/parity capture or verification, provider/pricing call, Docker, worker, network, upload, push, merge, cloud action, or background process ran.
+- Temporary repositories, ledgers, and locks were pytest-managed and exited with each focused command; no persistent process remains.
+- The full diff was reviewed for closed canonical fields and schema-v1 coexistence. The changes are limited to schema-v2 contracts/evaluation proof fields and their synthetic tests.
+- The exact source-bundle case independently derives its cumulative unified diff and canonical bundle bytes in the test, preventing the next-role overflow assertion from being satisfied by the earlier source cap.
+- `ruff` is clean and `git diff --check` reports no whitespace errors.
+
+## Concerns
+
+- The existing pytest warning for the unknown `cache_dir` option remains unchanged.
+- No broader or long-running suite was run, per the Task 4 resource constraints.
+
+# Fix Round 3 — 2026-08-28
+
+## Scope and files
+
+This round closes the sole open finding in `task-4-rereview-2.md`: raw UTF-8 caps and canonical JSON expansion now share one fail-closed bound without excluding model-authored Unicode Python.
+
+- `core/pit_optimization_contract.py`: schema-v2 canonical JSON now emits Unicode as UTF-8 (`ensure_ascii=False`); unsafe C0/C1 controls are rejected while tab/newline/carriage return remain available for Python/source/diff text; and a deterministic raw-byte-constrained maximizer now supplies source growth, cumulative diff, incumbent behavior, and every capped composite filler.
+- `tests/test_pit_optimizer_v2.py`: independently measures equal-raw backslash, quote, newline, BMP Unicode, astral Unicode, and unsafe-control canonical sizes; covers role/source/diff control closure; measures source/cumulative-diff and incumbent-composite maxima; and checks equal-raw exact prospective candidates.
+
+## Strict TDD evidence
+
+### 1. Canonical UTF-8 and role-text control closure
+
+RED: a valid 4,096-raw-byte Unicode role field expanded under default ASCII escaping and caused the canonical artifact to exceed its cap before the expected UTF-8 assertion.
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py::test_v2_canonical_text_preserves_utf8_and_rejects_unsafe_controls
+FAILED ... ValueError: investigator artifact exceeds its byte cap
+1 failed, 1 warning in 0.21s
+```
+
+GREEN after canonical Unicode became raw UTF-8 and unsafe controls became invalid canonical text:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py::test_v2_canonical_text_preserves_utf8_and_rejects_unsafe_controls
+1 passed, 1 warning in 0.12s
+```
+
+The test derives canonical string sizes directly with standard compact JSON, independently of production helpers. At 4,096 equal raw bytes:
+
+- backslash, quote, and newline each canonicalize to `2 + 2*4096 = 8,194` bytes;
+- BMP `é` and astral emoji each canonicalize to `2 + 4096 = 4,098` bytes with raw UTF-8 emission;
+- U+0001 would canonicalize to `2 + 6*4096 = 24,578` bytes, so it is now rejected rather than admitted into a raw-byte bound.
+
+### 2. Source/diff blob control closure
+
+The blob validator was restored to its pre-fix state before this test was added, so the regression produced an honest RED:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py::test_v2_source_and_diff_blobs_reject_unsafe_controls
+FAILED ... Failed: DID NOT RAISE <class 'ValueError'>
+1 failed, 1 warning in 0.17s
+```
+
+GREEN after applying the same closed unsafe-control rule to provider diffs and policy-source records:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py::test_v2_source_and_diff_blobs_reject_unsafe_controls
+1 passed, 1 warning in 0.12s
+```
+
+The tests use a real `AuthorArtifact` parser and real controller initial-source factory; no production helper or mock supplies the expected rejection.
+
+### 3. Equal-raw exact prospective candidates
+
+RED: three existing ASCII/backslash cases behaved as expected, but a 30,000-raw-byte Unicode source was incorrectly inflated beyond the 64-KiB source cap before the exact next-role decision.
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "candidate_materialization_checks_exact_next_role_envelope"
+...F
+FAILED ... ValueError: policy source bundle exceeds its byte cap
+1 failed, 3 passed, 33 deselected, 1 warning in 0.23s
+```
+
+GREEN after raw UTF-8 canonicalization and the shared raw-byte maximizer:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "candidate_materialization_checks_exact_next_role_envelope"
+4 passed, 33 deselected, 1 warning in 0.16s
+```
+
+Both 30,000-byte candidates independently derive their cumulative unified diff and compact canonical source bundle and prove it remains within 64 KiB. The backslash candidate is the true maximum escaping case and fails closed with `next_context_oversize`; the equal-raw Unicode candidate fits because its UTF-8 is emitted without expansion. The existing 10,000-byte/45,000-byte ASCII cases continue to prove fitting and overflowing exact envelopes.
+
+## Manifest and maximum-envelope evidence
+
+- `_v2_max_canonical_text` evaluates equal raw-byte representatives for backslash, quote, BMP Unicode, and astral Unicode under the actual schema-v2 canonical serializer. With unsafe controls closed, backslash/quote are the maximum two-byte escapes; Unicode remains at its raw UTF-8 size. Ties choose the first candidate deterministically.
+- The manifest positive test independently confirms the worst source-growth suffix and cumulative diff each contain exactly the 8,192-raw-byte maximum pattern. Each standalone canonical JSON string is therefore 16,386 bytes including quotes.
+- The same test inspects the uncapped-composite `incumbent_summary`: its behavioral field contains the exact 4,096-raw-byte maximum pattern, and the complete incumbent object is independently shown to be exactly 4,096 canonical bytes larger than an equal-raw Unicode incumbent.
+- The six section-capped objects remain independently within `[cap - 1, cap]`. All now receive filler from the same raw-byte maximizer instead of a literal backslash-only builder.
+- Manifest construction still rejects the `source_padding=1_000` fixture at the true worst investigator envelope, while the approved unpadded first-canary values remain constructible:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py::test_manifest_builder_is_provider_free_canonical_and_source_budgeted tests/test_pit_optimizer_v2.py::test_manifest_builder_renders_and_rejects_oversized_iteration_two_envelope
+2 passed, 1 warning in 1.76s
+```
+
+Canonicalization changes only schema-v2 output. ASCII schema-v2 identities remain byte-for-byte unchanged; Unicode schema-v2 identities now bind the canonical raw UTF-8 representation. Schema-v1 readers and canonicalizers were not changed.
+
+## Final focused verification
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py
+38 passed, 1 warning in 4.38s
+
+python -B -m ruff check core/pit_optimization_contract.py tests/test_pit_optimizer_v2.py
+All checks passed!
+
+git diff --check
+No whitespace errors; only the repository's Windows LF-to-CRLF notices.
+```
+
+## Process cleanup and self-review
+
+- Every command ran singly, synchronously, and in the foreground. No replay/parity capture or verification, provider/pricing call, Docker, network, upload, push, merge, cloud action, background helper, or broad suite ran.
+- Synthetic repositories and artifacts remained inside pytest-managed temporary roots and exited with the focused tests; no persistent process remains.
+- The full diff was reviewed against the finding. Raw-byte maximization now covers source growth, cumulative diff, all capped content factories, and the uncapped incumbent composite. Exact prospective candidates continue to render their actual controller-sealed source bundle.
+- Standard Python source whitespace (`\t`, `\n`, `\r`) remains allowed. Only unsafe C0/C1 controls whose JSON expansion breaks the raw-byte proof are closed; ordinary BMP and astral Unicode remain supported.
+- `ruff` is clean and `git diff --check` has no whitespace errors.
+
+## Concerns
+
+- The existing pytest warning for the unknown `cache_dir` option remains unchanged.
+- No broader or long-running suite was run, per the Task 4 resource constraints.

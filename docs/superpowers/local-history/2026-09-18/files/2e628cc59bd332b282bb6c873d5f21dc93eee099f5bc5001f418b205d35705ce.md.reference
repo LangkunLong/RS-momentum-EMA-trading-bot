@@ -1,0 +1,94 @@
+# Task 6 report — atomic three-file candidate materialization
+
+Date: 2026-08-31
+
+## Scope completed
+
+- Added `validate_candidate_sources(...)` with the exact three editable policy
+  paths as one complete replacement map. All UTF-8, LF/final-newline, syntax,
+  compile, declared-export, purity, and no-I/O checks finish before any write.
+- Snapshotted all prior policy bytes, rejected no-op bundles, wrote only to the
+  disposable candidate checkout, and restored all three files after every
+  post-write exception or cancellation.
+- Authenticated the clean source commit and equal candidate base tree, rejected
+  staged/untracked/out-of-scope, structural, and non-100644 changes, ran
+  `git diff --check`, and derived the cumulative diff locally without v4 patch,
+  hunk, changed-line, or diff-byte limits.
+- Bound candidate identity to all three resulting source hashes, the local
+  cumulative diff, authenticated parent, source commit, policy interface,
+  immutable constraints, and discovery-panel plan. The old discovery-manifest
+  property remains a compatibility alias for schema-v3 audit consumers.
+- Extended only the policy-contract import allowlist for `MarketContextV1` and
+  `BenchmarkContextV1`; both remain typed inputs and cannot be constructed by
+  candidate code.
+- Exposed the parsed v4 author's immutable complete replacement-source map and
+  updated only existing tests/fixtures. No test file, test function, or test
+  class was added.
+
+## Files changed
+
+- `core/pit_optimizer_candidate.py`
+- `core/pit_optimization_contract.py`
+- `tests/test_pit_optimizer_v2.py`
+- `tests/test_pit_optimizer_loop.py`
+- `.superpowers/sdd/2026-08-31-adaptive-oneil-optimizer-core-loop/task-6-report.md`
+
+## Verification
+
+- `python -B -m compileall -q core/pit_optimizer_candidate.py core/pit_optimization_contract.py`
+  — exit 0.
+- `python -B -m ruff check core/pit_optimizer_candidate.py core/pit_optimization_contract.py --no-cache`
+  — `All checks passed!`.
+- `python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py tests/test_pit_optimizer_loop.py -k "candidate or author or atomic or rollback or ast"`
+  — `109 passed, 17 failed, 229 deselected, 2 warnings` in 116.07 seconds.
+  The exact pre-edit baseline was `106 passed, 17 failed, 229 deselected`.
+  The same 17 failures remain the documented pre-existing schema-v3
+  authorization/controller fixture drift (`max_usd`, removed v2 controller
+  entry point, and related legacy setup); Task 6 introduced no new failing
+  test. Focused atomic/path/mode/rollback/AST checks were green.
+- `git diff --check` — exit 0; Git emitted only Windows LF-to-CRLF working-copy
+  notices, with no whitespace errors.
+
+## Concerns / handoff
+
+- Schema-v3 diff materialization, patch reanchoring, and `PatchBounds` remain
+  isolated on the legacy v3 path for audit compatibility. The new v4 source
+  path does not call them or enforce a diff-size ceiling.
+- Controller/accounting/qualification wiring remains for Tasks 7–9. No
+  provider, Docker, replay, secret, remote, original-checkout, or progress-ledger
+  operation was performed.
+
+## Fix round 1 — exact schema-v3 identity compatibility
+
+Date: 2026-09-01
+
+- Restored `CandidateIdentity` to the exact pre-Task-6 schema-v3 field dialect:
+  `discovery_manifest_sha256` is once again a serialized and digested field,
+  not a property alias for a v4 field.
+- Restored `validate_candidate_diff(...)` to its original schema-v3 canonical
+  values and digest construction, including the original non-empty scope
+  invariants used by archived holdout reconstruction.
+- Added a separate sealed `CandidateIdentityV4` emitted only by
+  `validate_candidate_sources(...)`; its canonical identity continues to bind
+  both `discovery_panel_plan_sha256` and `parent_identity_sha256`.
+- Extended the existing identity-shape test in place to independently rebuild
+  the legacy digest and compare the complete canonical JSON bytes. No test file,
+  function, or class was added.
+
+### Fix verification
+
+- RED before the production fix:
+  `python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "candidate_identity_has_exact_public_nine_field_json_shape"`
+  — `1 failed, 284 deselected`; the v4 plan field occupied the archived v3
+  manifest-field position.
+- `python -B -m compileall -q core/pit_optimizer_candidate.py tests/test_pit_optimizer_v2.py`
+  — exit 0.
+- `python -B -m ruff check core/pit_optimizer_candidate.py tests/test_pit_optimizer_v2.py --no-cache`
+  — `All checks passed!`.
+- `python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py tests/test_pit_optimizer_holdout.py -k "candidate_identity or discovery_winner_evidence_accepts_only"`
+  — `37 passed, 251 deselected, 2 warnings` in 47.24 seconds.
+- `git diff --check` — exit 0; only Windows LF-to-CRLF working-copy notices.
+
+No blocker remains. The fix did not touch controller/accounting/qualification,
+providers, Docker, replay, secrets, remote state, the original checkout, or the
+progress ledger.

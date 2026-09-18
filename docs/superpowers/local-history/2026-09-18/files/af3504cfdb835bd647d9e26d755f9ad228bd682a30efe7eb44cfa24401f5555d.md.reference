@@ -1,0 +1,304 @@
+# Task 1 fix round 1 scoped review package
+
+Fix base: pre-fix working-tree snapshots captured after the first task review
+Head: current uncommitted Task 1 files
+
+## core/canslim/earnings_trace.py
+
+```diff
+warning: in the working copy of '.superpowers/sdd/2026-08-26-task11-engine-fidelity-observability/task-1-fix1-before-earnings_trace.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'core/canslim/earnings_trace.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/.superpowers/sdd/2026-08-26-task11-engine-fidelity-observability/task-1-fix1-before-earnings_trace.py b/core/canslim/earnings_trace.py
+index a5233d2..35cdc24 100644
+--- a/.superpowers/sdd/2026-08-26-task11-engine-fidelity-observability/task-1-fix1-before-earnings_trace.py
++++ b/core/canslim/earnings_trace.py
+@@ -103,11 +103,10 @@ def pit_public_date_for_period(
+         return None
+     public_dates = pit_public_dates_by_period(frame)
+     if public_dates is None:
+         return None
+     try:
+         return public_dates[period]
+     except KeyError as error:
+         raise _PITProvenanceError(
+             f"{PIT_PUBLIC_DATES_ATTR} has no public date for {period.isoformat()}"
+         ) from error
+-
+
+```
+## core/canslim/c_current_earnings.py
+
+```diff
+warning: in the working copy of '.superpowers/sdd/2026-08-26-task11-engine-fidelity-observability/task-1-fix1-before-c_current_earnings.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'core/canslim/c_current_earnings.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/.superpowers/sdd/2026-08-26-task11-engine-fidelity-observability/task-1-fix1-before-c_current_earnings.py b/core/canslim/c_current_earnings.py
+index 7b5b173..7b568e3 100644
+--- a/.superpowers/sdd/2026-08-26-task11-engine-fidelity-observability/task-1-fix1-before-c_current_earnings.py
++++ b/core/canslim/c_current_earnings.py
+@@ -142,36 +142,47 @@ def _metric_family(row_label: object) -> MetricFamily:
+ 
+ 
+ def _trace_float(value: object) -> float | None:
+     """Coerce an observed trace value when representable as a float."""
+     try:
+         return float(value)
+     except (TypeError, ValueError):
+         return None
+ 
+ 
+-def _c_unavailable_reason(quarterly_income: pd.DataFrame) -> TraceReason:
+-    """Explain why the legacy row selector could not select an earnings pair."""
++def _c_unavailable_observation(
++    quarterly_income: pd.DataFrame,
++) -> tuple[MetricFamily, TraceReason, object, object]:
++    """Return the visible newest observation when C cannot select a pair."""
+     labels = quarterly_income.index.astype(str)
+-    for pattern in (r"Diluted EPS", r"Basic EPS", r"Net Income"):
++    for pattern, metric_family in (
++        (r"Diluted EPS", MetricFamily.DILUTED_EPS),
++        (r"Basic EPS", MetricFamily.BASIC_EPS),
++        (r"Net Income", MetricFamily.NET_INCOME),
++    ):
+         matches = labels.str.contains(pattern, case=False, regex=True)
+         for row_label in quarterly_income.index[matches]:
+             earnings = quarterly_income.loc[row_label]
+             if isinstance(earnings, pd.DataFrame):
+                 earnings = earnings.iloc[0]
+             comparisons = match_fiscal_year_over_year_periods(earnings)
+             if not comparisons:
+                 continue
+             latest = comparisons[0]
+-            if not pd.isna(latest.current_value) and not latest.matched:
+-                return TraceReason.NO_COMPARABLE_PRIOR_PERIOD
+-    return TraceReason.NO_VISIBLE_OBSERVATION
++            if not pd.isna(latest.current_value):
++                reason = (
++                    TraceReason.NO_COMPARABLE_PRIOR_PERIOD
++                    if not latest.matched
++                    else TraceReason.NO_VISIBLE_OBSERVATION
++                )
++                return metric_family, reason, latest.current_period, latest.current_value
++    return MetricFamily.UNAVAILABLE, TraceReason.NO_VISIBLE_OBSERVATION, None, None
+ 
+ 
+ def _evaluate_c_core(
+     quarterly_income: pd.DataFrame,
+     c_growth_target: Optional[float] = None,
+     *,
+     strict_trace_provenance: bool,
+ ) -> CTrace:
+     """Evaluate C and retain the selected fiscal pair and terminal condition."""
+     import numpy as np
+@@ -192,30 +203,41 @@ def _evaluate_c_core(
+     prior_value = None
+ 
+     if quarterly_income.empty:
+         return CTrace(
+             0.0, None, metric_family, terminal_reason, None, None, None, None, None, None
+         )
+ 
+     try:
+         row_label = _find_earnings_row(quarterly_income)
+         if row_label is None:
++            (
++                metric_family,
++                terminal_reason,
++                current_period_end,
++                current_raw_value,
++            ) = _c_unavailable_observation(quarterly_income)
++            current_value = _trace_float(current_raw_value)
++            if strict_trace_provenance:
++                current_public_date = pit_public_date_for_period(
++                    quarterly_income, current_period_end
++                )
+             return CTrace(
+                 0.0,
+                 None,
+                 metric_family,
+-                _c_unavailable_reason(quarterly_income),
+-                None,
+-                None,
+-                None,
++                terminal_reason,
++                current_period_end,
+                 None,
++                current_public_date,
+                 None,
++                current_value,
+                 None,
+             )
+ 
+         metric_family = _metric_family(row_label)
+         earnings = quarterly_income.loc[row_label]
+         if isinstance(earnings, pd.DataFrame):
+             earnings = earnings.iloc[0]
+         matches = match_fiscal_year_over_year_periods(earnings)
+         latest = matches[0]
+         current_period_end = latest.current_period
+@@ -329,11 +351,10 @@ def evaluate_c(
+         c_growth_target: Target growth rate (defaults to settings.C_GROWTH_TARGET)
+ 
+     Returns:
+         tuple: (score, current_growth) where score is 0-1 and current_growth is decimal
+ 
+     """
+     trace = _evaluate_c_core(
+         quarterly_income, c_growth_target, strict_trace_provenance=False
+     )
+     return trace.score, trace.current_growth
+-
+
+```
+## core/canslim/a_annual_earnings.py
+
+```diff
+warning: in the working copy of '.superpowers/sdd/2026-08-26-task11-engine-fidelity-observability/task-1-fix1-before-a_annual_earnings.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'core/canslim/a_annual_earnings.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/.superpowers/sdd/2026-08-26-task11-engine-fidelity-observability/task-1-fix1-before-a_annual_earnings.py b/core/canslim/a_annual_earnings.py
+index 92e4091..c351183 100644
+--- a/.superpowers/sdd/2026-08-26-task11-engine-fidelity-observability/task-1-fix1-before-a_annual_earnings.py
++++ b/core/canslim/a_annual_earnings.py
+@@ -47,36 +47,44 @@ def _trace_float(value: object) -> float | None:
+ 
+ 
+ def _period_end(label: object):
+     """Return the date corresponding to an annual frame column label."""
+     timestamp = pd.Timestamp(label)
+     if pd.isna(timestamp):
+         raise ValueError("annual period end is not a date")
+     return timestamp.date()
+ 
+ 
+-def _a_unavailable_trace(annual_income: pd.DataFrame) -> tuple[MetricFamily, TraceReason]:
++def _a_unavailable_trace(
++    annual_income: pd.DataFrame,
++) -> tuple[MetricFamily, TraceReason, object, object]:
+     """Describe why the legacy annual row selector found no usable family."""
+     labels = annual_income.index.astype(str)
+     for pattern, metric_family in (
+         (r"Diluted EPS", MetricFamily.DILUTED_EPS),
+         (r"Basic EPS", MetricFamily.BASIC_EPS),
+         (r"Net Income", MetricFamily.NET_INCOME),
+     ):
+         matches = labels.str.contains(pattern, case=False, regex=True)
+         for row_label in annual_income.index[matches]:
+             earnings = annual_income.loc[row_label]
+             if isinstance(earnings, pd.DataFrame):
+                 earnings = earnings.iloc[0]
+-            if not earnings.sort_index().dropna().empty:
+-                return metric_family, TraceReason.INSUFFICIENT_ANNUAL_HISTORY
+-    return MetricFamily.UNAVAILABLE, TraceReason.NO_VISIBLE_OBSERVATION
++            ordered = earnings.sort_index().dropna()
++            if not ordered.empty:
++                return (
++                    metric_family,
++                    TraceReason.INSUFFICIENT_ANNUAL_HISTORY,
++                    ordered.index[-1],
++                    ordered.iloc[-1],
++                )
++    return MetricFamily.UNAVAILABLE, TraceReason.NO_VISIBLE_OBSERVATION, None, None
+ 
+ def _safe_growth(current: float, previous: float) -> Optional[float]:
+     """Calculate YoY growth as a decimal.
+ 
+     Returns None when previous is negative to enforce the CANSLIM
+     requirement for established, positive earnings growth.
+     """
+     if current is None or previous in (None, 0):
+         return None
+ 
+@@ -240,59 +248,69 @@ def _evaluate_a_core(
+             None,
+             None,
+             None,
+             None,
+             None,
+         )
+ 
+     try:
+         row_label = _find_earnings_row(annual_income)
+         if row_label is None:
+-            metric_family, terminal_reason = _a_unavailable_trace(annual_income)
++            (
++                metric_family,
++                terminal_reason,
++                current_label,
++                current_raw_value,
++            ) = _a_unavailable_trace(annual_income)
++            current_value = _trace_float(current_raw_value)
++            if strict_trace_provenance and current_label is not None:
++                current_period_end = _period_end(current_label)
++                current_public_date = pit_public_date_for_period(
++                    annual_income, current_period_end
++                )
+             return ATrace(
+                 0.0,
+                 None,
+                 None,
+                 metric_family,
+                 terminal_reason,
++                current_period_end,
+                 None,
++                current_public_date,
+                 None,
+-                None,
+-                None,
+-                None,
++                current_value,
+                 None,
+             )
+ 
+         metric_family = _metric_family(row_label)
+         earnings = annual_income.loc[row_label].sort_index().dropna()
+-        if isinstance(earnings, pd.DataFrame):
+-            earnings = earnings.iloc[0]
+         if len(earnings) < 2:
+             return ATrace(
+                 0.0,
+                 None,
+                 None,
+                 metric_family,
+                 TraceReason.INSUFFICIENT_ANNUAL_HISTORY,
+                 None,
+                 None,
+                 None,
+                 None,
+                 None,
+                 None,
+             )
+ 
+-        current_period_end = _period_end(earnings.index[-1])
+-        prior_period_end = _period_end(earnings.index[-2])
+-        current_value = _trace_float(earnings.iloc[-1])
+-        prior_value = _trace_float(earnings.iloc[-2])
+         if strict_trace_provenance:
++            trace_earnings = earnings.iloc[0] if isinstance(earnings, pd.DataFrame) else earnings
++            current_period_end = _period_end(trace_earnings.index[-1])
++            prior_period_end = _period_end(trace_earnings.index[-2])
++            current_value = _trace_float(trace_earnings.iloc[-1])
++            prior_value = _trace_float(trace_earnings.iloc[-2])
+             current_public_date = pit_public_date_for_period(annual_income, current_period_end)
+             prior_public_date = pit_public_date_for_period(annual_income, prior_period_end)
+ 
+         if current_value is None or not np.isfinite(current_value):
+             terminal_reason = TraceReason.NONFINITE_CURRENT_VALUE
+         elif prior_value is None or not np.isfinite(prior_value):
+             terminal_reason = TraceReason.NONFINITE_PRIOR_VALUE
+         elif np.isclose(prior_value, 0.0):
+             terminal_reason = TraceReason.ZERO_PRIOR_VALUE
+         elif prior_value < 0:
+@@ -414,11 +432,10 @@ def evaluate_a(
+                annual_growth is most recent year decimal,
+                roe is return on equity decimal
+     """
+     trace = _evaluate_a_core(
+         annual_income,
+         a_growth_target,
+         balance_sheet,
+         strict_trace_provenance=False,
+     )
+     return trace.score, trace.annual_growth, trace.roe
+-
+
+```
+

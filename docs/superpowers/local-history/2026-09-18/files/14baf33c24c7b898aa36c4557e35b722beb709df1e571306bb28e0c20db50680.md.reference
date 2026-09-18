@@ -1,0 +1,126 @@
+# Task 9 Report — Focused Final Verification and Canary Readiness Handoff
+
+## Status
+
+Blocked at the prescribed focused test gates. Both compile commands passed, but each one-shot pytest suite reported Windows permission failures in test-created audit/controller temporary paths. The suites were not rerun. Because the architecture gate remained red, the final two-fold parity, manifest build, emitted prepare command, readiness inspection, and canary handoff generation were not launched.
+
+The implementation worktree remained on `codex/pit-optimizer-implementation` at a committed HEAD with no tracked or untracked status entry before verification. All sealed local input paths existed with the expected file or directory type; both JSON inputs parsed, and the PIT bundle had the SQLite file signature. The two create-only Task 9 outputs were absent at preflight.
+
+## Compile evidence
+
+The prescribed compile commands were each run exactly once:
+
+- `compileall`: exit 0 with no output; 13 Python sources were in scope (7 under `core/strategy_policy` plus 6 explicitly named production modules).
+- `py_compile`: exit 0 with no output; 4 explicitly named production modules were in scope.
+
+Total compile scope: 17 Python source files across two successful commands.
+
+## Test evidence
+
+The focused architecture suite was run exactly once:
+
+- 460 passed
+- 46 failed
+- 4 skipped
+- 2 warnings
+- 510 selected tests total
+- Exit 1 in 173.70 seconds
+
+The inspected failures were concentrated in Windows `Access denied` / `PermissionError` paths while tests attempted atomic audit writes or resolved controller temporary directories. The suite was not rerun or expanded.
+
+The optimizer-related agent-loop selection was run exactly once for diagnostic separation:
+
+- 96 passed
+- 4 failed
+- 489 deselected
+- 2 warnings
+- 100 selected tests total
+- Exit 1 in 5.66 seconds
+
+All four failures reported Windows `Access denied` / `PermissionError` while using test-created audit or controller temporary paths. This suite was not rerun or expanded.
+
+The two warnings in each suite were the repository's unsupported `cache_dir` pytest option and the upstream `websockets.legacy` deprecation.
+
+## Parity, manifest, and readiness
+
+- Final two-fold parity was not launched. Matched status is therefore not established, and `verified-final.json` remains absent.
+- The optimizer manifest was not built. No Task 9 manifest assertions, aggregate-ceiling authentication, or sanitized scope/preimage assertion can be claimed from a produced artifact.
+- The emitted prepare command was not generated or executed.
+- The derived readiness package was not produced or inspected. No Task 9 readiness assertion can be claimed.
+- No canary command or record-grant command was printed or executed.
+
+The intended sealed canary authority remains unchanged and unexercised: two iterations, six ordered all-R1 role calls, a maximum of 448000 tokens and USD 0.40, the sealed per-role caps, `apply=false`, and the three-file/12-hunk/80-line/8192-byte candidate bounds. These are plan requirements only in this blocked run, not assertions about a generated Task 9 manifest or readiness artifact.
+
+## Effect and accounting audit
+
+No OpenRouter/provider call, provider SDK construction, network access, live pricing lookup, grant creation, authorization lease, Docker command, replay, parity evaluation, candidate backtest, hidden-fold evaluation, source apply, commit, merge, push, upload, deploy, or cloud task occurred. Consequently there were zero live role calls, zero provider tokens, and zero provider spend.
+
+The exact Task 9 create-only parity and manifest outputs remain absent, and the optimizer runtime, candidates, and runs directories were not created.
+
+## Hygiene and resources
+
+- `git diff --check`: exit 0 with no output.
+- `git status --short --branch`: branch header only; tracked source is clean.
+- No Python task process or Docker CLI process remained.
+- Six exact non-reparse controller/state-machine temporary directories were verified inside the user temp root, removed, and confirmed absent. Four were created during the Task 9 test window; two predated this suite and should not have been attributed to Task 9 in the initial checkpoint.
+- Pre-existing pytest and artifact directories were preserved.
+- No tracked product or test file was edited, and no commit was created.
+
+## Handoff
+
+There is no executable Task 9 canary handoff because manifest and prepare were intentionally withheld after the red architecture gate. A fresh explicit operator authorization is still required before any live six-call canary, including the exact source scope, call, token, and USD ceilings. Full-window provider-free parity and the long replay remain deferred.
+
+Task 9 can resume only with a separately authorized verification attempt that resolves the Windows temporary-directory permission environment while preserving the one-shot/no-effect boundaries; this report does not authorize a rerun.
+
+## Recovery Attempt (2026-08-28)
+
+A progress-ledger ruling authorized one corrected execution of each red test gate outside the managed filesystem sandbox after a minimal same-Python probe isolated the original failures to the Windows private-directory ACL layer. The compile commands were not rerun.
+
+### Corrected test gates
+
+The focused architecture suite was executed exactly once outside the managed sandbox:
+
+- 506 passed
+- 4 skipped
+- 2 warnings
+- 510 selected tests total
+- Exit 0 in 140.75 seconds
+
+The optimizer-related agent-loop selection was then executed exactly once outside the managed sandbox:
+
+- 100 passed
+- 489 deselected
+- 2 warnings
+- 100 selected tests total
+- Exit 0 in 7.08 seconds
+
+The warnings remained the repository's unsupported `cache_dir` pytest option and the upstream `websockets.legacy` deprecation. Neither corrected suite was rerun.
+
+### Final parity blocker
+
+After both corrected suites passed, the clean committed branch, sealed-input types, create-only output absence, and inactive task-process state were rechecked successfully. The exact prescribed two-fold provider-free parity command was then executed once outside the managed sandbox.
+
+The command exited 1 during simulator entry validation with:
+
+```text
+ValueError: rounded loss exceeds recommended risk budget
+```
+
+No `PIT_POLICY_PARITY matched=true` line was emitted, and the create-only `verified-final.json` output remains absent. The parity matched status is therefore not established. The command was not retried, in accordance with the one-attempt parity rule.
+
+Because parity failed, the manifest was not built, the emitted prepare command was not generated or executed, and no Task 9 readiness package or inert canary command was produced. Sanitized manifest/readiness identity and aggregate-ceiling assertions therefore remain unavailable.
+
+### Recovery effect, hygiene, and handoff
+
+The recovery made no OpenRouter/provider call, provider SDK construction, network access, live pricing lookup, grant creation, authorization lease, Docker command, hidden-fold evaluation, long replay, candidate backtest, source apply, commit, merge, push, upload, deploy, or cloud task. The only replay was the one permitted two-discovery-fold parity attempt, which stopped on the entry-risk invariant before writing its attestation. There were zero live role calls, zero provider tokens, and zero provider spend.
+
+Final hygiene after the parity failure:
+
+- `git diff --check`: exit 0 with no output.
+- `git status --porcelain`: no entries; tracked source is clean.
+- Final parity and manifest outputs remain absent.
+- Optimizer runtime, candidates, and runs directories remain absent.
+- No matching Python task process, Docker CLI process, or recent task controller/state-machine temporary directory remains.
+- No tracked product or test file was edited, and no commit was created.
+
+There is still no executable Task 9 canary handoff. A fresh explicit operator authorization remains required before any future live six-call canary, but such authorization cannot be used until final provider-free parity succeeds under a separately authorized remediation or verification path. Full-window parity and the long replay remain deferred.

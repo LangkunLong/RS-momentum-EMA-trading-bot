@@ -1,0 +1,2080 @@
+# Review package: 205ad2d..032a430
+
+## Commits
+032a430 fix: bind parity capture signal cadence
+3ca78ef feat: isolate causal warmup from fold trading
+
+## Files changed
+ core/backtest_engine.py               |  71 ++-
+ core/pit_optimizer_evaluation.py      | 158 ++++++
+ core/pit_policy_parity.py             | 952 ++++++++++++++++++++++++++++++++++
+ tests/test_backtest_open_causality.py | 116 +++++
+ tests/test_pit_policy_parity.py       | 426 +++++++++++++++
+ 5 files changed, 1703 insertions(+), 20 deletions(-)
+
+## Diff
+diff --git a/core/backtest_engine.py b/core/backtest_engine.py
+index 3a24b54..ed39092 100644
+--- a/core/backtest_engine.py
++++ b/core/backtest_engine.py
+@@ -1184,22 +1184,24 @@ def _read_checkpoint_state(path: Path, *, offset: int, next_day_index: int) -> d
+ def _portfolio_checkpoint_fingerprint(
+     *,
+     bundle_sha256: Optional[str],
+     code_identity: Optional[str],
+     start_date: pd.Timestamp,
+     end_date: pd.Timestamp,
+     benchmark: str,
+     universe: Iterable[str],
+     simulator: "PortfolioSimulator",
+     strategy_identity: Optional[dict[str, Any]] = None,
++    history_start_date: Optional[pd.Timestamp] = None,
+ ) -> str:
+     simulator._verify_effective_engine_policy()
++    effective_history_start = start_date if history_start_date is None else history_start_date
+     config = {
+         "schema_version": _PORTFOLIO_CHECKPOINT_SCHEMA,
+         "bundle_sha256": bundle_sha256,
+         "code_identity": code_identity,
+         "strategy_identity": (
+             strategy_identity
+             if strategy_identity is not None
+             else _strategy_checkpoint_identity(
+                 simulator,
+                 require_explicit_custom=False,
+@@ -1207,20 +1209,21 @@ def _portfolio_checkpoint_fingerprint(
+         ),
+         "identity_prices_provenance_sha256": (
+             simulator.identity_transition_contract.prices_provenance_sha256
+             if simulator.identity_transition_contract is not None else None
+         ),
+         "identity_request_contracts_sha256": (
+             simulator.identity_transition_contract.request_contracts_sha256
+             if simulator.identity_transition_contract is not None else None
+         ),
+         "start_date": str(start_date.date()),
++        "history_start_date": str(effective_history_start.date()),
+         "end_date": str(end_date.date()),
+         "benchmark": benchmark,
+         "universe": sorted(str(item).upper() for item in universe),
+         "initial_capital": simulator.initial_capital,
+         "max_positions": simulator.max_positions,
+         "position_size_pct": simulator.position_size_pct,
+         "position_risk_pct": simulator.position_risk_pct,
+         "stop_loss_pct": simulator.stop_loss_pct,
+         "ma_exit_period": simulator.ma_exit_period,
+         "ma_consecutive": simulator.ma_consecutive,
+@@ -1424,20 +1427,21 @@ class PortfolioSimulator:
+         self._equity: float = initial_capital
+         self._open_positions: Dict[str, Trade] = {}
+         self._trades: List[Trade] = []
+         self._transactions: List[dict] = []
+         self._weekly_snapshots: List[dict] = []
+         self._signal_rows: List[dict] = []
+         self._entry_outcomes: List[EntryAttemptOutcome] = []
+         self._ticker_industry: Dict[str, str] = {}
+         self._execution_diagnostics = _new_execution_diagnostics()
+         self._pending_entries_remaining = 0
++        self._policy_client = None
+         self._strict_pit_pattern_histories: dict[str, _PreparedPatternHistory] = {}
+         self._strict_pit_history_frames: dict[str, pd.DataFrame] = {}
+         self._strict_pit_base_policy = BasePolicy.canonical_v1()
+         self._capture_effective_engine_policy()
+         self.data_fetcher = data_fetcher or DataFetcher()
+ 
+     def _synchronize_owned_builtin_policy(self) -> None:
+         """Bind the owned strategy to simulator policy before a fresh capture."""
+ 
+         if self._strategy_was_injected:
+@@ -1513,50 +1517,49 @@ class PortfolioSimulator:
+             raise ValueError("effective engine policy changed after run start")
+         return live_digest
+ 
+     def run(
+         self,
+         tickers: List[str],
+         lookback_weeks: int = DEFAULT_LOOKBACK_WEEKS,
+         *,
+         start_date: Optional[str] = None,
+         end_date: Optional[str] = None,
++        history_start_date: Optional[str] = None,
+         benchmark_symbol: Optional[str] = None,
+         checkpoint_path: Optional[str | Path] = None,
+         progress_log_path: Optional[str | Path] = None,
+         resume: bool = False,
+         checkpoint_every_days: int = 20,
+         checkpoint_code_identity: Optional[str] = None,
+     ) -> SimulationResult:
+         if checkpoint_every_days < 1:
+             raise ValueError("checkpoint_every_days must be positive")
+         if resume and checkpoint_path is None:
+             raise ValueError("resume requires checkpoint_path")
++        self._reset_run_state()
+         self._capture_effective_engine_policy()
+-        self._equity = self.initial_capital
+-        self._open_positions = {}
+-        self._trades = []
+-        self._transactions = []
+-        self._weekly_snapshots = []
+-        self._signal_rows = []
+-        self._entry_outcomes = []
+-        self._execution_diagnostics = _new_execution_diagnostics()
+-        self._pending_entries_remaining = 0
+-        self._reset_strict_pit_pattern_cache()
+ 
+         clear_session_cache()
+         benchmark = str(benchmark_symbol or self.benchmark_symbol).upper()
+-        start_ts, end_ts = _resolve_window(
++        trade_start, end_ts = _resolve_window(
+             start_date=start_date,
+             end_date=end_date,
+             lookback_weeks=lookback_weeks,
+         )
++        history_start = (
++            trade_start
++            if history_start_date is None
++            else pd.Timestamp(history_start_date).normalize()
++        )
++        if history_start > trade_start:
++            raise ValueError("history_start_date must not follow start_date")
+ 
+         if self.pit_bundle is not None:
+             bundle_symbols = set(self.pit_bundle.symbols())
+             requested = [str(ticker).upper() for ticker in tickers] or list(self.pit_bundle.symbols())
+             tickers = list(
+                 dict.fromkeys(
+                     ticker for ticker in requested if ticker in bundle_symbols and ticker != benchmark
+                 )
+             )
+             if not tickers:
+@@ -1568,21 +1571,22 @@ class PortfolioSimulator:
+         checkpoint = Path(checkpoint_path).resolve() if checkpoint_path is not None else None
+         progress = Path(progress_log_path).resolve() if progress_log_path is not None else None
+         state_log = checkpoint.with_name("portfolio_state.jsonl") if checkpoint is not None else None
+         strategy_identity = _strategy_checkpoint_identity(
+             self,
+             require_explicit_custom=checkpoint is not None,
+         )
+         fingerprint = _portfolio_checkpoint_fingerprint(
+             bundle_sha256=self.pit_bundle.sha256 if self.pit_bundle is not None else None,
+             code_identity=checkpoint_code_identity,
+-            start_date=start_ts,
++            start_date=trade_start,
++            history_start_date=history_start,
+             end_date=end_ts,
+             benchmark=benchmark,
+             universe=all_tickers,
+             simulator=self,
+             strategy_identity=strategy_identity,
+         )
+         checkpoint_state: Optional[dict[str, Any]] = None
+         origin_requested_min_rs_score = self.requested_min_rs_score
+         origin_requested_min_canslim_score = self.requested_min_canslim_score
+         restored_outputs: dict[str, list[Any]] = {
+@@ -1634,46 +1638,52 @@ class PortfolioSimulator:
+                 with state_log.open("r+b") as handle:
+                     handle.truncate(int(checkpoint_state["state_log_offset"]))
+             else:
+                 state_log.touch(exist_ok=False)
+         state_stream = state_log.open("ab") if state_log is not None else None
+         started_at = datetime.now().timestamp()
+         if progress is not None:
+             _append_checkpoint_jsonl(progress, {
+                 "phase": "resumed" if resume else "started",
+                 "fingerprint": fingerprint,
+-                "start_date": str(start_ts.date()),
++                "start_date": str(trade_start.date()),
++                "history_start_date": str(history_start.date()),
+                 "end_date": str(end_ts.date()),
+                 "universe_count": len(universe),
+             }, sync=True)
+ 
+         if self.pit_bundle is not None:
+             print(f"Reading point-in-time price data for {len(all_tickers)} tickers...")
+-            ticker_ohlcv = self.pit_bundle.fetch_price_data(all_tickers, start_ts, end_ts)
++            ticker_ohlcv = self.pit_bundle.fetch_price_data(all_tickers, history_start, end_ts)
+         else:
+             print(f"Downloading price data for {len(all_tickers)} tickers...")
+-            ticker_ohlcv = self.data_fetcher.fetch_price_data(all_tickers, start_ts, end_ts)
++            ticker_ohlcv = self.data_fetcher.fetch_price_data(all_tickers, history_start, end_ts)
+         if benchmark not in ticker_ohlcv:
+             if state_stream is not None:
+                 state_stream.close()
+             print(f"FATAL: Could not download {benchmark} benchmark data.")
+             return SimulationResult()
+ 
+         if self.pit_bundle is not None:
+             print(f"Reading point-in-time RS closes for {len(universe)} symbols...")
+-            all_closes = self.pit_bundle.fetch_closes(universe, start_ts, end_ts)
++            all_closes = self.pit_bundle.fetch_closes(universe, history_start, end_ts)
+         else:
+             print(f"Downloading RS universe closes for {len(universe)} tickers...")
+-            all_closes = self.data_fetcher.fetch_rs_universe_closes(universe, start_ts, end_ts)
++            all_closes = self.data_fetcher.fetch_rs_universe_closes(universe, history_start, end_ts)
+ 
+         benchmark_df = ticker_ohlcv[benchmark]
+-        trading_days = benchmark_df.loc[start_ts:end_ts].index
++        benchmark_sessions = benchmark_df.loc[history_start:end_ts].index
++        evaluation_sessions = tuple(
++            session for session in benchmark_sessions
++            if trade_start <= session <= end_ts
++        )
++        trading_days = pd.DatetimeIndex(evaluation_sessions)
+         if len(trading_days) < 30:
+             if state_stream is not None:
+                 state_stream.close()
+             print("ERROR: Not enough trading days in range.")
+             return SimulationResult()
+ 
+         self._configure_strict_pit_pattern_cache(ticker_ohlcv)
+         self._ticker_industry = (
+             load_industry_map(tickers)
+             if self.industry_group_filter_enabled
+@@ -1717,21 +1727,21 @@ class PortfolioSimulator:
+             equity_series = {
+                 str(row["date"]): float(row["equity"])
+                 for row in restored_outputs["equity"]
+             }
+             benchmark_series = {
+                 str(row["date"]): float(row["equity"])
+                 for row in restored_outputs["benchmark"]
+             }
+         else:
+             regime_tracker = MarketRegimeTracker()
+-            regime_tracker.bootstrap(benchmark_df, start_ts)
++            regime_tracker.bootstrap(benchmark_df, trade_start)
+             self._regime_tracker = regime_tracker
+             next_day_index = 0
+             equity_series = {}
+             benchmark_series = {}
+             benchmark_start_price = None
+             pending_entries = []
+ 
+         total_days = len(trading_days)
+         for day_idx, eval_date in enumerate(trading_days[next_day_index:], start=next_day_index):
+             self._verify_effective_engine_policy()
+@@ -1861,21 +1871,22 @@ class PortfolioSimulator:
+             final_offset = _append_checkpoint_jsonl(state_log, {
+                 "kind": "final",
+                 "transactions": self._transactions[final_transaction_start:],
+             }, stream=state_stream, sync=True)
+         else:
+             final_offset = 0
+         result_config = self._result_config(
+             tickers=tickers,
+             benchmark=benchmark,
+             all_closes=all_closes,
+-            start_ts=start_ts,
++            start_ts=trade_start,
++            history_start_ts=history_start,
+             end_ts=end_ts,
+             requested_entry_floors=(
+                 origin_requested_min_rs_score,
+                 origin_requested_min_canslim_score,
+             ),
+         )
+         result = SimulationResult(
+             trades=self._trades,
+             equity_curve=pd.Series(equity_series),
+             benchmark_curve=pd.Series(benchmark_series),
+@@ -1917,20 +1928,37 @@ class PortfolioSimulator:
+                     "percent": 100.0,
+                     "elapsed_seconds": round(datetime.now().timestamp() - started_at, 3),
+                     "open_positions": len(self._open_positions),
+                     "signal_rows": len(self._signal_rows),
+                     "transactions": len(self._transactions),
+                 }, sync=True)
+         if state_stream is not None:
+             state_stream.close()
+         return result
+ 
++    def _reset_run_state(self) -> None:
++        """Restore all mutable per-run state before evaluating an independent fold."""
++
++        self._equity = self.initial_capital
++        self._open_positions = {}
++        self._trades = []
++        self._transactions = []
++        self._weekly_snapshots = []
++        self._signal_rows = []
++        self._entry_outcomes = []
++        self._ticker_industry = {}
++        self._execution_diagnostics = _new_execution_diagnostics()
++        self._pending_entries_remaining = 0
++        self._regime_tracker = MarketRegimeTracker()
++        self._policy_client = None
++        self._reset_strict_pit_pattern_cache()
++
+     def _reset_strict_pit_pattern_cache(self) -> None:
+         """Clear the built-in strict-PIT acceleration state before each run."""
+ 
+         self._strict_pit_pattern_histories = {}
+         self._strict_pit_history_frames = {}
+         owned_strategy = self._owned_builtin_strategy
+         if owned_strategy is not None:
+             owned_strategy._strict_pit_entry_facts_provider = None
+             owned_strategy._strict_pit_history_provider = None
+ 
+@@ -2057,22 +2085,24 @@ class PortfolioSimulator:
+ 
+     def _result_config(
+         self,
+         *,
+         tickers: list[str],
+         benchmark: str,
+         all_closes: pd.DataFrame,
+         start_ts: pd.Timestamp,
+         end_ts: pd.Timestamp,
+         requested_entry_floors: tuple[float | None, float | None] | None = None,
++        history_start_ts: Optional[pd.Timestamp] = None,
+     ) -> dict[str, Any]:
+         self._verify_effective_engine_policy()
++        effective_history_start = start_ts if history_start_ts is None else history_start_ts
+         requested_min_rs_score, requested_min_canslim_score = (
+             requested_entry_floors
+             if requested_entry_floors is not None
+             else (
+                 self.requested_min_rs_score,
+                 self.requested_min_canslim_score,
+             )
+         )
+         return {
+             "tickers": tickers,
+@@ -2112,20 +2142,21 @@ class PortfolioSimulator:
+             "scale_out_fraction": self.scale_out_fraction,
+             "stagnation_days": self.stagnation_days,
+             "stagnation_threshold_pct": self.stagnation_threshold_pct,
+             "breakeven_trigger_pct": self.breakeven_trigger_pct,
+             "industry_group_filter_enabled": self.industry_group_filter_enabled,
+             "industry_group_top_n": self.industry_group_top_n,
+             "industry_group_min_size": self.industry_group_min_size,
+             "effective_engine_policy": self._effective_engine_policy,
+             "effective_engine_policy_sha256": self._effective_engine_policy_sha256,
+             "start_date": str(start_ts.date()),
++            "history_start_date": str(effective_history_start.date()),
+             "end_date": str(end_ts.date()),
+         }
+ 
+     def _checkpoint_payload(
+         self,
+         *,
+         fingerprint: str,
+         code_identity: Optional[str],
+         strategy_identity: dict[str, Any],
+         next_day_index: int,
+diff --git a/core/pit_optimizer_evaluation.py b/core/pit_optimizer_evaluation.py
+new file mode 100644
+index 0000000..fcb0421
+--- /dev/null
++++ b/core/pit_optimizer_evaluation.py
+@@ -0,0 +1,158 @@
++"""Immutable fold and aggregate contracts for the PIT optimizer."""
++
++from __future__ import annotations
++
++from dataclasses import asdict, dataclass
++from datetime import date
++import hashlib
++import json
++import math
++import re
++from itertools import pairwise
++
++
++_SHA256_RE = re.compile(r"[0-9a-f]{64}")
++
++
++def _canonical_json_bytes(value: object) -> bytes:
++    return (
++        json.dumps(
++            value,
++            sort_keys=True,
++            separators=(",", ":"),
++            allow_nan=False,
++        ).encode("utf-8")
++        + b"\n"
++    )
++
++
++def _date(value: str, label: str) -> date:
++    if not isinstance(value, str):
++        raise ValueError(f"{label} is invalid")
++    try:
++        parsed = date.fromisoformat(value)
++    except ValueError as exc:
++        raise ValueError(f"{label} is invalid") from exc
++    if parsed.isoformat() != value:
++        raise ValueError(f"{label} is not canonical")
++    return parsed
++
++
++def _finite(value: float | int, label: str) -> None:
++    if isinstance(value, bool) or type(value) not in {int, float} or not math.isfinite(float(value)):
++        raise ValueError(f"{label} must be finite")
++
++
++@dataclass(frozen=True, slots=True)
++class FoldSpec:
++    fold_id: str
++    purpose: str
++    start_date: str
++    end_date: str
++    sessions: tuple[str, ...]
++
++    def __post_init__(self) -> None:
++        if not isinstance(self.fold_id, str) or not self.fold_id:
++            raise ValueError("fold_id is invalid")
++        if self.purpose not in {"discovery", "hidden"}:
++            raise ValueError("fold purpose is invalid")
++        if type(self.sessions) is not tuple or len(self.sessions) != 60:
++            raise ValueError("fold must contain exactly 60 sessions")
++        parsed = tuple(_date(value, "fold session") for value in self.sessions)
++        if len(set(parsed)) != len(parsed) or any(left >= right for left, right in pairwise(parsed)):
++            raise ValueError("fold sessions must be unique and chronological")
++        start = _date(self.start_date, "fold start_date")
++        end = _date(self.end_date, "fold end_date")
++        if start != parsed[0] or end != parsed[-1]:
++            raise ValueError("fold boundaries must match sessions")
++
++
++@dataclass(frozen=True, slots=True)
++class FoldManifest:
++    data_identity_sha256: str
++    universe_sha256: str
++    benchmark: str
++    warmup_start_date: str
++    discovery_folds: tuple[FoldSpec, ...]
++    hidden_fold: FoldSpec
++
++    def __post_init__(self) -> None:
++        for name in ("data_identity_sha256", "universe_sha256"):
++            if _SHA256_RE.fullmatch(getattr(self, name) or "") is None:
++                raise ValueError(f"{name} is invalid")
++        if not isinstance(self.benchmark, str) or not self.benchmark or self.benchmark != self.benchmark.upper():
++            raise ValueError("benchmark is invalid")
++        warmup = _date(self.warmup_start_date, "warmup_start_date")
++        if type(self.discovery_folds) is not tuple or len(self.discovery_folds) != 2:
++            raise ValueError("fold manifest requires exactly two discovery folds")
++        if any(not isinstance(fold, FoldSpec) or fold.purpose != "discovery" for fold in self.discovery_folds):
++            raise ValueError("discovery fold purpose is invalid")
++        if not isinstance(self.hidden_fold, FoldSpec) or self.hidden_fold.purpose != "hidden":
++            raise ValueError("hidden fold purpose is invalid")
++        folds = (*self.discovery_folds, self.hidden_fold)
++        if len({fold.fold_id for fold in folds}) != len(folds):
++            raise ValueError("fold IDs must be unique")
++        seen: set[str] = set()
++        for fold in folds:
++            overlap = seen.intersection(fold.sessions)
++            if overlap:
++                raise ValueError("fold sessions overlap")
++            seen.update(fold.sessions)
++        if warmup >= _date(self.discovery_folds[0].start_date, "first discovery start"):
++            raise ValueError("warmup must precede discovery")
++        if any(
++            _date(left.end_date, "fold end") >= _date(right.start_date, "fold start") for left, right in pairwise(folds)
++        ):
++            raise ValueError("folds must be chronological with hidden strictly after discovery")
++
++    @property
++    def sha256(self) -> str:
++        return hashlib.sha256(_canonical_json_bytes(asdict(self))).hexdigest()
++
++
++@dataclass(frozen=True, slots=True)
++class AggregateMetric:
++    metric_id: str
++    value: float | int
++
++    def __post_init__(self) -> None:
++        if not isinstance(self.metric_id, str) or not self.metric_id:
++            raise ValueError("aggregate metric ID is invalid")
++        _finite(self.value, "aggregate metric value")
++
++
++@dataclass(frozen=True, slots=True)
++class FoldAggregateSummary:
++    fold_id: str
++    total_return_pct: float
++    excess_total_return_pp: float | None
++    max_drawdown_pct: float
++    sharpe_ratio: float
++    closed_trades: int
++    turnover_pct: float
++    average_exposure_pct: float
++    entry_funnel: tuple[AggregateMetric, ...]
++    exit_attribution: tuple[AggregateMetric, ...]
++
++    def __post_init__(self) -> None:
++        if not isinstance(self.fold_id, str) or not self.fold_id:
++            raise ValueError("aggregate fold_id is invalid")
++        for name in (
++            "total_return_pct",
++            "max_drawdown_pct",
++            "sharpe_ratio",
++            "turnover_pct",
++            "average_exposure_pct",
++        ):
++            _finite(getattr(self, name), name)
++        if self.excess_total_return_pp is not None:
++            _finite(self.excess_total_return_pp, "excess_total_return_pp")
++        if type(self.closed_trades) is not int or self.closed_trades < 0:
++            raise ValueError("closed_trades is invalid")
++        for name in ("entry_funnel", "exit_attribution"):
++            metrics = getattr(self, name)
++            if type(metrics) is not tuple or any(not isinstance(metric, AggregateMetric) for metric in metrics):
++                raise ValueError(f"{name} is invalid")
++            ids = tuple(metric.metric_id for metric in metrics)
++            if len(set(ids)) != len(ids):
++                raise ValueError(f"{name} metric IDs must be unique")
+diff --git a/core/pit_policy_parity.py b/core/pit_policy_parity.py
+new file mode 100644
+index 0000000..5ace66c
+--- /dev/null
++++ b/core/pit_policy_parity.py
+@@ -0,0 +1,952 @@
++"""Canonical pre/post extraction evidence for the PIT strategy-policy boundary."""
++
++from __future__ import annotations
++
++from dataclasses import asdict, dataclass
++from pathlib import Path
++from collections import Counter
++import argparse
++import hashlib
++import json
++import math
++import re
++import subprocess
++from typing import Callable, Iterable, Mapping, Sequence
++
++from core.pit_optimizer_evaluation import (
++    AggregateMetric,
++    FoldAggregateSummary,
++    FoldManifest,
++    FoldSpec,
++)
++
++
++_SHA256_RE = re.compile(r"[0-9a-f]{64}")
++_HEAD_RE = re.compile(r"[0-9a-f]{40}")
++_REFERENCE_SCHEMA_VERSION = 1
++_ATTESTATION_SCHEMA_VERSION = 1
++_PARITY_SIGNAL_EVERY_N_DAYS = 1
++_DISCOVERY_WINDOWS = (
++    ("discovery_1", "2021-06-25", "2021-09-20"),
++    ("discovery_2", "2021-09-21", "2021-12-14"),
++)
++_HIDDEN_WINDOW = ("hidden_1", "2021-12-15", "2022-03-11")
++
++
++def _canonical_json_bytes(value: object) -> bytes:
++    return (
++        json.dumps(
++            value,
++            sort_keys=True,
++            separators=(",", ":"),
++            ensure_ascii=False,
++            allow_nan=False,
++        ).encode("utf-8")
++        + b"\n"
++    )
++
++
++def _digest(value: object) -> str:
++    return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
++
++
++def _require_digest(value: str, label: str) -> None:
++    if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
++        raise ValueError(f"{label} is invalid")
++
++
++def _require_head(value: str, label: str) -> None:
++    if not isinstance(value, str) or _HEAD_RE.fullmatch(value) is None:
++        raise ValueError(f"{label} is invalid")
++
++
++def _finite(value: float, label: str) -> None:
++    if isinstance(value, bool) or type(value) not in {int, float} or not math.isfinite(float(value)):
++        raise ValueError(f"{label} must be finite")
++
++
++@dataclass(frozen=True, slots=True)
++class ParityTransaction:
++    date: str
++    symbol: str
++    from_symbol: str | None
++    action: str
++    price: float
++    quantity: float
++    value: float
++    reason: str
++
++    def __post_init__(self) -> None:
++        if not all(isinstance(item, str) and item for item in (self.date, self.symbol, self.action, self.reason)):
++            raise ValueError("parity transaction text is invalid")
++        if self.from_symbol is not None and (not isinstance(self.from_symbol, str) or not self.from_symbol):
++            raise ValueError("parity transaction from_symbol is invalid")
++        for name in ("price", "quantity", "value"):
++            _finite(getattr(self, name), f"parity transaction {name}")
++
++
++@dataclass(frozen=True, slots=True)
++class ParityEntryOutcome:
++    symbol: str
++    signal_date: str
++    entry_date: str
++    pivot: float | None
++    buy_zone_lower: float | None
++    buy_zone_upper: float | None
++    entry_open: float | None
++    outcome: str
++
++    def __post_init__(self) -> None:
++        if not all(
++            isinstance(item, str) and item for item in (self.symbol, self.signal_date, self.entry_date, self.outcome)
++        ):
++            raise ValueError("parity entry outcome text is invalid")
++        for name in ("pivot", "buy_zone_lower", "buy_zone_upper", "entry_open"):
++            value = getattr(self, name)
++            if value is not None:
++                _finite(value, f"parity entry outcome {name}")
++
++
++@dataclass(frozen=True, slots=True)
++class ParityEquityPoint:
++    session: str
++    equity: float
++
++    def __post_init__(self) -> None:
++        if not isinstance(self.session, str) or not self.session:
++            raise ValueError("parity equity session is invalid")
++        _finite(self.equity, "parity equity")
++
++
++@dataclass(frozen=True, slots=True)
++class ParityFoldEvidence:
++    fold_id: str
++    transactions: tuple[ParityTransaction, ...]
++    entry_outcomes: tuple[ParityEntryOutcome, ...]
++    equity: tuple[ParityEquityPoint, ...]
++    funnel: tuple[AggregateMetric, ...]
++    aggregate: FoldAggregateSummary
++    effective_policy_sha256: str
++    evidence_sha256: str
++
++    def __post_init__(self) -> None:
++        if not isinstance(self.fold_id, str) or not self.fold_id:
++            raise ValueError("parity evidence fold_id is invalid")
++        expected_types = (
++            (self.transactions, ParityTransaction, "transactions"),
++            (self.entry_outcomes, ParityEntryOutcome, "entry outcomes"),
++            (self.equity, ParityEquityPoint, "equity"),
++            (self.funnel, AggregateMetric, "funnel"),
++        )
++        for values, expected, label in expected_types:
++            if type(values) is not tuple or any(not isinstance(value, expected) for value in values):
++                raise ValueError(f"parity evidence {label} are invalid")
++        if self.aggregate.fold_id != self.fold_id:
++            raise ValueError("parity aggregate fold differs from evidence")
++        _require_digest(self.effective_policy_sha256, "effective policy digest")
++        _require_digest(self.evidence_sha256, "parity evidence digest")
++        primitive = asdict(self)
++        primitive.pop("evidence_sha256")
++        if _digest(primitive) != self.evidence_sha256:
++            raise ValueError("parity evidence digest mismatch")
++
++
++@dataclass(frozen=True, slots=True)
++class ParityReference:
++    schema_version: int
++    reference_source_head: str
++    reference_source_fingerprint_sha256: str
++    readiness_sha256: str
++    pit_bundle_sha256: str
++    baseline_manifest_sha256: str
++    effective_policy_sha256: str
++    fold_manifest: FoldManifest
++    universe: tuple[str, ...]
++    discovery_evidence: tuple[ParityFoldEvidence, ...]
++    discovery_output_sha256s: tuple[tuple[str, str], ...]
++    artifact_path: Path
++    artifact_sha256: str
++
++    def __post_init__(self) -> None:
++        if self.schema_version != _REFERENCE_SCHEMA_VERSION:
++            raise ValueError("parity reference schema is unsupported")
++        _require_head(self.reference_source_head, "reference source head")
++        for name in (
++            "reference_source_fingerprint_sha256",
++            "readiness_sha256",
++            "pit_bundle_sha256",
++            "baseline_manifest_sha256",
++            "effective_policy_sha256",
++            "artifact_sha256",
++        ):
++            _require_digest(getattr(self, name), name)
++        if not isinstance(self.fold_manifest, FoldManifest):
++            raise ValueError("parity reference fold manifest is invalid")
++        if (
++            type(self.universe) is not tuple
++            or not self.universe
++            or any(not isinstance(symbol, str) or not symbol for symbol in self.universe)
++        ):
++            raise ValueError("parity reference universe is invalid")
++        if len(set(self.universe)) != len(self.universe):
++            raise ValueError("parity reference universe contains duplicates")
++        if type(self.discovery_evidence) is not tuple or len(self.discovery_evidence) != 2:
++            raise ValueError("parity reference requires two discovery evidence records")
++        expected_ids = tuple(fold.fold_id for fold in self.fold_manifest.discovery_folds)
++        if tuple(evidence.fold_id for evidence in self.discovery_evidence) != expected_ids:
++            raise ValueError("parity reference evidence fold order is invalid")
++        expected_outputs = tuple((evidence.fold_id, evidence.evidence_sha256) for evidence in self.discovery_evidence)
++        if self.discovery_output_sha256s != expected_outputs:
++            raise ValueError("parity reference output digests are invalid")
++        if any(
++            evidence.effective_policy_sha256 != self.effective_policy_sha256 for evidence in self.discovery_evidence
++        ):
++            raise ValueError("parity reference effective policy differs by fold")
++        if not isinstance(self.artifact_path, Path) or not self.artifact_path.is_absolute():
++            raise ValueError("parity reference artifact path is invalid")
++
++
++@dataclass(frozen=True, slots=True)
++class ParityAttestation:
++    schema_version: int
++    reference_artifact_sha256: str
++    reference_source_head: str
++    final_source_head: str
++    final_source_fingerprint_sha256: str
++    pit_bundle_sha256: str
++    baseline_manifest_sha256: str
++    effective_policy_sha256: str
++    discovery_fold_manifest_sha256: str
++    policy_interface_version: int
++    reference_output_sha256s: tuple[tuple[str, str], ...]
++    final_output_sha256s: tuple[tuple[str, str], ...]
++    final_discovery_evidence: tuple[ParityFoldEvidence, ...]
++    transactions_equal: bool
++    entry_outcomes_equal: bool
++    equity_equal: bool
++    funnels_equal: bool
++    effective_policy_equal: bool
++    artifact_path: Path
++    artifact_sha256: str
++
++    def __post_init__(self) -> None:
++        if self.schema_version != _ATTESTATION_SCHEMA_VERSION:
++            raise ValueError("parity attestation schema is unsupported")
++        _require_head(self.reference_source_head, "reference source head")
++        _require_head(self.final_source_head, "final source head")
++        for name in (
++            "reference_artifact_sha256",
++            "final_source_fingerprint_sha256",
++            "pit_bundle_sha256",
++            "baseline_manifest_sha256",
++            "effective_policy_sha256",
++            "discovery_fold_manifest_sha256",
++            "artifact_sha256",
++        ):
++            _require_digest(getattr(self, name), name)
++        if type(self.policy_interface_version) is not int or self.policy_interface_version < 1:
++            raise ValueError("policy interface version is invalid")
++        flags = (
++            self.transactions_equal,
++            self.entry_outcomes_equal,
++            self.equity_equal,
++            self.funnels_equal,
++            self.effective_policy_equal,
++        )
++        if any(type(flag) is not bool for flag in flags) or not all(flags):
++            raise ValueError("parity attestation may contain only equal evidence")
++        if not isinstance(self.artifact_path, Path) or not self.artifact_path.is_absolute():
++            raise ValueError("parity attestation artifact path is invalid")
++
++
++def _reference_primitive(reference: ParityReference) -> dict[str, object]:
++    primitive = asdict(reference)
++    primitive.pop("artifact_path")
++    primitive.pop("artifact_sha256")
++    return primitive
++
++
++def _attestation_primitive(attestation: ParityAttestation) -> dict[str, object]:
++    primitive = asdict(attestation)
++    primitive.pop("artifact_path")
++    primitive.pop("artifact_sha256")
++    return primitive
++
++
++def _write_create_only(output: Path, primitive: Mapping[str, object]) -> tuple[Path, str]:
++    path = Path(output).resolve()
++    path.parent.mkdir(parents=True, exist_ok=True)
++    payload = _canonical_json_bytes(primitive)
++    with path.open("xb") as handle:
++        handle.write(payload)
++        handle.flush()
++    return path, hashlib.sha256(payload).hexdigest()
++
++
++def persist_parity_reference(
++    *,
++    output: Path,
++    reference_source_head: str,
++    reference_source_fingerprint_sha256: str,
++    readiness_sha256: str,
++    pit_bundle_sha256: str,
++    baseline_manifest_sha256: str,
++    effective_policy_sha256: str,
++    fold_manifest: FoldManifest,
++    universe: tuple[str, ...],
++    discovery_evidence: tuple[ParityFoldEvidence, ...],
++) -> ParityReference:
++    output_sha256s = tuple((evidence.fold_id, evidence.evidence_sha256) for evidence in discovery_evidence)
++    path = Path(output).resolve()
++    provisional = ParityReference(
++        schema_version=_REFERENCE_SCHEMA_VERSION,
++        reference_source_head=reference_source_head,
++        reference_source_fingerprint_sha256=reference_source_fingerprint_sha256,
++        readiness_sha256=readiness_sha256,
++        pit_bundle_sha256=pit_bundle_sha256,
++        baseline_manifest_sha256=baseline_manifest_sha256,
++        effective_policy_sha256=effective_policy_sha256,
++        fold_manifest=fold_manifest,
++        universe=universe,
++        discovery_evidence=discovery_evidence,
++        discovery_output_sha256s=output_sha256s,
++        artifact_path=path,
++        artifact_sha256="0" * 64,
++    )
++    primitive = _reference_primitive(provisional)
++    artifact_sha256 = _digest(primitive)
++    path, written_sha256 = _write_create_only(path, primitive)
++    if written_sha256 != artifact_sha256:
++        raise ValueError("parity reference artifact digest mismatch")
++    return ParityReference(
++        **{
++            **asdict(provisional),
++            "fold_manifest": fold_manifest,
++            "discovery_evidence": discovery_evidence,
++            "universe": universe,
++            "discovery_output_sha256s": output_sha256s,
++            "artifact_path": path,
++            "artifact_sha256": artifact_sha256,
++        }
++    )
++
++
++def _metric(value: object) -> AggregateMetric:
++    return AggregateMetric(**value)  # type: ignore[arg-type]
++
++
++def _aggregate_from_primitive(value: object) -> FoldAggregateSummary:
++    if not isinstance(value, dict):
++        raise ValueError("parity aggregate is malformed")
++    primitive = dict(value)
++    primitive["entry_funnel"] = tuple(_metric(item) for item in primitive.get("entry_funnel", ()))
++    primitive["exit_attribution"] = tuple(_metric(item) for item in primitive.get("exit_attribution", ()))
++    return FoldAggregateSummary(**primitive)
++
++
++def _fold_from_primitive(value: object) -> FoldSpec:
++    if not isinstance(value, dict):
++        raise ValueError("parity fold is malformed")
++    primitive = dict(value)
++    primitive["sessions"] = tuple(primitive.get("sessions", ()))
++    return FoldSpec(**primitive)
++
++
++def _manifest_from_primitive(value: object) -> FoldManifest:
++    if not isinstance(value, dict):
++        raise ValueError("parity fold manifest is malformed")
++    primitive = dict(value)
++    primitive["discovery_folds"] = tuple(_fold_from_primitive(item) for item in primitive.get("discovery_folds", ()))
++    primitive["hidden_fold"] = _fold_from_primitive(primitive.get("hidden_fold"))
++    return FoldManifest(**primitive)
++
++
++def _evidence_from_primitive(value: object) -> ParityFoldEvidence:
++    if not isinstance(value, dict):
++        raise ValueError("parity fold evidence is malformed")
++    primitive = dict(value)
++    primitive["transactions"] = tuple(ParityTransaction(**item) for item in primitive.get("transactions", ()))
++    primitive["entry_outcomes"] = tuple(ParityEntryOutcome(**item) for item in primitive.get("entry_outcomes", ()))
++    primitive["equity"] = tuple(ParityEquityPoint(**item) for item in primitive.get("equity", ()))
++    primitive["funnel"] = tuple(_metric(item) for item in primitive.get("funnel", ()))
++    primitive["aggregate"] = _aggregate_from_primitive(primitive.get("aggregate"))
++    return ParityFoldEvidence(**primitive)
++
++
++def load_parity_reference(path: Path) -> ParityReference:
++    resolved = Path(path).resolve()
++    raw = resolved.read_bytes()
++    try:
++        primitive = json.loads(raw)
++    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
++        raise ValueError("parity reference JSON is invalid") from exc
++    if not isinstance(primitive, dict) or raw != _canonical_json_bytes(primitive):
++        raise ValueError("parity reference is not canonical JSON")
++    artifact_sha256 = hashlib.sha256(raw).hexdigest()
++    value = dict(primitive)
++    value["fold_manifest"] = _manifest_from_primitive(value.get("fold_manifest"))
++    value["universe"] = tuple(value.get("universe", ()))
++    value["discovery_evidence"] = tuple(_evidence_from_primitive(item) for item in value.get("discovery_evidence", ()))
++    value["discovery_output_sha256s"] = tuple(tuple(item) for item in value.get("discovery_output_sha256s", ()))
++    return ParityReference(
++        **value,
++        artifact_path=resolved,
++        artifact_sha256=artifact_sha256,
++    )
++
++
++def verify_parity_evidence(
++    *,
++    reference: ParityReference,
++    output: Path,
++    final_source_head: str,
++    final_source_fingerprint_sha256: str,
++    policy_interface_version: int,
++    final_discovery_evidence: tuple[ParityFoldEvidence, ...],
++) -> ParityAttestation:
++    if tuple(item.fold_id for item in final_discovery_evidence) != tuple(
++        item.fold_id for item in reference.discovery_evidence
++    ):
++        raise ValueError("final parity folds differ from reference")
++    transactions_equal = all(
++        left.transactions == right.transactions
++        for left, right in zip(reference.discovery_evidence, final_discovery_evidence, strict=True)
++    )
++    entry_outcomes_equal = all(
++        left.entry_outcomes == right.entry_outcomes
++        for left, right in zip(reference.discovery_evidence, final_discovery_evidence, strict=True)
++    )
++    equity_equal = all(
++        left.equity == right.equity
++        for left, right in zip(reference.discovery_evidence, final_discovery_evidence, strict=True)
++    )
++    funnels_equal = all(
++        left.funnel == right.funnel and left.aggregate == right.aggregate
++        for left, right in zip(reference.discovery_evidence, final_discovery_evidence, strict=True)
++    )
++    effective_policy_equal = all(
++        item.effective_policy_sha256 == reference.effective_policy_sha256 for item in final_discovery_evidence
++    )
++    failures = [
++        label
++        for label, equal in (
++            ("transactions", transactions_equal),
++            ("entry outcomes", entry_outcomes_equal),
++            ("equity", equity_equal),
++            ("funnels", funnels_equal),
++            ("effective policy", effective_policy_equal),
++        )
++        if not equal
++    ]
++    if failures:
++        raise ValueError("parity differs in " + ", ".join(failures))
++    final_output_sha256s = tuple((item.fold_id, item.evidence_sha256) for item in final_discovery_evidence)
++    path = Path(output).resolve()
++    provisional = ParityAttestation(
++        schema_version=_ATTESTATION_SCHEMA_VERSION,
++        reference_artifact_sha256=reference.artifact_sha256,
++        reference_source_head=reference.reference_source_head,
++        final_source_head=final_source_head,
++        final_source_fingerprint_sha256=final_source_fingerprint_sha256,
++        pit_bundle_sha256=reference.pit_bundle_sha256,
++        baseline_manifest_sha256=reference.baseline_manifest_sha256,
++        effective_policy_sha256=reference.effective_policy_sha256,
++        discovery_fold_manifest_sha256=reference.fold_manifest.sha256,
++        policy_interface_version=policy_interface_version,
++        reference_output_sha256s=reference.discovery_output_sha256s,
++        final_output_sha256s=final_output_sha256s,
++        final_discovery_evidence=final_discovery_evidence,
++        transactions_equal=True,
++        entry_outcomes_equal=True,
++        equity_equal=True,
++        funnels_equal=True,
++        effective_policy_equal=True,
++        artifact_path=path,
++        artifact_sha256="0" * 64,
++    )
++    primitive = _attestation_primitive(provisional)
++    artifact_sha256 = _digest(primitive)
++    path, written_sha256 = _write_create_only(path, primitive)
++    if written_sha256 != artifact_sha256:
++        raise ValueError("parity attestation artifact digest mismatch")
++    return ParityAttestation(
++        **{
++            **asdict(provisional),
++            "final_discovery_evidence": final_discovery_evidence,
++            "reference_output_sha256s": reference.discovery_output_sha256s,
++            "final_output_sha256s": final_output_sha256s,
++            "artifact_path": path,
++            "artifact_sha256": artifact_sha256,
++        }
++    )
++
++
++def build_fixed_fold_manifest(
++    *,
++    readiness: Mapping[str, object],
++    benchmark_sessions: Iterable[str],
++    data_identity_sha256: str,
++) -> tuple[FoldManifest, tuple[str, ...]]:
++    """Seal the fixed two-discovery/one-hidden split from calendar labels only."""
++
++    _require_digest(data_identity_sha256, "fold data identity")
++    evaluation = readiness.get("evaluation_contract")
++    if not isinstance(evaluation, Mapping) or evaluation.get("verification_only") is not True:
++        raise ValueError("readiness is not the authenticated verification subset")
++    scope = evaluation.get("scope")
++    if not isinstance(scope, Mapping):
++        raise ValueError("readiness verification scope is absent")
++    expected_scope = {
++        "benchmark": "SPY",
++        "discovery_start": _DISCOVERY_WINDOWS[0][1],
++        "discovery_end": _DISCOVERY_WINDOWS[0][2],
++        "holdout_start": _DISCOVERY_WINDOWS[1][1],
++        "holdout_end": _DISCOVERY_WINDOWS[1][2],
++        "warmup_start": "2021-01-01",
++        "session_count": 60,
++    }
++    for name, expected in expected_scope.items():
++        if scope.get(name) != expected:
++            raise ValueError(f"readiness verification scope {name} is invalid")
++    raw_symbols = scope.get("symbols")
++    if not isinstance(raw_symbols, list) or any(not isinstance(item, str) or not item for item in raw_symbols):
++        raise ValueError("readiness verification universe is invalid")
++    universe = tuple(raw_symbols)
++    if len(universe) != scope.get("symbol_count") or len(set(universe)) != len(universe):
++        raise ValueError("readiness verification universe count is invalid")
++    calendar = tuple(str(item) for item in benchmark_sessions)
++    if len(calendar) != len(set(calendar)) or tuple(sorted(calendar)) != calendar:
++        raise ValueError("benchmark sessions are not unique and chronological")
++
++    def fold(fold_id: str, purpose: str, start: str, end: str) -> FoldSpec:
++        sessions = tuple(session for session in calendar if start <= session <= end)
++        return FoldSpec(fold_id, purpose, start, end, sessions)
++
++    discoveries = tuple(fold(fold_id, "discovery", start, end) for fold_id, start, end in _DISCOVERY_WINDOWS)
++    hidden = fold(_HIDDEN_WINDOW[0], "hidden", _HIDDEN_WINDOW[1], _HIDDEN_WINDOW[2])
++    universe_sha256 = _digest(list(universe))
++    return (
++        FoldManifest(
++            data_identity_sha256=data_identity_sha256,
++            universe_sha256=universe_sha256,
++            benchmark=str(scope["benchmark"]),
++            warmup_start_date=str(scope["warmup_start"]),
++            discovery_folds=discoveries,
++            hidden_fold=hidden,
++        ),
++        universe,
++    )
++
++
++def _sealed_evidence(
++    *,
++    fold_id: str,
++    transactions: tuple[ParityTransaction, ...],
++    entry_outcomes: tuple[ParityEntryOutcome, ...],
++    equity: tuple[ParityEquityPoint, ...],
++    funnel: tuple[AggregateMetric, ...],
++    aggregate: FoldAggregateSummary,
++    effective_policy_sha256: str,
++) -> ParityFoldEvidence:
++    primitive = {
++        "fold_id": fold_id,
++        "transactions": [asdict(item) for item in transactions],
++        "entry_outcomes": [asdict(item) for item in entry_outcomes],
++        "equity": [asdict(item) for item in equity],
++        "funnel": [asdict(item) for item in funnel],
++        "aggregate": asdict(aggregate),
++        "effective_policy_sha256": effective_policy_sha256,
++    }
++    return ParityFoldEvidence(
++        fold_id=fold_id,
++        transactions=transactions,
++        entry_outcomes=entry_outcomes,
++        equity=equity,
++        funnel=funnel,
++        aggregate=aggregate,
++        effective_policy_sha256=effective_policy_sha256,
++        evidence_sha256=_digest(primitive),
++    )
++
++
++def build_fold_evidence(*, fold: FoldSpec, result: object) -> ParityFoldEvidence:
++    """Convert one simulator result into complete canonical retrievable evidence."""
++
++    equity_curve = getattr(result, "equity_curve", None)
++    benchmark_curve = getattr(result, "benchmark_curve", None)
++    if equity_curve is None or benchmark_curve is None:
++        raise ValueError("simulation result curves are absent")
++    equity = tuple(ParityEquityPoint(str(session), float(value)) for session, value in equity_curve.items())
++    if tuple(point.session for point in equity) != fold.sessions:
++        raise ValueError("simulation equity sessions differ from the fold")
++    if tuple(str(session) for session in benchmark_curve.index) != fold.sessions:
++        raise ValueError("simulation benchmark sessions differ from the fold")
++
++    transaction_log = getattr(result, "transaction_log", None)
++    records = [] if transaction_log is None or transaction_log.empty else transaction_log.to_dict("records")
++    transaction_values: list[ParityTransaction] = []
++    for row in records:
++        raw_from_symbol = row.get("FromTicker")
++        from_symbol = (
++            None
++            if raw_from_symbol is None or (isinstance(raw_from_symbol, float) and math.isnan(raw_from_symbol))
++            else str(raw_from_symbol)
++        )
++        transaction_values.append(
++            ParityTransaction(
++                date=str(row["Date"]),
++                symbol=str(row["Ticker"]),
++                from_symbol=from_symbol,
++                action=str(row["Action"]),
++                price=float(row["Price"]),
++                quantity=float(row["Quantity"]),
++                value=float(row["Value"]),
++                reason=str(row["Reason"]),
++            )
++        )
++    transactions = tuple(transaction_values)
++    raw_outcomes = getattr(result, "entry_outcomes", ())
++    entry_outcomes = tuple(ParityEntryOutcome(**outcome.to_primitive()) for outcome in raw_outcomes)
++    raw_funnel = result.signal_funnel
++    funnel = tuple(AggregateMetric(metric_id, raw_funnel[metric_id]) for metric_id in sorted(raw_funnel))
++    exit_counts = Counter(str(getattr(trade, "exit_reason", None) or "unknown") for trade in result.closed_trades)
++    exit_attribution = tuple(AggregateMetric(reason, count) for reason, count in sorted(exit_counts.items()))
++    initial_capital = float(result.initial_capital)
++    if not math.isfinite(initial_capital) or initial_capital <= 0:
++        raise ValueError("simulation initial capital is invalid")
++    turnover_pct = sum(abs(item.value) for item in transactions) / initial_capital * 100.0
++    by_session: dict[str, list[ParityTransaction]] = {}
++    for transaction in transactions:
++        by_session.setdefault(transaction.date, []).append(transaction)
++    cash = initial_capital
++    exposure_values: list[float] = []
++    for point in equity:
++        for transaction in by_session.get(point.session, ()):
++            if transaction.action == "BUY":
++                cash -= transaction.value
++            elif transaction.action == "SELL":
++                cash += transaction.value
++        exposure_values.append(0.0 if point.equity == 0 else (point.equity - cash) / point.equity * 100.0)
++    average_exposure_pct = sum(exposure_values) / len(exposure_values) if exposure_values else 0.0
++    total_return_pct = float(result.total_return_pct)
++    benchmark_return_pct = float(result.benchmark_return_pct)
++    aggregate = FoldAggregateSummary(
++        fold_id=fold.fold_id,
++        total_return_pct=total_return_pct,
++        excess_total_return_pp=total_return_pct - benchmark_return_pct,
++        max_drawdown_pct=float(result.max_drawdown_pct),
++        sharpe_ratio=float(result.sharpe_ratio),
++        closed_trades=len(result.closed_trades),
++        turnover_pct=turnover_pct,
++        average_exposure_pct=average_exposure_pct,
++        entry_funnel=funnel,
++        exit_attribution=exit_attribution,
++    )
++    config = getattr(result, "config", None)
++    effective_policy_sha256 = config.get("effective_engine_policy_sha256") if isinstance(config, Mapping) else None
++    _require_digest(effective_policy_sha256, "simulation effective policy digest")
++    return _sealed_evidence(
++        fold_id=fold.fold_id,
++        transactions=transactions,
++        entry_outcomes=entry_outcomes,
++        equity=equity,
++        funnel=funnel,
++        aggregate=aggregate,
++        effective_policy_sha256=effective_policy_sha256,
++    )
++
++
++def capture_from_authenticated_inputs(
++    *,
++    readiness: Mapping[str, object],
++    readiness_sha256: str,
++    pit_bundle_sha256: str,
++    reference_source_head: str,
++    reference_source_fingerprint_sha256: str,
++    benchmark_sessions: Iterable[str],
++    output: Path,
++    evaluate_discovery_fold: Callable[[FoldSpec, tuple[str, ...], str], ParityFoldEvidence],
++) -> ParityReference:
++    """Compose a reference after callers authenticate source, readiness, and bundle."""
++
++    if Path(output).exists():
++        raise FileExistsError(Path(output))
++    _require_digest(readiness_sha256, "readiness digest")
++    identities = readiness.get("identities")
++    if not isinstance(identities, Mapping):
++        raise ValueError("readiness identities are absent")
++    if identities.get("pit_bundle_sha256") != pit_bundle_sha256:
++        raise ValueError("readiness PIT bundle identity differs")
++    baseline_manifest_sha256 = identities.get("baseline_manifest_sha256")
++    effective_policy_sha256 = identities.get("effective_policy_sha256")
++    _require_digest(baseline_manifest_sha256, "baseline manifest digest")
++    _require_digest(effective_policy_sha256, "effective policy digest")
++    manifest, universe = build_fixed_fold_manifest(
++        readiness=readiness,
++        benchmark_sessions=benchmark_sessions,
++        data_identity_sha256=pit_bundle_sha256,
++    )
++    evidence = tuple(
++        evaluate_discovery_fold(fold, universe, manifest.warmup_start_date) for fold in manifest.discovery_folds
++    )
++    if any(item.effective_policy_sha256 != effective_policy_sha256 for item in evidence):
++        raise ValueError("captured fold effective policy differs from readiness")
++    return persist_parity_reference(
++        output=Path(output),
++        reference_source_head=reference_source_head,
++        reference_source_fingerprint_sha256=reference_source_fingerprint_sha256,
++        readiness_sha256=readiness_sha256,
++        pit_bundle_sha256=pit_bundle_sha256,
++        baseline_manifest_sha256=baseline_manifest_sha256,
++        effective_policy_sha256=effective_policy_sha256,
++        fold_manifest=manifest,
++        universe=universe,
++        discovery_evidence=evidence,
++    )
++
++
++def _sha256_file(path: Path) -> str:
++    digest = hashlib.sha256()
++    with path.open("rb") as handle:
++        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def _canonical_object(path: Path, label: str) -> tuple[Path, dict[str, object], str]:
++    candidate = Path(path)
++    if candidate.is_symlink() or not candidate.is_file():
++        raise ValueError(f"{label} must be a regular non-link file")
++    resolved = candidate.resolve()
++    raw = resolved.read_bytes()
++    try:
++        value = json.loads(raw)
++    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
++        raise ValueError(f"{label} JSON is invalid") from exc
++    if not isinstance(value, dict) or raw != _canonical_json_bytes(value):
++        raise ValueError(f"{label} is not canonical JSON")
++    return resolved, value, hashlib.sha256(raw).hexdigest()
++
++
++def _source_identity(source_root: Path) -> tuple[str, str]:
++    root = Path(source_root).resolve()
++
++    def git(*args: str) -> bytes:
++        completed = subprocess.run(
++            ["git", *args],
++            cwd=root,
++            check=True,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
++        )
++        return completed.stdout
++
++    if git("status", "--porcelain", "--untracked-files=no").strip():
++        raise ValueError("parity capture requires a clean committed source")
++    head = git("rev-parse", "HEAD").decode("ascii").strip()
++    _require_head(head, "source head")
++    tree = git("ls-tree", "-r", "--full-tree", "HEAD")
++    return head, hashlib.sha256(tree).hexdigest()
++
++
++def _benchmark_calendar(bundle: object, benchmark: str) -> tuple[str, ...]:
++    connection = getattr(bundle, "_connection", None)
++    if connection is None:
++        raise ValueError("PIT bundle benchmark calendar is unavailable")
++    rows = connection.execute(
++        "SELECT trade_date FROM price WHERE ticker=? AND trade_date>=? AND trade_date<=? ORDER BY trade_date",
++        (benchmark, _DISCOVERY_WINDOWS[0][1], _HIDDEN_WINDOW[2]),
++    ).fetchall()
++    sessions = tuple(str(row[0]) for row in rows)
++    if not sessions:
++        raise ValueError("PIT bundle benchmark calendar is empty")
++    return sessions
++
++
++def _authenticated_readiness(path: Path) -> tuple[dict[str, object], str]:
++    _, readiness, readiness_sha256 = _canonical_object(path, "readiness artifact")
++    identities = readiness.get("identities")
++    effective_policy = readiness.get("effective_policy")
++    if not isinstance(identities, Mapping) or not isinstance(effective_policy, Mapping):
++        raise ValueError("readiness identity graph is incomplete")
++    from core.engine_policy import effective_engine_policy_sha256
++
++    expected_policy_sha256 = identities.get("effective_policy_sha256")
++    if effective_engine_policy_sha256(effective_policy) != expected_policy_sha256:
++        raise ValueError("readiness effective policy digest mismatch")
++    return readiness, readiness_sha256
++
++
++def simulator_kwargs_from_readiness(
++    readiness: Mapping[str, object],
++) -> dict[str, object]:
++    """Bind simulator constructor inputs that differ from engine defaults."""
++
++    policy = readiness.get("effective_policy")
++    entry_policy = policy.get("entry_policy") if isinstance(policy, Mapping) else None
++    cadence = (
++        entry_policy.get("signal_every_n_days")
++        if isinstance(entry_policy, Mapping)
++        else None
++    )
++    value = cadence.get("value") if isinstance(cadence, Mapping) else None
++    if type(value) is not int or value != _PARITY_SIGNAL_EVERY_N_DAYS:
++        raise ValueError("readiness signal cadence is invalid for parity capture")
++    return {"signal_every_n_days": value}
++
++
++def capture_parity_reference(
++    *,
++    readiness_path: Path,
++    pit_bundle_path: Path,
++    output: Path,
++    source_root: Path | None = None,
++) -> ParityReference:
++    """Authenticate local inputs and capture the inline-policy discovery reference."""
++
++    root = Path(source_root or Path(__file__).resolve().parents[1]).resolve()
++    source_head, source_fingerprint = _source_identity(root)
++    readiness, readiness_sha256 = _authenticated_readiness(Path(readiness_path))
++    identities = readiness["identities"]
++    if not isinstance(identities, Mapping):
++        raise ValueError("readiness identities are absent")
++    expected_bundle_sha256 = identities.get("pit_bundle_sha256")
++    _require_digest(expected_bundle_sha256, "readiness PIT bundle digest")
++    bundle_path = Path(pit_bundle_path)
++    if bundle_path.is_symlink() or not bundle_path.is_file():
++        raise ValueError("PIT bundle must be a regular non-link file")
++    if _sha256_file(bundle_path.resolve()) != expected_bundle_sha256:
++        raise ValueError("PIT bundle digest differs from readiness")
++
++    from core.backtest_engine import PortfolioSimulator
++    from core.pit_data import PITDataBundle
++
++    with PITDataBundle(bundle_path, expected_sha256=expected_bundle_sha256) as bundle:
++        evaluation = readiness.get("evaluation_contract")
++        scope = evaluation.get("scope") if isinstance(evaluation, Mapping) else None
++        benchmark = scope.get("benchmark") if isinstance(scope, Mapping) else None
++        if benchmark != "SPY":
++            raise ValueError("readiness benchmark is invalid")
++        calendar = _benchmark_calendar(bundle, benchmark)
++        simulator = PortfolioSimulator(
++            pit_bundle=bundle,
++            benchmark_symbol=benchmark,
++            **simulator_kwargs_from_readiness(readiness),
++        )
++
++        def evaluate(fold: FoldSpec, universe: tuple[str, ...], warmup: str) -> ParityFoldEvidence:
++            result = simulator.run(
++                list(universe),
++                start_date=fold.start_date,
++                end_date=fold.end_date,
++                history_start_date=warmup,
++                benchmark_symbol=benchmark,
++            )
++            return build_fold_evidence(fold=fold, result=result)
++
++        return capture_from_authenticated_inputs(
++            readiness=readiness,
++            readiness_sha256=readiness_sha256,
++            pit_bundle_sha256=expected_bundle_sha256,
++            reference_source_head=source_head,
++            reference_source_fingerprint_sha256=source_fingerprint,
++            benchmark_sessions=calendar,
++            output=Path(output),
++            evaluate_discovery_fold=evaluate,
++        )
++
++
++def verify_parity_reference(
++    *,
++    reference_path: Path,
++    pit_bundle_path: Path,
++    output: Path,
++    source_root: Path | None = None,
++) -> ParityAttestation:
++    """Re-evaluate discovery at a later clean HEAD and persist equality attestation."""
++
++    root = Path(source_root or Path(__file__).resolve().parents[1]).resolve()
++    final_head, final_fingerprint = _source_identity(root)
++    reference = load_parity_reference(Path(reference_path))
++    bundle_path = Path(pit_bundle_path)
++    if bundle_path.is_symlink() or not bundle_path.is_file():
++        raise ValueError("PIT bundle must be a regular non-link file")
++    if _sha256_file(bundle_path.resolve()) != reference.pit_bundle_sha256:
++        raise ValueError("PIT bundle digest differs from parity reference")
++
++    from core.backtest_engine import PortfolioSimulator
++    from core.pit_data import PITDataBundle
++    from core.strategy_policy import POLICY_INTERFACE_VERSION
++
++    with PITDataBundle(bundle_path, expected_sha256=reference.pit_bundle_sha256) as bundle:
++        simulator = PortfolioSimulator(
++            pit_bundle=bundle,
++            benchmark_symbol=reference.fold_manifest.benchmark,
++            signal_every_n_days=_PARITY_SIGNAL_EVERY_N_DAYS,
++        )
++        evidence = tuple(
++            build_fold_evidence(
++                fold=fold,
++                result=simulator.run(
++                    list(reference.universe),
++                    start_date=fold.start_date,
++                    end_date=fold.end_date,
++                    history_start_date=reference.fold_manifest.warmup_start_date,
++                    benchmark_symbol=reference.fold_manifest.benchmark,
++                ),
++            )
++            for fold in reference.fold_manifest.discovery_folds
++        )
++    return verify_parity_evidence(
++        reference=reference,
++        output=Path(output),
++        final_source_head=final_head,
++        final_source_fingerprint_sha256=final_fingerprint,
++        policy_interface_version=POLICY_INTERFACE_VERSION,
++        final_discovery_evidence=evidence,
++    )
++
++
++def _parser() -> argparse.ArgumentParser:
++    parser = argparse.ArgumentParser(description=__doc__)
++    commands = parser.add_subparsers(dest="command", required=True)
++    capture = commands.add_parser("capture")
++    capture.add_argument("--readiness", required=True, type=Path)
++    capture.add_argument("--pit-bundle", required=True, type=Path)
++    capture.add_argument("--output", required=True, type=Path)
++    verify = commands.add_parser("verify")
++    verify.add_argument("--reference", required=True, type=Path)
++    verify.add_argument("--pit-bundle", required=True, type=Path)
++    verify.add_argument("--output", required=True, type=Path)
++    return parser
++
++
++def main(argv: Sequence[str] | None = None) -> int:
++    args = _parser().parse_args(argv)
++    if args.command == "capture":
++        reference = capture_parity_reference(
++            readiness_path=args.readiness,
++            pit_bundle_path=args.pit_bundle,
++            output=args.output,
++        )
++        folds = ",".join(
++            f"{fold.fold_id}:{fold.start_date}..{fold.end_date}" for fold in reference.fold_manifest.discovery_folds
++        )
++        hidden = reference.fold_manifest.hidden_fold
++        print(
++            "PIT_POLICY_PARITY_REFERENCE "
++            f"sha256={reference.artifact_sha256} discovery={folds} "
++            f"hidden_unevaluated={hidden.fold_id}:{hidden.start_date}..{hidden.end_date}"
++        )
++        return 0
++    attestation = verify_parity_reference(
++        reference_path=args.reference,
++        pit_bundle_path=args.pit_bundle,
++        output=args.output,
++    )
++    print(f"PIT_POLICY_PARITY_VERIFIED sha256={attestation.artifact_sha256}")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/test_backtest_open_causality.py b/tests/test_backtest_open_causality.py
+index 481950a..051e07f 100644
+--- a/tests/test_backtest_open_causality.py
++++ b/tests/test_backtest_open_causality.py
+@@ -84,20 +84,49 @@ class _StaticFetcher:
+ 
+     def fetch_rs_universe_closes(
+         self,
+         _tickers: list[str],
+         _start_date: pd.Timestamp,
+         _end_date: pd.Timestamp,
+     ) -> pd.DataFrame:
+         return self.closes
+ 
+ 
++@dataclass
++class _RecordingFetcher(_StaticFetcher):
++    price_windows: list[tuple[pd.Timestamp, pd.Timestamp]]
++    close_windows: list[tuple[pd.Timestamp, pd.Timestamp]]
++
++    def fetch_price_data(
++        self,
++        tickers: list[str],
++        start_date: pd.Timestamp,
++        end_date: pd.Timestamp,
++    ) -> dict[str, pd.DataFrame]:
++        self.price_windows.append((start_date, end_date))
++        return {
++            symbol: frame.loc[start_date:end_date]
++            for symbol, frame in super().fetch_price_data(tickers, start_date, end_date).items()
++        }
++
++    def fetch_rs_universe_closes(
++        self,
++        tickers: list[str],
++        start_date: pd.Timestamp,
++        end_date: pd.Timestamp,
++    ) -> pd.DataFrame:
++        self.close_windows.append((start_date, end_date))
++        return super().fetch_rs_universe_closes(tickers, start_date, end_date).loc[
++            start_date:end_date
++        ]
++
++
+ @dataclass
+ class _DatedSignals:
+     signals: dict[tuple[str, pd.Timestamp], dict]
+ 
+     def evaluate_market(self, _spy: pd.DataFrame, _eval_date: pd.Timestamp) -> dict[str, bool]:
+         return {"market_is_bullish": True}
+ 
+     def evaluate_symbol(
+         self,
+         *,
+@@ -120,20 +149,107 @@ def _causal_rs_fixture() -> pd.DataFrame:
+ 
+ 
+ def test_public_rs_snapshot_matches_backtest_compatibility_delegate() -> None:
+     """Break caught: the public PIT RS snapshot diverged from the legacy engine checkpoint."""
+     closes = _causal_rs_fixture()
+     day = closes.index[-1]
+ 
+     assert calculate_rs_snapshot(closes, day) == _calculate_rs_snapshot(closes, day)
+ 
+ 
++def test_fold_history_is_visible_without_emitting_prefold_state_and_runs_reset(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Break caught: warmup either leaks outputs or disappears on an isolated fold."""
++    evaluation_dates = pd.bdate_range("2026-05-04", periods=30)
++    warmup_dates = pd.bdate_range(
++        end=evaluation_dates[0] - pd.offsets.BDay(1),
++        periods=60,
++    )
++    all_dates = warmup_dates.append(evaluation_dates)
++    lead = _ohlcv(
++        all_dates,
++        opens=[100.0] * len(all_dates),
++        closes=[100.0] * len(all_dates),
++    )
++    lead.loc[evaluation_dates[0], "Close"] = 102.0
++    lead.loc[evaluation_dates[0], "High"] = 102.0
++    lead.loc[evaluation_dates[0], "Volume"] = 1_300_000.0
++    lead.loc[evaluation_dates[-1], "Close"] = 102.0
++    lead.loc[evaluation_dates[-1], "High"] = 102.0
++    lead.loc[evaluation_dates[-1], "Volume"] = 1_300_000.0
++    spy = _ohlcv(
++        all_dates,
++        opens=[100.0] * len(all_dates),
++        closes=[100.0] * len(all_dates),
++    )
++    fetcher = _RecordingFetcher(
++        prices={"LEAD": lead, "SPY": spy},
++        closes=pd.DataFrame({"LEAD": lead["Close"]}),
++        price_windows=[],
++        close_windows=[],
++    )
++    strategy = _DatedSignals(
++        {
++            ("LEAD", evaluation_dates[0]): _signal("LEAD", evaluation_dates[0]),
++            ("LEAD", evaluation_dates[-1]): _signal("LEAD", evaluation_dates[-1]),
++        }
++    )
++    simulator = PortfolioSimulator(
++        initial_capital=1_000.0,
++        position_risk_pct=0.01,
++        stop_loss_pct=0.10,
++        ma_consecutive=999,
++        signal_every_n_days=1,
++        technical_only=True,
++        stagnation_days=999,
++        data_fetcher=fetcher,
++        strategy=strategy,
++    )
++    monkeypatch.setattr("core.backtest_engine.get_sp500_tickers", lambda: [])
++
++    results = [
++        simulator.run(
++            ["LEAD"],
++            start_date=str(evaluation_dates[0].date()),
++            end_date=str(evaluation_dates[-1].date()),
++            history_start_date=str(warmup_dates[0].date()),
++        )
++        for _ in range(2)
++    ]
++
++    expected_window = (warmup_dates[0], evaluation_dates[-1])
++    assert fetcher.price_windows == [expected_window, expected_window]
++    assert fetcher.close_windows == [expected_window, expected_window]
++    for result in results:
++        assert tuple(result.equity_curve.index) == tuple(
++            value.date().isoformat() for value in evaluation_dates
++        )
++        assert result.transaction_log["Date"].tolist() == [
++            str(evaluation_dates[1].date()),
++            str(evaluation_dates[-1].date()),
++        ]
++        assert result.transaction_log["Action"].tolist() == ["BUY", "SELL"]
++        assert result.transaction_log["Reason"].tolist()[-1] == "end_of_test"
++        assert len(result.entry_outcomes) == 1
++        assert result.entry_outcomes[0].signal_date == str(evaluation_dates[0].date())
++        assert all(
++            pd.Timestamp(value) >= evaluation_dates[0]
++            for value in result.transaction_log["Date"]
++        )
++        assert result.config["start_date"] == str(evaluation_dates[0].date())
++        assert result.config["history_start_date"] == str(warmup_dates[0].date())
++    assert results[0].transaction_log.to_dict("records") == results[1].transaction_log.to_dict("records")
++    assert results[0].entry_outcomes == results[1].entry_outcomes
++    assert results[0].equity_curve.to_dict() == results[1].equity_curve.to_dict()
++
++
+ def test_pending_open_buy_cannot_spend_same_day_exit_proceeds(monkeypatch: pytest.MonkeyPatch) -> None:
+     """Break caught: close/stop proceeds were available to a buy at that day's open."""
+     dates = pd.date_range("2026-01-02", periods=31, freq="B")
+     old_lows = [99.0] * len(dates)
+     old_lows[2] = 90.0
+     old = _with_warmup_and_canonical_entry(
+         _ohlcv(
+             dates,
+             opens=[100.0] * len(dates),
+             closes=[100.0] * len(dates),
+diff --git a/tests/test_pit_policy_parity.py b/tests/test_pit_policy_parity.py
+new file mode 100644
+index 0000000..11f3c76
+--- /dev/null
++++ b/tests/test_pit_policy_parity.py
+@@ -0,0 +1,426 @@
++"""Behavioral contracts for fold manifests and persisted policy parity."""
++
++from __future__ import annotations
++
++from dataclasses import asdict, replace
++import hashlib
++import json
++from pathlib import Path
++
++import pandas as pd
++import pytest
++
++from core.backtest_engine import EntryAttemptOutcome, SimulationResult, Trade
++from core.pit_optimizer_evaluation import (
++    AggregateMetric,
++    FoldAggregateSummary,
++    FoldManifest,
++    FoldSpec,
++)
++from core.pit_policy_parity import (
++    ParityEntryOutcome,
++    ParityEquityPoint,
++    ParityFoldEvidence,
++    ParityTransaction,
++    build_fixed_fold_manifest,
++    build_fold_evidence,
++    capture_from_authenticated_inputs,
++    load_parity_reference,
++    persist_parity_reference,
++    simulator_kwargs_from_readiness,
++    verify_parity_evidence,
++)
++
++
++def canonical_json_bytes_without_self_digest(
++    value: object,
++    self_digest: str,
++) -> bytes:
++    """Independent test oracle for canonical self-digest preimages."""
++    primitive = asdict(value) if hasattr(value, "__dataclass_fields__") else dict(value)  # type: ignore[arg-type]
++    primitive.pop(self_digest, None)
++    primitive.pop("artifact_path", None)
++    return (
++        json.dumps(
++            primitive,
++            sort_keys=True,
++            separators=(",", ":"),
++            allow_nan=False,
++        ).encode("utf-8")
++        + b"\n"
++    )
++
++
++def _fold(fold_id: str, purpose: str, start: str) -> FoldSpec:
++    sessions = tuple(value.date().isoformat() for value in pd.bdate_range(start=start, periods=60))
++    return FoldSpec(
++        fold_id=fold_id,
++        purpose=purpose,
++        start_date=sessions[0],
++        end_date=sessions[-1],
++        sessions=sessions,
++    )
++
++
++def _aggregate(fold_id: str) -> FoldAggregateSummary:
++    funnel = (AggregateMetric("entries_executed", 1),)
++    exits = (AggregateMetric("end_of_test", 1),)
++    return FoldAggregateSummary(
++        fold_id=fold_id,
++        total_return_pct=1.0,
++        excess_total_return_pp=0.5,
++        max_drawdown_pct=-0.25,
++        sharpe_ratio=1.5,
++        closed_trades=1,
++        turnover_pct=20.0,
++        average_exposure_pct=10.0,
++        entry_funnel=funnel,
++        exit_attribution=exits,
++    )
++
++
++def _evidence(fold_id: str, *, equity: float = 1_010.0) -> ParityFoldEvidence:
++    transaction = ParityTransaction(
++        date="2021-01-05",
++        symbol="AAA",
++        from_symbol=None,
++        action="BUY",
++        price=100.0,
++        quantity=1.0,
++        value=100.0,
++        reason="fixture",
++    )
++    outcome = ParityEntryOutcome(
++        symbol="AAA",
++        signal_date="2021-01-04",
++        entry_date="2021-01-05",
++        pivot=None,
++        buy_zone_lower=None,
++        buy_zone_upper=None,
++        entry_open=100.0,
++        outcome="entries_executed",
++    )
++    fields = {
++        "fold_id": fold_id,
++        "transactions": (transaction,),
++        "entry_outcomes": (outcome,),
++        "equity": (ParityEquityPoint("2021-01-05", equity),),
++        "funnel": (AggregateMetric("entries_executed", 1),),
++        "aggregate": _aggregate(fold_id),
++        "effective_policy_sha256": "d" * 64,
++    }
++    primitive = {
++        "fold_id": fold_id,
++        "transactions": [asdict(transaction)],
++        "entry_outcomes": [asdict(outcome)],
++        "equity": [asdict(fields["equity"][0])],
++        "funnel": [asdict(fields["funnel"][0])],
++        "aggregate": asdict(fields["aggregate"]),
++        "effective_policy_sha256": "d" * 64,
++    }
++    digest = hashlib.sha256(
++        json.dumps(primitive, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8") + b"\n"
++    ).hexdigest()
++    return ParityFoldEvidence(**fields, evidence_sha256=digest)
++
++
++def test_fold_manifest_rejects_reused_discovery_sessions() -> None:
++    """Break caught: the same market sessions could influence both discovery folds."""
++    first = _fold("discovery_1", "discovery", "2021-01-04")
++    second = replace(first, fold_id="discovery_2")
++    hidden = _fold("hidden_1", "hidden", "2022-01-03")
++    with pytest.raises(ValueError, match="overlap"):
++        FoldManifest(
++            data_identity_sha256="a" * 64,
++            universe_sha256="b" * 64,
++            benchmark="SPY",
++            warmup_start_date="2020-01-02",
++            discovery_folds=(first, second),
++            hidden_fold=hidden,
++        )
++
++
++def test_fold_manifest_requires_two_chronological_discovery_folds_before_hidden() -> None:
++    """Break caught: a short, reordered, or mislabeled fold could be evaluated."""
++    first = _fold("discovery_1", "discovery", "2021-01-04")
++    second = _fold("discovery_2", "discovery", "2021-04-01")
++    hidden = _fold("hidden_1", "hidden", "2022-01-03")
++    manifest = FoldManifest(
++        data_identity_sha256="a" * 64,
++        universe_sha256="b" * 64,
++        benchmark="SPY",
++        warmup_start_date="2020-01-02",
++        discovery_folds=(first, second),
++        hidden_fold=hidden,
++    )
++
++    assert len(first.sessions) == len(second.sessions) == len(hidden.sessions) == 60
++    assert manifest.sha256 == hashlib.sha256(canonical_json_bytes_without_self_digest(manifest, "sha256")).hexdigest()
++    with pytest.raises(ValueError, match="chronological"):
++        replace(manifest, discovery_folds=(second, first))
++
++
++def test_reference_persists_canonical_nested_evidence_and_is_create_only(tmp_path: Path) -> None:
++    """Break caught: parity hashes replaced retrievable evidence or an artifact was overwritten."""
++    first = _fold("discovery_1", "discovery", "2021-01-04")
++    second = _fold("discovery_2", "discovery", "2021-04-01")
++    manifest = FoldManifest(
++        data_identity_sha256="a" * 64,
++        universe_sha256="b" * 64,
++        benchmark="SPY",
++        warmup_start_date="2020-01-02",
++        discovery_folds=(first, second),
++        hidden_fold=_fold("hidden_1", "hidden", "2022-01-03"),
++    )
++    output = tmp_path / "reference.json"
++    evidence = (_evidence("discovery_1"), _evidence("discovery_2"))
++
++    reference = persist_parity_reference(
++        output=output,
++        reference_source_head="1" * 40,
++        reference_source_fingerprint_sha256="2" * 64,
++        readiness_sha256="3" * 64,
++        pit_bundle_sha256="4" * 64,
++        baseline_manifest_sha256="5" * 64,
++        effective_policy_sha256="d" * 64,
++        fold_manifest=manifest,
++        universe=("AAA", "BBB"),
++        discovery_evidence=evidence,
++    )
++    loaded = load_parity_reference(output)
++
++    assert loaded == reference
++    assert loaded.discovery_evidence == evidence
++    assert output.read_bytes() == canonical_json_bytes_without_self_digest(loaded, "artifact_sha256")
++    assert hashlib.sha256(output.read_bytes()).hexdigest() == loaded.artifact_sha256
++    with pytest.raises(FileExistsError):
++        persist_parity_reference(
++            output=output,
++            reference_source_head="1" * 40,
++            reference_source_fingerprint_sha256="2" * 64,
++            readiness_sha256="3" * 64,
++            pit_bundle_sha256="4" * 64,
++            baseline_manifest_sha256="5" * 64,
++            effective_policy_sha256="d" * 64,
++            fold_manifest=manifest,
++            universe=("AAA", "BBB"),
++            discovery_evidence=evidence,
++        )
++
++
++def test_attestation_is_not_written_when_any_retrievable_evidence_differs(tmp_path: Path) -> None:
++    """Break caught: matching summary hashes could conceal a changed equity path."""
++    first = _fold("discovery_1", "discovery", "2021-01-04")
++    second = _fold("discovery_2", "discovery", "2021-04-01")
++    manifest = FoldManifest(
++        data_identity_sha256="a" * 64,
++        universe_sha256="b" * 64,
++        benchmark="SPY",
++        warmup_start_date="2020-01-02",
++        discovery_folds=(first, second),
++        hidden_fold=_fold("hidden_1", "hidden", "2022-01-03"),
++    )
++    reference_path = tmp_path / "reference.json"
++    reference_evidence = (_evidence("discovery_1"), _evidence("discovery_2"))
++    persist_parity_reference(
++        output=reference_path,
++        reference_source_head="1" * 40,
++        reference_source_fingerprint_sha256="2" * 64,
++        readiness_sha256="3" * 64,
++        pit_bundle_sha256="4" * 64,
++        baseline_manifest_sha256="5" * 64,
++        effective_policy_sha256="d" * 64,
++        fold_manifest=manifest,
++        universe=("AAA", "BBB"),
++        discovery_evidence=reference_evidence,
++    )
++    output = tmp_path / "attestation.json"
++
++    with pytest.raises(ValueError, match="equity"):
++        verify_parity_evidence(
++            reference=load_parity_reference(reference_path),
++            output=output,
++            final_source_head="6" * 40,
++            final_source_fingerprint_sha256="7" * 64,
++            policy_interface_version=1,
++            final_discovery_evidence=(
++                _evidence("discovery_1", equity=999.0),
++                reference_evidence[1],
++            ),
++        )
++    assert not output.exists()
++
++
++def test_fixed_fold_manifest_uses_only_the_supplied_benchmark_calendar() -> None:
++    """Break caught: fold construction queried hidden values instead of sealing session IDs."""
++    closures = {"2021-07-05", "2021-09-06", "2021-11-25", "2021-12-24", "2022-01-17", "2022-02-21"}
++    sessions = tuple(
++        value.date().isoformat()
++        for value in pd.bdate_range("2021-06-25", "2022-03-11")
++        if value.date().isoformat() not in closures
++    )
++    readiness = {
++        "evaluation_contract": {
++            "verification_only": True,
++            "scope": {
++                "benchmark": "SPY",
++                "discovery_start": "2021-06-25",
++                "discovery_end": "2021-09-20",
++                "holdout_start": "2021-09-21",
++                "holdout_end": "2021-12-14",
++                "warmup_start": "2021-01-01",
++                "session_count": 60,
++                "symbol_count": 2,
++                "symbols": ["AAA", "BBB"],
++            },
++        }
++    }
++
++    manifest, universe = build_fixed_fold_manifest(
++        readiness=readiness,
++        benchmark_sessions=sessions,
++        data_identity_sha256="a" * 64,
++    )
++
++    assert universe == ("AAA", "BBB")
++    assert [(fold.start_date, fold.end_date) for fold in manifest.discovery_folds] == [
++        ("2021-06-25", "2021-09-20"),
++        ("2021-09-21", "2021-12-14"),
++    ]
++    assert (manifest.hidden_fold.start_date, manifest.hidden_fold.end_date) == (
++        "2021-12-15",
++        "2022-03-11",
++    )
++    assert all(len(fold.sessions) == 60 for fold in (*manifest.discovery_folds, manifest.hidden_fold))
++
++
++def test_fold_evidence_embeds_exact_result_rows_and_hand_checked_aggregates() -> None:
++    """Break caught: capture emitted only hashes or computed aggregates from a different result."""
++    fold = _fold("discovery_1", "discovery", "2021-01-04")
++    equity = pd.Series([1_000.0] * 60, index=fold.sessions)
++    transactions = pd.DataFrame(
++        [
++            {
++                "Date": fold.sessions[0],
++                "Ticker": "AAA",
++                "Action": "BUY",
++                "Price": 100.0,
++                "Quantity": 1.0,
++                "Value": 100.0,
++                "Reason": "fixture",
++            },
++            {
++                "Date": fold.sessions[-1],
++                "Ticker": "AAA",
++                "Action": "SELL",
++                "Price": 100.0,
++                "Quantity": 1.0,
++                "Value": 100.0,
++                "Reason": "end_of_test",
++            },
++        ]
++    )
++    trade = Trade("AAA", fold.sessions[0], 100.0, 1.0, 90.0)
++    trade.exit_date = fold.sessions[-1]
++    trade.exit_price = 100.0
++    trade.exit_reason = "end_of_test"
++    outcome = EntryAttemptOutcome(
++        "AAA", fold.sessions[0], fold.sessions[1], None, None, None, 100.0, "entries_executed"
++    )
++    result = SimulationResult(
++        trades=[trade],
++        equity_curve=equity,
++        benchmark_curve=equity,
++        initial_capital=1_000.0,
++        config={
++            "candidate_universe_count": 1,
++            "rs_universe_count": 1,
++            "effective_engine_policy_sha256": "d" * 64,
++        },
++        transaction_log=transactions,
++        signal_log=pd.DataFrame(),
++        entry_outcomes=(outcome,),
++    )
++
++    evidence = build_fold_evidence(fold=fold, result=result)
++
++    assert len(evidence.transactions) == 2
++    assert evidence.entry_outcomes == (
++        ParityEntryOutcome("AAA", fold.sessions[0], fold.sessions[1], None, None, None, 100.0, "entries_executed"),
++    )
++    assert tuple(point.session for point in evidence.equity) == fold.sessions
++    assert evidence.aggregate.total_return_pct == 0.0
++    assert evidence.aggregate.excess_total_return_pp == 0.0
++    assert evidence.aggregate.closed_trades == 1
++    assert evidence.aggregate.turnover_pct == 20.0
++    assert evidence.aggregate.average_exposure_pct == pytest.approx(59 / 6)
++    assert dict((item.metric_id, item.value) for item in evidence.aggregate.exit_attribution) == {"end_of_test": 1}
++
++
++def test_capture_evaluates_only_discovery_and_seals_hidden_calendar(tmp_path: Path) -> None:
++    """Break caught: reference capture evaluated hidden data or omitted its sealed boundary."""
++    closures = {"2021-07-05", "2021-09-06", "2021-11-25", "2021-12-24", "2022-01-17", "2022-02-21"}
++    sessions = tuple(
++        value.date().isoformat()
++        for value in pd.bdate_range("2021-06-25", "2022-03-11")
++        if value.date().isoformat() not in closures
++    )
++    readiness = {
++        "evaluation_contract": {
++            "verification_only": True,
++            "scope": {
++                "benchmark": "SPY",
++                "discovery_start": "2021-06-25",
++                "discovery_end": "2021-09-20",
++                "holdout_start": "2021-09-21",
++                "holdout_end": "2021-12-14",
++                "warmup_start": "2021-01-01",
++                "session_count": 60,
++                "symbol_count": 2,
++                "symbols": ["AAA", "BBB"],
++            },
++        },
++        "identities": {
++            "pit_bundle_sha256": "4" * 64,
++            "baseline_manifest_sha256": "5" * 64,
++            "effective_policy_sha256": "d" * 64,
++        },
++    }
++    evaluated: list[str] = []
++
++    def evaluate(fold: FoldSpec, _universe: tuple[str, ...], _warmup: str) -> ParityFoldEvidence:
++        evaluated.append(fold.fold_id)
++        return _evidence(fold.fold_id)
++
++    reference = capture_from_authenticated_inputs(
++        readiness=readiness,
++        readiness_sha256="3" * 64,
++        pit_bundle_sha256="4" * 64,
++        reference_source_head="1" * 40,
++        reference_source_fingerprint_sha256="2" * 64,
++        benchmark_sessions=sessions,
++        output=tmp_path / "reference.json",
++        evaluate_discovery_fold=evaluate,
++    )
++
++    assert evaluated == ["discovery_1", "discovery_2"]
++    assert reference.fold_manifest.hidden_fold.fold_id == "hidden_1"
++    assert len(reference.discovery_evidence) == 2
++
++
++def test_capture_simulator_binds_authenticated_signal_cadence() -> None:
++    """Break caught: reference capture silently used the engine's five-day default cadence."""
++    readiness = {
++        "effective_policy": {
++            "entry_policy": {
++                "signal_every_n_days": {
++                    "classification": "active_tunable_policy",
++                    "optimizer_candidate": True,
++                    "source": "core.backtest_engine.PortfolioSimulator.signal_every_n_days",
++                    "value": 1,
++                }
++            }
++        }
++    }
++
++    assert simulator_kwargs_from_readiness(readiness) == {"signal_every_n_days": 1}

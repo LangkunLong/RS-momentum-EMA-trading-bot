@@ -1,0 +1,686 @@
+# C-a package review
+Base = HEAD = a068e0aed40ecbe5e0078924071f374e7809b8c2. These are new diagnostic artifacts, no production diff or new commits.
+Read authority-trace-report.md separately once it is delivered; its config anchors are a required review dependency.
+current-verifier-evidence.json is referenced directly; its large before_file_hashes inventories are excluded from this diff to keep review bounded. Inspect its full_summary, authority and source/evaluator fields as needed.
+
+# authority-trace-brief.md SHA256 a6b7489c2ac6909dd96a1883a9b4c7edcc0773340b889cb4f3e6b289e8b7642c
+--- /dev/null
++++ authority-trace-brief.md
+@@ -0,0 +1,17 @@
++# Increment C-a: original saved authority trace
++
++Worktree: C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-v5-architecture
++
++Read this brief first. Trace only the real provider-free runtime-04 campaign development-controller-two-rounds-20260907-04. Its full summary failed at LocalContainerExecutorV5._load_reservation(repair=False): command digest matched, stored/current executor digests differed. Do not assume PATH drift or corruption.
++
++Deliverable: authority-trace-report.md in this same fresh package. Include exact local references, checked SHA-256 values, source function/line references, and a table of saved identity component evidence versus unavailable original context. Authenticate referenced artifacts with existing typed read APIs where safe; inspect source for side effects first. Hash-only evidence must not be mislabeled as semantic authentication.
++
++Follow authenticate_development_history_v5 in core/pit_optimizer_v5/development_preparation.py through saved CampaignLaunchV5, adapter config, owner/mount/executor authority. Find original saved launch/environment/host metadata and execution helpers. Inspect helpers as text only. Search only core/pit_optimizer_v5, relevant docs, and .artifacts/pit-optimizer-v5/development/runtime-04 plus directly referenced real artifacts; bounded nearby development metadata searches are allowed when provenance points there. Never read tests or unrelated sessions.
++
++Original manifest relative to runtime-04: campaigns/development-controller-two-rounds-20260907-04/manifest.json, SHA 8fcae0423117f3a234e64391c277bd7efe5cbb775ff61ec879d8cbeb5659d37c.
++Stored executor SHA: 2849cde885cc8bdde38230bc77ecd17163db42db1b071cc5a8a4212ce4601444.
++Prior principal executor SHA: a72e22fc6deeb4b23f65d82ef32abb148fea4ea6db5efecf26c4391e31605bb9.
++
++Constraints: no tests read/created/modified/run; no synthetic candidates, records, events, probes, mocked objects or fabricated authority. No credentials, .env, API/model/external calls, evaluations, campaign run/resume/poll/cleanup/reconciliation, Docker commands, source edits, environment changes, commits or Git manipulation. Preserve old artifacts byte-for-byte. Never dump environment values or owner tokens. Record digests and equality results only. No subagents. Do not run a full summary (principal owns the one current reproduction). Write only your named report in this new package. If you need an auxiliary diagnostic output, request a distinct filename from the principal first.
++
++Return compact status, report path, most important finding and unresolved evidence. Do not implement a correction.
+
+# principal-diagnosis.md SHA256 c886eee9b4a9872c341fdb70554502a2f0c0fda8235fe7204b8edb0e7bc97d7c
+--- /dev/null
++++ principal-diagnosis.md
+@@ -0,0 +1,59 @@
++# Increment C-a — historical executor verification diagnosis
++
++Status: diagnosis completed; proposed architectural correction under review. B4c source acceptance is retained. Campaign readiness remains held. No production correction has been implemented.
++
++## Current evidence
++
++The actual runtime-04 full summary still fails with `V5CliFailure(artifact_graph_invalid)` caused by `ValueError(container execution reservation is foreign)`. The failure reaches `LocalContainerExecutorV5._load_reservation(repair=False)`, with the original command digest matching and the executor digest differing. This reproduces the B4c principal result in this session without changing environment, source, records or authority.
++
++The actual06 full summary returns successfully and reports the historical failed campaign, with lifecycle/evaluated-feedback/rejected counts 0/0/0. All 27 fields match the saved B4c principal `summarize` result, comparing Decimal fields numerically. No extra provider call or evaluation occurred.
++
++| Round | Original executor digest | Current executor digest |
++| --- | --- | --- |
++| runtime-04 round 1 | 2849cde885cc8bdde38230bc77ecd17163db42db1b071cc5a8a4212ce4601444 | a72e22fc6deeb4b23f65d82ef32abb148fea4ea6db5efecf26c4391e31605bb9 |
++| runtime-04 round 2 | bae808e474cf877d4ac47641a02f7f1f5c01d2c0e6e21640b9aa9524d9e88c95 | ee5f5909728d6eda5a3cb6cc9b25e630debddecd5b6f6cde21766014941184ca |
++
++Current executor digests were recomputed from the exact source-defined identity payload and equal the constructed executor properties. No component substitution was used to force a match.
++
++## Component findings
++
++The comparison covers all ten original journal-indexed executions, five in each round. Existing typed loaders used `repair=False`; owner data came from real journal/reservation/launch authority. `authenticate_output_history` and `authenticate_lease_history` were called on existing records. These component checks are not a successful full historical-execution verification.
++
++| Component | Observation | Limit |
++| --- | --- | --- |
++| Manifest/profile/repository | Original launch manifest/config authenticate against the same manifest and root; mount authority reconstructs exactly | No relocation or archive migration claim |
++| Owner/command/request | All ten agree with launch owner, derived round lease, journal authority and command hash | No invented owner or command |
++| Workspace/mount | Workspace histories are retired; output histories authenticate against those workspace identities | Does not replace phase/output/role verification |
++| Docker executable | Saved control records match the current full executable-file identity digest | No Docker daemon call or image inventory inspection |
++| Control directory | All ten saved control identities match using the same hash encoding; transaction directories are absent as recorded | Directory absence alone does not establish historical completion |
++| Cleanup bindings | Saved reservation/control/cleanup/absence records agree on original executor and owner | Full phase-prefix, output and cleanup verifier remains blocked upstream |
++| Control environment | Only the current six-entry tuple and per-entry digests were captured | No original tuple/component digests established; no values printed or changed |
++| Runtime contract | Current literal was read from the executor constructor and included in exact current recomputation | Original launch-bound host contract preimage has not yet been established |
++
++The evidence excludes several proposed explanations, including a different current Docker file identity, mount identity or control-directory identity for these records. It does **not** isolate PATH or prove environmental drift as the sole cause. The original environment and host-contract preimage remain necessary to reproduce the original whole-executor digest.
++
++## Verifier seam
++
++`summary.py:265` calls `authenticate_development_history_v5`. That function loads the original campaign launch/config and calls `_verify_local_run` (`development_preparation.py:394–409`). `_verify_resource_history` constructs a fresh executor (`cli.py:943–979`). The constructor binds six current process environment entries and a current runtime-contract literal into executor identity (`production_sandbox.py:1505–1559`). `_load_reservation` then requires equality with the historical digest (`production_sandbox.py:1813–1829`).
++
++This binds historical reporting to current execution authority. The live guard is correct to reject a foreign executor; the correction must give historical reporting a distinct, authenticated read authority. Removing the guard or overriding an executor object's identity would also affect launch, recovery and cleanup and is unacceptable.
++
++## Preservation and execution record
++
++The 18 B4c recorded source hashes are unchanged. The complete 56-file evaluator source map recomputes to `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4`.
++
++Before/after snapshots match all 579 files under runtime-04 and all 83 files under actual06. State-index preflight checked 175 and 3 entries respectively. The evidence JSON contains the exact file inventories and hashes. No original file was repaired or rewritten.
++
++One initial preflight stopped before invoking a summary because ordinary Windows path access failed at 260 characters. Extended paths proved the index existed; the diagnostic reader was corrected. One initial control-root observation compared two different encodings and is explicitly superseded by `component-comparison-corrected.json`. It is not evidence of directory drift. A subsequent component-only pass covered both rounds; neither summary was rerun for that correction. An import error in that component helper occurred before archive access and was corrected.
++
++No tests were read, created or run; no synthetic records/events/candidates, credential reads, external calls, evaluations, campaign operations, production changes or commits occurred. New files are diagnostic scripts, reports and metadata in this package plus the scoped SDD ledger.
++
++## Evidence map
++
++- `current-verifier-evidence.json`: actual returned summary/failure chain, hashes and first component observation; its control-root comparison is superseded as above.
++- `component-comparison-corrected.json`: ten execution comparisons with the correct control-record encoding and exact current executor-payload recomputation.
++- `actual06-current-comparison.json`: same-command comparison of all 27 summary fields.
++- `authority-trace-report.md`: independent subagent trace of the original launch and per-round authority; final conclusions must account for this report.
++- `historical-verification-design.md`: narrow proposed correction and implementation checkpoints.
++
++Increment C-a ends with this finding/design. C-b readiness, C-c paid-run preparation and the original two-evaluated-round milestone are not claimed complete.
+
+# historical-verification-design.md SHA256 df1ca5748b889f2db7d2030138e6243f4c3f98dfc0ec98d50848df47e8ad630c
+--- /dev/null
++++ historical-verification-design.md
+@@ -0,0 +1,72 @@
++# Proposed completed-history verifier — Increment C-a decision package
++
++Disposition: proposed for principal review, not implemented. The scope is local historical reporting. It grants no execution capability, ownership transfer, campaign readiness or new paid-call budget.
++
++## Decision
++
++Preserve `LocalContainerExecutorV5`'s current identity guards. Add a separate, explicitly selected verifier for completed historical development rounds, bound to each original `CampaignRoundLaunchV5.adapter_config_ref`. The expected executor digest must come from that authenticated original config, not be taken from the reservation being checked.
++
++The original launch's config covers round 1; later rounds have independently saved configs. A single campaign-level config must not be used as every round's executor authority. The independent authority trace must confirm these config references and equality against the real reservations before implementation begins.
++
++The available original config digest can authenticate which executor produced historical records without reconstructing its process environment. It cannot establish that today's process has the same execution authority. The two meanings remain separate in API types and call paths.
++
++## Checkpoint H1: resolve immutable historical round authority
++
++Expected source scope: `development_preparation.py` and a new host-only `historical_verification.py`. No runtime behavior activation yet.
++
++1. Authenticate the manifest using the exact `CampaignLaunchV5.manifest_ref`, then load that campaign launch with `repair=False` and require manifest equality.
++2. Derive each round key using the existing canonical manifest/round mapping. Load `campaign-round` and `campaign-round-started` as `CampaignRoundLaunchV5`, both with `repair=False`. Require exact entry equality after removing only `started_epoch_ms`, require a positive start, the expected round number and the original campaign owner token. Require the first round's config reference to equal the campaign launch's reference.
++3. Load each referenced development config through the existing typed config authority check, including manifest and repository-root identity. Require source/workspace/data/output/control/tool paths, export mode and controller/provider-specific settings to agree with the original campaign config; only legitimately round-derived identity fields may differ. Do not read credential values.
++4. Derive the exact `WorkspaceOwnerV5` from the authenticated campaign/round/token and existing controller-lease derivation. Require all resource events, execution authorities and reservations to bind that owner. Reconstruct read-only workspace/mount adapters and require their identities to match the round's saved config. Their existing historical authentication methods remain mandatory.
++5. Return a frozen internal authority containing manifest, round, owner, exact config reference and expected executor/workspace/mount digests. Do not expose an override field on `LocalContainerExecutorV5`, and do not issue `OwnedLeaseV5`, execution reservations or opaque operational capabilities.
++
++Checkpoint result: explicit authority graph and real round-1/round-2 config verification. No tests or fabricated authority under the retained restrictions.
++
++## Checkpoint H2: verify completed historical execution records
++
++Expected source scope: `historical_verification.py`. If sharing pure predicates requires changes to `production_sandbox.py`, submit the exact extraction design before that source change; `_load_reservation` and all live capability/foreign-owner guards must remain byte-identical. Avoid maintaining an unchecked copy of the security-sensitive phase verifier.
++
++The reader consumes the H1 authority and actual journal execution index. All state reads use `repair=False`; no adapter transition locks, orphan repair, subprocesses, environment reads, Docker commands, cleanup or reconciliation are permitted. It cannot construct a live executor and cannot replace an executor digest on an existing object.
++
++Required checks, with the same failure behavior as their existing counterparts:
++
++| Evidence | Required binding |
++| --- | --- |
++| Reservation | Expected executor from original round config; exact owner, command and request; canonical argv command digest; deterministic container/control names; output-mount identity; exact two derived lease IDs and journal lease payloads |
++| Workspace and output mount | Existing lease retirement and output-history checks; exact source identity belongs to the journaled workspace; saved round config agrees with current pinned non-environment identities |
++| Panel input | Existing semantic-probe absence rule or exact panel request, evaluator/profile, quick/discovery purpose and episode ordinal |
++| Phases and container identity | All records bind the config-pinned executor and command; exact valid prefix of launch/create/start/collect; immutable container identity, lifecycle, network and state-attestation transitions |
++| Terminal/output | Expected executor, command, request and output mount; collected evidence where required; successful outputs for journaled success keys; bounded byte count and exact binary-state reference/content digest |
++| Cleanup/control | Both durable container-absent and cleanup records with expected executor/owner; correct same-encoding control-root identity; original control creation/readiness and tool identity; actual transaction-directory absence; exact cleanup counts and workspace retirement |
++| Campaign/record/roles | Existing round journal fold, role-package/paid-ledger authentication, checkpoint records, archive projection, finalizer and cleanup semantics remain mandatory |
++
++The completed-history reader accepts only an already settled round with successful durable cleanup. Settled means committed checkpoint record(s) or an authenticated terminal outcome; round 2's deadline failure must remain a failed outcome, not a second evaluated round. Missing/incomplete/foreign evidence fails closed. Unsupported historical schema or runtime-contract interpretation fails closed and names the unavailable evidence; no automatic migration or digest rebinding.
++
++This initial design retains current local workspace/data/output/control/tool identity checks. It does not support moved archives, changed Docker executables or missing resource roots. It also does not prove the exact historical environment or reconstruct live execution attestation from a digest.
++
++## Checkpoint H3: explicit summary integration
++
++Expected source scope: `summary.py`, `development_preparation.py`, and the reviewed historical module. Initial delivery need not change the CLI.
++
++Add an explicit keyword to `summarize_repository_v5`, for example `verification_scope="current_runtime" | "completed_history"`, defaulting to the current behavior. Require `completed_history` to be used with `command="summarize"` and the existing supported development scope; do not select it merely from a caught ownership exception. Route that explicit request through the new completed-history authority/reader, while retaining ordinary journal/record/role/projection authentication and unchanged summary fields/count calculations.
++
++Default callers, `run`, `resume`, `verify-run`, campaign budget accounting and cleanup continue to use current runtime authority. A new historical summary must not silently alter those call paths. A CLI flag or separate command can be considered later as a separate bounded change; it is not needed for the local direct-API verification milestone.
++
++Required permitted verification after implementation:
++
++1. Scoped exact source diff/AST review, Ruff and in-memory compilation. Recompute the complete evaluator map; stop if any covered source changed. No tests or synthetic evidence.
++2. Authenticate both original round configs and all actual runtime-04 execution histories. Invoke the full summary once with explicit completed-history scope; compare old returned values and new counts against real immutable baselines, preserving command-label and Decimal-format distinctions.
++3. Confirm runtime-04 still has one evaluated feedback round, round 2's deadline failure, complete recorded cleanup and counts 1/1/0. Confirm actual06 remains failed with counts 0/0/0 and no invented rejected records.
++4. Compare all original archive hashes before/after and all protected source hashes. Review default/live guard call sites statically; do not invoke a live campaign or create synthetic foreign reservations for coverage.
++5. Record unexecuted negative and operational branches honestly. A successful historical read is not proof that a fresh campaign is ready or that positive rejection/duplicate paths ran.
++
++## Rejected approaches
++
++- Replacing the stored executor digest, changing process environment until a digest happens to match, or guessing the original PATH.
++- Removing `_load_reservation`'s foreign-executor guard, adding an unchecked override, monkeypatching an executor, or calling repair/recovery to normalize the archive.
++- Trusting the reservation's own executor digest without the original round config anchor.
++- Using the new reader implicitly in `run`/`resume`/`verify-run` or treating lifecycle completion as evaluated feedback.
++
++## Exit and next step
++
++Increment C-a delivers this reviewable design and the authenticated diagnosis. After the principal accepts the exact H1/H2 boundaries, implement H1 alone with a subagent and return its source/evidence package before H2. Retain the current prohibition on tests, synthetic artifacts, external calls, campaigns and commits. C-b readiness consolidation follows only after the historical summary requirement has actually passed.
+
+# diagnose_existing_history.py SHA256 5625a26be0f820b0590d42133c272c47f7a84f2aa9133a68d1f72b0bb2916cf5
+--- /dev/null
++++ diagnose_existing_history.py
+@@ -0,0 +1,165 @@
++"""Archived one-shot diagnostic used for current-verifier-evidence.json.
++
++Its control-root comparison used two different encodings. That observation is
++superseded by component-comparison-corrected.json; do not interpret it as drift.
++The real returned summaries and their failure chains remain valid evidence.
++"""
++from pathlib import Path
++import ast
++from dataclasses import asdict
++import hashlib
++import json
++import sys
++
++ROOT = Path.cwd().resolve()
++sys.path.insert(0, str(ROOT))
++OUT = ROOT / '.artifacts/pit-optimizer-v5/development/increment-c-history-verifier'
++
++from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5
++from core.pit_optimizer_v5.contracts import ArtifactRefV5, canonical_sha256_v5, evaluator_source_map_v5, evaluator_source_sha256
++from core.pit_optimizer_v5.manifest import authenticate_campaign_manifest_v5
++from core.pit_optimizer_v5.operations import CampaignLaunchV5, _authorities
++from core.pit_optimizer_v5.development_preparation import load_development_config_v5
++from core.pit_optimizer_v5.summary import summarize_repository_v5
++from core.pit_optimizer_v5.production_sandbox import (
++    ExecutionControlRecordV5, MountReservationRecordV5, ExecutionCleanupRecordV5,
++    _directory_identity,
++)
++
++def long_path(path):
++    return path if str(path).startswith('\\\\?\\') else Path('\\\\?\\' + str(path))
++
++def digest(path):
++    with long_path(path).open('rb') as stream:
++        return hashlib.file_digest(stream, 'sha256').hexdigest()
++
++def archive_snapshot(root):
++    root = long_path(root)
++    result = {}
++    for path in sorted(root.rglob('*')):
++        if not path.is_file():
++            continue
++        if path.name.startswith('.env') or any('test' in part.lower() for part in path.relative_to(root).parts):
++            raise RuntimeError('unexpected forbidden path in bounded real archive')
++        result[path.relative_to(root).as_posix()] = digest(path)
++    return result
++
++def check_state_indexes(root):
++    root = long_path(root)
++    count = 0
++    for path in sorted((root / 'adapter-state').glob('*/*.json')):
++        relative = path.relative_to(root).as_posix()
++        index_path = root / 'adapter-state-authority' / path.parent.name / path.name
++        index = json.loads(index_path.read_text(encoding='utf-8'))
++        if index['value_ref'] != {'relative_path': relative, 'sha256': digest(path)}:
++            raise RuntimeError('state authority index mismatch; no summary permitted')
++        count += 1
++    return count
++
++def source_snapshot():
++    prior = json.loads((OUT.parent / 'luna-recovery-b4c/principal-architect-verification.json').read_text(encoding='utf-8'))
++    return {path: {'sha256': digest(ROOT / path), 'matches_B4c': digest(ROOT / path) == expected}
++            for path, expected in prior['source_hashes'].items()}
++
++def runtime_contract():
++    tree = ast.parse((ROOT / 'core/pit_optimizer_v5/production_sandbox.py').read_text(encoding='utf-8'))
++    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'LocalContainerExecutorV5')
++    init = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == '__init__')
++    for node in ast.walk(init):
++        if isinstance(node, ast.Dict):
++            for key, value in zip(node.keys, node.values):
++                if isinstance(key, ast.Constant) and key.value == 'runtime_contract':
++                    return ast.literal_eval(value)
++    raise RuntimeError('runtime contract literal unavailable')
++
++def failure_details(exc):
++    chain, components = [], []
++    cursor = exc
++    while cursor is not None:
++        frames = []
++        tb = cursor.__traceback__
++        while tb is not None:
++            frame = tb.tb_frame
++            frames.append({'file': Path(frame.f_code.co_filename).name, 'function': frame.f_code.co_name, 'line': tb.tb_lineno})
++            if frame.f_code.co_name == '_load_reservation':
++                local = frame.f_locals
++                executor, record, command = local['self'], local['record'], local['command_sha256']
++                repo = executor.repository
++                ready = repo.load_typed_state(namespace='container-control-ready', key=command, value_type=ExecutionControlRecordV5, repair=False)
++                mount = repo.load_typed_state(namespace='sandbox-mount-reservation', key=record.output_mount_authority_sha256, value_type=MountReservationRecordV5, repair=False)
++                cleanup = repo.load_typed_state(namespace='container-cleanup', key=command, value_type=ExecutionCleanupRecordV5, repair=False)
++                components.append({
++                    'round_index': executor.owner.round_index,
++                    'command_sha256': command,
++                    'stored_executor_sha256': record.executor_identity_sha256,
++                    'current_executor_sha256': executor.executor_identity_sha256,
++                    'command_matches': record.command_sha256 == command,
++                    'owner_matches': record.owner == executor.owner,
++                    'owner_sha256': executor.owner.sha256,
++                    'manifest_sha256': executor.manifest.sha256,
++                    'sandbox_profile_sha256': executor.sandbox_profile.sha256,
++                    'mount_factory_sha256': executor.mount_factory.mount_identity_sha256,
++                    'saved_mount_factory_sha256': None if mount is None else mount.factory_identity_sha256,
++                    'mount_factory_matches': mount is not None and mount.factory_identity_sha256 == executor.mount_factory.mount_identity_sha256,
++                    'docker_executable_identity_sha256': canonical_sha256_v5(executor._docker_identity),
++                    'saved_docker_executable_identity_sha256': None if ready is None else ready.docker_executable_identity_sha256,
++                    'docker_executable_matches': ready is not None and ready.docker_executable_identity_sha256 == canonical_sha256_v5(executor._docker_identity),
++                    'control_root_identity_sha256': _directory_identity(executor._control_root, executor._control_root_info),
++                    'saved_control_root_identity_sha256': None if ready is None else ready.control_root_identity_sha256,
++                    'control_root_matches': ready is not None and ready.control_root_identity_sha256 == _directory_identity(executor._control_root, executor._control_root_info),
++                    'control_environment_sha256': canonical_sha256_v5(executor._base_environment),
++                    'control_environment_entry_digests': {k: canonical_sha256_v5(v) for k, v in executor._base_environment},
++                    'runtime_contract_sha256': canonical_sha256_v5(runtime_contract()),
++                    'repository_root_identity_sha256': repo.root_identity_sha256,
++                    'saved_control_executor_matches_reservation': ready is not None and ready.executor_identity_sha256 == record.executor_identity_sha256,
++                    'saved_cleanup_executor_matches_reservation': cleanup is not None and cleanup.executor_identity_sha256 == record.executor_identity_sha256,
++                    'saved_cleanup_owner_matches': cleanup is not None and cleanup.owner_sha256 == executor.owner.sha256,
++                    'inspection_only_not_historical_verifier_success': True,
++                })
++            tb = tb.tb_next
++        chain.append({'type': type(cursor).__name__, 'message': str(cursor), 'frames': frames})
++        cursor = cursor.__cause__
++    return {'returned': False, 'failure_chain': chain, 'component_comparison': components}
++
++def main():
++    if (OUT / 'current-verifier-evidence.json').exists():
++        raise RuntimeError('one-shot evidence already exists; do not rerun summaries')
++    report = {'source_before': source_snapshot(), 'archives': {}}
++    if not all(v['matches_B4c'] for v in report['source_before'].values()):
++        raise RuntimeError('source identity differs from reviewed state')
++    source_map = evaluator_source_map_v5(ROOT)
++    report['evaluator'] = {'covered_files': len(source_map), 'sha256': evaluator_source_sha256(source_map), 'source_map': source_map}
++    targets = (
++        ('runtime-04', 'development-controller-two-rounds-20260907-04', '8fcae0423117f3a234e64391c277bd7efe5cbb775ff61ec879d8cbeb5659d37c'),
++        ('provider-runtime-06', 'development-provider-two-rounds-20260907-06', 'd90ed717c0d6b34d4cfa6bf7e2dd1f753e68c43b1127b200a66d2a9f930dfdf6'),
++    )
++    for name, campaign, manifest_sha in targets:
++        root = OUT.parent / name
++        before = archive_snapshot(root)
++        result = {'before_file_hashes': before, 'state_indexes_checked': check_state_indexes(root)}
++        report['archives'][name] = result
++        repo = LocalArtifactRepositoryV5(root)
++        authenticated = authenticate_campaign_manifest_v5(repository=repo, manifest_ref=ArtifactRefV5(f'campaigns/{campaign}/manifest.json', manifest_sha))
++        manifest = authenticated.manifest
++        launch = repo.load_typed_state(namespace='campaign-launch', key=manifest.sha256, value_type=CampaignLaunchV5, repair=False)
++        config = load_development_config_v5(repo, _authorities(authenticated), launch.adapter_config_ref)
++        result['authority'] = {'manifest_sha256': manifest.sha256, 'adapter_config_ref': asdict(launch.adapter_config_ref), 'repository_root_matches': config.repository_root_identity_sha256 == repo.root_identity_sha256}
++        try:
++            summary = summarize_repository_v5(repository=repo, manifest=manifest, command='summarize')
++            result['full_summary'] = {'returned': True, 'summary': asdict(summary)}
++        except Exception as exc:
++            result['full_summary'] = failure_details(exc)
++        after = archive_snapshot(root)
++        result['archive_unchanged'] = before == after
++        result['changed_or_added_paths'] = sorted(k for k in before.keys() | after.keys() if before.get(k) != after.get(k))
++        if not result['archive_unchanged']:
++            raise RuntimeError('historical archive changed; stop')
++    report['source_after'] = source_snapshot()
++    report['source_unchanged'] = report['source_before'] == report['source_after']
++    with (OUT / 'current-verifier-evidence.json').open('x', encoding='utf-8') as stream:
++        json.dump(report, stream, indent=2, default=str)
++        stream.write('\n')
++    print(json.dumps({'source_unchanged': report['source_unchanged'], 'evaluator_sha256': report['evaluator']['sha256'], 'archives': {k: {'archive_unchanged': v['archive_unchanged'], 'full_summary': v['full_summary']} for k, v in report['archives'].items()}}, default=str))
++
++if __name__ == '__main__':
++    main()
+
+# compare_existing_components.py SHA256 8d53887f1b8dba02386e453389b94bd847e1f1a015a868223ae188e8ff87ee25
+--- /dev/null
++++ compare_existing_components.py
+@@ -0,0 +1,93 @@
++"""Read-only comparison of original journal-bound resource components; no summary."""
++import json
++from pathlib import Path
++import runpy
++
++ROOT = Path.cwd().resolve()
++OUT = ROOT / '.artifacts/pit-optimizer-v5/development/increment-c-history-verifier'
++helpers = runpy.run_path(str(OUT / 'diagnose_existing_history.py'), run_name='diagnostic_helpers')
++from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5
++from core.pit_optimizer_v5.contracts import ArtifactRefV5, canonical_sha256_v5
++from core.pit_optimizer_v5.operations import CampaignLaunchV5, _authorities
++from core.pit_optimizer_v5.cli import _controller_lease_id_v5
++from core.pit_optimizer_v5.manifest import authenticate_campaign_manifest_v5
++from core.pit_optimizer_v5.development_preparation import load_development_config_v5
++from core.pit_optimizer_v5.memory import ResourceLeasePayloadV5
++from core.pit_optimizer_v5.production_workspace import LocalGitWorkspaceDriverV5
++from core.pit_optimizer_v5.workspace import WorkspaceRootsV5
++from core.pit_optimizer_v5.production_fs import acquire_absolute_directory_v5, directory_child_absent_v5
++from core.pit_optimizer_v5.production_sandbox import (
++    LocalSandboxMountFactoryV5, LocalContainerExecutorV5, ExecutionReservationRecordV5,
++    ExecutionControlRecordV5, ExecutionCleanupRecordV5, _directory_identity,
++)
++
++root = OUT.parent / 'runtime-04'
++before = helpers['archive_snapshot'](root)
++repo = LocalArtifactRepositoryV5(root)
++manifest_sha = '8fcae0423117f3a234e64391c277bd7efe5cbb775ff61ec879d8cbeb5659d37c'
++authenticated = authenticate_campaign_manifest_v5(repository=repo, manifest_ref=ArtifactRefV5('campaigns/development-controller-two-rounds-20260907-04/manifest.json', manifest_sha))
++authorities = _authorities(authenticated)
++manifest = authorities.manifest
++launch = repo.load_typed_state(namespace='campaign-launch', key=manifest.sha256, value_type=CampaignLaunchV5, repair=False)
++config = load_development_config_v5(repo, authorities, launch.adapter_config_ref)
++rounds = []
++for round_index in (1, 2):
++    executions = repo.verify_candidate_execution_index(campaign_id=manifest.campaign_id, round_index=round_index)
++    first = repo.load_typed_state(namespace='container-reservation', key=executions[0].command_sha256, value_type=ExecutionReservationRecordV5, repair=False)
++    owner = first.owner
++    assert owner.campaign_id == manifest.campaign_id and owner.round_index == round_index
++    assert owner.owner_token_sha256 == launch.owner_token_sha256
++    assert owner.controller_lease_id == _controller_lease_id_v5(manifest_sha256=manifest.sha256, round_index=round_index, owner_token_sha256=launch.owner_token_sha256)
++    driver = LocalGitWorkspaceDriverV5(roots=WorkspaceRootsV5(config.source_root, config.workspace_root), source_commit=manifest.source_commit, git_executable=Path(config.git_executable), repository=repo, owner=owner, export_mode=config.export_mode)
++    mounts = LocalSandboxMountFactoryV5(manifest=manifest, evaluator_contract=authorities.evaluator_contract, sandbox_profile=authorities.sandbox_profile, owner=owner, workspace_driver=driver, data_root=Path(config.data_root), output_root=Path(config.output_root), repository=repo)
++    executor = LocalContainerExecutorV5(manifest=manifest, sandbox_profile=authorities.sandbox_profile, owner=owner, mount_factory=mounts, docker_executable=Path(config.docker_executable), control_root=Path(config.control_root), repository=repo)
++    leases = []
++    for event in repo.load_round_events(campaign_id=manifest.campaign_id, round_index=round_index):
++        payload = repo.load_round_payload(event.payload_ref, expected_kind=event.event_kind)
++        if type(payload) is ResourceLeasePayloadV5:
++            leases.append(driver.authenticate_lease_history(payload))
++    current = {
++        'domain': 'pit-optimizer-v5-local-container-executor-v1', 'manifest_sha256': manifest.sha256,
++        'sandbox_profile_sha256': authorities.sandbox_profile.sha256, 'owner_sha256': owner.sha256,
++        'mount_factory_sha256': mounts.mount_identity_sha256, 'docker_executable_identity': executor._docker_identity,
++        'control_root_identity': _directory_identity(executor._control_root, executor._control_root_info),
++        'control_environment': executor._base_environment, 'runtime_contract': helpers['runtime_contract'](),
++        'repository_root_identity_sha256': repo.root_identity_sha256,
++    }
++    assert canonical_sha256_v5(current) == executor.executor_identity_sha256
++    items = []
++    with acquire_absolute_directory_v5(executor._control_root, expected_identity=(executor._control_root_info.st_dev, executor._control_root_info.st_ino)) as access:
++        correct_control_digest = executor._control_root_identity(access)
++        for authority in executions:
++            command = authority.command_sha256
++            reservation = repo.load_typed_state(namespace='container-reservation', key=command, value_type=ExecutionReservationRecordV5, repair=False)
++            ready = repo.load_typed_state(namespace='container-control-ready', key=command, value_type=ExecutionControlRecordV5, repair=False)
++            cleanup = repo.load_typed_state(namespace='container-cleanup', key=command, value_type=ExecutionCleanupRecordV5, repair=False)
++            absent = repo.load_typed_state(namespace='container-cleanup-container-absent', key=command, value_type=ExecutionCleanupRecordV5, repair=False)
++            output_source = mounts.authenticate_output_history(authority)
++            items.append({
++                'command_sha256': command, 'stage': authority.key.stage,
++                'stored_executor_sha256': reservation.executor_identity_sha256,
++                'current_executor_sha256': executor.executor_identity_sha256,
++                'command_binding_matches': reservation.command_sha256 == command == canonical_sha256_v5({'request_sha256': authority.request_sha256, 'argv': reservation.command_argv}),
++                'request_binding_matches': reservation.request_sha256 == authority.request_sha256,
++                'owner_binding_matches': reservation.owner == owner and authority.owner_token_sha256 == launch.owner_token_sha256,
++                'output_mount_authenticated': output_source in tuple(state.workspace_identity_sha256 for state in leases),
++                'saved_control_root_identity_sha256': ready.control_root_identity_sha256,
++                'current_control_record_identity_sha256': correct_control_digest,
++                'control_root_matches_same_encoding': ready.control_root_identity_sha256 == correct_control_digest,
++                'docker_identity_matches': ready.docker_executable_identity_sha256 == canonical_sha256_v5(executor._docker_identity),
++                'saved_executor_cross_records_match': reservation.executor_identity_sha256 == ready.executor_identity_sha256 == cleanup.executor_identity_sha256 == absent.executor_identity_sha256,
++                'cleanup_owner_matches': cleanup.owner_sha256 == absent.owner_sha256 == owner.sha256,
++                'control_transaction_absent': directory_child_absent_v5(access, reservation.control_relative_path),
++            })
++    rounds.append({'round_index': round_index, 'workspace_lifecycles': [state.lifecycle for state in leases], 'current_identity_recomputed_exactly': True,
++                   'current_component_digests': {key: canonical_sha256_v5(value) for key, value in current.items()}, 'executions': items})
++after = helpers['archive_snapshot'](root)
++report = {'supersedes': 'Only current-verifier-evidence.json control_root_matches and cross-encoding control-root comparison; its actual summary results remain valid.',
++          'correction': 'Executor constructor and control-ready records use different control-root hash encodings. Matching comparisons must use _control_root_identity for ready records.',
++          'rounds': rounds, 'archive_unchanged': before == after, 'full_historical_authentication_claimed': False}
++with (OUT / 'component-comparison-corrected.json').open('x', encoding='utf-8') as stream:
++    json.dump(report, stream, indent=2)
++    stream.write('\n')
++print(json.dumps({'archive_unchanged': report['archive_unchanged'], 'rounds': [{'round_index': r['round_index'], 'executions': len(r['executions']), 'control_roots_all_match': all(i['control_root_matches_same_encoding'] for i in r['executions']), 'all_other_record_checks_pass': all(all(v for k,v in i.items() if isinstance(v,bool)) for i in r['executions'])} for r in rounds]}))
+
+# actual06-current-comparison.json SHA256 61b84ecdfa7b1558aea8ab99c1b6e323220de2cf6249f119df76eed4d41e3597
+--- /dev/null
++++ actual06-current-comparison.json
+@@ -0,0 +1,8 @@
++{
++  "baseline": "luna-recovery-b4c/principal-architect-verification.json",
++  "same_command": true,
++  "comparison": "Decimal fields compared numerically; all other fields compared exactly",
++  "all_fields_match": true,
++  "keys_compared": 27,
++  "new_keys": []
++}
+
+# component-comparison-corrected.json SHA256 4cb2a4bf0a9f1909aeec745b6951ac28475d11d7243e4f0b98461605822ee237
+--- /dev/null
++++ component-comparison-corrected.json
+@@ -0,0 +1,220 @@
++{
++  "supersedes": "Only current-verifier-evidence.json control_root_matches and cross-encoding control-root comparison; its actual summary results remain valid.",
++  "correction": "Executor constructor and control-ready records use different control-root hash encodings. Matching comparisons must use _control_root_identity for ready records.",
++  "rounds": [
++    {
++      "round_index": 1,
++      "workspace_lifecycles": [
++        "retired"
++      ],
++      "current_identity_recomputed_exactly": true,
++      "current_component_digests": {
++        "domain": "f75766f44e4f30ce5770ec78ba43bf69a80f867675013d56d84ad82e9b87d95a",
++        "manifest_sha256": "32776e2d0e1e8aed1ba46b0890fc4863e82967be243d809f664c950799deaab9",
++        "sandbox_profile_sha256": "a532fde66e241cee6b5dac80f92adf865cab8119185fec98b0ae0392ff0d1348",
++        "owner_sha256": "944e91ca24203afeed80a36a9b0bece96e1db67441517c342724d46422adc91f",
++        "mount_factory_sha256": "f9652a529819c13b57beaf69c7f1e198804cdf241355ddf096cce4e6f08175c9",
++        "docker_executable_identity": "a6d5934c596409a3cbb82de906032ffe2235311bfea83dfb849cb89324f25947",
++        "control_root_identity": "ad4d405e9994d64c1dec8d15f2c2801949e77937237e69883189479b4c53c11a",
++        "control_environment": "082603d535b56d1771f5f5a35626e735434e2a1abe0541778ece8510fc8666b6",
++        "runtime_contract": "415b2b882444d65bd7461ca177def7e7b1036c53e6f719d48089a320e9af067c",
++        "repository_root_identity_sha256": "ad73e968e6f081161fd0c34eada320c3a676d8dc313b87e56c5255c380387e05"
++      },
++      "executions": [
++        {
++          "command_sha256": "5f11009231bfdaed37558cb31b1f7926301b57c4b55d57411c697da3e5f8af05",
++          "stage": "quick_evaluation",
++          "stored_executor_sha256": "2849cde885cc8bdde38230bc77ecd17163db42db1b071cc5a8a4212ce4601444",
++          "current_executor_sha256": "a72e22fc6deeb4b23f65d82ef32abb148fea4ea6db5efecf26c4391e31605bb9",
++          "command_binding_matches": true,
++          "request_binding_matches": true,
++          "owner_binding_matches": true,
++          "output_mount_authenticated": true,
++          "saved_control_root_identity_sha256": "bc0cd10f98fa386b277ab833fa6749cfd620769713b112ba9453f14938acd9d7",
++          "current_control_record_identity_sha256": "bc0cd10f98fa386b277ab833fa6749cfd620769713b112ba9453f14938acd9d7",
++          "control_root_matches_same_encoding": true,
++          "docker_identity_matches": true,
++          "saved_executor_cross_records_match": true,
++          "cleanup_owner_matches": true,
++          "control_transaction_absent": true
++        },
++        {
++          "command_sha256": "1a9a22bf855eb5b2f180155e064e9ca8654e20f6f243ebeb3386e5cdd66a2f06",
++          "stage": "discovery_evaluation",
++          "stored_executor_sha256": "2849cde885cc8bdde38230bc77ecd17163db42db1b071cc5a8a4212ce4601444",
++          "current_executor_sha256": "a72e22fc6deeb4b23f65d82ef32abb148fea4ea6db5efecf26c4391e31605bb9",
++          "command_binding_matches": true,
++          "request_binding_matches": true,
++          "owner_binding_matches": true,
++          "output_mount_authenticated": true,
++          "saved_control_root_identity_sha256": "bc0cd10f98fa386b277ab833fa6749cfd620769713b112ba9453f14938acd9d7",
++          "current_control_record_identity_sha256": "bc0cd10f98fa386b277ab833fa6749cfd620769713b112ba9453f14938acd9d7",
++          "control_root_matches_same_encoding": true,
++          "docker_identity_matches": true,
++          "saved_executor_cross_records_match": true,
++          "cleanup_owner_matches": true,
++          "control_transaction_absent": true
++        },
++        {
++          "command_sha256": "be9e7cbaa3b726472b7ff2c38a41cba319a6831dfe5209f8200b1c7174481c4c",
++          "stage": "discovery_evaluation",
++          "stored_executor_sha256": "2849cde885cc8bdde38230bc77ecd17163db42db1b071cc5a8a4212ce4601444",
++          "current_executor_sha256": "a72e22fc6deeb4b23f65d82ef32abb148fea4ea6db5efecf26c4391e31605bb9",
++          "command_binding_matches": true,
++          "request_binding_matches": true,
++          "owner_binding_matches": true,
++          "output_mount_authenticated": true,
++          "saved_control_root_identity_sha256": "bc0cd10f98fa386b277ab833fa6749cfd620769713b112ba9453f14938acd9d7",
++          "current_control_record_identity_sha256": "bc0cd10f98fa386b277ab833fa6749cfd620769713b112ba9453f14938acd9d7",
++          "control_root_matches_same_encoding": true,
++          "docker_identity_matches": true,
++          "saved_executor_cross_records_match": true,
++          "cleanup_owner_matches": true,
++          "control_transaction_absent": true
++        },
++        {
++          "command_sha256": "c8e5e25e49e3fcc5535c860e44fc2227b3b307f58cb5e005cbad6a1f48095018",
++          "stage": "discovery_evaluation",
++          "stored_executor_sha256": "2849cde885cc8bdde38230bc77ecd17163db42db1b071cc5a8a4212ce4601444",
++          "current_executor_sha256": "a72e22fc6deeb4b23f65d82ef32abb148fea4ea6db5efecf26c4391e31605bb9",
++          "command_binding_matches": true,
++          "request_binding_matches": true,
++          "owner_binding_matches": true,
++          "output_mount_authenticated": true,
++          "saved_control_root_identity_sha256": "bc0cd10f98fa386b277ab833fa6749cfd620769713b112ba9453f14938acd9d7",
++          "current_control_record_identity_sha256": "bc0cd10f98fa386b277ab833fa6749cfd620769713b112ba9453f14938acd9d7",
++          "control_root_matches_same_encoding": true,
++          "docker_identity_matches": true,
++          "saved_executor_cross_records_match": true,
++          "cleanup_owner_matches": true,
++          "control_transaction_absent": true
++        },
++        {
++          "command_sha256": "2dc0d253db13aa5e6cf81127ece9f219c680c320cc7d85e393c4f11e5ef1836c",
++          "stage": "discovery_evaluation",
++          "stored_executor_sha256": "2849cde885cc8bdde38230bc77ecd17163db42db1b071cc5a8a4212ce4601444",
++          "current_executor_sha256": "a72e22fc6deeb4b23f65d82ef32abb148fea4ea6db5efecf26c4391e31605bb9",
++          "command_binding_matches": true,
++          "request_binding_matches": true,
++          "owner_binding_matches": true,
++          "output_mount_authenticated": true,
++          "saved_control_root_identity_sha256": "bc0cd10f98fa386b277ab833fa6749cfd620769713b112ba9453f14938acd9d7",
++          "current_control_record_identity_sha256": "bc0cd10f98fa386b277ab833fa6749cfd620769713b112ba9453f14938acd9d7",
++          "control_root_matches_same_encoding": true,
++          "docker_identity_matches": true,
++          "saved_executor_cross_records_match": true,
++          "cleanup_owner_matches": true,
++          "control_transaction_absent": true
++        }
++      ]
++    },
++    {
++      "round_index": 2,
++      "workspace_lifecycles": [
++        "retired"
++      ],
++      "current_identity_recomputed_exactly": true,
++      "current_component_digests": {
++        "domain": "f75766f44e4f30ce5770ec78ba43bf69a80f867675013d56d84ad82e9b87d95a",
++        "manifest_sha256": "32776e2d0e1e8aed1ba46b0890fc4863e82967be243d809f664c950799deaab9",
++        "sandbox_profile_sha256": "a532fde66e241cee6b5dac80f92adf865cab8119185fec98b0ae0392ff0d1348",
++        "owner_sha256": "bc36165ecc02f13401d3359cbdcb5c138fbac168d63c04489b41f98108a7a105",
++        "mount_factory_sha256": "3445aca31ba0aa412172d3eb27a8e950f1f339af559c742ab127c67c5b64785d",
++        "docker_executable_identity": "a6d5934c596409a3cbb82de906032ffe2235311bfea83dfb849cb89324f25947",
++        "control_root_identity": "ad4d405e9994d64c1dec8d15f2c2801949e77937237e69883189479b4c53c11a",
++        "control_environment": "082603d535b56d1771f5f5a35626e735434e2a1abe0541778ece8510fc8666b6",
++        "runtime_contract": "415b2b882444d65bd7461ca177def7e7b1036c53e6f719d48089a320e9af067c",
++        "repository_root_identity_sha256": "ad73e968e6f081161fd0c34eada320c3a676d8dc313b87e56c5255c380387e05"
++      },
++      "executions": [
++        {
++          "command_sha256": "f4e822dc620b1f54570b03bd25008d18b17d7f9eb8f058d5ab68f4f3aef50d09",
++          "stage": "quick_evaluation",
++          "stored_executor_sha256": "bae808e474cf877d4ac47641a02f7f1f5c01d2c0e6e21640b9aa9524d9e88c95",
++          "current_executor_sha256": "ee5f5909728d6eda5a3cb6cc9b25e630debddecd5b6f6cde21766014941184ca",
++          "command_binding_matches": true,
++          "request_binding_matches": true,
++          "owner_binding_matches": true,
++          "output_mount_authenticated": true,
++          "saved_control_root_identity_sha256": "bc0cd10f98fa386b277ab833fa6749cfd620769713b112ba9453f14938acd9d7",
++          "current_control_record_identity_sha256": "bc0cd10f98fa386b277ab833fa6749cfd620769713b112ba9453f14938acd9d7",
++          "control_root_matches_same_encoding": true,
++          "docker_identity_matches": true,
++          "saved_executor_cross_records_match": true,
++          "cleanup_owner_matches": true,
++          "control_transaction_absent": true
++        },
++        {
++          "command_sha256": "185cacd992b6d5655c8075019bc82bca9086a34d06ad1ddd78b89dd29a14ae0a",
++          "stage": "discovery_evaluation",
++          "stored_executor_sha256": "bae808e474cf877d4ac47641a02f7f1f5c01d2c0e6e21640b9aa9524d9e88c95",
++          "current_executor_sha256": "ee5f5909728d6eda5a3cb6cc9b25e630debddecd5b6f6cde21766014941184ca",
++          "command_binding_matches": true,
++          "request_binding_matches": true,
++          "owner_binding_matches": true,
++          "output_mount_authenticated": true,
++          "saved_control_root_identity_sha256": "bc0cd10f98fa386b277ab833fa6749cfd620769713b112ba9453f14938acd9d7",
++          "current_control_record_identity_sha256": "bc0cd10f98fa386b277ab833fa6749cfd620769713b112ba9453f14938acd9d7",
++          "control_root_matches_same_encoding": true,
++          "docker_identity_matches": true,
++          "saved_executor_cross_records_match": true,
++          "cleanup_owner_matches": true,
++          "control_transaction_absent": true
++        },
++        {
++          "command_sha256": "0bb1f6307c70d3cbfb1322e92b6a71d82b582e3803e76bf02d627945dce0f874",
++          "stage": "discovery_evaluation",
++          "stored_executor_sha256": "bae808e474cf877d4ac47641a02f7f1f5c01d2c0e6e21640b9aa9524d9e88c95",
++          "current_executor_sha256": "ee5f5909728d6eda5a3cb6cc9b25e630debddecd5b6f6cde21766014941184ca",
++          "command_binding_matches": true,
++          "request_binding_matches": true,
++          "owner_binding_matches": true,
++          "output_mount_authenticated": true,
++          "saved_control_root_identity_sha256": "bc0cd10f98fa386b277ab833fa6749cfd620769713b112ba9453f14938acd9d7",
++          "current_control_record_identity_sha256": "bc0cd10f98fa386b277ab833fa6749cfd620769713b112ba9453f14938acd9d7",
++          "control_root_matches_same_encoding": true,
++          "docker_identity_matches": true,
++          "saved_executor_cross_records_match": true,
++          "cleanup_owner_matches": true,
++          "control_transaction_absent": true
++        },
++        {
++          "command_sha256": "6201775f8c50f7819c8f5920f92bb2f3a18d20040d8ad27503ffacc83b225cfa",
++          "stage": "discovery_evaluation",
++          "stored_executor_sha256": "bae808e474cf877d4ac47641a02f7f1f5c01d2c0e6e21640b9aa9524d9e88c95",
++          "current_executor_sha256": "ee5f5909728d6eda5a3cb6cc9b25e630debddecd5b6f6cde21766014941184ca",
++          "command_binding_matches": true,
++          "request_binding_matches": true,
++          "owner_binding_matches": true,
++          "output_mount_authenticated": true,
++          "saved_control_root_identity_sha256": "bc0cd10f98fa386b277ab833fa6749cfd620769713b112ba9453f14938acd9d7",
++          "current_control_record_identity_sha256": "bc0cd10f98fa386b277ab833fa6749cfd620769713b112ba9453f14938acd9d7",
++          "control_root_matches_same_encoding": true,
++          "docker_identity_matches": true,
++          "saved_executor_cross_records_match": true,
++          "cleanup_owner_matches": true,
++          "control_transaction_absent": true
++        },
++        {
++          "command_sha256": "b0ba2f425e3ef727abe5f0152c3cc6d60064be7f49676e7d04225a6a2bd58d21",
++          "stage": "discovery_evaluation",
++          "stored_executor_sha256": "bae808e474cf877d4ac47641a02f7f1f5c01d2c0e6e21640b9aa9524d9e88c95",
++          "current_executor_sha256": "ee5f5909728d6eda5a3cb6cc9b25e630debddecd5b6f6cde21766014941184ca",
++          "command_binding_matches": true,
++          "request_binding_matches": true,
++          "owner_binding_matches": true,
++          "output_mount_authenticated": true,
++          "saved_control_root_identity_sha256": "bc0cd10f98fa386b277ab833fa6749cfd620769713b112ba9453f14938acd9d7",
++          "current_control_record_identity_sha256": "bc0cd10f98fa386b277ab833fa6749cfd620769713b112ba9453f14938acd9d7",
++          "control_root_matches_same_encoding": true,
++          "docker_identity_matches": true,
++          "saved_executor_cross_records_match": true,
++          "cleanup_owner_matches": true,
++          "control_transaction_absent": true
++        }
++      ]
++    }
++  ],
++  "archive_unchanged": true,
++  "full_historical_authentication_claimed": false
++}
+
+# final-preservation-check.json SHA256 13ee0883ebc85d735cdd0e3a4a72e13439dee629bfed8251aa24bea29561898e
+--- /dev/null
++++ final-preservation-check.json
+@@ -0,0 +1,8 @@
++{
++  "runtime-04": true,
++  "provider-runtime-06": true,
++  "source_hashes_match_initial": true,
++  "head": "a068e0aed40ecbe5e0078924071f374e7809b8c2",
++  "branch": "codex/pit-optimizer-v5-architecture",
++  "diagnostic_scripts_compile": true
++}

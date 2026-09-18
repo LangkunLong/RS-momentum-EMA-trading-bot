@@ -1,3 +1,7 @@
+# Preserve immutable historical records; INDEX.json records their content hashes.
+# Archived source has a .reference suffix and is not active application code.
+exclude: ^docs/superpowers/local-history/2026-09-18/files/
+
 repos:
   # Ruff: lint for real bugs only (no formatting, no style)
   - repo: https://github.com/astral-sh/ruff-pre-commit
@@ -12,5 +16,9 @@ repos:
     hooks:
       - id: trailing-whitespace
       - id: end-of-file-fixer
+        # Module entry points also work when Windows blocks console-script launchers.
+        entry: python -m pre_commit_hooks.end_of_file_fixer
       - id: check-yaml
+        entry: python -m pre_commit_hooks.check_yaml
       - id: check-merge-conflict
+        entry: python -m pre_commit_hooks.check_merge_conflict

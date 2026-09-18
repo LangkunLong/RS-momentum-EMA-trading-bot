@@ -1,0 +1,48 @@
+# B3b independent static task review
+
+Verdict: APPROVED for the B3b implementation checkpoint. No actionable findings in the reviewed diff. This is a delegated implementation review, not the principal architect's next-increment authorization.
+
+Reviewed source SHA-256:
+
+| File | SHA-256 |
+| --- | --- |
+| core/pit_optimizer_v5/artifacts.py | 33a124043338d834fe3b60508b533c777df5c4fefbbdfb52ac812ab5eda0ca4f |
+| core/pit_optimizer_v5/runtime.py | 1c4c4dd2a3c7082982866e6ed820336e5afeb9755b0005fb80e65224bcc0d462 |
+| core/pit_optimizer_v5/production_runtime.py, unchanged B3a reference | 78da0dc5efcf5cf94541a465e0a3c212221c843dade07f680ddc5e1508fdc476 |
+
+The review read the binding B3b prompt, recovery design/plan including appended approval decisions, B3a architect review, the exact two-file diff against B3b preimages, and relevant repository/runtime/dataclass source. Commands were limited to reading source/documents, diffing, and hashing. No tests were read or executed, and no candidate, event, record, checkpoint, campaign, provider or evaluator was executed or fabricated by this reviewer.
+
+## Authority and routing
+
+Both append_experiment and load_experiment call the same _validate_experiment_render_rejection_binding. Append retains existing referenced-artifact authentication and critic authentication, then validates before create-only persistence. Load retains exact record decoding/canonical authentication and critic authentication, then validates before returning.
+
+Every record artifact reference with the events/ prefix is authenticated and strictly decoded by _load_experiment_event_reference before its event kind can influence routing. Missing, corrupt, noncanonical, malformed and noncanonical-path references fail rather than falling through. Routing is independent of status: the reserved validation code, any decoded render_rejected event, or a payloads/render_rejected/ substitution selects the strict branch. That branch requires exactly one rejection event and exactly that sole artifact reference. A bare rejection payload cannot supply authority, even with an altered validation code.
+
+The helper compares the decoded event's exact repository-generated campaign/round/sequence path, including minimum-width formatting. The validator loads the current round journal through unchanged load_round_events, which folds sequence/predecessor/state transitions and invokes corrected B2 context validation. It checks campaign/round across the loaded chain and exact event equality, SHA and canonical bytes at the referenced sequence. This supplies durable chain membership, not merely standalone file consistency. It introduces no completed-round, cleanup or critic prerequisite for a valid open prefix.
+
+Corrected B2 continues to authenticate the accepted author package and complete author-input hypothesis, derive the rejected identity, validate the original capped assignment enumeration, prohibit rendered conflicts and reject subsequent critic bindings to rejected identities. B3b obtains the unique prior intent/author from that authenticated chain and reuses existing role/payload loaders. It does not introduce another decoder or assignment enumeration.
+
+The record comparison covers invalid status, exact pre-validation-invalid identity, record/event/payload experiment IDs, event round, parent revision/fingerprint, data scope, semantic mode, complete hypothesis hash, discovery identity, accepted complete template and digest, canonical typed assignment bytes, and exact closed invalid validation with no changed symbols. Existing ExperimentRecordV5 invariants continue to reject policy revision, semantic fingerprint, quick/campaign evidence, target gap, critic fields and discovery episodes on invalid records.
+
+Repository read/authentication failures propagate unchanged. Binding ValueError/TypeError/ArithmeticError is converted to the existing append ValueError convention or ArtifactSchemaFailureV5 carrying the record reference on load. Decoder/noncanonical failures retain their specific artifact reference. There is no swallowed-error legacy fallback.
+
+## Publication and inherited load paths
+
+_publish accepts the explicit carrier union, rejects unsupported carrier types and duplicate candidate IDs, and compares every record's candidate identity/status before any record persistence. Archive-eligible records additionally require exact CandidateEvidenceV5. Only those checked materialized candidates enter the source_candidates map. Authority construction retains its evaluated/zero_trade filter, so rejected invalid records can remain in stored records/checkpoint history without materialization access or ArchiveRecordAuthorityV5. Record append order, checkpoint-reference ordering, reducer call and archive-authority ordering are preserved.
+
+Authenticated record loading propagates through:
+
+- load_experiment_journal -> load_experiment -> shared binding validator.
+- _verify_record_refs -> load_experiment -> shared binding validator.
+- publish_projection and recover_projection -> _verify_record_refs.
+- Finalized-discovery record verification -> _verify_record_refs.
+
+Precision for the final package: load_checkpoint itself remains an envelope-only _load_checkpoint wrapper. It does not independently traverse record references. Projection recovery/publication perform that traversal through _verify_record_refs. The new record validator's event/payload/role-invocation path has no call back to record/checkpoint loading, so it does not introduce record-authentication recursion.
+
+Legacy records with neither reserved rendering code nor rejection authority return through their existing path without loading a round journal. Ordinary events/ references still receive strict event-file authentication, as explicitly required. The actual runtime-04 evaluated-record execution check belongs to the parent implementation package; this independent review makes no execution claim for it.
+
+## Scope and limits
+
+The diff contains only the two private artifact helpers, their append/load calls, and _publish's union annotation and pre-persistence/source guards. production_runtime.py matches approved B3a. The existing B2 context validator, serialized schemas and _verify_finalized_discovery_rounds are outside the diff. No renderer activation, factory invocation branch, cleanup, recovery, feedback or all-invalid lifecycle behavior changed.
+
+New rejection append/load/publication behavior remains statically reviewed and unexecuted: actual06 has no durable rejection event. B4 still must address rendered_variant-only finalized candidate IDs and investigator/author/critic assumptions in _verify_finalized_discovery_rounds, _completed_result and recovery. The two evaluated feedback rounds remain unfinished. Principal architect review is required before B4.

@@ -1,0 +1,129 @@
+# Task 5 Re-review — Fix Round 1 of 5
+
+**Range:** `e815b244c21ff4b570c25d7f49d47b1fc167efee..278d41bcc02d88302d0b817ce06eab04d33ac4fe`  
+**Verdict:** **NEEDS FIXES**  
+**Open findings:** Critical 0, Important 3, Minor 2
+
+This was a read-only review except for this requested artifact. No network, provider, pricing, replay, real Docker, background process, or broad test suite was used.
+
+## Finding Verdicts
+
+| Prior finding | Verdict | Evidence |
+|---|---|---|
+| Important 1 — statelessness/determinism | **NOT ADDRESSED** | The authenticated A-B-A path, 32-observation bound, fixed hash seed, and direct imported-root checks were added, but the AST mutation rule remains bypassable through a name ever classified as locally mutable. See Required Finding 1. |
+| Important 2 — complete context and feedback lineage | **ADDRESSED** | `InvestigatorInput` requires the exact prefix `1..iteration-1` at `core/pit_optimization_contract.py:2928-2934`; `require_source_context_fit` measures the exact role object's canonical UTF-8 bytes plus the role prompt/schema at `core/pit_optimizer_candidate.py:876-918`. Prospective source-bundle growth remains `next_context_oversize`, while a sealed pre-call budget miss is `context_budget_exhausted`. |
+| Important 3 — forgeable CandidateIdentity | **ADDRESSED for the live controller boundary** | Construction, all fields, self-digest, and exact object registration are checked at `core/pit_optimizer_candidate.py:163-184,570-645`; `validate_author_manifest` authenticates before equality at lines 812-826. Direct construction, copied-seal/recomputed-digest objects, and field tampering are rejected. The newly added seal-field serialization issue is recorded separately as Minor 1. |
+| Important 4 — constants/reverse-order manifests | **ADDRESSED** | Constants are accepted by both scope contracts at `core/pit_optimization_contract.py:422-450`, and paths are normalized to the fixed editable-interface order in both `_apply_unified_diff` and CandidateIdentity. The constant and reverse-section end-to-end tests passed in the narrow verification. |
+| Important 5 — owned daemon lifecycle and error-resilient cleanup | **NOT ADDRESSED** | Normal create/inspect/start and session cleanup are materially improved, but two initialization/create-failure paths still lose live ownership, and one masks the initiating error. See Required Finding 2. |
+| Minor 1 — strict JSON scalar types | **ADDRESSED** | Exact positive integers are enforced in bootstrap/envelopes/encoders/decoders at `core/strategy_policy/worker.py:103-109,150-180,214-224,267-273,292-302,346-352`. Authenticated boolean/float sequence tests passed. |
+| Minor 2 — ancestor link/junction provenance | **ADDRESSED** | `_existing_path_without_links` checks every existing component for symlink/reparse state at `core/pit_optimizer_candidate.py:503-542`; both source bundling and worker packaging reuse it. The added Windows link/junction cases cover both consumers. |
+| Minor 3 — negative matrix/report accuracy | **NOT ADDRESSED** | The round adds several missing cases, but the rollback test injects only after `applied=True`, and the focused matrix still omits actual symlink mode plus V2 binary/rename cases and cross-worker comparison. The report's “always” cleanup and “closed mutation roots” claims are contradicted by current behavior. See Required Finding 3 and Minor 2. |
+
+## New Breakage / Required Findings
+
+### Important 1 — local-mutable classification can still be rebound or aliased to mutate imported/global state
+
+**Plan requirement:** Candidate-editable modules contain only pure functions and immutable constants; process-global/imported objects cannot be mutated.
+
+**Evidence:** `validate_policy_ast` collects a set of names that are assigned a list/dict anywhere in a function at `core/pit_optimizer_candidate.py:288-324`. Later, any attribute/subscript assignment whose root is in that historical set is accepted at lines 363-380. It does not prove that the root still refers to the locally created object, nor that nested values are local. A tiny in-memory reproducer was accepted:
+
+```python
+def evaluate_entry(snapshot):
+    cache = []
+    cache = math
+    cache.pi += 1.0
+    return EntryDecision(True, True, (None, None), ())
+```
+
+The same bypass works with an imported contract class or with a nested alias such as `cache = [math]; cache[0].pi += 1.0`. The added cases at `tests/test_pit_optimizer_v2.py:3078-3114` cover only direct `math.pi` and `EntryDecision.to_primitive` writes, so they do not close this dataflow gap. A-B-A is not a substitute for the static invariant: a candidate can preserve the probed outputs and make later/unprobed behavior stateful.
+
+**Required fix:** Do not grant mutation authority from a name's historical assignment. The simplest closed rule is to reject all attribute/subscript writes and allow only the exact local list-building operations required by the baseline (for example, `local_list.append(...)` where the name is never rebound or escaped). If richer mutation remains, enforce single-assignment/local provenance and reject imported/callable values at every alias depth.
+
+**Exact RED tests:** Require rejection of both sources above, plus `cache = []; cache = EntryDecision; cache.to_primitive = _helper`. Drive at least one alias-state candidate through the authenticated factory and prove it cannot reach a returned client.
+
+### Important 2 — worker initialization/create failures can leave the exact owned process/container/package live
+
+**Plan requirement:** Cleanup is unconditional on initialization failure and cancellation; cleanup faults do not replace an active primary error.
+
+**Evidence A — invalid probes after acquisition:** `PolicyWorkerSession.validate_determinism` validates the tuple before its cleanup `try` at `agent_loop.py:4761-4778`. `client_factory` starts the worker first and calls that method without an outer close guard at lines 5211-5220. Therefore an empty tuple, duplicate method, or wrong object raises after the CLI process, daemon, reader threads, and package exist, but before any cleanup. The existing factory tests at `tests/test_agent_loop.py:1073-1250` use only valid probes.
+
+**Evidence B — failed-create discovery loses tentative ownership:** On create exception/nonzero/invalid output, assignment to `daemon` occurs only if `_discover_owned_daemon` returns at `agent_loop.py:5098-5129`. Discovery obtains the full matching ID and then calls inspect at lines 4914-4946. If inspect times out, raises, or reports an identity inconsistency, `daemon` remains `None`; the outer cleanup at lines 5179-5188 skips daemon removal. A tiny fake reproducer left `control.exists is True` after calls `container ls, inspect`. Because discovery is invoked inside the create `except`, a discovery exception also replaces the original create exception, contrary to `task-5-report.md:324-325`.
+
+**Required fix:** Validate the complete probe tuple before `start`, and also wrap all post-start client initialization in a close-on-`BaseException` guard. During failed-create discovery, retain a tentative owner handle immediately after the unique full ID is returned by the exact fresh name+256-bit-label query, then inspect; cleanup that tentative handle in a shielded path even when inspect fails. Preserve the create exception as primary while attaching/reporting discovery and cleanup failures.
+
+**Exact RED tests:** 
+
+1. Call a factory with `determinism_probes=()` and assert no launch occurs, or—if validation remains post-start—assert process termination, daemon absence, thread closure, and no `pw-*` tree.
+2. Use `_Task5FakeDockerControl(fail_after_create=True, tamper_inspect=True)` and require `not control.exists` after rejection.
+3. Make create raise `OSError("create primary")` and discovery/list or inspect raise `OSError("discovery cleanup")`; require the raised primary to remain `create primary`, with cleanup failure retained as secondary evidence.
+
+### Important 3 — rollback is armed only after the mutating Git apply call returns
+
+**Plan requirement:** The candidate workspace is restored byte-for-byte on every validation failure or cancellation after an apply attempt.
+
+**Evidence:** `applied` starts false at `core/pit_optimizer_candidate.py:686`. The mutating `_git(..., "apply", ...)` runs at lines 710-718, but `applied = True` is not set until line 719. The exception handler restores bytes only when `applied` is true at lines 803-806. If the Git capability completes the mutation and then reports a timeout/transport exception, or cancellation lands after the child mutation but before `_git` returns, rollback is skipped. The new test at `tests/test_pit_optimizer_v2.py:3011-3048` patches `derive_authenticated_cumulative_diff`, which executes only after line 719, so it cannot catch this gap.
+
+**Required fix:** Arm restoration before invoking the mutating apply (or unconditionally restore the captured editable bytes on every exception after the check-only phase). Keep success as the only path that retains applied candidate bytes.
+
+**Exact RED test:** Wrap the real `agent_loop._git`; for the non-`--check` `git apply`, call the real function so bytes change and then raise `RuntimeError` and `KeyboardInterrupt` in separate cases. Assert all three editable files exactly equal their pre-call byte snapshots.
+
+## Minor Required Hardening
+
+### Minor 1 — the private identity seal became a tenth persisted dataclass field
+
+The exact Task 5 interface lists nine CandidateIdentity fields, but `core/pit_optimizer_candidate.py:163-174` declares `_controller_seal` with `field(...)`, not `InitVar`. `dataclasses.fields(CandidateIdentity)` therefore includes `_controller_seal`; generic `asdict`/artifact serialization also includes an opaque `object`, which is noncanonical and not JSON serializable. This is especially fragile because the plan later writes CandidateIdentity into `validation.json`, while the report at `task-5-report.md:330-332` intentionally limits authentication to live objects.
+
+Use an `InitVar` or a private factory that leaves the nine-field value contract unchanged; keep the exact-object registry check at consumers. Add a contract test asserting the exact nine dataclass fields and that the public identity primitive is canonical JSON. Persisted identities must still be rederived from trusted Git/source state, not accepted by digest alone.
+
+### Minor 2 — focused coverage and the report still overstate closure
+
+`task-5-report.md:185-190` says mutation roots are closed and daemon cleanup is unavoidable; lines 318-325 say the daemon always receives cleanup and active primaries are preserved. Required Findings 1-2 disprove those claims. The matrix at report lines 288-294 also does not include:
+
+- an editable index mode `120000` symlink (only gitlink `160000` is covered at `tests/test_pit_optimizer_v2.py:2917-2950`);
+- V2 candidate-boundary binary/rename/mode metadata (the legacy tests at `tests/test_agent_loop.py:5968-5986` are not focused CandidateIdentity cases);
+- a mutating-apply failure before `applied=True`;
+- invalid determinism-probe initialization;
+- create-primary plus discovery/inspect failure, daemon `rm`/absence faults, or an explicit-close cleanup-error assertion;
+- two fresh worker sessions producing byte-identical decisions for the same authenticated snapshots (the current test asserts `PYTHONHASHSEED=0` and one-session A-B-A, but does not compare workers).
+
+Add those focused negatives and revise the report to state only what the integrated paths prove.
+
+## Requirement Coverage
+
+| Area | Result |
+|---|---|
+| Sole `PatchBounds`; legacy and V2 ceilings | Meets. One shared type and the 4/25/400/256-KiB versus 3/12/200/64-KiB limits remain correctly threaded. |
+| Git-derived cumulative diff and rollback | **Blocked.** Fresh cumulative derivation and nominal/post-apply rollback work; the mutating-call ambiguity in Important 3 violates “every failure.” |
+| Path/file/hunk/line/byte/binary/rename/symlink/submodule/no-op scope | Implementation remains predominantly closed. Ancestor links and gitlinks are fixed; focused actual-symlink and structural metadata coverage is still incomplete. |
+| Authenticated CandidateIdentity / author equality | Meets for live controller objects. Minor 1 must restore the exact serializable nine-field value contract. |
+| Closed AST / compile allowlist / determinism | **Blocked** by Important 1. Authenticated A-B-A, bounded observation state, set rejection, and fixed hash seed are otherwise present. |
+| Complete source/context packaging / classification | Meets. Exact three-file bundles, exact contiguous history, full canonical role measurement, and both classifications are present. |
+| JSON-lines schema/digest/HMAC/sequence/chain/method/type binding | Meets. Strict scalars, duplicate/unknown field rejection, method/type binding, and bounded framing are intact. |
+| JsonLinePolicyClient typed dispatch/close | Meets. All five methods use exact snapshot/decision types and close once. |
+| Worker capabilities/package/argv/env/mount/resources/stdio/time/cleanup | **Blocked** by Important 2. Nominal ownership, secret handling, stderr draining, local cleanup, kill/wait/force-remove, and absence checks are materially improved. |
+| Tasks 1-4 compatibility | No focused regression observed. The canonical constant/reverse-path, complete-role, and strict-scalar checks passed; no broad Tasks 1-4 suite was run. |
+
+## Test / Report Audit
+
+- Narrow verification: **6 passed** — constant manifest, reverse-section canonical order, complete Unicode role sizing, both strict-sequence parameters, and nominal create-failure discovery. One pre-existing unknown `cache_dir` warning.
+- Tiny AST reproducer: `validate_policy_ast` printed `ACCEPTED_REBOUND_MUTATION` for the imported-math alias above.
+- Tiny daemon reproducer: failed discovery inspect printed `DISCOVERED_OBJECT_STILL_EXISTS True` after `container, inspect`.
+- `git diff --check e815b24..278d41b` passed.
+- The implementer's reported 127-test command was not broadly rerun. Passing added tests are honest for their direct paths, but their report generalizes beyond those paths as described in Minor 2.
+
+## Resource / Cleanup Audit
+
+- Production still requires a revalidated Docker capability; fake mode requires distinct injected process and control capabilities. The package remains the seven-file allowlist, with one read-only mount, fixed hash seed, sanitized CLI environment, closed inherited descriptors, bounded stdout/stderr, and fixed method/fold ceilings.
+- On ordinary success, candidate/protocol error, timeout, EOF, cancellation, bootstrap failure, and the tested thread-start failure, cleanup attempts local close/terminate/wait/kill, joins readers, kills/waits/force-removes the exact full-ID daemon, verifies absence, then removes the private tree.
+- Initialization is not unconditional: invalid probe metadata occurs after resource acquisition but outside the cleanup guard. Failed-create discovery likewise discards the unique ID if inspect fails. Those are deterministic leaks with the supplied fakes, not merely hypothetical Docker outages.
+- Session cleanup preserves an active call exception when its own cleanup actions fail. The create/discovery exception path does not preserve that precedence.
+- No real Docker/container or background process was started during this re-review.
+
+## Out-of-Scope Observations
+
+- The weak identity registry is intentionally process-local. That is acceptable only while every consumer receives the original live object; any restart, IPC, or artifact reload must rederive from authenticated Git/source inputs. Minor 1 prevents the private live seal from accidentally becoming artifact content.
+- Real Docker lifecycle behavior remains a later integration concern. It does not excuse the deterministic fake-capability leaks above.
+
+## Final Verdict
+
+**NEEDS FIXES — Critical 0, Important 3, Minor 2.** Fix Round 1 closes context lineage/sizing, live identity authentication, constants/path ordering, strict protocol scalars, ancestor links, and most normal worker cleanup. It is not ready while alias-based process-global mutation, two initialization/create ownership leaks, and pre-return Git-apply rollback remain open.

@@ -1,0 +1,57 @@
+"""Create-only public source byte acquisition; no evaluation, tests or credentials."""
+import hashlib
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+import sys
+import requests
+
+ROOT = Path(__file__).resolve().parents[3]
+OUT = ROOT / '.artifacts/pit-optimizer-v5/data/acquisition/raw/nasdaq-public'
+SOURCES = [
+    ('wikipedia-history-r1371960136.html', 'https://en.wikipedia.org/w/index.php?title=Historical_components_of_the_Nasdaq-100&oldid=1371960136', True),
+    ('wikipedia-components-r1368915166.html', 'https://en.wikipedia.org/w/index.php?title=List_of_NASDAQ-100_companies&oldid=1368915166', True),
+    ('nasdaq-2023-amended-106911.pdf', 'https://ir.nasdaq.com/node/106911/pdf', False),
+    ('nasdaq-2023-original-106896.pdf', 'https://ir.nasdaq.com/node/106896/pdf', False),
+    ('nasdaq-2025-retrospective.pdf', 'https://indexes.nasdaqomx.com/docs/202601%20NDX%20Reconstitution%20and%20Performance%20Highlights.pdf', False),
+    ('nasdaq-2025-retrospective.html', 'https://www.nasdaq.com/articles/global-indexes/2025-nasdaq-100-reconstitution-and-performance-highlights', False),
+    ('nasdaq-2020-annual.html', 'https://www.nasdaq.com/press-release/annual-changes-to-the-nasdaq-100-index-2020-12-11', False),
+    ('nasdaq-hon-sols-corporate-action-ECA2025-559.html', 'https://www.nasdaqtrader.com/TraderNews.aspx?id=ECA2025-559', False),
+    ('nasdaq-hon-sols-spinoff-approved-20251016.html', 'https://www.nasdaq.com/press-release/honeywell-board-directors-approves-spin-solstice-advanced-materials-2025-10-16', False),
+]
+
+def acquire(name, url, immutable_url=False):
+    OUT.mkdir(parents=True, exist_ok=True)
+    path = OUT / name
+    meta_path = OUT / (name + '.receipt.json')
+    if path.exists() or meta_path.exists():
+        raise FileExistsError(f'create-only output exists: {name}')
+    started = datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
+    record = dict(requested_url=url, url_is_revision_pinned=immutable_url,
+                  retrieved_at_utc=started, source_file=name)
+    try:
+        response = requests.get(url, headers={'User-Agent':'Mozilla/5.0 (compatible; public research source archival)'}, timeout=35)
+        data = response.content
+        with path.open('xb') as stream:
+            stream.write(data)
+        record.update(final_url=response.url, http_status=response.status_code,
+                      content_type=response.headers.get('Content-Type'),
+                      etag=response.headers.get('ETag'),
+                      last_modified=response.headers.get('Last-Modified'),
+                      byte_count=len(data), sha256=hashlib.sha256(data).hexdigest(),
+                      acquisition_ok=response.ok)
+    except requests.RequestException as exc:
+        record.update(acquisition_ok=False, error_type=type(exc).__name__, error=str(exc))
+    with meta_path.open('x', encoding='utf-8') as stream:
+        json.dump(record,stream,indent=2,sort_keys=True)
+        stream.write('\n')
+    print(json.dumps(record),flush=True)
+    return record
+
+if __name__ == '__main__':
+    if len(sys.argv) == 3:
+        acquire(sys.argv[1],sys.argv[2])
+    else:
+        for source in SOURCES:
+            name, url, pinned = source
+            acquire((sys.argv[1] if len(sys.argv) == 2 else '') + name, url, pinned)

@@ -1,0 +1,101 @@
+# Task 5 Independent Review
+
+## Verdict
+
+**PASS — Task 5 is spec-compliant and the isolated parser correction is safe.**
+
+No Critical, Important, or Minor finding was identified. The review accepted the reported exact command,
+compile, diff-check, and status evidence as instructed and did not rerun the sealed artifact diagnosis, the
+five-minute C/A command, tests, backtests, provider/network/cache operations, or optimizer work.
+
+## Finding classification
+
+- Critical: none.
+- Important: none.
+- Minor: none.
+
+## Exact production delta and CLI isolation
+
+The scoped review package preserves the pre-Task-5 parser line as
+`type=_absolute_path` and identifies the only production correction as changing that converter to `Path`
+(`task-5-review-package.md:3-17`; `task-3-review-package.md:39-41`). Current source contains exactly that
+line for `diagnose-task11-artifacts --baseline-run` (`pit_diagnosis.py:474-488`). The adjacent Task 3 C/A
+route already used `Path` (`pit_diagnosis.py:490-504`), while shared diagnosis inputs, `build-facts`,
+`verify-baseline`, evidence emission, and result verification retain their existing `_absolute_path`
+converters (`pit_diagnosis.py:400-519`). Dispatch remains command-specific
+(`pit_diagnosis.py:764-783`). No other CLI route is altered by this correction.
+
+The change makes the documented repository-relative argument work because `Path` preserves the relative
+spelling until `verify_baseline_run` validates the candidate directory and returns its resolved canonical
+directory (`core/pit_diagnosis/baseline.py:405-414`, `539-550`). It does not make the CLI argument an
+authority source. The artifact diagnosis requires exact equality with the closed canonical
+`strict-proper-base-task11` profile, discards caller authority after that boundary check, invokes baseline
+verification first, and rechecks the verified snapshot against canonical manifest and artifact hashes
+(`core/pit_diagnosis/task11_artifact_diagnosis.py:99-143`, `219-225`).
+
+Downstream source containment and file protections are unchanged. Every consumed path is a fixed filename
+joined beneath the verified resolved run directory; no CSV or manifest value selects those child paths.
+The directory and each child must be regular, non-link, and non-reparse, and each file is copied to an
+ephemeral byte snapshot whose complete SHA-256 must equal canonical authority before JSON/CSV parsing
+(`core/pit_diagnosis/task11_artifact_diagnosis.py:228-300`, `866-903`). Allowing relative spelling at the
+parser therefore does not weaken canonical authority, file/reparse rejection, or the downstream fixed-child
+containment model compared with an absolute spelling of the same directory.
+
+Privacy is also unchanged. The artifact reader reduces rows into counters and emits only the canonical
+profile/contract, execution reconciliation, and aggregate windows; the rendered windows contain counts,
+dates, percentages, and exit-reason aggregates, not symbols, row identities, URLs, or filesystem paths
+(`core/pit_diagnosis/task11_artifact_diagnosis.py:148-215`, `369-466`, `779-863`).
+
+## Report and sealed-evidence accuracy
+
+`task-5-report.md` accurately preserves the accepted sealed artifact result and authority:
+
+- profile `strict-proper-base-task11`, status `fidelity_incomplete`, explicitly not optimal;
+- manifest SHA-256 `f99eb6aade8b567b319accb95dadd80789064aacf1cb8b85d0cc31379caf6382` and
+  bundle SHA-256 `1af306ef1e46797473cd186fc48938ed6694ae25f5943c9f1905b528307cc2eb`;
+- focus-window funnel `375,703 -> 8,439 -> C 1,926/5,712/801 -> A 627/1,136/163 -> RS 238 ->`
+  qualified/attempted `173 -> executed 131`, with 42 next-open buy-zone rejections;
+- full-window 598,696 evaluated, 12,291 technical, 233 qualified/attempted, 176 executed, and 57
+  next-open buy-zone rejections, with all other named rejection counts zero.
+
+The report correctly applies the Task 5 no-rerun ruling from `progress.md`: Task 3 fix round 2 was the final
+authorized C/A run after immutable bytes-backed, query-only in-memory SQLite deserialization, and Tasks 4-5
+do not alter parsed bytes or reconciliation semantics. The reused final Task 3 evidence remains exact:
+C `8,439 = 1,926 + 5,712 + 801`, conditional A `1,926 = 627 + 1,136 + 163`, all C/A scalar and
+availability rows checked, zero mismatches, `passed=true`, all six source-chain objects digest-verified,
+and aggregate-only output. The by-year, metric-family, unavailable-reason, and public-date visibility
+counts in Task 5 match the final Task 3 report (`task-3-report.md:470-523`).
+
+The effective-policy claims also match the final reviewed Task 4 authority. Digest
+`744104da98b205d73b827d9ecd90e610dbc9d830eb11adc09b31cc034b3a006a`, 126 leaves, and classification
+counts `81 active fixed + 25 active tunable + 8 advisory/unsupported + 12 causal invariant` agree with
+`task-4-report.md` and the clean final review. Source confirms causal facts are non-candidates, CANSLIM
+thresholds/weights are active-fixed optimizer candidates rather than universal constraints, supported
+portfolio controls are active tunables, actual sizing is
+`portfolio_equity * position_risk_pct / stop_loss_pct`, and effective scale tiers are
+`[[0.1, 0.25], [0.15, 0.25], [0.2, 0.25]]`
+(`core/engine_policy.py:187-280`, `850-955`; `core/backtest_engine.py:2608-2618`;
+`config/settings.py:144-150`).
+
+All seven built-in compatibility fields are reported advisory/unsupported, and non-compatibility values
+fail closed before the default `DataFetcher` is constructed (`core/engine_policy.py:99-129`, `958-1006`;
+`core/backtest_engine.py:1322-1437`). Opaque injected strategies remain explicitly
+`engine_owned_envelope_only`; a JSON-safe declared identity expands only to
+`engine_owned_envelope_plus_declared_custom_identity` (`core/engine_policy.py:135-165`, `404-438`). These
+claims match the final Task 4 review (`task-4-fix3-review.md`) and do not overstate custom-strategy
+attestation.
+
+## Scope and constraints
+
+The sole production delta is argument parsing. It does not touch entry, scoring, sizing, exit, portfolio,
+provider, cache, dataset, or optimizer behavior. The handoff explicitly makes no return-improvement,
+drawdown-reduction, parameter-selection, optimality, or optimization claim; it assigns later optimization
+to the multi-agent backtest loop and keeps CANSLIM as the feature basis. It also records that no tests or
+test files were added, formal regression tests remain deliberately deferred, and no dataset download,
+network/provider access, cache refresh, backtest, optimizer, Git write, or sealed-artifact mutation occurred.
+
+## Review constraints observed
+
+Production and sealed reports were inspected read-only. Reported exact command/compile/diff evidence was
+accepted without rerun. No production file, test, dataset, cache, artifact, or Git state was modified; only
+this review artifact was created.

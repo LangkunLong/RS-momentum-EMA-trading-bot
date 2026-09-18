@@ -1,0 +1,238 @@
+# PIT Optimizer V5 final whole-branch fix-wave report
+
+Date: 2026-09-05
+Status: all Critical and Important findings 1-9 and minors 10-13 implemented and locally verified.
+Base: `5a56874cc762831ab6997f4d550fa12f5c43d3cc`
+Head: `3548febcb2c51cf5ed13c2dae6eadddeaa6ed5c8`
+Commit: `fix(pit-optimizer-v5): close final execution and recovery gaps`
+Scope: one coordinated wave, one local commit, 16 files, 1,265 insertions and 343 deletions.
+
+The full design, learning-search plan, progress ledger, authoritative final-review findings, and
+Task 9 report were read before implementation. The recorded rulings are preserved: all
+close-derived scale-outs execute at the next eligible open; raw codecs are selected only by exact
+typed authority edges; finite USD caps require authenticated model-price upper bounds and
+prospective reservation; no ceiling remains unlimited. No subagents were spawned.
+
+## Finding closure and implementation
+
+1. **Typed raw campaign edges.** The real repository authenticates exact raw bytes only for the
+   strictly decoded campaign manifest's panel-plan bundle/provenance edges. Raw authentication
+   streams SHA-256 without JSON parsing, normalization, reference extraction, or the generic
+   128 MiB JSON limit. Regular-file, containment, single-link, and before/open/after identity
+   checks remain enforced. An artifact previously authenticated through a raw edge cannot acquire
+   generic-JSON codec privilege through an alias. Existing explicit newline provenance handling
+   remains intact. Windows raw identity compares supported stable identity/size/mtime attributes;
+   POSIX retains the additional ctime comparison.
+
+2. **Causal scale-out timing.** Completed-close exit decisions enqueue authenticated pending
+   actions. Both close and scale-out actions execute at the next eligible open, using original
+   position quantity for scale-out fractions. Invalid/missing opens leave the pending decision
+   intact. Checkpoint serialization, symbol-transition remapping, tier state, and full-close
+   removal remain coherent. Earlier same-bar target prices no longer receive hindsight fills.
+
+3. **Wire-safe role messages.** The authenticated frozen internal request is unchanged. Only at
+   the provider boundary, content is converted to canonical JSON text within plain role/content
+   dictionaries. The wire envelope introduces no extra request fields.
+
+4. **Durable scheduling cursor.** Terminal no-novel authority now carries full before/after
+   scheduling cursors, archive identity, attempted novelty keys, and an authenticated outcome
+   chain. Production recovery reconstructs checkpoint-owned finalized records and actual terminal
+   investigator packages chronologically, keeping archive promotion checkpoint-only. Runtime
+   independently recomputes selected-parent novelty, cursor advance, state digests, and complete
+   reconstructible parent-pool exhaustion. Round N+1 advances; completed/terminal N can be resumed
+   after later progress without repeating paid work or changing the archive.
+
+5. **Lineage-aware investigator memory.** The arbitrary last-12 slice is replaced by the actual
+   selected-parent lineage projector under authenticated `investigator_memory_max_bytes`
+   (default 96 KiB). Mandatory lineage evidence is preserved. Authenticated prior critic packages
+   supply original comparative assessment, next campaign direction, causal reviews, and real
+   reissued evidence citations. Full-feedback entries retain hypotheses, predictions,
+   implementation instructions, provenance, and supporting evidence; summary entries remain
+   bounded without discarding non-review outcomes.
+
+6. **Causal critic evidence and usable author contracts.** Critic envelopes include bounded
+   symbol-neutral activity, exposure, cash, friction, expectancy, excursion, exit/entry/intent and
+   regime diagnostics, parent deltas, and up to eight actual bounded semantic-decision
+   differences. The supported evidence/request budgets are explicit. Author contracts regenerate
+   the trusted nested V3 snapshot/decision types, method surfaces, reason enums, ranking,
+   allocation/capacity, exit/tier, add-on and AST/import/export invariants from real V3 contracts.
+   These interface details participate in authenticated request identity.
+
+7. **Prospective token/USD authority.** Provider capabilities authenticate per-model input/output
+   price upper bounds and input framing overhead. Before a durable reservation or dispatch,
+   the real ledger recomputes a conservative wire/schema input bound plus maximum output tokens,
+   and reserves the corresponding worst-case USD where a finite ceiling exists. Finite ceilings
+   without model-price authority fail closed; `None` does not restrict spend. Settlements and
+   recovered reservations verify their bounds. Unknown transport outcomes consume their full
+   reserved tokens and cost; over-bound receipts become accounting failures. Decimal prices,
+   canonical identity and cumulative USD remain exact under low ambient Decimal precision.
+   Retry and repair defaults remain zero.
+
+8. **Truthful summary state.** Summary independently authenticates terminal round-outcome kinds
+   and cleanup evidence. A runtime-failed campaign remains failed even when cleanup succeeds;
+   cleanup success remains separately visible.
+
+9. **Live deadline.** The authenticated minimum remaining role/round deadline reaches the
+   one-shot provider. The concrete gateway uses the manifest role timeout, not an implicit
+   30-second timeout. A single asynchronous SDK call is bounded by wall-clock cancellation,
+   with zero retries and owned-client cleanup, and expires before reservation if no time remains.
+   Only the V5 gateway method changed; existing V2-V4 gateway paths are untouched.
+
+10. **Baseline champion fallback.** Reported best performance uses the authenticated baseline and
+    common campaign contract with the normal champion selector, so an all-regressing archive
+    cannot become the reported champion.
+
+11. **Sibling behavioral deduplication.** Semantic-equivalent siblings receive the typed
+    `sibling_equivalent` outcome and retain semantic metadata. Only the first behaviorally
+    distinct representative reaches expensive quick/discovery evaluation. Deterministic resume
+    reconstructs the same seen-fingerprint decisions.
+
+12. **Escape permission versus activation.** Hypotheses explicitly choose authoring mode, with
+    normal symbol edits as the default. Ordinary edits send only intended policy scope;
+    cross-policy requests include their necessary policies. Manifest full-source permission no
+    longer activates the escape automatically.
+
+13. **Usable structural escape.** Explicitly authorized full-source edits can introduce declared
+    validator-permitted private helper functions and uppercase constants. Undeclared top-level
+    AST edits, import changes, and API-export changes remain rejected; normal symbol editing and
+    closed validation remain intact.
+
+Two adjacent integration defects exposed by direct execution were corrected rather than hidden:
+the evaluator's typed report grid now matches quick-base-only plus four three-scenario discovery
+episodes, and canonical typed authority encoding supports strict UTF-8 semantic-decision bytes.
+Binary PIT artifacts still use only their explicit raw codec.
+
+## Documentation and preserved boundaries
+
+The plan's stale missing-critic paragraph now preserves authenticated precritic evidence with a
+typed critic-unavailable result, no finalized experiment record, and no archive/checkpoint
+promotion. Plan/spec text now documents prospective price/token reservation, explicit memory
+budget, canonical transport, live deadlines, scheduling state separation, richer evidence,
+structural-mode activation, typed raw edges, and next-open close-derived exits.
+
+Provider-neutral domain/runtime separation, O'Neil core policies, annualized portfolio CAGR as
+the primary objective, checkpoint-only archive promotion, V2-V4 readers/dispatch, confidentiality,
+zero retry/repair defaults, and exact workspace crash-recovery code were preserved. The
+pre-existing campaign-stage fail-closed `import-v4-candidate` deferral remains acknowledged.
+
+## Deterministic direct-check evidence
+
+The temporary direct fixture was run with:
+
+```text
+python -B .artifacts/v5_final_wave_smoke.py
+ALL_DIRECT_CHECKS 28
+```
+
+The final run occurred after the independent runtime scheduling-proof validation was added. It
+exercised real production composition, repository typed codecs and provider accounting with
+bounded in-memory collaborators; it created no provider, Docker, Git-materialized candidate,
+market-data, or replay workload. Its exact passing check labels were:
+
+1. narrow normal author scope, explicit structural opt-in, complete nested V3 contracts
+2. provider messages encode frozen payload as canonical JSON text in plain dictionaries
+3. full-source structural helper and constant additions render while preserving imports and exports
+4. full-source undeclared import edits rejected
+5. raw exact-byte digest mismatch rejected
+6. manifest plan raw edges authenticate non-JSON bytes without JSON decoding
+7. generic alias to authorized raw artifact remains fail-closed
+8. finite USD budget without authenticated model prices rejected
+9. prospective input plus output token and authenticated model-price reservation; no-cap unrestricted
+10. full deterministic investigator-author-critic round, sibling semantic dedup, one quick and four episodes, checkpoint promotion
+11. critic receives quick-base plus full discovery grid, parent deltas, causal diagnostics, and actual semantic traces
+12. completed round resumes idempotently without role, candidate, or publication work
+13. operator champion remains baseline when every candidate regresses
+14. next investigator receives authenticated campaign direction and lineage-budgeted prior experiment evidence
+15. two-parent no-novel cursor advances N+1, exhausts only complete pool, preserves checkpoint, and resumes N/N+1 idempotently
+16. full scheduling cursor and exhaustion history authenticate through durable typed round codecs
+17. insufficient prospective input plus maximum output tokens reject before reservation and dispatch
+18. insufficient prospective USD rejects before reservation and dispatch
+19. authenticated reservation settles exact reported usage and recovers without spending again
+20. unknown transport outcome consumes its full reserved tokens and cost with zero retry
+21. receipt exceeding authenticated cost upper bound becomes accounting failure
+22. no USD ceiling permits reported spend above finite-cap examples
+23. one-shot gateway uses canonical wire messages and authenticated remaining timeout above fixed 30 seconds
+24. live provider coroutine cancels at wall deadline
+25. close-derived scale-out queues without historical fill, survives missing open/checkpoint/remap, and fills next eligible open
+26. runtime failure remains failed in later summary despite successful cleanup
+27. price authority hashing and cumulative USD remain exact under low ambient Decimal precision
+28. streamed raw codec authenticates synthetic 129 MiB input without generic JSON-size cap
+
+Important fixture observations:
+
+- Three byte-distinct variants with equal behavior produced one quick evaluation, four discovery
+  episodes, two sibling-equivalent records, exactly three fixture role calls, and one checkpoint
+  promotion. Completed-round recovery performed no extra calls, candidates, or publications.
+  The regressing evaluated candidate did not replace the authenticated baseline champion.
+- A capacity-two archive with three completed rounds was followed by round-four no-novel and
+  round-five exhausted outcomes. Both parents were covered, checkpoint generation stayed at
+  three, and round-four/round-five resumes remained idempotent before and after later progress.
+- The actual local authorization ledger serialized and recovered typed reservations and
+  receipts. Insufficient prospective token/USD limits prevented both reservation and dispatch;
+  accepted fake usage settled at 50 tokens and USD 0.001; unknown usage consumed the exact
+  reservation; uncapped usage accepted USD 50.
+- The one-shot transport used a synthetic hosted-client coroutine with a granted 120-second
+  timeout (not 30), and a separate 30-millisecond deadline canceled the coroutine. No SDK
+  network request was sent.
+- Actual simulator methods observed synthetic high 130/close 99, did not create a historical
+  120 fill, survived a missing next open and AAA-to-BBB remap, then filled 2.5 shares at the
+  next eligible open of 97. Pending-intent checkpoint round-trip was exercised.
+- Raw authentication used the temporary fixture's own exact source bytes for the local
+  Windows file check. The 129 MiB case was a bounded simulated stream reusing a 1 MiB block,
+  not a real PIT artifact or a large on-disk temporary file.
+
+## Compile, import, lint, isolation, and commit checks
+
+Fresh after-commit direct compilation and imports reported:
+
+```text
+PASS compile 29 source files; import 33 modules; installed async SDK surface
+PASS provider-neutral domain/runtime import coupling
+PASS legacy gateway/simulator AST unchanged outside three V5 methods and pending V5 intent validation
+PASS no test files, O'Neil core policy changes, or V2-V4 dispatch edits; temporary fixture removed
+```
+
+Compilation used the built-in `compile` on all 27 V5 source files plus `agent_loop.py` and
+`core/backtest_engine.py`, with `python -B -` and no bytecode output. Imports covered 26 V5
+modules plus the backtest, gateway, legacy command/controller/artifacts/evaluation/authorization
+modules. Installed `AsyncCompletions.create` was checked via `inspect.unwrap` without calling it.
+
+The AST comparison against the base commit proved all legacy gateway/simulator AST unchanged
+except `OpenRouterGateway.request_pit_optimizer_v5_json_once`,
+`PortfolioSimulator._execute_v5_pending_policy_exits`,
+`PortfolioSimulator._check_exits_v5_after_close`, and
+`PendingPolicyExit.__post_init__`. Import AST checks covered search, selection, memory,
+runtime, contracts, and provider against legacy controller/concrete provider coupling.
+
+Commands passed before and after commit:
+
+```text
+python -B -m ruff check core/pit_optimizer_v5 agent_loop.py core/backtest_engine.py
+All checks passed!
+python -B -m ruff format --check <the 12 changed V5 Python files>
+12 files already formatted
+git diff --check
+git diff --cached --check
+git diff HEAD^ HEAD --check
+git status --porcelain=v1
+```
+
+The final status command returned no entries. Local commit hooks passed Ruff, trailing whitespace,
+end-of-file, and merge-conflict checks; YAML had no applicable files. Shared Git metadata required
+the authorized sandbox escalation; staging and commit then succeeded. No hook requested network
+installation. The temporary fixture was deleted with an exact-path patch before staging, and
+`Test-Path .artifacts/v5_final_wave_smoke.py` returned `False`. Reports remain in the existing
+ignored SDD evidence directory, outside the source commit.
+
+## Remaining concerns and handoff
+
+- No live provider, Docker/image/container, Git materialization, PIT market data, network,
+  replay, test file/suite, push, or merge operation was performed. Empirical optimizer returns
+  and live-service behavior are therefore not claimed as validated by this wave.
+- Finite-cost configurations need the new authenticated per-model price upper bounds. Existing
+  prototype V5 manifests/cursors/authorities that lack newly required typed fields need
+  regeneration/re-authentication before reuse; they are not silently repaired. No-ceiling
+  campaigns remain unlimited.
+- The previously acknowledged fail-closed campaign-stage `import-v4-candidate` deferral remains.
+- No known unclosed final-review finding remains. The branch/worktree is preserved, committed,
+  and ready for the controller's independent final disposition.

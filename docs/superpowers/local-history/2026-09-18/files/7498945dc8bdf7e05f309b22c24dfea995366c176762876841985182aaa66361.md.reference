@@ -1,0 +1,28 @@
+# Task 3 review — d323846..a9219a1
+
+## Spec Compliance
+
+The V5 evidence records are frozen/slotted and strictly validate nested V5 evidence, dates, counts, decimals, unique keys, and scenario selection (`core/pit_optimizer_v5/contracts.py:189`, `:454`, `:527`, `:544`). The sandbox has a separate digest-pinned image reference, fixed isolation modes, digest identity over all fields, and exact campaign-resource equality (`contracts.py:204`, `:228`, `:232`, `:264`). The contract fixes the complete gross/base/stress grid and base selection (`contracts.py:136`, `:321`), while scenario requests are non-empty, canonical, and include base (`evaluator.py:344`). The semantic source map is closed and fails on the currently missing diagnostics module (`contracts.py:25`, `:146`, `:169`). Construction validates resource/sandbox, execution, bundle, provenance, and transition identities before simulation (`evaluator.py:171`); results reject non-V5 aggregates and validate simulation identity before evidence assembly (`evaluator.py:369`).
+
+## Strengths
+
+- `selected_scenario` resolves by ID and requires exactly one match; no tuple-position assumption (`contracts.py:589`).
+- Each scenario receives a new simulator and a one-use worker factory; worker reuse is rejected (`evaluator.py:65`, `:290`).
+- The injected report builder is invoked and its output must be `EvaluationReportV5`; there is no placeholder success path in this package (`evaluator.py:313`).
+- The package keeps evaluator contracts separate from engine/policy imports and does not introduce provider, Docker, or replay infrastructure (`evaluator.py:11`).
+
+## Issues Critical
+
+None.
+
+## Issues Important
+
+- `candidate_root` is only checked then discarded, so the candidate path is not passed to or bound into the worker factory/simulator/evidence (`core/pit_optimizer_v5/evaluator.py:251`, `:260`, `:263`). The current factory type is `Callable[[], StrategyPolicyClient]` (`core/strategy_policy/__init__.py:42`), confirming that this evaluator has no channel through which the verified root can constrain the evaluated candidate. A caller can supply any valid directory and a factory for a different candidate while retaining the supplied policy digest in `PanelEvaluationV5` (`evaluator.py:330`). Bind an authenticated candidate-root identity to the candidate worker construction (for example, a root-aware factory or a factory closure verified against a candidate artifact identity) and include that binding in the simulator/result provenance before accepting evidence.
+
+## Issues Minor
+
+None.
+
+## Assessment
+
+Not ready to accept as Task 3 complete: the candidate-root/policy-identity acceptance point is not met. All other requested focused contract checks have concrete implementation evidence above. New tests were not requested and were not run.

@@ -1,0 +1,92 @@
+# Review package: 1e5fc0b1701d0ffc4ccc764822f15e85d0f80139..ec6cae1de94ebf9716f0b01d0eb96654d6cb17b6
+
+## Commits
+ec6cae1 fix: use absolute market count tolerance
+
+## Files changed
+ core/strategy_policy/contracts.py |  9 +++++++--
+ tests/test_strategy_policy.py     | 10 ++++++++++
+ 2 files changed, 17 insertions(+), 2 deletions(-)
+
+## Diff
+diff --git a/core/strategy_policy/contracts.py b/core/strategy_policy/contracts.py
+index 9b0d904..46b1d82 100644
+--- a/core/strategy_policy/contracts.py
++++ b/core/strategy_policy/contracts.py
+@@ -199,34 +199,39 @@ class MarketContextV1(_CanonicalContract):
+         ):
+             _unit_fraction(getattr(self, name), name)
+         _number(self.median_rs_score, "median_rs_score")
+         covered_counts: dict[str, int] = {}
+         for coverage_name in (
+             "breadth_50_coverage_fraction",
+             "breadth_200_coverage_fraction",
+             "rs_coverage_fraction",
+         ):
+             covered = float(getattr(self, coverage_name)) * self.active_constituent_count
+-            if not math.isclose(covered, round(covered), abs_tol=1e-9):
++            if not math.isclose(covered, round(covered), rel_tol=0.0, abs_tol=1e-9):
+                 _fail(coverage_name)
+             covered_counts[coverage_name] = round(covered)
+         for coverage_name, fraction_name in (
+             ("breadth_50_coverage_fraction", "breadth_above_50_fraction"),
+             ("breadth_200_coverage_fraction", "breadth_above_200_fraction"),
+             ("rs_coverage_fraction", "rs_at_least_80_fraction"),
+         ):
+             covered_count = covered_counts[coverage_name]
+             fraction = float(getattr(self, fraction_name))
+             numerator = fraction * covered_count
+             if (
+                 (covered_count == 0 and fraction != 0.0)
+-                or not math.isclose(numerator, round(numerator), abs_tol=1e-9)
++                or not math.isclose(
++                    numerator,
++                    round(numerator),
++                    rel_tol=0.0,
++                    abs_tol=1e-9,
++                )
+                 or not 0 <= round(numerator) <= covered_count
+             ):
+                 _fail(fraction_name)
+         if covered_counts["rs_coverage_fraction"] == 0 and self.median_rs_score != 0.0:
+             _fail("median_rs_score")
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class EntrySnapshot(_CanonicalContract):
+     market: MarketContextV1
+diff --git a/tests/test_strategy_policy.py b/tests/test_strategy_policy.py
+index 7c75559..aecb35c 100644
+--- a/tests/test_strategy_policy.py
++++ b/tests/test_strategy_policy.py
+@@ -532,20 +532,30 @@ def test_closed_deserializer_rejects_unknown_keys_and_transport_types() -> None:
+         _market_context(
+             breadth_50_coverage_fraction=0.0,
+             breadth_above_50_fraction=0.01,
+         )
+     with pytest.raises(ValueError, match="median_rs_score"):
+         _market_context(
+             rs_coverage_fraction=0.0,
+             rs_at_least_80_fraction=0.0,
+             median_rs_score=1.0,
+         )
++    with pytest.raises(ValueError, match="breadth_50_coverage_fraction"):
++        _market_context(
++            active_constituent_count=1_000_000_000,
++            breadth_50_coverage_fraction=0.9000000004,
++        )
++    with pytest.raises(ValueError, match="breadth_above_50_fraction"):
++        _market_context(
++            active_constituent_count=1_000_000_000,
++            breadth_above_50_fraction=540_000_000.4 / 900_000_000,
++        )
+ 
+ 
+ def test_contracts_reject_oversized_tuples_and_candidate_fill_prices() -> None:
+     """Break caught: unbounded or executable-price payloads could escape sandbox limits."""
+     with pytest.raises(ValueError, match="technical_blocking_reasons"):
+         _entry_snapshot(technical_blocking_reasons=tuple("x" for _ in range(33)))
+     with pytest.raises(TypeError):
+         ExitAction(
+             "close",
+             None,

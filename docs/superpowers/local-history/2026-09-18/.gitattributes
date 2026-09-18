@@ -1,0 +1,2 @@
+# Exact archived bytes; avoid newline conversion and historical whitespace rewrites.
+files/** -text -whitespace

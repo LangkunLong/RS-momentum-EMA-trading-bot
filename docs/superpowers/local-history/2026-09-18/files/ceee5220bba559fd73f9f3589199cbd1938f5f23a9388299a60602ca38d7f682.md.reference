@@ -1,0 +1,54 @@
+# B4c whole-increment static review
+
+## Findings
+
+No actionable production-source defect was found in the authorized B4c implementation. The earlier Task 2 CRLF preservation finding is resolved in the current bytes.
+
+The required successful before/after full-summary comparisons remain unavailable. `history-and-summary-review.md` explicitly reports that both real-repository calls failed before returning a summary with `V5CliFailure("artifact_graph_invalid")`, caused by `ValueError("container execution reservation is foreign")` in the existing verifier. Its archive-derived counts are not returned summary objects and cannot establish equality of every pre-existing summary key/value. This is an outstanding verification limitation for the principal, not a demonstrated B4c source regression. Neither the full-summary comparison nor complete Task 5 evidence delivery should be represented as passed on this review's authority.
+
+Spec compliance: PASS
+
+Task quality: PASS
+
+Archive-evidence representation: PASS
+
+The first two verdicts cover the static implementation and integration under review. They do not waive or claim completion of the unavailable full-summary evidence requirement. The evidence-representation verdict applies to the supplied Task 2/3 reports, reviews, combined diff, and history/summary report, which correctly distinguish static reasoning from execution.
+
+## Source and integration evidence
+
+- Read the B4c plan, combined diff, Task 2/3 briefs, reports and reviews (including the Task 2 re-review), and retained-history/summary report. Compared the exact source preimages and current files through raw-byte diffs and complete-module AST parsing. No application code was imported or executed by this review.
+- The rejection helper matches the specified checkpoint comparison, reload of every projected record, record equality, strictly prior round, discovery-plan identity, PIT scope and semantic mode checks. Fixed errors contain no record data; reload failures propagate. The predicate counts only invalid records with the literal reserved code. `SearchProjectionV5` binds stored references to checkpoint membership and order. `load_experiment` authenticates canonical record content and the rejection event, accepted author and round-intent bindings; the helper does not invent a second authority path.
+- The one integer `failure.rendering.policy_source_unbounded_or_stateful_count` item follows every parent episode and precedes archive/history evidence. Its nonzero guard leaves the evidence builder untouched at zero. Existing evidence calls and their relative order are preserved. The unchanged provider permits `failure.*` and puts aggregate evidence first in the authoritative citation sequence, so positive insertion shifts later IDs consistently. No source, path, symbol, exception or timestamp is added.
+- The author method remains unchanged and rebuilds investigator evidence from the same checkpoint before selecting the hypothesis's exact citations. Runtime recovery still adopts completed record rounds and returns historical terminal outcomes before constructing a new investigator request; the new prior-round check does not introduce historical request regeneration.
+- All three summary fields are appended after `evaluation_mode` with zero defaults. Existing positional parameters retain their positions. Strict integer validation rejects bool and negative values. All five specified cross-count checks and the fixed error are present, with no stronger cleanup requirement on the pre-existing evaluated count. `unavailable_summary_v5` retains its old positional construction and receives the new zero defaults.
+- New summary computations follow authenticated checkpoint-record loading and successful `verify_projection`. Lifecycle uses distinct record rounds with successful cleanup; evaluated feedback intersects those rounds with the unchanged evaluated-and-campaign-evidence selection; rejection count is per committed reserved-code invalid record irrespective of cleanup. Existing status/readiness, terminal, performance, champion, failure taxonomy, cost/token/call and cleanup calculations remain unchanged. Canonical serialization implementation is unchanged; the dataclass extension adds the three authorized output keys.
+- `CandidateArchiveReducerV5.apply` still advances the round cursor and retains attempted novelty for invalid records. `_authorities` skips records outside evaluated/zero-trade status. Memory preserves invalid status and complete hypothesis feedback within existing bounds, while critic reissue retains the established `review is None` skips. The cumulative count is independent of text-memory inclusion. No history, novelty, scheduling, selection or budget behavior was changed.
+
+## Preservation and scope
+
+`production_runtime.py` preimage SHA-256 is `78da0dc5efcf5cf94541a465e0a3c212221c843dade07f680ddc5e1508fdc476`; current SHA-256 is `a757a0ca89979be9453129321a04b96498fb06a9f37438034b46e407ad8b72eb`. Removing the two added blocks reproduces the exact preimage bytes. The complete 16-metric allowlist and parent-episode block are independently byte-equal. The whole old projection region is not claimed unchanged: it contains the authorized insertion.
+
+`summary.py` preimage SHA-256 is `4eaef3424a6043a5ce0aeef60bf0a8abe444d4a24588d93d26804d44a3127258`; current SHA-256 is `e4ccb8a2077ca28d2ece2e541839265b3f08218e1b66e93b635772e600270865`. Its source diff contains only the specified additions, with incidental line-ending differences around edited blocks. AST comparison identifies only `_investigator_parts`, `OptimizerSummaryV5.__post_init__`, and `summarize_repository_v5` as changed existing functions, plus the new `_render_rejection_count` helper. No existing function is removed.
+
+Independently recomputed all eleven source hashes in the C1 principal verification: only the two authorized files differ. The nine preserved hashes cover memory, runtime, artifacts, candidate IR, contracts, rendering, provider, selection and search. This review does not substitute those nine checks for the separate required 56-file evaluator-map verification, or infer preservation of all historical files from a two-file source diff.
+
+## Static decision table — source reasoning, not executed cases
+
+| Record/history condition | Completed lifecycle | Evaluated feedback | Rejection count |
+| --- | --- | --- | --- |
+| No checkpoint records | 0 | 0 | 0 |
+| One ordinary invalid record, cleanup complete | 1 | 0 | 0 |
+| One authenticated closed render rejection, cleanup complete | 1 | 0 | 1 |
+| Duplicate-only record round, cleanup complete | 1 | 0 | 0 |
+| One evaluated and one rejected record in one completed round | 1 | 1 | 1 |
+| Several evaluated candidates in one completed round | 1 | 1 | 0 |
+| Evaluated/rejected record round awaiting successful cleanup | 0 | 0 | Number of reserved-code invalid records |
+| Historical actual06 terminal failure without checkpoint records | 0 | 0 | 0 |
+
+## Archive evidence limits
+
+The supplied report identifies runtime-04's real evaluated record with four discovery episodes and bound critic, deriving counts 1/1/0 from its record and cleanup; it identifies actual06's five historical events, rendering/stage_failed terminal outcome and absence of checkpoint records or render-rejected events, deriving 0/0/0. This reviewer inspected the reports and supporting source paths rather than independently rerunning archive authentication. The reports do not present actual06 as a newly committed rejection, or present the derived values as successful full-summary output.
+
+No positive rejection metric, rejection-only/mixed summary behavior, or positive C1 branch has real execution evidence in the supplied bounded inventory. Preserved source logic supports compatibility statically; full returned-summary compatibility and preservation of all old output values remain unobserved. No fresh provider request or request-size result is claimed.
+
+Review actions were limited to reading source/reports, raw diff/hash/AST inspection and writing this report. No tests were read, created or run; no synthetic inputs, records, events or wrappers were constructed; no application, model/API, credential, evaluator, campaign, commit, push or deployment operation was performed.

@@ -1,0 +1,94 @@
+# V5 evaluator image acquisition report
+
+Source HEAD: `de6e1b888d3658cb7f83842d49eb1441140ad19d`.
+Worktree: `C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.worktrees\pit-optimizer-v5-architecture`.
+
+## Outcome
+
+The dedicated V5 evaluator image was built on the local Docker Desktop Linux engine. Its installed 56-file runtime source map verified successfully during the build and again in a network-disabled, read-only, non-root container. Required evaluator/probe entrypoint imports succeeded. No market evaluation, baseline capture, semantic probe suite, provider call, held-out stage, or replay was run.
+
+Usable immutable reference:
+
+`pit-optimizer-v5-evaluator@sha256:663f1749ba91df9e501e9de705cca83ff1c46305ca5a2ad589380fbe1d9893aa`
+
+This exact reference appears in Docker `RepoDigests` and resolves through both the build context endpoint and the runtime's fixed `npipe:////./pipe/docker_engine` endpoint. It was produced and loaded locally; nothing was pushed to a registry. A mutable convenience tag, `pit-optimizer-v5-evaluator:source-5989471897be`, also exists, but is not the profile authority.
+
+The default resource leaf and `SandboxProfileV5` are contract-valid and authenticated. They establish image/profile preparation only. They are not a baseline authority, evaluator contract, campaign manifest, provider adapter, or approval to evaluate. A later campaign must authenticate and bind the same resources and all remaining data/policy references.
+
+## Environment and non-destructive startup
+
+- Docker CLI 29.7.2 was installed at `C:\Users\llong\AppData\Local\Programs\DockerDesktop\resources\bin\docker.exe`.
+- Initial `docker version` returned `Server: null`, and the named pipe `dockerDesktopLinuxEngine` was absent. No Docker Desktop processes initially existed.
+- Started `Docker Desktop.exe` using `Start-Process -WindowStyle Hidden` with authorized local escalation. Initial Desktop status query raced startup and returned unavailable; the subsequent engine query succeeded.
+- Verified context `desktop-linux` uses the local `npipe:////./pipe/dockerDesktopLinuxEngine` endpoint. `docker buildx ls` showed local `docker` driver, running BuildKit v0.32.2. Every build explicitly selected `--context desktop-linux --builder desktop-linux`.
+- Engine: Docker Desktop 4.87.0 (236836), engine 29.7.2, Linux amd64, kernel `6.6.87.2-microsoft-standard-WSL2`, containerd v2.2.5. Image store driver status: `io.containerd.snapshotter.v1`.
+- Read-only WSL status/list showed the `docker-desktop` distribution running under WSL 2. No reset, prune, unrelated service stop, global WSL shutdown, virtualization change, or Docker configuration change was performed.
+- Sandbox-only Docker access returned access denied for its pipe/buildx lock/log paths. Authorized escalated calls succeeded; no automatic approval rejection occurred.
+
+## Recipe and exact context
+
+Used the unchanged `Dockerfile.pit-optimizer-v5`, its dedicated ignore file, and `requirements-lock.txt`. No legacy recipe was substituted and no tracked source was edited.
+
+Recipe inputs:
+
+| Path | SHA-256 |
+| --- | --- |
+| Dockerfile.pit-optimizer-v5 | `9161715e3ba1c964384b9b685848279f24b54c41813395514fed1fbd97129413` |
+| Dockerfile.pit-optimizer-v5.dockerignore | `a05b3e5aa9ca064074e53fc727d8a11f399c046c41744cc6bcd83d5d079b3afd` |
+| requirements-lock.txt | `9f1f1f14f18c86a2471a3d81bb5d103b3a26bb37da7f753daf90bfd9b5b312b6` |
+
+Base image: `python:3.13.14-slim@sha256:9662417aace5ae7b8e2609cce472b72a8958e134ba372808abe9cc1a0c0125e6`.
+
+The ignore file's explicit non-directory inclusions exactly equal `EVALUATOR_SOURCE_PATHS_V5` plus the two recipe files and requirements lock: 59 files in total, 1,408,017 bytes.
+
+The initial build from the worktree root transferred 8.62 MB and failed the recipe's required/forbidden-file guard after `COPY core/`. This is evidence that the intended minimal source closure was not enforced by that root-context invocation. The exact cause of Dockerignore handling was not changed or independently isolated in this task. No failed image was accepted, and no remote builder received this context. The failure and bounded remedy were reported to the controller before proceeding.
+
+The accepted build instead used a newly created exact-file context at:
+
+`.superpowers/sdd/2026-09-04-pit-optimizer-v5-campaign/evaluator-build-context-5989471897be/`
+
+Reproducible construction: import `EVALUATOR_SOURCE_PATHS_V5` from the source contracts using Python 3.13 with `-B`; create a fresh directory exclusively; for each of those 56 paths and the three recipe/lock paths, create parents and copy raw file bytes using exclusive `xb` creation; require the complete resulting file set to equal that 59-path set; require `evaluator_source_sha256(evaluator_source_map_v5(stage))` to equal `5989471897bee94e6886493f71b525c931388e029e6eeaa626abc3678c3e2fd7`. The accepted context contains no data, Git metadata, credentials, tests, or editable V3 policy modules.
+
+Accepted build command (from worktree root):
+
+```powershell
+docker --context desktop-linux buildx build --builder desktop-linux --load --progress plain --file .superpowers/sdd/2026-09-04-pit-optimizer-v5-campaign/evaluator-build-context-5989471897be/Dockerfile.pit-optimizer-v5 --build-arg PIT_V5_RUNTIME_SOURCE_SHA256=5989471897bee94e6886493f71b525c931388e029e6eeaa626abc3678c3e2fd7 --tag pit-optimizer-v5-evaluator:source-5989471897be --iidfile .superpowers/sdd/2026-09-04-pit-optimizer-v5-campaign/evaluator-image-build.iid .superpowers/sdd/2026-09-04-pit-optimizer-v5-campaign/evaluator-build-context-5989471897be
+```
+
+The exact context transferred 1.41 MB. The presence/absence guard and installed `image_manifest` verification both passed. The unchanged dependency layer from the first build was reused; it was created before any project source COPY. The accepted source layers came from the exact-file context.
+
+## Image identities and smoke evidence
+
+- Runtime source identity: `5989471897bee94e6886493f71b525c931388e029e6eeaa626abc3678c3e2fd7`.
+- Docker inspect Id and OCI image index digest: `sha256:663f1749ba91df9e501e9de705cca83ff1c46305ca5a2ad589380fbe1d9893aa`.
+- OCI platform manifest: `sha256:e8e86f876d915ff606c19dc7ca430b2ff87d9be798480a4d0eae60b91fe07d34`.
+- OCI config: `sha256:3387124570367916660b3c089f9b437c9e60a6e4414e032826c53cacb14b696e`.
+- Runtime-kind label exactly `evaluator-probe-v5`; runtime-source label exactly the authenticated source digest. These are the only image labels, satisfying the production runtime's closed label comparison.
+- Image user `65532:65532`; entrypoint `python`; Linux amd64.
+
+The source/import smoke used the immutable repository reference with `--pull never --network none --read-only --cap-drop ALL --security-opt no-new-privileges --pids-limit 32 --cpus 1 --memory 1024m --memory-swap 1024m --entrypoint python`, Python `-P -B`, no host mounts, and `--rm` for the owned temporary container. It recomputed installed runtime-source identity; imported `container_entry`, `probe_entry`, `container_protocol`, `evaluator`, and `strategy_policy.worker`; collected Python/distribution versions; and verified uid/gid 65532 and safe-path mode. This imported modules without invoking their evaluation/probe entrypoints. It exited 0. A final filtered container listing found no running preparation container.
+
+`record-evaluator-image.py` in this report's directory contains the exact harmless smoke and create-only provenance composition. Its provenance output is already present; rerunning intentionally fails exclusive creation rather than replacing it.
+
+## Create-only artifacts
+
+All paths below are relative to the authenticated artifact root `.artifacts/pit-optimizer-v5/`. Files were written with `LocalArtifactRepositoryV5.create_baseline_artifact` and authenticated against their exact references. The profile was composed by `build_sandbox_profile_v5` after authenticating the source and resource leaves. The index is an `ArtifactIndexV5`, not a fabricated evaluator/baseline authority.
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `evaluator/runtime-source-5989471897be.json` | `5989471897bee94e6886493f71b525c931388e029e6eeaa626abc3678c3e2fd7` |
+| `evaluator/image-provenance-663f1749ba91.json` | `8702c99b7ab7b36f5d3e612e5d294da5a8b9b0554a5ab3eefa6aba9c5252381f` |
+| `evaluator/resources-default-v5.json` | `aa32b01c816b858c5318003a647accbcbdbe44806d6efd5b5e12f458cdc5a65f` |
+| `evaluator/sandbox-profile-663f1749ba91.json` | `7a9c1e73046f7a00abcb5fc029350ea7e42e5841b179074a5ef43a94f5613483` |
+| `evaluator/image-preparation-index-663f1749ba91.json` | `65618a8bb60c50295f1d55468f4abc249f658782e5025fcc5c3ece71383c26df` |
+
+Default profile resources bind 1 CPU, 1024 MiB memory, 32 PIDs, and 67,108,864 output bytes. The complete `ResourceCapabilitiesV5` leaf additionally retains its declared default parallelism/timeouts. The controller confirmed no existing resource authority should be reused and authorized this explicit default leaf.
+
+## Remaining limitations and source follow-ups
+
+1. Image/profile acquisition has no remaining local engine blocker. Full evaluator/baseline/campaign authorities still need actual data, panel, policy, execution-profile, and identity-transition composition. No runtime performance claim follows from preparation.
+2. Do not use the worktree-root Docker build command as an exact-allowlist guarantee without independently reviewing/fixing the observed ignore behavior. The accepted image avoids that dependency by using the verified exact-file context. No source edit was made.
+3. The Windows requirements lock omits Linux-only transitive dependencies: this build resolved `SecretStorage==3.5.0` and `jeepney==0.9.0`. The installed versions are recorded in provenance, and the immutable image pins the actual obtained bytes. Fresh rebuild reproducibility requires a separately reviewed Linux-complete lock; no lockfile edit was made. Pinned versions also do not include wheel hashes.
+4. Locally loaded RepoDigests do not claim the image is published or recoverable from Docker Hub. Preserve the local image or rebuild from the recorded recipe/context; no registry push was performed.
+
+Final `git status --short --untracked-files=no` was empty. No tracked source change, commit, merge, upload, push, test command, provider/model call, evaluation, baseline capture, held-out stage, or replay was performed. The build recipe's shell `test` statements are file/argument guards, not a test suite.

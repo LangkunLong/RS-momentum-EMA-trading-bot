@@ -1,0 +1,235 @@
+from __future__ import annotations
+
+import ast
+import difflib
+import hashlib
+import json
+from pathlib import Path
+
+
+ROOT = Path.cwd()
+PACKAGE = ROOT / ".artifacts/pit-optimizer-v5/development/increment-c-history-h2"
+PREIMAGE = PACKAGE / "pre-h2a-production_sandbox.py"
+CURRENT = ROOT / "core/pit_optimizer_v5/production_sandbox.py"
+
+EXPECTED_HELPERS = {
+    "_require_history_control_ready_v5",
+    "_validate_history_cleanup_v5",
+    "_validate_history_control_binding_v5",
+    "_validate_history_control_completion_v5",
+    "_validate_history_output_length_v5",
+    "_validate_history_panel_v5",
+    "_validate_history_phases_v5",
+    "_validate_history_reservation_v5",
+    "_validate_history_terminal_v5",
+}
+EXPECTED_CHANGED_METHODS = {
+    "LocalContainerExecutorV5._authenticate_control_history_read_only",
+    "LocalContainerExecutorV5.authenticate_execution_history",
+}
+EXPECTED_CALLS = {
+    "LocalContainerExecutorV5._authenticate_control_history_read_only": {
+        "_require_history_control_ready_v5",
+        "_validate_history_control_binding_v5",
+        "_validate_history_control_completion_v5",
+    },
+    "LocalContainerExecutorV5.authenticate_execution_history": {
+        "_validate_history_cleanup_v5",
+        "_validate_history_output_length_v5",
+        "_validate_history_panel_v5",
+        "_validate_history_phases_v5",
+        "_validate_history_reservation_v5",
+        "_validate_history_terminal_v5",
+    },
+}
+PURE_HELPER_CALLS = {
+    "ValueError",
+    "any",
+    "canonical_sha256_v5",
+    "derive_execution_lease_id_v5",
+    "len",
+    "tuple",
+}
+EFFECT_CALLS = {
+    "_authenticate_control_history_read_only",
+    "_authenticate_executable",
+    "_container_identity",
+    "_control_created",
+    "_control_record",
+    "_load_reservation",
+    "_phase",
+    "_terminal_record",
+    "acquire_absolute_directory_v5",
+    "acquire_directory_v5",
+    "authenticate_output_history",
+    "directory_child_absent_v5",
+    "directory_entry_names_v5",
+    "load_binary_state",
+    "load_typed_state",
+    "open_regular_in_directory_v5",
+}
+
+
+def sha256(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def definitions(raw: bytes) -> tuple[dict[str, bytes], dict[str, ast.AST], set[str]]:
+    tree = ast.parse(raw)
+    lines = raw.splitlines(keepends=True)
+    values: dict[str, bytes] = {}
+    nodes: dict[str, ast.AST] = {}
+    records: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            values[node.name] = b"".join(lines[node.lineno - 1 : node.end_lineno])
+            nodes[node.name] = node
+        elif isinstance(node, ast.ClassDef):
+            if node.name.endswith("RecordV5"):
+                records.add(node.name)
+                values[node.name] = b"".join(lines[node.lineno - 1 : node.end_lineno])
+                nodes[node.name] = node
+            for child in node.body:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    name = f"{node.name}.{child.name}"
+                    values[name] = b"".join(lines[child.lineno - 1 : child.end_lineno])
+                    nodes[name] = child
+    return values, nodes, records
+
+
+def helper_calls(nodes: dict[str, ast.AST]) -> dict[str, list[str]]:
+    result: dict[str, list[str]] = {}
+    for name, node in nodes.items():
+        calls = sorted(
+            {
+                child.func.id
+                for child in ast.walk(node)
+                if isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Name)
+                and child.func.id in EXPECTED_HELPERS
+            }
+        )
+        if calls:
+            result[name] = calls
+    return result
+
+
+def call_name(node: ast.Call) -> str | None:
+    if isinstance(node.func, ast.Name):
+        return node.func.id
+    if isinstance(node.func, ast.Attribute):
+        return node.func.attr
+    return None
+
+
+def lexical_calls(node: ast.AST, selected: set[str]) -> list[str]:
+    result: list[str] = []
+
+    class Calls(ast.NodeVisitor):
+        def visit_Call(self, child: ast.Call) -> None:
+            name = call_name(child)
+            if name in selected:
+                result.append(name)
+            self.generic_visit(child)
+
+    Calls().visit(node)
+    return result
+
+
+pre_raw = PREIMAGE.read_bytes()
+current_raw = CURRENT.read_bytes()
+pre_values, pre_nodes, pre_records = definitions(pre_raw)
+current_values, current_nodes, current_records = definitions(current_raw)
+
+pre_names = set(pre_values)
+current_names = set(current_values)
+new_definitions = current_names - pre_names
+removed_definitions = pre_names - current_names
+changed_existing = {
+    name for name in pre_names & current_names if pre_values[name] != current_values[name]
+}
+protected = pre_names - EXPECTED_CHANGED_METHODS
+protected_mismatches = sorted(
+    name for name in protected if current_values.get(name) != pre_values[name]
+)
+record_mismatches = sorted(
+    name for name in pre_records if current_values.get(name) != pre_values[name]
+)
+calls = helper_calls(current_nodes)
+helper_non_pure_calls = {
+    name: sorted(
+        {
+            called
+            for child in ast.walk(current_nodes[name])
+            if isinstance(child, ast.Call)
+            and (called := call_name(child)) is not None
+            and called not in PURE_HELPER_CALLS
+        }
+    )
+    for name in EXPECTED_HELPERS
+}
+helper_self_references = {
+    name: any(isinstance(child, ast.Name) and child.id == "self" for child in ast.walk(current_nodes[name]))
+    for name in EXPECTED_HELPERS
+}
+effect_sequences = {
+    name: {
+        "before": lexical_calls(pre_nodes[name], EFFECT_CALLS),
+        "after": lexical_calls(current_nodes[name], EFFECT_CALLS),
+    }
+    for name in EXPECTED_CHANGED_METHODS
+}
+
+checks = {
+    "new_definitions_are_exact_helpers": new_definitions == EXPECTED_HELPERS,
+    "no_definitions_removed": not removed_definitions,
+    "only_designated_existing_methods_changed": changed_existing == EXPECTED_CHANGED_METHODS,
+    "all_other_functions_and_methods_byte_identical": not protected_mismatches,
+    "all_record_schemas_byte_identical": pre_records == current_records and not record_mismatches,
+    "helper_calls_exist_only_at_designated_sites": calls
+    == {name: sorted(value) for name, value in EXPECTED_CALLS.items()},
+    "helpers_have_only_pure_allowlisted_calls": not any(helper_non_pure_calls.values()),
+    "helpers_do_not_capture_executor_self": not any(helper_self_references.values()),
+    "effectful_read_call_order_is_unchanged": all(
+        item["before"] == item["after"] for item in effect_sequences.values()
+    ),
+    "preimage_is_crlf_only": b"\n" not in pre_raw.replace(b"\r\n", b""),
+    "current_is_crlf_only": b"\n" not in current_raw.replace(b"\r\n", b""),
+}
+evidence = {
+    "checks": checks,
+    "pass": all(checks.values()),
+    "preimage_sha256": sha256(pre_raw),
+    "current_sha256": sha256(current_raw),
+    "preimage_bytes": len(pre_raw),
+    "current_bytes": len(current_raw),
+    "new_definitions": sorted(new_definitions),
+    "removed_definitions": sorted(removed_definitions),
+    "changed_existing_definitions": sorted(changed_existing),
+    "protected_definition_count": len(protected),
+    "protected_mismatches": protected_mismatches,
+    "record_schema_count": len(pre_records),
+    "record_schema_mismatches": record_mismatches,
+    "helper_call_sites": calls,
+    "helper_non_pure_calls": helper_non_pure_calls,
+    "helper_self_references": helper_self_references,
+    "effectful_read_call_sequences": effect_sequences,
+}
+(PACKAGE / "h2a-static-verification.json").write_text(
+    json.dumps(evidence, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+
+pre_lines = pre_raw.decode("utf-8").splitlines(keepends=True)
+current_lines = current_raw.decode("utf-8").splitlines(keepends=True)
+diff = difflib.unified_diff(
+    pre_lines,
+    current_lines,
+    fromfile="a/core/pit_optimizer_v5/production_sandbox.py.pre-h2a",
+    tofile="b/core/pit_optimizer_v5/production_sandbox.py",
+)
+(PACKAGE / "h2a-source.diff").write_text("".join(diff), encoding="utf-8", newline="")
+
+print(json.dumps(evidence, indent=2, sort_keys=True))
+if not evidence["pass"]:
+    raise SystemExit(1)

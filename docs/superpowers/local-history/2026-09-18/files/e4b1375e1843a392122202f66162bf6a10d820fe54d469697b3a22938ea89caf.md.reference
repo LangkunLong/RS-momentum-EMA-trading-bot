@@ -1,0 +1,83 @@
+### Task 2: Build the SEC Security Master and Filing-Time Fundamentals
+
+**Files:**
+- Create: `core/sec_pit_fundamentals.py`
+- Create: `fetch_sec_pit_fundamentals.py`
+
+**Interfaces:**
+- Consumes: SEC `submissions.zip`, `companyfacts.zip`, `security_names.csv`, and `membership.csv`.
+- Produces: `build_security_master(...) -> SecurityMasterResult` and `extract_fundamentals(...) -> FundamentalExportResult`.
+- Produces: strict `fundamentals.csv` with the exact header already required by `build_pit_bundle.py`.
+- Produces: `security_master.csv`, `fundamentals_provenance.json`, and `fundamentals_coverage.json`.
+
+- [ ] **Step 1: Add SEC archive acquisition with provenance**
+
+Download only these official URLs:
+
+```text
+https://www.sec.gov/Archives/edgar/daily-index/bulkdata/submissions.zip
+https://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip
+```
+
+Use a user-agent containing the project name and operator contact configured through `--sec-user-agent`. Enforce at most five requests per second, a 30-second request timeout, and a caller-supplied maximum byte limit. Write each archive once and record URL, retrieval UTC, byte length, and SHA-256.
+
+- [ ] **Step 2: Resolve historical tickers to CIKs**
+
+Scan submissions metadata for current and former ticker symbols and names. Produce `security_master.csv` with:
+
+```text
+ticker,cik,company_name,first_membership_date,last_membership_date,mapping_basis
+```
+
+Require one CIK per ticker/date interval. If two issuers reused a ticker, split the intervals by membership dates. Unresolved or ambiguous mappings are written to `security_master_exclusions.csv` with a closed reason; they are never assigned by fuzzy name matching.
+
+- [ ] **Step 3: Extract accession-aware facts**
+
+For each resolved CIK, collect these US-GAAP concepts where present:
+
+```text
+EarningsPerShareBasic
+EarningsPerShareDiluted
+Revenues
+RevenueFromContractWithCustomerExcludingAssessedTax
+NetIncomeLoss
+CommonStockValue
+StockholdersEquity
+EntityCommonStockSharesOutstanding
+```
+
+Keep accession number, form, period end, filed date, fiscal year, and fiscal period while normalizing. Resolve alternative revenue concepts by a fixed priority list, not by taking the largest value.
+
+- [ ] **Step 4: Derive conservative public dates**
+
+Join company facts to submission acceptance timestamps by accession number. Set the normalized `public_date` to the first SPY trading day strictly after `acceptanceDateTime`; when acceptance time is unavailable, use the first SPY trading day after `filed` and increment `filed_date_fallback_count` in provenance.
+
+Retain amended facts as later rows with later public dates. Never rewrite the earlier record. Convert 10-Q facts to `quarterly`, 10-K facts to `annual`, equity/share facts to `balance`, and leave institutional fields blank.
+
+- [ ] **Step 5: Write strict fundamentals and coverage outputs**
+
+The CLI accepts:
+
+```text
+--membership-csv PATH
+--security-names-csv PATH
+--spy-trading-days-csv PATH
+--start-date 2020-01-01
+--end-date 2025-12-31
+--sec-user-agent TEXT
+--output-dir PATH
+```
+
+Write the exact `build_pit_bundle.py` fundamentals header and sort by ticker, statement type, public date, and period end. Report resolved CIK percentage, symbols with quarterly/annual/balance data, accession joins, fallback dates, and exclusions.
+
+- [ ] **Step 6: Perform the first functional SEC extraction**
+
+Run the CLI once against the membership union. Inspect `fundamentals_coverage.json` before proceeding. Required result: at least 95% of membership-union tickers resolve to a CIK or have an explicit exclusion reason; no record has `public_date <= period_end` unless the form legitimately reports an instantaneous balance fact after the period end normalization rule.
+
+- [ ] **Step 7: Commit SEC extraction**
+
+```powershell
+git add core/sec_pit_fundamentals.py fetch_sec_pit_fundamentals.py
+git commit -m "feat: extract SEC point-in-time fundamentals"
+```
+

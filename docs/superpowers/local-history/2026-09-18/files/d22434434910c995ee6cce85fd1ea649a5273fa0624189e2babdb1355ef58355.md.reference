@@ -1,0 +1,11 @@
+# Scoped Docker 29 running-state review
+
+**PASS.** No concrete finding in the three-line follow-up. Spec and quality pass for this normalization.
+
+Read `docker29-running-report.md`, the relevant source checks, and the saved running inspection's state and OOM configuration. The latter reports `Status=running`, `Running=true` and explicit `HostConfig.OomKillDisable=null`. Source SHA-256 independently matches `354ad9280086748a6945a413a42d3acf4597349d4983906e399de280902af759`.
+
+At `core/pit_optimizer_v5/production_sandbox.py:2714-2716`, only an explicit null OomKillDisable value normalizes to False. This represents the absent disable override and retains normal kernel OOM handling; it does not authorize disabling the OOM killer. Explicit True is not normalized and still fails the final host-authority comparison with expected False. OomKillDisable remains absent from the omitted-default allowlist, so a missing key fails the preceding closed-field check. Unknown fields and other host security/resource checks are unchanged.
+
+Both the already accepted created-state False and the observed running-state null yield the same canonical host value False. Consequently this field no longer changes the stable attestation at startup. The change does not rewrite existing container identities or frozen terminal failures, and it does not itself perform cleanup or retry an evaluation.
+
+The previously reviewed Docker 29 compatibility diff was not reopened. This is static review of the follow-up, not a successful live inspection or cleanup claim. No tests were read, created or run; no probes, imports/application execution, Docker, network, agents, staging or commits occurred. Only this report was written. Actual inspection and cleanup remain controller-owned.

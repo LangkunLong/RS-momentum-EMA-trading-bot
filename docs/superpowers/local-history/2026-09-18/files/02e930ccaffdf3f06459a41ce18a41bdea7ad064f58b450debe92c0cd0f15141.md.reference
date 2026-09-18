@@ -1,0 +1,97 @@
+# B3b implementation checkpoint
+
+Status: DONE_WITH_CONCERNS. B3b source changes are complete for architect review. New rejection append/load and publication branches were reviewed statically only; no durable rejection event exists in the authorized archived inputs. B4 activation and the two evaluated feedback rounds remain pending.
+
+## Scope and changed symbols
+
+- `core/pit_optimizer_v5/artifacts.py`: added `LocalArtifactRepositoryV5._load_experiment_event_reference` and the single shared `LocalArtifactRepositoryV5._validate_experiment_render_rejection_binding`; called that validator from `append_experiment` before create-only persistence and `load_experiment` after canonical record authentication.
+- `core/pit_optimizer_v5/runtime.py`: changed only `_Runtime._publish`: explicit candidate union, cheap type/identity/status checks before persistence, and a typed materialized-candidate map populated only for evaluated/zero_trade records. Existing record, archive reducer, checkpoint ordering and archive eligibility filtering remain intact.
+- `implementation.diff` contains only this increment's differences against the saved preimages, with repo-relative source labels. Exact preimages were provided by the architect, their hashes were confirmed, and they were not overwritten.
+
+The executing-plans skill supplied the checkpoint workflow. The explicit task restrictions supersede its generic testing, delegation, integration and worktree-creation steps. The existing isolated worktree and branch were verified; no additional worktree was created.
+
+## Authentication call graph and error handling
+
+Append: `append_experiment` -> existing authentication of every artifact ref -> existing critic binding -> shared render-rejection binding -> `_create_only` record persistence.
+
+Load: `load_experiment` -> existing record authentication, exact decode and canonical bytes/SHA checks -> existing critic binding -> the same shared render-rejection binding -> return.
+
+Shared binding: inspect all `events/` refs -> event helper -> repository `authenticate`, strict event decoder, canonical bytes/SHA, safe campaign component and exact generated path -> route by decoded event kind. A reserved rendering code or a rejection event requires exactly one rejection event-file ref; `payloads/render_rejected/` substitution is explicitly rejected. Event routing is independent of record status. Every event ref is authenticated and decoded before routing, including non-rejection events; failures cannot select a legacy fallback.
+
+Strict branch: `load_round_events` for the decoded campaign/round -> existing journal file decoder, strict payload decoder, `fold_round_events_v5` and corrected B2 `_validate_render_rejection_context` -> exact sequence entry/bytes/hash comparison -> existing payload decoder -> unique prior intent and accepted author package -> full record binding. Current journal contents are authenticated, with no cleanup or critic completion requirement added for an open prefix. Full B2 hypothesis, bounded typed assignment, author binding, terminal-conflict and critic-exclusion checks are reused unchanged.
+
+No recursion: journal loading calls payload loading, B2 context validation and `load_role_invocation`; that invocation loads only role request, attempt, terminal authority, role artifact, and (for controller authority) its binary response. These readers do not load experiment records or checkpoints. No candidate execution recovery or other orphan-repair method is called by the new validator.
+
+Inherited readers: `load_experiment_journal` -> `load_experiment`; `_verify_record_refs` -> `load_experiment`; `recover_projection` -> checkpoint decode -> `_verify_record_refs` -> `load_experiment`. Projection publication also uses `_verify_record_refs`, and finalized-discovery graph verification uses `_verify_record_refs`. The existing raw `load_checkpoint`/`_load_checkpoint` accessor only authenticates checkpoint syntax and bytes; it does not independently validate record refs. Its existing behavior is unchanged. No checkpoint publication, repair or projection recovery was executed during verification.
+
+Repository read/authentication failures propagate without conversion or fallback. New decoded binding mismatches use sanitized `ValueError` on append, and `ArtifactSchemaFailureV5(record_reference)` on load. Existing strict-decoder, malformed-event and canonical-byte errors retain their repository failure conventions and references.
+
+As directed by the architect, ordinary non-event references are not newly authenticated on load: legacy append-time referenced-artifact authentication and load-time critic binding remain exactly in place. Only `events/` paths enter the event helper; ordinary legacy refs cause no historical journal loads. No broad content scan or new artifact schema was introduced.
+
+## Static invariant coverage (not executed cases)
+
+| Condition | Expected code path and result |
+| --- | --- |
+| Valid durable rejection authority | Exact event-file authentication and path, complete B2 journal validation, exact durable sequence/bytes/hash, then full record/intent/author/payload equality; open prefix is sufficient. |
+| Closed rendering code with no event | Strict route has zero rejection events and fails before persistence/return. |
+| Missing or malformed event bytes/path/schema | Event helper authenticates and decodes before checking event kind; repository errors propagate. Canonical decoded path mismatch is a binding failure. |
+| Standalone or wrong-journal event | Exact generated path plus `load_round_events` requires the contiguous authenticated chain, prior intent, accepted author and exact event at its sequence; standalone self-consistency cannot establish these authorities. |
+| Noncanonical/wrong-round path | Full path equality uses decoded campaign and integer formatting `:04d`/`:06d`; record round also equals event round; every returned journal event must match its campaign/round. |
+| Wrong template | Complete canonical template bytes and SHA must match the authenticated accepted author's template; B2 binds author request to intent. |
+| Wrong assignment, including bool versus int | Canonical typed assignment bytes must equal payload assignment; B2 verifies deterministic bounded membership and recomputes the identity. |
+| Wrong hypothesis | Complete hypothesis SHA equals intent hypothesis SHA; B2 independently binds the full author-input hypothesis hash. |
+| Wrong mode, scope, parent revision or parent fingerprint | Explicit comparisons to the unique prior intent in the same authenticated round. |
+| Wrong discovery plan or experiment identity | Complete pre-validation identity equals payload identity, ID equals event/payload identity, and discovery plan equals intent. |
+| Wrong status or altered validation code | Event routing does not depend on status; strict form requires invalid/pre-validation identity; validation must be exactly false, payload's closed code, and empty changed symbols. |
+| Payload-only substitution | A `payloads/render_rejected/` ref fails explicitly; it never serves as durable journal membership. |
+| Extra refs | Strict record refs must be exactly `(event_ref,)`. |
+| Forbidden downstream evidence | Existing `ExperimentRecordV5` invalid-record invariants still forbid policy revision, candidate semantic fingerprint, quick/campaign evidence, target gap, critic fields and discovery episodes. Schema decoding and normal construction retain these invariants. |
+| Eligible record paired with rejected carrier | `_publish` checks exact candidate type, matching full identity/status before appending any record; evaluated/zero_trade source candidates additionally require exact `CandidateEvidenceV5`. |
+| Invalid record publication | Invalid records remain in stored/history/checkpoint inputs but do not enter the typed source-candidate map or `ArchiveRecordAuthorityV5`; archive reducer filtering is unchanged. |
+| Legacy records without rendering authority | Existing append authentication/critic path and load critic path remain; no journal is loaded for ordinary references. Actual evaluated compatibility load passed below. |
+
+## Actual archived compatibility check
+
+Read-only repository: `.artifacts/pit-optimizer-v5/development/runtime-04`.
+
+Record: `records/9e2a2dfdf35ce55653a3b9ec0d39ce87740a69a940ad5f3e473fd38ea629390d.json`.
+
+SHA before and after: `af6c73e632a3dc47cb344ecf3d1a55f9f58ba3e755e29fe992e0c03d0da103ac`.
+
+Executed `LocalArtifactRepositoryV5.load_experiment` against that exact archived ref. Result: evaluated, round 1, four discovery episodes, complete authenticated critic binding, ordinary ref prefixes `adapter-state` and `payloads`. Authenticated bytes before/after matched each other and the decoded record's canonical bytes. No writes, campaign execution, provider calls or evidence regeneration occurred.
+
+## Allowed verification actually run
+
+- `py -3.13 -B -m ruff check core/pit_optimizer_v5/artifacts.py core/pit_optimizer_v5/runtime.py`: passed.
+- `py -3.13 -B -c` compiling both changed files with `compile(Path(...).read_bytes(), ..., 'exec')`: passed; no bytecode files or source execution for this check.
+- `git diff --check -- core/pit_optimizer_v5/artifacts.py core/pit_optimizer_v5/runtime.py`: passed. Git emitted only its existing LF-to-CRLF working-copy warnings.
+- `git diff --no-index` of each provided preimage against the corresponding final source: inspected; only the above symbols differ. Exit 1 denotes expected differences. The diff was also obtained with command-scoped `core.autocrlf=false` and `core.safecrlf=false` for the saved patch, without changing configuration.
+- `Get-FileHash ... -Algorithm SHA256`: confirmed both preimages/starting sources and all final/untouched source hashes listed below.
+- `py -3.13 -B -c` calling existing `evaluator_source_map_v5(Path.cwd())` and `evaluator_source_sha256`: 56 covered files and identity `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4`, matching the architect's approved starting identity. No evaluator was rebuilt.
+- `py -3.13 -B -c` loading/authenticating only the named runtime-04 record as described above: passed.
+- Read-only `Get-Content`/`rg` inspection was limited to the binding requirements, approved review/plan, applicable skill instructions and relevant production symbols. Git worktree/branch checks confirmed `codex/pit-optimizer-v5-architecture`. One initial read/search command failed at PowerShell parsing because shell brace expansion was unsupported; it was corrected and made no changes.
+
+No tests were read, written or run. No synthetic records, events, responses or probes were created. No APIs, models, credentials, evaluations, campaign start/resume, evaluator rebuild, commit, push or deployment occurred. The independent static review is recorded separately in `task-review.md`.
+
+## Exact final source hashes
+
+| File | SHA256 |
+| --- | --- |
+| artifacts.py | `33a124043338d834fe3b60508b533c777df5c4fefbbdfb52ac812ab5eda0ca4f` |
+| runtime.py | `1c4c4dd2a3c7082982866e6ed820336e5afeb9755b0005fb80e65224bcc0d462` |
+| production_runtime.py (unchanged B3a/A) | `78da0dc5efcf5cf94541a465e0a3c212221c843dade07f680ddc5e1508fdc476` |
+| memory.py (unchanged B2) | `99e084eeff284d39a651e899e9562780e2581eb936ce7ff1f3f0542ed7b523aa` |
+| rendering.py (unchanged B1/B2 helper) | `bd726b9a32ddaf675a9883aade2099747a8682ab6be5f36d465de77542e93464` |
+| provider.py (unchanged) | `d9b17d62a6c8b485ba6ae6abb22a9e87f9d908b3c96409ba6e21f86eb691e937` |
+| contracts.py (unchanged) | `5ec3278af501f4abf285716bbd4d211fe5cd34c873e1644b63e3d43daa3de398` |
+| candidate_ir.py (unchanged) | `a437d9536fb57d48c7e9c9c6fab2f8a29ac9bea0666be61caeb2baf583b13f1b` |
+
+Preimage hashes: artifacts.py `135e006e892c6f32221d542bf5b9150c379d1a37713b3aa0e80307fe444174e1`; runtime.py `d331fd540b84a8bad160bd2dd85dc4a01803362511668503411eb7f44abd17df`.
+
+## Limitations and B4 boundary
+
+New rejection record append/load and `_publish` union branches are statically reviewed, not executed. The historical evaluated load proves only legacy compatibility. No fabricated case was used to claim stronger coverage.
+
+The new event-reference check uses exact canonical integer formatting, including values wider than the minimum widths. Existing `load_round_events` still accepts only six-digit sequence filenames; this inherited B2 limit is unchanged and would fail closed for sequences above 999999. No journal format/replay change was made in B3b.
+
+`_verify_finalized_discovery_rounds` still compares candidate IDs with rendered_variant-only IDs and requires investigator/author/critic completion. `_completed_result` and recovery retain critic assumptions. B4 must support legitimate rejection-inclusive/rejection-only closure while preserving all authority checks and mandatory critic for testable records. Strict rendering activation, `no_testable_experiments`, critic requests, completion/recovery, cleanup and feedback remain untouched. This checkpoint does not claim that the end-to-end rejected lifecycle works, and does not complete either outstanding evaluated feedback round.

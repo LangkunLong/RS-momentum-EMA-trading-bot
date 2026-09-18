@@ -1,0 +1,109 @@
+# Task 2 report — separate V5 policy and experiment identity
+
+## Outcome
+
+Implemented the pure V5 source/template/assignment IR and separated stable policy revision identity
+from evaluation-bound experiment identity. No tests were created, modified, or expanded.
+
+The Task 2 review corrections now bind every authoritative experiment to exactly one value from
+each declared template axis, using strict primitive-type equality, and encode a pre-validation
+failure as a distinct typed identity. The normal `ExperimentIdentityV5` can no longer carry a null
+policy revision.
+
+Focused review-fix commit: `468e6c9` (`fix: bind v5 experiment identity contracts`).
+
+Source scope:
+
+- Created `core/pit_optimizer_v5/candidate_ir.py`.
+- Modified `core/pit_optimizer_candidate.py` only to extract the panel-independent
+  `validate_policy_source_ast()` parse/compile/public-export service. The legacy
+  `validate_policy_ast()` now wraps that service before applying every existing V2/V4 language
+  rule. No `CandidateIdentity` or `CandidateIdentityV4` field, primitive, digest, seal, derivation,
+  or serialization path changed.
+
+## Implemented contracts
+
+- Added the exact frozen, slotted IR records from the brief:
+  `PolicyRevisionIdentityV5`, `LiteralAxisV5`, `SourceFileV5`, `SourceBundleV5`,
+  `SourceOperationV5`, `VariantAssignmentV5`, `StructuralTemplateV5`, `RenderedVariantV5`, and
+  `ExperimentIdentityV5`.
+- `PolicyRevisionIdentityV5.sha256` hashes only policy interface V3, the trusted policy-runtime
+  digest, immutable-constraint digest, and the canonical ordered digest tuple for all four exact
+  UTF-8 source byte strings. Parent, hypothesis, template, assignment, panel, discovery plan, and
+  round are deliberately absent.
+- `derive_policy_revision_identity_v5()` accepts only a complete `SourceBundleV5`; a source-byte
+  change therefore changes the revision while identical source remains stable across evaluation
+  panels and rounds.
+- `ExperimentIdentityV5.sha256` binds the required validated policy revision, parent revision,
+  complete hypothesis identity, complete template identity, complete assignment identity,
+  positive round, and discovery-plan identity. Direct construction with a null policy revision is
+  rejected.
+- `derive_experiment_identity_v5()` is a post-validation constructor and requires an actual V5
+  policy revision. It derives hypothesis/template/assignment digests from the typed objects and
+  rejects mismatched template lineage. Both it and the pre-validation-invalid factory require
+  assignment names to exactly equal the template axes and every assigned value to occur in its
+  axis using type-exact membership; unrelated, missing, extra, wrong-typed, and out-of-range values
+  fail before the validated template and assignment digests are bound.
+- `derive_pre_validation_invalid_experiment_identity_v5()` returns the explicit frozen/slotted
+  `PreValidationInvalidExperimentIdentityV5` type. Its null policy field is not an initializer
+  argument, and `validate_post_validation_experiment_identity_v5()` accepts only the non-null
+  `ExperimentIdentityV5` type with the exact validated revision.
+- Source bundles require the exact ordered four-path V5 scope and complete modules with exact
+  public functions. Source text is exact nonempty UTF-8/LF text ending in LF; no source
+  normalization occurs before hashing.
+- Normal source operations are whole authorized public-function or uppercase-constant
+  replacements. Operations are unique through scope validation and canonically ordered by the
+  fixed V5 path order and symbol. Arbitrary patch hunks are not represented.
+- Structural templates enforce exactly one authoring mode: nonempty normal operations or the
+  atomic ordered four-file full-source escape. Changed symbols are nonempty, unique, sorted,
+  authorized by `policy_scope.py`, exact for normal operations, and present in full-source
+  replacements.
+- Axes and assignments use only exact `bool`, `int`, finite `float`, or `str` primitives. Typed
+  uniqueness and template membership deliberately distinguish `bool` from `int`; axes and
+  assignment names are unique and sorted.
+- Rendered variants require their policy revision's four source digests to exactly match the
+  rendered bundle.
+
+## Verification evidence
+
+All commands ran from the isolated Task 2 worktree.
+
+1. A pre-fix direct smoke reproduced both review findings:
+   `RED_SMOKE_REPRODUCED invalid_assignments=2 direct_null=accepted`.
+2. The post-fix direct smoke exercised valid binding plus unrelated, missing, extra, wrong-typed,
+   and out-of-range assignments through both factories, direct null construction, the typed
+   post-validation boundary, and canonical valid serialization:
+   `V5_P1_SMOKE_OK assignment_rejections=10 direct_null_rejected=1 typed_invalid_rejected_post=1 canonical_valid_digest=1`.
+3. A direct before/after module comparison confirmed byte-identical canonical primitives and
+   digests for both an existing valid experiment and the typed pre-validation-invalid replacement:
+   `V5_DIGEST_COMPAT_SMOKE_OK valid=1 pre_validation_invalid=1`.
+4. The original deterministic in-memory V5 smoke (no test file created):
+   `V5_IDENTITY_SMOKE_OK source_change=1 panel_change=1 round_change=1 null_rejected=2 strict_literals=1 scope=4`.
+   It covered stable identical-source identity, a valid one-byte source change, panel-plan and
+   round experiment changes, two post-validation null-revision rejection paths, exact four-file
+   path order, positive round indexing, and strict bool/int literal distinction.
+5. The planned command
+   `python -B -m pytest tests/test_pit_optimizer_v5_domain.py -k "identity or template" -q`
+   could not run because that test file does not exist in the current Task 2 worktree; the earlier
+   attempt reported `file or directory not found`, and the review-fix pass reconfirmed its absence.
+6. Focused legacy identity compatibility, rerun after the review corrections:
+   `python -B -m pytest tests/test_pit_optimizer_v2.py::test_candidate_identity_is_git_derived_and_author_manifest_must_match tests/test_pit_optimizer_v2.py::test_candidate_identity_rejects_direct_unsealed_construction -q`
+   — `2 passed`.
+7. A broader read-only legacy identity run produced `34 passed, 2 failed`. Both failures are the
+   existing expectations that V4 complete-source input reject CRLF and a missing final LF;
+   unchanged `AuthorSourceFile.from_source()` instead canonicalizes those inputs before the
+   candidate validator. The extracted AST service is not on that normalization decision path and
+   the focused V4 derivation/sealing compatibility checks pass.
+8. Existing relevant evaluator/holdout checks, rerun after the review corrections:
+   `python -B -m pytest tests/test_pit_optimizer_subset_reference.py tests/test_pit_optimizer_holdout.py -q`
+   — `6 passed`.
+9. `python -B -m ruff check core/pit_optimizer_v5/candidate_ir.py` — `All checks passed!`.
+10. `python -B -m py_compile core/pit_optimizer_v5/candidate_ir.py` — exit code 0.
+11. `git diff --check` passed. The V5 pure-domain boundary audit found no provider, Docker,
+   subprocess, Git, filesystem-I/O, or CLI implementation in `candidate_ir.py`.
+12. The commit hooks passed Ruff, trailing-whitespace, final-newline, YAML, and merge-conflict
+    checks; the post-commit worktree is clean and the committed diff check passes.
+
+Pytest emitted only the repository's existing `websockets.legacy` deprecation and sandbox-denied
+pytest-cache warnings. No provider calls, Docker evaluation, market-data access, qualification,
+replay, push, or merge were performed.

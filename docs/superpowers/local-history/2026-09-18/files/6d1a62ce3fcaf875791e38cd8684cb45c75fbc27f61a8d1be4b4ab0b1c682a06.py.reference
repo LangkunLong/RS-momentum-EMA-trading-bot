@@ -1,0 +1,118 @@
+"""Read-only actual06 inspection for the B2 authority corrections."""
+
+from pathlib import Path
+import sys
+
+
+SOURCE_ROOT = Path.cwd().resolve()
+if not (SOURCE_ROOT / "core").is_dir():
+    raise ValueError("run this verification from the source worktree")
+sys.path.insert(0, str(SOURCE_ROOT))
+
+from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5
+from core.pit_optimizer_v5.candidate_ir import (
+    StructuralTemplateV5,
+    derive_pre_validation_invalid_experiment_identity_v5,
+)
+from core.pit_optimizer_v5.contracts import ArtifactRefV5, canonical_json_bytes_v5
+from core.pit_optimizer_v5.manifest import authenticate_campaign_manifest_v5
+from core.pit_optimizer_v5.memory import RoleCompletionPayloadV5, RoundIntentPayloadV5
+from core.pit_optimizer_v5.provider import AuthorRoleInputV5
+from core.pit_optimizer_v5.rendering import bounded_variant_assignments_v5
+
+
+ARTIFACT_ROOT = (SOURCE_ROOT / ".artifacts/pit-optimizer-v5/development/provider-runtime-06").resolve()
+PACKAGE = (SOURCE_ROOT / ".artifacts/pit-optimizer-v5/development/luna-recovery-b2-correction").resolve()
+MANIFEST_REF = ArtifactRefV5(
+    "campaigns/development-provider-two-rounds-20260907-06/manifest.json",
+    "d90ed717c0d6b34d4cfa6bf7e2dd1f753e68c43b1127b200a66d2a9f930dfdf6",
+)
+AUTHOR_REQUEST_SHA256 = "09564719a54cfd10a0b6edbc5b61996e7a68015866f1e0b538859c542d158c0f"
+AUTHOR_ARTIFACT_REF = ArtifactRefV5(
+    "roles/artifacts/author/98445c0e22a90e95482d40a77706b77780d2dd1e8e097092a81f9363c020e9f7.json",
+    "ad979279cdf09db2bd4ee6250d7b40103db2f5b89749e898dcd6ac234d5f06f2",
+)
+
+
+def _write_exclusive(name: str, value: object) -> None:
+    with (PACKAGE / name).open("xb") as handle:
+        handle.write(canonical_json_bytes_v5(value))
+
+
+def main() -> None:
+    repository = LocalArtifactRepositoryV5(ARTIFACT_ROOT)
+    authenticated = authenticate_campaign_manifest_v5(repository=repository, manifest_ref=MANIFEST_REF)
+    events = repository.load_round_events(
+        campaign_id=authenticated.manifest.campaign_id,
+        round_index=1,
+    )
+    payloads = tuple(repository.load_round_payload(event.payload_ref, expected_kind=event.event_kind) for event in events)
+    intents = tuple(item for item in payloads if type(item) is RoundIntentPayloadV5)
+    authors = tuple(
+        item for item in payloads if type(item) is RoleCompletionPayloadV5 and item.role == "author"
+    )
+    critics = tuple(
+        item for item in payloads if type(item) is RoleCompletionPayloadV5 and item.role == "critic"
+    )
+    if len(intents) != 1 or len(authors) != 1:
+        raise ValueError("actual06 lacks exact intent/author journal context")
+    intent = intents[0]
+    author_completion = authors[0]
+    if (
+        author_completion.outcome != "accepted"
+        or author_completion.request_sha256 != AUTHOR_REQUEST_SHA256
+        or author_completion.artifact_ref != AUTHOR_ARTIFACT_REF
+    ):
+        raise ValueError("actual06 author completion differs from its authenticated authority")
+    package = repository.load_role_invocation(author_completion)
+    template = package.artifact
+    author_input = package.request.role_input
+    if (
+        not package.accepted
+        or type(template) is not StructuralTemplateV5
+        or type(author_input) is not AuthorRoleInputV5
+        or author_input.hypothesis.sha256 != intent.hypothesis.sha256
+    ):
+        raise ValueError("actual06 complete author hypothesis does not match the round intent")
+    assignments = bounded_variant_assignments_v5(
+        template=template,
+        maximum=package.request.schema_authority.max_variants,
+    )
+    if len(assignments) != authenticated.manifest.search.max_variants_per_template:
+        raise ValueError("actual06 bounded assignment count differs from its authenticated cap")
+    identity = derive_pre_validation_invalid_experiment_identity_v5(
+        parent_revision_sha256=intent.parent_revision_sha256,
+        hypothesis=intent.hypothesis,
+        template=template,
+        assignment=assignments[0],
+        round_index=1,
+        discovery_plan_sha256=intent.discovery_plan_sha256,
+    )
+    _write_exclusive(
+        "actual06-correction-inspection.json",
+        {
+            "status": "actual_archived_input_read_only_inspection",
+            "provider_calls": 0,
+            "candidate_evaluations": 0,
+            "campaign_restarts": 0,
+            "synthetic_journal_events": 0,
+            "artifact_graph_verified": authenticated.graph.verified,
+            "round_event_kinds": [event.event_kind for event in events],
+            "render_rejected_event_count": sum(event.event_kind == "render_rejected" for event in events),
+            "critic_completion_count": len(critics),
+            "intent_hypothesis_sha256": intent.hypothesis.sha256,
+            "author_input_hypothesis_sha256": author_input.hypothesis.sha256,
+            "complete_hypotheses_match": True,
+            "accepted_author_request_sha256": author_completion.request_sha256,
+            "accepted_author_artifact_ref": author_completion.artifact_ref.to_primitive(),
+            "author_schema_maximum_variants": package.request.schema_authority.max_variants,
+            "bounded_assignment_sha256s": [item.sha256 for item in assignments],
+            "derived_pre_validation_experiment_id": identity.sha256,
+            "new_event_appended": False,
+            "note": "Actual06 has no render rejection or critic completion; the correction branches were not executed.",
+        },
+    )
+
+
+if __name__ == "__main__":
+    main()

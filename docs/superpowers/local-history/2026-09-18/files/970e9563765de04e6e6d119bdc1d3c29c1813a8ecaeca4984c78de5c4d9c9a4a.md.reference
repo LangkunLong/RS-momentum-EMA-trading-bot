@@ -1,0 +1,95 @@
+# PIT Optimizer V5 final whole-branch review findings
+
+Review range: `8dcce58104b4a933b1523b76dd79299d69fb658b..5a56874cc762831ab6997f4d550fa12f5c43d3cc`
+
+The final review verdict was **not ready to merge**. The single final fix wave must address every
+Critical and Important item below, and should close the listed minors when those surfaces are
+already touched. The user ruling remains: do not add or run tests; use deterministic direct fakes,
+compile/lint/import/diff checks, and no live provider/Docker/Git/data/network/replay work.
+
+## Critical
+
+1. **Typed raw campaign data edges.** `verify_graph()` visits the real PIT SQLite bundle and prices
+   provenance as generic canonical JSON. The manifest requires the bundle reference digest to equal
+   the actual SQLite bytes, so a real bundle cannot pass readiness. Add closed typed raw-byte graph
+   edges authenticated by exact bytes/digest without JSON parsing/reference extraction. Preserve the
+   existing explicit prices-provenance codec and do not normalize raw bytes. Selection of raw codecs
+   must come only from strictly decoded manifest/plan authority, never filename or caller type.
+
+2. **Causal scale-out execution.** V5 after-close exit logic observes the completed close and then
+   fills `scale_out` at an earlier intraday tier price from that same bar. Execute close-derived
+   scale-out decisions at the next eligible open (the controller ruling), with the same truthful
+   transition authentication as close exits. Do not allow completed-bar information to choose a
+   historical intraday fill.
+
+## Important
+
+3. **Wire-safe role messages.** Internal role-request content is a frozen typed mapping, but the
+   OpenAI/OpenRouter chat transport accepts text or typed content parts. At the gateway boundary,
+   convert the already authenticated internal envelope to canonical JSON text and plain transport
+   dictionaries. Preserve internal request identity and never leak additional fields.
+
+4. **Durable scheduling cursor.** A `no_novel_hypothesis` outcome currently computes only an advanced
+   state digest, writes no checkpoint, and recovery reconstructs only from finalized experiments.
+   Persist and authenticate a separate full scheduling cursor/state chain for terminal scheduling
+   outcomes, independent of checkpoint-authorized archive promotion. Round N+1 must advance after a
+   no-novel result and `novelty_exhausted` must arise only after the reconstructible parent pool is
+   exhausted. Resume of N remains idempotent.
+
+5. **Lineage-aware investigator memory and batch feedback.** Replace arbitrary
+   `stored_records[-12:]` with the implemented selected-parent lineage projector under an explicit
+   byte budget. Preserve mandatory parent/ancestor evidence. Load authenticated batch critic
+   `comparative_assessment` and `next_campaign_direction` with real supporting evidence; do not lose
+   campaign-level feedback after one round.
+
+6. **Causal critic evidence and usable author contracts.** Supply bounded symbol-neutral parent
+   deltas and existing activity/exposure/expectancy/excursion/friction/exit/regime diagnostics to
+   the critic, plus actual bounded semantic trace differences rather than only a count. Expand the
+   authenticated authoring contract to describe the usable V3 snapshot/decision surface and
+   invariants needed to write valid strategy code; identity/scope digests alone are insufficient.
+
+7. **Prospective token/USD authority.** The current provider checks caps only against prior usage,
+   then detects overspend after the paid call. Reserve a conservative authenticated input + maximum
+   output token bound before dispatch. For finite USD ceilings, add an authenticated per-model price
+   upper-bound authority and reserve the worst-case cost; fail closed when a finite ceiling lacks
+   such authority. Unlimited/no-USD-ceiling campaigns remain unrestricted. Actual receipts settle
+   against the reservation; no automatic retries are introduced.
+
+8. **Truthful summary state.** Later `summarize`/`verify-run` must inspect authenticated terminal
+   outcome kind and never relabel `runtime_failed` plus successful cleanup as `completed`. Cleanup
+   success remains an independent field.
+
+9. **Live provider deadline.** Carry the remaining authenticated role/round deadline through the
+   one-shot transport and enforce it during the network call. Do not silently use the gateway's
+   fixed 30-second default when the manifest grants a different bounded duration.
+
+## Minors to close where touched
+
+10. Compute reported best performance with authenticated baseline fallback/champion selection.
+11. Deduplicate behaviorally equivalent sibling variants before expensive quick evaluation.
+12. Treat full-source escape permission as permission, not automatic activation; normal edits should
+    send only their intended policy scope.
+13. Make full-source structural escape capable of introducing validator-permitted helper functions
+    and constants while preserving closed imports/API exports, or precisely document and surface a
+    typed unsupported outcome. Prefer implementation because adaptive strategy authoring needs it.
+
+## Plan/documentation corrections and accepted deferrals
+
+- Update the stale missing-critic paragraph in the learning-search plan to match the ledger ruling:
+  preserve authenticated precritic evidence, emit a typed critic-unavailable outcome, create no
+  finalized experiment record, and do not mutate archive/checkpoint promotion authority.
+- Update provider design text/contracts to include the new prospective price/token reservation
+  authority for finite ceilings.
+- `import-v4-candidate` remains an explicitly acknowledged campaign-stage fail-closed deferral.
+- The no-tests ruling supersedes the plan's test-writing steps; no test addition is required here.
+
+## Final fix-wave rulings
+
+- Scale-outs chosen from after-close information execute at the next eligible open, not a prior
+  intraday target. Cost if wrong: simulated timing becomes conservative relative to precommitted
+  intraday orders, but cannot benefit from hindsight.
+- Raw-data codec privilege is granted only by exact typed manifest/plan edges. Cost if wrong: future
+  raw artifact kinds require an explicit codec addition rather than generic graph traversal.
+- A finite USD ceiling without authenticated model-price upper bounds fails before a call; `None`
+  remains truly unlimited. Cost if wrong: a finite-cost campaign may require config migration before
+  it can run, but cannot overspend silently.

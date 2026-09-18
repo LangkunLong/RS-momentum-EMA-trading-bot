@@ -1,0 +1,42 @@
+# SDD ledger — plan: docs/superpowers/plans/2026-09-07-pit-optimizer-v5-b4c-feedback.md
+
+## Preflight scope scan
+
+| Tasks / interface | Producer → consumer | Finding / ruling |
+| --- | --- | --- |
+| 1 → 2 | Authenticated checkpoint records and existing evidence citation lane → one cumulative investigator metric | Compatible. The plan fixes the metric ID, insertion point, error strings, and zero-count omission. |
+| 1 → 3 | Existing checkpoint records and cleanup map → additive ephemeral summary fields | Compatible. Summary reads authenticated records only after `verify_projection`; no durable schema or event changes. |
+| 2 → 4 | Rejection feedback helper → retained history / novelty review | Compatible. Helper reloads projection records but does not change memory, reducer, authorities, or selection. |
+| 3 → 5 | New summary counts → real archive before/after read-only comparisons | Compatible. The plan fixes definitions and requires only real repositories. |
+| 2 ↔ 3 | `production_runtime.py` request projection ↔ `summary.py` operator output | No shared production file or mutable interface. Both count only committed, authenticated reserved-code invalid records. |
+
+## Rulings
+
+- Ruling: use this required `luna-recovery-b4c` package as the durable execution ledger instead of the skill's ordinary `.superpowers/sdd` scratch workspace — the user explicitly requires this fresh review package and preservation of existing artifacts; cost if wrong is a nonstandard skill-artifact location, mitigated by keeping task reports, reviews, preimages, and final verification here.
+- Ruling: generic subagent workflow defaults to tests and commits are overridden by the plan and user constraints — neither is authorized; cost if wrong is narrower executable evidence, mitigated by independent static review, scoped Ruff/compilation, evaluator identity, and real archive summary projection.
+- Ruling: `development/STATUS-20260907.md` is absent in this worktree — rely on the current principal C1 verification and terminal actual06 artifacts for campaign state; cost if stale would be an unnoticed newer state, mitigated by the principal's current approved terminal verification and no campaign operation in this increment.
+
+## Task ledger
+
+| Task | Status | Scope / evidence |
+| --- | --- | --- |
+| Task 1 — capture boundary | complete | Exact preimages/hashes captured; provider citation lane, projection/recovery, repository authentication and summary seams read. |
+| Task 2 — rejection metric | complete | `production_runtime.py` only; fix round 1 restored protected CRLF bytes, and scoped re-review passed. |
+| Task 3 — progress counts | complete | `summary.py` only; independent review passed. |
+| Task 4 — retained history / novelty | complete | Read-only source trace confirms invalid records retain novelty/history while archive/source authority remains evaluated/zero-trade only. |
+| Task 5 — verification / handoff | complete — awaiting principal review | Static checks, evaluator identity, direct authenticated archive evidence, and review package complete. |
+
+Task 2 BASE: `a068e0aed40ecbe5e0078924071f374e7809b8c2` (recorded for provenance only; commits are prohibited).
+
+Task 2: fix round 1/5 in progress — restore exact preimage CRLF bytes on protected episode-loop lines; the helper/insertion logic passed review.
+
+Ruling: permit the Task 2 implementer to use one PowerShell byte-preserving mechanical source splice after `apply_patch` demonstrably normalized required CRLF bytes — rebuild only `production_runtime.py` from its exact captured preimage plus the already reviewed helper and metric insertions; cost if wrong is an unintended byte change, mitigated by exact preimage diff/AST/allowlist-byte comparison and scoped re-review before Task 3.
+
+Task 2: fix round 1/5 (P2 CRLF preservation addressed, 0 open; no commits permitted); scoped re-review PASS.
+Task 2: complete (no commits permitted, review clean after fix round 1).
+Task 3 BASE: `a068e0aed40ecbe5e0078924071f374e7809b8c2` (provenance only; commits are prohibited).
+Task 3: complete (no commits permitted, review clean).
+
+Ruling: do not bypass the existing foreign container-reservation verifier to force full summary results — it is an archive-environment authority boundary and the user prohibits credential/environment workarounds; cost if wrong is unavailable full summary before/after evidence, mitigated by recording the exact failure, using authenticated direct archive facts, and escalating the limit to the principal.
+Task 4: complete (read-only retained-history/novelty trace).
+Task 5: complete (no commits permitted; whole-increment review clean, with full-summary limitation explicitly retained for principal review).

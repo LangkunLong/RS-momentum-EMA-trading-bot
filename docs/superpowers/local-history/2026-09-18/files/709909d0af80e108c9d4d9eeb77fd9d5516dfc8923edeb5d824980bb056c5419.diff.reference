@@ -1,0 +1,4575 @@
+# Review package: b5034600d99c40eff13fa2f461808748d07b8e9c..f6124bc3d50ac067a92fbc1bcb88f9b0ffa08e71
+
+## Commits
+f6124bc feat: add feedback-driven PIT incumbent loop
+
+## Files changed
+ core/pit_optimization.py         |   45 +-
+ core/pit_optimizer_artifacts.py  |  187 ++++
+ core/pit_optimizer_controller.py | 2143 ++++++++++++++++++++++++++++++++++++++
+ core/pit_optimizer_evaluation.py |  127 +++
+ tests/test_pit_optimizer_loop.py | 1840 ++++++++++++++++++++++++++++++++
+ tests/test_pit_optimizer_v2.py   |   87 +-
+ 6 files changed, 4427 insertions(+), 2 deletions(-)
+
+## Diff
+diff --git a/core/pit_optimization.py b/core/pit_optimization.py
+index b8d0b22..9c0e907 100644
+--- a/core/pit_optimization.py
++++ b/core/pit_optimization.py
+@@ -9,37 +9,45 @@ import math
+ import os
+ import re
+ import secrets
+ import shutil
+ import stat
+ import sys
+ from dataclasses import asdict, dataclass
+ from pathlib import Path
+ from statistics import mean, median
+ from types import MappingProxyType
+-from typing import Callable, Iterable, Mapping, Sequence
++from typing import TYPE_CHECKING, Callable, Iterable, Mapping, Sequence
+ 
+ import pandas as pd
+ 
++if TYPE_CHECKING:
++    from core.pit_optimizer_controller import (
++        PitOptimizerReadiness,
++        PitOptimizerResult,
++        PitOptimizerServices,
++    )
++
+ from core.pit_optimization_contract import (
+     BASELINE_MANIFEST_SHA256,
+     BASELINE_SOURCE_COMMIT,
+     ENTRY_CONTRACT_PATH,
+     FULL_END_DATE,
+     FULL_START_DATE,
+     HOLDOUT_END_DATE,
+     HOLDOUT_START_DATE,
+     MAX_CANARY_CALLS,
+     MAX_CANARY_USD,
+     PIT_BUNDLE_SHA256,
+     OptimizationComparison,
+     OptimizationWindowMetrics,
++    PitOptimizerGateConfig,
+     PitOptimizationCoding,
+     PitOptimizationReasoning,
+     PitOptimizationRoute,
+     build_comparison,
+     candidate_catalog,
+     validate_coding_selection,
+     validate_policy_delta,
+     verify_catalog_source,
+ )
+ 
+@@ -3242,12 +3250,47 @@ def _worker_main(arguments: Sequence[str]) -> int:
+     return 0
+ 
+ 
+ def closed_window_metrics(window: Mapping[str, object]) -> OptimizationWindowMetrics:
+     performance = window.get("performance")
+     if not isinstance(performance, Mapping):
+         raise ValueError("optimization window lacks performance")
+     return OptimizationWindowMetrics.from_mapping(performance)
+ 
+ 
++def prepare_pit_optimizer_v2(
++    config: PitOptimizerGateConfig,
++    *,
++    source_root: Path,
++    artifact_root: Path,
++    permanent_runtime_root: Path,
++    source_head: str,
++    source_fingerprint_sha256: str,
++) -> PitOptimizerReadiness:
++    """Provider-free public adapter for schema-v2 readiness preparation."""
++
++    from core.pit_optimizer_controller import prepare_pit_optimizer_v2 as prepare
++
++    return prepare(
++        config,
++        source_root=source_root,
++        artifact_root=artifact_root,
++        permanent_runtime_root=permanent_runtime_root,
++        source_head=source_head,
++        source_fingerprint_sha256=source_fingerprint_sha256,
++    )
++
++
++def run_pit_optimizer_v2(
++    *,
++    readiness: PitOptimizerReadiness,
++    services: PitOptimizerServices,
++) -> PitOptimizerResult:
++    """Public adapter for the injected schema-v2 incumbent loop."""
++
++    from core.pit_optimizer_controller import run_pit_optimizer_v2 as run
++
++    return run(readiness=readiness, services=services)
++
++
+ if __name__ == "__main__":
+     raise SystemExit(_worker_main(tuple(sys.argv[1:])))
+diff --git a/core/pit_optimizer_artifacts.py b/core/pit_optimizer_artifacts.py
+new file mode 100644
+index 0000000..228e7a0
+--- /dev/null
++++ b/core/pit_optimizer_artifacts.py
+@@ -0,0 +1,187 @@
++"""Crash-safe, incremental local artifacts for the schema-v2 PIT optimizer."""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++from pathlib import Path
++import tempfile
++from typing import Mapping
++
++
++def canonical_json_bytes(value: Mapping[str, object]) -> bytes:
++    """Return the one canonical UTF-8 representation used by optimizer artifacts."""
++
++    return (
++        json.dumps(
++            value,
++            sort_keys=True,
++            separators=(",", ":"),
++            ensure_ascii=False,
++            allow_nan=False,
++        ).encode("utf-8")
++        + b"\n"
++    )
++
++
++def _write_all(handle: object, payload: bytes) -> None:
++    written = handle.write(payload)  # type: ignore[attr-defined]
++    if written != len(payload):
++        raise OSError("optimizer artifact write was incomplete")
++
++
++def _fsync_directory(path: Path) -> None:
++    if os.name == "nt":
++        return
++    descriptor = os.open(path, os.O_RDONLY)
++    try:
++        os.fsync(descriptor)
++    finally:
++        os.close(descriptor)
++
++
++def write_create_only_bytes(path: Path, payload: bytes) -> tuple[Path, str]:
++    """Create and fsync one artifact without permitting an overwrite."""
++
++    target = Path(path)
++    if not target.is_absolute() or target.parent.is_symlink() or not target.parent.is_dir():
++        raise ValueError("optimizer artifact target is invalid")
++    target = target.resolve(strict=False)
++    created = False
++    try:
++        with target.open("xb") as handle:
++            created = True
++            _write_all(handle, payload)
++            handle.flush()
++            os.fsync(handle.fileno())
++        _fsync_directory(target.parent)
++    except BaseException:
++        if created:
++            try:
++                target.unlink(missing_ok=True)
++            except OSError:
++                pass
++        raise
++    return target, hashlib.sha256(payload).hexdigest()
++
++
++def write_create_only_json(
++    path: Path,
++    value: Mapping[str, object],
++) -> tuple[Path, str]:
++    return write_create_only_bytes(Path(path), canonical_json_bytes(value))
++
++
++def atomic_replace_bytes(path: Path, payload: bytes) -> tuple[Path, str]:
++    """Fsync a sibling temporary file before atomically replacing an artifact."""
++
++    target = Path(path)
++    if not target.is_absolute() or target.parent.is_symlink() or not target.parent.is_dir():
++        raise ValueError("optimizer artifact replacement target is invalid")
++    target = target.resolve(strict=False)
++    descriptor, temporary_name = tempfile.mkstemp(
++        prefix=f".{target.name}.",
++        suffix=".tmp",
++        dir=target.parent,
++    )
++    temporary = Path(temporary_name)
++    try:
++        with os.fdopen(descriptor, "wb") as handle:
++            _write_all(handle, payload)
++            handle.flush()
++            os.fsync(handle.fileno())
++        os.replace(temporary, target)
++        _fsync_directory(target.parent)
++    finally:
++        temporary.unlink(missing_ok=True)
++    return target, hashlib.sha256(payload).hexdigest()
++
++
++def atomic_replace_json(
++    path: Path,
++    value: Mapping[str, object],
++) -> tuple[Path, str]:
++    return atomic_replace_bytes(Path(path), canonical_json_bytes(value))
++
++
++class IncrementalArtifactStore:
++    """Bounded create-only evidence with two explicit replaceable snapshots."""
++
++    _REPLACEABLE_JSON = frozenset({"accounting.json"})
++    _REPLACEABLE_DIFF = frozenset({"incumbent.diff"})
++    _ROOT_JSON = frozenset(
++        {"run.json", "baseline.json", "accounting.json", "holdout.json", "summary.json"}
++    )
++    _ITERATION_JSON = frozenset(
++        {"investigator.json", "author.json", "validation.json", "discovery.json", "critic.json", "decision.json"}
++    )
++
++    def __init__(self, root: Path) -> None:
++        candidate = Path(root)
++        if not candidate.is_absolute() or candidate.is_symlink() or not candidate.is_dir():
++            raise ValueError("optimizer artifact root is invalid")
++        self._root = candidate.resolve()
++
++    @property
++    def root(self) -> Path:
++        return self._root
++
++    def _target(self, name: str, *, json_artifact: bool) -> Path:
++        if not isinstance(name, str) or "\\" in name:
++            raise ValueError("optimizer artifact name is invalid")
++        parts = Path(name).parts
++        valid = False
++        if json_artifact and name in self._ROOT_JSON:
++            valid = True
++        elif (
++            json_artifact
++            and len(parts) == 3
++            and parts[0] == "iterations"
++            and len(parts[1]) == 3
++            and parts[1].isdigit()
++            and parts[2] in self._ITERATION_JSON
++        ):
++            valid = True
++        elif not json_artifact and (
++            name in self._REPLACEABLE_DIFF
++            or (
++                len(parts) == 3
++                and parts[0] == "iterations"
++                and len(parts[1]) == 3
++                and parts[1].isdigit()
++                and parts[2] == "candidate.diff"
++            )
++        ):
++            valid = True
++        if not valid:
++            raise ValueError("optimizer artifact name is outside the closed layout")
++        parent = self._root.joinpath(*parts[:-1])
++        parent.mkdir(parents=True, exist_ok=True)
++        if parent.is_symlink() or self._root not in (parent, *parent.parents):
++            raise ValueError("optimizer artifact parent is invalid")
++        return parent / parts[-1]
++
++    def write_json_artifact(
++        self,
++        name: str,
++        value: Mapping[str, object],
++    ) -> tuple[Path, str]:
++        if not isinstance(value, Mapping) or value.get("schema_version") != 2:
++            raise ValueError("optimizer JSON artifact schema is invalid")
++        target = self._target(name, json_artifact=True)
++        if name in self._REPLACEABLE_JSON and target.exists():
++            return atomic_replace_json(target, value)
++        return write_create_only_json(target, value)
++
++    def write_diff_artifact(self, name: str, value: str) -> tuple[Path, str]:
++        if not isinstance(value, str) or "\x00" in value:
++            raise ValueError("optimizer diff artifact is invalid")
++        target = self._target(name, json_artifact=False)
++        payload = value.encode("utf-8")
++        if name in self._REPLACEABLE_DIFF and target.exists():
++            return atomic_replace_bytes(target, payload)
++        return write_create_only_bytes(target, payload)
++
++
++PitOptimizerArtifactStore = IncrementalArtifactStore
+diff --git a/core/pit_optimizer_controller.py b/core/pit_optimizer_controller.py
+new file mode 100644
+index 0000000..8292861
+--- /dev/null
++++ b/core/pit_optimizer_controller.py
+@@ -0,0 +1,2143 @@
++"""Provider-free orchestration for the schema-v2 PIT optimizer."""
++
++from __future__ import annotations
++
++from dataclasses import asdict, dataclass, field, fields, replace
++from decimal import Decimal
++import hashlib
++import json
++from pathlib import Path
++from typing import Callable, Mapping
++import uuid
++
++from core.pit_optimization_contract import (
++    AuthorArtifact,
++    AuthorInput,
++    AuthorManifestSummary,
++    CandidateComparisonSummary,
++    CandidateValidationSummary,
++    CriticArtifact,
++    CriticInput,
++    DiscoveryEvidenceSummary,
++    IncumbentSummary,
++    InvestigatorArtifact,
++    InvestigatorInput,
++    IterationFeedbackSummary,
++    PitOptimizerCallBudget,
++    PitOptimizerGateConfig,
++    PitOptimizerRunManifest,
++    ProviderSeed,
++    RuleSummaryRecord,
++    StrategyRuleSummary,
++    _CANDIDATE_COMPARISON_SEAL,
++    _VALIDATION_FAILURE_FLAGS,
++    _pit_optimizer_manifest_from_primitive,
++)
++from core.pit_optimizer_artifacts import canonical_json_bytes, write_create_only_json
++from core.pit_optimizer_authorization import (
++    AuthorizationRunLease,
++    FrozenModelPricing,
++    PitOptimizerRoleCall,
++)
++from core.pit_optimizer_candidate import (
++    CandidateIdentity,
++    build_policy_source_bundle,
++    require_source_context_fit,
++    validate_author_manifest,
++    validate_candidate_identity,
++)
++from core.pit_optimizer_evaluation import (
++    AggregateMetric,
++    DeterminismAttestation,
++    DiscoveryEvaluation,
++    FoldAggregateSummary,
++    HiddenEvaluation,
++    HoldoutDecision,
++    PitOptimizerCleanup,
++    ValidationExposureMetadata,
++    ValidationLedger,
++    ValidationReservation,
++    ValidationWindowIdentity,
++    discovery_score_from_folds,
++    strictly_improves_discovery,
++)
++from core.pit_policy_parity import (
++    ParityAttestation,
++    ParityEntryOutcome,
++    ParityEquityPoint,
++    ParityFoldEvidence,
++    ParityTransaction,
++    _source_identity,
++)
++
++
++@dataclass(frozen=True, slots=True)
++class PitOptimizerReadiness:
++    schema_version: int
++    manifest: PitOptimizerRunManifest
++    manifest_sha256: str
++    readiness_sha256: str
++    artifact_path: Path
++    parity: ParityAttestation
++    baseline_discovery: DiscoveryEvidenceSummary
++    provider_seed: ProviderSeed
++
++    def __post_init__(self) -> None:
++        if self.schema_version != 2:
++            raise ValueError("optimizer readiness schema is unsupported")
++        if not isinstance(self.manifest, PitOptimizerRunManifest):
++            raise ValueError("optimizer readiness manifest is invalid")
++        if self.manifest.sha256 != self.manifest_sha256:
++            raise ValueError("optimizer readiness manifest digest differs")
++        for value in (self.manifest_sha256, self.readiness_sha256):
++            if not isinstance(value, str) or len(value) != 64:
++                raise ValueError("optimizer readiness digest is invalid")
++        if not isinstance(self.artifact_path, Path) or not self.artifact_path.is_absolute():
++            raise ValueError("optimizer readiness artifact path is invalid")
++        if not isinstance(self.parity, ParityAttestation):
++            raise ValueError("optimizer readiness parity is invalid")
++        if not isinstance(self.baseline_discovery, DiscoveryEvidenceSummary):
++            raise ValueError("optimizer readiness discovery baseline is invalid")
++        if not isinstance(self.provider_seed, ProviderSeed):
++            raise ValueError("optimizer readiness provider seed is invalid")
++        if self.provider_seed.baseline_discovery != self.baseline_discovery:
++            raise ValueError("optimizer readiness provider baseline differs")
++
++
++@dataclass(frozen=True, slots=True)
++class CandidateWorkspace:
++    workspace_id: str
++    root: Path
++
++
++@dataclass(frozen=True, slots=True)
++class CandidateValidationOutcome:
++    valid: bool
++    failure_code: str | None
++    incremental_diff: str
++    cumulative_diff: str
++    identity: CandidateIdentity | None
++    changed_paths: tuple[str, ...]
++    changed_symbols: tuple[str, ...]
++
++
++@dataclass(frozen=True, slots=True)
++class OptimizerBudgetSummary:
++    api_calls: int
++    prompt_tokens: int
++    completion_tokens: int
++    total_tokens: int
++    authoritative_usd: float
++    retained_reservation_tokens: int
++    retained_reservation_usd: float
++    incomplete_accounting_calls: int
++
++
++@dataclass(frozen=True, slots=True)
++class PitOptimizerServices:
++    freeze_pricing: Callable[[str], FrozenModelPricing]
++    open_run_lease: Callable[[PitOptimizerReadiness, FrozenModelPricing], AuthorizationRunLease]
++    close_run_lease: Callable[[AuthorizationRunLease, str], None]
++    call_role: Callable[
++        [
++            PitOptimizerCallBudget,
++            InvestigatorInput | AuthorInput | CriticInput,
++            Callable[[str], object],
++            AuthorizationRunLease,
++            FrozenModelPricing,
++        ],
++        PitOptimizerRoleCall,
++    ]
++    create_candidate: Callable[[str | None], CandidateWorkspace]
++    validate_and_apply: Callable[
++        [CandidateWorkspace, AuthorArtifact, str | None], CandidateValidationOutcome
++    ]
++    evaluate_discovery: Callable[[CandidateWorkspace, CandidateIdentity], DiscoveryEvaluation]
++    confirm_discovery: Callable[
++        [CandidateWorkspace, CandidateIdentity, str], DeterminismAttestation
++    ]
++    reserve_hidden_validation: Callable[[CandidateIdentity], ValidationReservation]
++    evaluate_hidden: Callable[
++        [CandidateWorkspace, CandidateIdentity, ValidationReservation], HiddenEvaluation
++    ]
++    dispose_candidate: Callable[[CandidateWorkspace], PitOptimizerCleanup]
++    verify_inputs: Callable[[PitOptimizerReadiness], None]
++    cancellation_requested: Callable[[], bool]
++    write_json_artifact: Callable[[str, Mapping[str, object]], tuple[Path, str]]
++    write_diff_artifact: Callable[[str, str], tuple[Path, str]]
++
++
++@dataclass(frozen=True, slots=True)
++class PitOptimizerResult:
++    schema_version: int
++    phase: str
++    status: str
++    terminal_code: str
++    terminal_detail: str | None
++    exit_code: int
++    run_id: str
++    readiness_sha256: str
++    manifest_sha256: str
++    iterations_started: int
++    iterations_completed: int
++    valid_evaluations: int
++    incumbent_updates: int
++    non_improving_streak: int
++    discovery_winner: CandidateIdentity | None
++    hidden_validation_opened: bool
++    validation_reservation_sha256: str | None
++    long_replay_eligible: bool | None
++    budget: OptimizerBudgetSummary
++    artifact_root: Path
++    artifact_paths: tuple[tuple[Path, str], ...]
++    source_modified: bool
++    cleanup_complete: bool
++
++    def to_public_artifact(self) -> Mapping[str, object]:
++        root = self.artifact_root.resolve(strict=False)
++        artifact_digests: list[dict[str, str]] = []
++        for path, digest in self.artifact_paths:
++            resolved = path.resolve(strict=False)
++            try:
++                relative = resolved.relative_to(root)
++            except ValueError as exc:
++                raise ValueError("optimizer artifact escaped its run root") from exc
++            # summary.json cannot contain its own digest.  It is still retained in
++            # ``artifact_paths`` on the returned runtime result.
++            if relative.as_posix() == "summary.json":
++                continue
++            artifact_digests.append(
++                {"path": relative.as_posix(), "sha256": digest}
++            )
++        winner = self.discovery_winner
++        return {
++            "schema_version": self.schema_version,
++            "phase": self.phase,
++            "status": self.status,
++            "terminal": {
++                "code": self.terminal_code,
++                "detail": self.terminal_detail,
++                "exit_code": self.exit_code,
++            },
++            "run_id": self.run_id,
++            "readiness_sha256": self.readiness_sha256,
++            "manifest_sha256": self.manifest_sha256,
++            "iterations": {
++                "started": self.iterations_started,
++                "completed": self.iterations_completed,
++                "valid_evaluations": self.valid_evaluations,
++                "incumbent_updates": self.incumbent_updates,
++                "non_improving_streak": self.non_improving_streak,
++            },
++            "incumbent": None if winner is None else winner.to_primitive(),
++            "discovery_outcome": {
++                "winner_identity_sha256": (
++                    None if winner is None else winner.identity_sha256
++                ),
++            },
++            "hidden_outcome": {
++                "opened": self.hidden_validation_opened,
++                "validation_reservation_sha256": (
++                    self.validation_reservation_sha256
++                ),
++                "long_replay_eligible": self.long_replay_eligible,
++            },
++            "accounting": asdict(self.budget),
++            "cleanup": {
++                "complete": self.cleanup_complete,
++                "source_modified": self.source_modified,
++            },
++            "artifact_digests": artifact_digests,
++        }
++
++
++@dataclass(slots=True)
++class _RunState:
++    run_id: str
++    next_iteration: int
++    incumbent_workspace: CandidateWorkspace | None
++    incumbent_identity: CandidateIdentity | None
++    incumbent_cumulative_diff: str
++    incumbent_discovery: DiscoveryEvidenceSummary
++    prior_iterations: tuple[IterationFeedbackSummary, ...]
++    valid_evaluations: int
++    incumbent_updates: int
++    non_improving_streak: int
++    provider_enabled: bool
++    frozen_pricing: FrozenModelPricing | None
++    authorization_lease: AuthorizationRunLease | None
++    artifact_paths: list[tuple[Path, str]] = field(default_factory=list)
++    artifact_root: Path | None = None
++    call_records: list[PitOptimizerRoleCall] = field(default_factory=list)
++    iteration_workspace: CandidateWorkspace | None = None
++    iteration_source_bundle: object | None = None
++    prospective_source_bundle: object | None = None
++    last_investigator: PitOptimizerRoleCall | None = None
++    last_author: PitOptimizerRoleCall | None = None
++    iterations_started: int = 0
++    iterations_completed: int = 0
++    terminal_detail: str | None = None
++    lease_snapshot: AuthorizationRunLease | None = None
++    hidden_validation_opened: bool = False
++    validation_reservation: ValidationReservation | None = None
++    hidden_evaluation: HiddenEvaluation | None = None
++    evaluation_failure_code: str | None = None
++    cleanup_observations: list[PitOptimizerCleanup] = field(default_factory=list)
++    finalization_failures: list[str] = field(default_factory=list)
++
++
++@dataclass(frozen=True, slots=True)
++class _IterationOutcome:
++    completed: bool
++    terminal_code: str | None
++    feedback: IterationFeedbackSummary | None
++    candidate_workspace: CandidateWorkspace | None
++    candidate_identity: CandidateIdentity | None
++    discovery: DiscoveryEvaluation | None
++    incumbent_changed: bool
++
++
++class ProviderProtocolFailure(RuntimeError):
++    pass
++
++
++class ProviderAccountingFailure(RuntimeError):
++    pass
++
++
++class AuditFailure(RuntimeError):
++    pass
++
++
++class AuthorizationExhausted(RuntimeError):
++    pass
++
++
++class IdentityDrift(RuntimeError):
++    pass
++
++
++class SandboxIntegrityFailure(RuntimeError):
++    pass
++
++
++class EvidenceTampering(RuntimeError):
++    pass
++
++
++class TrustedEvaluatorNondeterminism(RuntimeError):
++    pass
++
++
++class ContextBudgetExhausted(RuntimeError):
++    pass
++
++
++OptimizerTerminalCode = frozenset(
++    {
++        "iteration_limit",
++        "budget_exhausted",
++        "stagnation_limit",
++        "cancelled",
++        "provider_protocol_failure",
++        "provider_accounting_failure",
++        "audit_failure",
++        "authorization_exhausted",
++        "identity_drift",
++        "trusted_evaluator_nondeterminism",
++        "sandbox_integrity_failure",
++        "evidence_tampering",
++    }
++)
++
++
++class _CandidateCapabilityRegistry:
++    """Keep live Candidate authority private and address it only by opaque ID."""
++
++    def __init__(
++        self,
++        *,
++        create_capability: Callable[[str | None], object],
++        validate_capability: Callable[
++            [object, AuthorArtifact, str | None], CandidateValidationOutcome
++        ],
++        dispose_capability: Callable[[object], PitOptimizerCleanup],
++    ) -> None:
++        self._create_capability = create_capability
++        self._validate_capability = validate_capability
++        self._dispose_capability = dispose_capability
++        self._entries: dict[str, tuple[CandidateWorkspace, object]] = {}
++
++    def create_candidate(self, cumulative_diff: str | None) -> CandidateWorkspace:
++        capability = self._create_capability(cumulative_diff)
++        root = getattr(capability, "root", None)
++        if not isinstance(root, Path) or not root.is_absolute() or root.is_symlink() or not root.is_dir():
++            raise RuntimeError("candidate capability root is invalid")
++        workspace = CandidateWorkspace(
++            workspace_id=f"workspace_{uuid.uuid4().hex}",
++            root=root.resolve(),
++        )
++        self._entries[workspace.workspace_id] = (workspace, capability)
++        return workspace
++
++    def _resolve(self, workspace: CandidateWorkspace) -> object:
++        if not isinstance(workspace, CandidateWorkspace):
++            raise RuntimeError("unknown candidate workspace")
++        entry = self._entries.get(workspace.workspace_id)
++        if entry is None or entry[0] != workspace:
++            raise RuntimeError("unknown candidate workspace")
++        return entry[1]
++
++    def validate_and_apply(
++        self,
++        workspace: CandidateWorkspace,
++        artifact: AuthorArtifact,
++        cumulative_diff: str | None,
++    ) -> CandidateValidationOutcome:
++        capability = self._resolve(workspace)
++        return self._validate_capability(capability, artifact, cumulative_diff)
++
++    def dispose_candidate(self, workspace: CandidateWorkspace) -> PitOptimizerCleanup:
++        capability = self._resolve(workspace)
++        # Revoke before invoking cleanup so even a failing disposer cannot be retried
++        # through a stale root reference.
++        self._entries.pop(workspace.workspace_id)
++        return self._dispose_capability(capability)
++
++
++def _parity_primitive(parity: ParityAttestation) -> dict[str, object]:
++    value = asdict(parity)
++    value.pop("artifact_path")
++    return value
++
++
++def _readiness_primitive(
++    *,
++    manifest: PitOptimizerRunManifest,
++    parity: ParityAttestation,
++    baseline: DiscoveryEvidenceSummary,
++    provider_seed: ProviderSeed,
++) -> dict[str, object]:
++    return {
++        "schema_version": 2,
++        "manifest": manifest.to_primitive(),
++        "manifest_sha256": manifest.sha256,
++        "parity": _parity_primitive(parity),
++        "baseline_discovery": baseline.to_primitive(),
++        "provider_seed": provider_seed.to_primitive(),
++    }
++
++
++def _aggregate_from_primitive(value: object) -> FoldAggregateSummary:
++    if not isinstance(value, dict):
++        raise ValueError("parity aggregate is invalid")
++    primitive = dict(value)
++    try:
++        primitive["entry_funnel"] = tuple(
++            AggregateMetric(**item) for item in primitive["entry_funnel"]
++        )
++        primitive["exit_attribution"] = tuple(
++            AggregateMetric(**item) for item in primitive["exit_attribution"]
++        )
++        return FoldAggregateSummary(**primitive)
++    except (KeyError, TypeError, ValueError) as exc:
++        raise ValueError("parity aggregate is invalid") from exc
++
++
++def _evidence_from_primitive(value: object) -> ParityFoldEvidence:
++    if not isinstance(value, dict):
++        raise ValueError("parity evidence is invalid")
++    primitive = dict(value)
++    try:
++        primitive["transactions"] = tuple(
++            ParityTransaction(**item) for item in primitive["transactions"]
++        )
++        primitive["entry_outcomes"] = tuple(
++            ParityEntryOutcome(**item) for item in primitive["entry_outcomes"]
++        )
++        primitive["equity"] = tuple(
++            ParityEquityPoint(**item) for item in primitive["equity"]
++        )
++        primitive["funnel"] = tuple(
++            AggregateMetric(**item) for item in primitive["funnel"]
++        )
++        primitive["aggregate"] = _aggregate_from_primitive(primitive["aggregate"])
++        return ParityFoldEvidence(**primitive)
++    except (KeyError, TypeError, ValueError) as exc:
++        if "evidence digest" in str(exc):
++            raise ValueError("parity evidence digest mismatch") from exc
++        raise ValueError("parity evidence is invalid") from exc
++
++
++def _load_manifest(path: Path) -> PitOptimizerRunManifest:
++    raw = Path(path).read_bytes()
++    try:
++        value = json.loads(raw)
++    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
++        raise ValueError("optimizer manifest is invalid JSON") from exc
++    if not isinstance(value, dict) or raw != canonical_json_bytes(value):
++        raise ValueError("optimizer manifest is not canonical JSON")
++    return _pit_optimizer_manifest_from_primitive(value)
++
++
++def _load_parity(path: Path) -> ParityAttestation:
++    candidate = Path(path)
++    if candidate.is_symlink() or not candidate.is_file():
++        raise ValueError("verified parity artifact must be a regular non-link file")
++    resolved = candidate.resolve()
++    raw = resolved.read_bytes()
++    try:
++        value = json.loads(raw)
++    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
++        raise ValueError("verified parity artifact is invalid JSON") from exc
++    expected_keys = {
++        field.name
++        for field in fields(ParityAttestation)
++        if field.name not in {"artifact_path", "artifact_sha256"}
++    }
++    if not isinstance(value, dict) or set(value) != expected_keys or raw != canonical_json_bytes(value):
++        raise ValueError("verified parity artifact is not canonical")
++    primitive = dict(value)
++    try:
++        primitive["reference_output_sha256s"] = tuple(
++            tuple(item) for item in primitive["reference_output_sha256s"]
++        )
++        primitive["final_output_sha256s"] = tuple(
++            tuple(item) for item in primitive["final_output_sha256s"]
++        )
++        primitive["final_discovery_evidence"] = tuple(
++            _evidence_from_primitive(item)
++            for item in primitive["final_discovery_evidence"]
++        )
++        return ParityAttestation(
++            **primitive,
++            artifact_path=resolved,
++            artifact_sha256=hashlib.sha256(raw).hexdigest(),
++        )
++    except (KeyError, TypeError, ValueError) as exc:
++        if "evidence digest" in str(exc):
++            raise
++        raise ValueError("verified parity closed contract is invalid") from exc
++
++
++def _validate_parity_graph(
++    parity: ParityAttestation,
++    manifest: PitOptimizerRunManifest,
++) -> None:
++    evidence = parity.final_discovery_evidence
++    expected_fold_ids = tuple(item.fold_id for item in manifest.fold_manifest.discovery_folds)
++    expected_outputs = tuple((item.fold_id, item.evidence_sha256) for item in evidence)
++    if (
++        len(evidence) != 2
++        or tuple(item.fold_id for item in evidence) != expected_fold_ids
++        or parity.final_output_sha256s != expected_outputs
++        or parity.reference_output_sha256s != expected_outputs
++        or any(item.effective_policy_sha256 != manifest.effective_policy_sha256 for item in evidence)
++    ):
++        raise ValueError("verified parity discovery evidence graph differs")
++    for fold, item in zip(manifest.fold_manifest.discovery_folds, evidence, strict=True):
++        if (
++            item.aggregate.fold_id != fold.fold_id
++            or item.funnel != item.aggregate.entry_funnel
++            or tuple(point.session for point in item.equity) != fold.sessions
++        ):
++            raise ValueError("verified parity nested evidence differs from fold manifest")
++        sessions = frozenset(fold.sessions)
++        if any(value.date not in sessions for value in item.transactions) or any(
++            value.signal_date not in sessions or value.entry_date not in sessions
++            for value in item.entry_outcomes
++        ):
++            raise ValueError("verified parity evidence lies outside its discovery fold")
++    if (
++        parity.artifact_sha256 != manifest.parity_attestation_sha256
++        or parity.final_source_head != manifest.source_head
++        or parity.final_source_fingerprint_sha256 != manifest.source_fingerprint_sha256
++        or parity.pit_bundle_sha256 != manifest.pit_bundle_sha256
++        or parity.baseline_manifest_sha256 != manifest.baseline_manifest_sha256
++        or parity.effective_policy_sha256 != manifest.effective_policy_sha256
++        or parity.discovery_fold_manifest_sha256 != manifest.fold_manifest.sha256
++        or parity.policy_interface_version != manifest.policy_interface_version
++    ):
++        raise ValueError("verified parity differs from optimizer manifest")
++
++
++def _baseline_from_parity(parity: ParityAttestation) -> DiscoveryEvidenceSummary:
++    evidence = parity.final_discovery_evidence
++    return DiscoveryEvidenceSummary(
++        folds=tuple(item.aggregate for item in evidence),
++        score=None,
++        evidence_ids=tuple(item.evidence_sha256 for item in evidence),
++    )
++
++
++def _provider_seed_from_baseline(
++    baseline: DiscoveryEvidenceSummary,
++) -> ProviderSeed:
++    entry_ids = sorted(
++        {metric.metric_id for fold in baseline.folds for metric in fold.entry_funnel}
++    )
++    exit_ids = sorted(
++        {metric.metric_id for fold in baseline.folds for metric in fold.exit_attribution}
++    )
++    summary = StrategyRuleSummary(
++        records=(
++            RuleSummaryRecord(
++                "attested.discovery_objective",
++                "Compare candidates only with the authenticated fixed discovery aggregates.",
++            ),
++            RuleSummaryRecord(
++                "attested.entry_funnel",
++                "Attested discovery entry metrics: " + ", ".join(entry_ids) + ".",
++            ),
++            RuleSummaryRecord(
++                "attested.exit_attribution",
++                "Attested discovery exit metrics: " + ", ".join(exit_ids) + ".",
++            ),
++        )
++    )
++    return ProviderSeed(rule_summary=summary, baseline_discovery=baseline)
++
++
++def _window_identity(
++    manifest: PitOptimizerRunManifest,
++    fold_index: int,
++) -> ValidationWindowIdentity:
++    fold = manifest.fold_manifest.discovery_folds[fold_index]
++    warmup_sha256 = hashlib.sha256(
++        canonical_json_bytes(
++            {
++                "warmup_start_date": manifest.fold_manifest.warmup_start_date,
++                "policy_interface_version": manifest.policy_interface_version,
++            }
++        )
++    ).hexdigest()
++    sessions_sha256 = hashlib.sha256(
++        canonical_json_bytes({"sessions": list(fold.sessions)})
++    ).hexdigest()
++    # ValidationLedger uses the digest of the bare session list.
++    sessions_sha256 = hashlib.sha256(
++        (
++            json.dumps(
++                list(fold.sessions),
++                sort_keys=True,
++                separators=(",", ":"),
++                allow_nan=False,
++            ).encode("utf-8")
++            + b"\n"
++        )
++    ).hexdigest()
++    return ValidationWindowIdentity(
++        pit_bundle_sha256=manifest.pit_bundle_sha256,
++        universe_sha256=manifest.fold_manifest.universe_sha256,
++        benchmark=manifest.fold_manifest.benchmark,
++        warmup_contract_sha256=warmup_sha256,
++        sessions_sha256=sessions_sha256,
++        session_count=len(fold.sessions),
++        first_session=fold.start_date,
++        last_session=fold.end_date,
++    )
++
++
++def prepare_pit_optimizer_v2(
++    config: PitOptimizerGateConfig,
++    *,
++    source_root: Path,
++    artifact_root: Path,
++    permanent_runtime_root: Path,
++    source_head: str,
++    source_fingerprint_sha256: str,
++) -> PitOptimizerReadiness:
++    """Authenticate and persist provider-projectable inputs without provider effects."""
++
++    if not isinstance(config, PitOptimizerGateConfig) or config.phase != "prepare":
++        raise ValueError("optimizer prepare requires a prepare gate")
++    config.validate()
++    source = Path(source_root)
++    artifacts = Path(artifact_root)
++    runtime = Path(permanent_runtime_root)
++    for path, label in ((artifacts, "artifact root"), (runtime, "permanent runtime root")):
++        if not path.is_absolute() or path.is_symlink() or not path.is_dir():
++            raise ValueError(f"optimizer {label} is invalid")
++    actual_source_head, actual_source_fingerprint = _source_identity(source)
++    if (source_head, source_fingerprint_sha256) != (
++        actual_source_head,
++        actual_source_fingerprint,
++    ):
++        raise ValueError("optimizer supplied source identity differs from clean source")
++    manifest = _load_manifest(config.optimizer_manifest)
++    parity = _load_parity(config.verified_parity_artifact)
++    if manifest.sha256 != config.optimizer_manifest_sha256:
++        raise ValueError("optimizer manifest digest differs")
++    if (manifest.source_head, manifest.source_fingerprint_sha256) != (
++        actual_source_head,
++        actual_source_fingerprint,
++    ):
++        raise ValueError("optimizer manifest source identity differs")
++    _validate_parity_graph(parity, manifest)
++
++    metadata = ValidationExposureMetadata(
++        run_id=manifest.run_id,
++        source_head=manifest.source_head,
++        baseline_policy_sha256=manifest.effective_policy_sha256,
++        candidate_identity_sha256=None,
++        exposure_kind="provider_context",
++    )
++    ledger = ValidationLedger(runtime / manifest.validation_ledger_name)
++    reservations = tuple(
++        ledger.mark_discovery(_window_identity(manifest, index), metadata)
++        for index in range(2)
++    )
++    ledger.seal_discovery_folds(manifest.fold_manifest, reservations)
++
++    baseline = _baseline_from_parity(parity)
++    provider_seed = _provider_seed_from_baseline(baseline)
++    primitive = _readiness_primitive(
++        manifest=manifest,
++        parity=parity,
++        baseline=baseline,
++        provider_seed=provider_seed,
++    )
++    output = artifacts.resolve() / f"{manifest.run_id}.readiness.json"
++    artifact_path, readiness_sha256 = write_create_only_json(output, primitive)
++    return PitOptimizerReadiness(
++        schema_version=2,
++        manifest=manifest,
++        manifest_sha256=manifest.sha256,
++        readiness_sha256=readiness_sha256,
++        artifact_path=artifact_path,
++        parity=parity,
++        baseline_discovery=baseline,
++        provider_seed=provider_seed,
++    )
++
++
++def _initialize_provider(
++    readiness: PitOptimizerReadiness,
++    state: _RunState,
++    services: PitOptimizerServices,
++) -> None:
++    pricing = services.freeze_pricing(readiness.manifest.model)
++    lease = services.open_run_lease(readiness, pricing)
++    state.frozen_pricing = pricing
++    state.authorization_lease = lease
++    state.lease_snapshot = lease
++
++
++def _record_artifact(
++    state: _RunState,
++    artifact: tuple[Path, str],
++) -> None:
++    path, digest = artifact
++    if not isinstance(path, Path) or not path.is_absolute():
++        raise ValueError("optimizer artifact path is invalid")
++    if not isinstance(digest, str) or len(digest) != 64:
++        raise ValueError("optimizer artifact digest is invalid")
++    root = path.parent if path.name in {"run.json", "baseline.json", "accounting.json"} else None
++    if state.artifact_root is None and root is not None:
++        state.artifact_root = root
++    if state.artifact_root is not None and state.artifact_root not in (path.parent, *path.parents):
++        raise ValueError("optimizer artifact escaped its run root")
++    state.artifact_paths[:] = [
++        item for item in state.artifact_paths if item[0] != path
++    ]
++    state.artifact_paths.append((path, digest))
++
++
++def _run_artifact(
++    readiness: PitOptimizerReadiness,
++    state: _RunState,
++) -> dict[str, object]:
++    manifest = readiness.manifest
++    if state.authorization_lease is None or state.frozen_pricing is None:
++        raise RuntimeError("provider capability is not initialized")
++    folds = (*manifest.fold_manifest.discovery_folds, manifest.fold_manifest.hidden_fold)
++    return {
++        "schema_version": 2,
++        "run_id": manifest.run_id,
++        "manifest_sha256": readiness.manifest_sha256,
++        "readiness_sha256": readiness.readiness_sha256,
++        "source": {
++            "head": manifest.source_head,
++            "fingerprint_sha256": manifest.source_fingerprint_sha256,
++            "policy_source_sha256s": [list(item) for item in manifest.policy_source_sha256s],
++            "policy_source_scope_sha256": manifest.policy_source_scope.sha256,
++            "immutable_constraints_sha256": manifest.immutable_constraints_sha256,
++        },
++        "pit_bundle_sha256": manifest.pit_bundle_sha256,
++        "baseline_manifest_sha256": manifest.baseline_manifest_sha256,
++        "effective_policy_sha256": manifest.effective_policy_sha256,
++        "parity_attestation_sha256": manifest.parity_attestation_sha256,
++        "fold_manifest_sha256": manifest.fold_manifest.sha256,
++        "fold_identities": [
++            {
++                "fold_id": fold.fold_id,
++                "purpose": fold.purpose,
++                "sessions_sha256": hashlib.sha256(
++                    (
++                        json.dumps(
++                            list(fold.sessions),
++                            sort_keys=True,
++                            separators=(",", ":"),
++                            allow_nan=False,
++                        ).encode("utf-8")
++                        + b"\n"
++                    )
++                ).hexdigest(),
++            }
++            for fold in folds
++        ],
++        "policy_interface_version": manifest.policy_interface_version,
++        "candidate_bounds": manifest.candidate_bounds.to_primitive(),
++        "authorization": {
++            "requirement_sha256": manifest.authorization_requirement.sha256,
++            "window_id": manifest.authorization_requirement.window_id,
++            "lease_id": state.authorization_lease.lease_id,
++        },
++        "frozen_pricing_sha256": state.frozen_pricing.pricing_sha256,
++        "status": "initialized",
++    }
++
++
++def _baseline_artifact(readiness: PitOptimizerReadiness) -> dict[str, object]:
++    manifest = readiness.manifest
++    return {
++        "schema_version": 2,
++        "fold_ids": [item.fold_id for item in readiness.baseline_discovery.folds],
++        "fold_aggregates": [
++            item.to_primitive() if hasattr(item, "to_primitive") else asdict(item)
++            for item in readiness.baseline_discovery.folds
++        ],
++        "evidence_ids": list(readiness.baseline_discovery.evidence_ids),
++        "universe_sha256": manifest.fold_manifest.universe_sha256,
++        "warmup_start_date": manifest.fold_manifest.warmup_start_date,
++        "engine_policy_sha256": manifest.effective_policy_sha256,
++        "parity_attestation_sha256": manifest.parity_attestation_sha256,
++    }
++
++
++def _accounting_artifact(
++    state: _RunState,
++) -> dict[str, object]:
++    lease = state.authorization_lease or state.lease_snapshot
++    return {
++        "schema_version": 2,
++        "call_records": [],
++        "authorized_totals": {
++            "calls": 0 if lease is None else lease.max_calls,
++            "tokens": 0 if lease is None else lease.max_tokens,
++            "usd": 0.0 if lease is None else lease.max_usd,
++        },
++        "reserved_totals": {"calls": 0, "tokens": 0, "usd": 0.0},
++        "actual_totals": {
++            "calls": 0,
++            "prompt_tokens": 0,
++            "completion_tokens": 0,
++            "total_tokens": 0,
++            "usd": 0.0,
++        },
++        "incomplete_exposure": {
++            "calls": 0,
++            "retained_tokens": 0,
++            "retained_usd": 0.0,
++        },
++        "audit_chain_head": "0" * 64,
++    }
++
++
++def _initialize_run_artifacts(
++    readiness: PitOptimizerReadiness,
++    state: _RunState,
++    services: PitOptimizerServices,
++) -> None:
++    """Acquire one lease, then durably establish the three root run artifacts."""
++
++    _initialize_provider(readiness, state, services)
++    try:
++        for name, primitive in (
++            ("run.json", _run_artifact(readiness, state)),
++            ("baseline.json", _baseline_artifact(readiness)),
++            ("accounting.json", _accounting_artifact(state)),
++        ):
++            _record_artifact(
++                state,
++                services.write_json_artifact(name, primitive),
++            )
++    except BaseException:
++        state.provider_enabled = False
++        lease = state.authorization_lease
++        if lease is not None:
++            try:
++                services.close_run_lease(lease, "audit_failure")
++            finally:
++                state.authorization_lease = None
++        raise
++
++
++def _iteration_name(state: _RunState, filename: str) -> str:
++    return f"iterations/{state.next_iteration:03d}/{filename}"
++
++
++def _plan_for(
++    readiness: PitOptimizerReadiness,
++    state: _RunState,
++    role: str,
++) -> PitOptimizerCallBudget:
++    match = next(
++        (
++            item
++            for item in readiness.manifest.call_budgets
++            if item.iteration == state.next_iteration and item.role == role
++        ),
++        None,
++    )
++    if match is None:
++        raise AuthorizationExhausted("authorization call plan is exhausted")
++    return match
++
++
++def _payload_sha256(payload: object) -> str:
++    canonical = getattr(payload, "canonical_json_bytes", None)
++    if not callable(canonical):
++        raise ProviderProtocolFailure("provider payload is not a closed role artifact")
++    return hashlib.sha256(canonical()).hexdigest()
++
++
++def _role_artifact(call: PitOptimizerRoleCall) -> dict[str, object]:
++    payload = call.payload
++    primitive = getattr(payload, "to_primitive", None)
++    if not callable(primitive):
++        raise ProviderProtocolFailure("provider payload is not serializable")
++    return {
++        "schema_version": 2,
++        "call_index": call.plan.call_index,
++        "iteration": call.plan.iteration,
++        "role": call.plan.role,
++        "payload_sha256": _payload_sha256(payload),
++        "payload": primitive(),
++    }
++
++
++def _budget_summary_from_calls(
++    calls: list[PitOptimizerRoleCall],
++) -> OptimizerBudgetSummary:
++    facts = [item.facts for item in calls]
++    return OptimizerBudgetSummary(
++        api_calls=sum(1 for item in facts if item.request_started),
++        prompt_tokens=sum(item.prompt_tokens or 0 for item in facts),
++        completion_tokens=sum(item.completion_tokens or 0 for item in facts),
++        total_tokens=sum(item.total_tokens or 0 for item in facts),
++        authoritative_usd=float(sum(Decimal(str(item.cost_usd or 0)) for item in facts)),
++        retained_reservation_tokens=sum(item.retained_reservation_tokens for item in facts),
++        retained_reservation_usd=float(
++            sum(Decimal(str(item.retained_reservation_usd)) for item in facts)
++        ),
++        incomplete_accounting_calls=sum(1 for item in facts if not item.accounting_complete),
++    )
++
++
++def _current_accounting_artifact(state: _RunState) -> dict[str, object]:
++    summary = _budget_summary_from_calls(state.call_records)
++    lease = state.authorization_lease or state.lease_snapshot
++    reserved_tokens = sum(
++        item.plan.max_input_tokens + item.plan.max_output_tokens
++        for item in state.call_records
++    )
++    reserved_usd = float(
++        sum(Decimal(str(item.plan.max_usd)) for item in state.call_records)
++    )
++    return {
++        "schema_version": 2,
++        "call_records": [
++            {
++                "plan": item.plan.to_primitive(),
++                "payload_sha256": _payload_sha256(item.payload),
++                "facts": asdict(item.facts),
++            }
++            for item in state.call_records
++        ],
++        "authorized_totals": {
++            "calls": 0 if lease is None else lease.max_calls,
++            "tokens": 0 if lease is None else lease.max_tokens,
++            "usd": 0.0 if lease is None else lease.max_usd,
++        },
++        "reserved_totals": {
++            "calls": len(state.call_records),
++            "tokens": reserved_tokens,
++            "usd": reserved_usd,
++        },
++        "actual_totals": {
++            "calls": summary.api_calls,
++            "prompt_tokens": summary.prompt_tokens,
++            "completion_tokens": summary.completion_tokens,
++            "total_tokens": summary.total_tokens,
++            "usd": summary.authoritative_usd,
++        },
++        "incomplete_exposure": {
++            "calls": summary.incomplete_accounting_calls,
++            "retained_tokens": summary.retained_reservation_tokens,
++            "retained_usd": summary.retained_reservation_usd,
++        },
++        "audit_chain_head": (
++            "0" * 64 if not state.call_records else state.call_records[-1].facts.audit_sha256
++        ),
++    }
++
++
++def _replace_accounting_artifact(
++    state: _RunState,
++    services: PitOptimizerServices,
++) -> None:
++    _record_artifact(
++        state,
++        services.write_json_artifact(
++            "accounting.json",
++            _current_accounting_artifact(state),
++        ),
++    )
++
++
++def _call_role(
++    readiness: PitOptimizerReadiness,
++    state: _RunState,
++    services: PitOptimizerServices,
++    plan: PitOptimizerCallBudget,
++    role_input: InvestigatorInput | AuthorInput | CriticInput,
++    parser: Callable[[str], object],
++) -> PitOptimizerRoleCall:
++    if not state.provider_enabled:
++        raise RuntimeError("provider capability is closed")
++    if state.authorization_lease is None or state.frozen_pricing is None:
++        raise RuntimeError("provider capability is not initialized")
++    try:
++        require_source_context_fit(role_input=role_input, role_budget=plan)
++    except ValueError as exc:
++        raise ContextBudgetExhausted("context_budget_exhausted") from exc
++    call = services.call_role(
++        plan,
++        role_input,
++        parser,
++        state.authorization_lease,
++        state.frozen_pricing,
++    )
++    if not isinstance(call, PitOptimizerRoleCall) or call.plan != plan:
++        raise ProviderProtocolFailure("provider returned a mismatched role call")
++    try:
++        validator = getattr(role_input, "validate_artifact", None)
++        if callable(validator):
++            validator(call.payload)
++        elif not isinstance(call.payload, InvestigatorArtifact):
++            raise ValueError("investigator payload type differs")
++    except (AttributeError, TypeError, ValueError) as exc:
++        raise ProviderProtocolFailure("provider role artifact failed closed validation") from exc
++    state.call_records.append(call)
++    _replace_accounting_artifact(state, services)
++    return call
++
++
++def _incumbent_summary(state: _RunState) -> IncumbentSummary:
++    accepted_iteration = None
++    behavioral_summary = "Authenticated fixed baseline."
++    if state.incumbent_identity is not None:
++        accepted = next(
++            (item for item in reversed(state.prior_iterations) if item.incumbent_changed),
++            None,
++        )
++        accepted_iteration = None if accepted is None else accepted.iteration
++        behavioral_summary = (
++            "Validated discovery incumbent."
++            if accepted is None
++            else accepted.author_summary
++        )
++    return IncumbentSummary(
++        candidate_identity_sha256=(
++            None if state.incumbent_identity is None else state.incumbent_identity.identity_sha256
++        ),
++        accepted_iteration=accepted_iteration,
++        behavioral_summary=behavioral_summary,
++        discovery=state.incumbent_discovery,
++    )
++
++
++def _run_investigator(
++    readiness: PitOptimizerReadiness,
++    state: _RunState,
++    services: PitOptimizerServices,
++) -> PitOptimizerRoleCall:
++    if state.iteration_workspace is not None:
++        raise SandboxIntegrityFailure("candidate workspace is already active")
++    state.evaluation_failure_code = None
++    workspace = services.create_candidate(state.incumbent_cumulative_diff or None)
++    if not isinstance(workspace, CandidateWorkspace):
++        raise SandboxIntegrityFailure("candidate service returned an invalid workspace")
++    state.iteration_workspace = workspace
++    try:
++        bundle = build_policy_source_bundle(
++            candidate_root=workspace.root,
++            cumulative_diff=state.incumbent_cumulative_diff,
++            policy_interface_version=readiness.manifest.policy_interface_version,
++        )
++    except ValueError as exc:
++        raise IdentityDrift("candidate source bundle could not be authenticated") from exc
++    state.iteration_source_bundle = bundle
++    role_input = InvestigatorInput(
++        schema_version=2,
++        iteration=state.next_iteration,
++        run_manifest_sha256=readiness.manifest_sha256,
++        policy_interface_version=readiness.manifest.policy_interface_version,
++        immutable_constraint_ids=readiness.manifest.immutable_constraint_ids,
++        candidate_bounds=readiness.manifest.candidate_bounds,
++        rule_summary=readiness.provider_seed.rule_summary,
++        source_bundle=bundle,
++        baseline_discovery=readiness.baseline_discovery,
++        incumbent_summary=_incumbent_summary(state),
++        prior_iterations=state.prior_iterations,
++    )
++    plan = _plan_for(readiness, state, "investigator")
++    call = _call_role(
++        readiness,
++        state,
++        services,
++        plan,
++        role_input,
++        lambda raw: InvestigatorArtifact.from_json(
++            raw,
++            max_total_bytes=plan.max_response_bytes,
++        ),
++    )
++    _record_artifact(
++        state,
++        services.write_json_artifact(
++            _iteration_name(state, "investigator.json"),
++            _role_artifact(call),
++        ),
++    )
++    state.last_investigator = call
++    return call
++
++
++def _run_author(
++    readiness: PitOptimizerReadiness,
++    state: _RunState,
++    investigator: PitOptimizerRoleCall,
++    services: PitOptimizerServices,
++) -> PitOptimizerRoleCall:
++    bundle = state.iteration_source_bundle
++    if bundle is None or not isinstance(investigator.payload, InvestigatorArtifact):
++        raise ProviderProtocolFailure("author predecessor is invalid")
++    role_input = AuthorInput(
++        schema_version=2,
++        iteration=state.next_iteration,
++        run_manifest_sha256=readiness.manifest_sha256,
++        policy_interface_version=readiness.manifest.policy_interface_version,
++        immutable_constraint_ids=readiness.manifest.immutable_constraint_ids,
++        candidate_bounds=readiness.manifest.candidate_bounds,
++        investigator=investigator.payload,
++        source_bundle=bundle,  # type: ignore[arg-type]
++    )
++    plan = _plan_for(readiness, state, "author")
++    call = _call_role(
++        readiness,
++        state,
++        services,
++        plan,
++        role_input,
++        lambda raw: AuthorArtifact.from_json(
++            raw,
++            max_diff_bytes=readiness.manifest.candidate_bounds.max_diff_bytes,
++            max_total_bytes=plan.max_response_bytes,
++        ),
++    )
++    _record_artifact(
++        state,
++        services.write_json_artifact(
++            _iteration_name(state, "author.json"),
++            _role_artifact(call),
++        ),
++    )
++    state.last_author = call
++    return call
++
++
++def _focused_checks(changed_symbols: tuple[str, ...]) -> list[str]:
++    selected = ["syntax_import", "purity_determinism"]
++    if any(".entry." in item for item in changed_symbols):
++        selected.append("entry")
++    if any(".risk." in item for item in changed_symbols):
++        selected.append("risk")
++    if any(".exit." in item for item in changed_symbols):
++        selected.append("exit")
++    return selected
++
++
++def _require_identity_graph(
++    readiness: PitOptimizerReadiness,
++    outcome: CandidateValidationOutcome,
++) -> None:
++    identity = outcome.identity
++    if identity is None:
++        raise IdentityDrift("valid candidate identity is absent")
++    try:
++        validate_candidate_identity(identity)
++    except ValueError as exc:
++        raise IdentityDrift("candidate identity is not authenticated") from exc
++    manifest = readiness.manifest
++    if (
++        identity.source_commit != manifest.source_head
++        or identity.policy_interface_version != manifest.policy_interface_version
++        or identity.cumulative_diff_sha256
++        != hashlib.sha256(outcome.cumulative_diff.encode("utf-8")).hexdigest()
++        or identity.immutable_constraints_sha256 != manifest.immutable_constraints_sha256
++        or identity.discovery_manifest_sha256 != manifest.fold_manifest.sha256
++        or identity.changed_paths != outcome.changed_paths
++        or identity.changed_symbols != outcome.changed_symbols
++    ):
++        raise IdentityDrift("candidate identity differs from the optimizer identity graph")
++
++
++def _validate_iteration_candidate(
++    readiness: PitOptimizerReadiness,
++    state: _RunState,
++    author: PitOptimizerRoleCall,
++    services: PitOptimizerServices,
++) -> CandidateValidationOutcome:
++    workspace = state.iteration_workspace
++    if workspace is None:
++        raise SandboxIntegrityFailure("candidate workspace is absent")
++    outcome = services.validate_and_apply(
++        workspace,
++        author.payload,  # type: ignore[arg-type]
++        state.incumbent_cumulative_diff or None,
++    )
++    if not isinstance(outcome, CandidateValidationOutcome):
++        raise SandboxIntegrityFailure("candidate validation outcome is invalid")
++    if outcome.valid:
++        if outcome.failure_code is not None or outcome.identity is None:
++            raise SandboxIntegrityFailure("valid candidate outcome is inconsistent")
++        _require_identity_graph(readiness, outcome)
++        try:
++            validate_author_manifest(author.payload, outcome.identity)  # type: ignore[arg-type]
++        except ValueError as exc:
++            raise IdentityDrift("author manifest differs from candidate identity") from exc
++        try:
++            state.prospective_source_bundle = build_policy_source_bundle(
++                candidate_root=workspace.root,
++                cumulative_diff=outcome.cumulative_diff,
++                policy_interface_version=readiness.manifest.policy_interface_version,
++            )
++        except ValueError as exc:
++            raise IdentityDrift("validated candidate source bundle differs") from exc
++    elif outcome.failure_code is None or outcome.identity is not None:
++        raise SandboxIntegrityFailure("invalid candidate outcome is inconsistent")
++    _record_artifact(
++        state,
++        services.write_diff_artifact(
++            _iteration_name(state, "candidate.diff"),
++            outcome.incremental_diff,
++        ),
++    )
++    primitive = {
++        "schema_version": 2,
++        "failure_code": outcome.failure_code,
++        "candidate_identity": (
++            None if outcome.identity is None else outcome.identity.to_primitive()
++        ),
++        "author_manifest_matches": outcome.valid,
++        "focused_checks": _focused_checks(outcome.changed_symbols),
++        "worker_attestation": {
++            "attempted": outcome.valid or outcome.failure_code in {"worker_failed", "replay_failed"},
++            "complete": outcome.valid,
++        },
++        "changed_paths": list(outcome.changed_paths),
++        "changed_symbols": list(outcome.changed_symbols),
++    }
++    _record_artifact(
++        state,
++        services.write_json_artifact(
++            _iteration_name(state, "validation.json"),
++            primitive,
++        ),
++    )
++    return outcome
++
++
++def _folds_digest(folds: tuple[FoldAggregateSummary, ...]) -> str:
++    return hashlib.sha256(
++        (
++            json.dumps(
++                [asdict(item) for item in folds],
++                sort_keys=True,
++                separators=(",", ":"),
++                allow_nan=False,
++            ).encode("utf-8")
++            + b"\n"
++        )
++    ).hexdigest()
++
++
++def _score_primitive(score: object) -> dict[str, object]:
++    return {
++        "median_excess_return_pp": str(score.median_excess_return_pp),
++        "worst_excess_return_pp": str(score.worst_excess_return_pp),
++        "max_drawdown_magnitude_pp": str(score.max_drawdown_magnitude_pp),
++    }
++
++
++def _evaluate_iteration_candidate(
++    readiness: PitOptimizerReadiness,
++    state: _RunState,
++    validation: CandidateValidationOutcome,
++    services: PitOptimizerServices,
++) -> DiscoveryEvaluation | None:
++    if not validation.valid:
++        return None
++    if state.iteration_workspace is None or validation.identity is None:
++        raise SandboxIntegrityFailure("valid candidate evaluation workspace is absent")
++    supplied = services.evaluate_discovery(state.iteration_workspace, validation.identity)
++    if not isinstance(supplied, DiscoveryEvaluation):
++        raise EvidenceTampering("discovery evaluation is not closed")
++    manifest = readiness.manifest
++    if any(
++        item.engine_policy_sha256 != manifest.effective_policy_sha256
++        or item.candidate_identity_sha256 != validation.identity.identity_sha256
++        for item in supplied.folds
++    ):
++        raise IdentityDrift("discovery evaluation identity differs")
++    candidate_folds = tuple(item.aggregate_metrics for item in supplied.folds)
++    if any(item.closed_trades < 1 for item in candidate_folds):
++        if (
++            supplied.comparison.rankable
++            or supplied.comparison.strictly_improves_incumbent
++        ):
++            raise EvidenceTampering("zero-trade discovery evaluation is rankable")
++        state.evaluation_failure_code = "no_discovery_trades"
++        _record_artifact(
++            state,
++            services.write_json_artifact(
++                _iteration_name(state, "discovery.json"),
++                {
++                    "schema_version": 2,
++                    "failure_code": "no_discovery_trades",
++                    "fixed_baseline_comparison": None,
++                    "incumbent_diagnostics": None,
++                    "rankable": False,
++                    "strictly_improves_incumbent": False,
++                    "folds": [
++                        {
++                            "fold_id": item.fold_id,
++                            "aggregate": asdict(item.aggregate_metrics),
++                        }
++                        for item in supplied.folds
++                    ],
++                    "engine_policy_sha256": manifest.effective_policy_sha256,
++                    "candidate_identity_sha256": validation.identity.identity_sha256,
++                },
++            ),
++        )
++        return None
++    baseline_folds = readiness.baseline_discovery.folds
++    baseline_sha256 = _folds_digest(baseline_folds)
++    try:
++        fixed_score = discovery_score_from_folds(
++            candidate_folds,
++            baseline_folds,
++            original_baseline_sha256=baseline_sha256,
++            expected_original_baseline_sha256=baseline_sha256,
++        )
++        incumbent_folds = state.incumbent_discovery.folds
++        incumbent_sha256 = _folds_digest(incumbent_folds)
++        incumbent_diagnostics = discovery_score_from_folds(
++            candidate_folds,
++            incumbent_folds,
++            original_baseline_sha256=incumbent_sha256,
++            expected_original_baseline_sha256=incumbent_sha256,
++        )
++        incumbent_score = state.incumbent_discovery.score
++        if incumbent_score is None:
++            incumbent_score = discovery_score_from_folds(
++                baseline_folds,
++                baseline_folds,
++                original_baseline_sha256=baseline_sha256,
++                expected_original_baseline_sha256=baseline_sha256,
++            )
++    except ValueError as exc:
++        raise EvidenceTampering("discovery fixed-baseline objective is invalid") from exc
++    expected_improvement = strictly_improves_discovery(fixed_score, incumbent_score)
++    comparison = supplied.comparison
++    if (
++        comparison.candidate_vs_fixed_baseline != fixed_score
++        or comparison.candidate_vs_incumbent_diagnostics != incumbent_diagnostics
++        or comparison.strictly_improves_incumbent
++        is not (comparison.rankable and expected_improvement)
++    ):
++        raise EvidenceTampering("discovery comparison differs from fixed-baseline objective")
++    normalized_folds = tuple(
++        replace(
++            item,
++            aggregate_metrics=replace(
++                item.aggregate_metrics,
++                excess_total_return_pp=(
++                    float(item.aggregate_metrics.total_return_pct)
++                    - float(baseline.total_return_pct)
++                ),
++            ),
++        )
++        for item, baseline in zip(supplied.folds, baseline_folds, strict=True)
++    )
++    discovery = replace(supplied, folds=normalized_folds)
++    _record_artifact(
++        state,
++        services.write_json_artifact(
++            _iteration_name(state, "discovery.json"),
++            {
++                "schema_version": 2,
++                "fixed_baseline_comparison": _score_primitive(fixed_score),
++                "incumbent_diagnostics": _score_primitive(incumbent_diagnostics),
++                "rankable": comparison.rankable,
++                "strictly_improves_incumbent": comparison.strictly_improves_incumbent,
++                "folds": [
++                    {
++                        "fold_id": item.fold_id,
++                        "aggregate": asdict(item.aggregate_metrics),
++                    }
++                    for item in discovery.folds
++                ],
++                "engine_policy_sha256": manifest.effective_policy_sha256,
++                "candidate_identity_sha256": validation.identity.identity_sha256,
++            },
++        ),
++    )
++    return discovery
++
++
++def _validation_summary(
++    validation: CandidateValidationOutcome,
++    evaluation_failure_code: str | None = None,
++) -> CandidateValidationSummary:
++    if evaluation_failure_code is not None:
++        if evaluation_failure_code not in _VALIDATION_FAILURE_FLAGS:
++            raise EvidenceTampering("discovery failure code is invalid")
++        return CandidateValidationSummary(
++            evaluation_failure_code,
++            *_VALIDATION_FAILURE_FLAGS[evaluation_failure_code],
++        )
++    if validation.valid:
++        return CandidateValidationSummary(None, True, True, True, True, True, True)
++    code = validation.failure_code
++    if code not in _VALIDATION_FAILURE_FLAGS:
++        code = "author_diff_invalid"
++    return CandidateValidationSummary(code, *_VALIDATION_FAILURE_FLAGS[code])
++
++
++def _critic_comparison(
++    discovery: DiscoveryEvaluation,
++    *,
++    fixed: bool,
++) -> CandidateComparisonSummary:
++    score = (
++        discovery.comparison.candidate_vs_fixed_baseline
++        if fixed
++        else discovery.comparison.candidate_vs_incumbent_diagnostics
++    )
++    return CandidateComparisonSummary(
++        folds=tuple(item.aggregate_metrics for item in discovery.folds),
++        score=score,
++        diagnostics=(),
++        _controller_seal=_CANDIDATE_COMPARISON_SEAL,
++    )
++
++
++def _run_critic(
++    readiness: PitOptimizerReadiness,
++    state: _RunState,
++    investigator: PitOptimizerRoleCall,
++    author: PitOptimizerRoleCall,
++    validation: CandidateValidationOutcome,
++    discovery: DiscoveryEvaluation | None,
++    services: PitOptimizerServices,
++) -> PitOptimizerRoleCall:
++    if not isinstance(investigator.payload, InvestigatorArtifact) or not isinstance(
++        author.payload,
++        AuthorArtifact,
++    ):
++        raise ProviderProtocolFailure("critic predecessors are invalid")
++    role_input = CriticInput(
++        schema_version=2,
++        iteration=state.next_iteration,
++        run_manifest_sha256=readiness.manifest_sha256,
++        immutable_constraint_ids=readiness.manifest.immutable_constraint_ids,
++        hypothesis_id=investigator.payload.hypothesis_id,
++        investigator_summary=investigator.payload,
++        author_manifest=AuthorManifestSummary(
++            hypothesis_id=author.payload.hypothesis_id,
++            behavioral_summary=author.payload.behavioral_summary,
++            changed_paths=author.payload.changed_paths,
++            changed_symbols=author.payload.changed_symbols,
++        ),
++        validation=_validation_summary(validation, state.evaluation_failure_code),
++        candidate_vs_baseline=(
++            None if discovery is None else _critic_comparison(discovery, fixed=True)
++        ),
++        candidate_vs_incumbent=(
++            None if discovery is None else _critic_comparison(discovery, fixed=False)
++        ),
++    )
++    plan = _plan_for(readiness, state, "critic")
++    call = _call_role(
++        readiness,
++        state,
++        services,
++        plan,
++        role_input,
++        lambda raw: CriticArtifact.from_json(
++            raw,
++            max_total_bytes=plan.max_response_bytes,
++        ),
++    )
++    _record_artifact(
++        state,
++        services.write_json_artifact(
++            _iteration_name(state, "critic.json"),
++            _role_artifact(call),
++        ),
++    )
++    return call
++
++
++def _persist_iteration_decision(
++    readiness: PitOptimizerReadiness,
++    state: _RunState,
++    validation: CandidateValidationOutcome,
++    discovery: DiscoveryEvaluation | None,
++    critic: PitOptimizerRoleCall,
++    services: PitOptimizerServices,
++) -> _IterationOutcome:
++    investigator_call = state.last_investigator
++    author_call = state.last_author
++    investigator = None if investigator_call is None else investigator_call.payload
++    author = None if author_call is None else author_call.payload
++    critic_payload = getattr(critic, "payload", None)
++    if not isinstance(investigator, InvestigatorArtifact) or not isinstance(
++        author,
++        AuthorArtifact,
++    ) or not isinstance(critic_payload, CriticArtifact):
++        raise ProviderProtocolFailure("iteration decision predecessors are invalid")
++    expected_critic = _iteration_name(state, "critic.json")
++    if state.artifact_paths and not any(
++        path.as_posix().endswith(expected_critic) for path, _digest_value in state.artifact_paths
++    ):
++        raise AuditFailure("critic artifact is not durable before decision")
++
++    rankable = discovery is not None and discovery.comparison.rankable
++    improves = bool(
++        validation.valid
++        and rankable
++        and discovery is not None
++        and discovery.comparison.strictly_improves_incumbent
++    )
++    prior_identity = (
++        None if state.incumbent_identity is None else state.incumbent_identity.identity_sha256
++    )
++    candidate_workspace = state.iteration_workspace
++    candidate_identity = validation.identity
++    score = (
++        None
++        if discovery is None
++        else discovery.comparison.candidate_vs_fixed_baseline
++    )
++
++    if rankable:
++        state.valid_evaluations += 1
++        state.non_improving_streak = 0 if improves else state.non_improving_streak + 1
++
++    if improves:
++        if candidate_identity is None or candidate_workspace is None:
++            raise IdentityDrift("improving candidate identity or workspace is absent")
++        try:
++            validate_candidate_identity(candidate_identity)
++        except ValueError as exc:
++            raise IdentityDrift("candidate identity drifted before incumbent replacement") from exc
++        bundle = state.prospective_source_bundle
++        if bundle is None:
++            raise IdentityDrift("prospective incumbent source bundle is absent")
++        if isinstance(candidate_identity, CandidateIdentity):
++            files = getattr(bundle, "files", ())
++            actual_file_sha256s = tuple(
++                (item.path, item.sha256) for item in files
++            )
++            if (
++                candidate_identity.cumulative_diff_sha256
++                != hashlib.sha256(validation.cumulative_diff.encode("utf-8")).hexdigest()
++                or actual_file_sha256s != candidate_identity.editable_file_sha256s
++            ):
++                raise IdentityDrift("prospective incumbent bundle differs from identity")
++        _record_artifact(
++            state,
++            services.write_diff_artifact(
++                "incumbent.diff",
++                validation.cumulative_diff,
++            ),
++        )
++        prior_workspace = state.incumbent_workspace
++        if prior_workspace is not None and prior_workspace != candidate_workspace:
++            services.dispose_candidate(prior_workspace)
++        assert discovery is not None
++        candidate_folds = tuple(item.aggregate_metrics for item in discovery.folds)
++        state.incumbent_discovery = DiscoveryEvidenceSummary(
++            folds=candidate_folds,
++            score=discovery.comparison.candidate_vs_fixed_baseline,
++            evidence_ids=tuple(
++                hashlib.sha256(
++                    canonical_json_bytes({"aggregate": asdict(item)})
++                ).hexdigest()
++                for item in candidate_folds
++            ),
++        )
++        state.incumbent_workspace = candidate_workspace
++        state.incumbent_identity = candidate_identity
++        state.incumbent_cumulative_diff = validation.cumulative_diff
++        state.incumbent_updates += 1
++    elif candidate_workspace is not None and candidate_workspace != state.incumbent_workspace:
++        services.dispose_candidate(candidate_workspace)
++
++    feedback = IterationFeedbackSummary(
++        iteration=state.next_iteration,
++        hypothesis_id=investigator.hypothesis_id,
++        family=investigator.family,
++        author_summary=author.behavioral_summary,
++        validation_code=(
++            state.evaluation_failure_code
++            or (
++                "valid"
++                if validation.valid and rankable
++                else validation.failure_code or "unrankable"
++            )
++        ),
++        discovery_score=score if rankable else None,
++        critic_disposition=critic_payload.disposition,
++        critic_next_direction=critic_payload.next_direction,
++        incumbent_changed=improves,
++    )
++    new_identity = (
++        None if state.incumbent_identity is None else state.incumbent_identity.identity_sha256
++    )
++    _record_artifact(
++        state,
++        services.write_json_artifact(
++            _iteration_name(state, "decision.json"),
++            {
++                "schema_version": 2,
++                "rankable": bool(rankable),
++                "quantized_score": None if score is None else _score_primitive(score),
++                "prior_incumbent_identity_sha256": prior_identity,
++                "new_incumbent_identity_sha256": new_identity,
++                "decision": "accept" if improves else "retain",
++            },
++        ),
++    )
++    state.prior_iterations = (*state.prior_iterations, feedback)
++    state.iterations_completed += 1
++    state.next_iteration += 1
++    state.iteration_workspace = None
++    state.iteration_source_bundle = None
++    state.prospective_source_bundle = None
++    state.evaluation_failure_code = None
++    return _IterationOutcome(
++        completed=True,
++        terminal_code=None,
++        feedback=feedback,
++        candidate_workspace=candidate_workspace if improves else None,
++        candidate_identity=candidate_identity if improves else None,
++        discovery=discovery,
++        incumbent_changed=improves,
++    )
++
++
++def _run_iteration(
++    readiness: PitOptimizerReadiness,
++    state: _RunState,
++    services: PitOptimizerServices,
++) -> _IterationOutcome:
++    investigator = _run_investigator(readiness, state, services)
++    author = _run_author(readiness, state, investigator, services)
++    validation = _validate_iteration_candidate(readiness, state, author, services)
++    discovery = _evaluate_iteration_candidate(readiness, state, validation, services)
++    critic = _run_critic(
++        readiness,
++        state,
++        investigator,
++        author,
++        validation,
++        discovery,
++        services,
++    )
++    return _persist_iteration_decision(
++        readiness,
++        state,
++        validation,
++        discovery,
++        critic,
++        services,
++    )
++
++
++def _pre_iteration_stop(
++    readiness: PitOptimizerReadiness,
++    state: _RunState,
++    services: PitOptimizerServices,
++) -> tuple[str, str | None] | None:
++    if services.cancellation_requested():
++        return "cancelled", None
++    if state.non_improving_streak >= readiness.manifest.non_improving_limit:
++        return "stagnation_limit", None
++    if state.next_iteration > min(readiness.manifest.max_iterations, 8):
++        return "iteration_limit", None
++    lease = state.authorization_lease
++    if lease is None:
++        return "authorization_exhausted", None
++    if _budget_summary_from_calls(state.call_records).incomplete_accounting_calls:
++        raise ProviderAccountingFailure("provider accounting is incomplete")
++    next_plans = tuple(
++        item
++        for item in readiness.manifest.call_budgets
++        if item.iteration == state.next_iteration
++    )
++    if tuple(item.role for item in next_plans) != (
++        "investigator",
++        "author",
++        "critic",
++    ):
++        return "authorization_exhausted", None
++    spent = _budget_summary_from_calls(state.call_records)
++    if lease.max_calls - spent.api_calls < 3:
++        return "budget_exhausted", "call_budget_exhausted"
++    required_tokens = sum(
++        item.max_input_tokens + item.max_output_tokens for item in next_plans
++    )
++    charged_tokens = spent.total_tokens + spent.retained_reservation_tokens
++    if lease.max_tokens - charged_tokens < required_tokens:
++        return "budget_exhausted", "token_budget_exhausted"
++    required_usd = sum(Decimal(str(item.max_usd)) for item in next_plans)
++    charged_usd = Decimal(str(spent.authoritative_usd)) + Decimal(
++        str(spent.retained_reservation_usd)
++    )
++    if Decimal(str(lease.max_usd)) - charged_usd < required_usd:
++        return "budget_exhausted", "cost_budget_exhausted"
++    return None
++
++
++def _finish_discovery(
++    readiness: PitOptimizerReadiness,
++    state: _RunState,
++    services: PitOptimizerServices,
++) -> DeterminismAttestation | None:
++    if state.incumbent_identity is None:
++        return None
++    if state.incumbent_workspace is None:
++        raise IdentityDrift("discovery incumbent workspace is absent")
++    fold_id = readiness.manifest.fold_manifest.discovery_folds[0].fold_id
++    expected = state.incumbent_discovery.evidence_ids[0]
++    attestation = services.confirm_discovery(
++        state.incumbent_workspace,
++        state.incumbent_identity,
++        fold_id,
++    )
++    if not isinstance(attestation, DeterminismAttestation):
++        raise TrustedEvaluatorNondeterminism("discovery repeat is not attested")
++    if (
++        attestation.fold_id != fold_id
++        or attestation.expected_evidence_sha256 != expected
++        or attestation.repeated_evidence_sha256 != expected
++        or not attestation.matched
++    ):
++        raise TrustedEvaluatorNondeterminism(
++            "trusted discovery repeat differs from incumbent evidence"
++        )
++    return attestation
++
++
++def _terminal_from_exception(exc: BaseException) -> tuple[str, str | None]:
++    mapping: tuple[tuple[type[BaseException], str], ...] = (
++        (ProviderProtocolFailure, "provider_protocol_failure"),
++        (ProviderAccountingFailure, "provider_accounting_failure"),
++        (AuditFailure, "audit_failure"),
++        (AuthorizationExhausted, "authorization_exhausted"),
++        (IdentityDrift, "identity_drift"),
++        (TrustedEvaluatorNondeterminism, "trusted_evaluator_nondeterminism"),
++        (SandboxIntegrityFailure, "sandbox_integrity_failure"),
++        (EvidenceTampering, "evidence_tampering"),
++    )
++    if isinstance(exc, ContextBudgetExhausted):
++        return "budget_exhausted", "context_budget_exhausted"
++    if isinstance(exc, KeyboardInterrupt):
++        return "cancelled", None
++    for kind, code in mapping:
++        if isinstance(exc, kind):
++            return code, None
++    if isinstance(exc, OSError):
++        return "audit_failure", None
++    return "sandbox_integrity_failure", None
++
++
++def _new_run_state(readiness: PitOptimizerReadiness) -> _RunState:
++    return _RunState(
++        run_id=readiness.manifest.run_id,
++        next_iteration=1,
++        incumbent_workspace=None,
++        incumbent_identity=None,
++        incumbent_cumulative_diff="",
++        incumbent_discovery=readiness.baseline_discovery,
++        prior_iterations=(),
++        valid_evaluations=0,
++        incumbent_updates=0,
++        non_improving_streak=0,
++        provider_enabled=True,
++        frozen_pricing=None,
++        authorization_lease=None,
++    )
++
++
++def _run_hidden_once(
++    readiness: PitOptimizerReadiness,
++    state: _RunState,
++    services: PitOptimizerServices,
++) -> HiddenEvaluation:
++    if state.hidden_validation_opened:
++        raise EvidenceTampering("hidden validation was already opened")
++    identity = state.incumbent_identity
++    workspace = state.incumbent_workspace
++    if identity is None or workspace is None:
++        raise IdentityDrift("hidden validation incumbent is absent")
++    identity_sha256 = getattr(identity, "identity_sha256", None)
++    if not isinstance(identity_sha256, str) or len(identity_sha256) != 64:
++        raise IdentityDrift("hidden validation incumbent identity is invalid")
++
++    reservation = services.reserve_hidden_validation(identity)
++    if not isinstance(reservation, ValidationReservation):
++        raise EvidenceTampering("hidden validation reservation is invalid")
++    state.validation_reservation = reservation
++    state.hidden_validation_opened = True
++
++    # This assignment is deliberately before the evaluator call.  The shared
++    # role-call path begins with this guard, so no later provider request can
++    # observe hidden-window identity, aggregates, or outcome.
++    state.provider_enabled = False
++    hidden = services.evaluate_hidden(workspace, identity, reservation)
++    if not isinstance(hidden, HiddenEvaluation):
++        raise EvidenceTampering("hidden evaluation is not closed")
++    hidden_fold_id = readiness.manifest.fold_manifest.hidden_fold.fold_id
++    if (
++        hidden.baseline_aggregate.fold_id != hidden_fold_id
++        or hidden.candidate_aggregate.fold_id != hidden_fold_id
++    ):
++        raise IdentityDrift("hidden evaluation fold identity differs")
++
++    expected_decision = HoldoutDecision.from_result(
++        excess_total_return_pp=(
++            Decimal(str(hidden.candidate_aggregate.total_return_pct))
++            - Decimal(str(hidden.baseline_aggregate.total_return_pct))
++        ),
++        closed_trades=hidden.candidate_aggregate.closed_trades,
++        safety_complete=hidden.decision.safety_complete,
++        integrity_complete=hidden.decision.integrity_complete,
++        accounting_complete=hidden.decision.accounting_complete,
++    )
++    if hidden.decision != expected_decision:
++        raise EvidenceTampering("hidden eligibility differs from trusted aggregates")
++    supplied_excess = hidden.candidate_aggregate.excess_total_return_pp
++    if supplied_excess is None or HoldoutDecision.from_result(
++        excess_total_return_pp=supplied_excess,
++        closed_trades=hidden.candidate_aggregate.closed_trades,
++        safety_complete=hidden.decision.safety_complete,
++        integrity_complete=hidden.decision.integrity_complete,
++        accounting_complete=hidden.decision.accounting_complete,
++    ).excess_total_return_pp != expected_decision.excess_total_return_pp:
++        raise EvidenceTampering("hidden candidate excess differs from trusted aggregates")
++
++    state.hidden_evaluation = hidden
++    _record_artifact(
++        state,
++        services.write_json_artifact(
++            "holdout.json",
++            {
++                "schema_version": 2,
++                "consumed_validation_key_sha256": (
++                    reservation.consumption_key_sha256
++                ),
++                "validation_reservation_sha256": (
++                    reservation.reservation_record_sha256
++                ),
++                "baseline_aggregate": asdict(hidden.baseline_aggregate),
++                "candidate_aggregate": asdict(hidden.candidate_aggregate),
++                "baseline_identity_sha256": (
++                    readiness.manifest.effective_policy_sha256
++                ),
++                "candidate_identity_sha256": identity_sha256,
++                "eligibility_checks": {
++                    "excess_total_return_pp": str(
++                        expected_decision.excess_total_return_pp
++                    ),
++                    "closed_trades": expected_decision.closed_trades,
++                    "safety_complete": expected_decision.safety_complete,
++                    "integrity_complete": expected_decision.integrity_complete,
++                    "accounting_complete": expected_decision.accounting_complete,
++                    "long_replay_eligible": (
++                        expected_decision.long_replay_eligible
++                    ),
++                },
++            },
++        ),
++    )
++    return hidden
++
++
++def _dispose_all_candidates_and_workers(
++    state: _RunState,
++    services: PitOptimizerServices,
++) -> PitOptimizerCleanup:
++    """Attempt every unique capability disposal and aggregate closed cleanup facts."""
++
++    workspaces: list[CandidateWorkspace] = []
++    seen: set[str] = set()
++    for workspace in (state.iteration_workspace, state.incumbent_workspace):
++        if workspace is not None and workspace.workspace_id not in seen:
++            seen.add(workspace.workspace_id)
++            workspaces.append(workspace)
++
++    observations: list[PitOptimizerCleanup] = []
++    for workspace in workspaces:
++        try:
++            cleanup = services.dispose_candidate(workspace)
++            if not isinstance(cleanup, PitOptimizerCleanup):
++                raise SandboxIntegrityFailure(
++                    "candidate cleanup result is invalid"
++                )
++            observations.append(cleanup)
++        except BaseException:
++            state.finalization_failures.append("candidate_cleanup")
++            observations.append(PitOptimizerCleanup(False, False, False))
++
++    state.cleanup_observations.extend(observations)
++    state.iteration_workspace = None
++    state.incumbent_workspace = None
++    state.iteration_source_bundle = None
++    state.prospective_source_bundle = None
++    return PitOptimizerCleanup(
++        candidate_removed=all(item.candidate_removed for item in observations),
++        worker_stopped=all(item.worker_stopped for item in observations),
++        source_modified=any(item.source_modified for item in observations),
++    )
++
++
++def _build_final_result(
++    *,
++    readiness: PitOptimizerReadiness,
++    state: _RunState,
++    terminal_code: str,
++    cleanup: PitOptimizerCleanup,
++) -> PitOptimizerResult:
++    """Construct the terminal value only from already-finalized local facts."""
++
++    if terminal_code not in OptimizerTerminalCode:
++        terminal_code = "sandbox_integrity_failure"
++    normal_codes = {
++        "iteration_limit",
++        "budget_exhausted",
++        "stagnation_limit",
++        "cancelled",
++    }
++    budget = _budget_summary_from_calls(state.call_records)
++    cleanup_complete = (
++        cleanup.candidate_removed
++        and cleanup.worker_stopped
++        and not cleanup.source_modified
++        and not state.finalization_failures
++    )
++    if terminal_code in normal_codes and budget.incomplete_accounting_calls:
++        terminal_code = "provider_accounting_failure"
++        state.terminal_detail = None
++    if terminal_code in normal_codes and not cleanup_complete:
++        terminal_code = "sandbox_integrity_failure"
++        state.terminal_detail = None
++
++    normal = terminal_code in normal_codes
++    hidden = state.hidden_evaluation
++    long_replay_eligible = (
++        None
++        if not state.hidden_validation_opened or hidden is None
++        else hidden.decision.long_replay_eligible
++    )
++    status = (
++        "aborted"
++        if not normal
++        else (
++            "long_replay_eligible"
++            if long_replay_eligible is True
++            else "loop_verified_no_long_replay_candidate"
++        )
++    )
++    root = state.artifact_root
++    if root is None:
++        root = (readiness.artifact_path.parent / state.run_id).resolve()
++    reservation = state.validation_reservation
++    return PitOptimizerResult(
++        schema_version=2,
++        phase="run",
++        status=status,
++        terminal_code=terminal_code,
++        terminal_detail=state.terminal_detail,
++        exit_code=0 if normal else 1,
++        run_id=state.run_id,
++        readiness_sha256=readiness.readiness_sha256,
++        manifest_sha256=readiness.manifest_sha256,
++        iterations_started=state.iterations_started,
++        iterations_completed=state.iterations_completed,
++        valid_evaluations=state.valid_evaluations,
++        incumbent_updates=state.incumbent_updates,
++        non_improving_streak=state.non_improving_streak,
++        discovery_winner=state.incumbent_identity,
++        hidden_validation_opened=state.hidden_validation_opened,
++        validation_reservation_sha256=(
++            None if reservation is None else reservation.reservation_record_sha256
++        ),
++        long_replay_eligible=long_replay_eligible,
++        budget=budget,
++        artifact_root=root,
++        artifact_paths=tuple(state.artifact_paths),
++        source_modified=cleanup.source_modified,
++        cleanup_complete=cleanup_complete,
++    )
++
++
++def _finalize_result(
++    readiness: PitOptimizerReadiness,
++    state: _RunState,
++    services: PitOptimizerServices,
++    terminal_code: str,
++) -> PitOptimizerResult:
++    state.provider_enabled = False
++    effective_terminal = terminal_code
++    lease = state.authorization_lease
++    if lease is not None:
++        try:
++            services.close_run_lease(lease, terminal_code)
++        except BaseException:
++            state.finalization_failures.append("lease_close")
++            effective_terminal = "audit_failure"
++            state.terminal_detail = None
++        finally:
++            state.authorization_lease = None
++
++    cleanup = _dispose_all_candidates_and_workers(state, services)
++    if (
++        effective_terminal in {
++            "iteration_limit",
++            "budget_exhausted",
++            "stagnation_limit",
++            "cancelled",
++        }
++        and (
++            not cleanup.candidate_removed
++            or not cleanup.worker_stopped
++            or cleanup.source_modified
++        )
++    ):
++        effective_terminal = "sandbox_integrity_failure"
++        state.terminal_detail = None
++
++    try:
++        services.verify_inputs(readiness)
++    except BaseException as exc:
++        state.finalization_failures.append("input_verification")
++        if effective_terminal in {
++            "iteration_limit",
++            "budget_exhausted",
++            "stagnation_limit",
++            "cancelled",
++        }:
++            effective_terminal, _detail = _terminal_from_exception(exc)
++            if effective_terminal in {
++                "iteration_limit",
++                "budget_exhausted",
++                "stagnation_limit",
++                "cancelled",
++            }:
++                effective_terminal = "sandbox_integrity_failure"
++        state.terminal_detail = None
++
++    if state.incumbent_cumulative_diff and not any(
++        path.name == "incumbent.diff" for path, _digest in state.artifact_paths
++    ):
++        try:
++            _record_artifact(
++                state,
++                services.write_diff_artifact(
++                    "incumbent.diff",
++                    state.incumbent_cumulative_diff,
++                ),
++            )
++        except BaseException:
++            state.finalization_failures.append("incumbent_artifact")
++            effective_terminal = "audit_failure"
++            state.terminal_detail = None
++
++    try:
++        _replace_accounting_artifact(state, services)
++    except BaseException:
++        state.finalization_failures.append("accounting_artifact")
++        effective_terminal = "audit_failure"
++        state.terminal_detail = None
++
++    result = _build_final_result(
++        readiness=readiness,
++        state=state,
++        terminal_code=effective_terminal,
++        cleanup=cleanup,
++    )
++    try:
++        summary_artifact = services.write_json_artifact(
++            "summary.json",
++            result.to_public_artifact(),
++        )
++        _record_artifact(state, summary_artifact)
++    except BaseException:
++        state.finalization_failures.append("summary_artifact")
++        return replace(
++            result,
++            status="aborted",
++            terminal_code="audit_failure",
++            terminal_detail=None,
++            exit_code=1,
++            cleanup_complete=False,
++        )
++    return replace(result, artifact_paths=tuple(state.artifact_paths))
++
++
++def run_pit_optimizer_v2(
++    *,
++    readiness: PitOptimizerReadiness,
++    services: PitOptimizerServices,
++) -> PitOptimizerResult:
++    if not isinstance(readiness, PitOptimizerReadiness):
++        raise ValueError("optimizer run readiness is invalid")
++    state = _new_run_state(readiness)
++    terminal_code = "iteration_limit"
++    try:
++        _initialize_run_artifacts(readiness, state, services)
++        while True:
++            stop = _pre_iteration_stop(readiness, state, services)
++            if stop is not None:
++                terminal_code, terminal_detail = stop
++                state.terminal_detail = terminal_detail
++                break
++            state.iterations_started += 1
++            outcome = _run_iteration(readiness, state, services)
++            if outcome.terminal_code is not None:
++                terminal_code = outcome.terminal_code
++                break
++        repeated = _finish_discovery(readiness, state, services)
++        if repeated is not None:
++            _run_hidden_once(readiness, state, services)
++    except BaseException as exc:
++        terminal_code, terminal_detail = _terminal_from_exception(exc)
++        state.terminal_detail = terminal_detail
++    return _finalize_result(readiness, state, services, terminal_code)
+diff --git a/core/pit_optimizer_evaluation.py b/core/pit_optimizer_evaluation.py
+index 0987a5d..c0062eb 100644
+--- a/core/pit_optimizer_evaluation.py
++++ b/core/pit_optimizer_evaluation.py
+@@ -374,20 +374,147 @@ class HoldoutDecision:
+         return cls(
+             excess_total_return_pp=excess,
+             closed_trades=closed_trades,
+             safety_complete=safety_complete,
+             integrity_complete=integrity_complete,
+             accounting_complete=accounting_complete,
+             long_replay_eligible=eligible,
+         )
+ 
+ 
++@dataclass(frozen=True, slots=True)
++class FoldEvaluationResult:
++    fold_id: str
++    engine_policy_sha256: str
++    candidate_identity_sha256: str
++    aggregate_metrics: FoldAggregateSummary
++
++    def __post_init__(self) -> None:
++        if not isinstance(self.fold_id, str) or not self.fold_id:
++            raise ValueError("fold evaluation ID is invalid")
++        _require_digest(self.engine_policy_sha256, "fold engine policy SHA-256")
++        _require_digest(
++            self.candidate_identity_sha256,
++            "fold candidate identity SHA-256",
++        )
++        if not isinstance(self.aggregate_metrics, FoldAggregateSummary):
++            raise ValueError("fold evaluation aggregate is invalid")
++        if self.aggregate_metrics.fold_id != self.fold_id:
++            raise ValueError("fold evaluation aggregate identity differs")
++
++
++@dataclass(frozen=True, slots=True)
++class DiscoveryComparison:
++    candidate_vs_fixed_baseline: DiscoveryScore
++    candidate_vs_incumbent_diagnostics: DiscoveryScore
++    rankable: bool
++    strictly_improves_incumbent: bool
++
++    def __post_init__(self) -> None:
++        if not isinstance(self.candidate_vs_fixed_baseline, DiscoveryScore) or not isinstance(
++            self.candidate_vs_incumbent_diagnostics,
++            DiscoveryScore,
++        ):
++            raise ValueError("discovery comparison scores are invalid")
++        if type(self.rankable) is not bool or type(self.strictly_improves_incumbent) is not bool:
++            raise ValueError("discovery comparison flags are invalid")
++        if self.strictly_improves_incumbent and not self.rankable:
++            raise ValueError("an unrankable discovery candidate cannot improve")
++
++
++@dataclass(frozen=True, slots=True)
++class DiscoveryEvaluation:
++    folds: tuple[FoldEvaluationResult, ...]
++    comparison: DiscoveryComparison
++
++    def __post_init__(self) -> None:
++        if (
++            type(self.folds) is not tuple
++            or len(self.folds) != 2
++            or any(not isinstance(item, FoldEvaluationResult) for item in self.folds)
++        ):
++            raise ValueError("discovery evaluation folds are invalid")
++        if tuple(item.fold_id for item in self.folds) != (
++            "discovery_1",
++            "discovery_2",
++        ):
++            raise ValueError("discovery evaluation fold order is invalid")
++        if not isinstance(self.comparison, DiscoveryComparison):
++            raise ValueError("discovery evaluation comparison is invalid")
++        if len({item.engine_policy_sha256 for item in self.folds}) != 1 or len(
++            {item.candidate_identity_sha256 for item in self.folds}
++        ) != 1:
++            raise ValueError("discovery evaluation fold identities differ")
++
++
++@dataclass(frozen=True, slots=True)
++class DeterminismAttestation:
++    fold_id: str
++    expected_evidence_sha256: str
++    repeated_evidence_sha256: str
++    matched: bool
++
++    def __post_init__(self) -> None:
++        if not isinstance(self.fold_id, str) or not self.fold_id:
++            raise ValueError("determinism fold ID is invalid")
++        _require_digest(
++            self.expected_evidence_sha256,
++            "determinism expected evidence SHA-256",
++        )
++        _require_digest(
++            self.repeated_evidence_sha256,
++            "determinism repeated evidence SHA-256",
++        )
++        if type(self.matched) is not bool:
++            raise ValueError("determinism match flag is invalid")
++        if self.matched is not (
++            self.expected_evidence_sha256 == self.repeated_evidence_sha256
++        ):
++            raise ValueError("determinism match flag differs from evidence")
++
++
++@dataclass(frozen=True, slots=True)
++class HiddenEvaluation:
++    baseline_aggregate: FoldAggregateSummary
++    candidate_aggregate: FoldAggregateSummary
++    decision: HoldoutDecision
++
++    def __post_init__(self) -> None:
++        if not isinstance(self.baseline_aggregate, FoldAggregateSummary) or not isinstance(
++            self.candidate_aggregate,
++            FoldAggregateSummary,
++        ):
++            raise ValueError("hidden evaluation aggregates are invalid")
++        if self.baseline_aggregate.fold_id != self.candidate_aggregate.fold_id:
++            raise ValueError("hidden evaluation fold identities differ")
++        if not isinstance(self.decision, HoldoutDecision):
++            raise ValueError("hidden evaluation decision is invalid")
++
++
++@dataclass(frozen=True, slots=True)
++class PitOptimizerCleanup:
++    candidate_removed: bool
++    worker_stopped: bool
++    source_modified: bool
++
++    def __post_init__(self) -> None:
++        if any(
++            type(value) is not bool
++            for value in (
++                self.candidate_removed,
++                self.worker_stopped,
++                self.source_modified,
++            )
++        ):
++            raise ValueError("optimizer cleanup flags are invalid")
++
++
+ def _require_digest(value: object, label: str) -> str:
+     if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
+         raise ValueError(f"{label} is invalid")
+     return value
+ 
+ 
+ def _require_closed_id(value: object, label: str) -> str:
+     if not isinstance(value, str) or _CLOSED_ID_RE.fullmatch(value) is None:
+         raise ValueError(f"{label} is invalid")
+     return value
+diff --git a/tests/test_pit_optimizer_loop.py b/tests/test_pit_optimizer_loop.py
+new file mode 100644
+index 0000000..46b62f6
+--- /dev/null
++++ b/tests/test_pit_optimizer_loop.py
+@@ -0,0 +1,1840 @@
++from __future__ import annotations
++
++from dataclasses import asdict, replace
++from datetime import date, timedelta
++from decimal import Decimal
++import hashlib
++import json
++from pathlib import Path
++import subprocess
++from typing import Mapping
++
++import pytest
++
++from core import pit_optimization_contract as contract
++from core.pit_optimizer_evaluation import (
++    AggregateMetric,
++    FoldAggregateSummary,
++    FoldManifest,
++    FoldSpec,
++)
++from core.pit_policy_parity import (
++    ParityAttestation,
++    ParityEquityPoint,
++    ParityFoldEvidence,
++)
++
++
++def _canonical_bytes(value: object) -> bytes:
++    return (
++        json.dumps(
++            value,
++            sort_keys=True,
++            separators=(",", ":"),
++            ensure_ascii=False,
++            allow_nan=False,
++        ).encode("utf-8")
++        + b"\n"
++    )
++
++
++def _sessions(start: date) -> tuple[str, ...]:
++    values: list[str] = []
++    cursor = start
++    while len(values) < 60:
++        if cursor.weekday() < 5:
++            values.append(cursor.isoformat())
++        cursor += timedelta(days=1)
++    return tuple(values)
++
++
++def _fold(fold_id: str, purpose: str, start: date) -> FoldSpec:
++    sessions = _sessions(start)
++    return FoldSpec(
++        fold_id=fold_id,
++        purpose=purpose,
++        start_date=sessions[0],
++        end_date=sessions[-1],
++        sessions=sessions,
++    )
++
++
++def _aggregate(fold_id: str, total_return: float) -> FoldAggregateSummary:
++    return FoldAggregateSummary(
++        fold_id=fold_id,
++        total_return_pct=total_return,
++        excess_total_return_pp=None,
++        max_drawdown_pct=-2.0,
++        sharpe_ratio=1.0,
++        closed_trades=4,
++        turnover_pct=12.0,
++        average_exposure_pct=35.0,
++        entry_funnel=(AggregateMetric("entries", 4),),
++        exit_attribution=(AggregateMetric("profit_target", 2),),
++    )
++
++
++def _evidence(
++    fold: FoldSpec,
++    *,
++    effective_policy_sha256: str,
++    total_return: float,
++) -> ParityFoldEvidence:
++    aggregate = _aggregate(fold.fold_id, total_return)
++    primitive = {
++        "fold_id": fold.fold_id,
++        "transactions": [],
++        "entry_outcomes": [],
++        "equity": [
++            asdict(ParityEquityPoint(session=session, equity=100.0 + index))
++            for index, session in enumerate(fold.sessions)
++        ],
++        "funnel": [asdict(item) for item in aggregate.entry_funnel],
++        "aggregate": asdict(aggregate),
++        "effective_policy_sha256": effective_policy_sha256,
++    }
++    return ParityFoldEvidence(
++        fold_id=fold.fold_id,
++        transactions=(),
++        entry_outcomes=(),
++        equity=tuple(
++            ParityEquityPoint(session=session, equity=100.0 + index)
++            for index, session in enumerate(fold.sessions)
++        ),
++        funnel=aggregate.entry_funnel,
++        aggregate=aggregate,
++        effective_policy_sha256=effective_policy_sha256,
++        evidence_sha256=hashlib.sha256(_canonical_bytes(primitive)).hexdigest(),
++    )
++
++
++def _call_budgets() -> tuple[contract.PitOptimizerCallBudget, ...]:
++    caps = {
++        "investigator": (8_000, 80_000, 88_000, 4_000, 8 * 1024, 0.05),
++        "author": (12_000, 76_000, 88_000, 8_000, 16 * 1024, 0.10),
++        "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024, 0.05),
++    }
++    return tuple(
++        contract.PitOptimizerCallBudget(
++            call_index=(iteration - 1) * 3 + ordinal,
++            iteration=iteration,
++            role=role,
++            model=contract.PIT_OPTIMIZER_R1_MODEL,
++            max_static_input_bytes=caps[role][0],
++            max_dynamic_input_bytes=caps[role][1],
++            max_input_tokens=caps[role][2],
++            max_output_tokens=caps[role][3],
++            max_response_bytes=caps[role][4],
++            max_usd=caps[role][5],
++        )
++        for iteration in (1, 2)
++        for ordinal, role in enumerate(contract.OPTIMIZER_V2_ROLES, start=1)
++    )
++
++
++def _git(root: Path, *args: str) -> bytes:
++    return subprocess.run(
++        ["git", *args],
++        cwd=root,
++        check=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++    ).stdout
++
++
++def _prepare_fixture(tmp_path: Path) -> dict[str, object]:
++    source_root = tmp_path / "source"
++    source_texts = {
++        "core/strategy_policy/entry.py": "def evaluate_entry(snapshot):\n    return None\n",
++        "core/strategy_policy/risk.py": (
++            "def recommend_capacity(snapshot):\n    return 1\n"
++            "def recommend_allocation(snapshot):\n    return 0.1\n"
++            "def select_eviction(snapshot):\n    return None\n"
++        ),
++        "core/strategy_policy/exit.py": "def evaluate_exit(snapshot):\n    return None\n",
++    }
++    for relative, text in source_texts.items():
++        path = source_root / relative
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_text(text, encoding="utf-8", newline="")
++    for args in (
++        ("init",),
++        ("config", "user.name", "Task 7 Test"),
++        ("config", "user.email", "task7@example.invalid"),
++        ("add", "."),
++        ("commit", "-m", "synthetic source"),
++    ):
++        _git(source_root, *args)
++    source_head = _git(source_root, "rev-parse", "HEAD").decode().strip()
++    source_fingerprint = hashlib.sha256(
++        _git(source_root, "ls-tree", "-r", "--full-tree", "HEAD")
++    ).hexdigest()
++
++    pit_bundle = tmp_path / "pit.sqlite3"
++    pit_bundle.write_bytes(b"provider-free-pit-fixture")
++    pit_sha256 = hashlib.sha256(pit_bundle.read_bytes()).hexdigest()
++    baseline_run = tmp_path / "baseline"
++    baseline_run.mkdir()
++    baseline_manifest = baseline_run / "run_manifest.json"
++    baseline_manifest.write_bytes(_canonical_bytes({"schema_version": 1}))
++    baseline_sha256 = hashlib.sha256(baseline_manifest.read_bytes()).hexdigest()
++    effective_policy_sha256 = "3" * 64
++
++    fold_manifest = FoldManifest(
++        data_identity_sha256=pit_sha256,
++        universe_sha256="4" * 64,
++        benchmark="SPY",
++        warmup_start_date="2020-01-02",
++        discovery_folds=(
++            _fold("discovery_1", "discovery", date(2021, 1, 4)),
++            _fold("discovery_2", "discovery", date(2021, 4, 1)),
++        ),
++        hidden_fold=_fold("hidden_sentinel", "hidden", date(2021, 7, 1)),
++    )
++    evidence = (
++        _evidence(
++            fold_manifest.discovery_folds[0],
++            effective_policy_sha256=effective_policy_sha256,
++            total_return=1.0,
++        ),
++        _evidence(
++            fold_manifest.discovery_folds[1],
++            effective_policy_sha256=effective_policy_sha256,
++            total_return=2.0,
++        ),
++    )
++    parity_path = tmp_path / "final-parity.json"
++    provisional = ParityAttestation(
++        schema_version=1,
++        reference_artifact_sha256="5" * 64,
++        reference_source_head="1" * 40,
++        final_source_head=source_head,
++        final_source_fingerprint_sha256=source_fingerprint,
++        pit_bundle_sha256=pit_sha256,
++        baseline_manifest_sha256=baseline_sha256,
++        effective_policy_sha256=effective_policy_sha256,
++        discovery_fold_manifest_sha256=fold_manifest.sha256,
++        policy_interface_version=1,
++        reference_output_sha256s=tuple(
++            (item.fold_id, item.evidence_sha256) for item in evidence
++        ),
++        final_output_sha256s=tuple(
++            (item.fold_id, item.evidence_sha256) for item in evidence
++        ),
++        final_discovery_evidence=evidence,
++        transactions_equal=True,
++        entry_outcomes_equal=True,
++        equity_equal=True,
++        funnels_equal=True,
++        effective_policy_equal=True,
++        artifact_path=parity_path.resolve(),
++        artifact_sha256="0" * 64,
++    )
++    parity_primitive = asdict(provisional)
++    parity_primitive.pop("artifact_path")
++    parity_primitive.pop("artifact_sha256")
++    parity_path.write_bytes(_canonical_bytes(parity_primitive))
++    parity = replace(
++        provisional,
++        artifact_sha256=hashlib.sha256(parity_path.read_bytes()).hexdigest(),
++    )
++
++    source_hashes = tuple(
++        (relative, hashlib.sha256(text.encode("utf-8")).hexdigest())
++        for relative, text in source_texts.items()
++    )
++    bounds = contract.PatchBounds(3, 12, 80, 8 * 1024)
++    scope = contract.PolicySourceScope(
++        schema_version=2,
++        policy_interface_version=1,
++        initial_policy_source_sha256s=source_hashes,
++        editable_paths=tuple(source_texts),
++        max_policy_source_bundle_bytes=contract.MAX_POLICY_SOURCE_BUNDLE_BYTES,
++        max_iteration_feedback_bytes=contract.MAX_ITERATION_FEEDBACK_BYTES,
++        max_iteration_history_bytes=contract.MAX_ITERATION_HISTORY_BYTES,
++        hard_patch_bounds=contract.PatchBounds(3, 12, 200, contract.MAX_AUTHOR_DIFF_BYTES),
++        candidate_bounds=bounds,
++        max_iterations=2,
++        allowed_descendant_rule="authenticated_initial_sources_plus_validated_cumulative_diff",
++    )
++    authorization = contract.AuthorizationRequirement(
++        window_id="window_task7",
++        max_calls=6,
++        max_tokens=448_000,
++        max_usd=0.40,
++        policy_source_scope_sha256=scope.sha256,
++        provider_retries=0,
++        apply=False,
++    )
++    constraints = ("causal_only", "no_external_io")
++    constraints_sha256 = hashlib.sha256(_canonical_bytes(constraints)).hexdigest()
++    manifest = contract.PitOptimizerRunManifest(
++        schema_version=2,
++        run_id="run_task7",
++        run_kind="subset_canary",
++        model=contract.PIT_OPTIMIZER_R1_MODEL,
++        source_head=source_head,
++        source_fingerprint_sha256=source_fingerprint,
++        legacy_readiness_sha256="6" * 64,
++        pit_bundle_sha256=pit_sha256,
++        baseline_manifest_sha256=baseline_sha256,
++        effective_policy_sha256=effective_policy_sha256,
++        policy_interface_version=1,
++        policy_source_sha256s=source_hashes,
++        editable_paths=tuple(source_texts),
++        policy_source_scope=scope,
++        immutable_constraints_sha256=constraints_sha256,
++        fold_manifest=fold_manifest,
++        parity_attestation_sha256=parity.artifact_sha256,
++        sandbox_image="example.invalid/task7@sha256:" + "7" * 64,
++        validation_ledger_name="pit_optimizer_validation_ledger.jsonl",
++        immutable_constraint_ids=constraints,
++        candidate_bounds=bounds,
++        call_budgets=_call_budgets(),
++        max_iterations=2,
++        non_improving_limit=3,
++        authorization_requirement=authorization,
++    )
++    manifest_path = tmp_path / "optimizer-manifest.json"
++    contract.write_optimizer_manifest(manifest, manifest_path)
++    artifact_root = tmp_path / "artifacts"
++    permanent_runtime_root = tmp_path / "runtime"
++    artifact_root.mkdir()
++    permanent_runtime_root.mkdir()
++    config = contract.PitOptimizerGateConfig(
++        phase="prepare",
++        baseline_run=baseline_run,
++        baseline_manifest_sha256=baseline_sha256,
++        pit_bundle=pit_bundle,
++        pit_bundle_sha256=pit_sha256,
++        effective_policy_sha256=effective_policy_sha256,
++        optimizer_manifest=manifest_path,
++        optimizer_manifest_sha256=manifest.sha256,
++        verified_parity_artifact=parity_path,
++        verified_parity_sha256=parity.artifact_sha256,
++        readiness_artifact=None,
++        readiness_sha256=None,
++        authorization_window_id=None,
++        authorization_requirement_sha256=authorization.sha256,
++        source_transmission_authorized=False,
++        max_usd=0.40,
++        max_api_calls=6,
++        max_tokens=448_000,
++        max_iterations=2,
++        apply=False,
++    )
++    return {
++        "config": config,
++        "manifest": manifest,
++        "parity": parity,
++        "source_root": source_root,
++        "artifact_root": artifact_root,
++        "permanent_runtime_root": permanent_runtime_root,
++        "source_head": source_head,
++        "source_fingerprint_sha256": source_fingerprint,
++    }
++
++
++def _prepare(inputs: dict[str, object]):
++    from core.pit_optimizer_controller import prepare_pit_optimizer_v2
++
++    return prepare_pit_optimizer_v2(
++        inputs["config"],
++        source_root=inputs["source_root"],
++        artifact_root=inputs["artifact_root"],
++        permanent_runtime_root=inputs["permanent_runtime_root"],
++        source_head=inputs["source_head"],
++        source_fingerprint_sha256=inputs["source_fingerprint_sha256"],
++    )
++
++
++def test_prepare_v2_writes_one_self_digested_provider_free_readiness(
++    tmp_path: Path,
++) -> None:
++    """Break caught: prepare could project unauthenticated or hidden evidence."""
++    inputs = _prepare_fixture(tmp_path)
++
++    readiness = _prepare(inputs)
++
++    raw = readiness.artifact_path.read_bytes()
++    primitive = json.loads(raw)
++    assert readiness.readiness_sha256 == hashlib.sha256(raw).hexdigest()
++    assert "readiness_sha256" not in primitive
++    assert "artifact_path" not in primitive
++    assert readiness.baseline_discovery.folds == tuple(
++        item.aggregate for item in inputs["parity"].final_discovery_evidence
++    )
++    assert readiness.provider_seed.baseline_discovery == readiness.baseline_discovery
++    projected = readiness.provider_seed.canonical_json_bytes().decode("utf-8")
++    hidden = inputs["manifest"].fold_manifest.hidden_fold
++    assert hidden.fold_id not in projected
++    assert hidden.start_date not in projected
++    assert hidden.end_date not in projected
++    ledger = Path(inputs["permanent_runtime_root"]) / "pit_optimizer_validation_ledger.jsonl"
++    records = [json.loads(line) for line in ledger.read_bytes().splitlines()]
++    assert [item["metadata"]["exposure_kind"] for item in records] == [
++        "provider_context",
++        "provider_context",
++    ]
++    assert not any(Path(inputs["artifact_root"]).glob("run.json"))
++
++
++def test_prepare_parity_rejects_nested_evidence_digest_mismatch(
++    tmp_path: Path,
++) -> None:
++    """Break caught: an outer rehash could bless tampered per-fold aggregates."""
++    inputs = _prepare_fixture(tmp_path)
++    config = inputs["config"]
++    manifest = inputs["manifest"]
++    assert isinstance(config, contract.PitOptimizerGateConfig)
++    assert isinstance(manifest, contract.PitOptimizerRunManifest)
++    parity_value = json.loads(Path(config.verified_parity_artifact).read_bytes())
++    parity_value["final_discovery_evidence"][0]["aggregate"]["total_return_pct"] = 99.0
++    tampered_parity = tmp_path / "tampered-parity.json"
++    tampered_parity.write_bytes(_canonical_bytes(parity_value))
++    tampered_parity_sha256 = hashlib.sha256(tampered_parity.read_bytes()).hexdigest()
++    rebound_manifest = replace(
++        manifest,
++        parity_attestation_sha256=tampered_parity_sha256,
++    )
++    rebound_manifest_path = tmp_path / "tampered-manifest.json"
++    contract.write_optimizer_manifest(rebound_manifest, rebound_manifest_path)
++    inputs["config"] = replace(
++        config,
++        optimizer_manifest=rebound_manifest_path,
++        optimizer_manifest_sha256=rebound_manifest.sha256,
++        verified_parity_artifact=tampered_parity,
++        verified_parity_sha256=tampered_parity_sha256,
++    )
++
++    with pytest.raises(ValueError, match="evidence digest"):
++        _prepare(inputs)
++
++
++def test_prepare_v2_rejects_tracked_source_drift(tmp_path: Path) -> None:
++    """Break caught: prepare could trust caller-supplied Git identity after drift."""
++    inputs = _prepare_fixture(tmp_path)
++    changed = Path(inputs["source_root"]) / "core/strategy_policy/entry.py"
++    changed.write_text("def evaluate_entry(snapshot):\n    return True\n", encoding="utf-8")
++
++    with pytest.raises(ValueError, match="clean committed source"):
++        _prepare(inputs)
++
++
++def test_prepare_discovery_exposure_precedes_provider_projection(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Break caught: discovery aggregates could enter context before permanent marking."""
++    import core.pit_optimizer_controller as controller
++
++    inputs = _prepare_fixture(tmp_path)
++    events: list[str] = []
++
++    class Ledger:
++        def __init__(self, path: Path) -> None:
++            assert path.name == "pit_optimizer_validation_ledger.jsonl"
++
++        def mark_discovery(self, identity: object, metadata: object) -> object:
++            events.append("mark")
++            return object()
++
++        def seal_discovery_folds(self, manifest: object, reservations: object) -> object:
++            events.append("seal")
++            return object()
++
++    original = controller._baseline_from_parity
++
++    def project(parity: ParityAttestation):
++        events.append("project")
++        return original(parity)
++
++    monkeypatch.setattr(controller, "ValidationLedger", Ledger)
++    monkeypatch.setattr(controller, "_baseline_from_parity", project)
++
++    _prepare(inputs)
++
++    assert events == ["mark", "mark", "seal", "project"]
++
++
++def test_run_lease_initialization_freezes_pricing_before_opening_lease() -> None:
++    """Break caught: provider authority could be acquired against mutable pricing."""
++    from unittest.mock import Mock
++
++    from core.pit_optimizer_authorization import AuthorizationRunLease, FrozenModelPricing
++    from core.pit_optimizer_controller import (
++        PitOptimizerReadiness,
++        PitOptimizerServices,
++        _RunState,
++        _initialize_provider,
++    )
++
++    events: list[str] = []
++    pricing = FrozenModelPricing.from_rates(
++        model="deepseek/deepseek-r1",
++        prompt_per_million=Decimal("1"),
++        completion_per_million=Decimal("2"),
++    )
++    lease = Mock(spec=AuthorizationRunLease)
++    readiness = Mock(spec=PitOptimizerReadiness)
++    readiness.manifest.model = "deepseek/deepseek-r1"
++    state = Mock(spec=_RunState)
++    services = Mock(spec=PitOptimizerServices)
++    services.freeze_pricing.side_effect = lambda model: events.append("pricing") or pricing
++    services.open_run_lease.side_effect = (
++        lambda ready, frozen: events.append("lease") or lease
++    )
++
++    _initialize_provider(readiness, state, services)
++
++    assert events == ["pricing", "lease"]
++    assert state.frozen_pricing is pricing
++    assert state.authorization_lease is lease
++
++
++def _run_state(readiness: object):
++    from core.pit_optimizer_controller import _RunState
++
++    return _RunState(
++        run_id=readiness.manifest.run_id,
++        next_iteration=1,
++        incumbent_workspace=None,
++        incumbent_identity=None,
++        incumbent_cumulative_diff="",
++        incumbent_discovery=readiness.baseline_discovery,
++        prior_iterations=(),
++        valid_evaluations=0,
++        incumbent_updates=0,
++        non_improving_streak=0,
++        provider_enabled=True,
++        frozen_pricing=None,
++        authorization_lease=None,
++    )
++
++
++def _pricing_and_lease(manifest: contract.PitOptimizerRunManifest):
++    from core.pit_optimizer_authorization import AuthorizationRunLease, FrozenModelPricing
++
++    pricing = FrozenModelPricing.from_rates(
++        model=manifest.model,
++        prompt_per_million=Decimal("1"),
++        completion_per_million=Decimal("2"),
++    )
++    lease = AuthorizationRunLease(
++        lease_id="lease_task7",
++        one_shot_key_sha256="8" * 64,
++        window_id=manifest.authorization_requirement.window_id,
++        run_manifest_sha256=manifest.sha256,
++        frozen_pricing_sha256=pricing.pricing_sha256,
++        max_calls=manifest.authorization_requirement.max_calls,
++        max_tokens=manifest.authorization_requirement.max_tokens,
++        max_usd=manifest.authorization_requirement.max_usd,
++    )
++    return pricing, lease
++
++
++def test_artifact_initialization_seals_run_baseline_and_accounting_after_lease(
++    tmp_path: Path,
++) -> None:
++    """Break caught: a run could call or advance without its initial durable identities."""
++    from unittest.mock import Mock
++
++    from core.pit_optimizer_controller import (
++        PitOptimizerServices,
++        _initialize_run_artifacts,
++    )
++
++    readiness = _prepare(_prepare_fixture(tmp_path))
++    state = _run_state(readiness)
++    pricing, lease = _pricing_and_lease(readiness.manifest)
++    services = Mock(spec=PitOptimizerServices)
++    events: list[str] = []
++    payloads: dict[str, Mapping[str, object]] = {}
++    services.freeze_pricing.side_effect = lambda model: events.append("pricing") or pricing
++    services.open_run_lease.side_effect = (
++        lambda ready, frozen: events.append("lease") or lease
++    )
++
++    def write(name: str, value: Mapping[str, object]) -> tuple[Path, str]:
++        events.append(name)
++        payloads[name] = value
++        path = (tmp_path / "run" / name).resolve()
++        path.parent.mkdir(parents=True, exist_ok=True)
++        return path, hashlib.sha256(_canonical_bytes(value)).hexdigest()
++
++    services.write_json_artifact.side_effect = write
++
++    _initialize_run_artifacts(readiness, state, services)
++
++    assert events == ["pricing", "lease", "run.json", "baseline.json", "accounting.json"]
++    assert tuple(payloads) == ("run.json", "baseline.json", "accounting.json")
++    assert payloads["run.json"]["run_id"] == readiness.manifest.run_id
++    assert payloads["run.json"]["authorization"]["lease_id"] == lease.lease_id
++    assert payloads["run.json"]["frozen_pricing_sha256"] == pricing.pricing_sha256
++    assert payloads["baseline.json"]["fold_ids"] == ["discovery_1", "discovery_2"]
++    serialized = json.dumps(payloads, sort_keys=True)
++    assert "hidden_results" not in serialized
++    assert "raw_response" not in serialized
++    assert "system_prompt" not in serialized
++    assert state.next_iteration == 1
++
++
++def test_artifact_failure_closes_retained_lease_without_state_advance(
++    tmp_path: Path,
++) -> None:
++    """Break caught: an fsync/write failure could leak authority or advance iteration state."""
++    from unittest.mock import Mock
++
++    from core.pit_optimizer_controller import PitOptimizerServices, _initialize_run_artifacts
++
++    readiness = _prepare(_prepare_fixture(tmp_path))
++    state = _run_state(readiness)
++    pricing, lease = _pricing_and_lease(readiness.manifest)
++    services = Mock(spec=PitOptimizerServices)
++    services.freeze_pricing.return_value = pricing
++    services.open_run_lease.return_value = lease
++    writes: list[str] = []
++
++    def fail_second(name: str, value: Mapping[str, object]) -> tuple[Path, str]:
++        writes.append(name)
++        if name == "baseline.json":
++            raise OSError("injected artifact fsync failure")
++        return (tmp_path / name).resolve(), "9" * 64
++
++    services.write_json_artifact.side_effect = fail_second
++
++    with pytest.raises(OSError, match="injected artifact fsync failure"):
++        _initialize_run_artifacts(readiness, state, services)
++
++    assert writes == ["run.json", "baseline.json"]
++    services.close_run_lease.assert_called_once_with(lease, "audit_failure")
++    assert state.authorization_lease is None
++    assert state.next_iteration == 1
++
++
++def test_artifact_initialization_store_is_create_only_and_accounting_replaceable(
++    tmp_path: Path,
++) -> None:
++    """Break caught: immutable evidence could be overwritten through the artifact store."""
++    from core.pit_optimizer_artifacts import IncrementalArtifactStore
++
++    root = (tmp_path / "run-artifacts").resolve()
++    root.mkdir()
++    store = IncrementalArtifactStore(root)
++    first_path, first_digest = store.write_json_artifact(
++        "run.json",
++        {"schema_version": 2, "run_id": "run_task7"},
++    )
++    assert first_path == root / "run.json"
++    assert first_digest == hashlib.sha256(first_path.read_bytes()).hexdigest()
++    with pytest.raises(FileExistsError):
++        store.write_json_artifact(
++            "run.json",
++            {"schema_version": 2, "run_id": "run_other"},
++        )
++    store.write_json_artifact(
++        "accounting.json",
++        {"schema_version": 2, "api_calls": 0},
++    )
++    replaced_path, replaced_digest = store.write_json_artifact(
++        "accounting.json",
++        {"schema_version": 2, "api_calls": 1},
++    )
++    assert json.loads(replaced_path.read_bytes())["api_calls"] == 1
++    assert replaced_digest == hashlib.sha256(replaced_path.read_bytes()).hexdigest()
++
++
++def test_artifact_failure_removes_an_uncommitted_create(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Break caught: a failed file fsync could leave a seemingly valid partial artifact."""
++    import core.pit_optimizer_artifacts as artifacts
++
++    target = (tmp_path / "run.json").resolve()
++    monkeypatch.setattr(
++        artifacts.os,
++        "fsync",
++        lambda descriptor: (_ for _ in ()).throw(OSError("injected fsync")),
++    )
++
++    with pytest.raises(OSError, match="injected fsync"):
++        artifacts.write_create_only_json(
++            target,
++            {"schema_version": 2, "run_id": "run_task7"},
++        )
++    assert not target.exists()
++
++
++def test_artifact_initialization_candidate_capability_is_keyed_only_by_workspace_id(
++    tmp_path: Path,
++) -> None:
++    """Break caught: a removed/forged root reference could recreate candidate authority."""
++    from types import SimpleNamespace
++    from unittest.mock import Mock
++
++    from core.pit_optimizer_controller import (
++        CandidateValidationOutcome,
++        CandidateWorkspace,
++        _CandidateCapabilityRegistry,
++    )
++    from core.pit_optimizer_evaluation import PitOptimizerCleanup
++
++    root = (tmp_path / "candidate").resolve()
++    root.mkdir()
++    capability = SimpleNamespace(root=root)
++    author = Mock(spec=contract.AuthorArtifact)
++    outcome = CandidateValidationOutcome(False, "syntax_failed", "diff", "diff", None, (), ())
++    disposed: list[object] = []
++    registry = _CandidateCapabilityRegistry(
++        create_capability=lambda cumulative: capability,
++        validate_capability=lambda live, artifact, cumulative: outcome,
++        dispose_capability=lambda live: disposed.append(live)
++        or PitOptimizerCleanup(True, True, False),
++    )
++
++    workspace = registry.create_candidate(None)
++    assert registry.validate_and_apply(workspace, author, None) is outcome
++    forged = CandidateWorkspace("workspace_forged", workspace.root)
++    with pytest.raises(RuntimeError, match="unknown candidate workspace"):
++        registry.validate_and_apply(forged, author, None)
++    assert registry.dispose_candidate(workspace) == PitOptimizerCleanup(True, True, False)
++    assert disposed == [capability]
++    with pytest.raises(RuntimeError, match="unknown candidate workspace"):
++        registry.validate_and_apply(workspace, author, None)
++    with pytest.raises(RuntimeError, match="unknown candidate workspace"):
++        registry.dispose_candidate(workspace)
++
++
++def test_single_iteration_orders_critic_before_decision(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Break caught: an improving candidate could be accepted before durable criticism."""
++    from unittest.mock import Mock
++
++    import core.pit_optimizer_controller as controller
++    from core.pit_optimizer_authorization import PitOptimizerRoleCall
++    from core.pit_optimizer_controller import (
++        CandidateValidationOutcome,
++        _IterationOutcome,
++        _run_iteration,
++    )
++    from core.pit_optimizer_evaluation import DiscoveryEvaluation
++
++    events: list[str] = []
++    investigator_call = Mock(spec=PitOptimizerRoleCall)
++    author_call = Mock(spec=PitOptimizerRoleCall)
++    validation = Mock(spec=CandidateValidationOutcome)
++    discovery = Mock(spec=DiscoveryEvaluation)
++    critic_call = Mock(spec=PitOptimizerRoleCall)
++    outcome = Mock(spec=_IterationOutcome)
++    monkeypatch.setattr(
++        controller,
++        "_run_investigator",
++        lambda *args: events.append("investigator") or investigator_call,
++    )
++    monkeypatch.setattr(
++        controller,
++        "_run_author",
++        lambda *args: events.append("author") or author_call,
++    )
++    monkeypatch.setattr(
++        controller,
++        "_validate_iteration_candidate",
++        lambda *args: events.append("validate") or validation,
++    )
++    monkeypatch.setattr(
++        controller,
++        "_evaluate_iteration_candidate",
++        lambda *args: events.append("discovery") or discovery,
++    )
++    monkeypatch.setattr(
++        controller,
++        "_run_critic",
++        lambda *args: events.append("critic") or critic_call,
++    )
++    monkeypatch.setattr(
++        controller,
++        "_persist_iteration_decision",
++        lambda *args: events.append("decision") or outcome,
++    )
++
++    assert _run_iteration(Mock(), Mock(), Mock()) is outcome
++    assert events == ["investigator", "author", "validate", "discovery", "critic", "decision"]
++
++
++def test_invalid_author_still_receives_critic_before_a_retain_decision(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Break caught: static/syntax rejection could silently skip critic feedback."""
++    from unittest.mock import Mock
++
++    import core.pit_optimizer_controller as controller
++    from core.pit_optimizer_controller import CandidateValidationOutcome, _run_iteration
++
++    events: list[str] = []
++    validation = CandidateValidationOutcome(
++        valid=False,
++        failure_code="syntax_failed",
++        incremental_diff="candidate diff",
++        cumulative_diff="",
++        identity=None,
++        changed_paths=(),
++        changed_symbols=(),
++    )
++    monkeypatch.setattr(
++        controller,
++        "_run_investigator",
++        lambda *args: events.append("investigator") or Mock(),
++    )
++    monkeypatch.setattr(
++        controller,
++        "_run_author",
++        lambda *args: events.append("author") or Mock(),
++    )
++    monkeypatch.setattr(
++        controller,
++        "_validate_iteration_candidate",
++        lambda *args: events.append("validate") or validation,
++    )
++
++    def no_discovery(*args: object) -> None:
++        events.append("no_discovery")
++        return None
++
++    monkeypatch.setattr(controller, "_evaluate_iteration_candidate", no_discovery)
++    monkeypatch.setattr(
++        controller,
++        "_run_critic",
++        lambda *args: events.append("critic") or Mock(),
++    )
++    monkeypatch.setattr(
++        controller,
++        "_persist_iteration_decision",
++        lambda *args: events.append("retain") or Mock(),
++    )
++
++    _run_iteration(Mock(), Mock(), Mock())
++
++    assert events == [
++        "investigator",
++        "author",
++        "validate",
++        "no_discovery",
++        "critic",
++        "retain",
++    ]
++
++
++def test_malformed_author_protocol_failure_never_becomes_critic_feedback(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Break caught: malformed provider output could be exposed as candidate feedback."""
++    from unittest.mock import Mock
++
++    import core.pit_optimizer_controller as controller
++    from core.pit_optimizer_controller import ProviderProtocolFailure, _run_iteration
++
++    events: list[str] = []
++    monkeypatch.setattr(
++        controller,
++        "_run_investigator",
++        lambda *args: events.append("investigator") or Mock(),
++    )
++
++    def malformed(*args: object) -> object:
++        events.append("author")
++        raise ProviderProtocolFailure("malformed author response")
++
++    monkeypatch.setattr(controller, "_run_author", malformed)
++    monkeypatch.setattr(
++        controller,
++        "_run_critic",
++        lambda *args: events.append("critic") or Mock(),
++        raising=False,
++    )
++
++    with pytest.raises(ProviderProtocolFailure, match="malformed author"):
++        _run_iteration(Mock(), Mock(), Mock())
++    assert events == ["investigator", "author"]
++
++
++def test_focused_candidate_checks_persist_only_controller_derived_scope(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Break caught: advisory author scope could replace controller-derived check scope."""
++    from unittest.mock import Mock
++
++    import core.pit_optimizer_controller as controller
++    from core.pit_optimizer_authorization import PitOptimizerRoleCall
++    from core.pit_optimizer_controller import (
++        CandidateValidationOutcome,
++        CandidateWorkspace,
++        PitOptimizerServices,
++        _validate_iteration_candidate,
++    )
++
++    readiness = Mock()
++    readiness.manifest.run_id = "run_task7"
++    state = Mock()
++    state.next_iteration = 1
++    state.incumbent_cumulative_diff = "prior diff"
++    state.iteration_workspace = CandidateWorkspace("workspace_task7", tmp_path.resolve())
++    author = Mock(spec=PitOptimizerRoleCall)
++    author.payload = Mock(spec=contract.AuthorArtifact)
++    outcome = CandidateValidationOutcome(
++        valid=False,
++        failure_code="purity_failed",
++        incremental_diff="candidate diff",
++        cumulative_diff="prior diff",
++        identity=None,
++        changed_paths=("core/strategy_policy/risk.py",),
++        changed_symbols=("core.strategy_policy.risk.recommend_allocation",),
++    )
++    services = Mock(spec=PitOptimizerServices)
++    services.validate_and_apply.return_value = outcome
++    written: dict[str, Mapping[str, object]] = {}
++    services.write_diff_artifact.side_effect = (
++        lambda name, value: ((tmp_path / name).resolve(), hashlib.sha256(value.encode()).hexdigest())
++    )
++    services.write_json_artifact.side_effect = (
++        lambda name, value: written.setdefault(name, value)
++        and ((tmp_path / name).resolve(), hashlib.sha256(_canonical_bytes(value)).hexdigest())
++    )
++    monkeypatch.setattr(controller, "_record_artifact", lambda *args: None)
++
++    assert _validate_iteration_candidate(readiness, state, author, services) is outcome
++    services.validate_and_apply.assert_called_once_with(
++        state.iteration_workspace,
++        author.payload,
++        "prior diff",
++    )
++    assert written["iterations/001/validation.json"]["changed_symbols"] == [
++        "core.strategy_policy.risk.recommend_allocation"
++    ]
++
++
++def test_no_discovery_trades_becomes_safe_critic_feedback(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Break caught: zero trades could be misclassified as evidence tampering."""
++    from unittest.mock import Mock
++
++    import core.pit_optimizer_controller as controller
++    from core.pit_optimizer_controller import (
++        CandidateValidationOutcome,
++        CandidateWorkspace,
++        PitOptimizerServices,
++        _evaluate_iteration_candidate,
++    )
++    from core.pit_optimizer_evaluation import (
++        DiscoveryComparison,
++        DiscoveryEvaluation,
++        DiscoveryScore,
++        FoldEvaluationResult,
++    )
++
++    readiness = _prepare(_prepare_fixture(tmp_path))
++    state = _run_state(readiness)
++    state.iteration_workspace = CandidateWorkspace(
++        "workspace_zero_trades",
++        tmp_path.resolve(),
++    )
++    identity = Mock()
++    identity.identity_sha256 = "a" * 64
++    validation = CandidateValidationOutcome(
++        True,
++        None,
++        "candidate diff",
++        "cumulative diff",
++        identity,
++        ("core/strategy_policy/entry.py",),
++        ("core.strategy_policy.entry.evaluate_entry",),
++    )
++    zero = DiscoveryScore(Decimal("0.00"), Decimal("0.00"), Decimal("0.00"))
++    folds = tuple(
++        FoldEvaluationResult(
++            fold_id=baseline.fold_id,
++            engine_policy_sha256=readiness.manifest.effective_policy_sha256,
++            candidate_identity_sha256="a" * 64,
++            aggregate_metrics=replace(
++                baseline,
++                closed_trades=0,
++                excess_total_return_pp=0.0,
++            ),
++        )
++        for baseline in readiness.baseline_discovery.folds
++    )
++    services = Mock(spec=PitOptimizerServices)
++    services.evaluate_discovery.return_value = DiscoveryEvaluation(
++        folds,
++        DiscoveryComparison(zero, zero, False, False),
++    )
++    payloads: list[Mapping[str, object]] = []
++    services.write_json_artifact.side_effect = lambda name, value: (
++        payloads.append(value) or (tmp_path / name).resolve(),
++        hashlib.sha256(_canonical_bytes(value)).hexdigest(),
++    )
++    monkeypatch.setattr(controller, "_record_artifact", lambda *args: None)
++
++    assert _evaluate_iteration_candidate(readiness, state, validation, services) is None
++    assert state.evaluation_failure_code == "no_discovery_trades"
++    assert payloads == [
++        {
++            "schema_version": 2,
++            "failure_code": "no_discovery_trades",
++            "fixed_baseline_comparison": None,
++            "incumbent_diagnostics": None,
++            "rankable": False,
++            "strictly_improves_incumbent": False,
++            "folds": [
++                {
++                    "fold_id": item.fold_id,
++                    "aggregate": asdict(item.aggregate_metrics),
++                }
++                for item in folds
++            ],
++            "engine_policy_sha256": readiness.manifest.effective_policy_sha256,
++            "candidate_identity_sha256": "a" * 64,
++        }
++    ]
++
++
++def _role_facts(plan: contract.PitOptimizerCallBudget):
++    from core.pit_optimizer_authorization import PitOptimizerProviderFacts
++
++    return PitOptimizerProviderFacts(
++        call_index=plan.call_index,
++        iteration=plan.iteration,
++        role=plan.role,
++        requested_model=plan.model,
++        returned_model=plan.model,
++        frozen_pricing_sha256="8" * 64,
++        outcome="accepted",
++        request_started=True,
++        response_received=True,
++        finish_reason="stop",
++        response_schema_valid=True,
++        accounting_complete=True,
++        prompt_tokens=1,
++        completion_tokens=1,
++        total_tokens=2,
++        cost_usd=0.001,
++        retained_reservation_tokens=0,
++        retained_reservation_usd=0.0,
++        audit_sha256=hashlib.sha256(f"audit-{plan.call_index}".encode()).hexdigest(),
++    )
++
++
++def _entry_diff(old: str, new: str) -> str:
++    return (
++        "--- a/core/strategy_policy/entry.py\n"
++        "+++ b/core/strategy_policy/entry.py\n"
++        "@@ -1,2 +1,2 @@\n"
++        " def evaluate_entry(snapshot):\n"
++        f"-    return {old}\n"
++        f"+    return {new}\n"
++    )
++
++
++def test_two_iteration_role_lineage_is_exact_and_provider_seed_stays_hidden(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Break caught: iteration two could lose critic history or use stale source context."""
++    from unittest.mock import Mock
++
++    import core.pit_optimizer_controller as controller
++    from core.pit_optimization_contract import (
++        AuthorArtifact,
++        CriticArtifact,
++        InvestigatorArtifact,
++        IterationFeedbackSummary,
++    )
++    from core.pit_optimizer_authorization import PitOptimizerRoleCall
++    from core.pit_optimizer_controller import (
++        CandidateValidationOutcome,
++        CandidateWorkspace,
++        PitOptimizerServices,
++        _IterationOutcome,
++        _run_iteration,
++    )
++
++    inputs = _prepare_fixture(tmp_path)
++    readiness = _prepare(inputs)
++    state = _run_state(readiness)
++    pricing, lease = _pricing_and_lease(readiness.manifest)
++    state.frozen_pricing = pricing
++    state.authorization_lease = lease
++    source_before = _git(Path(inputs["source_root"]), "status", "--porcelain")
++    candidate_count = 0
++    role_inputs: list[object] = []
++    role_order: list[str] = []
++
++    def create_candidate(cumulative_diff: str | None) -> CandidateWorkspace:
++        nonlocal candidate_count
++        candidate_count += 1
++        root = (tmp_path / f"candidate-{candidate_count}").resolve()
++        texts = {
++            "core/strategy_policy/entry.py": (
++                "def evaluate_entry(snapshot):\n    return True\n"
++                if cumulative_diff
++                else "def evaluate_entry(snapshot):\n    return None\n"
++            ),
++            "core/strategy_policy/risk.py": (
++                "def recommend_capacity(snapshot):\n    return 1\n"
++                "def recommend_allocation(snapshot):\n    return 0.1\n"
++                "def select_eviction(snapshot):\n    return None\n"
++            ),
++            "core/strategy_policy/exit.py": "def evaluate_exit(snapshot):\n    return None\n",
++        }
++        for relative, text in texts.items():
++            path = root / relative
++            path.parent.mkdir(parents=True, exist_ok=True)
++            path.write_text(text, encoding="utf-8", newline="")
++        return CandidateWorkspace(f"workspace_{candidate_count}", root)
++
++    def call_role(plan: contract.PitOptimizerCallBudget, role_input: object, *args: object):
++        role_order.append(plan.role)
++        role_inputs.append(role_input)
++        hypothesis = f"hypothesis_{plan.iteration}"
++        if plan.role == "investigator":
++            payload = InvestigatorArtifact(
++                hypothesis_id=hypothesis,
++                family="entry",
++                evidence_ids=(readiness.baseline_discovery.evidence_ids[0],),
++                causal_rationale="Test one bounded entry change.",
++                target_paths=("core/strategy_policy/entry.py",),
++                target_symbols=("core.strategy_policy.entry.evaluate_entry",),
++                expected_diagnostic_changes=("entries",),
++                known_risks=(),
++                author_instructions=("Change only the entry return.",),
++            )
++        elif plan.role == "author":
++            payload = AuthorArtifact(
++                hypothesis_id=hypothesis,
++                behavioral_summary=f"iteration {plan.iteration} entry change",
++                changed_paths=("core/strategy_policy/entry.py",),
++                changed_symbols=("core.strategy_policy.entry.evaluate_entry",),
++                unified_diff=(
++                    _entry_diff("None", "True")
++                    if plan.iteration == 1
++                    else _entry_diff("True", "False")
++                ),
++                assumptions=(),
++                validation_suggestions=(),
++            )
++        else:
++            payload = CriticArtifact(
++                hypothesis_id=hypothesis,
++                prediction_vs_observation="Candidate was locally rejected.",
++                causal_explanation="Keep the bounded direction for the next iteration.",
++                evidence_ids=(readiness.baseline_discovery.evidence_ids[0],),
++                disposition="refine",
++                next_direction=f"direction {plan.iteration}",
++            )
++        return PitOptimizerRoleCall(plan, payload, _role_facts(plan))
++
++    services = Mock(spec=PitOptimizerServices)
++    services.create_candidate.side_effect = create_candidate
++    services.call_role.side_effect = call_role
++    services.write_json_artifact.side_effect = lambda name, value: (
++        (tmp_path / "run" / name).resolve(),
++        hashlib.sha256(_canonical_bytes(value)).hexdigest(),
++    )
++    services.write_diff_artifact.side_effect = lambda name, value: (
++        (tmp_path / "run" / name).resolve(),
++        hashlib.sha256(value.encode()).hexdigest(),
++    )
++    monkeypatch.setattr(controller, "_record_artifact", lambda *args: None)
++
++    def validate(*args: object) -> CandidateValidationOutcome:
++        author_call = args[2]
++        return CandidateValidationOutcome(
++            valid=False,
++            failure_code="syntax_failed",
++            incremental_diff=author_call.payload.unified_diff,
++            cumulative_diff=state.incumbent_cumulative_diff,
++            identity=None,
++            changed_paths=author_call.payload.changed_paths,
++            changed_symbols=author_call.payload.changed_symbols,
++        )
++
++    monkeypatch.setattr(controller, "_validate_iteration_candidate", validate)
++    monkeypatch.setattr(controller, "_evaluate_iteration_candidate", lambda *args: None)
++
++    def persist(
++        ready: object,
++        current: object,
++        validation: object,
++        discovery: object,
++        critic: object,
++        service_values: object,
++    ) -> _IterationOutcome:
++        investigator = state.last_investigator.payload
++        author = state.last_author.payload
++        changed = state.next_iteration == 1
++        feedback = IterationFeedbackSummary(
++            iteration=state.next_iteration,
++            hypothesis_id=investigator.hypothesis_id,
++            family=investigator.family,
++            author_summary=author.behavioral_summary,
++            validation_code="syntax_failed",
++            discovery_score=None,
++            critic_disposition=critic.payload.disposition,
++            critic_next_direction=critic.payload.next_direction,
++            incumbent_changed=changed,
++        )
++        if changed:
++            state.incumbent_cumulative_diff = author.unified_diff
++        state.prior_iterations = (*state.prior_iterations, feedback)
++        state.iteration_workspace = None
++        state.iteration_source_bundle = None
++        state.next_iteration += 1
++        return _IterationOutcome(True, None, feedback, None, None, None, changed)
++
++    monkeypatch.setattr(controller, "_persist_iteration_decision", persist)
++
++    _run_iteration(readiness, state, services)
++    _run_iteration(readiness, state, services)
++
++    assert role_order == ["investigator", "author", "critic"] * 2
++    assert len(role_inputs) == 6
++    second_investigator = role_inputs[3]
++    second_author = role_inputs[4]
++    assert second_investigator.prior_iterations == (state.prior_iterations[0],)
++    assert second_investigator.source_bundle.cumulative_diff == _entry_diff("None", "True")
++    assert second_author.source_bundle == second_investigator.source_bundle
++    hidden = readiness.manifest.fold_manifest.hidden_fold
++    assert all(
++        hidden.fold_id.encode() not in item.canonical_json_bytes()
++        and hidden.start_date.encode() not in item.canonical_json_bytes()
++        and hidden.end_date.encode() not in item.canonical_json_bytes()
++        for item in role_inputs
++    )
++    assert _git(Path(inputs["source_root"]), "status", "--porcelain") == source_before == b""
++
++
++def _decision_calls(state: object, *, iteration: int):
++    from unittest.mock import Mock
++
++    from core.pit_optimization_contract import AuthorArtifact, CriticArtifact, InvestigatorArtifact
++
++    investigator = Mock()
++    investigator.payload = InvestigatorArtifact(
++        hypothesis_id=f"hypothesis_{iteration}",
++        family="entry",
++        evidence_ids=("evidence",),
++        causal_rationale="Bounded causal rationale.",
++        target_paths=("core/strategy_policy/entry.py",),
++        target_symbols=("core.strategy_policy.entry.evaluate_entry",),
++        expected_diagnostic_changes=("entries",),
++        known_risks=(),
++        author_instructions=("Keep the patch bounded.",),
++    )
++    author = Mock()
++    author.payload = AuthorArtifact(
++        hypothesis_id=f"hypothesis_{iteration}",
++        behavioral_summary="Bounded entry behavior.",
++        changed_paths=("core/strategy_policy/entry.py",),
++        changed_symbols=("core.strategy_policy.entry.evaluate_entry",),
++        unified_diff=_entry_diff("None", "True"),
++        assumptions=(),
++        validation_suggestions=(),
++    )
++    critic = Mock()
++    critic.payload = CriticArtifact(
++        hypothesis_id=f"hypothesis_{iteration}",
++        prediction_vs_observation="The measured result matched the bounded evidence.",
++        causal_explanation="The fixed-baseline score is authoritative.",
++        evidence_ids=("evidence",),
++        disposition="refine",
++        next_direction="Retain only strict fixed-baseline improvements.",
++    )
++    state.last_investigator = investigator
++    state.last_author = author
++    return critic
++
++
++def test_incumbent_transition_replaces_diff_only_after_critic_and_fixed_score(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Break caught: incumbent state could follow diagnostic deltas or precede criticism."""
++    from types import SimpleNamespace
++    from unittest.mock import Mock
++
++    import core.pit_optimizer_controller as controller
++    from core.pit_optimizer_controller import (
++        CandidateValidationOutcome,
++        CandidateWorkspace,
++        PitOptimizerServices,
++        _persist_iteration_decision,
++    )
++    from core.pit_optimizer_evaluation import (
++        DiscoveryComparison,
++        DiscoveryEvaluation,
++        DiscoveryScore,
++        FoldEvaluationResult,
++    )
++
++    readiness = _prepare(_prepare_fixture(tmp_path))
++    state = _run_state(readiness)
++    state.iteration_workspace = CandidateWorkspace("workspace_improver", tmp_path.resolve())
++    state.prospective_source_bundle = SimpleNamespace(files=())
++    identity = Mock()
++    identity.identity_sha256 = "a" * 64
++    identity.to_primitive.return_value = {"identity_sha256": "a" * 64}
++    validation = CandidateValidationOutcome(
++        True,
++        None,
++        "incremental diff",
++        "cumulative winning diff",
++        identity,
++        ("core/strategy_policy/entry.py",),
++        ("core.strategy_policy.entry.evaluate_entry",),
++    )
++    fixed_score = controller.discovery_score_from_folds(
++        tuple(
++            replace(fold, total_return_pct=fold.total_return_pct + 1.0)
++            for fold in readiness.baseline_discovery.folds
++        ),
++        readiness.baseline_discovery.folds,
++        original_baseline_sha256=controller._folds_digest(readiness.baseline_discovery.folds),
++        expected_original_baseline_sha256=controller._folds_digest(
++            readiness.baseline_discovery.folds
++        ),
++    )
++    diagnostics = DiscoveryScore(Decimal("0.50"), Decimal("0.25"), Decimal("2.00"))
++    folds = tuple(
++        FoldEvaluationResult(
++            fold_id=baseline.fold_id,
++            engine_policy_sha256=readiness.manifest.effective_policy_sha256,
++            candidate_identity_sha256="a" * 64,
++            aggregate_metrics=replace(
++                baseline,
++                total_return_pct=baseline.total_return_pct + 1.0,
++                excess_total_return_pp=1.0,
++            ),
++        )
++        for baseline in readiness.baseline_discovery.folds
++    )
++    discovery = DiscoveryEvaluation(
++        folds,
++        DiscoveryComparison(fixed_score, diagnostics, True, True),
++    )
++    critic = _decision_calls(state, iteration=1)
++    events = ["critic"]
++    services = Mock(spec=PitOptimizerServices)
++    services.write_diff_artifact.side_effect = lambda name, value: (
++        events.append(name) or (tmp_path / name).resolve(),
++        hashlib.sha256(value.encode()).hexdigest(),
++    )
++    services.write_json_artifact.side_effect = lambda name, value: (
++        events.append(name) or (tmp_path / name).resolve(),
++        hashlib.sha256(_canonical_bytes(value)).hexdigest(),
++    )
++    monkeypatch.setattr(controller, "validate_candidate_identity", lambda item: None)
++    monkeypatch.setattr(controller, "_record_artifact", lambda *args: None)
++
++    outcome = _persist_iteration_decision(
++        readiness,
++        state,
++        validation,
++        discovery,
++        critic,
++        services,
++    )
++
++    assert events == ["critic", "incumbent.diff", "iterations/001/decision.json"]
++    assert outcome.incumbent_changed is True
++    assert state.incumbent_cumulative_diff == "cumulative winning diff"
++    assert state.incumbent_discovery.score == fixed_score
++    assert state.non_improving_streak == 0
++
++
++def test_next_context_oversize_keeps_prior_incumbent_without_stagnation_count(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Break caught: a candidate-attributable context overflow could discard the incumbent."""
++    from unittest.mock import Mock
++
++    import core.pit_optimizer_controller as controller
++    from core.pit_optimizer_controller import (
++        CandidateValidationOutcome,
++        PitOptimizerServices,
++        _persist_iteration_decision,
++    )
++
++    readiness = _prepare(_prepare_fixture(tmp_path))
++    state = _run_state(readiness)
++    state.incumbent_cumulative_diff = "prior incumbent diff"
++    critic = _decision_calls(state, iteration=1)
++    validation = CandidateValidationOutcome(
++        False,
++        "next_context_oversize",
++        "oversized candidate diff",
++        "prior incumbent diff",
++        None,
++        ("core/strategy_policy/entry.py",),
++        ("core.strategy_policy.entry.evaluate_entry",),
++    )
++    services = Mock(spec=PitOptimizerServices)
++    writes: list[str] = []
++    services.write_json_artifact.side_effect = lambda name, value: (
++        writes.append(name) or (tmp_path / name).resolve(),
++        hashlib.sha256(_canonical_bytes(value)).hexdigest(),
++    )
++    monkeypatch.setattr(controller, "_record_artifact", lambda *args: None)
++
++    outcome = _persist_iteration_decision(
++        readiness,
++        state,
++        validation,
++        None,
++        critic,
++        services,
++    )
++
++    assert outcome.incumbent_changed is False
++    assert state.incumbent_cumulative_diff == "prior incumbent diff"
++    assert state.non_improving_streak == 0
++    services.write_diff_artifact.assert_not_called()
++    assert writes == ["iterations/001/decision.json"]
++
++
++def test_stop_condition_precedence_and_complete_iteration_budget(
++    tmp_path: Path,
++) -> None:
++    """Break caught: the loop could start a role when all three calls cannot complete."""
++    from unittest.mock import Mock
++
++    from core.pit_optimizer_controller import PitOptimizerServices, _pre_iteration_stop
++
++    readiness = _prepare(_prepare_fixture(tmp_path))
++    state = _run_state(readiness)
++    pricing, lease = _pricing_and_lease(readiness.manifest)
++    state.frozen_pricing = pricing
++    state.authorization_lease = lease
++    services = Mock(spec=PitOptimizerServices)
++    services.cancellation_requested.return_value = False
++
++    assert _pre_iteration_stop(readiness, state, services) is None
++    state.non_improving_streak = 3
++    assert _pre_iteration_stop(readiness, state, services) == (
++        "stagnation_limit",
++        None,
++    )
++    state.non_improving_streak = 0
++    services.cancellation_requested.return_value = True
++    assert _pre_iteration_stop(readiness, state, services) == ("cancelled", None)
++    services.cancellation_requested.return_value = False
++    state.authorization_lease = replace(lease, max_calls=2)
++    assert _pre_iteration_stop(readiness, state, services) == (
++        "budget_exhausted",
++        "call_budget_exhausted",
++    )
++    state.authorization_lease = replace(lease, max_tokens=223_999)
++    assert _pre_iteration_stop(readiness, state, services) == (
++        "budget_exhausted",
++        "token_budget_exhausted",
++    )
++    state.authorization_lease = replace(lease, max_usd=0.19)
++    assert _pre_iteration_stop(readiness, state, services) == (
++        "budget_exhausted",
++        "cost_budget_exhausted",
++    )
++    state.authorization_lease = lease
++    state.next_iteration = 3
++    assert _pre_iteration_stop(readiness, state, services) == (
++        "iteration_limit",
++        None,
++    )
++
++
++@pytest.mark.parametrize(
++    ("exception_name", "terminal_code", "terminal_detail"),
++    [
++        ("ProviderProtocolFailure", "provider_protocol_failure", None),
++        ("ProviderAccountingFailure", "provider_accounting_failure", None),
++        ("AuditFailure", "audit_failure", None),
++        ("AuthorizationExhausted", "authorization_exhausted", None),
++        ("IdentityDrift", "identity_drift", None),
++        ("TrustedEvaluatorNondeterminism", "trusted_evaluator_nondeterminism", None),
++        ("SandboxIntegrityFailure", "sandbox_integrity_failure", None),
++        ("EvidenceTampering", "evidence_tampering", None),
++        ("ContextBudgetExhausted", "budget_exhausted", "context_budget_exhausted"),
++    ],
++)
++def test_terminal_boundary_classification_is_closed(
++    exception_name: str,
++    terminal_code: str,
++    terminal_detail: str | None,
++) -> None:
++    """Break caught: integrity/accounting failures could become critic feedback or normal stops."""
++    import core.pit_optimizer_controller as controller
++
++    exception_type = getattr(controller, exception_name)
++    assert controller._terminal_from_exception(exception_type("injected")) == (
++        terminal_code,
++        terminal_detail,
++    )
++
++
++def test_terminal_boundary_run_routes_partial_iteration_to_common_finalizer(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Break caught: a partial protocol failure could bypass lease cleanup/final evidence."""
++    from unittest.mock import Mock
++
++    import core.pit_optimizer_controller as controller
++    from core.pit_optimizer_controller import (
++        PitOptimizerReadiness,
++        PitOptimizerServices,
++        ProviderProtocolFailure,
++        run_pit_optimizer_v2,
++    )
++
++    readiness = Mock(spec=PitOptimizerReadiness)
++    readiness.manifest.run_id = "run_task7"
++    readiness.manifest.max_iterations = 2
++    readiness.manifest.call_budgets = ()
++    readiness.baseline_discovery = Mock()
++    services = Mock(spec=PitOptimizerServices)
++    events: list[str] = []
++    monkeypatch.setattr(
++        controller,
++        "_initialize_run_artifacts",
++        lambda *args: events.append("initialize"),
++    )
++    monkeypatch.setattr(controller, "_pre_iteration_stop", lambda *args: None)
++    monkeypatch.setattr(
++        controller,
++        "_run_iteration",
++        lambda *args: (_ for _ in ()).throw(ProviderProtocolFailure("malformed")),
++    )
++    sentinel = Mock()
++    monkeypatch.setattr(
++        controller,
++        "_finalize_result",
++        lambda ready, state, service_values, code: events.append(code) or sentinel,
++        raising=False,
++    )
++
++    assert run_pit_optimizer_v2(readiness=readiness, services=services) is sentinel
++    assert events == ["initialize", "provider_protocol_failure"]
++
++
++def test_discovery_repeat_requires_byte_identical_incumbent_evidence(
++    tmp_path: Path,
++) -> None:
++    """Break caught: a nondeterministic discovery winner could cross the hidden boundary."""
++    from unittest.mock import Mock
++
++    from core.pit_optimizer_controller import (
++        CandidateWorkspace,
++        PitOptimizerServices,
++        TrustedEvaluatorNondeterminism,
++        _finish_discovery,
++    )
++    from core.pit_optimizer_evaluation import DeterminismAttestation
++
++    readiness = _prepare(_prepare_fixture(tmp_path))
++    state = _run_state(readiness)
++    services = Mock(spec=PitOptimizerServices)
++    assert _finish_discovery(readiness, state, services) is None
++    services.confirm_discovery.assert_not_called()
++
++    identity = Mock()
++    identity.identity_sha256 = "a" * 64
++    state.incumbent_identity = identity
++    state.incumbent_workspace = CandidateWorkspace("workspace_winner", tmp_path.resolve())
++    expected = state.incumbent_discovery.evidence_ids[0]
++    services.confirm_discovery.return_value = DeterminismAttestation(
++        fold_id="discovery_1",
++        expected_evidence_sha256=expected,
++        repeated_evidence_sha256=expected,
++        matched=True,
++    )
++    assert _finish_discovery(readiness, state, services).matched is True
++
++    services.confirm_discovery.return_value = DeterminismAttestation(
++        fold_id="discovery_1",
++        expected_evidence_sha256=expected,
++        repeated_evidence_sha256="f" * 64,
++        matched=False,
++    )
++    with pytest.raises(TrustedEvaluatorNondeterminism):
++        _finish_discovery(readiness, state, services)
++
++
++def _hidden_result(
++    fold_id: str,
++    *,
++    baseline_return: float = 1.0,
++    candidate_return: float = 1.1,
++    closed_trades: int = 3,
++    safety_complete: bool = True,
++    integrity_complete: bool = True,
++    accounting_complete: bool = True,
++):
++    from core.pit_optimizer_evaluation import HiddenEvaluation, HoldoutDecision
++
++    baseline = replace(
++        _aggregate(fold_id, baseline_return),
++        closed_trades=3,
++        excess_total_return_pp=None,
++    )
++    candidate = replace(
++        _aggregate(fold_id, candidate_return),
++        closed_trades=closed_trades,
++        excess_total_return_pp=candidate_return - baseline_return,
++    )
++    return HiddenEvaluation(
++        baseline,
++        candidate,
++        HoldoutDecision.from_result(
++            excess_total_return_pp=Decimal(str(candidate_return))
++            - Decimal(str(baseline_return)),
++            closed_trades=closed_trades,
++            safety_complete=safety_complete,
++            integrity_complete=integrity_complete,
++            accounting_complete=accounting_complete,
++        ),
++    )
++
++
++def test_provider_call_is_impossible_after_hidden_boundary() -> None:
++    """Break caught: a role call could observe or react to hidden validation."""
++    from unittest.mock import Mock
++
++    from core.pit_optimizer_controller import _RunState, _call_role
++
++    state = Mock(spec=_RunState)
++    state.provider_enabled = False
++    with pytest.raises(RuntimeError, match="provider capability is closed"):
++        _call_role(Mock(), state, Mock(), Mock(), Mock(), Mock())
++
++
++def test_hidden_boundary_reserves_once_closes_provider_then_writes_holdout(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Break caught: hidden results could be evaluated before provider revocation/reservation."""
++    from unittest.mock import Mock
++
++    import core.pit_optimizer_controller as controller
++    from core.pit_optimizer_controller import (
++        CandidateWorkspace,
++        PitOptimizerServices,
++        _call_role,
++        _run_hidden_once,
++    )
++    from core.pit_optimizer_evaluation import ValidationReservation
++
++    readiness = _prepare(_prepare_fixture(tmp_path))
++    state = _run_state(readiness)
++    identity = Mock()
++    identity.identity_sha256 = "a" * 64
++    state.incumbent_identity = identity
++    state.incumbent_workspace = CandidateWorkspace("workspace_hidden", tmp_path.resolve())
++    reservation = ValidationReservation("b" * 64, "c" * 64)
++    hidden = _hidden_result(readiness.manifest.fold_manifest.hidden_fold.fold_id)
++    services = Mock(spec=PitOptimizerServices)
++    events: list[str] = []
++    services.reserve_hidden_validation.side_effect = (
++        lambda candidate: events.append("reserve") or reservation
++    )
++
++    def evaluate(*args: object):
++        events.append("evaluate")
++        assert state.provider_enabled is False
++        with pytest.raises(RuntimeError, match="provider capability is closed"):
++            _call_role(readiness, state, services, Mock(), Mock(), Mock())
++        return hidden
++
++    services.evaluate_hidden.side_effect = evaluate
++    holdout_payloads: list[Mapping[str, object]] = []
++
++    def write(name: str, value: Mapping[str, object]) -> tuple[Path, str]:
++        events.append(name)
++        holdout_payloads.append(value)
++        return (tmp_path / name).resolve(), hashlib.sha256(_canonical_bytes(value)).hexdigest()
++
++    services.write_json_artifact.side_effect = write
++    monkeypatch.setattr(controller, "_record_artifact", lambda *args: None)
++
++    assert _run_hidden_once(readiness, state, services) is hidden
++
++    assert events == ["reserve", "evaluate", "holdout.json"]
++    services.reserve_hidden_validation.assert_called_once_with(identity)
++    services.evaluate_hidden.assert_called_once_with(
++        state.incumbent_workspace,
++        identity,
++        reservation,
++    )
++    assert state.hidden_validation_opened is True
++    assert state.validation_reservation is reservation
++    assert state.hidden_evaluation is hidden
++    assert holdout_payloads[0]["consumed_validation_key_sha256"] == "b" * 64
++    assert holdout_payloads[0]["candidate_identity_sha256"] == "a" * 64
++
++
++@pytest.mark.parametrize(
++    ("candidate_return", "closed_trades", "complete", "expected"),
++    [
++        (1.10, 3, True, True),
++        (1.09, 3, True, False),
++        (1.10, 2, True, False),
++        (1.10, 3, False, False),
++    ],
++)
++def test_hidden_qualification_is_quantized_and_complete(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++    candidate_return: float,
++    closed_trades: int,
++    complete: bool,
++    expected: bool,
++) -> None:
++    """Break caught: holdout eligibility could ignore the exact return/trade/completeness gate."""
++    from unittest.mock import Mock
++
++    import core.pit_optimizer_controller as controller
++    from core.pit_optimizer_controller import CandidateWorkspace, PitOptimizerServices, _run_hidden_once
++    from core.pit_optimizer_evaluation import ValidationReservation
++
++    readiness = _prepare(_prepare_fixture(tmp_path))
++    state = _run_state(readiness)
++    identity = Mock()
++    identity.identity_sha256 = "a" * 64
++    state.incumbent_identity = identity
++    state.incumbent_workspace = CandidateWorkspace("workspace_hidden", tmp_path.resolve())
++    services = Mock(spec=PitOptimizerServices)
++    services.reserve_hidden_validation.return_value = ValidationReservation("b" * 64, "c" * 64)
++    services.evaluate_hidden.return_value = _hidden_result(
++        readiness.manifest.fold_manifest.hidden_fold.fold_id,
++        candidate_return=candidate_return,
++        closed_trades=closed_trades,
++        safety_complete=complete,
++        integrity_complete=complete,
++        accounting_complete=complete,
++    )
++    services.write_json_artifact.side_effect = lambda name, value: (
++        (tmp_path / name).resolve(),
++        hashlib.sha256(_canonical_bytes(value)).hexdigest(),
++    )
++    monkeypatch.setattr(controller, "_record_artifact", lambda *args: None)
++
++    result = _run_hidden_once(readiness, state, services)
++
++    assert result.decision.long_replay_eligible is expected
++
++
++def test_hidden_boundary_provider_projectable_inputs_omit_hidden_identity_and_results(
++    tmp_path: Path,
++) -> None:
++    """Break caught: a hidden sentinel could leak through the readiness provider seed."""
++    readiness = _prepare(_prepare_fixture(tmp_path))
++    hidden = readiness.manifest.fold_manifest.hidden_fold
++    payload = readiness.provider_seed.canonical_json_bytes()
++    assert hidden.fold_id.encode() not in payload
++    assert hidden.start_date.encode() not in payload
++    assert hidden.end_date.encode() not in payload
++    assert b"holdout" not in payload.lower()
++
++
++def test_hidden_boundary_finalization_attempts_every_cleanup_and_writes_summary_last(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Break caught: one cleanup failure could suppress revocation, verification, or summary."""
++    from unittest.mock import Mock
++
++    import core.pit_optimizer_controller as controller
++    from core.pit_optimizer_controller import (
++        CandidateWorkspace,
++        PitOptimizerServices,
++        _finalize_result,
++    )
++    from core.pit_optimizer_evaluation import PitOptimizerCleanup
++
++    readiness = _prepare(_prepare_fixture(tmp_path))
++    state = _run_state(readiness)
++    pricing, lease = _pricing_and_lease(readiness.manifest)
++    state.frozen_pricing = pricing
++    state.authorization_lease = lease
++    state.lease_snapshot = lease
++    state.artifact_root = (tmp_path / "run").resolve()
++    state.incumbent_workspace = CandidateWorkspace("workspace_cleanup", tmp_path.resolve())
++    services = Mock(spec=PitOptimizerServices)
++    events: list[str] = []
++
++    def fail_close(*args: object) -> None:
++        events.append("close")
++        raise RuntimeError("injected close failure")
++
++    services.close_run_lease.side_effect = fail_close
++    services.dispose_candidate.side_effect = lambda workspace: events.append("dispose") or PitOptimizerCleanup(
++        True,
++        True,
++        False,
++    )
++    services.verify_inputs.side_effect = lambda ready: events.append("verify")
++
++    def write(name: str, value: Mapping[str, object]) -> tuple[Path, str]:
++        events.append(name)
++        return (state.artifact_root / name).resolve(), hashlib.sha256(
++            _canonical_bytes(value)
++        ).hexdigest()
++
++    services.write_json_artifact.side_effect = write
++    monkeypatch.setattr(controller, "_record_artifact", lambda *args: None)
++
++    result = _finalize_result(readiness, state, services, "iteration_limit")
++
++    assert events == ["close", "dispose", "verify", "accounting.json", "summary.json"]
++    assert result.status == "aborted"
++    assert result.terminal_code == "audit_failure"
++    assert result.cleanup_complete is False
++    assert state.provider_enabled is False
++    assert state.authorization_lease is None
++
++
++def test_hidden_boundary_result_has_exact_fields_and_no_secret_bearing_paths(
++    tmp_path: Path,
++) -> None:
++    """Break caught: public summary could serialize runtime paths or provider/source bodies."""
++    from dataclasses import fields
++
++    from core.pit_optimizer_controller import PitOptimizerResult
++
++    expected_fields = (
++        "schema_version",
++        "phase",
++        "status",
++        "terminal_code",
++        "terminal_detail",
++        "exit_code",
++        "run_id",
++        "readiness_sha256",
++        "manifest_sha256",
++        "iterations_started",
++        "iterations_completed",
++        "valid_evaluations",
++        "incumbent_updates",
++        "non_improving_streak",
++        "discovery_winner",
++        "hidden_validation_opened",
++        "validation_reservation_sha256",
++        "long_replay_eligible",
++        "budget",
++        "artifact_root",
++        "artifact_paths",
++        "source_modified",
++        "cleanup_complete",
++    )
++    assert tuple(item.name for item in fields(PitOptimizerResult)) == expected_fields
+diff --git a/tests/test_pit_optimizer_v2.py b/tests/test_pit_optimizer_v2.py
+index f6308bd..660b95e 100644
+--- a/tests/test_pit_optimizer_v2.py
++++ b/tests/test_pit_optimizer_v2.py
+@@ -26,30 +26,115 @@ from types import SimpleNamespace
+ import pytest
+ 
+ import core.pit_optimization_contract as contract
+ import core.pit_optimizer_evaluation as evaluation
+ from core.pit_optimizer_evaluation import (
+     AggregateMetric,
+     FoldAggregateSummary,
+     FoldManifest,
+     FoldSpec,
+ )
+-from core.pit_policy_parity import ParityAttestation
++from core.pit_policy_parity import ParityAttestation, ParityFoldEvidence
+ 
+ 
+ _POLICY_PATHS = (
+     "core/strategy_policy/entry.py",
+     "core/strategy_policy/risk.py",
+     "core/strategy_policy/exit.py",
+ )
+ 
+ 
++@pytest.fixture
++def final_parity(tmp_path: Path) -> ParityAttestation:
++    """Two closed final-parity fold records for pure Task 7 projection tests."""
++
++    effective_policy_sha256 = "a" * 64
++
++    def evidence(fold_id: str, total_return_pct: float) -> ParityFoldEvidence:
++        aggregate = FoldAggregateSummary(
++            fold_id=fold_id,
++            total_return_pct=total_return_pct,
++            excess_total_return_pp=None,
++            max_drawdown_pct=-1.0,
++            sharpe_ratio=1.0,
++            closed_trades=3,
++            turnover_pct=10.0,
++            average_exposure_pct=25.0,
++            entry_funnel=(AggregateMetric("entries", 3),),
++            exit_attribution=(AggregateMetric("profit_target", 2),),
++        )
++        primitive = {
++            "fold_id": fold_id,
++            "transactions": [],
++            "entry_outcomes": [],
++            "equity": [],
++            "funnel": [asdict(item) for item in aggregate.entry_funnel],
++            "aggregate": asdict(aggregate),
++            "effective_policy_sha256": effective_policy_sha256,
++        }
++        digest = hashlib.sha256(_canonical_file_bytes(primitive)).hexdigest()
++        return ParityFoldEvidence(
++            fold_id=fold_id,
++            transactions=(),
++            entry_outcomes=(),
++            equity=(),
++            funnel=aggregate.entry_funnel,
++            aggregate=aggregate,
++            effective_policy_sha256=effective_policy_sha256,
++            evidence_sha256=digest,
++        )
++
++    evidence_values = (
++        evidence("discovery_1", 1.0),
++        evidence("discovery_2", 2.0),
++    )
++    return ParityAttestation(
++        schema_version=1,
++        reference_artifact_sha256="b" * 64,
++        reference_source_head="1" * 40,
++        final_source_head="2" * 40,
++        final_source_fingerprint_sha256="c" * 64,
++        pit_bundle_sha256="d" * 64,
++        baseline_manifest_sha256="e" * 64,
++        effective_policy_sha256=effective_policy_sha256,
++        discovery_fold_manifest_sha256="f" * 64,
++        policy_interface_version=1,
++        reference_output_sha256s=tuple(
++            (item.fold_id, item.evidence_sha256) for item in evidence_values
++        ),
++        final_output_sha256s=tuple(
++            (item.fold_id, item.evidence_sha256) for item in evidence_values
++        ),
++        final_discovery_evidence=evidence_values,
++        transactions_equal=True,
++        entry_outcomes_equal=True,
++        equity_equal=True,
++        funnels_equal=True,
++        effective_policy_equal=True,
++        artifact_path=(tmp_path / "final-parity.json").resolve(),
++        artifact_sha256="9" * 64,
++    )
++
++
++def test_prepare_baseline_comes_from_final_parity(final_parity: ParityAttestation) -> None:
++    """Break caught: prepare could substitute a non-attested discovery baseline."""
++    from core.pit_optimizer_controller import _baseline_from_parity
++
++    baseline = _baseline_from_parity(final_parity)
++    assert baseline.folds == tuple(
++        item.aggregate for item in final_parity.final_discovery_evidence
++    )
++    assert baseline.evidence_ids == tuple(
++        item.evidence_sha256 for item in final_parity.final_discovery_evidence
++    )
++
++
+ def _canonical_text(value: object) -> str:
+     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+ 
+ 
+ def test_v2_canonical_text_preserves_utf8_and_rejects_unsafe_controls() -> None:
+     """Break caught: ASCII escaping made valid Unicode larger than the sealed bound."""
+     raw_bytes = contract.MAX_ROLE_TEXT_BYTES
+     backslashes = "\\" * raw_bytes
+     quotes = '"' * raw_bytes
+     newlines = "\n" * raw_bytes

@@ -1,0 +1,47 @@
+# H3c independent integration review
+
+Spec: **PASS for the frozen source and static integration boundary.** Quality/security: **PASS; no actionable H3c finding.** Actual completed-history summaries remain unexecuted and are a separate verification step. This verdict does not establish returned-summary equivalence or campaign success.
+
+Reviewed the task/review briefs, accepted read-only design, sequence, completed-state census and workspace addendum, narrow saved-preimage diff, frozen source, implementation report, supplied static/protected-definition/preservation evidence, and reachable repository, workspace, mount, role, record and projection interfaces. H1/H2a/H2b/H3a/H3b remain accepted dependencies; this was not a whole dirty-branch review.
+
+Independently read source SHA-256 values matching the freeze:
+
+- `historical_verification.py`: `978c0bd83ddbafecc9ef388420c23634429f32a5f6473eef441c09db4c6c521b`
+- `development_preparation.py`: `e7f7e2c0d6c4b66eefd31b031cc18cf53f3924a013b39a318d613ccff75b72f8`
+- `summary.py`: `bbf96eeece0e5c3aab963e975977f16f703ec5780802869c565558d9f9f588c5`
+- `production_runtime.py`: `1a232da79f5ddf0c01e48f39dd94008f6ad3b34ed08af385c3787e4f4555e070`
+- Narrow diff: `b9797a8f6a97875932e9d3c909aa4dc4c1d6223f0231b260d30d2d01813dc242`.
+
+## Integration and census
+
+`summary.py:172–199` adds the exact-string closed scope keyword with `current_runtime` default. Historical entry requires direct `command="summarize"`, supported development scope, and authentication before aggregation, including zero-round requests. The prior late development verifier runs only in current-runtime mode (`:281`). No exception fallback, identity override, CLI activation or presentation/count/Decimal/status formula change appears in the diff.
+
+`development_preparation.py:418–538` accepts only repository and manifest, authenticates launch, full original manifest graph and saved config, then calls H1 and H2 for every observed started round. Equality binds their results back to that original authority. Neither caller-supplied historical facts nor inferred event-owner tokens replace authentication. At least one actual round is required. Each round needs checkpoint-owned record(s) or an authenticated journal terminal; H2 requires the final successful cleanup and exact resource counts. Scheduling rejects record/terminal conflicts and advances past neither unfinished nor exhausted history.
+
+`historical_verification.py:313–415` authenticates round/start namespace value/index unions and reads every canonical key through the cap. Canonical event directories and explicit campaign/round equality close the unchanged event reader's directory-binding gap. Prepared-only, started-without-events, event-only, malformed, and attributable out-of-range state fail. Truly absent future slots remain allowed.
+
+The census at `:418–720` authenticates all canonical request entries and compares exact references, calls and requests against the complete ordered journal collection. It verifies candidate indexes in every in-range round, including empty ones, and compares the complete selected execution payload collection with H1-indexed authorities. Observed entry failures propagate; unrelated authenticated records cannot supply selected authority.
+
+All three reservation namespaces use value/index union enumeration and immutable typed loads. Keys are lease token, output authority and command digest respectively. Selected owners must exactly equal the original H1 round owner. Workspace records match H1 lease/payload/driver/root/revision facts; mount and container records equal H2's authenticated records. Extra selected reservations and foreign tokens fail. An unjournaled workspace is rejected as unsupported without assuming it is live, preserving the addendum's retired-orphan distinction.
+
+## Reachable read/write boundary
+
+The path is early historical authentication → original launch/manifest/config → round census → H1/H2 per round → checkpoint/records → request/execution/reservation census → H3a or H3b → immutable projection → unchanged summary aggregation and immutable projection.
+
+H1's driver/mount constructors retain the accepted local root and executable identity checks; they do not launch commands. Workspace history reaches reservation/created/ready/retirement reads with repair disabled. Its shared retirement recovery branch cannot execute because `authenticate_lease_history` fixes `recover_retirement_index=False`. Mount history uses three explicit `repair=False` loads and pinned existing output-directory reads. H2 retains saved-command, journal-origin, phase, terminal, binary-output, cleanup, control-absence and retired-workspace authentication. Successful evidence requires its indexed succeeded output; result-less aborted executions remain non-success and must still have terminal and cleanup evidence. Earlier failed cleanup attempts remain permitted by the existing fold.
+
+The new public/census state loads and all historical-verifier state loads explicitly use `repair=False`. H3a forwards false to both controller authority reads and classifies existing sealed bytes directly. H3b receives the original authenticated provider config and the entire ordered package tuple, including empty execution/package cases; immutable ledger/request/response readers retain exact accounting and migration-required failure. No invoker, executor, paid ledger/gateway, materializer, transition, nonce, append, reconcile, provider call or recovery method is invoked.
+
+Repository graph, typed/raw/binary, role request/attempt/terminal/artifact, round payload/event, execution-index, checkpoint and experiment readers are immutable on these paths. Existing critic and render-rejection bindings remain reached. `load_candidate_execution` and `recover_projection` are not called.
+
+`production_runtime.py:1353–1387,1416–1474` preserves policy-source membership/digests, reducer, scheduling and exact checkpoint/archive reconstruction while forwarding the repair flag to the actual policy-source read. Historical calls at `development_preparation.py:533` and `summary.py:232` disable repair; defaults and publication/recovery callers remain true. The reducer constructor and scheduling/champion helpers add no write capability.
+
+The reached workspace boundary authenticates saved export mode/driver identity and created/ready/retired lifecycle/resource evidence. No separate confirmation champion or finalized-discovery reader is invoked, and no all-round successful-finalization requirement is imposed on failed development history. The implementation report's corresponding precision correction was inspected; source remains unchanged.
+
+## Evidence and remaining limits
+
+Supplied definition/preimage evidence confines changes to the authorized additions and three changed definitions, preserves protected methods and H3a/H3b source, and records passing scoped Ruff, in-memory compilation and whitespace checks. The unchanged 56-file evaluator digest is `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4`. Supplied complete archive maps are unchanged: runtime04 has 579 files, actual06 has 83. These checks and archive scans were inspected, not rerun.
+
+The unchanged formulas should retain runtime04's round-2 deadline failure and expected counts 1/1/0, and actual06's paid failure and 0/0/0; actual returned values remain unverified. Missing/foreign/pending/orphan, cleanup-retry, result-less and scheduling branches received static review only. Enumeration observes existing evidence without an atomic cross-file snapshot or concurrent-writer guarantee. H1/H2 still require their accepted local identity/availability checks; this is not a claim to reconstruct unknown historical host/environment bytes.
+
+The separately inspected collector's keyword-only manifest-load defect was corrected before execution. Its fixed archives, original manifests, review digest and field/Decimal/command/count comparisons are suitable for the principal's next step, using bytecode suppression and a final match between source hashes and this reviewed freeze. No summary/authentication execution was performed for this review. No tests were read, created or run; no synthetic cases, source edits, credentials/environment reads, operational/external calls, campaigns, commits or subagents were used. Only this review document was written.

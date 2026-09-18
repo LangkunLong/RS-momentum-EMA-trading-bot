@@ -1,0 +1,222 @@
+# Task 6 — Regenerate clean local schema-v3 readiness and stop at live boundary
+
+## Purpose
+
+Authenticate the clean reviewed implementation against the existing sealed local PIT subset evidence and produce a provider-free schema-v3 manifest/readiness plus an inert canary command. Consume zero provider calls and do not start Docker.
+
+## Hard boundaries
+
+- Worktree/source root: `C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-implementation`
+- Required reviewed HEAD: `205df8d`
+- Sealed local evidence root: `C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.artifacts`
+- New ignored outputs (confirmed absent at task start):
+  - `.artifacts/pit-policy-parity-v10`
+  - `.artifacts/pit-optimizer-v10`
+- Do not modify tracked source/tests/docs/manifests, record a grant, construct a provider client, call pricing/provider/network, start Docker, open hidden data, evaluate a candidate, run replay, push, or upload.
+- Use only the existing two 60-session discovery folds/25-symbol subset. Hidden remains sealed.
+- Do not dispatch subagents.
+
+## Required sequence
+
+1. Confirm HEAD exactly matches the required commit and `git diff --check`, `git diff --exit-code`, cached diff, and status are clean.
+2. Resolve every sealed input from the main repository's local `.artifacts` root, not from the feature worktree's new output root:
+   - parity reference: `pit-policy-parity-v2/reference.json`;
+   - PIT bundle: `task-4-regeneration-20260823T223000Z/pit-bundle/pit_baseline.sqlite3`;
+   - subset readiness: `pit-optimizer-subset-performance-20260827T200714Z/pit-optimization-readiness-d3cbfcb22900/readiness.json`;
+   - baseline run: `task-11-prefix-replay-20260826T001500Z/run-20260826T002913Z-1af306ef1e46`;
+   - prior authenticated optimizer manifest containing the digest-pinned sandbox image: prefer `pit-optimizer-v7/manifest.json`; fail closed if identity cannot be resolved.
+   If the ignored parity reference is absent, the authorized recovery is:
+   - read the exact source commit from the authenticated sealed readiness;
+   - require that commit exists and is an ancestor of reviewed HEAD;
+   - create one disposable detached worktree at that exact commit;
+   - run `python -B -m core.pit_policy_parity capture` there against the same
+     readiness and PIT bundle, writing the reconstructed reference into the new
+     parity-v10 output;
+   - remove the disposable worktree and verify reviewed HEAD against the closed
+     reconstructed reference. Capture evaluates discovery folds only and must
+     report the hidden fold unevaluated.
+   If the ignored v7 manifest is absent, extract a worker image only if
+   `docs/pit-baseline-data-provenance.md` and
+   `docs/superpowers/plans/2026-08-27-model-authored-pit-optimizer.md` each
+   contain the same valid digest-pinned image reference. Any mismatch fails
+   closed.
+   If the exact ancestor predates `core/pit_policy_parity.py`, use only an
+   ignored external capture harness. It must put the clean ancestor root first
+   and reviewed current root second on the `core` namespace package path,
+   pre-import and assert that `core.pit_optimization`, `core.backtest_engine`,
+   `core.pit_data`, and `core.engine_policy` resolve under the ancestor, then
+   import and assert that `core.pit_optimizer_evaluation` and
+   `core.pit_policy_parity` resolve under reviewed current source. Call
+   `capture_parity_reference(..., source_root=ancestor_root)` directly. Do not
+   copy or ignore helper code inside the ancestor worktree.
+   If that ancestor `PortfolioSimulator.run` predates the
+   `history_start_date` keyword, the ignored harness may monkeypatch it in
+   memory with a compatibility wrapper only. The wrapper must preserve the
+   requested fold `start_date` passed to the historical method and temporarily
+   replace `self.pit_bundle` with a delegating adapter whose only overrides are
+   `fetch_price_data` and `fetch_closes`, forwarding both to the original
+   bundle with the requested earlier `history_start_date`. All other
+   attributes/methods delegate unchanged, and the original bundle must be
+   restored in `finally`. Assert exactly two discovery calls with the expected
+   fold/warmup pairs and no hidden call. Do not patch trading dates, policy,
+   scoring, or outputs.
+   If the sealed readiness fingerprint was produced by the historical
+   `agent_loop.source_fingerprint` algorithm, import that exact ancestor
+   implementation and recompute it for every local branch containing the
+   sealed commit. The harness may intercept only the historical
+   `git symbolic-ref --quiet --short HEAD` result for each candidate branch;
+   every other Git, index, tracked-file, and untracked-name input must come
+   from the clean detached ancestor. Require exactly one digest to equal the
+   sealed readiness fingerprint and do not print any fingerprint. For capture,
+   bind the reference to the sealed head and authenticated historical
+   fingerprint in memory, while separately running the reviewed current
+   helper's original clean HEAD/tree identity check before and after capture.
+   Preserve the prior failed `reference.json` as evidence and write this new
+   attempt only to `reference-authenticated.json`.
+   If exact historical fingerprint recovery yields zero matches, treat that as
+   evidence that the legacy aggregate cannot be reconstructed from the
+   surviving readiness: its branch and working-tree metadata components were
+   not retained. Do not guess or vary hidden inputs. The migration may instead
+   bind capture to the readiness's exact source commit only when all of these
+   independently pass: the readiness remains canonical; the commit exists and
+   is an ancestor of reviewed HEAD; a disposable detached worktree is exactly
+   at that commit and has no tracked, staged, or untracked changes; the current
+   helper's deterministic full-tree identity is unchanged before and after
+   capture; and the existing readiness policy, entry-contract, PIT-bundle, and
+   baseline identity checks all pass. Use the same strict module-origin and
+   history adapter rules. Preserve both earlier failed outputs and write only
+   `reference-tree-authenticated.json`, requiring it absent first. Then require
+   the normal reviewed-current parity verifier to produce an equality
+   attestation before any manifest/readiness construction.
+3. Create only the new ignored parity/optimizer/runtime/run output directories and a short explicit controller-temp parent outside any Git ancestor. Validate exact paths before use and clean the temp parent afterward.
+4. Run provider-free parity verification to new `pit-policy-parity-v10/verified-final.json` using `python -B -m core.pit_policy_parity verify`. Require matched=true and no hidden/provider/Docker activity.
+5. Build the schema-v3 manifest with `python -B -m core.pit_optimizer_evaluation build-subset-manifest` and exact role profile:
+   - iterations 2;
+   - investigator 8000 static / 78000 dynamic / 86000 input / 16000 output / 8192 response bytes;
+   - author 12000 / 48500 / 72000 / 14000 / 16384;
+   - critic 8000 / 24000 / 32000 / 4000 / 8192;
+   - max files 3, max hunks 12, max changed lines 80, max diff bytes 8192;
+   - git executable `C:/Program Files/Git/cmd/git.exe`;
+   - Docker executable `C:/Users/llong/AppData/Local/Programs/DockerDesktop/resources/bin/docker.exe`;
+   - use the digest-pinned sandbox image read from the prior local manifest;
+   - output `.artifacts/pit-optimizer-v10/manifest.json`.
+6. Require emitted output to report schema 3, exactly 6 calls, 448000 tokens, 2 iterations, provider retries 0, apply false, and a provider-free prepare command. Manifest/command must contain no active `max_usd`, role USD, grant USD, reserved USD, or cost-exhaustion authority.
+7. Execute only the emitted prepare command exactly as emitted. It must reauthenticate source/parity/bundle/baseline/folds/policy scope/image, write schema-v3 readiness, and emit an inert canary command. Do not reconstruct it by hand.
+8. Inspect closed evidence without printing credentials, provider contents, raw hashes, container IDs, hidden identities, or secrets. Require:
+   - schema_version=3;
+   - max_calls=6;
+   - max_tokens=448000;
+   - provider_retries=0;
+   - apply=false;
+   - enforcing USD fields absent;
+   - provider records absent;
+   - hidden result absent;
+   - source_modified=false;
+   - no Docker/provider/network process/activity;
+   - exact temp cleanup;
+   - tracked worktree remains clean at the same HEAD.
+9. Stop. Do not record authorization or execute the canary command.
+
+## Environment handling
+
+- Production hardened Windows handle operations may require running the same provider-free command outside the filesystem sandbox. Escalate only the exact command if the sandbox produces an access-denied failure; do not weaken production validation.
+- Do not delete or overwrite any pre-existing evidence. The v10 output roots were absent at task start; if they unexpectedly appear populated before creation, stop and report instead of replacing them.
+
+## Superseding post-rounded-stop parity recovery
+
+The earlier `reference.json` and `reference-tree-authenticated.json` attempts are
+preserved failed migration evidence and must not be used or overwritten. The
+tracked approved optimizer plan records that the legacy reference was superseded
+after the reviewed rounded-stop risk-ceiling correction, and that corrected
+version-4 ignored artifact is the one that was later verified. Its bytes were
+removed, but its exact introducing commit is present in local Git history.
+
+Reconstruct that corrected reference as follows:
+
+1. Require the exact local commit `da7fd865221517768ed2cd6b5c6ef984aa1f83ba`
+   to exist, to be an ancestor of the required reviewed HEAD, and to be the
+   commit whose subject is `fix: clamp entry sizing to rounded-stop risk`.
+2. Create a clean disposable detached worktree at that commit. Require no
+   tracked, staged, or untracked changes. Use its own direct
+   `core.pit_policy_parity` helper; do not mix modules or install an adapter.
+3. Capture the same canonical readiness/PIT-bundle discovery folds to the new,
+   absent-only output `pit-policy-parity-v10/reference-post-clamp.json`. Require
+   exactly two discovery folds and no hidden evaluation, plus stable clean
+   commit/tree identity before and after capture.
+4. Remove and unregister the detached worktree. Run the normal reviewed-current
+   verifier against `reference-post-clamp.json` to create the still-absent
+   `verified-final.json`. Require exact transaction, entry-outcome, equity,
+   funnel, aggregate, effective-policy, fold, bundle, and baseline equality.
+5. Only after that equality attestation passes, continue the original
+   schema-v3 manifest/prepare/readiness sequence and stop at the inert canary.
+
+The post-rounding clamp is a hard safety contract and must not be reverted or
+patched in memory. Preserve all failed earlier outputs for provenance.
+
+After Task 7, preserve the earlier `verified-final.json` attestation to the
+superseded reviewed HEAD. Re-run only the normal verifier against the existing
+authenticated `reference-post-clamp.json`, writing the new absent-only output
+`verified-final-task7.json` for required HEAD `205df8d`. Use that new attestation
+for the real manifest. The partial optimizer-v10 root is now expected to contain
+only empty `runtime` and `runs` directories; `manifest.json` and every readiness
+artifact must still be absent before retry. Do not recreate or overwrite parity
+references, earlier attestations, or diagnostic evidence.
+
+The first Task-7 manifest (`manifest.json`) is preserved but its emitted prepare
+command failed before any runtime/readiness write because it sealed a permanent
+runtime directory inside `source_root`. Preserve that manifest and the empty
+internal `runtime`/`runs` directories. For the path-layout retry only:
+
+- create one new absent local runtime root under the main repository's ignored
+  `.artifacts` directory, as a sibling of (not inside) the feature worktree;
+- require it to be an absolute regular non-link directory and to have no path
+  overlap with source, the feature artifact root, or the controller temp parent;
+- build a new create-only `manifest-external-runtime.json` using that exact
+  runtime root and the same verified-final-task7/policy/data/image/resource
+  inputs;
+- execute only that new manifest's emitted prepare command, then require all
+  normal runtime/source/artifact/temp isolation gates and stop at the inert
+  canary.
+
+Do not edit or overwrite `manifest.json`. If the external runtime path is not
+cleanly isolated, stop rather than selecting another layout.
+
+The external-runtime manifest is also preserved: its prepare command proved the
+artifact root cannot be inside source. Before one final layout attempt, the
+complete production containment rules were enumerated together. Use exactly
+three mutually disjoint roots:
+
+- a new empty ignored permanent-runtime directory under the main repository's
+  `.artifacts`, outside the feature worktree;
+- a new empty ignored run-artifact directory under the main repository's
+  `.artifacts`, outside the feature worktree and sibling (not parent/child) to
+  the runtime and every sealed PIT input;
+- a new exact controller-temp parent under the operating-system temp directory,
+  outside source, runtime, artifact root, baseline, and PIT bundle.
+
+Require pairwise non-overlap in both containment directions across source,
+runtime, artifact, controller temp, baseline run, and PIT bundle before build.
+Write a third absent-only `manifest-isolated-roots.json` in the feature's local
+manifest evidence directory, using the new external runtime and artifact roots.
+Execute only its emitted prepare command. Preserve both earlier manifests and
+their empty roots. This is the final path-layout attempt: on any further gate,
+stop and report rather than choosing another layout.
+
+The isolated-roots manifest passed every layout gate, but its prepare process
+returned the closed `source_preflight_lock` stage. A read-only process ownership
+audit found no running `agent_loop.py`, PIT optimizer, replay, or OpenRouter
+Python process; the repository lock is the expected persistent one-byte regular
+file. The managed sandbox exposes `.git` read-only, while production `SourceLock`
+must open that exact file read/write and take a byte-range lock. This is the
+Windows handle case already covered by Environment handling above. Do not delete
+or replace the lock file. The exact prepare command emitted by
+`manifest-isolated-roots.json` may be rerun once with filesystem-sandbox
+escalation. Do not alter/reconstruct the command, manifest, paths, environment,
+or inputs. Stop on any failure after that one exact escalated invocation.
+
+## Report
+
+Write a detailed ignored report to:
+`C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-implementation/.superpowers/sdd/2026-08-28-pit-optimizer-audit-only-usd/task-6-report.md`
+
+Report aggregate readiness status, paths, schema/call/token/retry/apply/USD/hidden/provider/Docker/source/cleanup gates, and whether the inert canary command was emitted. Redact the command if it embeds raw identities; do not print hashes/secrets. Return status, concise result, blocker if any, and report path. Make no commit.

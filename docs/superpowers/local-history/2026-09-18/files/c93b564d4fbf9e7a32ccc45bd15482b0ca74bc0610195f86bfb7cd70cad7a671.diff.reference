@@ -1,0 +1,82 @@
+# Review package: 7a59244..205ad2d
+
+## Commits
+205ad2d fix: close strategy policy instances
+
+## Files changed
+ core/strategy_policy/contracts.py |  2 ++
+ tests/test_strategy_policy.py     | 19 +++++++++++++++++++
+ 2 files changed, 21 insertions(+)
+
+## Diff
+diff --git a/core/strategy_policy/contracts.py b/core/strategy_policy/contracts.py
+index c9c3320..144b018 100644
+--- a/core/strategy_policy/contracts.py
++++ b/core/strategy_policy/contracts.py
+@@ -56,20 +56,22 @@ def _string(value: object, name: str) -> None:
+ 
+ def _tuple(value: object, name: str, *, maximum: int = _MAX_TUPLE_ITEMS) -> tuple[Any, ...]:
+     if type(value) is not tuple or len(value) > maximum:
+         _fail(name)
+     return value
+ 
+ 
+ class _CanonicalContract:
+     """Strict canonical JSON conversion shared by closed dataclass contracts."""
+ 
++    __slots__ = ()
++
+     _nested_fields: ClassVar[dict[str, type["_CanonicalContract"]]] = {}
+ 
+     def to_primitive(self) -> dict[str, object]:
+         def encode(value: object) -> object:
+             if isinstance(value, _CanonicalContract):
+                 return value.to_primitive()
+             if type(value) is tuple:
+                 return [encode(item) for item in value]
+             return value
+ 
+diff --git a/tests/test_strategy_policy.py b/tests/test_strategy_policy.py
+index 9d2541b..90ec750 100644
+--- a/tests/test_strategy_policy.py
++++ b/tests/test_strategy_policy.py
+@@ -177,20 +177,39 @@ def test_entry_decision_is_closed_and_bool_strict() -> None:
+         )
+     with pytest.raises(ValueError, match="qualified"):
+         EntryDecision(
+             qualified=1,  # type: ignore[arg-type]
+             market_permitted=True,
+             rank=(1.0, 2.0),
+             blocking_codes=(),
+         )
+ 
+ 
++def test_contract_instances_have_no_mutable_instance_dictionary() -> None:
++    """Break caught: inherited instance storage could admit hidden policy fields."""
++    contracts = (
++        _entry_snapshot(),
++        EntryDecision(True, True, (80.0, 85.0), ()),
++        _capacity_snapshot(),
++        CapacityDecision(4, True),
++        _allocation_snapshot(),
++        AllocationDecision(0.01, 0.08, None),
++        EvictionPosition(0, 100.0, 95.0, 70.0),
++        _eviction_snapshot(),
++        EvictionDecision(0),
++        _exit_snapshot(),
++        ExitAction("scale_out", 0.10, 0.25, "take_profit_scale_out"),
++        ExitDecision((), 100.0, False, 0, True, True),
++    )
++    assert all(not hasattr(contract, "__dict__") for contract in contracts)
++
++
+ def test_every_contract_round_trips_canonical_json_and_is_frozen() -> None:
+     """Break caught: policy transport could change a validated primitive contract."""
+     contracts = (
+         _entry_snapshot(),
+         EntryDecision(True, True, (80.0, 85.0), ()),
+         _capacity_snapshot(),
+         CapacityDecision(4, True),
+         _allocation_snapshot(),
+         AllocationDecision(0.01, 0.08, None),
+         EvictionPosition(0, 100.0, 95.0, 70.0),

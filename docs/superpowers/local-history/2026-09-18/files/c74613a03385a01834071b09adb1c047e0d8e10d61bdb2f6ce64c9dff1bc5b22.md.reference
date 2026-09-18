@@ -1,0 +1,46 @@
+# Task 2 — authenticated cumulative rendering-rejection evidence
+
+Read this first; it is the complete implementation requirement for this task. Work only in `core/pit_optimizer_v5/production_runtime.py`; use `apply_patch` only. Do not edit any other production file, tests, historical artifacts, or package files except the assigned implementation report.
+
+Add `LocalRoleRequestFactoryV5._render_rejection_count(self, inputs: FeedbackRoundInputV5, projection: SearchProjectionV5) -> int` adjacent to `_investigator_parts`, with exactly this logic and error strings:
+
+```python
+if self._repository.load_checkpoint() != projection.checkpoint:
+    raise ValueError("investigator rejection checkpoint differs")
+count = 0
+for stored in projection.stored_records:
+    record = self._repository.load_experiment(stored.reference)
+    if (
+        record != stored.record
+        or record.round_index >= inputs.round_index
+        or record.experiment_identity.discovery_plan_sha256
+        != inputs.panel_plan.discovery_plan_sha256
+        or (record.pit_data_scope, record.semantic_mode)
+        != (inputs.manifest.pit_data_scope, inputs.manifest.semantic_mode)
+    ):
+        raise ValueError("investigator rejection record authority differs")
+    if (
+        record.status == "invalid"
+        and record.validation.failure_code
+        == "policy_source_unbounded_or_stateful"
+    ):
+        count += 1
+return count
+```
+
+In `_investigator_parts`, after the entire existing parent-episode loop and before `families`, insert exactly the existing aggregate-evidence-lane behavior:
+
+```python
+rejection_count = self._render_rejection_count(inputs, projection)
+if rejection_count:
+    evaluator_ids.append(
+        evidence.add(
+            "failure.rendering.policy_source_unbounded_or_stateful_count",
+            rejection_count,
+        )
+    )
+```
+
+The 16-item Increment-A allowlist and complete per-episode body must remain byte-identical. Keep every existing `evidence.add` call and its relative order unchanged. The new item occurs after all episode evidence and before archive/history evidence; it is omitted at zero. Do not alter author flow, request budgets, provider schema, event/record/schema/identity behavior, evaluator source, or repository authentication. Reload failures propagate—never turn them into zero. Do not create or execute candidates, records, events, requests, wrappers, tests, models/API calls, evaluator/campaign activity, commits, pushes, or deployment.
+
+Starting `production_runtime.py` SHA-256 is `78da0dc5efcf5cf94541a465e0a3c212221c843dade07f680ddc5e1508fdc476`; exact preimage is `preimages/production_runtime.py.preimage` in this package. Write report to `task-2-report.md`: source change, static authority rationale, final hash, exact function scope, and only permitted static checks. Return only DONE/status, one-line static check outcome, and concerns. Do not delegate.

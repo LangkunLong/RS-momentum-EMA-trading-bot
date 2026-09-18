@@ -1,0 +1,60 @@
+--- before/provider.py
++++ after/provider.py
+@@ -2053,12 +2053,53 @@
+     if isinstance(authority, Mapping) and authority.get("role") == "author":
+         # Match the existing local qualified-symbol contract at generation time.
+         # Never normalize a received artifact or change its canonical authority.
+-        names = result["properties"]["artifact"]["properties"]["changed_symbols"]["items"]
++        artifact = result["properties"]["artifact"]["properties"]
++        names = artifact["changed_symbols"]["items"]
+         names["pattern"] = r"^core\.strategy_policy\.v3\.[a-z_]+\.[A-Za-z_]\w*$"
+-        names["description"] = (
+-            "Fully qualified module.symbol from each source_operation: "
+-            "remove .py, replace / with ., append .symbol."
++        artifact["changed_symbols"]["description"] = "Sorted unique module.symbol names; match operations in symbol-edits mode."
++        names["description"] = "Path without .py, / replaced by ., then .symbol."
++        operations = artifact["source_operations"]
++        operations["description"] = "Unique edits ordered by path enum order, then symbol. One complete function/constant each."
++        source = operations["items"]["properties"]["replacement_source"]
++        source["pattern"] = r"^[^\r\u0000\ufeff][^\r\u0000]*\n$"
++        source["description"] = "Decoded Python source must end in LF; no CR, NUL or initial BOM."
++        axes = artifact["axes"]
++        axes["description"] = "Sort by unique public identifier name; unique typed values must include default."
++        # Share identical literal alternatives to keep added guidance within the
++        # canonical schema byte bound used by historical ledger reservations.
++        axis = axes["items"]["properties"]
++        literal = axis["default"]
++        if literal != axis["values"]["items"] or "$defs" in result:
++            raise ValueError("author transport literal schemas differ")
++        result["$defs"] = {"literal": literal}
++        axis["default"] = {"$ref": "#/$defs/literal"}
++        axis["values"]["items"] = {"$ref": "#/$defs/literal"}
++        full_source = artifact["full_source_escape"]
++        if "anyOf" not in full_source:
++            operations["minItems"] = 1
++        if "anyOf" in full_source:
++            full_source["description"] = "If non-null, include all paths in enum order and set source_operations to []."
++            for branch in full_source["anyOf"]:
++                if branch.get("type") == "array":
++                    branch["items"]["properties"]["source"].update(
++                        pattern=source["pattern"], description=source["description"]
++                    )
++        result["properties"]["artifact"]["description"] = (
++            "Preserve market gates and ranking unless explicitly targeted by the hypothesis."
+         )
++    if isinstance(authority, Mapping):
++        result["properties"]["binding"]["description"] = "Copy input binding exactly."
++        artifact = result["properties"]["artifact"]["properties"]
++        if authority.get("role") == "investigator":
++            artifact["hypotheses"]["description"] = (
++                "Consecutive ranks from 1; unique hypothesis and prediction metric IDs. "
++                "Cite only issued evidence IDs."
++            )
++        elif authority.get("role") == "critic":
++            artifact["reviews"]["description"] = (
++                "One review per input binding.experiment_ids entry, in that order. "
++                "All citations must use issued evidence IDs."
++            )
+     return result
+ 
+ 

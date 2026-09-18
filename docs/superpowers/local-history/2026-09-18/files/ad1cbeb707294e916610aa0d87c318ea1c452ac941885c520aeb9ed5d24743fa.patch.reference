@@ -1,0 +1,548 @@
+diff --git a/core/backtest_engine.py b/core/backtest_engine.py
+index 53f231f..89fecca 100644
+--- a/core/backtest_engine.py
++++ b/core/backtest_engine.py
+@@ -15,7 +15,7 @@ from contextlib import contextmanager
+ from dataclasses import dataclass, field
+ from datetime import datetime
+ from pathlib import Path
+-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
++from typing import Any, Callable, Dict, Iterable, Iterator, List, Literal, Optional
+ 
+ import numpy as np
+ import pandas as pd
+@@ -2161,7 +2161,17 @@ class PortfolioSimulator:
+         policy_client_factory: StrategyPolicyClientFactory | None = None,
+         execution_profile: ExecutionProfileV5 | None = None,
+         friction_scenario: FrictionScenario | None = None,
++        pit_data_scope: Literal["production", "development_sp500_v2"] = "production",
+     ) -> None:
++        if pit_data_scope not in {"production", "development_sp500_v2"}:
++            raise ValueError("simulator PIT data scope is invalid")
++        if pit_data_scope == "development_sp500_v2" and (
++            execution_profile is None
++            or pit_bundle is None
++            or pit_bundle.metadata.get("schema_version") != "2"
++            or type(identity_transition_contract) is not PriceIdentityTransitionContract
++        ):
++            raise ValueError("development scope requires V5 execution and authenticated schema-V2 PIT data")
+         if (execution_profile is None) != (friction_scenario is None):
+             raise ValueError(
+                 "execution_profile and friction_scenario must be supplied together"
+@@ -2220,6 +2230,7 @@ class PortfolioSimulator:
+         self.cash_deployment_threshold_pct = cash_deployment_threshold_pct
+         self.technical_only = technical_only
+         self.pit_bundle = pit_bundle
++        self.pit_data_scope = pit_data_scope
+         self.execution_profile = execution_profile
+         self.friction_scenario = friction_scenario
+         self.execution_profile_sha256 = (
+@@ -2449,10 +2460,12 @@ class PortfolioSimulator:
+             if client.interface_version == POLICY_INTERFACE_VERSION_V3 and (
+                 not self._v5_enabled
+                 or self.pit_bundle is None
+-                or self.pit_bundle.metadata.get("schema_version") != "3"
++                or self.pit_bundle.metadata.get("schema_version") != (
++                    "2" if self.pit_data_scope == "development_sp500_v2" else "3"
++                )
+             ):
+                 raise ValueError(
+-                    "policy interface V3 requires V5 execution and a schema-V3 PIT bundle"
++                    "policy interface V3 requires V5 execution and a PIT bundle matching its explicit data scope"
+                 )
+             return self._run_with_policy_client_active(
+                 tickers,
+@@ -3572,6 +3585,7 @@ class PortfolioSimulator:
+             "technical_only": self.technical_only,
+             "data_mode": "point_in_time" if self.pit_bundle is not None else "provider_cache",
+             "pit_bundle_sha256": self.pit_bundle.sha256 if self.pit_bundle is not None else None,
++            "pit_data_scope": self.pit_data_scope,
+             "pit_data_cutoff": str(self.pit_bundle.data_cutoff.date()) if self.pit_bundle is not None else None,
+             "pit_manifest": self.pit_bundle.manifest() if self.pit_bundle is not None else None,
+             "take_profit_pct": self.take_profit_pct,
+@@ -3841,6 +3855,7 @@ class PortfolioSimulator:
+             raise ValueError("V3 entry features require a PIT bundle")
+         return build_entry_features_v3(
+             bundle=self.pit_bundle,
++            allow_schema_v2_development=self.pit_data_scope == "development_sp500_v2",
+             symbol=symbol,
+             session=session.date(),
+             price_history=history.loc[:session],
+@@ -3862,6 +3877,8 @@ class PortfolioSimulator:
+             raise ValueError("V3 holding features require a PIT bundle")
+         return build_holding_features_v3(
+             bundle=self.pit_bundle,
++            allow_schema_v2_development=self.pit_data_scope == "development_sp500_v2",
++            identity_transition_contract=self.identity_transition_contract,
+             symbol=symbol,
+             session=session.date(),
+             price_history=history.loc[:session],
+@@ -3882,6 +3899,7 @@ class PortfolioSimulator:
+             self.pit_bundle,
+             session=session.date(),
+             symbols=self._open_positions,
++            allow_schema_v2_development=self.pit_data_scope == "development_sp500_v2",
+         )
+         notionals: list[float] = []
+         risks: list[float] = []
+diff --git a/core/engine_policy.py b/core/engine_policy.py
+index 8b354b0..4a214d6 100644
+--- a/core/engine_policy.py
++++ b/core/engine_policy.py
+@@ -57,6 +57,7 @@ class _SimulatorPolicy(Protocol):
+     _strategy_was_injected: bool
+     _owned_builtin_strategy: object
+     pit_bundle: object
++    pit_data_scope: object
+     strategy: object
+ 
+ 
+@@ -189,9 +190,14 @@ def _owned_builtin_provider_mode(simulator: _SimulatorPolicy) -> str:
+ def _causal_invariant_fields(
+     simulator: _SimulatorPolicy,
+ ) -> dict[str, dict[str, object]]:
+-    del simulator
+     invariant = PolicyClassification.CAUSAL_INVARIANT
+     return {
++        "pit_data_scope": _field(
++            simulator.pit_data_scope,
++            invariant,
++            "core.backtest_engine.PortfolioSimulator.pit_data_scope",
++            optimizer_candidate=False,
++        ),
+         "technical_fact_cutoff": _field(
+             "completed_session_only",
+             invariant,
+diff --git a/core/industry_group.py b/core/industry_group.py
+index ccafeaf..783ab75 100644
+--- a/core/industry_group.py
++++ b/core/industry_group.py
+@@ -38,6 +38,7 @@ def load_pit_industry_assignments_as_of(
+     *,
+     session: date,
+     symbols: Iterable[str],
++    allow_schema_v2_development: bool = False,
+ ) -> Mapping[str, PITIndustryAssignment]:
+     """Return each requested symbol's latest authenticated classification.
+ 
+@@ -47,9 +48,11 @@ def load_pit_industry_assignments_as_of(
+     never consults the current provider/cache used by :func:`load_industry_map`.
+ 
+     Args:
+-        bundle: Open, authenticated, query-only schema-V3 PIT bundle.
++        bundle: Open, authenticated, query-only PIT bundle.
+         session: Completed session whose public information set is requested.
+         symbols: Canonical active-union symbols (plus an optional held symbol).
++        allow_schema_v2_development: Explicitly permit schema-V2 development
++            data, which has no dated classifications and returns no assignments.
+ 
+     Returns:
+         Mapping from symbols with an available assignment to immutable records.
+@@ -59,10 +62,21 @@ def load_pit_industry_assignments_as_of(
+     """
+     if type(session) is not date:
+         raise ValueError("industry as-of session must be a date")
+-    if bundle.metadata.get("schema_version") != "3":
++    if type(allow_schema_v2_development) is not bool:
++        raise ValueError("PIT industry development flag must be a bool")
++    schema_version = bundle.metadata.get("schema_version")
++    if schema_version != "3" and not (
++        allow_schema_v2_development and schema_version == "2"
++    ):
+         raise ValueError("PIT industry assignments require a schema-V3 bundle")
+ 
+     requested = frozenset(_pit_symbol(symbol) for symbol in symbols)
++    if schema_version == "2":
++        if session > date.fromisoformat(bundle.metadata["data_cutoff"]):
++            raise ValueError("industry session exceeds the authenticated bundle cutoff")
++        # Schema V2 has no authenticated dated classifications. Keep missing
++        # facts missing so portfolio exposure remains explicitly unclassified.
++        return MappingProxyType({})
+     if not requested:
+         return MappingProxyType({})
+ 
+diff --git a/core/pit_feature_snapshot.py b/core/pit_feature_snapshot.py
+index f62e1f7..5a63f63 100644
+--- a/core/pit_feature_snapshot.py
++++ b/core/pit_feature_snapshot.py
+@@ -32,7 +32,7 @@ from core.canslim.l_leader_laggard import (
+     finite_rs_snapshot,
+ )
+ from core.industry_group import load_pit_industry_assignments_as_of
+-from core.pit_data import PITDataBundle
++from core.pit_data import PITDataBundle, PriceIdentityTransitionContract
+ from core.pit_provenance import PIT_PUBLIC_DATES_ATTR
+ from core.pit_universe_v3 import UNIVERSE_IDS
+ 
+@@ -81,15 +81,18 @@ def build_entry_features_v3(
+     session: date,
+     price_history: pd.DataFrame,
+     rs_snapshot: Mapping[str, float],
++    allow_schema_v2_development: bool = False,
+ ) -> EntryFeaturesV3:
+     """Build entry features from facts observable by ``session`` only."""
+     symbol, active_symbols, validated_rs = _validated_context(
+-        bundle, symbol, session, rs_snapshot, require_active=True
++        bundle, symbol, session, rs_snapshot, require_active=True,
++        allow_schema_v2_development=allow_schema_v2_development,
+     )
+     assignments = load_pit_industry_assignments_as_of(
+         bundle,
+         session=session,
+         symbols=active_symbols,
++        allow_schema_v2_development=allow_schema_v2_development,
+     )
+     groups = {ticker: assignment.group_id for ticker, assignment in assignments.items()}
+     target_group = groups.get(symbol)
+@@ -140,16 +143,21 @@ def build_holding_features_v3(
+     session: date,
+     price_history: pd.DataFrame,
+     rs_snapshot: Mapping[str, float],
++    allow_schema_v2_development: bool = False,
++    identity_transition_contract: PriceIdentityTransitionContract | None = None,
+ ) -> HoldingFeaturesV3:
+     """Build refreshed holding features from facts observable by ``session``."""
+     symbol, active_symbols, validated_rs = _validated_context(
+-        bundle, symbol, session, rs_snapshot, require_active=False
++        bundle, symbol, session, rs_snapshot, require_active=False,
++        allow_schema_v2_development=allow_schema_v2_development,
++        identity_transition_contract=identity_transition_contract,
+     )
+     assignment_symbols = active_symbols.union((symbol,))
+     assignments = load_pit_industry_assignments_as_of(
+         bundle,
+         session=session,
+         symbols=assignment_symbols,
++        allow_schema_v2_development=allow_schema_v2_development,
+     )
+     groups = {ticker: assignment.group_id for ticker, assignment in assignments.items()}
+     target_group = groups.get(symbol)
+@@ -179,10 +187,17 @@ def _validated_context(
+     rs_snapshot: Mapping[str, float],
+     *,
+     require_active: bool,
++    allow_schema_v2_development: bool = False,
++    identity_transition_contract: PriceIdentityTransitionContract | None = None,
+ ) -> tuple[str, frozenset[str], Mapping[str, float]]:
+     if type(session) is not date:
+         raise ValueError("feature session must be a date")
+-    if bundle.metadata.get("schema_version") != "3":
++    if type(allow_schema_v2_development) is not bool:
++        raise ValueError("feature development flag must be a bool")
++    schema_version = bundle.metadata.get("schema_version")
++    if schema_version != "3" and not (
++        allow_schema_v2_development and schema_version == "2"
++    ):
+         raise ValueError("V3 features require a schema-V3 PIT bundle")
+     if session > bundle.data_cutoff.date():
+         raise ValueError("feature session exceeds the authenticated bundle cutoff")
+@@ -200,15 +215,31 @@ def _validated_context(
+     if require_active and symbol not in active_symbols:
+         raise ValueError("entry feature symbol is not active in the PIT union")
+     if not require_active:
+-        lineage_id = bundle.security_lineage_id(symbol)
+-        resolved_symbol = bundle.membership_v3.ticker_for_lineage_at(
+-            lineage_id, session
+-        )
++        if schema_version == "2":
++            if (
++                type(identity_transition_contract) is not PriceIdentityTransitionContract
++                or identity_transition_contract.prices_provenance_sha256
++                != bundle.metadata["prices_provenance_sha256"]
++                or identity_transition_contract.request_contracts_sha256
++                != bundle.metadata["price_identity_request_contracts_sha256"]
++            ):
++                raise ValueError("development holding features require the authenticated identity transition contract")
++            resolved_symbol = identity_transition_contract.resolve_open_holding(symbol, session)
++        else:
++            lineage_id = bundle.security_lineage_id(symbol)
++            resolved_symbol = bundle.membership_v3.ticker_for_lineage_at(
++                lineage_id, session
++            )
+         if resolved_symbol != symbol:
+             raise ValueError(
+                 "holding feature symbol is not the active authenticated price identity"
+             )
+-    validated_rs = finite_rs_snapshot(rs_snapshot, required_symbols=active_symbols)
++    # Legacy membership can include a ticker before its admitted price history
++    # is available (for example BBWI in early 2021). Preserve the causal engine's
++    # omissions; holding RS stays None and no industry mean is computed in V2.
++    validated_rs = finite_rs_snapshot(
++        rs_snapshot, required_symbols=() if schema_version == "2" else active_symbols
++    )
+     return symbol, active_symbols, validated_rs
+ 
+ 
+diff --git a/core/pit_optimizer_v5/container_entry.py b/core/pit_optimizer_v5/container_entry.py
+index dd27372..23e578e 100644
+--- a/core/pit_optimizer_v5/container_entry.py
++++ b/core/pit_optimizer_v5/container_entry.py
+@@ -6,6 +6,7 @@ import argparse
+ import hashlib
+ import os
+ from pathlib import Path
++import re
+ import stat
+ import sys
+ from types import SimpleNamespace
+@@ -202,6 +203,7 @@ def _validate_cli_authority(
+ 
+ 
+ def main(argv: tuple[str, ...] | None = None) -> int:
++    stage = "request"
+     try:
+         arguments = _parser().parse_args(argv)
+         raw_input = _read_input()
+@@ -209,10 +211,12 @@ def main(argv: tuple[str, ...] | None = None) -> int:
+         _validate_cli_authority(arguments, raw_input=raw_input, request=request)
+         from .image_manifest import verify_installed_evaluator_source_v5
+ 
++        stage = "image authentication"
+         verify_installed_evaluator_source_v5(
+             source_root=Path(__file__).resolve().parents[2],
+             expected_sha256=request.sandbox_profile.runtime_source_sha256,
+         )
++        stage = "policy authentication"
+         source = read_policy_source_v5()
+         policy_revision = derive_policy_revision_identity_v5(
+             source_bundle=source,
+@@ -225,6 +229,7 @@ def main(argv: tuple[str, ...] | None = None) -> int:
+         )
+         if policy_revision != request.policy_revision:
+             raise ValueError("panel policy source differs from request authority")
++        stage = "bundle authentication"
+         with PITDataBundle(
+             _BUNDLE_PATH,
+             expected_sha256=request.evaluator_contract.pit_bundle_sha256,
+@@ -232,6 +237,7 @@ def main(argv: tuple[str, ...] | None = None) -> int:
+         ) as bundle:
+             if request.baseline_capture_inputs_ref is not None and bundle.metadata.get("schema_version") != "3":
+                 raise ValueError("baseline requires a schema-V3 three-universe bundle")
++            stage = "evaluator authentication"
+             evaluator = PitPanelEvaluatorV5(
+                 contract=request.evaluator_contract,
+                 sandbox_profile=request.sandbox_profile,
+@@ -246,7 +252,9 @@ def main(argv: tuple[str, ...] | None = None) -> int:
+                 prices_provenance=_PROVENANCE_PATH,
+                 report_builder=summarize_panel_result,
+                 candidate_policy_authority=policy_revision,
++                pit_data_scope=request.pit_data_scope,
+             )
++            stage = "panel simulation"
+             evaluation = evaluator.evaluate_candidate(
+                 candidate_root=_POLICY_ROOT.resolve(strict=True),
+                 panel=request.panel,
+@@ -257,13 +265,33 @@ def main(argv: tuple[str, ...] | None = None) -> int:
+                 ),
+                 scenario_ids=request.scenario_ids,
+             )
++        stage = "output authentication"
+         output = panel_execution_output_bytes_v5(
+             request=request,
+             evaluation=evaluation,
+         )
+         _write_output(content=output, maximum_bytes=request.output_limit_bytes)
+         return 0
+-    except BaseException:
++    except BaseException as exc:
++        # Bound and sanitize the integration diagnostic; never print locals,
++        # environment variables, source lines, or a policy worker transcript.
++        message = " ".join(str(exc).split())[:2048]
++        message = re.sub(r"https?://\S+", "[redacted URL]", message)
++        message = re.sub(
++            r"(?i)\b(api[_-]?key|token|password|secret|authorization)\b"
++            r"\s*[=:]\s*\S+",
++            r"\1=[redacted]",
++            message,
++        )
++        location = ""
++        trace = exc.__traceback__
++        while trace is not None:
++            location = f"{Path(trace.tb_frame.f_code.co_filename).name}:{trace.tb_lineno}"
++            trace = trace.tb_next
++        print(
++            f"PIT panel failed at {stage} ({location}): {type(exc).__name__}: {message}",
++            file=sys.stderr,
++        )
+         return 3
+ 
+ 
+diff --git a/core/pit_optimizer_v5/container_protocol.py b/core/pit_optimizer_v5/container_protocol.py
+index 8d75a2b..296c0ff 100644
+--- a/core/pit_optimizer_v5/container_protocol.py
++++ b/core/pit_optimizer_v5/container_protocol.py
+@@ -57,6 +57,7 @@ class PanelExecutionRequestV5:
+     worker_startup_timeout_seconds: int
+     output_limit_bytes: int
+     baseline_capture_inputs_ref: ArtifactRefV5 | None = None
++    pit_data_scope: Literal["production", "development_sp500_v2"] = "production"
+ 
+     def __post_init__(self) -> None:
+         if (
+@@ -71,6 +72,13 @@ class PanelExecutionRequestV5:
+         ):
+             raise ValueError("panel execution request schema is invalid")
+         _digest(self.request_sha256, "panel request SHA-256")
++        if self.pit_data_scope not in {"production", "development_sp500_v2"}:
++            raise ValueError("panel execution PIT data scope is invalid")
++        if self.pit_data_scope == "development_sp500_v2" and (
++            self.baseline_capture_inputs_ref is not None
++            or self.panel.purpose not in {"quick", "discovery"}
++        ):
++            raise ValueError("development data cannot authorize baseline capture or held-out evaluation")
+         validate_episode_plan_panel_v5(self.episode, self.panel)
+         if self.episode.purpose != self.panel.purpose:
+             raise ValueError("panel execution purpose differs from its authenticated panel")
+diff --git a/core/pit_optimizer_v5/evaluator.py b/core/pit_optimizer_v5/evaluator.py
+index fc1f68a..1d49a5c 100644
+--- a/core/pit_optimizer_v5/evaluator.py
++++ b/core/pit_optimizer_v5/evaluator.py
+@@ -10,7 +10,7 @@ from dataclasses import dataclass
+ from datetime import date
+ from decimal import Decimal
+ from pathlib import Path
+-from typing import Protocol
++from typing import Literal, Protocol
+ 
+ from core.backtest_engine import PortfolioSimulator, SimulationResultV5
+ from core.backtest_fills import ExecutionProfileV5, FrictionScenario
+@@ -321,7 +321,12 @@ class PitPanelEvaluatorV5:
+         candidate_policy_authority: PolicyRevisionIdentityV5 | None = None,
+         baseline_worker_factory: BaselineWorkerFactoryV5 | None = None,
+         simulator_factory: SimulatorFactoryV5 = PortfolioSimulator,
++        pit_data_scope: Literal["production", "development_sp500_v2"] = "production",
+     ) -> None:
++        if pit_data_scope not in {"production", "development_sp500_v2"}:
++            raise ValueError("evaluator PIT data scope is invalid")
++        if pit_data_scope == "development_sp500_v2" and baseline_policy_revision is not None:
++            raise ValueError("development data cannot authorize baseline evaluation")
+         if type(contract) is not EvaluatorContractV5:
+             raise ValueError("evaluator contract must use schema V5")
+         if type(sandbox_profile) is not SandboxProfileV5:
+@@ -384,6 +389,11 @@ class PitPanelEvaluatorV5:
+         metadata = getattr(pit_bundle, "metadata", None)
+         if not isinstance(metadata, Mapping):
+             raise ValueError("PIT bundle metadata is unavailable")
++        expected_schema = "2" if pit_data_scope == "development_sp500_v2" else "3"
++        if metadata.get("schema_version") != expected_schema:
++            raise ValueError(
++                f"{pit_data_scope} evaluation requires a schema-V{expected_schema} PIT bundle"
++            )
+         warmup_start = metadata.get("warmup_start")
+         if type(warmup_start) is not str:
+             raise ValueError("PIT bundle warmup start is unavailable")
+@@ -393,6 +403,7 @@ class PitPanelEvaluatorV5:
+             raise ValueError("PIT bundle warmup start is invalid") from exc
+ 
+         self._contract = contract
++        self._pit_data_scope = pit_data_scope
+         self._sandbox_profile = sandbox_profile
+         self._execution_profile = execution_profile
+         self._pit_bundle = pit_bundle
+@@ -473,6 +484,8 @@ class PitPanelEvaluatorV5:
+     ) -> PanelEvaluationV5:
+         if type(panel) is not EvaluationPanelSpec:
+             raise ValueError("evaluation panel must use the authenticated panel schema")
++        if self._pit_data_scope == "development_sp500_v2" and panel.purpose not in {"quick", "discovery"}:
++            raise ValueError("development data cannot authorize held-out evaluation")
+         if type(policy_revision) is not PolicyRevisionIdentityV5:
+             raise ValueError("evaluation policy revision must use the V5 identity schema")
+         if (
+@@ -532,6 +545,7 @@ class PitPanelEvaluatorV5:
+                 policy_client_factory=single_worker,
+                 execution_profile=self._execution_profile,
+                 friction_scenario=scenario,
++                pit_data_scope=self._pit_data_scope,
+             )
+             if not callable(getattr(simulator, "run", None)):
+                 raise TypeError("V5 simulator factory returned an invalid simulator")
+@@ -611,6 +625,7 @@ class PitPanelEvaluatorV5:
+         if not isinstance(config, Mapping):
+             raise ValueError("V5 result configuration is absent")
+         expected = {
++            "pit_data_scope": self._pit_data_scope,
+             "pit_bundle_sha256": self._contract.pit_bundle_sha256,
+             "execution_profile_sha256": self._contract.execution_profile_sha256,
+             "friction_scenario": _scenario_primitive(scenario),
+diff --git a/docs/pit-optimizer-v5-development.md b/docs/pit-optimizer-v5-development.md
+new file mode 100644
+index 0000000..a98c30d
+--- /dev/null
++++ b/docs/pit-optimizer-v5-development.md
+@@ -0,0 +1,76 @@
++# PIT optimizer V5 development evaluation
++
++The existing V5 candidate evaluator can run authenticated schema-V2 S&P data with
++the V3 policy interface when its canonical `PanelExecutionRequestV5` explicitly
++sets `pit_data_scope="development_sp500_v2"`. This is a provisional integration
++path through the same candidate worker, portfolio simulator, fills, and report
++builder used by V5.
++
++## Selecting the scope
++
++Construct a request with `pit_data_scope="development_sp500_v2"`, a `quick` or
++`discovery` panel, and `baseline_capture_inputs_ref=None`. To update an existing
++request object before serialization:
++
++```python
++from dataclasses import replace
++from core.pit_optimizer_v5.container_protocol import panel_execution_request_bytes_v5
++
++development_request = replace(
++    request,
++    pit_data_scope="development_sp500_v2",
++    baseline_capture_inputs_ref=None,
++)
++request_bytes = panel_execution_request_bytes_v5(development_request)
++input_sha256 = development_request.sha256
++```
++
++Use the newly serialized bytes and input SHA in the image-bound invocation. The
++scope is part of the canonical input hash, and output binds that complete input
++hash. The simulator also records scope in result configuration and effective
++engine policy identity. Rebuild the evaluator image and regenerate its source,
++sandbox, contract, and request identities after this source change. Old serialized
++requests must be regenerated to include the new field, even for production.
++
++The constructor default is `production`, which requires schema-V3 data in the V5
++evaluator. Development scope requires actual schema 2; it neither relabels a
++bundle nor accepts schema 1. Development requests cannot carry baseline-capture
++authority or evaluate a qualification/held-out panel. A baseline source revision
++may still be measured as a development candidate, without creating a production
++baseline artifact. Production preparation and authorization gates are unchanged.
++
++## Real development data and limitations
++
++The local development bundle is
++`.artifacts/pit-optimizer-v5/development/data/sp500-v2/pit_bundle.sqlite3`, SHA-256
++`cf729b47d762ae86287bb8a87c28a1664e7475c74ef1aca736fbc240111349de`, with its adjacent
++`prices_provenance.json`. Authentication still checks the bundle, provenance,
++identity contract, policy source, and evaluator authority.
++
++This bundle contains historical S&P membership and SPY/QQQ/IWM reference prices.
++It is not a three-universe V5 production dataset. Existing S&P affiliations are
++reported as `("sp500",)`. No dated industry classification or sector taxonomy is
++invented: entry industry/sector RS remains `None`, holding industry RS remains
++`None`, and held industry/sector notionals remain `unclassified`.
++
++Schema-V2 development allows the causal engine's partial RS snapshots. A missing
++holding RS stays `None`; supplied malformed, nonfinite, or out-of-range RS values
++still fail. Membership and tradable-universe data are not rewritten. One observed
++limitation is BBWI: legacy membership starts on 2021-01-01, while actual price rows
++start on 2021-08-03, so its RS is absent on 2021-03-31. This is not a zero score or
++synthetic history. Normal strategy qualification continues to use available facts.
++
++Price and public-date cutoffs, completed-session history validation, and causal
++feature calculations remain active. Legacy holding validation uses the existing
++hash-bound `PriceIdentityTransitionContract.resolve_open_holding`, so unsupported
++identity boundaries still fail instead of extending a holding with invented data.
++Production schema-V3 feature validation still requires complete active-union RS.
++
++The container exits nonzero on failure and emits a bounded stderr diagnostic with
++the integration stage, final source filename/line, exception class, and sanitized
++message. It does not print source lines, locals, environment values, or a worker
++transcript. No success artifact is emitted for a failed evaluation.
++
++A completed development run demonstrates integration on this provisional S&P
++data. It does not establish production baseline, held-out, industry-feature, or
++three-universe readiness.

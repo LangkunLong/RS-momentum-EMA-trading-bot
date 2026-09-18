@@ -1,0 +1,437 @@
+### Task 7: Implement the Incumbent Loop, Incremental Artifacts, and Hidden Boundary
+
+**Files:**
+
+- Create: core/pit_optimizer_artifacts.py
+- Create: core/pit_optimizer_controller.py
+- Modify: core/pit_optimization.py
+- Modify: core/pit_optimizer_evaluation.py
+- Create: tests/test_pit_optimizer_loop.py
+- Modify: tests/test_pit_optimizer_v2.py
+
+**Interfaces:**
+
+- Produces: PitOptimizerReadiness; PitOptimizerServices; PitOptimizerResult; incremental artifact store; schema-v2 prepare and incumbent-loop entry points.
+- Consumes: authenticated fixed discovery baselines, source/bundle/fold/policy identities, authorization window, candidate/evaluation services, validation ledger, and cancellation signal.
+
+**Controller interfaces:**
+
+    @dataclass(frozen=True, slots=True)
+    class PitOptimizerReadiness:
+        schema_version: int
+        manifest: PitOptimizerRunManifest
+        manifest_sha256: str
+        readiness_sha256: str
+        artifact_path: Path
+        parity: ParityAttestation
+        baseline_discovery: DiscoveryEvidenceSummary
+        provider_seed: ProviderSeed
+
+    @dataclass(frozen=True, slots=True)
+    class CandidateWorkspace:
+        workspace_id: str
+        root: Path
+
+    @dataclass(frozen=True, slots=True)
+    class CandidateValidationOutcome:
+        valid: bool
+        failure_code: str | None
+        incremental_diff: str
+        cumulative_diff: str
+        identity: CandidateIdentity | None
+        changed_paths: tuple[str, ...]
+        changed_symbols: tuple[str, ...]
+
+    @dataclass(frozen=True, slots=True)
+    class OptimizerBudgetSummary:
+        api_calls: int
+        prompt_tokens: int
+        completion_tokens: int
+        total_tokens: int
+        authoritative_usd: float
+        retained_reservation_tokens: int
+        retained_reservation_usd: float
+        incomplete_accounting_calls: int
+
+    @dataclass(frozen=True, slots=True)
+    class PitOptimizerServices:
+        freeze_pricing: Callable[[str], FrozenModelPricing]
+        open_run_lease: Callable[[PitOptimizerReadiness, FrozenModelPricing], AuthorizationRunLease]
+        close_run_lease: Callable[[AuthorizationRunLease, str], None]
+        call_role: Callable[[PitOptimizerCallBudget, InvestigatorInput | AuthorInput | CriticInput, Callable[[str], object], AuthorizationRunLease, FrozenModelPricing], PitOptimizerRoleCall]
+        create_candidate: Callable[[str | None], CandidateWorkspace]
+        validate_and_apply: Callable[[CandidateWorkspace, AuthorArtifact, str | None], CandidateValidationOutcome]
+        evaluate_discovery: Callable[[CandidateWorkspace, CandidateIdentity], DiscoveryEvaluation]
+        confirm_discovery: Callable[[CandidateWorkspace, CandidateIdentity, str], DeterminismAttestation]
+        reserve_hidden_validation: Callable[[CandidateIdentity], ValidationReservation]
+        evaluate_hidden: Callable[[CandidateWorkspace, CandidateIdentity, ValidationReservation], HiddenEvaluation]
+        dispose_candidate: Callable[[CandidateWorkspace], PitOptimizerCleanup]
+        verify_inputs: Callable[[PitOptimizerReadiness], None]
+        cancellation_requested: Callable[[], bool]
+        write_json_artifact: Callable[[str, Mapping[str, object]], tuple[Path, str]]
+        write_diff_artifact: Callable[[str, str], tuple[Path, str]]
+
+    @dataclass(frozen=True, slots=True)
+    class PitOptimizerResult:
+        schema_version: int
+        phase: str
+        status: str
+        terminal_code: str
+        terminal_detail: str | None
+        exit_code: int
+        run_id: str
+        readiness_sha256: str
+        manifest_sha256: str
+        iterations_started: int
+        iterations_completed: int
+        valid_evaluations: int
+        incumbent_updates: int
+        non_improving_streak: int
+        discovery_winner: CandidateIdentity | None
+        hidden_validation_opened: bool
+        validation_reservation_sha256: str | None
+        long_replay_eligible: bool | None
+        budget: OptimizerBudgetSummary
+        artifact_root: Path
+        artifact_paths: tuple[tuple[Path, str], ...]
+        source_modified: bool
+        cleanup_complete: bool
+
+        def to_public_artifact(self) -> Mapping[str, object]
+
+    def prepare_pit_optimizer_v2(
+        config: PitOptimizerGateConfig,
+        *,
+        source_root: Path,
+        artifact_root: Path,
+        permanent_runtime_root: Path,
+        source_head: str,
+        source_fingerprint_sha256: str,
+    ) -> PitOptimizerReadiness
+
+    def run_pit_optimizer_v2(
+        *,
+        readiness: PitOptimizerReadiness,
+        services: PitOptimizerServices,
+    ) -> PitOptimizerResult
+
+    FoldEvaluationResult(
+        fold_id: str,
+        engine_policy_sha256: str,
+        candidate_identity_sha256: str,
+        aggregate_metrics: FoldAggregateSummary,
+    )
+    DiscoveryComparison(
+        candidate_vs_fixed_baseline: DiscoveryScore,
+        candidate_vs_incumbent_diagnostics: DiscoveryScore,
+        rankable: bool,
+        strictly_improves_incumbent: bool,
+    )
+    DiscoveryEvaluation(
+        folds: tuple[FoldEvaluationResult, ...],
+        comparison: DiscoveryComparison,
+    )
+    DeterminismAttestation(
+        fold_id: str,
+        expected_evidence_sha256: str,
+        repeated_evidence_sha256: str,
+        matched: bool,
+    )
+    HiddenEvaluation(
+        baseline_aggregate: FoldAggregateSummary,
+        candidate_aggregate: FoldAggregateSummary,
+        decision: HoldoutDecision,
+    )
+    PitOptimizerCleanup(
+        candidate_removed: bool,
+        worker_stopped: bool,
+        source_modified: bool,
+    )
+    OptimizerTerminalCode = {
+        "iteration_limit",
+        "budget_exhausted",
+        "stagnation_limit",
+        "cancelled",
+        "provider_protocol_failure",
+        "provider_accounting_failure",
+        "audit_failure",
+        "authorization_exhausted",
+        "identity_drift",
+        "trusted_evaluator_nondeterminism",
+        "sandbox_integrity_failure",
+        "evidence_tampering",
+    }
+
+`status` is exactly ready, long_replay_eligible, loop_verified_no_long_replay_candidate, or aborted. A pre-call context overflow uses terminal_code=budget_exhausted and terminal_detail=context_budget_exhausted; it never becomes candidate feedback or a provider call.
+
+PitOptimizerReadiness.readiness_sha256 is the only readiness self-digest. The create-only readiness JSON serializes neither readiness_sha256 nor runtime-only artifact_path; its exact canonical file-byte digest becomes readiness_sha256 when read into the runtime dataclass. CandidateWorkspace is an inert reference: the concrete agent_loop.Candidate capability remains in a private PitOptimizerServices registry keyed by workspace_id. validate_and_apply and dispose_candidate must resolve that existing capability from the registry and can never reconstruct authority from root; disposal atomically removes the registry entry. The five evaluation dataclasses shown above live in core/pit_optimizer_evaluation.py and are committed with this task.
+
+**State-machine invariants:**
+
+- A complete iteration is investigator, author, local validation/discovery evaluation, then critic.
+- Every nonterminal author outcome receives a critic, including static rejection, syntax/import failure, worker failure, timeout, zero trades, or underperformance.
+- Provider/protocol/audit/identity failure is terminal and may leave a partial iteration.
+- The controller compares a valid candidate only after the critic artifact is durably persisted.
+- The incumbent starts at the fixed baseline and candidates build on the current best cumulative diff.
+- Every candidate excess return and DiscoveryScore uses the original authenticated fold baselines carried by the final parity attestation/readiness. Candidate-versus-incumbent deltas are diagnostics only and never become the objective reference.
+- Stop at min(configured iterations, floor(authorized calls / 3), 8), or after three consecutive valid evaluated non-improvements. Invalid candidates do not increment the valid-non-improvement counter.
+- Token/cost/call/context exhaustion checked before a complete iteration is a normal budget_exhausted stop. User cancellation is cancelled. Trusted evaluator nondeterminism, evidence tampering, sandbox escape/integrity failure, identity drift, audit failure, provider protocol failure, and uncertain accounting are terminal and never become critic feedback. Every terminal path closes the non-spend run lease and releases only unused future allowance; spent calls and retained uncertain reservations remain charged.
+
+**Exact local artifact layout:**
+
+    run.json
+    baseline.json
+    accounting.json
+    iterations/001/investigator.json
+    iterations/001/author.json
+    iterations/001/candidate.diff
+    iterations/001/validation.json
+    iterations/001/discovery.json
+    iterations/001/critic.json
+    iterations/001/decision.json
+    incumbent.diff
+    holdout.json
+    summary.json
+
+Create holdout.json only when hidden validation is opened. Repeat the numbered iteration directory for every started iteration and retain partial contents on a terminal provider/integrity failure.
+
+Every artifact has schema_version=2 and exact top-level keys:
+
+- run.json: manifest-sealed run_id, complete manifest/source/readiness/bundle/baseline/effective-policy/parity/fold identities, policy_interface_version, candidate_bounds, authorization requirement/window/lease IDs, frozen pricing identity, status;
+- baseline.json: discovery fold IDs, final-parity-attested per-fold aggregate metrics, universe/warmup identities, engine_policy_sha256, parity_attestation_sha256;
+- accounting.json: call records, authorized/reserved/actual call-token-USD totals, incomplete exposure, audit-chain head;
+- investigator.json / author.json / critic.json: the validated closed role artifact plus call index/iteration and payload digest, never raw response envelopes;
+- validation.json: candidate failure code or CandidateIdentity, author_manifest_matches, focused-check results, worker attestation;
+- discovery.json: fixed-baseline comparisons, incumbent diagnostics, per-fold aggregates, engine_policy_sha256, candidate_identity_sha256;
+- decision.json: rankable, quantized score, prior/new incumbent identity, deterministic controller decision;
+- holdout.json: consumed validation key, baseline/candidate aggregates, both identities, eligibility checks;
+- summary.json: terminal status/code, iterations, incumbent, discovery/hidden outcome, exact accounting, cleanup, source_modified, artifact digests.
+
+**Controller implementation skeleton:**
+
+    @dataclass(slots=True)
+    class _RunState:
+        run_id: str
+        next_iteration: int
+        incumbent_workspace: CandidateWorkspace | None
+        incumbent_identity: CandidateIdentity | None
+        incumbent_cumulative_diff: str
+        incumbent_discovery: DiscoveryEvidenceSummary
+        prior_iterations: tuple[IterationFeedbackSummary, ...]
+        valid_evaluations: int
+        incumbent_updates: int
+        non_improving_streak: int
+        provider_enabled: bool
+        frozen_pricing: FrozenModelPricing | None
+        authorization_lease: AuthorizationRunLease | None
+
+    @dataclass(frozen=True, slots=True)
+    class _IterationOutcome:
+        completed: bool
+        terminal_code: str | None
+        feedback: IterationFeedbackSummary | None
+        candidate_workspace: CandidateWorkspace | None
+        candidate_identity: CandidateIdentity | None
+        discovery: DiscoveryEvaluation | None
+        incumbent_changed: bool
+
+    _initialize_run_artifacts(readiness, state, services) -> None
+    _initialize_provider(readiness, state, services) -> None
+    _baseline_from_parity(parity: ParityAttestation) -> DiscoveryEvidenceSummary
+    _run_investigator(readiness, state, services) -> PitOptimizerRoleCall
+    _run_author(readiness, state, investigator, services) -> PitOptimizerRoleCall
+    _validate_iteration_candidate(readiness, state, author, services) -> CandidateValidationOutcome
+    _evaluate_iteration_candidate(readiness, state, validation, services) -> DiscoveryEvaluation | None
+    _run_critic(readiness, state, investigator, author, validation, discovery, services) -> PitOptimizerRoleCall
+    _persist_iteration_decision(readiness, state, validation, discovery, critic, services) -> _IterationOutcome
+    _call_role(readiness, state, services, plan, role_input, parser) -> PitOptimizerRoleCall
+    _run_iteration(readiness, state, services) -> _IterationOutcome
+    _finish_discovery(readiness, state, services) -> DeterminismAttestation | None
+    _run_hidden_once(readiness, state, services) -> HiddenEvaluation
+    _dispose_all_candidates_and_workers(state, services) -> PitOptimizerCleanup
+    _replace_accounting_artifact(state, services) -> None
+    _build_final_result(*, readiness, state, terminal_code, cleanup) -> PitOptimizerResult
+    _finalize_result(readiness, state, services, terminal_code) -> PitOptimizerResult
+
+- [ ] **Step 1: Add failing provider-free prepare tests.** Authenticate clean source, manifest, final parity, and every embedded ParityFoldEvidence self-digest; reject tracked drift or nested evidence mismatch. Require baseline_discovery/provider_seed to be derived only from attested fold aggregates/funnel/exit attribution. Spy that both discovery identities are permanently marked before any aggregate is provider-projectable. Assert prepare performs zero replay, hidden evaluation, gateway construction, authorization lease, grant mutation, or provider call, and that no hidden ID/date/metric enters ProviderSeed.
+
+  Task 2's parity test exposes a real `final_parity` fixture built from two small ParityFoldEvidence values; add this pure projection anchor:
+
+  ```python
+  def test_prepare_baseline_comes_from_final_parity(final_parity):
+      baseline = _baseline_from_parity(final_parity)
+      assert baseline.folds == tuple(
+          item.aggregate for item in final_parity.final_discovery_evidence
+      )
+      assert baseline.evidence_ids == tuple(
+          item.evidence_sha256 for item in final_parity.final_discovery_evidence
+      )
+  ```
+- [ ] **Step 2: Run the prepare slice and confirm prepare_pit_optimizer_v2 fails closed.**
+
+      python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py tests/test_pit_optimizer_v2.py -k "prepare_v2 or prepare_parity or prepare_discovery_exposure"
+
+- [ ] **Step 3: Implement provider-free prepare and rerun Step 2.** Recompute nested hashes, enforce the complete identity graph, derive the two fixed discovery baselines from final parity evidence, mark discovery exposure, and atomically write readiness. Do not instantiate or invoke any live/provider/replay service. Expected: green.
+
+  ```python
+  def _baseline_from_parity(parity: ParityAttestation):
+      evidence = parity.final_discovery_evidence
+      return DiscoveryEvidenceSummary(
+          folds=tuple(item.aggregate for item in evidence),
+          score=None,
+          evidence_ids=tuple(item.evidence_sha256 for item in evidence),
+      )
+  ```
+- [ ] **Step 4: Add failing artifact-initialization, pricing, capability, and run-lease tests.** Require one frozen R1 pricing record and then the non-spend one-shot lease before the first call; store both in _RunState and pass both to every call_role. Atomically create run.json, baseline.json, and accounting.json with complete identities; create iterations/NNN before its investigator; refuse overwrite/partial fsync; and prevent state advance after an artifact failure. Assert the initial files contain no provider bodies or hidden results. Require manifest.run_id as the sole run ID. Prove validate/dispose resolve the existing candidate capability by workspace_id, reject an unknown/removed ID, and never recreate it from root.
+
+  ```python
+  def test_initialize_freezes_pricing_before_opening_lease():
+      events: list[str] = []
+      pricing = freeze_pricing_record(
+          "deepseek/deepseek-r1",
+          {"prompt": 1, "completion": 2},
+      )
+      lease = Mock(spec=AuthorizationRunLease)
+      readiness = Mock(spec=PitOptimizerReadiness)
+      readiness.manifest.model = "deepseek/deepseek-r1"
+      state = Mock(spec=_RunState)
+      services = Mock(spec=PitOptimizerServices)
+      services.freeze_pricing.side_effect = lambda model: events.append("pricing") or pricing
+      services.open_run_lease.side_effect = lambda ready, frozen: events.append("lease") or lease
+      _initialize_provider(readiness, state, services)
+      assert events == ["pricing", "lease"]
+      assert state.frozen_pricing is pricing
+      assert state.authorization_lease is lease
+  ```
+- [ ] **Step 5: Run the artifact slice and confirm the store/controller seams fail.**
+
+      python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py -k "artifact_initialization or run_lease or artifact_failure"
+
+- [ ] **Step 6: Implement _initialize_run_artifacts, the private capability registry, and create/replace/fsync store primitives.** Freeze pricing, open and retain the run lease, create the three root artifacts from readiness.manifest.run_id, and expose create-only iteration paths plus atomic replacement for accounting/incumbent state. Candidate services retain the capability keyed by workspace_id until exactly one disposal. Re-run Step 5; expected: green.
+
+  ```python
+  def _initialize_provider(readiness, state, services):
+      pricing = services.freeze_pricing(readiness.manifest.model)
+      lease = services.open_run_lease(readiness, pricing)
+      state.frozen_pricing = pricing
+      state.authorization_lease = lease
+  ```
+
+  _initialize_run_artifacts calls `_initialize_provider` before its first create-only artifact and includes both identities in run.json; if any subsequent create/fsync fails, its outer finally closes the retained lease.
+- [ ] **Step 7: Add failing single-iteration role/validation branches.** For a valid mocked candidate require investigator then author, fresh authenticated-base-plus-incumbent materialization, rendered-size check, exact reservation/call persistence, author-manifest match, candidate.diff, validation.json, focused checks selected only by changed symbols, two fresh discovery-fold workers, and then critic. A disallowed patch skips replay but still receives critic feedback and keeps the incumbent. A malformed author response terminates after two calls without critic because protocol integrity failed.
+
+  ```python
+  def test_one_iteration_orders_critic_before_decision(monkeypatch):
+      events: list[str] = []
+      investigator_call = Mock(spec=PitOptimizerRoleCall)
+      author_call = Mock(spec=PitOptimizerRoleCall)
+      validation = Mock(spec=CandidateValidationOutcome)
+      discovery = Mock(spec=DiscoveryEvaluation)
+      critic_call = Mock(spec=PitOptimizerRoleCall)
+      outcome = Mock(spec=_IterationOutcome)
+      monkeypatch.setattr(controller, "_run_investigator", lambda *a: events.append("investigator") or investigator_call)
+      monkeypatch.setattr(controller, "_run_author", lambda *a: events.append("author") or author_call)
+      monkeypatch.setattr(controller, "_validate_iteration_candidate", lambda *a: events.append("validate") or validation)
+      monkeypatch.setattr(controller, "_evaluate_iteration_candidate", lambda *a: events.append("discovery") or discovery)
+      monkeypatch.setattr(controller, "_run_critic", lambda *a: events.append("critic") or critic_call)
+      monkeypatch.setattr(controller, "_persist_iteration_decision", lambda *a: events.append("decision") or outcome)
+      assert _run_iteration(Mock(), Mock(), Mock()) is outcome
+      assert events == ["investigator", "author", "validate", "discovery", "critic", "decision"]
+  ```
+- [ ] **Step 8: Run the single-iteration slice and confirm _run_iteration is incomplete.**
+
+      python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py -k "single_iteration or invalid_author or malformed_author or focused_candidate_checks"
+
+- [ ] **Step 9: Implement _run_iteration through durable critic feedback and rerun Step 8.** Persist investigator/author before consuming their outputs. On a safe candidate failure, build the closed sanitized CriticInput and persist critic/decision; on protocol, audit, identity, or sandbox integrity failure, terminate immediately. For valid candidates, run only syntax/import, purity/determinism, and the entry/risk/exit tests selected by changed symbols, then evaluate both discovery folds with fresh simulators/workers against the fixed baseline and persist discovery.json before critic. Expected: green.
+
+  ```python
+  def _run_iteration(readiness, state, services):
+      investigator = _run_investigator(readiness, state, services)
+      author = _run_author(readiness, state, investigator, services)
+      validation = _validate_iteration_candidate(
+          readiness, state, author, services
+      )
+      discovery = _evaluate_iteration_candidate(
+          readiness, state, validation, services
+      )
+      critic = _run_critic(
+          readiness,
+          state,
+          investigator,
+          author,
+          validation,
+          discovery,
+          services,
+      )
+      return _persist_iteration_decision(
+          readiness, state, validation, discovery, critic, services
+      )
+  ```
+
+  `_evaluate_iteration_candidate` returns None without replay for a closed candidate failure; `_run_critic` still runs. The three role helpers themselves persist their artifact before returning. Only a caught protocol/audit/identity/accounting exception exits before critic.
+- [ ] **Step 10: Add failing two-iteration incumbent tests.** Require exact role order [investigator, author, critic, investigator, author, critic], exactly six calls, first critic feedback in the second investigator input, current incumbent source/diff in the second author input, no hidden sentinel in any prompt, and no source-worktree mutation. Make iteration 1 improve; require its exact prospective PolicySourceBundle to fit before atomic incumbent.diff replacement. Make iteration 2 non-improve; require its excess to remain relative to the original fixed baseline while incumbent deltas are diagnostics. Cover candidate-attributable next_context_oversize keeping the prior incumbent.
+- [ ] **Step 11: Run the incumbent-loop slice and confirm the state transition fails.**
+
+      python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py -k "two_iteration or incumbent_transition or next_context_oversize"
+
+- [ ] **Step 12: Implement incumbent comparison/history state and rerun Step 11.** Compare only after critic.json is durable, use the Decimal lexicographic objective, revalidate bundle/digest/CandidateIdentity before replacement, retain evidence while disposing rejected roots, and build the exact bounded IterationFeedbackSummary for the next investigator. Expected: green.
+- [ ] **Step 13: Add failing stop and terminal-boundary tests.** Cover iteration limit, three valid non-improvers, pre-iteration complete-plan call/token/cost/context exhaustion, cancellation, trusted evaluator nondeterminism, evidence tampering, sandbox integrity failure, audit write failure, identity drift, and uncertain provider accounting. Budget/context exhaustion and cancellation are normal stops; integrity/accounting failures abort. Invalid candidates do not increase the non-improving streak. Every path closes the lease, releasing only unused future allowance.
+- [ ] **Step 14: Run the stop/terminal slice and confirm final-discovery handling fails.**
+
+      python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py -k "stop_condition or terminal_boundary or discovery_repeat"
+
+- [ ] **Step 15: Implement pre-iteration stop checks plus _finish_discovery and rerun Step 14.** Before investigator, require the full next investigator/author/critic plan to fit and check cancellation. If no candidate strictly beats baseline, finish without hidden validation. Otherwise repeat one discovery fold with a fresh worker and require byte-identical aggregate evidence; mismatch is trusted_evaluator_nondeterminism. Expected: green.
+- [ ] **Step 16: Add failing hidden-boundary tests.** Require atomic hidden reservation with source/baseline/candidate metadata, provider_enabled=false before evaluation, hard rejection of every later call_role attempt, independent fresh resets for hidden baseline/candidate, and content-free ledger outcome. Assert all payload builders omit hidden IDs/dates/baselines/results. Cover both long_replay_eligible at quantized excess >=0.10 point with >=3 closed trades and complete safety/integrity/accounting, and loop_verified_no_long_replay_candidate otherwise.
+
+  ```python
+  def test_provider_call_is_impossible_after_hidden_boundary():
+      state = Mock(spec=_RunState)
+      state.provider_enabled = False
+      with pytest.raises(RuntimeError, match="provider capability is closed"):
+          _call_role(Mock(), state, Mock(), Mock(), Mock(), Mock())
+  ```
+- [ ] **Step 17: Run the hidden slice and confirm _run_hidden_once is missing.**
+
+      python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py -k "hidden_boundary or hidden_qualification or provider_closed"
+
+- [ ] **Step 18: Implement _run_hidden_once, finalization, and cleanup; rerun Step 17.** Reserve once, set provider_enabled=false, evaluate once, record the content-free outcome, and write holdout.json only after the event. Then close the lease with the terminal code, stop all workers, dispose every capability/root, verify the source fingerprint and final accounting, persist an inert cumulative incumbent.diff when present, and write summary.json last from those final facts. Never commit, apply to the operator worktree, merge, push, or deploy. Expected: green.
+
+  The provider guard is the first statement in the shared call helper:
+
+  ```python
+  if not state.provider_enabled:
+      raise RuntimeError("provider capability is closed")
+  if state.authorization_lease is None or state.frozen_pricing is None:
+      raise RuntimeError("provider capability is not initialized")
+  ```
+
+  The common terminal path uses this exact ordering; each close/dispose/verify write is wrapped by the existing attempt-all cleanup accumulator so one failure cannot suppress later cleanup or summary evidence. `_build_final_result` is a pure constructor over the final accounting/cleanup values and is unit-tested with the PitOptimizerResult field list above:
+
+  ```python
+  state.provider_enabled = False
+  if state.authorization_lease is not None:
+      services.close_run_lease(state.authorization_lease, terminal_code)
+      state.authorization_lease = None
+  cleanup = _dispose_all_candidates_and_workers(state, services)
+  services.verify_inputs(readiness)
+  _replace_accounting_artifact(state, services)
+  result = _build_final_result(
+      readiness=readiness,
+      state=state,
+      terminal_code=terminal_code,
+      cleanup=cleanup,
+  )
+  services.write_json_artifact("summary.json", result.to_public_artifact())
+  return result
+  ```
+- [ ] **Step 19: Run the complete controller tests.**
+
+      python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py tests/test_pit_optimizer_v2.py
+
+- [ ] **Step 20: Commit the feedback-driven controller.**
+
+      git add core/pit_optimizer_artifacts.py core/pit_optimizer_controller.py core/pit_optimizer_evaluation.py core/pit_optimization.py tests/test_pit_optimizer_loop.py tests/test_pit_optimizer_v2.py
+      git commit -m "feat: add feedback-driven PIT incumbent loop"
+
+---
+

@@ -1,0 +1,55 @@
+# Task 1 staged implementation report
+
+Status: implemented in separate proposed copies; ready for independent review. Not applied. No implementation commit exists. Task 2/3 and remote calls remain unperformed and unapproved where applicable.
+
+## Package
+
+`originals/` contains exact source preimage bytes; `proposed/` contains the integrated proposed source using repository-relative paths. `source-preimages.json` and `proposed-hashes.json` enumerate all seven SHA256 identities. `implementation.patch` uses canonical repository-relative a/b headers. `verification-output.txt` contains exact static results; `verification-command.json` records the Ruff argument array. `live-preimage-verification.json` records all seven live sources still matching their original snapshots at packaging. No other source was changed. These receipts do not replace the fresh preimage check required before application.
+
+## Integrated behavior
+
+- contracts.py and manifest.py independently accept provider-backed development only with disabled development semantics and zero retries/repair. Optional USD semantics and all existing capability checks are unchanged. No apply/qualification/replay permission was added.
+- development_preparation.py splits common development scope from controller-only exchange. A distinct ProviderDevelopmentAdapterConfigV5 binds the host identities, gateway/ledger/audit identities, fixed OPENROUTER_API_KEY handle, and policy_only export. The old controller config definition/serialized shape is unchanged. Config loading selects its exact type from the authenticated manifest, not file shape or a caller mode flag. The shared development factory accepts both exact types and validates manifest/root/mode and concrete graph identity.
+- cli.py factors the existing paid construction and exact graph verification for reuse. Production wrappers retain production scope and full export. Development injects that same ledger-backed invoker into the existing shared runtime with policy_only export. No transport, candidate engine or accounting subsystem is duplicated.
+- operations.py derives paid identities whenever a provider is present, selects the appropriate config, and requires response_directory only for controller mode (rejects it for paid mode). Per-round config derivation carries the correct path/credential handle fields. The started/no-journal exemption remains exclusively provider-free controller development; paid uncertainty cannot silently restart. Existing reservation reconciliation, owner hashes, original deadlines and budget stopping are reused unchanged.
+- runtime.py admits controller terminal provenance only for provider-free development; paid development requires LedgerRoleTerminalAuthorityV5. Existing pending controller gate already requires provider=None and remains unchanged. Existing paid reconciliation remains unchanged.
+- summary.py and development history use original saved launch/config authority, then the existing local run verifier selects controller package authentication or paid ledger authentication based on manifest.provider. The controller-only helper now explicitly rejects paid authority. Resource history already reconstructs config.export_mode, so paid development preserves policy-only source authentication without additional changes.
+
+## Exact preparation interfaces after later reviewed application
+
+The existing `import-development --input-file ABSOLUTE_JSON [--validate-only]` input may include `provider` or omit it/use null for controller mode. A non-null provider uses the existing canonical ProviderCapabilitiesV5 JSON shape, with all dataclass keys present: model, maximum_role_calls, maximum_total_tokens, maximum_output_tokens_per_role, maximum_usd, automatic_retries, schema_repair_calls, price_upper_bound, input_token_overhead_upper_bound. Decimal fields use canonical serialized decimal strings; maximum_usd/price_upper_bound may be null for audited-cost-only mode. Nonzero retries/repair reject before first import write. No model, token value, price or user budget is chosen by this patch. Existing panel/data/source/caps inputs and real parent authentication remain required. Validation/preparation results disclose the provider capabilities.
+
+`prepare-development` uses the existing real path arguments. Controller mode still requires --response-directory; provider mode omits it and rejects a supplied directory. It creates a distinct config with a fixed credential HANDLE, never the value. `run-campaign` and `resume-campaign` dispatch by authenticated scope and provider/config authority using the existing execution loop. `verify-run` and `summarize` use the development config loader and shared history verifier. Standalone production run/resume remain production-only. No mixed staged/live CLI execution was attempted.
+
+## Assumption/consumer audit
+
+Resolved both independent provider prohibitions (contracts and manifest builder), development common/controller helper scope, config/factory type and path selection, production-only paid composition reuse, development terminal selection, and the paid/no-journal recovery exemption. Retained controller_roles.py provider-free guard, fixture authority checks, provider-free pending behavior, evaluator/container-protocol provisional data/panel restrictions, disabled semantics, production standalone restrictions, and optional monetary policy. Inspected production_provider.py ledger construction/reservation/accounting and provider.py role types/serialization: their paid machinery is already scope-neutral and needs no direct consumer edit. Existing `_verify_local_run` provider-present branch already authenticates ledger receipts; resource history already uses export_mode. No direct consumers outside the planned seven require edits from this source assessment.
+
+## Verification and limitations
+
+Scoped Ruff passed on seven proposed paths. Every proposed file compiled in memory without imports. Added patch lines passed whitespace review; all source snapshots and live preimage matches passed. No tests were read/created/modified/run; no synthetic probes, application imports/CLI, credentials, provider/network/Docker calls, staging in Git, commits, hooks, or campaign/artifact writes occurred. This staging package is source evidence only, not proof of runtime behavior.
+
+Independent review is still required. The image closure changes (at least contracts/runtime) require rebuilt/sealed exact evaluator authority and fresh authentic baseline reports before a new campaign. Actual call-free preparation and later explicitly approved provider execution remain controller-owned after live campaign cleanup and application. The sole remaining operational choices are the model/destination, finite token/call/time caps, optional USD policy/prices, source/evidence disclosure and explicit external authorization. No speculative accounting or policy behavior changes are included.
+
+## Source-review checklist
+
+- [x] Exact originals and proposed hashes with no live mutation.
+- [x] Both manifest constructor and builder allow only the intended new combination.
+- [x] Controller configuration serialization remains unchanged; paid configuration is explicit.
+- [x] Shared gateway graph checks bind model capabilities/ledger/audit/credential handle and repository.
+- [x] Policy-only development and full production export remain separate.
+- [x] Paid uncertainty, deadline and owner semantics retain existing safeguards.
+- [x] Controller versus ledger terminal/history provenance remains exclusive.
+- [x] Existing bounded role messages and source authority are reused; no outbound scope expansion.
+- [x] Optional USD accounting is preserved with no invented model or caps.
+- [ ] Independent review and any staging-only corrections.
+- [ ] Later application/preimage recheck, local preparation, rebuilt image/baselines, explicit external authorization and actual run.
+
+
+## Actual-response text-guard follow-up (provider.py only)
+
+The controller reproduced rejection on the exact archived runtime/controller-investigator-round1-response.json: causal_claim contains the normal sentence “A plausible cause ...”, and author_instructions contains “no I/O”. Source reading confirms the uppercase regex treats bare A, I and O as unknown uppercase symbols. No synthetic inputs or application calls were used by this implementer.
+
+Added bare A and I to the existing ordinary-uppercase token allowance. Added recognition of bounded exact I/O only in the uppercase scan, by masking its three characters locally. Boundaries exclude embedding in identifiers, slash/dot paths, dollar prefixes and dotted alphanumeric suffixes. The original text still goes through path, credential and explicit ticker-context scans first; the original text is returned unchanged, so stored text/hash is unchanged. Cash and market suffix checks still run and reject A/I with those markers; standalone O and other unknown uppercase tokens remain rejected. No other parser or role schema changed.
+
+provider.py was snapshotted with exact original bytes and added to the eight-file inventories and patch. The seven previously proposed wiring hashes are unchanged, recorded in seven-wiring-hashes-before-provider-fix.json; the ongoing wiring review therefore remains against the same bytes. All eight proposed files compile and Ruff passes. All eight live source files still match their preimages. This module is evaluator-covered and must be included in later rebuild identity. The controller will preflight the exact archived response only after safe application; this report does not claim that execution has occurred. No live source, tests, probes, network, Docker, credentials or commits touched.

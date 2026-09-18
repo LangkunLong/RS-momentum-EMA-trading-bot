@@ -1,0 +1,3176 @@
+# Review package: 75502d435b1ba5b74894c2b055e926dfeaa03cef..9450d157811e91cfac172aba7aa661108e00ebad
+
+## Commits
+9450d15 feat: add causal adaptive market context
+
+## Files changed
+ core/backtest_engine.py                | 137 ++++++++++++++++++++++---------
+ core/strategy_policy/__init__.py       |   5 +-
+ core/strategy_policy/contracts.py      | 127 ++++++++++++++++++++++++++---
+ core/strategy_policy/entry.py          |   2 +-
+ core/strategy_policy/exit.py           |   2 +-
+ core/strategy_policy/market_context.py | 117 +++++++++++++++++++++++++++
+ core/strategy_policy/risk.py           |   3 +
+ core/strategy_policy/runtime.py        |  10 +--
+ core/strategy_policy/worker.py         |   1 +
+ tests/test_backtest_engine.py          | 143 +++++++++++++++++++++++++--------
+ tests/test_backtest_open_causality.py  | 117 ++++++++++++++++++++-------
+ tests/test_strategy_policy.py          |  50 ++++++++++--
+ 12 files changed, 597 insertions(+), 117 deletions(-)
+
+## Diff
+diff --git a/core/backtest_engine.py b/core/backtest_engine.py
+index 9cc94f0..aa6bf78 100644
+--- a/core/backtest_engine.py
++++ b/core/backtest_engine.py
+@@ -68,27 +68,32 @@ from core.strategy_policy import (
+     AllocationSnapshot,
+     CapacityDecision,
+     CapacitySnapshot,
+     EntryDecision,
+     EntrySnapshot,
+     EvictionDecision,
+     EvictionPosition,
+     EvictionSnapshot,
+     ExitDecision,
+     ExitSnapshot,
++    MarketContextV1,
+     StrategyPolicyClient,
+     StrategyPolicyClientFactory,
+     validate_allocation_decision,
+     validate_capacity_decision,
+     validate_eviction_decision,
+     validate_exit_decision,
+ )
++from core.strategy_policy.market_context import (
++    BENCHMARK_CONTEXT_SYMBOLS,
++    build_market_context,
++)
+ from core.strategy_policy.runtime import InProcessPolicyClient
+ from core.trading_sessions import (
+     exact_session_row,
+     history_through_exact_session,
+     normalize_us_equity_session,
+ )
+ 
+ sys.stdout.reconfigure(line_buffering=True)
+ 
+ 
+@@ -174,52 +179,63 @@ def _calculate_rs_snapshot(
+     eligible_tickers: Optional[Iterable[str]] = None,
+ ) -> Dict[str, float]:
+     """Compatibility delegate for the public causal RS snapshot."""
+     return calculate_rs_snapshot(all_closes, eval_date, eligible_tickers)
+ 
+ 
+ @dataclass(slots=True)
+ class PendingEntry:
+     signal: dict[str, object]
+     capacity: CapacityDecision
++    market: MarketContextV1
+ 
+     def to_primitive(self) -> dict[str, object]:
+         return {
+             "signal": dict(self.signal),
+             "capacity": {
+                 "max_positions": self.capacity.max_positions,
+                 "eviction_enabled": self.capacity.eviction_enabled,
+             },
++            "market": self.market.to_primitive(),
+         }
+ 
+     @classmethod
+     def from_primitive(cls, raw: Mapping[str, object]) -> "PendingEntry":
+         signal = raw.get("signal")
+         capacity = raw.get("capacity")
+-        if not isinstance(signal, Mapping) or not isinstance(capacity, Mapping):
++        market = raw.get("market")
++        if (
++            set(raw) != {"signal", "capacity", "market"}
++            or not isinstance(signal, Mapping)
++            or not isinstance(capacity, Mapping)
++            or not isinstance(market, Mapping)
++        ):
+             raise ValueError("pending entry checkpoint is invalid")
+         max_positions = capacity.get("max_positions")
+         eviction_enabled = capacity.get("eviction_enabled")
+         if max_positions is not None and (
+             type(max_positions) is not int
+             or max_positions < 1
+             or max_positions > MAXIMUM_POLICY_POSITIONS
+         ):
+             raise ValueError("pending capacity is invalid")
+         if type(eviction_enabled) is not bool:
+             raise ValueError("pending eviction flag is invalid")
+         return cls(
+             signal=dict(signal),
+             capacity=CapacityDecision(
+                 max_positions=max_positions,
+                 eviction_enabled=eviction_enabled,
+             ),
++            market=MarketContextV1.from_canonical_json(
++                json.dumps(market, sort_keys=True, separators=(",", ":"))
++            ),
+         )
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class ProjectedEntryTransition:
+     eviction_slot: int | None
+     eviction_symbol: str | None
+     eviction_price: float | None
+     entry_open: float
+     portfolio_equity_at_entry_open: float
+@@ -733,29 +749,26 @@ def _causal_open_price(ohlcv: pd.DataFrame, eval_date: pd.Timestamp) -> float |
+ def _entry_policy_snapshot(
+     *,
+     row: Mapping[str, object],
+     facts: CanslimEntryFacts,
+     technical_only: bool,
+     require_proper_base: bool,
+     require_bullish_market: bool,
+     use_stateful_regime_gate: bool,
+     market_allowed: bool,
+     market_state: Mapping[str, object],
+-    default_market_regime: str = "confirmed_uptrend",
++    market: MarketContextV1,
+ ) -> EntrySnapshot:
+     """Copy trusted completed-session facts into the identity-free entry schema."""
+ 
+-    raw_regime = market_state.get("market_regime", default_market_regime)
+-    market_regime = (
+-        raw_regime.value if isinstance(raw_regime, MarketRegime) else raw_regime
+-    )
+     return EntrySnapshot(
++        market=market,
+         technical_only=technical_only,
+         require_proper_base=require_proper_base,
+         c_score=_finite_signal_number(row.get("c_score")),
+         a_score=_finite_signal_number(row.get("a_score")),
+         n_score=_finite_signal_number(row.get("n_score")),
+         s_score=_finite_signal_number(row.get("s_score")),
+         l_score=_finite_signal_number(row.get("l_score")),
+         i_score=_finite_signal_number(row.get("i_score")),
+         m_score=_finite_signal_number(row.get("m_score")),
+         current_growth=_finite_signal_number(row.get("current_growth")),
+@@ -776,23 +789,20 @@ def _entry_policy_snapshot(
+         has_volume_surge=facts.has_volume_surge,
+         in_buy_zone=facts.in_buy_zone,
+         technical_eligible=facts.eligible,
+         technical_blocking_reasons=tuple(facts.blocking_reasons),
+         has_power_gap_today=bool(row.get("has_peg_today", False)),
+         require_bullish_market=require_bullish_market,
+         market_is_bullish=bool(market_state.get("market_is_bullish", market_allowed)),
+         cash_deployment_override=bool(market_state.get("cash_deployment_override", False)),
+         use_stateful_regime_gate=use_stateful_regime_gate,
+         regime_allows_entries=bool(market_state.get("regime_allows_entries", True)),
+-        market_regime=str(market_regime),
+-        distribution_days=int(market_state.get("distribution_days", 0)),
+-        follow_through=bool(market_state.get("follow_through", False)),
+     )
+ 
+ 
+ def _validated_entry_policy_decision(decision: object) -> EntryDecision:
+     if type(decision) is not EntryDecision:
+         raise ValueError("entry policy decision is invalid")
+     try:
+         canonical = EntryDecision.from_canonical_json(decision.to_canonical_json())
+     except (TypeError, ValueError, OverflowError) as exc:
+         raise ValueError("entry policy decision is invalid") from exc
+@@ -1066,20 +1076,23 @@ class CanslimStrategy:
+             s_score=score_value(s_score),
+             l_score=l_score,
+             m_score=score_value(m_score),
+         )
+ 
+         m_pass = bool(
+             not self.require_bullish_market
+             or market_state["market_is_bullish"]
+             or market_state.get("cash_deployment_override", False)
+         )
++        market = market_state.get("market")
++        if type(market) is not MarketContextV1:
++            raise ValueError("entry market context is invalid")
+         policy_snapshot = _entry_policy_snapshot(
+             row={
+                 "c_score": c_score,
+                 "a_score": a_score,
+                 "n_score": n_score,
+                 "s_score": s_score,
+                 "l_score": l_score,
+                 "i_score": i_score,
+                 "m_score": m_score,
+                 "current_growth": c_growth,
+@@ -1095,20 +1108,21 @@ class CanslimStrategy:
+             },
+             facts=entry_facts,
+             technical_only=self.technical_only,
+             require_proper_base=self.require_proper_base,
+             require_bullish_market=self.require_bullish_market,
+             use_stateful_regime_gate=bool(
+                 market_state.get("use_stateful_regime_gate", False)
+             ),
+             market_allowed=m_pass,
+             market_state=market_state,
++            market=market,
+         )
+         policy_client = self._policy_client_provider()
+         decision = _validated_entry_policy_decision(
+             policy_client.evaluate_entry(policy_snapshot)
+         )
+         entry_contract_eligible = decision.qualified
+         entry_blocking_reasons = decision.blocking_codes
+         total_score, normalized_rs_score = decision.rank
+         buy_signal_without_market = entry_contract_eligible
+         buy_signal = bool(buy_signal_without_market and decision.market_permitted)
+@@ -1189,21 +1203,21 @@ def _new_execution_diagnostics() -> dict[str, int]:
+         "entry_rejected_invalid_price": 0,
+         "entry_rejected_next_open_buy_zone": 0,
+         "entry_rejected_invalid_risk": 0,
+         "entry_rejected_no_cash": 0,
+         "eviction_attempts": 0,
+         "evictions_executed": 0,
+         "eviction_rejections": 0,
+     }
+ 
+ 
+-_PORTFOLIO_CHECKPOINT_SCHEMA = 3
++_PORTFOLIO_CHECKPOINT_SCHEMA = 4
+ _BUILTIN_CANSLIM_STRATEGY_CHECKPOINT_VERSION = 1
+ _MISSING_CHECKPOINT_IDENTITY = object()
+ 
+ 
+ def _checkpoint_json_safe(value: Any) -> Any:
+     """Convert simulator state to JSON without serializing executable objects."""
+ 
+     if value is None or isinstance(value, (str, bool, int)):
+         return value
+     if isinstance(value, (pd.Timestamp, datetime)):
+@@ -1674,20 +1688,21 @@ class PortfolioSimulator:
+         self._weekly_snapshots: List[dict] = []
+         self._signal_rows: List[dict] = []
+         self._entry_outcomes: List[EntryAttemptOutcome] = []
+         self._ticker_industry: Dict[str, str] = {}
+         self._execution_diagnostics = _new_execution_diagnostics()
+         self._pending_entries_remaining = 0
+         self._projected_entry_states: dict[int, object] = {}
+         self._entry_projection_safety_limits: dict[int, tuple[float, float]] = {}
+         self._entry_projection_notional_caps: dict[int, float] = {}
+         self._exit_policy_snapshots: dict[int, ExitSnapshot] = {}
++        self._market_context_cache: dict[str, MarketContextV1] = {}
+         self._policy_client_factory = (
+             policy_client_factory
+             if policy_client_factory is not None
+             else InProcessPolicyClient
+         )
+         self._policy_client: StrategyPolicyClient | None = None
+         self._strict_pit_pattern_histories: dict[str, _PreparedPatternHistory] = {}
+         self._strict_pit_history_frames: dict[str, pd.DataFrame] = {}
+         self._strict_pit_base_policy = BasePolicy.canonical_v1()
+         self._capture_effective_engine_policy()
+@@ -1872,24 +1887,26 @@ class PortfolioSimulator:
+             all_tickers = list(
+                 dict.fromkeys([*tickers, *market_reference_tickers, benchmark])
+             )
+             market_context_universe = tuple(self.pit_bundle.price_symbols())
+             if set(market_context_universe) != tradable_set.union(reference_set):
+                 raise ValueError(
+                     "point-in-time market context must exactly cover tradables and references"
+                 )
+         else:
+             tradable_tickers = tuple(dict.fromkeys(str(ticker).upper() for ticker in tickers))
+-            market_reference_tickers = (benchmark,)
+-            all_tickers = list(dict.fromkeys([*tickers, benchmark]))
++            market_reference_tickers = BENCHMARK_CONTEXT_SYMBOLS
++            all_tickers = list(dict.fromkeys([*tickers, *market_reference_tickers, benchmark]))
+             market_context_universe = tuple(
+-                dict.fromkeys([*tickers, *get_sp500_tickers(), benchmark])
++                dict.fromkeys(
++                    [*tickers, *get_sp500_tickers(), *market_reference_tickers, benchmark]
++                )
+             )
+         universe = list(market_context_universe)
+         checkpoint = Path(checkpoint_path).resolve() if checkpoint_path is not None else None
+         progress = Path(progress_log_path).resolve() if progress_log_path is not None else None
+         state_log = checkpoint.with_name("portfolio_state.jsonl") if checkpoint is not None else None
+         strategy_identity = _strategy_checkpoint_identity(
+             self,
+             require_explicit_custom=checkpoint is not None,
+         )
+         fingerprint = _portfolio_checkpoint_fingerprint(
+@@ -2081,48 +2098,64 @@ class PortfolioSimulator:
+                     prev_bar = hist.iloc[-2]
+                     curr_bar = hist.iloc[-1]
+                     regime_tracker.update(
+                         date=eval_date,
+                         close=float(curr_bar["Close"]),
+                         prev_close=float(prev_bar["Close"]),
+                         volume=float(curr_bar["Volume"]),
+                         prev_volume=float(prev_bar["Volume"]),
+                     )
+ 
++            market_state = self.strategy.evaluate_market(benchmark_df, eval_date)
++            if self.pit_bundle is not None:
++                context_members = self.pit_bundle.members_at(eval_date).intersection(
++                    self.pit_bundle.tradable_symbols()
++                )
++            else:
++                context_members = set(market_context_universe).difference(
++                    (*market_reference_tickers, benchmark)
++                )
++            market = self._market_context_for_session(
++                eval_date=eval_date,
++                all_closes=all_closes,
++                active_constituents=context_members,
++                market_state=market_state,
++            )
++
+             date_str = str(eval_date.date())
+ 
+             self._apply_identity_transitions(ticker_ohlcv, eval_date)
+ 
+             for pending_idx, pending in enumerate(pending_entries):
+                 self._pending_entries_remaining = len(pending_entries) - pending_idx
+                 self._enter_position(pending, ticker_ohlcv, eval_date)
+             self._pending_entries_remaining = 0
+             pending_entries = []
+ 
+             for symbol in list(self._open_positions.keys()):
+                 ohlcv = ticker_ohlcv.get(symbol)
+                 if ohlcv is not None:
+-                    self._check_exits(symbol, ohlcv, eval_date)
++                    self._check_exits(symbol, ohlcv, eval_date, market=market)
+ 
+             is_signal_day = day_idx % self.signal_every_n_days == 0
+-            market_state = self.strategy.evaluate_market(benchmark_df, eval_date)
+             if is_signal_day:
+                 active_tickers = tickers
+                 if self.pit_bundle is not None:
+                     active_members = self.pit_bundle.members_at(eval_date)
+                     active_tickers = [ticker for ticker in tickers if ticker in active_members]
+                 pending_entries = self._evaluate_signals(
+                     tickers=active_tickers,
+                     ticker_ohlcv=ticker_ohlcv,
+                     all_closes=all_closes,
+                     eval_date=eval_date,
+                     market_state=market_state,
++                    market=market,
+                 )
+ 
+             equity_series[date_str] = self._mark_equity(ticker_ohlcv, eval_date)
+ 
+             benchmark_bar = benchmark_df.loc[:eval_date]
+             if not benchmark_bar.empty:
+                 benchmark_price = float(benchmark_bar["Close"].iloc[-1])
+                 if benchmark_start_price is None:
+                     benchmark_start_price = benchmark_price
+                 benchmark_series[date_str] = (benchmark_price / benchmark_start_price) * self.initial_capital
+@@ -2275,22 +2308,55 @@ class PortfolioSimulator:
+         self._signal_rows = []
+         self._entry_outcomes = []
+         self._ticker_industry = {}
+         self._execution_diagnostics = _new_execution_diagnostics()
+         self._pending_entries_remaining = 0
+         self._projected_entry_states = {}
+         self._entry_projection_safety_limits = {}
+         self._entry_projection_notional_caps = {}
+         self._exit_policy_snapshots = {}
+         self._regime_tracker = MarketRegimeTracker()
++        self._market_context_cache: dict[str, MarketContextV1] = {}
+         self._reset_strict_pit_pattern_cache()
+ 
++    def _market_context_for_session(
++        self,
++        *,
++        eval_date: pd.Timestamp,
++        all_closes: pd.DataFrame,
++        active_constituents: Iterable[str],
++        market_state: Mapping[str, object],
++    ) -> MarketContextV1:
++        session = pd.Timestamp(eval_date).normalize()
++        key = session.date().isoformat()
++        cached = self._market_context_cache.get(key)
++        if cached is not None:
++            return cached
++        active = tuple(sorted(str(symbol).upper() for symbol in active_constituents))
++        rs_scores = _calculate_rs_snapshot(
++            all_closes,
++            session,
++            eligible_tickers=active,
++        )
++        regime = getattr(self._regime_tracker.regime, "value", self._regime_tracker.regime)
++        context = build_market_context(
++            session=session,
++            oneil_regime=str(regime),
++            distribution_days=self._regime_tracker.distribution_days,
++            follow_through=bool(market_state.get("follow_through", False)),
++            closes=all_closes,
++            active_constituents=active,
++            rs_scores=rs_scores,
++        )
++        self._market_context_cache[key] = context
++        return context
++
+     def _reset_strict_pit_pattern_cache(self) -> None:
+         """Clear the built-in strict-PIT acceleration state before each run."""
+ 
+         self._strict_pit_pattern_histories = {}
+         self._strict_pit_history_frames = {}
+         owned_strategy = self._owned_builtin_strategy
+         if owned_strategy is not None:
+             owned_strategy._strict_pit_entry_facts_provider = None
+             owned_strategy._strict_pit_history_provider = None
+ 
+@@ -2662,20 +2728,21 @@ class PortfolioSimulator:
+ 
+     def _canonicalize_signal_row(
+         self,
+         *,
+         row: dict[str, Any],
+         ticker: str,
+         ticker_history: pd.DataFrame,
+         eval_date: pd.Timestamp,
+         market_allowed: bool,
+         market_state: dict[str, Any],
++        market: MarketContextV1,
+         entry_facts: CanslimEntryFacts | None = None,
+     ) -> dict[str, Any]:
+         """Rebuild the authoritative entry decision at the execution boundary."""
+ 
+         canonical = dict(row)
+         if self.require_proper_base and isinstance(entry_facts, CanslimEntryFacts):
+             facts = entry_facts
+         else:
+             available = history_through_exact_session(ticker_history, eval_date)
+             if available is None:
+@@ -2697,20 +2764,21 @@ class PortfolioSimulator:
+         current_growth = _finite_signal_number(canonical.get("current_growth"))
+         annual_growth = _finite_signal_number(canonical.get("annual_growth"))
+         composite_score = _finite_signal_number(
+             canonical.get("entry_composite_score")
+         )
+         snapshot = self._build_entry_snapshot(
+             row=canonical,
+             facts=facts,
+             market_allowed=market_allowed,
+             market_state=market_state,
++            market=market,
+         )
+         client = self._policy_client or InProcessPolicyClient()
+         decision = self._validate_entry_policy_decision(
+             client.evaluate_entry(snapshot)
+         )
+         entry_eligible = decision.qualified
+         entry_blocking_reasons = decision.blocking_codes
+         canslim_rank, rs_rank = decision.rank
+ 
+         canonical.update(
+@@ -2753,56 +2821,49 @@ class PortfolioSimulator:
+         )
+         return canonical
+ 
+     def _build_entry_snapshot(
+         self,
+         *,
+         row: Mapping[str, object],
+         facts: CanslimEntryFacts,
+         market_allowed: bool,
+         market_state: Mapping[str, object],
++        market: MarketContextV1,
+     ) -> EntrySnapshot:
+         """Copy trusted completed-session entry facts into the closed policy schema."""
+ 
+-        tracker_regime = getattr(
+-            getattr(self, "_regime_tracker", None),
+-            "regime",
+-            MarketRegime.CONFIRMED_UPTREND,
+-        )
+-        default_market_regime = (
+-            tracker_regime.value
+-            if isinstance(tracker_regime, MarketRegime)
+-            else "confirmed_uptrend"
+-        )
+         return _entry_policy_snapshot(
+             row=row,
+             facts=facts,
+             technical_only=self.technical_only,
+             require_proper_base=self.require_proper_base,
+             require_bullish_market=self.require_bullish_market,
+             use_stateful_regime_gate=self.use_stateful_regime_gate,
+             market_allowed=market_allowed,
+             market_state=market_state,
+-            default_market_regime=default_market_regime,
++            market=market,
+         )
+ 
+     @staticmethod
+     def _validate_entry_policy_decision(decision: object) -> EntryDecision:
+         return _validated_entry_policy_decision(decision)
+ 
+     def _resolve_capacity(
+         self,
+         *,
+         eligible_signal_count: int,
+         cash_fraction: float,
++        market: MarketContextV1,
+     ) -> CapacityDecision:
+         snapshot = CapacitySnapshot(
++            market=market,
+             configured_max_positions=self.max_positions,
+             maximum_policy_positions=MAXIMUM_POLICY_POSITIONS,
+             open_position_count=len(self._open_positions),
+             eligible_signal_count=eligible_signal_count,
+             cash_fraction=cash_fraction,
+             configured_eviction_enabled=self.enable_eviction,
+         )
+         decision = self._adapter_policy_client().recommend_capacity(snapshot)
+         if type(decision) is not CapacityDecision:
+             raise ValueError("capacity policy decision is invalid")
+@@ -2820,20 +2881,21 @@ class PortfolioSimulator:
+         return full, eviction_enabled
+ 
+     def _evaluate_signals(
+         self,
+         *,
+         tickers: List[str],
+         ticker_ohlcv: Dict[str, pd.DataFrame],
+         all_closes: pd.DataFrame,
+         eval_date: pd.Timestamp,
+         market_state: dict,
++        market: MarketContextV1,
+     ) -> List[PendingEntry]:
+         self._execution_diagnostics["signal_days"] += 1
+         regime_allowed = bool(self._regime_tracker.allows_entries)
+         cash_override = False
+         if (
+             self.require_bullish_market
+             and
+             self.cash_deployment_threshold_pct is not None
+             and not market_state["market_is_bullish"]
+         ):
+@@ -2846,20 +2908,21 @@ class PortfolioSimulator:
+         effective_market_state["cash_deployment_override"] = cash_override
+         effective_market_state["use_stateful_regime_gate"] = (
+             self.use_stateful_regime_gate
+         )
+         effective_market_state["regime_allows_entries"] = regime_allowed
+         effective_market_state["market_regime"] = getattr(
+             getattr(self._regime_tracker, "regime", None),
+             "value",
+             "confirmed_uptrend",
+         )
++        effective_market_state["market"] = market
+         market_allowed = bool(
+             not self.require_bullish_market
+             or market_state["market_is_bullish"]
+             or cash_override
+         )
+         if self.use_stateful_regime_gate and not regime_allowed:
+             self._execution_diagnostics["blocked_by_regime_days"] += 1
+         if not market_allowed:
+             self._execution_diagnostics["blocked_by_market_days"] += 1
+         entries_allowed = market_allowed and (
+@@ -2922,20 +2985,21 @@ class PortfolioSimulator:
+                 )
+             if row is None:
+                 continue
+             row = self._canonicalize_signal_row(
+                 row=row,
+                 ticker=ticker,
+                 ticker_history=ticker_ohlcv[ticker],
+                 eval_date=eval_date,
+                 market_allowed=market_allowed,
+                 market_state=effective_market_state,
++                market=market,
+                 entry_facts=entry_facts,
+             )
+             self._signal_rows.append(row)
+             if row.get("buy_signal_without_market", row.get("buy_signal", False)):
+                 self._execution_diagnostics["potential_buy_signal_rows"] += 1
+                 if (
+                     self.require_bullish_market
+                     and not row.get("market_regime_is_bullish", market_state["market_is_bullish"])
+                     and not cash_override
+                 ):
+@@ -2971,41 +3035,42 @@ class PortfolioSimulator:
+         )
+         portfolio_equity = self._mark_equity(ticker_ohlcv, eval_date)
+         cash_fraction = (
+             self._equity / portfolio_equity
+             if self._equity > 0 and portfolio_equity > 0
+             else math.ulp(1.0)
+         )
+         capacity = self._resolve_capacity(
+             eligible_signal_count=len(signals),
+             cash_fraction=min(cash_fraction, 1.0),
++            market=market,
+         )
+         if capacity.max_positions is None:
+             candidate_limit = len(signals)
+         else:
+             open_slots = max(
+                 capacity.max_positions - len(self._open_positions),
+                 0,
+             )
+             candidate_limit = open_slots
+             if (
+                 candidate_limit == 0
+                 and len(self._open_positions) == capacity.max_positions
+                 and capacity.eviction_enabled
+             ):
+                 candidate_limit = 1
+         self._execution_diagnostics["capacity_truncated_signals"] += max(
+             len(signals) - candidate_limit,
+             0,
+         )
+         return [
+-            PendingEntry(signal=dict(signal), capacity=capacity)
++            PendingEntry(signal=dict(signal), capacity=capacity, market=market)
+             for signal in signals[:candidate_limit]
+         ]
+ 
+     def _build_eviction_snapshot(
+         self,
+         *,
+         pending: PendingEntry,
+         ticker_ohlcv: Mapping[str, pd.DataFrame],
+         entry_date: pd.Timestamp,
+     ) -> EvictionSnapshot:
+@@ -3021,20 +3086,21 @@ class PortfolioSimulator:
+             )
+             positions.append(
+                 EvictionPosition(
+                     slot=slot,
+                     entry_price=trade.entry_price,
+                     causal_execution_price=causal_price,
+                     rs_score=trade.rs_score,
+                 )
+             )
+         return EvictionSnapshot(
++            market=pending.market,
+             capacity_is_finite=pending.capacity.max_positions is not None,
+             capacity_is_full=full,
+             eviction_enabled=eviction_enabled,
+             candidate_rs_score=candidate_rs,
+             positions=tuple(positions),
+         )
+ 
+     def _project_entry_transition(
+         self,
+         *,
+@@ -3323,32 +3389,26 @@ class PortfolioSimulator:
+             self._execution_diagnostics["eviction_rejections"] += 1
+             return False
+ 
+         evict_sym, _, evict_price = min(pool, key=lambda x: x[1].rs_score)
+         self._close_trade(evict_sym, evict_price, "evicted", str(eval_date.date()))
+         self._execution_diagnostics["evictions_executed"] += 1
+         return True
+ 
+     def _enter_position(
+         self,
+-        pending: PendingEntry | dict[str, object],
++        pending: PendingEntry,
+         ticker_ohlcv: Dict[str, pd.DataFrame],
+         entry_date: pd.Timestamp,
+     ) -> None:
+-        if not isinstance(pending, PendingEntry):
+-            pending = PendingEntry(
+-                signal=dict(pending),
+-                capacity=CapacityDecision(
+-                    self.max_positions,
+-                    self.enable_eviction,
+-                ),
+-            )
++        if type(pending) is not PendingEntry:
++            raise TypeError("entry execution requires an explicit pending entry")
+         if (
+             pending.capacity.max_positions is not None
+             and pending.capacity.max_positions > MAXIMUM_POLICY_POSITIONS
+         ):
+             raise ValueError("pending capacity is invalid")
+         signal = pending.signal
+         self._execution_diagnostics["entry_attempts"] += 1
+         symbol = str(signal["symbol"]).upper()
+         entry_date_text = str(entry_date.date())
+         raw_signal_date = signal.get("signal_date", entry_date)
+@@ -3442,20 +3502,21 @@ class PortfolioSimulator:
+         if projection is None:
+             if full:
+                 self._execution_diagnostics["eviction_rejections"] += 1
+                 finish("entry_rejected_capacity")
+             else:
+                 finish("entry_rejected_missing_data")
+             return
+         entry_open = projection.entry_open
+ 
+         allocation_snapshot = AllocationSnapshot(
++            market=pending.market,
+             portfolio_equity_at_entry_open=(
+                 projection.portfolio_equity_at_entry_open
+             ),
+             cash_before_transition=max(self._equity, math.ulp(1.0)),
+             projected_cash_after_eviction=max(
+                 projection.projected_cash,
+                 math.ulp(1.0),
+             ),
+             gross_exposure_before=max(
+                 projection.portfolio_equity_at_entry_open - self._equity,
+@@ -3517,22 +3578,24 @@ class PortfolioSimulator:
+         self,
+         *,
+         trade: Trade,
+         current_high: float,
+         current_low: float,
+         current_close: float,
+         history_session_count: int,
+         ema_today: float | None,
+         consecutive_closes_below_ema: bool,
+         protective_stop_candidates: tuple[float, ...],
++        market: MarketContextV1,
+     ) -> ExitSnapshot:
+         return ExitSnapshot(
++            market=market,
+             entry_price=trade.entry_price,
+             original_qty=trade.qty,
+             remaining_qty=float(trade.remaining_qty or 0.0),
+             stop_price=trade.stop_price,
+             realized_pnl=trade.realized_pnl,
+             canslim_score=trade.canslim_score,
+             rs_score=trade.rs_score,
+             days_held=trade.days_held,
+             peak_close=float(trade.peak_close or trade.entry_price),
+             breakeven_armed=trade.breakeven_armed,
+@@ -3604,20 +3667,21 @@ class PortfolioSimulator:
+             else:
+                 raise ValueError("exit action kind is invalid")
+         trade.scale_out_tier = decision.scale_out_tier
+ 
+     def _check_exits(
+         self,
+         symbol: str,
+         ohlcv: pd.DataFrame,
+         eval_date: pd.Timestamp,
+         *_unused_args,
++        market: MarketContextV1,
+         **_unused_kwargs,
+     ) -> None:
+         trade = self._open_positions.get(symbol)
+         if trade is None:
+             return
+ 
+         bar = ohlcv.loc[eval_date:eval_date]
+         if bar.empty:
+             return
+ 
+@@ -3665,20 +3729,21 @@ class PortfolioSimulator:
+         protective_stop_candidates = tuple(sorted(stop_candidates))
+         snapshot = self._build_exit_snapshot(
+             trade=trade,
+             current_high=high,
+             current_low=low,
+             current_close=close,
+             history_session_count=len(history),
+             ema_today=ema_today,
+             consecutive_closes_below_ema=consecutive_closes_below_ema,
+             protective_stop_candidates=protective_stop_candidates,
++            market=market,
+         )
+         decision = self._adapter_policy_client().evaluate_exit(snapshot)
+         if type(decision) is not ExitDecision:
+             raise ValueError("exit policy decision is invalid")
+         decision = validate_exit_decision(snapshot, decision)
+         self._exit_policy_snapshots[id(decision)] = snapshot
+         self._apply_exit_decision(symbol, trade, decision, close, date_str)
+ 
+     def _apply_identity_transitions(
+         self,
+diff --git a/core/strategy_policy/__init__.py b/core/strategy_policy/__init__.py
+index d4b8143..5964677 100644
+--- a/core/strategy_policy/__init__.py
++++ b/core/strategy_policy/__init__.py
+@@ -1,49 +1,52 @@
+ """Public pure strategy-policy contract."""
+ 
+ from __future__ import annotations
+ 
+ from typing import Callable, Protocol
+ 
+ from .contracts import (
+     AllocationDecision,
+     AllocationSnapshot,
++    BenchmarkContextV1,
+     CapacityDecision,
+     CapacitySnapshot,
+     EntryDecision,
+     EntrySnapshot,
+     EvictionDecision,
+     EvictionPosition,
+     EvictionSnapshot,
+     ExitAction,
+     ExitDecision,
+     ExitSnapshot,
++    MarketContextV1,
+     validate_allocation_decision,
+     validate_capacity_decision,
+     validate_eviction_decision,
+     validate_exit_decision,
+ )
+ 
+-POLICY_INTERFACE_VERSION = 1
++POLICY_INTERFACE_VERSION = 2
+ 
+ 
+ class StrategyPolicyClient(Protocol):
+     interface_version: int
+ 
+     def evaluate_entry(self, snapshot: EntrySnapshot) -> EntryDecision: ...
+     def recommend_capacity(self, snapshot: CapacitySnapshot) -> CapacityDecision: ...
+     def recommend_allocation(self, snapshot: AllocationSnapshot) -> AllocationDecision: ...
+     def select_eviction(self, snapshot: EvictionSnapshot) -> EvictionDecision: ...
+     def evaluate_exit(self, snapshot: ExitSnapshot) -> ExitDecision: ...
+     def close(self) -> None: ...
+ 
+ 
+ StrategyPolicyClientFactory = Callable[[], StrategyPolicyClient]
+ 
+ __all__ = [
+     "POLICY_INTERFACE_VERSION", "StrategyPolicyClient", "StrategyPolicyClientFactory",
++    "BenchmarkContextV1", "MarketContextV1",
+     "EntrySnapshot", "EntryDecision", "CapacitySnapshot", "CapacityDecision",
+     "AllocationSnapshot", "AllocationDecision", "EvictionPosition", "EvictionSnapshot",
+     "EvictionDecision", "ExitSnapshot", "ExitAction", "ExitDecision",
+     "validate_capacity_decision", "validate_allocation_decision", "validate_eviction_decision",
+     "validate_exit_decision",
+ ]
+diff --git a/core/strategy_policy/contracts.py b/core/strategy_policy/contracts.py
+index 144b018..0091e09 100644
+--- a/core/strategy_policy/contracts.py
++++ b/core/strategy_policy/contracts.py
+@@ -1,17 +1,18 @@
+ """Closed immutable scalar contracts for pure strategy-policy code."""
+ 
+ from __future__ import annotations
+ 
+ import json
+ import math
+ from dataclasses import dataclass, fields
++from datetime import date
+ from typing import Any, ClassVar
+ 
+ 
+ _MAX_TUPLE_ITEMS = 32
+ _MARKET_REGIMES = frozenset({"confirmed_uptrend", "under_pressure", "correction"})
+ _SCALE_OUT_REASON = "take_profit_scale_out"
+ _CLOSE_REASONS = frozenset({"time_stop", "ma_violation", "policy_exit"})
+ 
+ 
+ def _fail(name: str) -> None:
+@@ -35,20 +36,26 @@ def _positive(value: object, name: str, *, nullable: bool = False) -> None:
+     if value is not None and float(value) <= 0:
+         _fail(name)
+ 
+ 
+ def _fraction(value: object, name: str, *, nullable: bool = False) -> None:
+     _positive(value, name, nullable=nullable)
+     if value is not None and float(value) > 1:
+         _fail(name)
+ 
+ 
++def _unit_fraction(value: object, name: str) -> None:
++    _number(value, name)
++    if not 0 <= float(value) <= 1:
++        _fail(name)
++
++
+ def _integer(value: object, name: str, *, minimum: int = 0, nullable: bool = False) -> None:
+     if value is None and nullable:
+         return
+     if type(value) is not int or value < minimum:
+         _fail(name)
+ 
+ 
+ def _string(value: object, name: str) -> None:
+     if type(value) is not str or not value or len(value) > 128:
+         _fail(name)
+@@ -93,42 +100,125 @@ class _CanonicalContract:
+         expected = {field.name for field in fields(cls)}
+         actual = set(decoded)
+         if actual != expected:
+             unknown = actual - expected
+             if unknown:
+                 raise ValueError("canonical JSON has unknown keys")
+             raise ValueError("canonical JSON is missing keys")
+         values: dict[str, object] = dict(decoded)
+         for name, nested_type in cls._nested_fields.items():
+             value = values[name]
+-            if name in {"positions", "actions"}:
++            if type(value) is list:
+                 if type(value) is not list:
+                     _fail(name)
+                 values[name] = tuple(
+                     nested_type.from_canonical_json(json.dumps(item, sort_keys=True, separators=(",", ":")))
+                     for item in value
+                 )
+             elif type(value) is dict:
+                 values[name] = nested_type.from_canonical_json(
+                     json.dumps(value, sort_keys=True, separators=(",", ":"))
+                 )
+         for name, value in tuple(values.items()):
+             if type(value) is list:
+                 if name == "scale_out_tiers":
+                     values[name] = tuple(tuple(item) if type(item) is list else item for item in value)
+                 else:
+                     values[name] = tuple(value)
+         return cls(**values)  # type: ignore[arg-type]
+ 
+ 
++@dataclass(frozen=True, slots=True)
++class BenchmarkContextV1(_CanonicalContract):
++    symbol: str
++    close_to_sma_50_fraction: float
++    close_to_sma_200_fraction: float
++    realized_volatility_20d_fraction: float
++
++    def __post_init__(self) -> None:
++        _string(self.symbol, "symbol")
++        for name in (
++            "close_to_sma_50_fraction",
++            "close_to_sma_200_fraction",
++            "realized_volatility_20d_fraction",
++        ):
++            _number(getattr(self, name), name)
++        if self.realized_volatility_20d_fraction < 0:
++            _fail("realized_volatility_20d_fraction")
++
++
++@dataclass(frozen=True, slots=True)
++class MarketContextV1(_CanonicalContract):
++    schema_version: int
++    session: str
++    oneil_regime: str
++    distribution_days: int
++    follow_through: bool
++    benchmarks: tuple[BenchmarkContextV1, ...]
++    active_constituent_count: int
++    breadth_above_50_fraction: float
++    breadth_50_coverage_fraction: float
++    breadth_above_200_fraction: float
++    breadth_200_coverage_fraction: float
++    median_rs_score: float
++    rs_at_least_80_fraction: float
++    rs_coverage_fraction: float
++
++    _nested_fields: ClassVar[dict[str, type[_CanonicalContract]]] = {
++        "benchmarks": BenchmarkContextV1,
++    }
++
++    def __post_init__(self) -> None:
++        if type(self.schema_version) is not int or self.schema_version != 1:
++            _fail("schema_version")
++        _string(self.session, "session")
++        try:
++            parsed_session = date.fromisoformat(self.session)
++        except ValueError as exc:
++            raise ValueError("session is invalid") from exc
++        if parsed_session.isoformat() != self.session:
++            _fail("session")
++        if self.oneil_regime not in _MARKET_REGIMES:
++            _fail("oneil_regime")
++        _integer(self.distribution_days, "distribution_days")
++        _bool(self.follow_through, "follow_through")
++        benchmarks = _tuple(self.benchmarks, "benchmarks", maximum=3)
++        if (
++            tuple(item.symbol for item in benchmarks if type(item) is BenchmarkContextV1)
++            != ("SPY", "QQQ", "IWM")
++            or any(type(item) is not BenchmarkContextV1 for item in benchmarks)
++        ):
++            _fail("benchmarks")
++        _integer(self.active_constituent_count, "active_constituent_count", minimum=1)
++        for name in (
++            "breadth_above_50_fraction",
++            "breadth_50_coverage_fraction",
++            "breadth_above_200_fraction",
++            "breadth_200_coverage_fraction",
++            "rs_at_least_80_fraction",
++            "rs_coverage_fraction",
++        ):
++            _unit_fraction(getattr(self, name), name)
++        _number(self.median_rs_score, "median_rs_score")
++        for name in (
++            "breadth_50_coverage_fraction",
++            "breadth_200_coverage_fraction",
++            "rs_coverage_fraction",
++        ):
++            covered = float(getattr(self, name)) * self.active_constituent_count
++            if not math.isclose(covered, round(covered), abs_tol=1e-9):
++                _fail(name)
++
++
+ @dataclass(frozen=True, slots=True)
+ class EntrySnapshot(_CanonicalContract):
++    market: MarketContextV1
+     technical_only: bool
+     require_proper_base: bool
+     c_score: float | None
+     a_score: float | None
+     n_score: float | None
+     s_score: float | None
+     l_score: float | None
+     i_score: float | None
+     m_score: float | None
+     current_growth: float | None
+@@ -149,42 +239,40 @@ class EntrySnapshot(_CanonicalContract):
+     has_volume_surge: bool
+     in_buy_zone: bool
+     technical_eligible: bool
+     technical_blocking_reasons: tuple[str, ...]
+     has_power_gap_today: bool
+     require_bullish_market: bool
+     market_is_bullish: bool
+     cash_deployment_override: bool
+     use_stateful_regime_gate: bool
+     regime_allows_entries: bool
+-    market_regime: str
+-    distribution_days: int
+-    follow_through: bool
++
++    _nested_fields: ClassVar[dict[str, type[_CanonicalContract]]] = {"market": MarketContextV1}
+ 
+     def __post_init__(self) -> None:
+         for field in (
+             "technical_only", "require_proper_base", "institutional_data_available", "price_advanced",
+             "has_volume_surge", "in_buy_zone", "technical_eligible", "has_power_gap_today",
+             "require_bullish_market", "market_is_bullish", "cash_deployment_override",
+-            "use_stateful_regime_gate", "regime_allows_entries", "follow_through",
++            "use_stateful_regime_gate", "regime_allows_entries",
+         ):
+             _bool(getattr(self, field), field)
+         for field in (
+             "c_score", "a_score", "n_score", "s_score", "l_score", "i_score", "m_score",
+             "current_growth", "annual_growth", "rs_score", "canslim_score", "entry_composite_score",
+             "technical_score", "event_close", "prior_close", "event_volume", "prior_average_volume_50",
+             "pivot", "volume_ratio", "extension",
+         ):
+             _number(getattr(self, field), field, nullable=True)
+-        _integer(self.distribution_days, "distribution_days")
+-        if self.market_regime not in _MARKET_REGIMES:
+-            _fail("market_regime")
++        if type(self.market) is not MarketContextV1:
++            _fail("market")
+         for item in _tuple(self.technical_blocking_reasons, "technical_blocking_reasons"):
+             _string(item, "technical_blocking_reasons")
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class EntryDecision(_CanonicalContract):
+     qualified: bool
+     market_permitted: bool
+     rank: tuple[float | None, float | None]
+     blocking_codes: tuple[str, ...]
+@@ -196,28 +284,33 @@ class EntryDecision(_CanonicalContract):
+         if len(rank) != 2:
+             _fail("rank")
+         for item in rank:
+             _number(item, "rank", nullable=True)
+         for item in _tuple(self.blocking_codes, "blocking_codes"):
+             _string(item, "blocking_codes")
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class CapacitySnapshot(_CanonicalContract):
++    market: MarketContextV1
+     configured_max_positions: int | None
+     maximum_policy_positions: int
+     open_position_count: int
+     eligible_signal_count: int
+     cash_fraction: float
+     configured_eviction_enabled: bool
+ 
++    _nested_fields: ClassVar[dict[str, type[_CanonicalContract]]] = {"market": MarketContextV1}
++
+     def __post_init__(self) -> None:
++        if type(self.market) is not MarketContextV1:
++            _fail("market")
+         _integer(self.maximum_policy_positions, "maximum_policy_positions", minimum=1)
+         _integer(self.configured_max_positions, "configured_max_positions", minimum=1, nullable=True)
+         if self.configured_max_positions is not None and self.configured_max_positions > self.maximum_policy_positions:
+             _fail("configured_max_positions")
+         _integer(self.open_position_count, "open_position_count")
+         _integer(self.eligible_signal_count, "eligible_signal_count")
+         _fraction(self.cash_fraction, "cash_fraction")
+         _bool(self.configured_eviction_enabled, "configured_eviction_enabled")
+ 
+ 
+@@ -226,36 +319,41 @@ class CapacityDecision(_CanonicalContract):
+     max_positions: int | None
+     eviction_enabled: bool
+ 
+     def __post_init__(self) -> None:
+         _integer(self.max_positions, "max_positions", minimum=1, nullable=True)
+         _bool(self.eviction_enabled, "eviction_enabled")
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class AllocationSnapshot(_CanonicalContract):
++    market: MarketContextV1
+     portfolio_equity_at_entry_open: float
+     cash_before_transition: float
+     projected_cash_after_eviction: float
+     gross_exposure_before: float
+     projected_gross_exposure_after_eviction: float
+     entry_open: float
+     pending_entries_remaining: int
+     capacity_is_uncapped: bool
+     configured_position_risk_pct: float
+     configured_stop_loss_pct: float
+     maximum_position_risk_fraction: float
+     maximum_stop_fraction: float
+     canslim_score: float | None
+     rs_score: float | None
+ 
++    _nested_fields: ClassVar[dict[str, type[_CanonicalContract]]] = {"market": MarketContextV1}
++
+     def __post_init__(self) -> None:
++        if type(self.market) is not MarketContextV1:
++            _fail("market")
+         for field in (
+             "portfolio_equity_at_entry_open", "cash_before_transition", "projected_cash_after_eviction",
+             "gross_exposure_before", "projected_gross_exposure_after_eviction", "entry_open",
+         ):
+             _positive(getattr(self, field), field)
+         _integer(self.pending_entries_remaining, "pending_entries_remaining", minimum=1)
+         _bool(self.capacity_is_uncapped, "capacity_is_uncapped")
+         for field in (
+             "configured_position_risk_pct", "configured_stop_loss_pct", "maximum_position_risk_fraction",
+             "maximum_stop_fraction",
+@@ -286,29 +384,35 @@ class EvictionPosition(_CanonicalContract):
+ 
+     def __post_init__(self) -> None:
+         _integer(self.slot, "slot")
+         _positive(self.entry_price, "entry_price")
+         _positive(self.causal_execution_price, "causal_execution_price", nullable=True)
+         _number(self.rs_score, "rs_score")
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class EvictionSnapshot(_CanonicalContract):
++    market: MarketContextV1
+     capacity_is_finite: bool
+     capacity_is_full: bool
+     eviction_enabled: bool
+     candidate_rs_score: float
+     positions: tuple[EvictionPosition, ...]
+ 
+-    _nested_fields: ClassVar[dict[str, type[_CanonicalContract]]] = {"positions": EvictionPosition}
++    _nested_fields: ClassVar[dict[str, type[_CanonicalContract]]] = {
++        "market": MarketContextV1,
++        "positions": EvictionPosition,
++    }
+ 
+     def __post_init__(self) -> None:
++        if type(self.market) is not MarketContextV1:
++            _fail("market")
+         _bool(self.capacity_is_finite, "capacity_is_finite")
+         _bool(self.capacity_is_full, "capacity_is_full")
+         _bool(self.eviction_enabled, "eviction_enabled")
+         _number(self.candidate_rs_score, "candidate_rs_score")
+         slots: set[int] = set()
+         for position in _tuple(self.positions, "positions"):
+             if type(position) is not EvictionPosition or position.slot in slots:
+                 _fail("positions")
+             slots.add(position.slot)
+ 
+@@ -316,20 +420,21 @@ class EvictionSnapshot(_CanonicalContract):
+ @dataclass(frozen=True, slots=True)
+ class EvictionDecision(_CanonicalContract):
+     slot: int | None
+ 
+     def __post_init__(self) -> None:
+         _integer(self.slot, "slot", nullable=True)
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class ExitSnapshot(_CanonicalContract):
++    market: MarketContextV1
+     entry_price: float
+     original_qty: float
+     remaining_qty: float
+     stop_price: float
+     realized_pnl: float
+     canslim_score: float
+     rs_score: float
+     days_held: int
+     peak_close: float
+     breakeven_armed: bool
+@@ -347,21 +452,25 @@ class ExitSnapshot(_CanonicalContract):
+     breakeven_trigger_pct: float
+     ema_period: int
+     ema_consecutive: int
+     stagnation_days: int
+     stagnation_threshold_pct: float
+     scale_out_tiers: tuple[tuple[float, float], ...]
+     early_winner_gain_pct: float
+     early_winner_trigger_days: int
+     early_winner_release_days: int
+ 
++    _nested_fields: ClassVar[dict[str, type[_CanonicalContract]]] = {"market": MarketContextV1}
++
+     def __post_init__(self) -> None:
++        if type(self.market) is not MarketContextV1:
++            _fail("market")
+         for field in (
+             "entry_price", "original_qty", "remaining_qty", "stop_price", "peak_close", "current_high",
+             "current_low", "current_close",
+         ):
+             _positive(getattr(self, field), field)
+         _number(self.realized_pnl, "realized_pnl")
+         _number(self.canslim_score, "canslim_score")
+         _number(self.rs_score, "rs_score")
+         _number(self.ema_today, "ema_today", nullable=True)
+         for field in ("days_held", "scale_out_tier", "history_session_count"):
+diff --git a/core/strategy_policy/entry.py b/core/strategy_policy/entry.py
+index c0230d0..9b52ecf 100644
+--- a/core/strategy_policy/entry.py
++++ b/core/strategy_policy/entry.py
+@@ -7,21 +7,21 @@ from .contracts import EntryDecision, EntrySnapshot
+ 
+ def _threshold_code(value: float | None, floor: float, unavailable: str, below: str) -> str | None:
+     if value is None:
+         return unavailable
+     if value < floor:
+         return below
+     return None
+ 
+ 
+ def evaluate_entry(snapshot: EntrySnapshot) -> EntryDecision:
+-    """Apply the fixed CANSLIM entry gates to trusted completed-session facts."""
++    """Apply fixed gates; adaptive code may also inspect ``snapshot.market``."""
+     blocking_codes = list(snapshot.technical_blocking_reasons)
+     if not snapshot.technical_only:
+         for code in (
+             _threshold_code(snapshot.current_growth, 0.25, "current_growth_unavailable", "current_growth_below_threshold"),
+             _threshold_code(snapshot.annual_growth, 0.25, "annual_growth_unavailable", "annual_growth_below_threshold"),
+             _threshold_code(snapshot.rs_score, 80.0, "rs_score_unavailable", "rs_score_below_threshold"),
+             _threshold_code(snapshot.entry_composite_score, 70.0, "composite_score_unavailable", "composite_score_below_threshold"),
+         ):
+             if code is not None:
+                 blocking_codes.append(code)
+diff --git a/core/strategy_policy/exit.py b/core/strategy_policy/exit.py
+index d593b58..f5c01a1 100644
+--- a/core/strategy_policy/exit.py
++++ b/core/strategy_policy/exit.py
+@@ -1,19 +1,19 @@
+ """Baseline pure exit policy."""
+ 
+ from __future__ import annotations
+ 
+ from .contracts import ExitAction, ExitDecision, ExitSnapshot
+ 
+ 
+ def evaluate_exit(snapshot: ExitSnapshot) -> ExitDecision:
+-    """Return the baseline action plan after the engine's hard-stop precheck."""
++    """Return the baseline plan; interface-v2 market context is observational."""
+     early_winner_hold = snapshot.early_winner_hold
+     scale_out_tier = snapshot.scale_out_tier
+     gain_fraction = (snapshot.current_close - snapshot.entry_price) / snapshot.entry_price
+ 
+     if early_winner_hold and snapshot.days_held >= snapshot.early_winner_release_days:
+         early_winner_hold = False
+         scale_out_tier = 0
+     if (
+         not early_winner_hold
+         and snapshot.days_held <= snapshot.early_winner_trigger_days
+diff --git a/core/strategy_policy/market_context.py b/core/strategy_policy/market_context.py
+new file mode 100644
+index 0000000..aa95bfc
+--- /dev/null
++++ b/core/strategy_policy/market_context.py
+@@ -0,0 +1,117 @@
++"""Trusted causal construction of immutable strategy market context."""
++
++from __future__ import annotations
++
++import math
++from collections.abc import Iterable, Mapping
++
++import numpy as np
++import pandas as pd
++
++from .contracts import BenchmarkContextV1, MarketContextV1
++
++
++BENCHMARK_CONTEXT_SYMBOLS = ("SPY", "QQQ", "IWM")
++
++
++def _causal_closes(
++    closes: pd.DataFrame,
++    symbol: str,
++    session: pd.Timestamp,
++) -> pd.Series:
++    if symbol not in closes.columns:
++        return pd.Series(dtype=float)
++    values = pd.to_numeric(closes.loc[:session, symbol], errors="coerce").astype(float)
++    if (
++        values.empty
++        or pd.Timestamp(values.index[-1]).normalize() != session
++        or not math.isfinite(float(values.iloc[-1]))
++        or float(values.iloc[-1]) <= 0
++    ):
++        return pd.Series(dtype=float)
++    return values
++
++
++def build_market_context(
++    *,
++    session: pd.Timestamp,
++    oneil_regime: str,
++    distribution_days: int,
++    follow_through: bool,
++    closes: pd.DataFrame,
++    active_constituents: Iterable[str],
++    rs_scores: Mapping[str, float],
++) -> MarketContextV1:
++    """Build one complete context using data known at ``session`` close."""
++
++    normalized_session = pd.Timestamp(session).normalize()
++    active = tuple(dict.fromkeys(str(symbol).upper() for symbol in active_constituents))
++    if not active:
++        raise ValueError("market context active constituent cross-section is empty")
++
++    benchmarks: list[BenchmarkContextV1] = []
++    for symbol in BENCHMARK_CONTEXT_SYMBOLS:
++        history = _causal_closes(closes, symbol, normalized_session)
++        window_200 = history.iloc[-200:]
++        if (
++            len(window_200) != 200
++            or not np.isfinite(window_200).all()
++            or bool((window_200 <= 0).any())
++        ):
++            raise ValueError(f"market context {symbol} reference window is incomplete")
++        returns = window_200.iloc[-21:].pct_change().dropna()
++        if len(returns) != 20:
++            raise ValueError(f"market context {symbol} volatility window is incomplete")
++        close = float(window_200.iloc[-1])
++        volatility = float(returns.std(ddof=1) * math.sqrt(252.0))
++        if not math.isfinite(volatility):
++            raise ValueError(f"market context {symbol} volatility is invalid")
++        benchmarks.append(
++            BenchmarkContextV1(
++                symbol=symbol,
++                close_to_sma_50_fraction=close / float(window_200.iloc[-50:].mean()) - 1.0,
++                close_to_sma_200_fraction=close / float(window_200.mean()) - 1.0,
++                realized_volatility_20d_fraction=volatility,
++            )
++        )
++
++    above_50: list[bool] = []
++    above_200: list[bool] = []
++    eligible_rs: list[float] = []
++    for symbol in active:
++        raw_history = _causal_closes(closes, symbol, normalized_session)
++        history = raw_history[np.isfinite(raw_history) & (raw_history > 0)]
++        if len(history) >= 50:
++            above_50.append(float(history.iloc[-1]) > float(history.iloc[-50:].mean()))
++        if len(history) >= 200:
++            above_200.append(float(history.iloc[-1]) > float(history.iloc[-200:].mean()))
++        raw_rs = rs_scores.get(symbol)
++        if (
++            type(raw_rs) is not bool
++            and isinstance(raw_rs, (int, float))
++            and math.isfinite(float(raw_rs))
++        ):
++            eligible_rs.append(float(raw_rs))
++    if not above_50 or not above_200 or not eligible_rs:
++        raise ValueError("market context eligible constituent cross-section is empty")
++
++    active_count = len(active)
++    return MarketContextV1(
++        schema_version=1,
++        session=normalized_session.date().isoformat(),
++        oneil_regime=oneil_regime,
++        distribution_days=distribution_days,
++        follow_through=follow_through,
++        benchmarks=tuple(benchmarks),
++        active_constituent_count=active_count,
++        breadth_above_50_fraction=sum(above_50) / len(above_50),
++        breadth_50_coverage_fraction=len(above_50) / active_count,
++        breadth_above_200_fraction=sum(above_200) / len(above_200),
++        breadth_200_coverage_fraction=len(above_200) / active_count,
++        median_rs_score=float(np.median(eligible_rs)),
++        rs_at_least_80_fraction=sum(value >= 80.0 for value in eligible_rs) / len(eligible_rs),
++        rs_coverage_fraction=len(eligible_rs) / active_count,
++    )
++
++
++__all__ = ["BENCHMARK_CONTEXT_SYMBOLS", "build_market_context"]
+diff --git a/core/strategy_policy/risk.py b/core/strategy_policy/risk.py
+index 4b61437..d3150aa 100644
+--- a/core/strategy_policy/risk.py
++++ b/core/strategy_policy/risk.py
+@@ -6,35 +6,38 @@ from .contracts import (
+     AllocationDecision,
+     AllocationSnapshot,
+     CapacityDecision,
+     CapacitySnapshot,
+     EvictionDecision,
+     EvictionSnapshot,
+ )
+ 
+ 
+ def recommend_capacity(snapshot: CapacitySnapshot) -> CapacityDecision:
++    """Preserve baseline capacity while interface v2 supplies market context."""
+     return CapacityDecision(
+         max_positions=snapshot.configured_max_positions,
+         eviction_enabled=snapshot.configured_eviction_enabled,
+     )
+ 
+ 
+ def recommend_allocation(snapshot: AllocationSnapshot) -> AllocationDecision:
++    """Preserve baseline risk and stop fractions independent of market context."""
+     return AllocationDecision(
+         risk_fraction=snapshot.configured_position_risk_pct,
+         stop_distance_fraction=snapshot.configured_stop_loss_pct,
+         notional_fraction_cap=None,
+     )
+ 
+ 
+ def select_eviction(snapshot: EvictionSnapshot) -> EvictionDecision:
++    """Preserve baseline relative-strength eviction selection."""
+     eligible = tuple(
+         position
+         for position in snapshot.positions
+         if position.causal_execution_price is not None
+         and position.rs_score < snapshot.candidate_rs_score
+     )
+     underwater = tuple(
+         position
+         for position in eligible
+         if position.causal_execution_price < position.entry_price
+diff --git a/core/strategy_policy/runtime.py b/core/strategy_policy/runtime.py
+index 920788c..90ea9fc 100644
+--- a/core/strategy_policy/runtime.py
++++ b/core/strategy_policy/runtime.py
+@@ -14,33 +14,33 @@ from .contracts import (
+     EvictionDecision,
+     EvictionSnapshot,
+     ExitDecision,
+     ExitSnapshot,
+ )
+ 
+ 
+ class InProcessPolicyClient:
+     interface_version = POLICY_INTERFACE_VERSION
+ 
+-    def evaluate_entry(self, snapshot):
++    def evaluate_entry(self, snapshot: EntrySnapshot) -> EntryDecision:
+         return entry.evaluate_entry(snapshot)
+ 
+-    def recommend_capacity(self, snapshot):
++    def recommend_capacity(self, snapshot: CapacitySnapshot) -> CapacityDecision:
+         return risk.recommend_capacity(snapshot)
+ 
+-    def recommend_allocation(self, snapshot):
++    def recommend_allocation(self, snapshot: AllocationSnapshot) -> AllocationDecision:
+         return risk.recommend_allocation(snapshot)
+ 
+-    def select_eviction(self, snapshot):
++    def select_eviction(self, snapshot: EvictionSnapshot) -> EvictionDecision:
+         return risk.select_eviction(snapshot)
+ 
+-    def evaluate_exit(self, snapshot):
++    def evaluate_exit(self, snapshot: ExitSnapshot) -> ExitDecision:
+         return exit.evaluate_exit(snapshot)
+ 
+     def close(self) -> None:
+         return None
+ 
+ 
+ class JsonLinePolicyClient:
+     """Typed evaluator adapter over one authenticated worker session."""
+ 
+     def __init__(self, *, session: object, interface_version: int) -> None:
+diff --git a/core/strategy_policy/worker.py b/core/strategy_policy/worker.py
+index 567613a..f71953f 100644
+--- a/core/strategy_policy/worker.py
++++ b/core/strategy_policy/worker.py
+@@ -248,20 +248,21 @@ def decode_worker_ready(raw: str, *, bootstrap: WorkerBootstrap) -> WorkerReady:
+ def _require_method_pair(method: str, value: object, *, response: bool) -> type[object]:
+     if method not in _METHOD_TYPES:
+         raise ValueError("policy method is invalid")
+     expected = _METHOD_TYPES[method][1 if response else 0]
+     if type(value) is not expected:
+         raise ValueError("policy method/payload pairing is invalid")
+     return expected
+ 
+ 
+ def _contract_from_payload(contract_type: type[object], payload: object) -> object:
++    """Rebuild interface-v2 contracts, including their nested market context."""
+     if not isinstance(payload, dict):
+         raise ValueError("policy payload is invalid")
+     raw = _canonical_bytes(payload).decode("utf-8")
+     try:
+         return contract_type.from_canonical_json(raw)  # type: ignore[attr-defined]
+     except (TypeError, ValueError) as exc:
+         raise ValueError("policy method/payload pairing is invalid") from exc
+ 
+ 
+ def encode_policy_request(
+diff --git a/tests/test_backtest_engine.py b/tests/test_backtest_engine.py
+index 4778685..28c560d 100644
+--- a/tests/test_backtest_engine.py
++++ b/tests/test_backtest_engine.py
+@@ -4,27 +4,29 @@ from datetime import datetime
+ from pathlib import Path
+ from types import SimpleNamespace
+ from unittest.mock import patch
+ 
+ import pandas as pd
+ import pytest
+ 
+ from core.canslim.entry_contract import CanslimEntryFacts
+ from core.strategy_policy import (
+     AllocationDecision,
++    BenchmarkContextV1,
+     CapacityDecision,
+     EntryDecision,
+     EntrySnapshot,
+     EvictionDecision,
+     ExitAction,
+     ExitDecision,
+     ExitSnapshot,
++    MarketContextV1,
+ )
+ from core.strategy_policy.runtime import InProcessPolicyClient
+ from core.backtest_engine import (
+     CanslimStrategy,
+     DataFetcher,
+     PendingEntry,
+     PerformanceReport,
+     ProjectedEntryTransition,
+     SimulationResult,
+     _calculate_rs_snapshot,
+@@ -42,29 +44,58 @@ class _ExplodingFetcher:
+ 
+ class _CountingClient(InProcessPolicyClient):
+     def __init__(self, closed: list[int]) -> None:
+         self._closed_events = closed
+ 
+     def close(self) -> None:
+         self._closed_events.append(1)
+ 
+ 
+ class _MismatchedVersionClient(_CountingClient):
+-    interface_version = 2
++    interface_version = 1
+ 
+ 
+ class _RaisingVersionClient(_CountingClient):
+     @property
+     def interface_version(self) -> int:
+         raise RuntimeError("injected interface version failure")
+ 
+ 
++def _market_context(session: str = "2026-08-27") -> MarketContextV1:
++    return MarketContextV1(
++        schema_version=1,
++        session=session,
++        oneil_regime="confirmed_uptrend",
++        distribution_days=0,
++        follow_through=False,
++        benchmarks=tuple(
++            BenchmarkContextV1(symbol, 0.05, 0.10, 0.20)
++            for symbol in ("SPY", "QQQ", "IWM")
++        ),
++        active_constituent_count=1,
++        breadth_above_50_fraction=1.0,
++        breadth_50_coverage_fraction=1.0,
++        breadth_above_200_fraction=1.0,
++        breadth_200_coverage_fraction=1.0,
++        median_rs_score=90.0,
++        rs_at_least_80_fraction=1.0,
++        rs_coverage_fraction=1.0,
++    )
++
++
++def _pending_entry(
++    signal: dict[str, object],
++    capacity: CapacityDecision,
++) -> PendingEntry:
++    return PendingEntry(signal=signal, capacity=capacity, market=_market_context())
++
++
+ def test_policy_client_factory_creates_and_closes_once_per_run() -> None:
+     made: list[_CountingClient] = []
+     closed: list[int] = []
+ 
+     def factory() -> _CountingClient:
+         client = _CountingClient(closed)
+         made.append(client)
+         return client
+ 
+     simulator = PortfolioSimulator(
+@@ -92,52 +123,57 @@ def test_policy_client_factory_creates_and_closes_once_per_run() -> None:
+         with pytest.raises(ValueError, match="observation-only"):
+             PortfolioSimulator(
+                 pit_bundle=reference_bundle,
+                 technical_only=True,
+             ).run(
+                 ["AAA", reference],
+                 start_date="2021-06-25",
+                 end_date="2021-09-20",
+             )
+ 
++    constituents = ("AAA", "BBB", "CCC", "DDD", "EEE", "FFF", "GGG", "HHH", "III", "JJJ")
++    all_symbols = (*constituents, "IWM", "QQQ", "SPY")
+     prices = {
+-        symbol: _make_ohlcv(n=80, close_value=100.0)
+-        for symbol in ("AAA", "IWM", "QQQ", "SPY")
++        symbol: _make_ohlcv(n=260, close_value=100.0)
++        for symbol in all_symbols
+     }
+ 
+     def fetch_price_data(symbols, _start, _end):
+         return {symbol: prices[symbol] for symbol in symbols}
+ 
+     def fetch_closes(symbols, _start, _end):
+         return pd.DataFrame(
+             {symbol: prices[symbol]["Close"] for symbol in symbols}
+         )
+ 
++    reference_bundle.tradable_symbols = lambda: constituents
++    reference_bundle.price_symbols = lambda: all_symbols
+     reference_bundle.fetch_price_data = fetch_price_data
+     reference_bundle.fetch_closes = fetch_closes
+-    reference_bundle.members_at = lambda _session: frozenset({"AAA"})
++    reference_bundle.members_at = lambda _session: frozenset(constituents)
+     reference_bundle.sha256 = "a" * 64
+     reference_bundle.data_cutoff = prices["SPY"].index[-1]
+     reference_bundle.manifest = lambda: {}
+     result = PortfolioSimulator(
+         pit_bundle=reference_bundle,
+         technical_only=True,
+         signal_every_n_days=1,
+     ).run(
+         ["AAA"],
+-        start_date=str(prices["AAA"].index[0].date()),
++        start_date=str(prices["AAA"].index[199].date()),
++        history_start_date=str(prices["AAA"].index[0].date()),
+         end_date=str(prices["AAA"].index[-1].date()),
+     )
+ 
+     assert result.config["tickers"] == ["AAA"]
+     assert result.config["market_reference_tickers"] == ["IWM", "QQQ", "SPY"]
+-    assert result.config["market_context_universe_count"] == 4
++    assert result.config["market_context_universe_count"] == len(all_symbols)
+     assert set(result.signal_log.get("symbol", pd.Series(dtype=str))) <= {"AAA"}
+     assert {trade.symbol for trade in result.trades} <= {"AAA"}
+     assert all(
+         not set(str(row["Holdings"]).split(",")).intersection({"IWM", "QQQ", "SPY"})
+         for _, row in result.weekly_holdings.iterrows()
+     )
+     assert set(result.transaction_log.get("Ticker", pd.Series(dtype=str))) <= {"AAA"}
+ 
+ 
+ @pytest.mark.parametrize(
+@@ -244,80 +280,80 @@ def _eligible_entry_facts() -> CanslimEntryFacts:
+ 
+ def test_take_profit_scale_out_fires_all_three_tiers_on_gap_up() -> None:
+     """When high clears all 3 tier thresholds in one bar, all 3 tiers fire."""
+     sim = PortfolioSimulator(initial_capital=100_000.0, stagnation_days=999)
+     trade = Trade(symbol="NVDA", entry_date="2026-04-01", entry_price=100.0, qty=10.0, stop_price=92.0)
+     trade.days_held = 15  # becomes 16 after increment — outside 15-day 8-week-hold window
+     sim._open_positions["NVDA"] = trade
+ 
+     # high=121 clears tier1(110), tier2(115), tier3(120)
+     ohlcv = _make_ohlcv(n=5, close_value=121.0, high_value=121.0, low_value=109.0)
+-    sim._check_exits("NVDA", ohlcv, ohlcv.index[-1])
++    sim._check_exits("NVDA", ohlcv, ohlcv.index[-1], market=_market_context())
+ 
+     assert "NVDA" in sim._open_positions
+     result = sim._open_positions["NVDA"]
+     assert result.scale_out_tier == 3
+     assert result.remaining_qty == pytest.approx(2.5)  # 25% of 10 remains
+     # pnl: (110-100)*2.5 + (115-100)*2.5 + (120-100)*2.5 = 25+37.5+50 = 112.5
+     assert result.realized_pnl == pytest.approx(112.5)
+     sell_reasons = [tx["Reason"] for tx in sim._transactions if tx["Action"] == "SELL"]
+     assert sell_reasons.count("take_profit_scale_out") == 3
+ 
+ 
+ def test_scale_out_tier1_only_when_gain_between_10_and_15_pct() -> None:
+     """Only tier 1 fires when high is between 10% and 15% above entry."""
+     sim = PortfolioSimulator(initial_capital=100_000.0, stagnation_days=999)
+     trade = Trade(symbol="AAPL", entry_date="2026-04-01", entry_price=100.0, qty=8.0, stop_price=92.0)
+     sim._open_positions["AAPL"] = trade
+ 
+     # high=112 clears tier1(110) but NOT tier2(115)
+     ohlcv = _make_ohlcv(n=3, close_value=112.0, high_value=112.0, low_value=109.0)
+-    sim._check_exits("AAPL", ohlcv, ohlcv.index[-1])
++    sim._check_exits("AAPL", ohlcv, ohlcv.index[-1], market=_market_context())
+ 
+     assert "AAPL" in sim._open_positions
+     result = sim._open_positions["AAPL"]
+     assert result.scale_out_tier == 1
+     assert result.remaining_qty == pytest.approx(6.0)  # sold 25% of 8 = 2 shares
+     assert result.realized_pnl == pytest.approx(20.0)  # (110-100)*2
+     sell_txns = [tx for tx in sim._transactions if tx["Action"] == "SELL"]
+     assert len(sell_txns) == 1
+ 
+ 
+ def test_scale_out_remaining_qty_is_25_pct_of_original_after_tier3() -> None:
+     """After all 3 tiers, exactly 25% of original qty remains."""
+     sim = PortfolioSimulator(initial_capital=100_000.0, stagnation_days=999)
+     qty = 20.0
+     trade = Trade(symbol="MSFT", entry_date="2026-04-01", entry_price=50.0, qty=qty, stop_price=46.0)
+     trade.days_held = 15  # becomes 16 after increment — outside 15-day 8-week-hold window
+     sim._open_positions["MSFT"] = trade
+ 
+     ohlcv = _make_ohlcv(n=3, close_value=62.0, high_value=62.0, low_value=51.0)
+-    sim._check_exits("MSFT", ohlcv, ohlcv.index[-1])
++    sim._check_exits("MSFT", ohlcv, ohlcv.index[-1], market=_market_context())
+ 
+     result = sim._open_positions["MSFT"]
+     assert result.scale_out_tier == 3
+     assert result.remaining_qty == pytest.approx(qty * 0.25)
+ 
+ 
+ def test_time_stop_exits_stagnant_position() -> None:
+     sim = PortfolioSimulator(
+         initial_capital=100_000.0,
+         stagnation_days=20,
+         stagnation_threshold_pct=0.05,
+     )
+     trade = Trade(symbol="MSFT", entry_date="2026-03-20", entry_price=100.0, qty=10.0, stop_price=93.0)
+     trade.days_held = 19
+     trade.peak_close = 103.0
+     sim._open_positions["MSFT"] = trade
+ 
+     ohlcv = _make_ohlcv(n=5, close_value=102.0, high_value=103.0, low_value=101.0)
+-    sim._check_exits("MSFT", ohlcv, ohlcv.index[-1])
++    sim._check_exits("MSFT", ohlcv, ohlcv.index[-1], market=_market_context())
+ 
+     assert "MSFT" not in sim._open_positions
+     assert sim._trades[-1].exit_reason == "time_stop"
+ 
+ 
+ def test_stop_moves_to_breakeven_after_eight_percent_gain() -> None:
+     sim = PortfolioSimulator(initial_capital=100_000.0, stagnation_days=999)
+     trade = Trade(symbol="NVDA", entry_date="2026-04-01", entry_price=100.0, qty=10.0, stop_price=93.0)
+     sim._open_positions["NVDA"] = trade
+ 
+@@ -326,25 +362,25 @@ def test_stop_moves_to_breakeven_after_eight_percent_gain() -> None:
+         {
+             "Open": [100.0, 108.5],
+             "High": [108.5, 109.0],
+             "Low": [99.0, 99.5],
+             "Close": [107.0, 100.5],
+             "Volume": [1_000_000, 1_000_000],
+         },
+         index=dates,
+     )
+ 
+-    sim._check_exits("NVDA", first, dates[0])
++    sim._check_exits("NVDA", first, dates[0], market=_market_context())
+     assert sim._open_positions["NVDA"].stop_price == pytest.approx(100.0)
+     assert sim._open_positions["NVDA"].breakeven_armed is True
+ 
+-    sim._check_exits("NVDA", first, dates[1])
++    sim._check_exits("NVDA", first, dates[1], market=_market_context())
+     assert "NVDA" not in sim._open_positions
+     assert sim._trades[-1].exit_reason == "stop_loss"
+     assert sim._trades[-1].exit_price == pytest.approx(100.0)
+ 
+ 
+ def test_profitable_trade_trails_stop_with_21_day_ema() -> None:
+     sim = PortfolioSimulator(initial_capital=100_000.0, stagnation_days=999)
+     dates = pd.date_range("2026-03-02", periods=23, freq="B")
+     closes = [100.0 + i for i in range(23)]
+     ohlcv = pd.DataFrame(
+@@ -361,28 +397,28 @@ def test_profitable_trade_trails_stop_with_21_day_ema() -> None:
+     trade = Trade(
+         symbol="MSFT",
+         entry_date=str(dates[0].date()),
+         entry_price=100.0,
+         qty=10.0,
+         stop_price=93.0,
+         breakeven_armed=True,
+     )
+     sim._open_positions["MSFT"] = trade
+ 
+-    sim._check_exits("MSFT", ohlcv, dates[21])
++    sim._check_exits("MSFT", ohlcv, dates[21], market=_market_context())
+     raised_stop = sim._open_positions["MSFT"].stop_price
+     assert raised_stop > 100.0
+     assert sim._open_positions["MSFT"].ema_trailing_active is True
+ 
+     exit_bar = ohlcv.copy()
+     exit_bar.loc[dates[22], "Low"] = raised_stop - 0.5
+-    sim._check_exits("MSFT", exit_bar, dates[22])
++    sim._check_exits("MSFT", exit_bar, dates[22], market=_market_context())
+ 
+     assert "MSFT" not in sim._open_positions
+     assert sim._trades[-1].exit_reason == "stop_loss"
+     assert sim._trades[-1].exit_price == pytest.approx(raised_stop)
+ 
+ 
+ def test_weekly_holdings_snapshot_records_open_positions() -> None:
+     sim = PortfolioSimulator(initial_capital=100_000.0)
+     sim._equity = 90_000.0
+     sim._open_positions["AAPL"] = Trade("AAPL", "2026-04-01", 100.0, 5.0, 93.0)
+@@ -470,21 +506,21 @@ def test_technical_only_mode_allows_buy_without_fundamentals() -> None:
+         patch("core.backtest_engine._evaluate_technical_at_date", return_value={
+             "n_score": 0.95, "s_score": 0.85, "close": 150.0, "is_breakout": True, "has_volume_surge": True,
+             "has_power_gap": False, "power_gap_details": {}, "entry_facts": _eligible_entry_facts(),
+         }),
+     ):
+         row = strategy.evaluate_symbol(
+             ticker="NVDA",
+             ticker_ohlcv=ticker_ohlcv,
+             all_closes=all_closes,
+             eval_date=dates[-1],
+-            market_state={"m_score": 0.9, "market_is_bullish": True, "distribution_days": 0, "follow_through": True},
++                market_state={"m_score": 0.9, "market_is_bullish": True, "distribution_days": 0, "follow_through": True, "market": _market_context()},
+         )
+ 
+     assert row is not None
+     assert row["technical_score"] >= 70.0
+     assert row["buy_signal"] is True
+ 
+ 
+ def test_technical_only_mode_skips_fundamental_fetch() -> None:
+     strategy = CanslimStrategy(technical_only=True)
+     dates = pd.date_range("2026-01-01", periods=80, freq="B")
+@@ -508,21 +544,21 @@ def test_technical_only_mode_skips_fundamental_fetch() -> None:
+         patch("core.backtest_engine._evaluate_technical_at_date", return_value={
+             "n_score": 0.95, "s_score": 0.85, "close": 150.0, "is_breakout": True, "has_volume_surge": True,
+             "has_power_gap": False, "power_gap_details": {}, "entry_facts": _eligible_entry_facts(),
+         }),
+     ):
+         strategy.evaluate_symbol(
+             ticker="NVDA",
+             ticker_ohlcv=ticker_ohlcv,
+             all_closes=all_closes,
+             eval_date=dates[-1],
+-            market_state={"m_score": 0.9, "market_is_bullish": True, "distribution_days": 0, "follow_through": True},
++                market_state={"m_score": 0.9, "market_is_bullish": True, "distribution_days": 0, "follow_through": True, "market": _market_context()},
+         )
+ 
+     mocked_fund.assert_not_called()
+ 
+ 
+ def test_entry_policy_canslim_strategy_receives_institutional_reweighted_snapshot() -> None:
+     """Break caught: the built-in strategy could bypass policy after scoring facts."""
+     snapshots: list[EntrySnapshot] = []
+ 
+     class Client(InProcessPolicyClient):
+@@ -566,22 +602,23 @@ def test_entry_policy_canslim_strategy_receives_institutional_reweighted_snapsho
+     ):
+         row = strategy.evaluate_symbol(
+             ticker="AAA",
+             ticker_ohlcv=ticker_ohlcv,
+             all_closes=all_closes,
+             eval_date=dates[-1],
+             market_state={
+                 "m_score": 0.8,
+                 "market_is_bullish": True,
+                 "distribution_days": 0,
+-                "follow_through": False,
+-            },
++                    "follow_through": False,
++                    "market": _market_context(),
++                },
+         )
+ 
+     assert len(snapshots) == 1
+     assert snapshots[0].institutional_data_available is False
+     assert snapshots[0].canslim_score == pytest.approx(82.2222222222)
+     assert not hasattr(snapshots[0], "symbol")
+     assert not hasattr(snapshots[0], "signal_date")
+     assert row is not None
+     assert (row["buy_signal"], row["canslim_score"], row["rs_score"]) == (
+         False,
+@@ -651,74 +688,74 @@ def test_resolve_universe_supports_nasdaq100_and_russell2000() -> None:
+ 
+ def test_eight_week_hold_triggered_by_20pct_gain_in_3_weeks() -> None:
+     """20%+ gain within 15 trading days sets eight_week_hold=True and suppresses tier exits."""
+     sim = PortfolioSimulator(initial_capital=100_000.0, stagnation_days=999)
+     trade = Trade(symbol="CRWD", entry_date="2026-01-01", entry_price=100.0, qty=10.0, stop_price=92.0)
+     trade.days_held = 13  # will become 14 after increment in _check_exits
+     sim._open_positions["CRWD"] = trade
+ 
+     # close=122 → 22% gain, within 15-day window → should trigger hold
+     ohlcv = _make_ohlcv(n=20, close_value=122.0, high_value=122.0, low_value=109.0)
+-    sim._check_exits("CRWD", ohlcv, ohlcv.index[-1])
++    sim._check_exits("CRWD", ohlcv, ohlcv.index[-1], market=_market_context())
+ 
+     result = sim._open_positions["CRWD"]
+     assert result.eight_week_hold is True
+     assert result.scale_out_tier == 0  # no tiers fired
+     assert result.remaining_qty == pytest.approx(10.0)  # nothing sold
+ 
+ 
+ def test_eight_week_hold_not_triggered_after_3_week_window() -> None:
+     """20%+ gain after 15 trading days does NOT trigger the 8-week hold."""
+     sim = PortfolioSimulator(initial_capital=100_000.0, stagnation_days=999)
+     trade = Trade(symbol="NVDA", entry_date="2026-01-01", entry_price=100.0, qty=10.0, stop_price=92.0)
+     trade.days_held = 15  # will become 16 after increment — outside window
+     sim._open_positions["NVDA"] = trade
+ 
+     # close=122 → 22% gain, but day 16 is outside the 15-day window
+     ohlcv = _make_ohlcv(n=20, close_value=122.0, high_value=122.0, low_value=109.0)
+-    sim._check_exits("NVDA", ohlcv, ohlcv.index[-1])
++    sim._check_exits("NVDA", ohlcv, ohlcv.index[-1], market=_market_context())
+ 
+     result = sim._open_positions["NVDA"]
+     assert result.eight_week_hold is False
+     assert result.scale_out_tier == 3  # all 3 tiers fired normally
+ 
+ 
+ def test_eight_week_hold_releases_after_40_bars_and_tiers_resume() -> None:
+     """Hold expires on bar 40; scale_out_tier resets so tiers can fire."""
+     sim = PortfolioSimulator(initial_capital=100_000.0, stagnation_days=999)
+     trade = Trade(symbol="MU", entry_date="2026-01-01", entry_price=100.0, qty=10.0, stop_price=92.0)
+     trade.days_held = 39  # will become 40 after increment — release fires
+     trade.eight_week_hold = True
+     trade.scale_out_tier = 0
+     sim._open_positions["MU"] = trade
+ 
+     # price at 25% gain — all 3 tiers would fire once hold releases
+     ohlcv = _make_ohlcv(n=45, close_value=125.0, high_value=125.0, low_value=109.0)
+-    sim._check_exits("MU", ohlcv, ohlcv.index[-1])
++    sim._check_exits("MU", ohlcv, ohlcv.index[-1], market=_market_context())
+ 
+     result = sim._open_positions["MU"]
+     assert result.eight_week_hold is False
+     assert result.scale_out_tier == 3  # all 3 tiers fired after release
+     assert result.remaining_qty == pytest.approx(2.5)
+ 
+ 
+ def test_stop_loss_fires_during_eight_week_hold() -> None:
+     """Hard stop-loss is NEVER suppressed by the 8-week hold."""
+     sim = PortfolioSimulator(initial_capital=100_000.0, stagnation_days=999)
+     trade = Trade(symbol="VST", entry_date="2026-01-01", entry_price=100.0, qty=10.0, stop_price=92.0)
+     trade.days_held = 5
+     trade.eight_week_hold = True
+     sim._open_positions["VST"] = trade
+ 
+     # low drops below stop
+     ohlcv = _make_ohlcv(n=10, close_value=90.0, high_value=91.0, low_value=89.0)
+-    sim._check_exits("VST", ohlcv, ohlcv.index[-1])
++    sim._check_exits("VST", ohlcv, ohlcv.index[-1], market=_market_context())
+ 
+     assert "VST" not in sim._open_positions
+     assert sim._trades[-1].exit_reason == "stop_loss"
+ 
+ 
+ def _make_full_sim(
+     positions: dict,
+     capital: float = 100_000.0,
+ ) -> tuple:
+     """Build a simulator with pre-loaded open positions and matching OHLCV data.
+@@ -756,20 +793,21 @@ def test_full_portfolio_signal_reaches_eviction_and_replaces_lower_rs_position()
+     sim.strategy = SimpleNamespace(evaluate_symbol=lambda **_kwargs: signal)
+     ohlcv_map["GEV"] = _make_canonical_entry_ohlcv(120.0)
+     entry_date = ohlcv_map["GEV"].index[-1]
+ 
+     signals = sim._evaluate_signals(
+         tickers=["GEV"],
+         ticker_ohlcv=ohlcv_map,
+         all_closes=pd.DataFrame(index=ohlcv_map["GEV"].index),
+         eval_date=entry_date,
+         market_state={"market_is_bullish": True},
++        market=_market_context(),
+     )
+ 
+     assert [pending.signal["symbol"] for pending in signals] == ["GEV"]
+     sim._enter_position(signals[0], ohlcv_map, entry_date)
+     assert set(sim._open_positions) == {"GEV"}
+     assert [(trade.symbol, trade.exit_reason) for trade in sim._trades] == [("MSFT", "evicted")]
+ 
+ 
+ def test_full_portfolio_without_eviction_returns_no_candidates() -> None:
+     """A disabled eviction policy must retain the hard capacity gate."""
+@@ -784,20 +822,21 @@ def test_full_portfolio_without_eviction_returns_no_candidates() -> None:
+         }
+     )
+     ohlcv_map["GEV"] = _make_canonical_entry_ohlcv(120.0)
+ 
+     signals = sim._evaluate_signals(
+         tickers=["GEV"],
+         ticker_ohlcv=ohlcv_map,
+         all_closes=pd.DataFrame(index=ohlcv_map["GEV"].index),
+         eval_date=ohlcv_map["GEV"].index[-1],
+         market_state={"market_is_bullish": True},
++        market=_market_context(),
+     )
+ 
+     assert signals == []
+ 
+ 
+ def test_open_slot_returns_only_best_ranked_candidate() -> None:
+     """Normal capacity admits only the highest-ranked signal for one free slot."""
+     sim, ohlcv_map = _make_full_sim({"MSFT": (100.0, 60.0, 95.0)})
+     sim.max_positions = 2
+     sim.enable_eviction = True
+@@ -811,40 +850,45 @@ def test_open_slot_returns_only_best_ranked_candidate() -> None:
+     ohlcv_map["LOW"] = _make_canonical_entry_ohlcv(50.0)
+     ohlcv_map["BEST"] = _make_canonical_entry_ohlcv(60.0)
+     eval_date = ohlcv_map["BEST"].index[-1]
+ 
+     signals = sim._evaluate_signals(
+         tickers=["LOW", "BEST"],
+         ticker_ohlcv=ohlcv_map,
+         all_closes=pd.DataFrame(index=ohlcv_map["BEST"].index),
+         eval_date=eval_date,
+         market_state={"market_is_bullish": True},
++        market=_market_context(),
+     )
+ 
+     assert [pending.signal["symbol"] for pending in signals] == ["BEST"]
+ 
+ 
+ def test_eviction_skips_incumbent_with_missing_price_data() -> None:
+     """A candidate cannot evict a holding whose current value is unknown."""
+     sim, ohlcv_map = _make_full_sim({"MSFT": (100.0, 60.0, 95.0)})
+     sim.max_positions = 1
+     del ohlcv_map["MSFT"]
+     ohlcv_map["GEV"] = _make_ohlcv(n=60, close_value=120.0)
+     signal = {
+         "symbol": "GEV",
+         "rs_score": 90.0,
+         "canslim_score": 80.0,
+         "signal_reason": "Volume Breakout",
+         "buy_signal": True,
+     }
+ 
+-    sim._enter_position(signal, ohlcv_map, ohlcv_map["GEV"].index[-1])
++    sim._enter_position(
++        _pending_entry(signal, CapacityDecision(sim.max_positions, sim.enable_eviction)),
++        ohlcv_map,
++        ohlcv_map["GEV"].index[-1],
++    )
+ 
+     assert set(sim._open_positions) == {"MSFT"}
+     assert sim._trades == []
+ 
+ 
+ def test_eviction_pass1_evicts_underwater_lower_rs_position() -> None:
+     """Pass 1: evicts the underwater position with the lowest RS."""
+     positions = {
+         "AAPL": (100.0, 85.0, 105.0),  # profitable, rs=85
+         "MSFT": (100.0, 70.0, 95.0),   # underwater, rs=70 ← should be evicted
+@@ -858,21 +902,25 @@ def test_eviction_pass1_evicts_underwater_lower_rs_position() -> None:
+     new_signal = {
+         "symbol": "GEV",
+         "rs_score": 80.0,
+         "canslim_score": 75.0,
+         "signal_reason": "Volume Breakout",
+         "buy_signal": True,
+     }
+     ohlcv_map["GEV"] = _make_ohlcv(n=10, close_value=50.0)
+     entry_date = ohlcv_map["GEV"].index[-1]
+ 
+-    sim._enter_position(new_signal, ohlcv_map, entry_date)
++    sim._enter_position(
++        _pending_entry(new_signal, CapacityDecision(sim.max_positions, sim.enable_eviction)),
++        ohlcv_map,
++        entry_date,
++    )
+ 
+     assert "MSFT" not in sim._open_positions
+     assert "GEV" in sim._open_positions
+     evicted = next(t for t in sim._trades if t.symbol == "MSFT")
+     assert evicted.exit_reason == "evicted"
+ 
+ 
+ def test_eviction_pass2_evicts_lowest_rs_when_no_underwater_positions() -> None:
+     """Pass 2: when no underwater positions qualify, evicts the lowest RS (profitable)."""
+     positions = {
+@@ -887,21 +935,25 @@ def test_eviction_pass2_evicts_lowest_rs_when_no_underwater_positions() -> None:
+     new_signal = {
+         "symbol": "VRT",
+         "rs_score": 80.0,
+         "canslim_score": 75.0,
+         "signal_reason": "Volume Breakout",
+         "buy_signal": True,
+     }
+     ohlcv_map["VRT"] = _make_ohlcv(n=10, close_value=60.0)
+     entry_date = ohlcv_map["VRT"].index[-1]
+ 
+-    sim._enter_position(new_signal, ohlcv_map, entry_date)
++    sim._enter_position(
++        _pending_entry(new_signal, CapacityDecision(sim.max_positions, sim.enable_eviction)),
++        ohlcv_map,
++        entry_date,
++    )
+ 
+     assert "MSFT" not in sim._open_positions
+     assert "VRT" in sim._open_positions
+     evicted = next(t for t in sim._trades if t.symbol == "MSFT")
+     assert evicted.exit_reason == "evicted"
+ 
+ 
+ def test_eviction_skipped_when_new_signal_rs_lower_than_all_positions() -> None:
+     """No eviction if new signal's RS is not higher than any open position."""
+     positions = {
+@@ -917,21 +969,25 @@ def test_eviction_skipped_when_new_signal_rs_lower_than_all_positions() -> None:
+     new_signal = {
+         "symbol": "GEV",
+         "rs_score": 79.0,
+         "canslim_score": 75.0,
+         "signal_reason": "Volume Breakout",
+         "buy_signal": True,
+     }
+     ohlcv_map["GEV"] = _make_ohlcv(n=10, close_value=40.0)
+     entry_date = ohlcv_map["GEV"].index[-1]
+ 
+-    sim._enter_position(new_signal, ohlcv_map, entry_date)
++    sim._enter_position(
++        _pending_entry(new_signal, CapacityDecision(sim.max_positions, sim.enable_eviction)),
++        ohlcv_map,
++        entry_date,
++    )
+ 
+     assert set(sim._open_positions.keys()) == original
+     assert "GEV" not in sim._open_positions
+ 
+ 
+ def test_eviction_disabled_when_flag_is_false() -> None:
+     """enable_eviction=False prevents all eviction logic."""
+     positions = {
+         "AAPL": (100.0, 60.0, 95.0),
+         "MSFT": (100.0, 65.0, 96.0),
+@@ -946,21 +1002,25 @@ def test_eviction_disabled_when_flag_is_false() -> None:
+     new_signal = {
+         "symbol": "VST",
+         "rs_score": 95.0,
+         "canslim_score": 80.0,
+         "signal_reason": "Volume Breakout",
+         "buy_signal": True,
+     }
+     ohlcv_map["VST"] = _make_ohlcv(n=10, close_value=70.0)
+     entry_date = ohlcv_map["VST"].index[-1]
+ 
+-    sim._enter_position(new_signal, ohlcv_map, entry_date)
++    sim._enter_position(
++        _pending_entry(new_signal, CapacityDecision(sim.max_positions, sim.enable_eviction)),
++        ohlcv_map,
++        entry_date,
++    )
+ 
+     assert set(sim._open_positions.keys()) == original
+     assert "VST" not in sim._open_positions
+ 
+ 
+ @pytest.mark.parametrize(
+     ("configured_limit", "configured_eviction", "open_count", "expected"),
+     [
+         (None, True, 2, CapacityDecision(None, True)),
+         (4, True, 2, CapacityDecision(4, True)),
+@@ -979,41 +1039,47 @@ def test_policy_capacity_resolves_validated_baseline_decisions(
+         max_positions=configured_limit,
+         enable_eviction=configured_eviction,
+     )
+     simulator._open_positions = {
+         f"OLD{slot}": Trade(f"OLD{slot}", "2026-01-01", 100.0, 1.0, 92.0)
+         for slot in range(open_count)
+     }
+     assert simulator._resolve_capacity(
+         eligible_signal_count=3,
+         cash_fraction=0.5,
++        market=_market_context(),
+     ) == expected
+ 
+ 
+ def test_policy_capacity_rejects_finite_limit_above_engine_ceiling() -> None:
+     """Break caught: an injected policy could bypass the 25-position safety ceiling."""
+ 
+     class Client(InProcessPolicyClient):
+         def recommend_capacity(self, _snapshot):
+             return CapacityDecision(26, True)
+ 
+     simulator = PortfolioSimulator()
+     simulator._policy_client = Client()
+     with pytest.raises(ValueError, match="max_positions"):
+-        simulator._resolve_capacity(eligible_signal_count=1, cash_fraction=1.0)
++        simulator._resolve_capacity(
++            eligible_signal_count=1,
++            cash_fraction=1.0,
++            market=_market_context(),
++        )
+ 
+ 
+ def test_policy_capacity_pending_entry_round_trip_and_carried_capacity() -> None:
+     """Break caught: next-session entry could silently reread changed defaults."""
+     pending = PendingEntry(
+         signal={"symbol": "NEW", "rs_score": 90.0},
+         capacity=CapacityDecision(max_positions=1, eviction_enabled=False),
++        market=_market_context(),
+     )
+     assert PendingEntry.from_primitive(pending.to_primitive()) == pending
+     simulator = PortfolioSimulator(max_positions=None, enable_eviction=True)
+     simulator._open_positions = {"OLD": object()}
+     assert simulator._capacity_state(pending) == (True, False)
+ 
+ 
+ def test_policy_capacity_lowered_below_holdings_blocks_without_liquidation() -> None:
+     """Break caught: lowering a policy cap could force unrequested liquidation."""
+     class Client(InProcessPolicyClient):
+@@ -1035,25 +1101,27 @@ def test_policy_capacity_lowered_below_holdings_blocks_without_liquidation() ->
+             "NEW", rs_score=99.0, canslim_score=90.0
+         )
+     )
+ 
+     assert simulator._evaluate_signals(
+         tickers=["NEW"],
+         ticker_ohlcv={"OLD1": frame, "OLD2": frame, "NEW": frame},
+         all_closes=pd.DataFrame(index=frame.index),
+         eval_date=frame.index[-1],
+         market_state={"market_is_bullish": True},
++        market=_market_context(),
+     ) == []
+ 
+     pending = PendingEntry(
+         signal={"symbol": "NEW", "rs_score": 99.0, "canslim_score": 90.0},
+         capacity=CapacityDecision(1, True),
++        market=_market_context(),
+     )
+ 
+     assert simulator._capacity_state(pending) == (True, False)
+     simulator._enter_position(
+         pending,
+         {"OLD1": frame, "OLD2": frame, "NEW": frame},
+         frame.index[-1],
+     )
+ 
+     assert simulator._open_positions == positions
+@@ -1084,38 +1152,41 @@ def test_policy_capacity_evaluate_signals_carries_one_batch_decision() -> None:
+             "NEW", rs_score=90.0, canslim_score=80.0
+         )
+     )
+ 
+     pending = simulator._evaluate_signals(
+         tickers=["NEW"],
+         ticker_ohlcv={"NEW": frame},
+         all_closes=pd.DataFrame(index=frame.index),
+         eval_date=frame.index[-1],
+         market_state={"market_is_bullish": True},
++        market=_market_context(),
+     )
+ 
+     assert client.capacity_calls == 1
+     assert pending == [
+         PendingEntry(
+             signal=pending[0].signal,
+             capacity=CapacityDecision(1, False),
++            market=_market_context(),
+         )
+     ]
+ 
+ 
+ def test_policy_capacity_checkpoint_serializes_pending_carrier() -> None:
+     """Break caught: a resumed run could lose the carried capacity decision."""
+     simulator = PortfolioSimulator()
+     simulator._reset_run_state()
+     pending = PendingEntry(
+         signal={"symbol": "NEW", "rs_score": 90.0},
+         capacity=CapacityDecision(1, False),
++        market=_market_context(),
+     )
+     payload = simulator._checkpoint_payload(
+         fingerprint="a" * 64,
+         code_identity="code",
+         strategy_identity={"kind": "built_in"},
+         next_day_index=1,
+         total_days=2,
+         state_log_offset=0,
+         regime_tracker=simulator._regime_tracker,
+         pending_entries=[pending],
+@@ -1129,40 +1200,42 @@ def test_policy_capacity_checkpoint_serializes_pending_carrier() -> None:
+ 
+ def test_policy_capacity_next_session_enforces_carried_decision() -> None:
+     """Break caught: entry execution could use permissive current defaults instead."""
+     simulator = PortfolioSimulator(max_positions=None, enable_eviction=True)
+     old = Trade("OLD", "2026-01-01", 100.0, 1.0, 92.0)
+     simulator._open_positions = {"OLD": old}
+     frame = _make_ohlcv(n=60, close_value=100.0)
+     pending = PendingEntry(
+         signal={"symbol": "NEW", "rs_score": 99.0, "canslim_score": 90.0},
+         capacity=CapacityDecision(1, False),
++        market=_market_context(),
+     )
+ 
+     simulator._enter_position(pending, {"NEW": frame, "OLD": frame}, frame.index[-1])
+ 
+     assert simulator._open_positions == {"OLD": old}
+     assert simulator._transactions == []
+     assert simulator._entry_outcomes[-1].outcome == "entry_rejected_capacity"
+ 
+ 
+ def test_policy_eviction_snapshot_uses_stable_opaque_slots() -> None:
+     """Break caught: eviction policy could receive symbols or unstable slot order."""
+     simulator = PortfolioSimulator(max_positions=2, enable_eviction=True)
+     simulator._open_positions = {
+         "BBB": Trade("BBB", "2026-01-01", 100.0, 1.0, 92.0, rs_score=60.0),
+         "AAA": Trade("AAA", "2026-01-01", 100.0, 1.0, 92.0, rs_score=70.0),
+     }
+     frame = _make_ohlcv(n=2, close_value=95.0)
+     pending = PendingEntry(
+         signal={"symbol": "NEW", "rs_score": 90.0},
+         capacity=CapacityDecision(2, True),
++        market=_market_context(),
+     )
+ 
+     snapshot = simulator._build_eviction_snapshot(
+         pending=pending,
+         ticker_ohlcv={"BBB": frame, "AAA": frame, "NEW": frame},
+         entry_date=frame.index[-1],
+     )
+ 
+     assert [position.slot for position in snapshot.positions] == [0, 1]
+     assert [position.rs_score for position in snapshot.positions] == [60.0, 70.0]
+@@ -1171,20 +1244,21 @@ def test_policy_eviction_snapshot_uses_stable_opaque_slots() -> None:
+ 
+ def test_policy_eviction_rejects_unknown_slot_without_mutation() -> None:
+     """Break caught: a policy-selected unknown slot could evict an arbitrary holding."""
+     simulator = PortfolioSimulator(max_positions=1, enable_eviction=True)
+     old = Trade("OLD", "2026-01-01", 100.0, 1.0, 92.0, rs_score=60.0)
+     simulator._open_positions = {"OLD": old}
+     frame = _make_ohlcv(n=2, close_value=95.0)
+     pending = PendingEntry(
+         signal={"symbol": "NEW", "rs_score": 90.0},
+         capacity=CapacityDecision(1, True),
++        market=_market_context(),
+     )
+     before = (simulator._equity, dict(simulator._open_positions), list(simulator._transactions))
+ 
+     with pytest.raises(ValueError, match="slot"):
+         simulator._project_entry_transition(
+             pending=pending,
+             ticker_ohlcv={"OLD": frame, "NEW": frame},
+             entry_date=frame.index[-1],
+             eviction=EvictionDecision(9),
+         )
+@@ -1316,21 +1390,24 @@ def test_policy_allocation_fixed_engine_ceilings_apply_to_direct_entry(
+     """Break caught: compatibility entry paths could relax fixed safety ceilings."""
+     simulator = PortfolioSimulator(
+         initial_capital=1_000.0,
+         position_risk_pct=position_risk_pct,
+         stop_loss_pct=stop_loss_pct,
+     )
+     frame = _make_ohlcv(n=2, close_value=100.0)
+ 
+     with pytest.raises(ValueError, match=message):
+         simulator._enter_position(
+-            {"symbol": "NEW", "rs_score": 90.0, "canslim_score": 80.0},
++            _pending_entry(
++                {"symbol": "NEW", "rs_score": 90.0, "canslim_score": 80.0},
++                CapacityDecision(simulator.max_positions, simulator.enable_eviction),
++            ),
+             {"NEW": frame},
+             frame.index[-1],
+         )
+ 
+ 
+ def test_projected_entry_transition_failed_allocation_is_byte_stable() -> None:
+     """Break caught: eviction could occur before allocation validation completes."""
+ 
+     class Client(InProcessPolicyClient):
+         def recommend_allocation(self, _snapshot):
+@@ -1338,20 +1415,21 @@ def test_projected_entry_transition_failed_allocation_is_byte_stable() -> None:
+ 
+     simulator = PortfolioSimulator(max_positions=1, enable_eviction=True)
+     simulator._policy_client = Client()
+     old = Trade("OLD", "2026-01-01", 100.0, 10.0, 92.0, rs_score=60.0)
+     simulator._open_positions = {"OLD": old}
+     simulator._equity = 1_000.0
+     frame = _make_ohlcv(n=60, close_value=95.0)
+     pending = PendingEntry(
+         signal={"symbol": "NEW", "rs_score": 90.0, "canslim_score": 80.0},
+         capacity=CapacityDecision(1, True),
++        market=_market_context(),
+     )
+     before = (
+         simulator._equity,
+         dict(simulator._open_positions),
+         list(simulator._trades),
+         list(simulator._transactions),
+     )
+ 
+     with pytest.raises(ValueError, match="risk_fraction"):
+         simulator._enter_position(
+@@ -1369,20 +1447,21 @@ def test_projected_entry_transition_failed_allocation_is_byte_stable() -> None:
+ 
+ 
+ def test_policy_allocation_uncapped_batch_preserves_cash_for_remaining_entries() -> None:
+     """Break caught: early uncapped entries could starve a same-session batch."""
+     simulator = PortfolioSimulator(initial_capital=1_000.0, max_positions=None)
+     simulator._pending_entries_remaining = 10
+     frame = _make_ohlcv(n=2, close_value=100.0)
+     pending = PendingEntry(
+         signal={"symbol": "NEW", "rs_score": 90.0, "canslim_score": 80.0},
+         capacity=CapacityDecision(None, True),
++        market=_market_context(),
+     )
+ 
+     simulator._enter_position(pending, {"NEW": frame}, frame.index[-1])
+ 
+     buy = simulator._transactions[-1]
+     assert buy["Action"] == "BUY"
+     assert buy["Value"] == 100.0
+ 
+ 
+ def test_policy_exit_hard_stop_precedes_any_policy_call() -> None:
+@@ -1393,21 +1472,21 @@ def test_policy_exit_hard_stop_precedes_any_policy_call() -> None:
+         def evaluate_exit(self, snapshot: ExitSnapshot) -> ExitDecision:
+             calls.append(snapshot)
+             return super().evaluate_exit(snapshot)
+ 
+     simulator = PortfolioSimulator()
+     simulator._policy_client = Client()
+     trade = Trade("AAA", "2026-01-01", 100.0, 10.0, 92.0)
+     simulator._open_positions = {"AAA": trade}
+     frame = _make_ohlcv(n=3, close_value=90.0, high_value=91.0, low_value=89.0)
+ 
+-    simulator._check_exits("AAA", frame, frame.index[-1])
++    simulator._check_exits("AAA", frame, frame.index[-1], market=_market_context())
+ 
+     assert calls == []
+     assert simulator._trades[-1].exit_reason == "stop_loss"
+     assert simulator._trades[-1].exit_price == 92.0
+ 
+ 
+ def test_policy_exit_close_uses_trusted_current_close() -> None:
+     """Break caught: an exit decision could fail to route or acquire fill authority."""
+ 
+     class Client(InProcessPolicyClient):
+@@ -1421,21 +1500,21 @@ def test_policy_exit_close_uses_trusted_current_close() -> None:
+                 ema_trailing_active=snapshot.ema_trailing_active,
+             )
+ 
+     simulator = PortfolioSimulator(stagnation_days=999)
+     simulator._policy_client = Client()
+     simulator._open_positions = {
+         "AAA": Trade("AAA", "2026-01-01", 100.0, 10.0, 92.0)
+     }
+     frame = _make_ohlcv(n=3, close_value=103.0, high_value=104.0, low_value=99.0)
+ 
+-    simulator._check_exits("AAA", frame, frame.index[-1])
++    simulator._check_exits("AAA", frame, frame.index[-1], market=_market_context())
+ 
+     assert simulator._trades[-1].exit_reason == "policy_exit"
+     assert simulator._trades[-1].exit_price == 103.0
+ 
+ 
+ def test_policy_exit_rejects_uncrossed_scale_out_before_mutation() -> None:
+     """Break caught: an invalid action plan could partially sell before rejection."""
+ 
+     class Client(InProcessPolicyClient):
+         def evaluate_exit(self, snapshot: ExitSnapshot) -> ExitDecision:
+@@ -1456,13 +1535,13 @@ def test_policy_exit_rejects_uncrossed_scale_out_before_mutation() -> None:
+             )
+ 
+     simulator = PortfolioSimulator(stagnation_days=999)
+     simulator._policy_client = Client()
+     trade = Trade("AAA", "2026-01-01", 100.0, 10.0, 92.0)
+     simulator._open_positions = {"AAA": trade}
+     frame = _make_ohlcv(n=3, close_value=105.0, high_value=109.0, low_value=99.0)
+     before = (trade.remaining_qty, simulator._equity, list(simulator._transactions))
+ 
+     with pytest.raises(ValueError, match="crossed"):
+-        simulator._check_exits("AAA", frame, frame.index[-1])
++        simulator._check_exits("AAA", frame, frame.index[-1], market=_market_context())
+ 
+     assert (trade.remaining_qty, simulator._equity, simulator._transactions) == before
+diff --git a/tests/test_backtest_open_causality.py b/tests/test_backtest_open_causality.py
+index dafc710..9fed17d 100644
+--- a/tests/test_backtest_open_causality.py
++++ b/tests/test_backtest_open_causality.py
+@@ -1,19 +1,23 @@
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass
+ 
+ import pandas as pd
+ import pytest
+ 
+-from core.backtest_engine import PortfolioSimulator, Trade, _calculate_rs_snapshot
++from core.backtest_engine import PendingEntry, PortfolioSimulator, Trade, _calculate_rs_snapshot
+ from core.momentum_analysis import calculate_rs_snapshot
++from core.strategy_policy import BenchmarkContextV1, CapacityDecision, MarketContextV1
++
++
++_CONTEXT_SYMBOLS = tuple(f"CTX{number:02d}" for number in range(10))
+ 
+ 
+ def _ohlcv(
+     dates: pd.DatetimeIndex,
+     *,
+     opens: list[float],
+     closes: list[float],
+     lows: list[float] | None = None,
+ ) -> pd.DataFrame:
+     effective_lows = (
+@@ -31,21 +35,21 @@ def _ohlcv(
+     )
+ 
+ 
+ def _with_warmup_and_canonical_entry(
+     history: pd.DataFrame,
+     signal_date: pd.Timestamp | None,
+ ) -> pd.DataFrame:
+     first_session = pd.Timestamp(history.index[0])
+     warmup_dates = pd.bdate_range(
+         end=first_session - pd.offsets.BDay(1),
+-        periods=51,
++        periods=260,
+     )
+     base_close = float(history["Close"].iloc[0])
+     warmup = _ohlcv(
+         warmup_dates,
+         opens=[base_close] * len(warmup_dates),
+         closes=[base_close] * len(warmup_dates),
+     )
+     combined = pd.concat([warmup, history])
+     if signal_date is not None:
+         event_close = base_close * 1.02
+@@ -62,20 +66,64 @@ def _signal(symbol: str, signal_date: pd.Timestamp, *, rs_score: float = 90.0) -
+     return {
+         "symbol": symbol,
+         "signal_date": str(signal_date.date()),
+         "rs_score": rs_score,
+         "canslim_score": 80.0,
+         "signal_reason": "causality regression",
+         "buy_signal": True,
+     }
+ 
+ 
++def _market_context(session: pd.Timestamp) -> MarketContextV1:
++    return MarketContextV1(
++        schema_version=1,
++        session=session.date().isoformat(),
++        oneil_regime="confirmed_uptrend",
++        distribution_days=0,
++        follow_through=False,
++        benchmarks=tuple(
++            BenchmarkContextV1(symbol, 0.0, 0.0, 0.0)
++            for symbol in ("SPY", "QQQ", "IWM")
++        ),
++        active_constituent_count=10,
++        breadth_above_50_fraction=0.0,
++        breadth_50_coverage_fraction=1.0,
++        breadth_above_200_fraction=0.0,
++        breadth_200_coverage_fraction=1.0,
++        median_rs_score=55.0,
++        rs_at_least_80_fraction=0.0,
++        rs_coverage_fraction=1.0,
++    )
++
++
++def _pending(signal: dict[str, object], capacity: CapacityDecision) -> PendingEntry:
++    signal_session = pd.Timestamp(signal["signal_date"])
++    return PendingEntry(signal, capacity, _market_context(signal_session))
++
++
++def _context_closes(dates: pd.DatetimeIndex) -> dict[str, pd.Series]:
++    return {
++        symbol: pd.Series(
++            [100.0 * (1.0 + (offset + 1) * 0.0001) ** day for day in range(len(dates))],
++            index=dates,
++        )
++        for offset, symbol in enumerate((*_CONTEXT_SYMBOLS, "SPY", "QQQ", "IWM"))
++    }
++
++
++def _reference_prices(dates: pd.DatetimeIndex) -> dict[str, pd.DataFrame]:
++    return {
++        symbol: _ohlcv(dates, opens=[100.0] * len(dates), closes=[100.0] * len(dates))
++        for symbol in ("SPY", "QQQ", "IWM")
++    }
++
++
+ @dataclass
+ class _StaticFetcher:
+     prices: dict[str, pd.DataFrame]
+     closes: pd.DataFrame
+ 
+     def fetch_price_data(
+         self,
+         _tickers: list[str],
+         _start_date: pd.Timestamp,
+         _end_date: pd.Timestamp,
+@@ -156,63 +204,58 @@ def test_public_rs_snapshot_matches_backtest_compatibility_delegate() -> None:
+     assert calculate_rs_snapshot(closes, day) == _calculate_rs_snapshot(closes, day)
+ 
+ 
+ def test_fold_history_is_visible_without_emitting_prefold_state_and_runs_reset(
+     monkeypatch: pytest.MonkeyPatch,
+ ) -> None:
+     """Break caught: warmup either leaks outputs or disappears on an isolated fold."""
+     evaluation_dates = pd.bdate_range("2026-05-04", periods=30)
+     warmup_dates = pd.bdate_range(
+         end=evaluation_dates[0] - pd.offsets.BDay(1),
+-        periods=60,
++        periods=260,
+     )
+     all_dates = warmup_dates.append(evaluation_dates)
+     lead = _ohlcv(
+         all_dates,
+         opens=[100.0] * len(all_dates),
+         closes=[100.0] * len(all_dates),
+     )
+     lead.loc[evaluation_dates[0], "Close"] = 102.0
+     lead.loc[evaluation_dates[0], "High"] = 102.0
+     lead.loc[evaluation_dates[0], "Volume"] = 1_300_000.0
+     lead.loc[evaluation_dates[-1], "Close"] = 102.0
+     lead.loc[evaluation_dates[-1], "High"] = 102.0
+     lead.loc[evaluation_dates[-1], "Volume"] = 1_300_000.0
+-    spy = _ohlcv(
+-        all_dates,
+-        opens=[100.0] * len(all_dates),
+-        closes=[100.0] * len(all_dates),
+-    )
+     fetcher = _RecordingFetcher(
+-        prices={"LEAD": lead, "SPY": spy},
+-        closes=pd.DataFrame({"LEAD": lead["Close"]}),
++        prices={"LEAD": lead, **_reference_prices(all_dates)},
++        closes=pd.DataFrame({"LEAD": lead["Close"], **_context_closes(all_dates)}),
+         price_windows=[],
+         close_windows=[],
+     )
+     strategy = _DatedSignals(
+         {
+             ("LEAD", evaluation_dates[0]): _signal("LEAD", evaluation_dates[0]),
+             ("LEAD", evaluation_dates[-1]): _signal("LEAD", evaluation_dates[-1]),
+         }
+     )
+     simulator = PortfolioSimulator(
+         initial_capital=1_000.0,
+         position_risk_pct=0.008,
+         stop_loss_pct=0.08,
+         ma_consecutive=999,
+         signal_every_n_days=1,
+         technical_only=True,
+         stagnation_days=999,
+         data_fetcher=fetcher,
+         strategy=strategy,
+     )
+-    monkeypatch.setattr("core.backtest_engine.get_sp500_tickers", lambda: [])
++    monkeypatch.setattr("core.backtest_engine.get_sp500_tickers", lambda: list(_CONTEXT_SYMBOLS))
+ 
+     results = [
+         simulator.run(
+             ["LEAD"],
+             start_date=str(evaluation_dates[0].date()),
+             end_date=str(evaluation_dates[-1].date()),
+             history_start_date=str(warmup_dates[0].date()),
+         )
+         for _ in range(2)
+     ]
+@@ -254,43 +297,42 @@ def test_pending_open_buy_cannot_spend_same_day_exit_proceeds(monkeypatch: pytes
+             opens=[100.0] * len(dates),
+             closes=[100.0] * len(dates),
+             lows=old_lows,
+         ),
+         dates[0],
+     )
+     new = _with_warmup_and_canonical_entry(
+         _ohlcv(dates, opens=[50.0] * len(dates), closes=[50.0] * len(dates)),
+         dates[1],
+     )
+-    spy = _with_warmup_and_canonical_entry(
+-        _ohlcv(dates, opens=[100.0] * len(dates), closes=[100.0] * len(dates)),
+-        None,
++    full_dates = pd.DatetimeIndex(old.index)
++    prices = {"OLD": old, "NEW": new, **_reference_prices(full_dates)}
++    closes = pd.DataFrame(
++        {"OLD": old["Close"], "NEW": new["Close"], **_context_closes(full_dates)}
+     )
+-    prices = {"OLD": old, "NEW": new, "SPY": spy}
+-    closes = pd.DataFrame({"OLD": old["Close"], "NEW": new["Close"]})
+     strategy = _DatedSignals(
+         {
+             ("OLD", dates[0]): _signal("OLD", dates[0]),
+             ("NEW", dates[1]): _signal("NEW", dates[1]),
+         }
+     )
+     simulator = PortfolioSimulator(
+         initial_capital=1_000.0,
+         position_risk_pct=0.01,
+         stop_loss_pct=0.0101,
+         signal_every_n_days=1,
+         technical_only=True,
+         stagnation_days=999,
+         data_fetcher=_StaticFetcher(prices, closes),
+         strategy=strategy,
+     )
+-    monkeypatch.setattr("core.backtest_engine.get_sp500_tickers", lambda: [])
++    monkeypatch.setattr("core.backtest_engine.get_sp500_tickers", lambda: list(_CONTEXT_SYMBOLS))
+ 
+     result = simulator.run(
+         ["OLD", "NEW"],
+         start_date=str(dates[0].date()),
+         end_date=str(dates[-1].date()),
+     )
+ 
+     new_buys = result.transaction_log.loc[
+         (result.transaction_log["Ticker"] == "NEW") & (result.transaction_log["Action"] == "BUY")
+     ]
+@@ -308,37 +350,37 @@ def test_new_open_position_still_observes_same_day_stop(monkeypatch: pytest.Monk
+     lows[1] = 40.0
+     new = _with_warmup_and_canonical_entry(
+         _ohlcv(
+             dates,
+             opens=[50.0] * len(dates),
+             closes=[50.0] * len(dates),
+             lows=lows,
+         ),
+         dates[0],
+     )
+-    spy = _with_warmup_and_canonical_entry(
+-        _ohlcv(dates, opens=[100.0] * len(dates), closes=[100.0] * len(dates)),
+-        None,
+-    )
+-    prices = {"NEW": new, "SPY": spy}
++    full_dates = pd.DatetimeIndex(new.index)
++    prices = {"NEW": new, **_reference_prices(full_dates)}
+     strategy = _DatedSignals({("NEW", dates[0]): _signal("NEW", dates[0])})
+     simulator = PortfolioSimulator(
+         initial_capital=1_000.0,
+         position_risk_pct=0.01,
+         stop_loss_pct=0.08,
+         signal_every_n_days=1,
+         technical_only=True,
+         stagnation_days=999,
+-        data_fetcher=_StaticFetcher(prices, pd.DataFrame({"NEW": new["Close"]}, index=dates)),
++        data_fetcher=_StaticFetcher(
++            prices,
++            pd.DataFrame({"NEW": new["Close"], **_context_closes(full_dates)}),
++        ),
+         strategy=strategy,
+     )
+-    monkeypatch.setattr("core.backtest_engine.get_sp500_tickers", lambda: [])
++    monkeypatch.setattr("core.backtest_engine.get_sp500_tickers", lambda: list(_CONTEXT_SYMBOLS))
+ 
+     result = simulator.run(
+         ["NEW"],
+         start_date=str(dates[0].date()),
+         end_date=str(dates[-1].date()),
+     )
+ 
+     transactions = result.transaction_log.loc[result.transaction_log["Ticker"] == "NEW"]
+     assert transactions["Action"].tolist() == ["BUY", "SELL"]
+     assert transactions["Date"].tolist() == [str(dates[1].date()), str(dates[1].date())]
+@@ -370,21 +412,28 @@ def test_entry_sizing_marks_holdings_at_open_then_strictly_prior_close() -> None
+     prices = {
+         "OPEN_MARK": _ohlcv(dates, opens=[90.0, 95.0, 100.0], closes=[90.0, 95.0, 500.0]),
+         "PRIOR_MARK": _ohlcv(
+             dates,
+             opens=[80.0, 85.0, float("nan")],
+             closes=[80.0, float("nan"), 800.0],
+         ),
+         "NEW": _ohlcv(dates, opens=[10.0, 10.0, 10.0], closes=[10.0, 10.0, 10.0]),
+     }
+ 
+-    simulator._enter_position(_signal("NEW", dates[1]), prices, dates[2])
++    simulator._enter_position(
++        _pending(
++            _signal("NEW", dates[1]),
++            CapacityDecision(simulator.max_positions, simulator.enable_eviction),
++        ),
++        prices,
++        dates[2],
++    )
+ 
+     buy = next(row for row in simulator._transactions if row["Action"] == "BUY")
+     assert buy["Ticker"] == "NEW"
+     assert buy["Value"] == pytest.approx(280.0)
+     assert buy["Quantity"] == pytest.approx(28.0)
+ 
+ 
+ def test_capped_eviction_selects_and_sells_using_causal_open_price() -> None:
+     """Break caught: capped replacement used same-day closes to choose and price eviction."""
+     dates = pd.DatetimeIndex([pd.Timestamp("2026-04-16"), pd.Timestamp("2026-04-17")])
+@@ -408,21 +457,28 @@ def test_capped_eviction_selects_and_sells_using_causal_open_price() -> None:
+     prices = {
+         "OPEN_WINNER": _ohlcv(dates, opens=[100.0, 120.0], closes=[100.0, 80.0]),
+         "OPEN_LOSER": _ohlcv(
+             dates,
+             opens=[100.0, float("nan")],
+             closes=[90.0, 150.0],
+         ),
+         "NEW": _ohlcv(dates, opens=[50.0, 50.0], closes=[50.0, 50.0]),
+     }
+ 
+-    simulator._enter_position(_signal("NEW", dates[0], rs_score=80.0), prices, dates[1])
++    simulator._enter_position(
++        _pending(
++            _signal("NEW", dates[0], rs_score=80.0),
++            CapacityDecision(simulator.max_positions, simulator.enable_eviction),
++        ),
++        prices,
++        dates[1],
++    )
+ 
+     evicted = next(trade for trade in simulator._trades if trade.exit_reason == "evicted")
+     sell = next(row for row in simulator._transactions if row["Action"] == "SELL")
+     assert evicted.symbol == "OPEN_LOSER"
+     assert evicted.exit_price == pytest.approx(90.0)
+     assert sell["Ticker"] == "OPEN_LOSER"
+     assert sell["Price"] == pytest.approx(90.0)
+     assert set(simulator._open_positions) == {"OPEN_WINNER", "NEW"}
+ 
+ 
+@@ -432,14 +488,21 @@ def test_pivotless_pending_entry_requires_exact_next_session_open(bar_state: str
+     dates = pd.DatetimeIndex([pd.Timestamp("2026-08-21"), pd.Timestamp("2026-08-24")])
+     history = _ohlcv(dates, opens=[100.0, 101.0], closes=[100.0, 102.0])
+     if bar_state == "missing":
+         history = history.iloc[:1]
+     elif bar_state == "missing_open":
+         history = history.drop(columns="Open")
+     else:
+         history.loc[dates[1], "Open"] = float("nan")
+     simulator = PortfolioSimulator(initial_capital=1_000.0, technical_only=True)
+ 
+-    simulator._enter_position(_signal("LEAD", dates[0]), {"LEAD": history}, dates[1])
++    simulator._enter_position(
++        _pending(
++            _signal("LEAD", dates[0]),
++            CapacityDecision(simulator.max_positions, simulator.enable_eviction),
++        ),
++        {"LEAD": history},
++        dates[1],
++    )
+ 
+     assert simulator._transactions == []
+     assert simulator._entry_outcomes[-1].outcome == "entry_rejected_missing_data"
+diff --git a/tests/test_strategy_policy.py b/tests/test_strategy_policy.py
+index 419cf4f..2956b98 100644
+--- a/tests/test_strategy_policy.py
++++ b/tests/test_strategy_policy.py
+@@ -11,42 +11,68 @@ from types import SimpleNamespace
+ 
+ import pandas as pd
+ import pytest
+ 
+ from core.backtest_engine import PortfolioSimulator
+ from core.canslim.entry_contract import CanslimEntryFacts
+ from core.strategy_policy import (
+     POLICY_INTERFACE_VERSION,
+     AllocationDecision,
+     AllocationSnapshot,
++    BenchmarkContextV1,
+     CapacityDecision,
+     CapacitySnapshot,
+     EntryDecision,
+     EntrySnapshot,
+     EvictionDecision,
+     EvictionPosition,
+     EvictionSnapshot,
+     ExitAction,
+     ExitDecision,
+     ExitSnapshot,
++    MarketContextV1,
+     validate_exit_decision,
+ )
+ from core.strategy_policy.entry import evaluate_entry
+ from core.strategy_policy.exit import evaluate_exit
+ from core.strategy_policy.risk import (
+     recommend_allocation,
+     recommend_capacity,
+     select_eviction,
+ )
+ from core.strategy_policy.runtime import InProcessPolicyClient
+ 
+ 
++def _market_context(**changes: object) -> MarketContextV1:
++    values: dict[str, object] = {
++        "schema_version": 1,
++        "session": "2026-08-27",
++        "oneil_regime": "confirmed_uptrend",
++        "distribution_days": 2,
++        "follow_through": False,
++        "benchmarks": tuple(
++            BenchmarkContextV1(symbol, 0.05, 0.10, 0.20)
++            for symbol in ("SPY", "QQQ", "IWM")
++        ),
++        "active_constituent_count": 100,
++        "breadth_above_50_fraction": 0.60,
++        "breadth_50_coverage_fraction": 0.90,
++        "breadth_above_200_fraction": 0.55,
++        "breadth_200_coverage_fraction": 0.80,
++        "median_rs_score": 72.0,
++        "rs_at_least_80_fraction": 0.40,
++        "rs_coverage_fraction": 0.95,
++    }
++    values.update(changes)
++    return MarketContextV1(**values)  # type: ignore[arg-type]
++
++
+ def _entry_snapshot(**changes: object) -> EntrySnapshot:
+     values: dict[str, object] = {
+         "technical_only": False,
+         "require_proper_base": False,
+         "c_score": 0.8,
+         "a_score": 0.8,
+         "n_score": 0.8,
+         "s_score": 0.8,
+         "l_score": 0.9,
+         "i_score": 0.5,
+@@ -69,43 +95,43 @@ def _entry_snapshot(**changes: object) -> EntrySnapshot:
+         "has_volume_surge": True,
+         "in_buy_zone": True,
+         "technical_eligible": True,
+         "technical_blocking_reasons": (),
+         "has_power_gap_today": False,
+         "require_bullish_market": True,
+         "market_is_bullish": True,
+         "cash_deployment_override": False,
+         "use_stateful_regime_gate": False,
+         "regime_allows_entries": True,
+-        "market_regime": "confirmed_uptrend",
+-        "distribution_days": 2,
+-        "follow_through": False,
++        "market": _market_context(),
+     }
+     values.update(changes)
+     return EntrySnapshot(**values)  # type: ignore[arg-type]
+ 
+ 
+ def _capacity_snapshot(**changes: object) -> CapacitySnapshot:
+     values: dict[str, object] = {
++        "market": _market_context(),
+         "configured_max_positions": 4,
+         "maximum_policy_positions": 25,
+         "open_position_count": 2,
+         "eligible_signal_count": 3,
+         "cash_fraction": 0.5,
+         "configured_eviction_enabled": True,
+     }
+     values.update(changes)
+     return CapacitySnapshot(**values)  # type: ignore[arg-type]
+ 
+ 
+ def _allocation_snapshot(**changes: object) -> AllocationSnapshot:
+     values: dict[str, object] = {
++        "market": _market_context(),
+         "portfolio_equity_at_entry_open": 10_000.0,
+         "cash_before_transition": 5_000.0,
+         "projected_cash_after_eviction": 5_000.0,
+         "gross_exposure_before": 5_000.0,
+         "projected_gross_exposure_after_eviction": 5_000.0,
+         "entry_open": 100.0,
+         "pending_entries_remaining": 2,
+         "capacity_is_uncapped": True,
+         "configured_position_risk_pct": 0.01,
+         "configured_stop_loss_pct": 0.08,
+@@ -113,35 +139,37 @@ def _allocation_snapshot(**changes: object) -> AllocationSnapshot:
+         "maximum_stop_fraction": 0.08,
+         "canslim_score": 80.0,
+         "rs_score": 85.0,
+     }
+     values.update(changes)
+     return AllocationSnapshot(**values)  # type: ignore[arg-type]
+ 
+ 
+ def _eviction_snapshot(**changes: object) -> EvictionSnapshot:
+     values: dict[str, object] = {
++        "market": _market_context(),
+         "capacity_is_finite": True,
+         "capacity_is_full": True,
+         "eviction_enabled": True,
+         "candidate_rs_score": 90.0,
+         "positions": (
+             EvictionPosition(0, 100.0, 95.0, 70.0),
+             EvictionPosition(1, 100.0, 105.0, 60.0),
+         ),
+     }
+     values.update(changes)
+     return EvictionSnapshot(**values)  # type: ignore[arg-type]
+ 
+ 
+ def _exit_snapshot(**changes: object) -> ExitSnapshot:
+     values: dict[str, object] = {
++        "market": _market_context(),
+         "entry_price": 100.0,
+         "original_qty": 10.0,
+         "remaining_qty": 10.0,
+         "stop_price": 92.0,
+         "realized_pnl": 0.0,
+         "canslim_score": 80.0,
+         "rs_score": 85.0,
+         "days_held": 5,
+         "peak_close": 110.0,
+         "breakeven_armed": False,
+@@ -246,20 +274,21 @@ def test_entry_policy_recanonicalizes_full_and_technical_rows(
+         index=pd.bdate_range("2026-01-01", periods=60),
+     )
+ 
+     canonical = simulator._canonicalize_signal_row(
+         row=row,
+         ticker="AAA",
+         ticker_history=history,
+         eval_date=history.index[-1],
+         market_allowed=True,
+         market_state={"market_is_bullish": True},
++        market=_market_context(),
+         entry_facts=facts,
+     )
+ 
+     assert (
+         canonical["buy_signal"],
+         canonical["canslim_score"],
+         canonical["rs_score"],
+         canonical["entry_blocking_reasons"],
+     ) == expected
+     assert len(client.snapshots) == 1
+@@ -295,20 +324,21 @@ def test_entry_policy_rejects_identity_fill_nonfinite_and_unknown_fields(
+                 "annual_growth": 0.30,
+                 "rs_score": 85.0,
+                 "entry_composite_score": 75.0,
+                 "canslim_score": 80.0,
+             },
+             ticker="AAA",
+             ticker_history=history,
+             eval_date=history.index[-1],
+             market_allowed=True,
+             market_state={"market_is_bullish": True},
++            market=_market_context(),
+             entry_facts=facts,
+         )
+ 
+ 
+ @pytest.mark.parametrize(
+     ("rank_mode", "ticker_order", "expected_order"),
+     [
+         ("reverse", ("LOW", "BEST"), ("LOW", "BEST")),
+         ("nullable_tie", ("BEST", "LOW"), ("BEST", "LOW")),
+     ],
+@@ -364,20 +394,21 @@ def test_policy_rank_uses_valid_nullable_decisions_and_stable_order(
+     simulator.strategy = SimpleNamespace(
+         evaluate_symbol=lambda **kwargs: rows[kwargs["ticker"]]
+     )
+ 
+     pending = simulator._evaluate_signals(
+         tickers=list(ticker_order),
+         ticker_ohlcv={ticker: history for ticker in ticker_order},
+         all_closes=pd.DataFrame(index=history.index),
+         eval_date=history.index[-1],
+         market_state={"market_is_bullish": True},
++        market=_market_context(),
+     )
+ 
+     assert tuple(item.signal["symbol"] for item in pending) == expected_order
+ 
+ 
+ def test_entry_decision_is_closed_and_bool_strict() -> None:
+     """Break caught: permissive schemas could admit hidden identity or bool coercion."""
+     with pytest.raises(TypeError):
+         EntryDecision(
+             qualified=True,
+@@ -391,39 +422,41 @@ def test_entry_decision_is_closed_and_bool_strict() -> None:
+             qualified=1,  # type: ignore[arg-type]
+             market_permitted=True,
+             rank=(1.0, 2.0),
+             blocking_codes=(),
+         )
+ 
+ 
+ def test_contract_instances_have_no_mutable_instance_dictionary() -> None:
+     """Break caught: inherited instance storage could admit hidden policy fields."""
+     contracts = (
++        _market_context(),
+         _entry_snapshot(),
+         EntryDecision(True, True, (80.0, 85.0), ()),
+         _capacity_snapshot(),
+         CapacityDecision(4, True),
+         _allocation_snapshot(),
+         AllocationDecision(0.01, 0.08, None),
+         EvictionPosition(0, 100.0, 95.0, 70.0),
+         _eviction_snapshot(),
+         EvictionDecision(0),
+         _exit_snapshot(),
+         ExitAction("scale_out", 0.10, 0.25, "take_profit_scale_out"),
+         ExitDecision((), 100.0, False, 0, True, True),
+     )
+     assert all(not hasattr(contract, "__dict__") for contract in contracts)
+ 
+ 
+ def test_every_contract_round_trips_canonical_json_and_is_frozen() -> None:
+     """Break caught: policy transport could change a validated primitive contract."""
+     contracts = (
++        _market_context(),
+         _entry_snapshot(),
+         EntryDecision(True, True, (80.0, 85.0), ()),
+         _capacity_snapshot(),
+         CapacityDecision(4, True),
+         _allocation_snapshot(),
+         AllocationDecision(0.01, 0.08, None),
+         EvictionPosition(0, 100.0, 95.0, 70.0),
+         _eviction_snapshot(),
+         EvictionDecision(0),
+         _exit_snapshot(),
+@@ -450,21 +483,22 @@ def test_every_contract_round_trips_canonical_json_and_is_frozen() -> None:
+ )
+ def test_contract_collections_must_be_tuples(factory, field: str, value: object) -> None:
+     """Break caught: caller mutation could alter a policy fact after validation."""
+     with pytest.raises(ValueError, match=field):
+         factory(**{field: value})
+ 
+ 
+ @pytest.mark.parametrize(
+     ("factory", "field", "value"),
+     [
+-        (_entry_snapshot, "market_regime", "moonshot"),
++        (_market_context, "oneil_regime", "moonshot"),
++        (_market_context, "benchmarks", tuple(reversed(_market_context().benchmarks))),
+         (_entry_snapshot, "canslim_score", math.nan),
+         (_entry_snapshot, "rs_score", math.inf),
+         (_capacity_snapshot, "cash_fraction", True),
+         (_allocation_snapshot, "entry_open", True),
+         (_exit_snapshot, "current_close", math.inf),
+     ],
+ )
+ def test_contracts_reject_invalid_enums_nonfinite_and_bool_numbers(factory, field: str, value: object) -> None:
+     """Break caught: malformed scalar facts could cross the trusted-policy boundary."""
+     with pytest.raises(ValueError, match=field):
+@@ -473,20 +507,26 @@ def test_contracts_reject_invalid_enums_nonfinite_and_bool_numbers(factory, fiel
+ 
+ def test_closed_deserializer_rejects_unknown_keys_and_transport_types() -> None:
+     """Break caught: JSON transport could smuggle non-contract data into policy code."""
+     raw = json.loads(_entry_snapshot().to_canonical_json())
+     raw["symbol"] = "AAPL"
+     with pytest.raises(ValueError, match="unknown"):
+         EntrySnapshot.from_canonical_json(json.dumps(raw))
+     for hidden in (date(2026, 8, 27), Path("secret"), lambda: None, {"bad": "mutable"}):
+         with pytest.raises(ValueError):
+             _entry_snapshot(c_score=hidden)
++    zero = _market_context(
++        breadth_above_50_fraction=0.0,
++        breadth_above_200_fraction=0.0,
++        rs_at_least_80_fraction=0.0,
++    )
++    assert zero.breadth_above_50_fraction == 0.0
+ 
+ 
+ def test_contracts_reject_oversized_tuples_and_candidate_fill_prices() -> None:
+     """Break caught: unbounded or executable-price payloads could escape sandbox limits."""
+     with pytest.raises(ValueError, match="technical_blocking_reasons"):
+         _entry_snapshot(technical_blocking_reasons=tuple("x" for _ in range(33)))
+     with pytest.raises(TypeError):
+         ExitAction(
+             "close",
+             None,
+@@ -605,11 +645,11 @@ def test_exit_decision_validates_action_plan_against_trusted_snapshot() -> None:
+         )
+     with pytest.raises(ValueError, match="crossed"):
+         validate_exit_decision(snapshot, invalid_crossing)
+     invalid_stop = ExitDecision((), 99.0, False, 0, False, False)
+     with pytest.raises(ValueError, match="next_stop_price"):
+         validate_exit_decision(snapshot, invalid_stop)
+ 
+ 
+ def test_interface_version_is_stable() -> None:
+     """Break caught: incompatible policy clients could be accepted without a version boundary."""
+-    assert POLICY_INTERFACE_VERSION == 1
++    assert POLICY_INTERFACE_VERSION == 2

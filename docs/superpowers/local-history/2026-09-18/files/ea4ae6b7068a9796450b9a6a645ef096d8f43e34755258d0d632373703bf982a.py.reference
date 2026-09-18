@@ -1,0 +1,159 @@
+"""Bounded direct synthetic authorities; no test framework, external adapter, or market rows."""
+from pathlib import Path
+from contextlib import nullcontext
+from dataclasses import fields, replace
+from datetime import date
+from decimal import Decimal
+import sys
+sys.path.insert(0, str(Path.cwd()))
+from core.backtest_fills import ExecutionProfileV5
+from core.pit_optimizer_v5.contracts import *
+from core.pit_optimizer_v5.candidate_ir import SourceBundleV5, SourceFileV5, derive_policy_revision_identity_v5
+from core.pit_optimizer_v5.policy_scope import EDITABLE_POLICY_PATHS_V5
+from core.pit_optimizer_v5.probes import fingerprint_policy_client_v5
+from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5
+from core.pit_optimizer_v5.search import BaselineParentAuthorityV5, campaign_cagr_pct
+from core.pit_optimizer_v5.manifest import AuthenticatedCampaignManifestV5, PolicyScopeDescriptorV5
+from core.pit_optimizer_v5.fixture_runtime import *
+from core.pit_optimizer_v5.fixture_runtime import FIXTURE_NEXT_DIRECTION_V5, FIXTURE_CRITIC_EXPLANATION_V5
+from core.pit_optimizer_v5.runtime import run_feedback_round_v5
+from core.pit_optimizer_v5.memory import RoleCompletionPayloadV5
+from core.pit_optimizer_v5.summary import summarize_repository_v5
+from core.strategy_policy.v3.entry import evaluate_entry
+from core.strategy_policy.v3.risk import recommend_capacity, recommend_allocation, select_eviction
+from core.strategy_policy.v3.position import evaluate_add_on
+from core.strategy_policy.v3.exit import evaluate_exit
+from core.pit_optimizer_evaluation import EvaluationPanelSpec, PanelSecurityLineage
+
+class DirectClient:
+    interface_version = 3
+    evaluate_entry = staticmethod(evaluate_entry)
+    recommend_capacity = staticmethod(recommend_capacity)
+    recommend_allocation = staticmethod(recommend_allocation)
+    select_eviction = staticmethod(select_eviction)
+    evaluate_add_on = staticmethod(evaluate_add_on)
+    evaluate_exit = staticmethod(evaluate_exit)
+    def close(self): pass
+
+original = {path: Path(path).read_bytes() for path in EDITABLE_POLICY_PATHS_V5}
+sources = SourceBundleV5(tuple(SourceFileV5(path, raw.decode() + ('\nFIXTURE_ENTRY_THRESHOLD = 0\n' if path.endswith('/entry.py') else '')) for path, raw in original.items()))
+revision = derive_policy_revision_identity_v5(source_bundle=sources, trusted_policy_runtime_sha256='1'*64, immutable_constraints_sha256='2'*64)
+fingerprint = fingerprint_policy_client_v5(DirectClient())
+profile = ExecutionProfileV5(5, 'next_open', 'open_then_stop', 'last_session_close', 'half_spread_plus_market_impact_plus_commission_bps')
+resources = ResourceCapabilitiesV5()
+sandbox = sandbox_profile_from_manifest_v5(image_name='synthetic', image_digest='sha256:'+'3'*64, runtime_source_sha256='4'*64, resources=resources)
+target = AnnualizedReturnTargetV5.from_text('10.00')
+def ref(name): return ArtifactRefV5(name+'.json', canonical_sha256_v5(name))
+panels = {}
+def episode(name, ordinal, year):
+    panel = EvaluationPanelSpec.from_lineages(purpose='quick' if ordinal is None else 'discovery', sessions=(f'{year}-01-01',f'{year}-12-31'), lineages=(PanelSecurityLineage('synthetic-lineage',('SYNTH',),('sp500',)),))
+    panels[name] = panel
+    return EpisodePlanV5(name, ordinal, panel.purpose, panel.start_date, panel.end_date, ('synthetic-lineage',), ArtifactRefV5(name+'.json',panel.sha256))
+plan = CampaignPanelPlanV5(5, ref('bundle'), ref('prices'), '5'*64, target.sha256, episode('mechanics', None, 2000), episode('quick', None, 2001), tuple(episode(f'discovery-{i}',i,2001+i) for i in (1,2,3,4)), '6'*64, '7'*64)
+contract = EvaluatorContractV5(5,profile.sha256,sandbox.sha256,'8'*64,plan.pit_bundle_ref.sha256,plan.prices_provenance_ref.sha256,'9'*64,sources.sha256,revision.sha256,initial_friction_grid_v5(),'base')
+values = {}
+for field in fields(EvaluationReportV5):
+    if 'tuple[' in field.type: values[field.name] = ()
+    elif 'None' in field.type: values[field.name] = None
+    elif field.type == 'int': values[field.name] = 1
+    else: values[field.name] = Decimal('1')
+report = EvaluationReportV5(**values)
+episodes = tuple(EpisodeEvaluationV5(e.episode_id,e.episode_ordinal,e.start_date,e.end_date,PanelEvaluationV5(contract.sha256,sandbox.sha256,e.panel_ref.sha256,revision.sha256,e.start_date,e.end_date,(date.fromisoformat(e.end_date)-date.fromisoformat(e.start_date)).days,'base',tuple(ScenarioPanelEvaluationV5(s,Decimal(100),Decimal(101),report) for s in ('gross','base','stress')))) for e in plan.discovery)
+score = campaign_cagr_pct(episodes=episodes, discovery_plan=plan, evaluator_contract=contract)
+campaign = CampaignEvidenceV5(plan.discovery_plan_sha256,episodes,score,4)
+
+with nullcontext(sys.argv[1]) as temp:
+    repository = LocalArtifactRepositoryV5(Path(temp))
+    for name,panel in panels.items(): repository.create_evaluation_panel_spec(name+'.json',panel)
+    def put(name,value): return repository.create_typed_artifact(name+'.json',value)
+    source_ref, revision_ref = put('baseline-source',sources),put('baseline-revision',revision)
+    baseline = BaselineParentAuthorityV5(revision,revision_ref,fingerprint,campaign,sources,source_ref)
+    scope = PolicyScopeDescriptorV5(5,'a'*40,revision.editable_source_sha256,revision_ref,False)
+    manifest = CampaignManifestV5(5,'synthetic-fixture',target,SearchCapabilitiesV5(max_feedback_rounds=2,max_variants_per_template=3,max_discovery_survivors_per_template=3,allow_full_source_escape=False),None,resources,ARTIFACT_ROOT_V5,put('profile',profile),put('contract',contract),put('baseline',baseline),put('plan',plan),put('scope',scope),revision_ref,put('sandbox',sandbox),'a'*40,False,False,False)
+    manifest_ref = put('manifest',manifest)
+    graph = ArtifactGraphVerificationV5(manifest_ref,(repository.authenticate(manifest_ref),),None)
+    authorities = AuthenticatedCampaignManifestV5(manifest_ref,graph,manifest,plan,profile,contract,baseline,revision,scope,sandbox)
+    if len(sys.argv)>2:
+        from core.pit_optimizer_v5 import cli
+        cli.authenticate_campaign_manifest_v5 = lambda **kwargs: authorities
+        output=[]
+        code=cli.dispatch_v5_cli(['run-fixture','--artifact-root',temp,'--manifest-path',manifest_ref.relative_path,'--manifest-sha256',manifest_ref.sha256],emit=output.append)
+        print('CLI direct authority boundary',code,output)
+        assert code==0 and len(output)==1
+        assert 'synthetic_fixture' in output[0] and FIXTURE_NEXT_DIRECTION_V5 not in output[0]
+        assert 'replacement_source' not in output[0] and 'source_unchanged":true' in output[0]
+        cli.ProductionV5CommandServices._authorities = staticmethod(lambda *args: cli.CampaignAuthoritiesV5(manifest,plan,contract,baseline,sandbox))
+        for command in ('summarize','verify-run'):
+            output=[]
+            code=cli.dispatch_v5_cli([command,'--artifact-root',temp,'--manifest-path',manifest_ref.relative_path,'--manifest-sha256',manifest_ref.sha256],emit=output.append)
+            assert code==0 and len(output)==1 and '"role_calls":0' in output[0] and '"source_unchanged":true' in output[0]
+            print(command,'direct authority boundary OK')
+        raise SystemExit(0)
+    inputs,deps = compose_fixture_round_v5(repository=repository, authorities=authorities, round_index=1)
+    for method_name in ('materialize','validate','fingerprint','evaluate_quick','evaluate_episode'):
+        original_method=getattr(deps.candidates,method_name)
+        def diagnosed(*args,_method=original_method,**kwargs):
+            try: return _method(*args,**kwargs)
+            except Exception:
+                import traceback
+                traceback.print_exc()
+                raise
+        setattr(deps.candidates,method_name,diagnosed)
+    result = run_feedback_round_v5(inputs,deps)
+    print('round1',result.status,result.failure,result.cleanup)
+    if result.status != 'completed':
+        from core.pit_optimizer_v5.fixture_runtime import _response
+        from core.pit_optimizer_v5.provider import _author_from_json
+        import json
+        for event in repository.load_round_events(campaign_id=manifest.campaign_id,round_index=1):
+            payload=repository.load_round_payload(event.payload_ref,expected_kind=event.event_kind)
+            if type(payload) is RoleCompletionPayloadV5:
+                package=repository.load_role_invocation(payload)
+                print('attempt',package.attempt)
+                if payload.role=='author': _author_from_json(json.loads(_response(package.request))['artifact'])
+    assert result.status == 'completed'
+    assert result.cleanup.cleanup_complete and not deps.candidates.active
+    assert len(deps.candidates.evaluations)==39
+    first_records = [repository.load_experiment(r) for r in result.record_refs]
+    assert len(first_records)==3 and all(r.status=='evaluated' for r in first_records)
+    assert {r.variant_assignment.values for r in first_records} == {(('entry_threshold',i),) for i in (1,2,3)}
+    assert len(deps.candidates.mechanics)==3
+    assert len({r.semantic_fingerprint.fingerprint_sha256 for r in first_records})==3
+    repository = LocalArtifactRepositoryV5(Path(temp))
+    inputs2,deps2 = compose_fixture_round_v5(repository=repository, authorities=authorities, round_index=2)
+    result2 = run_feedback_round_v5(inputs2,deps2)
+    print('round2',result2.status,result2.failure,result2.cleanup)
+    assert result2.status=='completed' and result2.cleanup.cleanup_complete and not deps2.candidates.active
+    assert len(deps2.candidates.evaluations)==39 and len(deps2.candidates.mechanics)==3
+    for index in (1,2):
+        for event in repository.load_round_events(campaign_id=manifest.campaign_id,round_index=index):
+            payload = repository.load_round_payload(event.payload_ref,expected_kind=event.event_kind)
+            if type(payload) is RoleCompletionPayloadV5:
+                package = repository.load_role_invocation(payload)
+                assert package.attempt.usage.external_attempt_count==package.attempt.usage.total_tokens==package.attempt.usage.cost_usd==0
+                if index==2 and payload.role=='investigator':
+                    text=canonical_json_bytes_v5(package.request.role_input).decode()
+                    assert FIXTURE_NEXT_DIRECTION_V5 in text and FIXTURE_CRITIC_EXPLANATION_V5 in text
+    summary=summarize_repository_v5(repository=repository,manifest=manifest,command='run-fixture')
+    print(canonical_json_bytes_v5(summary).decode())
+    assert summary.role_calls==summary.total_tokens==summary.cost_usd==0
+    assert summary.source_unchanged and summary.cleanup_complete
+    from core.pit_optimizer_v5.provider import FixtureRoleRunnerV5, RoleEvidenceBindingFailureV5, RoleAuthorizationFailureV5
+    from core.pit_optimizer_v5.fixture_runtime import _response
+    import json
+    changed=json.loads(_response(package.request))
+    changed['binding']['parent_revision_sha256']='f'*64
+    try: FixtureRoleRunnerV5(responses={package.request.role:(json.dumps(changed),)}).invoke_once(package.request)
+    except RoleEvidenceBindingFailureV5: pass
+    else: raise AssertionError('foreign binding accepted')
+    dynamic=FixtureRoleRunnerV5(responses={},campaign_fixture=True)
+    dynamic.invoke_once(package.request)
+    try: dynamic.invoke_once(package.request)
+    except RoleAuthorizationFailureV5: pass
+    else: raise AssertionError('extra dynamic slot accepted')
+    for invalid in (replace(authorities,manifest=replace(manifest,search=replace(manifest.search,max_variants_per_template=2,max_discovery_survivors_per_template=2))), replace(authorities,manifest=replace(manifest,provider=ProviderCapabilitiesV5('synthetic-model',3,1000,100,None)))):
+        try: compose_fixture_round_v5(repository=repository,authorities=invalid,round_index=1)
+        except ValueError: pass
+        else: raise AssertionError('invalid fixture manifest accepted')
+    assert all(Path(path).read_bytes()==raw for path,raw in original.items())
+    print('DIRECT FLOW OK: 3 declared variants; 3 base quick; 36 discovery scenario evaluations; exact critic memory restored; zero external usage; source unchanged; leases cleaned')

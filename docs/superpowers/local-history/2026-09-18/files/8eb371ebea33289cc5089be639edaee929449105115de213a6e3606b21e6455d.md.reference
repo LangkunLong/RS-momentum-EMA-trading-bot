@@ -1,0 +1,37 @@
+### Task 4: Correct CAH Non-finite Growth and XOM Issuer Identity
+
+**Files:**
+- Modify: `core/canslim/c_current_earnings.py`
+- Modify: `core/canslim/a_annual_earnings.py`
+- Modify: `core/sec_pit_fundamentals.py`
+- Modify only generated ignored artifacts in fresh SEC/bundle directories
+
+- [ ] **Step 1: Make C/A growth finite-or-missing**
+
+Reject non-finite operands in both `_safe_growth` implementations. Preserve the
+current EPS-row selection policy; do not introduce a new per-period Net Income
+fallback in this bugfix.
+
+- [ ] **Step 2: Bind XOM to its reviewed historical issuer**
+
+Add reviewed mapping `XOM -> 0000034088`. Prove the present-day holdings-company
+CIK `0002115436` cannot win through a current-ticker match.
+
+- [ ] **Step 3: Run narrow real-data probes**
+
+Against the existing bundle, prove CAH at 2021-05-13 returns no non-finite value.
+Against the pinned local SEC archives, prove XOM resolves with
+`reviewed_baseline_cik` and yields normalized rows. Do not run broad tests yet.
+
+- [ ] **Step 4: Regenerate immutable SEC outputs and PIT bundle**
+
+Reuse the already downloaded exact SEC archives without network access. Publish
+security master, fundamentals, audit, coverage, provenance, marker, bundle, and
+bundle manifest to fresh paths. Recompute and record all hashes.
+
+- [ ] **Step 5: Independent review and commit**
+
+Review finite semantics, exact CIK identity, archive reuse, no-overwrite
+publication, cross-hashes, and bundle verification. Commit production changes
+and ledger; never commit generated archives/CSV/SQLite outputs.
+

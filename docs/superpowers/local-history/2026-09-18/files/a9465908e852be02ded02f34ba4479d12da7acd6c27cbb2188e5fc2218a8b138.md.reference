@@ -1,0 +1,34 @@
+# Task 4 Independent Review
+
+## Spec Compliance
+
+The five-file change matches the requested V3 surface: the nine frozen/slotted composition records are present, V2 decision records are reused, the add-on decision is additive, and runtime/worker select V2 or V3 explicitly. V2's public version and five-method tuple remain unchanged. The adapter is scalar-only and does not accept a bundle, pandas object, raw transaction row, or filesystem value.
+
+The closed-contract implementation rejects unknown/missing fields, duplicate JSON keys, booleans in V3-owned numeric fields, non-finite numeric values, noncanonical affiliations/exposures, and future sessions. The adapter recomputes portfolio, return, notional, and excursion values from its supplied trusted scalar facts.
+
+## Strengths
+
+- `core/strategy_policy/contracts_v3.py:151-197` uses exact field sets, duplicate-key rejection, nested reconstruction, and byte-for-byte canonical JSON verification for V3 contract JSON.
+- `core/strategy_policy/adapter_v3.py:117-152` derives portfolio fractions from dollar totals and rejects cash/gross, risk, count, sector, and industry reconciliation failures on the normal adapter path.
+- `core/strategy_policy/runtime.py:51-89` and `core/strategy_policy/worker.py:559-611` require the four V3 modules, six exact exports, exact snapshot/decision types, and fail before emitting ready when imports/exports are invalid.
+- `core/strategy_policy/worker.py:347-476` binds each decoded request and response to the bootstrapped interface version, method, sequence, payload hash, and HMAC chain. V2 requests still select only `_METHOD_TYPES` at `:377-380`.
+
+## Issues Critical
+
+None.
+
+## Issues Important
+
+1. `core/strategy_policy/contracts_v3.py:273-277` — `PortfolioFeaturesV3` accepts sector and industry exposure totals below `gross_exposure_fraction`; it only rejects totals above gross. Thus a direct contract/JSON construction can silently omit classifications while claiming a nonzero gross portfolio, even though the required V3 state is meant to reconcile exposures to trusted gross exposure. The adapter happens to enforce equality at `adapter_v3.py:136-141`, but the contract itself is the worker-facing trust boundary. Require each exposure sum to equal gross (within `_same`), including empty tuples only when gross is zero. Confidence: 10/10.
+
+2. `core/strategy_policy/contracts_v3.py:568-575` — an accepted `AddOnDecisionV3` with an explicit aggregate `notional_fraction_cap` is allowed even when the cap exceeds `snapshot.current_notional_fraction + snapshot.remaining_cash_fraction`. For example, current notional `0.40`, cash `0.10`, and cap `0.90` passes, despite requiring unavailable cash. This accepts an impossible quantity/cap request at the policy boundary; enforce `cap <= current_notional_fraction + remaining_cash_fraction` (within the chosen tolerance), while preserving the intended `None` fallback. Confidence: 10/10.
+
+3. `core/strategy_policy/contracts_v3.py:546-553` — `ExitSnapshotV3` verifies that MFE is derived from `base.peak_close`, but never requires MFE to be at least the current unrealized return; it also permits an MAE below `-1`. A base with entry `100`, current close `120`, peak close `110`, and supplied MFE `0.10` passes despite a maximum return below the current return. Likewise, a payload MAE of `-2` passes at `:552`. Require `favorable >= unrealized` and bound adverse excursion to `[-1, 0]`; make the analogous lower-bound check for add-on MAE at `:467`. Confidence: 10/10.
+
+## Issues Minor
+
+1. `core/strategy_policy/contracts_v3.py:200-229` — the public `from_primitive()` path constructs `EntryFeaturesV3`/`HoldingFeaturesV3` directly after only converting affiliations. Their numeric validator accepts any value coercible by `float` (`core/pit_feature_snapshot.py:451-462`), so a `Decimal` can enter a supposedly scalar-primitive V3 snapshot. It is only rejected later by `to_primitive()` at `contracts_v3.py:125-138`, rather than failing at decode/construction. Validate generic nested feature fields as exact JSON scalar types (or route this path through a strict primitive validator) to keep the contract closed at ingress. Confidence: 9/10.
+
+## Assessment
+
+Changes are structurally close and V2/V3 negotiation, request/version binding, and worker startup failure behavior are sound in the reviewed diff. Do not treat the V3 boundary as complete until the three important reconciliation/decision/excursion validation gaps are fixed. No reported tests were rerun, per the bounded-review instruction.

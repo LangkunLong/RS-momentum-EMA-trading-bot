@@ -1,0 +1,52 @@
+# Task 2 report
+
+## Files
+
+- Modified `core/pit_diagnosis/models.py` with immutable partition, experiment, catalog, and identity types.
+- Added `core/pit_diagnosis/catalog.py` with fixed partitions, canonical catalog loading, and identity construction.
+- Added `config/pit_diagnosis_experiments_v1.json` containing the approved 21 D0-D5 experiments.
+- Added `tests/test_pit_diagnosis_catalog.py`.
+
+## Decisions
+
+The three date partitions are fixed to discovery 2021-01-01 through 2023-12-31, validation 2024-01-01 through 2024-12-31, and locked evaluation 2025-01-01 through 2025-12-31. D0-D4 records each declare exactly one changed causal dimension; D5 is empty in JSON and controller-composed. Catalog loading uses Task 1 canonical JSON and SHA-256 helpers and rejects unknown rule IDs, diagnostic-only promotion, malformed records, and invalid composition.
+
+## Verification
+
+`python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_catalog.py`
+
+Output: `2 passed, 1 warning in 0.03s` (pytest reported the existing unknown `cache_dir` config warning).
+
+`python -m ruff check core/pit_diagnosis/models.py core/pit_diagnosis/catalog.py tests/test_pit_diagnosis_catalog.py`
+
+Output: `All checks passed!`
+
+`git diff --check`
+
+Output: clean.
+
+## Commit
+
+`7a1f6d6` — `feat: define bounded PIT diagnosis experiments`.
+
+## Concerns
+
+No functional concerns. The existing pytest configuration emits an unrelated `cache_dir` warning when cacheprovider is disabled.
+
+## Round 1 reviewer fixes
+
+Experiment identity normalization now includes every experiment schema field (including changed dimensions, cited rules, promotion/controller/code flags, and variants), and recursively freezes nested identity fields. Experiment phases are closed to D0-D5, D5 rejects pre-composed dimensions/variants, and direct catalog construction validates non-empty version and lowercase SHA-256 metadata. Added regressions for identity collisions, invalid phase/D5 shape, malformed metadata, and nested immutability.
+
+Verification after fixes:
+
+`python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_catalog.py`
+
+Output: `4 passed, 1 warning in 0.04s` (the existing unknown `cache_dir` config warning).
+
+`python -m ruff check core/pit_diagnosis/models.py core/pit_diagnosis/catalog.py tests/test_pit_diagnosis_catalog.py`
+
+Output: `All checks passed!`
+
+`git diff --check`
+
+Output: clean.

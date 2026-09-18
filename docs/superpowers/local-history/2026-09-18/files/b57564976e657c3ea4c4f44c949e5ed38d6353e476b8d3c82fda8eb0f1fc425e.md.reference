@@ -1,0 +1,45 @@
+# Task 4 review — V5 semantic probes
+
+## Spec Compliance
+
+APPROVED.
+
+The fixed V1 suite covers all six V3 policy methods and the required bull/correction, broad/narrow, boundary, winner, and loser cases (`core/pit_optimizer_v5/probes.py:50-79`, `core/pit_optimizer_v5/probes.py:575-664`). Inputs are exact typed contract snapshots, execution uses a deterministic deranged two-pass schedule, and observations are restored to declared suite order (`core/pit_optimizer_v5/probes.py:892-899`, `core/pit_optimizer_v5/probes.py:934-979`). Canonical input serialization preserves concrete primitive, Decimal, tuple/list, `None`, enum, mapping, and dataclass identities (`core/pit_optimizer_v5/probes.py:98-168`). Decision types, fixed input bindings, fingerprint contents, and suite-local comparison language are otherwise enforced (`core/pit_optimizer_v5/probes.py:676-708`, `core/pit_optimizer_v5/probes.py:711-838`, `core/pit_optimizer_v5/probes.py:982-1008`).
+
+## Strengths
+
+- The fingerprint excludes source, revision, and evaluation-context identity and hashes only the versioned suite plus canonical observations (`core/pit_optimizer_v5/probes.py:750-800`).
+- Missing, duplicated, reordered, or input-mismatched observations fail closed against the fixed suite (`core/pit_optimizer_v5/probes.py:769-794`).
+- The module imports only standard-library helpers and pure policy/snapshot contracts; it introduces no filesystem, subprocess, provider, Docker, replay, or mutable infrastructure dependency (`core/pit_optimizer_v5/probes.py:3-47`).
+- Comparison results explicitly claim only equivalence or divergence on suite V1 and keep differing probe IDs in suite order (`core/pit_optimizer_v5/probes.py:810-838`, `core/pit_optimizer_v5/probes.py:982-1008`).
+
+## Issues
+
+### Critical
+
+None.
+
+### Important
+
+1. `core/pit_optimizer_v5/probes.py:861-875`, `core/pit_optimizer_v5/probes.py:878-889`, `core/pit_optimizer_v5/probes.py:902-931` — the typed, sanitized failure identity is not reliable at the policy boundary. `_call_case()` wraps both the untrusted method invocation and local decision validation in one `try`, so a policy implementation that deterministically raises the common `TypeError`, `ValueError`, or `RuntimeError` is recorded as `PolicyProbeProtocolFailureV5`, not `PolicyProbeExecutionFailureV5`; repeated state-dependent failures in those classes are also collapsed by `_raise_failed_outcome()`'s protocol-first branch before exception signatures can be compared. Separately, `_validate_client()` accesses every method via `getattr()` outside its guarded block, so a client with an exceptional descriptor or `__getattribute__` can leak a raw exception and message instead of a sanitized `PolicyProbeProtocolFailureV5`. Split method invocation from post-return protocol validation, classify client-thrown non-timeout exceptions as execution outcomes, compare repeated outcome signatures before collapsing them to a stable failure class, and wrap surface-member lookup so all malformed-client failures remain typed and sanitized.
+
+### Minor
+
+None.
+
+## Pre-existing integration blocker
+
+The reported `PolicyWorkerSession` interface-version defect is acknowledged but is outside this pure one-file task. This review does not require `agent_loop.py` or worker integration to be changed here.
+
+## Re-review Resolution
+
+The corrective change fully resolves the prior Important finding:
+
+- Client interface/member lookup and callable-surface checks are contained and converted to sanitized protocol failures; missing, noncallable, and exceptional members cannot leak raw exceptions (`core/pit_optimizer_v5/probes.py:923-963`).
+- Policy invocation is isolated from post-return decision canonicalization and snapshot validation, so ordinary policy-raised exceptions are captured as `policy_execution` while invalid decisions remain `decision_protocol` (`core/pit_optimizer_v5/probes.py:897-920`).
+- Both pass signatures are compared before failure classification. Matching exception roles and classes produce the corresponding timeout, protocol, or execution failure; differing roles/classes, including decision-versus-exception, produce `PolicyProbeExceptionMismatchV5`; differing successful decisions remain `PolicyProbeNondeterminismV5` (`core/pit_optimizer_v5/probes.py:978-1057`).
+- Public failures retain only fixed failure codes, canonical probe/method bindings, and bounded canonical outcome roles. Exception messages are discarded and exception classes remain private transient comparison data; neither enters a failure object or semantic fingerprint (`core/pit_optimizer_v5/probes.py:197-231`, `core/pit_optimizer_v5/probes.py:863-895`).
+
+## Assessment
+
+Approved. The scoped corrective diff satisfies the typed and sanitized failure-boundary requirements without changing suite or fingerprint semantics. No source or tests were modified, and verification commands were not rerun during this read-only re-review.

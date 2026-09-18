@@ -1,0 +1,11 @@
+# Principal H2 ruling and sequence
+
+The principal approves extraction-design.md, subject to independent source review of each increment. The historical-only saved-command interpreter is appropriate because this path authenticates a recognized serialized V5 grammar and independent original round configuration. It does not claim the unavailable original host runtime/environment preimage. No live command-builder changes are approved.
+
+Ruling: Split H2 into H2a shared predicate extraction and H2b completed resource history plus saved-command interpreter, with independent review between them — this isolates behavior-preserving changes to the live verifier from new historical composition — the cost if wrong is additional integration/review work; it does not change accepted evidence semantics.
+
+H2a modifies only production_sandbox.py: implement the pure helpers listed in extraction-design.md and delegate the exact existing inline blocks at the same positions and with the same error precedence. Record schemas and every other method stay byte-identical. In particular all foreign-executor guards, runtime argv, constructor, reservation loading, phase/terminal/container/control-created guards, launch/recover/reconcile/cleanup and active control inspection stay unchanged. No new historical caller yet.
+
+H2b then modifies only historical_verification.py using reviewed H1 authority and reviewed H2a helpers. It authenticates real historical execution history end to end, including the closed saved command grammar, full output and cleanup, but does not activate summaries/role checks. The historical entry calls H1 itself rather than trusting a caller-constructed dataclass. No operational capability wrappers or executor instantiation.
+
+Each task uses fresh implementer, narrow preimage/diff, scoped Ruff and in-memory compile, exact evaluator closure, real archive before/after digests, then independent spec and quality review. No tests, synthetic evidence, external calls, campaigns, credentials, commits, existing artifact modification, or evaluator edits. Completed summaries remain H3 work.

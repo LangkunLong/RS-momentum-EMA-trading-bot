@@ -1,0 +1,37 @@
+# P2 protection map
+
+## Authorized production spans
+
+| File | Authorized change | Frozen evidence |
+| --- | --- | --- |
+| `campaign_admission.py` | P2 imports, private data-only authority/prefix helpers, `require_live_role_admission_v5`, and public export | Existing P1 definitions are AST-identical to the exact preimage. Fix round 1 changes only the five reviewed admission conditions in P2 code. |
+| `production_runtime.py` | Admission import; one `_guarded_request` method on `LocalRoleRequestFactoryV5`; three complete request return expressions wrapped by that method | All other top-level definitions and all other factory methods are AST-identical. Exactly three guarded returns. Unified diff: 80 additions, 55 deletions. |
+| `production_provider.py` | Admission imports and the enrolled-only block in `LocalRoleAuthorizationLedgerV5.reserve_role_slot` | All other top-level definitions and ledger methods are AST-identical. Fix round 1 adds only two enrolled incoming-attempt comparisons. |
+
+Existing request construction fields, canonical identities, provider arithmetic, serialized dataclasses, ledger accounting, terminal handling, and unrelated operations were not altered. Existing source bytes and newline forms outside the displayed authorized diff hunks remain those of the principal preimages.
+
+## Guard call graph
+
+```text
+LocalRoleRequestFactoryV5.{investigator,author,critic}_request
+  -> build_role_request_v5
+  -> LocalRoleRequestFactoryV5._guarded_request
+  -> require_live_role_admission_v5
+  -> append_role_request in runtime._complete_role (only after the factory returns)
+
+LocalRoleAuthorizationLedgerV5.reserve_role_slot
+  -> existing verified ledger / duplicate / incomplete checks
+  -> existing content-only request lookup and budget predicate
+  -> existing slot construction and lease_started capture
+  -> enrolled-only exact persisted call/request and incoming-attempt lookup
+  -> require_live_role_admission_v5
+  -> RoleLedgerReservationV5 construction and append
+```
+
+`require_live_role_admission_v5` rediscovers enrollment for every call and returns immediately when no binding exists. Enrolled calls authenticate the P1 envelope, selected original launch/config/root/owner, contiguous selected round configs/starts, and the real current deadline. Stored authority loading is separate from the live clock comparison.
+
+The logical-prefix reader authenticates every prior round with the existing completed-resource reader, verifies the archive/checkpoint without repair, binds evaluated records to the accepted critic and successful cleanup, and authenticates all journal packages against verified ledger prefix slices. A prior `no_novel_hypothesis` outcome is the only terminal outcome eligible for continuation; other stop outcomes win even if conflicting committed records exist. The only incomplete state accepted is the exact current persisted request with zero or one matching reservation and zero or one matching terminal. Earlier completed roles can replay for recovery. A new current role or tail requires all prior current packages accepted. A settled current round cannot admit a new role, and admission counters use the prior-round receipt boundary so current author/critic spending does not demand a second three-call reserve.
+
+The selected round census examines value/index unions. A wrong-key record is treated as selected when linked through the canonical key, original owner/config, campaign round-config path, or an authenticated provider config naming the selected manifest; selected wrong-key records fail closed. A referenced config that cannot be authenticated also fails closed rather than being classified as foreign.
+
+The public live guard keeps stored authority and prefix facts clock-free. After all immutable authentication and the boundary decision, it validates the caller's original live timestamp and then reads real wall time once for a fresh final deadline check. The ledger retains its original `lease_started` value for the invocation claim.

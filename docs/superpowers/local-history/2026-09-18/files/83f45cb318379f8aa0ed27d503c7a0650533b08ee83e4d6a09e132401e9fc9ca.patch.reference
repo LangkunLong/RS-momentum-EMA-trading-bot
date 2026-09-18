@@ -1,0 +1,129 @@
+--- reviewed-stage/cli.py
++++ core/pit_optimizer_v5/cli.py
+@@ -1019,21 +1019,38 @@
+             )
+             summary = summarize_repository_v5(
+                 repository=repository,
+                 manifest=authenticated.manifest,
+                 command=request.command,
+                 readiness_code="completed" if completed else "runtime_failed",
+             )
+             if not completed:
+                 raise V5CliFailure("runtime_failed", exit_code=1, summary=summary)
+             return summary
+-        authorities = self._authorities(repository, request.manifest_ref)
++        if request.command in {"verify-run", "summarize"}:
++            authenticated = authenticate_campaign_manifest_v5(repository=repository, manifest_ref=request.manifest_ref)
++            if authenticated.manifest.pit_data_scope == "development_sp500_v2":
++                from core.pit_optimizer_v5.development_preparation import require_development_v5
++
++                require_development_v5(authenticated.manifest)
++                authorities = CampaignAuthoritiesV5(
++                    authenticated.manifest,
++                    authenticated.panel_plan,
++                    authenticated.evaluator_contract,
++                    authenticated.baseline_authority,
++                    authenticated.sandbox_profile,
++                )
++            else:
++                authorities = self._authorities(repository, request.manifest_ref)
++        else:
++            # Standalone run/resume retain the production-only authority boundary.
++            authorities = self._authorities(repository, request.manifest_ref)
+         if request.command in {"verify-run", "summarize"}:
+             if (
+                 authorities.manifest.pit_data_scope == "development_sp500_v2"
+                 and authorities.manifest.semantic_mode == "disabled_development"
+             ):
+                 from core.pit_optimizer_v5.development_preparation import load_development_config_v5
+ 
+                 if request.adapter_config_ref is None:
+                     raise V5CliFailure("production_config_missing")
+                 config = load_development_config_v5(repository, authorities, request.adapter_config_ref)
+--- reviewed-stage/development_preparation.py
++++ core/pit_optimizer_v5/development_preparation.py
+@@ -326,20 +326,22 @@
+     from core.pit_optimizer_v5.contracts import (
+         AnnualizedReturnTargetV5,
+         CampaignPanelPlanV5,
+         EpisodePlanV5,
+         EpisodeEvaluationV5,
+         CampaignEvidenceV5,
+         ResourceCapabilitiesV5,
+         SearchCapabilitiesV5,
+         selected_scenario,
+         validate_campaign_evidence_v5,
++        validate_episode_plan_panel_v5,
++        validate_sandbox_profile_resources_v5,
+     )
+     from core.pit_optimizer_v5.manifest import build_campaign_manifest_v5
+     from core.pit_optimizer_v5.search import BaselineParentAuthorityV5, campaign_cagr_pct
+ 
+     if not repository.root.is_absolute() or len(parent_results) != 4:
+         raise ValueError("absolute repository and four real parent pairs required")
+     ArtifactRefV5(output_prefix + "/manifest.json", "0" * 64)
+     pairs = []
+     for ordinal, item in enumerate(parent_results, 1):
+         paths = (Path(item["request_path"]), Path(item["output_path"]))
+@@ -448,21 +450,38 @@
+         ),
+         target.sha256,
+         episode(mechanics, mechanics_ref, "development-mechanics-unexecuted"),
+         episode(quick, quick_panel_ref, "development-quick"),
+         planned,
+         canonical_sha256_v5(local_descriptors["confirmation"]),
+         canonical_sha256_v5(local_descriptors["qualification"]),
+     )
+     if panel_plan_ref is not None:
+         plan = repository.load_typed_artifact(panel_plan_ref, value_type=CampaignPanelPlanV5)
+-        # Imported path text may differ; actual content identity/dates remain mandatory below.
++        if plan.sha256 != panel_plan_ref.sha256:
++            raise ValueError("supplied panel plan identity differs")
++        # Authenticate every existing child before preflight success or create-only writes.
++        for reference in (plan.pit_bundle_ref, plan.prices_provenance_ref):
++            repository.authenticate_raw_artifact(reference)
++        panel_children = tuple(
++            repository.load_evaluation_panel_spec(item.panel_ref)
++            for item in (plan.mechanics, plan.quick, *plan.discovery)
++        )
++    else:
++        panel_children = (mechanics, quick, *(request.panel for request, _, _, _ in pairs))
++    if plan.target_sha256 != target.sha256:
++        raise ValueError("panel plan target differs from the supplied target")
++    for planned_episode, panel_child in zip((plan.mechanics, plan.quick, *plan.discovery), panel_children, strict=True):
++        validate_episode_plan_panel_v5(planned_episode, panel_child)
++        if planned_episode.purpose != panel_child.purpose:
++            raise ValueError("panel purpose differs from its authenticated plan")
++    # Imported path text may differ; actual content identity/dates remain mandatory below.
+     episodes = tuple(
+         EpisodeEvaluationV5(
+             request.episode.episode_id, index, request.episode.start_date, request.episode.end_date, output.evaluation
+         )
+         for index, (request, output, _, _) in enumerate(pairs, 1)
+     )
+     evidence = CampaignEvidenceV5(
+         plan.discovery_plan_sha256,
+         episodes,
+         campaign_cagr_pct(episodes=episodes, discovery_plan=plan, evaluator_contract=contract),
+@@ -486,20 +505,21 @@
+     )
+     expected_cap_names = {
+         "quick_timeout_seconds",
+         "discovery_episode_timeout_seconds",
+         "round_wall_timeout_seconds",
+         "campaign_wall_timeout_seconds",
+     }
+     if type(caps) is not dict or set(caps) != expected_cap_names:
+         raise ValueError("caps must explicitly supply quick, discovery, round and campaign timeouts")
+     resources = replace(resources, **caps)
++    validate_sandbox_profile_resources_v5(profile, resources)
+     search = SearchCapabilitiesV5(
+         hypotheses_per_investigator=1,
+         max_tunable_axes=1,
+         max_variants_per_template=1,
+         max_discovery_survivors_per_template=1,
+         archive_capacity=2,
+         max_feedback_rounds=2,
+         investigator_memory_max_bytes=96 * 1024,
+         allow_full_source_escape=False,
+     )

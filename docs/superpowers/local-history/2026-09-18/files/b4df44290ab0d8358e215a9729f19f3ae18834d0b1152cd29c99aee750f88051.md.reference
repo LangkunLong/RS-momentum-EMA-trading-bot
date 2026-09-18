@@ -1,0 +1,44 @@
+# H2b completed historical resource authentication
+
+## Scope
+
+Implemented H2b only in `core/pit_optimizer_v5/historical_verification.py`. The new public `authenticate_completed_historical_round_resources_v5(*, repository, manifest, round_index)` calls accepted H1 `authenticate_historical_round_v5` internally and accepts no caller-built round authority or executor override. It returns frozen data facts for H3; it does not authenticate or activate summary, role-set, round-outcome, checkpoint, archive, provider, or campaign-completion state.
+
+The exact accepted H1 source preimage is `1833ae0f443d5cb4d55cc1c05110e4f0d957f52afd540d480689a7b7967d0ba0` (18,616 bytes). Final H2b source is `67549e09ff33dd46f72e55cf2cee598e99cc1dabc03a5c8d033541b0999d141f` (74,524 bytes). Both use LF byte style. The complete narrow diff is `h2b-source.diff`.
+
+## Implemented authentication
+
+For every execution in H1's authenticated candidate-execution index, H2b now:
+
+- applies the reviewed H2a reservation, panel, phase, terminal/output, cleanup, control-binding, and completed-control predicates;
+- loads all typed state with `repair=False`, preserves phase read order, and rejects foreign executor, command, and phase-name records immediately;
+- requires a settled durable terminal and complete execution cleanup; journal success requires a succeeded terminal with a bounded immutable output whose exact length matches the terminal;
+- pins the current control directory and Docker parent, hashes the Docker file using the live identity tuple, derives the recorded control/transaction identity encodings, and observes the transaction child is actually absent;
+- authenticates the exact preceding contextual rendered-event ID, unique intent and accepted author package, complete hypothesis/discovery binding, structural template, variant policy/assignment, prior valid validation, and parent/child workspace revisions. Parent-identical candidates cannot authorize an execution;
+- reconstructs only canonical dictionaries and tuples for the exact request primitive, panel semantics, ordered saved Docker argv, runtime argv digest, and sorted expected mounts. No request, command, mount-handle, owned-lease, executor, candidate, finalizer, or evidence capability is fabricated.
+
+The source workspace match uses H1's lease-bound workspace identity. The request source mount root is separately derived from canonical path plus the saved created/ready device and inode, without the lease SHA. The two encodings are never compared as identical. Removed source workspaces are not reopened.
+
+All journal resource-lease events must be workspaces; workspace payloads, refs, lease IDs, source identities, and execution lease identities cannot be reused. Every workspace must be retired, every execution must link to exactly one workspace, and every successful semantic/quick/discovery journal key must occur exactly once in the execution index. A recovery chain may contain failed cleanup attempts, but its final cleanup must be complete with exact workspace/policy-worker/evaluator/container counts. An indexed execution with no stage evidence remains non-successful at this layer and must still have its settled terminal and cleanup; H3 owns full outcome/failure settlement.
+
+The authenticated manifest/config graph supplies each round's original evaluator, sandbox image/profile, parent policy, and saved executor identity. Current fixed evaluator constants are not substituted into runtime-04 history.
+
+## Verification
+
+Static verification passed for the complete reachable local callgraph: all 19 reachable typed-state reads explicitly set `repair=False`; no forbidden operational/capability call was found; the public signature is exactly repository/manifest/round_index and calls H1 internally. Scoped Ruff and in-memory compilation pass. The complete current evaluator closure remains 56 files at digest `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4` with every file unchanged.
+
+Read-only authentication of actual runtime-04 passed for rounds 1 and 2: one retired workspace, five indexed executions, five successful journal keys, and final cleanup counts `(1, 0, 5, 5)` in each round. All ten executions authenticated their archived request, command, output, terminal, cleanup, workspace link, and current completed-control observation. Round 2 resource completion is deliberately separate from its failed terminal round outcome.
+
+Complete extended-Windows-root archive maps were captured before and after verification. Runtime-04 remained 579 files / 69,994,319 bytes at tree digest `1988b37428bcbf647d468ec163b7ca235b99b26b2a7bcee80d7de733e19f8aa9`; provider-runtime-06 remained 83 files / 68,980,002 bytes at `2c411970b0a2d9cdfd2499afa01aed14fa723bb3ae5f4d44baee0d539b923f16`. No path changed.
+
+Evidence: `h2b-static-verification.json`, `h2b-source-hashes.json`, `h2b-evaluator-source-map.json`, `h2b-actual-auth-results.json`, `h2b-preservation-check.json`, the four complete `h2b-*-before/after.json` maps, `h2b-ruff.txt`, `h2b-compile.txt`, and `h2b-diff-check.txt`.
+
+No tests, synthetic records, negative cases, mocks, probes, Docker/Git workspace execution, campaigns, summaries, provider/API/external calls, credential/environment reads, installs, or commits were used. H2b is ready for independent review and no broader historical claim is made.
+
+## Fix 1 — closed host-path grammar
+
+Addressed the independent review's sole P2 by adding a pure historical Docker host-path validator equivalent to the live grammar. Reconstructed source, data, and output mount hosts now reject blank, surrounding-whitespace, nonabsolute, noncanonical, comma, NUL, LF, or CR spelling before request/argv hashing. The derived panel-input host is checked before both runtime-argv and expected-mount construction. Invalid spelling is rejected without normalization, escaping, capability construction, or retired-source access.
+
+The exact pre-fix source is `pre-h2b-fix1-historical_verification.py`, SHA-256 `67549e09ff33dd46f72e55cf2cee598e99cc1dabc03a5c8d033541b0999d141f`. The fix is `h2b-fix1.diff`; final source is 75,122 bytes at `8c48c486dad583dfdb5508b21edc8bc75d3d979f042916ef96b82e0f15a17468`, retaining LF byte style.
+
+Scoped Ruff and in-memory compile pass. The actual runtime-04 read authenticated all ten executions again. Full extended-root archive maps remained unchanged at 579 runtime-04 files and 83 provider-runtime-06 files, and the 56-file evaluator closure remains fixed at `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4`. Fix evidence uses the `h2b-fix1-*` files. No tests, synthetic cases, summaries, external operations, or commits were used. Ready for scoped re-review.

@@ -1,0 +1,165 @@
+"""Archived one-shot diagnostic used for current-verifier-evidence.json.
+
+Its control-root comparison used two different encodings. That observation is
+superseded by component-comparison-corrected.json; do not interpret it as drift.
+The real returned summaries and their failure chains remain valid evidence.
+"""
+from pathlib import Path
+import ast
+from dataclasses import asdict
+import hashlib
+import json
+import sys
+
+ROOT = Path.cwd().resolve()
+sys.path.insert(0, str(ROOT))
+OUT = ROOT / '.artifacts/pit-optimizer-v5/development/increment-c-history-verifier'
+
+from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5
+from core.pit_optimizer_v5.contracts import ArtifactRefV5, canonical_sha256_v5, evaluator_source_map_v5, evaluator_source_sha256
+from core.pit_optimizer_v5.manifest import authenticate_campaign_manifest_v5
+from core.pit_optimizer_v5.operations import CampaignLaunchV5, _authorities
+from core.pit_optimizer_v5.development_preparation import load_development_config_v5
+from core.pit_optimizer_v5.summary import summarize_repository_v5
+from core.pit_optimizer_v5.production_sandbox import (
+    ExecutionControlRecordV5, MountReservationRecordV5, ExecutionCleanupRecordV5,
+    _directory_identity,
+)
+
+def long_path(path):
+    return path if str(path).startswith('\\\\?\\') else Path('\\\\?\\' + str(path))
+
+def digest(path):
+    with long_path(path).open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+def archive_snapshot(root):
+    root = long_path(root)
+    result = {}
+    for path in sorted(root.rglob('*')):
+        if not path.is_file():
+            continue
+        if path.name.startswith('.env') or any('test' in part.lower() for part in path.relative_to(root).parts):
+            raise RuntimeError('unexpected forbidden path in bounded real archive')
+        result[path.relative_to(root).as_posix()] = digest(path)
+    return result
+
+def check_state_indexes(root):
+    root = long_path(root)
+    count = 0
+    for path in sorted((root / 'adapter-state').glob('*/*.json')):
+        relative = path.relative_to(root).as_posix()
+        index_path = root / 'adapter-state-authority' / path.parent.name / path.name
+        index = json.loads(index_path.read_text(encoding='utf-8'))
+        if index['value_ref'] != {'relative_path': relative, 'sha256': digest(path)}:
+            raise RuntimeError('state authority index mismatch; no summary permitted')
+        count += 1
+    return count
+
+def source_snapshot():
+    prior = json.loads((OUT.parent / 'luna-recovery-b4c/principal-architect-verification.json').read_text(encoding='utf-8'))
+    return {path: {'sha256': digest(ROOT / path), 'matches_B4c': digest(ROOT / path) == expected}
+            for path, expected in prior['source_hashes'].items()}
+
+def runtime_contract():
+    tree = ast.parse((ROOT / 'core/pit_optimizer_v5/production_sandbox.py').read_text(encoding='utf-8'))
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'LocalContainerExecutorV5')
+    init = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == '__init__')
+    for node in ast.walk(init):
+        if isinstance(node, ast.Dict):
+            for key, value in zip(node.keys, node.values):
+                if isinstance(key, ast.Constant) and key.value == 'runtime_contract':
+                    return ast.literal_eval(value)
+    raise RuntimeError('runtime contract literal unavailable')
+
+def failure_details(exc):
+    chain, components = [], []
+    cursor = exc
+    while cursor is not None:
+        frames = []
+        tb = cursor.__traceback__
+        while tb is not None:
+            frame = tb.tb_frame
+            frames.append({'file': Path(frame.f_code.co_filename).name, 'function': frame.f_code.co_name, 'line': tb.tb_lineno})
+            if frame.f_code.co_name == '_load_reservation':
+                local = frame.f_locals
+                executor, record, command = local['self'], local['record'], local['command_sha256']
+                repo = executor.repository
+                ready = repo.load_typed_state(namespace='container-control-ready', key=command, value_type=ExecutionControlRecordV5, repair=False)
+                mount = repo.load_typed_state(namespace='sandbox-mount-reservation', key=record.output_mount_authority_sha256, value_type=MountReservationRecordV5, repair=False)
+                cleanup = repo.load_typed_state(namespace='container-cleanup', key=command, value_type=ExecutionCleanupRecordV5, repair=False)
+                components.append({
+                    'round_index': executor.owner.round_index,
+                    'command_sha256': command,
+                    'stored_executor_sha256': record.executor_identity_sha256,
+                    'current_executor_sha256': executor.executor_identity_sha256,
+                    'command_matches': record.command_sha256 == command,
+                    'owner_matches': record.owner == executor.owner,
+                    'owner_sha256': executor.owner.sha256,
+                    'manifest_sha256': executor.manifest.sha256,
+                    'sandbox_profile_sha256': executor.sandbox_profile.sha256,
+                    'mount_factory_sha256': executor.mount_factory.mount_identity_sha256,
+                    'saved_mount_factory_sha256': None if mount is None else mount.factory_identity_sha256,
+                    'mount_factory_matches': mount is not None and mount.factory_identity_sha256 == executor.mount_factory.mount_identity_sha256,
+                    'docker_executable_identity_sha256': canonical_sha256_v5(executor._docker_identity),
+                    'saved_docker_executable_identity_sha256': None if ready is None else ready.docker_executable_identity_sha256,
+                    'docker_executable_matches': ready is not None and ready.docker_executable_identity_sha256 == canonical_sha256_v5(executor._docker_identity),
+                    'control_root_identity_sha256': _directory_identity(executor._control_root, executor._control_root_info),
+                    'saved_control_root_identity_sha256': None if ready is None else ready.control_root_identity_sha256,
+                    'control_root_matches': ready is not None and ready.control_root_identity_sha256 == _directory_identity(executor._control_root, executor._control_root_info),
+                    'control_environment_sha256': canonical_sha256_v5(executor._base_environment),
+                    'control_environment_entry_digests': {k: canonical_sha256_v5(v) for k, v in executor._base_environment},
+                    'runtime_contract_sha256': canonical_sha256_v5(runtime_contract()),
+                    'repository_root_identity_sha256': repo.root_identity_sha256,
+                    'saved_control_executor_matches_reservation': ready is not None and ready.executor_identity_sha256 == record.executor_identity_sha256,
+                    'saved_cleanup_executor_matches_reservation': cleanup is not None and cleanup.executor_identity_sha256 == record.executor_identity_sha256,
+                    'saved_cleanup_owner_matches': cleanup is not None and cleanup.owner_sha256 == executor.owner.sha256,
+                    'inspection_only_not_historical_verifier_success': True,
+                })
+            tb = tb.tb_next
+        chain.append({'type': type(cursor).__name__, 'message': str(cursor), 'frames': frames})
+        cursor = cursor.__cause__
+    return {'returned': False, 'failure_chain': chain, 'component_comparison': components}
+
+def main():
+    if (OUT / 'current-verifier-evidence.json').exists():
+        raise RuntimeError('one-shot evidence already exists; do not rerun summaries')
+    report = {'source_before': source_snapshot(), 'archives': {}}
+    if not all(v['matches_B4c'] for v in report['source_before'].values()):
+        raise RuntimeError('source identity differs from reviewed state')
+    source_map = evaluator_source_map_v5(ROOT)
+    report['evaluator'] = {'covered_files': len(source_map), 'sha256': evaluator_source_sha256(source_map), 'source_map': source_map}
+    targets = (
+        ('runtime-04', 'development-controller-two-rounds-20260907-04', '8fcae0423117f3a234e64391c277bd7efe5cbb775ff61ec879d8cbeb5659d37c'),
+        ('provider-runtime-06', 'development-provider-two-rounds-20260907-06', 'd90ed717c0d6b34d4cfa6bf7e2dd1f753e68c43b1127b200a66d2a9f930dfdf6'),
+    )
+    for name, campaign, manifest_sha in targets:
+        root = OUT.parent / name
+        before = archive_snapshot(root)
+        result = {'before_file_hashes': before, 'state_indexes_checked': check_state_indexes(root)}
+        report['archives'][name] = result
+        repo = LocalArtifactRepositoryV5(root)
+        authenticated = authenticate_campaign_manifest_v5(repository=repo, manifest_ref=ArtifactRefV5(f'campaigns/{campaign}/manifest.json', manifest_sha))
+        manifest = authenticated.manifest
+        launch = repo.load_typed_state(namespace='campaign-launch', key=manifest.sha256, value_type=CampaignLaunchV5, repair=False)
+        config = load_development_config_v5(repo, _authorities(authenticated), launch.adapter_config_ref)
+        result['authority'] = {'manifest_sha256': manifest.sha256, 'adapter_config_ref': asdict(launch.adapter_config_ref), 'repository_root_matches': config.repository_root_identity_sha256 == repo.root_identity_sha256}
+        try:
+            summary = summarize_repository_v5(repository=repo, manifest=manifest, command='summarize')
+            result['full_summary'] = {'returned': True, 'summary': asdict(summary)}
+        except Exception as exc:
+            result['full_summary'] = failure_details(exc)
+        after = archive_snapshot(root)
+        result['archive_unchanged'] = before == after
+        result['changed_or_added_paths'] = sorted(k for k in before.keys() | after.keys() if before.get(k) != after.get(k))
+        if not result['archive_unchanged']:
+            raise RuntimeError('historical archive changed; stop')
+    report['source_after'] = source_snapshot()
+    report['source_unchanged'] = report['source_before'] == report['source_after']
+    with (OUT / 'current-verifier-evidence.json').open('x', encoding='utf-8') as stream:
+        json.dump(report, stream, indent=2, default=str)
+        stream.write('\n')
+    print(json.dumps({'source_unchanged': report['source_unchanged'], 'evaluator_sha256': report['evaluator']['sha256'], 'archives': {k: {'archive_unchanged': v['archive_unchanged'], 'full_summary': v['full_summary']} for k, v in report['archives'].items()}}, default=str))
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,5 @@
+{
+  "core/pit_optimizer_v5/provider.py": "6929ad6c0014ea45e76fb0159f4e6ed8f3351bbc11e45b126d8d4ae9965eb856",
+  "agent_loop.py": "5c2bf1336735602f491121e88bc2b7c4cdbf5f259c980f662dbf32c8efa7285c",
+  ".superpowers/sdd/2026-09-04-pit-optimizer-v5-campaign/prepare-provider-development.py": "d843fc553621565add6bc017a5f07975e98e48b8164e96b45e7c631039f8679f"
+}

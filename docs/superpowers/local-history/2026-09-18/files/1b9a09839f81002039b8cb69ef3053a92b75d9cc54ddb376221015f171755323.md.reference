@@ -1,0 +1,17 @@
+# Task 5 Exact Review Package
+
+Task 5 made one production correction after the documented command proved a parser integration defect. The pre-task line is preserved in `task-3-review-package.md:39-41`; the current line is in `pit_diagnosis.py`.
+
+```diff
+diff --git a/pit_diagnosis.py b/pit_diagnosis.py
+--- a/pit_diagnosis.py
++++ b/pit_diagnosis.py
+@@
+     task11_artifact_diagnosis.add_argument(
+-        "--baseline-run", required=True, type=_absolute_path
++        "--baseline-run", required=True, type=Path
+     )
+```
+
+Review `task-5-report.md` for the exact accepted command output, reused final Task 3 evidence, policy audit, structural verification, and constraints. No other production file was changed by Task 5.
+

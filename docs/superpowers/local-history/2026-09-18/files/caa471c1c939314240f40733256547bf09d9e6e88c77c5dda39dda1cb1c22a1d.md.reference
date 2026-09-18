@@ -1,0 +1,19 @@
+# Task 3 Fix Re-review — `48c9946..ad43db4`
+
+## Scope
+
+Reviewed only the two prior Important findings and regressions directly introduced by their fix.  No tests or git commands were run.
+
+## Findings
+
+None.
+
+## Verification
+
+- `core/pit_feature_snapshot.py:224-263` validates every observed OHLCV scalar, still rejecting booleans, NaN, infinity, negative volume, non-positive OHLC, and invalid observed OHLC relationships, while retaining `None` as missingness.
+- `core/pit_feature_snapshot.py:251-359` makes the technical dependencies metric-local: ATR consumes 20 highs/lows and 21 closes; gap consumes only event open and prior close; ADV50 excludes the event row; 52-week distance consumes 252 highs plus event close; and volume ratio consumes the prior 50 volumes plus event volume.  A required `None` returns `None`; an out-of-window or unrelated `None` does not contaminate the result.
+- `core/pit_feature_snapshot.py:197-211` resolves a holding through the authenticated `security_lineage_id()` and `membership_v3.ticker_for_lineage_at()` before RS validation.  The equality check accepts the active successor, rejects the retired predecessor on and after the transition date, and rejects unknown/unbound symbols before group assignment, price processing, or RS input validation.
+
+## Verdict
+
+PASS.  The two prior Important findings are resolved, and this targeted re-review found no new breakage in the corrected boundaries.

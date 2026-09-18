@@ -1,0 +1,27 @@
+"""Parity-first entry policy for policy interface V3."""
+
+from __future__ import annotations
+
+from core.strategy_policy.contracts import EntryDecision
+from core.strategy_policy.contracts_v3 import EntrySnapshotV3
+from core.strategy_policy.entry import evaluate_entry as _evaluate_entry_v2
+
+
+def evaluate_entry(snapshot: EntrySnapshotV3) -> EntryDecision:
+    """Admit technical relative-strength leaders without growth or composite gates."""
+    baseline = _evaluate_entry_v2(snapshot.base)
+    blocking_codes = snapshot.base.technical_blocking_reasons
+    if not blocking_codes and not snapshot.base.technical_only:
+        if snapshot.base.rs_score is None:
+            blocking_codes = ("rs_score_unavailable",)
+        elif snapshot.base.rs_score < 80.0:
+            blocking_codes = ("rs_score_below_threshold",)
+    return EntryDecision(
+        qualified=not blocking_codes,
+        market_permitted=baseline.market_permitted,
+        rank=baseline.rank,
+        blocking_codes=blocking_codes,
+    )
+
+
+__all__ = ("evaluate_entry",)

@@ -1,0 +1,11 @@
+# Architect checkpoint B1: APPROVED
+
+No blocking findings. Exact rendering.py SHA a74a513b42bb65e8c68492ee342dab9c049939e4d11dee2c09365425c69e65dd reviewed against its saved preimage.
+
+The known ValueError is caught only at candidate bundle construction. Parent validation, marker/import handling, unknown errors and collisions remain outside that recovery path. Rejected assignments consume the normal cap; no rejected source bundle or policy revision is retained. Existing strict callers cannot receive a rejection carrier.
+
+Independent verification authenticated actual06 manifest/parent/request/artifact, checked the actual response-text hash and parsed artifact equality, reproduced the closed rejection, and confirmed strict rendering still raises the exact original ValueError. IncrementA, candidate_ir.py and evaluator identity remain unchanged.
+
+Valid/mixed multi-assignment outcomes were inspected in the shared loop against the preimage, not exercised with invented inputs. No tests, provider calls, candidate execution or campaign replay occurred. This approves the B1 rendering seam; it does not prove journal or feedback-loop integration.
+
+Next scope: B2 only, then architect review before B3/B4. Build the dedicated rejection event and authenticated append/replay behavior. Do not weaken the existing validation predecessor rule, add all-invalid completion, or launch a campaign yet.

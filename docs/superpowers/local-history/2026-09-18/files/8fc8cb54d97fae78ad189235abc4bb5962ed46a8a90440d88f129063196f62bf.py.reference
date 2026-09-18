@@ -1,0 +1,48 @@
+"""Record the existing sandbox profile for an exact completed local image build."""
+
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import re
+
+from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5
+from core.pit_optimizer_v5.baseline import build_sandbox_profile_v5
+from core.pit_optimizer_v5.contracts import ArtifactRefV5, evaluator_source_map_v5, evaluator_source_sha256
+
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--build-prefix", required=True)
+args = parser.parse_args()
+if re.fullmatch(r"[0-9a-f]{12}", args.build_prefix) is None:
+    raise ValueError("Build prefix must identify an exact local source build")
+root = Path.cwd()
+artifact_root = root / ".artifacts/pit-optimizer-v5"
+build = artifact_root / "evaluator/builds" / args.build_prefix
+record = json.loads((build / "image-record.json").read_text())
+stage = root / ".superpowers/sdd/2026-09-04-pit-optimizer-v5-campaign" / ("evaluator-build-context-" + args.build_prefix)
+source_map = evaluator_source_map_v5(stage)
+runtime_sha = evaluator_source_sha256(source_map)
+if runtime_sha != record["runtime_source_sha256"] or not runtime_sha.startswith(args.build_prefix):
+    raise ValueError("Staged source differs from the completed image record")
+resources_path = "evaluator/resources-default-v5.json"
+resources_sha = hashlib.sha256((artifact_root / resources_path).read_bytes()).hexdigest()
+if resources_sha != "aa32b01c816b858c5318003a647accbcbdbe44806d6efd5b5e12f458cdc5a65f":
+    raise ValueError("Default development resource authority has changed")
+repository = LocalArtifactRepositoryV5(artifact_root)
+source_ref = repository.create_baseline_artifact("evaluator/runtime-source-" + args.build_prefix + ".json", source_map)
+if source_ref.sha256 != runtime_sha:
+    raise ValueError("Recorded source leaf differs from its runtime identity")
+image_name, image_digest = record["image_reference"].split("@", 1)
+profile_ref = build_sandbox_profile_v5(
+    repository=repository,
+    resources_ref=ArtifactRefV5(resources_path, resources_sha),
+    evaluator_source_ref=source_ref,
+    image_name=image_name,
+    image_digest=image_digest,
+    output_path="evaluator/sandbox-profile-development-" + args.build_prefix + ".json",
+)
+result = {"image_reference": record["image_reference"], "runtime_source_sha256": runtime_sha, "runtime_source_path": source_ref.relative_path, "profile_path": profile_ref.relative_path, "profile_sha256": profile_ref.sha256, "resources_sha256": resources_sha}
+with (build / "profile-record.json").open("x", encoding="utf-8") as stream:
+    stream.write(json.dumps(result, indent=2) + "\n")
+print(json.dumps(result))

@@ -1,0 +1,48 @@
+### Task 5: Add Schema-v4 Parent and Atomic Author Contracts
+
+**Files:**
+
+- Modify: `core/pit_optimization_contract.py`
+- Modify: `core/pit_optimizer_evaluation.py`
+- Modify: `tests/test_pit_optimizer_v2.py`
+- Modify: `tests/test_pit_optimizer_loop.py`
+
+**Interfaces:**
+
+- Produces: `PolicyAuthoringScopeV4`, `SelectedParentIdentity`, `SelectedParentSummary`, `AuthorSourceFile`, `AuthorArtifactV4`, `RoleOutputInvalidSummary`, `InvestigatorInputV4`, `AuthorInputV4`, `CriticInputV4`, and `PitOptimizerRunManifest(schema_version=4)`.
+- Changes critic dispositions to exactly `promote`, `refine`, and `abandon`.
+
+- [ ] **Step 1: Add a schema-v4 manifest beside the v3 loader.**
+
+  Bind campaign ID/sequence, clean source identity, policy interface 2, exact bundle/discovery-plan identities, qualification commitment, `AnnualizedReturnTarget`, optional seed checkpoint identity, exact ordered editable paths, sandbox identity, `apply=false`, `provider_retries=0`, and one call budget per planned role. Keep exactly three calls per complete iteration but allow finite run lengths beyond two iterations.
+
+- [ ] **Step 2: Replace patch bounds with source-context sizing.**
+
+  `PolicyAuthoringScopeV4` contains the exact three initial file hashes, actual canonical source-bundle byte count, finite iteration/history input byte caps, finite response/token caps from each call plan, and descendant rule `authenticated_parent_plus_atomic_full_sources`. It contains no file-count choice, hunk count, changed-line count, diff-byte limit, or USD ceiling.
+
+- [ ] **Step 3: Make parent selection explicit in every role input.**
+
+  Baseline, champion, and branch each receive a canonical `SelectedParentIdentity`; baseline is not represented by an unbound null. Investigator and author inputs include the same selected-parent identity/source digest. Investigator returns one to three canonical focus areas (`entry`, `risk_sizing`, `exit`) rather than one controller-enforced family/file.
+
+- [ ] **Step 4: Define one closed three-file author response.**
+
+  The response contains `hypothesis_id`, `parent_identity_sha256`, `behavioral_summary`, a `policy_sources` object with exactly the three required repository-relative keys, `assumptions`, and `validation_suggestions`. Require valid UTF-8 text, LF only, no NUL/CR, final newline, unchanged files included, and at least one changed file. Parse all sources before exposing any candidate workspace.
+
+- [ ] **Step 5: Redesign comparison and failure feedback.**
+
+  Replace fold arrays in v4 feedback with quick/discovery `PanelAggregateSummary` values, target progress, baseline/champion diagnostics, compact prior hypotheses, and validation status. `CriticInputV4` accepts exactly one of a valid author manifest or a content-free `RoleOutputInvalidSummary` for an invalid author.
+
+- [ ] **Step 6: Update prompts and response schemas.**
+
+  Tell investigator to diagnose O'Neil behavior and propose a focused mechanism; tell author to implement the plan across any/all three complete files; tell critic to explain measured CAGR behavior and choose promote/refine/abandon. Keep local closed parsing authoritative and size response bytes from the real source bundle plus declared output headroom.
+
+- [ ] **Step 7: Update existing contract/role fixtures and verify.**
+
+  ```powershell
+  python -B -m compileall -q core/pit_optimization_contract.py core/pit_optimizer_evaluation.py
+  python -B -m ruff check core/pit_optimization_contract.py core/pit_optimizer_evaluation.py --no-cache
+  python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py tests/test_pit_optimizer_loop.py -k "manifest or role or source or response or context"
+  git add core/pit_optimization_contract.py core/pit_optimizer_evaluation.py tests/test_pit_optimizer_v2.py tests/test_pit_optimizer_loop.py
+  git commit -m "feat: add atomic schema v4 optimizer roles"
+  ```
+

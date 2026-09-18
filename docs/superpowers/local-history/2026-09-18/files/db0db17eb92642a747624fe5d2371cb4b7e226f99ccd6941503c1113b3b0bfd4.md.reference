@@ -1,0 +1,30 @@
+# C1 architect handoff — exact-duplicate record invariant correction
+
+## Requested review
+
+Review the single authorized production hunk in [memory.py](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-v5-architecture/core/pit_optimizer_v5/memory.py:464), represented with repository-relative labels in [memory.py.diff](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-v5-architecture/.artifacts/pit-optimizer-v5/development/luna-recovery-c1/memory.py.diff). No B4c work has begun.
+
+The guard now distinguishes the template's nonempty declared edit scope from the validator's actual change set only where both conditions hold: `status == "exact_duplicate"` and the post-validation experiment policy revision equals its parent revision. That sole conjunctive branch requires `validation.changed_symbols == ()`. Every other post-validation record retains the original strict equality with `template.changed_symbols`.
+
+## State and event effect
+
+This is a host-record admission correction, not a renderer, runtime, journal, serialization, or finalization transition change. A parent-identical exact duplicate with its durable empty validation can now proceed from the common record constructor into the pre-existing identity derivation and exact-duplicate evidence guard. A nonempty validation remains rejected. A changed-policy candidate remains on the old declared-symbol path, and a falsely labelled exact duplicate is rejected by the unchanged policy-parent evidence rule. Invalid/render-rejected records retain their separate pre-validation identity route.
+
+No event ordering or payload is altered. Runtime's existing exact-duplicate short-circuit still emits/retains its pre-existing semantic outcome and bypasses quick screening. B4b's unchanged finalizer still requires the record's validation to equal the actual durable validation stage, so no record can be fabricated through this guard.
+
+## Evidence
+
+- Exact preimage SHA-256: `99e084eeff284d39a651e899e9562780e2581eb936ce7ff1f3f0542ed7b523aa`.
+- Final `memory.py` SHA-256: `37e3a04791d827edd0e5fe99e1d62cb9997163f66954f99727177248f8949d76`.
+- The B4b-protected `runtime.py` and `artifacts.py` remain respectively `d834eae8e3e120355b4479c77f87ebe46519a0b82a52cc072abe1dab60943aec` and `2bab516e4945976d9bf6bb356934289cd14d9b87c25088521a043c8ac5cfa2c2`; all other protected hashes are in [architect-verification.json](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-v5-architecture/.artifacts/pit-optimizer-v5/development/luna-recovery-c1/architect-verification.json).
+- Scoped Ruff, in-memory compilation, exact-preimage whitespace/diff checks, and an independent AST comparison passed. The AST outside `ExperimentRecordV5._validate_post_validation_identity` is identical.
+- The 56-file evaluator identity remains `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4`; `memory.py` is outside its closure.
+- Read-only authenticated archive verification preserved runtime-04's canonical evaluated record, four discovery episodes, and critic binding. Actual06 remains its existing five-event terminal journal with its accepted author response, terminal `rendering/stage_failed`, and zero render-rejected events.
+
+## Static versus executed verification
+
+The decision table and exact-duplicate positive path are static source review only. The bounded actual record inventory has four records (three `evaluation_failed`, one `evaluated`) and no exact duplicate; no synthetic candidate, record, event, response, or wrapper was constructed. The only executed checks were scoped lint/compilation, hashes/diff/AST comparison, evaluator identity recomputation, and read-only authentication/decoding of the existing runtime-04 and actual06 artifacts. No evaluator or candidate evaluation, campaign operation, model/API call, credential access, commit, push, or deployment occurred.
+
+The independent source review is in [task-review.md](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-v5-architecture/.artifacts/pit-optimizer-v5/development/luna-recovery-c1/task-review.md); the implementer trace and decision table are in [implementation-report.md](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-v5-architecture/.artifacts/pit-optimizer-v5/development/luna-recovery-c1/implementation-report.md).
+
+**Checkpoint:** awaiting principal architect review before B4c.

@@ -1,0 +1,1044 @@
+"""Prepare the reviewed native C-c campaign package without launching it.
+
+This driver is reserved for principal execution after final source, script, and
+updated-readiness approval.  It creates immutable preparation artifacts and one
+nonpersisting round-1 investigator preview.  It never enrolls or starts a
+campaign, persists a role request, reserves a role slot, resolves credentials,
+or invokes a provider, evaluator, container, or Docker.
+"""
+
+from __future__ import annotations
+
+import argparse
+from hashlib import sha256
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import sys
+
+
+SOURCE_ROOT = Path(__file__).resolve().parents[5]
+DEVELOPMENT_ROOT = SOURCE_ROOT / ".artifacts/pit-optimizer-v5/development"
+PACKAGE_ROOT = Path(__file__).resolve().parent
+DRIVER_REVIEW_PATH = PACKAGE_ROOT / "independent-review.md"
+ORIGINAL_ROOT = DEVELOPMENT_ROOT / "provider-runtime-06"
+AUTHORIZED_ARTIFACTS_ROOT = SOURCE_ROOT.parents[1] / ".artifacts"
+CAMPAIGN_ID = "development-provider-two-evaluated-admission-20260908-01"
+ARTIFACT_ROOT = DEVELOPMENT_ROOT / "provider-admission-20260908-01"
+RESOURCE_PARENT = AUTHORIZED_ARTIFACTS_ROOT / "pit-v5-admission-20260908-01"
+RESOURCE_ROOTS = {
+    "workspace_root": RESOURCE_PARENT / "workspace",
+    "data_root": RESOURCE_PARENT / "data",
+    "output_root": RESOURCE_PARENT / "output",
+    "control_root": RESOURCE_PARENT / "control",
+}
+FRESH_PATHS = {
+    "manifest": f"campaigns/{CAMPAIGN_ID}/manifest.json",
+    "policy_scope": f"campaigns/{CAMPAIGN_ID}/policy-scope.json",
+    "adapter_config": f"campaigns/{CAMPAIGN_ID}/round-1-adapter-config.json",
+    "campaign_policy": f"campaigns/{CAMPAIGN_ID}/campaign-admission-policy.json",
+    "review_package": f"proposal/{CAMPAIGN_ID}",
+}
+
+EXPECTED_SOURCE_REVIEW = (
+    PACKAGE_ROOT.parent / "admission-p4/independent-review.md",
+    "4e4991b0dfcdcfe980b2bd2655ba5bf88af6300c956c179d2e258014dd1fef4b",
+)
+EXPECTED_SOURCE_AUTHORITY = (
+    PACKAGE_ROOT.parent / "admission-p4/reviewed-source-authority.json",
+    "d896bce97945b9438bed6f4837fd16213530338563e3bbd728eafaa8a9fbbe09",
+)
+EXPECTED_PRINCIPAL_READINESS = (
+    PACKAGE_ROOT.parent / "admission-readiness.md",
+    "14f385172f29dccf258d4be4802137724774e57b267ebbac4201a4945c01aed2",
+)
+EXPECTED_INDEPENDENT_READINESS = (
+    PACKAGE_ROOT.parent / "admission-readiness-independent-review.md",
+    "50cd6d863fb3f6235af3a47fcf90fe4d21a5425c8852055b470abe9c95634f3a",
+)
+EXPECTED_TOOL_EVIDENCE = (
+    PACKAGE_ROOT.parent / "preparation-tool-files.json",
+    "c329ade7d4f50a705bd6992da477870f4d1e0c3e4862feffe0f855d7c3fb243d",
+)
+EXPECTED_NATIVE_LAUNCH_NOTES = (
+    PACKAGE_ROOT.parent / "native-launch-envelope-notes.md",
+    "1ea2eabd612c94d3992f0485a9cc5ec387e4fd465e44fb1c48a97abbc06ef49c",
+)
+EXECUTABLES = {
+    "python": (
+        Path("C:/Program Files/WindowsApps/PythonSoftwareFoundation.Python.3.13_3.13.3824.0_x64__qbz5n2kfra8p0/python.exe"),
+        "ad169f4cb4bfb78c7a5c030a4529c19d6643276778e33994c93e145b6191c3ec",
+    ),
+    "git": (
+        Path("C:/Program Files/Git/bin/git.exe"),
+        "3cbd024d9d11ef08bd6a0cb5a973613c50825b4952bc6006f3f4222f436091e5",
+    ),
+    "docker": (
+        Path("C:/Users/llong/AppData/Local/Programs/DockerDesktop/resources/bin/docker.exe"),
+        "00ffff945b67c65aae98dd980621a80ee135ed4e0931b33ca03687caee019713",
+    ),
+}
+EXPECTED_SOURCE_COMMIT = "0985d9bae74162ec1da8a7268bd54e47f21b0b85"
+ORIGINAL_MANIFEST_PATH = "campaigns/development-provider-two-rounds-20260907-06/manifest.json"
+ORIGINAL_MANIFEST_SHA256 = "d90ed717c0d6b34d4cfa6bf7e2dd1f753e68c43b1127b200a66d2a9f930dfdf6"
+EXPECTED_EVALUATOR_SOURCE_SHA256 = "005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4"
+EXPECTED_IMAGE_NAME = "pit-optimizer-v5-evaluator"
+EXPECTED_IMAGE_DIGEST = "sha256:4e85b19aa8c135362ae8796e4d33a410ec5af650d296c358ae6a7737d5b05b6a"
+EXPECTED_TARGET_SHA256 = "83843c6441df61749b5381ea733971d69501d3bce7586072fa3117bed6e34df2"
+EXPECTED_DISCOVERY_PLAN_SHA256 = "3570d0168e9872044545c6ba70a919b51854cca91b2ea6bac448a9fc4337ad4b"
+
+SOURCE_SHA256_BY_PATH = {
+    "core/pit_optimizer_v5/artifacts.py": "2bab516e4945976d9bf6bb356934289cd14d9b87c25088521a043c8ac5cfa2c2",
+    "core/pit_optimizer_v5/campaign_admission.py": "3ea07b2b6db87cec0d1347aebb8035960a24de3fd2c7b9ec69f63b3db5d75670",
+    "core/pit_optimizer_v5/candidate_ir.py": "a437d9536fb57d48c7e9c9c6fab2f8a29ac9bea0666be61caeb2baf583b13f1b",
+    "core/pit_optimizer_v5/cli.py": "cf127dba9914911e51b7c9a7bf907ed3208aaffa8fb81184e30b1a0e7debae74",
+    "core/pit_optimizer_v5/contracts.py": "5ec3278af501f4abf285716bbd4d211fe5cd34c873e1644b63e3d43daa3de398",
+    "core/pit_optimizer_v5/controller_roles.py": "62f7414dd31a7970d08bcbf7fcc7faaeb19e5ee806cba5363311aef338b15b1f",
+    "core/pit_optimizer_v5/development_preparation.py": "4c2336bd973f349cd5aa1d5b8b78353f80e458e22daa9349d85c67775c08521e",
+    "core/pit_optimizer_v5/historical_verification.py": "978c0bd83ddbafecc9ef388420c23634429f32a5f6473eef441c09db4c6c521b",
+    "core/pit_optimizer_v5/manifest.py": "813970f8f9ea467c2af8e674c4f9d90b25d06796f798c02d8e9134ad32daeded",
+    "core/pit_optimizer_v5/memory.py": "37e3a04791d827edd0e5fe99e1d62cb9997163f66954f99727177248f8949d76",
+    "core/pit_optimizer_v5/operations.py": "02249f02dfad345ef3b6cca59a378f5bc0a211517427991f4c661158e9883942",
+    "core/pit_optimizer_v5/production_fs.py": "26e744b81bd9ab9b2b241980657ce924f13783aeb06372f4d4f1db447a02b06a",
+    "core/pit_optimizer_v5/production_provider.py": "e8aa63d92f48574bfb082f20a15f253f06c4e304d9afee95f0b02ed7954b80f4",
+    "core/pit_optimizer_v5/production_runtime.py": "9d1fad0710037a64b46d1745d107203d114483baac215563e49e1c28e8892f83",
+    "core/pit_optimizer_v5/production_sandbox.py": "8dd79cef1e524a87cc324745ac7ee49fbbe5e1a91f271ce0d641451dc99337d7",
+    "core/pit_optimizer_v5/production_workspace.py": "4e040d8edae52bab0635af6327601bf62e34011976182a213e925bfdb9f8b115",
+    "core/pit_optimizer_v5/provider.py": "d9b17d62a6c8b485ba6ae6abb22a9e87f9d908b3c96409ba6e21f86eb691e937",
+    "core/pit_optimizer_v5/rendering.py": "bd726b9a32ddaf675a9883aade2099747a8682ab6be5f36d465de77542e93464",
+    "core/pit_optimizer_v5/runtime.py": "d834eae8e3e120355b4479c77f87ebe46519a0b82a52cc072abe1dab60943aec",
+    "core/pit_optimizer_v5/search.py": "2f756453123ce834d03cf5fcd2eb57c82781fe228d77e7d4218b600c1b124e3c",
+    "core/pit_optimizer_v5/selection.py": "208bf033ffbb2222cf5df4d35741f4b562e0c359a9cb5504dce8e846205085d9",
+    "core/pit_optimizer_v5/summary.py": "bbf96eeece0e5c3aab963e975977f16f703ec5780802869c565558d9f9f588c5",
+}
+
+FIXED_DEPENDENCY_SHA256_BY_PATH = {
+    "preparation-seed/execution-profile.json": "93ced32086727384e67f36c5bdfa8ebfd3211a7fe47e25e7356b170a3bacb3af",
+    "preparation-seed/evaluator-contract.json": "73a4a914ca3a6088e6275eb1ab83f32fdfb26a24474c69a886313b30a75ccde4",
+    "preparation-seed/sandbox-profile.json": "0923e93f56e06fc982c9db00815329d1cdc936c0a0b9a140d287b7611ad5b1c9",
+    "preparation-seed/baseline-parent.json": "1f23034024f3b5caa55604cb21b561cb941e92d54bc09969935bea856a54dd6e",
+    "preparation-seed/source-bundle.json": "109a61992ac79317446861c4cb2053f2704239eb1f8eacfe2b2d27ca2cf7456e",
+    "preparation-seed/policy-revision.json": "5d2a95ba2572e71dab448934544cef22130415fcc1691c9a98deb820d40a1fa9",
+    "preparation-seed/panel-plan.json": "34fd3430ce952fa7115ec8802a4998cd6e940df5052c2dcfd92a1fb1a87843d5",
+    "panels/specs/quick.json": "bfa5c7767c74f0757442cc47a2cda8aaee9f43193a2ebe041b1bffbb0328cc05",
+    "preparation-seed/panels/discovery-1.json": "7fac6df621ef1d2eee4953a9e77870d5d5d074097052dcc353ee2a6337ab8be0",
+    "preparation-seed/panels/discovery-2.json": "2a67df05f796cdba0f3df464f9523a61b1c60160e235da826676da2e9f0323da",
+    "preparation-seed/panels/discovery-3.json": "09ae5201ed57186a9ac77444bc5cef9cf0f389b7364d8e7ec1f725b2ca364840",
+    "preparation-seed/panels/discovery-4.json": "1d76bae18728586aa1f14a4bea9228eb00bb4e7a023c53cba7dd9cc6a3fa4b73",
+    "data/pit_bundle.sqlite3": "cf729b47d762ae86287bb8a87c28a1664e7475c74ef1aca736fbc240111349de",
+    "data/prices_provenance.json": "97dad8197d1fcc0d7a8cedb1a0bc13b76d7169b56a8b9c0a0e836c0a25c4f8a2",
+}
+
+PARENT_PROVENANCE_PATH = "preparation-seed/parent-provenance.json"
+PARENT_PROVENANCE_SHA256 = "65cdc2349e3f63540bf60e1c09e3ab15d97164ebcdd674fe9af094c06053d3e5"
+PARENT_BLOB_SHA256 = (
+    "a15e1ba2ea3139efa700f5172c0ce4a709a83a188b27859825ee56ce2d61fbc6",
+    "8a38323a3cddc585214f8c36a9f669b8d5d0ea877af304a4d1a8253a77c1f24a",
+    "63d472c3821e70db68d708e52573c42422afbb6733dffb2a67fed95e0de4e363",
+    "d21eb4b6833f35f32ba531b891c559168700018b997c705bb250ee1a4763fda6",
+    "e80fe1c375894f409788a792e577007464c1cb97beca8ee79c0130dd316e9a80",
+    "045de2d770e228fe92568b36dbe25e67cd9d9bb38a9ee6b3896587bb5295eb33",
+    "af3d2983a167e0038dd0479bc2f6bd4cc4a2da76885b9552e776c0389d762771",
+    "ec05b032c65311f3dffa6a3b05952b79bee2dd020810f529c5c0c7ff651fbe6f",
+)
+
+QUICK_EVIDENCE_SHA256_BY_PATH = {
+    "request/panel-request.json": "46827813aa0afcf47a1de3b70a167a8db0e5a5df41bc3ce929f6f5e2cb1ba28c",
+    "output/panel-evaluation.json": "ee52964453c9831f371ca7539a6d30d5c47707d5c0e6cf3d16436e15c28c5716",
+    "verification-record.json": "30cd7f6c5048b535f864ae657d9292064d1e3739e07caff954bccd2d1d987843",
+}
+QUICK_EVIDENCE_ROOT = DEVELOPMENT_ROOT / "runs/runtime-parent-quick-005064e57e80-01"
+
+POLICY_SOURCE_SHA256_BY_PATH = {
+    "core/strategy_policy/v3/entry.py": "83f75bec59daaa74af1f02f335abd8bdbaa03eb97cd8a5e91addd4156ea01b85",
+    "core/strategy_policy/v3/risk.py": "32098cc02d13c2fbede053818bb99686b9659639b976108d9730adbfcf6cfe20",
+    "core/strategy_policy/v3/position.py": "8a9d0b790c0e3b7bc70a45d9e10b06f9b3c0337ebad662d8111f8abc35886cd1",
+    "core/strategy_policy/v3/exit.py": "61b07c9e42813e5d58a4ce7d669f06466e9bf5b6b4cf2872d624022959d8f837",
+}
+
+FORBIDDEN_RUNTIME_TOP_LEVEL = frozenset(
+    {
+        "archive",
+        "authorization",
+        "campaign-admission",
+        "campaign-launch",
+        "campaign-round-config",
+        "campaign-round-started",
+        "checkpoints",
+        "cleanup",
+        "critics",
+        "ledgers",
+        "receipts",
+        "reservations",
+        "responses",
+        "roles",
+        "rounds",
+        "state",
+    }
+)
+_DIGEST = re.compile(r"[0-9a-f]{64}")
+_REPARSE_POINT = 0x400
+
+
+def digest(raw: bytes) -> str:
+    return sha256(raw).hexdigest()
+
+
+def read_exact(path: Path, expected_sha256: str, label: str) -> bytes:
+    if not path.is_file() or path.is_symlink() or is_reparse(path):
+        raise RuntimeError(f"{label} is not a regular link-free file: {path}")
+    raw = path.read_bytes()
+    if digest(raw) != expected_sha256:
+        raise RuntimeError(f"{label} digest mismatch: {path}")
+    return raw
+
+
+def is_reparse(path: Path) -> bool:
+    attributes = getattr(path.lstat(), "st_file_attributes", 0)
+    is_junction = getattr(path, "is_junction", None)
+    return bool(attributes & _REPARSE_POINT) or bool(is_junction and is_junction())
+
+
+def require_absolute_link_free_directory(path_text: str, label: str) -> Path:
+    supplied = Path(path_text)
+    if not supplied.is_absolute():
+        raise RuntimeError(f"{label} must be an absolute directory")
+    resolved = supplied.resolve(strict=True)
+    if not resolved.is_dir():
+        raise RuntimeError(f"{label} is not a directory: {resolved}")
+    anchor = Path(resolved.anchor)
+    current = anchor
+    for component in resolved.parts[1:]:
+        current /= component
+        if current.is_symlink() or is_reparse(current):
+            raise RuntimeError(f"{label} contains a link or reparse point: {current}")
+    return resolved
+
+
+def require_under(child: Path, parent: Path, label: str) -> None:
+    if child == parent or not child.is_relative_to(parent):
+        raise RuntimeError(f"{label} must be a strict child of {parent}")
+
+
+def roots_overlap(left: Path, right: Path) -> bool:
+    return left == right or left.is_relative_to(right) or right.is_relative_to(left)
+
+
+def require_empty(path: Path, label: str) -> None:
+    if any(path.iterdir()):
+        raise RuntimeError(f"{label} must be genuinely fresh and empty: {path}")
+
+
+def safe_relative(value: str, label: str) -> str:
+    pure = PurePosixPath(value)
+    if (
+        not value
+        or pure.is_absolute()
+        or str(pure) != value
+        or any(part in {"", ".", ".."} for part in pure.parts)
+        or any("\\" in part or ":" in part for part in pure.parts)
+    ):
+        raise RuntimeError(f"{label} must be a canonical relative POSIX path")
+    return value
+
+
+def file_identity(path: Path) -> dict[str, object]:
+    status = path.stat()
+    return {
+        "path": str(path),
+        "sha256": digest(path.read_bytes()),
+        "size_bytes": status.st_size,
+        "device": status.st_dev,
+        "inode": status.st_ino,
+    }
+
+
+def snapshot_files(root: Path) -> dict[str, str]:
+    return {
+        path.relative_to(root).as_posix(): digest(path.read_bytes())
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def write_exclusive(path: Path, raw: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        written = 0
+        while written < len(raw):
+            written += os.write(descriptor, raw[written:])
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--approved-source-review-sha256", required=True)
+    parser.add_argument("--approved-source-authority-sha256", required=True)
+    parser.add_argument("--approved-principal-readiness-sha256", required=True)
+    parser.add_argument("--approved-independent-readiness-sha256", required=True)
+    parser.add_argument("--approved-driver-review-path", required=True)
+    parser.add_argument("--approved-driver-review-sha256", required=True)
+    parser.add_argument("--approved-driver-sha256", required=True)
+    return parser.parse_args()
+
+
+def authenticate_review_gates(args: argparse.Namespace) -> dict[str, object]:
+    if not sys.dont_write_bytecode:
+        raise RuntimeError("run the reviewed preparation driver with Python -B")
+    expected_review_path, expected_review_sha = EXPECTED_SOURCE_REVIEW
+    expected_authority_path, expected_authority_sha = EXPECTED_SOURCE_AUTHORITY
+    source_review_path = expected_review_path.resolve(strict=True)
+    source_authority_path = expected_authority_path.resolve(strict=True)
+    if args.approved_source_review_sha256 != expected_review_sha:
+        raise RuntimeError("explicit final source-review authority differs from the approved P4 freeze")
+    review_raw = read_exact(source_review_path, expected_review_sha, "final independent source review")
+    if args.approved_source_authority_sha256 != expected_authority_sha:
+        raise RuntimeError("explicit final source-map authority differs from the approved P4 freeze")
+    authority_raw = read_exact(
+        source_authority_path,
+        expected_authority_sha,
+        "final reviewed-source authority",
+    )
+    authority = json.loads(authority_raw)
+    if (
+        type(authority) is not dict
+        or set(authority) != {"review_sha256", "scope", "source_sha256_by_path"}
+        or authority["review_sha256"] != expected_review_sha
+        or authority["source_sha256_by_path"] != SOURCE_SHA256_BY_PATH
+        or len(authority["source_sha256_by_path"]) != 22
+    ):
+        raise RuntimeError("reviewed-source authority content differs from the final approved map")
+
+    readiness = {}
+    for label, supplied, authority in (
+        (
+            "principal",
+            args.approved_principal_readiness_sha256,
+            EXPECTED_PRINCIPAL_READINESS,
+        ),
+        (
+            "independent",
+            args.approved_independent_readiness_sha256,
+            EXPECTED_INDEPENDENT_READINESS,
+        ),
+    ):
+        readiness_path, expected_sha = authority
+        if supplied != expected_sha:
+            raise RuntimeError(f"explicit {label} updated-readiness authority differs")
+        readiness_path = readiness_path.resolve(strict=True)
+        readiness_raw = read_exact(
+            readiness_path,
+            expected_sha,
+            f"updated {label} readiness review",
+        )
+        readiness_text = readiness_raw.decode("utf-8")
+        if not re.search(r"\b(PASS|APPROVE|APPROVED)\b", readiness_text, re.IGNORECASE):
+            raise RuntimeError(f"updated {label} readiness review lacks an approval verdict")
+        readiness[label] = {
+            "path": str(readiness_path),
+            "sha256": digest(readiness_raw),
+        }
+
+    driver_path = Path(__file__).resolve(strict=True)
+    if not _DIGEST.fullmatch(args.approved_driver_sha256):
+        raise RuntimeError("driver requires its explicit independently reviewed SHA-256")
+    driver_raw = read_exact(driver_path, args.approved_driver_sha256, "campaign preparation driver")
+    driver_review_path = Path(args.approved_driver_review_path).resolve(strict=True)
+    if driver_review_path != DRIVER_REVIEW_PATH.resolve(strict=True):
+        raise RuntimeError("independent driver review path differs from the fixed review artifact")
+    if not _DIGEST.fullmatch(args.approved_driver_review_sha256):
+        raise RuntimeError("driver review requires an explicit lowercase SHA-256")
+    driver_review_raw = read_exact(
+        driver_review_path,
+        args.approved_driver_review_sha256,
+        "independent campaign preparation driver review",
+    )
+    driver_review_text = driver_review_raw.decode("utf-8")
+    if (
+        args.approved_driver_sha256 not in driver_review_text
+        or not re.search(r"\b(PASS|APPROVE|APPROVED)\b", driver_review_text, re.IGNORECASE)
+    ):
+        raise RuntimeError("independent driver review does not approve this exact driver")
+
+    tool_path, tool_sha = EXPECTED_TOOL_EVIDENCE
+    tool_raw = read_exact(tool_path.resolve(strict=True), tool_sha, "preparation tool-file evidence")
+    launch_notes_path, launch_notes_sha = EXPECTED_NATIVE_LAUNCH_NOTES
+    launch_notes_raw = read_exact(
+        launch_notes_path.resolve(strict=True),
+        launch_notes_sha,
+        "native launch-envelope notes",
+    )
+
+    source_before = {
+        relative: digest((SOURCE_ROOT / relative).read_bytes())
+        for relative in SOURCE_SHA256_BY_PATH
+    }
+    if source_before != SOURCE_SHA256_BY_PATH:
+        raise RuntimeError("one or more of the 22 independently reviewed source files changed")
+    return {
+        "source_review_path": str(source_review_path),
+        "source_review_sha256": digest(review_raw),
+        "source_authority_path": str(source_authority_path),
+        "source_authority_sha256": digest(authority_raw),
+        "readiness": readiness,
+        "driver_path": str(driver_path),
+        "driver_sha256": digest(driver_raw),
+        "driver_review_path": str(driver_review_path),
+        "driver_review_sha256": digest(driver_review_raw),
+        "tool_evidence_path": str(tool_path.resolve(strict=True)),
+        "tool_evidence_sha256": digest(tool_raw),
+        "native_launch_notes_path": str(launch_notes_path.resolve(strict=True)),
+        "native_launch_notes_sha256": digest(launch_notes_raw),
+        "source_sha256_by_path": source_before,
+    }
+
+
+def preflight_paths_and_inputs(args: argparse.Namespace) -> dict[str, object]:
+    authorized = require_absolute_link_free_directory(
+        str(AUTHORIZED_ARTIFACTS_ROOT),
+        "authorized main-repository artifact root",
+    )
+    development = require_absolute_link_free_directory(str(DEVELOPMENT_ROOT), "development artifact parent")
+    if ARTIFACT_ROOT.exists() or RESOURCE_PARENT.exists():
+        raise RuntimeError("selected fresh artifact or resource root already exists")
+    if ARTIFACT_ROOT.parent.resolve(strict=True) != development:
+        raise RuntimeError("selected fresh artifact root has an unexpected parent")
+    if RESOURCE_PARENT.parent.resolve(strict=True) != authorized:
+        raise RuntimeError("selected fresh resource parent has an unexpected parent")
+    planned_roots = {"artifact_root": ARTIFACT_ROOT.resolve(strict=False), **RESOURCE_ROOTS}
+    for label, root in RESOURCE_ROOTS.items():
+        require_under(root, authorized, label)
+        if roots_overlap(root, SOURCE_ROOT.resolve(strict=True)):
+            raise RuntimeError(f"{label} overlaps the source worktree")
+    entries = tuple(planned_roots.items())
+    for index, (left_label, left) in enumerate(entries):
+        for right_label, right in entries[index + 1 :]:
+            if roots_overlap(left, right):
+                raise RuntimeError(f"{left_label} overlaps {right_label}")
+    executable_identities = {}
+    for label, (path, expected) in EXECUTABLES.items():
+        path = path.resolve(strict=True)
+        read_exact(path, expected, f"{label} executable")
+        executable_identities[label] = file_identity(path)
+    running_python = Path(sys.executable).resolve(strict=True)
+    selected_python = EXECUTABLES["python"][0].resolve(strict=True)
+    if not os.path.samefile(running_python, selected_python):
+        raise RuntimeError("preparation must run under the exact Python executable used by the rendered launch")
+
+    paths = {label: safe_relative(value, f"{label} path") for label, value in FRESH_PATHS.items()}
+    expected_manifest = f"campaigns/{CAMPAIGN_ID}/manifest.json"
+    if paths["manifest"] != expected_manifest:
+        raise RuntimeError(f"manifest path must be {expected_manifest}")
+    campaign_prefix = PurePosixPath(paths["manifest"]).parent
+    for label in ("policy_scope", "adapter_config", "campaign_policy"):
+        if PurePosixPath(paths[label]).parent != campaign_prefix:
+            raise RuntimeError(f"{label} must be a distinct file in the fresh campaign directory")
+    if len(set(paths.values())) != len(paths):
+        raise RuntimeError("fresh artifact output paths must be distinct")
+    review_parts = PurePosixPath(paths["review_package"]).parts
+    if len(review_parts) < 2 or review_parts[0] != "proposal":
+        raise RuntimeError("review package must use a fresh proposal/... directory outside roles/state")
+    if any(part in FORBIDDEN_RUNTIME_TOP_LEVEL for part in review_parts):
+        raise RuntimeError("review package path enters a runtime state namespace")
+
+    source_payloads = {}
+    for relative, expected in FIXED_DEPENDENCY_SHA256_BY_PATH.items():
+        source_payloads[relative] = read_exact(
+            ORIGINAL_ROOT / relative,
+            expected,
+            f"fixed dependency {relative}",
+        )
+    source_payloads[PARENT_PROVENANCE_PATH] = read_exact(
+        ORIGINAL_ROOT / PARENT_PROVENANCE_PATH,
+        PARENT_PROVENANCE_SHA256,
+        "parent provenance sidecar",
+    )
+    parent_blobs = {}
+    for expected in PARENT_BLOB_SHA256:
+        relative = f"adapter-blobs/development-parent-originals/{expected}.bin"
+        parent_blobs[expected] = read_exact(ORIGINAL_ROOT / relative, expected, "original parent evidence blob")
+    quick_evidence = {
+        relative: read_exact(QUICK_EVIDENCE_ROOT / relative, expected, f"quick evidence {relative}")
+        for relative, expected in QUICK_EVIDENCE_SHA256_BY_PATH.items()
+    }
+    return {
+        "authorized_root": authorized,
+        "planned_roots": planned_roots,
+        "paths": paths,
+        "executables": executable_identities,
+        "source_payloads": source_payloads,
+        "parent_blobs": parent_blobs,
+        "quick_evidence": quick_evidence,
+    }
+
+
+def create_fresh_roots(source_payloads: dict[str, bytes]) -> dict[str, Path]:
+    os.mkdir(ARTIFACT_ROOT)
+    os.mkdir(RESOURCE_PARENT)
+    for root in RESOURCE_ROOTS.values():
+        os.mkdir(root)
+    roots = {
+        "artifact_root": require_absolute_link_free_directory(str(ARTIFACT_ROOT), "fresh artifact root"),
+        **{
+            label: require_absolute_link_free_directory(str(root), label)
+            for label, root in RESOURCE_ROOTS.items()
+        },
+    }
+    for label in ("artifact_root", "workspace_root", "data_root", "output_root", "control_root"):
+        require_empty(roots[label], label)
+    for name in ("pit_bundle.sqlite3", "prices_provenance.json"):
+        relative = f"data/{name}"
+        write_exclusive(roots["data_root"] / name, source_payloads[relative])
+        read_exact(
+            roots["data_root"] / name,
+            FIXED_DEPENDENCY_SHA256_BY_PATH[relative],
+            f"fresh mounted data resource {name}",
+        )
+    if {item.name for item in roots["data_root"].iterdir()} != {
+        "pit_bundle.sqlite3",
+        "prices_provenance.json",
+    }:
+        raise RuntimeError("fresh mounted data root contains unexpected entries")
+    return roots
+
+
+def require_prelaunch_absence(artifact_root: Path) -> None:
+    present = {item.name for item in artifact_root.iterdir()}
+    forbidden = sorted(present & FORBIDDEN_RUNTIME_TOP_LEVEL)
+    if forbidden:
+        raise RuntimeError(f"preparation created prohibited runtime state: {forbidden}")
+
+
+def main() -> int:
+    args = parse_arguments()
+
+    # These gates and all 22 reviewed source-byte checks intentionally precede
+    # importing project source or writing any destination byte.
+    gates = authenticate_review_gates(args)
+    preflight = preflight_paths_and_inputs(args)
+
+    sys.path.insert(0, str(SOURCE_ROOT))
+    from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5
+    from core.pit_optimizer_v5.campaign_admission import (
+        CampaignAdmissionPolicyV5,
+        authenticate_prepared_campaign_policy_v5,
+        require_role_envelope_v5,
+    )
+    from core.pit_optimizer_v5.contracts import (
+        ArtifactRefV5,
+        CampaignPanelPlanV5,
+        EvaluatorContractV5,
+        ExecutionProfileV5,
+        PolicyRevisionIdentityV5,
+        ProviderCapabilitiesV5,
+        ResourceCapabilitiesV5,
+        SearchCapabilitiesV5,
+        SourceBundleV5,
+        canonical_json_bytes_v5,
+        canonical_primitive_v5,
+    )
+    from core.pit_optimizer_v5.development_preparation import (
+        DevelopmentRoundFactoryV5,
+        capture_development_policy_v5,
+        load_development_config_v5,
+    )
+    from core.pit_optimizer_v5.manifest import (
+        authenticate_campaign_manifest_v5,
+        build_campaign_manifest_v5,
+    )
+    from core.pit_optimizer_v5.operations import (
+        _authorities,
+        prepare_development_adapter_config_v5,
+        render_production_command_v5,
+    )
+    from core.pit_optimizer_v5.provider import (
+        prospective_role_usage_v5,
+        wire_role_messages_v5,
+        wire_role_schema_v5,
+    )
+    from core.pit_optimizer_v5.production_runtime import LocalArchiveReducerFactoryV5
+    from core.pit_optimizer_v5.runtime import SearchProjectionV5
+    from core.pit_optimizer_v5.search import BaselineParentAuthorityV5
+    from core.pit_optimizer_v5.selection import select_parent_v5
+    from core.pit_optimizer_v5.contracts import SandboxProfileV5
+
+    source_repository = LocalArtifactRepositoryV5(ORIGINAL_ROOT.resolve(strict=True))
+    original_manifest_ref = ArtifactRefV5(ORIGINAL_MANIFEST_PATH, ORIGINAL_MANIFEST_SHA256)
+    original = authenticate_campaign_manifest_v5(
+        repository=source_repository,
+        manifest_ref=original_manifest_ref,
+    )
+    if (
+        not original.graph.verified
+        or original.evaluator_contract.evaluator_source_sha256 != EXPECTED_EVALUATOR_SOURCE_SHA256
+        or original.sandbox_profile.image_name != EXPECTED_IMAGE_NAME
+        or original.sandbox_profile.image_digest != EXPECTED_IMAGE_DIGEST
+        or original.panel_plan.discovery_plan_sha256 != EXPECTED_DISCOVERY_PLAN_SHA256
+        or original.manifest.target.sha256 != EXPECTED_TARGET_SHA256
+        or original.manifest.pit_data_scope != "development_sp500_v2"
+        or original.manifest.semantic_mode != "disabled_development"
+    ):
+        raise RuntimeError("actual06 immutable fixed graph differs from approved authority")
+
+    roots = create_fresh_roots(preflight["source_payloads"])
+    artifact_root = roots["artifact_root"]
+    destination = LocalArtifactRepositoryV5(artifact_root)
+    source_payloads = preflight["source_payloads"]
+
+    typed_imports = (
+        ("preparation-seed/execution-profile.json", ExecutionProfileV5),
+        ("preparation-seed/evaluator-contract.json", EvaluatorContractV5),
+        ("preparation-seed/sandbox-profile.json", SandboxProfileV5),
+        ("preparation-seed/baseline-parent.json", BaselineParentAuthorityV5),
+        ("preparation-seed/source-bundle.json", SourceBundleV5),
+        ("preparation-seed/policy-revision.json", PolicyRevisionIdentityV5),
+        ("preparation-seed/panel-plan.json", CampaignPanelPlanV5),
+    )
+    imported_refs = []
+    for relative, value_type in typed_imports:
+        expected_ref = ArtifactRefV5(relative, FIXED_DEPENDENCY_SHA256_BY_PATH[relative])
+        value = source_repository.load_typed_artifact(expected_ref, value_type=value_type)
+        observed_ref = destination.create_typed_artifact(relative, value)
+        if observed_ref != expected_ref:
+            raise RuntimeError(f"typed dependency import changed identity: {relative}")
+        imported_refs.append(observed_ref)
+
+    panel_paths = (
+        "panels/specs/quick.json",
+        "preparation-seed/panels/discovery-1.json",
+        "preparation-seed/panels/discovery-2.json",
+        "preparation-seed/panels/discovery-3.json",
+        "preparation-seed/panels/discovery-4.json",
+    )
+    for relative in panel_paths:
+        expected_ref = ArtifactRefV5(relative, FIXED_DEPENDENCY_SHA256_BY_PATH[relative])
+        panel = source_repository.load_evaluation_panel_spec_exact(expected_ref)
+        observed_ref = destination.create_evaluation_panel_spec(relative, panel)
+        if observed_ref != expected_ref:
+            raise RuntimeError(f"panel dependency import changed identity: {relative}")
+        imported_refs.append(observed_ref)
+
+    for relative in ("data/pit_bundle.sqlite3", "data/prices_provenance.json"):
+        expected_ref = ArtifactRefV5(relative, FIXED_DEPENDENCY_SHA256_BY_PATH[relative])
+        source_repository.authenticate_raw_artifact(expected_ref)
+        write_exclusive(artifact_root / relative, source_payloads[relative])
+        authenticated_raw = destination.authenticate_raw_artifact(expected_ref)
+        if authenticated_raw.reference != expected_ref:
+            raise RuntimeError(f"raw dependency import changed identity: {relative}")
+        imported_refs.append(expected_ref)
+
+    write_exclusive(
+        artifact_root / PARENT_PROVENANCE_PATH,
+        source_payloads[PARENT_PROVENANCE_PATH],
+    )
+    provenance_ref = ArtifactRefV5(PARENT_PROVENANCE_PATH, PARENT_PROVENANCE_SHA256)
+    if destination.authenticate(provenance_ref).reference != provenance_ref:
+        raise RuntimeError("parent provenance sidecar import changed identity")
+    parent_refs = [provenance_ref]
+    for expected, raw in preflight["parent_blobs"].items():
+        observed_ref = destination.append_binary_state(
+            namespace="development-parent-originals",
+            key=expected,
+            content=raw,
+        )
+        expected_ref = ArtifactRefV5(
+            f"adapter-blobs/development-parent-originals/{expected}.bin",
+            expected,
+        )
+        if observed_ref != expected_ref:
+            raise RuntimeError("original parent evidence import changed identity")
+        parent_refs.append(observed_ref)
+    if len(imported_refs) != 14 or len(parent_refs) != 9:
+        raise RuntimeError("fresh import cardinality differs from the approved 14+9 inventory")
+
+    snapshot, policy_sources = capture_development_policy_v5(
+        source_root=SOURCE_ROOT,
+        git_executable=EXECUTABLES["git"][0].resolve(strict=True),
+        expected_source_commit=EXPECTED_SOURCE_COMMIT,
+    )
+    if {path: digest(raw) for path, raw in policy_sources.items()} != POLICY_SOURCE_SHA256_BY_PATH:
+        raise RuntimeError("immutable commit policy blobs differ from approved fixed source")
+
+    search = SearchCapabilitiesV5(
+        hypotheses_per_investigator=1,
+        max_tunable_axes=1,
+        max_variants_per_template=1,
+        max_discovery_survivors_per_template=1,
+        archive_capacity=2,
+        max_feedback_rounds=3,
+        allow_full_source_escape=False,
+        investigator_memory_max_bytes=98_304,
+    )
+    provider = ProviderCapabilitiesV5(
+        model="openai/gpt-5.4",
+        maximum_role_calls=8,
+        maximum_total_tokens=600_000,
+        maximum_output_tokens_per_role=8_192,
+        maximum_usd=None,
+        automatic_retries=0,
+        schema_repair_calls=0,
+        price_upper_bound=None,
+        input_token_overhead_upper_bound=4_096,
+    )
+    sandbox = original.sandbox_profile
+    resources = ResourceCapabilitiesV5(
+        max_parallel_evaluations=1,
+        evaluation_cpu_limit=sandbox.cpu_limit,
+        evaluation_memory_mib=sandbox.memory_limit_mib,
+        evaluation_pid_limit=sandbox.pid_limit,
+        evaluation_output_limit_bytes=sandbox.output_limit_bytes,
+        policy_method_timeout_seconds=1,
+        worker_startup_timeout_seconds=30,
+        role_call_timeout_seconds=300,
+        mechanics_timeout_seconds=60,
+        quick_timeout_seconds=600,
+        discovery_episode_timeout_seconds=1_200,
+        round_wall_timeout_seconds=7_200,
+        campaign_wall_timeout_seconds=21_600,
+        cleanup_timeout_seconds=60,
+    )
+    dependency_refs = {
+        relative: ArtifactRefV5(relative, expected)
+        for relative, expected in FIXED_DEPENDENCY_SHA256_BY_PATH.items()
+    }
+    paths = preflight["paths"]
+    authenticated = build_campaign_manifest_v5(
+        repository=destination,
+        campaign_id=CAMPAIGN_ID,
+        target=original.manifest.target,
+        source_snapshot=snapshot,
+        execution_profile_ref=dependency_refs["preparation-seed/execution-profile.json"],
+        evaluator_contract_ref=dependency_refs["preparation-seed/evaluator-contract.json"],
+        baseline_authority_ref=dependency_refs["preparation-seed/baseline-parent.json"],
+        panel_plan_ref=dependency_refs["preparation-seed/panel-plan.json"],
+        sandbox_profile_ref=dependency_refs["preparation-seed/sandbox-profile.json"],
+        policy_scope_path=paths["policy_scope"],
+        manifest_path=paths["manifest"],
+        search=search,
+        provider=provider,
+        resources=resources,
+        pit_data_scope="development_sp500_v2",
+        semantic_mode="disabled_development",
+    )
+
+    prepared = prepare_development_adapter_config_v5(
+        repository=destination,
+        authenticated=authenticated,
+        output_path=paths["adapter_config"],
+        source_root=str(SOURCE_ROOT),
+        workspace_root=str(roots["workspace_root"]),
+        data_root=str(roots["data_root"]),
+        output_root=str(roots["output_root"]),
+        control_root=str(roots["control_root"]),
+        git_executable=str(EXECUTABLES["git"][0].resolve(strict=True)),
+        docker_executable=str(EXECUTABLES["docker"][0].resolve(strict=True)),
+        round_index=1,
+        owner_token_sha256=None,
+        response_directory=None,
+    )
+    config_ref = prepared["adapter_config_ref"]
+    owner_token_sha256 = prepared["owner_token_sha256"]
+    config = load_development_config_v5(destination, _authorities(authenticated), config_ref)
+
+    policy = CampaignAdmissionPolicyV5(
+        schema_version=5,
+        policy_revision=1,
+        manifest_ref=authenticated.manifest_ref,
+        adapter_config_ref=config_ref,
+        owner_token_sha256=owner_token_sha256,
+        repository_root_identity_sha256=destination.root_identity_sha256,
+        target_evaluated_feedback_rounds=2,
+        prospective_total_tokens_per_role=75_000,
+    )
+    policy_ref = destination.create_typed_artifact(paths["campaign_policy"], policy)
+    authenticated_policy = authenticate_prepared_campaign_policy_v5(
+        repository=destination,
+        manifest=authenticated.manifest,
+        policy_ref=policy_ref,
+    )
+    if authenticated_policy != policy:
+        raise RuntimeError("prepared campaign admission policy did not reauthenticate exactly")
+
+    require_prelaunch_absence(artifact_root)
+    before_preview = snapshot_files(artifact_root)
+    authorities = _authorities(authenticated)
+    composition = DevelopmentRoundFactoryV5(
+        adapter_config_ref=config_ref,
+        adapter_config=config,
+    ).compose_round(
+        repository=destination,
+        authorities=authorities,
+        round_index=1,
+        owner_token_sha256=owner_token_sha256,
+        adapter_config=config,
+    )
+    composition.validate_for(
+        repository=destination,
+        authorities=authorities,
+        round_index=1,
+        owner_token_sha256=owner_token_sha256,
+        adapter_config=config,
+    )
+    reducer = LocalArchiveReducerFactoryV5(destination).recovery_reducer(composition.inputs)
+    initial_state = reducer.initial()
+    projection = SearchProjectionV5(
+        checkpoint=None,
+        state=initial_state,
+        stored_records=(),
+    )
+    parent = select_parent_v5(
+        state=projection.state,
+        baseline=composition.inputs.baseline,
+        discovery_plan=composition.inputs.panel_plan,
+        evaluator_contract=composition.inputs.evaluator_contract,
+        stored_records=(),
+    )
+    request = composition.dependencies.requests.investigator_request(
+        composition.inputs,
+        projection,
+        parent,
+    )
+    require_role_envelope_v5(
+        policy=authenticated_policy,
+        manifest=authenticated.manifest,
+        request=request,
+    )
+    if before_preview != snapshot_files(artifact_root):
+        raise RuntimeError("round-1 preview persisted or changed repository bytes")
+    require_prelaunch_absence(artifact_root)
+
+    provider_authority = authenticated.manifest.provider
+    if provider_authority is None:
+        raise RuntimeError("fresh campaign lacks its paid development provider authority")
+    input_bound, cost_bound = prospective_role_usage_v5(request, provider_authority)
+    if cost_bound is not None or provider_authority.maximum_usd is not None:
+        raise RuntimeError("C-c preparation must not claim a price or hard USD ceiling")
+    request_raw = canonical_json_bytes_v5(request.to_primitive())
+    wire_messages = wire_role_messages_v5(request.messages)
+    wire_messages_raw = canonical_json_bytes_v5(wire_messages)
+    canonical_schema_raw = request.schema_authority.canonical_schema_json
+    wire_schema = wire_role_schema_v5(json.loads(canonical_schema_raw))
+    wire_schema_raw = canonical_json_bytes_v5(wire_schema)
+    prospective_total = input_bound + request.max_output_tokens
+    if prospective_total > authenticated_policy.prospective_total_tokens_per_role:
+        raise RuntimeError("initial preview exceeds the authenticated prospective role envelope")
+
+    before_render = snapshot_files(artifact_root)
+    launch = render_production_command_v5(
+        repository=destination,
+        authenticated=authenticated,
+        artifact_root=artifact_root,
+        adapter_config_ref=config_ref,
+        round_index=1,
+        owner_token_sha256=owner_token_sha256,
+        command="run-campaign",
+        campaign_policy_ref=policy_ref,
+    )
+    if tuple(launch["argv"])[0] != sys.executable or "--campaign-policy-sha256" not in launch["argv"]:
+        raise RuntimeError("native rendered launch does not pin the actual interpreter and campaign policy")
+    if before_render != snapshot_files(artifact_root):
+        raise RuntimeError("native command rendering persisted or changed repository bytes")
+
+    original_after = authenticate_campaign_manifest_v5(
+        repository=source_repository,
+        manifest_ref=original_manifest_ref,
+    )
+    source_after = {
+        relative: digest((SOURCE_ROOT / relative).read_bytes())
+        for relative in SOURCE_SHA256_BY_PATH
+    }
+    if original_after != original or source_after != SOURCE_SHA256_BY_PATH:
+        raise RuntimeError("source authority changed during preparation")
+    for readiness in gates["readiness"].values():
+        if digest(Path(readiness["path"]).read_bytes()) != readiness["sha256"]:
+            raise RuntimeError("updated readiness approval changed during preparation")
+
+    review_directory = artifact_root / paths["review_package"]
+    if review_directory.exists():
+        raise RuntimeError("review output package already exists")
+    request_path = review_directory / "initial-investigator-request.json"
+    messages_path = review_directory / "initial-investigator-wire-messages.json"
+    schema_path = review_directory / "initial-investigator-wire-schema.json"
+    write_exclusive(request_path, request_raw)
+    write_exclusive(messages_path, wire_messages_raw)
+    write_exclusive(schema_path, wire_schema_raw)
+
+    graph_refs = tuple(
+        item.reference.to_primitive()
+        for item in authenticated.graph.authenticated
+    )
+    quick_refs = tuple(
+        {
+            "path": str((QUICK_EVIDENCE_ROOT / relative).resolve(strict=True)),
+            "sha256": expected,
+            "copied_into_runtime_graph": False,
+        }
+        for relative, expected in QUICK_EVIDENCE_SHA256_BY_PATH.items()
+    )
+    report = {
+        "schema_version": 5,
+        "status": "prepared_for_independent_review_not_authorized_for_execution",
+        "review_gates": gates,
+        "campaign": {
+            "campaign_id": CAMPAIGN_ID,
+            "artifact_root": str(artifact_root),
+            "repository_root_identity_sha256": destination.root_identity_sha256,
+            "manifest_ref": authenticated.manifest_ref.to_primitive(),
+            "adapter_config_ref": config_ref.to_primitive(),
+            "campaign_policy_ref": policy_ref.to_primitive(),
+            "owner_token_sha256": owner_token_sha256,
+            "enrollment_created": False,
+            "campaign_launch_created": False,
+            "round_start_created": False,
+        },
+        "source": {
+            "source_root": str(SOURCE_ROOT),
+            "immutable_commit": EXPECTED_SOURCE_COMMIT,
+            "policy_source_sha256_by_path": POLICY_SOURCE_SHA256_BY_PATH,
+            "full_source_escape_allowed": False,
+        },
+        "fixed_authority": {
+            "original_manifest_ref": original_manifest_ref.to_primitive(),
+            "original_graph_authenticated": original.graph.verified,
+            "imported_dependency_refs": tuple(item.to_primitive() for item in imported_refs),
+            "imported_parent_provenance_refs": tuple(item.to_primitive() for item in parent_refs),
+            "fresh_graph_refs": graph_refs,
+            "evaluator_source_sha256": EXPECTED_EVALUATOR_SOURCE_SHA256,
+            "image": f"{EXPECTED_IMAGE_NAME}@{EXPECTED_IMAGE_DIGEST}",
+            "quick_evidence_refs": quick_refs,
+        },
+        "limits": {
+            "pit_data_scope": "development_sp500_v2",
+            "semantic_mode": "disabled_development",
+            "model_identifier": "openai/gpt-5.4",
+            "model_availability_claimed": False,
+            "target_evaluated_feedback_rounds": 2,
+            "maximum_lifecycle_attempts": 3,
+            "maximum_role_calls": 8,
+            "maximum_total_tokens": 600_000,
+            "prospective_total_tokens_per_role": 75_000,
+            "maximum_output_tokens_per_role": 8_192,
+            "input_token_overhead_upper_bound": 4_096,
+            "automatic_retries": 0,
+            "schema_repair_calls": 0,
+            "maximum_usd": None,
+            "price_upper_bound": None,
+            "hard_usd_ceiling": False,
+            "hypotheses_per_investigator": 1,
+            "maximum_tunable_axes": 1,
+            "maximum_variants_per_template": 1,
+            "maximum_discovery_survivors_per_template": 1,
+            "archive_capacity": 2,
+            "investigator_memory_max_bytes": 98_304,
+        },
+        "resources": canonical_primitive_v5(resources),
+        "native_identities": {
+            "executables": preflight["executables"],
+            "repository_root_identity_sha256": destination.root_identity_sha256,
+            "candidate_base_identity_sha256": config.candidate_base_identity_sha256,
+            "workspace_driver_identity_sha256": config.workspace_driver_identity_sha256,
+            "mount_factory_identity_sha256": config.mount_factory_identity_sha256,
+            "container_executor_identity_sha256": config.container_executor_identity_sha256,
+            "gateway_identity_sha256": config.gateway_identity_sha256,
+            "ledger_identity_sha256": config.ledger_identity_sha256,
+            "audit_store_identity_sha256": config.audit_store_identity_sha256,
+            "credential_handle_name": config.api_key_environment_variable,
+            "environment_values_published": False,
+            "docker_executed": False,
+        },
+        "initial_preview": {
+            "request_ref": {
+                "relative_path": request_path.relative_to(artifact_root).as_posix(),
+                "sha256": digest(request_raw),
+            },
+            "wire_messages_ref": {
+                "relative_path": messages_path.relative_to(artifact_root).as_posix(),
+                "sha256": digest(wire_messages_raw),
+            },
+            "wire_schema_ref": {
+                "relative_path": schema_path.relative_to(artifact_root).as_posix(),
+                "sha256": digest(wire_schema_raw),
+            },
+            "role_request_sha256": request.sha256,
+            "canonical_request_size_bytes": len(request_raw),
+            "wire_messages_size_bytes": len(wire_messages_raw),
+            "canonical_schema_size_bytes": len(canonical_schema_raw),
+            "wire_schema_size_bytes": len(wire_schema_raw),
+            "response_schema_sha256": request.response_schema_sha256,
+            "input_tokens_upper_bound": input_bound,
+            "maximum_output_tokens": request.max_output_tokens,
+            "prospective_total_tokens": prospective_total,
+            "prospective_envelope_remaining": (
+                authenticated_policy.prospective_total_tokens_per_role - prospective_total
+            ),
+            "cost_upper_bound_usd": None,
+            "projection": {
+                "checkpoint": None,
+                "state": canonical_primitive_v5(initial_state),
+                "stored_records": (),
+            },
+            "parent": parent.to_primitive(),
+            "repository_bytes_unchanged_by_preview": True,
+            "request_persisted_under_roles": False,
+        },
+        "later_role_contracts": {
+            "author": {
+                "exact_request_bytes": "unknown_until_actual_authorized_investigator_response",
+                "allowed_policy_source_sha256_by_path": POLICY_SOURCE_SHA256_BY_PATH,
+                "full_source_escape_allowed": False,
+                "maximum_output_tokens": 8_192,
+            },
+            "critic": {
+                "exact_request_bytes": "unknown_until_actual_authorized_candidate_evaluation",
+                "maximum_output_tokens": 8_192,
+            },
+            "fabricated_response_dependent_bytes": False,
+        },
+        "native_run_campaign_command": launch,
+        "launch_envelope": {
+            "generic_route_documented_at": gates["native_launch_notes_path"],
+            "generic_route_notes_sha256": gates["native_launch_notes_sha256"],
+            "paid_launcher_written_or_run": False,
+            "awake_or_credential_launcher_run": False,
+        },
+        "execution": {
+            "prepared_by_actual_interpreter": True,
+            "launch_must_use_same_interpreter_and_environment": True,
+            "provider_calls": 0,
+            "evaluations": 0,
+            "docker_runs": 0,
+            "role_requests_persisted": 0,
+            "role_reservations": 0,
+            "credentials_or_environment_values_read": False,
+            "execution_authorized": False,
+        },
+    }
+    report_raw = canonical_json_bytes_v5(report)
+    report_path = review_directory / "campaign-preparation-report.json"
+    write_exclusive(report_path, report_raw)
+    print(
+        json.dumps(
+            {
+                "status": report["status"],
+                "campaign_id": CAMPAIGN_ID,
+                "manifest_sha256": authenticated.manifest_ref.sha256,
+                "campaign_policy_sha256": policy_ref.sha256,
+                "preview_request_sha256": request.sha256,
+                "report_path": str(report_path),
+                "report_sha256": digest(report_raw),
+                "maximum_usd": None,
+                "execution_authorized": False,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

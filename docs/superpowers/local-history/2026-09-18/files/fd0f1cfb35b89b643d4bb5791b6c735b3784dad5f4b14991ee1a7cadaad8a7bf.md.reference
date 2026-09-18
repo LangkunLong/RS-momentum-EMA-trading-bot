@@ -1,0 +1,35 @@
+# Spec Compliance
+
+❌ Overall. The independent warmup/evaluation boundary, deterministic run reset, fixed fold manifest, discovery-only capture, canonical evidence hashing, and create-only persistence substantially match the Task 2 contract. However, the final parity gate can attest the reference at the same source HEAD, and the readiness/source/reference trust boundaries do not fully fail closed.
+
+⚠️ The reported test and real-capture commands were not rerun, per the review instruction. This assessment uses the supplied diff as the authoritative change view.
+
+# Strengths
+
+- `core/backtest_engine.py` cleanly separates `history_start_date` loading from `trade_start` evaluation sessions, binds both dates into checkpoint/result identity, resets per-run portfolio/diagnostic/cache state, and preserves the existing final-session liquidation ordering.
+- `core/pit_optimizer_evaluation.py` enforces two discovery folds plus one hidden fold, exactly 60 unique chronological sessions per fold, non-overlap, hidden-after-discovery ordering, one shared identity set, and canonical manifest hashing.
+- `core/pit_policy_parity.py` embeds transactions, entry outcomes, exact equity points, funnels, aggregates, policy digests, and nested evidence digests rather than substituting hashes for evidence. Reference and attestation writes use create-only mode.
+- Hidden access is limited to the benchmark `trade_date` query, while capture iterates only `manifest.discovery_folds`.
+- The synthetic engine test exercises causal warmup visibility, no pre-fold outputs, next-open entry, last-session non-execution, deterministic liquidation, and consecutive-run reset behavior.
+
+# Issues
+
+## Critical
+
+- **[Critical, confidence 10/10] `core/pit_policy_parity.py:859` — verification does not require a later source HEAD.** `verify_parity_reference` records the current identity at line 869 and proceeds directly to equality attestation at line 900; neither it nor `verify_parity_evidence` at line 398 rejects `final_source_head == reference.reference_source_head` or verifies ancestry. Running `verify` immediately against the freshly captured reference can therefore publish a create-only, all-true “final” attestation before policy extraction occurred, and that output can then block the legitimate later attestation. Require a different final HEAD and prove the reference HEAD is an ancestor of it before any evaluation or write; add same-HEAD and non-descendant rejection tests.
+
+## Important
+
+- **[Important, confidence 9/10] `core/pit_policy_parity.py:766` — the legacy readiness artifact is only partially authenticated.** `_authenticated_readiness` checks canonical bytes plus the effective-policy digest (lines 767-776). The later scope check validates only selected scope leaves (lines 499-510). It does not validate the readiness schema/gate/phase, budget contract, `scope_sha256`, sealed-input cross-links, baseline authority identity, source/catalog identity, or the rest of the producer's closed readiness contract. The tests reinforce this gap by passing a deliberately incomplete mapping at `tests/test_pit_policy_parity.py:368`. A canonical but internally inconsistent readiness file can thus be accepted and hashed into a reference. Reuse the existing full readiness validator (or reproduce its closed-field checks) and compare all externally fixed identities before discovery evaluation.
+
+- **[Important, confidence 10/10] `core/pit_policy_parity.py:731` — “clean committed source” omits untracked files and is vulnerable to a capture-time race.** The status command explicitly uses `--untracked-files=no` at line 744, so an untracked executable/configuration file is compatible with the claimed clean source. The status/HEAD/tree identity is also sampled only once before the long evaluation; capture and verification do not recheck it immediately before persistence. Evidence can therefore be produced from an untracked or mid-run-mutated worktree while the artifact records the old committed tree. Include all non-ignored untracked files in the cleanliness gate and re-verify unchanged status, HEAD, and fingerprint after evaluation and before the create-only write.
+
+- **[Important, confidence 10/10] `core/pit_policy_parity.py:183` — reference loading does not validate the manifest/evidence cross-links.** `ParityReference.__post_init__` checks only universe shape, fold IDs, output digests, and policy digest (lines 183-204). It never requires `fold_manifest.data_identity_sha256 == pit_bundle_sha256`, recomputes `fold_manifest.universe_sha256` from the embedded universe, requires each evidence equity index to equal its 60-session fold, or requires the top-level funnel to equal `aggregate.entry_funnel`. The behavioral capture test demonstrates the hole: `_evidence` contains one equity point (`tests/test_pit_policy_parity.py:82` and line 107), yet it is accepted for each 60-session fold at lines 391-408. Add these cross-field invariants to reference construction/loading and reject transaction/outcome dates outside their fold.
+
+## Minor
+
+- None.
+
+# Assessment
+
+**Task quality: Needs fixes.** The engine and fold mechanics are strong, but the same-HEAD false attestation is a blocking parity-gate defect, and the three authentication gaps violate the task's fail-closed evidence contract.

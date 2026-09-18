@@ -1,0 +1,70 @@
+### Task 7: Add Focused Regression Coverage After the Functional Report Exists
+
+**Files:**
+- Create: `tests/test_public_membership.py`
+- Create: `tests/test_sec_pit_fundamentals.py`
+- Create: `tests/test_pit_baseline.py`
+- Modify: `tests/test_leader_evaluation.py`
+- Modify: `tests/test_pit_data.py`
+- Modify: `tests/test_leader_basket.py`
+
+**Interfaces:**
+- Consumes: all acquisition, normalization, labeling, reconciliation, and reporting interfaces from Tasks 1-6.
+- Produces: deterministic offline regressions; no test performs network access.
+
+- [ ] **Step 1: Cover membership rewind and symbol aliases**
+
+Use a two-table HTML fixture with a three-symbol current state and two historical swaps. Assert reversing changes derives the correct seed, replaying restores the current state, duplicate additions/removals fail, and an unknown punctuation alias fails closed.
+
+- [ ] **Step 2: Cover SEC accession and public dates**
+
+Use minimal submissions/companyfacts ZIP fixtures. Assert a 10-Q fact is unavailable on its period end, becomes available only on the first trading day after acceptance, an amendment appears only at its later public date, and a missing acceptance timestamp increments the filed-date fallback count.
+
+- [ ] **Step 3: Cover price export validation without unsafe host pickle loading**
+
+Use a disposable worker fixture containing one valid SPY/AAPL cache and mutations for wrong SHA, extra SQLite tables, duplicate dates, invalid OHLC, missing SPY, and partial member coverage. Assert the host never imports/deserializes the payload.
+
+- [ ] **Step 4: Cover five-year and rolling labels**
+
+Extend `tests/test_leader_evaluation.py` with a stable member, later addition, delisted leader, short-history issue, and ticker with a missing start price. Assert diagnostic labels never alter `members_at()` eligibility.
+
+- [ ] **Step 5: Cover recall and execution reconciliation**
+
+Build a toy `SimulationResult` where one leader is signaled and entered, one is signaled but cash-blocked, one fails multiple gates, and one has missing fundamentals. Assert signal recall, execution recall, failed-gate counts, and missing-data counts exactly.
+
+- [ ] **Step 6: Cover one offline end-to-end run**
+
+Build a tiny strict PIT bundle with 65+ trading days, two members, SPY, and as-of fundamentals. Run `pit_baseline.main(...)` into a temporary directory. Assert all required artifacts exist, hashes reconcile, and a second run targeting the same directory refuses to overwrite it.
+
+- [ ] **Step 7: Run focused tests**
+
+```powershell
+python -m pytest tests/test_public_membership.py tests/test_sec_pit_fundamentals.py tests/test_pit_data.py tests/test_leader_evaluation.py tests/test_leader_basket.py tests/test_pit_baseline.py -q --no-cov
+```
+
+Expected: all focused tests pass without network access.
+
+- [ ] **Step 8: Run static checks**
+
+```powershell
+python -m ruff check core/public_membership.py core/sec_pit_fundamentals.py core/pit_data.py core/leader_evaluation.py core/leader_basket.py core/pit_baseline_report.py fetch_sp500_membership.py fetch_sec_pit_fundamentals.py export_pit_prices.py pit_baseline.py
+python -m compileall -q core fetch_sp500_membership.py fetch_sec_pit_fundamentals.py export_pit_prices.py pit_baseline.py
+git diff --check
+```
+
+Expected: all commands exit zero.
+
+- [ ] **Step 9: Run the broader backtest suite once**
+
+```powershell
+python -m pytest tests/test_backtest_engine.py tests/test_backtest_pnl.py tests/test_backtest_logic.py tests/test_pit_data.py tests/test_leader_evaluation.py tests/test_leader_basket.py tests/test_pit_baseline.py -q --no-cov
+```
+
+Expected: all selected engine and PIT tests pass.
+
+- [ ] **Step 10: Commit final verification**
+
+```powershell
+git add tests/test_public_membership.py tests/test_sec_pit_fundamentals.py tests/test_pit_baseline.py tests/test_leader_evaluation.py tests/test_pit_data.py tests/test_leader_basket.py README.md
+git commit -m "test: verify five-year PIT baseline"
+```

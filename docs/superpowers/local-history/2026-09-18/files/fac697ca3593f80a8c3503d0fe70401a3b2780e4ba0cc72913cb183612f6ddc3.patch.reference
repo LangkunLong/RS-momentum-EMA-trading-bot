@@ -1,0 +1,186 @@
+diff --git a/core/pit_optimizer_v5/runtime.py.artifacts/pit-optimizer-v5/development/luna-recovery-b3a/preimages/runtime.py b/core/pit_optimizer_v5/runtime.pycore/pit_optimizer_v5/runtime.py
+index 59d9290..2d71d56 100644
+--- a/core/pit_optimizer_v5/runtime.py.artifacts/pit-optimizer-v5/development/luna-recovery-b3a/preimages/runtime.py
++++ b/core/pit_optimizer_v5/runtime.pycore/pit_optimizer_v5/runtime.py
+@@ -16,6 +16,7 @@ from core.pit_optimizer_v5.candidate_ir import (
+     RenderedVariantV5,
+     SourceBundleV5,
+     StructuralTemplateV5,
++    VariantAssignmentV5,
+     derive_experiment_identity_v5,
+     derive_pre_validation_invalid_experiment_identity_v5,
+ )
+@@ -360,6 +361,67 @@ class CandidateEvidenceV5:
+         return self.experiment_identity.sha256
+ 
+ 
++@dataclass(frozen=True, slots=True)
++class RejectedCandidateEvidenceV5:
++    """Closed pre-materialization rejection; event authentication is deferred to B3b."""
++
++    experiment_identity: PreValidationInvalidExperimentIdentityV5
++    template: StructuralTemplateV5
++    assignment: VariantAssignmentV5
++    validation: ValidationResultV5
++    rejection_event_ref: ArtifactRefV5
++
++    def __post_init__(self) -> None:
++        if type(self.experiment_identity) is not PreValidationInvalidExperimentIdentityV5:
++            raise ValueError("rejected candidate identity is invalid")
++        if type(self.template) is not StructuralTemplateV5:
++            raise ValueError("rejected candidate template is invalid")
++        if type(self.assignment) is not VariantAssignmentV5:
++            raise ValueError("rejected candidate assignment is invalid")
++        if type(self.validation) is not ValidationResultV5:
++            raise ValueError("rejected candidate validation is invalid")
++        if type(self.rejection_event_ref) is not ArtifactRefV5:
++            raise ValueError("rejected candidate event reference is invalid")
++        if self.experiment_identity.template_sha256 != self.template.sha256:
++            raise ValueError("rejected candidate template differs from its identity")
++        if self.experiment_identity.assignment_sha256 != self.assignment.sha256:
++            raise ValueError("rejected candidate assignment differs from its identity")
++        if self.experiment_identity.parent_revision_sha256 != self.template.parent_revision_sha256:
++            raise ValueError("rejected candidate parent differs from its template")
++        if (
++            self.validation.valid
++            or self.validation.failure_code != "policy_source_unbounded_or_stateful"
++            or self.validation.changed_symbols != ()
++        ):
++            raise ValueError("rejected candidate validation is not the closed render rejection")
++        event_path = self.rejection_event_ref.relative_path.split("/")
++        if (
++            len(event_path) != 4
++            or event_path[0] != "events"
++            or len(event_path[2]) != 4
++            or not event_path[2].isdigit()
++            or not event_path[3].endswith(".json")
++            or len(event_path[3]) != 11
++            or not event_path[3][:-5].isdigit()
++        ):
++            raise ValueError("rejected candidate event reference is not a round event path")
++
++    @property
++    def experiment_id(self) -> str:
++        return self.experiment_identity.sha256
++
++    @property
++    def status(self) -> Literal["invalid"]:
++        return "invalid"
++
++    @property
++    def artifact_refs(self) -> tuple[ArtifactRefV5, ...]:
++        return (self.rejection_event_ref,)
++
++
++CandidateRecordEvidenceV5 = CandidateEvidenceV5 | RejectedCandidateEvidenceV5
++
++
+ @dataclass(frozen=True, slots=True)
+ class SearchProjectionV5:
+     checkpoint: RepositoryCheckpointV5 | None
+@@ -750,9 +812,9 @@ class ExperimentRecordFactoryV5(Protocol):
+         parent: ParentCandidateV5,
+         decision: ScheduledHypothesisV5,
+         template: StructuralTemplateV5,
+-        candidates: tuple[CandidateEvidenceV5, ...],
+-        critic: CriticArtifactV5,
+-        critic_ref: ArtifactRefV5,
++        candidates: tuple[CandidateRecordEvidenceV5, ...],
++        critic: CriticArtifactV5 | None,
++        critic_ref: ArtifactRefV5 | None,
+     ) -> tuple[ExperimentRecordV5, ...]: ...
+ 
+ 
+@@ -2590,19 +2652,68 @@ class _Runtime:
+         parent: ParentCandidateV5,
+         decision: ScheduledHypothesisV5,
+         template: StructuralTemplateV5,
+-        candidates: tuple[CandidateEvidenceV5, ...],
+-        critic: CriticArtifactV5,
+-        critic_ref: ArtifactRefV5,
++        candidates: tuple[CandidateRecordEvidenceV5, ...],
++        critic: CriticArtifactV5 | None,
++        critic_ref: ArtifactRefV5 | None,
+     ) -> tuple[ExperimentRecordV5, ...]:
+-        reviews = {review.experiment_id: review for review in critic.reviews}
+-        expected_review_ids = tuple(
+-            candidate.experiment_id for candidate in candidates if is_testable_experiment_status_v5(candidate.status)
+-        )
+-        if tuple(reviews) != expected_review_ids:
++        if type(candidates) is not tuple or not candidates:
++            raise _RuntimeAbort(RuntimeFailureV5("finalization", "invalid_dependency_result"))
++        expected_review_ids: list[str] = []
++        for candidate in candidates:
++            if type(candidate) is CandidateEvidenceV5:
++                if is_testable_experiment_status_v5(candidate.status):
++                    expected_review_ids.append(candidate.experiment_id)
++            elif type(candidate) is not RejectedCandidateEvidenceV5:
++                raise _RuntimeAbort(RuntimeFailureV5("finalization", "invalid_dependency_result"))
++        if (critic is None) != (critic_ref is None):
+             raise _RuntimeAbort(RuntimeFailureV5("finalization", "invalid_dependency_result"))
++        if critic is not None and (type(critic) is not CriticArtifactV5 or type(critic_ref) is not ArtifactRefV5):
++            raise _RuntimeAbort(RuntimeFailureV5("finalization", "invalid_dependency_result"))
++        if expected_review_ids:
++            if critic is None or critic_ref is None:
++                raise _RuntimeAbort(RuntimeFailureV5("finalization", "invalid_dependency_result"))
++            reviews = {review.experiment_id: review for review in critic.reviews}
++            if tuple(reviews) != tuple(expected_review_ids):
++                raise _RuntimeAbort(RuntimeFailureV5("finalization", "invalid_dependency_result"))
++        else:
++            if critic is not None or critic_ref is not None:
++                raise _RuntimeAbort(RuntimeFailureV5("finalization", "invalid_dependency_result"))
++            reviews = {}
+         records: list[ExperimentRecordV5] = []
+         try:
+             for candidate in candidates:
++                if type(candidate) is RejectedCandidateEvidenceV5:
++                    if candidate.template != template or candidate.template.sha256 != template.sha256:
++                        raise ValueError("rejected candidate template differs from record construction template")
++                    records.append(
++                        ExperimentRecordV5(
++                            experiment_id=candidate.experiment_id,
++                            experiment_identity=candidate.experiment_identity,
++                            round_index=self.inputs.round_index,
++                            parent_revision_sha256=parent.policy_identity_sha256,
++                            parent_semantic_fingerprint_sha256=parent.semantic_fingerprint_sha256,
++                            pit_data_scope=self.inputs.manifest.pit_data_scope,
++                            semantic_mode=self.inputs.manifest.semantic_mode,
++                            hypothesis=decision.hypothesis,
++                            template=template,
++                            template_sha256=template.sha256,
++                            variant_assignment=candidate.assignment,
++                            policy_revision=None,
++                            semantic_fingerprint=None,
++                            status="invalid",
++                            validation=candidate.validation,
++                            quick_evidence=None,
++                            discovery_episodes=(),
++                            campaign_evidence=None,
++                            target_gap_pct=None,
++                            critic_review=None,
++                            artifact_refs=candidate.artifact_refs,
++                            critic_artifact_ref=None,
++                        )
++                    )
++                    continue
++                if type(candidate) is not CandidateEvidenceV5:
++                    raise ValueError("record candidate carrier is invalid")
+                 testable = is_testable_experiment_status_v5(candidate.status)
+                 campaign = candidate.campaign_evidence
+                 records.append(
+@@ -3018,6 +3129,7 @@ def run_feedback_round_v5(
+ __all__ = [
+     "ArchiveReducerFactoryV5",
+     "CandidateEvidenceV5",
++    "CandidateRecordEvidenceV5",
+     "CandidateExecutionAuthorityV5",
+     "CandidateExecutionKeyV5",
+     "CandidateExecutionPersistenceV5",
+@@ -3037,6 +3149,7 @@ __all__ = [
+     "PaidRoleRecoveryRequiredV5",
+     "PendingControllerRoleV5",
+     "RoleRequestFactoryV5",
++    "RejectedCandidateEvidenceV5",
+     "RoundPersistenceV5",
+     "RuntimeCancellationV5",
+     "RuntimeClockV5",

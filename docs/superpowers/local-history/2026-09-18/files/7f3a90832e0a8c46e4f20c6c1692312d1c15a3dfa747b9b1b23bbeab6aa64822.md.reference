@@ -1,0 +1,205 @@
+# Task 2 report — V5 execution profile and pending policy exits
+
+## Outcome
+
+Implemented the opt-in optimizer V5 execution path in `core/backtest_fills.py` and
+`core/backtest_engine.py`. No test file was created or modified, per the controller ruling.
+
+V5 now requires an exact `ExecutionProfileV5` and `FrictionScenario` pair. Supplying neither keeps
+the legacy V2–V4 path; supplying only one is rejected. The profile digest is SHA-256 over canonical
+JSON containing every profile field and cannot be supplied by the caller.
+
+## Implementation details
+
+- Added frozen, slotted, exact-value-validated `ExecutionProfileV5`, canonical primitive
+  serialization, and derived SHA-256 identity.
+- Added frozen, slotted `PendingPolicyExit` with strict canonical date/symbol/action validation and
+  checkpoint primitive round-trip support.
+- Added a separate V5 session path in this order:
+  1. existing identity-transition hook plus V5 pending-symbol remapping;
+  2. opening gap stops for pre-open holdings, with conflicting pending actions canceled;
+  3. surviving prior-close policy exits at the current open;
+  4. pending new entries at the current open;
+  5. remaining intraday stop touches, including same-session entries;
+  6. after-close position-state update and close-action queuing; and
+  7. after-close entry evaluation.
+- Existing engine code has no add-on/pyramiding carrier. No add-on feature or Task 5 identity
+  authentication was invented. The pending-remap/cancellation boundary is narrow and can accept a
+  future add-on carrier.
+- Price-triggered scale-outs execute only at their declared crossed threshold. All close-derived
+  actions (time stop, MA violation, policy exit) queue for the next eligible open.
+- Every V5 BUY and SELL uses `ExecutionFill.cash_delta`. V5 entry sizing includes spread, market
+  impact, and commission affordability, and derives stop risk from the actual execution price.
+- Transaction rows retain the legacy readable columns. `SimulationResult.fill_log` adds V5 fill
+  evidence for reference price, actual execution price, commission, spread, impact, slippage, cash
+  delta, and total friction. `fill_cost_totals` reconciles these costs.
+- V5 checkpoint schema is 5 and binds the complete execution profile, derived profile SHA-256,
+  friction scenario, pending policy exits, fill rows, cost totals, and final post-liquidation equity.
+  Legacy checkpoints remain schema 4 and omit all V5-only keys.
+- Terminal liquidation remains at the last-session close reference and applies the declared V5
+  friction. Self-review found and fixed a journal edge where completed resume initially restored
+  pre-terminal-friction equity; the V5 final record now carries the exact terminal equity override.
+
+## Verification evidence
+
+### Static checks — pass
+
+```text
+python -B -m ruff check core/backtest_fills.py core/backtest_engine.py
+All checks passed!
+
+python -B -m py_compile core/backtest_fills.py core/backtest_engine.py
+exit 0
+
+git diff --check
+exit 0 (only Git's CRLF conversion advisory)
+```
+
+### Existing focused engine tests
+
+```text
+python -B -m pytest tests/test_backtest_engine.py -k "policy_exit or stop" -q
+10 passed, 45 deselected, 2 warnings
+```
+
+The full primary legacy engine suite was also run after implementation:
+
+```text
+python -B -m pytest tests/test_backtest_engine.py -q
+55 passed, 2 warnings
+```
+
+The second command requested by the brief has a known pre-existing stale-test result, unchanged
+before and after this task:
+
+```text
+python -B -m pytest tests/test_backtest_open_causality.py tests/test_backtest_pnl.py -k "exit or stop or gap" -q
+8 failed, 6 passed, 33 deselected, 3 warnings
+```
+
+Seven failures call current private engine APIs using obsolete signatures (`dict` rather than
+`PendingEntry`, or omit the keyword-only `market` context). The eighth synthetic run supplies fewer
+than the now-required 200 benchmark sessions. The pre-edit baseline produced the same eight
+failures. Per the user override, these tests were not edited.
+
+`tests/test_backtest_fills.py` is absent because Task 1 followed the same no-test-edit controller
+ruling; an attempted optional file-specific run therefore reported `file or directory not found`.
+
+Pytest warnings were the existing `websockets.legacy` deprecation and an environment permission
+warning for the configured `.artifacts/pytest` cache path.
+
+### Provider-free deterministic V5 smoke — pass
+
+The final smoke patched the universe helper to a fixed local list and used synthetic OHLCV and an
+in-process policy client. It exercised the real `PortfolioSimulator.run()` loop, checkpoint write,
+completed resume, gap path, friction, pending serialization, partial-pair rejection, and legacy
+close accounting. Scratch files were removed afterward.
+
+```json
+{"checkpoint_resume_exact": true, "friction_usd": 15.0, "gap_priority": "stop_loss", "legacy_cash": 1010.0, "legacy_schema": 4, "next_open": ["2025-10-03", "2025-10-06"], "pending_round_trip": true}
+```
+
+Assertions included:
+
+- close-derived `policy_exit` stayed open on 2025-10-03 and sold at 2025-10-06 open;
+- a 90.0 opening gap below the stop sold with `stop_loss`, not the queued policy exit;
+- BUY and SELL fill logs and positive friction totals were present;
+- live and completed-resume transaction rows, fill rows, cost totals, normalized date keys, and
+  equity values were identical;
+- a V5 pending exit round-tripped exactly;
+- a legacy 900.0 cash account selling one share at 110.0 ended at exactly 1010.0, emitted no V5
+  fill rows, and retained checkpoint schema 4; and
+- a partial execution-profile/friction pair raised `ValueError`.
+
+An earlier version of the end-to-end smoke accidentally allowed the existing universe helper to
+attempt its provider fallback; the sandbox blocked both requests before data was returned. The
+final evidence run was explicitly provider-free.
+
+## Compatibility evidence
+
+- Legacy execution still enters before same-session legacy exit checks and retains same-close
+  policy actions.
+- Legacy transaction dictionaries and cash arithmetic are unchanged.
+- Legacy result configuration and checkpoint payloads contain no V5-only keys.
+- Legacy checkpoint schema remains 4; V5 alone selects schema 5.
+- Existing `tests/test_backtest_engine.py` passes 55/55.
+- Only `core/backtest_fills.py` and `core/backtest_engine.py` are staged for the task commit.
+
+## Files
+
+- `core/backtest_fills.py`
+- `core/backtest_engine.py`
+
+## Concerns / deferred work
+
+- The repository has no pending add-on implementation, so only existing pending entries are run in
+  the specified open phase. Add-on behavior remains deferred rather than approximated.
+- Task 5 still owns authenticated identity-transition construction/binding. Task 2 only consumes
+  the already-existing transition hook and remaps V5 pending symbols when a supplied contract fires.
+- The stale focused tests described above should be reconciled after the optimizer goal when the
+  controller permits test changes.
+
+## Self-review
+
+Reviewed all BUY/SELL call sites and confirmed V5 routes them through the centralized friction-aware
+entry, scale-out, and close paths. Reviewed staged scope, schema branching, pending cancellation,
+terminal liquidation, and checkpoint restore. No remaining Task 2 finding after the terminal-equity
+journal fix.
+
+## Review fix round
+
+Addressed all four Important findings from `task-2-review.md` without modifying tests or widening
+the source scope:
+
+- V5 queued policy exits now require a valid exact-session `Open`; a prior-session price is never
+  used for an open-phase fill, and the pending exit survives until an eligible open exists.
+- V5 selected evictions now separately require the held symbol's valid exact-session `Open` at the
+  fill boundary. Stale prices remain permitted only for non-fill valuation; a missing eviction open
+  declines the projected transition and leaves the holding intact.
+- Phase 5 now closes any still-open position whose causal stop resolver fires. Phase 2 has already
+  removed pre-open gap-stop holdings, so a remaining `gap_stop` is precisely the same-session-entry
+  case where adverse friction placed the actual-fill-derived stop above the reference open. The
+  position map prevents double closes.
+- Friction components are allocated in integer cents from their unrounded relative weights so their
+  reported sum exactly equals the cash-delta friction boundary. `_record_v5_fill` independently
+  enforces that reconciliation before emitting evidence.
+- Restored legacy result compatibility by moving `fill_log` and `fill_cost_totals` into the
+  `SimulationResultV5` subtype. Successful legacy runs return the original `SimulationResult`
+  field/schema shape and do not initialize or expose V5 fill-cost totals. V5 live and resumed runs
+  return the subtype required by later optimizer consumers.
+
+### Fix-round verification — pass
+
+```text
+python -B -m ruff check core/backtest_fills.py core/backtest_engine.py
+All checks passed!
+
+python -B -m py_compile core/backtest_fills.py core/backtest_engine.py
+exit 0
+
+git diff --check
+exit 0 (only Git's CRLF conversion advisory)
+
+python -B -m pytest tests/test_backtest_engine.py -k "policy_exit or stop" -q
+10 passed, 45 deselected, 2 warnings
+```
+
+The warnings were the existing `websockets.legacy` deprecation and the environment's configured
+pytest-cache permission warning.
+
+### Fix-round deterministic smoke — pass
+
+The provider-free smoke used local OHLCV, a ten-symbol local RS cross-section, and an in-process
+static strategy. Temporary script, checkpoint, progress, and state-journal files were removed after
+the run. Its final evidence was:
+
+```json
+{"checkpoint_resume_type":"SimulationResultV5","legacy_result_fields":["benchmark_curve","benchmark_symbol","config","entry_outcomes","equity_curve","execution_diagnostics","initial_capital","signal_log","trades","transaction_log","weekly_holdings"],"missing_open_eviction_declined":true,"missing_open_pending_retained":1,"one_cent_friction":0.01,"same_session_stop":"stop_loss"}
+```
+
+The smoke asserted that a queued exit survived when only the prior bar existed; an eviction was
+declined under the same missing-open condition; a high-bps same-session entry whose derived stop was
+already crossed closed through phase 5; three sub-cent friction components reconciled to the one-cent
+cash impact and V5 aggregate; a successful legacy result had neither V5 field in dataclass/asdict
+serialization nor as attributes; and a completed schema-5 checkpoint resumed into
+`SimulationResultV5` with identical fill evidence and totals.

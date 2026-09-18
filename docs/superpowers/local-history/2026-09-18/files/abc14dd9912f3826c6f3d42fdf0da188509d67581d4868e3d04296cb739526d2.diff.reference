@@ -1,0 +1,73 @@
+# Review package: cef8d40b83e0f4025f50662b14c76b447d76b349..75502d4
+
+## Commits
+75502d4 fix: bind PIT replay panel to parity manifest
+
+## Files changed
+ core/pit_optimization_contract.py | 4 ++++
+ pit_optimizer_holdout.py          | 5 +++++
+ 2 files changed, 9 insertions(+)
+
+## Diff
+diff --git a/core/pit_optimization_contract.py b/core/pit_optimization_contract.py
+index eb82c5c..f04f8bb 100644
+--- a/core/pit_optimization_contract.py
++++ b/core/pit_optimization_contract.py
+@@ -1515,23 +1515,27 @@ def build_subset_manifest(
+         fold_manifest, selected_universe = build_fixed_fold_manifest(
+             readiness=legacy_readiness,
+             benchmark_sessions=benchmark_sessions,
+             data_identity_sha256=bundle_sha256,
+         )
+     else:
+         fold_manifest, selected_universe = _attested_parity_reference_folds(
+             parity_attestation=parity_attestation,
+             parity_reference=parity_reference,
+         )
++        scope = evaluation.get("scope") if isinstance(evaluation, Mapping) else None
++        raw_universe = scope.get("symbols") if isinstance(scope, Mapping) else None
+         if (
+             fold_manifest.data_identity_sha256 != bundle_sha256
+             or fold_manifest.benchmark != "SPY"
++            or not isinstance(raw_universe, list)
++            or tuple(raw_universe) != selected_universe
+         ):
+             raise ValueError("attested parity reference differs from legacy readiness")
+ 
+     if (
+         parity.pit_bundle_sha256 != bundle_sha256
+         or parity.baseline_manifest_sha256 != baseline_sha256
+         or parity.effective_policy_sha256 != effective_policy_sha256
+         or parity.discovery_fold_manifest_sha256 != fold_manifest.sha256
+         or parity.final_source_head != actual_source_head
+         or parity.final_source_fingerprint_sha256
+diff --git a/pit_optimizer_holdout.py b/pit_optimizer_holdout.py
+index b57fbc2..439cdd2 100644
+--- a/pit_optimizer_holdout.py
++++ b/pit_optimizer_holdout.py
+@@ -241,20 +241,25 @@ def _build_hidden_evaluator(
+         tradable_tickers = tuple(bundle.tradable_symbols())
+         market_reference_tickers = tuple(bundle.reference_symbols())
+         market_context_universe = tuple(bundle.price_symbols())
+     if (
+         set(universe).intersection(market_reference_tickers)
+         or not set(universe).issubset(tradable_tickers)
+         or set(market_context_universe)
+         != set(tradable_tickers).union(market_reference_tickers)
+     ):
+         raise HoldoutPreflightError("holdout panel escapes the tradable universe")
++    universe_sha256 = hashlib.sha256(
++        _canonical_json_bytes(list(universe)) + b"\n"
++    ).hexdigest()
++    if universe_sha256 != manifest.fold_manifest.universe_sha256:
++        raise HoldoutPreflightError("holdout_universe_identity_invalid")
+     probes = (
+         PolicyDeterminismProbe(
+             "recommend_capacity",
+             CapacitySnapshot(None, 25, 0, 3, 1.0, False),
+             CapacitySnapshot(5, 25, 2, 1, 0.5, True),
+         ),
+     )
+     docker = configure_docker_executable(
+         docker_executable,
+         source_root=repo_root,

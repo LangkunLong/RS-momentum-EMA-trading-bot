@@ -1,0 +1,37 @@
+### Task 8: Document and Review the First Deliverable
+
+**Files:**
+- Modify: `README.md`
+- Create: `docs/pit-baseline-data-provenance.md`
+
+**Interfaces:**
+- Consumes: the completed run manifest, coverage audit, summary, and report.
+- Produces: an operator runbook and a decision record for the next milestone.
+
+- [ ] **Step 1: Document acquisition and offline replay commands**
+
+Add the exact commands used to fetch membership/SEC inputs, export prices, build the bundle, verify its digest, and run `pit_baseline.py`. Explicitly state which steps require network access and which must run offline.
+
+- [ ] **Step 2: Document known MVP limitations**
+
+Record that prices came from the existing hash-pinned cache, institutional history is absent, ambiguous corporate actions were excluded, and public membership was reconstructed from a pinned table with official spot checks rather than a licensed constituent master.
+
+- [ ] **Step 3: Review the actual baseline before optimization**
+
+Classify findings into exactly four groups:
+
+```text
+data coverage defects
+CANSLIM signal-logic gaps
+execution/cash-deployment gaps
+strategy performance gaps
+```
+
+Do not start parameter optimization until data coverage and execution reconciliation are satisfactory. Preserve the baseline run directory and bundle digest as the comparison point for future changes.
+
+- [ ] **Step 4: Commit documentation**
+
+```powershell
+git add README.md docs/pit-baseline-data-provenance.md
+git commit -m "docs: record five-year PIT baseline provenance"
+```

@@ -1,0 +1,27 @@
+# C-c preparation driver independent static review — final freeze 02
+
+Specification verdict: **PASS**. Quality verdict: **APPROVE**.
+
+I explicitly approve the exact driver SHA-256 `48053dcc003ccdd576d7c8c3290463b85a3a534304ad7527bbfbfc2431d4adc9` for principal actual preparation only, with its fixed source, readiness, tool, input, path, and review gates intact. This does not authorize a paid launch. The resulting actual prepared package still requires independent artifact/launch review and a separate fresh user paid grant.
+
+## Exact final evidence
+
+- `prepare_c_c_campaign.py`: 49,039 bytes, SHA-256 `48053dcc003ccdd576d7c8c3290463b85a3a534304ad7527bbfbfc2431d4adc9`.
+- `implementation-report.md`: 6,369 bytes, SHA-256 `828b9aa3a477e7f2689dc24fe4d613630e9592995af1b1c6fa17be7ab123f798`.
+- `fix-01.diff`: SHA-256 `50467f6750736134bbe81e621605fb2c2f4b7d66bc030946d513ac018002331b`.
+- Both final files independently matched their exact retained `review-freeze-02-exact` copies and the stated sizes/hashes.
+- The original full bounded review is retained at `review-freeze-01/independent-review.md`, SHA-256 `80fcb2976832d74e32b7c5ac770f2eaff2a2b58357372736140406a361b73196`, independently verified. Its reviewed original driver SHA was `05a12300be6b9b1253c55cdfaff0b55005cb18a0fe520e31f95fe609093e9831`.
+
+## Scoped resolution
+
+**I1 resolved.** Final driver line 526 imports `ExecutionProfileV5` from `core.backtest_fills`; line 543 imports `PolicyRevisionIdentityV5` and `SourceBundleV5` from `core.pit_optimizer_v5.candidate_ir`. The three invalid `contracts` imports are removed. Static AST inspection confirms the actual defining top-level classes at `core/backtest_fills.py:17` and `core/pit_optimizer_v5/candidate_ir.py:904,1013`. Imports remain after the same gates and preflight. No native call signatures or preparation behavior changed.
+
+**M1 resolved.** Final driver lines 1016-1019 replace the inaccurate combined field with separate assertions: `credential_resolution_performed: false`, `environment_values_published: false`, `native_internal_git_environment_handling: true`, and `native_internal_executor_environment_identity_handling: true`. These match the previously traced native construction path: credential resolution is lazy and unused; Git environment sanitization and executor identity construction internally handle environment values; output contains identity digests without publishing those values. The implementation report now states that distinction accurately. Native environment behavior was not redesigned.
+
+An independent byte comparison established that the entire final driver equals the original retained driver with exactly these import and four-field reporting replacements. The complete retained diff, including report edits, introduces no additional finding. The final driver parses as an AST. All earlier bounded conclusions on other native import bindings/signatures, gate ordering, exact dependencies/provenance, native fresh preparation, create-only writes, caps, nonpersisting request preview, pure policy accounting, policy-pinned native command rendering, and absence of operational invocation continue to apply through this exact delta. There are no remaining findings within this review scope.
+
+## Authority and limits
+
+This final verdict relies on the retained full bounded freeze-01 review plus the focused I1/M1 correction review above; it does not repeat the prior source or readiness reviews. The protected final source review remains SHA-256 `4e4991b0dfcdcfe980b2bd2655ba5bf88af6300c956c179d2e258014dd1fef4b`, its 22-file authority remains `d896bce97945b9438bed6f4837fd16213530338563e3bbd728eafaa8a9fbbe09`, and independent readiness remains `50cd6d863fb3f6235af3a47fcf90fe4d21a5425c8852055b470abe9c95634f3a`.
+
+This is static approval, not evidence of successful preparation, positive enrolled admission, or paid execution. No driver/project import or execution, tests, synthetic probes, native reader or summary invocation, Git/Docker command, provider/API/evaluation/campaign operation, credential/environment-value access, or archive mutation was performed. Only source/AST/diff/hash and retained report inspection were used. Later response-dependent request bytes remain unknown. Preserve this final report for its execution-gate hash; review actual preparation results separately.

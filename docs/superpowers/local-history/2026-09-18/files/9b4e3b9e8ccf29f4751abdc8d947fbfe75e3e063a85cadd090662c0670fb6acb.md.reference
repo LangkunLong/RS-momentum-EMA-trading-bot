@@ -1,0 +1,178 @@
+# Task 4 Fix Round 1 Independent Review
+
+## Verdict
+
+**FAIL — two original Important findings remain open, and one new Important attestation gap was found.**
+
+The stale-snapshot architecture and early-winner wording are fixed. Cadence, industry activation/top-N/
+minimum size, and the named M settings are now represented and consumed correctly. The policy still is not
+a complete effective-policy attestation, however: material hard-coded M/RS/N/S/I rules remain outside the
+schema, custom strategy configuration is represented only by its Python type, and behavior-bearing state on
+the owned built-in strategy is invisible to the live verifier.
+
+## Original finding status
+
+### ADDRESSED — Critical: one-time construction snapshot could attest stale live policy
+
+**Confidence: 10/10.**
+
+The fix now has the required lifecycle:
+
+- `run()` captures a fresh live policy at the official start, before cache clearing and data access
+  (`core/backtest_engine.py:1494-1524`). This replaces the constructor snapshot and therefore preserves
+  supported pre-run changes to represented simulator policy such as `max_positions`.
+- `_verify_effective_engine_policy` rebuilds the live object and digest, compares both with the stored object
+  and digest, and independently rehashes the stored object (`core/backtest_engine.py:1478-1492`). It does not
+  rely only on rehashing the old snapshot.
+- Verification runs before checkpoint fingerprint construction (`core/backtest_engine.py:1194-1242`), at
+  the start of every simulated session before exits or signals (`core/backtest_engine.py:1713-1725`), before
+  result config (`core/backtest_engine.py:2036-2046`), before every checkpoint payload
+  (`core/backtest_engine.py:2103-2121`), and before completed-checkpoint result restoration
+  (`core/backtest_engine.py:2151-2159`).
+- Future PIT publication calls the live simulator verifier and then requires the live digest, the config
+  digest, and a canonical rehash of the config policy to agree (`pit_baseline.py:1474-1487`). Only after this
+  check are the summary and manifest policy variables used (`pit_baseline.py:1488-1508`, `1529-1546`). They
+  are defined on every successful publication path.
+
+The implementer's accepted direct probes also demonstrate a supported pre-run mutation being recaptured and
+a live `settings.SCALE_OUT_TIERS` mutation being rejected (`task-4-report.md:121-143`). I did not rerun them,
+as required.
+
+The new nested-strategy coverage issue below limits the completeness of the resulting attestation, but it is
+not the original stale-object/stale-digest implementation defect: for every field that the policy actually
+represents, live rebuilding and boundary verification are now correctly implemented.
+
+### OPEN — Important: active cadence, industry, M, and broader scoring behavior was outside the policy
+
+**Confidence: 10/10.**
+
+The specifically reported cadence and industry omissions are addressed. The policy now contains classified
+leaves for cadence, industry activation/mode/top-N/minimum size (`core/engine_policy.py:230-263`); execution
+uses cadence at `core/backtest_engine.py:1748-1755` and passes the captured industry top-N/minimum size
+explicitly into ranking before applying the attested activation flag (`core/backtest_engine.py:2352-2373`).
+All settings-backed built-in M evaluator and stateful-regime inputs named in the first review are also present
+at `core/engine_policy.py:399-470`, and their live consumers read those same settings in
+`core/canslim/m_market_direction.py:92-116`, `140-185`, and `354-368`, `401-443`.
+
+The finding remains open because the new claim of a complete behavior-bearing surface is broader than those
+settings, and material fixed inputs are still omitted from the only returned M/scoring mappings:
+
+- Built-in M follow-through detection consumes a default 30-session search window and a hard-coded `-0.01`
+  rally-reset threshold (`core/canslim/m_market_direction.py:252-258`, `282-314`); `evaluate_m` calls it
+  without overriding the 30-session window (`core/canslim/m_market_direction.py:412-418`). It also has an
+  active `<50`-row fallback with score `0.4` and bearish state (`core/canslim/m_market_direction.py:378-385`).
+  None appears in the complete market mapping at `core/engine_policy.py:399-470`.
+- The RS snapshot requires at least ten ranked performances before returning any scores
+  (`core/momentum_analysis.py:126-146`). The policy records quarterly settings, the 252-day fallback, and
+  60-session per-symbol history, but not that ten-symbol gate (`core/engine_policy.py:298-324`).
+- N scoring materially uses proximity bands `0.98`, `0.90`, and `0.75` plus the lower-band `0.3` factor
+  (`core/canslim/n_new_products.py:125-159`). S scoring uses fixed power-gap thresholds `0.02` and `1.5`, a
+  50-session volume baseline/lookback, fixed up/down-volume caps, and float bands
+  (`core/canslim/s_supply_demand.py:77-140`, `143-216`, `281-321`). I scoring uses fixed ownership and holder-
+  trend bands (`core/canslim/i_institutional.py:24-96`). The policy's complete N/S/I inventory contains only
+  settings-backed weights/targets and the explicit S proximity value (`core/engine_policy.py:360-395`).
+
+These are strategy decisions, not causal invariants or run data. They can be represented as exact fixed
+threshold leaves or truthful sourced formula leaves without inspecting prices, trades, caches, or artifacts.
+Until they are, the digest cannot truthfully stand for the complete built-in scoring/M policy asserted by
+`task-4-report.md:84-90`, `170-172`.
+
+Required fix: finish the behavior inventory for the built-in M/RS/N/S/I paths and wrap the material fixed
+thresholds/formulas with sources and classifications. Supported policy thresholds/weights remain later
+optimizer candidates; causal timing and data-visibility invariants remain non-candidates.
+
+### OPEN — Important: injected-strategy compatibility and policy claims
+
+**Confidence: 9/10.**
+
+The original compatibility regression is fixed: `min_c_a_growth` is validated only for the owned built-in
+strategy (`core/backtest_engine.py:1439-1467`), and built-in-only scoring and unsupported leaves are omitted
+for injected strategies (`core/engine_policy.py:325-326`, `634-640`). A minimal custom strategy therefore no
+longer has to invent a `CanslimStrategy` attribute.
+
+The identity/claim portion remains open. The custom policy identity is only
+`{type(strategy).__module__, type(strategy).__qualname__}` (`core/engine_policy.py:273-289`), after which the
+custom mapping returns without describing its scoring configuration (`core/engine_policy.py:298-326`). Two
+instances of the same class with different thresholds, rulebooks, or modes therefore have the same effective
+policy and digest. This is not hypothetical in the supported codebase: `CachedDiagnosisStrategy` behavior
+depends on its `rulebook`, `experiment`, and `strict_canslim` constructor state
+(`core/pit_diagnosis/strategy.py:158-190`), yet all such instances share one type identity. The engine already
+has a JSON-safe explicit `checkpoint_identity` contract for custom strategies
+(`core/backtest_engine.py:1075-1132`), but it is not part of the effective policy and is evaluated only for
+checkpoint identity.
+
+Required fix: do not imply that type provenance attests custom policy configuration. Bind a declared stable,
+JSON-safe custom policy identity where one exists, or explicitly classify custom strategy internals as
+opaque/unattested and scope the digest claim to the engine-owned canonical envelope. The latter preserves
+custom-strategy compatibility without inspecting mutable runtime balances, trades, prices, or artifacts.
+
+### ADDRESSED — Important: early-winner leaf overstated the hold
+
+**Confidence: 10/10.**
+
+The leaf now says that a 20% gain by held day 15 suppresses only tiered scale-outs while the flag is active,
+that the flag clears at the start of processing when `days_held >= 40`, and that hard stop, stagnation,
+protective-stop, and EMA behavior remains active (`core/engine_policy.py:566-581`). That exactly matches flag
+release/trigger ordering, the unconditional hard stop, the guarded scale-out block, and the later exit logic
+at `core/backtest_engine.py:2672-2720`. No exit behavior was changed.
+
+## New findings
+
+### Important — Live verification does not cover behavior-bearing state on the owned built-in strategy
+
+**Confidence: 9/10.**
+
+The policy records simulator-level `technical_only`/proper-base/market fields and the strategy's type, but it
+does not record or compare the owned strategy's duplicated execution inputs (`core/engine_policy.py:224-289`).
+Actual built-in execution branches on `strategy.require_proper_base` and `strategy.technical_only`, and uses
+`strategy.fundamental_provider` (`core/backtest_engine.py:743-824`, `878-900`). Those attributes are assigned
+at construction (`core/backtest_engine.py:621-672`, `1381-1412`) but are not frozen.
+
+Consequently, changing one of those nested behavior inputs after capture can change scoring/data selection
+while `_verify_effective_engine_policy` rebuilds the same policy and passes. A pre-run change to the
+simulator-level mode can also be recaptured without synchronizing its owned strategy copy, producing an
+attested simulator mode that is not the mode used for built-in score construction. This is the same class of
+hidden mutable policy the live verifier is intended to eliminate, although it is distinct from the original
+stored-object bug.
+
+Required fix: make the owned strategy consume the attested engine-owned values, or add its material bound
+values/provider mode to the live policy and fail closed on disagreement. Do not include provider objects or
+runtime data themselves; a stable mode/provenance marker is sufficient.
+
+No new Critical or Minor findings were identified.
+
+## Other verified requirements
+
+- Constructor-time inert validation still precedes `DataFetcher` construction
+  (`core/backtest_engine.py:1323-1351`, `1380`), and run-start revalidation precedes cache/data access
+  (`core/backtest_engine.py:1512-1524`). Non-default inert requests therefore fail closed at the required
+  boundary.
+- Canonical hashing remains sorted, compact UTF-8 JSON with `allow_nan=False`
+  (`core/engine_policy.py:61-67`, `664-667`). The digest exists after construction and run-start capture,
+  is available to checkpoint fingerprint creation, and is present in result config
+  (`core/backtest_engine.py:1437`, `1512`, `1194-1242`, `2097-2098`).
+- The actual entry thresholds, component/C/A weights, metric priority, non-M composite, M settings, capacity
+  and eviction, risk-sizing formula and inputs, scale tiers, and configured exits that are already represented
+  retain the values/classifications verified in the first review (`core/engine_policy.py:169-264`, `327-395`,
+  `399-589`). CANSLIM remains the declared feature basis and optimization remains future work
+  (`core/engine_policy.py:644-659`); causal invariants remain optimizer non-candidates.
+- No normal-default strategy semantic change was found in the fix diff. In particular, the industry change
+  preserves the existing provider/non-technical activation condition while making the already-bound defaults
+  explicit at execution (`core/backtest_engine.py:1415-1422`, `1654-1659`, `2357-2373`). The additional
+  failures are policy-attestation/inert-request fail-closed paths, not optimizer tuning.
+- `core.engine_policy` does not import `core.backtest_engine`, so no circular import was introduced
+  (`core/engine_policy.py:1-20`). The scoped package changes only the authorized production files and report;
+  no sealed Task 11 artifact was rewritten.
+- Requiring `_verify_effective_engine_policy` and authenticated policy keys at PIT publication
+  (`pit_baseline.py:1474-1487`) intentionally rejects the old `FakePortfolio`, which exposes neither
+  (`tests/test_pit_baseline.py:77-115`). This is not classified as a production defect: Task 4 explicitly
+  strengthens the future output contract, and accepting or synthesizing an unauthenticated fake policy would
+  defeat it. The fixture should be brought forward when test edits are permitted. `_run_portfolio`'s existing
+  test-double accommodation concerns resumability-call compatibility (`pit_baseline.py:1208-1239`), not a
+  waiver of publication integrity.
+
+## Review constraints observed
+
+The refreshed report's direct probes, compilation, and diff-check evidence were accepted without rerunning.
+No test, backtest, provider/network command, cache refresh, optimizer operation, download, or Git mutation was
+performed. Production sources were inspected read-only; only this review artifact was created.

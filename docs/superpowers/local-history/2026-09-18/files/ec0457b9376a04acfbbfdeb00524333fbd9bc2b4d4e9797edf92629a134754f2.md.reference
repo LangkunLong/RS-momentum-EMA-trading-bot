@@ -1,0 +1,37 @@
+# B2 architect checkpoint review package
+
+## Scope and compatibility
+
+B2 adds the closed `RenderRejectionPayloadV5` and `render_rejected` event only. The payload carries the existing pre-validation-invalid identity, exact typed assignment, accepted-author artifact reference, and `policy_source_unbounded_or_stateful`; it does not carry a source bundle, source bytes, or a policy revision.
+
+`memory.py` registers the event in the closed event and payload unions, canonical payload encoding, event/payload identity binding, recovery steps, and candidate state fold. `artifacts.py` decodes its exact four-key body and validates the event during both append and durable replay. `runtime.py` only registers the payload type with the existing generic journal mapping. It does not call the outcome renderer or change the campaign renderer.
+
+The one B2 deviation into `rendering.py` is `bounded_variant_assignments_v5`. It shares B1's existing `_ordered_assignments` iterator and cap exactly, and B1's outcome loop now calls it. It performs no source rendering. This lets repository authentication verify membership in the original bounded deterministic enumeration using the accepted author's authenticated schema maximum. B1 public APIs remain intact; strict `render_variants` is still the runtime call site.
+
+The saved preimages are the exact starting bytes for this increment. `artifacts.py`, `runtime.py`, and B1's `rendering.py` had pre-existing worktree changes relative to Git; `scoped-diff.patch` is deliberately against those saved preimages, not the Git index.
+
+## Event and state transition
+
+For a materialized candidate, the existing chain remains unchanged:
+
+`absent -> rendered_variant(post-validation identity) -> validation -> existing downstream stages`
+
+The new pre-materialization path is:
+
+`absent -> render_rejected(pre-validation-invalid identity) -> terminal`
+
+At `append_round_event` and after decoding in `load_round_events`, repository validation requires exactly one prior round intent and accepted author completion. It authenticates the author invocation, requires the payload's artifact reference and template hash to match it, binds the request's parent/hypothesis/discovery-plan authority to the intent, recomputes the pre-validation identity, and compares the assignment's canonical typed bytes against only the accepted author's capped deterministic enumeration.
+
+The fold rejects a duplicate rejection or any same-identity candidate continuation. Repository context also rejects a `rendered_variant` with the same typed assignment anywhere in that round, closing the pre/post-validation identity gap. Existing candidate-stage rules still require `rendered_variant` before `validation_invalid`; B2 neither alters nor repurposes that path. Candidate work, including rejection, is rejected after critic completion. No materialization, evaluator, record, critic-finalization, or campaign lifecycle implementation was added.
+
+## Actual artifacts loaded vs static review
+
+Executed, read-only actual06 inspection authenticated the manifest graph, loaded the durable round events, exact round intent, accepted author completion, role invocation, and structural author artifact. The accepted author schema cap is one; the shared bounded enumeration yielded the archived assignment, and the pre-validation identity was derived from those authenticated inputs. See `actual06-authority-verification.json`.
+
+Actual06's durable event sequence remains `role_completion, round_intent, role_completion, round_outcome, cleanup_result`; it contains zero `render_rejected` events. No payload or event was constructed or appended to actual06. Therefore append/replay rejection behavior, conflict rejection, and valid-candidate compatibility are static code-review and compilation/Ruff evidence only, not executed end-to-end verification.
+
+## Verification
+
+Scoped Ruff, in-memory compilation, and scoped diff check passed. The evaluator identity remains `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4`. `candidate_ir.py` is unchanged at `a437d9536fb57d48c7e9c9c6fab2f8a29ac9bea0666be61caeb2baf583b13f1b`; approved Increment A source remains `0e0dbb7e5dcac8ebd4716dbbaa124c83f1d3e79aec24f41e09976b8acdc8102b`.
+
+No tests, synthetic probes, model/API calls, credential reads, candidate evaluations, campaign restarts, commits, pushes, or deployment occurred. B3 and B4 remain unimplemented.

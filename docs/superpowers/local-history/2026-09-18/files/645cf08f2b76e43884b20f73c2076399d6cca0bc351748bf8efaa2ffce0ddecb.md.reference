@@ -1,0 +1,46 @@
+# Principal architect review — B4c
+
+Disposition: APPROVED for the bounded B4c source implementation. No actionable source finding. Increment A, B1–B4c and the C1 record-invariant correction are now accepted at their source checkpoints. This is not campaign-readiness approval.
+
+## Scope and reasoning
+
+LocalRoleRequestFactoryV5._render_rejection_count matches the approved authority chain: the actual current repository checkpoint equals the projection checkpoint, every record is reloaded through authenticated load_experiment and compared exactly, and records must precede the requested round with matching discovery plan/scope/mode. The literal reserved-code invalid-record predicate counts one per committed record. Authentication errors propagate. Existing SearchProjectionV5 membership/order and B3b rejection-event/author/intent binding remain mandatory.
+
+The single cumulative integer is omitted at zero and inserted after all episode metrics, before archive/history evidence. The provider contract already permits failure.* and enforces that citation sequence. The author path rebuilds the same evidence and preserves exact hypothesis citations. No provider, history/novelty, rendering, runtime, record or finalizer source changed in B4c.
+
+Three defaulted summary fields preserve existing positional arguments and add strict nonnegative integer and cross-count validation. Completed lifecycles count record rounds with successful cleanup; evaluated feedback counts their intersection with actual evaluated records carrying campaign evidence; reserved-code invalid records count independently of cleanup. All existing calculations and status meanings remain unchanged.
+
+## Fresh independent evidence
+
+Principal verification is in principal-architect-verification.json, separate from the implementer's architect-verification.json.
+
+- Scoped Ruff, in-memory compilation, exact-preimage whitespace checks and expected function scope passed.
+- Removing the two production-runtime insertions reconstructs its exact preimage bytes. Increment A's allowlist and episode loop are independently byte-identical.
+- Protected source hashes match the submission. The evaluator remains 005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4 across 56 files; both B4c files are excluded from that closure.
+- Runtime-04's authenticated record, critic and cleanup derive lifecycle/evaluated-feedback/rejected counts 1/1/0.
+- Actual06's authenticated five-event terminal journal and absence of checkpoint records derive 0/0/0.
+
+Final edited hashes:
+- production_runtime.py: a757a0ca89979be9453129321a04b96498fb06a9f37438034b46e407ad8b72eb
+- summary.py: e4ccb8a2077ca28d2ece2e541839265b3f08218e1b66e93b635772e600270865
+
+## Updated summary-verification result
+
+The implementer's report that both full summary calls failed was accurate for its execution context. Fresh principal calls produced different results:
+
+1. Actual06 returned a full authenticated summary. All three new counts are zero; status=failed, typed_failures=[rendering:stage_failed], role_calls=2, total_tokens=8596, cost_usd=0.04234, cleanup_complete=true. Comparing with its immutable terminal-verification.json matches all 23 historical keys other than command: historical run versus current read-only summarize. The three additional keys are exactly the authorized additions. This is not a same-command before/after pair; principal-actual06-summary-comparison.json records the distinction.
+2. Runtime-04 still raised V5CliFailure(artifact_graph_invalid), caused by ValueError(container execution reservation is foreign). Read-only inspection of that real exception frame confirms its command digest matches but executor digest differs:
+   - stored: 2849cde885cc8bdde38230bc77ecd17163db42db1b071cc5a8a4212ce4601444
+   - current principal process: a72e22fc6deeb4b23f65d82ef32abb148fea4ea6db5efecf26c4391e31605bb9
+
+No check was bypassed and no environment or historical file was changed. Source inspection proves executor identity includes manifest, sandbox profile, owner, mount identity, Docker executable identity, control-directory identity, six allowlisted control-environment entries, runtime contract and repository-root identity. The precise mismatching component has not been isolated. Do not call this proven PATH drift or archive corruption.
+
+The unresolved runtime-04 full-summary comparison is transferred explicitly to Increment C. Acceptance of this additive B4c source change does not waive that readiness dependency or claim complete Task 5 execution evidence.
+
+## Limits and next scope
+
+No real committed render-rejected or exact-duplicate record is available in the bounded four-record inventory. Positive rejection metrics, duplicate/rejection-only/mixed lifecycles, finalized-round paths and positive C1 behavior remain static-reviewed and unexecuted.
+
+This review ran read-only historical authentication/summary projections, source checks and documentation writes only. No tests, synthetic inputs/artifacts, credentials, environment change, paid/model/external calls, candidate evaluation, campaign operation, production edit, commit, push or deployment.
+
+Next session: restore docs/superpowers/plans/2026-09-08-pit-optimizer-v5-transition.md and begin its Increment C-a read-only historical-verifier diagnosis. Keep campaign readiness held until the remaining verification issue is resolved or receives a concrete architect decision. No new paid-call budget exists.

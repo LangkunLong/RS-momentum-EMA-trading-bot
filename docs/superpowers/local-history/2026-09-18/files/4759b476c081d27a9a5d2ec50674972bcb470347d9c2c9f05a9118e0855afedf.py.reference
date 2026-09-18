@@ -1,0 +1,161 @@
+"""Construct and verify a future/unexecuted investigator request from actual06 authority."""
+
+from pathlib import Path
+
+from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5
+from core.pit_optimizer_v5.contracts import ArtifactRefV5, canonical_json_bytes_v5, selected_scenario
+from core.pit_optimizer_v5.manifest import authenticate_campaign_manifest_v5
+from core.pit_optimizer_v5.production_runtime import (
+    _INVESTIGATOR_ENTRY_COUNTS_V5,
+    LocalArchiveReducerFactoryV5,
+    LocalRoleRequestFactoryV5,
+)
+from core.pit_optimizer_v5.provider import prospective_role_usage_v5
+from core.pit_optimizer_v5.runtime import FeedbackRoundInputV5, SearchProjectionV5
+from core.pit_optimizer_v5.selection import select_parent_v5
+
+
+ROOT = Path('.artifacts/pit-optimizer-v5/development/provider-runtime-06').resolve()
+PACKAGE = Path('.artifacts/pit-optimizer-v5/development/luna-recovery-a').resolve()
+MANIFEST = ArtifactRefV5(
+    'campaigns/development-provider-two-rounds-20260907-06/manifest.json',
+    'd90ed717c0d6b34d4cfa6bf7e2dd1f753e68c43b1127b200a66d2a9f930dfdf6',
+)
+OWNER_TOKEN_SHA256 = 'dcd362587c7de544ba2f722c7003f7b2d1396b8dbb10d9c1e78fd2fe9c366e5b'
+HISTORICAL_REQUESTS = (
+    '09564719a54cfd10a0b6edbc5b61996e7a68015866f1e0b538859c542d158c0f',
+    '3b4dc10f306d3fcc48cd4bfc3848a573f67905725520c35c913bb1af24f74866',
+)
+HEADLINES = (
+    'portfolio_annualized_return_pct',
+    'max_drawdown_pct',
+    'closed_trades',
+    'average_exposure_pct',
+)
+
+
+def save_exclusive(name: str, value: object) -> None:
+    with (PACKAGE / name).open('xb') as handle:
+        handle.write(canonical_json_bytes_v5(value))
+
+
+def main() -> None:
+    repository = LocalArtifactRepositoryV5(ROOT)
+    authenticated = authenticate_campaign_manifest_v5(repository=repository, manifest_ref=MANIFEST)
+    historical_before = tuple(repository.load_unique_role_request_by_sha256(item).sha256 for item in HISTORICAL_REQUESTS)
+    inputs = FeedbackRoundInputV5(
+        authenticated.manifest,
+        authenticated.panel_plan,
+        authenticated.evaluator_contract,
+        authenticated.baseline_authority,
+        1,
+        OWNER_TOKEN_SHA256,
+    )
+    reducer = LocalArchiveReducerFactoryV5(repository).recovery_reducer(inputs)
+    projection = SearchProjectionV5(None, reducer.initial(), ())
+    parent = select_parent_v5(
+        state=projection.state,
+        baseline=inputs.baseline,
+        discovery_plan=inputs.panel_plan,
+        evaluator_contract=inputs.evaluator_contract,
+        stored_records=(),
+    )
+    factory = LocalRoleRequestFactoryV5(repository=repository, manifest=authenticated.manifest)
+    request = factory.investigator_request(inputs, projection, parent)
+    duplicate = factory.investigator_request(inputs, projection, parent)
+    if request.to_primitive() != duplicate.to_primitive() or request.sha256 != duplicate.sha256:
+        raise ValueError('future investigator request is not deterministic')
+    if authenticated.manifest.provider is None:
+        raise ValueError('actual06 provider authority is unavailable')
+    input_bound, cost_bound = prospective_role_usage_v5(request, authenticated.manifest.provider)
+    historical_after = tuple(repository.load_unique_role_request_by_sha256(item).sha256 for item in HISTORICAL_REQUESTS)
+    if historical_before != HISTORICAL_REQUESTS or historical_after != HISTORICAL_REQUESTS:
+        raise ValueError('stored historical request authority changed')
+    if request.sha256 in HISTORICAL_REQUESTS:
+        raise ValueError('future request reused a historical request hash')
+
+    expected: list[tuple[str, object]] = []
+    entry_rows: list[dict[str, object]] = []
+    first_counts = None
+    for episode in authenticated.baseline_authority.campaign.episodes:
+        report = selected_scenario(episode.evaluation).report
+        prefix = f'episode.{episode.episode_ordinal}'
+        expected.extend((f'{prefix}.{metric_id}', getattr(report, metric_id)) for metric_id in HEADLINES)
+        counts = {item.metric_id: item.count for item in report.entry_funnel}
+        if first_counts is None:
+            first_counts = counts
+        for metric_id in _INVESTIGATOR_ENTRY_COUNTS_V5:
+            if metric_id in counts:
+                expected.append((f'{prefix}.entry.{metric_id}', counts[metric_id]))
+                entry_rows.append(
+                    {
+                        'episode_ordinal': episode.episode_ordinal,
+                        'source_metric_id': metric_id,
+                        'value': counts[metric_id],
+                    }
+                )
+    if first_counts is None:
+        raise ValueError('actual06 baseline has no episodes')
+    for metric_id, value in (
+        ('stage.evaluated_rows', 960),
+        ('stage.market_pass', 960),
+        ('stage.entry_block_composite_score_below_threshold', 932),
+        ('stage.buy_signal_count', 0),
+        ('episode.discovery.entries_executed', 0),
+    ):
+        if first_counts.get(metric_id) != value:
+            raise ValueError(f'actual06 first-window count differs: {metric_id}')
+
+    actual = tuple((item.metric_id, item.value) for item in request.role_evidence.items)
+    if actual != tuple(expected):
+        raise ValueError('future evaluator evidence differs from actual parent projection')
+    entry_items = tuple(item for item in request.role_evidence.items if '.entry.' in item.metric_id)
+    if any(type(item.value) is not int for item in entry_items):
+        raise ValueError('future entry evidence is not integer-only')
+    if any(item.metric_id.split('.entry.', 1)[1] not in _INVESTIGATOR_ENTRY_COUNTS_V5 for item in entry_items):
+        raise ValueError('future entry evidence escaped its closed allowlist')
+    entry_ids = tuple(item.evidence_id for item in entry_items)
+    if not set(entry_ids).issubset(request.role_input.aggregate_evaluator_evidence):
+        raise ValueError('future entry evidence is outside aggregate evaluator evidence')
+    if tuple(item.evidence_id for item in request.role_evidence.items) != request.role_input.aggregate_evaluator_evidence:
+        raise ValueError('future evaluator citation sequence differs from issued evidence')
+
+    save_exclusive('future-investigator-request.json', request.to_primitive())
+    save_exclusive(
+        'future-investigator-request-verification.json',
+        {
+            'status': 'future_unexecuted_local_preview',
+            'provider_calls': 0,
+            'candidate_evaluations': 0,
+            'artifact_root_read_only': str(ROOT),
+            'manifest_ref': MANIFEST.to_primitive(),
+            'artifact_graph_verified': authenticated.graph.verified,
+            'parent_origin': parent.origin,
+            'parent_policy_identity_sha256': parent.policy_identity_sha256,
+            'historical_request_sha256_before': historical_before,
+            'historical_request_sha256_after': historical_after,
+            'preview_request_sha256': request.sha256,
+            'preview_differs_from_historical_requests': True,
+            'input_token_upper_bound': input_bound,
+            'cost_upper_bound_usd': cost_bound,
+            'entry_projection_allowlist': _INVESTIGATOR_ENTRY_COUNTS_V5,
+            'entry_projection_rows': tuple(entry_rows),
+            'entry_evidence_ids': entry_ids,
+            'entry_values_are_existing_ints': True,
+            'entry_values_are_in_aggregate_evaluator_evidence': True,
+            'entry_order_and_ids_are_deterministic': True,
+            'raw_identifiers_exported': False,
+            'first_window_expected_counts': {
+                'stage.evaluated_rows': 960,
+                'stage.market_pass': 960,
+                'stage.entry_block_composite_score_below_threshold': 932,
+                'stage.buy_signal_count': 0,
+                'episode.discovery.entries_executed': 0,
+            },
+            'counts_overlap_and_are_not_causal': True,
+        },
+    )
+
+
+if __name__ == '__main__':
+    main()

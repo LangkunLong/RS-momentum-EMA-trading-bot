@@ -1,0 +1,14 @@
+# Scoped Docker start cleanup recovery review
+
+**PASS.** No concrete finding in the new cleanup-only recovery branch. Spec and quality pass for this scoped change.
+
+Read `docker-start-cleanup-report.md` and the new branch with necessary cleanup, phase-persistence and read-only history-validation context. Source SHA-256 independently matches `9f8bcc8cc54c64141357652e8d7f48cb4b805b1bfc24997c939f7693b549961e`. Earlier accepted Docker inspection changes were not reopened.
+
+- Cleanup first authenticates the supplied owner/leases and saved reservation, loads the durable container identity, validates created/started identity references, fully inspects the exact container ID and checks stable identity. A name-only container without durable identity remains rejected.
+- Recovery applies only when started is absent, a created phase is present, and the authenticated live state is running or exited. It additionally requires both launch_claim and start_claim, plus the closed created/empty-network phase. `_phase` authenticates each claim's executor, exact command and phase; these are not unbound presence checks.
+- The new observation uses the existing create-only `_append_observed_phase` writer and therefore binds identity, inspected lifecycle, state and network attestations. It is written before removal, allowing interruption after repair to use the existing started-phase cleanup path. Existing history verification permits started observations of exited state and preserves phase-prefix and identity checks.
+- Removal still targets the exact authenticated container ID and is followed by absence verification. No start/restart command is added. No terminal result is overwritten, no output is fabricated, and missing claims or foreign identity still prevent this recovery. Already-started and still-created branches retain their prior checks.
+
+The controller's latest dispatch states the owned container was stopped at 09:26 UTC within its allowance; the report's earlier running description is historical. This review did not re-inspect, stop, restart or remove it and does not claim cleanup success. Actual cleanup remains controller-owned; the frozen failure remains evidence of that failed evaluation.
+
+No tests were read, created or run. No probes, application imports/execution, Docker, network, agents, commits or staging occurred. Only this review report was written. Verdict applies to the identified source bytes, not a new commit or completed recovery.

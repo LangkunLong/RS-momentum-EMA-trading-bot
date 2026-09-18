@@ -1,0 +1,105 @@
+# Next Luna session: B3a representation and record construction only
+
+Work in C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.worktrees\pit-optimizer-v5-architecture.
+
+A, B1, and corrected B2 are architect-approved. B2's approval and exact source guards are in `.artifacts/pit-optimizer-v5/development/luna-recovery-b2-correction/architect-review.md` and `architect-verification.json`.
+
+Implement B3a only, then stop for architect review. B3a creates the in-memory representation and record construction support. B3b will authenticate records against durable rejection events and prepare publication safeguards. B4 will activate the renderer outcome path, complete/recover rejected-only rounds and expose rejection feedback to the next investigator.
+
+## 1. Read and preserve the starting state
+
+Read the recovery design and plan:
+- docs/superpowers/plans/2026-09-07-pit-optimizer-v5-recovery-design.md
+- docs/superpowers/plans/2026-09-07-pit-optimizer-v5-luna-recovery.md, especially the latest B2 correction decision and B3 split.
+
+Read the relevant production code only:
+- runtime.py: CandidateEvidenceV5, ExperimentRecordFactoryV5, _Runtime._expected_records, _require_exact_records, and the current factory call site in run.
+- production_runtime.py: CanonicalExperimentRecordFactoryV5.
+- memory.py: ExperimentRecordV5 and its invalid/status/critic invariants.
+- contracts.py: ValidationResultV5 and CriticArtifactV5.
+- B2's RenderRejectionPayloadV5 and repository context validator for reference.
+
+Confirm current source hashes match the B2 correction architect verification. Save exact preimages in a fresh `.artifacts/pit-optimizer-v5/development/luna-recovery-b3a` package before editing. If files have unexpected changes, inspect and report rather than overwriting them.
+
+Expected edits: runtime.py and production_runtime.py only. Preserve memory.py, artifacts.py, rendering.py, provider.py, candidate_ir.py, contracts.py and all historical artifacts. In production_runtime.py, allow imports needed by the record factory and changes inside that factory only; preserve the approved Increment A request projection and count allowlist exactly. The whole-file A hash will necessarily change when the factory changes, so prove preservation through the exact preimage/scoped diff and unchanged projection-region bytes, not a false whole-file equality claim.
+
+## 2. Add a separate frozen rejected-candidate carrier
+
+Add `RejectedCandidateEvidenceV5` alongside CandidateEvidenceV5 in runtime.py. Do not subclass CandidateEvidenceV5 or weaken its required materialized field.
+
+Use these fields:
+- experiment_identity: PreValidationInvalidExperimentIdentityV5
+- template: StructuralTemplateV5
+- assignment: VariantAssignmentV5
+- validation: ValidationResultV5
+- rejection_event_ref: ArtifactRefV5
+
+Validate exact types. Require identity.template_sha256 == template.sha256, identity.assignment_sha256 == assignment.sha256, and identity.parent_revision_sha256 == template.parent_revision_sha256. Require exactly `ValidationResultV5(False, "policy_source_unbounded_or_stateful", ())`: no changed symbols, generic exception text, success or alternative failure code. Use a fixed invalid status property, an experiment_id property derived from the identity, and an artifact_refs property containing only the rejection event reference. Do not make status or artifact references arbitrarily mutable constructor inputs.
+
+The reference means the durable **RoundEventV5 event file** at `events/<campaign>/<round>/<sequence>.json`, not just the rejection payload file or author artifact. This choice gives B3b enough context to verify journal membership, campaign/round, predecessor and accepted-author authority without changing ExperimentRecordV5's serialized schema. The carrier can validate reference shape/type but cannot establish persistence; document that semantic authentication belongs to B3b. Do not invent or persist an event in B3a.
+
+Keep source bundles, policy revision objects, candidate handles, leases, containers and evaluator evidence out of this carrier. Use explicit type branches in factories rather than adding fake materialization/downstream-evidence fields to make it resemble CandidateEvidenceV5.
+
+Export the carrier and define one explicit union, `CandidateRecordEvidenceV5 = CandidateEvidenceV5 | RejectedCandidateEvidenceV5`, for record construction.
+
+## 3. Extend the three record-construction contracts together
+
+Use the explicit union in:
+- ExperimentRecordFactoryV5.build_records protocol.
+- CanonicalExperimentRecordFactoryV5.build_records.
+- _Runtime._expected_records.
+
+At these construction boundaries only, accept `critic: CriticArtifactV5 | None` and `critic_ref: ArtifactRefV5 | None`. Preserve all existing callers, runtime flow, and the independent `_expected_records` plus `_require_exact_records` equality check. Do not implement _expected_records by calling the concrete factory; that removes the independent output check.
+
+Use the same rules in expected and concrete construction:
+1. Classify candidates by exact supported carrier type. Derive expected critic IDs only from existing testable-status CandidateEvidenceV5 entries, in their input order. RejectedCandidateEvidenceV5 is always invalid/untestable.
+2. If any testable candidate exists, require both critic and critic_ref with their exact types, and the exact ordered reviews for the testable IDs. Preserve mandatory critic evidence for evaluated/testable candidates. A rejection in a mixed batch must receive no review and must not appear in the critic's review IDs.
+3. Permit both critic fields to be None only for a nonempty batch with no testable candidates. Reject partially absent pairs. Do not construct an empty CriticArtifactV5. The no-testable path uses an empty internal review mapping only, not a fabricated artifact.
+4. Keep existing error conventions: the concrete factory raises a precise ValueError; the runtime expected-record boundary reports finalization/invalid_dependency_result. Ensure optional-critic checks occur before dereferencing critic.reviews.
+
+No-testable support here is preparatory record construction. Do not change run's no_testable_experiments abort or call a critic differently yet.
+
+## 4. Build rejected records explicitly
+
+For RejectedCandidateEvidenceV5, construct the existing ExperimentRecordV5 using:
+- the carrier's pre-validation identity and its experiment ID;
+- the round, parent and hypothesis from the existing authenticated construction inputs;
+- the actual template, with equality/hash checks against the carrier's template;
+- the assignment directly from the carrier;
+- status "invalid" and the exact closed-code invalid validation result;
+- policy_revision, semantic_fingerprint, quick_evidence, campaign_evidence, target_gap_pct, critic_review and critic_artifact_ref all None;
+- discovery_episodes = ();
+- artifact_refs = (rejection_event_ref,);
+- the existing parent semantic fingerprint, pit_data_scope and semantic_mode from the normal construction inputs. A parent fingerprint is parent authority, not fabricated candidate evidence.
+
+Preserve input candidate order, identity derivation, and the existing materialized candidate branch's field meanings. Let existing ExperimentRecordV5 invariants verify the complete hypothesis/parent/template/assignment/round identity. Add the direct carrier-versus-construction-template check rather than silently replacing a different carrier template. Do not substitute parent source bytes or derive a policy revision for rejection.
+
+Do not change ExperimentRecordV5's canonical encoding or add serialized fields. Do not append, load or publish newly constructed rejection records yet: repository rejection linkage is intentionally deferred to B3b.
+
+## 5. Keep runtime activation and persistence out of this increment
+
+Preserve the existing strict render_variants call, _candidate materialization/validation/evaluation path, _publish, run, _completed_result, cleanup, recovery and investigator projection. No rejection event append, record publication, checkpoint generation or archive/promotion work belongs in B3a.
+
+The eventual runtime branch must never materialize a rejected candidate. This increment prepares the type and factories; it does not claim that the campaign already uses them.
+
+## 6. Verify within the user's allowed scope
+
+Run scoped Ruff, in-memory compilation and scoped diff checks for changed files. Recompute the evaluator source map and identity; require all 56 covered files to remain at identity 005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4. Verify untouched B1/B2 files and candidate_ir hashes. Confirm A's request projection and count allowlist bytes are unchanged.
+
+Static review must trace:
+- rejected-only construction with no critic;
+- mixed construction with critic reviews only for testable candidates;
+- required-critic preservation for ordinary testable candidates;
+- invalid record fields and assignment access without materialization;
+- exact expected/concrete record equality and input ordering;
+- no changes to live campaign behavior or serialized record schema.
+
+You may authenticate actual06's existing manifest/intent/author and render the unchanged accepted author through the approved B1 API read-only. It has no real rejection event reference. Therefore do not fabricate one to instantiate the carrier or exercise the record factory. Without suitable existing real evidence, report new carrier/record branches as statically reviewed and unexecuted. Do not label that end-to-end verification.
+
+No tests may be read, created, changed or run. No synthetic probes, made-up journal events, fake provider responses, credentials, model/API calls, candidate evaluations or campaigns. No commits, pushes or deployment. Do not rebuild the evaluator or regenerate baseline evidence.
+
+## 7. Return the B3a checkpoint package
+
+Save exact starting preimages, scoped diff, final hashes, changed-symbol list, static invariant explanation, scoped checks, evaluator identity and any actual archived-input inspection. Explain the event-reference choice and why record persistence remains deferred.
+
+Stop for architect review before B3b/B4. The original goal of two real evaluated feedback rounds remains unfinished; this is local implementation scope and provides no additional external-call budget.

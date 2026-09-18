@@ -1,0 +1,25 @@
+# C1 execution ledger
+
+## Scope and rulings
+
+- The principal architect selected the narrow invariant correction recorded in the B4b review package: only `core/pit_optimizer_v5/memory.py` may change.
+- The authorized behavior is confined to `ExperimentRecordV5._validate_post_validation_identity`: an `exact_duplicate` whose policy revision equals its parent revision must validate an empty *actual* `validation.changed_symbols`; every other record must continue to match `template.changed_symbols`.
+- B4b `runtime.py` and `artifacts.py` are held unchanged. B4c and all campaign activity are out of scope.
+- The user explicitly prohibits tests, synthetic probes, model/API calls, credential access, evaluator/candidate evaluation, commits, pushes, deployment, and campaign restart/resume. These restrictions override generic development defaults.
+- Verification is static only: scoped Ruff, in-memory compilation, narrow source/diff inspection, evaluator identity hashing, and read-only actual-artifact inspection.
+
+## Task ledger
+
+| Task | Status | Scope | Verification |
+| --- | --- | --- | --- |
+| C1 guard correction | complete — awaiting principal review | `memory.py` only | independent review, scoped lint/compile, hashes/diff/AST, evaluator identity, and read-only archive checks passed |
+
+## Dependencies / consumer-producer notes
+
+- `ExperimentIdentityV5` type and `ValidationResultV5` validity are checked before the changed-symbol comparison; subsequent existing identity validation and derivation still bind the policy-revision field after it.
+- `StructuralTemplateV5.changed_symbols` remains the declared candidate change for all non-parent-identical records. The exception is conjunctive (`status == "exact_duplicate"` and parent-policy equality).
+- Status evidence and post-validation identity derivation remain downstream of the corrected comparison and must not change.
+
+## Completion boundary
+
+The C1 package is ready for principal architect review. B4c is not started. The positive parent-identical exact-duplicate branch was not executed because the bounded real archive inventory contains no such record; it is documented as static review only.

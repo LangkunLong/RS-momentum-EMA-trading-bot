@@ -1,0 +1,18 @@
+# Task 1 Re-review 1
+
+## Finding Verdicts
+
+- **ADDRESSED** — `core/strategy_policy/contracts.py:66`: `_CanonicalContract` now declares `__slots__ = ()`, removing the inherited instance dictionary from frozen slotted contract subclasses and closing the mutable scalar/tuple boundary.
+- **ADDRESSED** — `tests/test_strategy_policy.py:187`: `test_contract_instances_have_no_mutable_instance_dictionary` instantiates all snapshot, decision, and nested policy contracts and asserts that none has `__dict__`.
+
+## New Breakage in Fix Diff
+
+None found. The fix diff changes only the base instance layout and adds its regression test; it does not alter serialization, validation, policy behavior, or public contract fields. The slot-only base is compatible with the existing frozen slotted dataclass descendants.
+
+## Out-of-Scope Observations
+
+None. The implementer report contains the covering narrow RED/GREEN commands and output, including the regression result (`1 passed, 26 deselected`) and the complete focused-file result (`27 passed`), plus the stated pre-existing pytest configuration warning.
+
+## Verdict
+
+**ADDRESSED.** Fix round 1 resolves the reported inherited mutable `__dict__` issue, with covering test evidence and no new breakage identified in the fix diff.

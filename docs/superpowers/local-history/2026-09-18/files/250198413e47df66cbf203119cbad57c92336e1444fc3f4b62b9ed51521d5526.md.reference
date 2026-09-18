@@ -1,0 +1,114 @@
+# Task 4 report — detect behaviorally inert V5 candidates
+
+## Outcome
+
+Created `core/pit_optimizer_v5/probes.py` as the only source change. The module owns one fixed,
+versioned `pit-policy-v3-probes-v1` suite, canonical probe evidence, typed sanitized failure modes,
+and suite-local semantic comparison. It depends on the pure `StrategyPolicyClientV3` protocol and
+trusted policy contracts; it contains no CLI, provider, Git, Docker, subprocess, filesystem, replay,
+or market-data implementation. No tests were created or modified.
+
+Focused implementation commit: `f3669c1` (`feat: reject behaviorally inert v5 candidates`).
+
+Focused review-fix commit: `be0295f` (`fix: classify v5 probe execution failures`).
+
+## Implemented contracts
+
+- `PolicyProbeCaseV5` and `policy_probe_suite_v1()` expose an immutable 11-case suite built from
+  trusted V3/base snapshot constructors. The suite covers all six V3 methods, confirmed-uptrend and
+  correction regimes, broad and narrow breadth, entry/risk/capacity/RS/scale boundaries, zero and
+  positive exposure, and explicit winner/loser holding states.
+- `canonical_probe_json_v5()` encodes concrete types with unambiguous tags before hashing. It
+  preserves `None`, strict booleans/integers, exact finite float bit patterns, finite Decimal sign,
+  digits and exponent, strings, bytes, tuples versus lists, enums, mappings, and frozen contract
+  dataclass fields. Unsupported or non-finite inputs fail closed.
+- `fingerprint_policy_client_v5()` accepts only a complete interface-V3 client surface. It calls
+  every fixed probe exactly twice in a deterministic two-pass derangement, so unrelated calls occur
+  between both executions of every snapshot. Results are collected by probe ID and canonicalized
+  back to declared suite order independent of execution order.
+- Exact decision types are required. Every result must round-trip through its contract's canonical
+  JSON, and capacity/allocation/eviction/add-on/exit decisions are checked against their exact fixed
+  snapshot with the trusted pairing validators.
+- `ProbeObservationV5` binds probe ID, method, lossless input digest, and canonical decision bytes.
+  `SemanticFingerprintV5` requires the exact ordered suite with no missing or duplicate observation,
+  revalidates each decision against its fixed input, and verifies a digest over the suite ID and all
+  ordered observation fields.
+- The fingerprint intentionally contains no source bytes, revision identity, template identity, or
+  evaluation context. Formatting-only source variants with identical fixed-suite decisions therefore
+  match.
+- Typed failures distinguish incomplete suite evidence, timeout, client/decision protocol failure,
+  deterministic execution failure, repeated-call exception mismatch, and decision drift. Public
+  failures contain only fixed failure codes, canonical probe/method bindings, and stable outcome
+  roles. Underlying exception messages are discarded, and exception types are used only as private,
+  transient two-pass comparison keys; neither is attached to the failure or fingerprint.
+- `classify_semantic_fingerprints_v5()` returns a frozen
+  `SemanticFingerprintComparisonV5`. A complete match is classified only as
+  `behavioral_equivalent_on_suite_v1`; divergence is
+  `behaviorally_distinct_on_suite_v1` with canonically ordered differing probe IDs. Neither result
+  claims global behavioral equivalence.
+
+## Separate worker-boundary integration blocker
+
+The read-only boundary audit found a pre-existing production V3 worker issue outside Task 4's
+approved one-file scope. `PolicyWorkerSession.call()` in `agent_loop.py` invokes
+`DecisionDeterminismGuard.observe(method, snapshot, decision)` without passing the authenticated
+worker interface version. The guard defaults to interface V2, so a valid V3 snapshot/decision can be
+rejected after its authenticated response. The future focused fix is to pass
+`interface_version=self._bootstrap.interface_version`. Per controller direction this task did not
+modify `agent_loop.py` or the worker; the pure probe runner is ready for either in-process or fixed
+JSON-line V3 clients.
+
+## Verification evidence
+
+All commands ran from the isolated Task 4 worktree.
+
+1. Direct red smoke proved the requested API was absent before implementation:
+   `V5_PROBES_RED_OK missing_module=1`.
+2. The comprehensive deterministic smoke covered suite size/order, 22 twice-interleaved calls,
+   every method, both regimes and breadth states, exact boundaries, winner/loser cases, baseline
+   repeatability, a formatting-equivalent wrapper, one-decision divergence, stateful nondeterminism,
+   malformed output, timeout, exception mismatch, lossless Decimal/tuple/None/Enum encoding, and
+   missing/duplicate observation rejection:
+   `V5_PROBES_SMOKE_OK probes=11 calls=22 methods=6 regimes=2 breadth=2 boundaries=1 winner_loser=1 repeat=1 format_equivalent=1 divergence=1 nondeterminism=1 malformed=1 timeout=1 exception_mismatch=1 canonical_types=1 missing_duplicate=2`.
+3. A post-review baseline repeat/fingerprint comparison smoke passed:
+   `V5_PROBES_POST_REVIEW_SMOKE_OK 11`.
+4. `python -B -m pytest tests/test_strategy_policy.py -q --no-cov` — `41 passed`.
+5. The planned focused V5 domain test could not run because
+   `tests/test_pit_optimizer_v5_domain.py` does not exist in this worktree; no replacement test was
+   added under the user override.
+6. Selected legacy worker tests were not usable as a Task 4 compatibility signal at this HEAD:
+   five fail before reaching probe behavior because they still construct interface version 1 (the
+   current closed worker supports V2/V3) or use pre-market-context snapshot constructor arities.
+   These failures occur unchanged without importing `probes.py` and are separate from the V3 guard
+   integration blocker above.
+7. `python -B -m ruff check core/pit_optimizer_v5/probes.py` — `All checks passed!`.
+8. `python -B -m py_compile core/pit_optimizer_v5/probes.py` — exit code 0.
+9. `git diff --check` passed.
+
+## Review correction verification
+
+The review finding was reproduced before the fix: a raising method descriptor leaked its raw
+`RuntimeError`, deterministic `ValueError` was mislabeled as protocol failure, different exception
+classes and exception-versus-decision were collapsed to protocol failure, and the public failure
+retained exception-type payload. The bounded red smoke reported
+`V5_PROBE_REVIEW_RED_OK` with each of those failures.
+
+The corrected runner now separates client-member lookup, method-surface validation, policy
+invocation, and post-return decision protocol validation. It compares both pass signatures before
+choosing a stable failure class. The final direct smoke covered raising property lookup,
+missing/noncallable methods, repeated `ValueError`, repeated `TypeError`, different exception
+classes, exception-versus-decision, public role fields, message/type secrecy, and unchanged baseline
+repeatability:
+`V5_PROBE_REVIEW_FINAL_SMOKE_OK cases=7 baseline_repeat=1 secrecy=1 roles=1`.
+
+Fresh post-fix checks:
+
+- `python -B -m pytest tests/test_strategy_policy.py -q --no-cov` — `41 passed`.
+- `python -B -m ruff check core/pit_optimizer_v5/probes.py` — `All checks passed!`.
+- `python -B -m ruff format --check core/pit_optimizer_v5/probes.py` — already formatted.
+- `python -B -m py_compile core/pit_optimizer_v5/probes.py` — exit code 0.
+- `git diff --check` and the commit hooks passed.
+
+Pytest emitted only the repository's existing `websockets.legacy` deprecation and sandbox-denied
+pytest-cache warnings. No provider calls, Docker evaluation, market-data access, qualification,
+replay, data mutation, push, or merge were performed.

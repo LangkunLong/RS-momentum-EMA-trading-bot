@@ -1,0 +1,1571 @@
+# Review package: 278d41b..7bbb4b3
+
+## Commits
+7bbb4b3 fix: close candidate confinement rereview findings
+
+## Files changed
+ agent_loop.py                   | 150 +++++++++++----
+ core/pit_optimizer_candidate.py | 108 ++++++-----
+ core/strategy_policy/worker.py  |  15 ++
+ tests/test_agent_loop.py        | 416 +++++++++++++++++++++++++++++++++++++++-
+ tests/test_pit_optimizer_v2.py  | 161 +++++++++++++++-
+ 5 files changed, 756 insertions(+), 94 deletions(-)
+
+## Diff
+diff --git a/agent_loop.py b/agent_loop.py
+index 53ea35d..2502b13 100644
+--- a/agent_loop.py
++++ b/agent_loop.py
+@@ -4618,20 +4618,31 @@ def _cleanup_owned_policy_daemon(daemon: _OwnedPolicyDaemon) -> list[BaseExcepti
+     if (
+         absence is None
+         or absence.timed_out
+         or absence.returncode != 0
+         or absence.stdout.strip()
+     ):
+         errors.append(SandboxError("owned policy daemon absence was not verified"))
+     return errors
+ 
+ 
++def _record_policy_secondary_errors(
++    primary: BaseException,
++    phase: str,
++    errors: Sequence[BaseException],
++) -> None:
++    for error in errors:
++        primary.add_note(
++            f"policy daemon {phase} secondary failure: {type(error).__name__}"
++        )
++
++
+ class PolicyWorkerSession:
+     """One bounded authenticated JSON-lines session owned by a single fold."""
+ 
+     def __init__(
+         self,
+         *,
+         process: Any,
+         package_root: Path,
+         daemon: _OwnedPolicyDaemon,
+         bootstrap: object,
+@@ -4752,31 +4763,25 @@ class PolicyWorkerSession:
+                 )
+                 self._guard.observe(method, snapshot, decision)
+                 self._previous_hmac = request.hmac_sha256
+                 self._sequence += 1
+                 return decision
+             except BaseException as exc:
+                 self.close(primary_error=exc)
+                 raise
+ 
+     def validate_determinism(self, probes: tuple[object, ...]) -> None:
+-        from core.strategy_policy.worker import PolicyDeterminismProbe
++        from core.strategy_policy.worker import validate_policy_determinism_probes
+ 
+-        if (
+-            type(probes) is not tuple
+-            or not 1 <= len(probes) <= 5
+-            or any(not isinstance(item, PolicyDeterminismProbe) for item in probes)
+-            or len({item.method for item in probes}) != len(probes)
+-        ):
+-            raise ValueError("policy determinism probes are invalid")
+         try:
+-            for probe in probes:
++            validated = validate_policy_determinism_probes(probes)
++            for probe in validated:
+                 self.call(probe.method, probe.repeated_snapshot)
+                 self.call(probe.method, probe.unrelated_snapshot)
+                 self.call(probe.method, probe.repeated_snapshot)
+         except BaseException as exc:
+             self.close(primary_error=exc)
+             raise
+ 
+     def close(self, *, primary_error: BaseException | None = None) -> None:
+         if self._closed:
+             return
+@@ -4910,20 +4915,41 @@ class PolicyWorkerRunner:
+             owner_token=owner_token,
+             image=self.image,
+         )
+ 
+     def _discover_owned_daemon(
+         self,
+         *,
+         environment: Mapping[str, str],
+         container_name: str,
+         owner_token: str,
++    ) -> _OwnedPolicyDaemon | None:
++        daemon = self._discover_tentative_owned_daemon(
++            environment=environment,
++            container_name=container_name,
++            owner_token=owner_token,
++        )
++        if daemon is None:
++            return None
++        return self._inspect_owned_daemon(
++            environment=environment,
++            container_id=daemon.container_id,
++            container_name=container_name,
++            owner_token=owner_token,
++        )
++
++    def _discover_tentative_owned_daemon(
++        self,
++        *,
++        environment: Mapping[str, str],
++        container_name: str,
++        owner_token: str,
+     ) -> _OwnedPolicyDaemon | None:
+         result = self._control(
+             environment,
+             "container",
+             "ls",
+             "--all",
+             "--quiet",
+             "--no-trunc",
+             "--filter",
+             f"name=^/{re.escape(container_name)}$",
+@@ -4931,25 +4957,28 @@ class PolicyWorkerRunner:
+             f"label=pit-policy.owner={owner_token}",
+         )
+         identities = tuple(line.strip() for line in result.stdout.splitlines() if line.strip())
+         if not identities:
+             return None
+         if (
+             len(identities) != 1
+             or re.fullmatch(r"[0-9a-f]{64}", identities[0]) is None
+         ):
+             raise SandboxError("owned policy daemon discovery is ambiguous")
+-        return self._inspect_owned_daemon(
+-            environment=environment,
++        return _OwnedPolicyDaemon(
++            engine_path=self.engine_path,
++            control_runner=self._control_runner,
++            environment=dict(environment),
+             container_id=identities[0],
+             container_name=container_name,
+             owner_token=owner_token,
++            image=self.image,
+         )
+ 
+     @staticmethod
+     def _candidate_sources(candidate_root: Path) -> dict[str, bytes]:
+         from core.pit_optimizer_candidate import _read_policy_sources, validate_policy_ast
+ 
+         try:
+             policy_sources = _read_policy_sources(candidate_root)
+         except ValueError as exc:
+             raise SandboxError(str(exc)) from exc
+@@ -5088,53 +5117,81 @@ class PolicyWorkerRunner:
+                 "--mount",
+                 f"type=bind,src={package_root},dst=/workspace/policy,readonly",
+                 "--workdir",
+                 "/workspace/policy",
+                 self.image,
+                 "python",
+                 "-B",
+                 "-m",
+                 "core.strategy_policy.worker",
+             )
++
++            def recover_failed_create(
++                primary_error: BaseException,
++            ) -> _OwnedPolicyDaemon | None:
++                try:
++                    tentative = self._discover_tentative_owned_daemon(
++                        environment=environment,
++                        container_name=container_name,
++                        owner_token=owner_token,
++                    )
++                except BaseException as discovery_error:
++                    _record_policy_secondary_errors(
++                        primary_error,
++                        "discovery",
++                        (discovery_error,),
++                    )
++                    return None
++                if tentative is not None:
++                    try:
++                        self._inspect_owned_daemon(
++                            environment=environment,
++                            container_id=tentative.container_id,
++                            container_name=container_name,
++                            owner_token=owner_token,
++                        )
++                    except BaseException as inspect_error:
++                        _record_policy_secondary_errors(
++                            primary_error,
++                            "inspect",
++                            (inspect_error,),
++                        )
++                return tentative
++
++            create_error: BaseException | None = None
+             try:
+                 created = self._control_runner(
+                     create_argv,
+                     env=environment,
+                     timeout=10.0,
+                     output_limit=64 * 1024,
+                 )
+-            except BaseException:
+-                daemon = self._discover_owned_daemon(
+-                    environment=environment,
+-                    container_name=container_name,
+-                    owner_token=owner_token,
+-                )
+-                raise
+-            if (
++            except BaseException as exc:
++                create_error = exc
++                created = None
++            if create_error is None and (
+                 not isinstance(created, ProcessResult)
+                 or created.timed_out
+                 or created.returncode != 0
+             ):
+-                daemon = self._discover_owned_daemon(
+-                    environment=environment,
+-                    container_name=container_name,
+-                    owner_token=owner_token,
+-                )
+-                raise SandboxError("policy daemon creation failed")
++                create_error = SandboxError("policy daemon creation failed")
++            if create_error is not None:
++                daemon = recover_failed_create(create_error)
++                raise create_error
++            assert isinstance(created, ProcessResult)
+             container_id = created.stdout.strip()
+             if re.fullmatch(r"[0-9a-f]{64}", container_id or "") is None:
+-                daemon = self._discover_owned_daemon(
+-                    environment=environment,
+-                    container_name=container_name,
+-                    owner_token=owner_token,
++                identity_error = SandboxError(
++                    "policy daemon returned an invalid full identity"
+                 )
+-                raise SandboxError("policy daemon returned an invalid full identity")
++                daemon = recover_failed_create(identity_error)
++                raise identity_error
+             daemon = _OwnedPolicyDaemon(
+                 engine_path=engine_path,
+                 control_runner=self._control_runner,
+                 environment=dict(environment),
+                 container_id=container_id,
+                 container_name=container_name,
+                 owner_token=owner_token,
+                 image=self.image,
+             )
+             daemon = self._inspect_owned_daemon(
+@@ -5169,62 +5226,75 @@ class PolicyWorkerRunner:
+                 method_timeout_seconds=self.method_timeout_seconds,
+                 fold_timeout_seconds=self.fold_timeout_seconds,
+             )
+             try:
+                 process.stdin.write(bootstrap.to_json().encode("utf-8") + b"\n")
+                 process.stdin.flush()
+             except BaseException as exc:
+                 session.close(primary_error=exc)
+                 raise
+             return session
+-        except BaseException:
++        except BaseException as primary_error:
++            cleanup_errors: list[BaseException] = []
+             if process is not None and session is None:
+-                _cleanup_unowned_policy_process(process)
++                cleanup_errors.extend(_cleanup_unowned_policy_process(process))
+             if daemon is not None and session is None:
+-                _cleanup_owned_policy_daemon(daemon)
++                cleanup_errors.extend(_cleanup_owned_policy_daemon(daemon))
+             try:
+                 if temporary_root.exists():
+                     _remove_private_tree(temporary_root)
+-            except BaseException:
+-                pass
++            except BaseException as cleanup_error:
++                cleanup_errors.append(cleanup_error)
++            _record_policy_secondary_errors(
++                primary_error,
++                "cleanup",
++                cleanup_errors,
++            )
+             raise
+ 
+     def client_factory(
+         self,
+         *,
+         candidate_root: Path,
+         interface_version: int,
+         fold_run_id: str,
+         determinism_probes: tuple[object, ...],
+     ) -> Callable[[], Any]:
+         """Return a one-shot simulator factory for exactly one fresh fold session."""
++        from core.strategy_policy.worker import validate_policy_determinism_probes
++
++        validated_probes = validate_policy_determinism_probes(determinism_probes)
+         started = False
+         lock = threading.Lock()
+ 
+         def create_client() -> Any:
+             nonlocal started
+             with lock:
+                 if started:
+                     raise RuntimeError("policy worker fold session already started")
+                 started = True
+             from core.strategy_policy.runtime import JsonLinePolicyClient
+ 
+             session = self.start(
+                 candidate_root=candidate_root,
+                 interface_version=interface_version,
+                 fold_run_id=fold_run_id,
+             )
+-            session.validate_determinism(determinism_probes)
+-            return JsonLinePolicyClient(
+-                session=session,
+-                interface_version=interface_version,
+-            )
++            try:
++                session.validate_determinism(validated_probes)
++                return JsonLinePolicyClient(
++                    session=session,
++                    interface_version=interface_version,
++                )
++            except BaseException as exc:
++                session.close(primary_error=exc)
++                raise
+ 
+         return create_client
+ 
+ 
+ class SandboxRunner:
+     """Digest-pinned observational runner with an exact inspected confinement contract."""
+ 
+     def __init__(
+         self,
+         *,
+diff --git a/core/pit_optimizer_candidate.py b/core/pit_optimizer_candidate.py
+index 10fb024..15da068 100644
+--- a/core/pit_optimizer_candidate.py
++++ b/core/pit_optimizer_candidate.py
+@@ -1,16 +1,16 @@
+ """Controller-owned validation and identity for model-authored policy candidates."""
+ 
+ from __future__ import annotations
+ 
+ import ast
+-from dataclasses import dataclass, field
++from dataclasses import InitVar, dataclass
+ import hashlib
+ import json
+ import os
+ from pathlib import Path
+ import re
+ import stat
+ from typing import Mapping
+ from weakref import WeakValueDictionary
+ 
+ import core.pit_optimization_contract as optimization_contract
+@@ -164,27 +164,41 @@ _ALLOWED_AST_NODES = (
+ class CandidateIdentity:
+     source_commit: str
+     policy_interface_version: int
+     cumulative_diff_sha256: str
+     editable_file_sha256s: tuple[tuple[str, str], ...]
+     changed_paths: tuple[str, ...]
+     changed_symbols: tuple[str, ...]
+     immutable_constraints_sha256: str
+     discovery_manifest_sha256: str
+     identity_sha256: str
+-    _controller_seal: object = field(default=None, repr=False, compare=False)
++    _controller_seal: InitVar[object] = None
+ 
+-    def __post_init__(self) -> None:
+-        if self._controller_seal is not _CANDIDATE_IDENTITY_CONSTRUCTION_SEAL:
++    def __post_init__(self, _controller_seal: object) -> None:
++        if _controller_seal is not _CANDIDATE_IDENTITY_CONSTRUCTION_SEAL:
+             raise ValueError("candidate identity must be controller derived")
+         _validate_candidate_identity_fields(self)
+ 
++    def to_primitive(self) -> dict[str, object]:
++        return {
++            **_candidate_identity_values(self),
++            "identity_sha256": self.identity_sha256,
++        }
++
++    def to_canonical_json(self) -> str:
++        return json.dumps(
++            self.to_primitive(),
++            sort_keys=True,
++            separators=(",", ":"),
++            allow_nan=False,
++        ) + "\n"
++
+ 
+ _AUTHENTICATED_CANDIDATE_IDENTITIES: WeakValueDictionary[
+     int, CandidateIdentity
+ ] = WeakValueDictionary()
+ 
+ 
+ def _immutable_literal(value: object) -> bool:
+     if value is None or type(value) in {bool, int, float, str}:
+         return True
+     return type(value) is tuple and all(_immutable_literal(item) for item in value)
+@@ -278,57 +292,62 @@ def validate_policy_ast(*, path: str, source: str) -> None:
+             except (TypeError, ValueError) as exc:
+                 raise ValueError("policy constant requires an immutable literal") from exc
+             if not _immutable_literal(value):
+                 raise ValueError("policy constant requires an immutable literal")
+ 
+     parents = {
+         child: parent
+         for parent in ast.walk(tree)
+         for child in ast.iter_child_nodes(parent)
+     }
+-    mutable_names: dict[ast.FunctionDef, set[str]] = {}
++    appendable_names: dict[ast.FunctionDef, set[str]] = {}
+     for function in (
+         item for item in tree.body if isinstance(item, ast.FunctionDef)
+     ):
+-        names = {
+-            descendant.targets[0].id
+-            for descendant in ast.walk(function)
+-            if isinstance(descendant, ast.Assign)
+-            and len(descendant.targets) == 1
+-            and isinstance(descendant.targets[0], ast.Name)
+-            and isinstance(
+-                descendant.value,
+-                (ast.List, ast.Dict, ast.ListComp, ast.DictComp),
+-            )
+-            or isinstance(descendant, ast.Assign)
+-            and len(descendant.targets) == 1
+-            and isinstance(descendant.targets[0], ast.Name)
+-            and isinstance(descendant.value, ast.Call)
+-            and isinstance(descendant.value.func, ast.Name)
+-            and descendant.value.func.id in {"list", "dict"}
+-        }
+-        names.update(
+-            descendant.target.id
+-            for descendant in ast.walk(function)
+-            if isinstance(descendant, ast.AnnAssign)
+-            and isinstance(descendant.target, ast.Name)
+-            and isinstance(
+-                descendant.value,
+-                (ast.List, ast.Dict, ast.ListComp, ast.DictComp),
+-            )
+-            or isinstance(descendant, ast.AnnAssign)
+-            and isinstance(descendant.target, ast.Name)
+-            and isinstance(descendant.value, ast.Call)
+-            and isinstance(descendant.value.func, ast.Name)
+-            and descendant.value.func.id in {"list", "dict"}
+-        )
+-        mutable_names[function] = names
++        binding_counts: dict[str, int] = {}
++        for descendant in ast.walk(function):
++            if isinstance(descendant, ast.Name) and isinstance(
++                descendant.ctx, ast.Store
++            ):
++                binding_counts[descendant.id] = binding_counts.get(descendant.id, 0) + 1
++        names: set[str] = set()
++        for descendant in ast.walk(function):
++            if (
++                isinstance(descendant, ast.Assign)
++                and len(descendant.targets) == 1
++                and isinstance(descendant.targets[0], ast.Name)
++                and (
++                    isinstance(descendant.value, ast.List)
++                    or (
++                        isinstance(descendant.value, ast.Call)
++                        and isinstance(descendant.value.func, ast.Name)
++                        and descendant.value.func.id == "list"
++                    )
++                )
++                and binding_counts.get(descendant.targets[0].id) == 1
++            ):
++                names.add(descendant.targets[0].id)
++            elif (
++                isinstance(descendant, ast.AnnAssign)
++                and isinstance(descendant.target, ast.Name)
++                and (
++                    isinstance(descendant.value, ast.List)
++                    or (
++                        isinstance(descendant.value, ast.Call)
++                        and isinstance(descendant.value.func, ast.Name)
++                        and descendant.value.func.id == "list"
++                    )
++                )
++                and binding_counts.get(descendant.target.id) == 1
++            ):
++                names.add(descendant.target.id)
++        appendable_names[function] = names
+ 
+     for node in ast.walk(tree):
+         if not isinstance(node, _ALLOWED_AST_NODES):
+             if isinstance(node, ast.ClassDef):
+                 raise ValueError("policy class definitions are forbidden")
+             if isinstance(node, ast.AsyncFunctionDef):
+                 raise ValueError("policy async definitions are forbidden")
+             if isinstance(node, (ast.Yield, ast.YieldFrom)):
+                 raise ValueError("policy generator behavior is forbidden")
+             if isinstance(node, (ast.Global, ast.Nonlocal)):
+@@ -351,72 +370,69 @@ def validate_policy_ast(*, path: str, source: str) -> None:
+                 if not _immutable_literal(value):
+                     raise ValueError("policy function default must be immutable")
+             argument_names = {
+                 argument.arg
+                 for argument in (
+                     *node.args.posonlyargs,
+                     *node.args.args,
+                     *node.args.kwonlyargs,
+                 )
+             }
+-            local_mutables = mutable_names[node]
+             for descendant in ast.walk(node):
+                 if isinstance(descendant, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                     targets = (
+                         descendant.targets
+                         if isinstance(descendant, ast.Assign)
+                         else [descendant.target]
+                     )
+                     for target in targets:
+                         root = _root_name(target)
+                         if root in argument_names:
+                             raise ValueError("policy input writes are forbidden")
+                         if root in local_functions and isinstance(
+                             target, (ast.Attribute, ast.Subscript)
+                         ):
+                             raise ValueError("policy function attribute writes are forbidden")
+-                        if isinstance(target, (ast.Attribute, ast.Subscript)) and (
+-                            root not in local_mutables
+-                        ):
++                        if isinstance(target, (ast.Attribute, ast.Subscript)):
+                             raise ValueError("policy mutation root is outside local state")
+         if isinstance(node, (ast.Set, ast.SetComp)):
+             raise ValueError("policy unordered iteration is forbidden")
+         if isinstance(node, ast.Attribute):
+             if node.attr.startswith("__"):
+                 raise ValueError("policy reflection attributes are forbidden")
+             if _root_name(node) in local_functions:
+                 raise ValueError("policy function attributes are forbidden")
+         if isinstance(node, ast.Call):
+             owner: ast.AST | None = node
+             while owner is not None and not isinstance(owner, ast.FunctionDef):
+                 owner = parents.get(owner)
+-            call_mutables = (
+-                mutable_names.get(owner, set())
++            call_appendables = (
++                appendable_names.get(owner, set())
+                 if isinstance(owner, ast.FunctionDef)
+                 else set()
+             )
+             if isinstance(node.func, ast.Name):
+                 name = node.func.id
+                 if name in _REFLECTION_CALLS:
+                     raise ValueError("policy reflection calls are forbidden")
+                 if name in _DANGEROUS_CALLS:
+                     raise ValueError("policy call is outside the allowlist")
+                 if name not in (
+                     _PURE_BUILTINS | imported_contracts | local_functions
+                 ):
+                     raise ValueError("policy call is outside the allowlist")
+             elif isinstance(node.func, ast.Attribute):
+                 root = _root_name(node.func)
+                 if root == "math":
+                     if not imported_math or node.func.attr.startswith("_"):
+                         raise ValueError("policy math call is outside the allowlist")
+-                elif node.func.attr == "append" and root in call_mutables:
++                elif node.func.attr == "append" and root in call_appendables:
+                     continue
+                 else:
+                     raise ValueError("policy attribute call is outside the allowlist")
+             else:
+                 raise ValueError("policy dynamic call is outside the allowlist")
+ 
+ 
+ def _symbol_nodes(path: str, source: str) -> dict[str, str]:
+     if path not in _ALLOWED_PUBLIC:
+         raise ValueError("policy source path is outside the editable scope")
+@@ -700,30 +716,30 @@ def validate_candidate_diff(
+             _git(
+                 candidate_root,
+                 "apply",
+                 "--check",
+                 "--whitespace=error-all",
+                 "-",
+                 input_bytes=encoded,
+                 timeout=30.0,
+                 git=git,
+             )
++            applied = True
+             _git(
+                 candidate_root,
+                 "apply",
+                 "--whitespace=error-all",
+                 "-",
+                 input_bytes=encoded,
+                 timeout=30.0,
+                 git=git,
+             )
+-            applied = True
+         except PreflightError as exc:
+             removed_lines = tuple(
+                 line[1:]
+                 for line in incremental_diff.splitlines(keepends=True)
+                 if line.startswith("-") and not line.startswith("--- ")
+             )
+             added_lines = tuple(
+                 line[1:]
+                 for line in incremental_diff.splitlines(keepends=True)
+                 if line.startswith("+") and not line.startswith("+++ ")
+diff --git a/core/strategy_policy/worker.py b/core/strategy_policy/worker.py
+index b11e257..1149a90 100644
+--- a/core/strategy_policy/worker.py
++++ b/core/strategy_policy/worker.py
+@@ -377,20 +377,34 @@ class PolicyDeterminismProbe:
+ 
+     def __post_init__(self) -> None:
+         _require_method_pair(self.method, self.repeated_snapshot, response=False)
+         _require_method_pair(self.method, self.unrelated_snapshot, response=False)
+         if _canonical_bytes(self.repeated_snapshot.to_primitive()) == _canonical_bytes(  # type: ignore[attr-defined]
+             self.unrelated_snapshot.to_primitive()  # type: ignore[attr-defined]
+         ):
+             raise ValueError("policy determinism probe snapshots must differ")
+ 
+ 
++def validate_policy_determinism_probes(
++    probes: tuple[object, ...],
++) -> tuple[PolicyDeterminismProbe, ...]:
++    """Validate the bounded, method-unique probe set before worker allocation."""
++    if (
++        type(probes) is not tuple
++        or not 1 <= len(probes) <= 5
++        or any(type(item) is not PolicyDeterminismProbe for item in probes)
++        or len({item.method for item in probes}) != len(probes)
++    ):
++        raise ValueError("policy determinism probes are invalid")
++    return probes  # type: ignore[return-value]
++
++
+ class DecisionDeterminismGuard:
+     """Remember bounded snapshot results and reject state-dependent changes."""
+ 
+     def __init__(self, *, max_observations: int = 32) -> None:
+         if type(max_observations) is not int or not 1 <= max_observations <= 32:
+             raise ValueError("policy determinism observation cap is invalid")
+         self._max_observations = max_observations
+         self._observed: OrderedDict[tuple[str, bytes], bytes] = OrderedDict()
+ 
+     @property
+@@ -472,12 +486,13 @@ __all__ = [
+     "POLICY_METHODS",
+     "PolicyDeterminismProbe",
+     "PolicyRequestEnvelope",
+     "PolicyResponseEnvelope",
+     "WorkerBootstrap",
+     "decode_policy_request",
+     "decode_policy_response",
+     "encode_policy_request",
+     "encode_policy_response",
+     "initial_chain_sha256",
++    "validate_policy_determinism_probes",
+     "worker_main",
+ ]
+diff --git a/tests/test_agent_loop.py b/tests/test_agent_loop.py
+index 012d569..df26b96 100644
+--- a/tests/test_agent_loop.py
++++ b/tests/test_agent_loop.py
+@@ -361,55 +361,70 @@ class _Task5FakeProcess:
+         if self.returncode is None:
+             self.returncode = 0
+         return self.returncode
+ 
+ 
+ class _Task5FakeDockerControl:
+     def __init__(
+         self,
+         *,
+         failures: dict[str, BaseException] | None = None,
++        failures_on_call: dict[tuple[str, int], BaseException] | None = None,
+         fail_after_create: bool = False,
++        raise_after_create: BaseException | None = None,
++        create_output: str | None = None,
+         tamper_inspect: bool = False,
+     ) -> None:
+         self.container_id = "c" * 64
+         self.calls: list[tuple[str, ...]] = []
+         self.exists = False
+         self.name = ""
+         self.owner = ""
+         self.image = ""
+         self.failures = failures or {}
++        self.failures_on_call = failures_on_call or {}
++        self.operation_counts: dict[str, int] = {}
+         self.fail_after_create = fail_after_create
++        self.raise_after_create = raise_after_create
++        self.create_output = create_output
+         self.tamper_inspect = tamper_inspect
+ 
+     def __call__(self, argv: tuple[str, ...], **_kwargs: object) -> object:
+         from agent_loop import ProcessResult
+ 
+         args = tuple(argv)
+         self.calls.append(args)
+         operation = args[1]
++        self.operation_counts[operation] = self.operation_counts.get(operation, 0) + 1
++        occurrence_failure = self.failures_on_call.get(
++            (operation, self.operation_counts[operation])
++        )
++        if occurrence_failure is not None:
++            raise occurrence_failure
+         if operation in self.failures:
+             raise self.failures[operation]
+         if operation == "create":
+             self.name = args[args.index("--name") + 1]
+             self.owner = args[args.index("--label") + 1].split("=", 1)[1]
+             self.image = args[-5]
+             self.exists = True
++            if self.raise_after_create is not None:
++                raise self.raise_after_create
+             if self.fail_after_create:
+                 return ProcessResult(
+                     125,
+                     "",
+                     "create transport fault",
+                     hashlib.sha256(b"").hexdigest(),
+                     hashlib.sha256(b"create transport fault").hexdigest(),
+                 )
+-            return ProcessResult.ok(self.container_id + "\n")
++            return ProcessResult.ok((self.create_output or self.container_id) + "\n")
+         if operation == "inspect":
+             return ProcessResult.ok(
+                 json.dumps(
+                     [
+                         {
+                             "Id": self.container_id,
+                             "Name": "/" + self.name,
+                             "Config": {
+                                 "Image": self.image,
+                                 "Labels": {
+@@ -423,20 +438,64 @@ class _Task5FakeDockerControl:
+                 )
+             )
+         if operation == "rm":
+             self.exists = False
+             return ProcessResult.ok()
+         if operation == "container":
+             return ProcessResult.ok(self.container_id + "\n" if self.exists else "")
+         return ProcessResult.ok()
+ 
+ 
++def _task5_authenticated_capacity_process() -> _Task5FakeProcess:
++    from core.strategy_policy.contracts import CapacityDecision
++    from core.strategy_policy.worker import (
++        WorkerBootstrap,
++        decode_policy_request,
++        encode_policy_response,
++        initial_chain_sha256,
++    )
++
++    process = _Task5FakeProcess()
++    state: dict[str, object] = {"sequence": 1}
++
++    def respond(value: bytes) -> None:
++        raw = value.decode("utf-8").rstrip("\n")
++        if "bootstrap" not in state:
++            bootstrap = WorkerBootstrap.from_json(raw)
++            state["bootstrap"] = bootstrap
++            state["previous"] = initial_chain_sha256(bootstrap)
++            return
++        bootstrap = state["bootstrap"]
++        sequence = state["sequence"]
++        assert isinstance(bootstrap, WorkerBootstrap)
++        assert isinstance(sequence, int)
++        request, _snapshot = decode_policy_request(
++            raw,
++            bootstrap=bootstrap,
++            expected_sequence=sequence,
++            expected_previous_hmac_sha256=str(state["previous"]),
++        )
++        line, _response = encode_policy_response(
++            bootstrap=bootstrap,
++            sequence=sequence,
++            request_hmac_sha256=request.hmac_sha256,
++            method=request.method,
++            decision=CapacityDecision(None, False),
++        )
++        state["previous"] = request.hmac_sha256
++        state["sequence"] = sequence + 1
++        process.stdout.values.put(line.encode("utf-8") + b"\n")
++
++    process.stdin.callback = respond
++    return process
++
++
+ def _task5_policy_candidate(tmp_path: Path) -> Path:
+     source = Path(__file__).parents[1] / "core" / "strategy_policy"
+     candidate = tmp_path / "candidate"
+     for name in ("entry.py", "risk.py", "exit.py"):
+         target = candidate / "core" / "strategy_policy" / name
+         target.parent.mkdir(parents=True, exist_ok=True)
+         shutil.copyfile(source / name, target)
+     (candidate / "credentials.env").write_text("TOKEN=forbidden\n", encoding="utf-8")
+     (candidate / "pit.sqlite3").write_bytes(b"sealed-data")
+     return candidate
+@@ -497,20 +556,77 @@ def test_policy_worker_rejects_intermediate_policy_directory_link_before_launch(
+     )
+     with pytest.raises(SandboxError, match="link|provenance"):
+         runner.start(
+             candidate_root=_task5_linked_policy_candidate(tmp_path),
+             interface_version=1,
+             fold_run_id="discovery_link",
+         )
+     assert launches == 0
+ 
+ 
++def test_policy_worker_alias_state_candidate_cannot_reach_authenticated_client(
++    tmp_path: Path,
++) -> None:
++    """Break caught: an imported-object alias escaped AST checks before authenticated use."""
++    from agent_loop import PolicyWorkerRunner
++    from core.strategy_policy.contracts import CapacitySnapshot
++    from core.strategy_policy.worker import PolicyDeterminismProbe
++
++    candidate = _task5_policy_candidate(tmp_path)
++    entry = candidate / "core" / "strategy_policy" / "entry.py"
++    entry.write_text(
++        entry.read_text("utf-8").replace(
++            "from __future__ import annotations\n",
++            "from __future__ import annotations\nimport math\n",
++            ).replace(
++                "    blocking_codes = list(snapshot.technical_blocking_reasons)\n",
++                "    blocking_codes = list(snapshot.technical_blocking_reasons)\n"
++                "    blocking_codes = math\n"
++                "    blocking_codes.pi += 1.0\n",
++        ),
++        encoding="utf-8",
++        newline="\n",
++    )
++    launches = 0
++    control = _Task5FakeDockerControl()
++
++    def process_factory(_argv: list[str], **_kwargs: object) -> _Task5FakeProcess:
++        nonlocal launches
++        launches += 1
++        return _Task5FakeProcess()
++
++    runner = PolicyWorkerRunner(
++        image="example.invalid/policy@sha256:" + "a" * 64,
++        injected_engine_path=Path("C:/fake/docker.exe"),
++        process_factory=process_factory,
++        control_runner=control,
++        temp_parent=tmp_path,
++        method_timeout_seconds=0.01,
++    )
++    probe = PolicyDeterminismProbe(
++        "recommend_capacity",
++        CapacitySnapshot(None, 25, 0, 3, 1.0, False),
++        CapacitySnapshot(5, 25, 2, 1, 0.5, True),
++    )
++    factory = runner.client_factory(
++        candidate_root=candidate,
++        interface_version=1,
++        fold_run_id="alias_state",
++        determinism_probes=(probe,),
++    )
++    with pytest.raises(ValueError, match="mutation root"):
++        factory()
++    assert launches == 0
++    assert control.calls == []
++    assert not tuple(tmp_path.glob("pw-*"))
++
++
+ def test_policy_worker_command_mount_allowlist_and_cleanup_use_only_fakes(
+     tmp_path: Path,
+     monkeypatch: pytest.MonkeyPatch,
+ ) -> None:
+     """Break caught: the policy worker inherited host access or weak Docker limits."""
+     from agent_loop import PolicyWorkerRunner
+ 
+     candidate = _task5_policy_candidate(tmp_path)
+     calls: list[tuple[list[str], dict[str, object], _Task5FakeProcess]] = []
+ 
+@@ -958,21 +1074,24 @@ def test_policy_worker_bootstrap_failure_cleans_verified_daemon_owner(
+     assert not control.exists
+     assert not tuple(tmp_path.glob("pw-*"))
+ 
+ 
+ def test_policy_worker_creation_failure_discovers_and_removes_exact_owned_daemon(
+     tmp_path: Path,
+ ) -> None:
+     """Break caught: a failed create response orphaned the daemon object it had created."""
+     from agent_loop import PolicyWorkerRunner, SandboxError
+ 
+-    control = _Task5FakeDockerControl(fail_after_create=True)
++    control = _Task5FakeDockerControl(
++        fail_after_create=True,
++        tamper_inspect=True,
++    )
+     launches = 0
+ 
+     def process_factory(_argv: list[str], **_kwargs: object) -> _Task5FakeProcess:
+         nonlocal launches
+         launches += 1
+         return _Task5FakeProcess()
+ 
+     runner = PolicyWorkerRunner(
+         image="example.invalid/policy@sha256:" + "a" * 64,
+         injected_engine_path=Path("C:/fake/docker.exe"),
+@@ -991,20 +1110,303 @@ def test_policy_worker_creation_failure_discovers_and_removes_exact_owned_daemon
+     assert "inspect" in [call[1] for call in control.calls]
+     assert [call[1] for call in control.calls][-4:] == [
+         "kill",
+         "wait",
+         "rm",
+         "container",
+     ]
+     assert not tuple(tmp_path.glob("pw-*"))
+ 
+ 
++@pytest.mark.parametrize("probe_case", ("empty", "wrong_type", "duplicate"))
++def test_policy_worker_rejects_invalid_determinism_probes_before_start(
++    tmp_path: Path,
++    probe_case: str,
++) -> None:
++    """Break caught: invalid probes allocated a package and daemon before rejection."""
++    from agent_loop import PolicyWorkerRunner
++    from core.strategy_policy.contracts import CapacitySnapshot
++    from core.strategy_policy.worker import PolicyDeterminismProbe
++
++    probes: tuple[object, ...]
++    if probe_case == "duplicate":
++        probe = PolicyDeterminismProbe(
++            "recommend_capacity",
++            CapacitySnapshot(None, 25, 0, 3, 1.0, False),
++            CapacitySnapshot(5, 25, 2, 1, 0.5, True),
++        )
++        probes = (probe, probe)
++    elif probe_case == "wrong_type":
++        probes = (object(),)
++    else:
++        probes = ()
++    launches = 0
++    control = _Task5FakeDockerControl()
++
++    def process_factory(_argv: list[str], **_kwargs: object) -> _Task5FakeProcess:
++        nonlocal launches
++        launches += 1
++        return _Task5FakeProcess()
++
++    runner = PolicyWorkerRunner(
++        image="example.invalid/policy@sha256:" + "a" * 64,
++        injected_engine_path=Path("C:/fake/docker.exe"),
++        process_factory=process_factory,
++        control_runner=control,
++        temp_parent=tmp_path,
++    )
++    with pytest.raises(ValueError, match="determinism probes"):
++        runner.client_factory(
++            candidate_root=_task5_policy_candidate(tmp_path),
++            interface_version=1,
++            fold_run_id="invalid_probes",
++            determinism_probes=probes,
++        )
++    assert launches == 0
++    assert control.calls == []
++    assert not tuple(tmp_path.glob("pw-*"))
++
++
++def test_policy_worker_client_initialization_cancellation_closes_started_session(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Break caught: cancellation constructing the client leaked an initialized worker."""
++    from agent_loop import PolicyWorkerRunner
++    from core.strategy_policy.contracts import CapacitySnapshot
++    from core.strategy_policy.runtime import JsonLinePolicyClient
++    from core.strategy_policy.worker import PolicyDeterminismProbe
++
++    process = _task5_authenticated_capacity_process()
++    control = _Task5FakeDockerControl()
++    runner = PolicyWorkerRunner(
++        image="example.invalid/policy@sha256:" + "a" * 64,
++        injected_engine_path=Path("C:/fake/docker.exe"),
++        process_factory=lambda _argv, **_kwargs: process,
++        control_runner=control,
++        temp_parent=tmp_path,
++    )
++    probe = PolicyDeterminismProbe(
++        "recommend_capacity",
++        CapacitySnapshot(None, 25, 0, 3, 1.0, False),
++        CapacitySnapshot(5, 25, 2, 1, 0.5, True),
++    )
++
++    def cancel_client(_self: object, **_kwargs: object) -> None:
++        raise KeyboardInterrupt()
++
++    monkeypatch.setattr(JsonLinePolicyClient, "__init__", cancel_client)
++    factory = runner.client_factory(
++        candidate_root=_task5_policy_candidate(tmp_path),
++        interface_version=1,
++        fold_run_id="client_cancel",
++        determinism_probes=(probe,),
++    )
++    with pytest.raises(KeyboardInterrupt):
++        factory()
++    assert process.terminated == 1
++    assert not control.exists
++    assert not tuple(tmp_path.glob("pw-*"))
++
++
++@pytest.mark.parametrize("inspect_mode", ("fault", "tamper"))
++def test_policy_worker_create_primary_survives_discovery_inspection_failure(
++    tmp_path: Path,
++    inspect_mode: str,
++) -> None:
++    """Break caught: inspecting a tentative daemon masked create failure and leaked it."""
++    from agent_loop import PolicyWorkerRunner
++
++    primary = OSError("create primary")
++    control = _Task5FakeDockerControl(
++        failures={"inspect": OSError("inspect secondary")}
++        if inspect_mode == "fault"
++        else None,
++        raise_after_create=primary,
++        tamper_inspect=inspect_mode == "tamper",
++    )
++    runner = PolicyWorkerRunner(
++        image="example.invalid/policy@sha256:" + "a" * 64,
++        injected_engine_path=Path("C:/fake/docker.exe"),
++        process_factory=lambda _argv, **_kwargs: _Task5FakeProcess(),
++        control_runner=control,
++        temp_parent=tmp_path,
++    )
++    with pytest.raises(OSError, match="create primary") as captured:
++        runner.start(
++            candidate_root=_task5_policy_candidate(tmp_path),
++            interface_version=1,
++            fold_run_id=f"inspect_{inspect_mode}",
++        )
++    assert any("inspect" in note for note in getattr(captured.value, "__notes__", ()))
++    assert not control.exists
++    assert [call[1] for call in control.calls][-4:] == [
++        "kill",
++        "wait",
++        "rm",
++        "container",
++    ]
++    assert not tuple(tmp_path.glob("pw-*"))
++
++
++def test_policy_worker_create_primary_survives_discovery_list_failure(
++    tmp_path: Path,
++) -> None:
++    """Break caught: a discovery-list fault replaced the original create error."""
++    from agent_loop import PolicyWorkerRunner
++
++    control = _Task5FakeDockerControl(
++        failures={
++            "create": OSError("create primary"),
++            "container": OSError("list secondary"),
++        }
++    )
++    runner = PolicyWorkerRunner(
++        image="example.invalid/policy@sha256:" + "a" * 64,
++        injected_engine_path=Path("C:/fake/docker.exe"),
++        process_factory=lambda _argv, **_kwargs: _Task5FakeProcess(),
++        control_runner=control,
++        temp_parent=tmp_path,
++    )
++    with pytest.raises(OSError, match="create primary") as captured:
++        runner.start(
++            candidate_root=_task5_policy_candidate(tmp_path),
++            interface_version=1,
++            fold_run_id="list_fault",
++        )
++    assert any("discovery" in note for note in getattr(captured.value, "__notes__", ()))
++    assert not control.exists
++    assert not tuple(tmp_path.glob("pw-*"))
++
++
++def test_policy_worker_invalid_create_identity_retains_tentative_owner(
++    tmp_path: Path,
++) -> None:
++    """Break caught: invalid create output lost a discovered owner when inspect failed."""
++    from agent_loop import PolicyWorkerRunner, SandboxError
++
++    control = _Task5FakeDockerControl(
++        failures={"inspect": OSError("inspect secondary")},
++        create_output="short-id",
++    )
++    runner = PolicyWorkerRunner(
++        image="example.invalid/policy@sha256:" + "a" * 64,
++        injected_engine_path=Path("C:/fake/docker.exe"),
++        process_factory=lambda _argv, **_kwargs: _Task5FakeProcess(),
++        control_runner=control,
++        temp_parent=tmp_path,
++    )
++    with pytest.raises(SandboxError, match="invalid full identity") as captured:
++        runner.start(
++            candidate_root=_task5_policy_candidate(tmp_path),
++            interface_version=1,
++            fold_run_id="invalid_identity",
++        )
++    assert any("inspect" in note for note in getattr(captured.value, "__notes__", ()))
++    assert not control.exists
++    assert [call[1] for call in control.calls][-4:] == [
++        "kill",
++        "wait",
++        "rm",
++        "container",
++    ]
++    assert not tuple(tmp_path.glob("pw-*"))
++
++
++@pytest.mark.parametrize("cleanup_operation", ("rm", "container"))
++def test_policy_worker_create_primary_records_cleanup_failure(
++    tmp_path: Path,
++    cleanup_operation: str,
++) -> None:
++    """Break caught: daemon cleanup faults disappeared or replaced failed create."""
++    from agent_loop import PolicyWorkerRunner
++
++    control = _Task5FakeDockerControl(
++        failures={"rm": OSError("rm secondary")}
++        if cleanup_operation == "rm"
++        else None,
++        failures_on_call={
++            ("container", 2): OSError("container secondary")
++        }
++        if cleanup_operation == "container"
++        else None,
++        raise_after_create=OSError("create primary"),
++    )
++    runner = PolicyWorkerRunner(
++        image="example.invalid/policy@sha256:" + "a" * 64,
++        injected_engine_path=Path("C:/fake/docker.exe"),
++        process_factory=lambda _argv, **_kwargs: _Task5FakeProcess(),
++        control_runner=control,
++        temp_parent=tmp_path,
++    )
++    with pytest.raises(OSError, match="create primary") as captured:
++        runner.start(
++            candidate_root=_task5_policy_candidate(tmp_path),
++            interface_version=1,
++            fold_run_id=f"cleanup_{cleanup_operation}",
++        )
++    notes = getattr(captured.value, "__notes__", ())
++    assert any("cleanup" in note for note in notes)
++    assert [call[1] for call in control.calls][-4:] == [
++        "kill",
++        "wait",
++        "rm",
++        "container",
++    ]
++    if cleanup_operation == "rm":
++        assert control.exists
++        control.exists = False
++    else:
++        assert not control.exists
++    assert not tuple(tmp_path.glob("pw-*"))
++
++
++@pytest.mark.parametrize("cleanup_operation", ("rm", "container"))
++def test_policy_worker_explicit_close_reports_cleanup_verification_failure(
++    tmp_path: Path,
++    cleanup_operation: str,
++) -> None:
++    """Break caught: explicit close silently accepted rm or absence-check failure."""
++    from agent_loop import PolicyWorkerRunner, SandboxError
++
++    control = _Task5FakeDockerControl()
++    process = _Task5FakeProcess()
++    runner = PolicyWorkerRunner(
++        image="example.invalid/policy@sha256:" + "a" * 64,
++        injected_engine_path=Path("C:/fake/docker.exe"),
++        process_factory=lambda _argv, **_kwargs: process,
++        control_runner=control,
++        temp_parent=tmp_path,
++    )
++    session = runner.start(
++        candidate_root=_task5_policy_candidate(tmp_path),
++        interface_version=1,
++        fold_run_id=f"close_{cleanup_operation}",
++    )
++    control.failures[cleanup_operation] = OSError(f"{cleanup_operation} fault")
++    with pytest.raises(SandboxError, match="cleanup"):
++        session.close()
++    session.close()
++    assert [call[1] for call in control.calls][-4:] == [
++        "kill",
++        "wait",
++        "rm",
++        "container",
++    ]
++    if cleanup_operation == "rm":
++        assert control.exists
++        control.exists = False
++    else:
++        assert not control.exists
++    assert not tuple(tmp_path.glob("pw-*"))
++
++
+ def test_policy_worker_thread_start_failure_cleans_process_daemon_and_package(
+     tmp_path: Path,
+     monkeypatch: pytest.MonkeyPatch,
+ ) -> None:
+     """Break caught: a partial reader-thread startup escaped all three owner cleanups."""
+     from agent_loop import PolicyWorkerRunner
+ 
+     candidate = _task5_policy_candidate(tmp_path)
+     control = _Task5FakeDockerControl()
+     process = _Task5FakeProcess()
+@@ -1136,39 +1538,45 @@ def test_policy_worker_client_factory_starts_one_authenticated_session_per_fold(
+         fold_run_id="discovery_1",
+         determinism_probes=(
+             PolicyDeterminismProbe(
+                 "recommend_capacity",
+                 CapacitySnapshot(None, 25, 0, 3, 1.0, False),
+                 CapacitySnapshot(5, 25, 2, 1, 0.5, True),
+             ),
+         ),
+     )
+     first = first_factory()
+-    assert first.recommend_capacity(
++    first_decision = first.recommend_capacity(
+         CapacitySnapshot(None, 25, 0, 3, 1.0, False)
+-    ) == CapacityDecision(None, False)
++    )
++    assert first_decision == CapacityDecision(None, False)
+     with pytest.raises(RuntimeError, match="already started"):
+         first_factory()
+     first.close()
+ 
+     second = runner.client_factory(
+         candidate_root=candidate,
+         interface_version=1,
+         fold_run_id="discovery_2",
+         determinism_probes=(
+             PolicyDeterminismProbe(
+                 "recommend_capacity",
+                 CapacitySnapshot(None, 25, 0, 3, 1.0, False),
+                 CapacitySnapshot(5, 25, 2, 1, 0.5, True),
+             ),
+         ),
+     )()
++    second_decision = second.recommend_capacity(
++        CapacitySnapshot(None, 25, 0, 3, 1.0, False)
++    )
++    assert second_decision == first_decision
++    assert second_decision.to_canonical_json() == first_decision.to_canonical_json()
+     second.close()
+     assert len(processes) == 2
+     assert all(process.terminated == 1 for process in processes)
+ 
+ 
+ def test_policy_worker_client_factory_runs_authenticated_stateful_aba_probe(
+     tmp_path: Path,
+ ) -> None:
+     """Break caught: fold validation returned a client without an A-B-A purity probe."""
+     from agent_loop import PolicyWorkerRunner
+diff --git a/tests/test_pit_optimizer_v2.py b/tests/test_pit_optimizer_v2.py
+index db56dbf..a577ed7 100644
+--- a/tests/test_pit_optimizer_v2.py
++++ b/tests/test_pit_optimizer_v2.py
+@@ -2613,20 +2613,49 @@ def test_candidate_identity_rejects_direct_unsealed_construction() -> None:
+                 (path, "c" * 64) for path in _POLICY_PATHS
+             ),
+             changed_paths=("core/strategy_policy/entry.py",),
+             changed_symbols=("core.strategy_policy.entry.evaluate_entry",),
+             immutable_constraints_sha256="d" * 64,
+             discovery_manifest_sha256="e" * 64,
+             identity_sha256="f" * 64,
+         )
+ 
+ 
++def test_candidate_identity_has_exact_public_nine_field_json_shape(
++    tmp_path: Path,
++) -> None:
++    """Break caught: the construction seal leaked into persisted identity data."""
++    from core.pit_optimizer_candidate import CandidateIdentity
++
++    identity, _author = _task5_authenticated_identity(tmp_path)
++    expected_fields = (
++        "source_commit",
++        "policy_interface_version",
++        "cumulative_diff_sha256",
++        "editable_file_sha256s",
++        "changed_paths",
++        "changed_symbols",
++        "immutable_constraints_sha256",
++        "discovery_manifest_sha256",
++        "identity_sha256",
++    )
++    assert tuple(item.name for item in fields(CandidateIdentity)) == expected_fields
++    primitive = identity.to_primitive()
++    assert tuple(primitive) == expected_fields
++    assert primitive == asdict(identity)
++    assert not any(key.startswith("_") for key in primitive)
++    rendered = identity.to_canonical_json()
++    assert rendered.endswith("\n")
++    assert json.loads(rendered) == json.loads(json.dumps(primitive))
++    assert "controller_seal" not in rendered
++
++
+ @pytest.mark.parametrize(
+     ("field", "value"),
+     (
+         ("source_commit", "f" * 40),
+         ("policy_interface_version", True),
+         ("cumulative_diff_sha256", "f" * 64),
+         (
+             "editable_file_sha256s",
+             tuple((path, "f" * 64) for path in _POLICY_PATHS),
+         ),
+@@ -2674,21 +2703,26 @@ def test_candidate_identity_rejects_attacker_recomputed_digest(
+     }
+     recomputed = hashlib.sha256(
+         json.dumps(
+             forged_fields,
+             sort_keys=True,
+             separators=(",", ":"),
+             allow_nan=False,
+         ).encode("utf-8")
+         + b"\n"
+     ).hexdigest()
+-    forged = replace(identity, **forged_fields, identity_sha256=recomputed)
++    forged = object.__new__(type(identity))
++    for field_name, field_value in {
++        **forged_fields,
++        "identity_sha256": recomputed,
++    }.items():
++        object.__setattr__(forged, field_name, field_value)
+     with pytest.raises(ValueError, match="candidate identity"):
+         validate_author_manifest(author, forged)
+ 
+ 
+ def test_candidate_identity_constant_symbol_is_author_representable(
+     tmp_path: Path,
+ ) -> None:
+     """Break caught: an AST-valid immutable constant could not appear in AuthorArtifact."""
+     from core.pit_optimizer_candidate import (
+         validate_author_manifest,
+@@ -2907,56 +2941,108 @@ def test_candidate_identity_rejects_protected_or_generated_paths(
+             bounds=contract.PatchBounds(3, 12, 200, 64 * 1024),
+             source_commit=_task5_git(
+                 authenticated, "rev-parse", "HEAD", text=True
+             ).strip(),
+             policy_interface_version=1,
+             immutable_constraints_sha256="a" * 64,
+             discovery_manifest_sha256="b" * 64,
+         )
+ 
+ 
+-def test_candidate_identity_rejects_gitlink_index_mode(
++@pytest.mark.parametrize("mode", ("120000", "160000"))
++def test_candidate_identity_rejects_non_regular_index_mode(
+     tmp_path: Path,
++    mode: str,
+ ) -> None:
+-    """Break caught: a gitlink at an editable path could evade regular-source provenance."""
++    """Break caught: a symlink/gitlink could evade regular-source provenance."""
+     from core.pit_optimizer_candidate import validate_candidate_diff
+ 
+     authenticated, candidate_root, git = _task5_policy_roots(tmp_path)
+     incremental = _task5_incremental_diff(
+         candidate_root,
+         "core/strategy_policy/entry.py",
+         "return EntryDecision(True, True, (None, None), ())",
+         "return EntryDecision(False, True, (None, None), ())",
+     )
+     commit = _task5_git(authenticated, "rev-parse", "HEAD", text=True).strip()
++    object_id = (
++        commit
++        if mode == "160000"
++        else _task5_git(
++            authenticated,
++            "rev-parse",
++            "HEAD:core/strategy_policy/entry.py",
++            text=True,
++        ).strip()
++    )
+     _task5_git(
+         candidate_root,
+         "update-index",
+         "--add",
+         "--cacheinfo",
+-        f"160000,{commit},core/strategy_policy/entry.py",
++        f"{mode},{object_id},core/strategy_policy/entry.py",
+     )
+ 
+     with pytest.raises(ValueError, match="100644|regular"):
+         validate_candidate_diff(
+             authenticated_base_root=authenticated,
+             candidate_root=candidate_root,
+             incremental_diff=incremental,
+             git=git,
+             bounds=contract.PatchBounds(3, 12, 200, 64 * 1024),
+             source_commit=commit,
+             policy_interface_version=1,
+             immutable_constraints_sha256="a" * 64,
+             discovery_manifest_sha256="b" * 64,
+         )
+ 
+ 
++@pytest.mark.parametrize(
++    "metadata",
++    (
++        "GIT binary patch\n",
++        (
++            "similarity index 100%\n"
++            "rename from core/strategy_policy/entry.py\n"
++            "rename to core/strategy_policy/risk.py\n"
++        ),
++        "old mode 100644\nnew mode 100755\n",
++    ),
++)
++def test_candidate_identity_rejects_v2_structural_diff_metadata(
++    tmp_path: Path,
++    metadata: str,
++) -> None:
++    """Break caught: binary, rename, or mode metadata crossed the V2 identity boundary."""
++    from core.pit_optimizer_candidate import validate_candidate_diff
++
++    authenticated, candidate_root, git = _task5_policy_roots(tmp_path)
++    incremental = _task5_raw_author_diff(
++        "return EntryDecision(True, True, (None, None), ())",
++        "return EntryDecision(False, True, (None, None), ())",
++    ).replace("index 1111111..2222222 100644\n", metadata)
++    with pytest.raises(ValueError, match="structural|binary|rename|mode"):
++        validate_candidate_diff(
++            authenticated_base_root=authenticated,
++            candidate_root=candidate_root,
++            incremental_diff=incremental,
++            git=git,
++            bounds=contract.PatchBounds(3, 12, 200, 64 * 1024),
++            source_commit=_task5_git(
++                authenticated, "rev-parse", "HEAD", text=True
++            ).strip(),
++            policy_interface_version=1,
++            immutable_constraints_sha256="a" * 64,
++            discovery_manifest_sha256="b" * 64,
++        )
++
++
+ @pytest.mark.parametrize(
+     ("field", "expected"),
+     (
+         ("hunks", "max_hunks"),
+         ("lines", "max_changed_lines"),
+         ("bytes", "max_diff_bytes"),
+     ),
+ )
+ def test_candidate_identity_rejects_cumulative_hunk_line_and_byte_growth(
+     tmp_path: Path,
+@@ -3041,20 +3127,84 @@ def test_candidate_identity_rolls_back_after_fault_or_cancellation(
+             source_commit=_task5_git(
+                 authenticated, "rev-parse", "HEAD", text=True
+             ).strip(),
+             policy_interface_version=1,
+             immutable_constraints_sha256="a" * 64,
+             discovery_manifest_sha256="b" * 64,
+         )
+     assert entry.read_bytes() == before_entry
+ 
+ 
++@pytest.mark.parametrize(
++    "failure",
++    (RuntimeError("mutating apply fault"), KeyboardInterrupt()),
++)
++def test_candidate_identity_rolls_back_when_real_mutating_apply_raises(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++    failure: BaseException,
++) -> None:
++    """Break caught: Git could mutate bytes and raise before rollback was armed."""
++    import agent_loop
++    from core.pit_optimizer_candidate import (
++        EDITABLE_POLICY_PATHS,
++        validate_candidate_diff,
++    )
++
++    authenticated, candidate_root, git = _task5_policy_roots(tmp_path)
++    before = {
++        path: (candidate_root / path).read_bytes() for path in EDITABLE_POLICY_PATHS
++    }
++    incremental = _task5_incremental_diff(
++        candidate_root,
++        "core/strategy_policy/entry.py",
++        "return EntryDecision(True, True, (None, None), ())",
++        "return EntryDecision(False, True, (None, None), ())",
++    )
++    real_git = agent_loop._git
++    mutating_apply_seen = False
++
++    def mutate_then_raise(root: Path, *args: str, **kwargs: object) -> object:
++        nonlocal mutating_apply_seen
++        result = real_git(root, *args, **kwargs)
++        if args and args[0] == "apply" and "--check" not in args:
++            mutating_apply_seen = True
++            assert (candidate_root / "core/strategy_policy/entry.py").read_bytes() != (
++                before["core/strategy_policy/entry.py"]
++            )
++            raise failure
++        return result
++
++    monkeypatch.setattr(agent_loop, "_git", mutate_then_raise)
++    with pytest.raises(
++        type(failure),
++        match="mutating apply fault" if isinstance(failure, RuntimeError) else None,
++    ):
++        validate_candidate_diff(
++            authenticated_base_root=authenticated,
++            candidate_root=candidate_root,
++            incremental_diff=incremental,
++            git=git,
++            bounds=contract.PatchBounds(3, 12, 200, 64 * 1024),
++            source_commit=_task5_git(
++                authenticated, "rev-parse", "HEAD", text=True
++            ).strip(),
++            policy_interface_version=1,
++            immutable_constraints_sha256="a" * 64,
++            discovery_manifest_sha256="b" * 64,
++        )
++    assert mutating_apply_seen
++    assert {
++        path: (candidate_root / path).read_bytes() for path in EDITABLE_POLICY_PATHS
++    } == before
++
++
+ def test_changed_symbols_use_before_after_ast() -> None:
+     """Break caught: author symbol claims were trusted instead of AST comparison."""
+     from core.pit_optimizer_candidate import derive_changed_symbols
+ 
+     path = "core/strategy_policy/risk.py"
+     before = {path: "def recommend_capacity(snapshot):\n    return None\n"}
+     after = {
+         path: (
+             "def recommend_capacity(snapshot):\n"
+             "    return snapshot.configured_max_positions\n"
+@@ -3080,20 +3230,23 @@ def _task5_entry_source(body: str, *, prelude: str = "") -> str:
+     (
+         (_task5_entry_source("return EntryDecision(True, True, (None, None), ())", prelude="\nclass MutablePolicy:\n    pass\n"), "class"),
+         (_task5_entry_source("return EntryDecision(True, True, (None, None), ())", prelude="\nVALUES = []\n"), "constant"),
+         ("from .contracts import EntryDecision\n\ndef evaluate_entry(snapshot, cache=[]):\n    return EntryDecision(True, True, (None, None), ())\n", "default"),
+         (_task5_entry_source("global STATE\nreturn EntryDecision(True, True, (None, None), ())"), "global"),
+         (_task5_entry_source("snapshot.market_is_bullish = True\nreturn EntryDecision(True, True, (None, None), ())"), "input"),
+         (_task5_entry_source("snapshot[0] = True\nreturn EntryDecision(True, True, (None, None), ())"), "input"),
+         (_task5_entry_source("evaluate_entry.cache = True\nreturn EntryDecision(True, True, (None, None), ())"), "function attribute"),
+         (_task5_entry_source("math.pi += 1.0\nreturn EntryDecision(True, True, (None, None), ())", prelude="\nimport math\n"), "mutation root"),
+         (_task5_entry_source("EntryDecision.to_primitive = _helper\nreturn EntryDecision(True, True, (None, None), ())", prelude="\ndef _helper():\n    return None\n"), "mutation root"),
++        (_task5_entry_source("cache = []\ncache = math\ncache.pi += 1.0\nreturn EntryDecision(True, True, (None, None), ())", prelude="\nimport math\n"), "mutation root"),
++        (_task5_entry_source("cache = []\ncache = EntryDecision\ncache.to_primitive = _helper\nreturn EntryDecision(True, True, (None, None), ())", prelude="\ndef _helper():\n    return None\n"), "mutation root"),
++        (_task5_entry_source("cache = [math]\ncache[0].pi += 1.0\nreturn EntryDecision(True, True, (None, None), ())", prelude="\nimport math\n"), "mutation root"),
+         (_task5_entry_source("value = getattr(snapshot, 'market_is_bullish')\nreturn EntryDecision(value, True, (None, None), ())"), "reflection"),
+         (_task5_entry_source("return EntryDecision(True, True, (None, None), ())", prelude="\nimport time\n"), "import"),
+         (_task5_entry_source("return EntryDecision(True, True, (None, None), ())", prelude="\nimport random\n"), "import"),
+         (_task5_entry_source("return EntryDecision(True, True, (None, None), ())", prelude="\nimport os\n"), "import"),
+         (_task5_entry_source("handle = open('x')\nreturn EntryDecision(True, True, (None, None), ())"), "call"),
+         (_task5_entry_source("module = __import__('os')\nreturn EntryDecision(True, True, (None, None), ())"), "call"),
+         (_task5_entry_source("value = eval('1')\nreturn EntryDecision(True, True, (None, None), ())"), "call"),
+         ("from .contracts import EntryDecision\n\nasync def evaluate_entry(snapshot):\n    return EntryDecision(True, True, (None, None), ())\n", "async"),
+         (_task5_entry_source("yield snapshot\nreturn EntryDecision(True, True, (None, None), ())"), "generator"),
+         (_task5_entry_source("return EntryDecision(True, True, (None, None), ())", prelude="\ndef public_helper():\n    return True\n"), "public"),

@@ -1,0 +1,32 @@
+# Task 1 Review — Three-Universe Membership Domain
+
+## Spec Compliance
+
+The V3 implementation substantially satisfies the closed membership-domain requirements: it validates exact universe IDs and canonical event ordering, maintains state at the `(lineage, universe)` level, derives the active ticker set from that deduplicated affiliation union, and returns immutable result mappings. The transition-day calculation is inclusive for the successor and exclusive for the retired predecessor, so a same-lineage rename changes the tradable ticker without changing the lineage identity. V3 dispatch occurs before legacy membership loading; it requires `membership_v3` and authenticated prices provenance, and it does not use V1/V2 rename inference for V3.
+
+One required compatibility guarantee is not met: the shared ticker canonicalizer was widened globally, changing the V1/V2 reader and inference paths.
+
+## Strengths
+
+- `core/pit_universe_v3.py:87-102` rejects duplicate events, non-canonical ordering, duplicate additions, and removals with no active affiliation.
+- `core/pit_universe_v3.py:188-257` preserves all active affiliations per lineage, exposes a deduplicated lineage union, and resolves ticker identities only when exactly one contracted identity is active.
+- `core/pit_universe_v3.py:235-238` makes the explicit transition effective on its date: the successor is eligible from that date while the predecessor is retired from it.
+- `core/pit_data.py:359-380` authenticates the V3 price identity contract before constructing the V3 universe and rejects disagreement between membership bindings and price identities.
+- `core/pit_data.py:808-868` requires explicit, canonical V3 transition rows rather than deriving them from membership changes. `core/pit_data.py:275-284` also rejects symlinked provenance inputs.
+- `core/pit_data.py:439-468` dispatches required SQLite tables by schema version, avoiding a V3 dependency on the legacy `membership` table.
+
+## Issues Critical
+
+None.
+
+## Issues Important
+
+- `core/pit_data.py:266-268` — The global `_canonical_ticker()` character set now admits digits. That function is still used by V1/V2 membership loading, price-symbol loading, and legacy `load_price_identity_transition_contract()` inference (`core/pit_data.py:524-544`, `core/pit_data.py:575-577`, `core/pit_data.py:869-908`). A legacy bundle/provenance containing `DUAL2` (or any digit-bearing ticker) previously failed canonical validation but now opens and may produce inferred transitions. This violates the explicit requirement that V1/V2 paths and rename inference remain byte/behavior compatible. Keep the legacy canonicalizer unchanged and use a V3-only ticker validator (or route the widened validation solely through the V3 contract path).
+
+## Issues Minor
+
+None.
+
+## Assessment
+
+**Changes requested.** The V3 domain, lineage-union behavior, affiliation removal semantics, ambiguity rejection, explicit provenance transition handling, and schema dispatch are sound on this review. Restore V1/V2 ticker-validation behavior before landing; no source or test changes were made by this review.

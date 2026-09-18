@@ -1,0 +1,9 @@
+# Docker 29 running-state compatibility
+
+The saved actual inspection at `.artifacts/pit-optimizer-v5/development/runtime-03/running-container-inspect.json` reports `HostConfig.OomKillDisable: null` for container `406ac450c875815b04db196d7e3361b52451262ee3c16151665238461a1b3d9d`. The existing host validator requires canonical `False` and previously left this null unchanged, necessarily rejecting the saved running inspection as differing from executor authority. The persisted container-created and container-identity records confirm the same container had already passed created-state validation; the terminal record remains an honest frozen failure with no collected output.
+
+Changed only `core/pit_optimizer_v5/production_sandbox.py` source: normalize explicit null for the required `OomKillDisable` field to its disabled-override default, `False`. Explicit `True` remains rejected. Field presence, unknown-field rejection, memory and swap bounds, PID and CPU bounds, mount permissions and identities, pinned image, private none-network, and the remaining isolation checks are unchanged. Canonical host authority remains `False`, preserving the existing created-state stable identity. This is three added lines beyond the previously reviewed Docker 29 changes.
+
+Source SHA256: `354ad9280086748a6945a413a42d3acf4597349d4983906e399de280902af759`.
+
+Static verification passed: `python -m ruff check core/pit_optimizer_v5/production_sandbox.py`; Python built-in `compile` of the source bytes in memory without importing application code; `git diff --check -- core/pit_optimizer_v5/production_sandbox.py`. No tests, synthetic probes, application or Docker execution, network calls, artifact changes, staging, hooks changes, or commit attempts. Actual inspection and cleanup remain controller-owned. No implementation commit exists.

@@ -1,0 +1,23 @@
+# Finding Verdicts
+
+- **ADDRESSED** — Same-HEAD and non-descendant verification. `core/pit_policy_parity.py:429-430` rejects the reference HEAD even at the evidence-composition layer. `core/pit_policy_parity.py:779-798` proves the reference HEAD is an ancestor of the final HEAD and distinguishes a non-descendant from an unverifiable ancestry result. `verify_parity_reference` obtains the clean final identity and performs that ancestry check at `core/pit_policy_parity.py:1097-1104`, before opening/authenticating the bundle at line 1105 or evaluating folds at lines 1115-1133. The requested rejection tests are present at `tests/test_pit_policy_parity.py:461` and `tests/test_pit_policy_parity.py:499`.
+
+- **ADDRESSED** — Full readiness authentication. `_authenticated_readiness` closes the top-level schema/gate/phase contract at `core/pit_policy_parity.py:836-858`, closes identity and sealed-input key sets at lines 859-884, pins bundle/baseline/date/evidence authorities and cross-links at lines 902-947, reconstructs and compares the exact source-authored candidate catalog at lines 948-974, verifies the effective-policy digest/catalog and provider projection at lines 976-989, and invokes the existing producer validator `_readiness_identity` at lines 991-997. The incomplete-contract and tampered-catalog tests are present at `tests/test_pit_policy_parity.py:535` and `tests/test_pit_policy_parity.py:561`.
+
+- **ADDRESSED** — Clean source and post-evaluation race. `_source_identity` now includes all non-ignored untracked files via `git status --porcelain --untracked-files=all` at `core/pit_policy_parity.py:758-776`. Capture performs the supplied final check immediately before persistence at lines 715-721, wired to a fresh status/HEAD/tree comparison at lines 1080-1084. Verification likewise invokes the final check at line 467, wired at lines 1141-1145. Coverage exists for untracked files and capture/verification drift at `tests/test_pit_policy_parity.py:622`, `tests/test_pit_policy_parity.py:648`, and `tests/test_pit_policy_parity.py:706`.
+
+- **ADDRESSED** — Manifest/evidence cross-links. `ParityReference.__post_init__` requires manifest data identity to equal the PIT bundle at `core/pit_policy_parity.py:186-187`, recomputes the embedded-universe digest at lines 188-197, binds every equity index to its sealed fold sessions at lines 210-216, binds the top-level funnel to the aggregate at lines 217-218, and rejects transaction/signal/entry dates outside the fold at lines 219-225. `load_parity_reference` reconstructs through this dataclass validation at lines 397-416, so the invariants apply to existing artifacts as well as construction. Parameterized coverage is present at `tests/test_pit_policy_parity.py:754` and `tests/test_pit_policy_parity.py:797`.
+
+The implementer report includes the covering focused commands and RED/GREEN outputs at `task-2-report.md:235-285`, final targeted suite/lint outputs at lines 287-303, and metadata-only loading from clean HEAD with `unchanged=true` plus an explicit before/after byte-hash assertion at lines 316-330. This confirms the existing reference was loaded under the stricter checks without capture/replay/bundle evaluation or artifact mutation.
+
+# New Breakage in Fix Diff
+
+None identified. The fix is confined to `core/pit_policy_parity.py` and `tests/test_pit_policy_parity.py`; the added validation is applied on both construction and loading, the new pre-persistence callback is wired at all production composition call sites, and the ancestry gate precedes bundle access and fold evaluation.
+
+# Out-of-Scope Observations
+
+- The report records the pre-existing canary fixture/regex mismatch at `task-2-report.md:305-314`: the fixture raises `canary readiness evaluation contract is absent`, while the test accepts only `readiness artifact` or `sealed optimization input`. The fix diff does not modify that canary test or its production frame, so it is out of scope for this rereview.
+
+# Verdict
+
+**PASS — all four prior findings are addressed, no new breakage was found in the fix diff, and the report contains the required focused evidence plus unchanged metadata-only loading of the existing reference.**

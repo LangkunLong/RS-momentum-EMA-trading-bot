@@ -1,0 +1,23 @@
+# C-c preparation driver static review brief
+
+Review the frozen driver produced under `campaign-preparation-driver/` against the original transition C-c requirements, `fresh-preparation-inventory.md`, the admission design, and final source/readiness authorities. This is preparation-only code. No execution of the driver or repository modules belongs to review. Source-only read/AST/diff/hash, Ruff and in-memory compilation are allowed; no tests may be read, created, modified or run.
+
+## Gate and write scope
+
+Before any source import or artifact/resource write, the driver must authenticate the actual fixed final source approval, its 22-file source authority, the actual readiness approval, and the caller's exact reviewed selections. It must fail on mismatches, preexisting destination roots or unsafe/overlapping paths. All fresh destinations stay inside the authorized main repository; source is the existing architecture worktree and mounted resource roots are disjoint outside that source tree. Existing archives, production sources and mutable old resource roots are untouched. No deletion, overwrite, historical enrollment, state migration or recovery is permitted.
+
+## Exact native preparation
+
+Authenticate original actual06's graph and the precise fixed dependencies/provenance from the inventory. Import only the 14 existing dependency files and nine exact parent-provenance files; no old manifest/scope/config/owner/roles/ledger/request/checkpoint/reservation/start state. Preserve each original dependency ref and exact raw bytes. Capture the real four immutable policy blobs via the native read-only Git helper at commit0985d9bae74162ec1da8a7268bd54e47f21b0b85. Use direct native manifest building, native preparation with a fresh real owner/config, and the new immutable prepared policy artifact. No binding/enrollment, launch, start, paid reservation or provider/evaluation execution may occur.
+
+Native adapter construction is allowed for this genuine fresh preparation, as the accepted inventory specifies; the ban on constructing operational adapters applies to historical verification. Credentials must remain lazy and unread. No fake capability/dependency/request object may stand in for the native preparation/factory. The actual initial empty projection is legitimate only after fresh repository emptiness is established. Use normal factory/reducer/parent selection and actual investigator request construction; save preview bytes outside roles/state and check the real request against the prepared policy's pure envelope predicate. Do not append it to role request history or manufacture any later response-dependent packet.
+
+## Caps and evidence
+
+Target2, attempts3, calls8, total600000, prospective envelope75000, output8192, overhead4096, retry0/repair0, one hypothesis/axis/variant/survivor, archive2, memory98304, no full-source escape; paid development_sp500_v2, semantics disabled, model identifier openai/gpt-5.4. No dollar quote/hard dollar ceiling is established. Fixed evaluator005064 and image/profile/data/parent/plan authority remain as inventoried. Role300/quick600/discovery1200/round7200/campaign21600/cleanup60/mechanics60/method1/startup30, one evaluator, exact fixed sandbox CPU/memory/PID/output limits. The packet/command must expose these actual prepared values and exact source/manifest/config/policy/root/owner/tool identities. Keep later actual packet bytes and positive enrolled execution explicitly unexecuted.
+
+Use the physical Python executable identified in `preparation-tool-files.json`; the observed Windows app launcher alias is not byte-readable. Preparation and eventual native launch use the same actual interpreter/environment. Only tool/native identity digests may be saved; no environment values, .env or credentials. Hash Git/Docker file bytes without invoking Docker. Exact native run-campaign command rendering must pin the prepared policy; rendering is not execution. No new paid execution wrapper is in this driver scope.
+
+## Review output
+
+Read the frozen script once in bounded chunks and inspect only necessary native source callpaths for concrete side-effect/identity risks. Verify report claims against code. Write `campaign-preparation-driver/independent-review.md` with separate spec and quality verdicts, exact script/report hashes, findings with file:line and the clear execution boundary: approval permits principal actual preparation only, never a paid run. Do not run source imports, script, probes, native readers, Git/Docker commands, provider calls or tests. A complete actual prepared package still needs its own independent artifact/launch review and the separate fresh user paid grant.

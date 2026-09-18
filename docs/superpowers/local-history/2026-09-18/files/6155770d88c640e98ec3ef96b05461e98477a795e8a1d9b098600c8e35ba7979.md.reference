@@ -1,0 +1,37 @@
+# Production loop wiring recovery fix review — 2026-09-07
+
+**Final verdict: APPROVE.** The original Important/P1 recovery-ordering defect is addressed in the exact supplied diff `9af42dffead6827d8412748309b3863a4a5e59da` → `30e562369f92fdc32a0c2cf07689f4b459d5af9c`. No new Critical, Important, or Minor findings were found within the repair scope.
+
+Reviewed `loop-wiring-fix-brief.md`, `loop-wiring-review.md`, `loop-wiring-fix-report.md`, and the complete `loop-wiring-fix-review.patch`. Relevant production source was inspected only to verify the changed ledger, reconciliation, journal, runtime, campaign, and CLI contracts. Per instruction, no tests were read, created, modified, or run. No provider, Docker, or network calls were made, and no source, index, or branch state was changed.
+
+## Original finding verdict
+
+### I1/P1 — Reconcile paid requests before applying an expired work deadline: ADDRESSED
+
+- `core/pit_optimizer_v5/runtime.py:902-954` discovers existing ledger-backed requests and reconciles any missing journal completion before `_Runtime` is constructed. `run_feedback_round_v5` invokes this at `runtime.py:2802-2805`, ahead of all runtime deadline checks and outside the abort-to-terminal handler.
+- `core/pit_optimizer_v5/operations.py:378-385` runs the same reconciliation before inspecting and reusing a completed/terminal campaign round. An affected terminal journal therefore produces the explicit immutable-journal diagnostic instead of silently entering the reuse shortcut.
+- `core/pit_optimizer_v5/production_provider.py:854-876` enumerates only requests already represented by authenticated ledger reservations. `_load_verified` permits the intended partial reservation/terminal chain, while `authenticate_role_invocations` retains the final cardinality check; the discovery path can therefore see and repair the original mismatch.
+- `core/pit_optimizer_v5/production_provider.py:878-927` uses the existing local reconciler. It consumes an existing ledger terminal, settles a durable saved response, or settles an expired unreported claim. It returns `pending` while the claim lease remains live. The new path calls `reconcile_once`, never `invoke_once` or `reserve_role_slot`, so it cannot issue fresh paid work, create a replacement reservation, or inflate retries.
+- `core/pit_optimizer_v5/runtime.py:939-954` raises `PaidRoleRecoveryRequiredV5` for pending or unavailable recovery before any round terminal or cleanup is appended. Pending claims consequently remain recoverable on a later resume.
+- `core/pit_optimizer_v5/operations.py:366-373` and `operations.py:487-493` retain the original persisted campaign and round elapsed-time calculations. Reconciliation does not reset either timestamp; after successful reconciliation, the original expired deadline still prevents new optimization work.
+- `core/pit_optimizer_v5/runtime.py:940-946` detects terminal or cleanup state before attempting the forbidden role-completion append and reports `journal_closed`. `runtime.py:802-806` gives an honest, actionable immutable-history diagnostic, and `cli.py:1819-1835` exposes recovery-required details to the command caller.
+
+## New findings
+
+### Critical
+
+None.
+
+### Important
+
+None.
+
+### Minor
+
+None.
+
+## Out-of-scope observations
+
+- Runtime behavior was not exercised because the review scope explicitly prohibits reading or running tests and prohibits provider/Docker execution. This verdict is based on the supplied exact patch and direct production-source contract tracing.
+- Already-terminal journals with a missing role completion remain intentionally immutable. The fix can settle recoverable ledger state but cannot make such a journal cardinality-verifiable without an explicit repair/migration; it now reports that condition accurately rather than claiming automatic repair.
+- End-to-end production validation still depends on genuine campaign manifest, baseline, provider, and execution authorities. That existing integration dependency is unchanged by this fix.

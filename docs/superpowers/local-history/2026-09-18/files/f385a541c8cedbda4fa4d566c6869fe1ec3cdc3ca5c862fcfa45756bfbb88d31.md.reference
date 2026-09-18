@@ -1,0 +1,29 @@
+# H3b independent review
+
+Spec: PASS. Quality/security: APPROVE within the bounded H3b extraction scope. No actionable source finding identified.
+
+Reviewed the task/design briefs, exact saved preimage and H3b diff, frozen `production_provider.py`, relevant immutable repository and provider helpers, completed task report, and supplied static/authentication/preservation evidence. This verdict does not cover older dirty-branch changes or activate historical summaries.
+
+## Source assessment
+
+Independently confirmed final source SHA-256 `6077f0a716fa5d64594f5760d86b00f3b2865b605ca25bf3ab57bed07793b94f`, 56,151 bytes, with all 1,212 newlines CRLF. Independent source-byte comparison found exactly the six permitted existing read methods changed; all 20 other existing methods, including decorated properties, both constructors, gateway invocation, clock, reserve/publish/settle/recover/reconcile methods, remain byte-identical.
+
+Independent normalized AST comparison confirmed all six extracted bodies equal their originals after explicit immutable context and helper-call substitutions, removing only the package authenticator's internal ledger-load assignment now supplied as verified records. This preserves predicate and classification order, original error texts, duplicate reservation/slot/terminal detection, unique persisted request comparisons, prospective input/cost bounds, model/schema/output caps, invocation deadline, deterministic slot/authorization binding, ordinal and terminal continuity, prior/cumulative accounting, response identities, full terminal facts/artifact/receipt equality, and journal order. Existing collection validation still precedes the operational ledger read.
+
+The frozen read identity recomputes the exact existing campaign/audit/ledger/gateway formulas. Its inputs are repository identity, immutable manifest/provider values and the configured variable name `OPENROUTER_API_KEY`; no secret value or environment lookup is involved. The historical entry requires exact repository, manifest, original provider-config, tuple and package types. It compares all five relevant original config identities against recomputed values, then verifies the ledger and packages. It accepts no externally supplied expected identity digest. The ledger/package length equality rejects pending reservations and missing completions, including when packages are empty.
+
+Current identity-bearing read delegates derive/check context before shared verification. The two pure usage delegates require only the immutable manifest. The historical path does not construct an operational ledger/gateway, use `__new__`, issue capabilities, inspect clocks/nonces, enter transitions, invoke transport, or catch migration-required into recovery.
+
+## Transitive boundary
+
+Direct repository calls are limited to `load_role_ledger_records`, `load_role_provider_response`, `load_unique_role_request_by_sha256`, and `load_unique_role_request_entry_by_sha256`. Audited transitive typed/raw artifact, request, response and ledger reads reach `_names`/`_read_relative` with `create=False`; they do not call repairable typed state or writers. The legacy ledger path authenticates exact legacy relations and raises `RoleLedgerMigrationRequiredV5` unchanged. Pure usage/classification functions load no repository artifacts. Existing provider parser and prospective-usage helpers remain value computations.
+
+The request-value loader's equal-value behavior remains distinct from the exactly-one persisted call/request check in package authentication. Full request census, H1 authentication of the supplied original config, and campaign eligibility remain required H3c responsibilities; this entry alone is not completed-campaign authorization.
+
+## Evidence and limits
+
+Supplied actual06 authentication passes for the original investigator and author packages and all five config identity comparisons. Recorded usage remains two external attempts, 8,596 tokens and USD 0.0423400. Accepted role packages retain their exact package hashes; the campaign remains `runtime_failed`, rendering / `stage_failed`, with zero round-2 packages. H3b does not reinterpret that campaign as successful.
+
+Independently compared the complete supplied before/after maps: runtime04's 579 files / 69,994,319 bytes and actual06's 83 files / 68,980,002 bytes are identical. Recomputed each supplied map's schema-ordered tree digest and matched the recorded values. The asserted extended Windows roots and unchanged-path evidence are present. The supplied 56-file evaluator map equals the prior H3a map at fixed digest `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4`. Recorded scoped Ruff, in-memory compilation and diff checks pass.
+
+Reviewer work was source/AST/hash and supplied-evidence inspection only. No production source edits, tests read/created/run, synthetic/negative cases, authentication reruns, summaries, campaigns, provider/Docker/external calls, credentials/environment reads, commits or subagents. Archive authentication and preservation results are the implementer's supplied evidence, not independently rerun execution. Missing/duplicate/legacy/pending branches and live operational behavior have static evidence only. H3c integration and final historical-summary acceptance remain outside this verdict.

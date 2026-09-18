@@ -1,0 +1,157 @@
+### Task 8: Wire Schema-v2 Readiness, CLI, Summary, and Provider-Free Proof
+
+**Files:**
+
+- Modify: agent_loop.py
+- Modify: core/pit_optimization.py
+- Modify: core/pit_optimization_contract.py
+- Modify: core/pit_optimizer_evaluation.py
+- Modify: tests/test_agent_loop.py
+- Modify: tests/test_pit_optimizer_loop.py
+- Modify: tests/test_pit_optimizer_v2.py
+- Modify: tests/test_pit_optimization_contract.py only for v1/v2 coexistence assertions
+
+**Interfaces:**
+
+- Produces: gate pit_optimizer; provider-free prepare output; exact canary command; closed user-facing schema-v2 summary.
+- Consumes: explicit absolute local paths, exact manifest/readiness/parity identities, Docker image identity, operator ceilings, and source-transmission acknowledgement.
+
+    @dataclass(frozen=True, slots=True)
+    class PitOptimizerLiveRun:
+        readiness: PitOptimizerReadiness
+        optimizer_services: PitOptimizerServices
+
+    _build_pit_optimizer_v2_config(
+        namespace: argparse.Namespace,
+    ) -> PitOptimizerGateConfig
+    _dispatch_pit_optimizer_v2(
+        config: PitOptimizerGateConfig,
+        *,
+        prepare: Callable[[PitOptimizerGateConfig], PitOptimizerReadiness],
+        build_live_services: Callable[[PitOptimizerGateConfig], PitOptimizerLiveRun],
+    ) -> PitOptimizerReadiness | PitOptimizerResult
+    _pit_optimizer_v2_prepare_lines(
+        config: PitOptimizerGateConfig,
+        readiness: PitOptimizerReadiness,
+    ) -> tuple[str, str]
+    _pit_optimizer_v2_summary(
+        result: PitOptimizerResult,
+    ) -> dict[str, object]
+
+**CLI route:**
+
+- Add gate pit_optimizer for schema-v2 runs.
+- Keep gate pit_optimization as the legacy schema-v1 route and artifact verifier.
+- Add --optimizer-manifest and --optimizer-manifest-sha256.
+- Add --verified-parity and --verified-parity-sha256.
+- Add --optimizer-authorization-window-id and --optimizer-authorization-requirement-sha256. Prepare derives both from the manifest; canary requires exact matches.
+- Add --authorize-policy-source-transmission, accepted only for phase canary.
+- Reuse --max-iterations, --max-api-calls, --max-tokens, --max-usd, and require apply=false.
+- The sealed manifest owns exact folds, universe identity, warmup, immutable constraints, and per-role input/output/USD caps.
+
+- [ ] **Step 1: Write phase/config tests for both schema-v2 routes.** The Task 4 synthetic-manifest test exposes a canonical `v2_gate` fixture. Prepare rejects source transmission authorization and derives a requirement without a live window; canary requires authorization, exact identities, at least two iterations, sealed ceilings, and apply=false.
+
+  ```python
+  def test_prepare_rejects_source_authorization_and_canary_requires_it(v2_gate):
+      with pytest.raises(ConfigurationError, match="prepare.*transmission"):
+          replace(
+              v2_gate,
+              phase="prepare",
+              source_transmission_authorized=True,
+          ).validate()
+      with pytest.raises(ConfigurationError, match="source transmission"):
+          replace(
+              v2_gate,
+              phase="canary",
+              source_transmission_authorized=False,
+          ).validate()
+  ```
+
+- [ ] **Step 2: Run the config slice and verify red.**
+
+      python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py tests/test_pit_optimizer_v2.py -k "pit_optimizer_v2_config"
+
+  Expected: the parser/config route is missing while legacy `pit_optimization` tests stay green.
+- [ ] **Step 3: Add the parser fields and implement _build_pit_optimizer_v2_config.** Keep `pit_optimization` unchanged as schema v1. PitOptimizerGateConfig.validate performs the closed phase checks plus non-overlap/regular-file checks; it never opens a file outside the authenticated paths or constructs live services. Re-run Step 2; expected: green.
+- [ ] **Step 4: Add and test build-subset-manifest with the same synthetic files.** Pass explicit readiness, final parity, PIT bundle, baseline run, source/runtime/temp/artifact roots, Git/Docker executables, digest-pinned image, two-iteration input/output/response-byte/USD caps, candidate bounds, and output. Assert six calls/448000 tokens/USD 0.40, canonical PolicySourceScope, and the complete identity graph. Spy that no pricing, replay, grant, hidden evaluation, or provider service is called.
+- [ ] **Step 5: Run the manifest node and implement only its CLI adapter.**
+
+      python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "build_subset_manifest_cli"
+
+  Expected red: route missing. After the adapter passes the exact parsed values to build_subset_manifest/write_optimizer_manifest/build_prepare_command, rerun; expected: green.
+- [ ] **Step 6: Write the provider-free dispatch test.**
+
+  ```python
+  def test_prepare_dispatch_never_builds_live_services(v2_gate, readiness):
+      events: list[str] = []
+      result = _dispatch_pit_optimizer_v2(
+          replace(v2_gate, phase="prepare"),
+          prepare=lambda config: events.append("prepare") or readiness,
+          build_live_services=lambda config: pytest.fail(
+              "prepare constructed live services"
+          ),
+      )
+      assert result is readiness
+      assert events == ["prepare"]
+  ```
+
+- [ ] **Step 7: Run the dispatch node and verify red.**
+
+      python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py::test_prepare_dispatch_never_builds_live_services
+
+- [ ] **Step 8: Implement phase-first dispatch and rerun Step 7.**
+
+  ```python
+  def _dispatch_pit_optimizer_v2(config, *, prepare, build_live_services):
+      config.validate()
+      if config.phase == "prepare":
+          return prepare(config)
+      if config.phase != "canary":
+          raise ConfigurationError("unknown PIT optimizer phase")
+      services = build_live_services(config)
+      return run_pit_optimizer_v2(
+          readiness=services.readiness,
+          services=services.optimizer_services,
+      )
+  ```
+
+  Prepare authenticates source, sealed bundle, baseline, folds, policy, parity, image, validation ledger, scope, and budgets; then reuses final-parity discovery evidence without replay. It does not construct a gateway, freeze pricing, open a lease, record a grant, evaluate hidden, or expose hidden identity.
+- [ ] **Step 9: Add the canary-service order test.** Require exact scope/window authentication, one R1 pricing freeze, all six conservative preflight checks, one lease open, then controller execution. The private service registry owns existing Candidate capabilities; PolicyWorkerRunner/JsonLinePolicyClient receives only the generated policy package. Run both dispatch tests:
+
+      python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py -k "prepare_dispatch or canary_dispatch"
+
+- [ ] **Step 10: Implement the live-service builder and exact prepare lines.** Reuse source lock/export, AuditTrail, both ledgers, candidate capability APIs, trusted evaluator, worker runner, and cleanup. Use subprocess.list2cmdline for a two-element tuple whose prefixes are exactly PIT_OPTIMIZER_READY= and PIT_OPTIMIZER_CANARY_COMMAND=. The command carries authenticated manifest/readiness/parity/window/requirement identities, six calls, 448000 tokens, USD 0.40, two iterations, apply=false, and --authorize-policy-source-transmission.
+- [ ] **Step 11: Write the closed-summary test.** Add artifact_root: Path to PitOptimizerResult. Represent the incumbent only with changed paths/symbols, never a raw digest.
+
+  ```python
+  def test_v2_summary_excludes_provider_content_and_raw_hashes(v2_result):
+      summary = _pit_optimizer_v2_summary(v2_result)
+      assert set(summary) == {
+          "schema_version", "phase", "status", "terminal_code", "exit_code",
+          "run_id", "iterations_started", "iterations_completed",
+          "valid_evaluations", "incumbent_updates", "incumbent",
+          "hidden_validation_opened", "long_replay_eligible", "budget",
+          "artifact_root", "source_modified", "cleanup_complete",
+      }
+      encoded = json.dumps(summary, sort_keys=True)
+      assert v2_result.manifest_sha256 not in encoded
+      assert v2_result.readiness_sha256 not in encoded
+  ```
+
+- [ ] **Step 12: Run the summary node, implement the exact dictionary, and rerun.**
+
+      python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py -k "pit_optimizer_v2_summary"
+
+  The dictionary uses only the keys asserted above and excludes credentials, provider contents, raw trades, container IDs, and raw hashes.
+- [ ] **Step 13: Run mocked integration and legacy coexistence.**
+
+      python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py tests/test_agent_loop.py tests/test_pit_optimizer_v2.py tests/test_pit_optimization_contract.py -k "pit_optimizer or pit_optimization"
+
+- [ ] **Step 14: Run the synthetic policy-worker Docker smoke and commit.** The smoke uses only synthetic snapshots and asserts network none, mount allowlist, deterministic output, resource limits, and cleanup; it makes no replay or provider call.
+
+      python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "policy_worker_docker_smoke"
+      git add agent_loop.py core/pit_optimization.py core/pit_optimization_contract.py core/pit_optimizer_evaluation.py tests/test_agent_loop.py tests/test_pit_optimizer_loop.py tests/test_pit_optimizer_v2.py tests/test_pit_optimization_contract.py
+      git commit -m "feat: expose model-authored PIT optimizer"
+
+---
+

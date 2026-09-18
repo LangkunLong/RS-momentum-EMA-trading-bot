@@ -1,0 +1,278 @@
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import sys
+from collections import Counter
+from dataclasses import fields
+from pathlib import Path
+from typing import Iterable
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+
+from core.backtest_engine import PortfolioSimulator
+from core.pit_data import PITDataBundle
+from core.pit_policy_parity import (
+    AggregateMetric,
+    FoldAggregateSummary,
+    ParityFoldEvidence,
+    _PARITY_SIGNAL_EVERY_N_DAYS,
+    _source_identity,
+    build_fold_evidence,
+    load_parity_reference,
+)
+
+
+NUMERIC_TRANSACTION_FIELDS = ("price", "quantity", "value")
+TRANSACTION_FIELDS = (
+    "date",
+    "symbol",
+    "from_symbol",
+    "action",
+    "price",
+    "quantity",
+    "value",
+    "reason",
+)
+AGGREGATE_SCALARS = (
+    "total_return_pct",
+    "excess_total_return_pp",
+    "max_drawdown_pct",
+    "sharpe_ratio",
+    "closed_trades",
+    "turnover_pct",
+    "average_exposure_pct",
+)
+
+
+def _relation(left: float, right: float) -> str:
+    if right > left:
+        return "current_higher"
+    if right < left:
+        return "current_lower"
+    return "equal"
+
+
+def _numeric_category(left: float | None, right: float | None) -> dict[str, object]:
+    if left is None or right is None:
+        return {"relation": "missing_side", "abs_delta": None}
+    return {
+        "relation": _relation(float(left), float(right)),
+        "abs_delta": abs(float(right) - float(left)),
+    }
+
+
+def _metric_map(values: Iterable[AggregateMetric]) -> dict[str, float]:
+    return {item.metric_id: float(item.value) for item in values}
+
+
+def _compare_metrics(
+    left: Iterable[AggregateMetric],
+    right: Iterable[AggregateMetric],
+) -> dict[str, object]:
+    left_map = _metric_map(left)
+    right_map = _metric_map(right)
+    shared = sorted(set(left_map) & set(right_map))
+    differing = [name for name in shared if left_map[name] != right_map[name]]
+    deltas = [abs(right_map[name] - left_map[name]) for name in differing]
+    return {
+        "reference_metric_count": len(left_map),
+        "current_metric_count": len(right_map),
+        "missing_from_current": sorted(set(left_map) - set(right_map)),
+        "new_in_current": sorted(set(right_map) - set(left_map)),
+        "differing_metric_ids": differing,
+        "max_abs_numeric_delta": max(deltas, default=0.0),
+    }
+
+
+def _compare_transactions(left: ParityFoldEvidence, right: ParityFoldEvidence) -> dict[str, object]:
+    paired = min(len(left.transactions), len(right.transactions))
+    field_counts: Counter[str] = Counter()
+    maxima = {name: 0.0 for name in NUMERIC_TRANSACTION_FIELDS}
+    first: dict[str, object] | None = None
+    for index in range(paired):
+        left_item = left.transactions[index]
+        right_item = right.transactions[index]
+        different = [name for name in TRANSACTION_FIELDS if getattr(left_item, name) != getattr(right_item, name)]
+        for name in different:
+            field_counts[name] += 1
+        for name in NUMERIC_TRANSACTION_FIELDS:
+            maxima[name] = max(maxima[name], abs(float(getattr(right_item, name)) - float(getattr(left_item, name))))
+        if different and first is None:
+            first = {
+                "aligned_index": index,
+                "differing_fields": different,
+                "action_categories": {
+                    "reference": left_item.action,
+                    "current": right_item.action,
+                    "equal": left_item.action == right_item.action,
+                },
+                "reason_categories": {
+                    "reference": left_item.reason,
+                    "current": right_item.reason,
+                    "equal": left_item.reason == right_item.reason,
+                },
+                "price_category": _numeric_category(left_item.price, right_item.price),
+                "quantity_category": _numeric_category(left_item.quantity, right_item.quantity),
+            }
+    if len(left.transactions) != len(right.transactions):
+        field_counts["count"] = abs(len(right.transactions) - len(left.transactions))
+        if first is None:
+            first = {
+                "aligned_index": paired,
+                "differing_fields": ["count"],
+                "action_categories": {"reference": "present" if len(left.transactions) > paired else "missing", "current": "present" if len(right.transactions) > paired else "missing", "equal": False},
+                "reason_categories": {"reference": "present" if len(left.transactions) > paired else "missing", "current": "present" if len(right.transactions) > paired else "missing", "equal": False},
+                "price_category": {"relation": "missing_side", "abs_delta": None},
+                "quantity_category": {"relation": "missing_side", "abs_delta": None},
+            }
+    return {
+        "reference_count": len(left.transactions),
+        "current_count": len(right.transactions),
+        "count_delta": len(right.transactions) - len(left.transactions),
+        "aligned_differing_record_count": sum(
+            1 for index in range(paired) if left.transactions[index] != right.transactions[index]
+        ),
+        "differing_field_counts": dict(sorted(field_counts.items())),
+        "max_abs_numeric_deltas": maxima,
+        "first_difference_categories": first,
+    }
+
+
+def _compare_equity(left: ParityFoldEvidence, right: ParityFoldEvidence) -> dict[str, object]:
+    paired = min(len(left.equity), len(right.equity))
+    session_mismatches = 0
+    value_mismatches = 0
+    maximum = 0.0
+    first_relation: str | None = None
+    for index in range(paired):
+        left_item = left.equity[index]
+        right_item = right.equity[index]
+        session_mismatches += int(left_item.session != right_item.session)
+        if left_item.equity != right_item.equity:
+            value_mismatches += 1
+            maximum = max(maximum, abs(right_item.equity - left_item.equity))
+            if first_relation is None:
+                first_relation = _relation(left_item.equity, right_item.equity)
+    return {
+        "reference_count": len(left.equity),
+        "current_count": len(right.equity),
+        "session_mismatch_count": session_mismatches,
+        "value_mismatch_count": value_mismatches,
+        "max_abs_equity_delta": maximum,
+        "first_value_difference_relation": first_relation,
+    }
+
+
+def _compare_aggregate(left: FoldAggregateSummary, right: FoldAggregateSummary) -> dict[str, object]:
+    scalar_deltas: dict[str, object] = {}
+    for name in AGGREGATE_SCALARS:
+        left_value = getattr(left, name)
+        right_value = getattr(right, name)
+        if left_value != right_value:
+            scalar_deltas[name] = _numeric_category(left_value, right_value)
+    return {
+        "differing_scalar_fields": sorted(scalar_deltas),
+        "scalar_deltas": scalar_deltas,
+        "entry_funnel": _compare_metrics(left.entry_funnel, right.entry_funnel),
+        "exit_attribution": _compare_metrics(left.exit_attribution, right.exit_attribution),
+    }
+
+
+def _fold_diagnostic(index: int, left: ParityFoldEvidence, right: ParityFoldEvidence) -> dict[str, object]:
+    differing_paths: set[str] = set()
+    transaction = _compare_transactions(left, right)
+    for name in transaction["differing_field_counts"]:
+        differing_paths.add(f"fold[{index}].transactions[].{name}")
+    equity = _compare_equity(left, right)
+    if equity["session_mismatch_count"]:
+        differing_paths.add(f"fold[{index}].equity[].session")
+    if equity["value_mismatch_count"]:
+        differing_paths.add(f"fold[{index}].equity[].equity")
+    funnel = _compare_metrics(left.funnel, right.funnel)
+    for name in funnel["differing_metric_ids"]:
+        differing_paths.add(f"fold[{index}].funnel.{name}")
+    aggregate = _compare_aggregate(left.aggregate, right.aggregate)
+    for name in aggregate["differing_scalar_fields"]:
+        differing_paths.add(f"fold[{index}].aggregate.{name}")
+    for group in ("entry_funnel", "exit_attribution"):
+        for name in aggregate[group]["differing_metric_ids"]:
+            differing_paths.add(f"fold[{index}].aggregate.{group}.{name}")
+    return {
+        "fold_index": index,
+        "differing_paths": sorted(differing_paths),
+        "transactions": transaction,
+        "entry_outcomes_equal": left.entry_outcomes == right.entry_outcomes,
+        "entry_outcome_count": len(right.entry_outcomes),
+        "equity": equity,
+        "funnel": funnel,
+        "aggregate": aggregate,
+        "effective_policy_equal": left.effective_policy_sha256 == right.effective_policy_sha256,
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--source-root", required=True, type=Path)
+    parser.add_argument("--reference", required=True, type=Path)
+    parser.add_argument("--pit-bundle", required=True, type=Path)
+    parser.add_argument("--output", required=True, type=Path)
+    args = parser.parse_args()
+    source_root = args.source_root.resolve(strict=True)
+    reference_path = args.reference.resolve(strict=True)
+    bundle_path = args.pit_bundle.resolve(strict=True)
+    output = args.output.resolve(strict=False)
+    if output.exists():
+        raise FileExistsError(output)
+
+    source_before = _source_identity(source_root)
+    reference = load_parity_reference(reference_path)
+    with PITDataBundle(bundle_path, expected_sha256=reference.pit_bundle_sha256) as bundle:
+        simulator = PortfolioSimulator(
+            pit_bundle=bundle,
+            benchmark_symbol=reference.fold_manifest.benchmark,
+            signal_every_n_days=_PARITY_SIGNAL_EVERY_N_DAYS,
+        )
+        current = tuple(
+            build_fold_evidence(
+                fold=fold,
+                result=simulator.run(
+                    list(reference.universe),
+                    start_date=fold.start_date,
+                    end_date=fold.end_date,
+                    history_start_date=reference.fold_manifest.warmup_start_date,
+                    benchmark_symbol=reference.fold_manifest.benchmark,
+                ),
+            )
+            for fold in reference.fold_manifest.discovery_folds
+        )
+    source_after = _source_identity(source_root)
+    if source_after != source_before:
+        raise RuntimeError("reviewed source identity changed during diagnosis")
+    if len(current) != 2 or len(reference.discovery_evidence) != 2:
+        raise RuntimeError("diagnosis requires exactly two discovery folds")
+
+    fold_diagnostics = [
+        _fold_diagnostic(index, left, right)
+        for index, (left, right) in enumerate(
+            zip(reference.discovery_evidence, current, strict=True)
+        )
+    ]
+    diagnostic = {
+        "schema_version": 1,
+        "discovery_fold_count": 2,
+        "hidden_evaluated": False,
+        "source_identity_stable": True,
+        "folds": fold_diagnostics,
+    }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("x", encoding="utf-8", newline="\n") as handle:
+        json.dump(diagnostic, handle, indent=2, sort_keys=True, allow_nan=False)
+        handle.write("\n")
+    print(json.dumps({"diagnostic_written": True, "fold_count": 2, "hidden_evaluated": False}, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

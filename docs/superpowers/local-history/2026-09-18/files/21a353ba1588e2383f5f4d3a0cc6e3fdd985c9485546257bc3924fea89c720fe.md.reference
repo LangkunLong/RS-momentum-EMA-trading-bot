@@ -1,0 +1,67 @@
+# Whole-Change-Set Final Review Package
+
+Branch: `codex/pit-canslim-strategy-diagnosis`
+Base/HEAD commit: `515cb1e50d051e2ee4253603608f2fd3920004bc`
+Review target: the exact uncommitted working-tree snapshot below. No commits were created because the starting tree contained user-owned Task 11A/11B work and commit/push/merge was not authorized.
+
+## Exact scope
+
+```text
+ M core/backtest_engine.py
+ M core/canslim/a_annual_earnings.py
+ M core/canslim/c_current_earnings.py
+ M core/pit_data.py
+ M core/pit_diagnosis/baseline.py
+ M pit_baseline.py
+ M pit_diagnosis.py
+?? core/canslim/earnings_trace.py
+?? core/engine_policy.py
+?? core/pit_diagnosis/task11_artifact_diagnosis.py
+?? core/pit_diagnosis/task11_ca_provenance.py
+?? docs/superpowers/plans/2026-08-26-task11-engine-fidelity-observability.md
+?? docs/superpowers/specs/2026-08-26-task11-engine-fidelity-observability-design.md
+```
+
+Review tracked changes with `git diff -- <tracked paths>`. Read each untracked file completely. Do not include ignored `.superpowers/sdd` review/report artifacts in the production diff, but use them as evidence.
+
+## Snapshot SHA-256 / byte size
+
+```text
+core/backtest_engine.py	145366	ac71e70d32c00261a1aacb1a863dfb60dad6a25c905f4250a50045ea6677a3f7
+core/canslim/a_annual_earnings.py	14574	2b94b0187dba6662e20a58f7305bde88aac3c7385093f7268fa486f1aeca26bb
+core/canslim/c_current_earnings.py	12576	ea24abe98bc41764e72e5ac81a9278c44042f07bb7e00f4ab7debe0f2bb8ebe4
+core/pit_data.py	46134	ea127ad73f65525ab1822c9486ee856acbbb2f0223b33d8c418341deceb837c1
+core/pit_diagnosis/baseline.py	36545	890cfe839c4d8440a4bb136f0c0343dea7555a7ef5897ee6081a48c7517ed38e
+pit_baseline.py	79220	56b18bf93287086e4dc0ab727fdeb4030948897ce613760fba24971f4383cf66
+pit_diagnosis.py	36630	56a84b6501f38e4e3710e8f93a703541a1e5a188bf7d7e1b1d33fe7df815de80
+core/canslim/earnings_trace.py	3693	fe7928e3e09c76d10627e2bab287d3c31c95272bc0c6ed536e6065af44f8d2d4
+core/engine_policy.py	38852	78a5047f0d88df297dc60b09c96f56b3133ede7572e127c99f356321ef05d15a
+core/pit_diagnosis/task11_artifact_diagnosis.py	41046	b6a68e74c666117cad23782a228a80bdc8848b44b7a6a31186bdece05bee014d
+core/pit_diagnosis/task11_ca_provenance.py	36284	03333e0a94371876bd93ccbdef23884544a8d75fe86fc326904d77740e1074e6
+docs/superpowers/plans/2026-08-26-task11-engine-fidelity-observability.md	28146	827e054ada850d3c77ec36102c86409580aff976aabd03a70035e7234507b2ef
+docs/superpowers/specs/2026-08-26-task11-engine-fidelity-observability-design.md	14137	6fbaf53c29f4865d6e660898443f640818c72429153af4ef18334c346bc9d18c
+```
+
+## Requirements authority
+
+- Spec: `docs/superpowers/specs/2026-08-26-task11-engine-fidelity-observability-design.md`
+- Plan: `docs/superpowers/plans/2026-08-26-task11-engine-fidelity-observability.md`
+- Recovery ledger: `.superpowers/sdd/2026-08-26-task11-engine-fidelity-observability/progress.md`
+- Task reports/reviews: same ignored SDD directory, especially `task-3-report.md`, `task-3-fix2-review.md`, `task-4-report.md`, `task-4-fix3-review.md`, `task-5-report.md`, and `task-5-review.md`.
+
+## Binding user constraints
+
+- CANSLIM is the feature/design basis, not an exact immutable optimization objective.
+- Later multi-agent optimization may loosen/tighten supported CANSLIM-derived thresholds, weights, and gates to maximize return and minimize drawdown.
+- Causal PIT visibility, realistic execution, data integrity, accounting, and truthful observability are invariant.
+- This build must expose metrics/stats/policy truthfully but must not optimize.
+- No tests were added or run; regression tests are explicitly deferred until the user ends the build phase.
+- No new datasets/downloads/network/provider calls/backtests/cache refreshes/optimizer access/commits/pushes/merges.
+
+## Accepted evidence
+
+- Fresh sealed artifact diagnosis: exit 0, exact focus funnel `375703 -> 8439 -> C 1926/5712/801 -> A 627/1136/163 -> RS 238 -> 173 attempted -> 131 executed`; full window `598696 -> 12291 -> 233 attempted -> 176 executed`. Fidelity remains incomplete/not optimal.
+- Final authenticated C/A run: C 8439 and conditional A 1926 fully reconciled from immutable bytes-backed query-only in-memory SQLite, zero scalar/availability mismatches, aggregate-only output.
+- Effective policy: digest `744104da98b205d73b827d9ecd90e610dbc9d830eb11adc09b31cc034b3a006a`, 126 leaves = 81 active-fixed + 25 active-tunable + 8 advisory/unsupported + 12 causal invariants; 105 future optimizer candidates.
+- Full authorized `py_compile` and `git diff --check` exited 0; no pytest/unit tests by user direction.
+

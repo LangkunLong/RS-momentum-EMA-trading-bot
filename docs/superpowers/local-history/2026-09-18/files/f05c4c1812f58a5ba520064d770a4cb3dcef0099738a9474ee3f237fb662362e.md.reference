@@ -1,0 +1,50 @@
+### Task 9: Focused Final Verification and Canary Readiness Handoff
+
+This is a verification-only task. Do not edit tracked product or test files and do not commit. Work only from the clean committed `codex/pit-optimizer-implementation` worktree at `C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.worktrees\pit-optimizer-implementation`.
+
+**Hard boundaries:**
+
+- No OpenRouter/provider call, provider SDK construction, live pricing lookup, grant creation, authorization lease, Docker command, network access, hidden-fold evaluation, long replay, full-window replay, candidate backtest, source apply, merge, push, upload, deploy, or cloud task.
+- The final two-fold parity command is provider-free and may run exactly once. Preflight all paths, output absence, and repository cleanliness before starting it. If it fails after launch, do not retry; stop and report the exact aggregate failure.
+- Run each prescribed test suite once. Do not expand or rerun tests merely to improve coverage.
+- Keep raw artifact hashes, hidden identities/data, credentials, provider content, and container identifiers out of user-facing/report prose. A sanitized digest/preimage summary may name the categories bound, never raw values.
+- Local writes are limited to ignored `.artifacts` outputs and this SDD report. Remove only exact task-created temporary resources; preserve all pre-existing artifacts.
+
+**Path ruling:**
+
+The implementation was intentionally kept local in the isolated worktree and was not merged into the original verification checkout. Therefore final source identity must be the clean implementation worktree HEAD. Use the original checkout only as the location of sealed input artifacts. Write new parity/optimizer outputs under the implementation worktree's ignored `.artifacts` tree. Substituting the worktree for the plan's original `--source-root` is required to authenticate the code being verified; it does not alter sealed data, model, budgets, folds, or policy scope.
+
+**Steps:**
+
+1. Confirm branch, clean tracked status, committed HEAD, no active task agent process/container, and the exact existence/type of all sealed inputs. Confirm these create-only outputs do not yet exist:
+   - `C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.worktrees\pit-optimizer-implementation\.artifacts\pit-policy-parity-v2\verified-final.json`
+   - `C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.worktrees\pit-optimizer-implementation\.artifacts\pit-optimizer-v2\manifest.json`
+2. Compile only the changed production modules:
+
+       python -B -m compileall -q core/strategy_policy core/pit_optimizer_candidate.py core/pit_optimizer_evaluation.py core/pit_optimizer_authorization.py core/pit_optimizer_artifacts.py core/pit_optimizer_controller.py core/pit_policy_parity.py
+       python -B -m py_compile agent_loop.py core/backtest_engine.py core/pit_optimization.py core/pit_optimization_contract.py
+
+3. Run the focused architecture suite once:
+
+       python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_strategy_policy.py tests/test_pit_policy_parity.py tests/test_pit_optimizer_v2.py tests/test_pit_optimizer_loop.py tests/test_backtest_engine.py tests/test_backtest_custom_strategy_contract.py tests/test_backtest_open_causality.py tests/test_task11_effective_policy_contract.py
+
+4. Run the optimizer-related agent-loop selection once:
+
+       python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py tests/test_pit_optimization_contract.py -k "pit_optimizer or pit_optimization or provider_call or budget_reservation or policy_worker"
+
+5. Reconfirm `git status --porcelain` prints nothing. Then run this exact final-side two-fold parity once from the implementation worktree:
+
+       python -B -m core.pit_policy_parity verify --reference "C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.worktrees\pit-optimizer-implementation\.artifacts\pit-policy-parity-v2\reference.json" --pit-bundle "C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.artifacts\task-4-regeneration-20260823T223000Z\pit-bundle\pit_baseline.sqlite3" --output "C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.worktrees\pit-optimizer-implementation\.artifacts\pit-policy-parity-v2\verified-final.json"
+
+   Require `PIT_POLICY_PARITY matched=true`. Inspect the canonical output locally and verify it binds the intermediate reference, current clean final HEAD/tree, sealed bundle/baseline/folds, policy interface, exact discovery outputs, and unchanged schema-v1 effective policy. It must contain no hidden result and start no provider/Docker process.
+6. Create only these ignored local directories if absent: `.artifacts\pit-optimizer-v2\runtime`, `.artifacts\pit-optimizer-v2\candidates`, and `.artifacts\pit-optimizer-v2\runs`. Then build the manifest exactly once with the sealed values below:
+
+       python -B -m core.pit_optimizer_evaluation build-subset-manifest --readiness "C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.artifacts\pit-optimizer-subset-performance-20260827T200714Z\pit-optimization-readiness-d3cbfcb22900\readiness.json" --verified-parity "C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.worktrees\pit-optimizer-implementation\.artifacts\pit-policy-parity-v2\verified-final.json" --pit-bundle "C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.artifacts\task-4-regeneration-20260823T223000Z\pit-bundle\pit_baseline.sqlite3" --baseline-run "C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.artifacts\task-11-prefix-replay-20260826T001500Z\run-20260826T002913Z-1af306ef1e46" --source-root "C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.worktrees\pit-optimizer-implementation" --permanent-runtime-root "C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.worktrees\pit-optimizer-implementation\.artifacts\pit-optimizer-v2\runtime" --controller-temp-parent "C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.worktrees\pit-optimizer-implementation\.artifacts\pit-optimizer-v2\candidates" --artifact-root "C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.worktrees\pit-optimizer-implementation\.artifacts\pit-optimizer-v2\runs" --git-executable "C:\Program Files\Git\cmd\git.exe" --docker-executable "C:\Users\llong\AppData\Local\Programs\DockerDesktop\resources\bin\docker.exe" --sandbox-image localhost/rs-agent-loop@sha256:7ecfb4ebb3b327940bef347e4c82e82fb4a0e8b40fc63b92b2536fe8c83acf1c --iterations 2 --investigator-static-bytes 8000 --investigator-dynamic-bytes 80000 --investigator-input-tokens 88000 --investigator-output-tokens 4000 --investigator-response-bytes 8192 --investigator-max-usd 0.05 --author-static-bytes 12000 --author-dynamic-bytes 76000 --author-input-tokens 88000 --author-output-tokens 8000 --author-response-bytes 16384 --author-max-usd 0.10 --critic-static-bytes 8000 --critic-dynamic-bytes 24000 --critic-input-tokens 32000 --critic-output-tokens 4000 --critic-response-bytes 8192 --critic-max-usd 0.05 --max-files 3 --max-hunks 12 --max-changed-lines 80 --max-diff-bytes 8192 --output "C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.worktrees\pit-optimizer-implementation\.artifacts\pit-optimizer-v2\manifest.json"
+
+   Require the manifest to encode exactly two iterations, six R1 role calls in the sealed role order, 448000 maximum tokens, USD 0.40, exact per-role caps, the final source/artifact/image identities, the three-file/12-hunk/80-line/8192-byte bounds, and one closed AuthorizationRequirement. This step must perform no replay, pricing lookup, grant, hidden evaluation, provider call, or Docker action.
+7. Capture the exact emitted `PIT_OPTIMIZER_PREPARE_COMMAND` and execute that emitted command once without editing/re-rendering it. Prepare must remain provider-free. Require it to authenticate the full identity graph, permanently mark only the two discovery windows, reuse attested discovery baselines, write the derived readiness artifact, and emit an inert canary command. It must not construct the gateway, freeze pricing, open a lease, create a grant, replay a fold, evaluate hidden data, or start Docker.
+8. Inspect the readiness package locally. Confirm: no hidden fold result; no provider/accounting call; schema-v1 policy identity matches; candidate paths are exactly the three pure policy modules; both discovery windows are permanently marked non-hidden; source is unchanged; and the command remains `apply=false` with exact two-iteration/six-call/448000-token/USD-0.40 ceilings. Do not execute the canary command and do not print or run a record-grant command.
+9. Run `git diff --check` and `git status --short --branch`. Confirm tracked source is clean. Check for and remove only exact Task 9 temporary controller/process/container resources; do not touch pre-existing pytest or artifact directories.
+10. Write `.superpowers\sdd\2026-08-27-model-authored-pit-optimizer\task-9-report.md` with exact compile/test counts, parity result, sanitized manifest/readiness assertions, effect/accounting audit, hygiene, and the unexecuted canary handoff summary. State plainly that a fresh operator authorization is still required before any live six-call canary and that full-window parity/long replay remain deferred.
+
+Stop immediately and report if any source cleanliness, identity, create-only output, aggregate ceiling, provider-free boundary, cleanup, or sealed-artifact check fails.

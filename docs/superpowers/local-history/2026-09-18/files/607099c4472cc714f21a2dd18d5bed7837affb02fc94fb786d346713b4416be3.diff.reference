@@ -1,0 +1,904 @@
+# Review package: da9837f..2e01492
+
+## Commits
+2e01492 fix: harden PIT price export boundaries
+
+## Files changed
+ export_pit_prices.py               | 338 +++++++++++++++++++++++++++++--------
+ tests/test_export_pit_prices.py    | 313 ++++++++++++++++++++++++++++++++++
+ tools/export_price_cache_worker.py |   2 +
+ 3 files changed, 587 insertions(+), 66 deletions(-)
+
+## Diff
+diff --git a/export_pit_prices.py b/export_pit_prices.py
+index 5179c16..df97be2 100644
+--- a/export_pit_prices.py
++++ b/export_pit_prices.py
+@@ -12,38 +12,46 @@ import re
+ import shutil
+ import sqlite3
+ import stat
+ import subprocess
+ import tempfile
+ import uuid
+ from contextlib import closing
+ from dataclasses import dataclass
+ from datetime import date, timedelta
+ from pathlib import Path
+-from typing import Sequence
++from typing import BinaryIO, Callable, Sequence
+ from urllib.parse import quote
+ 
+ _BASELINE_START = date(2020, 1, 1)
+ _BASELINE_END = date(2025, 12, 31)
+ _EXPECTED_SCHEMA = [
+     (0, "cache_key", "TEXT", 0, None, 1),
+     (1, "cache_kind", "TEXT", 1, None, 0),
+     (2, "created_at", "TEXT", 1, None, 0),
+     (3, "payload", "BLOB", 1, None, 0),
+ ]
+ _MEMBERSHIP_COLUMNS = ("effective_date", "ticker", "member")
+ _PRICE_COLUMNS = ("trade_date", "ticker", "open", "high", "low", "close", "volume")
+ _OUTPUT_NAMES = ("prices.csv", "spy_trading_days.csv", "prices_provenance.json")
+ _TICKER_RE = re.compile(r"[A-Z0-9][A-Z0-9.-]{0,14}")
+ _DIGEST_RE = re.compile(r"[0-9a-f]{64}")
+ _IMAGE_RE = re.compile(r"[^\s]+@sha256:[0-9a-f]{64}")
+ _COMPLETION = '{"status":"complete","version":1}\n'
++_WORKER_UID_GID = "65532:65532"
++_PIDS_LIMIT = 64
++_MEMORY_BYTES = 2 * 1024 * 1024 * 1024
++_NANO_CPUS = 2_000_000_000
++_TMPFS_BYTES = 64 * 1024 * 1024
++_TMPFS_DESTINATION = "/tmp"
++_TMPFS_FLAGS = frozenset({"rw", "noexec", "nosuid", "nodev"})
++_TMPFS_CREATE_SPEC = f"{_TMPFS_DESTINATION}:rw,noexec,nosuid,nodev,size={_TMPFS_BYTES}"
+ _NYSE_HOLIDAYS = frozenset(
+     date.fromisoformat(value)
+     for value in (
+         "2020-01-01", "2020-01-20", "2020-02-17", "2020-04-10", "2020-05-25",
+         "2020-07-03", "2020-09-07", "2020-11-26", "2020-12-25",
+         "2021-01-01", "2021-01-18", "2021-02-15", "2021-04-02", "2021-05-31",
+         "2021-07-05", "2021-09-06", "2021-11-25", "2021-12-24",
+         "2022-01-17", "2022-02-21", "2022-04-15", "2022-05-30", "2022-06-20",
+         "2022-07-04", "2022-09-05", "2022-11-24", "2022-12-26",
+         "2023-01-02", "2023-01-16", "2023-02-20", "2023-04-07", "2023-05-29",
+@@ -226,122 +234,253 @@ def _docker_call(executable: Path, args: Sequence[str], *, timeout: float) -> su
+         timeout=timeout,
+         env=environment,
+     )
+ 
+ 
+ def _mount(source: Path, destination: str, *, readonly: bool) -> str:
+     value = f"type=bind,src={source.resolve()},dst={destination}"
+     return value + (",readonly" if readonly else "")
+ 
+ 
+-def _attest_container(
+-    executable: Path,
++def _local_image_id(executable: Path, image: str) -> str:
++    inspected = _docker_call(executable, ("image", "inspect", image), timeout=30)
++    if inspected.returncode != 0:
++        raise RuntimeError("digest-pinned sandbox image is not available locally")
++    try:
++        values = json.loads(inspected.stdout)
++        item = values[0]
++        image_id = item["Id"]
++        repo_digests = item["RepoDigests"]
++    except (json.JSONDecodeError, IndexError, KeyError, TypeError) as exc:
++        raise RuntimeError("local sandbox image inspection is malformed") from exc
++    if (
++        len(values) != 1
++        or not isinstance(image_id, str)
++        or re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None
++        or not isinstance(repo_digests, list)
++        or image not in repo_digests
++    ):
++        raise RuntimeError("local sandbox image does not match the required digest")
++    return image_id
++
++
++def _docker_create_args(
++    name: str,
++    ownership: str,
++    image: str,
++    mount_specs: Sequence[tuple[Path, str, bool]],
++) -> list[str]:
++    args = [
++        "create", "--pull", "never", "--name", name,
++        "--label", f"pit-price-export.owner={ownership}",
++        "--network", "none", "--read-only", "--cap-drop", "ALL",
++        "--security-opt", "no-new-privileges", "--pids-limit", str(_PIDS_LIMIT),
++        "--memory", f"{_MEMORY_BYTES}b", "--cpus", "2", "--user", _WORKER_UID_GID,
++        "--entrypoint", "python", "--workdir", "/worker",
++        "--tmpfs", _TMPFS_CREATE_SPEC,
++    ]
++    for source, destination, readonly in mount_specs:
++        args.extend(("--mount", _mount(source, destination, readonly=readonly)))
++    for setting in (
++        "HOME=/tmp", "PYTHONDONTWRITEBYTECODE=1", "PYTHONNOUSERSITE=1", "PYTHONHASHSEED=0",
++        "OPENBLAS_NUM_THREADS=1", "OMP_NUM_THREADS=1", "MKL_NUM_THREADS=1",
++        "NUMEXPR_NUM_THREADS=1", "HTTP_PROXY=http://127.0.0.1:9",
++        "HTTPS_PROXY=http://127.0.0.1:9", "ALL_PROXY=http://127.0.0.1:9", "NO_PROXY=",
++    ):
++        args.extend(("--env", setting))
++    args.extend(
++        (
++            image, "/worker/export_price_cache_worker.py", "--request", "/input/request.json",
++            "--cache", "/input/cache.sqlite3", "--output", "/output/prices.csv",
++        )
++    )
++    return args
++
++
++def _size_bytes(value: str) -> int:
++    match = re.fullmatch(r"([0-9]+)([kmgt]?)(?:b)?", value.casefold())
++    if match is None:
++        raise ValueError
++    number = int(match.group(1))
++    factor = {"": 1, "k": 1024, "m": 1024**2, "g": 1024**3, "t": 1024**4}[
++        match.group(2)
++    ]
++    return number * factor
++
++
++def _exact_tmpfs(value: object) -> bool:
++    if not isinstance(value, dict) or set(value) != {_TMPFS_DESTINATION}:
++        return False
++    options = value[_TMPFS_DESTINATION]
++    if not isinstance(options, str):
++        return False
++    parts = options.split(",")
++    if len(parts) != len(set(parts)):
++        return False
++    flags = {part for part in parts if "=" not in part}
++    sizes = [part.split("=", 1)[1] for part in parts if part.startswith("size=")]
++    if flags != _TMPFS_FLAGS or len(sizes) != 1 or len(parts) != len(flags) + 1:
++        return False
++    try:
++        return _size_bytes(sizes[0]) == _TMPFS_BYTES
++    except ValueError:
++        return False
++
++
++def _validate_container_item(
++    item: object,
+     container_id: str,
+     name: str,
+     ownership: str,
+     image: str,
++    image_id: str,
+     mounts: dict[str, tuple[Path, bool]],
+ ) -> None:
+-    inspected = _docker_call(executable, ("inspect", container_id), timeout=30)
+-    if inspected.returncode != 0:
+-        raise RuntimeError(f"cannot inspect offline worker: {inspected.stderr.strip()}")
+     try:
+-        item = json.loads(inspected.stdout)[0]
++        if not isinstance(item, dict):
++            raise TypeError
+         config = item["Config"]
+         host = item["HostConfig"]
+         network = item["NetworkSettings"]["Networks"]
+-    except (json.JSONDecodeError, IndexError, KeyError, TypeError) as exc:
++        actual_mounts = {
++            entry["Destination"]: (Path(entry["Source"]).resolve(), not entry["RW"])
++            for entry in item["Mounts"]
++        }
++    except (KeyError, TypeError) as exc:
+         raise RuntimeError("offline worker inspection is malformed") from exc
+-    actual_mounts = {
+-        entry["Destination"]: (Path(entry["Source"]).resolve(), not entry["RW"])
+-        for entry in item.get("Mounts", [])
+-    }
+     expected_cmd = [
+         "/worker/export_price_cache_worker.py", "--request", "/input/request.json",
+         "--cache", "/input/cache.sqlite3", "--output", "/output/prices.csv",
+     ]
++    exact_limits = (
++        isinstance(host, dict)
++        and type(host.get("PidsLimit")) is int
++        and host.get("PidsLimit") == _PIDS_LIMIT
++        and type(host.get("Memory")) is int
++        and host.get("Memory") == _MEMORY_BYTES
++        and type(host.get("NanoCpus")) is int
++        and host.get("NanoCpus") == _NANO_CPUS
++        and _exact_tmpfs(host.get("Tmpfs"))
++    )
++    labels = config.get("Labels") if isinstance(config, dict) else None
+     if (
+-        item.get("Id") != container_id
++        not isinstance(config, dict)
++        or not isinstance(host, dict)
++        or not isinstance(network, dict)
++        or item.get("Id") != container_id
+         or item.get("Name") != f"/{name}"
+-        or (config.get("Labels") or {}).get("pit-price-export.owner") != ownership
++        or item.get("Image") != image_id
++        or not isinstance(labels, dict)
++        or labels.get("pit-price-export.owner") != ownership
+         or config.get("Image") != image
+         or config.get("Entrypoint") != ["python"]
+         or config.get("Cmd") != expected_cmd
+-        or config.get("User") != "65532:65532"
++        or config.get("User") != _WORKER_UID_GID
+         or config.get("WorkingDir") != "/worker"
+         or host.get("NetworkMode") != "none"
+         or host.get("ReadonlyRootfs") is not True
+         or host.get("CapDrop") != ["ALL"]
+         or "no-new-privileges" not in (host.get("SecurityOpt") or [])
++        or not exact_limits
+         or set(network) != {"none"}
+         or actual_mounts != mounts
+     ):
+         raise RuntimeError("offline worker confinement differs from the exact contract")
+ 
+ 
++def _attest_container(
++    executable: Path,
++    container_id: str,
++    name: str,
++    ownership: str,
++    image: str,
++    image_id: str,
++    mounts: dict[str, tuple[Path, bool]],
++) -> None:
++    inspected = _docker_call(executable, ("inspect", container_id), timeout=30)
++    if inspected.returncode != 0:
++        raise RuntimeError(f"cannot inspect offline worker: {inspected.stderr.strip()}")
++    try:
++        values = json.loads(inspected.stdout)
++        item = values[0]
++    except (json.JSONDecodeError, IndexError, TypeError) as exc:
++        raise RuntimeError("offline worker inspection is malformed") from exc
++    if len(values) != 1:
++        raise RuntimeError("offline worker inspection is malformed")
++    _validate_container_item(item, container_id, name, ownership, image, image_id, mounts)
++
++
++def _prepare_container_access(
++    root: Path,
++    worker_script: Path,
++    request_path: Path,
++    cache_path: Path,
++    output_dir: Path,
++    *,
++    native_posix: bool | None = None,
++) -> Path:
++    prepared_worker = root / "export_price_cache_worker.py"
++    with worker_script.open("rb") as reader, prepared_worker.open("xb") as writer:
++        shutil.copyfileobj(reader, writer, length=1024 * 1024)
++        writer.flush()
++        os.fsync(writer.fileno())
++    use_posix_modes = os.name == "posix" if native_posix is None else native_posix
++    if use_posix_modes:
++        os.chmod(root, 0o700)
++        for path in (prepared_worker, request_path, cache_path):
++            os.chmod(path, 0o444)
++        # The unpredictable 0700 parent keeps the bind private on the host;
++        # execute/write for "other" lets only the mounted UID create its known output.
++        os.chmod(output_dir, 0o733)
++    else:
++        for path in (prepared_worker, request_path, cache_path):
++            os.chmod(path, stat.S_IREAD)
++    return prepared_worker
++
++
+ def _run_worker(
+     executable: Path,
+     image: str,
+     worker_script: Path,
+     snapshot: CacheSnapshot,
+     request_path: Path,
+     output_dir: Path,
+ ) -> Path:
+     executable = _regular_file(executable, "Docker executable")
+     if executable.name.casefold() not in {"docker", "docker.exe"}:
+         raise ValueError("Docker executable must be docker or docker.exe")
+     if _IMAGE_RE.fullmatch(image) is None:
+         raise ValueError("sandbox image must be repository-and-SHA256 digest pinned")
+     worker_script = _regular_file(worker_script, "worker script")
++    image_id = _local_image_id(executable, image)
+     name = f"pit-price-export-{uuid.uuid4().hex}"
+     ownership = uuid.uuid4().hex
+-    mounts = {
+-        "/worker/export_price_cache_worker.py": (worker_script, True),
+-        "/input/request.json": (request_path.resolve(), True),
+-        "/input/cache.sqlite3": (snapshot.path.resolve(), True),
+-        "/output": (output_dir.resolve(), False),
+-    }
+-    args = [
+-        "create", "--name", name, "--label", f"pit-price-export.owner={ownership}",
+-        "--network", "none", "--read-only", "--cap-drop", "ALL",
+-        "--security-opt", "no-new-privileges", "--pids-limit", "64",
+-        "--memory", "2g", "--cpus", "2", "--user", "65532:65532",
+-        "--entrypoint", "python", "--workdir", "/worker",
+-        "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m",
+-    ]
+-    for source, destination, readonly in (
++    mount_specs = (
+         (worker_script, "/worker/export_price_cache_worker.py", True),
+         (request_path, "/input/request.json", True),
+         (snapshot.path, "/input/cache.sqlite3", True),
+         (output_dir, "/output", False),
+-    ):
+-        args.extend(("--mount", _mount(source, destination, readonly=readonly)))
+-    for setting in (
+-        "HOME=/tmp", "PYTHONDONTWRITEBYTECODE=1", "PYTHONNOUSERSITE=1", "PYTHONHASHSEED=0",
+-        "OPENBLAS_NUM_THREADS=1", "OMP_NUM_THREADS=1", "MKL_NUM_THREADS=1",
+-        "NUMEXPR_NUM_THREADS=1", "HTTP_PROXY=http://127.0.0.1:9",
+-        "HTTPS_PROXY=http://127.0.0.1:9", "ALL_PROXY=http://127.0.0.1:9", "NO_PROXY=",
+-    ):
+-        args.extend(("--env", setting))
+-    args.extend(
+-        (
+-            image, "/worker/export_price_cache_worker.py", "--request", "/input/request.json",
+-            "--cache", "/input/cache.sqlite3", "--output", "/output/prices.csv",
+-        )
+     )
++    mounts = {
++        destination: (source.resolve(), readonly)
++        for source, destination, readonly in mount_specs
++    }
++    args = _docker_create_args(name, ownership, image, mount_specs)
+     container_id = ""
+     try:
+         created = _docker_call(executable, tuple(args), timeout=60)
+         container_id = created.stdout.strip()
+         if created.returncode != 0 or re.fullmatch(r"[0-9a-f]{64}", container_id) is None:
+             raise RuntimeError(f"offline worker creation failed: {created.stderr.strip()}")
+-        _attest_container(executable, container_id, name, ownership, image, mounts)
++        _attest_container(
++            executable, container_id, name, ownership, image, image_id, mounts
++        )
+         started = _docker_call(executable, ("start", container_id), timeout=30)
+         if started.returncode != 0 or started.stdout.strip() != container_id:
+             raise RuntimeError(f"offline worker start failed: {started.stderr.strip()}")
+         waited = _docker_call(executable, ("wait", container_id), timeout=600)
+         if waited.returncode != 0 or waited.stdout.strip() != "0":
+             logs = _docker_call(executable, ("logs", container_id), timeout=30)
+             raise RuntimeError(f"offline worker failed: {logs.stderr.strip() or logs.stdout.strip()}")
+         logs = _docker_call(executable, ("logs", container_id), timeout=30)
+         if logs.returncode != 0 or logs.stdout != _COMPLETION or logs.stderr:
+             raise RuntimeError("offline worker returned an invalid completion envelope")
+@@ -368,21 +507,26 @@ def _run_worker(
+                 executable,
+                 (
+                     "container", "ls", "--all", "--quiet", "--no-trunc",
+                     "--filter", f"label=pit-price-export.owner={ownership}",
+                 ),
+                 timeout=30,
+             )
+             if removed.returncode != 0 or remaining.returncode != 0 or remaining.stdout.strip():
+                 raise RuntimeError("offline worker cleanup could not be verified")
+     entries = tuple(output_dir.iterdir())
+-    if len(entries) != 1 or entries[0].name != "prices.csv" or not entries[0].is_file():
++    if (
++        len(entries) != 1
++        or entries[0].name != "prices.csv"
++        or entries[0].is_symlink()
++        or not entries[0].is_file()
++    ):
+         raise RuntimeError("offline worker emitted files outside the exact output contract")
+     return entries[0]
+ 
+ 
+ def _expected_trading_days(start: date, end: date) -> tuple[date, ...]:
+     days: list[date] = []
+     current = start
+     while current <= end:
+         if current.weekday() < 5 and current not in _NYSE_HOLIDAYS:
+             days.append(current)
+@@ -496,64 +640,126 @@ def _validate_prices(
+ def _csv_text(rows: Sequence[Sequence[object]], header: Sequence[str]) -> str:
+     from io import StringIO
+ 
+     stream = StringIO(newline="")
+     writer = csv.writer(stream, lineterminator="\n")
+     writer.writerow(header)
+     writer.writerows(rows)
+     return stream.getvalue()
+ 
+ 
++def _file_identity(path: Path) -> tuple[int, int, int]:
++    info = path.lstat()
++    return info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode)
++
++
++def _unlink_owned(path: Path, identity: tuple[int, int, int] | None) -> None:
++    if identity is None:
++        return
++    try:
++        if _file_identity(path) == identity:
++            path.unlink()
++    except FileNotFoundError:
++        pass
++
++
++def _write_staged(path: Path, write: Callable[[BinaryIO], None]) -> tuple[int, int, int]:
++    identity: tuple[int, int, int] | None = None
++    try:
++        with path.open("xb") as stream:
++            info = os.fstat(stream.fileno())
++            identity = (info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode))
++            write(stream)
++            stream.flush()
++            os.fsync(stream.fileno())
++        return identity
++    except Exception:
++        _unlink_owned(path, identity)
++        raise
++
++
++def _fsync_directory(path: Path) -> None:
++    if os.name != "posix":
++        return
++    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
++    try:
++        os.fsync(descriptor)
++    finally:
++        os.close(descriptor)
++
++
+ def _publish(output_dir: Path, source_prices: Path, spy_days: Sequence[date], provenance: dict[str, object]) -> None:
+     output_dir.mkdir(parents=True, exist_ok=True)
+-    targets = [output_dir / name for name in _OUTPUT_NAMES]
+-    if any(path.exists() or path.is_symlink() for path in targets):
++    finals = tuple(output_dir / name for name in _OUTPUT_NAMES)
++    staging = tuple(
++        final.with_name(f".{final.name}.{uuid.uuid4().hex}.tmp") for final in finals
++    )
++    if any(path.exists() or path.is_symlink() for path in finals):
+         raise ValueError("refusing to overwrite an existing price export artifact")
+-    created: list[Path] = []
++    staged_identities: dict[Path, tuple[int, int, int]] = {}
++    installed_identities: dict[Path, tuple[int, int, int]] = {}
++    success = False
+     try:
+-        prices = targets[0]
+-        with source_prices.open("rb") as reader, prices.open("xb") as writer:
+-            shutil.copyfileobj(reader, writer, length=1024 * 1024)
+-        created.append(prices)
+-        targets[1].write_text(
+-            _csv_text([(value.isoformat(),) for value in spy_days], ("trade_date",)),
+-            encoding="utf-8",
+-            newline="",
++        def copy_prices(stream: BinaryIO) -> None:
++            with source_prices.open("rb") as reader:
++                shutil.copyfileobj(reader, stream, length=1024 * 1024)
++
++        staged_identities[staging[0]] = _write_staged(staging[0], copy_prices)
++        spy_bytes = _csv_text(
++            [(value.isoformat(),) for value in spy_days], ("trade_date",)
++        ).encode()
++        staged_identities[staging[1]] = _write_staged(
++            staging[1], lambda stream: stream.write(spy_bytes)
+         )
+-        created.append(targets[1])
+-        targets[2].write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8", newline="")
+-        created.append(targets[2])
+-    except Exception:
+-        for path in created:
+-            path.unlink(missing_ok=True)
+-        raise
++        provenance_bytes = (json.dumps(provenance, indent=2, sort_keys=True) + "\n").encode()
++        staged_identities[staging[2]] = _write_staged(
++            staging[2], lambda stream: stream.write(provenance_bytes)
++        )
++        for staged, final in zip(staging, finals, strict=True):
++            os.link(staged, final)
++            installed_identities[final] = staged_identities[staged]
++            installed = _file_identity(final)
++            if installed != staged_identities[staged]:
++                raise RuntimeError("published artifact identity changed during installation")
++        _fsync_directory(output_dir)
++        success = True
++    finally:
++        if not success:
++            for final in reversed(finals):
++                _unlink_owned(final, installed_identities.get(final))
++        for staged in staging:
++            _unlink_owned(staged, staged_identities.get(staged))
++        _fsync_directory(output_dir)
+ 
+ 
+ def export(args: argparse.Namespace) -> dict[str, object]:
+     """Run the validated, confined cache export and return its provenance."""
+     if args.start_date != _BASELINE_START or args.end_date != _BASELINE_END:
+         raise ValueError("price window must be exactly 2020-01-01 through 2025-12-31")
+     membership_path = _regular_file(Path(args.membership_csv), "membership CSV")
+     membership = _load_membership(membership_path)
+     source = _regular_file(Path(args.cache), "cache")
+     source_before = source.stat()
+-    worker_script = Path(args.worker_script).resolve(strict=True)
++    worker_script = _regular_file(Path(args.worker_script), "worker script")
+     output_dir = Path(args.output_dir).resolve()
+     with tempfile.TemporaryDirectory(prefix="pit-price-export-") as temporary:
+         root = Path(temporary)
+         worker_output = root / "output"
+         worker_output.mkdir()
+         snapshot = _copy_and_validate_cache(source, args.cache_sha256, root)
+         request_path = root / "request.json"
+         _canonical_request(request_path, membership, args.start_date, args.end_date)
++        prepared_worker = _prepare_container_access(
++            root, worker_script, request_path, snapshot.path, worker_output
++        )
+         prices_path = _run_worker(
+-            Path(args.docker_executable), args.sandbox_image, worker_script,
++            Path(args.docker_executable), args.sandbox_image, prepared_worker,
+             snapshot, request_path, worker_output,
+         )
+         metrics, spy_days = _validate_prices(prices_path, membership, args.start_date, args.end_date)
+         source_after = source.stat()
+         if (
+             (source_before.st_dev, source_before.st_ino, source_before.st_size, source_before.st_mtime_ns)
+             != (source_after.st_dev, source_after.st_ino, source_after.st_size, source_after.st_mtime_ns)
+             or _sha256_file(source) != snapshot.sha256
+         ):
+             raise ValueError("source cache changed during the confined export")
+diff --git a/tests/test_export_pit_prices.py b/tests/test_export_pit_prices.py
+new file mode 100644
+index 0000000..3531b39
+--- /dev/null
++++ b/tests/test_export_pit_prices.py
+@@ -0,0 +1,313 @@
++"""Focused trust-boundary tests for the confined PIT price exporter."""
++
++from __future__ import annotations
++
++import os
++import stat
++import subprocess
++from copy import deepcopy
++from datetime import date
++from pathlib import Path
++
++import pytest
++
++import export_pit_prices as exporter
++
++
++def _provenance() -> dict[str, object]:
++    return {"source_kind": "existing_hash_pinned_cache"}
++
++
++def test_publish_uses_unique_staging_and_cleans_owned_files_on_install_race(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Break caught: a destination race left a directly-written partial price bundle."""
++    output = tmp_path / "exports"
++    source = tmp_path / "worker-prices.csv"
++    source.write_bytes(b"trade_date,ticker,open,high,low,close,volume\n")
++    real_link = os.link
++
++    def race_on_second_install(source_path: str | bytes, target_path: str | bytes) -> None:
++        target = Path(target_path)
++        if target.name == "spy_trading_days.csv":
++            target.write_bytes(b"racer-owned\n")
++        real_link(source_path, target_path)
++
++    monkeypatch.setattr(exporter.os, "link", race_on_second_install)
++
++    with pytest.raises(FileExistsError):
++        exporter._publish(output, source, (date(2025, 12, 31),), _provenance())
++
++    assert not (output / "prices.csv").exists()
++    assert (output / "spy_trading_days.csv").read_bytes() == b"racer-owned\n"
++    assert not (output / "prices_provenance.json").exists()
++    assert not tuple(output.glob(".*.tmp"))
++
++
++def test_publish_installs_fsynced_staging_files_without_residue(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Break caught: final files were opened directly and never flushed durably before install."""
++    output = tmp_path / "exports"
++    source = tmp_path / "worker-prices.csv"
++    prices = b"trade_date,ticker,open,high,low,close,volume\n"
++    source.write_bytes(prices)
++    fsynced: list[int] = []
++    real_fsync = os.fsync
++
++    def record_fsync(file_descriptor: int) -> None:
++        fsynced.append(file_descriptor)
++        real_fsync(file_descriptor)
++
++    monkeypatch.setattr(exporter.os, "fsync", record_fsync)
++
++    exporter._publish(output, source, (date(2025, 12, 31),), _provenance())
++
++    assert (output / "prices.csv").read_bytes() == prices
++    assert (output / "spy_trading_days.csv").read_text(encoding="utf-8") == "trade_date\n2025-12-31\n"
++    assert '"source_kind": "existing_hash_pinned_cache"' in (
++        output / "prices_provenance.json"
++    ).read_text(encoding="utf-8")
++    assert len(fsynced) >= 3
++    assert not tuple(output.glob(".*.tmp"))
++
++
++def test_publish_registers_final_before_post_link_attestation_failure(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Break caught: a linked final escaped cleanup when its first identity read failed."""
++    output = tmp_path / "exports"
++    source = tmp_path / "worker-prices.csv"
++    source.write_bytes(b"trade_date,ticker,open,high,low,close,volume\n")
++    real_identity = exporter._file_identity
++    failed_once = False
++
++    def fail_first_final_identity(path: Path) -> tuple[int, int, int]:
++        nonlocal failed_once
++        if path.name == "prices.csv" and not failed_once:
++            failed_once = True
++            raise OSError("simulated post-link stat failure")
++        return real_identity(path)
++
++    monkeypatch.setattr(exporter, "_file_identity", fail_first_final_identity)
++
++    with pytest.raises(OSError, match="post-link stat failure"):
++        exporter._publish(output, source, (date(2025, 12, 31),), _provenance())
++
++    assert not any((output / name).exists() for name in exporter._OUTPUT_NAMES)
++    assert not tuple(output.glob(".*.tmp"))
++
++
++def test_local_image_check_rejects_digest_that_is_not_already_installed(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Break caught: Docker create could pull an absent image despite a pinned digest."""
++    executable = tmp_path / "docker"
++    executable.write_bytes(b"docker")
++    image = "registry.invalid/worker@sha256:" + "a" * 64
++
++    def missing_image(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
++        return subprocess.CompletedProcess([], 1, "", "No such image")
++
++    monkeypatch.setattr(exporter, "_docker_call", missing_image)
++
++    with pytest.raises(RuntimeError, match="not available locally"):
++        exporter._local_image_id(executable, image)
++
++
++def test_docker_create_policy_forbids_pulls_and_requests_exact_limits(tmp_path: Path) -> None:
++    """Break caught: create omitted local-only policy or requested different resource limits."""
++    source = tmp_path / "worker.py"
++    request = tmp_path / "request.json"
++    cache = tmp_path / "cache.sqlite3"
++    output = tmp_path / "output"
++    for path in (source, request, cache):
++        path.write_bytes(b"x")
++    output.mkdir()
++    mounts = (
++        (source, "/worker/export_price_cache_worker.py", True),
++        (request, "/input/request.json", True),
++        (cache, "/input/cache.sqlite3", True),
++        (output, "/output", False),
++    )
++
++    args = exporter._docker_create_args(
++        "worker-name",
++        "owner-token",
++        "registry.invalid/worker@sha256:" + "a" * 64,
++        mounts,
++    )
++
++    assert args[args.index("--pull") + 1] == "never"
++    assert args[args.index("--pids-limit") + 1] == "64"
++    assert args[args.index("--memory") + 1] == "2147483648b"
++    assert args[args.index("--cpus") + 1] == "2"
++    assert args[args.index("--tmpfs") + 1] == "/tmp:rw,noexec,nosuid,nodev,size=67108864"
++
++
++def test_native_posix_access_keeps_root_private_and_grants_only_required_modes(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Break caught: UID 65532 could not read owner-only inputs or write the output bind."""
++    root = tmp_path / "private"
++    root.mkdir()
++    worker = tmp_path / "worker.py"
++    request = root / "request.json"
++    cache = root / "cache.sqlite3"
++    output = root / "output"
++    worker.write_bytes(b"worker")
++    request.write_bytes(b"request")
++    cache.write_bytes(b"cache")
++    output.mkdir()
++    modes: dict[Path, int] = {}
++
++    def record_chmod(path: str | bytes | os.PathLike[str], mode: int) -> None:
++        modes[Path(path)] = mode
++
++    monkeypatch.setattr(exporter.os, "chmod", record_chmod)
++
++    prepared = exporter._prepare_container_access(
++        root,
++        worker,
++        request,
++        cache,
++        output,
++        native_posix=True,
++    )
++
++    assert prepared.parent == root
++    assert prepared.read_bytes() == b"worker"
++    assert modes == {
++        root: 0o700,
++        prepared: 0o444,
++        request: 0o444,
++        cache: 0o444,
++        output: 0o733,
++    }
++
++
++@pytest.mark.skipif(os.name != "posix", reason="requires native POSIX mode bits")
++def test_native_posix_access_modes_are_effective_on_disk(tmp_path: Path) -> None:
++    """Break caught: requested POSIX modes were not the effective bind-source modes."""
++    root = tmp_path / "private"
++    root.mkdir()
++    worker = tmp_path / "worker.py"
++    request = root / "request.json"
++    cache = root / "cache.sqlite3"
++    output = root / "output"
++    worker.write_bytes(b"worker")
++    request.write_bytes(b"request")
++    cache.write_bytes(b"cache")
++    output.mkdir()
++
++    prepared = exporter._prepare_container_access(root, worker, request, cache, output)
++
++    assert stat.S_IMODE(root.stat().st_mode) == 0o700
++    assert stat.S_IMODE(prepared.stat().st_mode) == 0o444
++    assert stat.S_IMODE(request.stat().st_mode) == 0o444
++    assert stat.S_IMODE(cache.stat().st_mode) == 0o444
++    assert stat.S_IMODE(output.stat().st_mode) == 0o733
++
++
++def _inspection(tmp_path: Path) -> tuple[dict[str, object], dict[str, tuple[Path, bool]]]:
++    mounts = {
++        "/worker/export_price_cache_worker.py": (tmp_path / "worker.py", True),
++        "/input/request.json": (tmp_path / "request.json", True),
++        "/input/cache.sqlite3": (tmp_path / "cache.sqlite3", True),
++        "/output": (tmp_path / "output", False),
++    }
++    for path, _readonly in mounts.values():
++        if path.suffix:
++            path.write_bytes(b"x")
++        else:
++            path.mkdir()
++    item: dict[str, object] = {
++        "Id": "b" * 64,
++        "Name": "/worker-name",
++        "Image": "sha256:" + "c" * 64,
++        "Config": {
++            "Image": "registry.invalid/worker@sha256:" + "a" * 64,
++            "Entrypoint": ["python"],
++            "Cmd": [
++                "/worker/export_price_cache_worker.py", "--request", "/input/request.json",
++                "--cache", "/input/cache.sqlite3", "--output", "/output/prices.csv",
++            ],
++            "User": "65532:65532",
++            "WorkingDir": "/worker",
++            "Labels": {"pit-price-export.owner": "owner-token"},
++        },
++        "HostConfig": {
++            "NetworkMode": "none",
++            "ReadonlyRootfs": True,
++            "CapDrop": ["ALL"],
++            "SecurityOpt": ["no-new-privileges"],
++            "PidsLimit": 64,
++            "Memory": 2_147_483_648,
++            "NanoCpus": 2_000_000_000,
++            "Tmpfs": {"/tmp": "nodev,size=64m,rw,nosuid,noexec"},
++        },
++        "NetworkSettings": {"Networks": {"none": {}}},
++        "Mounts": [
++            {
++                "Destination": destination,
++                "Source": str(source.resolve()),
++                "RW": not readonly,
++            }
++            for destination, (source, readonly) in mounts.items()
++        ],
++    }
++    return item, mounts
++
++
++@pytest.mark.parametrize(
++    ("field", "bad_value"),
++    [
++        ("PidsLimit", 65),
++        ("PidsLimit", 64.0),
++        ("Memory", 2_147_483_647),
++        ("NanoCpus", 1_000_000_000),
++        ("Tmpfs", {"/tmp": "rw,noexec,nosuid,nodev,size=64m,exec"}),
++    ],
++)
++def test_container_attestation_rejects_resource_limit_drift(
++    tmp_path: Path,
++    field: str,
++    bad_value: object,
++) -> None:
++    """Break caught: inspected limits could differ from the requested confinement contract."""
++    item, mounts = _inspection(tmp_path)
++    mutated = deepcopy(item)
++    mutated["HostConfig"][field] = bad_value  # type: ignore[index]
++
++    with pytest.raises(RuntimeError, match="confinement differs"):
++        exporter._validate_container_item(
++            mutated,
++            "b" * 64,
++            "worker-name",
++            "owner-token",
++            "registry.invalid/worker@sha256:" + "a" * 64,
++            "sha256:" + "c" * 64,
++            mounts,
++        )
++
++
++def test_container_attestation_normalizes_exact_tmpfs_size_and_option_order(
++    tmp_path: Path,
++) -> None:
++    """Break caught: harmless Docker tmpfs option reordering was confused with policy drift."""
++    item, mounts = _inspection(tmp_path)
++
++    exporter._validate_container_item(
++        item,
++        "b" * 64,
++        "worker-name",
++        "owner-token",
++        "registry.invalid/worker@sha256:" + "a" * 64,
++        "sha256:" + "c" * 64,
++        mounts,
++    )
+diff --git a/tools/export_price_cache_worker.py b/tools/export_price_cache_worker.py
+index 03edffa..99bfa31 100644
+--- a/tools/export_price_cache_worker.py
++++ b/tools/export_price_cache_worker.py
+@@ -4,20 +4,21 @@ This program is intentionally run only inside the disposable, network-disabled
+ container created by ``export_pit_prices.py``.  It is the sole process in the
+ export path that imports ``pickle`` or deserializes cache payloads.
+ """
+ 
+ from __future__ import annotations
+ 
+ import argparse
+ import csv
+ import json
+ import math
++import os
+ import pickle
+ import re
+ import sqlite3
+ from contextlib import closing
+ from datetime import date
+ from pathlib import Path
+ from urllib.parse import quote
+ 
+ import pandas as pd
+ 
+@@ -176,20 +177,21 @@ def export_prices(request_path: Path, cache_path: Path, output_path: Path) -> No
+     with output_path.open("x", encoding="utf-8", newline="") as stream:
+         writer = csv.writer(stream, lineterminator="\n")
+         writer.writerow(_OUTPUT_COLUMNS)
+         records = (
+             (trade_date, ticker, values)
+             for ticker, frame_rows in selected.items()
+             for trade_date, values in frame_rows
+         )
+         for trade_date, ticker, values in sorted(records):
+             writer.writerow((trade_date.isoformat(), ticker, *(_format_number(value) for value in values)))
++    os.chmod(output_path, 0o644)
+ 
+ 
+ def main() -> int:
+     parser = argparse.ArgumentParser(description="Confined hash-pinned cache price converter")
+     parser.add_argument("--request", type=Path, required=True)
+     parser.add_argument("--cache", type=Path, required=True)
+     parser.add_argument("--output", type=Path, required=True)
+     args = parser.parse_args()
+     export_prices(args.request, args.cache, args.output)
+     print('{"status":"complete","version":1}', flush=True)

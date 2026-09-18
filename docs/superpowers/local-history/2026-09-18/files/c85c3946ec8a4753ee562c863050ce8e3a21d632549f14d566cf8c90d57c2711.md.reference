@@ -1,0 +1,21 @@
+# Task 11 pre-first-call context fix report
+
+Status: complete
+
+## Root cause and ruling
+
+- The iteration-1 investigator input fit the authenticated 78,000-byte canonical dynamic-payload cap, but a legacy 16,000-byte feedback allocation rejected one component before provider dispatch.
+- The schema-v4 canonical transmitted payload is now the authoritative dynamic-context bound. Feedback/history allocation fields remain positive, serialized advisory fields for schema compatibility.
+
+## Fix
+
+- Removed runtime component-partition and synthetic component-sum rejection while retaining manifest, scope, call-plan, source-identity, static, exact dynamic, response-headroom, and authorization checks.
+- Added a typed role-context overflow error and mapped real static/dynamic cap failures to `budget_exhausted` with `context_budget_exhausted` detail; the v4 runner no longer rewrites that terminal as `audit_failure`.
+- Made the CLI return 0 for a completed `PitOptimizerResultV4` and 1 for an aborted result without adding `exit_code` to the v4 schema or artifact.
+
+## Verification
+
+- `python -m compileall -q agent_loop.py core/pit_optimization_contract.py core/pit_optimizer_controller.py`: passed.
+- `python -m ruff check agent_loop.py core/pit_optimization_contract.py core/pit_optimizer_controller.py`: passed.
+- `git diff --check`: passed; Git emitted only existing LF-to-CRLF working-copy warnings for the changed Python files.
+- No tests, provider calls, Docker commands, external-temp reproduction, or policy-file changes were performed.

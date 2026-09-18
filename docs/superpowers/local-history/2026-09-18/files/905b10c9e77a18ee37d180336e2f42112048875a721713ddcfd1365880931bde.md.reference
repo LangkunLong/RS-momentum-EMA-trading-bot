@@ -1,0 +1,9 @@
+# Approved replacement campaign04
+
+This is the single replacement permitted by the user's approved continuation in provider-runtime-03/user-authorization.json. It follows an identified, reviewed local repair: the author supplied a bare changed_symbols name; the provider-facing author schema now requires the existing fully qualified module.symbol form. Canonical schemas, local parsing, data and evaluator remain unchanged. The failed response and campaign03 journal are preserved.
+
+Static Ruff, in-memory compilation and independent source review passed. The actual archived author schema projects to3193bytes, below3264canonicalbytes; old accounting remains unchanged. Actual call-free preparation and prelaunch CLI summary passed (ready, zero calls).
+
+Same GPT-5.4/OpenRouter destination, routing, source-sharing scope and resources as approved:2rounds,6calls,448000tokens,8192output/call, zero automatic retries/repairs, no hard dollar ceiling. Campaign03 used2calls,8115tokens,$0.036675. Even if campaign04 uses all its caps, this continuation totals at most8calls and456115tokens, within the12call/896000token grant. No further replacement is authorized; stop after this campaign. No held-out, production data purchase, deployment or trading.
+
+Manifest SHA5fafaffb4258986fbc39c049b7d67ec4cc7804490be5a24a932ca7149ea3b561; config SHA723c2499cc920062058d071889b82b83cc5a6c2be0b29bc08158b4a3a8aba5d6; initial body SHA7616b962ba4a922f3f2cc5af07803b2757a828ea404263f86bdb44c3a51fc748. Exact argv and source/helper identities are in launch-review.json. Use --start once, then only original-deadline recovery if permitted; never restart a terminal campaign. User requested a detailed Luna implementation handoff after successful two-round completion.

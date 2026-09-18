@@ -1,0 +1,21 @@
+# Task 2 review — APPROVED
+
+Scoped re-review of `daa5a3c..468e6c9` found both original P1s closed.
+
+- `_validated_template_assignment_digests_v5()` requires ordered assignment names to exactly
+  match `template.axes` and uses `(type(value), value)` membership. Both
+  `derive_experiment_identity_v5()` and
+  `derive_pre_validation_invalid_experiment_identity_v5()` call it before binding their
+  template and assignment digests.
+- `ExperimentIdentityV5.policy_revision_sha256` is now required and validated as a SHA-256
+  string. `PreValidationInvalidExperimentIdentityV5` is the distinct null-policy type, with its
+  null field excluded from its initializer; the post-validation validator accepts only the normal
+  identity type, so it rejects the typed invalid identity at the boundary.
+- The normal identity's canonical primitive payload and digest logic are unchanged. The new typed
+  pre-validation-invalid payload preserves the prior null-policy payload's keys, values, and
+  order, so canonical valid and pre-validation digests remain compatible.
+- The review-fix commit changes only `core/pit_optimizer_v5/candidate_ir.py`; V4 code and its
+  serialized/digest paths are untouched.
+
+No tests were run for this read-only scoped re-review. The two documented legacy CRLF/final-LF
+failures remain outside the reviewed diff and are not findings.

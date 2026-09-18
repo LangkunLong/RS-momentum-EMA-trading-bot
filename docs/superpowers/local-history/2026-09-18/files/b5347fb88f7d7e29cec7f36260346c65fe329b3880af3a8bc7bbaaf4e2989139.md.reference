@@ -1,0 +1,50 @@
+# Independent development composition review
+
+## Verdicts
+
+**Spec: changes required.** The shared campaign/runtime composition, development authority import, controller provenance and policy-only export are implemented, but the required standalone development verification surface is unreachable. Read-only import validation also does not perform all checks required by the publishing path.
+
+**Quality: changes required.** One P1 and one P2 finding below. These are static, concrete control-flow findings, not observed execution failures. No tests, probes, application imports, compilation, CLI execution, Docker, network or provider calls were performed. No agents were spawned. Only this review report was written; source and staging were not changed.
+
+## Findings
+
+### P1 — Development verify-run and summarize never reach their new branch
+
+Location: `core/pit_optimizer_v5/cli.py:1029-1034` (new branch); rejecting dependency at `cli.py:741-742`.
+
+For an authenticated `development_sp500_v2` manifest, `execute()` first calls `self._authorities(...)` at line 1029. That loader unconditionally raises `campaign_authority_invalid` unless scope is `production`. The development branch added immediately afterward therefore cannot run, even with a valid development config and authentic controller history. Both documented `verify-run` and `summarize` fail before controller-package/resource verification, including at a pending investigator request with no journal events. The shared campaign operation uses its separate `_authorities(authenticated)` helper, so its internal verification does not make the standalone CLI branch reachable.
+
+Route these read-only commands through an authenticated scope-aware authority loader before the production-only guard, while retaining explicit production restrictions for standalone run/resume. This is required to make the report's development verification claim true.
+
+### P2 — Validate-only reports success for inputs that the publishing path rejects
+
+Location: `core/pit_optimizer_v5/development_preparation.py:506-513`; supplied-plan loading at lines 456-458 and eventual manifest construction at lines 555-572.
+
+With four otherwise valid real pairs, provide a typed `panel_plan_ref` whose discovery entries match those pairs but whose `target_sha256` differs from the supplied `target_pct`. Campaign aggregation and `validate_campaign_evidence_v5` bind discovery evidence and data identities but do not compare the plan target with the new target. The early `validate_only` return therefore reports `status=validated`. The same input without that flag writes original-pair provenance, source/policy/baseline and other artifacts, then fails in `manifest.py:_validate_precomposition_bindings_v5` (line 561) on the target mismatch. Similarly, typed loading of a supplied plan does not perform the panel-child authentication done later by manifest construction, so missing/mismatched quick or mechanics children can pass this preflight.
+
+Perform the same applicable target and full supplied-plan child checks before both the validate-only return and the first create-only write. Final manifest publication currently fails closed; the defect is a misleading operator preflight and avoidable partial import, not acceptance of an invalid final manifest.
+
+## Requirements traced successfully
+
+- `operations.py` contains one `_run_campaign_v5`; production/development wrappers select config loaders and factories. Both compositions use `_compose_round_from_paths_v5` and the existing `run_feedback_round_v5`, not a second optimizer loop. The development path constructs the controller invoker without a gateway or paid authorization ledger.
+- Parent preparation requires four existing absolute request/output pairs, explicit development scope and episode ordinals/IDs, and compares canonical output encoding against exact supplied output bytes. The protocol binds request/input, panel/dates, policy, evaluator, sandbox and scenario identities. Preparation cross-checks one execution/profile/policy/method/startup authority, explicit intended evaluator and sandbox hashes, gross/base/stress with base selection, immutable four-policy blob identities, and actual repository bundle/provenance bytes. Canonical campaign validation requires unique disjoint discovery panels and matching dates. Imported panel-reference path text can differ without altering preserved original bytes. Missing outputs prevent publication.
+- Source capture reads the explicit immutable commit and only the four allowed policy blobs. It does not require unrelated host HEAD/worktree content to match that older policy commit. Policy-only workspace export checks exact complete membership and regular blob modes and includes mode/allowlist in driver identity. Recovery reconstructs the same mode. The production full-export identity encoding and full-export default remain unchanged.
+- Automatically created confirmation/qualification descriptors explicitly say unexecuted and capability-disabled and have content-derived identities. The mechanics slot is explicitly named unexecuted and references actual quick content; no held-out evaluation is claimed. Baseline semantic evidence is actually absent under `disabled_development`; provider, apply, qualification and full replay remain disabled.
+- The pending result branch at `operations.py:581` precedes cleanup gating. It returns durable pending role/request identity and the original resume command without advancing the round. Campaign and round start timestamps are reused; remaining time is calculated from those timestamps and passed as the shortened runtime deadline. Controller submission does not modify them. The no-journal development investigator case is explicitly resumable. Expiry is not refreshed.
+- Internal verification reconstructs controller packages from already sealed exact response bytes and rejects non-controller terminal authorities under explicit development scope. The controller exchange authenticates persisted call/request and launch ownership, validates response keys and binding, and uses create-only sealing. Prior-round cleanup no longer forces a later pending round to be retired, while per-round resource-history checks still reject a completed cleanup without durable resource retirement. This internal capability is subject to the standalone CLI finding above.
+- Search/resource composition fixes two rounds, one hypothesis/axis/variant/survivor, archive capacity two, 96 KiB memory and one evaluation at a time. Physical bounds come from the authenticated profile. The four explicit timeout input fields permit the controller-authorized 900-second future quick/discovery bound before manifest construction; saved launch deadlines are unaffected. No change in this diff forces archive admission or removes existing zero-trade quick eligibility.
+
+## Evidence boundary and reviewed identity
+
+Read the composition brief, linked design, implementation report and supplied patch, then the four scoped source files and only relevant protocol, manifest, contract, search, controller and runtime context. Also read the semantic increment report. Source review makes no real-run or readiness claim. Per controller's latest evidence, the first corrected 30-session parent attempt timed out at 600 seconds during scenario three; 900 seconds is authorized for future runs/configuration before manifest creation. There is no completed four-parent set or manifest yet. The report's older 600-second example is therefore not completion evidence and must be overridden with the approved future bound when the controller prepares actual inputs.
+
+Commitless staged review: HEAD remains `a068e0aed40ecbe5e0078924071f374e7809b8c2`. The supplied `development-composition-review.patch` SHA-256 was independently read as `f738b9879565ed9e55a7546b3ab60638a9b1ea90287b39c73f0fd6aeb1adbaca`; it includes the implementation report and four source files. The source-only staged diff is 890 insertions / 43 deletions. Scoped unstaged diff was empty. The staged source blob identities are:
+
+| File | Staged Git blob |
+| --- | --- |
+| `core/pit_optimizer_v5/cli.py` | `1329f793853d26b6337c9b9ea5f0dde52e5218c0` |
+| `core/pit_optimizer_v5/development_preparation.py` | `93c81fc1136ea4c022e5bb94af753c209b44da8f` |
+| `core/pit_optimizer_v5/operations.py` | `4cb5e0e995a8b01d444d64ed065ba4c1e061e7c6` |
+| `core/pit_optimizer_v5/production_workspace.py` | `7092a749dff5317b6e86ff57f5d9b46bb201bd15` |
+
+No commit was attempted and no workaround for the controller-reported automatic rejection of a hooks-disabled commit was attempted. These verdicts apply to the staged bytes identified above, not a nonexistent implementation commit or future fixes.

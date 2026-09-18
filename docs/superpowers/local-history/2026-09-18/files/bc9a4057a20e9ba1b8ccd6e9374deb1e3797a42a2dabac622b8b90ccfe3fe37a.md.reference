@@ -1,0 +1,32 @@
+# Principal architect review: C1 approved; B4b hold cleared
+
+Disposition: APPROVED for the submitted C1 source correction. The sole C1 blocker in the previously reviewed B4b implementation is resolved, so B4b plus C1 is accepted at this architect checkpoint. B4c implementation is the next bounded scope; campaign readiness or execution is not approved by this review.
+
+## Finding resolution
+
+Only ExperimentRecordV5._validate_post_validation_identity changed. Empty actual changed symbols now require both status == exact_duplicate and the experiment policy revision equal to the parent. Nonempty symbols on that branch fail. Every other post-validation record keeps exact declared-template symbol equality.
+
+The existing complete policy identity binding, full identity derivation and exact-duplicate evidence guard are unchanged. Together they prevent a false identity field or status label from creating an exemption. Invalid records keep their separate pre-validation route. The template's nonempty declared edit scope, actual durable validation, strict quick-screen admission and B4b finalizer's actual-validation comparison remain unchanged.
+
+No additional C1 source finding. This is acceptance based on a narrow reviewed invariant and the permitted verification, not a claim that new duplicate or rejection lifecycles have run.
+
+## Independent checks
+
+Fresh principal checks authenticated every submitted protected source hash and the exact preimage/diff. The final memory.py SHA is 37e3a04791d827edd0e5fe99e1d62cb9997163f66954f99727177248f8949d76. Only the approved method differs in the AST; the entire module AST excluding that method is identical.
+
+Scoped Ruff, in-memory compilation and exact-preimage whitespace checking passed. Git returned the ordinary source-difference code with CRLF advisories and no whitespace diagnostics. The evaluator identity remains 005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4 across 56 files; memory.py is outside the closure.
+
+Runtime-04's real record authenticated with its custom canonical encoding unchanged: evaluated, four discovery episodes, exact critic binding. Its 19 events and three accepted role packages authenticated. Actual06's manifest graph, accepted author and five-event terminal journal also authenticated; rendering/stage_failed and successful cleanup remain intact, with zero render_rejected events.
+
+The bounded four-record inventory still contains three evaluation_failed and one evaluated record, with no exact_duplicate. No positive C1 branch, new rejection event, record construction, finalized wrapper or lifecycle branch was executed. No tests, synthetic probes, credentials, external/model calls, candidate evaluation, campaign activity, production edits, commits, pushes or deployment occurred during this principal review.
+
+Independent evidence: principal-architect-verification.json in this directory. It is separate from the implementer's architect-verification.json. Initial verification-harness mistakes used an incorrect preimage suffix and a generic dataclass serializer; both were corrected to the actual preimage and record.canonical_json_bytes(), and the final full verification passed.
+
+## Next decision
+
+B4c may change production_runtime.py for one authenticated cumulative rejection count, plus summary.py for explicit completed-lifecycle, evaluated-feedback and rejected-experiment counts. Keep C1/B4b source and evaluator authority fixed.
+
+Detailed implementation plan: docs/superpowers/plans/2026-09-07-pit-optimizer-v5-b4c-feedback.md.
+Ready-to-paste session instructions: next-luna-prompt-b4c.md in this directory.
+
+This acceptance supersedes the earlier B4b HELD disposition only for C1. The positive paths remain unexecuted until real authorized evidence is available. The original two evaluated feedback rounds are unfinished; no campaign budget is renewed.

@@ -1,0 +1,81 @@
+# Task 3 report — deterministic V5 local variant rendering
+
+## Outcome
+
+Created `core/pit_optimizer_v5/rendering.py` as the only source change. It renders normal
+`SourceOperationV5` templates and atomic four-file full-source escapes into deterministic,
+manifest-capped `RenderedVariantV5` values without filesystem, Git, subprocess, provider, Docker,
+CLI, replay, or market-data behavior. No tests were created or modified.
+
+Focused implementation commit: `7272bdd` (`feat: render optimizer v5 local variants`).
+
+The approved interface correction adds a required keyword-only
+`parent_revision: PolicyRevisionIdentityV5` argument to `render_variants()`. The renderer verifies
+that the template names that authenticated parent revision and that all four source digests in the
+revision exactly match the supplied parent bundle. Child revisions are then derived from rendered
+source bytes while preserving the authenticated parent's policy-interface, trusted-runtime, and
+immutable-constraint identities. No authority is inferred from an opaque revision digest.
+
+## Implemented contracts
+
+- The parent and every rendered result are exact ordered `SourceBundleV5` four-file bundles.
+  Constructing each `SourceFileV5` invokes the extracted source parse/compile/public-export
+  validator, and `RenderedVariantV5` verifies that the derived revision identifies the exact
+  rendered bytes.
+- Normal operations replace only an authorized complete public function or uppercase module
+  constant. Parent target spans are located syntactically, whole physical statement lines are
+  replaced, and duplicate/overlapping operations fail closed.
+- The full-source escape is accepted only when its entire four-file content can be reconstructed
+  from the authenticated parent by replacing exactly the declared authorized symbols. Any byte
+  change elsewhere, including path/import/module-level changes, is rejected.
+- Every declared axis must have exactly one syntactically valid `PIT_AXIS("name")` call inside its
+  authorized function or constant value. Missing, duplicated, unknown, malformed, or out-of-scope
+  markers fail; tokenizer inspection ensures no executable marker name remains after rendering.
+- Marker calls are replaced by their exact source spans, never with `ast.unparse`. Canonical
+  parenthesized Python literals preserve strict `bool`/`int`/finite-`float`/`str` types and numeric
+  precedence while leaving unrelated source bytes untouched. AST UTF-8 byte columns are converted
+  safely to Python string offsets.
+- Parent and child import ASTs must match exactly and imports must remain top-level. Together with
+  the full-source reconstruction rule, this prevents normal-operation and escape-mode import
+  expansion while preserving parent formatting outside target spans.
+- Assignment enumeration emits the declared default first, one-axis-at-a-time deviations next in
+  declared axis/value order, and remaining Cartesian assignments ordered by canonical assignment
+  identity. Scheduling-tier duplicates are removed with strict type-aware keys, and the cap applies
+  to emitted unique assignments.
+- A default whose rendered bytes and policy identity equal the parent is deliberately emitted for
+  downstream `exact_duplicate` classification. If two distinct strict assignments render identical
+  complete bundles, `VariantRenderingCollisionV5` fails closed instead of collapsing them.
+- Repeating a render with identical inputs returns byte-identical ordered variants.
+
+The reusable extracted V5 source service is deliberately structural: syntax, compilation, async
+top-level rejection, and exact public exports. V5 import and authoring authority are enforced here
+and in `policy_scope.py`; introducing a broader V3 policy-language purity validator is outside the
+approved Task 3 one-file boundary.
+
+## Verification evidence
+
+All commands ran from the isolated Task 3 worktree.
+
+1. The primary deterministic direct smoke exercised one through four axes, a Cartesian space over
+   the cap, default/OAT/identity ordering, strict bool/int/float/string values, negative-number
+   precedence, missing/duplicate/unknown/malformed placeholders, markers outside constant values,
+   unauthorized symbols, unsupported types, nested import rejection, normal/full-source rendering,
+   full-source escape rejection outside declared symbols, authenticated lineage, parent-identical
+   default emission, Unicode source-span handling, and repeat byte stability:
+   `V5_RENDERING_SMOKE_OK axes={1: 3, 2: 9, 3: 12, 4: 12} cap=12 ordering=1 placeholders=4 authority=3 full_source=1 strict_types=1 negative_precedence=1 noop_preserved=1 byte_stability=1 unicode_span=1`.
+2. A separate direct fault-injection smoke forced two strict assignments to render the same bundle
+   and confirmed typed rejection: `V5_RENDERING_COLLISION_SMOKE_OK`.
+3. The planned focused command for
+   `tests/test_pit_optimizer_v5_domain.py -k "render or variant or placeholder"` could not run
+   because that test file does not exist in this worktree; its absence was reconfirmed and no test
+   file was added under the user override.
+4. Focused legacy V2/V4 identity compatibility — `2 passed`.
+5. Existing subset-reference and holdout checks — `6 passed`.
+6. Existing strategy-policy checks — `41 passed`.
+7. `python -B -m ruff check core/pit_optimizer_v5/rendering.py` — `All checks passed!`.
+8. `python -B -m py_compile core/pit_optimizer_v5/rendering.py` — exit code 0.
+9. `git diff --check` passed.
+
+Pytest emitted only the repository's existing `websockets.legacy` deprecation and sandbox-denied
+pytest-cache warnings. No provider calls, Docker evaluation, market-data access, qualification,
+replay, data mutation, push, or merge were performed.

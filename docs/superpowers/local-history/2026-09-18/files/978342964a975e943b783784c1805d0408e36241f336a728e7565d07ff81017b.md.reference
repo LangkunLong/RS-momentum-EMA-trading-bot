@@ -1,0 +1,23 @@
+# Baseline preparation wiring review
+
+Verdict: **changes required**.
+
+Reviewed `30e562369f92fdc32a0c2cf07689f4b459d5af9c..a55947da8343da97960e3cc311401d447efebc42` against the scoped baseline-preparation brief. No tests were read, created, modified, or run; no Docker, provider, network, evaluator, or held-out panel action was performed.
+
+## Findings
+
+### [P1] Emitted capture command is only a placeholder template — `core/pit_optimizer_v5/baseline_preparation.py:79`
+
+`prepare_baseline_inputs_v5` returns `capture_argv` with the literal values `<ABSOLUTE_ARTIFACT_ROOT>`, `<ABSOLUTE_CLEAN_SOURCE_ROOT>`, `<ABSOLUTE_SCRATCH_ROOT>`, `<ABSOLUTE_GIT_EXECUTABLE>`, `<GIT_SHA256>`, `<ABSOLUTE_DOCKER_EXECUTABLE>`, and `<DOCKER_SHA256>` (`baseline_preparation.py:79-104`). The preparation CLI accepts none of those host authorities (`core/pit_optimizer_v5/cli.py:1241-1264`), so it cannot substitute them. The operations guide explicitly tells the operator to fill the placeholders and manually reconstruct a second command (`docs/pit-optimizer-v5-operations.md:41-53`). This does not satisfy the brief's requirement to emit an actionable, complete `capture-baseline` command and leaves the requested end-to-end connection unfinished. Accept the required host paths and executable digests during preparation (or otherwise bind them from explicit authenticated host input) and emit argv that can be invoked directly.
+
+### [P1] Existing host composition for source/revision/scope was not exposed — `core/pit_optimizer_v5/baseline_preparation.py:21`
+
+The new builder requires explicit path/hash pairs for `source_bundle_ref`, `baseline_policy_revision_ref`, and `policy_scope_ref` (`baseline_preparation.py:29-31`) and does not attempt the brief's requested host derivation. These identities do not require invented authority: `SourceBundleV5` is the closed ordered four-file value (`core/pit_optimizer_v5/candidate_ir.py:1012-1033`), clean source inspection already reads and pins the exact editable files (`core/pit_optimizer_v5/readiness.py:335-385`), `derive_policy_revision_identity_v5` derives the revision from that bundle plus the actual runtime and constraints digests (`core/pit_optimizer_v5/candidate_ir.py:1383-1398`), and production manifest composition constructs `PolicyScopeDescriptorV5` from the clean commit/digests and revision reference (`core/pit_optimizer_v5/manifest.py:617-632`). Therefore the report's statement that production lacks sufficient builders for all three (`baseline-preparation-report.md`, “Remaining real upstream inputs”) and the documentation's claim that no safe production builder can derive them (`docs/pit-optimizer-v5-operations.md:17`) are too broad. Final V3 data/panel artifacts and any genuinely absent evaluator/resource identities remain honest external dependencies, but the derivable host identities should be composed and persisted rather than demanded as redundant references.
+
+## Confirmed requirements
+
+- The descriptor contains the ten explicit `BaselineCaptureInputsV5` references (`core/pit_optimizer_v5/baseline_preparation.py:42-54`).
+- The pending canonical bytes and their exact path/hash graph are authenticated before publication, then reauthenticated after publication (`core/pit_optimizer_v5/baseline_preparation.py:55-78`; `core/pit_optimizer_v5/baseline.py:150-270`).
+- Publication uses the strict baseline create-only repository operation; an existing output fails even for identical bytes (`core/pit_optimizer_v5/artifacts.py:1468-1480`).
+- Preparation itself performs no evaluation, Docker startup, provider call, artifact relocation scan, or confirmation/qualification panel read. Authentication follows explicit edges; the panel reads are limited to the mechanics, quick, and four discovery episodes named by the supplied plan (`core/pit_optimizer_v5/baseline.py:171-212,260-264`).
+

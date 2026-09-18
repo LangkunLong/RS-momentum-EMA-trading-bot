@@ -1,0 +1,19 @@
+# Task 1 Rereview 2 — Explicit V3 Resolver
+
+## Finding Verdict
+
+**Resolved.** `core/pit_data.py:183-189` restores `resolve_open_holding()` to the exact legacy validator. The new `resolve_open_holding_v3()` at `core/pit_data.py:191-197` is an explicit separate entry point using only `_canonical_ticker_v3`; both delegate to the same transition mechanics without adding serialized contract state or changing identity data.
+
+`core/pit_universe_v3.py:244-250` routes the final V3 lineage identity resolution through the explicit V3 method and rejects any disagreement with the already-computed active identity. `rg` found no other resolver call sites: V3 universe resolution uses the V3 method, and no V1/V2 path calls it.
+
+## New Breakage
+
+None found in the fix-only diff. The V3 resolver uses the same shared transition implementation, so predecessor/successor boundary behavior is unchanged; only ticker syntax selection is separated.
+
+## Out-of-Scope
+
+No tests, Git commands, providers, Docker/replay surfaces, source files, or bundle artifacts were run or modified. This rereview examined only `c4da6a4..2f8f84c` and the appended task report.
+
+## Verdict
+
+**Approved.** The prior legacy-validation regression is closed and the explicit V3 route satisfies the requested resolver isolation.

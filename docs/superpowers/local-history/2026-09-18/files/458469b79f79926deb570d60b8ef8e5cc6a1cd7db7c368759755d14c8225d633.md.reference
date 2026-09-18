@@ -1,0 +1,117 @@
+# Task 3 Report: Causal Adaptive Market Context
+
+## Status and commit
+
+- Status: complete.
+- Commit: `9450d157811e91cfac172aba7aa661108e00ebad`
+- Subject: `feat: add causal adaptive market context`
+- Base: `75502d435b1ba5b74894c2b055e926dfeaa03cef`
+- Worktree after commit: clean.
+
+## Implementation
+
+- Added closed frozen `BenchmarkContextV1` and `MarketContextV1` contracts. The benchmark tuple is strictly ordered as `SPY`, `QQQ`, `IWM`; sessions are strict ISO dates; all scalar values are finite; coverage fractions permit zero; risk and stop fractions retain the existing strictly-positive validator.
+- Added canonical recursive serialization for nested market contracts and exported policy interface version 2.
+- Added the trusted `build_market_context` module. It reads only exact data through the completed session, requires complete 200-close benchmark windows, computes `close / SMA - 1`, uses exactly 21 closes for 20 returns, sample standard deviation with `ddof=1`, and annualizes by `sqrt(252)`.
+- Breadth 50-day, breadth 200-day, and RS leadership eligibility are calculated independently against the full active membership set. Each measure has its own active-member coverage denominator, and an empty eligible cross-section is rejected.
+- The simulator caches one immutable context per ISO session. PIT runs use full active bundle membership rather than the evaluated trading panel; reference symbols remain observation-only and separate from tradables.
+- Daily timing is: regime state already includes the first bootstrapped completed session and updates on each later completed session; current context is then built; pending next-open eviction/allocation uses only `pending.market`; exits receive current completed-session context; entry qualification and capacity receive that same current context; every resulting `PendingEntry` stores it.
+- Removed the direct-dictionary `_enter_position` fallback, preventing allocation/eviction without an explicit signal-session market context.
+- Bumped portfolio checkpoint schema to 4. Pending entries serialize and reconstruct the complete nested market value canonically; older schemas are rejected by the existing closed checkpoint loader.
+- Preserved baseline entry, capacity, allocation, eviction, and exit thresholds. Allocation remains capped at 1% portfolio risk and an 8% stop; leverage remains unavailable; hard-stop and existing exit ordering/timing remain unchanged.
+
+## Existing tests and fixtures updated
+
+- Updated the existing strategy-policy nested contract, immutability, canonical round-trip, scalar validation, and interface-version assertions.
+- Updated existing pending-entry, checkpoint, capacity, allocation, eviction, and exit fixtures to provide and assert the nested market carrier.
+- Updated existing causality fixtures with sufficient causal warmup, three reference histories, and a background constituent cross-section without expanding their evaluated trading panels.
+- No test files or test functions were added.
+
+## Exact verification commands
+
+Final fresh verification after all source and fixture changes:
+
+1. `python -B -m compileall -q core/strategy_policy core/backtest_engine.py`
+   - Exit code 0; no output.
+2. `python -B -m ruff check core/strategy_policy core/backtest_engine.py --no-cache`
+   - Exit code 0; `All checks passed!`
+3. `python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_strategy_policy.py tests/test_backtest_engine.py tests/test_backtest_open_causality.py`
+   - Exit code 0; `101 passed, 2 warnings in 12.04s`.
+   - Warnings were the existing unknown `cache_dir` pytest option and `websockets.legacy` deprecation noted as out of scope.
+4. Commit hooks:
+   - Ruff, trailing whitespace, end-of-file, YAML, and merge-conflict hooks all passed.
+
+TDD evidence: the first focused policy test failed at collection because `BenchmarkContextV1` did not yet exist; after adding the contracts it progressed to expected engine-threading failures. The final focused suite is green.
+
+## Files changed
+
+- `core/strategy_policy/market_context.py` (new)
+- `core/strategy_policy/contracts.py`
+- `core/strategy_policy/__init__.py`
+- `core/strategy_policy/runtime.py`
+- `core/strategy_policy/worker.py`
+- `core/strategy_policy/entry.py`
+- `core/strategy_policy/risk.py`
+- `core/strategy_policy/exit.py`
+- `core/backtest_engine.py`
+- `tests/test_strategy_policy.py`
+- `tests/test_backtest_engine.py`
+- `tests/test_backtest_open_causality.py`
+
+## Targeted self-review
+
+- Lookahead: all close inputs are sliced through the exact normalized session; benchmark and constituent event closes must exist on that session; pending next-open calls receive no current-session context argument.
+- Context ordering: benchmark construction and validation both enforce `(SPY, QQQ, IWM)`, independent of bundle provenance order.
+- Coverage denominators: 50-day breadth, 200-day breadth, and RS use separate eligible counts over the same full active constituent count; missing histories do not leak between measures.
+- Mutable nested state: market and benchmark contracts are frozen, slotted dataclasses; collections are tuples; canonical reconstruction rejects unknown/missing keys and wrong nested types.
+- Baseline drift: no entry thresholds changed; capacity and eviction logic are unchanged; allocation remains 1%/8% bounded and unlevered; hard stops still precede policy exits; scale-out, EMA, stagnation, and early-winner thresholds are unchanged.
+- Regime timing: retained the original day-zero guard because `MarketRegimeTracker.bootstrap` already consumes the first evaluation session; removing it would double-count that bar. Later bars update before context construction.
+
+## Concerns
+
+- None blocking. Evaluation inputs must now provide the designed causal warmup and a non-empty eligible active cross-section; incomplete reference or membership data fails closed by design.
+
+## Review fix round 1
+
+- Commit: `1e5fc0b1701d0ffc4ccc764822f15e85d0f80139` (`fix: enforce nested market context authority`).
+- Coverage/count consistency now reconstructs each covered count from coverage times active constituents and each positive numerator from its associated unit fraction times the covered count. Both must be integral; numerators must remain within their covered count; zero coverage requires a zero associated fraction.
+- Zero RS coverage now requires the finite median-RS sentinel to be exactly `0.0`, keeping the closed non-null contract internally coherent without weakening the zero-allowing unit-fraction validator.
+- The baseline stateful entry gate now reads `snapshot.market.oneil_regime` directly: `confirmed_uptrend` and `under_pressure` allow entries, while `correction` blocks them. The non-stateful gate and every other entry threshold are unchanged. Engine-produced behavior remains equivalent to the tracker contract.
+- Existing assertions only were amended; no test file or test function was added.
+
+### Review-fix evidence
+
+1. RED: `python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_strategy_policy.py`
+   - Exit code 1 with five expected failures: three non-integral implied numerators were accepted, zero-coverage inconsistency was accepted, and nested correction was ignored.
+2. GREEN: the same focused policy command after implementation.
+   - Exit code 0; `41 passed, 2 warnings in 0.69s`.
+3. `python -B -m compileall -q core/strategy_policy core/backtest_engine.py`
+   - Exit code 0; no output.
+4. `python -B -m ruff check core/strategy_policy core/backtest_engine.py tests/test_strategy_policy.py --no-cache`
+   - Exit code 0; `All checks passed!`
+5. `python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_strategy_policy.py tests/test_backtest_engine.py tests/test_backtest_open_causality.py`
+   - Exit code 0; `105 passed, 2 warnings in 11.96s`.
+   - Warnings remain the existing unknown `cache_dir` pytest option and `websockets.legacy` deprecation.
+6. Commit hooks all passed: Ruff, trailing whitespace, end-of-file, YAML, and merge-conflict checks.
+
+## Review fix round 2
+
+- Commit: `ec6cae1de94ebf9716f0b01d0eb96654d6cb17b6` (`fix: use absolute market count tolerance`).
+- Both discrete integrality comparisons now call `math.isclose` with `rel_tol=0.0` and the existing `abs_tol=1e-9`. Large constituent counts therefore cannot scale the tolerance and admit a materially fractional covered count or implied numerator.
+- Existing zero-coverage behavior and nested-regime authority are unchanged.
+- The existing closed-contract assertion now includes one-billion-constituent coverage and numerator cases with a 0.4-person discrepancy.
+
+### Review-fix-round-2 evidence
+
+1. RED: `python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_strategy_policy.py::test_closed_deserializer_rejects_unknown_keys_and_transport_types`
+   - Exit code 1 because the large-count fractional coverage was accepted under default relative tolerance.
+2. GREEN: the same single-test command after the fix.
+   - Exit code 0; `1 passed, 2 warnings in 0.69s`.
+3. `python -B -m compileall -q core/strategy_policy`
+   - Exit code 0; no output.
+4. `python -B -m ruff check core/strategy_policy/contracts.py tests/test_strategy_policy.py --no-cache`
+   - Exit code 0; `All checks passed!`
+5. `python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_strategy_policy.py`
+   - Exit code 0; `41 passed, 2 warnings in 0.67s`.
+   - Warnings remain the existing unknown `cache_dir` pytest option and `websockets.legacy` deprecation.
+6. Commit hooks all passed: Ruff, trailing whitespace, end-of-file, YAML, and merge-conflict checks.

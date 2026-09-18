@@ -1,0 +1,15 @@
+# Development execution scope wiring review
+
+Reviewed pinned base `cbd0d8dcec5a9830087b233cc4cbb87fd58dc07d` through pinned head `cb0019f78da8b93578e6f7050882cca231b5c83f` against `development-scope-brief.md`, `development-scope-report.md`, and `development-scope-review.patch`.
+
+## Result: FAIL
+
+### [P1] Preserve decoding of pre-scope manifest and baseline-parent artifacts
+
+Locations: `core/pit_optimizer_v5/contracts.py:1061`, `core/pit_optimizer_v5/search.py:817`, `core/pit_optimizer_v5/artifacts.py:375-379`
+
+Adding a dataclass default does not make an old persisted artifact decodable. `_decode_dataclass` first calls `_exact_keys` with every initialized dataclass field and then indexes every field in `primitive`, so an existing `CampaignManifestV5` or `BaselineParentAuthorityV5` JSON object without `pit_data_scope` is rejected before either constructor can apply the new `"production"` default. This contradicts the brief's requirement to keep existing local run artifacts decodable and the report's statement that newly decoded legacy manifests and parents receive the production default. Add an explicit, narrowly scoped legacy decode migration for these two artifact types (missing `pit_data_scope` only becomes `"production"`; unknown keys remain rejected), then ensure authentication handles the intentional canonical-identity migration rather than silently claiming the old digest for re-emitted bytes. If compatibility is intentionally limited to retained original bytes instead, revise the implementation/report to state precisely which legacy artifacts remain loadable and how callers authenticate them.
+
+## Review constraints
+
+No tests were read, created, modified, or run. No probes, Docker, network, provider calls, source changes, or Git mutations were performed. Review used the supplied pinned patch and only adjacent non-test source needed to confirm the decoder behavior.

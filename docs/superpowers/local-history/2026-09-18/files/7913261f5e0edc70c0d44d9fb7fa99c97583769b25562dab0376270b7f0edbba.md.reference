@@ -1,0 +1,141 @@
+# Task 5 Report — Causal O'Neil Pyramiding
+
+## Outcome
+
+Implemented strategy-universe Task 5 on branch `codex/pit-optimizer-v5-architecture` from accepted
+base `561bd37`.
+
+The source change is limited to:
+
+- `core/backtest_engine.py`
+- `core/pit_optimizer_v5/diagnostics.py` (minimal scope expansion explicitly authorized after the
+  accepted single-fill endpoint invariant blocked correct weighted-average add-on evidence)
+
+No tests, Task-4 policy files, provider/Docker paths, bundle artifacts, replay, qualification,
+deployment, market-data files, push, or merge were changed.
+
+## Pending add-on lifecycle
+
+`PendingAddOn` is the exact frozen/slotted six-field record from the brief. It validates canonical
+symbol/date, positive finite risk, optional unit notional cap, and reason text; it has a strict
+primitive checkpoint round trip. Pending add-ons and their outcome counters are emitted and
+restored only in checkpoint schema V5. Schema-4/V2 payloads remain free of add-on fields.
+
+At every V5 open the engine now:
+
+1. applies authenticated identity transitions and remaps entries, exits, and add-ons;
+2. applies opening-gap stops and cancels affected add-ons;
+3. cancels any add-on conflicting with a pending full exit, then executes that exit;
+4. executes pending entries and then surviving add-ons at an exact eligible Open; and
+5. applies intraday stops.
+
+A missing exact Open leaves an add-on pending for the next eligible session. A present but invalid
+Open terminates it as `invalid_price`. A stopped/exited holding is cancelled before BUY, and a
+missing holding terminates as `no_position`. Duplicate restored/remapped pending symbols fail
+closed. The close phase queues at most one add-on per surviving symbol, and the engine bounds each
+episode to two add-ons.
+
+The V5 add-on outcome map contains the required exact categories: `queued`, `executed`,
+`cancelled`, `already_pending`, `invalid_price`, `risk`, `cash`, `cap`, and `no_position`.
+
+## V3 trusted policy boundary
+
+The run accepts policy interface 2 or 3. V3 is allowed only with V5 execution and an authenticated
+schema-V3 PIT bundle. Raw built-in fact extraction stays on the unchanged V2 baseline; every
+candidate-facing call is rebuilt at the engine boundary with `StrategyPolicyAdapterV3` and the
+causal Task-3 feature builders. Entry, capacity, allocation, eviction, add-on, and exit receive only
+their immutable V3 snapshots. The original V2 `ticker in self._open_positions: continue` signal
+path is unchanged.
+
+Portfolio snapshots derive cash, gross exposure, drawdown, per-position open risk, pending-entry
+competition, and complete industry/unclassified-sector notionals from engine-owned amounts. The
+policy interface version is sealed into result configuration and checkpoint fingerprint identity.
+
+## Execution authority and accounting
+
+At the next eligible open, the engine—not candidate policy—computes expected spread, impact, and
+commission affordability. It enforces:
+
+- cash and no leverage;
+- the 1% engine position-risk ceiling and the requested incremental risk;
+- current risk already carried to the unchanged protective stop;
+- the optional candidate aggregate-position cap;
+- the engine aggregate-position cap derived from the canonical risk/stop contract; and
+- the maximum two add-ons per episode.
+
+The actual `apply_friction()` BUY fill supplies execution price and cash delta. The engine updates
+remaining/aggregate quantity, remaining-lot weighted-average entry, peak-entry anchor, commission
+P&L, and episode state without lowering the existing stop. It records a transaction action `ADD`,
+a canonical BUY fill with `add_on:<reason_code>`, and an `add_on` quantity-path transition. This
+keeps the V5 fill schema and cash/friction reconciliation unchanged while making pyramiding
+distinct in transactions and episode evidence.
+
+## Diagnostics compatibility root cause and fix
+
+The first direct add-on/close smoke exposed an accepted evaluator invariant that required
+`episode.entry_price == closed_trade.entry_price == first BUY execution price`. Correctly updating
+the trade to a weighted-average entry made every real multi-BUY episode fail before quantity-path
+reconciliation.
+
+The authorized diagnostics change replaces only the last equality with the remaining-lot basis
+replayed from canonical fills. Each BUY combines its actual execution value with the then-live
+quantity and basis; each SELL reduces live quantity without changing the surviving shares'
+per-share basis. The existing endpoint checks still bind the first BUY's session and symbol to the
+episode, and the first quantity-path row still binds its exact execution price and reason. With one
+BUY, the replayed basis equals that same first execution price, so single-fill/V2 behavior is
+unchanged. Fill friction, cent rounding, cash totals, ordered quantity changes, BUY/SELL actions,
+and terminal quantity reconciliation remain intact.
+
+## P1 remaining-lot basis correction
+
+Review found that an add-on following a scale-out used every historical BUY fill in its numerator
+while using only unsold shares in its live quantity. A deterministic pre-fix reproduction (entry
+100 at 100, scale out 50 at 120, then add 25.75 at 110) produced engine basis `102.0477137177`
+instead of the remaining-lot basis `103.3993399340`.
+
+The focused correction removes the historical-fill scan. Add-on execution now values the existing
+position as `trade.entry_price * current_qty` and combines that amount with the new actual fill over
+`current_qty + add_qty`. Realized scale-out P&L is left untouched; the unchanged stop and live
+quantity continue to be the inputs to engine-owned pre-fill risk sizing. Diagnostics mirrors this
+contract by replaying live quantity and basis across the ordered BUY/SELL fill path, rather than
+averaging shares already sold. No checkpoint, transaction, fill, or V2 schema changed.
+
+## Verification evidence
+
+1. `python -B -m pytest tests/test_backtest_open_causality.py tests/test_backtest_engine.py -q`:
+   **64 passed**. Warnings were limited to the existing websockets deprecation and sandbox-denied
+   pytest-cache write.
+2. `python -B -m ruff check core/backtest_engine.py core/pit_optimizer_v5/diagnostics.py`:
+   **All checks passed**.
+3. `python -B -m py_compile core/backtest_engine.py core/pit_optimizer_v5/diagnostics.py`: passed.
+4. `git diff --check`: passed with only existing Windows LF-to-CRLF notices.
+5. Direct close/queue smoke: a V3 add-on decision produced a `2024-01-02` signal targeting
+   `2024-01-03`, no same-close transaction/fill, and a second decision while pending incremented
+   `already_pending` without creating a duplicate.
+6. Direct next-open multi-fill smoke: initial fill `100.10`, add-on reference `110.00`, add-on fill
+   `110.11`, quantity `100 -> 111.036996`, weighted entry `101.0949866725`, and positive remaining
+   cash. The transaction was `ADD`; fills were `BUY, BUY, SELL`; the episode path was
+   `entry, add_on, exit`; and `_validate_episodes` passed.
+7. Checkpoint/remap smoke: a pending add-on round-tripped in schema 5, remapped `OLD -> NEW`,
+   preserved all other fields, restored the exact counter schema, and was absent from a schema-4
+   payload.
+8. Direct P1 lifecycle smoke with non-zero spread, impact, and commission: `entry, scale_out,
+   add_on, exit` produced remaining-lot basis `103.4335517842`; transaction actions were `BUY,
+   SELL, ADD, SELL`; canonical fills were `BUY, SELL, BUY, SELL`; closed-trade P&L and fill-cash P&L
+   both rounded to `2616.30`; ending cash was `102616.30`; and `_validate_episodes` passed.
+
+## Self-review
+
+- Confirmed add-on decisions occur only after completed-session exit/state processing and never
+  fill at the signal close.
+- Confirmed identity remap precedes gap-stop/full-exit cancellation and all BUY work.
+- Confirmed missing exact opens remain pending, invalid opens terminate, and checkpoint removal
+  follows successful execution so resume cannot execute twice.
+- Confirmed stop price is never lowered; actual fill price drives weighted-average entry and risk.
+- Confirmed an add-on after a partial exit uses only the surviving quantity and cost basis, while
+  preserving already-realized scale-out P&L and exact fill-cash reconciliation.
+- Confirmed candidate risk/cap requests cannot bypass cash, engine risk, aggregate size, or count
+  ceilings.
+- Confirmed transaction `ADD` does not alter the diagnostics-owned BUY/SELL fill schema.
+- Confirmed V2's existing-position skip and legacy checkpoint/result framing remain unchanged.
+- Confirmed no tests were created or modified.

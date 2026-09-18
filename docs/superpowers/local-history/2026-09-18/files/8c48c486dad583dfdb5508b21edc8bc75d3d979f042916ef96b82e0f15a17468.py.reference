@@ -1,0 +1,1934 @@
+"""Read-only authentication of original development-round resource authority."""
+
+from __future__ import annotations
+
+import ntpath
+from dataclasses import dataclass, fields, replace
+from pathlib import Path, PurePosixPath
+from typing import Literal
+
+from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5
+from core.pit_optimizer_v5.candidate_ir import (
+    RenderedVariantV5,
+    StructuralTemplateV5,
+    derive_experiment_identity_v5,
+)
+from core.pit_optimizer_v5.cli import CampaignAuthoritiesV5, _controller_lease_id_v5
+from core.pit_optimizer_v5.container_protocol import PanelExecutionRequestV5
+from core.pit_optimizer_v5.contracts import (
+    ArtifactRefV5,
+    CampaignManifestV5,
+    EpisodePlanV5,
+    EvaluatorContractV5,
+    SandboxProfileV5,
+    canonical_primitive_v5,
+    canonical_sha256_v5,
+)
+from core.pit_optimizer_v5.development_preparation import (
+    DevelopmentAdapterConfigV5,
+    ProviderDevelopmentAdapterConfigV5,
+    load_development_config_v5,
+    require_development_v5,
+)
+from core.pit_optimizer_v5.manifest import (
+    AuthenticatedCampaignManifestV5,
+    authenticate_campaign_manifest_v5,
+)
+from core.pit_optimizer_v5.memory import (
+    CandidateExecutionAuthorityV5,
+    CandidateExecutionKeyV5,
+    CandidateStageResultPayloadV5,
+    CleanupResultPayloadV5,
+    EpisodeEvidencePayloadV5,
+    QuickEvidencePayloadV5,
+    RenderedVariantPayloadV5,
+    ResourceLeasePayloadV5,
+    RoleCompletionPayloadV5,
+    RoundEventPayloadV5,
+    RoundEventV5,
+    RoundIntentPayloadV5,
+)
+from core.pit_optimizer_v5.operations import CampaignLaunchV5, CampaignRoundLaunchV5
+from core.pit_optimizer_v5.policy_scope import EDITABLE_POLICY_PATHS_V5
+from core.pit_optimizer_v5.production_fs import (
+    acquire_absolute_directory_v5,
+    directory_child_absent_v5,
+    hash_regular_in_directory_v5,
+)
+from core.pit_optimizer_v5.production_sandbox import (
+    ExecutionCleanupRecordV5,
+    ExecutionContainerIdentityRecordV5,
+    ExecutionControlCreatedRecordV5,
+    ExecutionControlRecordV5,
+    ExecutionPhaseRecordV5,
+    ExecutionReservationRecordV5,
+    ExecutionTerminalRecordV5,
+    LocalSandboxMountFactoryV5,
+    MountCreatedRecordV5,
+    MountReadyRecordV5,
+    MountReservationRecordV5,
+    _require_history_control_ready_v5,
+    _validate_history_cleanup_v5,
+    _validate_history_control_binding_v5,
+    _validate_history_control_completion_v5,
+    _validate_history_output_length_v5,
+    _validate_history_panel_v5,
+    _validate_history_phases_v5,
+    _validate_history_reservation_v5,
+    _validate_history_terminal_v5,
+)
+from core.pit_optimizer_v5.production_workspace import (
+    LocalGitWorkspaceDriverV5,
+    WorkspaceCreatedRecordV5,
+    WorkspaceLeaseRecordV5,
+    WorkspaceLeaseRetirementV5,
+    WorkspaceLeaseStateV5,
+    WorkspaceReadyRecordV5,
+)
+from core.pit_optimizer_v5.probes import PROBE_SUITE_ID_V5
+from core.pit_optimizer_v5.provider import AuthorRoleInputV5
+from core.pit_optimizer_v5.sandbox import (
+    derive_execution_lease_id_v5,
+    derive_sandbox_mount_authorities_v5,
+    derive_trusted_probe_runtime_authority_v5,
+)
+from core.pit_optimizer_v5.workspace import WorkspaceLeaseV5, WorkspaceOwnerV5, WorkspaceRootsV5
+
+
+DevelopmentConfigV5 = DevelopmentAdapterConfigV5 | ProviderDevelopmentAdapterConfigV5
+
+_ROUND_DERIVED_CONFIG_FIELDS = frozenset(
+    {
+        "candidate_base_identity_sha256",
+        "workspace_driver_identity_sha256",
+        "mount_factory_identity_sha256",
+        "container_executor_identity_sha256",
+    }
+)
+
+_DATA_FILES_V5 = ("pit_bundle.sqlite3", "prices_provenance.json")
+_DOCKER_EXECUTABLE_MAXIMUM_BYTES_V5 = 512 * 1024 * 1024
+_PANEL_INPUT_TARGET_V5 = "/pit/request/panel-request.json"
+
+
+@dataclass(frozen=True, slots=True)
+class _HistoricalExecutionResourcesV5:
+    authority: CandidateExecutionAuthorityV5
+    reservation: ExecutionReservationRecordV5
+    source_identity_sha256: str
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.authority) is not CandidateExecutionAuthorityV5
+            or type(self.reservation) is not ExecutionReservationRecordV5
+            or type(self.source_identity_sha256) is not str
+            or len(self.source_identity_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in self.source_identity_sha256)
+        ):
+            raise ValueError("historical execution resource authority is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class _HistoricalWorkspaceResourceV5:
+    """Data-only projection of authenticated workspace history."""
+
+    payload: ResourceLeasePayloadV5
+    payload_ref: ArtifactRefV5
+    lease_sha256: str
+    owner_sha256: str
+    workspace_root_identity_sha256: str
+    workspace_root_path_sha256: str
+    workspace_relative_path: str
+    lease_token_sha256: str
+    parent_revision_sha256: str
+    child_revision_sha256: str
+    lifecycle: Literal["active", "removed", "retired"]
+    source_identity_sha256: str
+
+    def __post_init__(self) -> None:
+        digests = (
+            self.lease_sha256,
+            self.owner_sha256,
+            self.workspace_root_identity_sha256,
+            self.workspace_root_path_sha256,
+            self.lease_token_sha256,
+            self.parent_revision_sha256,
+            self.child_revision_sha256,
+            self.source_identity_sha256,
+        )
+        if (
+            type(self.payload) is not ResourceLeasePayloadV5
+            or self.payload.resource_kind != "workspace"
+            or type(self.payload_ref) is not ArtifactRefV5
+            or any(
+                type(value) is not str
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+                for value in digests
+            )
+            or type(self.workspace_relative_path) is not str
+            or not self.workspace_relative_path
+            or self.lifecycle not in {"active", "removed", "retired"}
+        ):
+            raise ValueError("historical workspace resource authority is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class HistoricalRoundAuthorityV5:
+    """Authenticated facts for one original round, without operational capabilities."""
+
+    authenticated_manifest: AuthenticatedCampaignManifestV5
+    campaign_launch: CampaignLaunchV5
+    round_launch: CampaignRoundLaunchV5
+    round_started: CampaignRoundLaunchV5
+    original_config_ref: ArtifactRefV5
+    original_config: DevelopmentConfigV5
+    round_config_ref: ArtifactRefV5
+    round_config: DevelopmentConfigV5
+    owner: WorkspaceOwnerV5
+    expected_executor_identity_sha256: str
+    expected_workspace_identity_sha256: str
+    expected_mount_identity_sha256: str
+    resource_events: tuple[ResourceLeasePayloadV5, ...]
+    workspace_history: tuple[_HistoricalWorkspaceResourceV5, ...]
+    execution_history: tuple[_HistoricalExecutionResourcesV5, ...]
+
+    def __post_init__(self) -> None:
+        config_types = (DevelopmentAdapterConfigV5, ProviderDevelopmentAdapterConfigV5)
+        digests = (
+            self.expected_executor_identity_sha256,
+            self.expected_workspace_identity_sha256,
+            self.expected_mount_identity_sha256,
+        )
+        if (
+            type(self.authenticated_manifest) is not AuthenticatedCampaignManifestV5
+            or type(self.campaign_launch) is not CampaignLaunchV5
+            or type(self.round_launch) is not CampaignRoundLaunchV5
+            or type(self.round_started) is not CampaignRoundLaunchV5
+            or type(self.original_config_ref) is not ArtifactRefV5
+            or type(self.original_config) not in config_types
+            or type(self.round_config_ref) is not ArtifactRefV5
+            or type(self.round_config) not in config_types
+            or type(self.owner) is not WorkspaceOwnerV5
+            or any(
+                type(value) is not str
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+                for value in digests
+            )
+            or type(self.resource_events) is not tuple
+            or any(type(item) is not ResourceLeasePayloadV5 for item in self.resource_events)
+            or type(self.workspace_history) is not tuple
+            or any(type(item) is not _HistoricalWorkspaceResourceV5 for item in self.workspace_history)
+            or type(self.execution_history) is not tuple
+            or any(type(item) is not _HistoricalExecutionResourcesV5 for item in self.execution_history)
+        ):
+            raise ValueError("historical round authority is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class _CompletedHistoricalExecutionV5:
+    authority: CandidateExecutionAuthorityV5
+    reservation: ExecutionReservationRecordV5
+    mount_reservation: MountReservationRecordV5
+    panel_input: PanelExecutionRequestV5 | None
+    terminal: ExecutionTerminalRecordV5
+    cleanup: ExecutionCleanupRecordV5
+    workspace_payload_ref: ArtifactRefV5
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.authority) is not CandidateExecutionAuthorityV5
+            or type(self.reservation) is not ExecutionReservationRecordV5
+            or type(self.mount_reservation) is not MountReservationRecordV5
+            or (
+                self.panel_input is not None
+                and type(self.panel_input) is not PanelExecutionRequestV5
+            )
+            or type(self.terminal) is not ExecutionTerminalRecordV5
+            or type(self.cleanup) is not ExecutionCleanupRecordV5
+            or type(self.workspace_payload_ref) is not ArtifactRefV5
+            or self.reservation.command_sha256 != self.authority.command_sha256
+            or self.mount_reservation.output_authority_sha256
+            != self.authority.output_mount_authority_sha256
+            or self.terminal.command_sha256 != self.authority.command_sha256
+            or self.cleanup.command_sha256 != self.authority.command_sha256
+        ):
+            raise ValueError("completed historical execution facts are invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class CompletedHistoricalRoundResourcesV5:
+    """Frozen completed-resource facts for later historical integration."""
+
+    round_authority: HistoricalRoundAuthorityV5
+    events: tuple[RoundEventV5, ...]
+    payloads: tuple[RoundEventPayloadV5, ...]
+    successful_execution_keys: tuple[CandidateExecutionKeyV5, ...]
+    execution_history: tuple[_CompletedHistoricalExecutionV5, ...]
+    cleanup: CleanupResultPayloadV5
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.round_authority) is not HistoricalRoundAuthorityV5
+            or type(self.events) is not tuple
+            or any(type(item) is not RoundEventV5 for item in self.events)
+            or type(self.payloads) is not tuple
+            or len(self.payloads) != len(self.events)
+            or type(self.successful_execution_keys) is not tuple
+            or any(
+                type(item) is not CandidateExecutionKeyV5
+                for item in self.successful_execution_keys
+            )
+            or len(set(self.successful_execution_keys))
+            != len(self.successful_execution_keys)
+            or type(self.execution_history) is not tuple
+            or any(
+                type(item) is not _CompletedHistoricalExecutionV5
+                for item in self.execution_history
+            )
+            or type(self.cleanup) is not CleanupResultPayloadV5
+            or not self.cleanup.cleanup_complete
+        ):
+            raise ValueError("completed historical round resource facts are invalid")
+
+
+def _campaign_authorities(authenticated: AuthenticatedCampaignManifestV5) -> CampaignAuthoritiesV5:
+    return CampaignAuthoritiesV5(
+        manifest=authenticated.manifest,
+        panel_plan=authenticated.panel_plan,
+        evaluator_contract=authenticated.evaluator_contract,
+        baseline=authenticated.baseline_authority,
+        sandbox_profile=authenticated.sandbox_profile,
+    )
+
+
+def _require_round_config_matches_original(
+    original: DevelopmentConfigV5,
+    current: DevelopmentConfigV5,
+) -> None:
+    if type(current) is not type(original):
+        raise ValueError("historical round config type differs from campaign launch")
+    for field in fields(original):
+        if field.name not in _ROUND_DERIVED_CONFIG_FIELDS and getattr(current, field.name) != getattr(original, field.name):
+            raise ValueError("historical round config differs outside round-derived identities")
+
+
+def _project_workspace_history(
+    *,
+    payload_ref: ArtifactRefV5,
+    state: WorkspaceLeaseStateV5,
+) -> _HistoricalWorkspaceResourceV5:
+    lease = state.lease
+    return _HistoricalWorkspaceResourceV5(
+        payload=lease.payload,
+        payload_ref=payload_ref,
+        lease_sha256=lease.sha256,
+        owner_sha256=lease.owner.sha256,
+        workspace_root_identity_sha256=lease.workspace_root_identity_sha256,
+        workspace_root_path_sha256=lease.workspace_root_path_sha256,
+        workspace_relative_path=lease.workspace_relative_path,
+        lease_token_sha256=lease.lease_token_sha256,
+        parent_revision_sha256=lease.parent_revision_sha256,
+        child_revision_sha256=lease.child_revision_sha256,
+        lifecycle=state.lifecycle,
+        source_identity_sha256=state.workspace_identity_sha256,
+    )
+
+
+def _windows_key(path: str) -> str:
+    return ntpath.normcase(ntpath.normpath(path))
+
+
+def _require_docker_host_path_v5(path: str) -> str:
+    if (
+        type(path) is not str
+        or not path
+        or path.strip() != path
+        or not ntpath.isabs(path)
+        or ntpath.normpath(path) != path
+        or any(character in path for character in {",", "\x00", "\n", "\r"})
+    ):
+        raise ValueError("historical Docker host mount path is invalid")
+    return path
+
+
+def _successful_execution_keys_v5(
+    events: tuple[RoundEventV5, ...],
+    payloads: tuple[RoundEventPayloadV5, ...],
+) -> tuple[CandidateExecutionKeyV5, ...]:
+    result: list[CandidateExecutionKeyV5] = []
+    semantic_outcomes = {
+        "behavioral_equivalent",
+        "sibling_equivalent",
+        "behaviorally_distinct",
+    }
+    for event, payload in zip(events, payloads, strict=True):
+        key = None
+        if (
+            type(payload) is CandidateStageResultPayloadV5
+            and payload.stage == "semantic_probe"
+            and payload.outcome in semantic_outcomes
+        ):
+            key = CandidateExecutionKeyV5(
+                payload.experiment_id,
+                "semantic_probe",
+                None,
+            )
+        elif type(payload) is QuickEvidencePayloadV5:
+            key = CandidateExecutionKeyV5(
+                payload.experiment_id,
+                "quick_evaluation",
+                None,
+            )
+        elif type(payload) is EpisodeEvidencePayloadV5:
+            key = CandidateExecutionKeyV5(
+                payload.experiment_id,
+                "discovery_evaluation",
+                payload.episode.episode_ordinal,
+            )
+        if key is not None:
+            if event.experiment_id != key.experiment_id or key in result:
+                raise ValueError("historical successful execution journal is ambiguous")
+            result.append(key)
+    return tuple(result)
+
+
+def _require_execution_stage_record_v5(
+    *,
+    authority: CandidateExecutionAuthorityV5,
+    events: tuple[RoundEventV5, ...],
+    payloads: tuple[RoundEventPayloadV5, ...],
+) -> bool:
+    key = authority.key
+    if key.stage == "semantic_probe":
+        matches = tuple(
+            payload
+            for event, payload in zip(events, payloads, strict=True)
+            if event.experiment_id == key.experiment_id
+            and type(payload) is CandidateStageResultPayloadV5
+            and payload.stage == "semantic_probe"
+        )
+        successful = {
+            "behavioral_equivalent",
+            "sibling_equivalent",
+            "behaviorally_distinct",
+        }
+        if len(matches) > 1 or matches and matches[0].outcome not in {
+            *successful,
+            "semantic_probe_failed",
+        }:
+            raise ValueError("historical semantic execution journal result is ambiguous")
+        return bool(matches and matches[0].outcome in successful)
+    if key.stage == "quick_evaluation":
+        successes = tuple(
+            payload
+            for event, payload in zip(events, payloads, strict=True)
+            if event.experiment_id == key.experiment_id
+            and type(payload) is QuickEvidencePayloadV5
+        )
+        failures = tuple(
+            payload
+            for event, payload in zip(events, payloads, strict=True)
+            if event.experiment_id == key.experiment_id
+            and type(payload) is CandidateStageResultPayloadV5
+            and payload.outcome == "quick_evaluation_failed"
+        )
+        if len(successes) + len(failures) > 1:
+            raise ValueError("historical quick execution journal result is ambiguous")
+        return bool(successes)
+    if key.stage == "discovery_evaluation":
+        successes = tuple(
+            payload
+            for event, payload in zip(events, payloads, strict=True)
+            if event.experiment_id == key.experiment_id
+            and type(payload) is EpisodeEvidencePayloadV5
+            and payload.episode.episode_ordinal == key.episode_ordinal
+        )
+        failures = tuple(
+            payload
+            for event, payload in zip(events, payloads, strict=True)
+            if event.experiment_id == key.experiment_id
+            and type(payload) is CandidateStageResultPayloadV5
+            and payload.outcome == "discovery_evaluation_failed"
+            and payload.episode_ordinal == key.episode_ordinal
+        )
+        if len(successes) + len(failures) > 1:
+            raise ValueError("historical discovery execution journal result is ambiguous")
+        return bool(successes)
+    raise ValueError("historical execution stage is outside the saved V5 grammar")
+
+
+def _journal_execution_context_v5(
+    *,
+    repository: LocalArtifactRepositoryV5,
+    manifest: CampaignManifestV5,
+    authority: CandidateExecutionAuthorityV5,
+    events: tuple[RoundEventV5, ...],
+    payloads: tuple[RoundEventPayloadV5, ...],
+) -> tuple[RenderedVariantV5, RoundIntentPayloadV5, StructuralTemplateV5]:
+    execution_positions = tuple(
+        index
+        for index, (event, payload) in enumerate(
+            zip(events, payloads, strict=True)
+        )
+        if event.event_kind == "candidate_execution"
+        and type(payload) is CandidateExecutionAuthorityV5
+        and payload == authority
+    )
+    if len(execution_positions) != 1:
+        raise ValueError("historical execution lacks its exact indexed journal event")
+    execution_position = execution_positions[0]
+    execution_event = events[execution_position]
+    if execution_event.experiment_id != authority.key.experiment_id:
+        raise ValueError("historical execution key differs from its contextual experiment")
+
+    rendered_positions = tuple(
+        index
+        for index, (event, payload) in enumerate(
+            zip(events[:execution_position], payloads[:execution_position], strict=True)
+        )
+        if event.event_kind == "rendered_variant"
+        and event.experiment_id == authority.key.experiment_id
+        and type(payload) is RenderedVariantPayloadV5
+    )
+    if len(rendered_positions) != 1:
+        raise ValueError("historical execution lacks one preceding rendered variant")
+    rendered_position = rendered_positions[0]
+    rendered = payloads[rendered_position]
+    assert type(rendered) is RenderedVariantPayloadV5
+
+    intents = tuple(
+        payload
+        for payload in payloads[:rendered_position]
+        if type(payload) is RoundIntentPayloadV5
+    )
+    author_completions = tuple(
+        payload
+        for payload in payloads[:rendered_position]
+        if type(payload) is RoleCompletionPayloadV5 and payload.role == "author"
+    )
+    if len(intents) != 1 or len(author_completions) != 1:
+        raise ValueError("historical execution context is incomplete or ambiguous")
+    intent = intents[0]
+    author_completion = author_completions[0]
+    package = repository.load_role_invocation(author_completion)
+    template = package.artifact
+    author_input = package.request.role_input
+    binding = package.request.expected_binding
+    if (
+        author_completion.outcome != "accepted"
+        or not package.accepted
+        or package.call.campaign_id != manifest.campaign_id
+        or package.call.round_index != authority.round_index
+        or package.call.role != "author"
+        or package.request.role != "author"
+        or type(template) is not StructuralTemplateV5
+        or type(author_input) is not AuthorRoleInputV5
+        or author_completion.artifact_sha256 != template.sha256
+        or template.parent_revision_sha256 != intent.parent_revision_sha256
+        or template.hypothesis_id != intent.hypothesis.hypothesis_id
+        or author_input.hypothesis != intent.hypothesis
+        or author_input.policy_contracts.parent_revision.sha256
+        != intent.parent_revision_sha256
+        or binding.parent_revision_sha256 != intent.parent_revision_sha256
+        or binding.discovery_plan_sha256 != intent.discovery_plan_sha256
+        or binding.hypothesis_id != intent.hypothesis.hypothesis_id
+        or intent.pit_data_scope != manifest.pit_data_scope
+        or intent.semantic_mode != manifest.semantic_mode
+    ):
+        raise ValueError("historical execution author context is foreign")
+
+    variant = rendered.variant
+    experiment = derive_experiment_identity_v5(
+        policy_revision=variant.policy_revision,
+        parent_revision_sha256=intent.parent_revision_sha256,
+        hypothesis=intent.hypothesis,
+        template=template,
+        assignment=variant.assignment,
+        round_index=authority.round_index,
+        discovery_plan_sha256=intent.discovery_plan_sha256,
+    )
+    if (
+        experiment.sha256 != execution_event.experiment_id
+        or experiment.sha256 != authority.key.experiment_id
+    ):
+        raise ValueError("historical execution uses a non-contextual experiment identity")
+
+    validations = tuple(
+        payload
+        for event, payload in zip(
+            events[:execution_position],
+            payloads[:execution_position],
+            strict=True,
+        )
+        if event.experiment_id == authority.key.experiment_id
+        and type(payload) is CandidateStageResultPayloadV5
+        and payload.stage == "validation"
+    )
+    if (
+        len(validations) != 1
+        or validations[0].outcome != "validation_valid"
+        or validations[0].validation is None
+        or not validations[0].validation.valid
+    ):
+        raise ValueError("historical execution lacks prior successful validation")
+    parent_identical = variant.policy_revision.sha256 == intent.parent_revision_sha256
+    expected_changed = () if parent_identical else template.changed_symbols
+    if validations[0].validation.changed_symbols != expected_changed:
+        raise ValueError("historical execution validation differs from its template")
+    if parent_identical:
+        raise ValueError("parent-identical candidate cannot authorize historical execution")
+    return variant, intent, template
+
+
+def _load_historical_workspace_records_v5(
+    *,
+    repository: LocalArtifactRepositoryV5,
+    round_authority: HistoricalRoundAuthorityV5,
+    source_identity_sha256: str,
+    parent_revision_sha256: str,
+    child_revision_sha256: str,
+) -> tuple[
+    _HistoricalWorkspaceResourceV5,
+    WorkspaceLeaseV5,
+    WorkspaceCreatedRecordV5,
+    WorkspaceReadyRecordV5,
+]:
+    matches = tuple(
+        item
+        for item in round_authority.workspace_history
+        if item.source_identity_sha256 == source_identity_sha256
+    )
+    if len(matches) != 1:
+        raise ValueError("historical execution workspace source is ambiguous")
+    workspace = matches[0]
+    if (
+        workspace.lifecycle != "retired"
+        or workspace.owner_sha256 != round_authority.owner.sha256
+        or workspace.parent_revision_sha256 != parent_revision_sha256
+        or workspace.child_revision_sha256 != child_revision_sha256
+        or not workspace.payload.lease_id.startswith("workspace.")
+    ):
+        raise ValueError("historical execution workspace authority is foreign")
+    key = workspace.payload.lease_id.removeprefix("workspace.")
+    reservation = repository.load_typed_state(
+        namespace="workspace-reservation",
+        key=key,
+        value_type=WorkspaceLeaseRecordV5,
+        repair=False,
+    )
+    created = repository.load_typed_state(
+        namespace="workspace-created",
+        key=key,
+        value_type=WorkspaceCreatedRecordV5,
+        repair=False,
+    )
+    ready = repository.load_typed_state(
+        namespace="workspace-ready",
+        key=key,
+        value_type=WorkspaceReadyRecordV5,
+        repair=False,
+    )
+    retirement = repository.load_typed_state(
+        namespace="workspace-retirement",
+        key=key,
+        value_type=WorkspaceLeaseRetirementV5,
+        repair=False,
+    )
+    if reservation is None or created is None or ready is None or retirement is None:
+        raise ValueError("historical execution workspace records are incomplete")
+    lease = reservation.lease
+    source_path = str(
+        Path(round_authority.round_config.workspace_root)
+        / workspace.workspace_relative_path
+    )
+    expected_binding = canonical_sha256_v5(
+        {
+            "canonical_path_key": _windows_key(source_path),
+            "device": created.workspace_device,
+            "inode": created.workspace_inode,
+            "lease_sha256": lease.sha256,
+        }
+    )
+    if (
+        reservation.driver_identity_sha256
+        != round_authority.expected_workspace_identity_sha256
+        or lease.payload != workspace.payload
+        or lease.sha256 != workspace.lease_sha256
+        or lease.owner != round_authority.owner
+        or lease.owner.sha256 != workspace.owner_sha256
+        or lease.workspace_root_identity_sha256
+        != workspace.workspace_root_identity_sha256
+        or lease.workspace_root_path_sha256 != workspace.workspace_root_path_sha256
+        or lease.workspace_relative_path != workspace.workspace_relative_path
+        or lease.lease_token_sha256 != workspace.lease_token_sha256
+        or lease.lease_token_sha256 != key
+        or lease.parent_revision_sha256 != parent_revision_sha256
+        or lease.child_revision_sha256 != child_revision_sha256
+        or created.driver_identity_sha256
+        != round_authority.expected_workspace_identity_sha256
+        or created.lease_id != workspace.payload.lease_id
+        or created.lease_sha256 != lease.sha256
+        or ready.driver_identity_sha256
+        != round_authority.expected_workspace_identity_sha256
+        or ready.lease_id != workspace.payload.lease_id
+        or ready.lease_sha256 != lease.sha256
+        or (created.workspace_device, created.workspace_inode)
+        != (ready.workspace_device, ready.workspace_inode)
+        or ready.workspace_identity_sha256 != expected_binding
+        or ready.workspace_identity_sha256 != workspace.source_identity_sha256
+        or retirement.driver_identity_sha256
+        != round_authority.expected_workspace_identity_sha256
+        or retirement.lease_id != workspace.payload.lease_id
+        or retirement.lease_sha256 != lease.sha256
+    ):
+        raise ValueError("historical execution workspace records are foreign")
+    return workspace, lease, created, ready
+
+
+def _mount_primitive_v5(
+    *,
+    kind: Literal["source", "data", "output"],
+    mode: Literal["read_only", "bounded_write_only"],
+    root_identity_sha256: str,
+    content_authority_sha256: str,
+    host_path: str,
+    container_path: str,
+    maximum_bytes: int | None,
+) -> dict[str, object]:
+    host_path = _require_docker_host_path_v5(host_path)
+    return {
+        "kind": kind,
+        "mode": mode,
+        "root_identity_sha256": root_identity_sha256,
+        "content_authority_sha256": content_authority_sha256,
+        "host_path_key": _windows_key(host_path),
+        "container_path": container_path,
+        "maximum_bytes": maximum_bytes,
+    }
+
+
+def _expected_episode_v5(
+    *,
+    round_authority: HistoricalRoundAuthorityV5,
+    authority: CandidateExecutionAuthorityV5,
+    intent: RoundIntentPayloadV5,
+) -> tuple[EpisodePlanV5, tuple[str, ...]]:
+    plan = round_authority.authenticated_manifest.panel_plan
+    contract = round_authority.authenticated_manifest.evaluator_contract
+    if plan.discovery_plan_sha256 != intent.discovery_plan_sha256:
+        raise ValueError("historical panel plan differs from round intent")
+    if authority.key.stage == "semantic_probe":
+        if round_authority.authenticated_manifest.manifest.semantic_mode != "required":
+            raise ValueError("historical semantic probe is outside required semantics")
+        return plan.mechanics, ()
+    if authority.key.stage == "quick_evaluation":
+        return plan.quick, (contract.selection_scenario_id,)
+    if authority.key.stage == "discovery_evaluation":
+        matches = tuple(
+            item
+            for item in plan.discovery
+            if item.episode_ordinal == authority.key.episode_ordinal
+        )
+        if len(matches) != 1:
+            raise ValueError("historical discovery execution ordinal is invalid")
+        return matches[0], tuple(item.scenario_id for item in contract.friction_grid)
+    raise ValueError("historical execution stage is outside the saved V5 grammar")
+
+
+def _saved_docker_argv_v5(
+    *,
+    manifest: CampaignManifestV5,
+    authority: CandidateExecutionAuthorityV5,
+    variant: RenderedVariantV5,
+    episode: EpisodePlanV5,
+    scenario_ids: tuple[str, ...],
+    panel_input: PanelExecutionRequestV5 | None,
+    source_path: str,
+    data_path: str,
+    output_path: str,
+    evaluator_contract: EvaluatorContractV5,
+    sandbox_profile: SandboxProfileV5,
+) -> tuple[str, ...]:
+    cpu = canonical_primitive_v5(manifest.resources.evaluation_cpu_limit)
+    if type(cpu) is not str:
+        raise ValueError("historical evaluation CPU authority is invalid")
+    argv = [
+        "docker",
+        "run",
+        "--rm",
+        "--network",
+        "none",
+        "--read-only",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "--pids-limit",
+        str(manifest.resources.evaluation_pid_limit),
+        "--cpus",
+        cpu,
+        "--memory",
+        f"{manifest.resources.evaluation_memory_mib}m",
+    ]
+    for relative in EDITABLE_POLICY_PATHS_V5:
+        name = relative.rsplit("/", 1)[-1]
+        argv.extend(
+            (
+                "--mount",
+                (
+                    f"type=bind,src={ntpath.join(source_path, *relative.split('/'))},"
+                    f"dst=/pit/candidate/{name},readonly"
+                ),
+            )
+        )
+    if authority.key.stage != "semantic_probe":
+        argv.extend(
+            (
+                "--mount",
+                f"type=bind,src={data_path},dst=/pit/data,readonly",
+            )
+        )
+    argv.extend(
+        (
+            "--mount",
+            f"type=bind,src={output_path},dst=/pit/output",
+            "--tmpfs",
+            "/tmp:rw,noexec,nosuid,nodev,size=16m",
+            "--",
+            sandbox_profile.image_reference,
+            "python",
+            "-P",
+            "-B",
+            "-m",
+        )
+    )
+    if authority.key.stage == "semantic_probe":
+        argv.extend(
+            (
+                "core.pit_optimizer_v5.probe_entry",
+                "--request-sha256",
+                authority.request_sha256,
+                "--policy-sha256",
+                variant.policy_revision.sha256,
+                "--trusted-runtime-sha256",
+                variant.policy_revision.trusted_policy_runtime_sha256,
+                "--immutable-constraints-sha256",
+                variant.policy_revision.immutable_constraints_sha256,
+                "--suite-id",
+                PROBE_SUITE_ID_V5,
+                "--evaluator-contract-sha256",
+                evaluator_contract.sha256,
+                "--sandbox-profile-sha256",
+                sandbox_profile.sha256,
+                "--probe-runtime-sha256",
+                sandbox_profile.runtime_source_sha256,
+                "--probe-runtime-authority-sha256",
+                derive_trusted_probe_runtime_authority_v5(
+                    evaluator_contract=evaluator_contract,
+                    sandbox_profile=sandbox_profile,
+                ),
+                "--call-timeout-seconds",
+                str(manifest.resources.policy_method_timeout_seconds),
+                "--output-limit-bytes",
+                str(manifest.resources.evaluation_output_limit_bytes),
+            )
+        )
+        return tuple(argv)
+    if panel_input is None:
+        raise ValueError("historical panel command lacks its saved panel input")
+    argv.extend(
+        (
+            "core.pit_optimizer_v5.container_entry",
+            "--request-sha256",
+            authority.request_sha256,
+            "--input-sha256",
+            panel_input.sha256,
+            "--evaluator-sha256",
+            evaluator_contract.sha256,
+            "--sandbox-sha256",
+            sandbox_profile.sha256,
+            "--policy-sha256",
+            variant.policy_revision.sha256,
+            "--panel-sha256",
+            episode.panel_ref.sha256,
+            "--start-date",
+            episode.start_date,
+            "--end-date",
+            episode.end_date,
+            "--output-limit-bytes",
+            str(manifest.resources.evaluation_output_limit_bytes),
+        )
+    )
+    for scenario_id in scenario_ids:
+        argv.extend(("--scenario", scenario_id))
+    return tuple(argv)
+
+
+def _historical_runtime_argv_v5(
+    *,
+    command_argv: tuple[str, ...],
+    authority: CandidateExecutionAuthorityV5,
+    owner: WorkspaceOwnerV5,
+    expected_executor_identity_sha256: str,
+    sandbox_profile: SandboxProfileV5,
+    docker_path: str,
+    data_path: str,
+    repository_root: str,
+    panel_input: PanelExecutionRequestV5 | None,
+) -> tuple[str, ...]:
+    generic = list(command_argv)
+    if generic[:3] != ["docker", "run", "--rm"]:
+        raise ValueError("historical command does not use the closed V5 grammar")
+    container_name = f"pit-v5-{authority.command_sha256[:40]}"
+    generic[0] = docker_path
+    generic[1] = "create"
+    del generic[2]
+    generic[2:2] = [
+        "--name",
+        container_name,
+        "--label",
+        f"pit-v5.executor={expected_executor_identity_sha256}",
+        "--label",
+        f"pit-v5.command={authority.command_sha256}",
+        "--label",
+        f"pit-v5.owner={owner.sha256}",
+        "--pull",
+        "never",
+        "--hostname",
+        container_name,
+        "--runtime",
+        "runc",
+        "--restart",
+        "no",
+        "--memory-swap",
+        f"{sandbox_profile.memory_limit_mib}m",
+        "--no-healthcheck",
+        "--stop-signal",
+        "SIGTERM",
+        "--stop-timeout",
+        "10",
+        "--privileged=false",
+        "--ipc",
+        "private",
+        "--cgroupns",
+        "private",
+        "--oom-kill-disable=false",
+        "--init=false",
+        "--publish-all=false",
+        "--log-driver",
+        "none",
+        "--shm-size",
+        "16m",
+        "--user",
+        "65532:65532",
+        "--entrypoint",
+        "python",
+        "--workdir",
+        "/",
+    ]
+    if authority.key.stage != "semantic_probe":
+        data_argument = f"type=bind,src={data_path},dst=/pit/data,readonly"
+        try:
+            data_index = generic.index(data_argument)
+        except ValueError:
+            raise ValueError("historical container data mount grammar is invalid") from None
+        if data_index == 0 or generic[data_index - 1] != "--mount":
+            raise ValueError("historical container data mount grammar is invalid")
+        data_file_arguments: list[str] = []
+        for name in _DATA_FILES_V5:
+            data_file_arguments.extend(
+                (
+                    "--mount",
+                    f"type=bind,src={Path(data_path) / name},dst=/pit/data/{name},readonly",
+                )
+            )
+        generic[data_index - 1 : data_index + 1] = data_file_arguments
+        if panel_input is None:
+            raise ValueError("historical panel command lacks its saved panel input")
+        input_path = Path(repository_root).joinpath(
+            *PurePosixPath(
+                f"adapter-state/container-panel-input/{authority.request_sha256}.json"
+            ).parts
+        )
+        input_host_path = _require_docker_host_path_v5(str(input_path))
+        separator = generic.index("--")
+        generic[separator:separator] = [
+            "--mount",
+            (
+                f"type=bind,src={input_host_path},dst={_PANEL_INPUT_TARGET_V5},"
+                "readonly"
+            ),
+        ]
+    elif panel_input is not None or any("/pit/data" in item for item in generic):
+        raise ValueError("historical semantic probe grammar exposes PIT data")
+    separator = generic.index("--")
+    if (
+        generic[separator + 1] != sandbox_profile.image_reference
+        or generic[separator + 2] != "python"
+    ):
+        raise ValueError("historical image command differs from the closed V5 grammar")
+    del generic[separator + 2]
+    return tuple(generic)
+
+
+def _validate_saved_execution_command_v5(
+    *,
+    reservation: ExecutionReservationRecordV5,
+    authority: CandidateExecutionAuthorityV5,
+    manifest: CampaignManifestV5,
+    evaluator_contract: EvaluatorContractV5,
+    sandbox_profile: SandboxProfileV5,
+    variant: RenderedVariantV5,
+    episode: EpisodePlanV5,
+    scenario_ids: tuple[str, ...],
+    panel_input: PanelExecutionRequestV5 | None,
+    workspace_lease: WorkspaceLeaseV5,
+    workspace_ready: WorkspaceReadyRecordV5,
+    mount_reservation: MountReservationRecordV5,
+    mount_created: MountCreatedRecordV5,
+    mount_ready: MountReadyRecordV5,
+    paths: tuple[str, str, str, str, str],
+    docker_identity: tuple[int, int, int, str],
+    expected_executor_identity_sha256: str,
+) -> None:
+    source_path, data_path, output_path, docker_path, repository_root = paths
+    if (
+        workspace_lease.child_revision_sha256 != variant.policy_revision.sha256
+        or workspace_ready.lease_sha256 != workspace_lease.sha256
+        or mount_reservation.output_relative_path
+        != f"pit-v5-output-{authority.output_mount_authority_sha256[:24]}"
+        or Path(output_path).name != mount_reservation.output_relative_path
+        or mount_created.output_authority_sha256
+        != authority.output_mount_authority_sha256
+        or mount_ready.output_authority_sha256
+        != authority.output_mount_authority_sha256
+        or (mount_created.output_device, mount_created.output_inode)
+        != (mount_ready.output_device, mount_ready.output_inode)
+        or type(docker_identity) is not tuple
+        or len(docker_identity) != 4
+        or type(docker_identity[0]) is not int
+        or type(docker_identity[1]) is not int
+        or type(docker_identity[2]) is not int
+        or type(docker_identity[3]) is not str
+    ):
+        raise ValueError("historical saved execution paths or identities are invalid")
+
+    semantic_probe = authority.key.stage == "semantic_probe"
+    if semantic_probe:
+        if panel_input is not None or scenario_ids:
+            raise ValueError("historical semantic probe carries panel data")
+    else:
+        if panel_input is None:
+            raise ValueError("historical panel execution lacks its typed input")
+        if (
+            panel_input.schema_version != 5
+            or panel_input.request_sha256 != authority.request_sha256
+            or panel_input.evaluator_contract != evaluator_contract
+            or panel_input.sandbox_profile != sandbox_profile
+            or panel_input.execution_profile.to_primitive()
+            != {
+                "schema_version": 5,
+                "close_policy_exit_timing": "next_open",
+                "gap_stop_rule": "open_then_stop",
+                "end_of_test_rule": "last_session_close",
+                "friction_model": (
+                    "half_spread_plus_market_impact_plus_commission_bps"
+                ),
+            }
+            or panel_input.policy_revision != variant.policy_revision
+            or panel_input.episode != episode
+            or panel_input.panel.sha256 != episode.panel_ref.sha256
+            or panel_input.scenario_ids != scenario_ids
+            or panel_input.policy_method_timeout_seconds
+            != manifest.resources.policy_method_timeout_seconds
+            or panel_input.worker_startup_timeout_seconds
+            != manifest.resources.worker_startup_timeout_seconds
+            or panel_input.output_limit_bytes
+            != manifest.resources.evaluation_output_limit_bytes
+            or panel_input.baseline_capture_inputs_ref is not None
+            or panel_input.pit_data_scope != manifest.pit_data_scope
+        ):
+            raise ValueError("historical panel input differs from saved request semantics")
+
+    source_content, data_content, output_content = (
+        derive_sandbox_mount_authorities_v5(
+            owner=reservation.owner,
+            policy_revision=variant.policy_revision,
+            evaluator_contract=evaluator_contract,
+            sandbox_profile=sandbox_profile,
+            panel=episode,
+            scenario_ids=scenario_ids,
+            execution_key=authority.key,
+        )
+    )
+    source_root_identity = canonical_sha256_v5(
+        {
+            "canonical_path_key": _windows_key(source_path),
+            "device": workspace_ready.workspace_device,
+            "inode": workspace_ready.workspace_inode,
+        }
+    )
+    source_mount = _mount_primitive_v5(
+        kind="source",
+        mode="read_only",
+        root_identity_sha256=source_root_identity,
+        content_authority_sha256=source_content,
+        host_path=source_path,
+        container_path="/pit/candidate",
+        maximum_bytes=None,
+    )
+    output_mount = _mount_primitive_v5(
+        kind="output",
+        mode="bounded_write_only",
+        root_identity_sha256=mount_ready.output_root_identity_sha256,
+        content_authority_sha256=output_content,
+        host_path=output_path,
+        container_path="/pit/output",
+        maximum_bytes=manifest.resources.evaluation_output_limit_bytes,
+    )
+    if semantic_probe:
+        if data_content is not None:
+            raise ValueError("historical semantic probe data authority is invalid")
+        mounts = (source_mount, output_mount)
+    else:
+        if data_content is None:
+            raise ValueError("historical panel data authority is absent")
+        data_mount = _mount_primitive_v5(
+            kind="data",
+            mode="read_only",
+            root_identity_sha256=mount_reservation.data_root_identity_sha256,
+            content_authority_sha256=data_content,
+            host_path=data_path,
+            container_path="/pit/data",
+            maximum_bytes=None,
+        )
+        mounts = (source_mount, data_mount, output_mount)
+    if (
+        len({str(item["root_identity_sha256"]) for item in mounts}) != len(mounts)
+        or len({str(item["host_path_key"]) for item in mounts}) != len(mounts)
+    ):
+        raise ValueError("historical saved request mount roots are not distinct")
+    request_primitive = {
+        "owner_sha256": reservation.owner.sha256,
+        "manifest_sha256": manifest.sha256,
+        "execution_key": canonical_primitive_v5(authority.key),
+        "policy_revision": variant.policy_revision.to_primitive(),
+        "evaluator_contract_sha256": evaluator_contract.sha256,
+        "sandbox_profile_sha256": sandbox_profile.sha256,
+        "panel": canonical_primitive_v5(episode),
+        "panel_spec": (
+            None if panel_input is None else canonical_primitive_v5(panel_input.panel)
+        ),
+        "scenario_ids": scenario_ids,
+        "mounts": mounts,
+    }
+    request_sha256 = canonical_sha256_v5(request_primitive)
+    if (
+        request_sha256 != authority.request_sha256
+        or reservation.request_sha256 != request_sha256
+        or output_content != authority.output_mount_authority_sha256
+        or output_content != mount_reservation.output_authority_sha256
+    ):
+        raise ValueError("historical saved request digest is invalid")
+
+    expected_argv = _saved_docker_argv_v5(
+        manifest=manifest,
+        authority=authority,
+        variant=variant,
+        episode=episode,
+        scenario_ids=scenario_ids,
+        panel_input=panel_input,
+        source_path=source_path,
+        data_path=data_path,
+        output_path=output_path,
+        evaluator_contract=evaluator_contract,
+        sandbox_profile=sandbox_profile,
+    )
+    if (
+        reservation.command_argv != expected_argv
+        or canonical_sha256_v5(
+            {
+                "request_sha256": request_sha256,
+                "argv": reservation.command_argv,
+            }
+        )
+        != authority.command_sha256
+    ):
+        raise ValueError("historical saved Docker argv is outside the closed V5 grammar")
+    runtime_argv = _historical_runtime_argv_v5(
+        command_argv=reservation.command_argv,
+        authority=authority,
+        owner=reservation.owner,
+        expected_executor_identity_sha256=expected_executor_identity_sha256,
+        sandbox_profile=sandbox_profile,
+        docker_path=docker_path,
+        data_path=data_path,
+        repository_root=repository_root,
+        panel_input=panel_input,
+    )
+    if reservation.runtime_argv_sha256 != canonical_sha256_v5(runtime_argv):
+        raise ValueError("historical runtime argv digest is invalid")
+
+    source_mounts = tuple(
+        (
+            _windows_key(
+                str(Path(source_path).joinpath(*relative.split("/")))
+            ),
+            f"/pit/candidate/{relative.rsplit('/', 1)[-1]}",
+            False,
+        )
+        for relative in EDITABLE_POLICY_PATHS_V5
+    )
+    if semantic_probe:
+        data_mounts: tuple[tuple[str, str, bool], ...] = ()
+        input_mounts: tuple[tuple[str, str, bool], ...] = ()
+    else:
+        data_mounts = tuple(
+            (
+                _windows_key(str(Path(data_path) / name)),
+                f"/pit/data/{name}",
+                False,
+            )
+            for name in _DATA_FILES_V5
+        )
+        input_path = Path(repository_root).joinpath(
+            *PurePosixPath(
+                f"adapter-state/container-panel-input/{request_sha256}.json"
+            ).parts
+        )
+        input_host_path = _require_docker_host_path_v5(str(input_path))
+        input_mounts = (
+            (_windows_key(input_host_path), _PANEL_INPUT_TARGET_V5, False),
+        )
+    expected_mounts = tuple(
+        sorted(
+            (
+                *source_mounts,
+                *data_mounts,
+                *input_mounts,
+                (_windows_key(output_path), "/pit/output", True),
+            )
+        )
+    )
+    if reservation.expected_mounts != expected_mounts:
+        raise ValueError("historical runtime mount authority is invalid")
+
+
+def _authenticate_completed_execution_v5(
+    *,
+    repository: LocalArtifactRepositoryV5,
+    manifest: CampaignManifestV5,
+    round_authority: HistoricalRoundAuthorityV5,
+    execution: _HistoricalExecutionResourcesV5,
+    events: tuple[RoundEventV5, ...],
+    payloads: tuple[RoundEventPayloadV5, ...],
+) -> _CompletedHistoricalExecutionV5:
+    authority = execution.authority
+    reservation = execution.reservation
+    command_sha256 = authority.command_sha256
+    expected_executor = round_authority.expected_executor_identity_sha256
+    if (
+        reservation.executor_identity_sha256 != expected_executor
+        or reservation.command_sha256 != command_sha256
+    ):
+        raise ValueError("historical execution reservation is foreign")
+    _validate_history_reservation_v5(
+        reservation,
+        authority,
+        round_authority.owner,
+        f"pit-v5-{command_sha256[:40]}",
+    )
+
+    output_key = authority.output_mount_authority_sha256
+    mount_reservation = repository.load_typed_state(
+        namespace="sandbox-mount-reservation",
+        key=output_key,
+        value_type=MountReservationRecordV5,
+        repair=False,
+    )
+    mount_created = repository.load_typed_state(
+        namespace="sandbox-mount-created",
+        key=output_key,
+        value_type=MountCreatedRecordV5,
+        repair=False,
+    )
+    mount_ready = repository.load_typed_state(
+        namespace="sandbox-mount-ready",
+        key=output_key,
+        value_type=MountReadyRecordV5,
+        repair=False,
+    )
+    if (
+        mount_reservation is None
+        or mount_created is None
+        or mount_ready is None
+        or mount_reservation.factory_identity_sha256
+        != round_authority.expected_mount_identity_sha256
+        or mount_reservation.owner != round_authority.owner
+        or mount_reservation.execution_key_sha256
+        != canonical_sha256_v5(authority.key)
+        or mount_reservation.output_authority_sha256 != output_key
+        or mount_reservation.source_root_identity_sha256
+        != execution.source_identity_sha256
+        or mount_created.factory_identity_sha256
+        != round_authority.expected_mount_identity_sha256
+        or mount_created.output_authority_sha256 != output_key
+        or mount_ready.factory_identity_sha256
+        != round_authority.expected_mount_identity_sha256
+        or mount_ready.output_authority_sha256 != output_key
+        or (mount_created.output_device, mount_created.output_inode)
+        != (mount_ready.output_device, mount_ready.output_inode)
+    ):
+        raise ValueError("historical execution mount records are foreign")
+
+    variant, intent, _template = _journal_execution_context_v5(
+        repository=repository,
+        manifest=manifest,
+        authority=authority,
+        events=events,
+        payloads=payloads,
+    )
+    workspace, workspace_lease, _workspace_created, workspace_ready = (
+        _load_historical_workspace_records_v5(
+            repository=repository,
+            round_authority=round_authority,
+            source_identity_sha256=mount_reservation.source_root_identity_sha256,
+            parent_revision_sha256=intent.parent_revision_sha256,
+            child_revision_sha256=variant.policy_revision.sha256,
+        )
+    )
+    episode, scenario_ids = _expected_episode_v5(
+        round_authority=round_authority,
+        authority=authority,
+        intent=intent,
+    )
+    panel_input = repository.load_typed_state(
+        namespace="container-panel-input",
+        key=authority.request_sha256,
+        value_type=PanelExecutionRequestV5,
+        repair=False,
+    )
+    evaluator_contract = round_authority.authenticated_manifest.evaluator_contract
+    sandbox_profile = round_authority.authenticated_manifest.sandbox_profile
+    _validate_history_panel_v5(
+        authority,
+        panel_input,
+        evaluator_contract,
+        sandbox_profile,
+    )
+    if authority.key.stage != "semantic_probe":
+        if (
+            panel_input is None
+            or repository.load_evaluation_panel_spec(episode.panel_ref)
+            != panel_input.panel
+        ):
+            raise ValueError("historical panel input differs from manifest graph")
+
+    phase_names = (
+        "launch_claim",
+        "created",
+        "start_claim",
+        "started",
+        "collected",
+    )
+    phases: list[ExecutionPhaseRecordV5 | None] = []
+    for phase_name in phase_names:
+        phase = repository.load_typed_state(
+            namespace=f"container-{phase_name.replace('_', '-')}",
+            key=command_sha256,
+            value_type=ExecutionPhaseRecordV5,
+            repair=False,
+        )
+        if phase is not None and (
+            phase.executor_identity_sha256 != expected_executor
+            or phase.command_sha256 != command_sha256
+            or phase.phase != phase_name
+        ):
+            raise ValueError("container phase record is foreign")
+        phases.append(phase)
+    identity = repository.load_typed_state(
+        namespace="container-identity",
+        key=command_sha256,
+        value_type=ExecutionContainerIdentityRecordV5,
+        repair=False,
+    )
+    if identity is not None and (
+        identity.executor_identity_sha256 != expected_executor
+        or identity.command_sha256 != command_sha256
+    ):
+        raise ValueError("container identity record is foreign")
+    phase_tuple = tuple(phases)
+    assert len(phase_tuple) == 5
+    _validate_history_phases_v5(phase_tuple, identity)  # type: ignore[arg-type]
+
+    terminal = repository.load_typed_state(
+        namespace="container-terminal",
+        key=command_sha256,
+        value_type=ExecutionTerminalRecordV5,
+        repair=False,
+    )
+    if terminal is not None and (
+        terminal.executor_identity_sha256 != expected_executor
+        or terminal.command_sha256 != command_sha256
+    ):
+        raise ValueError("container terminal is foreign")
+    successful = _require_execution_stage_record_v5(
+        authority=authority,
+        events=events,
+        payloads=payloads,
+    )
+    _validate_history_terminal_v5(
+        terminal,
+        authority,
+        phases[4],
+        successful,
+    )
+    if terminal is None:
+        raise ValueError("historical execution lacks its settled durable terminal")
+    if terminal.output_ref is not None:
+        content = repository.load_binary_state(
+            namespace="container-output",
+            key=command_sha256,
+            reference=terminal.output_ref,
+            maximum_bytes=manifest.resources.evaluation_output_limit_bytes + 1,
+        )
+        _validate_history_output_length_v5(terminal, content)
+
+    expected_cleanup = ExecutionCleanupRecordV5(
+        5,
+        expected_executor,
+        command_sha256,
+        round_authority.owner.sha256,
+    )
+    container_absent = repository.load_typed_state(
+        namespace="container-cleanup-container-absent",
+        key=command_sha256,
+        value_type=ExecutionCleanupRecordV5,
+        repair=False,
+    )
+    if container_absent is not None and (
+        container_absent.executor_identity_sha256 != expected_executor
+        or container_absent.command_sha256 != command_sha256
+    ):
+        raise ValueError("container absence cleanup record is foreign")
+    cleanup = repository.load_typed_state(
+        namespace="container-cleanup",
+        key=command_sha256,
+        value_type=ExecutionCleanupRecordV5,
+        repair=False,
+    )
+    if cleanup is not None and (
+        cleanup.executor_identity_sha256 != expected_executor
+        or cleanup.command_sha256 != command_sha256
+    ):
+        raise ValueError("container cleanup record is foreign")
+    cleanup_complete = _validate_history_cleanup_v5(
+        container_absent,
+        cleanup,
+        expected_cleanup,
+    )
+    if not cleanup_complete or container_absent is None or cleanup is None:
+        raise ValueError("historical execution cleanup is incomplete")
+
+    control_created = repository.load_typed_state(
+        namespace="container-control-created",
+        key=command_sha256,
+        value_type=ExecutionControlCreatedRecordV5,
+        repair=False,
+    )
+    if control_created is not None and (
+        control_created.executor_identity_sha256 != expected_executor
+        or control_created.command_sha256 != command_sha256
+    ):
+        raise ValueError("container control creation record is foreign")
+    control_ready = repository.load_typed_state(
+        namespace="container-control-ready",
+        key=command_sha256,
+        value_type=ExecutionControlRecordV5,
+        repair=False,
+    )
+    if control_ready is not None and (
+        control_ready.executor_identity_sha256 != expected_executor
+        or control_ready.command_sha256 != command_sha256
+    ):
+        raise ValueError("container control readiness record is foreign")
+    _require_history_control_ready_v5(control_created, control_ready, True)
+    assert control_created is not None and control_ready is not None
+    control_path = Path(round_authority.round_config.control_root)
+    docker_path = Path(round_authority.round_config.docker_executable)
+    source_path = str(
+        Path(round_authority.round_config.workspace_root)
+        / workspace.workspace_relative_path
+    )
+    data_path = str(Path(round_authority.round_config.data_root))
+    output_path = str(
+        Path(round_authority.round_config.output_root)
+        / mount_reservation.output_relative_path
+    )
+    with (
+        acquire_absolute_directory_v5(control_path) as control_root,
+        acquire_absolute_directory_v5(docker_path.parent) as docker_parent,
+    ):
+        actual_absent = directory_child_absent_v5(
+            control_root,
+            reservation.control_relative_path,
+        )
+        docker_identity = hash_regular_in_directory_v5(
+            docker_parent,
+            docker_path.name,
+            maximum_bytes=_DOCKER_EXECUTABLE_MAXIMUM_BYTES_V5,
+        )
+        control_root_sha256 = canonical_sha256_v5(
+            {
+                "path": _windows_key(str(control_root.path)),
+                "identity": control_root.identity,
+            }
+        )
+        transaction_root_sha256 = canonical_sha256_v5(
+            {
+                "path": _windows_key(
+                    str(control_root.path / reservation.control_relative_path)
+                ),
+                "identity": (
+                    control_created.transaction_device,
+                    control_created.transaction_inode,
+                ),
+            }
+        )
+        docker_identity_sha256 = canonical_sha256_v5(docker_identity)
+        _validate_saved_execution_command_v5(
+            reservation=reservation,
+            authority=authority,
+            manifest=manifest,
+            evaluator_contract=evaluator_contract,
+            sandbox_profile=sandbox_profile,
+            variant=variant,
+            episode=episode,
+            scenario_ids=scenario_ids,
+            panel_input=panel_input,
+            workspace_lease=workspace_lease,
+            workspace_ready=workspace_ready,
+            mount_reservation=mount_reservation,
+            mount_created=mount_created,
+            mount_ready=mount_ready,
+            paths=(
+                source_path,
+                data_path,
+                output_path,
+                str(docker_path),
+                str(repository.root),
+            ),
+            docker_identity=docker_identity,
+            expected_executor_identity_sha256=expected_executor,
+        )
+        _validate_history_control_binding_v5(
+            reservation,
+            control_created,
+            control_ready,
+            expected_executor,
+            control_root_sha256,
+            transaction_root_sha256,
+            docker_identity_sha256,
+        )
+        if not _validate_history_control_completion_v5(
+            control_created,
+            control_ready,
+            cleanup_complete,
+            True,
+            actual_absent,
+            control_root_sha256,
+        ):
+            raise ValueError("historical completed control branch was not authenticated")
+    return _CompletedHistoricalExecutionV5(
+        authority=authority,
+        reservation=reservation,
+        mount_reservation=mount_reservation,
+        panel_input=panel_input,
+        terminal=terminal,
+        cleanup=cleanup,
+        workspace_payload_ref=workspace.payload_ref,
+    )
+
+
+def _authenticate_execution_resources(
+    *,
+    repository: LocalArtifactRepositoryV5,
+    owner: WorkspaceOwnerV5,
+    expected_executor_identity_sha256: str,
+    workspace_source_identity_sha256s: tuple[str, ...],
+    mount_factory: LocalSandboxMountFactoryV5,
+    executions: tuple[CandidateExecutionAuthorityV5, ...],
+) -> tuple[_HistoricalExecutionResourcesV5, ...]:
+    result: list[_HistoricalExecutionResourcesV5] = []
+    command_ids: set[str] = set()
+    request_ids: set[str] = set()
+    output_ids: set[str] = set()
+    lease_ids: set[str] = set()
+    for authority in executions:
+        if (
+            type(authority) is not CandidateExecutionAuthorityV5
+            or authority.campaign_id != owner.campaign_id
+            or authority.round_index != owner.round_index
+            or authority.owner_token_sha256 != owner.owner_token_sha256
+        ):
+            raise ValueError("historical execution is foreign to its round owner")
+        expected_lease_ids = tuple(
+            derive_execution_lease_id_v5(authority.command_sha256, resource_kind)
+            for resource_kind in ("evaluator_process", "container")
+        )
+        reservation = repository.load_typed_state(
+            namespace="container-reservation",
+            key=authority.command_sha256,
+            value_type=ExecutionReservationRecordV5,
+            repair=False,
+        )
+        if (
+            reservation is None
+            or reservation.executor_identity_sha256 != expected_executor_identity_sha256
+            or reservation.owner != owner
+            or reservation.command_sha256 != authority.command_sha256
+            or reservation.request_sha256 != authority.request_sha256
+            or canonical_sha256_v5(
+                {
+                    "request_sha256": authority.request_sha256,
+                    "argv": reservation.command_argv,
+                }
+            )
+            != authority.command_sha256
+            or reservation.output_mount_authority_sha256 != authority.output_mount_authority_sha256
+            or reservation.lease_ids != expected_lease_ids
+            or tuple(item.lease_id for item in authority.lease_payloads) != expected_lease_ids
+            or any(
+                item.owner_campaign_id != owner.campaign_id
+                or item.owner_token_sha256 != owner.owner_token_sha256
+                for item in authority.lease_payloads
+            )
+        ):
+            raise ValueError("historical execution reservation differs from original authority")
+        source_identity = mount_factory.authenticate_output_history(authority)
+        if source_identity not in workspace_source_identity_sha256s:
+            raise ValueError("historical output lacks its authenticated workspace source")
+        current_lease_ids = set(expected_lease_ids)
+        if (
+            authority.command_sha256 in command_ids
+            or authority.request_sha256 in request_ids
+            or authority.output_mount_authority_sha256 in output_ids
+            or current_lease_ids & lease_ids
+        ):
+            raise ValueError("historical execution resource identity is reused")
+        command_ids.add(authority.command_sha256)
+        request_ids.add(authority.request_sha256)
+        output_ids.add(authority.output_mount_authority_sha256)
+        lease_ids.update(current_lease_ids)
+        result.append(_HistoricalExecutionResourcesV5(authority, reservation, source_identity))
+    return tuple(result)
+
+
+def authenticate_historical_round_v5(
+    *,
+    repository: LocalArtifactRepositoryV5,
+    manifest: CampaignManifestV5,
+    round_index: int,
+) -> HistoricalRoundAuthorityV5:
+    """Resolve one original round's durable authority without repair or recovery."""
+
+    if type(repository) is not LocalArtifactRepositoryV5 or type(manifest) is not CampaignManifestV5:
+        raise ValueError("historical verification requires exact local repository and V5 manifest types")
+    if (
+        type(round_index) is not int
+        or round_index < 1
+        or round_index > manifest.search.max_feedback_rounds
+    ):
+        raise ValueError("historical verification round is outside the manifest cap")
+    require_development_v5(manifest)
+
+    launch = repository.load_typed_state(
+        namespace="campaign-launch",
+        key=manifest.sha256,
+        value_type=CampaignLaunchV5,
+        repair=False,
+    )
+    if launch is None or launch.manifest_ref.sha256 != manifest.sha256:
+        raise ValueError("historical round lacks its original campaign launch")
+    authenticated = authenticate_campaign_manifest_v5(
+        repository=repository,
+        manifest_ref=launch.manifest_ref,
+    )
+    if authenticated.manifest != manifest:
+        raise ValueError("historical manifest differs from the authenticated campaign launch")
+    authorities = _campaign_authorities(authenticated)
+
+    round_key = canonical_sha256_v5(
+        {
+            "campaign_manifest_sha256": manifest.sha256,
+            "round_index": round_index,
+        }
+    )
+    round_launch = repository.load_typed_state(
+        namespace="campaign-round",
+        key=round_key,
+        value_type=CampaignRoundLaunchV5,
+        repair=False,
+    )
+    round_started = repository.load_typed_state(
+        namespace="campaign-round-started",
+        key=round_key,
+        value_type=CampaignRoundLaunchV5,
+        repair=False,
+    )
+    if (
+        round_launch is None
+        or round_started is None
+        or round_launch.round_index != round_index
+        or round_started.round_index != round_index
+        or round_launch.owner_token_sha256 != launch.owner_token_sha256
+        or round_started.owner_token_sha256 != launch.owner_token_sha256
+        or round_launch.started_epoch_ms is not None
+        or round_started.started_epoch_ms is None
+        or round_started.started_epoch_ms < 1
+        or replace(round_started, started_epoch_ms=None) != round_launch
+        or (round_index == 1 and round_launch.adapter_config_ref != launch.adapter_config_ref)
+    ):
+        raise ValueError("historical round launch/start authority is invalid")
+
+    original_config = load_development_config_v5(repository, authorities, launch.adapter_config_ref)
+    round_config = load_development_config_v5(repository, authorities, round_launch.adapter_config_ref)
+    _require_round_config_matches_original(original_config, round_config)
+
+    owner = WorkspaceOwnerV5(
+        campaign_id=manifest.campaign_id,
+        round_index=round_index,
+        owner_token_sha256=launch.owner_token_sha256,
+        controller_lease_id=_controller_lease_id_v5(
+            manifest_sha256=manifest.sha256,
+            round_index=round_index,
+            owner_token_sha256=launch.owner_token_sha256,
+        ),
+    )
+    workspace_driver = LocalGitWorkspaceDriverV5(
+        roots=WorkspaceRootsV5(round_config.source_root, round_config.workspace_root),
+        source_commit=manifest.source_commit,
+        git_executable=Path(round_config.git_executable),
+        repository=repository,
+        owner=owner,
+        export_mode=round_config.export_mode,
+    )
+    mount_factory = LocalSandboxMountFactoryV5(
+        manifest=manifest,
+        evaluator_contract=authorities.evaluator_contract,
+        sandbox_profile=authorities.sandbox_profile,
+        owner=owner,
+        workspace_driver=workspace_driver,
+        data_root=Path(round_config.data_root),
+        output_root=Path(round_config.output_root),
+        repository=repository,
+    )
+    if (
+        workspace_driver.driver_identity_sha256 != round_config.workspace_driver_identity_sha256
+        or mount_factory.mount_identity_sha256 != round_config.mount_factory_identity_sha256
+    ):
+        raise ValueError("historical workspace or mount identity differs from saved round config")
+
+    events = repository.load_round_events(campaign_id=manifest.campaign_id, round_index=round_index)
+    if not events or any(event.campaign_id != manifest.campaign_id or event.round_index != round_index for event in events):
+        raise ValueError("historical round event journal is absent or foreign")
+    payloads = tuple(
+        repository.load_round_payload(event.payload_ref, expected_kind=event.event_kind)
+        for event in events
+    )
+    resource_events = tuple(item for item in payloads if type(item) is ResourceLeasePayloadV5)
+    if any(
+        item.owner_campaign_id != owner.campaign_id or item.owner_token_sha256 != owner.owner_token_sha256
+        for item in resource_events
+    ):
+        raise ValueError("historical resource event is foreign to its round owner")
+    workspace_history = tuple(
+        _project_workspace_history(
+            payload_ref=event.payload_ref,
+            state=workspace_driver.authenticate_lease_history(payload),
+        )
+        for event, payload in zip(events, payloads, strict=True)
+        if type(payload) is ResourceLeasePayloadV5 and payload.resource_kind == "workspace"
+    )
+    workspace_source_identity_sha256s = tuple(item.source_identity_sha256 for item in workspace_history)
+    executions = repository.verify_candidate_execution_index(
+        campaign_id=manifest.campaign_id,
+        round_index=round_index,
+    )
+    execution_history = _authenticate_execution_resources(
+        repository=repository,
+        owner=owner,
+        expected_executor_identity_sha256=round_config.container_executor_identity_sha256,
+        workspace_source_identity_sha256s=workspace_source_identity_sha256s,
+        mount_factory=mount_factory,
+        executions=executions,
+    )
+
+    return HistoricalRoundAuthorityV5(
+        authenticated_manifest=authenticated,
+        campaign_launch=launch,
+        round_launch=round_launch,
+        round_started=round_started,
+        original_config_ref=launch.adapter_config_ref,
+        original_config=original_config,
+        round_config_ref=round_launch.adapter_config_ref,
+        round_config=round_config,
+        owner=owner,
+        expected_executor_identity_sha256=round_config.container_executor_identity_sha256,
+        expected_workspace_identity_sha256=round_config.workspace_driver_identity_sha256,
+        expected_mount_identity_sha256=round_config.mount_factory_identity_sha256,
+        resource_events=resource_events,
+        workspace_history=workspace_history,
+        execution_history=execution_history,
+    )
+
+
+def authenticate_completed_historical_round_resources_v5(
+    *,
+    repository: LocalArtifactRepositoryV5,
+    manifest: CampaignManifestV5,
+    round_index: int,
+) -> CompletedHistoricalRoundResourcesV5:
+    """Authenticate one completed round's durable resources without recovery."""
+
+    round_authority = authenticate_historical_round_v5(
+        repository=repository,
+        manifest=manifest,
+        round_index=round_index,
+    )
+    events = repository.load_round_events(
+        campaign_id=manifest.campaign_id,
+        round_index=round_index,
+    )
+    payloads = tuple(
+        repository.load_round_payload(
+            event.payload_ref,
+            expected_kind=event.event_kind,
+        )
+        for event in events
+    )
+    if (
+        not events
+        or any(
+            event.campaign_id != manifest.campaign_id
+            or event.round_index != round_index
+            for event in events
+        )
+    ):
+        raise ValueError("completed historical resource journal is absent or foreign")
+
+    resource_pairs = tuple(
+        (event, payload)
+        for event, payload in zip(events, payloads, strict=True)
+        if type(payload) is ResourceLeasePayloadV5
+    )
+    if (
+        tuple(payload for _event, payload in resource_pairs)
+        != round_authority.resource_events
+        or len(resource_pairs) != len(round_authority.workspace_history)
+        or any(payload.resource_kind != "workspace" for _event, payload in resource_pairs)
+        or any(
+            event.payload_ref != workspace.payload_ref
+            or payload != workspace.payload
+            or workspace.lifecycle != "retired"
+            for (event, payload), workspace in zip(
+                resource_pairs,
+                round_authority.workspace_history,
+                strict=True,
+            )
+        )
+    ):
+        raise ValueError("completed historical workspace resources are incomplete")
+
+    workspace_lease_ids = tuple(
+        workspace.payload.lease_id for workspace in round_authority.workspace_history
+    )
+    workspace_payload_paths = tuple(
+        workspace.payload_ref.relative_path
+        for workspace in round_authority.workspace_history
+    )
+    workspace_sources = tuple(
+        workspace.source_identity_sha256
+        for workspace in round_authority.workspace_history
+    )
+    if (
+        len(set(workspace_lease_ids)) != len(workspace_lease_ids)
+        or len(set(workspace_payload_paths)) != len(workspace_payload_paths)
+        or len(set(workspace_sources)) != len(workspace_sources)
+    ):
+        raise ValueError("completed historical workspace resource identity is reused")
+
+    execution_lease_ids = tuple(
+        payload.lease_id
+        for execution in round_authority.execution_history
+        for payload in execution.authority.lease_payloads
+    )
+    if (
+        len(set(execution_lease_ids)) != len(execution_lease_ids)
+        or set(workspace_lease_ids) & set(execution_lease_ids)
+    ):
+        raise ValueError("completed historical execution lease identity is reused")
+
+    successful_execution_keys = _successful_execution_keys_v5(events, payloads)
+    indexed_execution_keys = tuple(
+        execution.authority.key for execution in round_authority.execution_history
+    )
+    if any(
+        sum(indexed == successful for indexed in indexed_execution_keys) != 1
+        for successful in successful_execution_keys
+    ):
+        raise ValueError("successful historical execution is absent from the index")
+
+    completed_executions = tuple(
+        _authenticate_completed_execution_v5(
+            repository=repository,
+            manifest=manifest,
+            round_authority=round_authority,
+            execution=execution,
+            events=events,
+            payloads=payloads,
+        )
+        for execution in round_authority.execution_history
+    )
+    if any(
+        sum(
+            completed.workspace_payload_ref == workspace.payload_ref
+            for workspace in round_authority.workspace_history
+        )
+        != 1
+        for completed in completed_executions
+    ):
+        raise ValueError("completed historical execution lacks one exact workspace source")
+
+    cleanup_payloads = tuple(
+        payload for payload in payloads if type(payload) is CleanupResultPayloadV5
+    )
+    expected_counts = (
+        len(round_authority.workspace_history),
+        0,
+        len(completed_executions),
+        len(completed_executions),
+    )
+    if (
+        not cleanup_payloads
+        or not cleanup_payloads[-1].cleanup_complete
+        or (
+            cleanup_payloads[-1].owned_workspaces,
+            cleanup_payloads[-1].owned_policy_workers,
+            cleanup_payloads[-1].owned_evaluators,
+            cleanup_payloads[-1].owned_containers,
+        )
+        != expected_counts
+    ):
+        raise ValueError("completed historical resource cleanup counts are invalid")
+
+    return CompletedHistoricalRoundResourcesV5(
+        round_authority=round_authority,
+        events=events,
+        payloads=payloads,
+        successful_execution_keys=successful_execution_keys,
+        execution_history=completed_executions,
+        cleanup=cleanup_payloads[-1],
+    )

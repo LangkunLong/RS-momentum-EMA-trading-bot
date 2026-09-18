@@ -1,0 +1,74 @@
+"""Local image preparation only: immutable inspection and import/source smoke."""
+from pathlib import Path
+import hashlib
+import json
+import subprocess
+import sys
+
+ROOT = Path.cwd()
+sys.path.insert(0, str(ROOT))
+from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5
+from core.pit_optimizer_v5.contracts import evaluator_source_map_v5, evaluator_source_sha256
+
+DOCKER = r"C:\Users\llong\AppData\Local\Programs\DockerDesktop\resources\bin\docker.exe"
+REFERENCE = "pit-optimizer-v5-evaluator@sha256:663f1749ba91df9e501e9de705cca83ff1c46305ca5a2ad589380fbe1d9893aa"
+SOURCE = "5989471897bee94e6886493f71b525c931388e029e6eeaa626abc3678c3e2fd7"
+
+def invoke(args):
+    result = subprocess.run([DOCKER, "--context", "desktop-linux", *args], capture_output=True, text=True, timeout=90, check=False)
+    if result.returncode:
+        raise RuntimeError(f"bounded Docker operation failed: {args[0]}, exit {result.returncode}")
+    return result.stdout
+
+image = json.loads(invoke(["image", "inspect", REFERENCE]))[0]
+assert REFERENCE in image["RepoDigests"]
+assert image["Config"]["Labels"] == {
+    "io.trading-bot.pit-v5.runtime-kind": "evaluator-probe-v5",
+    "io.trading-bot.pit-v5.runtime-source-sha256": SOURCE,
+}
+assert image["Config"]["User"] == "65532:65532"
+smoke = """from pathlib import Path
+import importlib, importlib.metadata, json, os, sys
+from core.pit_optimizer_v5.image_manifest import verify_installed_evaluator_source_v5
+source = verify_installed_evaluator_source_v5(source_root=Path('/usr/local/lib/python3.13/site-packages'), expected_sha256='5989471897bee94e6886493f71b525c931388e029e6eeaa626abc3678c3e2fd7')
+modules = ['core.pit_optimizer_v5.container_entry','core.pit_optimizer_v5.probe_entry','core.pit_optimizer_v5.container_protocol','core.pit_optimizer_v5.evaluator','core.strategy_policy.worker']
+for module in modules: importlib.import_module(module)
+print(json.dumps({'runtime_source_sha256':source,'python':sys.version.split()[0],'uid':os.getuid(),'gid':os.getgid(),'safe_path':sys.flags.safe_path,'imported_modules':modules,'installed_distributions':dict(sorted((item.metadata['Name'],item.version) for item in importlib.metadata.distributions()))},sort_keys=True))
+"""
+observed = json.loads(invoke(["run", "--rm", "--pull", "never", "--network", "none", "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "32", "--cpus", "1", "--memory", "1024m", "--memory-swap", "1024m", "--entrypoint", "python", REFERENCE, "-P", "-B", "-c", smoke]))
+assert observed["runtime_source_sha256"] == SOURCE
+assert observed["uid"] == observed["gid"] == 65532
+assert observed["safe_path"] is True
+assert evaluator_source_sha256(evaluator_source_map_v5(ROOT)) == SOURCE
+repo = LocalArtifactRepositoryV5(ROOT / ".artifacts/pit-optimizer-v5")
+provenance = {
+    "schema_version": 5,
+    "record_kind": "local_evaluator_image_preparation",
+    "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+    "runtime_source_ref": {"relative_path":"evaluator/runtime-source-5989471897be.json","sha256":SOURCE},
+    "docker_context": "desktop-linux",
+    "docker_endpoint": "npipe:////./pipe/dockerDesktopLinuxEngine",
+    "builder_driver": "docker",
+    "image_reference": REFERENCE,
+    "docker_inspect_id": image["Id"],
+    "repository_digests": image["RepoDigests"],
+    "oci_platform_manifest_digest": "sha256:e8e86f876d915ff606c19dc7ca430b2ff87d9be798480a4d0eae60b91fe07d34",
+    "oci_config_digest": "sha256:3387124570367916660b3c089f9b437c9e60a6e4414e032826c53cacb14b696e",
+    "base_image": "python:3.13.14-slim@sha256:9662417aace5ae7b8e2609cce472b72a8958e134ba372808abe9cc1a0c0125e6",
+    "recipe_sha256_by_path": {name:hashlib.sha256((ROOT/name).read_bytes()).hexdigest() for name in ("Dockerfile.pit-optimizer-v5","Dockerfile.pit-optimizer-v5.dockerignore","requirements-lock.txt")},
+    "exact_context_file_count": 59,
+    "exact_context_file_bytes": 1408017,
+    "labels":image["Config"]["Labels"],
+    "architecture":image["Architecture"],
+    "os":image["Os"],
+    "smoke":observed,
+    "smoke_network_mode":"none",
+    "smoke_read_only":True,
+    "smoke_host_mounts":[],
+    "evaluations_executed":False,
+    "registry_push_performed":False,
+    "linux_unpinned_transitives":{"SecretStorage":"3.5.0","jeepney":"0.9.0"},
+}
+ref = repo.create_baseline_artifact("evaluator/image-provenance-663f1749ba91.json", provenance)
+assert repo.authenticate_exact(ref).reference == ref
+print(json.dumps({"provenance_ref":{"relative_path":ref.relative_path,"sha256":ref.sha256},"smoke":"passed","image_reference":REFERENCE,"runtime_source_sha256":SOURCE},sort_keys=True))

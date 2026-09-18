@@ -1,0 +1,16 @@
+{
+  "observed_at_utc": "2026-09-07T16:20:07.367299+00:00",
+  "operation": "actual CLI summarize on preserved runtime-04 with absolute artifact root and original manifest/config refs",
+  "exit_code": 0,
+  "evaluation_mode": "development_sp500_v2",
+  "status": "failed",
+  "typed_failures": [
+    "discovery_evaluation:deadline_exceeded"
+  ],
+  "evaluated_experiments": 1,
+  "checkpoint_generation": 1,
+  "cleanup_complete": true,
+  "source_changes_required": false,
+  "provider_calls": 0,
+  "initial_invocation_error": "relative artifact root rejected; corrected to absolute path, no source fix"
+}

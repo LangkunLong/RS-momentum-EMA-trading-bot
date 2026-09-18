@@ -1,0 +1,112 @@
+# Task 5 Re-review — Fix Round 2 of 5
+
+**Range:** `278d41bcc02d88302d0b817ce06eab04d33ac4fe..7bbb4b39cb9cfd4dde4c09849d27e483ee8bdccb`  
+**Verdict:** **NEEDS FIXES**  
+**Open findings:** Critical 0, Important 2, Minor 2
+
+This was a read-only review except for this requested artifact. The full scoped review package and Fix Round 2 report were read. No provider, network, pricing, replay, real Docker, background process, or broad suite was used.
+
+## Finding Verdicts
+
+| Open item from Re-review 1 | Verdict | Evidence |
+|---|---|---|
+| Important — AST alias/rebind mutation | **ADDRESSED** | `core/pit_optimizer_candidate.py:302-343` grants baseline list-building authority only to a name with one `Store` binding, and lines 380-396 reject every attribute/subscript assignment. The prior `cache=[]; cache=math; cache.pi += 1`, contract-class rebind, and `[math][0]` writes are now rejected; the authenticated pre-launch regression is present at `tests/test_agent_loop.py:556-626`. Current entry/risk/exit sources still validate. A smaller grammar/report mismatch remains as deferred Minor 2, but no current process-global mutation escape was found. |
+| Important — worker preflight/tentative ownership/primary preservation | **NOT ADDRESSED at the integrated cleanup boundary** | Probe validation before allocation and the post-start close guard are present at `agent_loop.py:5263-5290`; failed-create discovery retains a tentative full-ID handle and preserves the create primary at lines 5128-5187. However cleanup can still report a live full-ID daemon as absent, and an acquired session silently discards cleanup failures when a primary is active. See Important 1-2. |
+| Important — pre-return Git-apply rollback | **ADDRESSED** | Restoration is armed at `core/pit_optimizer_candidate.py:726` before the mutating apply at lines 727-735; every later `BaseException` restores the three captured files at lines 819-825. Both real-mutation `RuntimeError`/`KeyboardInterrupt` cases passed in the narrow run. |
+| Minor — exact nine-field identity value contract | **ADDRESSED** | `CandidateIdentity` has nine persisted fields and an `InitVar` seal at `core/pit_optimizer_candidate.py:163-193`. `to_primitive`/canonical JSON omit the seal. Live trust still requires field/self-digest validation and exact weak-registry object identity at lines 586-660; serialization does not authenticate a reloaded value. |
+| Minor — residual structural/cross-worker/report coverage | **NOT ADDRESSED in full** | The 120000/160000 index modes and V2 binary/rename/mode metadata now have focused tests and passed. The cross-worker assertion still compares hard-coded fake decisions rather than two executions of candidate policy, and the cleanup report overstates what the integrated paths prove. See Minor 1 and Test / Report Audit. |
+
+## New Breakage / Required Findings
+
+### Important 1 — cleanup can return success while the known full-ID daemon still exists
+
+**Requirement:** Once a unique full container ID is known, cleanup must independently attempt kill/wait/force-remove and verify that exact object is absent. A failed or tampered ownership inspection must not turn the absence check into a false negative.
+
+**Evidence:** `_cleanup_owned_policy_daemon` accepts every typed `ProcessResult` for kill/wait/rm without checking `timed_out` or `returncode` at `agent_loop.py:4589-4606`. Its final query filters on both the full ID and the expected owner label at lines 4607-4617. That label is specifically untrusted on the supported inspect-tamper path. If `rm` returns nonzero and leaves an object whose inspected label differs, the label filter hides the still-present full ID and lines 4618-4625 return no errors.
+
+A tiny synchronous fake reproducer returned:
+
+```text
+errors= []
+daemon_still_exists= True
+```
+
+It modeled a nonzero `rm`, a still-present exact 64-hex ID, and a current label different from the tentative expected label. This state is reachable from the existing full-ID-before-inspect flow at `agent_loop.py:5188-5202`, where inspect mismatch is intentionally handled by cleanup.
+
+**Required fix:** Treat timeout/nonzero results from each kill/wait/rm action as secondary cleanup failures, while still attempting every later action. Verify final absence by the known full ID alone; ownership predicates may authorize targeting, but must not filter the object out of the absence proof. Do not claim verified absence unless the ID-only query succeeds and is empty.
+
+**Exact RED test:** Have the fake create return a full ID, make inspect report the wrong label, make `rm` return a nonzero `ProcessResult` without removing the object, and make `container ls` honor its filters. Assert the identity primary remains primary, the full-ID object remains observable, and cleanup is recorded as unverified. A direct helper test should also require `_cleanup_owned_policy_daemon(...)` to return errors for this state.
+
+### Important 2 — acquired-session primary failures silently drop cleanup/absence failures
+
+**Requirement:** Candidate/protocol error, timeout, cancellation, and client initialization must preserve the active primary while retaining/reporting any cleanup failure; a potentially live worker/daemon must not become invisible.
+
+**Evidence:** `PolicyWorkerSession.close` gathers local-process, thread, daemon, and tree errors at `agent_loop.py:4785-4803`, but line 4804 handles them only when `primary_error is None`. With a primary, the method returns without adding notes or otherwise retaining the errors. This affects `call`, determinism, bootstrap/client initialization, timeout, EOF, and cancellation paths that invoke `close(primary_error=...)`.
+
+The integrated fake reproducer made an authenticated session return malformed protocol JSON and made daemon `rm` raise while leaving the daemon present. The result was:
+
+```text
+ValueError
+notes= ()
+daemon_still_exists= True
+```
+
+This contradicts `task-5-report.md:342,472,480`, which says active primaries carry typed secondary notes and unverified cleanup is reported.
+
+**Required fix:** After all independent cleanup attempts, call the existing secondary-error recorder when `primary_error is not None` and `errors` is nonempty; keep the original exception as primary. Preserve the current explicit-close behavior for `primary_error is None`.
+
+**Exact RED test:** Extend the existing malformed-protocol cleanup test: after session start, inject `rm` failure (or an absence-query failure), call `session.call`, capture the protocol primary, and assert its type/message are unchanged, `__notes__` records cleanup/absence failure, every later cleanup action ran, and the fake live/unverified state is not reported as clean. Repeat with `KeyboardInterrupt` or client-constructor cancellation for the `BaseException` path.
+
+## Minor Required / Deferred Observations
+
+### Minor 1 — the cross-worker equality test does not execute candidate policy
+
+`tests/test_agent_loop.py:1535-1575` does create two wrapper sessions and compares canonical decisions, but each `_task5_authenticated_capacity_process` at lines 450-491 decodes the request and returns the same hard-coded `CapacityDecision(None, False)`. The assertion would pass even if `worker_main` loaded a process-dependent candidate. The test is useful for fresh-session framing, but `task-5-report.md:404,444` overstates it as cross-worker candidate determinism.
+
+Add a synchronous fake-isolated worker test that actually loads the same validated candidate in two fresh worker runtimes and compares authenticated decision payloads for the same snapshots, or narrow the report to “two fresh session wrappers returned the fake's identical response.” This is a coverage/report fix; the static AST closure and fixed `PYTHONHASHSEED=0` remain the primary implementation controls.
+
+### Minor 2 — `.append` is not syntactically limited to an exact name receiver
+
+The report says only `local_name.append(...)` is allowed, but `core/pit_optimizer_candidate.py:423-429` checks `_root_name(node.func)`. It therefore also accepts `local_name[0].append(...)` or `local_name.attribute.append(...)` when the root name was classified appendable. Current trusted snapshots and contract objects expose only immutable tuples/scalars/frozen records, so no present process-global escape was found; this is deferred hardening. Require `node.func.value` to be the exact `ast.Name` in `call_appendables`, or revise the documented grammar and add provenance tests for nested receivers.
+
+## Requirement Coverage
+
+| Area | Result |
+|---|---|
+| Sole `PatchBounds`; legacy and V2 ceilings | Meets; this round does not disturb the shared 4/25/400/256-KiB legacy and 3/12/200/64-KiB V2 limits. |
+| Git-derived cumulative diff and rollback | Meets for reviewed paths; the mutating-call gap is fixed and real-mutation failure/cancellation tests restore all three files. |
+| Path/file/hunk/line/byte/binary/rename/symlink/submodule/no-op scope | Meets. Focused 120000/160000 and V2 structural negatives now cover the prior matrix omissions. |
+| Authenticated CandidateIdentity / author equality | Meets for the live controller boundary. Exact nine-field serialization is public data only; consumers still reauthenticate the original registered object. |
+| Closed AST / compile allowlist / determinism | The prior Important escape is closed. Baseline compatibility passed; Minor 2 is grammar hardening, and Minor 1 is remaining cross-worker evidence. |
+| Complete source/context packaging and next-context classification | Meets; no scoped change regressed complete three-file/current-context packaging or the Task 4 classification contract. |
+| JSON-lines closure, duplicate fields, digest/HMAC/sequence/chain/method/type binding | Meets; the new exact probe validator preserves the existing strict protocol boundary. |
+| `JsonLinePolicyClient` typed dispatch/close | Meets for reviewed behavior; the post-start constructor guard now closes on all `BaseException`s. |
+| Worker capabilities/package/host paths/argv/env/mount/resources/stdio/time/cleanup | **Blocked by Important 1-2.** Allocation preflight and tentative ownership improved, but cleanup verification and active-primary reporting are not closed. |
+| Tasks 1-4 compatibility | No regression observed. Constant/reverse canonical ordering, current baseline AST, complete source bundle, sealed live identity, and strict protocol types remain intact. No broad regression suite was run. |
+
+## Test / Report Audit
+
+- Narrow verification: **19 passed**. It covered exact identity shape, real mutating-apply rollback, 120000/160000 modes, invalid probe preflight, create/inspect/tentative cleanup, invalid create identity, client-constructor cancellation, explicit cleanup failure, two session wrappers, constant/reverse path ordering, current baseline AST, and complete source bundling. Only the pre-existing unknown `cache_dir` warning appeared.
+- Tiny cleanup-verification reproducer: `_cleanup_owned_policy_daemon` returned `errors=[]` while the exact full-ID fake remained live because nonzero `rm` was ignored and the owner-label filter hid it.
+- Tiny integrated primary reproducer: malformed protocol plus `rm` failure returned the unchanged `ValueError`, but `__notes__` was empty while the fake daemon remained live.
+- The added structural tests are honest characterizations of existing rejection behavior. The real-mutation rollback test is correctly positioned around the actual non-check Git apply.
+- The reported 150-test command was not broadly rerun. Report lines 342/472/480 must be narrowed or the two required cleanup fixes and REDs added.
+- `git status --short --untracked-files=all` and `git diff --check` were clean before writing this requested artifact.
+
+## Resource / Cleanup Audit
+
+- Probe tuples are now validated before package/daemon/process allocation. Determinism validation and client construction are guarded by close-on-`BaseException`.
+- A unique full ID from exact fresh name+owner discovery is retained before inspect; discovery/inspect failures no longer replace the create primary. If discovery cannot produce one unique ID, the report correctly avoids claiming absence.
+- Normal cleanup still independently attempts local stdin/terminate/wait/kill/streams, joins output readers, attempts daemon kill/wait/rm/query, and removes the private package tree.
+- Cleanup outcome is not yet trustworthy on two paths: status failures are not inspected and the final label-filtered query can hide the known ID; acquired-session cleanup errors are dropped when a primary exists.
+- No real Docker/container or background process was started. All worker checks and reproducers used injected synchronous fakes.
+
+## Out-of-Scope Observations
+
+- Docker labels are normally immutable, but the implementation explicitly supports an inspect-mismatch/tamper branch. Once ownership inspection fails, that unverified label cannot safely participate in the absence proof; the full ID is the authoritative object key.
+- The weak identity registry remains deliberately process-local. Any future persistence, IPC, or restart consumer must rederive identity from authenticated Git/source inputs rather than trusting the nine-field digest value.
+- Real Docker integration and replay/parity remain intentionally deferred and were not used in this review.
+
+## Final Verdict
+
+**NEEDS FIXES — Critical 0, Important 2, Minor 2.** Fix Round 2 closes the prior AST alias/rebind mutation, pre-return Git rollback, exact nine-field identity shape, probe preflight, and nominal tentative-owner flow. It is not ready while a known full-ID daemon can be falsely considered absent and cleanup failures during an active session primary disappear without secondary evidence.

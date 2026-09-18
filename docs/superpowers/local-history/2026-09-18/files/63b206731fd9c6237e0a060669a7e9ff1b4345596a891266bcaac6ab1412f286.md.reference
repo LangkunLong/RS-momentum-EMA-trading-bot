@@ -1,0 +1,33 @@
+# Architect checkpoint B2: corrections required
+
+B2 is not approved for B3 yet. The closed payload, exact decoding, capped assignment membership, shared append/replay check, and absent-to-terminal state transition are appropriate. Two journal authority requirements remain incomplete. These findings come from static review; no synthetic events or altered historical inputs were executed.
+
+## Findings
+
+### P2: bind the complete author hypothesis to the round intent
+
+Location: `core/pit_optimizer_v5/artifacts.py:2828-2831`, inside `_validate_render_rejection_context`.
+
+The accepted author request contains the complete `role_input.hypothesis`, but this check compares only its binding/template hypothesis ID to the intent's ID. The subsequent invalid identity is derived using the complete `intent.hypothesis`. If the intent has the same ID but different instructions, predictions, claims, or evidence, this code can authenticate a rejection under a hypothesis different from the one supplied to the accepted author. Loading the role invocation authenticates its own request and artifact; provider validation also compares only the hypothesis ID to that request's binding and has no round intent available.
+
+Correction: require the authenticated author input's complete hypothesis SHA-256 to equal the round intent hypothesis SHA-256 before deriving the rejection identity. Preserve the existing parent, discovery plan, campaign/round, accepted-author, template, and typed assignment checks. Keep the check in the repository path shared by append and replay.
+
+Actual06's two complete hypothesis hashes already match: `a075e27c21a40c71b4dc8e67cf49a0dbffc42f6c528717c905173b2b5da9eea5`. The historical artifact is consistent; the general invariant is missing from production code.
+
+### P2: exclude rejected identities from subsequent critic requests
+
+Location: `core/pit_optimizer_v5/artifacts.py:2782`, repository rejection context; related fold behavior at `core/pit_optimizer_v5/memory.py:1515-1517`.
+
+The fold makes the rejected identity terminal and blocks later candidate stage events, but a later critic role completion only sets `critic_complete` and continues. The repository context authenticates the author and checks rendered-assignment conflicts, but never checks a critic request's bound experiment IDs against rejected identities. A critic invocation whose internally consistent request labels a rejected identity as testable can therefore be accepted into this round's journal. Generic role-package validation binds the critic response to that request; it does not establish eligibility from the round journal. This leaves B2's explicit 'no subsequent critic for it' invariant unenforced.
+
+Correction: whenever a round contains render rejections, authenticate each critic completion's stored invocation and reject any intersection between `request.expected_binding.experiment_ids` and the rejected experiment identity hashes. Apply to accepted and failed critic completions: both represent requests and can carry a rejected identity. Preserve existing campaign/round/role binding checks, and ensure this runs both on append and replay. A critic for other testable candidates in a mixed round must remain allowed. Do not implement critic request construction or all-invalid finalization here; those remain B3/B4 work.
+
+## Independent verification
+
+See `architect-verification.json`. Current source hashes, saved preimages, scoped patch hash, and the actual06 verification file match the submitted package. Scoped Ruff, in-memory compilation, and scoped diff checks passed. Approved A and candidate_ir remain unchanged; the 56-file evaluator identity is `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4`.
+
+The actual06 manifest graph, intent, accepted author invocation, and cap-one assignment were authenticated read-only. The derived invalid identity remains `18ea7a802fed21683eef0d31354f6d656e07af576199c27819bdacde25faeb7f`. Actual06 still has zero rejection events. This does not exercise new rejection append/replay, rejection conflicts, or mixed-round critic exclusion.
+
+## Next scope
+
+Implement the two B2 corrections only, preferably in artifacts.py's existing shared context validator. Follow `next-luna-prompt.md` in this directory. Preserve the original B2 package and save a new correction package. Return to the architect checkpoint before B3/B4. No production source was changed during this architect review, and no campaign or external request was made.

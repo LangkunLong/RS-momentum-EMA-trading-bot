@@ -1,0 +1,39 @@
+# Review — focused V3 policy worker integration fix
+
+## Spec Compliance
+
+APPROVED.
+
+- `PolicyWorkerSession.__init__` reads the bootstrap interface version once and requires `type(value) is int` plus membership in the public supported-version set before assigning session state, creating the determinism guard, constructing queues/events/threads, or starting reader threads (`agent_loop.py:7931-7974`). This accepts exactly V2 and V3 because the authoritative set is `{POLICY_INTERFACE_VERSION, POLICY_INTERFACE_VERSION_V3}` = `{2, 3}` (`core/strategy_policy/__init__.py:43-47`); booleans, strings, V1, and unsupported integers fail closed.
+- The captured value is stored as `_policy_interface_version` and the only `DecisionDeterminismGuard.observe()` call supplies it explicitly (`agent_loop.py:7940-7942`, `agent_loop.py:8182-8187`). There is no remaining default-V2 guard path in `PolicyWorkerSession`.
+- Authenticated request and response handling continue to use the same immutable controller-owned bootstrap (`agent_loop.py:8140-8146`, `agent_loop.py:8170-8177`). `decode_policy_response()` selects its exact request/decision contracts from `bootstrap.interface_version`, so envelope decoding and determinism validation share the same authority (`core/strategy_policy/worker.py:431-476`).
+- The interface check precedes `_started_at`, sequence/HMAC initialization, guard allocation, synchronization objects, reader-thread construction, and thread startup; invalid versions therefore cause no worker-session lifecycle side effects (`agent_loop.py:7931-7974`).
+- The diff changes only `agent_loop.py`, adding validation/storage and the explicit guard keyword. Request writing, response authentication, HMAC/sequence advancement, timeout handling, failure containment, cleanup, process ownership, providers, Docker, and evaluator behavior are untouched (`agent_loop.py:8140-8195`).
+
+## Strengths
+
+- The patch relies on the central supported-version set instead of duplicating version literals.
+- Exact-type validation prevents Python's `bool`/`int` equivalence from admitting `True` as interface V1.
+- Capturing the version once prevents decoder/guard authority from drifting during a session; `WorkerBootstrap` itself is frozen and slotted (`core/strategy_policy/worker.py:132-145`).
+
+## Issues
+
+### Critical
+
+None.
+
+### Important
+
+None.
+
+### Minor
+
+None.
+
+## Pre-existing test state
+
+The documented interface-V1 fixtures are stale against the explicit supported `{2, 3}` contract. Their failure is pre-existing and is not a defect introduced by this patch.
+
+## Assessment
+
+APPROVED. The fix closes the V3 determinism-authority gap without timing, sequencing, cleanup, provider, Docker, evaluator, or other behavioral drift. Verification commands were not rerun during this read-only review.

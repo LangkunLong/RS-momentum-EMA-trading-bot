@@ -1,0 +1,726 @@
+diff --git a/.artifacts/pit-optimizer-v5/development/increment-c-campaign-proposal/admission-p4/principal-preimages/campaign_admission.py b/core/pit_optimizer_v5/campaign_admission.py
+--- a/.artifacts/pit-optimizer-v5/development/increment-c-campaign-proposal/admission-p4/principal-preimages/campaign_admission.py
++++ b/core/pit_optimizer_v5/campaign_admission.py
+@@ -30,9 +30,11 @@
+     CleanupResultPayloadV5,
+     ExperimentRecordV5,
+     RoleCompletionPayloadV5,
++    RoundOutcomeKindV5,
+     RoundOutcomePayloadV5,
+ )
+ from core.pit_optimizer_v5.provider import (
++    LedgerRoleTerminalAuthorityV5,
+     RoleCallKeyV5,
+     RoleInvocationPackageV5,
+     RoleRequestV5,
+@@ -41,6 +43,12 @@
+ )
+ 
+ if TYPE_CHECKING:
++    from core.pit_optimizer_v5.development_preparation import (
++        _CompletedDevelopmentHistoryV5,
++    )
++    from core.pit_optimizer_v5.historical_verification import (
++        CompletedHistoricalRoundResourcesV5,
++    )
+     from core.pit_optimizer_v5.operations import CampaignLaunchV5, CampaignRoundLaunchV5
+ 
+ 
+@@ -197,6 +205,93 @@
+     cost_usd: Decimal
+     observed_started_rounds: tuple[int, ...]
+     prestart_round_index: int | None
++
++
++@dataclass(frozen=True, slots=True)
++class _CampaignPrefixFactsV5:
++    boundary: _CampaignBoundaryFactsV5
++    evaluated_round_indices: tuple[int, ...]
++    final_round_outcome: RoundOutcomeKindV5 | None
++
++
++@dataclass(frozen=True, slots=True)
++class CampaignPolicyComplianceV5:
++    """Data-only enrolled-policy report over authenticated completed history."""
++
++    policy_ref: ArtifactRefV5
++    manifest_ref: ArtifactRefV5
++    configured_round_indices: tuple[int, ...]
++    started_epoch_ms_by_round: tuple[tuple[int, int], ...]
++    evaluated_feedback_round_indices: tuple[int, ...]
++    attempted_rounds: int
++    external_attempts: int
++    total_tokens: int
++    cost_usd: Decimal
++    final_decision: Literal[
++        "admit",
++        "evaluated_feedback_target_reached",
++        "insufficient_milestone_reserve",
++    ]
++    final_round_outcome: RoundOutcomeKindV5 | None
++    logical_prefix_eligibility: Literal["verified"]
++    temporal_evidence_scope: Literal[
++        "stored_campaign_launch_and_round_start_epochs_only"
++    ]
++    global_publication_timestamps: Literal["unavailable"]
++
++    def __post_init__(self) -> None:
++        if (
++            type(self.policy_ref) is not ArtifactRefV5
++            or type(self.manifest_ref) is not ArtifactRefV5
++            or type(self.configured_round_indices) is not tuple
++            or not self.configured_round_indices
++            or self.configured_round_indices
++            != tuple(range(1, len(self.configured_round_indices) + 1))
++            or type(self.started_epoch_ms_by_round) is not tuple
++            or tuple(index for index, _epoch in self.started_epoch_ms_by_round)
++            != self.configured_round_indices
++            or any(
++                type(index) is not int
++                or type(epoch) is not int
++                or epoch < 1
++                for index, epoch in self.started_epoch_ms_by_round
++            )
++            or type(self.evaluated_feedback_round_indices) is not tuple
++            or self.evaluated_feedback_round_indices
++            != tuple(sorted(set(self.evaluated_feedback_round_indices)))
++            or any(
++                index not in self.configured_round_indices
++                for index in self.evaluated_feedback_round_indices
++            )
++            or type(self.attempted_rounds) is not int
++            or self.attempted_rounds != len(self.configured_round_indices)
++            or type(self.external_attempts) is not int
++            or self.external_attempts < 0
++            or type(self.total_tokens) is not int
++            or self.total_tokens < 0
++            or type(self.cost_usd) is not Decimal
++            or not self.cost_usd.is_finite()
++            or self.cost_usd < 0
++            or self.final_decision
++            not in {
++                "admit",
++                "evaluated_feedback_target_reached",
++                "insufficient_milestone_reserve",
++            }
++            or self.final_round_outcome
++            not in {
++                None,
++                "no_novel_hypothesis",
++                "novelty_exhausted",
++                "critic_unavailable",
++                "runtime_failed",
++            }
++            or self.logical_prefix_eligibility != "verified"
++            or self.temporal_evidence_scope
++            != "stored_campaign_launch_and_round_start_epochs_only"
++            or self.global_publication_timestamps != "unavailable"
++        ):
++            raise ValueError("campaign policy compliance report is invalid")
+ 
+ 
+ def _worst_role_envelope_cost_v5(
+@@ -1049,19 +1144,21 @@
+     return tuple(sorted(rounds))
+ 
+ 
+-def _role_packages_v5(
+-    *,
+-    repository: LocalArtifactRepositoryV5,
++def _validated_role_packages_v5(
++    *,
+     manifest: CampaignManifestV5,
+     round_index: int,
+     payloads: tuple[object, ...],
+     policy: CampaignAdmissionPolicyV5,
++    packages: tuple[RoleInvocationPackageV5, ...],
+ ) -> tuple[tuple[RoleCompletionPayloadV5, RoleInvocationPackageV5], ...]:
+     result: list[tuple[RoleCompletionPayloadV5, RoleInvocationPackageV5]] = []
+-    for payload in payloads:
+-        if type(payload) is not RoleCompletionPayloadV5:
+-            continue
+-        package = repository.load_role_invocation(payload)
++    role_payloads = tuple(
++        payload for payload in payloads if type(payload) is RoleCompletionPayloadV5
++    )
++    if len(role_payloads) != len(packages):
++        raise ValueError("campaign admission role package count differs")
++    for payload, package in zip(role_payloads, packages, strict=True):
+         call = package.call
+         if (
+             payload.campaign_id != manifest.campaign_id
+@@ -1087,6 +1184,27 @@
+     return tuple(result)
+ 
+ 
++def _role_packages_v5(
++    *,
++    repository: LocalArtifactRepositoryV5,
++    manifest: CampaignManifestV5,
++    round_index: int,
++    payloads: tuple[object, ...],
++    policy: CampaignAdmissionPolicyV5,
++) -> tuple[tuple[RoleCompletionPayloadV5, RoleInvocationPackageV5], ...]:
++    role_payloads = tuple(
++        payload for payload in payloads if type(payload) is RoleCompletionPayloadV5
++    )
++    packages = tuple(repository.load_role_invocation(payload) for payload in role_payloads)
++    return _validated_role_packages_v5(
++        manifest=manifest,
++        round_index=round_index,
++        payloads=payloads,
++        policy=policy,
++        packages=packages,
++    )
++
++
+ def _evaluated_round_indices_v5(
+     *,
+     records: tuple[ExperimentRecordV5, ...],
+@@ -1126,6 +1244,135 @@
+             raise ValueError("evaluated campaign round lacks its authenticated critic")
+         evaluated_rounds.append(index)
+     return tuple(evaluated_rounds)
++
++
++def _compose_campaign_prefix_facts_v5(
++    *,
++    manifest: CampaignManifestV5,
++    policy: CampaignAdmissionPolicyV5,
++    completed_rounds: tuple[CompletedHistoricalRoundResourcesV5, ...],
++    records: tuple[ExperimentRecordV5, ...],
++    completed_by_round: dict[
++        int,
++        tuple[tuple[RoleCompletionPayloadV5, RoleInvocationPackageV5], ...],
++    ],
++    observed_started_rounds: tuple[int, ...],
++    prestart_round_index: int | None,
++    allow_final_stop: bool,
++) -> _CampaignPrefixFactsV5:
++    """Compose one authenticated logical prefix without reading mutable state."""
++
++    from core.pit_optimizer_v5.historical_verification import (
++        CompletedHistoricalRoundResourcesV5,
++    )
++
++    round_indices = tuple(
++        completed.round_authority.owner.round_index
++        for completed in completed_rounds
++    )
++    if (
++        type(completed_rounds) is not tuple
++        or any(
++            type(completed) is not CompletedHistoricalRoundResourcesV5
++            for completed in completed_rounds
++        )
++        or round_indices != tuple(range(1, len(round_indices) + 1))
++        or type(records) is not tuple
++        or any(type(record) is not ExperimentRecordV5 for record in records)
++        or any(record.round_index not in round_indices for record in records)
++        or type(completed_by_round) is not dict
++        or tuple(completed_by_round) != round_indices
++        or type(observed_started_rounds) is not tuple
++        or observed_started_rounds != round_indices
++        or (
++            prestart_round_index is not None
++            and (
++                type(prestart_round_index) is not int
++                or prestart_round_index != len(round_indices) + 1
++            )
++        )
++        or type(allow_final_stop) is not bool
++    ):
++        raise ValueError("campaign admission prefix facts are invalid")
++
++    packages: list[RoleInvocationPackageV5] = []
++    final_round_outcome: RoundOutcomeKindV5 | None = None
++    for position, completed in enumerate(completed_rounds, start=1):
++        entries = completed_by_round[position]
++        if (
++            type(entries) is not tuple
++            or any(
++                type(payload) is not RoleCompletionPayloadV5
++                or type(package) is not RoleInvocationPackageV5
++                or payload.round_index != position
++                or package.call.round_index != position
++                for payload, package in entries
++            )
++        ):
++            raise ValueError("campaign admission prefix role facts are invalid")
++        round_packages = tuple(package for _payload, package in entries)
++        for package in round_packages:
++            if type(package.terminal_authority) is not LedgerRoleTerminalAuthorityV5:
++                raise ValueError("campaign admission prefix requires paid ledger authority")
++            require_role_envelope_v5(
++                policy=policy,
++                manifest=manifest,
++                request=package.request,
++            )
++        packages.extend(round_packages)
++
++        round_records = tuple(
++            record for record in records if record.round_index == position
++        )
++        round_outcomes = tuple(
++            payload
++            for payload in completed.payloads
++            if type(payload) is RoundOutcomePayloadV5
++        )
++        if (
++            len(round_outcomes) > 1
++            or (round_outcomes and round_records)
++            or (not round_records and not round_outcomes)
++        ):
++            raise ValueError("campaign admission prefix settlement is invalid")
++        outcome = None if not round_outcomes else round_outcomes[0].outcome
++        continuable = (
++            outcome in {None, "no_novel_hypothesis"}
++            and all(package.accepted for package in round_packages)
++        )
++        if not continuable and (
++            not allow_final_stop or position != len(completed_rounds)
++        ):
++            raise ValueError("campaign admission follows a noncontinuable round")
++        if position == len(completed_rounds):
++            final_round_outcome = outcome
++
++    evaluated_rounds = _evaluated_round_indices_v5(
++        records=records,
++        completed_by_round=completed_by_round,
++        round_indices=range(1, len(completed_rounds) + 1),
++    )
++    receipt = None
++    if packages:
++        terminal = packages[-1].terminal_authority
++        assert type(terminal) is LedgerRoleTerminalAuthorityV5
++        receipt = terminal.receipt
++    boundary = _CampaignBoundaryFactsV5(
++        evaluated_feedback_rounds=len(evaluated_rounds),
++        attempted_rounds=len(completed_rounds),
++        external_attempts=(
++            0 if receipt is None else receipt.cumulative_external_attempts
++        ),
++        total_tokens=(0 if receipt is None else receipt.cumulative_total_tokens),
++        cost_usd=(Decimal("0") if receipt is None else receipt.cumulative_cost_usd),
++        observed_started_rounds=observed_started_rounds,
++        prestart_round_index=prestart_round_index,
++    )
++    return _CampaignPrefixFactsV5(
++        boundary=boundary,
++        evaluated_round_indices=evaluated_rounds,
++        final_round_outcome=final_round_outcome,
++    )
+ 
+ 
+ def _load_live_role_prefix_v5(
+@@ -1503,20 +1750,6 @@
+         )
+         completed_by_round[index] = entries
+         journal_entries.extend(entries)
+-        round_records = tuple(record for record in records if record.round_index == index)
+-        round_outcomes = tuple(
+-            payload
+-            for payload in completed.payloads
+-            if type(payload) is RoundOutcomePayloadV5
+-        )
+-        if round_outcomes and (
+-            len(round_outcomes) != 1
+-            or round_outcomes[0].outcome != "no_novel_hypothesis"
+-            or bool(round_records)
+-        ):
+-            raise ValueError("campaign boundary prior round has a stopping outcome")
+-        if not round_records and not round_outcomes:
+-            raise ValueError("campaign boundary prior round lacks committed settlement")
+ 
+     observed_requests = _existing_campaign_role_requests_v5(repository, manifest)
+     journal_requests = {
+@@ -1552,25 +1785,216 @@
+         reservations=reservations,
+         terminals=terminals,
+     )
+-    evaluated_rounds = _evaluated_round_indices_v5(
++    prefix = _compose_campaign_prefix_facts_v5(
++        manifest=manifest,
++        policy=admission.policy,
++        completed_rounds=completed_rounds,
+         records=records,
+         completed_by_round=completed_by_round,
+-        round_indices=range(1, next_round_index),
+-    )
+-    receipt = None if not terminals else terminals[-1].receipt
+-    return _CampaignBoundaryFactsV5(
+-        evaluated_feedback_rounds=len(evaluated_rounds),
+-        attempted_rounds=len(starts),
+-        external_attempts=(
+-            0 if receipt is None else receipt.cumulative_external_attempts
+-        ),
+-        total_tokens=(0 if receipt is None else receipt.cumulative_total_tokens),
+-        cost_usd=(Decimal("0") if receipt is None else receipt.cumulative_cost_usd),
+         observed_started_rounds=tuple(starts),
+         prestart_round_index=(
+             next_round_index if next_round_index in launches else None
+         ),
+-    )
++        allow_final_stop=False,
++    )
++    return prefix.boundary
++
++
++def _completed_history_role_facts_v5(
++    *,
++    manifest: CampaignManifestV5,
++    policy: CampaignAdmissionPolicyV5,
++    history: _CompletedDevelopmentHistoryV5,
++) -> dict[
++    int,
++    tuple[tuple[RoleCompletionPayloadV5, RoleInvocationPackageV5], ...],
++]:
++    completed_by_round: dict[
++        int,
++        tuple[tuple[RoleCompletionPayloadV5, RoleInvocationPackageV5], ...],
++    ] = {}
++    ordered_packages: list[RoleInvocationPackageV5] = []
++    for completed in history.rounds:
++        round_index = completed.round_authority.owner.round_index
++        packages = tuple(
++            package
++            for package in history.packages
++            if package.call.round_index == round_index
++        )
++        entries = _validated_role_packages_v5(
++            manifest=manifest,
++            round_index=round_index,
++            payloads=completed.payloads,
++            policy=policy,
++            packages=packages,
++        )
++        completed_by_round[round_index] = entries
++        ordered_packages.extend(package for _payload, package in entries)
++    if tuple(ordered_packages) != history.packages:
++        raise ValueError("campaign compliance packages differ from completed history")
++    return completed_by_round
++
++
++def _authenticate_completed_campaign_policy_v5(
++    *,
++    repository: LocalArtifactRepositoryV5,
++    manifest: CampaignManifestV5,
++    history: _CompletedDevelopmentHistoryV5,
++    expected_policy_ref: ArtifactRefV5 | None,
++) -> CampaignPolicyComplianceV5 | None:
++    """Compose optional policy compliance after original history authentication."""
++
++    from core.pit_optimizer_v5.development_preparation import (
++        _CompletedDevelopmentHistoryV5,
++    )
++
++    if type(history) is not _CompletedDevelopmentHistoryV5:
++        raise ValueError("campaign compliance history authority is invalid")
++    admission = load_campaign_admission_v5(
++        repository=repository,
++        manifest=manifest,
++        expected_policy_ref=expected_policy_ref,
++    )
++    if admission is None:
++        return None
++    if (
++        type(history.original_config) is not ProviderDevelopmentAdapterConfigV5
++        or history.authenticated_manifest.manifest != manifest
++        or history.campaign_launch.manifest_ref != admission.policy.manifest_ref
++        or history.campaign_launch.adapter_config_ref
++        != admission.policy.adapter_config_ref
++        or history.campaign_launch.owner_token_sha256
++        != admission.policy.owner_token_sha256
++        or history.original_config.repository_root_identity_sha256
++        != admission.policy.repository_root_identity_sha256
++    ):
++        raise ValueError("campaign compliance original authority differs")
++
++    census = _load_campaign_round_state_census_v5(
++        repository=repository,
++        manifest=manifest,
++        admission=admission,
++        owner_token_sha256=history.campaign_launch.owner_token_sha256,
++    )
++    configured_rounds = tuple(index for index, _launch in census.launches)
++    started_rounds = tuple(index for index, _started in census.starts)
++    if (
++        census.authenticated_manifest != history.authenticated_manifest
++        or census.campaign_launch != history.campaign_launch
++        or census.original_config != history.original_config
++        or configured_rounds != history.round_indices
++        or started_rounds != history.round_indices
++    ):
++        raise ValueError("campaign compliance round census differs from completed history")
++
++    completed_by_round = _completed_history_role_facts_v5(
++        manifest=manifest,
++        policy=admission.policy,
++        history=history,
++    )
++    for round_index in history.round_indices:
++        prior_count = round_index - 1
++        prior = _compose_campaign_prefix_facts_v5(
++            manifest=manifest,
++            policy=admission.policy,
++            completed_rounds=history.rounds[:prior_count],
++            records=tuple(
++                record
++                for record in history.records
++                if record.round_index < round_index
++            ),
++            completed_by_round={
++                index: completed_by_round[index]
++                for index in range(1, round_index)
++            },
++            observed_started_rounds=tuple(range(1, round_index)),
++            prestart_round_index=None,
++            allow_final_stop=False,
++        )
++        decision = campaign_boundary_decision_v5(
++            policy=admission.policy,
++            manifest=manifest,
++            evaluated_feedback_rounds=prior.boundary.evaluated_feedback_rounds,
++            attempted_rounds=prior.boundary.attempted_rounds,
++            external_attempts=prior.boundary.external_attempts,
++            total_tokens=prior.boundary.total_tokens,
++            cost_usd=prior.boundary.cost_usd,
++        )
++        if decision != "admit":
++            raise ValueError(
++                f"historical campaign round was not policy-admissible: {decision}"
++            )
++
++    final = _compose_campaign_prefix_facts_v5(
++        manifest=manifest,
++        policy=admission.policy,
++        completed_rounds=history.rounds,
++        records=history.records,
++        completed_by_round=completed_by_round,
++        observed_started_rounds=history.round_indices,
++        prestart_round_index=None,
++        allow_final_stop=True,
++    )
++    final_decision = campaign_boundary_decision_v5(
++        policy=admission.policy,
++        manifest=manifest,
++        evaluated_feedback_rounds=final.boundary.evaluated_feedback_rounds,
++        attempted_rounds=final.boundary.attempted_rounds,
++        external_attempts=final.boundary.external_attempts,
++        total_tokens=final.boundary.total_tokens,
++        cost_usd=final.boundary.cost_usd,
++    )
++    return CampaignPolicyComplianceV5(
++        policy_ref=admission.binding.policy_ref,
++        manifest_ref=admission.binding.manifest_ref,
++        configured_round_indices=configured_rounds,
++        started_epoch_ms_by_round=tuple(
++            (index, started.started_epoch_ms)
++            for index, started in census.starts
++            if started.started_epoch_ms is not None
++        ),
++        evaluated_feedback_round_indices=final.evaluated_round_indices,
++        attempted_rounds=final.boundary.attempted_rounds,
++        external_attempts=final.boundary.external_attempts,
++        total_tokens=final.boundary.total_tokens,
++        cost_usd=final.boundary.cost_usd,
++        final_decision=final_decision,
++        final_round_outcome=final.final_round_outcome,
++        logical_prefix_eligibility="verified",
++        temporal_evidence_scope=(
++            "stored_campaign_launch_and_round_start_epochs_only"
++        ),
++        global_publication_timestamps="unavailable",
++    )
++
++
++def authenticate_campaign_policy_compliance_v5(
++    *,
++    repository: LocalArtifactRepositoryV5,
++    manifest: CampaignManifestV5,
++    expected_policy_ref: ArtifactRefV5,
++) -> CampaignPolicyComplianceV5:
++    """Authenticate completed history under one explicitly pinned enrolled policy."""
++
++    if type(expected_policy_ref) is not ArtifactRefV5:
++        raise ValueError("expected campaign compliance policy reference is invalid")
++    from core.pit_optimizer_v5.development_preparation import (
++        _authenticate_completed_development_history_facts_v5,
++    )
++
++    history = _authenticate_completed_development_history_facts_v5(
++        repository,
++        manifest,
++    )
++    report = _authenticate_completed_campaign_policy_v5(
++        repository=repository,
++        manifest=manifest,
++        history=history,
++        expected_policy_ref=expected_policy_ref,
++    )
++    if report is None:
++        raise ValueError("expected campaign compliance enrollment is missing")
++    return report
+ 
+ 
+ def require_live_role_admission_v5(
+@@ -1636,6 +2060,8 @@
+     "AuthenticatedCampaignAdmissionV5",
+     "CampaignAdmissionBindingV5",
+     "CampaignAdmissionPolicyV5",
++    "CampaignPolicyComplianceV5",
++    "authenticate_campaign_policy_compliance_v5",
+     "authenticate_prepared_campaign_policy_v5",
+     "campaign_boundary_decision_v5",
+     "load_campaign_admission_v5",
+diff --git a/.artifacts/pit-optimizer-v5/development/increment-c-campaign-proposal/admission-p4/principal-preimages/development_preparation.py b/core/pit_optimizer_v5/development_preparation.py
+--- a/.artifacts/pit-optimizer-v5/development/increment-c-campaign-proposal/admission-p4/principal-preimages/development_preparation.py
++++ b/core/pit_optimizer_v5/development_preparation.py
+@@ -4,9 +4,10 @@
+ 
+ from dataclasses import dataclass, fields, replace
+ import hashlib
+-import json
+-from pathlib import Path
+-import subprocess
++import json
++from pathlib import Path
++import subprocess
++from typing import TYPE_CHECKING
+ 
+ from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5
+ from core.pit_optimizer_v5.contracts import ArtifactRefV5, canonical_json_bytes_v5, canonical_sha256_v5
+@@ -17,11 +18,20 @@
+ )
+ from core.pit_optimizer_v5.manifest import PolicySourceSnapshotV5, _sanitized_git_environment_v5
+ from core.pit_optimizer_v5.policy_scope import EDITABLE_POLICY_PATHS_V5
+-from core.pit_optimizer_v5.provider import (
++from core.pit_optimizer_v5.provider import (
+     ControllerRoleTerminalAuthorityV5,
+     ExistingPersistedRoleRequestV5,
+-    parse_and_bind_role_artifact,
+-)
++    parse_and_bind_role_artifact,
++)
++
++if TYPE_CHECKING:
++    from core.pit_optimizer_v5.historical_verification import (
++        CompletedHistoricalRoundResourcesV5,
++    )
++    from core.pit_optimizer_v5.manifest import AuthenticatedCampaignManifestV5
++    from core.pit_optimizer_v5.memory import ExperimentRecordV5
++    from core.pit_optimizer_v5.operations import CampaignLaunchV5
++    from core.pit_optimizer_v5.provider import RoleInvocationPackageV5
+ 
+ PATH_FIELDS = (
+     "source_root",
+@@ -121,8 +131,49 @@
+                 raise ValueError("development config identity invalid")
+         for field in PATH_FIELDS:
+             _canonical_windows_path_v5(getattr(self, field), field)
+-        if self.api_key_environment_variable != "OPENROUTER_API_KEY":
+-            raise ValueError("development provider secret handle is invalid")
++        if self.api_key_environment_variable != "OPENROUTER_API_KEY":
++            raise ValueError("development provider secret handle is invalid")
++
++
++@dataclass(frozen=True, slots=True)
++class _CompletedDevelopmentHistoryV5:
++    """Data-only result of the complete immutable history authentication path."""
++
++    authenticated_manifest: AuthenticatedCampaignManifestV5
++    campaign_launch: CampaignLaunchV5
++    original_config: DevelopmentAdapterConfigV5 | ProviderDevelopmentAdapterConfigV5
++    round_indices: tuple[int, ...]
++    rounds: tuple[CompletedHistoricalRoundResourcesV5, ...]
++    records: tuple[ExperimentRecordV5, ...]
++    packages: tuple[RoleInvocationPackageV5, ...]
++
++    def __post_init__(self) -> None:
++        from core.pit_optimizer_v5.historical_verification import (
++            CompletedHistoricalRoundResourcesV5,
++        )
++        from core.pit_optimizer_v5.manifest import AuthenticatedCampaignManifestV5
++        from core.pit_optimizer_v5.memory import ExperimentRecordV5
++        from core.pit_optimizer_v5.operations import CampaignLaunchV5
++        from core.pit_optimizer_v5.provider import RoleInvocationPackageV5
++
++        if (
++            type(self.authenticated_manifest) is not AuthenticatedCampaignManifestV5
++            or type(self.campaign_launch) is not CampaignLaunchV5
++            or type(self.original_config)
++            not in {DevelopmentAdapterConfigV5, ProviderDevelopmentAdapterConfigV5}
++            or type(self.round_indices) is not tuple
++            or not self.round_indices
++            or self.round_indices != tuple(sorted(set(self.round_indices)))
++            or type(self.rounds) is not tuple
++            or any(type(item) is not CompletedHistoricalRoundResourcesV5 for item in self.rounds)
++            or tuple(item.round_authority.owner.round_index for item in self.rounds)
++            != self.round_indices
++            or type(self.records) is not tuple
++            or any(type(item) is not ExperimentRecordV5 for item in self.records)
++            or type(self.packages) is not tuple
++            or any(type(item) is not RoleInvocationPackageV5 for item in self.packages)
++        ):
++            raise ValueError("completed development history facts are invalid")
+ 
+ 
+ def development_config_type_v5(manifest):
+@@ -415,8 +466,11 @@
+             raise ValueError("controller package differs from exact sealed response")
+ 
+ 
+-def authenticate_completed_development_history_v5(repository, manifest) -> None:
+-    """Authenticate one completed development campaign without repair or adapters."""
++def _authenticate_completed_development_history_facts_v5(
++    repository,
++    manifest,
++) -> _CompletedDevelopmentHistoryV5:
++    """Return facts after the complete immutable history authentication path."""
+ 
+     from core.pit_optimizer_v5.contracts import CampaignManifestV5
+     from core.pit_optimizer_v5.historical_verification import (
+@@ -530,12 +584,37 @@
+             adapter_config=original_config,
+             packages=packages,
+         )
+-    LocalArchiveReducerFactoryV5(repository).verify_projection(
+-        manifest=manifest,
+-        panel_plan=authenticated.panel_plan,
+-        evaluator_contract=authenticated.evaluator_contract,
+-        repair=False,
+-    )
++    LocalArchiveReducerFactoryV5(repository).verify_projection(
++        manifest=manifest,
++        panel_plan=authenticated.panel_plan,
++        evaluator_contract=authenticated.evaluator_contract,
++        repair=False,
++    )
++    return _CompletedDevelopmentHistoryV5(
++        authenticated_manifest=authenticated,
++        campaign_launch=launch,
++        original_config=original_config,
++        round_indices=round_indices,
++        rounds=tuple(rounds),
++        records=records,
++        packages=packages,
++    )
++
++
++def authenticate_completed_development_history_v5(repository, manifest) -> None:
++    """Authenticate one completed development campaign without repair or adapters."""
++
++    facts = _authenticate_completed_development_history_facts_v5(repository, manifest)
++    from core.pit_optimizer_v5.campaign_admission import (
++        _authenticate_completed_campaign_policy_v5,
++    )
++
++    _authenticate_completed_campaign_policy_v5(
++        repository=repository,
++        manifest=manifest,
++        history=facts,
++        expected_policy_ref=None,
++    )
+ 
+ 
+ def authenticate_development_history_v5(repository, manifest):

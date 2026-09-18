@@ -1,0 +1,2404 @@
+# Review package: f30032b7578e326be7b4cbf67f726d89cda987f6..264d4c78914f03e2d479a5af9040e742e0a972ad
+
+## Commits
+264d4c7 fix: recover from accounted optimizer role output
+
+## Files changed
+ agent_loop.py                       |  64 +++-
+ core/pit_optimization_contract.py   |  12 +-
+ core/pit_optimizer_artifacts.py     |  77 ++++-
+ core/pit_optimizer_authorization.py | 673 ++++++++++++++++++++++++++++++++----
+ tests/test_pit_optimizer_loop.py    |  19 +-
+ tests/test_pit_optimizer_v2.py      | 157 +++++++--
+ 6 files changed, 861 insertions(+), 141 deletions(-)
+
+## Diff
+diff --git a/agent_loop.py b/agent_loop.py
+index 5dad003..3cee45f 100644
+--- a/agent_loop.py
++++ b/agent_loop.py
+@@ -62,20 +62,21 @@ if TYPE_CHECKING:
+         PitOptimizerCallBudget,
+         PitOptimizerGateConfig,
+     )
+     from core.pit_optimizer_authorization import (
+         AuthorizationCallReservation,
+         AuthorizationLedger,
+         AuthorizationRunLease,
+         OptimizerPricingSnapshot,
+         PitOptimizerProviderFacts,
+         PitOptimizerRoleCall,
++        PitOptimizerRoleAttempt,
+         TerminalAuditReceipt,
+     )
+     from core.pit_optimizer_controller import (
+         PitOptimizerReadiness,
+         PitOptimizerResult,
+         PitOptimizerServices,
+     )
+     from core.pit_optimizer_evaluation import DiscoveryScore
+ 
+ MAX_ITERATIONS = 10
+@@ -4146,20 +4147,26 @@ class OpenRouterGateway:
+     def _pit_optimizer_terminal_code(
+         facts: "PitOptimizerProviderFacts",
+         requested: str | None,
+     ) -> str | None:
+         if requested not in {None, "failed", "cancelled", "budget_exhausted"}:
+             raise AuditError("optimizer terminal code is invalid")
+         if requested is not None:
+             return requested
+         if facts.outcome == "accepted":
+             return None
++        if facts.outcome == "schema_invalid" and (
++            facts.response_validation_code is not None
++            and facts.accounting_complete
++            and facts.accounting_source is not None
++        ):
++            return None
+         if facts.outcome == "budget_exceeded":
+             return "budget_exhausted"
+         return "failed"
+ 
+     def _register_pit_optimizer_lifecycle(
+         self,
+         *,
+         authorization_lease: "AuthorizationRunLease",
+         plan: "PitOptimizerCallBudget",
+         budget_reservation: PitOptimizerResourceReservation,
+@@ -4309,22 +4316,22 @@ class OpenRouterGateway:
+         reserved_digest = self._ensure_pit_optimizer_reserved_event(lifecycle)
+         expected_lifecycle_digest = (
+             lifecycle.started_event_sha256 or reserved_digest
+         )
+         if facts.audit_sha256 != expected_lifecycle_digest:
+             raise AuditError("optimizer lifecycle facts digest differs")
+         if facts.request_started and lifecycle.started_event_sha256 is None:
+             raise AuditError("optimizer started lifecycle event is absent")
+         if not facts.request_started and lifecycle.started_event_sha256 is not None:
+             raise AuditError("optimizer before-send lifecycle has a start event")
+-        if facts.outcome == "accepted" and not response_processed:
+-            raise AuditError("optimizer accepted response was not processed by gateway")
++        if facts.outcome in {"accepted", "schema_invalid"} and not response_processed:
++            raise AuditError("optimizer response was not processed by gateway")
+         if facts.outcome == "accepted":
+             if payload_sha256 is None or _SHA256_RE.fullmatch(payload_sha256) is None:
+                 raise AuditError("optimizer accepted artifact digest is invalid")
+         elif payload_sha256 is not None:
+             raise AuditError("optimizer rejected lifecycle cannot bind an artifact")
+         self.pit_optimizer_ledger.verify_pit_optimizer_reconciliation(
+             lifecycle.budget_reservation,
+             usage,
+             request_started=facts.request_started,
+         )
+@@ -4547,28 +4554,29 @@ class OpenRouterGateway:
+             elif first_postpublication_error is None:
+                 first_postpublication_error = error
+         if first_postpublication_error is not None:
+             raise first_postpublication_error
+ 
+     def recover_pit_optimizer_finalization(
+         self,
+         *,
+         authorization_lease: "AuthorizationRunLease",
+         call_budget: "PitOptimizerCallBudget",
+-    ) -> "PitOptimizerProviderFacts":
++    ) -> "PitOptimizerProviderFacts | PitOptimizerRoleAttempt":
+         """Idempotently complete authorization and return verified terminal facts."""
+ 
+         from core.pit_optimizer_authorization import (
+             AuthorizationError,
+             AuthorizationLedger,
+             AuthorizationRunLease,
+             PitOptimizerProviderFacts,
++            PitOptimizerRoleAttempt,
+         )
+ 
+         if not isinstance(self.authorization_ledger, AuthorizationLedger):
+             raise ConfigurationError("optimizer authorization ledger is required")
+         if not isinstance(self.audit_trail, AuditTrail):
+             raise ConfigurationError("optimizer audit trail is required")
+         if not isinstance(authorization_lease, AuthorizationRunLease):
+             raise ConfigurationError("optimizer authorization lease is invalid")
+         plan_snapshot = self.authorization_ledger.snapshot_call_plan(call_budget)
+         if (
+@@ -4611,55 +4619,61 @@ class OpenRouterGateway:
+                 receipt,
+             )
+             self.authorization_ledger.verify_reconciliation(
+                 reservation,
+                 facts,
+                 terminal_audit_receipt=receipt,
+                 terminal_code=receipt.terminal_code,
+             )
+         if not isinstance(facts, PitOptimizerProviderFacts):
+             raise AuthorizationError("recovered optimizer facts are invalid")
++        if facts.outcome == "schema_invalid":
++            return PitOptimizerRoleAttempt(
++                plan=plan_snapshot,
++                facts=facts,
++                payload=None,
++            )
+         return facts
+ 
+     def request_pit_optimizer_once(
+         self,
+         role: str,
+         dynamic_input: object,
+         parser: Callable[[str], PayloadT],
+         *,
+         call_budget: "PitOptimizerCallBudget",
+         authorization_lease: "AuthorizationRunLease",
+         frozen_pricing: "OptimizerPricingSnapshot",
+         wall_deadline: float,
+         monotonic: Callable[[], float],
+-    ) -> "PitOptimizerRoleCall":
++    ) -> "PitOptimizerRoleAttempt":
+         """Perform exactly one all-R1 schema-v3 call with durable accounting."""
+ 
+         from core.pit_optimization_contract import (
+             AuthorArtifact,
+             AuthorInput,
+             CriticArtifact,
+             CriticInput,
+             InvestigatorArtifact,
+             InvestigatorInput,
+             PIT_OPTIMIZER_V2_SYSTEM_PROMPTS,
+             PitOptimizerCallBudget,
+             pit_optimizer_response_format,
+         )
+         from core.pit_optimizer_authorization import (
+             AuthorizationError,
+             AuthorizationCallReservation,
+             AuthorizationLedger,
+             AuthorizationRunLease,
+             OptimizerPricingSnapshot,
+             PitOptimizerProviderFacts,
+-            PitOptimizerRoleCall,
++            PitOptimizerRoleAttempt,
+         )
+ 
+         role_inputs = {
+             "investigator": InvestigatorInput,
+             "author": AuthorInput,
+             "critic": CriticInput,
+         }
+         if (
+             role not in role_inputs
+             or not isinstance(call_budget, PitOptimizerCallBudget)
+@@ -5123,23 +5137,25 @@ class OpenRouterGateway:
+                     request_started=True,
+                     response_received=True,
+                     returned_model=returned_model,
+                     finish_reason=finish_reason,
+                     response_schema_valid=False,
+                     usage=usage,
+                     response_validation_code=response_validation_code,
+                     accounting_source=usage.accounting_source,
+                 )
+                 finalize(facts, usage)
+-                raise ResponseValidationError(
+-                    "optimizer response schema is invalid"
+-                ) from exc
++                return PitOptimizerRoleAttempt(
++                    plan=plan_snapshot,
++                    facts=facts,
++                    payload=None,
++                )
+             accounting_stage = "artifact_binding"
+             expected_payload_type = {
+                 "investigator": InvestigatorArtifact,
+                 "author": AuthorArtifact,
+                 "critic": CriticArtifact,
+             }[role]
+             if not isinstance(completion.payload, expected_payload_type):
+                 facts = provider_facts(
+                     outcome="schema_invalid",
+                     request_started=True,
+@@ -5147,61 +5163,69 @@ class OpenRouterGateway:
+                     returned_model=returned_model,
+                     finish_reason=finish_reason,
+                     response_schema_valid=False,
+                     usage=usage,
+                     response_validation_code=(
+                         ProtocolFailureCode.VALIDATOR_BOUNDARY_INVALID.value
+                     ),
+                     accounting_source=usage.accounting_source,
+                 )
+                 finalize(facts, usage)
+-                raise ResponseValidationError(
+-                    "optimizer parser returned the wrong artifact type"
++                return PitOptimizerRoleAttempt(
++                    plan=plan_snapshot,
++                    facts=facts,
++                    payload=None,
+                 )
+             try:
+                 role_snapshot.validate_artifact(completion.payload)
+-            except ValueError as exc:
++            except ValueError:
+                 facts = provider_facts(
+                     outcome="schema_invalid",
+                     request_started=True,
+                     response_received=True,
+                     returned_model=returned_model,
+                     finish_reason=finish_reason,
+                     response_schema_valid=False,
+                     usage=usage,
+                     response_validation_code=(
+                         ProtocolFailureCode.PAYLOAD_BINDING_INVALID.value
+                     ),
+                     accounting_source=usage.accounting_source,
+                 )
+                 finalize(facts, usage)
+-                raise ResponseValidationError(
+-                    "optimizer artifact differs from its input"
+-                ) from exc
++                return PitOptimizerRoleAttempt(
++                    plan=plan_snapshot,
++                    facts=facts,
++                    payload=None,
++                )
+             accounting_stage = "provider_facts"
+             facts = provider_facts(
+                 outcome="accepted",
+                 request_started=True,
+                 response_received=True,
+                 returned_model=completion.model,
+                 finish_reason=finish_reason,
+                 response_schema_valid=True,
+                 usage=usage,
+                 accounting_source=usage.accounting_source,
+             )
+             accounting_stage = "payload_digest"
+             payload_digest = hashlib.sha256(
+                 completion.payload.canonical_json_bytes()
+             ).hexdigest()
+             accounting_stage = "publication"
+             finalize(facts, usage, payload_sha256=payload_digest)
+-            return PitOptimizerRoleCall(plan_snapshot, completion.payload, facts)
++            return PitOptimizerRoleAttempt(
++                plan=plan_snapshot,
++                facts=facts,
++                payload=completion.payload,
++            )
+         except BaseException as original:
+             outer_terminal_code = (
+                 "cancelled"
+                 if not isinstance(original, Exception)
+                 else "budget_exhausted"
+                 if isinstance(original, BudgetExceededError)
+                 else "failed"
+             )
+             if not finalized and budget_reservation is not None:
+                 if authorization_reservation is None:
+@@ -14338,28 +14362,32 @@ class AuditTrail:
+         lifecycle_digest = start_digest or reserved_digest
+         if _SHA256_RE.fullmatch(lifecycle_digest) is None:
+             raise AuditError("optimizer lifecycle digest is invalid")
+         if terminal_details.get("lifecycle_audit_sha256") != lifecycle_digest:
+             raise AuditError("optimizer terminal lifecycle digest differs")
+         facts = self._pit_optimizer_facts_from_record(
+             record,
+             lifecycle_digest,
+         )
+         terminal_code = terminal_details.get("terminal_code")
+-        if record.outcome == "accepted":
++        if record.outcome in {"accepted", "schema_invalid"}:
+             if terminal_code not in {
+                 None,
+                 "failed",
+                 "cancelled",
+                 "budget_exhausted",
+             }:
+                 raise AuditError("optimizer audit terminal code is invalid")
++            if record.outcome == "schema_invalid" and terminal_code is not None:
++                raise AuditError(
++                    "accounted invalid optimizer audit cannot close the lease"
++                )
+         elif terminal_code not in {
+             "failed",
+             "cancelled",
+             "budget_exhausted",
+         }:
+             raise AuditError("rejected optimizer audit terminal code is invalid")
+         payload_sha256 = terminal_details.get("payload_sha256")
+         if record.outcome == "accepted":
+             if (
+                 not isinstance(payload_sha256, str)
+@@ -14412,24 +14440,24 @@ class AuditTrail:
+                 record.accounting_failure_code
+             )
+         if record.retained_reservation_tokens is not None:
+             expected_details["retained_reservation_tokens"] = (
+                 record.retained_reservation_tokens
+             )
+         if terminal_details != expected_details:
+             raise AuditError("optimizer terminal audit evidence differs")
+         if type(terminal_details.get("response_processed")) is not bool:
+             raise AuditError("optimizer response processing evidence is invalid")
+-        if record.outcome == "accepted" and not terminal_details[
++        if record.outcome in {"accepted", "schema_invalid"} and not terminal_details[
+             "response_processed"
+         ]:
+-            raise AuditError("optimizer accepted response was not processed")
++            raise AuditError("optimizer response was not processed")
+         return terminal, facts, budget_state
+ 
+     def verify_terminal_audit_receipt(
+         self,
+         receipt: "TerminalAuditReceipt",
+         *,
+         authorization_reservation: "AuthorizationCallReservation",
+         provider_facts: "PitOptimizerProviderFacts",
+     ) -> dict[str, object]:
+         """Cross-verify one durable receipt against exact audit and ledger facts."""
+diff --git a/core/pit_optimization_contract.py b/core/pit_optimization_contract.py
+index e3e3d1a..95c3d37 100644
+--- a/core/pit_optimization_contract.py
++++ b/core/pit_optimization_contract.py
+@@ -5301,25 +5301,29 @@ class CriticArtifactV4(_V2Canonical):
+ 
+ @dataclass(frozen=True, slots=True)
+ class RoleOutputInvalidSummary(_V2Canonical):
+     iteration: int
+     call_index: int
+     role: str
+     validation_code: str
+ 
+     def __post_init__(self) -> None:
+         _require_positive_int(self.iteration, "role output invalid summary iteration")
+-        if self.role != "author":
+-            raise ValueError("role output invalid summary must describe the author")
+-        expected_call_index = (self.iteration - 1) * len(OPTIMIZER_V4_ROLES) + 2
++        if self.role not in OPTIMIZER_V4_ROLES:
++            raise ValueError("role output invalid summary role is invalid")
++        expected_call_index = (
++            (self.iteration - 1) * len(OPTIMIZER_V4_ROLES)
++            + OPTIMIZER_V4_ROLES.index(self.role)
++            + 1
++        )
+         if self.call_index != expected_call_index:
+-            raise ValueError("role output invalid summary author slot is invalid")
++            raise ValueError("role output invalid summary plan slot is invalid")
+         if self.validation_code not in PIT_OPTIMIZER_RESPONSE_VALIDATION_CODES:
+             raise ValueError("role output invalid summary validation code is invalid")
+ 
+ 
+ def _v4_cagr(value: object, field: str) -> Decimal:
+     if not isinstance(value, Decimal) or not value.is_finite():
+         raise ValueError(f"{field} must be a finite Decimal")
+     if value != value.quantize(Decimal("0.01")):
+         raise ValueError(f"{field} must use 0.01 percentage-point precision")
+     return value
+diff --git a/core/pit_optimizer_artifacts.py b/core/pit_optimizer_artifacts.py
+index adba282..dfc77d0 100644
+--- a/core/pit_optimizer_artifacts.py
++++ b/core/pit_optimizer_artifacts.py
+@@ -1,14 +1,15 @@
+ """Crash-safe, incremental local artifacts for the schema-v3 PIT optimizer."""
+ 
+ from __future__ import annotations
+ 
++from dataclasses import asdict
+ import hashlib
+ import json
+ import os
+ from pathlib import Path
+ import secrets
+ import stat
+ import tempfile
+ from typing import Mapping
+ 
+ 
+@@ -494,20 +495,28 @@ class IncrementalArtifactStore:
+     """Bounded create-only evidence with two explicit replaceable snapshots."""
+ 
+     _REPLACEABLE_JSON = frozenset({"accounting.json"})
+     _REPLACEABLE_DIFF = frozenset({"incumbent.diff"})
+     _ROOT_JSON = frozenset(
+         {"run.json", "baseline.json", "accounting.json", "holdout.json", "summary.json"}
+     )
+     _ITERATION_JSON = frozenset(
+         {"investigator.json", "author.json", "validation.json", "discovery.json", "critic.json", "decision.json"}
+     )
++    _ROLE_OUTPUT_INVALID_JSON = frozenset(
++        {
++            "investigator_output_invalid.json",
++            "author_output_invalid.json",
++            "critic_output_invalid.json",
++        }
++    )
++    _PLAN_SKIP_JSON = "authorization_skips.json"
+ 
+     def __init__(self, root: Path) -> None:
+         candidate = Path(root)
+         if not candidate.is_absolute():
+             raise ValueError("optimizer artifact root is invalid")
+         candidate = Path(os.path.abspath(candidate))
+         try:
+             with _acquire_absolute_directory(candidate) as access:
+                 self._root_identity = access.identity
+         except (OSError, ValueError) as exc:
+@@ -556,21 +565,24 @@ class IncrementalArtifactStore:
+         parts = Path(name).parts
+         valid = False
+         if json_artifact and name in self._ROOT_JSON:
+             valid = True
+         elif (
+             json_artifact
+             and len(parts) == 3
+             and parts[0] == "iterations"
+             and len(parts[1]) == 3
+             and parts[1].isdigit()
+-            and parts[2] in self._ITERATION_JSON
++            and parts[2]
++            in self._ITERATION_JSON
++            | self._ROLE_OUTPUT_INVALID_JSON
++            | {self._PLAN_SKIP_JSON}
+         ):
+             valid = True
+         elif not json_artifact and (
+             name in self._REPLACEABLE_DIFF
+             or (
+                 len(parts) == 3
+                 and parts[0] == "iterations"
+                 and len(parts[1]) == 3
+                 and parts[1].isdigit()
+                 and parts[2] == "candidate.diff"
+@@ -579,29 +591,90 @@ class IncrementalArtifactStore:
+             valid = True
+         if not valid:
+             raise ValueError("optimizer artifact name is outside the closed layout")
+         return tuple(parts[:-1]), parts[-1]
+ 
+     def write_json_artifact(
+         self,
+         name: str,
+         value: Mapping[str, object],
+     ) -> tuple[Path, str]:
+-        if not isinstance(value, Mapping) or value.get("schema_version") != 3:
++        if not isinstance(value, Mapping):
+             raise ValueError("optimizer JSON artifact schema is invalid")
+         parent_parts, target_name = self._target(name, json_artifact=True)
++        is_recovery_artifact = target_name in (
++            self._ROLE_OUTPUT_INVALID_JSON | {self._PLAN_SKIP_JSON}
++        )
++        if value.get("schema_version") != (4 if is_recovery_artifact else 3):
++            raise ValueError("optimizer JSON artifact schema is invalid")
+         payload = canonical_json_bytes(value)
+         with self._secure_directory(parent_parts, create=False) as directory:
+             if name in self._REPLACEABLE_JSON and directory.entry_exists(target_name):
+                 return _atomic_replace_in_directory(directory, target_name, payload)
+             return _write_create_only_in_directory(directory, target_name, payload)
+ 
++    def write_role_output_invalid(self, attempt: object) -> tuple[Path, str]:
++        """Persist closed plan/provider facts, never rejected provider content."""
++
++        from core.pit_optimizer_authorization import PitOptimizerRoleAttempt
++
++        if (
++            not isinstance(attempt, PitOptimizerRoleAttempt)
++            or not attempt.recoverable_schema_invalid
++        ):
++            raise ValueError("optimizer role-output-invalid artifact is invalid")
++        self.prepare_iteration(attempt.plan.iteration)
++        return self.write_json_artifact(
++            (
++                f"iterations/{attempt.plan.iteration:03d}/"
++                f"{attempt.plan.role}_output_invalid.json"
++            ),
++            {
++                "schema_version": 4,
++                "artifact_type": "role_output_invalid",
++                "plan": attempt.plan.to_primitive(),
++                "provider_facts": asdict(attempt.facts),
++                "payload": None,
++            },
++        )
++
++    def write_authorization_plan_skips(
++        self,
++        skips: tuple[object, ...],
++    ) -> tuple[Path, str]:
++        """Persist hash-chained zero-charge settlements without provider content."""
++
++        from core.pit_optimizer_authorization import AuthorizationPlanSkip
++
++        if (
++            type(skips) is not tuple
++            or not skips
++            or any(not isinstance(skip, AuthorizationPlanSkip) for skip in skips)
++        ):
++            raise ValueError("optimizer authorization skip artifact is invalid")
++        typed_skips = tuple(
++            skip for skip in skips if isinstance(skip, AuthorizationPlanSkip)
++        )
++        iteration = typed_skips[0].iteration
++        if any(skip.iteration != iteration for skip in typed_skips):
++            raise ValueError("optimizer authorization skips span iterations")
++        self.prepare_iteration(iteration)
++        return self.write_json_artifact(
++            f"iterations/{iteration:03d}/{self._PLAN_SKIP_JSON}",
++            {
++                "schema_version": 4,
++                "artifact_type": "authorization_plan_skips",
++                "iteration": iteration,
++                "skips": [skip.to_record() for skip in typed_skips],
++            },
++        )
++
+     def write_diff_artifact(self, name: str, value: str) -> tuple[Path, str]:
+         if not isinstance(value, str) or "\x00" in value:
+             raise ValueError("optimizer diff artifact is invalid")
+         parent_parts, target_name = self._target(name, json_artifact=False)
+         payload = value.encode("utf-8")
+         with self._secure_directory(parent_parts, create=False) as directory:
+             if name in self._REPLACEABLE_DIFF and directory.entry_exists(target_name):
+                 return _atomic_replace_in_directory(directory, target_name, payload)
+             return _write_create_only_in_directory(directory, target_name, payload)
+ 
+diff --git a/core/pit_optimizer_authorization.py b/core/pit_optimizer_authorization.py
+index b511120..89da88d 100644
+--- a/core/pit_optimizer_authorization.py
++++ b/core/pit_optimizer_authorization.py
+@@ -16,25 +16,28 @@ import math
+ import os
+ from pathlib import Path
+ import re
+ import threading
+ from types import MappingProxyType
+ from typing import Iterator, Mapping, Sequence
+ 
+ from core.pit_optimization_contract import (
+     AuthorizationRequirement,
+     AuthorArtifact,
++    AuthorArtifactV4,
+     AuthorInput,
+     AuthorManifestSummary,
+     CriticArtifact,
++    CriticArtifactV4,
+     CriticInput,
+     InvestigatorArtifact,
++    InvestigatorArtifactV4,
+     InvestigatorInput,
+     OPTIMIZER_V2_ROLES,
+     PatchBounds,
+     PitOptimizerCallBudget,
+     PitOptimizerRunManifest,
+     PolicySourceBundle,
+     PolicySourceRecord,
+     authenticate_policy_source_bundle,
+ )
+ import core.pit_optimization_contract as _contract
+@@ -738,20 +741,90 @@ class PitOptimizerRoleCall:
+             self.plan.call_index,
+             self.plan.iteration,
+             self.plan.role,
+             self.plan.model,
+         ):
+             raise ValueError("optimizer role call facts differ from plan")
+         if self.facts.outcome != "accepted" or not self.facts.response_schema_valid:
+             raise ValueError("optimizer role call requires accepted provider facts")
+ 
+ 
++@dataclass(frozen=True, slots=True)
++class PitOptimizerRoleAttempt:
++    """One settled provider attempt without reclassifying invalid output as accepted."""
++
++    plan: PitOptimizerCallBudget
++    facts: PitOptimizerProviderFacts
++    payload: (
++        InvestigatorArtifact
++        | AuthorArtifact
++        | CriticArtifact
++        | InvestigatorArtifactV4
++        | AuthorArtifactV4
++        | CriticArtifactV4
++        | None
++    )
++
++    def __post_init__(self) -> None:
++        if not isinstance(self.plan, PitOptimizerCallBudget):
++            raise ValueError("optimizer role attempt plan is invalid")
++        if not isinstance(self.facts, PitOptimizerProviderFacts):
++            raise ValueError("optimizer role attempt facts are invalid")
++        if (
++            self.facts.call_index,
++            self.facts.iteration,
++            self.facts.role,
++            self.facts.requested_model,
++        ) != (
++            self.plan.call_index,
++            self.plan.iteration,
++            self.plan.role,
++            self.plan.model,
++        ):
++            raise ValueError("optimizer role attempt facts differ from plan")
++        expected_payloads = {
++            "investigator": (InvestigatorArtifact, InvestigatorArtifactV4),
++            "author": (AuthorArtifact, AuthorArtifactV4),
++            "critic": (CriticArtifact, CriticArtifactV4),
++        }[self.plan.role]
++        if self.payload is not None:
++            if not isinstance(self.payload, expected_payloads):
++                raise ValueError("optimizer role attempt payload differs from plan role")
++            if (
++                self.facts.outcome != "accepted"
++                or not self.facts.request_started
++                or not self.facts.response_received
++                or not self.facts.response_schema_valid
++                or not self.facts.accounting_complete
++            ):
++                raise ValueError("optimizer role attempt payload is not accepted")
++            return
++        if not (
++            self.facts.outcome == "schema_invalid"
++            and self.facts.request_started
++            and self.facts.response_received
++            and not self.facts.response_schema_valid
++            and self.facts.accounting_complete
++            and self.facts.response_validation_code
++            in _contract.PIT_OPTIMIZER_RESPONSE_VALIDATION_CODES
++            and self.facts.accounting_source is not None
++            and self.facts.retained_reservation_tokens == 0
++        ):
++            raise ValueError(
++                "optimizer role attempt without payload is not an accounted invalid response"
++            )
++
++    @property
++    def recoverable_schema_invalid(self) -> bool:
++        return self.payload is None
++
++
+ @dataclass(frozen=True, slots=True)
+ class TerminalAuditReceipt:
+     """Durable identity cross-verified against one immutable AuditTrail event."""
+ 
+     audit_run_id: str
+     run_manifest_sha256: str
+     call_index: int
+     iteration: int
+     role: str
+     outcome: str
+@@ -795,20 +868,25 @@ class TerminalAuditReceipt:
+             )
+             if self.terminal_code not in {
+                 None,
+                 "failed",
+                 "cancelled",
+                 "budget_exhausted",
+             }:
+                 raise ValueError("terminal audit receipt code is invalid")
+         elif self.payload_sha256 is not None:
+             raise ValueError("rejected terminal audit receipt cannot bind a payload")
++        elif self.outcome == "schema_invalid":
++            if self.terminal_code is not None:
++                raise ValueError(
++                    "accounted invalid terminal audit receipt cannot close the lease"
++                )
+         elif self.terminal_code not in {
+             "failed",
+             "cancelled",
+             "budget_exhausted",
+         }:
+             raise ValueError("rejected terminal audit receipt code is invalid")
+ 
+     def to_primitive(self) -> dict[str, object]:
+         return {
+             "audit_run_id": self.audit_run_id,
+@@ -817,20 +895,111 @@ class TerminalAuditReceipt:
+             "iteration": self.iteration,
+             "role": self.role,
+             "outcome": self.outcome,
+             "provider_record_sha256": self.provider_record_sha256,
+             "terminal_event_sha256": self.terminal_event_sha256,
+             "payload_sha256": self.payload_sha256,
+             "terminal_code": self.terminal_code,
+         }
+ 
+ 
++@dataclass(frozen=True, slots=True)
++class AuthorizationPlanSkip:
++    """One zero-charge plan settlement authenticated by the ledger hash chain."""
++
++    schema_version: int
++    record_index: int
++    lease_id: str
++    call_index: int
++    iteration: int
++    role: str
++    triggering_call_index: int
++    reason: str
++    previous_record_sha256: str
++    record_sha256: str
++
++    def __post_init__(self) -> None:
++        if self.schema_version != 3:
++            raise ValueError("authorization plan skip schema is invalid")
++        _positive_int(self.record_index, "authorization plan skip record index")
++        _require_id(self.lease_id, "authorization plan skip lease ID")
++        _positive_int(self.call_index, "authorization plan skip call index")
++        _positive_int(self.iteration, "authorization plan skip iteration")
++        if self.role not in OPTIMIZER_V2_ROLES:
++            raise ValueError("authorization plan skip role is invalid")
++        _positive_int(
++            self.triggering_call_index,
++            "authorization plan skip triggering call index",
++        )
++        if (
++            self.triggering_call_index >= self.call_index
++            or self.reason != "predecessor_role_output_invalid"
++        ):
++            raise ValueError("authorization plan skip trigger is invalid")
++        _require_digest(
++            self.previous_record_sha256,
++            "authorization plan skip prior ledger SHA-256",
++        )
++        _require_digest(self.record_sha256, "authorization plan skip SHA-256")
++        if self.record_sha256 != _authorization_record_digest(self.to_record()):
++            raise ValueError("authorization plan skip digest differs")
++
++    def to_record(self) -> dict[str, object]:
++        return {
++            "schema_version": self.schema_version,
++            "record_type": "plan_skip",
++            "record_index": self.record_index,
++            "previous_record_sha256": self.previous_record_sha256,
++            "lease_id": self.lease_id,
++            "call_index": self.call_index,
++            "iteration": self.iteration,
++            "role": self.role,
++            "triggering_call_index": self.triggering_call_index,
++            "reason": self.reason,
++            "record_sha256": self.record_sha256,
++        }
++
++    @classmethod
++    def from_record(cls, value: Mapping[str, object]) -> "AuthorizationPlanSkip":
++        expected_keys = {
++            "schema_version",
++            "record_type",
++            "record_index",
++            "previous_record_sha256",
++            "lease_id",
++            "call_index",
++            "iteration",
++            "role",
++            "triggering_call_index",
++            "reason",
++            "record_sha256",
++        }
++        if (
++            not isinstance(value, Mapping)
++            or set(value) != expected_keys
++            or value.get("record_type") != "plan_skip"
++        ):
++            raise ValueError("authorization plan skip record is invalid")
++        return cls(
++            schema_version=value.get("schema_version"),  # type: ignore[arg-type]
++            record_index=value.get("record_index"),  # type: ignore[arg-type]
++            lease_id=value.get("lease_id"),  # type: ignore[arg-type]
++            call_index=value.get("call_index"),  # type: ignore[arg-type]
++            iteration=value.get("iteration"),  # type: ignore[arg-type]
++            role=value.get("role"),  # type: ignore[arg-type]
++            triggering_call_index=value.get("triggering_call_index"),  # type: ignore[arg-type]
++            reason=value.get("reason"),  # type: ignore[arg-type]
++            previous_record_sha256=value.get("previous_record_sha256"),  # type: ignore[arg-type]
++            record_sha256=value.get("record_sha256"),  # type: ignore[arg-type]
++        )
++
++
+ @dataclass(frozen=True, slots=True)
+ class AuthenticatedRoleInputSnapshot:
+     """One controller-originated role input, closed over its exact wire bytes."""
+ 
+     role: str
+     iteration: int
+     canonical_bytes: bytes
+     expected_hypothesis_id: str | None = None
+     source_bundle: PolicySourceBundle | None = None
+     candidate_bounds: PatchBounds | None = None
+@@ -1294,62 +1463,94 @@ class AuthorizationLedger:
+             expected_hypothesis_id=expected_hypothesis_id,
+             source_bundle=source_bundle,
+             candidate_bounds=candidate_bounds,
+         )
+ 
+     def bind_controller_role_input(
+         self,
+         dynamic_input: object,
+         plan: PitOptimizerCallBudget,
+         *,
+-        predecessor_calls: Sequence[PitOptimizerRoleCall] = (),
++        predecessor_calls: Sequence[
++            PitOptimizerRoleCall | PitOptimizerRoleAttempt | AuthorizationPlanSkip
++        ] = (),
++        predecessor_attempts: Sequence[
++            PitOptimizerRoleAttempt | AuthorizationPlanSkip
++        ]
++        | None = None,
+     ) -> AuthenticatedRoleInputSnapshot:
+         """Issue one plan-exclusive snapshot from durable predecessor receipts."""
+ 
+         snapshot = self._snapshot_role_input(dynamic_input, plan)
+         canonical_plan = self.snapshot_call_plan(plan)
+-        if type(predecessor_calls) is not tuple or any(
+-            not isinstance(item, PitOptimizerRoleCall) for item in predecessor_calls
++        if predecessor_attempts is not None and predecessor_calls:
++            raise AuthorizationError("optimizer predecessor lineage is ambiguous")
++        predecessors = (
++            predecessor_attempts
++            if predecessor_attempts is not None
++            else predecessor_calls
++        )
++        if type(predecessors) is not tuple or any(
++            not isinstance(
++                item,
++                (PitOptimizerRoleCall, PitOptimizerRoleAttempt, AuthorizationPlanSkip),
++            )
++            for item in predecessors
+         ):
+             raise AuthorizationError("optimizer predecessor calls are invalid")
+         expected_predecessors: tuple[PitOptimizerCallBudget, ...]
+         if canonical_plan.role == "investigator":
+             expected_predecessors = self._call_plan_snapshots[
+                 : canonical_plan.call_index - 1
+             ]
+         elif canonical_plan.role == "author":
+             expected_predecessors = (
+                 self._call_plan_snapshots[canonical_plan.call_index - 2],
+             )
+         else:
+             expected_predecessors = (
+                 self._call_plan_snapshots[canonical_plan.call_index - 3],
+                 self._call_plan_snapshots[canonical_plan.call_index - 2],
+             )
+-        if len(predecessor_calls) != len(expected_predecessors):
++        if len(predecessors) != len(expected_predecessors):
+             raise AuthorizationError(
+                 "optimizer role input predecessor lineage is incomplete"
+             )
+         with _authorization_file_lock(self._lock_path):
+             records = self._read_records()
+             for predecessor, expected_plan in zip(
+-                predecessor_calls,
++                predecessors,
+                 expected_predecessors,
+                 strict=True,
+             ):
+-                if predecessor.plan != expected_plan:
++                predecessor_plan = (
++                    self._call_plan_snapshots[predecessor.call_index - 1]
++                    if isinstance(predecessor, AuthorizationPlanSkip)
++                    else predecessor.plan
++                )
++                if predecessor_plan != expected_plan:
+                     raise AuthorizationError(
+                         "optimizer role input predecessor plan differs"
+                     )
+-                payload_sha256 = hashlib.sha256(
+-                    predecessor.payload.canonical_json_bytes()
+-                ).hexdigest()
++                if isinstance(predecessor, AuthorizationPlanSkip):
++                    if predecessor.to_record() not in records:
++                        raise AuthorizationError(
++                            "optimizer role input predecessor skip is absent"
++                        )
++                    continue
++                payload_sha256 = (
++                    None
++                    if predecessor.payload is None
++                    else hashlib.sha256(
++                        predecessor.payload.canonical_json_bytes()
++                    ).hexdigest()
++                )
+                 matches = [
+                     item
+                     for item in records
+                     if item.get("record_type") == "reconciliation"
+                     and item.get("provider_facts") == asdict(predecessor.facts)
+                     and isinstance(item.get("terminal_audit_receipt"), dict)
+                     and item["terminal_audit_receipt"].get(
+                         "run_manifest_sha256"
+                     )
+                     == self._manifest.sha256
+@@ -1357,21 +1558,21 @@ class AuthorizationLedger:
+                         item["terminal_audit_receipt"].get("call_index"),
+                         item["terminal_audit_receipt"].get("iteration"),
+                         item["terminal_audit_receipt"].get("role"),
+                         item["terminal_audit_receipt"].get("outcome"),
+                         item["terminal_audit_receipt"].get("payload_sha256"),
+                     )
+                     == (
+                         expected_plan.call_index,
+                         expected_plan.iteration,
+                         expected_plan.role,
+-                        "accepted",
++                        predecessor.facts.outcome,
+                         payload_sha256,
+                     )
+                 ]
+                 if len(matches) != 1:
+                     raise AuthorizationError(
+                         "optimizer role input predecessor receipt is absent"
+                     )
+                 reconciliation = matches[0]
+                 receipt_primitive = reconciliation.get(
+                     "terminal_audit_receipt"
+@@ -1404,66 +1605,108 @@ class AuthorizationLedger:
+                 self._cross_verify_audit_receipt(
+                     receipt,
+                     durable_reservation,
+                     predecessor.facts,
+                     records=records,
+                 )
+         primitive = json.loads(
+             snapshot.canonical_bytes,
+             object_pairs_hook=_reject_duplicate_keys,
+         )
++        legacy_calls: tuple[PitOptimizerRoleCall, ...] = tuple(
++            item
++            if isinstance(item, PitOptimizerRoleCall)
++            else PitOptimizerRoleCall(item.plan, item.payload, item.facts)
++            for item in predecessors
++            if not isinstance(item, AuthorizationPlanSkip)
++            and item.payload is not None
++            and isinstance(
++                item.payload,
++                (InvestigatorArtifact, AuthorArtifact, CriticArtifact),
++            )
++        )
+         if canonical_plan.role == "investigator" and canonical_plan.iteration > 1:
+             feedbacks = primitive.get("prior_iterations")
+-            if (
+-                not isinstance(feedbacks, list)
+-                or len(feedbacks) * len(OPTIMIZER_V2_ROLES)
+-                != len(predecessor_calls)
+-            ):
++            if not isinstance(feedbacks, list):
+                 raise AuthorizationError(
+                     "optimizer role input predecessor artifact differs"
+                 )
+-            for offset, feedback in enumerate(feedbacks):
+-                investigator_call, author_call, critic_call = predecessor_calls[
++            complete_groups: list[tuple[PitOptimizerRoleCall, ...]] = []
++            for offset in range(canonical_plan.iteration - 1):
++                group = predecessors[
+                     offset * len(OPTIMIZER_V2_ROLES) :
+                     (offset + 1) * len(OPTIMIZER_V2_ROLES)
+                 ]
++                if all(
++                    not isinstance(item, AuthorizationPlanSkip)
++                    and item.payload is not None
++                    and item.facts.outcome == "accepted"
++                    for item in group
++                ):
++                    complete_groups.append(
++                        tuple(
++                            item
++                            if isinstance(item, PitOptimizerRoleCall)
++                            else PitOptimizerRoleCall(
++                                item.plan,
++                                item.payload,
++                                item.facts,
++                            )
++                            for item in group
++                            if not isinstance(item, AuthorizationPlanSkip)
++                        )
++                    )
++            if len(feedbacks) != len(complete_groups):
++                raise AuthorizationError(
++                    "optimizer role input predecessor artifact differs"
++                )
++            for feedback, group in zip(feedbacks, complete_groups, strict=True):
++                investigator_call, author_call, critic_call = group
+                 investigator_payload = investigator_call.payload
+                 author_payload = author_call.payload
+                 critic_payload = critic_call.payload
+                 assert isinstance(investigator_payload, InvestigatorArtifact)
+                 assert isinstance(author_payload, AuthorArtifact)
+                 assert isinstance(critic_payload, CriticArtifact)
+                 if not isinstance(feedback, dict) or (
+                     feedback.get("iteration"),
+                     feedback.get("hypothesis_id"),
+                     feedback.get("family"),
+                     feedback.get("author_summary"),
+                     feedback.get("critic_disposition"),
+                     feedback.get("critic_next_direction"),
+                 ) != (
+-                    offset + 1,
++                    investigator_call.plan.iteration,
+                     investigator_payload.hypothesis_id,
+                     investigator_payload.family,
+                     author_payload.behavioral_summary,
+                     critic_payload.disposition,
+                     critic_payload.next_direction,
+                 ):
+                     raise AuthorizationError(
+                         "optimizer role input predecessor artifact differs"
+                     )
+         elif canonical_plan.role == "author":
+-            if primitive.get("investigator") != predecessor_calls[0].payload.to_primitive():
++            if (
++                len(legacy_calls) != 1
++                or primitive.get("investigator")
++                != legacy_calls[0].payload.to_primitive()
++            ):
+                 raise AuthorizationError(
+                     "optimizer role input predecessor artifact differs"
+                 )
+         elif canonical_plan.role == "critic":
+-            investigator_call, author_call = predecessor_calls
++            if len(legacy_calls) != 2:
++                raise AuthorizationError(
++                    "optimizer critic requires accepted predecessor artifacts"
++                )
++            investigator_call, author_call = legacy_calls
+             author_payload = author_call.payload
+             assert isinstance(author_payload, AuthorArtifact)
+             _require_critic_predecessor_lineage(
+                 primitive,
+                 investigator_call.payload,
+                 author_payload,
+             )
+         with self._role_input_lock:
+             if canonical_plan.call_index in self._consumed_role_input_plans:
+                 raise AuthorizationError("optimizer role input plan was already consumed")
+@@ -2083,20 +2326,22 @@ class AuthorizationLedger:
+         one_shot_keys: set[str] = set()
+         active_reservations: dict[str, AuthorizationCallReservation] = {}
+         reconciled_reservations: set[str] = set()
+         closed_leases: set[str] = set()
+         charged_by_lease: dict[str, tuple[int, int]] = {}
+         overage_leases: set[str] = set()
+         reconciliations_by_lease: dict[
+             str,
+             list[tuple[AuthorizationCallReservation, PitOptimizerProviderFacts]],
+         ] = {}
++        plan_skips_by_lease: dict[str, list[AuthorizationPlanSkip]] = {}
++        settled_call_indices_by_lease: dict[str, set[int]] = {}
+         pending_terminal_closes: dict[str, frozenset[str]] = {}
+         gateway_lifecycles: dict[str, list[dict[str, object]]] = {}
+         for index, line in enumerate(raw.splitlines(keepends=True), start=1):
+             try:
+                 value = json.loads(line, object_pairs_hook=_reject_duplicate_keys)
+             except (UnicodeDecodeError, json.JSONDecodeError, AuthorizationError) as exc:
+                 raise AuthorizationError("authorization ledger contains invalid JSON") from exc
+             if not isinstance(value, dict) or line != _canonical_json_bytes(value):
+                 raise AuthorizationError("authorization ledger record is not canonical JSON")
+             if value.get("schema_version") == 2:
+@@ -2285,37 +2530,44 @@ class AuthorizationLedger:
+                 primitive = value.get("reservation")
+                 if not isinstance(primitive, dict):
+                     raise AuthorizationError("authorization reservation record is malformed")
+                 try:
+                     reservation = AuthorizationCallReservation(**primitive)
+                 except (TypeError, ValueError) as exc:
+                     raise AuthorizationError("authorization reservation record is invalid") from exc
+                 if reservation.lease_id not in leases:
+                     raise AuthorizationError("authorization reservation lease is absent")
+                 lease = leases[reservation.lease_id]
+-                prior_reservations = [
+-                    record
+-                    for record in records
+-                    if record.get("record_type") == "reservation"
+-                    and isinstance(record.get("reservation"), dict)
+-                    and record["reservation"].get("lease_id")
+-                    == reservation.lease_id
+-                ]
+                 if (
+                     (reservation.projected_call_usd is not None)
+                     != (lease.pricing_status == "available")
+                     or reservation.call_index > len(self._call_plan_snapshots)
+-                    or reservation.call_index != len(prior_reservations) + 1
+                 ):
+                     raise AuthorizationError(
+                         "authorization reservation pricing or plan is invalid"
+                     )
++                settled_indices = settled_call_indices_by_lease.setdefault(
++                    reservation.lease_id,
++                    set(),
++                )
++                next_unsettled = next(
++                    (
++                        call_index
++                        for call_index in range(1, len(self._call_plan_snapshots) + 1)
++                        if call_index not in settled_indices
++                    ),
++                    None,
++                )
++                if reservation.call_index != next_unsettled:
++                    raise AuthorizationError(
++                        "authorization reservation is not the next unsettled plan"
++                    )
+                 plan = self._call_plan_snapshots[reservation.call_index - 1]
+                 if (
+                     reservation.call_index,
+                     reservation.iteration,
+                     reservation.role,
+                     reservation.reserved_tokens,
+                 ) != (
+                     plan.call_index,
+                     plan.iteration,
+                     plan.role,
+@@ -2598,45 +2850,136 @@ class AuthorizationLedger:
+                         lifecycle_commitment,
+                         budget_recovery_sha256=budget_recovery_sha256,
+                     )
+                     if terminal_commitment != expected_terminal:
+                         raise AuthorizationError(
+                             "authorization gateway terminal audit commitment differs"
+                         )
+                 reconciliations_by_lease.setdefault(lease_id, []).append(
+                     (reservation, facts)
+                 )
++                settled_indices = settled_call_indices_by_lease.setdefault(
++                    lease_id,
++                    set(),
++                )
++                if reservation.call_index in settled_indices:
++                    raise AuthorizationError(
++                        "authorization plan slot is settled more than once"
++                    )
++                settled_indices.add(reservation.call_index)
+                 receipt_terminal_code = (
+                     replayed_receipt.terminal_code
+                     if terminal_audit_receipt is not None
+                     else None
+                 )
+                 if resource_overage:
+                     if receipt_terminal_code not in {None, "budget_exhausted"}:
+                         raise AuthorizationError(
+                             "authorization resource overage terminal receipt differs"
+                         )
+                     pending_terminal_closes[lease_id] = frozenset(
+                         {"budget_exhausted"}
+                     )
+                 elif receipt_terminal_code is not None:
+                     pending_terminal_closes[lease_id] = frozenset(
+                         {receipt_terminal_code}
+                     )
+-                elif facts.outcome != "accepted":
++                elif not self._provider_facts_settle_plan(
++                    facts,
++                    self._call_plan_snapshots[reservation.call_index - 1],
++                ):
+                     # Without a terminal receipt, an explicit caller-supplied
+                     # failed/cancelled/budget code is not otherwise persisted.
+                     pending_terminal_closes[lease_id] = frozenset(
+                         {"failed", "cancelled", "budget_exhausted"}
+                     )
+                 del active_reservations[lease_id]
+                 reconciled_reservations.add(reservation.reservation_id)
++            elif record_type == "plan_skip":
++                if set(value) != expected_common | {
++                    "lease_id",
++                    "call_index",
++                    "iteration",
++                    "role",
++                    "triggering_call_index",
++                    "reason",
++                }:
++                    raise AuthorizationError("authorization plan skip keys are invalid")
++                try:
++                    skip = AuthorizationPlanSkip.from_record(value)
++                except (TypeError, ValueError) as exc:
++                    raise AuthorizationError(
++                        "authorization plan skip record is invalid"
++                    ) from exc
++                if skip.lease_id not in leases or skip.lease_id in closed_leases:
++                    raise AuthorizationError("authorization plan skip lease is invalid")
++                if skip.lease_id in active_reservations:
++                    raise AuthorizationError(
++                        "authorization plan skip cannot bypass an active reservation"
++                    )
++                if skip.call_index > len(self._call_plan_snapshots):
++                    raise AuthorizationError("authorization plan skip index is invalid")
++                plan = self._call_plan_snapshots[skip.call_index - 1]
++                if (skip.call_index, skip.iteration, skip.role) != (
++                    plan.call_index,
++                    plan.iteration,
++                    plan.role,
++                ):
++                    raise AuthorizationError(
++                        "authorization plan skip differs from sealed plan"
++                    )
++                settled_indices = settled_call_indices_by_lease.setdefault(
++                    skip.lease_id,
++                    set(),
++                )
++                next_unsettled = next(
++                    (
++                        call_index
++                        for call_index in range(1, len(self._call_plan_snapshots) + 1)
++                        if call_index not in settled_indices
++                    ),
++                    None,
++                )
++                if skip.call_index != next_unsettled:
++                    raise AuthorizationError(
++                        "authorization plan skips must settle a contiguous plan prefix"
++                    )
++                trigger = next(
++                    (
++                        (reservation, facts)
++                        for reservation, facts in reconciliations_by_lease.get(
++                            skip.lease_id,
++                            [],
++                        )
++                        if reservation.call_index == skip.triggering_call_index
++                    ),
++                    None,
++                )
++                if trigger is None:
++                    raise AuthorizationError(
++                        "authorization plan skip trigger is absent"
++                    )
++                trigger_reservation, trigger_facts = trigger
++                if not (
++                    trigger_reservation.iteration == skip.iteration
++                    and trigger_reservation.role == "investigator"
++                    and trigger_facts.outcome == "schema_invalid"
++                    and trigger_facts.accounting_complete
++                    and trigger_facts.response_validation_code
++                    in _contract.PIT_OPTIMIZER_RESPONSE_VALIDATION_CODES
++                    and trigger_facts.accounting_source is not None
++                ):
++                    raise AuthorizationError(
++                        "authorization plan skip trigger is not an accounted invalid investigator"
++                    )
++                settled_indices.add(skip.call_index)
++                plan_skips_by_lease.setdefault(skip.lease_id, []).append(skip)
+             elif record_type == "lease_close":
+                 if set(value) != expected_common | {"lease_id", "terminal_code"}:
+                     raise AuthorizationError("authorization lease close keys are invalid")
+                 lease_id = value.get("lease_id")
+                 if lease_id not in leases or lease_id in closed_leases:
+                     raise AuthorizationError("authorization lease close is invalid")
+                 if lease_id in active_reservations:
+                     raise AuthorizationError("authorization lease closed with an active reservation")
+                 terminal_code = value.get("terminal_code")
+                 if terminal_code not in {
+@@ -2654,47 +2997,46 @@ class AuthorizationLedger:
+                 expected_terminal_codes = pending_terminal_closes.get(str(lease_id))
+                 if (
+                     expected_terminal_codes is not None
+                     and terminal_code not in expected_terminal_codes
+                 ):
+                     raise AuthorizationError(
+                         "authorization terminal reconciliation close differs"
+                     )
+                 if terminal_code in {"completed", "early_stop"}:
+                     reconciliations = reconciliations_by_lease.get(str(lease_id), [])
+-                    for offset, (reservation, facts) in enumerate(reconciliations):
+-                        if offset >= len(self._call_plan_snapshots):
+-                            raise AuthorizationError(
+-                                "authorization completed plan has excess calls"
+-                            )
+-                        plan = self._call_plan_snapshots[offset]
+-                        if (
+-                            reservation.call_index,
+-                            reservation.iteration,
+-                            reservation.role,
+-                        ) != (plan.call_index, plan.iteration, plan.role) or not (
+-                            self._provider_facts_accept_plan(facts, plan)
+-                        ):
++                    skips = plan_skips_by_lease.get(str(lease_id), [])
++                    covered = {
++                        reservation.call_index for reservation, _facts in reconciliations
++                    } | {skip.call_index for skip in skips}
++                    for reservation, facts in reconciliations:
++                        plan = self._call_plan_snapshots[reservation.call_index - 1]
++                        if not self._provider_facts_settle_plan(facts, plan):
+                             raise AuthorizationError(
+-                                "authorization completed plan has a non-accepted call"
++                                "authorization completed plan has an unsettled call"
+                             )
+-                    if terminal_code == "completed" and len(reconciliations) != len(
++                    expected_prefix = set(range(1, len(covered) + 1))
++                    if covered != expected_prefix:
++                        raise AuthorizationError(
++                            "authorization completed plan coverage is not contiguous"
++                        )
++                    if terminal_code == "completed" and len(covered) != len(
+                         self._call_plan_snapshots
+                     ):
+                         raise AuthorizationError(
+                             "authorization completed lease requires the exact call plan"
+                         )
+                     if terminal_code == "early_stop" and not (
+-                        0 < len(reconciliations) < len(self._call_plan_snapshots)
++                        0 < len(covered) < len(self._call_plan_snapshots)
+                     ):
+                         raise AuthorizationError(
+-                            "authorization early stop requires an accepted partial plan"
++                            "authorization early stop requires a settled partial plan"
+                         )
+                 pending_terminal_closes.pop(str(lease_id), None)
+                 closed_leases.add(str(lease_id))
+             else:
+                 raise AuthorizationError("authorization ledger record type is invalid")
+             if record_type in {"grant", "window"}:
+                 approval_digest = value.get("operator_approval_reference_sha256")
+                 try:
+                     _require_digest(approval_digest, "operator approval reference SHA-256")
+                 except ValueError as exc:
+@@ -3307,40 +3649,67 @@ class AuthorizationLedger:
+             "cancelled",
+             "budget_exhausted",
+         }:
+             raise AuthorizationError(
+                 "authorization reconciliation terminal code is invalid"
+             )
+         if requested_terminal_code is not None:
+             return requested_terminal_code
+         if provider_facts.outcome == "accepted":
+             return None
++        if provider_facts.outcome == "schema_invalid" and (
++            provider_facts.response_validation_code
++            in _contract.PIT_OPTIMIZER_RESPONSE_VALIDATION_CODES
++            and provider_facts.accounting_source is not None
++        ):
++            return None
+         if provider_facts.outcome == "budget_exceeded":
+             return "budget_exhausted"
+         return "failed"
+ 
+     @staticmethod
+     def _provider_facts_accept_plan(
+         facts: PitOptimizerProviderFacts,
+         plan: PitOptimizerCallBudget,
+     ) -> bool:
+         return (
+             facts.outcome == "accepted"
+             and facts.request_started
+             and facts.response_received
+             and facts.finish_reason == "stop"
+             and facts.returned_model == plan.model
+             and facts.requested_model == plan.model
+             and facts.response_schema_valid
+             and facts.accounting_complete
+         )
+ 
++    @classmethod
++    def _provider_facts_settle_plan(
++        cls,
++        facts: PitOptimizerProviderFacts,
++        plan: PitOptimizerCallBudget,
++    ) -> bool:
++        if cls._provider_facts_accept_plan(facts, plan):
++            return True
++        return (
++            facts.outcome == "schema_invalid"
++            and facts.request_started
++            and facts.response_received
++            and facts.requested_model == plan.model
++            and not facts.response_schema_valid
++            and facts.accounting_complete
++            and facts.response_validation_code
++            in _contract.PIT_OPTIMIZER_RESPONSE_VALIDATION_CODES
++            and facts.accounting_source is not None
++            and facts.retained_reservation_tokens == 0
++        )
++
+     def _verify_reconciliation_records(
+         self,
+         records: Sequence[dict[str, object]],
+         reservation: AuthorizationCallReservation,
+         provider_facts: PitOptimizerProviderFacts,
+         terminal_audit_sha256: str,
+         terminal_code: str | None,
+         terminal_audit_receipt: TerminalAuditReceipt | None = None,
+     ) -> None:
+         reconciliation = next(
+@@ -3452,44 +3821,59 @@ class AuthorizationLedger:
+                         lease_reservation = AuthorizationCallReservation(
+                             **reservation_record["reservation"]
+                         )
+                         lease_facts = PitOptimizerProviderFacts(**facts_primitive)
+                     except (TypeError, ValueError) as exc:
+                         raise AuthorizationError(
+                             "authorization reconciliation evidence is invalid"
+                         ) from exc
+                     lease_reconciliations.append((lease_reservation, lease_facts))
+                 expected_plans = self._call_plan_snapshots
++                lease_skips = [
++                    AuthorizationPlanSkip.from_record(item)
++                    for item in records
++                    if item.get("record_type") == "plan_skip"
++                    and item.get("lease_id") == reservation.lease_id
++                ]
+                 if not lease_reconciliations or any(
+-                    facts.outcome != "accepted"
+-                    for _lease_reservation, facts in lease_reconciliations
++                    not self._provider_facts_settle_plan(
++                        facts,
++                        expected_plans[lease_reservation.call_index - 1],
++                    )
++                    for lease_reservation, facts in lease_reconciliations
+                 ):
+                     raise AuthorizationError(
+-                        "authorization accepted reconciliation close has a non-accepted prefix"
++                        "authorization reconciliation close has an unsettled call"
++                    )
++                covered = {
++                    lease_reservation.call_index
++                    for lease_reservation, _facts in lease_reconciliations
++                } | {skip.call_index for skip in lease_skips}
++                if covered != set(range(1, len(covered) + 1)):
++                    raise AuthorizationError(
++                        "authorization lease settlement is not contiguous"
+                     )
+                 if close_code == "completed":
+-                    if len(lease_reconciliations) != len(expected_plans):
++                    if len(covered) != len(expected_plans):
+                         raise AuthorizationError(
+                             "authorization completed lease has an incomplete call plan"
+                         )
+-                elif not 0 < len(lease_reconciliations) < len(expected_plans):
++                elif not 0 < len(covered) < len(expected_plans):
+                     raise AuthorizationError(
+                         "authorization early-stop lease has an invalid call prefix"
+                     )
+-                for offset, (lease_reservation, lease_facts) in enumerate(
+-                    lease_reconciliations
+-                ):
+-                    if offset >= len(expected_plans):
++                for lease_reservation, lease_facts in lease_reconciliations:
++                    if lease_reservation.call_index > len(expected_plans):
+                         raise AuthorizationError(
+                             "authorization lease call plan has excess calls"
+                         )
+-                    expected_plan = expected_plans[offset]
++                    expected_plan = expected_plans[lease_reservation.call_index - 1]
+                     if (
+                         lease_reservation.call_index,
+                         lease_reservation.iteration,
+                         lease_reservation.role,
+                     ) != (
+                         expected_plan.call_index,
+                         expected_plan.iteration,
+                         expected_plan.role,
+                     ) or (
+                         lease_facts.call_index,
+@@ -3566,35 +3950,57 @@ class AuthorizationLedger:
+             reservations = self._reservation_records(records, lease.lease_id)
+             reconciled = self._reconciled_ids(records)
+             reservation_ids = {
+                 str(item["reservation"].get("reservation_id"))
+                 for item in reservations
+             }
+             if any(
+                 item.get("record_type") == "reconciliation"
+                 and item.get("reservation_id") in reservation_ids
+                 and isinstance(item.get("provider_facts"), dict)
+-                and item["provider_facts"].get("outcome") != "accepted"
++                and item["provider_facts"].get("outcome")
++                not in {"accepted", "schema_invalid"}
+                 for item in records
+             ):
+                 raise AuthorizationError(
+                     "authorization lease has a terminal reconciliation"
+                 )
+             if any(
+                 item["reservation"].get("reservation_id") not in reconciled
+                 for item in reservations
+             ):
+                 raise AuthorizationError("authorization lease has an active call reservation")
+-            next_offset = len(reservations)
+-            if next_offset >= len(self._manifest.call_budgets):
++            settled_indices = {
++                int(item["provider_facts"]["call_index"])
++                for item in records
++                if item.get("record_type") == "reconciliation"
++                and item.get("reservation_id") in reservation_ids
++                and isinstance(item.get("provider_facts"), dict)
++                and type(item["provider_facts"].get("call_index")) is int
++            } | {
++                int(item["call_index"])
++                for item in records
++                if item.get("record_type") == "plan_skip"
++                and item.get("lease_id") == lease.lease_id
++                and type(item.get("call_index")) is int
++            }
++            next_call_index = next(
++                (
++                    call_index
++                    for call_index in range(1, len(self._call_plan_snapshots) + 1)
++                    if call_index not in settled_indices
++                ),
++                None,
++            )
++            if next_call_index is None:
+                 raise AuthorizationError("authorization planned calls are exhausted")
+-            expected = self._call_plan_snapshots[next_offset]
++            expected = self._call_plan_snapshots[next_call_index - 1]
+             if canonical_plan != expected:
+                 raise AuthorizationError("authorization call is not the next sealed plan")
+             if stored_lease.run_manifest_sha256 != self._manifest.sha256:
+                 raise AuthorizationError("authorization lease manifest is stale")
+             if (
+                 stored_lease.pricing_status == "available"
+             ) != (projected_call_text is not None):
+                 raise AuthorizationError(
+                     "authorization pricing availability differs from call projection"
+                 )
+@@ -3613,20 +4019,134 @@ class AuthorizationLedger:
+                 role=canonical_plan.role,
+                 reserved_tokens=reserved_tokens,
+                 projected_call_usd=projected_call_text,
+             )
+             self._append_records(
+                 records,
+                 [{"record_type": "reservation", "reservation": asdict(reservation)}],
+             )
+             return reservation
+ 
++    def skip_unstarted_plans(
++        self,
++        lease: AuthorizationRunLease,
++        plans: tuple[PitOptimizerCallBudget, ...],
++        *,
++        triggering_attempt: PitOptimizerRoleAttempt,
++        reason: str = "predecessor_role_output_invalid",
++    ) -> tuple[AuthorizationPlanSkip, ...]:
++        """Settle the unstarted remainder of an invalid investigator iteration."""
++
++        if type(plans) is not tuple or any(
++            not isinstance(plan, PitOptimizerCallBudget) for plan in plans
++        ):
++            raise AuthorizationError("authorization plan skips are invalid")
++        if (
++            not isinstance(triggering_attempt, PitOptimizerRoleAttempt)
++            or not triggering_attempt.recoverable_schema_invalid
++            or triggering_attempt.plan.role != "investigator"
++            or reason != "predecessor_role_output_invalid"
++        ):
++            raise AuthorizationError("authorization plan skip trigger is invalid")
++        trigger_plan = self.snapshot_call_plan(triggering_attempt.plan)
++        canonical_plans = tuple(self.snapshot_call_plan(plan) for plan in plans)
++        expected_plans = tuple(
++            plan
++            for plan in self._call_plan_snapshots
++            if plan.iteration == trigger_plan.iteration
++            and plan.call_index > trigger_plan.call_index
++        )
++        if canonical_plans != expected_plans or not canonical_plans:
++            raise AuthorizationError(
++                "authorization skips must cover the remaining invalid iteration"
++            )
++        with _authorization_file_lock(self._lock_path):
++            records = self._read_records()
++            self._lease_from_records(records, lease)
++            if any(
++                item.get("record_type") == "lease_close"
++                and item.get("lease_id") == lease.lease_id
++                for item in records
++            ):
++                raise AuthorizationError("authorization lease is closed")
++            reservations = self._reservation_records(records, lease.lease_id)
++            reservation_ids = {
++                str(item["reservation"].get("reservation_id"))
++                for item in reservations
++            }
++            if any(
++                item["reservation"].get("reservation_id")
++                not in self._reconciled_ids(records)
++                for item in reservations
++            ):
++                raise AuthorizationError(
++                    "authorization lease has an active call reservation"
++                )
++            trigger_matches = [
++                item
++                for item in records
++                if item.get("record_type") == "reconciliation"
++                and item.get("reservation_id") in reservation_ids
++                and item.get("provider_facts") == asdict(triggering_attempt.facts)
++            ]
++            if len(trigger_matches) != 1:
++                raise AuthorizationError(
++                    "authorization plan skip trigger reconciliation is absent"
++                )
++            settled_indices = {
++                int(item["provider_facts"]["call_index"])
++                for item in records
++                if item.get("record_type") == "reconciliation"
++                and item.get("reservation_id") in reservation_ids
++                and isinstance(item.get("provider_facts"), dict)
++                and type(item["provider_facts"].get("call_index")) is int
++            } | {
++                int(item["call_index"])
++                for item in records
++                if item.get("record_type") == "plan_skip"
++                and item.get("lease_id") == lease.lease_id
++                and type(item.get("call_index")) is int
++            }
++            expected_next = next(
++                (
++                    call_index
++                    for call_index in range(1, len(self._call_plan_snapshots) + 1)
++                    if call_index not in settled_indices
++                ),
++                None,
++            )
++            if expected_next != canonical_plans[0].call_index:
++                raise AuthorizationError(
++                    "authorization plan skips are not the next unsettled plans"
++                )
++            appended = self._append_records(
++                records,
++                [
++                    {
++                        "record_type": "plan_skip",
++                        "lease_id": lease.lease_id,
++                        "call_index": plan.call_index,
++                        "iteration": plan.iteration,
++                        "role": plan.role,
++                        "triggering_call_index": trigger_plan.call_index,
++                        "reason": reason,
++                    }
++                    for plan in canonical_plans
++                ],
++            )
++        try:
++            return tuple(AuthorizationPlanSkip.from_record(item) for item in appended)
++        except (TypeError, ValueError) as exc:
++            raise AuthorizationError(
++                "authorization plan skip publication is invalid"
++            ) from exc
++
+     def reconcile_call(
+         self,
+         reservation: AuthorizationCallReservation,
+         provider_facts: PitOptimizerProviderFacts,
+         *,
+         terminal_audit_sha256: str | None = None,
+         terminal_audit_receipt: TerminalAuditReceipt | None = None,
+         terminal_code: str | None = None,
+         _gateway_lifecycle: object | None = None,
+         _recovery_seal: object | None = None,
+@@ -4120,33 +4640,33 @@ class AuthorizationLedger:
+                     return
+                 raise AuthorizationError("authorization lease is already closed")
+             reservations = self._reservation_records(records, lease.lease_id)
+             reconciled = self._reconciled_ids(records)
+             if any(
+                 item["reservation"].get("reservation_id") not in reconciled
+                 for item in reservations
+             ):
+                 raise AuthorizationError("authorization lease has an active call reservation")
+             if terminal_code in {"completed", "early_stop"}:
+-                accepted_plans: list[PitOptimizerCallBudget] = []
+-                for offset, item in enumerate(reservations):
++                reconciled_plans: set[int] = set()
++                for item in reservations:
+                     primitive = item.get("reservation")
+                     if not isinstance(primitive, dict):
+                         raise AuthorizationError(
+                             "authorization reservation record is invalid"
+                         )
+                     reservation = AuthorizationCallReservation(**primitive)
+-                    if offset >= len(self._manifest.call_budgets):
++                    if reservation.call_index > len(self._manifest.call_budgets):
+                         raise AuthorizationError(
+                             "authorization completed plan has excess calls"
+                         )
+-                    plan = self._manifest.call_budgets[offset]
++                    plan = self._manifest.call_budgets[reservation.call_index - 1]
+                     if (
+                         reservation.call_index,
+                         reservation.iteration,
+                         reservation.role,
+                     ) != (plan.call_index, plan.iteration, plan.role):
+                         raise AuthorizationError(
+                             "authorization completed plan order differs"
+                         )
+                     reconciliation = next(
+                         record
+@@ -4154,36 +4674,47 @@ class AuthorizationLedger:
+                         if record.get("record_type") == "reconciliation"
+                         and record.get("reservation_id")
+                         == reservation.reservation_id
+                     )
+                     facts_primitive = reconciliation.get("provider_facts")
+                     if not isinstance(facts_primitive, dict):
+                         raise AuthorizationError(
+                             "authorization provider facts are invalid"
+                         )
+                     facts = PitOptimizerProviderFacts(**facts_primitive)
+-                    if not self._provider_facts_accept_plan(facts, plan):
++                    if not self._provider_facts_settle_plan(facts, plan):
+                         raise AuthorizationError(
+-                            "authorization completed plan has a non-accepted call"
++                            "authorization completed plan has an unsettled call"
+                         )
+-                    accepted_plans.append(plan)
+-                if terminal_code == "completed" and len(accepted_plans) != len(
++                    reconciled_plans.add(plan.call_index)
++                skipped_plans = {
++                    AuthorizationPlanSkip.from_record(record).call_index
++                    for record in records
++                    if record.get("record_type") == "plan_skip"
++                    and record.get("lease_id") == lease.lease_id
++                }
++                covered_plans = reconciled_plans | skipped_plans
++                if covered_plans != set(range(1, len(covered_plans) + 1)):
++                    raise AuthorizationError(
++                        "authorization completed plan coverage is not contiguous"
++                    )
++                if terminal_code == "completed" and len(covered_plans) != len(
+                     self._manifest.call_budgets
+                 ):
+                     raise AuthorizationError(
+                         "authorization completed lease requires the exact call plan"
+                     )
+                 if terminal_code == "early_stop" and not (
+-                    0 < len(accepted_plans) < len(self._manifest.call_budgets)
++                    0 < len(covered_plans) < len(self._manifest.call_budgets)
+                 ):
+                     raise AuthorizationError(
+-                        "authorization early stop requires an accepted partial plan"
++                        "authorization early stop requires a settled partial plan"
+                     )
+             self._append_records(
+                 records,
+                 [
+                     {
+                         "record_type": "lease_close",
+                         "lease_id": lease.lease_id,
+                         "terminal_code": terminal_code,
+                     }
+                 ],
+diff --git a/tests/test_pit_optimizer_loop.py b/tests/test_pit_optimizer_loop.py
+index 8391596..4279780 100644
+--- a/tests/test_pit_optimizer_loop.py
++++ b/tests/test_pit_optimizer_loop.py
+@@ -103,36 +103,35 @@ def _evidence(
+         ),
+         funnel=aggregate.entry_funnel,
+         aggregate=aggregate,
+         effective_policy_sha256=effective_policy_sha256,
+         evidence_sha256=hashlib.sha256(_canonical_bytes(primitive)).hexdigest(),
+     )
+ 
+ 
+ def _call_budgets() -> tuple[contract.PitOptimizerCallBudget, ...]:
+     caps = {
+-        "investigator": (8_000, 80_000, 88_000, 4_000, 8 * 1024, 0.05),
+-        "author": (12_000, 76_000, 88_000, 8_000, 16 * 1024, 0.10),
+-        "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024, 0.05),
++        "investigator": (8_000, 78_000, 86_000, 16_000, 8 * 1024),
++        "author": (12_000, 48_500, 72_000, 14_000, 16 * 1024),
++        "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024),
+     }
+     return tuple(
+         contract.PitOptimizerCallBudget(
+             call_index=(iteration - 1) * 3 + ordinal,
+             iteration=iteration,
+             role=role,
+             model=contract.PIT_OPTIMIZER_R1_MODEL,
+             max_static_input_bytes=caps[role][0],
+             max_dynamic_input_bytes=caps[role][1],
+             max_input_tokens=caps[role][2],
+             max_output_tokens=caps[role][3],
+             max_response_bytes=caps[role][4],
+-            max_usd=caps[role][5],
+         )
+         for iteration in (1, 2)
+         for ordinal, role in enumerate(contract.OPTIMIZER_V2_ROLES, start=1)
+     )
+ 
+ 
+ def _git(root: Path, *args: str) -> bytes:
+     return subprocess.run(
+         ["git", *args],
+         cwd=root,
+@@ -268,29 +267,28 @@ def _prepare_fixture(tmp_path: Path) -> dict[str, object]:
+         max_iteration_history_bytes=contract.MAX_ITERATION_HISTORY_BYTES,
+         hard_patch_bounds=contract.PatchBounds(3, 12, 200, contract.MAX_AUTHOR_DIFF_BYTES),
+         candidate_bounds=bounds,
+         max_iterations=2,
+         allowed_descendant_rule="authenticated_initial_sources_plus_validated_cumulative_diff",
+     )
+     authorization = contract.AuthorizationRequirement(
+         window_id="window_task7",
+         max_calls=6,
+         max_tokens=448_000,
+-        max_usd=0.40,
+         policy_source_scope_sha256=scope.sha256,
+         provider_retries=0,
+         apply=False,
+     )
+     constraints = ("causal_only", "no_external_io")
+     constraints_sha256 = hashlib.sha256(_canonical_bytes(constraints)).hexdigest()
+     manifest = contract.PitOptimizerRunManifest(
+-        schema_version=2,
++        schema_version=3,
+         run_id="run_task7",
+         run_kind="subset_canary",
+         model=contract.PIT_OPTIMIZER_R1_MODEL,
+         source_head=source_head,
+         source_fingerprint_sha256=source_fingerprint,
+         legacy_readiness_sha256="6" * 64,
+         pit_bundle_sha256=pit_sha256,
+         baseline_manifest_sha256=baseline_sha256,
+         effective_policy_sha256=effective_policy_sha256,
+         policy_interface_version=1,
+@@ -324,21 +322,20 @@ def _prepare_fixture(tmp_path: Path) -> dict[str, object]:
+         effective_policy_sha256=effective_policy_sha256,
+         optimizer_manifest=manifest_path,
+         optimizer_manifest_sha256=manifest.sha256,
+         verified_parity_artifact=parity_path,
+         verified_parity_sha256=parity.artifact_sha256,
+         readiness_artifact=None,
+         readiness_sha256=None,
+         authorization_window_id=None,
+         authorization_requirement_sha256=authorization.sha256,
+         source_transmission_authorized=False,
+-        max_usd=0.40,
+         max_api_calls=6,
+         max_tokens=448_000,
+         max_iterations=2,
+         apply=False,
+     )
+     return {
+         "config": config,
+         "manifest": manifest,
+         "parity": parity,
+         "source_root": source_root,
+@@ -827,36 +824,36 @@ def test_artifact_initialization_store_is_create_only_and_accounting_replaceable
+     tmp_path: Path,
+ ) -> None:
+     """Break caught: immutable evidence could be overwritten through the artifact store."""
+     from core.pit_optimizer_artifacts import IncrementalArtifactStore
+ 
+     root = (tmp_path / "run-artifacts").resolve()
+     root.mkdir()
+     store = IncrementalArtifactStore(root)
+     first_path, first_digest = store.write_json_artifact(
+         "run.json",
+-        {"schema_version": 2, "run_id": "run_task7"},
++        {"schema_version": 3, "run_id": "run_task7"},
+     )
+     assert first_path == root / "run.json"
+     assert first_digest == hashlib.sha256(first_path.read_bytes()).hexdigest()
+     with pytest.raises(FileExistsError):
+         store.write_json_artifact(
+             "run.json",
+-            {"schema_version": 2, "run_id": "run_other"},
++            {"schema_version": 3, "run_id": "run_other"},
+         )
+     store.write_json_artifact(
+         "accounting.json",
+-        {"schema_version": 2, "api_calls": 0},
++        {"schema_version": 3, "api_calls": 0},
+     )
+     replaced_path, replaced_digest = store.write_json_artifact(
+         "accounting.json",
+-        {"schema_version": 2, "api_calls": 1},
++        {"schema_version": 3, "api_calls": 1},
+     )
+     assert json.loads(replaced_path.read_bytes())["api_calls"] == 1
+     assert replaced_digest == hashlib.sha256(replaced_path.read_bytes()).hexdigest()
+ 
+ 
+ def test_artifact_failure_removes_an_uncommitted_create(
+     tmp_path: Path,
+     monkeypatch: pytest.MonkeyPatch,
+ ) -> None:
+     """Break caught: a failed file fsync could leave a seemingly valid partial artifact."""
+diff --git a/tests/test_pit_optimizer_v2.py b/tests/test_pit_optimizer_v2.py
+index ee1e8b6..f1276df 100644
+--- a/tests/test_pit_optimizer_v2.py
++++ b/tests/test_pit_optimizer_v2.py
+@@ -3774,42 +3774,40 @@ def test_pit_optimizer_v2_record_grant_cli_uses_only_explicit_temp_inputs(
+     assert getenv_calls == []
+ 
+ 
+ def _task6_authorized_ledger(
+     tmp_path: Path,
+     manifest: contract.PitOptimizerRunManifest,
+     *,
+     grant_id: str = "grant-v2",
+     calls: int = 6,
+     tokens: int = 448_000,
+-    usd: float = 0.40,
+ ):
+     from core.pit_optimizer_authorization import (
+         AuthorizationLedger,
+         OperatorAuthorizationGrant,
+         record_authorized_grant,
+     )
+ 
+     runtime = tmp_path / f"runtime-{grant_id}"
+     runtime.mkdir()
+     ledger_path = runtime / "pit_optimizer_authorization_ledger.jsonl"
+     manifest_path = tmp_path / f"manifest-{grant_id}.json"
+     contract.write_optimizer_manifest(manifest, manifest_path)
+     window = record_authorized_grant(
+         ledger_path=ledger_path,
+         manifest_path=manifest_path,
+         manifest_sha256=manifest.sha256,
+         grant=OperatorAuthorizationGrant(
+             grant_id=grant_id,
+             additional_calls=calls,
+             additional_tokens=tokens,
+-            additional_usd=usd,
+             policy_source_scope_sha256=manifest.policy_source_scope.sha256,
+         ),
+         operator_approval_reference=f"approval-{grant_id}",
+     )
+     return AuthorizationLedger(ledger_path, manifest), ledger_path, window
+ 
+ 
+ def test_pit_optimizer_v2_authorization_window_query_is_read_only(
+     tmp_path: Path,
+     v2_manifest: contract.PitOptimizerRunManifest,
+@@ -4251,101 +4249,130 @@ def _task6_open_lease(tmp_path: Path, manifest: contract.PitOptimizerRunManifest
+         grant_id=f"grant-{tmp_path.name[-12:].lower()}",
+     )
+     pricing = freeze_pricing_record(
+         "deepseek/deepseek-r1",
+         {"prompt": 2, "completion": 8},
+     )
+     lease = ledger.open_run_lease(
+         window_id=window.window_id,
+         authorization_requirement_sha256=manifest.authorization_requirement.sha256,
+         run_manifest_sha256=manifest.sha256,
+-        frozen_pricing_sha256=pricing.pricing_sha256,
++        pricing_snapshot=pricing,
++        projected_plan_usd=Decimal("0"),
+     )
+     return ledger, ledger_path, lease, pricing
+ 
+ 
+ def _task6_provider_facts(
+     reservation,
+     pricing,
+     *,
+     outcome: str = "accepted",
+     request_started: bool = True,
+     response_received: bool = True,
+     schema_valid: bool = True,
+     accounting_complete: bool = True,
+     prompt_tokens: int | None = 100,
+     completion_tokens: int | None = 50,
+     total_tokens: int | None = 150,
+     cost_usd: float | None = 0.01,
+     retained_tokens: int = 0,
+-    retained_usd: float = 0.0,
+ ):
+     from core.pit_optimizer_authorization import PitOptimizerProviderFacts
+ 
+     return PitOptimizerProviderFacts(
+         call_index=reservation.call_index,
+         iteration=reservation.iteration,
+         role=reservation.role,
+         requested_model="deepseek/deepseek-r1",
+         returned_model=("deepseek/deepseek-r1" if response_received else None),
+-        frozen_pricing_sha256=pricing.pricing_sha256,
++        pricing_snapshot_sha256=pricing.pricing_payload_sha256,
+         outcome=outcome,
+         request_started=request_started,
+         response_received=response_received,
+         finish_reason=("stop" if response_received else None),
+         response_schema_valid=schema_valid,
+         accounting_complete=accounting_complete,
+         prompt_tokens=prompt_tokens,
+         completion_tokens=completion_tokens,
+         total_tokens=total_tokens,
+         cost_usd=cost_usd,
+         retained_reservation_tokens=retained_tokens,
+-        retained_reservation_usd=retained_usd,
+         audit_sha256="a" * 64,
++        response_validation_code=(
++            "payload_schema_invalid" if outcome == "schema_invalid" else None
++        ),
++        accounting_source=("inline" if accounting_complete else None),
+     )
+ 
+ 
+ def test_pit_optimizer_v2_terminal_reconciliation_fences_reopened_lease(
+     tmp_path: Path,
+     v2_manifest: contract.PitOptimizerRunManifest,
+ ) -> None:
+-    """Break caught: a crash after terminal reconcile could unlock plan two."""
+-    from core.pit_optimizer_authorization import AuthorizationError, AuthorizationLedger
++    """A reopened lease advances only after authenticated zero-charge skips."""
++    from core.pit_optimizer_authorization import (
++        AuthorizationLedger,
++        PitOptimizerRoleAttempt,
++    )
+ 
+     authorization, ledger_path, lease, pricing = _task6_open_lease(
+         tmp_path,
+         v2_manifest,
+     )
+-    reservation = authorization.reserve_call(lease, v2_manifest.call_budgets[0])
++    reservation = authorization.reserve_call(
++        lease,
++        v2_manifest.call_budgets[0],
++        projected_call_usd=Decimal("0"),
++    )
+     facts = _task6_provider_facts(
+         reservation,
+         pricing,
+         outcome="schema_invalid",
+         schema_valid=False,
+     )
+ 
+     authorization.reconcile_call(
+         reservation,
+         facts,
+         terminal_audit_sha256="b" * 64,
+     )
++    attempt = PitOptimizerRoleAttempt(
++        plan=v2_manifest.call_budgets[0],
++        facts=facts,
++        payload=None,
++    )
++    skips = authorization.skip_unstarted_plans(
++        lease,
++        tuple(v2_manifest.call_budgets[1:3]),
++        triggering_attempt=attempt,
++    )
+     reopened = AuthorizationLedger(ledger_path, v2_manifest)
+-
+-    with pytest.raises(AuthorizationError, match="(?:terminal|closed)"):
+-        reopened.reserve_call(lease, v2_manifest.call_budgets[1])
++    next_reservation = reopened.reserve_call(
++        lease,
++        v2_manifest.call_budgets[3],
++        projected_call_usd=Decimal("0"),
++    )
+ 
+     records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
+-    assert [record["record_type"] for record in records[-2:]] == [
++    assert [skip.call_index for skip in skips] == [2, 3]
++    assert [record["record_type"] for record in records[-4:]] == [
+         "reconciliation",
+-        "lease_close",
++        "plan_skip",
++        "plan_skip",
++        "reservation",
+     ]
+-    assert records[-1]["terminal_code"] == "failed"
++    assert all(
++        "charged_calls" not in record and "charged_tokens" not in record
++        for record in records[-3:-1]
++    )
++    assert next_reservation.call_index == 4
+ 
+ 
+ @pytest.mark.parametrize(
+     "changes",
+     (
+         {"response_received": False, "returned_model": None},
+         {"finish_reason": "non_stop"},
+         {"returned_model": "other/model"},
+     ),
+ )
+@@ -4482,40 +4509,43 @@ def test_pit_optimizer_v2_completed_accepts_only_full_ordered_plan(
+     records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
+     assert records[-1]["terminal_code"] == "completed"
+ 
+ 
+ @pytest.mark.parametrize("nonaccepted_outcome", ["schema_invalid", "uncertain_accounting"])
+ def test_pit_optimizer_v2_nonaccepted_full_plan_cannot_be_completed(
+     tmp_path: Path,
+     v2_manifest: contract.PitOptimizerRunManifest,
+     nonaccepted_outcome: str,
+ ) -> None:
+-    """Break caught: call count alone could conceal a rejected or uncertain role."""
++    """Accounted invalid output settles; uncertain accounting remains terminal."""
+     from core.pit_optimizer_authorization import AuthorizationError
+ 
+     ledger, ledger_path, lease, pricing = _task6_open_lease(tmp_path, v2_manifest)
+     for index, plan in enumerate(v2_manifest.call_budgets[:3]):
+-        reservation = ledger.reserve_call(lease, plan)
++        reservation = ledger.reserve_call(
++            lease,
++            plan,
++            projected_call_usd=Decimal("0"),
++        )
+         if index == 2 and nonaccepted_outcome == "uncertain_accounting":
+             facts = _task6_provider_facts(
+                 reservation,
+                 pricing,
+                 outcome="uncertain_accounting",
+                 response_received=False,
+                 schema_valid=False,
+                 accounting_complete=False,
+                 prompt_tokens=None,
+                 completion_tokens=None,
+                 total_tokens=None,
+                 cost_usd=None,
+                 retained_tokens=reservation.reserved_tokens,
+-                retained_usd=reservation.reserved_usd,
+             )
+         else:
+             facts = _task6_provider_facts(
+                 reservation,
+                 pricing,
+                 outcome=(
+                     "schema_invalid"
+                     if index == 2 and nonaccepted_outcome == "schema_invalid"
+                     else "accepted"
+                 ),
+@@ -4526,27 +4556,54 @@ def test_pit_optimizer_v2_nonaccepted_full_plan_cannot_be_completed(
+                 completion_tokens=5,
+                 total_tokens=15,
+                 cost_usd=0.001,
+             )
+         ledger.reconcile_call(
+             reservation,
+             facts,
+             terminal_audit_sha256="b" * 64,
+         )
+ 
+-    with pytest.raises(AuthorizationError, match="closed"):
+-        ledger.reserve_call(lease, v2_manifest.call_budgets[3])
+-    with pytest.raises(AuthorizationError, match="already closed"):
++    if nonaccepted_outcome == "schema_invalid":
++        for plan in v2_manifest.call_budgets[3:]:
++            reservation = ledger.reserve_call(
++                lease,
++                plan,
++                projected_call_usd=Decimal("0"),
++            )
++            ledger.reconcile_call(
++                reservation,
++                _task6_provider_facts(
++                    reservation,
++                    pricing,
++                    prompt_tokens=10,
++                    completion_tokens=5,
++                    total_tokens=15,
++                    cost_usd=0.001,
++                ),
++                terminal_audit_sha256="b" * 64,
++            )
+         ledger.close_run_lease(lease, terminal_code="completed")
++    else:
++        with pytest.raises(AuthorizationError, match="closed"):
++            ledger.reserve_call(
++                lease,
++                v2_manifest.call_budgets[3],
++                projected_call_usd=Decimal("0"),
++            )
++        with pytest.raises(AuthorizationError, match="already closed"):
++            ledger.close_run_lease(lease, terminal_code="completed")
+     records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
+     assert records[-1]["record_type"] == "lease_close"
+-    assert records[-1]["terminal_code"] == "failed"
++    assert records[-1]["terminal_code"] == (
++        "completed" if nonaccepted_outcome == "schema_invalid" else "failed"
++    )
+ 
+ 
+ def test_pit_optimizer_v2_budget_reservation_is_exact_sequential_and_released(
+     tmp_path: Path,
+     v2_manifest: contract.PitOptimizerRunManifest,
+ ) -> None:
+     """Break caught: future calls or a second active call could be pre-reserved."""
+     from core.pit_optimizer_authorization import AuthorizationError
+ 
+     ledger, ledger_path, lease, pricing = _task6_open_lease(tmp_path, v2_manifest)
+@@ -4639,21 +4696,20 @@ def test_pit_optimizer_v2_provider_call_uncertain_retains_one_full_reservation(
+         pricing,
+         outcome="uncertain_accounting",
+         response_received=False,
+         schema_valid=False,
+         accounting_complete=False,
+         prompt_tokens=None,
+         completion_tokens=None,
+         total_tokens=None,
+         cost_usd=None,
+         retained_tokens=reservation.reserved_tokens,
+-        retained_usd=reservation.reserved_usd,
+     )
+ 
+     ledger.reconcile_call(
+         reservation,
+         facts,
+         terminal_audit_sha256="b" * 64,
+     )
+     ledger.close_run_lease(lease, terminal_code="failed")
+ 
+     records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
+@@ -5099,21 +5155,22 @@ def _task6_gateway_context(
+     )
+     pricing = gateway.freeze_pit_optimizer_pricing(
+         model=contract.PIT_OPTIMIZER_R1_MODEL,
+         wall_deadline=10.0,
+         monotonic=lambda: 1.0,
+     )
+     lease = authorization.open_run_lease(
+         window_id=window.window_id,
+         authorization_requirement_sha256=manifest.authorization_requirement.sha256,
+         run_manifest_sha256=manifest.sha256,
+-        frozen_pricing_sha256=pricing.pricing_sha256,
++        pricing_snapshot=pricing,
++        projected_plan_usd=Decimal("0"),
+     )
+     return (
+         authorization,
+         ledger_path,
+         lease,
+         pricing,
+         budget,
+         audit,
+         client,
+         gateway,
+@@ -9057,20 +9114,21 @@ def test_pit_optimizer_v2_next_investigator_requires_prior_iteration_receipts(
+     investigator_artifact = investigator_call.payload
+     critic_artifact = critic_call.payload
+     assert isinstance(investigator_artifact, contract.InvestigatorArtifact)
+     assert isinstance(critic_artifact, contract.CriticArtifact)
+     feedback = contract.IterationFeedbackSummary(
+         iteration=1,
+         hypothesis_id=investigator_artifact.hypothesis_id,
+         family=investigator_artifact.family,
+         author_summary=author_artifact.behavioral_summary,
+         validation_code="valid",
++        candidate_folds=(),
+         discovery_score=None,
+         critic_disposition=critic_artifact.disposition,
+         critic_next_direction=critic_artifact.next_direction,
+         incumbent_changed=False,
+     )
+     second_input = replace(
+         _task6_manifest_investigator_input(v2_manifest),
+         iteration=2,
+         prior_iterations=(feedback,),
+     )
+@@ -9101,39 +9159,39 @@ def test_pit_optimizer_v2_next_investigator_requires_prior_iteration_receipts(
+         "outcome",
+         "provider_outcome",
+         "error_type",
+         "charge_basis",
+         "response_validation_code",
+     ),
+     (
+         (
+             _task6_fake_response("{}"),
+             "schema_invalid",
+-            "ResponseValidationError",
++            None,
+             "authoritative",
+-            "payload_schema_invalid",
++            "payload_keys_invalid",
+         ),
+         (
+             RuntimeError("synthetic post-send transport failure"),
+             "uncertain_accounting",
+             "GatewayError",
+             "retained_reservation",
+             None,
+         ),
+     ),
+ )
+ def test_pit_optimizer_v2_gateway_terminal_failures_close_without_retry(
+     tmp_path: Path,
+     v2_manifest: contract.PitOptimizerRunManifest,
+     outcome: object,
+     provider_outcome: str,
+-    error_type: str,
++    error_type: str | None,
+     charge_basis: str,
+     response_validation_code: str | None,
+ ) -> None:
+     """Break caught: malformed/uncertain calls could leak a reservation or retry."""
+     import agent_loop
+ 
+     (
+         authorization,
+         ledger_path,
+         lease,
+@@ -9142,46 +9200,75 @@ def test_pit_optimizer_v2_gateway_terminal_failures_close_without_retry(
+         audit,
+         client,
+         gateway,
+     ) = _task6_gateway_context(
+         tmp_path,
+         v2_manifest,
+         grant_id=f"grant-terminal-{provider_outcome.replace('_', '-')}",
+         outcomes=[outcome],
+     )
+ 
+-    expected_error = getattr(agent_loop, error_type)
+-    with pytest.raises(expected_error):
+-        gateway.request_pit_optimizer_once(
++    def request_once():
++        return gateway.request_pit_optimizer_once(
+             "investigator",
+             _task6_bind_role_input(
+                 authorization,
+                 v2_manifest.call_budgets[0],
+                 _task6_manifest_investigator_input(v2_manifest),
+             ),
+             _task6_investigator_parser,
+             call_budget=v2_manifest.call_budgets[0],
+             authorization_lease=lease,
+             frozen_pricing=pricing,
+             wall_deadline=10.0,
+             monotonic=lambda: 1.0,
+         )
++
++    if error_type is None:
++        attempt = request_once()
++        assert attempt.payload is None
++        assert attempt.recoverable_schema_invalid
++    else:
++        expected_error = getattr(agent_loop, error_type)
++        with pytest.raises(expected_error):
++            request_once()
+     assert len(client.completions.calls) == 1
+     records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
+-    assert records[-2]["record_type"] == "reconciliation"
+-    assert records[-2]["provider_facts"]["outcome"] == provider_outcome
+-    assert records[-2]["charge_basis"] == charge_basis
++    reconciliation = next(
++        item for item in reversed(records) if item["record_type"] == "reconciliation"
++    )
++    assert reconciliation["provider_facts"]["outcome"] == provider_outcome
++    assert reconciliation["cost_accounting_status"] == (
++        "authoritative" if charge_basis == "authoritative" else "unavailable"
++    )
+     assert (
+-        records[-2]["provider_facts"]["response_validation_code"]
++        reconciliation["provider_facts"]["response_validation_code"]
+         == response_validation_code
+     )
+-    assert records[-1]["record_type"] == "lease_close"
++    closes = [item for item in records if item["record_type"] == "lease_close"]
++    if provider_outcome == "schema_invalid":
++        assert closes == []
++        skips = authorization.skip_unstarted_plans(
++            lease,
++            tuple(v2_manifest.call_budgets[1:3]),
++            triggering_attempt=attempt,
++        )
++        assert [skip.role for skip in skips] == ["author", "critic"]
++        assert [skip.call_index for skip in skips] == [2, 3]
++        next_reservation = authorization.reserve_call(
++            lease,
++            v2_manifest.call_budgets[3],
++            projected_call_usd=Decimal("0"),
++        )
++        assert next_reservation.call_index == 4
++    else:
++        assert closes[-1]["terminal_code"] == "failed"
+     assert audit._events[-1]["event"] == "provider_call_rejected"
+ 
+ 
+ def test_pit_optimizer_v2_gateway_sdk_failure_releases_both_reservations(
+     tmp_path: Path,
+     v2_manifest: contract.PitOptimizerRunManifest,
+     monkeypatch: pytest.MonkeyPatch,
+ ) -> None:
+     """Break caught: local SDK construction could be misreported as paid spend."""
+     import agent_loop

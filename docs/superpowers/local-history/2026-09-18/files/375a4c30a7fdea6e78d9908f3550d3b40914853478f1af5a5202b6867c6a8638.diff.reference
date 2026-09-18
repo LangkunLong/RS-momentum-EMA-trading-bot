@@ -1,0 +1,57 @@
+diff --git a/.artifacts/pit-optimizer-v5/development/increment-c-history-h2/pre-h2b-fix1-historical_verification.py b/core/pit_optimizer_v5/historical_verification.py
+index 5dcf6f9..5ba237e 100644
+--- a/.artifacts/pit-optimizer-v5/development/increment-c-history-h2/pre-h2b-fix1-historical_verification.py
++++ b/core/pit_optimizer_v5/historical_verification.py
+@@ -340,6 +340,19 @@ def _windows_key(path: str) -> str:
+     return ntpath.normcase(ntpath.normpath(path))
+ 
+ 
++def _require_docker_host_path_v5(path: str) -> str:
++    if (
++        type(path) is not str
++        or not path
++        or path.strip() != path
++        or not ntpath.isabs(path)
++        or ntpath.normpath(path) != path
++        or any(character in path for character in {",", "\x00", "\n", "\r"})
++    ):
++        raise ValueError("historical Docker host mount path is invalid")
++    return path
++
++
+ def _successful_execution_keys_v5(
+     events: tuple[RoundEventV5, ...],
+     payloads: tuple[RoundEventPayloadV5, ...],
+@@ -684,6 +697,7 @@ def _mount_primitive_v5(
+     container_path: str,
+     maximum_bytes: int | None,
+ ) -> dict[str, object]:
++    host_path = _require_docker_host_path_v5(host_path)
+     return {
+         "kind": kind,
+         "mode": mode,
+@@ -938,11 +952,12 @@ def _historical_runtime_argv_v5(
+                 f"adapter-state/container-panel-input/{authority.request_sha256}.json"
+             ).parts
+         )
++        input_host_path = _require_docker_host_path_v5(str(input_path))
+         separator = generic.index("--")
+         generic[separator:separator] = [
+             "--mount",
+             (
+-                f"type=bind,src={input_path},dst={_PANEL_INPUT_TARGET_V5},"
++                f"type=bind,src={input_host_path},dst={_PANEL_INPUT_TARGET_V5},"
+                 "readonly"
+             ),
+         ]
+@@ -1183,8 +1198,9 @@ def _validate_saved_execution_command_v5(
+                 f"adapter-state/container-panel-input/{request_sha256}.json"
+             ).parts
+         )
++        input_host_path = _require_docker_host_path_v5(str(input_path))
+         input_mounts = (
+-            (_windows_key(str(input_path)), _PANEL_INPUT_TARGET_V5, False),
++            (_windows_key(input_host_path), _PANEL_INPUT_TARGET_V5, False),
+         )
+     expected_mounts = tuple(
+         sorted(

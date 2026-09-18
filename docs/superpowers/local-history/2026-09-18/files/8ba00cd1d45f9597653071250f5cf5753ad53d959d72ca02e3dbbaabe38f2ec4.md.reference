@@ -1,0 +1,685 @@
+# Task 9 implementation report
+
+## Scope
+
+Task 9 adds the explicit PIT optimizer V5 command boundary without changing legacy V4 parsing or
+embedding a second optimizer in `agent_loop.py`. No provider, Docker, Git materialization, replay,
+market-data, or network operation was performed, and no test file was created or modified.
+
+## Command boundary
+
+- `core.pit_optimizer_v5.cli` defines closed `run`, `resume`, `verify-run`, `summarize`, and
+  `import-v4-candidate` commands. Parsing only constructs a frozen request and performs no adapter
+  construction or side effect.
+- `agent_loop.py` detects only the explicit `pit-optimizer-v5` prefix and delegates the remaining
+  arguments. Every other argument vector still reaches the pre-existing parser and V4 controller.
+- Campaign-specific manifest construction/rendering remains deferred. The CLI consumes an exact
+  manifest reference under an absolute local artifact root.
+
+## Production composition
+
+- Production authority loading uses `LocalArtifactRepositoryV5.verify_graph` plus strict typed input
+  decoding for the manifest, panel plan, evaluator contract, baseline authority, and sandbox profile.
+- A production round must return exact `FeedbackRoundInputV5` / `FeedbackRoundDependenciesV5` bound
+  to that same repository. The provider boundary must be `LedgerBackedRoleInvokerV5`, containing an
+  `AuthorizedRoleRunnerV5` backed by `GatewayCompletionProviderV5` and a durable
+  `LedgerRoleAuthorizationLifecycleV5` for the exact manifest. The candidate boundary must be the
+  accepted `DockerCandidateRuntimeV5`. Fixture/no-op shapes fail before runtime.
+- `LedgerBackedRoleInvokerV5` permits a provider call only for `FreshPersistedRoleRequestV5` and
+  routes `ExistingPersistedRoleRequestV5` only to paid-response reconciliation. Terminal attempts
+  require exact ledger receipts and call/request bindings.
+- No user-controlled CLI option selects dependency implementations. If campaign-specific production
+  adapters are unavailable, run/resume fail closed without a provider or evaluator action.
+- The review fix adds an authenticated `ProductionAdapterConfigV5` and an exact concrete
+  `ProductionRoundFactoryV5`. A trusted local host registers that factory against the canonical
+  artifact root, manifest digest, and config digest; the default CLI resolves it and reaches the
+  accepted runtime. Missing config or a missing registration is a stable readiness failure.
+- Gateway, role-ledger/reconciler, workspace driver, candidate base, mount factory, and two-phase
+  container executor capabilities now have exact identity-bound production wrappers. Composition
+  verifies their manifest/ledger/audit/config bindings and rejects arbitrary structural substitutes.
+
+## Read-only verification and summaries
+
+- `verify-run` authenticates the graph, event/payload chains, role invocation packages, indexed
+  execution reservations, and checkpoint record references without repair or mutation. A nonempty
+  provider/checkpoint run additionally requires the production factory's ledger/archive verifier.
+- `summarize` emits only a closed schema of counts, aggregate token/cost facts, checkpoint generation,
+  aggregate campaign CAGR/target gap, and cleanup status. It excludes prompts, responses, source,
+  paths, digests, resource IDs, credentials, and scenario details.
+- `import-v4-candidate` is explicit but currently returns the stable
+  `import_campaign_authority_unavailable` readiness reason; it does not invent V5 campaign evidence
+  or copy V4 numeric evidence.
+
+## Verification
+
+The temporary direct fake (removed after use) produced `PIT_OPTIMIZER_V5_TASK9_SMOKE_OK`. It covered
+zero-work parsing, run/resume/verify/summarize routing, content-free output, explicit V5 delegation,
+unchanged legacy parser routing, fixture production rejection, and fail-closed V4 import readiness.
+The final sweep used `py_compile`, Ruff format/check, package/module export imports, a forbidden
+pure-domain coupling scan, focused dispatch inspection, and `git diff --check`.
+
+The review-fix smoke additionally verified closed malformed-argument handling, sanitized unexpected
+service exceptions, stable missing-config readiness, and rejection of a structural factory. Public
+execution and dispatch boundaries convert unexpected failures to `internal_failure` without emitting
+exception text, tracebacks, paths, hashes, or content; static help remains the only preserved
+`SystemExit(0)` path.
+
+## Production-composition review correction
+
+- Run/resume may now load an authenticated `ProductionAdapterConfigV5` and resolve an exact
+  `ProductionRoundFactoryV5` registered for the canonical local artifact root, manifest identity,
+  and config identity. Missing config or live capabilities fails with a stable readiness code;
+  registered capabilities reach the accepted feedback runtime.
+- Production role composition requires identity-bound gateway and role-ledger capabilities for the
+  exact manifest, ledger, and audit store. The lifecycle and paid-response reconciler must be the
+  same exact capability. Candidate composition requires identity-bound Git workspace, candidate
+  base, mount, and two-phase container executor capabilities plus the exact local repository.
+- The public execute boundary and command dispatcher sanitize parse, artifact, composition,
+  verification, summary, and runtime exceptions. Unexpected failures emit only the allowlisted
+  `internal_failure` status; raw exception text, tracebacks, paths, hashes, and content are excluded.
+
+## Task 9B3 probe isolation fix
+
+Commit `25b33ddf2c95` (`fix(pit-v5): isolate semantic probe inputs`) makes semantic probing a
+first-class durable sandbox execution. The digest-pinned image supplies the trusted probe entry,
+probe suite, and policy worker. The request mounts only the four independently authenticated V3
+policy files plus the bounded output directory, uses `/` as its work directory, and carries no PIT
+data authority or mount. Panel evaluation retains its source, exact two-file PIT data, and output
+mount grammar.
+
+The focused verification commands and results were:
+
+- `python -m py_compile core/pit_optimizer_v5/sandbox.py core/pit_optimizer_v5/production_sandbox.py core/pit_optimizer_v5/probe_entry.py core/strategy_policy/worker.py` — passed.
+- `python -m ruff check core/pit_optimizer_v5/sandbox.py core/pit_optimizer_v5/production_sandbox.py core/pit_optimizer_v5/probe_entry.py core/strategy_policy/worker.py` — `All checks passed!`.
+- `git diff --check -- core/pit_optimizer_v5/sandbox.py core/pit_optimizer_v5/production_sandbox.py core/pit_optimizer_v5/probe_entry.py core/strategy_policy/worker.py` — passed.
+- The bounded constructor/argument-vector fake reported `PROBE_ISOLATION_SMOKE_OK semantic_mounts=5 panel_mounts=4 forged_data=rejected`.
+- The overlay/runtime coupling fake reported `PROBE_RUNTIME_COUPLING_OK exact_overlay_args=rejected_extras trusted_sources=3`.
+- The focused commit's pre-commit Ruff, whitespace, end-of-file, YAML, and merge-conflict hooks all passed.
+
+The cached diff contained exactly the four probe files (559 insertions and 142 deletions). No
+provider, Docker, Git materialization, market-data, network, replay, or test-suite operation ran for
+this correction, and no test file was created or modified.
+
+## Task 9B3 bounded policy callbacks
+
+Commit `8868e96790cb0fb71975df85a76e9a6c7e7114a9` (`fix(pit-v5): bound selector callbacks`)
+closes higher-order callback and sequence-allocation escape paths in the V5 candidate language.
+Only `min`/`max` may accept a callback, it must be a direct private one-argument policy helper,
+and its input must be either an exact authenticated V3 collection path or a bounded tuple.
+Callback execution is charged by the authenticated collection bound in the same acyclic static
+call graph as direct helper calls. The validator uses an iterative graph proof with exact call-depth
+and work ceilings, so adversarially deep source cannot recurse inside the controller validator.
+
+Dynamic string/bytes/tuple concatenation, percent formatting, f-strings, and sequence repetition
+are rejected. Numeric `Add` and `Mod` remain usable through a narrow syntax-only numeric proof;
+fixed immutable tuple literals may be concatenated only when their combined item count remains
+bounded. The proof tracks local assignments conservatively and refuses rebinding ambiguity. This
+is deliberately not a general Python type system: snapshot values must be explicitly converted by
+approved numeric builtins, while authenticated portfolio/eviction collections retain bounded
+selector and reducer traversal.
+
+The focused verification commands and results were:
+
+- `python -B -m py_compile core/pit_optimizer_v5/candidate_ir.py` — passed.
+- `python -m ruff check core/pit_optimizer_v5/candidate_ir.py` — `All checks passed!`.
+- `git diff --check -- core/pit_optimizer_v5/candidate_ir.py` — passed (only the existing Windows
+  LF-to-CRLF advisory was emitted).
+- The current-policy fake reported `AST_CURRENT_POLICIES_OK accepted=4`.
+- The bounded selector fake reported `AST_SAFE_SELECTOR_OK selectors=2 numeric_add_mod=accepted`.
+- The bypass corpus fake reported `AST_REJECTION_CORPUS_OK rejected=21`.
+- The graph-bound fake reported
+  `AST_GRAPH_BOUNDS_OK callback_work=rejected callback_depth=rejected local_rebind=rejected collection_authority=rejected`.
+- The long-graph fake reported
+  `AST_LONG_GRAPH_OK depth=200 rejected_without_validator_recursion`.
+- The focused commit's pre-commit Ruff, whitespace, end-of-file, YAML, and merge-conflict hooks all
+  passed.
+
+The cached diff contained only `core/pit_optimizer_v5/candidate_ir.py` (381 insertions and 115
+deletions). No provider, Docker, Git materialization, market-data, network, replay, or test-suite
+operation ran for this correction, and no test file was created or modified. The pre-existing
+production factory/bootstrap edits remained unstaged and were preserved unchanged.
+
+## Task 9B3 trusted evaluator image packaging
+
+Commit `75c7fc2d34c4be6afb8f2d211e7c3dce3629ce4d` (`fix(pit-v5): package trusted evaluator image`)
+adds a dedicated digest-pinned V5 evaluator/probe image definition and its Dockerfile-specific
+deny-all build-context allowlist. The allowlist contains exactly the 53 authenticated project-source
+paths in `EVALUATOR_SOURCE_PATHS_V5`, plus the Dockerfile, its ignore file, and the dependency lock.
+It excludes all four editable V3 policy files, PIT data, local artifacts, tests, environment files,
+secrets, and provider/controller sources. The trusted source closure is installed root-owned under
+the interpreter site-packages path; both probe and panel commands use `python -P` so a mounted source
+working directory cannot shadow image-owned modules.
+
+The V5 AST parser no longer imports the capability-heavy legacy optimizer module. Six missing
+top-level evaluator dependencies are now part of the authenticated source map. The evaluator
+contract source digest must exactly equal the sandbox profile runtime-source digest at authority,
+request, and concrete-runtime construction boundaries. The image carries only two exact PIT V5
+labels, and concrete image inspection rejects missing, extra, or mismatched labels before container
+creation. The immutable image reference remains repository-name plus digest; the image digest covers
+the base runtime and installed dependencies while the runtime-source label binds the exact project
+source map that the Dockerfile installs.
+
+The focused verification commands and direct-fake results were:
+
+- `python -B -m py_compile core/pit_optimizer_v5/candidate_ir.py core/pit_optimizer_v5/contracts.py core/pit_optimizer_v5/sandbox.py core/pit_optimizer_v5/production_sandbox.py` — passed.
+- `python -m ruff check core/pit_optimizer_v5/candidate_ir.py core/pit_optimizer_v5/contracts.py core/pit_optimizer_v5/sandbox.py core/pit_optimizer_v5/production_sandbox.py` — `All checks passed!`.
+- `git diff --check -- Dockerfile.pit-optimizer-v5 Dockerfile.pit-optimizer-v5.dockerignore core/pit_optimizer_v5/candidate_ir.py core/pit_optimizer_v5/contracts.py core/pit_optimizer_v5/sandbox.py core/pit_optimizer_v5/production_sandbox.py` — passed (only existing Windows LF-to-CRLF advisories were emitted).
+- The exact-context fake reported `PIT_V5_IMAGE_PACKAGING_OK trusted_sources=53 context_files=56 editable_sources=0 data_paths=0`.
+- The static import-closure fake reported `PIT_V5_TRUSTED_IMPORT_CLOSURE_OK trusted_sources=53 editable_overlay_sources=4 unresolved=0`.
+- The closed runtime import fake reported `PIT_V5_CLOSED_RUNTIME_IMPORT_OK probe=loaded panel_evaluator=loaded forbidden_modules=absent`.
+- The image-label/digest fake reported `PIT_V5_IMAGE_AUTHORITY_OK digest_pinned=1 runtime_match=required exact_labels=required`.
+- The execution-grammar fake reported `PIT_V5_IMAGE_ARGV_OK safe_path=-P probe_entry=image_owned panel_sources=present runtime_binding=closed`.
+- The local parser parity fake reported `PIT_V5_LOCAL_AST_PARSER_OK policies=4 legacy_optimizer_import=absent`.
+- The focused commit's pre-commit Ruff, whitespace, end-of-file, YAML, and merge-conflict hooks all passed.
+
+The cached diff contained only the two dedicated image files and focused hunks in
+`candidate_ir.py`, `contracts.py`, `sandbox.py`, and `production_sandbox.py` (156 insertions and 22
+deletions). No image was built, no Docker/container/provider/network/data/replay/test-suite operation
+ran, and no test file was created or modified. The pre-existing production factory/bootstrap edits
+remained unstaged and were restored unchanged after the commit hooks.
+
+## Task 9B3 rounded-value allocation fix
+
+Commit `643ff90651c59ad6435f840d399f2be5f5a05170` (`fix(pit-v5): classify rounded
+values safely`) closes the reviewed sequence-allocation bypass by conservatively classifying every
+allowed `round(...)` call as integer-valued. This matches the one-argument and explicit-`None`
+forms and prevents rounded values from serving as the falsely inferred floating operand that had
+allowed dynamic sequence repetition. A policy can still request a floating proof explicitly with
+`float(round(...))`; ordinary numeric round, addition, modulo, and casts remain usable.
+
+The focused verification commands and direct-fake results were:
+
+- `python -B -m py_compile core/pit_optimizer_v5/candidate_ir.py` — passed.
+- `python -m ruff check core/pit_optimizer_v5/candidate_ir.py` — `All checks passed!`.
+- `git diff --check -- core/pit_optimizer_v5/candidate_ir.py` — passed (only the existing Windows
+  LF-to-CRLF advisory was emitted).
+- The direct fake reported `PIT_V5_ROUND_KIND_OK policies=4 bypasses=rejected
+  numeric_round=accepted explicit_float_cast=accepted numeric_mod=accepted`; it validated all four
+  current V3 policy files, rejected both `"x" * round(float(1000000000000))` and
+  `"x" * round(float(1000000000000), None)`, and accepted the intended numeric forms.
+- The focused commit's pre-commit Ruff, whitespace, end-of-file, YAML, and merge-conflict hooks all
+  passed.
+
+The cached diff contained only `core/pit_optimizer_v5/candidate_ir.py` (two insertions and two
+deletions). No provider, Docker/container, image-build, network, data, replay, or test-suite
+operation ran, and no test file was created or modified. The pre-existing production
+factory/bootstrap edits remained unstaged and were restored unchanged after the commit hooks.
+
+## Task 9B3 trusted panel runtime and image attestation
+
+Commit `350e5e84a5493a72e8119418f55c308a78429f60` (`fix(pit-v5): complete trusted
+panel runtime`) adds the real image-resident quick/discovery panel entrypoint and its closed
+canonical protocol. The host authenticates the complete referenced `EvaluationPanelSpec`, persists
+one request-bound input record, pins that exact regular file with the four candidate-policy files
+and two PIT data files, and mounts only those seven read-only files plus the bounded output
+directory. The image-owned entrypoint reauthenticates the request, policy source, PIT bundle, and
+provenance before invoking `PitPanelEvaluatorV5`; its canonical output is bound to both the outer
+Docker request and the exact mounted input digest. Panel and semantic-probe execution now share the
+same trusted image-owned module path and `/` working directory, so candidate files cannot shadow
+trusted evaluator modules.
+
+The dedicated image allowlist now contains all 56 authenticated evaluator source paths, including
+the panel entry, protocol, and build verifier, while continuing to exclude the four editable policy
+files and all PIT data, artifacts, tests, provider/controller source, and secrets. During image
+construction, `core.pit_optimizer_v5.image_manifest` recomputes the canonical source-map digest
+from the installed allowlisted bytes and fails unless it equals `PIT_V5_RUNTIME_SOURCE_SHA256`;
+only then is the same value written to the exact runtime-source label.
+
+The focused verification commands and results were:
+
+- `python -B -m py_compile core/pit_optimizer_v5/container_entry.py core/pit_optimizer_v5/container_protocol.py core/pit_optimizer_v5/image_manifest.py core/pit_optimizer_v5/evaluator.py core/pit_optimizer_v5/probe_entry.py core/pit_optimizer_v5/contracts.py core/pit_optimizer_v5/sandbox.py core/pit_optimizer_v5/production_sandbox.py` — passed.
+- `python -m ruff check core/pit_optimizer_v5/container_entry.py core/pit_optimizer_v5/container_protocol.py core/pit_optimizer_v5/image_manifest.py core/pit_optimizer_v5/evaluator.py core/pit_optimizer_v5/probe_entry.py core/pit_optimizer_v5/contracts.py core/pit_optimizer_v5/sandbox.py core/pit_optimizer_v5/production_sandbox.py` — `All checks passed!`.
+- `git diff --check -- Dockerfile.pit-optimizer-v5 Dockerfile.pit-optimizer-v5.dockerignore core/pit_optimizer_v5/contracts.py core/pit_optimizer_v5/evaluator.py core/pit_optimizer_v5/probe_entry.py core/pit_optimizer_v5/sandbox.py core/pit_optimizer_v5/production_sandbox.py core/pit_optimizer_v5/container_entry.py core/pit_optimizer_v5/container_protocol.py core/pit_optimizer_v5/image_manifest.py` — passed (only the existing Windows LF-to-CRLF advisories were emitted).
+- `python -B -c "p=r'.artifacts/task9b3_panel_smoke.py'; exec(compile(open(p, encoding='utf-8').read(), p, 'exec'), {'__file__': p})"` — reported `PIT_V5_PANEL_RUNTIME_OK trusted_sources=56 generic_mounts=6 runtime_mounts=8 protocol=roundtrip forged_output=rejected installed_digest=recomputed`. The ignored temporary fake was removed immediately afterward.
+- `git diff --cached --check` and the focused cached name/numstat inspection passed; the index contained exactly the two dedicated image files and eight focused panel-runtime source/config files. The commit's Ruff, trailing-whitespace, end-of-file, YAML, and merge-conflict hooks all passed.
+
+No Docker/image build, container, provider, network, Git materialization, market-data, replay, or
+test-suite operation ran, and no test file was created or modified. The pre-existing production
+factory/bootstrap edits remain unstaged and unchanged; the post-commit index is clean.
+
+## Task 9B3 authoritative panel artifact codec
+
+Commit `3d2b4bab0635627ffd0ef75b9aced38ca1413bf8` (`fix(pit-v5): authenticate legacy
+panel artifacts`) fixes the incompatible panel serialization boundary. The dedicated repository
+loader authenticates the contained raw file and its reference digest, rejects duplicate keys and
+inexact nested schemas, reconstructs `EvaluationPanelSpec`, and requires an exact round trip through
+the same newline-bearing serializer that defines `EvaluationPanelSpec.sha256`. It additionally
+requires `panel.sha256 == reference.sha256`; panel identity and the generic V5 codec are unchanged.
+`LocalSandboxMountFactoryV5.panel_for` now selects this dedicated loader.
+
+The same correction covers CLI readiness graph traversal. Only the exact panel-plan reference in
+a strictly decoded authenticated `CampaignManifestV5`, followed by the episode panel references in
+its strictly decoded `CampaignPanelPlanV5`, selects panel authentication. Episode dates, lineages,
+purpose, and digest must match. Every ordinary graph edge retains generic V5 authentication, even
+when it aliases an already verified panel. Completion records include the traversal role while the
+returned authenticated graph remains deduplicated. Filenames and caller-selected artifact types
+cannot opt an ordinary edge into the legacy codec.
+
+The focused verification commands and results were:
+
+- `python -B -m py_compile core/pit_optimizer_v5/artifacts.py core/pit_optimizer_v5/production_sandbox.py` — passed.
+- `python -m ruff check core/pit_optimizer_v5/artifacts.py core/pit_optimizer_v5/production_sandbox.py` — `All checks passed!`.
+- `python -m ruff format --check core/pit_optimizer_v5/artifacts.py` — `1 file already formatted`.
+- The broader format check identified existing formatting drift in `production_sandbox.py`; a
+  separate `git show HEAD:core/pit_optimizer_v5/production_sandbox.py` piped through Ruff's stdin
+  format check also returned 1 before this commit. Its unrelated formatting and dirty hunks were
+  preserved. Only `artifacts.py` was formatted.
+- `git diff --check -- core/pit_optimizer_v5/artifacts.py core/pit_optimizer_v5/production_sandbox.py`
+  and `git diff --cached --check` — passed (the former emitted the existing Windows LF-to-CRLF advisory).
+- `python -B -c "p=r'.artifacts/task9b3_panel_codec_smoke.py'; exec(compile(open(p, encoding='utf-8').read(), p, 'exec'), {'__file__': p})"`
+  passed before and after the commit hooks with these exact results:
+  `PIT_V5_PANEL_CODEC_OK valid=quick,discovery factory=integrated digest_rejections=2 noncanonical_rejections=8 malformed_rejections=16 episode_binding_rejections=8 generic_codec=unchanged`
+  and
+  `PIT_V5_PANEL_GRAPH_OK valid_nodes=16 panel_nodes=6 invalid_graphs_rejected=11 ordinary_codec=strict panel_route=authenticated_manifest_plan_edges`.
+- The 11 rejected graphs cover newline-free, noncanonical, malformed, and digest-mismatched panels;
+  newline-bearing ordinary children; ordinary-edge aliases to an authenticated panel; an indirect
+  pseudo-plan; malformed plan/manifest schemas; and mismatched episode fields.
+- Cached inspection contained exactly `artifacts.py` and the focused `panel_for` hunk in
+  `production_sandbox.py` (98 insertions, 13 deletions). Ruff, whitespace, end-of-file, and
+  merge-conflict commit hooks passed; YAML was skipped because no YAML files changed.
+- The post-commit index is clean. The complete pre/post unstaged diff and the untracked
+  `production_runtime.py` SHA-256 matched exactly after removing only Git's line-ending advisory.
+
+The ignored temporary direct fake was removed after verification. No test file was created or
+modified, and no tests, Docker/image build, container, provider, network, Git materialization,
+market-data, or replay operation ran. The loader/graph fix leaves the surrounding production
+factory/bootstrap work unstaged and unchanged.
+
+## Task 9B3 production factory and fresh-process bootstrap
+
+Commit `f995525ad507fa3a5c10c313ac24d44d120e345c` (`feat(pit-v5): bootstrap
+production runtime`) removes the process-local production-factory registry and constructs the
+closed concrete V5 graph directly from an authenticated adapter-config artifact. Run and resume
+now bind the exact local artifact repository, provider ledger/audit/gateway, one-shot role runner,
+Git materializer, sandbox mount factory, container executor, panel/probe evaluator, candidate-base
+operations, request/novelty/record/archive factories, monotonic clock, cancellation, and composite
+owned cleanup. Composition rechecks the complete concrete alias and identity graph before entering
+the accepted runtime. OpenRouter retries and schema-repair calls remain zero, and the fixed
+`OPENROUTER_API_KEY` environment handle is resolved only at the actual one-shot invocation.
+
+The sandbox mount factory no longer reads PIT bundle bytes during construction. It binds the
+authenticated logical data authorities and pinned data-root identity at construction, then checks
+the exact two-file layout, bounded hashes, and issued file identities while the data directory and
+files are held for an actual panel transaction. Semantic probes continue to receive no PIT-data
+mount or handle. Verify and summarize reconstruct only the smallest read-only authorities needed
+to authenticate the event/payload chain, candidate-execution index, role ledger/accounting,
+checkpoint/experiment set, archive projection, and cleanup records.
+
+The focused verification commands and results were:
+
+- The ignored controlled fake was run as `python -B .artifacts/task9b3_factory_smoke.py` with
+  `PIT_V5_SMOKE_ROOT` set to a freshly created inherited-ACL directory. It reported exactly
+  `PIT_V5_FACTORY_BOOTSTRAP_OK constructors=83 registry=absent run_resume=fresh_process verify_summary=read_only cross_ledger=rejected structural_delegate=rejected readiness_data_reads=0`;
+  its cleanup then reported `SMOKE_ROOT_EXISTS=False`. It exercised normal fresh-process run and
+  resume without registry mutation, invalid cross-ledger/config authority, generic structural
+  delegate rejection, zero construction-time external operations, and mutation-free sanitized
+  verify/summarize paths. The temporary fake was removed immediately afterward.
+- `python -B -m py_compile agent_loop.py core/pit_optimizer_v5/cli.py core/pit_optimizer_v5/contracts.py core/pit_optimizer_v5/production_provider.py core/pit_optimizer_v5/production_runtime.py core/pit_optimizer_v5/production_sandbox.py core/pit_optimizer_v5/production_workspace.py core/pit_optimizer_v5/provider.py core/pit_optimizer_v5/sandbox.py core/pit_optimizer_v5/summary.py core/pit_optimizer_v5/workspace.py` — passed before and after commit.
+- `python -m ruff check agent_loop.py core/pit_optimizer_v5/cli.py core/pit_optimizer_v5/contracts.py core/pit_optimizer_v5/production_provider.py core/pit_optimizer_v5/production_runtime.py core/pit_optimizer_v5/production_sandbox.py core/pit_optimizer_v5/production_workspace.py core/pit_optimizer_v5/provider.py core/pit_optimizer_v5/sandbox.py core/pit_optimizer_v5/summary.py core/pit_optimizer_v5/workspace.py` — `All checks passed!` before and after commit.
+- The package/module import-export check reported
+  `PIT_V5_IMPORT_EXPORT_OK 11 8 True`; it also asserted that the removed registry is absent and
+  every declared concrete runtime export resolves.
+- The forbidden pure-domain import scan reported `PIT_V5_PURE_DOMAIN_COUPLING_SCAN_CLEAN`.
+- `git diff --cached --check`, the exact cached name/stat inspection, `git diff HEAD^ HEAD --check`,
+  and the post-commit status check passed. The focused commit contains exactly the ten reported V5
+  factory/bootstrap files. Comparing `agent_loop.py` with the pre-slice base reported
+  `PIT_V4_DISPATCH_DIFF_UNCHANGED`.
+- The commit's Ruff, trailing-whitespace, end-of-file, YAML, and merge-conflict hooks passed.
+
+No test file was created or modified, and no test suite, provider call, Docker/image/container
+operation, network access, Git materialization, market-data read, replay, push, or merge ran. The
+worktree and index were clean after the commit.
+
+## Task 9B3 factory/bootstrap recovery and verification fix round 1
+
+Commit `b378ca5700cc484953da7a482724b833aa2c9441` (`fix(pit-v5): authenticate recovery
+and verification state`) completes the interrupted five-file implementation against base
+`f995525ad507fa3a5c10c313ac24d44d120e345c` and addresses the four independent-review P1s.
+
+- Successful materialization returns its owned workspace lease without a post-creation deadline
+  exception. The accepted runtime journals that lease before its existing post-call deadline check.
+- Workspace history authentication reads the exact reservation, creation, readiness, owner, root,
+  token, and retirement bindings. Both already-retired workspaces and the removal-before-retirement
+  crash window remain recoverable; foreign retirement records and reappearing retired paths fail.
+- Every journal role package is bound to its exact production-ledger reservation, request, call,
+  attempt facts, artifact, terminal, receipt, and global completion order. Missing terminals,
+  fixture authority, mismatched accounting facts, and incomplete ledger/journal correspondence fail.
+- Read-only verification reconstructs concrete local authorities from the authenticated adapter
+  config for every resource-bearing round. It authenticates every container reservation, phase and
+  identity chain, bounded durable output, output mount readiness, control readiness, and cleanup
+  attestation, and binds the output reservation's source to authenticated workspace readiness.
+  Successful journal evidence requires its exact indexed execution and a successful durable output.
+  Complete cleanup requires exact resource counts and every underlying retirement/cleanup record;
+  a later round's cleanup cannot hide earlier active resources. All adapter state reads in these
+  verification paths use `repair=False`; no repair, process launch, provider call, or lock creation
+  is used. `verify-run` and `summarize` accept the existing paired adapter-config path/digest options;
+  a resource-bearing run without that authority fails with `production_config_missing`.
+
+The ignored temporary direct fake was run as
+`python -B .artifacts/task9b3_recovery_smoke.py`. Its final output was exactly:
+
+```text
+PIT_V5_MATERIALIZATION_DEADLINE_OK successful_lease_returned=1 registration_before_deadline=1
+PIT_V5_WORKSPACE_RECOVERY_OK retired=idempotent removed=recoverable missing_and_forged=rejected repair=0
+PIT_V5_ROLE_LEDGER_BINDING_OK exact=accepted missing_terminal_fixture_forged_receipt_request_attempt_call=rejected
+PIT_V5_EXECUTION_HISTORY_OK reservations_mounts_control_terminal_cleanup=authenticated tampering=rejected repair=0
+PIT_V5_READ_ONLY_CLI_OK execution_workspace_hooks=required config=authenticated_reference false_cleanup=rejected
+PIT_V5_JOURNAL_LEDGER_DISPATCH_OK every_completion=forwarded
+PIT_V5_COMPLETION_AUTHORITY_OK successful_output=required cross_round_cleanup=closed
+PIT_V5_FIX_IMPORT_EXPORT_OK modules=6 registry=absent
+PIT_V5_PURE_DOMAIN_COUPLING_SCAN_CLEAN modules=8
+```
+
+The fake exercised actual recovery/authentication methods with deterministic in-memory records and
+no-follow filesystem fakes, including missing records, changed roots/owners/receipts/requests/facts,
+phase-chain gaps, changed output length/digest, missing successful outputs, and source/workspace
+mismatch. Its state store rejected any verification read without `repair=False`. The pure-domain
+scan retained the existing runtime imports of the two data contracts `PersistedRoleInvocationV5`
+and `RepositoryCheckpointV5`; it found no provider/Git/Docker/filesystem implementation imports.
+The temporary fake was removed before staging; `Test-Path` returned `False`.
+
+The exact focused commands, both before and after commit, were:
+
+- `python -B -m py_compile core/pit_optimizer_v5/cli.py core/pit_optimizer_v5/production_provider.py core/pit_optimizer_v5/production_runtime.py core/pit_optimizer_v5/production_sandbox.py core/pit_optimizer_v5/production_workspace.py` — passed.
+- `python -m ruff check core/pit_optimizer_v5/cli.py core/pit_optimizer_v5/production_provider.py core/pit_optimizer_v5/production_runtime.py core/pit_optimizer_v5/production_sandbox.py core/pit_optimizer_v5/production_workspace.py` — `All checks passed!`.
+- `python -m ruff format --check core/pit_optimizer_v5/cli.py core/pit_optimizer_v5/production_provider.py core/pit_optimizer_v5/production_runtime.py core/pit_optimizer_v5/production_sandbox.py core/pit_optimizer_v5/production_workspace.py` — `5 files already formatted`.
+- `git diff --check`, `git diff --cached --check`, and `git diff HEAD^ HEAD --check` — passed.
+- `git diff --exit-code f995525ad507fa3a5c10c313ac24d44d120e345c -- agent_loop.py core/pit_optimizer_v5/summary.py core/pit_optimizer_v5/provider.py core/pit_optimizer_v5/runtime.py core/pit_optimizer_v5/workspace.py` — passed; legacy dispatch and accepted pure runtime contracts remain unchanged.
+- Cached name/stat inspection showed exactly `cli.py`, `production_provider.py`,
+  `production_runtime.py`, `production_sandbox.py`, and `production_workspace.py`
+  (958 insertions, 287 deletions, including Ruff normalization in touched modules).
+- Commit hooks passed Ruff, trailing-whitespace, end-of-file, and merge-conflict checks; YAML had
+  no applicable files. The index and worktree were clean after commit.
+
+No test file or suite was created, modified, or run. No provider, Docker/image/container operation,
+Git materialization, network, market-data read, replay, push, or merge ran. API-key lookup remains
+lazy, automatic retries and schema repair remain zero, no registry was reintroduced, and summary
+output remains the existing content-free schema. Independent re-review remains the next gate.
+
+## Task 9B3 retirement-index recovery fix round 2
+
+Commit `5a56874cc762831ab6997f4d550fa12f5c43d3cc` (`fix(pit-v5): recover orphan
+workspace retirement indexes`) addresses the remaining P1 against base
+`b378ca5700cc484953da7a482724b833aa2c9441`. Operational cleanup recovery now has a
+separate `recover_lease_history` path serialized by the exact workspace transition. It first
+authenticates the immutable reservation, creation/readiness records, exact owner/root/token/lease
+bindings, and workspace absence. Only the exact missing retirement-index reference derived from
+that independent authority can enter recovery. The repository recovery primitive authenticates
+the already-existing retirement bytes against that expected value and publishes only their missing
+create-only index; it never creates or replaces value bytes or repairs an unrelated index.
+
+The existing read-only `authenticate_lease_history` route and all verification state reads retain
+`repair=False`. Indexed-but-missing values, noncanonical/tampered/foreign orphan values, conflicting
+authority, missing prerequisite indexes, and reappearing workspaces cannot trigger index repair.
+The earlier removed-before-retirement window still returns `removed` without manufacturing a
+retirement value. Composite cleanup rejects a foreign round before entering operational recovery.
+
+The temporary deterministic fake ran as
+`python -B .artifacts/task9b3_retirement_index_smoke.py` and reported exactly:
+
+```text
+PIT_V5_RETIREMENT_INDEX_RECOVERY_OK orphan=authenticated index_writes=1 resume=idempotent verification_repairs=0
+PIT_V5_RETIREMENT_INDEX_REJECTION_OK foreign_tampered_missing_conflicting_reappeared=rejected unrelated_index_repairs=0 value_writes=0
+PIT_V5_RETIREMENT_INDEX_RACE_OK conflicting_publication=rejected overwrite=0
+```
+
+It exercised the real repository typed decoding, canonical byte/digest authentication, index
+loading, and recovery logic against an in-memory byte store. It reproduced value publication
+without index publication, proved read-only verification fails without writing, observed one exact
+index creation during composite recovery, and repeated recovery/verification three times without
+another write. Negative cases also covered a conflicting index appearing at create-only
+publication. The fake rejected all generic `repair=True` reads and any value or unrelated index
+write. It was removed before staging; `Test-Path` returned `False`.
+
+The focused commands passed before and after commit:
+
+- `python -B -m py_compile core/pit_optimizer_v5/artifacts.py core/pit_optimizer_v5/production_workspace.py core/pit_optimizer_v5/production_runtime.py`.
+- `python -m ruff check core/pit_optimizer_v5/artifacts.py core/pit_optimizer_v5/production_workspace.py core/pit_optimizer_v5/production_runtime.py` — `All checks passed!`.
+- `python -m ruff format --check core/pit_optimizer_v5/artifacts.py core/pit_optimizer_v5/production_workspace.py core/pit_optimizer_v5/production_runtime.py` — `3 files already formatted`.
+- `git diff --check`, `git diff --cached --check`, and `git diff HEAD^ HEAD --check`.
+- `git diff --exit-code b378ca5700cc484953da7a482724b833aa2c9441 -- core/pit_optimizer_v5/cli.py core/pit_optimizer_v5/production_sandbox.py` — unchanged read-only CLI/container verification.
+
+The focused commit contains exactly `artifacts.py`, `production_runtime.py`, and
+`production_workspace.py` (88 insertions, 6 deletions). Ruff, whitespace, end-of-file, and
+merge-conflict hooks passed; YAML had no applicable files. The worktree and index are clean.
+No test file/suite, provider, Docker/container, Git materialization, network, data, replay, push,
+or merge operation ran. Stopped for independent re-review.
+
+## Final whole-branch fix-wave completion (2026-09-05)
+
+Date: 2026-09-05
+Status: all Critical and Important findings 1-9 and minors 10-13 implemented and locally verified.
+Base: `5a56874cc762831ab6997f4d550fa12f5c43d3cc`
+Head: `3548febcb2c51cf5ed13c2dae6eadddeaa6ed5c8`
+Commit: `fix(pit-optimizer-v5): close final execution and recovery gaps`
+Scope: one coordinated wave, one local commit, 16 files, 1,265 insertions and 343 deletions.
+
+The full design, learning-search plan, progress ledger, authoritative final-review findings, and
+Task 9 report were read before implementation. The recorded rulings are preserved: all
+close-derived scale-outs execute at the next eligible open; raw codecs are selected only by exact
+typed authority edges; finite USD caps require authenticated model-price upper bounds and
+prospective reservation; no ceiling remains unlimited. No subagents were spawned.
+
+## Finding closure and implementation
+
+1. **Typed raw campaign edges.** The real repository authenticates exact raw bytes only for the
+   strictly decoded campaign manifest's panel-plan bundle/provenance edges. Raw authentication
+   streams SHA-256 without JSON parsing, normalization, reference extraction, or the generic
+   128 MiB JSON limit. Regular-file, containment, single-link, and before/open/after identity
+   checks remain enforced. An artifact previously authenticated through a raw edge cannot acquire
+   generic-JSON codec privilege through an alias. Existing explicit newline provenance handling
+   remains intact. Windows raw identity compares supported stable identity/size/mtime attributes;
+   POSIX retains the additional ctime comparison.
+
+2. **Causal scale-out timing.** Completed-close exit decisions enqueue authenticated pending
+   actions. Both close and scale-out actions execute at the next eligible open, using original
+   position quantity for scale-out fractions. Invalid/missing opens leave the pending decision
+   intact. Checkpoint serialization, symbol-transition remapping, tier state, and full-close
+   removal remain coherent. Earlier same-bar target prices no longer receive hindsight fills.
+
+3. **Wire-safe role messages.** The authenticated frozen internal request is unchanged. Only at
+   the provider boundary, content is converted to canonical JSON text within plain role/content
+   dictionaries. The wire envelope introduces no extra request fields.
+
+4. **Durable scheduling cursor.** Terminal no-novel authority now carries full before/after
+   scheduling cursors, archive identity, attempted novelty keys, and an authenticated outcome
+   chain. Production recovery reconstructs checkpoint-owned finalized records and actual terminal
+   investigator packages chronologically, keeping archive promotion checkpoint-only. Runtime
+   independently recomputes selected-parent novelty, cursor advance, state digests, and complete
+   reconstructible parent-pool exhaustion. Round N+1 advances; completed/terminal N can be resumed
+   after later progress without repeating paid work or changing the archive.
+
+5. **Lineage-aware investigator memory.** The arbitrary last-12 slice is replaced by the actual
+   selected-parent lineage projector under authenticated `investigator_memory_max_bytes`
+   (default 96 KiB). Mandatory lineage evidence is preserved. Authenticated prior critic packages
+   supply original comparative assessment, next campaign direction, causal reviews, and real
+   reissued evidence citations. Full-feedback entries retain hypotheses, predictions,
+   implementation instructions, provenance, and supporting evidence; summary entries remain
+   bounded without discarding non-review outcomes.
+
+6. **Causal critic evidence and usable author contracts.** Critic envelopes include bounded
+   symbol-neutral activity, exposure, cash, friction, expectancy, excursion, exit/entry/intent and
+   regime diagnostics, parent deltas, and up to eight actual bounded semantic-decision
+   differences. The supported evidence/request budgets are explicit. Author contracts regenerate
+   the trusted nested V3 snapshot/decision types, method surfaces, reason enums, ranking,
+   allocation/capacity, exit/tier, add-on and AST/import/export invariants from real V3 contracts.
+   These interface details participate in authenticated request identity.
+
+7. **Prospective token/USD authority.** Provider capabilities authenticate per-model input/output
+   price upper bounds and input framing overhead. Before a durable reservation or dispatch,
+   the real ledger recomputes a conservative wire/schema input bound plus maximum output tokens,
+   and reserves the corresponding worst-case USD where a finite ceiling exists. Finite ceilings
+   without model-price authority fail closed; `None` does not restrict spend. Settlements and
+   recovered reservations verify their bounds. Unknown transport outcomes consume their full
+   reserved tokens and cost; over-bound receipts become accounting failures. Decimal prices,
+   canonical identity and cumulative USD remain exact under low ambient Decimal precision.
+   Retry and repair defaults remain zero.
+
+8. **Truthful summary state.** Summary independently authenticates terminal round-outcome kinds
+   and cleanup evidence. A runtime-failed campaign remains failed even when cleanup succeeds;
+   cleanup success remains separately visible.
+
+9. **Live deadline.** The authenticated minimum remaining role/round deadline reaches the
+   one-shot provider. The concrete gateway uses the manifest role timeout, not an implicit
+   30-second timeout. A single asynchronous SDK call is bounded by wall-clock cancellation,
+   with zero retries and owned-client cleanup, and expires before reservation if no time remains.
+   Only the V5 gateway method changed; existing V2-V4 gateway paths are untouched.
+
+10. **Baseline champion fallback.** Reported best performance uses the authenticated baseline and
+    common campaign contract with the normal champion selector, so an all-regressing archive
+    cannot become the reported champion.
+
+11. **Sibling behavioral deduplication.** Semantic-equivalent siblings receive the typed
+    `sibling_equivalent` outcome and retain semantic metadata. Only the first behaviorally
+    distinct representative reaches expensive quick/discovery evaluation. Deterministic resume
+    reconstructs the same seen-fingerprint decisions.
+
+12. **Escape permission versus activation.** Hypotheses explicitly choose authoring mode, with
+    normal symbol edits as the default. Ordinary edits send only intended policy scope;
+    cross-policy requests include their necessary policies. Manifest full-source permission no
+    longer activates the escape automatically.
+
+13. **Usable structural escape.** Explicitly authorized full-source edits can introduce declared
+    validator-permitted private helper functions and uppercase constants. Undeclared top-level
+    AST edits, import changes, and API-export changes remain rejected; normal symbol editing and
+    closed validation remain intact.
+
+Two adjacent integration defects exposed by direct execution were corrected rather than hidden:
+the evaluator's typed report grid now matches quick-base-only plus four three-scenario discovery
+episodes, and canonical typed authority encoding supports strict UTF-8 semantic-decision bytes.
+Binary PIT artifacts still use only their explicit raw codec.
+
+## Documentation and preserved boundaries
+
+The plan's stale missing-critic paragraph now preserves authenticated precritic evidence with a
+typed critic-unavailable result, no finalized experiment record, and no archive/checkpoint
+promotion. Plan/spec text now documents prospective price/token reservation, explicit memory
+budget, canonical transport, live deadlines, scheduling state separation, richer evidence,
+structural-mode activation, typed raw edges, and next-open close-derived exits.
+
+Provider-neutral domain/runtime separation, O'Neil core policies, annualized portfolio CAGR as
+the primary objective, checkpoint-only archive promotion, V2-V4 readers/dispatch, confidentiality,
+zero retry/repair defaults, and exact workspace crash-recovery code were preserved. The
+pre-existing campaign-stage fail-closed `import-v4-candidate` deferral remains acknowledged.
+
+## Deterministic direct-check evidence
+
+The temporary direct fixture was run with:
+
+```text
+python -B .artifacts/v5_final_wave_smoke.py
+ALL_DIRECT_CHECKS 28
+```
+
+The final run occurred after the independent runtime scheduling-proof validation was added. It
+exercised real production composition, repository typed codecs and provider accounting with
+bounded in-memory collaborators; it created no provider, Docker, Git-materialized candidate,
+market-data, or replay workload. Its exact passing check labels were:
+
+1. narrow normal author scope, explicit structural opt-in, complete nested V3 contracts
+2. provider messages encode frozen payload as canonical JSON text in plain dictionaries
+3. full-source structural helper and constant additions render while preserving imports and exports
+4. full-source undeclared import edits rejected
+5. raw exact-byte digest mismatch rejected
+6. manifest plan raw edges authenticate non-JSON bytes without JSON decoding
+7. generic alias to authorized raw artifact remains fail-closed
+8. finite USD budget without authenticated model prices rejected
+9. prospective input plus output token and authenticated model-price reservation; no-cap unrestricted
+10. full deterministic investigator-author-critic round, sibling semantic dedup, one quick and four episodes, checkpoint promotion
+11. critic receives quick-base plus full discovery grid, parent deltas, causal diagnostics, and actual semantic traces
+12. completed round resumes idempotently without role, candidate, or publication work
+13. operator champion remains baseline when every candidate regresses
+14. next investigator receives authenticated campaign direction and lineage-budgeted prior experiment evidence
+15. two-parent no-novel cursor advances N+1, exhausts only complete pool, preserves checkpoint, and resumes N/N+1 idempotently
+16. full scheduling cursor and exhaustion history authenticate through durable typed round codecs
+17. insufficient prospective input plus maximum output tokens reject before reservation and dispatch
+18. insufficient prospective USD rejects before reservation and dispatch
+19. authenticated reservation settles exact reported usage and recovers without spending again
+20. unknown transport outcome consumes its full reserved tokens and cost with zero retry
+21. receipt exceeding authenticated cost upper bound becomes accounting failure
+22. no USD ceiling permits reported spend above finite-cap examples
+23. one-shot gateway uses canonical wire messages and authenticated remaining timeout above fixed 30 seconds
+24. live provider coroutine cancels at wall deadline
+25. close-derived scale-out queues without historical fill, survives missing open/checkpoint/remap, and fills next eligible open
+26. runtime failure remains failed in later summary despite successful cleanup
+27. price authority hashing and cumulative USD remain exact under low ambient Decimal precision
+28. streamed raw codec authenticates synthetic 129 MiB input without generic JSON-size cap
+
+Important fixture observations:
+
+- Three byte-distinct variants with equal behavior produced one quick evaluation, four discovery
+  episodes, two sibling-equivalent records, exactly three fixture role calls, and one checkpoint
+  promotion. Completed-round recovery performed no extra calls, candidates, or publications.
+  The regressing evaluated candidate did not replace the authenticated baseline champion.
+- A capacity-two archive with three completed rounds was followed by round-four no-novel and
+  round-five exhausted outcomes. Both parents were covered, checkpoint generation stayed at
+  three, and round-four/round-five resumes remained idempotent before and after later progress.
+- The actual local authorization ledger serialized and recovered typed reservations and
+  receipts. Insufficient prospective token/USD limits prevented both reservation and dispatch;
+  accepted fake usage settled at 50 tokens and USD 0.001; unknown usage consumed the exact
+  reservation; uncapped usage accepted USD 50.
+- The one-shot transport used a synthetic hosted-client coroutine with a granted 120-second
+  timeout (not 30), and a separate 30-millisecond deadline canceled the coroutine. No SDK
+  network request was sent.
+- Actual simulator methods observed synthetic high 130/close 99, did not create a historical
+  120 fill, survived a missing next open and AAA-to-BBB remap, then filled 2.5 shares at the
+  next eligible open of 97. Pending-intent checkpoint round-trip was exercised.
+- Raw authentication used the temporary fixture's own exact source bytes for the local
+  Windows file check. The 129 MiB case was a bounded simulated stream reusing a 1 MiB block,
+  not a real PIT artifact or a large on-disk temporary file.
+
+## Compile, import, lint, isolation, and commit checks
+
+Fresh after-commit direct compilation and imports reported:
+
+```text
+PASS compile 29 source files; import 33 modules; installed async SDK surface
+PASS provider-neutral domain/runtime import coupling
+PASS legacy gateway/simulator AST unchanged outside three V5 methods and pending V5 intent validation
+PASS no test files, O'Neil core policy changes, or V2-V4 dispatch edits; temporary fixture removed
+```
+
+Compilation used the built-in `compile` on all 27 V5 source files plus `agent_loop.py` and
+`core/backtest_engine.py`, with `python -B -` and no bytecode output. Imports covered 26 V5
+modules plus the backtest, gateway, legacy command/controller/artifacts/evaluation/authorization
+modules. Installed `AsyncCompletions.create` was checked via `inspect.unwrap` without calling it.
+
+The AST comparison against the base commit proved all legacy gateway/simulator AST unchanged
+except `OpenRouterGateway.request_pit_optimizer_v5_json_once`,
+`PortfolioSimulator._execute_v5_pending_policy_exits`,
+`PortfolioSimulator._check_exits_v5_after_close`, and
+`PendingPolicyExit.__post_init__`. Import AST checks covered search, selection, memory,
+runtime, contracts, and provider against legacy controller/concrete provider coupling.
+
+Commands passed before and after commit:
+
+```text
+python -B -m ruff check core/pit_optimizer_v5 agent_loop.py core/backtest_engine.py
+All checks passed!
+python -B -m ruff format --check <the 12 changed V5 Python files>
+12 files already formatted
+git diff --check
+git diff --cached --check
+git diff HEAD^ HEAD --check
+git status --porcelain=v1
+```
+
+The final status command returned no entries. Local commit hooks passed Ruff, trailing whitespace,
+end-of-file, and merge-conflict checks; YAML had no applicable files. Shared Git metadata required
+the authorized sandbox escalation; staging and commit then succeeded. No hook requested network
+installation. The temporary fixture was deleted with an exact-path patch before staging, and
+`Test-Path .artifacts/v5_final_wave_smoke.py` returned `False`. Reports remain in the existing
+ignored SDD evidence directory, outside the source commit.
+
+## Remaining concerns and handoff
+
+- No live provider, Docker/image/container, Git materialization, PIT market data, network,
+  replay, test file/suite, push, or merge operation was performed. Empirical optimizer returns
+  and live-service behavior are therefore not claimed as validated by this wave.
+- Finite-cost configurations need the new authenticated per-model price upper bounds. Existing
+  prototype V5 manifests/cursors/authorities that lack newly required typed fields need
+  regeneration/re-authentication before reuse; they are not silently repaired. No-ceiling
+  campaigns remain unlimited.
+- The previously acknowledged fail-closed campaign-stage `import-v4-candidate` deferral remains.
+- No known unclosed final-review finding remains. The branch/worktree is preserved, committed,
+  and ready for the controller's independent final disposition.

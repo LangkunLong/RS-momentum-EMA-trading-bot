@@ -1,0 +1,9 @@
+# B3b architect handoff
+
+Status: implementation and independent static review complete. This is the B3b checkpoint; it is not authorization for B4.
+
+The only production changes are the shared rejected-record authority validator in `core/pit_optimizer_v5/artifacts.py` and the `_publish` carrier-union guard in `core/pit_optimizer_v5/runtime.py`. The validator is invoked both before an experiment record is appended and after a record is decoded/authenticated on load. It authenticates every `events/` record reference before routing; a render rejection requires the single canonical durable event reference, current authenticated journal membership, B2 context validation, and exact record-to-intent/author/payload binding. `_publish` validates candidate/record identity and status before persistence and permits source authority only from a matching `CandidateEvidenceV5` for evaluated or zero-trade records.
+
+Independent static review found no actionable issue. The real read-only compatibility load proves only the legacy evaluated runtime-04 record remains valid; no rejected record or carrier branch was constructed or executed. Exact checks and hashes are in `architect-verification.json`; preimages and the narrow two-file patch are retained beside this handoff.
+
+Known B4 boundary: `_verify_finalized_discovery_rounds`, `_completed_result`, and recovery still assume rendered/testable/critic lifecycle paths. They were deliberately not changed. Campaign06 remains terminal and untouched.

@@ -1,0 +1,72 @@
+"""Run and seal the four selected real baseline windows, one evaluator at a time."""
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--sandbox-profile', required=True, type=Path)
+parser.add_argument('--completed-quick-run', required=True, type=Path)
+parser.add_argument('--label-prefix', required=True)
+parser.add_argument('--start-ordinal', type=int, choices=(1, 2, 3, 4), default=1)
+args = parser.parse_args()
+if re.fullmatch(r'[a-z0-9][a-z0-9-]{0,65}', args.label_prefix) is None:
+    raise ValueError('Use a bounded plain run prefix')
+root = Path.cwd().resolve()
+development = root / '.artifacts/pit-optimizer-v5/development'
+helpers = root / '.superpowers/sdd/2026-09-04-pit-optimizer-v5-campaign'
+profile_path = args.sandbox_profile.resolve()
+profile_bytes = profile_path.read_bytes()
+profile = json.loads(profile_bytes)
+image_reference = profile['image_name'] + '@' + profile['image_digest']
+profile_sha = hashlib.sha256(profile_bytes).hexdigest()
+quick = args.completed_quick_run.resolve()
+verified = json.loads((quick / 'verification-record.json').read_text())
+cleanup = json.loads((quick / 'cleanup-record.json').read_text())
+if (verified['sandbox_sha256'] != profile_sha or verified['image_reference'] != image_reference
+        or not verified['canonical_output_and_source_verified'] or not cleanup['removed']
+        or hashlib.sha256((quick / 'output/panel-evaluation.json').read_bytes()).hexdigest() != verified['output_sha256']):
+    raise ValueError('A completed and sealed real quick run under this image is required')
+selection = json.loads((development / 'panels/minimum30-development-windows/selection.json').read_text())
+windows = selection['windows']
+if [item['ordinal'] for item in windows] != [1, 2, 3, 4]:
+    raise ValueError('The original four windows are required')
+plan_path = development / (args.label_prefix + '-baseline-plan.json')
+plan = {'profile_path': str(profile_path), 'profile_sha256': profile_sha,
+        'image_reference': image_reference, 'completed_quick_run': str(quick),
+        'window_selection': selection, 'episode_wall_seconds': 1200,
+        'max_parallel_evaluations': 1, 'policy_root': str(development / 'candidates/runtime-parent-0985d9b')}
+if plan_path.exists():
+    if json.loads(plan_path.read_text()) != plan:
+        raise ValueError('Existing baseline plan differs')
+else:
+    with plan_path.open('x') as stream:
+        json.dump(plan, stream, indent=2)
+
+def invoke(helper, values):
+    expression = 'import runpy; runpy.run_path(' + repr(str(helpers / helper)) + ", run_name='__main__')"
+    subprocess.run([sys.executable, '-B', '-c', expression, *values], check=True)
+
+for window in windows:
+    ordinal = window['ordinal']
+    label = args.label_prefix + '-' + str(ordinal)
+    run = development / 'runs' / label
+    if ordinal < args.start_ordinal:
+        prior = json.loads((run / 'verification-record.json').read_text())
+        removed = json.loads((run / 'cleanup-record.json').read_text())
+        if prior['sandbox_sha256'] != profile_sha or prior['panel_sha256'] != window['panel_sha256'] or not removed['removed']:
+            raise ValueError('Earlier windows must already be verified and cleaned before continuing')
+        continue
+    if run.exists():
+        raise ValueError('Run already exists; inspect its exact process/result before continuing from a later ordinal')
+    print(json.dumps({'stage': 'baseline_launch', 'ordinal': ordinal, 'label': label}), flush=True)
+    invoke('launch-development-panel.py', [
+        '--label', label, '--policy-root', plan['policy_root'], '--sandbox-profile', str(profile_path),
+        '--panel-spec', window['selected_panel_path'], '--panel-sha256', window['panel_sha256'],
+        '--episode-ordinal', str(ordinal), '--maximum-wall-seconds', '1200'])
+    invoke('seal-development-run.py', ['--run', str(run)])
+    print(json.dumps({'stage': 'baseline_verified_and_cleaned', 'ordinal': ordinal, 'label': label}), flush=True)
+print(json.dumps({'stage': 'baseline_refresh_completed', 'plan_path': str(plan_path)}), flush=True)

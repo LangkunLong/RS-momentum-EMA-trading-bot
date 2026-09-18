@@ -1,0 +1,381 @@
+from __future__ import annotations
+
+import ast
+import difflib
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+
+ROOT = Path.cwd()
+sys.path.insert(0, str(ROOT))
+PACKAGE = ROOT / ".artifacts/pit-optimizer-v5/development/increment-c-history-h3"
+SOURCES = {
+    "historical_verification": ROOT / "core/pit_optimizer_v5/historical_verification.py",
+    "development_preparation": ROOT / "core/pit_optimizer_v5/development_preparation.py",
+    "summary": ROOT / "core/pit_optimizer_v5/summary.py",
+    "production_runtime": ROOT / "core/pit_optimizer_v5/production_runtime.py",
+}
+PREIMAGES = {
+    name: PACKAGE / f"pre-h3c-{path.name}"
+    for name, path in SOURCES.items()
+}
+RUNTIME = ROOT / ".artifacts/pit-optimizer-v5/development/runtime-04"
+PROVIDER = ROOT / ".artifacts/pit-optimizer-v5/development/provider-runtime-06"
+
+
+def digest(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def write_json(name: str, value: object) -> None:
+    (PACKAGE / name).write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def definitions(raw: bytes) -> tuple[dict[str, bytes], dict[str, ast.FunctionDef]]:
+    tree = ast.parse(raw)
+    lines = raw.splitlines(keepends=True)
+    values: dict[str, bytes] = {}
+    nodes: dict[str, ast.FunctionDef] = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            values[node.name] = b"".join(lines[node.lineno - 1 : node.end_lineno])
+            if isinstance(node, ast.FunctionDef):
+                nodes[node.name] = node
+        elif isinstance(node, ast.ClassDef):
+            for child in node.body:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    name = f"{node.name}.{child.name}"
+                    values[name] = b"".join(lines[child.lineno - 1 : child.end_lineno])
+                    if isinstance(child, ast.FunctionDef):
+                        nodes[name] = child
+    return values, nodes
+
+
+def call_name(call: ast.Call) -> str | None:
+    if isinstance(call.func, ast.Name):
+        return call.func.id
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr
+    return None
+
+
+def repair_arguments(nodes: list[ast.FunctionDef]) -> list[dict[str, object]]:
+    result = []
+    for node in nodes:
+        for child in ast.walk(node):
+            if not isinstance(child, ast.Call) or call_name(child) != "load_typed_state":
+                continue
+            repair = next((item.value for item in child.keywords if item.arg == "repair"), None)
+            result.append(
+                {
+                    "function": node.name,
+                    "line": child.lineno,
+                    "repair": ast.unparse(repair) if repair is not None else None,
+                }
+            )
+    return result
+
+
+def static() -> None:
+    expected_changes = {
+        "historical_verification": {
+            "added": {
+                "_authenticate_completed_history_census_v5",
+                "_existing_campaign_execution_payloads_v5",
+                "_existing_campaign_role_requests_v5",
+                "_existing_names_v5",
+                "_existing_reservation_states_v5",
+                "_existing_round_state_v5",
+            },
+            "changed": set(),
+        },
+        "development_preparation": {
+            "added": {"authenticate_completed_development_history_v5"},
+            "changed": set(),
+        },
+        "summary": {
+            "added": set(),
+            "changed": {"summarize_repository_v5"},
+        },
+        "production_runtime": {
+            "added": set(),
+            "changed": {
+                "LocalArchiveReducerFactoryV5._authorities",
+                "LocalArchiveReducerFactoryV5.verify_projection",
+            },
+        },
+    }
+    comparisons = {}
+    source_hashes = {}
+    final_nodes: dict[str, dict[str, ast.FunctionDef]] = {}
+    all_protected = {}
+    passed = True
+    for name in SOURCES:
+        pre_raw = PREIMAGES[name].read_bytes()
+        raw = SOURCES[name].read_bytes()
+        pre_defs, _pre_nodes = definitions(pre_raw)
+        current_defs, current_nodes = definitions(raw)
+        final_nodes[name] = current_nodes
+        added = set(current_defs) - set(pre_defs)
+        removed = set(pre_defs) - set(current_defs)
+        changed = {
+            item
+            for item in set(pre_defs) & set(current_defs)
+            if pre_defs[item] != current_defs[item]
+        }
+        expected = expected_changes[name]
+        item_pass = (
+            added == expected["added"]
+            and changed == expected["changed"]
+            and not removed
+        )
+        passed &= item_pass
+        comparisons[name] = {
+            "pass": item_pass,
+            "added": sorted(added),
+            "changed": sorted(changed),
+            "removed": sorted(removed),
+        }
+        protected = {
+            item: {
+                "preimage_sha256": digest(pre_defs[item]),
+                "source_sha256": digest(current_defs[item]),
+                "unchanged": pre_defs[item] == current_defs[item],
+            }
+            for item in sorted(set(pre_defs) - expected["changed"])
+        }
+        all_protected[name] = protected
+        passed &= all(item["unchanged"] for item in protected.values())
+        source_hashes[name] = {
+            "preimage_sha256": digest(pre_raw),
+            "preimage_bytes": len(pre_raw),
+            "source_sha256": digest(raw),
+            "source_bytes": len(raw),
+            "final_newline": raw.endswith(b"\n"),
+        }
+
+    historical_nodes = final_nodes["historical_verification"]
+    development_nodes = final_nodes["development_preparation"]
+    runtime_nodes = final_nodes["production_runtime"]
+    new_historical = [
+        historical_nodes[name]
+        for name in sorted(expected_changes["historical_verification"]["added"])
+    ]
+    public_node = development_nodes["authenticate_completed_development_history_v5"]
+    historical_typed_state = repair_arguments(list(historical_nodes.values()))
+    new_typed_state = repair_arguments([*new_historical, public_node])
+    projection_typed_state = repair_arguments(
+        [runtime_nodes["LocalArchiveReducerFactoryV5._authorities"]]
+    )
+    selected_nodes = [*new_historical, public_node]
+    selected_calls = sorted(
+        {
+            name
+            for node in selected_nodes
+            for child in ast.walk(node)
+            if isinstance(child, ast.Call)
+            if (name := call_name(child)) is not None
+        }
+    )
+    forbidden = sorted(
+        set(selected_calls)
+        & {
+            "append_round_event",
+            "append_typed_state",
+            "recover_projection",
+            "recover_typed_state_index",
+            "reconcile_once",
+            "invoke_once",
+            "adapter_state_transition",
+            "LocalContainerExecutorV5",
+            "LocalRoleAuthorizationLedgerV5",
+            "OpenRouterOneShotJsonCompletionV5",
+        }
+    )
+    accepted_evaluator = json.loads(
+        (PACKAGE / "h3b-evaluator-source-map.json").read_text(encoding="utf-8")
+    )
+    evaluator_map = {
+        path: digest((ROOT / path).read_bytes())
+        for path in accepted_evaluator["source_sha256_by_path"]
+    }
+    from core.pit_optimizer_v5.contracts import canonical_sha256_v5
+
+    evaluator = {
+        "count": len(evaluator_map),
+        "sha256": canonical_sha256_v5(evaluator_map),
+        "source_sha256_by_path": evaluator_map,
+    }
+    frozen_hashes = {
+        "controller_roles.py": digest(
+            (ROOT / "core/pit_optimizer_v5/controller_roles.py").read_bytes()
+        ),
+        "production_provider.py": digest(
+            (ROOT / "core/pit_optimizer_v5/production_provider.py").read_bytes()
+        ),
+    }
+    checks = {
+        "exact_definition_change_boundary": passed,
+        "all_historical_typed_state_reads_are_repair_false": bool(historical_typed_state)
+        and all(item["repair"] == "False" for item in historical_typed_state),
+        "new_entry_and_census_typed_state_reads_are_repair_false": bool(new_typed_state)
+        and all(item["repair"] == "False" for item in new_typed_state),
+        "projection_forwards_repair": projection_typed_state
+        == [
+            {
+                "function": "_authorities",
+                "line": projection_typed_state[0]["line"],
+                "repair": "repair",
+            }
+        ]
+        if projection_typed_state
+        else False,
+        "no_mutating_or_operational_call_in_new_history_path": not forbidden,
+        "h3a_controller_is_frozen": frozen_hashes["controller_roles.py"]
+        == "62f7414dd31a7970d08bcbf7fcc7faaeb19e5ee806cba5363311aef338b15b1f",
+        "h3b_provider_is_frozen": frozen_hashes["production_provider.py"]
+        == "6077f0a716fa5d64594f5760d86b00f3b2865b605ca25bf3ab57bed07793b94f",
+        "evaluator_closure_is_unchanged": evaluator == accepted_evaluator,
+        "all_sources_have_final_newline": all(
+            item["final_newline"] for item in source_hashes.values()
+        ),
+    }
+    evidence = {
+        "pass": all(checks.values()),
+        "checks": checks,
+        "definition_changes": comparisons,
+        "source_hashes": source_hashes,
+        "protected_definition_hashes": all_protected,
+        "historical_typed_state_reads": historical_typed_state,
+        "new_path_typed_state_reads": new_typed_state,
+        "projection_typed_state_reads": projection_typed_state,
+        "new_path_calls": selected_calls,
+        "forbidden_calls": forbidden,
+        "frozen_source_hashes": frozen_hashes,
+        "evaluator": {"count": evaluator["count"], "sha256": evaluator["sha256"]},
+    }
+    write_json("h3c-static-verification.json", evidence)
+    write_json("h3c-source-hashes.json", source_hashes)
+    write_json("h3c-evaluator-source-map.json", evaluator)
+    diff_parts = []
+    for name, path in SOURCES.items():
+        pre_raw = PREIMAGES[name].read_bytes()
+        raw = path.read_bytes()
+        diff_parts.extend(
+            difflib.unified_diff(
+                pre_raw.decode("utf-8").splitlines(keepends=True),
+                raw.decode("utf-8").splitlines(keepends=True),
+                fromfile=f"a/{path.relative_to(ROOT).as_posix()}.pre-h3c",
+                tofile=f"b/{path.relative_to(ROOT).as_posix()}",
+            )
+        )
+    (PACKAGE / "h3c-source.diff").write_text(
+        "".join(diff_parts),
+        encoding="utf-8",
+        newline="",
+    )
+    print(json.dumps(evidence, indent=2, sort_keys=True))
+    if not evidence["pass"]:
+        raise SystemExit(1)
+
+
+def extended_root(path: Path) -> str:
+    absolute = str(path.resolve())
+    if os.name != "nt" or absolute.startswith("\\\\?\\"):
+        raise RuntimeError("H3c archive evidence requires a non-extended Windows root")
+    return f"\\\\?\\{absolute}"
+
+
+def archive_map(path: Path) -> dict[str, object]:
+    root = extended_root(path)
+    files = {}
+    for directory, directories, names in os.walk(root):
+        directories.sort()
+        for name in sorted(names):
+            absolute = os.path.join(directory, name)
+            relative = os.path.relpath(absolute, root).replace(os.sep, "/")
+            with open(absolute, "rb") as handle:
+                raw = handle.read()
+            files[relative] = {"sha256": digest(raw), "bytes": len(raw)}
+    files = dict(sorted(files.items()))
+    tree = digest(
+        json.dumps(files, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    )
+    return {
+        "archive_root": path.relative_to(ROOT).as_posix(),
+        "extended_root": root,
+        "extended_root_asserted": root.startswith("\\\\?\\"),
+        "file_count": len(files),
+        "byte_count": sum(int(item["bytes"]) for item in files.values()),
+        "tree_sha256": tree,
+        "canonicalization": "sorted ordinal relative path keys; compact UTF-8 JSON object of sha256 and byte count",
+        "files": files,
+    }
+
+
+def before() -> None:
+    for prefix in ("runtime-04", "provider-runtime-06"):
+        accepted = json.loads(
+            (PACKAGE / f"h3b-{prefix}-after.json").read_text(encoding="utf-8")
+        )
+        write_json(f"h3c-{prefix}-before.json", accepted)
+
+
+def after() -> None:
+    runtime = archive_map(RUNTIME)
+    provider = archive_map(PROVIDER)
+    if runtime["file_count"] != 579 or provider["file_count"] != 83:
+        raise RuntimeError("archive file count differs from the sealed scope")
+    write_json("h3c-runtime-04-after.json", runtime)
+    write_json("h3c-provider-runtime-06-after.json", provider)
+
+
+def preservation() -> None:
+    result = {}
+    for key, prefix in (
+        ("runtime_04", "runtime-04"),
+        ("provider_runtime_06", "provider-runtime-06"),
+    ):
+        before_map = json.loads(
+            (PACKAGE / f"h3c-{prefix}-before.json").read_text(encoding="utf-8")
+        )
+        after_map = json.loads(
+            (PACKAGE / f"h3c-{prefix}-after.json").read_text(encoding="utf-8")
+        )
+        changed = sorted(
+            path
+            for path in set(before_map["files"]) | set(after_map["files"])
+            if before_map["files"].get(path) != after_map["files"].get(path)
+        )
+        result[key] = {
+            "before_file_count": before_map["file_count"],
+            "after_file_count": after_map["file_count"],
+            "before_byte_count": before_map["byte_count"],
+            "after_byte_count": after_map["byte_count"],
+            "before_tree_sha256": before_map["tree_sha256"],
+            "after_tree_sha256": after_map["tree_sha256"],
+            "extended_roots_asserted": before_map["extended_root_asserted"]
+            and after_map["extended_root_asserted"],
+            "changed_paths": changed,
+            "unchanged": not changed,
+        }
+    evidence = {
+        **result,
+        "pass": all(item["unchanged"] for item in result.values()),
+    }
+    write_json("h3c-preservation-check.json", evidence)
+    print(json.dumps(evidence, indent=2, sort_keys=True))
+    if not evidence["pass"]:
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2 or sys.argv[1] not in {"static", "before", "after", "preservation"}:
+        raise SystemExit("usage: h3c_evidence.py static|before|after|preservation")
+    globals()[sys.argv[1]]()

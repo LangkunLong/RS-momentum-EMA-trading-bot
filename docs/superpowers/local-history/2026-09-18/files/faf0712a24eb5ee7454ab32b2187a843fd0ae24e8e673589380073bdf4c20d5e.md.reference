@@ -1,0 +1,25 @@
+# P3 fix round 1 report
+
+Status: source frozen for scoped independent re-review.
+
+## Reviewed finding
+
+Important I1 in `admission-p3/independent-review.md` found that the reused and newly accepted settlement paths could consume `evaluated_feedback_target_reached` after immutable boundary fact authentication without rechecking the original campaign deadline. A resume after expiry, or a deadline crossed during the heavy fact read, could therefore report target success.
+
+## Correction
+
+`operations.py` now checks `time.monotonic() >= deadline` immediately after `_load_campaign_boundary_facts_v5` returns and before `campaign_boundary_decision_v5` runs. The existing `deadline` is derived in the operational layer from the original persisted launch epoch and configured campaign duration.
+
+The shared boundary helper feeds all four enrolled boundary consumers. This gate therefore covers reused and new accepted settlements, including the final capped round, as well as the already protected pre-configuration and pre-start boundaries. It returns `campaign_deadline_exhausted`, preserving deadline failure precedence. Legacy absence still returns before the new clock check. No clock, request, write, or provider operation was added to immutable fact composition.
+
+## Scope and verification
+
+- Exact fix: two inserted lines in `operations.py`; `cli.py` and `campaign_admission.py` are byte-identical to freeze 01.
+- Scoped Ruff on `operations.py`: pass.
+- In-memory compile of `operations.py`: pass.
+- Source/AST ordering check: fact load precedes exactly one clock gate, which precedes the policy decision; four boundary consumers remain present.
+- Fix diff inspection: one hunk with only the two authorized lines.
+- Newline preservation: frozen `operations.py` contains 1,082 CRLF and zero bare LF.
+- No tests or runtime behavior were executed under the continuing P3 constraints.
+
+`review-freeze-01/` remains the untouched exact fix preimage. `fix-round-1.diff` is the exact correction; `actual-task.diff` is the updated full P3 diff from principal preimages.

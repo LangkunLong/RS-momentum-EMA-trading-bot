@@ -1,0 +1,129 @@
+# P2 live campaign admission preparation
+
+This document records the read-only preparation completed before P2 source work began. No production source was changed and no test was read, created, modified, or run during that preparation. The final independently approved P1 input was `core/pit_optimizer_v5/campaign_admission.py` SHA-256 `7e15ed500121b4c85df7a838feab51750e1f476a3e5427b9d1a0b1f0f58a89d9`, 17,227 bytes, LF. Its finite-USD corrections did not change the interfaces used below.
+
+## Source anchors and immutable inputs
+
+The relevant source-only facts are:
+
+- `LocalRoleRequestFactoryV5` is in `production_runtime.py`. Its three complete return values are `investigator_request` at lines 817-839, `author_request` at lines 841-907, and `critic_request` at lines 1022-1161 in the inspected preimage. Each directly returns `build_role_request_v5(...)`.
+- Runtime builds the authoritative `RoleCallKeyV5` in `_complete_role` only after the request factory returns. It binds `inputs.campaign_id`, `inputs.round_index`, the fixed role position, `attempt_kind="primary"`, `attempt_index=1`, and `request.sha256`. It checks an existing journal completion before request persistence, then calls `append_role_request` at inspected `runtime.py:1216`. A fresh request goes to the invoker; an existing request goes only to reconciliation.
+- `append_role_request` persists `roles/requests/{call.sha256}.json` and returns a fresh/existing capability. `load_unique_role_request_entry_by_sha256` requires exactly one authenticated persisted call/request pair. The content-only `load_unique_role_request_by_sha256` accepts duplicate call entries carrying identical request content and is therefore insufficient for P2's ledger call binding.
+- `LocalRoleAuthorizationLedgerV5.reserve_role_slot` holds `role_provider_transition(campaign_id=...)`. It authenticates the existing ledger, rejects duplicate reservations and any incomplete prior reservation, derives prior cumulative totals, currently loads only the request content, applies the existing provider limits, constructs a slot and reservation, and appends the reservation. The admission guard belongs inside this existing transition after exact request recovery and the old duplicate/incomplete checks, and before `RoleLedgerReservationV5` construction/append.
+- `_load_verified_role_ledger_v5` authenticates persisted requests, prospective bounds, identity fields, ordinal continuity, cumulative receipt arithmetic, provider responses and terminals. `_authenticate_role_invocations_v5` binds complete journal packages to an exact equal-size ledger and requires terminal sequence order. For a live partial campaign it must be called with the completed prefix slices, not with the optional current unjournaled tail.
+- `load_round_events` already authenticates canonical filenames, the contiguous predecessor chain, role completion positions, candidate stage order, and the terminal/cleanup suffix rules. `authenticate_completed_historical_round_resources_v5` includes `authenticate_historical_round_v5` and authenticates one completed prior round, its original launch/config/owner, real resources, successful execution closure and final successful cleanup. It is suitable per prior settled round. `_authenticate_completed_history_census_v5` is deliberately unsuitable because it equates all campaign requests/resources with completed journal state and rejects a supported live current tail.
+- `LocalArchiveReducerFactoryV5.verify_projection(..., repair=False)` authenticates the committed checkpoint/archive and scheduling projection. `load_experiment` authenticates each record's critic artifact binding. An evaluated count must still be intersected with successfully cleaned prior rounds and tied to the accepted critic completion from that round.
+
+Inspected source hashes before this note:
+
+| Source | SHA-256 |
+| --- | --- |
+| `production_runtime.py` | `1a232da79f5ddf0c01e48f39dd94008f6ad3b34ed08af385c3787e4f4555e070` |
+| `production_provider.py` | `6077f0a716fa5d64594f5760d86b00f3b2865b605ca25bf3ab57bed07793b94f` |
+| `runtime.py` | `d834eae8e3e120355b4479c77f87ebe46519a0b82a52cc072abe1dab60943aec` |
+| `historical_verification.py` | `978c0bd83ddbafecc9ef388420c23634429f32a5f6473eef441c09db4c6c521b` |
+| `development_preparation.py` | `e7f7e2c0d6c4b66eefd31b031cc18cf53f3924a013b39a318d613ccff75b72f8` |
+| `artifacts.py` | `2bab516e4945976d9bf6bb356934289cd14d9b87c25088521a043c8ac5cfa2c2` |
+| `memory.py` | `37e3a04791d827edd0e5fe99e1d62cb9997163f66954f99727177248f8949d76` |
+
+## Proposed data-only composition in `campaign_admission.py`
+
+Keep P1's serialized dataclasses unchanged. Add only private frozen fact carriers for live authority and logical-prefix results. A practical split is `_LiveCampaignRoundAuthorityV5` plus `_CampaignRolePrefixV5`. The first carries the authenticated admission, original campaign launch/config, current round config/start, and exact campaign/round deadline epochs. The second carries journal packages, verified ledger records, prior-round counters, the current role disposition (`replay` or `next`), and whether the exact current request is already persisted as the sole supported tail.
+
+Add an optional factory-owner argument to the P2 helper, as accepted by the principal:
+
+```python
+def require_live_role_admission_v5(
+    *,
+    repository: LocalArtifactRepositoryV5,
+    manifest: CampaignManifestV5,
+    request: RoleRequestV5,
+    round_index: int,
+    now_epoch_ms: int,
+    owner_token_sha256: str | None = None,
+) -> None:
+    ...
+```
+
+The function must call `load_campaign_admission_v5` on every invocation. If that returns `None`, return immediately before applying any new owner, round, deadline, request-census or ledger requirement. This preserves the legacy path and prevents cached policy absence. After enrollment, require exact non-bool integer types for round/time, a valid role request, and the P1 envelope via `require_role_envelope_v5`.
+
+Use a private stored-authority reader, with live clock comparison kept in a separate validator so later historical composition cannot substitute a fake current time:
+
+1. Re-authenticate the original manifest selected by the enrolled policy. Census the `campaign-launch` value/index union with `repair=False`, detect selected wrong-key records through manifest/config/owner linkage, and require the sole selected launch at `manifest.sha256`. Require exact equality of the launch's manifest reference, adapter-config reference and owner with both policy/binding identities, plus the repository-root identity already authenticated by P1.
+2. If `owner_token_sha256` was supplied, validate it as an exact digest and require equality with the original enrolled/launch owner. The factory supplies it. The ledger supplies `None`; its authority comes from the exact persisted call and the independently authenticated durable launch/round owner.
+3. Enumerate the value/index unions for `campaign-round` and `campaign-round-started`, using `load_typed_state(..., repair=False)` for every observed member. This must reject malformed filenames, missing halves, duplicate selected indices, canonical-key mismatch for this manifest, starts without configurations, configurations/starts beyond the admitted round, and any selected state beyond the manifest cap. Because `CampaignRoundLaunchV5` has no manifest field, classify selection through the canonical key, original owner/config, the campaign's round-config path, or an authenticated referenced provider config whose `campaign_manifest_sha256` equals this manifest. Only records proven foreign after those checks may be ignored.
+4. Require exact current configuration and start records at `sha256({"campaign_manifest_sha256": manifest.sha256, "round_index": round_index})`. The configuration has `started_epoch_ms is None`; the start has a real epoch and equals `replace(configuration, started_epoch_ms=None)`. Both owner tokens equal the original launch owner. Round 1 uses the original config reference; later config references load through `load_development_config_v5` and match the original config outside the existing four round-derived identity fields. Reuse `_require_round_config_matches_original` by a local import or move that data-only comparison into a cycle-safe shared private helper; do not construct an adapter, gateway, ledger, executor, clock, nonce or capability.
+5. In the stored-authority reader require every observed selected round start to fall within the original campaign lifetime. In a separate live-only validator require `round_started.started_epoch_ms <= now_epoch_ms`, `now_epoch_ms < launch.started_epoch_ms + campaign_wall_timeout_seconds * 1000`, and `now_epoch_ms < round_started.started_epoch_ms + round_wall_timeout_seconds * 1000`. This enforces the original persisted deadlines without refreshing either epoch and keeps historical facts independent of a substituted live clock.
+
+Build `_load_campaign_role_prefix_v5(...)` without the whole completed-history census:
+
+1. Run `LocalArchiveReducerFactoryV5(repository).verify_projection(..., repair=False)` once using the authenticated manifest's panel plan and evaluator contract. Load checkpoint-owned records through `load_experiment`; reject any committed record from the current or a later round in a live new-call path. A completed-request replay may observe a settled current round, but it must not authorize another role or reservation.
+2. For every index `1 .. round_index - 1`, call `authenticate_completed_historical_round_resources_v5`. Require the returned launch/original config/owner to equal the live campaign authority and require the set of prior indices to be exactly contiguous. This authenticates successful cleanup and rejects gaps or prior unsettled state. Do not call H1/H2 for the current fresh investigator because a real current start may exist before its first intent/event.
+3. Load current events directly and their payloads. `load_round_events` supplies the canonical chain check. Collect every `RoleCompletionPayloadV5` from all authenticated prior rounds plus the current round, and load each exact `RoleInvocationPackageV5`. Require campaign, round, role, fixed role position, `primary`, attempt 1, request ref and payload/package identities to agree. Include all earlier roles of the current round; never fabricate the current package.
+4. Determine the requested role's fixed position from `request.role`. Current journal completions are a canonical prefix. If the requested position is already in that prefix, require the exact persisted package request/call and classify this invocation as an authenticated replay. If it is the next position, classify it as the sole possible new/current call. Reject a skipped position. If the current round already has a terminal, successful cleanup, or committed record, allow only an exact completed-request replay; reject any new role/call even when the prior-round boundary still says `admit`.
+5. Enumerate actual campaign request files with `_existing_campaign_role_requests_v5`. Re-run `require_role_envelope_v5` for every selected enrolled request. The observed set must equal all journal-package requests plus at most one exact unjournaled current `RoleCallKeyV5(campaign_id, round_index, request.role, fixed_position, "primary", 1, request.sha256)`. The optional tail may be absent at factory time and must be present in the ledger path. Reject every other orphan, alternate request SHA, duplicate semantic request entry, later-round call, retry/repair call, noncanonical filename, or role-position mismatch.
+6. Obtain the immutable production ledger identity with `_role_ledger_read_identity_v5`, passing the original config's fixed API-key handle. Call `_load_verified_role_ledger_v5` once. Upgrade every reservation's content-only request lookup by resolving `load_unique_role_request_entry_by_sha256` and binding the exact call. Require ledger calls to be in nondecreasing round/fixed-role order and to contain no later round.
+7. Let `N` be the number of journal packages. Authenticate exactly the completed prefix with `_authenticate_role_invocations_v5(..., packages=packages, reservations=reservations[:N], terminals=terminals[:N])`. The full verified ledger may then have only these shapes: `N/N` reservations/terminals; `N+1/N` for the exact current in-flight reservation; or `N+1/N+1` for the exact current terminal not yet journaled. The extra reservation and optional terminal must bind the sole exact current request/call. A persisted exact current request with no reservation is also allowed. No second tail or unrelated incomplete state is accepted.
+8. Compute the admission boundary from the admitted round's prior-round prefix only. `attempted_rounds` is the number of contiguous successfully cleaned prior rounds. Find the last verified terminal whose exact persisted call has `call.round_index < round_index`; use its cumulative external attempts, total tokens and cost, or zero values if absent. Require all prior calls to be terminal and all current-round ledger entries to follow that boundary. Do not use final/current cumulative totals for author or critic, because that would re-admit an already admitted round against a new three-call reserve.
+9. Count evaluated rounds as distinct prior round indices having checkpoint-committed `ExperimentRecordV5(status="evaluated", campaign_evidence is not None)`, intersected with the successfully cleaned H2 rounds. For every counted round require its journal to contain the accepted critic completion/package and require the critic artifact digest to match the record's `critic_artifact_ref`; `load_experiment` also authenticates the record-to-critic review binding. A terminal without such a committed evaluated record does not count.
+10. Call `campaign_boundary_decision_v5` with only those prior-prefix counters and require the result to be `admit`. The target or reserve refusal is an exception here; no denied package, outcome, terminal, cleanup, or synthetic usage record is written.
+
+All imports of `historical_verification` and the private read-only helpers in `production_provider` should be local to the P2 reader. This avoids a module cycle when `production_provider` imports the public admission guard. Calling the existing reader functions is acceptable; constructing `LocalRoleAuthorizationLedgerV5` is not. The enrolled campaign is fresh/current-format, so the live ledger reader should not need legacy migration. P2 source review should still confirm that no migration write is reachable for the admitted campaign.
+
+## Exact native insertions
+
+In `production_runtime.py`, add the admission import and one method directly on `LocalRoleRequestFactoryV5`:
+
+```python
+def _guarded_request(
+    self,
+    inputs: FeedbackRoundInputV5,
+    request: RoleRequestV5,
+) -> RoleRequestV5:
+    require_live_role_admission_v5(
+        repository=self.repository,
+        manifest=self.manifest,
+        request=request,
+        round_index=inputs.round_index,
+        now_epoch_ms=time.time_ns() // 1_000_000,
+        owner_token_sha256=inputs.owner_token_sha256,
+    )
+    return request
+```
+
+Wrap only the three existing complete `build_role_request_v5(...)` return expressions as `self._guarded_request(inputs, build_role_request_v5(...))`. Do not alter request construction, output limits, evidence, schema authority, binding or canonical request identity. This guard executes before `_complete_role`, so a normal policy refusal occurs before `append_role_request`. Every call reloads enrollment; the constructor stores no admission state.
+
+In `production_provider.py`, retain the existing transition, `_load_verified`, duplicate-reservation refusal, incomplete-prior-reservation refusal, content-only lookup, provider-budget predicate, slot construction, and original `lease_started` placement. This preserves legacy duplicate-identical-content behavior and legacy error/accounting/clock order. After `lease_started`, rediscover enrollment. Only when enrollment is present, resolve the exact persisted pair with:
+
+```python
+call, exact_request = self._repository.load_unique_role_request_entry_by_sha256(
+    request.request_sha256
+)
+```
+
+Require `exact_request` to equal the legacy content lookup result and bind call campaign, role, fixed position, primary attempt 1 and request SHA. Then, still before `RoleLedgerReservationV5` construction, call:
+
+```python
+lease_started = self._now_ms()
+require_live_role_admission_v5(
+    repository=self._repository,
+    manifest=self._manifest,
+    request=exact_request,
+    round_index=call.round_index,
+    now_epoch_ms=lease_started,
+)
+```
+
+The omitted owner argument defaults to `None`; the guard authenticates the durable original owner and exact call. Use the same `lease_started` in the invocation claim. The shared helper must itself require `call.campaign_id == manifest.campaign_id`, the request role/fixed position, primary attempt 1, and exact request SHA through the persisted census. This placement remains inside the existing ledger transition, does not nest a transition, and precedes reservation append/provider invocation. Existing duplicate/incomplete refusal still wins before any new spend. A lower-level bypass denied here follows the current caller's authorization-failure handling; P2 must not manufacture a replacement denial artifact or journal package.
+
+## Bounded architectural issues for implementation/review
+
+1. The original five-argument P2 helper signature could not authenticate the factory's actual owner. The accepted optional `owner_token_sha256` parameter closes that gap while keeping the ledger on durable authority. It must be checked only after enrollment discovery so legacy behavior remains unchanged.
+2. A live prefix cannot be forced through `_authenticate_completed_history_census_v5`: a supported current request may be persisted but not journaled, and earlier current-round roles may be journaled while the round remains incomplete. The exact one-call tail rule plus completed ledger prefix slices is the narrow replacement.
+3. Settled current state is distinct from replay. An exact already completed request may pass the factory guard so `_complete_role` can return its durable package without spending. Any new position after a terminal, cleanup, or committed current record must fail. The ledger's existing duplicate reservation check prevents a completed replay from reserving again.
+4. Boundary counters must be anchored immediately before the current round's first reservation. Using the latest receipt for author/critic would wrongly demand another three-call reserve and can strand a round that was validly admitted. Current usage remains governed by the ordinary ledger caps and the per-request envelope.
+5. `_load_verified_role_ledger_v5` initially authenticates reservations by request content. P2 must additionally resolve every selected reservation with `load_unique_role_request_entry_by_sha256`; otherwise identical request bytes under two call keys could obscure the authoritative round.
+6. Historical round/config/resource helpers must be called with their immutable modes. Every `load_typed_state` introduced by P2 uses `repair=False`; `verify_projection` also uses `repair=False`. No recovery helper, adapter composition, operational executor/gateway/ledger construction, clock/nonce creation, provider call or environment read belongs in the shared facts path.
+7. Persisted epochs prove launch/start relations and current deadline validity, but no source field proves cross-round checkpoint/cleanup publication time. P2 should state only live logical-prefix eligibility; P4 retains the historical temporal-evidence limitation.
+
+Static P2 review should verify exactly three guarded factory return sites, one exact persisted-call load in `reserve_role_slot`, one live guard inside the existing ledger transition before reservation construction/append, no admission cached in either constructor, `repair=False` on every typed-state/projection read, no whole-history census call, and no changes to existing serialized dataclasses or request/ledger identity formulas.

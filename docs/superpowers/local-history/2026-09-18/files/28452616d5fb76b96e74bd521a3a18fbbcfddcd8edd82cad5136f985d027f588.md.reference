@@ -1,0 +1,45 @@
+# Fixed-authority preparation for C-b
+
+This is fixed-input evidence only. It does not approve readiness, advance C-c, prepare a campaign packet, or resolve the outstanding H2b/H3 summary verification.
+
+## Selected authority
+
+The sealed authority matching the requested evaluator is `provider-runtime-06`, manifest `campaigns/development-provider-two-rounds-20260907-06/manifest.json` SHA-256 `d90ed717c0d6b34d4cfa6bf7e2dd1f753e68c43b1127b200a66d2a9f930dfdf6`. `authenticate_campaign_manifest_v5` succeeded with 16 authenticated graph edges.
+
+The fixed identities are:
+
+- evaluator map: 56 files, `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4`; a fresh `evaluator_source_map_v5` recomputation exactly matched the C-a map;
+- evaluator contract: `preparation-seed/evaluator-contract.json`, `73a4a914ca3a6088e6275eb1ab83f32fdfb26a24474c69a886313b30a75ccde4`;
+- profile: `preparation-seed/sandbox-profile.json`, and evaluator profile `.artifacts/pit-optimizer-v5/evaluator/sandbox-profile-development-005064e57e80.json`; both hash to `0923e93f56e06fc982c9db00815329d1cdc936c0a0b9a140d287b7611ad5b1c9`;
+- image: `pit-optimizer-v5-evaluator@sha256:4e85b19aa8c135362ae8796e4d33a410ec5af650d296c358ae6a7737d5b05b6a`;
+- execution profile: `preparation-seed/execution-profile.json`, `93ced32086727384e67f36c5bdfa8ebfd3211a7fe47e25e7356b170a3bacb3af`;
+- parent source: `preparation-seed/source-bundle.json`, `109a61992ac79317446861c4cb2053f2704239eb1f8eacfe2b2d27ca2cf7456e`;
+- parent revision: `preparation-seed/policy-revision.json`, `5d2a95ba2572e71dab448934544cef22130415fcc1691c9a98deb820d40a1fa9`;
+- parent authority: `preparation-seed/baseline-parent.json`, `1f23034024f3b5caa55604cb21b561cb941e92d54bc09969935bea856a54dd6e`;
+- panel plan: `preparation-seed/panel-plan.json`, `34fd3430ce952fa7115ec8802a4998cd6e940df5052c2dcfd92a1fb1a87843d5`;
+- data: `data/pit_bundle.sqlite3`, `cf729b47d762ae86287bb8a87c28a1664e7475c74ef1aca736fbc240111349de`; prices provenance `data/prices_provenance.json`, `97dad8197d1fcc0d7a8cedb1a0bc13b76d7169b56a8b9c0a0e836c0a25c4f8a2`.
+
+Runtime-04 also passed graph authentication, but it binds evaluator `4acebbc4...`, image `51ea3ca6...`, profile `364d460e...`, and parent revision `901b1ed2...`. It is therefore not the fixed `005064` report authority and was not used to rebind reports.
+
+## Parent reports and quick result
+
+Actual06 parent provenance is `preparation-seed/parent-provenance.json`, SHA-256 `65cdc2349e3f63540bf60e1c09e3ab15d97164ebcdd674fe9af094c06053d3e5`. Its four output digests point to the original immutable reports outside the archive root:
+
+| Episode | Panel SHA-256 | Original output SHA-256 | Verification record SHA-256 |
+|---|---|---|---|
+| discovery-1 | `7fac6df621ef1d2eee4953a9e77870d5d5d074097052dcc353ee2a6337ab8be0` | `8a38323a3cddc585214f8c36a9f669b8d5d0ea877af304a4d1a8253a77c1f24a` | `5d2b0aeeb7f39a036b1e8c652502d6728f8eb09290d98c79184b41b193f806b8` |
+| discovery-2 | `2a67df05f796cdba0f3df464f9523a61b1c60160e235da826676da2e9f0323da` | `d21eb4b6833f35f32ba531b891c559168700018b997c705bb250ee1a4763fda6` | `7974a147217942a9e5a349a7481bb526b9f10bc0121ae634d8a3baa0197d7150` |
+| discovery-3 | `09ae5201ed57186a9ac77444bc5cef9cf0f389b7364d8e7ec1f725b2ca364840` | `045de2d770e228fe92568b36dbe25e67cd9d9bb38a9ee6b3896587bb5295eb33` | `44b35f45840e75a9eccbf9c98cad437c8443f63985e448d30872631de4a196a1` |
+| discovery-4 | `1d76bae18728586aa1f14a4bea9228eb00bb4e7a023c53cba7dd9cc6a3fa4b73` | `ec05b032c65311f3dffa6a3b05952b79bee2dd020810f529c5c0c7ff651fbe6f` | `d03bb0542523452b796a07ae6e932bffb6d58ca1a080831b6e553c8e57a3f6e5` |
+
+Each request and output was decoded through the canonical container protocol, and re-encoding the request-bound output reproduced the exact bytes. Each request matched the selected manifest's evaluator, profile, execution profile, parent revision, panel, PIT bundle, and prices provenance. The provenance input/output digests matched the original files. Every selected base report has zero closed trades, 0% total return, and 0% annualized return; aggregate parent campaign CAGR and closed trades are also zero.
+
+The quick result is `.artifacts/pit-optimizer-v5/development/runs/runtime-parent-quick-005064e57e80-01/output/panel-evaluation.json`, SHA-256 `ee52964453c9831f371ca7539a6d30d5c47707d5c0e6cf3d16436e15c28c5716`; its verification record hashes to `30cd7f6c5048b535f864ae657d9292064d1e3739e07caff954bccd2d1d987843`. It is canonical and request-bound to the same fixed evaluator/profile/execution/parent/data identities and quick panel `bfa5c7767c74f0757442cc47a2cda8aaee9f43193a2ebe041b1bffbb0328cc05`. Its base result is also zero trades and zero return. It is not a parent-provenance edge; its request episode id is `development-first-loop-2021q1` while the manifest plan label is `development-quick`, though the panel digest is identical.
+
+## Checks and limits
+
+`authenticate_campaign_manifest_v5` first authenticates the complete referenced graph by exact digests and canonical encodings, including typed panels and raw PIT/provenance edges. It then validates manifest/panel/evaluator/resource/profile/baseline/source/policy bindings and the closed apply, qualification, and replay flags. Separate checks were required for the current evaluator map, external evaluator profile, parent-provenance pairs, original request/output byte binding, aggregate metrics, and full-archive preservation.
+
+Before and after reads, complete C-a archive maps matched exactly: runtime-04 579 files and provider-runtime-06 83 files, with zero missing, added, or changed paths. Hashing used asserted `\\?\C:\...` roots.
+
+No tests, campaign actions, synthetic objects, rendering, provider/API/Docker calls, environment or credential reads, Git operations, process-liveness checks, source edits, or old helper mains were executed. Actual06's historical C-a summary remains `failed/runtime_failed` with `rendering:stage_failed`, 0 experiments, 0 completed lifecycle rounds, and 0 evaluated feedback rounds. Current H2b/H3 summary behavior remains unverified here.

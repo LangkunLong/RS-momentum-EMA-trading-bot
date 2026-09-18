@@ -1,0 +1,30 @@
+# H2b independent spec and quality review
+
+Spec: **FAIL — one P2 closed-grammar omission.** Quality: **changes requested**, limited to the finding below. No other actionable defect found in the reviewed H2b scope.
+
+Reviewed the approved extraction design, implementation sequence, saved-command correction, task brief/report, narrow preimage diff, final source, shared predicates and relevant live grammar/record/repository helpers. Independently read the final source SHA-256: `67549e09ff33dd46f72e55cf2cee598e99cc1dabc03a5c8d033541b0999d141f`, matching the sealed report. H1 and H2a were treated as accepted dependencies; the broader dirty branch was not reviewed.
+
+## Finding
+
+**[P2] Reject host paths outside the live mount grammar before reconstructing their digests.** `core/pit_optimizer_v5/historical_verification.py:677` (`_mount_primitive_v5`), `:767` (source mount argument), `:776` (data mount argument), `:782` (output mount argument), and `:936`/`:1181` (panel-input path) normalize or interpolate paths without validating the closed host-path language. The corresponding live `sandbox.py:143–151` rejects comma, NUL, LF and CR, as well as noncanonical/blank host paths; `production_sandbox.py:95–103` applies the same delimiter/canonical restrictions to the panel-input mount before the live runtime argv and expected mounts are formed.
+
+This restriction is not supplied by H1: `cli.py:137–147` and `workspace.py:79–90` accept canonical Windows directory names containing commas; the link-free root checks in `production_sandbox.py:126` and `production_workspace.py:59` do not reject that legal filesystem character either. Repository construction also does not impose Docker mount-token restrictions. Consequently, H2b's reconstructed metadata/argv can agree with saved hashes for a host path which the live V5 request/reservation grammar cannot emit. A comma is a Docker mount-field separator, so mere equality with an interpolated string is insufficient to establish the claimed closed serialized semantics. This is an authentication-language mismatch, not a claim that H2b launches a command or that the ten supplied histories contain such paths.
+
+Apply equivalent pure path validation to the reconstructed source/data/output mount hosts and the panel-input host used by runtime argv/expected mounts, without constructing capability objects or reopening retired sources. Preserve the live canonical spelling rather than repairing or escaping an invalid recorded path. Review the updated narrow diff and saved evidence; no synthetic execution is required to establish or correct this static discrepancy.
+
+## Boundaries and corrections that pass review
+
+- The public entry (`:1772`) calls H1 internally and has only repository/manifest/round-index inputs. Expected executor, owner and config provenance come from the original-round authentication. H2b returns frozen data facts and does not instantiate executor, request, command, mount or lease capabilities. The workspace lease consumed internally is an existing typed saved record.
+- Immediate phase-name/executor/command guards remain beside ordered reads. Shared H2a reservation, panel, phase/identity, terminal/output, cleanup and control predicates are used. Typed state reads explicitly disable repair. Successful journal keys require durable succeeded output; binary reads retain the bound and exact length check. Current control/Docker identities are pinned and encoded as the live predicates expect, and transaction absence is actually observed.
+- Context derives the exact experiment ID from accepted author/template, complete intent/hypothesis, policy and strictly validated assignment; validation must precede execution. Parent-identical, invalid and rejected origins cannot justify an indexed execution. Retired workspace/source binding and source mount-root identity use their distinct encodings; source workspaces are not reopened.
+- Request/panel fields, policy-file order, probe and panel flags, scenario order, runtime transformation and sorted expected mount tuples otherwise match the reviewed live grammar. Unsupported execution stages fail closed. Unsaved historical host/environment preimages are not claimed.
+- The cleanup correction (`:1888–1918`) allows earlier failed attempts and checks the final complete payload against exact counts. The existing journal fold requires complete cleanup to close the chain. The absent-stage-result correction (`:384–446`) returns non-success when no stage evidence exists, while `:1372` still requires a settled durable terminal and subsequent complete cleanup. H3 retains outcome/failure settlement responsibility.
+- Workspace payload/ref/source uniqueness, execution lease reuse, exact source links and successful-key coverage are reconciled at the resource boundary.
+
+## Evidence limits
+
+Supplied evidence records ten actual runtime-04 panel executions across rounds 1 and 2, all with succeeded terminals and complete execution cleanup; each round has one retired workspace and counts `(1, 0, 5, 5)`. Round 2's failed round outcome is compatible with these resource facts. Probe, missing-stage and cleanup-retry branches were reviewed statically, not dynamically demonstrated by this evidence.
+
+Saved Ruff/in-memory compile checks pass. The evaluator map reports 56 unchanged files at digest `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4`; preservation evidence reports unchanged complete runtime-04 (579 files) and provider-runtime-06 (83 files) archive maps. Those supplied runs were not repeated. No full summary, role/campaign completion, checkpoint or archive-eligibility authentication is concluded; H3 owns that integration.
+
+This review used static reads and a source hash check only. No tests were read, created or run; no synthetic artifacts, requests, probes, wrappers, authentication reruns, source edits, credentials/environment reads, Docker/provider/external calls, campaigns, summaries, commits or subagents were used. Only this review document was written.

@@ -1,0 +1,266 @@
+# Task 5 — Provider-free complete production-composition proof
+
+## Status
+
+**PASS**
+
+**One-line result:** The active schema-v3 production composition completed two provider-free iterations with exactly six accepted investigator/author/critic calls per pricing variant, preserved complete authoritative accounting at **2.4 USD**, selected and deterministically confirmed a **simulated** discovery winner, opened no hidden validation, ran no full replay, and completed cleanup without modifying source.
+
+Reviewed source commit: `adcda5f27ce31e1a545a2e7694cfa67bb0cf3f8c`
+
+Tracked source/tests/manifests changed: **none**
+
+Commit created: **none**
+
+Provider/network/Docker/hidden/full-replay activity: **none**
+
+## Scope and controls
+
+- Worktree: `C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-implementation`
+- Ignored harness: `.superpowers/sdd/2026-08-28-pit-optimizer-audit-only-usd/task-5-harness.py`
+- Successful proof: `.superpowers/sdd/2026-08-28-pit-optimizer-audit-only-usd/task-5-evidence/proof-g/task-5-proof.json`
+- The harness used active production orchestration, authorization, resource-ledger, audit, artifact-store, candidate validation/application, discovery selection, and cleanup code.
+- Only the external boundaries were fake: an in-memory OpenRouter client, a disposable no-process policy worker, and a deterministic discovery evaluator.
+- `OPENROUTER_API_KEY` and `OPENROUTER` were absent from the harness process. `urllib.request.urlopen` was blocked and observed zero attempts. The supplied OpenRouter client was entirely in memory.
+- Docker and full-replay subprocess signatures were blocked and observed zero attempts. The Docker path was a non-executed marker file.
+- Hidden folds were fail-closed in the fake evaluator. Any hidden candidate or baseline evaluation would have raised immediately and incremented a counter; both counters remained zero.
+- The harness required `gateway.max_attempts == 1`, an authorization requirement with `provider_retries=0`, exactly six transport invocations, and an exhausted six-response queue. Therefore provider retry/repair/healing calls were zero.
+
+## Commands and concise outputs
+
+### 1. Baseline identity and cleanliness
+
+```powershell
+git rev-parse HEAD
+git status --short
+git status --porcelain=v1 --untracked-files=all -- '.superpowers/sdd/2026-08-28-pit-optimizer-audit-only-usd'
+```
+
+Output:
+
+```text
+adcda5f27ce31e1a545a2e7694cfa67bb0cf3f8c
+```
+
+Both status commands emitted no entries.
+
+### 2. Required existing production-composition node
+
+```powershell
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py::test_dispatch_with_production_composition_completes_mocked_two_iteration_canary
+```
+
+Output summary:
+
+```text
+FAILED tests/test_pit_optimizer_loop.py::test_dispatch_with_production_composition_completes_mocked_two_iteration_canary
+TypeError: AuthorizationRequirement.__init__() got an unexpected keyword argument 'max_usd'
+1 failed, 2 warnings in 1.27s
+```
+
+The node failed before preparation or production composition. The immediate cause is the stale fixture constructing `AuthorizationRequirement(max_usd=...)`, while active schema v3 removed USD authorization ceilings. The aggregate fixture drift is:
+
+- `PitOptimizerRunManifest(schema_version=2)` while the active outer manifest requires schema 3;
+- removed `max_usd` arguments on `AuthorizationRequirement`, `PitOptimizerCallBudget`, and `PitOptimizerGateConfig`;
+- calls to removed `_dispatch_pit_optimizer_v2` and `_build_pit_optimizer_v2_live_run` rather than the active v3 entrypoints.
+
+The test was not edited.
+
+### 3. Ignored harness and successful production-composition run
+
+The harness and proof were first confirmed ignored by `.superpowers/sdd/.gitignore`.
+
+```powershell
+Remove-Item Env:OPENROUTER_API_KEY -ErrorAction SilentlyContinue
+Remove-Item Env:OPENROUTER -ErrorAction SilentlyContinue
+python -B '.superpowers/sdd/2026-08-28-pit-optimizer-audit-only-usd/task-5-harness.py' --output-root '.superpowers/sdd/2026-08-28-pit-optimizer-audit-only-usd/task-5-evidence/proof-g'
+```
+
+The successful run used filesystem-sandbox escalation only because production's Windows artifact store opens secure directory handles that a sandboxed Microsoft Store Python token could not reopen. The harness still blocked provider/network, Docker, and replay activity.
+
+Output:
+
+```text
+status=PASS
+available_pricing:   iterations=2, api_calls=6, authoritative_usd=2.4, cleanup_complete=true, hidden_calls=0
+unavailable_pricing: iterations=2, api_calls=6, authoritative_usd=2.4, cleanup_complete=true, hidden_calls=0
+```
+
+### 4. Independent retained-evidence verification
+
+A read-only PowerShell assertion block reopened `task-5-proof.json`, both `summary.json` and `accounting.json` files, both authorization ledgers, both audit chains, and every digest listed by each summary. It also checked for holdout/full-replay artifacts and exact `t5c-*`/`t5s-*` temp roots.
+
+Output:
+
+```text
+variant             pricing     iterations calls usd artifacts
+available_pricing   available            2     6 2.4        19
+unavailable_pricing unavailable          2     6 2.4        19
+
+independent_evidence_verification=PASS
+owned_temp_roots_remaining=0
+```
+
+### 5. Final tracked-source verification
+
+```powershell
+git rev-parse HEAD
+git diff --exit-code
+git diff --cached --exit-code
+git status --short --untracked-files=all
+git check-ignore -v \
+  '.superpowers/sdd/2026-08-28-pit-optimizer-audit-only-usd/task-5-harness.py' \
+  '.superpowers/sdd/2026-08-28-pit-optimizer-audit-only-usd/task-5-report.md' \
+  '.superpowers/sdd/2026-08-28-pit-optimizer-audit-only-usd/task-5-evidence/proof-g/task-5-proof.json'
+```
+
+Output: HEAD remained `adcda5f27ce31e1a545a2e7694cfa67bb0cf3f8c`; both diff commands exited 0; status emitted no entries; all three local Task 5 paths matched `.superpowers/sdd/.gitignore:1:*`.
+
+## Exact production entrypoints exercised
+
+Each pricing variant recorded this exact sequence once:
+
+1. `agent_loop._dispatch_pit_optimizer_v3`
+2. `agent_loop._build_pit_optimizer_v3_live_run`
+3. `core.pit_optimization.run_pit_optimizer_v3`
+
+The public `core.pit_optimization.run_pit_optimizer_v3` adapter was wrapped only to record entry and immediately invoked its original implementation. The live run was built by `_build_pit_optimizer_v3_live_run`; its returned production services were thinly traced and then called unchanged.
+
+Preparation used the active provider-free `core.pit_optimization.prepare_pit_optimizer_v3` adapter to create authenticated readiness.
+
+## Assertions proved
+
+### Calls, iterations, and ordering
+
+For each of the two independent pricing variants:
+
+- outer result and durable summary schema version: `3`;
+- iterations started: `2`;
+- iterations completed: `2`;
+- valid discovery evaluations: `2`;
+- accepted API calls: `6`;
+- exact order: `(1, investigator)`, `(1, author)`, `(1, critic)`, `(2, investigator)`, `(2, author)`, `(2, critic)`;
+- fake transport calls: `6`;
+- provider retries: `0`;
+- automatic repair/healing calls: `0`;
+- terminal code: `iteration_limit`;
+- status: `loop_verified_no_long_replay_candidate`;
+- exit code: `0`.
+
+### Authorization and resource reconciliation
+
+For each variant:
+
+- lease opens: `1`;
+- unique one-shot reservations: `6`;
+- reconciliations: `6`;
+- lease closes: `1`;
+- every reconciliation outcome: `accepted`;
+- every reconciliation accounting flag: complete;
+- reservation order exactly matched the sealed six-call plan;
+- audit events: `6 provider_call_reserved`, `6 provider_call_started`, and `6 provider_call_accepted`;
+- durable provider call artifacts: `6`;
+- durable provider budget-recovery artifacts: `6`.
+
+### Complete high-cost accounting
+
+Each variant reported:
+
+- prompt tokens: `600`;
+- completion tokens: `300`;
+- total tokens: `900`;
+- authoritative USD: canonical string `"2.4"`;
+- incomplete accounting calls: `0`;
+- retained reservation tokens: `0`;
+- accounting complete: `true`.
+
+The deliberately high valid total of 2.4 USD did not stop either run. The available-pricing variant retained a projected-plan advisory of `"2.56427"`; the unavailable-pricing variant retained `projected_plan_usd=null`. Both completed identically because USD is audit data, not a schema-v3 stop ceiling.
+
+### Feedback lineage
+
+The second investigator's actual production-rendered input contained exactly one prior-iteration aggregate. It included:
+
+```json
+{
+  "iteration": 1,
+  "hypothesis_id": "hypothesis_1",
+  "family": "entry",
+  "validation_code": "valid",
+  "discovery_score": {
+    "median_excess_return_pp": "1.00",
+    "worst_excess_return_pp": "1.00",
+    "max_drawdown_magnitude_pp": "2.00"
+  },
+  "critic_disposition": "refine",
+  "critic_next_direction": "Keep the stronger bounded simulated candidate.",
+  "incumbent_changed": true
+}
+```
+
+This proves the first iteration's controller-computed evaluator aggregate and accepted critic direction reached the second investigator input.
+
+### Simulated discovery selection
+
+This is explicitly **simulated selection-plumbing evidence, not real invested-return evidence**.
+
+- Baseline discovery totals were synthetic.
+- Candidate 1 deterministically added `1.0` percentage point on each discovery fold.
+- Candidate 2 deterministically added `0.5` percentage point on each discovery fold, so it did not replace candidate 1.
+- Incumbent updates: `1`.
+- A non-null discovery winner was returned in both variants.
+- Evaluator sequence in both variants:
+
+```text
+discovery_1 first
+discovery_2 first
+discovery_1 second
+discovery_2 second
+discovery_1 first   # deterministic confirmation of the selected winner
+```
+
+The repeated winner evidence matched, proving production confirmation plumbing.
+
+### Hidden validation and replay
+
+For each variant:
+
+- `hidden_validation_opened=false`;
+- validation reservation SHA-256: `null`;
+- `long_replay_eligible=null`;
+- hidden candidate-worker calls: `0`;
+- hidden baseline-evaluator calls: `0`;
+- hidden-validation ledger records: `0`;
+- `holdout.json`: absent;
+- full-replay artifact names: absent;
+- full-replay process attempts: `0`.
+
+### Durable artifacts and cleanup
+
+For each variant:
+
+- 19 controller-declared artifact paths were present and matched their recorded SHA-256 values;
+- root artifacts included `run.json`, `baseline.json`, `accounting.json`, `incumbent.diff`, and `summary.json`;
+- both iteration directories durably contained investigator, author, candidate diff, validation, discovery, critic, and decision artifacts;
+- audit-chain verification passed;
+- candidate quarantines remaining before parent cleanup: `0`;
+- production result `source_modified=false`;
+- production result `cleanup_complete=true`;
+- fake worker process launches: `0`;
+- fake worker active processes: `0`;
+- fake worker disposed: `true`;
+- exact ephemeral controller parent removed: `true`;
+- exact ephemeral synthetic source root removed: `true`;
+- final matching Task 5 OS-temp roots: `0`.
+
+## Concerns and blockers
+
+- **No production blocker remains for the provider-free proof.**
+- The tracked existing pytest node is stale and remains red for the schema-v2 fixture/API drift described above. It was intentionally not edited.
+- On this Windows host, the successful proof needed compact ignored evidence path names to stay below legacy path limits and needed execution outside the filesystem sandbox so production's secure Win32 directory handles could reopen mode-0700 audit directories. These are local harness-environment constraints, not provider or optimizer-loop failures.
+- Failed harness-only evidence is retained, ignored, and superseded by `proof-g`: `proof-20260829-b`, `proof-20260829-c`, `proof-20260829-d`, `proof-20260829-e`, and `proof-f`. The `proof-20260829-c`, `proof-20260829-d`, and `proof-20260829-e` roots contain production audit subdirectories whose secure ACLs deny ordinary sandbox traversal; `proof-g` deliberately retains the same protection on successful durable evidence. These evidence roots are not ephemeral controller/source roots or live processes.
+- There are no remaining `t5c-*`, `t5s-*`, or `task5-*` OS-temp targets. The one failed-run root previously created at `C:/Users/llong/AppData/Local/Temp/task5-available_pricing-controller-d3um9x13` was removed by exact literal path and independently verified absent.
+- No live provider or pricing service was contacted. No real performance, return, trading, or investability conclusion can be drawn from the simulated discovery winner.
+
+## Report path
+
+`C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-implementation/.superpowers/sdd/2026-08-28-pit-optimizer-audit-only-usd/task-5-report.md`

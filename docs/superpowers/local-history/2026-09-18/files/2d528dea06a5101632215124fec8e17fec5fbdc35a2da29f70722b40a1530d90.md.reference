@@ -1,0 +1,163 @@
+# Task 6 Fix Round 1 Re-review
+
+**Base:** `458ba55`  
+**Head:** `5cebaf9`  
+**Verdict:** **NEEDS FIXES — Critical 2, Important 1, Minor 2**
+
+## Scope and method
+
+This was a fresh read-only review of the full Fix Round 1 section of `task-6-report.md`, the full supplied `review-458ba55..5cebaf9.diff`, the Task 6 brief, the relevant approved-design sections, current code, and focused tests. No tracked file was edited. No provider, network, live-pricing, real-SDK, replay, Docker, background process, or permanent ledger was used. The only execution beyond read-only inspection was one pure in-process pricing reproducer.
+
+The ordinary-path fixes are substantial, but the two Critical boundaries are still live-object checks rather than checks over the exact bytes/rates later consumed. The all-exit fix also unlocks the authorization lease before terminal audit/closure is durable, so a crash or persistent audit failure can permit a later planned call after a terminal outcome.
+
+## Prior-finding adjudication
+
+| Prior finding | Verdict | Evidence |
+|---|---|---|
+| Critical 1 — manifest-to-wire authorization | **NOT ADDRESSED** | Reverse/forward source validation is sound, but it authenticates a live input at `agent_loop.py:3238-3246`, invokes the caller-supplied `monotonic` capability at line 3247, and only then serializes the transmitted bytes at line 3258. The callback can synchronously swap the frozen input's source bundle with `object.__setattr__`; the exact bytes sent were never authenticated. Non-source run provenance is also a caller-replaceable digest tag, not an authenticated origin. |
+| Critical 2 — exact frozen pricing and mandatory fresh gateway freeze | **NOT ADDRESSED** | Canonical Decimal construction and fresh per-ledger cache binding are fixed, but the paid boundary validates only cached object identity/digest fields at `agent_loop.py:3217-3225`. A cached frozen object can be mutated in place after construction while retaining its digest; preflight then prices the mutated rates at `agent_loop.py:3259-3265`. A pure reproducer confirmed a retained digest with zero computed cost. |
+| Important 1 — all-`BaseException` reconciliation/finalization | **PARTIALLY ADDRESSED; OPEN** | Phase tracking, active-reservation recovery, and one-shot interruption retries are useful. However authorization reconciliation occurs before terminal audit/lease close (`agent_loop.py:3112-3147`), and `reserve_call` treats a reconciled nonaccepted call as unlocked (`core/pit_optimizer_authorization.py:1326-1344`). Crash/audit failure in that window permits the next plan. The cleanup loop also silently abandons finalization after exactly two caught `BaseException`s (`agent_loop.py:3651-3661`). |
+| Important 2 — immediate deadline check | **ADDRESSED** | Remaining time is resampled after the durable start event and again immediately before `.create` at `agent_loop.py:3383-3408`; the SDK uses that fresh value at lines 3411-3419. The focused fake-clock test is at `tests/test_pit_optimizer_v2.py:4588`. |
+| Important 3 — closed accepted facts/records and completed history | **ADDRESSED** | Accepted facts close response/model/finish/schema/accounting at `core/pit_optimizer_authorization.py:378-386`; accepted audit records close the same state at `agent_loop.py:1492-1506`. `completed` requires the exact full accepted plan and `early_stop` only a nonempty accepted proper prefix at `core/pit_optimizer_authorization.py:1576-1636`. This matches the prior RED, which explicitly allowed a partial accepted prefix; it does not require `early_stop` itself to be a full iteration. |
+| Important 4 — atomic grant plus window | **ADDRESSED** | The exclusive lock/hash-chain checks remain; `_append_records` now writes and fsyncs a same-directory complete image, verifies it, atomically replaces, verifies publication, and fsyncs the directory where supported (`core/pit_optimizer_authorization.py:764-805`). `record_grant_and_window` publishes both records in that one replacement at lines 1031-1105 and supports an exact idempotent retry. Focused short-write, partial-tail, and concurrent tests are at `tests/test_pit_optimizer_v2.py:2191-2335`. |
+| Minor 1 — parser callable checked too late | **ADDRESSED** | `request_pit_optimizer_once` rejects a non-callable parser before serialization/effects at `agent_loop.py:3190-3206`; the fake/temp proof is at `tests/test_pit_optimizer_v2.py:4246`. |
+| Minor 2 — evidence corrections | **ORIGINAL ITEMS ADDRESSED; NEW OVERCLAIMS OPEN** | The integrated one-cent test, exact-six completion, partial `early_stop`, negative accepted constructors, and short-write injection now exist. The Fix Round report nevertheless overclaims both Critical closures and all-exit closure (`task-6-report.md:114-125`), and labels the old `822241a..458ba55` pair as the Fix Round review base/head at line 113 instead of `458ba55..5cebaf9`. |
+
+## Required findings
+
+### Critical 1 — authentication is not over the exact transmitted role bytes
+
+`authenticate_policy_source_bundle` is materially sound for a stable object: it reverses the cumulative diff, authenticates reconstructed initial hashes, then reapplies the bounded diff and requires the supplied current texts (`core/pit_optimization_contract.py:1661-1736`). Equal-shaped static scope-B input is therefore rejected.
+
+The paid boundary does not keep that stable-object assumption:
+
+- Frozen dataclasses and the module-private construction token are construction checks, not live immutability or exact-object authentication (`core/pit_optimization_contract.py:1418-1443`). Python's `object.__setattr__` can mutate these instances after construction.
+- The gateway authenticates `dynamic_input.source_bundle` at `agent_loop.py:3238-3246`.
+- It then calls the injected `monotonic` callable at line 3247.
+- It serializes `dynamic_input` only at line 3258 and sends those captured bytes at lines 3399-3420.
+
+A synchronous callback can therefore replace source bundle A with equal-sized foreign bundle B after A was authenticated but before B is serialized. No concurrency or background process is needed.
+
+The claimed non-source provenance is also self-asserted. `_validate_role_common` checks only that `run_manifest_sha256` is a well-formed digest (`core/pit_optimization_contract.py:2954-2965`), and the gateway checks only equality to the current manifest (`agent_loop.py:3211-3215`). A foreign `CriticInput` or summary package can be relabeled with `dataclasses.replace(..., run_manifest_sha256=current_manifest.sha256)`. The test at `tests/test_pit_optimizer_v2.py:3897-3968` supplies an obviously mismatched digest; it does not copy a foreign package and relabel it with the accepted digest.
+
+**Impact:** Task 6 can still transmit source bytes that differ from those authenticated at its paid boundary, and it cannot prove that non-source summaries originated in the leased run. This is the same manifest-to-wire authorization failure, not Task 7 sequencing debt.
+
+**Required fix:** Capture one immutable canonical role-byte snapshot first, authenticate the source bundle and run provenance reconstructed from that snapshot, size that same snapshot, and send exactly that snapshot. Do not invoke any caller capability between authentication and capture. For non-source provenance, consume a controller-authenticated live object/capability or verify controller-derived content identities; a freely replaceable digest field is not provenance.
+
+**Exact fake/temp RED:** Build manifest/scope A, valid investigator input A, and equal-sized foreign bundle B. Freeze normally with a fake loader. Pass a synchronous `monotonic` whose first request-time call executes `object.__setattr__(investigator_input, "source_bundle", B)` and returns an in-budget time. Use the fake client/temp ledgers. Require pre-effect `AuthorizationError`, zero fake calls, zero BudgetLedger calls, no authorization reservation, and no audit event. Current code serializes and transmits B. Add a second case that constructs a critic package for run B, replaces only its digest tag with A's digest, and requires rejection before effects.
+
+**Why Task 6:** `request_pit_optimizer_once` is the final local gate and owns both the callback and the serialization/send ordering. Task 7 cannot authenticate bytes that Task 6 checks before a re-entrant capability and serializes afterward.
+
+### Critical 2 — object identity does not authenticate the live pricing rates used by preflight
+
+`FrozenModelPricing.__post_init__` now correctly recomputes the canonical model/rate digest (`core/pit_optimizer_authorization.py:193-230`), and the built-in loader preserves exact Decimal values (`agent_loop.py:2423-2465`). Cache invalidation on authorization-ledger identity change is also present (`agent_loop.py:2988-3029`).
+
+The paid boundary does not revalidate the live cached fields. It requires that the supplied object be the cached object and that stored digests match (`agent_loop.py:3217-3225`), then computes conservative cost from that same mutable-at-runtime object's rates (`agent_loop.py:1602-1605`, `3259-3265`). Construction-time `frozen=True` does not stop `object.__setattr__`.
+
+The focused pure reproducer produced:
+
+```text
+{'same_digest': True, 'mutated_cost': '0'}
+```
+
+It froze prompt/completion rates of `999`, retained the original digest, set both live fields to Decimal zero with `object.__setattr__`, and obtained zero conservative cost. The caller-supplied `monotonic` gap described above also permits mutation after the gateway identity check and before preflight.
+
+The existing tests cover constructor-time `replace` rejection (`tests/test_pit_optimizer_v2.py:4029-4060`), a separately constructed equal record (`tests/test_pit_optimizer_v2.py:4099-4168`), and cross-ledger cache reuse. They do not mutate the actual cached object consumed by preflight.
+
+**Impact:** A high-rate lease digest can authorize a call priced with zero or lower live rates, reopening the exact conservative-cost bypass.
+
+**Required fix:** At consumption, recompute the canonical digest from an exact rate snapshot and compare it to both the gateway's frozen commitment and the lease. Use only that validated snapshot for all preflight/reservation calculations. Capture/revalidate after any caller callback that can mutate the live object, or ensure all later calculations use bytes/Decimals copied before such callbacks.
+
+**Exact fake/temp RED:** Freeze high Decimal rates through the gateway and open a matching temp lease. Mutate the cached object's two rate slots to zero with `object.__setattr__` while leaving its digest unchanged. Invoke the wrapper with a call whose true high-rate cost exceeds the cap. Require a pre-effect `AuthorizationError` (or true-rate `BudgetExceededError`), zero fake SDK calls, no ledger reservation, and no audit event. Add the request-time mutating-clock variant. Current code accepts zero-rate preflight.
+
+**Why Task 6:** Task 6 defines the pricing commitment, cache, lease comparison, conservative calculation, and paid wrapper. Task 7 cannot repair a commitment that Task 6 does not reauthenticate at the point it consumes the rates.
+
+### Important 1 — reconciliation unlocks the next call before terminal audit and lease closure are durable
+
+The new phase-aware outer handler improves normal exceptions, but finalization order is:
+
+1. BudgetLedger reconciliation;
+2. AuthorizationLedger reconciliation;
+3. terminal provider audit;
+4. lease close for terminal outcomes (`agent_loop.py:3095-3147`).
+
+Authorization replay removes a reservation from `active_reservations` as soon as its reconciliation record is read (`core/pit_optimizer_authorization.py:651-718`). `reserve_call` checks only closed status, absence of an active reservation, plan offset, and ceilings (`core/pit_optimizer_authorization.py:1326-1355`); it never fences a prior nonaccepted reconciliation or a reconciliation awaiting terminal audit.
+
+Consequences:
+
+- An accepted call can have its next call reserved concurrently before its required terminal provider record/audit is durable.
+- A `schema_invalid`, `provider_failed`, `failed_before_send`, `budget_exceeded`, or `uncertain_accounting` reconciliation followed by process death or persistent audit failure leaves an apparently reusable open lease. Reopening the temp ledger permits the next planned call, disguising a terminal failure as continued execution.
+- The outer handler retries finalization only twice and silently swallows both cleanup failures (`agent_loop.py:3651-3661`). It has no durable pending-finalization state or restart completion path.
+
+The new interruption test injects exactly one exception *before* each operation, then lets the second attempt succeed (`tests/test_pit_optimizer_v2.py:4496-4555`). It does not cover a post-publication exception, repeated cancellation, persistent audit failure, crash/reopen, or a re-entrant next reservation in the reconciliation-to-audit window.
+
+**Required fix:** Keep a durable authorization-side pending-finalization fence after reservation/reconciliation. No later plan may reserve until the exact terminal audit is committed; a nonaccepted reconciliation must permanently fence/close the lease even if the process dies before the explicit close call. One viable sequence is BudgetLedger reconcile, immutable terminal audit, then an authorization transaction that reconciles and either unlocks an accepted call or atomically reconciles plus closes a terminal call. A restart must be able to verify the immutable audit and complete the pending transition. Cleanup failures must not be discarded after an arbitrary fixed attempt count.
+
+**Exact fake/temp REDs:** 
+
+1. Open a temp lease, reserve plan 1, and reconcile authoritative `schema_invalid` facts without writing `lease_close` (simulated crash). Reopen `AuthorizationLedger` and call `reserve_call(lease, plan_2)`. Require `AuthorizationError`; current code appends plan 2.
+2. During `audit.write_provider_call`, synchronously attempt `authorization.reserve_call(lease, plan_2)` after plan 1 reconciliation. Require rejection until audit completion; current code permits it.
+3. Wrap a finalizer operation so it performs the real mutation and then raises on every invocation. Require verified idempotent postcondition, both ledgers closed consistently, one terminal audit, a terminal lease, and propagation of the original exception. Current code stops before later phases and gives up after two attempts.
+
+**Why Task 6:** Only Task 6 owns reservation state, reconciliation facts, terminal audit ordering, and lease transitions. Task 7 cannot make two Task 6 filesystems crash-atomic or stop another caller from using an authorization lease that Task 6 has already marked inactive.
+
+## New breakage
+
+### Minor 1 — the advertised `Pricing` input is now impossible
+
+The Task 6 interface and gateway loader type still advertise `Mapping[str, Any] | Pricing` (`task-6-brief.md:159-162`, `agent_loop.py:2734`). `freeze_pricing_record` accepts a `Pricing` instance syntactically, extracts its necessarily-float fields, and then rejects every float as inexact (`agent_loop.py:1541-1558`). Thus every valid legacy `Pricing` object fails the advertised Task 6 API.
+
+**RED:** `freeze_pricing_record(R1, Pricing(1.0, 2.0))` should either follow a documented exact conversion or the public type must no longer claim `Pricing`. Keep the legacy general gateway path unchanged.
+
+### Minor 2 — Fix Round evidence metadata and claims are not exact
+
+`task-6-report.md:113` records `822241a..458ba55` as the Fix Round review pair even though this round is `458ba55..5cebaf9`. Lines 118-120 claim exact manifest-to-wire, live pricing, and all-exit closure that the REDs above disprove. The original evidence corrections at line 125 are otherwise materially improved.
+
+No unrelated new Critical/Important regression was found outside the live-consumption/finalization roots above.
+
+## Requirement coverage
+
+| Requirement | Status | Review result |
+|---|---|---|
+| Hash chain, exclusive lock, canonical replay, grant/window crash atomicity | **Meets** | Full-image same-directory replacement prevents a visible grant-only prefix; lock/hash checks and exact retry are present. Windows cannot directory-fsync through this implementation, but loss of a rename is fail-closed rather than half-authority. |
+| Old 20/19 isolation; explicit named grants; most-restrictive ceilings | **Meets** | `_remaining_grant_capacity` charges only windows intersecting explicitly selected grant IDs and conservatively applies grant/window/requirement/lease minima (`core/pit_optimizer_authorization.py:899-986`, `1191-1223`). The record-grant CLI creates a window from only the newly supplied grant. |
+| Authenticated manifest/requirement/source scope and non-secret approval | **Partial / blocked** | Manifest/requirement/window and approval-hash handling meet at grant time. Actual stable source descendants authenticate, but exact transmitted bytes and non-source run provenance remain blocked by Critical 1. |
+| One-shot run key, exclusive reopen rules, no-spend lease open | **Meets for open; terminal fence blocked** | The one-shot key and active-grant exclusion are durable and lease open debits nothing. Post-reconciliation terminal fencing is incomplete (Important 1). |
+| Frozen exact Decimal R1 pricing, fresh per run, no drift | **Blocked** | Exact construction and cache lifecycle meet; live cached rates are not reauthenticated at consumption (Critical 2). |
+| Next-call-only reservation; exact indexes/iterations/roles; most conservative reconciliation | **Meets ordinarily; crash-finalization partial** | Sequential plan and exact reservations are enforced. Authoritative overage commits and uncertainty retains full maxima. Reconciliation prematurely unlocks the next call before audit/terminal close. |
+| Complete pre-send bytes/tokens/USD before SDK/ledger/start effect | **Blocked by live snapshot defects** | Calculations precede effects and the one-cent integrated proof is good, but they use role/pricing values that can differ from those authenticated. |
+| BudgetLedger/AuthorizationLedger consistency for every exception/cancellation | **Blocked** | Normal phase cases and one interruption per finalizer step work; repeated/post-publication failures and crash/reopen do not have a durable completion fence. |
+| All-R1 roles; exactly one SDK request; `max_retries=0`; no healing/recovery | **Meets in reviewed path** | The wrapper directly makes one `.create`, all roles use R1, lazy SDK construction sets `max_retries=0`, and no generation recovery/healing path is called. |
+| Iteration-aware closed ProviderCallRecord/audit with legacy readability | **Meets for accepted closure; ordering partial** | Accepted state and schema-v1 compatibility are preserved. Terminal audit remains outside the authorization unlock transaction. |
+| Terminal lease close / no disguised retry | **Blocked** | A terminal reconciliation alone does not fence the lease; crash or audit failure can permit the next planned call. |
+| Content, credential, source, provider-response secrecy | **Meets in reviewed persistence paths** | Ledgers/audits store content-free facts/digests; approval text is hashed; provider prompts/source/raw responses/headers/credentials are absent from accounting artifacts. |
+| Record-grant CLI cannot infer authority, combine stale capacity, or read provider credentials | **Meets** | All grant ceilings/scope/ID/reference are explicit, the manifest is digest-authenticated, the created window names only that grant, and the module does not load provider credentials. |
+
+## Test and report audit
+
+- The new tests are fake/temp-only. The SDK test replaces the module with a fake, the pricing HTTP test monkeypatches `urlopen`, and authorization/audit paths use pytest temporary roots. The foreground thread-pool test joins both workers and touches only a temp ledger.
+- No broad suite was rerun during this re-review. The reported focused results were inspected but not independently reproduced. One pure pricing reproducer confirmed the live-rate gap.
+- The reverse/forward descendant test and static foreign-source tests are useful, but they do not authenticate the exact byte snapshot across a re-entrant callback.
+- The critic cross-run test proves rejection of a mismatched tag, not provenance of a correctly relabeled foreign package.
+- The pricing tests prove constructor digest closure and gateway object identity, not live cached-field integrity.
+- The finalizer tests prove recovery from one pre-operation interruption, not post-publication failure, persistent cancellation, crash/reopen, or audit-before-next-call ordering.
+- Atomic grant/window, exact-cent preflight, accepted-state, completed/early-stop, deadline, and parser tests match their current assertions and are honest.
+
+## Resource and secrecy audit
+
+- Review execution used no provider/network/live pricing/SDK/replay/container/background/permanent ledger and did not mutate tracked files.
+- Provider source and response bodies are not copied into `ProviderCallRecord`, authorization reconciliation, or terminal audit details. Only closed lifecycle/accounting values and payload/artifact digests persist.
+- The approval reference is validated as short canonical non-secret text and only its SHA-256 is stored (`core/pit_optimizer_authorization.py:127-137`).
+- SDK failures are wrapped with generic messages; raw provider exception values are not written to the reviewed accounting paths.
+- The full-image authorization append uses bounded in-memory ledger bytes already subject to canonical record validation. Crash-left `.auth-*.tmp` files are ignored authority, though startup cleanup is not implemented.
+
+## Out-of-scope observations
+
+- Live OpenRouter/SDK compatibility remains intentionally untested.
+- `_load_current_pricing` still uses an unbounded `response.read()` at `agent_loop.py:2437-2441`; this predates the fix's Decimal change but should receive a response-byte cap before a hostile live endpoint is considered resource-bounded.
+- Windows has no directory-fsync branch after `os.replace`. The reviewed scheme still prevents publication of a grant-only prefix and fails closed if rename metadata is lost; stronger power-loss durability would need a platform-specific primitive and recovery test.
+- Full Task 7 controller sequencing and the mocked two-iteration flow remain deferred. They do not resolve the Task 6 paid-boundary snapshot or durable authorization-fence defects.
+
+## Final disposition
+
+**NEEDS FIXES.** Fix Round 1 correctly closes the ordinary reverse-diff, exact-construction, deadline, accepted-state, completion, parser, and grant/window-atomicity cases. It is not ready while the exact source bytes and exact pricing rates can change after authentication, and while a reconciled terminal call can unlock the next planned call before terminal audit/lease closure is durable.

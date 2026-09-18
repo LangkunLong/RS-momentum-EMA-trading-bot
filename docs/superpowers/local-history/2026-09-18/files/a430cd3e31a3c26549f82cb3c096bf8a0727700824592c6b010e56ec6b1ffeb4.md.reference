@@ -1,0 +1,30 @@
+## Spec Compliance
+
+Compliant. `core/backtest_fills.py` implements standalone frozen/slotted primitives, leaving legacy engine paths untouched. It follows the required causal long-stop order: `open <= stop` yields a gap fill at open; otherwise `low <= stop` fills at stop ([core/backtest_fills.py](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-v5-architecture/core/backtest_fills.py:108)).
+
+Friction is adverse by side, commission affects cash, execution prices are not cent-rounded, and final accounting fields are rounded ([core/backtest_fills.py](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-v5-architecture/core/backtest_fills.py:125)). Required invalid inputs are rejected through the validation helpers and dataclass hooks ([core/backtest_fills.py](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-v5-architecture/core/backtest_fills.py:14)).
+
+## Strengths
+
+- Immutable, typed public records with validated friction scenarios.
+- Correct BUY/SELL execution direction and cash signs.
+- Handles invalid/overflowed calculated execution prices before constructing a fill.
+- Reported smoke, invalid-input, Ruff, `py_compile`, and whitespace-diff checks are appropriate evidence. Test absence is not a finding under the explicit waiver.
+
+## Issues
+
+### Critical
+
+None.
+
+### Important
+
+None.
+
+### Minor
+
+None.
+
+## Assessment
+
+Approve. The Task 1 implementation meets the bounded V5 evaluator-truth specification and quality bar. Per the parent instruction not to mutate files, I did not write `task-1-review.md`; this response is the requested review content.

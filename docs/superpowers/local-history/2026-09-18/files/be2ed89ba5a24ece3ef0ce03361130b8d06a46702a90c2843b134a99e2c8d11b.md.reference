@@ -1,0 +1,97 @@
+# SDD ledger — plan: .superpowers/sdd/2026-08-25-price-loop-diagnosis/plan.md
+
+## Setup and preflight
+
+- Existing branch is `codex/pit-canslim-strategy-diagnosis` at `33a5fde`.
+- The working tree was clean before this plan.
+- The existing PIT bundle and compact fundamentals are the only inputs in scope.
+- No tests, downloads, optimizer calls, or shared-branch writes are permitted.
+
+### Task/interface scan
+
+| Task | Interface | Finding / ruling |
+|---|---|---|
+| 1 -> 2 | bounded diagnostics -> engine change | The audit must prove a timing/coverage defect before implementation; thresholds remain unchanged. |
+| 2 -> 3 | engine change -> replay output | The replay must report signal, execution, rejection, and cash counters from the same result object. |
+| 1 -> 3 | data coverage -> selected universe | The verification universe must be explicit and bounded; do not infer full S&P coverage from 12 tickers. |
+
+### Ruling
+
+- Ruling: treat same-day volume and evaluation cadence as separate hypotheses — collapsing them would hide whether misses come from confirmation semantics or from sampling every fifth session; cost if wrong is one additional bounded diagnostic run.
+
+Task 2: implementer completed in the working tree (base `33a5fde`); report
+counts immutable entry-attempt outcomes without changing engine behavior.
+Task 2: task review dispatched for the additive report diff; commit remains
+pending because the sandbox denied `.git/index.lock` creation.
+Task 2: complete (commit `734647a`, review PASS/APPROVED; no findings).
+
+Task 1: bounded read-only audits completed. The bundle has 866,025 price rows
+for 607 symbols, 99.971% active-member/session coverage, and complete history
+for the selected 12 leaders. Five-day sampling produced 40 signals; daily
+sampling produced 103 signals and 81 executions, with zero cash/capacity/risk
+rejections. This supports cadence as the first-order opportunity issue, not a
+price-coverage or SEC-data issue. Exact daily artifacts/output capture remains
+the verification step.
+
+Task 3: bounded daily replay completed by the price-loop runner at
+`equity_curve_20260825_172557.csv`: 103 signals, 81 executions, 22
+next-open buy-zone rejections, and zero cash/capacity/risk rejections. A
+post-commit one-symbol daily replay verified the new report section and showed
+`entries_executed: 3` plus `entry_rejected_next_open_buy_zone: 1`.
+
+Ruling: keep the 1.30x same-day volume confirmation unchanged for CANSLIM
+fidelity; make daily evaluation the diagnostic default for PIT callers rather
+than weakening the volume rule. Cost if wrong: a later strategy diagnosis may
+need to revisit volume semantics, but changing it now would conflate timing
+with fidelity.
+
+Task 3: complete (bounded replay and report verification complete; no further
+engine change required in this pass).
+
+Leader-recall follow-up: the existing corrected full PIT replay reports
+50/100 raw five-year leaders signaled and 47/100 executed (42/72 and 40/72
+for members present at the start), with a 65.06% mechanical leader basket
+versus -9.99% CANSLIM and 84.79% SPY. The bounded 14-name daily technical
+cohort on bundle `8d5bdca9...` produced 165 signals and 138 executions, with
+78.2% average cash and no cash/capacity/risk blocks. This cohort result is
+diagnostic only because it is selected from ex-post leaders.
+
+Leader-recall artifact: `.artifacts/backtests/technical_only_non_pit_exposure_aware_leader_recall.csv` and `.json`; explicitly labeled non-PIT-exposure-aware.
+
+Task 4: coverage audit and documented C/A fallback repair are in progress. The
+bounded artifact audit identified existing PIT rows where a preferred EPS row
+is present but has no latest as-of comparison while Net Income is available;
+the implementation is limited to selecting the documented fallback row and
+does not relax any CANSLIM threshold or add data.
+
+Task 4: implementation complete (`2578552..2164b61`). The task reviewer
+returned Spec PASS and Task quality APPROVED after the report was amended with
+baseline-versus-current probe evidence; scoped re-review returned ADDRESSED
+with no new breakage.
+
+Ruling: use the existing normalized Net Income fallback when the preferred EPS
+row lacks a latest as-of comparison, while preserving invalid-growth fail-closed
+semantics — this repairs a documented evaluator contract without importing
+external data; cost if wrong is a bounded change in C/A availability that must
+be rechecked against the next replay.
+
+Ruling: replace the rolling-high pivot only in strict, validated PIT
+fundamental runs; retain the two-argument/technical-only compatibility path —
+this enforces the hard CANSLIM proper-base requirement without changing legacy
+diagnostic behavior; cost if wrong is reduced strict-PIT recall until the
+pattern policy is refined, which is measurable in the next bounded replay.
+
+Task 5: implementation complete in commit `ab068de`; task review is pending.
+The requested six-symbol replay was stopped after ten minutes with no output
+and no artifacts; the implementer used a one-symbol 2024 strict-PIT replay
+instead (24 signal rows, zero attempts/executions/rejections).
+
+Task 5: complete (`ab068de..a1449a0`, review clean). The scoped re-review
+returned ADDRESSED, Spec PASS, and Task quality APPROVED after the report
+recorded the one-symbol 2023–2025 strict-PIT replay (666 evaluated rows, 3
+signals/attempts, 2 executions, 1 next-open buy-zone rejection, no crash).
+
+Final review: the broad whole-branch reviewer was interrupted after two
+bounded waits without returning a verdict. Direct `git diff --check` was clean,
+the focused Task 4 and Task 5 reviews were clean, and no additional source
+changes were made. This is a review-process limitation, not a code finding.

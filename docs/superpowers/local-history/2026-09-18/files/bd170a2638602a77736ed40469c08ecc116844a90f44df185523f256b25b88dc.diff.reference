@@ -1,0 +1,443 @@
+# Review package: c0719d5a62c223d0736ee9a611157f13a7c363a3..d474d92
+
+## Commits
+d474d92 Migrate PIT optimizer manifest to resource-only v3
+
+## Files changed
+ core/pit_optimization_contract.py | 109 ++++----------------------------------
+ core/pit_optimizer_evaluation.py  |   5 +-
+ 2 files changed, 11 insertions(+), 103 deletions(-)
+
+## Diff
+diff --git a/core/pit_optimization_contract.py b/core/pit_optimization_contract.py
+index 33d81c5..1ab8e34 100644
+--- a/core/pit_optimization_contract.py
++++ b/core/pit_optimization_contract.py
+@@ -460,45 +460,37 @@ def _validate_scoped_paths_symbols(
+ class PitOptimizerCallBudget(_V2Canonical):
+     call_index: int
+     iteration: int
+     role: str
+     model: str
+     max_static_input_bytes: int
+     max_dynamic_input_bytes: int
+     max_input_tokens: int
+     max_output_tokens: int
+     max_response_bytes: int
+-    max_usd: float
+ 
+     def __post_init__(self) -> None:
+         _require_positive_int(self.call_index, "optimizer call index")
+         _require_positive_int(self.iteration, "optimizer call iteration")
+         if self.role not in OPTIMIZER_V2_ROLES:
+             raise ValueError("optimizer call role is invalid")
+         _v2_text(self.model, "optimizer call model")
+         for name in (
+             "max_static_input_bytes",
+             "max_dynamic_input_bytes",
+             "max_input_tokens",
+             "max_output_tokens",
+             "max_response_bytes",
+         ):
+             _require_positive_int(getattr(self, name), f"optimizer call {name}")
+         if self.max_static_input_bytes + self.max_dynamic_input_bytes > self.max_input_tokens:
+             raise ValueError("optimizer call input sections exceed the input token cap")
+-        if (
+-            isinstance(self.max_usd, bool)
+-            or type(self.max_usd) not in {int, float}
+-            or not math.isfinite(float(self.max_usd))
+-            or float(self.max_usd) <= 0
+-        ):
+-            raise ValueError("optimizer call USD cap must be positive and finite")
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class PolicySourceScope(_V2Canonical):
+     schema_version: int
+     policy_interface_version: int
+     initial_policy_source_sha256s: tuple[tuple[str, str], ...]
+     editable_paths: tuple[str, ...]
+     max_policy_source_bundle_bytes: int
+     max_iteration_feedback_bytes: int
+@@ -551,36 +543,28 @@ class PolicySourceScope(_V2Canonical):
+     @property
+     def sha256(self) -> str:
+         return _v2_digest(self)
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class AuthorizationRequirement(_V2Canonical):
+     window_id: str
+     max_calls: int
+     max_tokens: int
+-    max_usd: float
+     policy_source_scope_sha256: str
+     provider_retries: int
+     apply: bool
+ 
+     def __post_init__(self) -> None:
+         _v2_identifier(self.window_id, "authorization window ID")
+         _require_positive_int(self.max_calls, "authorization call cap")
+         _require_positive_int(self.max_tokens, "authorization token cap")
+-        if (
+-            isinstance(self.max_usd, bool)
+-            or type(self.max_usd) not in {int, float}
+-            or not math.isfinite(float(self.max_usd))
+-            or float(self.max_usd) <= 0
+-        ):
+-            raise ValueError("authorization USD cap must be positive and finite")
+         _require_digest(
+             self.policy_source_scope_sha256,
+             "authorization policy source scope SHA-256",
+         )
+         if self.provider_retries != 0:
+             raise ValueError("authorization provider retries must be zero")
+         if self.apply is not False:
+             raise ValueError("authorization apply must be false")
+ 
+     @property
+@@ -610,21 +594,21 @@ class PitOptimizerRunManifest(_V2Canonical):
+     sandbox_image: str
+     validation_ledger_name: str
+     immutable_constraint_ids: tuple[str, ...]
+     candidate_bounds: PatchBounds
+     call_budgets: tuple[PitOptimizerCallBudget, ...]
+     max_iterations: int
+     non_improving_limit: int
+     authorization_requirement: AuthorizationRequirement
+ 
+     def __post_init__(self) -> None:
+-        if self.schema_version != 2:
++        if self.schema_version != 3:
+             raise ValueError("optimizer run manifest schema is unsupported")
+         _v2_identifier(self.run_id, "optimizer run ID")
+         if self.run_kind != "subset_canary":
+             raise ValueError("optimizer run kind is invalid")
+         if self.model != PIT_OPTIMIZER_R1_MODEL:
+             raise ValueError("optimizer model is invalid")
+         if not isinstance(self.source_head, str) or re.fullmatch(
+             r"[0-9a-f]{40}", self.source_head
+         ) is None:
+             raise ValueError("optimizer source HEAD is invalid")
+@@ -720,41 +704,30 @@ class PitOptimizerRunManifest(_V2Canonical):
+         if total_tokens > self.authorization_requirement.max_tokens:
+             raise ValueError("optimizer tokens exceed authorization")
+         if (
+             total_tokens != 448_000
+             or self.authorization_requirement.max_tokens != 448_000
+         ):
+             if total_tokens == self.authorization_requirement.max_tokens:
+                 raise ValueError("first subset canary tokens must be exactly 448000")
+         if total_tokens != self.authorization_requirement.max_tokens:
+             raise ValueError("optimizer tokens must exactly consume authorization")
+-        if (
+-            sum(float(item.max_usd) for item in self.call_budgets)
+-            > float(self.authorization_requirement.max_usd) + 1e-12
+-        ):
+-            raise ValueError("optimizer USD exceeds authorization")
+         _require_first_call_plan(
+             self.call_budgets,
+             max_iterations=self.max_iterations,
+         )
+         if (
+             self.authorization_requirement.max_calls != 6
+             or self.authorization_requirement.max_tokens != 448_000
+-            or not math.isclose(
+-                float(self.authorization_requirement.max_usd),
+-                0.40,
+-                rel_tol=0.0,
+-                abs_tol=1e-12,
+-            )
+         ):
+             raise ValueError(
+-                "first subset canary authorization ceilings are invalid"
++                "first subset canary authorization limits are invalid"
+             )
+ 
+     @property
+     def sha256(self) -> str:
+         return _v2_digest(self)
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class PitOptimizerGateConfig:
+     phase: str
+@@ -765,21 +738,20 @@ class PitOptimizerGateConfig:
+     effective_policy_sha256: str
+     optimizer_manifest: Path
+     optimizer_manifest_sha256: str
+     verified_parity_artifact: Path
+     verified_parity_sha256: str
+     readiness_artifact: Path | None
+     readiness_sha256: str | None
+     authorization_window_id: str | None
+     authorization_requirement_sha256: str
+     source_transmission_authorized: bool
+-    max_usd: float
+     max_api_calls: int
+     max_tokens: int
+     max_iterations: int
+     apply: bool
+     source_root: Path | None = None
+     permanent_runtime_root: Path | None = None
+     controller_temp_parent: Path | None = None
+     artifact_root: Path | None = None
+     git_executable: Path | None = None
+     docker_executable: Path | None = None
+@@ -933,36 +905,23 @@ class PitOptimizerGateConfig:
+         if not isinstance(authorization, dict):
+             raise ValueError("optimizer manifest authorization requirement is absent")
+         authorization_sha256 = hashlib.sha256(
+             _v2_canonical_bytes(authorization) + b"\n"
+         ).hexdigest()
+         if authorization_sha256 != self.authorization_requirement_sha256:
+             raise ValueError("optimizer gate authorization requirement digest differs")
+         _require_positive_int(self.max_api_calls, "optimizer gate call cap")
+         _require_positive_int(self.max_tokens, "optimizer gate token cap")
+         _require_positive_int(self.max_iterations, "optimizer gate iteration cap")
+-        if (
+-            isinstance(self.max_usd, bool)
+-            or type(self.max_usd) not in {int, float}
+-            or not math.isfinite(float(self.max_usd))
+-            or float(self.max_usd) <= 0
+-        ):
+-            raise ValueError("optimizer gate USD cap is invalid")
+         if (
+             authorization.get("max_calls") != self.max_api_calls
+             or authorization.get("max_tokens") != self.max_tokens
+-            or not math.isclose(
+-                float(authorization.get("max_usd", -1)),
+-                float(self.max_usd),
+-                rel_tol=0.0,
+-                abs_tol=1e-12,
+-            )
+             or primitive.get("max_iterations") != self.max_iterations
+         ):
+             raise ValueError("optimizer gate ceilings differ from manifest")
+         if authorization.get("apply") is not self.apply:
+             raise ValueError("optimizer gate apply differs from authorization requirement")
+         if readiness_path is not None:
+             assert self.readiness_sha256 is not None
+             _require_digest(self.readiness_sha256, "optimizer gate readiness SHA-256")
+             raw_readiness = readiness_path.read_bytes()
+             if hashlib.sha256(raw_readiness).hexdigest() != self.readiness_sha256:
+@@ -1145,82 +1104,37 @@ def _source_bundle_envelope_bytes(
+     initial_bytes = sum(len(source_texts[path].encode("utf-8")) for path in _POLICY_EDITABLE_PATHS)
+     envelope_bytes = len(_v2_canonical_bytes(primitive)) - initial_bytes
+     return initial_bytes, envelope_bytes
+ 
+ 
+ def _require_first_call_plan(
+     call_budgets: tuple[PitOptimizerCallBudget, ...],
+     *,
+     max_iterations: int,
+ ) -> None:
+-    expected_profiles = (
+-        {
+-            "investigator": (8_000, 80_000, 88_000, 4_000, 8 * 1024, 0.05),
+-            "author": (12_000, 76_000, 88_000, 8_000, 16 * 1024, 0.10),
+-            "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024, 0.05),
+-        },
+-        {
+-            # The current R1 price schedule makes the original investigator
+-            # slice too small for its sealed prompt/output maximum.  This
+-            # alternate profile still totals exactly USD 0.40 across two
+-            # iterations while preserving the complete 448,000-token
+-            # envelope and zero-retry call order.
+-            "investigator": (8_000, 80_000, 88_000, 4_000, 8 * 1024, 0.08),
+-            "author": (12_000, 76_000, 88_000, 8_000, 16 * 1024, 0.09),
+-            "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024, 0.03),
+-        },
+-        {
+-            # DeepSeek R1 may account a small reasoning suffix beyond the
+-            # request's nominal output cap.  Give the investigator enough
+-            # sealed headroom while moving the same output allowance from
+-            # the author, keeping the aggregate 448,000-token ceiling intact.
+-            "investigator": (8_000, 80_000, 88_000, 8_000, 8 * 1024, 0.08),
+-            "author": (12_000, 76_000, 88_000, 4_000, 16 * 1024, 0.09),
+-            "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024, 0.03),
+-        },
+-        {
+-            # The observed R1 reasoning envelope can exceed 8k completion
+-            # tokens.  Tighten the conservative dynamic-input slices (still
+-            # above the sealed worst-case render) to fund a 16k investigator
+-            # output cap without changing the 448,000-token aggregate.
+-            "investigator": (8_000, 78_000, 86_000, 16_000, 8 * 1024, 0.08),
+-            "author": (12_000, 70_000, 82_000, 4_000, 16 * 1024, 0.09),
+-            "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024, 0.03),
+-        },
+-        {
+-            # The sealed investigator envelope costs just under ten cents at
+-            # the frozen R1 schedule.  Rebalance the same USD 0.20 per
+-            # iteration so that this complete plan passes its conservative
+-            # preflight without changing the token envelope or call order.
+-            # R1 author responses can include a larger reasoning envelope than
+-            # the requested output cap.  Keep a 14k completion envelope while
+-            # tightening the author input slice to the measured worst-case
+-            # render (48,289 bytes plus static context); the resulting
+-            # conservative cost stays within the $0.07 author cap.
+-            "investigator": (8_000, 78_000, 86_000, 16_000, 8 * 1024, 0.10),
+-            "author": (12_000, 48_500, 72_000, 14_000, 16 * 1024, 0.07),
+-            "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024, 0.03),
+-        },
+-    )
++    expected_profile = {
++        "investigator": (8_000, 78_000, 86_000, 16_000, 8 * 1024),
++        "author": (12_000, 48_500, 72_000, 14_000, 16 * 1024),
++        "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024),
++    }
+     if max_iterations != 2 or len(call_budgets) != 6:
+         raise ValueError("first subset canary requires two complete iterations")
+     for budget in call_budgets:
+         actual = (
+             budget.max_static_input_bytes,
+             budget.max_dynamic_input_bytes,
+             budget.max_input_tokens,
+             budget.max_output_tokens,
+             budget.max_response_bytes,
+-            float(budget.max_usd),
+         )
+-        if budget.model != PIT_OPTIMIZER_R1_MODEL or not any(
+-            actual == profile.get(budget.role) for profile in expected_profiles
++        if budget.model != PIT_OPTIMIZER_R1_MODEL or actual != expected_profile.get(
++            budget.role
+         ):
+             raise ValueError("first subset canary call caps are invalid")
+ 
+ 
+ def build_subset_manifest(
+     *,
+     legacy_readiness: Mapping[str, object],
+     legacy_readiness_path: Path,
+     parity_attestation: object,
+     verified_parity_path: Path,
+@@ -1398,27 +1312,26 @@ def build_subset_manifest(
+     render_worst_iteration_two_role_inputs(
+         scope=scope,
+         source_texts=source_texts,
+         immutable_constraint_ids=constraint_ids,
+         call_budgets=call_budgets,
+     )
+     authorization = AuthorizationRequirement(
+         window_id=f"window_{uuid.uuid4().hex}",
+         max_calls=6,
+         max_tokens=448_000,
+-        max_usd=0.40,
+         policy_source_scope_sha256=scope.sha256,
+         provider_retries=0,
+         apply=False,
+     )
+     return PitOptimizerRunManifest(
+-        schema_version=2,
++        schema_version=3,
+         run_id=f"run_{uuid.uuid4().hex}",
+         run_kind="subset_canary",
+         model=PIT_OPTIMIZER_R1_MODEL,
+         source_head=str(identities["source_head"]),
+         source_fingerprint_sha256=str(identities["source_fingerprint_sha256"]),
+         legacy_readiness_sha256=readiness_sha256,
+         pit_bundle_sha256=bundle_sha256,
+         baseline_manifest_sha256=baseline_sha256,
+         effective_policy_sha256=effective_policy_sha256,
+         policy_interface_version=parity.policy_interface_version,
+@@ -1545,22 +1458,20 @@ def build_prepare_command(
+         "--pit-bundle-sha256",
+         manifest.pit_bundle_sha256,
+         "--baseline-run",
+         str(baseline_run),
+         "--baseline-manifest-sha256",
+         manifest.baseline_manifest_sha256,
+         "--effective-policy-sha256",
+         manifest.effective_policy_sha256,
+         "--optimizer-authorization-requirement-sha256",
+         manifest.authorization_requirement.sha256,
+-        "--max-usd",
+-        "0.40",
+         "--max-api-calls",
+         "6",
+         "--max-tokens",
+         "448000",
+         "--max-iterations",
+         "2",
+     ]
+     return subprocess.list2cmdline(arguments)
+ 
+ 
+diff --git a/core/pit_optimizer_evaluation.py b/core/pit_optimizer_evaluation.py
+index f683888..56b511d 100644
+--- a/core/pit_optimizer_evaluation.py
++++ b/core/pit_optimizer_evaluation.py
+@@ -1247,21 +1247,20 @@ def _manifest_cli_parser() -> argparse.ArgumentParser:
+     build.add_argument("--iterations", type=int, required=True)
+     for role in ("investigator", "author", "critic"):
+         for suffix in (
+             "static-bytes",
+             "dynamic-bytes",
+             "input-tokens",
+             "output-tokens",
+             "response-bytes",
+         ):
+             build.add_argument(f"--{role}-{suffix}", type=int, required=True)
+-        build.add_argument(f"--{role}-max-usd", type=float, required=True)
+     build.add_argument("--max-files", type=int, required=True)
+     build.add_argument("--max-hunks", type=int, required=True)
+     build.add_argument("--max-changed-lines", type=int, required=True)
+     build.add_argument("--max-diff-bytes", type=int, required=True)
+     return parser
+ 
+ 
+ def _call_budgets_from_namespace(namespace: argparse.Namespace) -> tuple[object, ...]:
+     from core.pit_optimization_contract import (
+         OPTIMIZER_V2_ROLES,
+@@ -1292,28 +1291,27 @@ def _call_budgets_from_namespace(namespace: argparse.Namespace) -> tuple[object,
+                         f"{prefix}_input_tokens",
+                     ),
+                     max_output_tokens=getattr(
+                         namespace,
+                         f"{prefix}_output_tokens",
+                     ),
+                     max_response_bytes=getattr(
+                         namespace,
+                         f"{prefix}_response_bytes",
+                     ),
+-                    max_usd=getattr(namespace, f"{prefix}_max_usd"),
+                 )
+             )
+     return tuple(budgets)
+ 
+ 
+ def main(argv: Sequence[str] | None = None) -> int:
+-    """Build one provider-free schema-v2 subset manifest and prepare command."""
++    """Build one provider-free schema-v3 subset manifest and prepare command."""
+     namespace = _manifest_cli_parser().parse_args(
+         list(sys.argv[1:] if argv is None else argv)
+     )
+     if namespace.command != "build-subset-manifest":
+         raise ValueError("unknown PIT optimizer evaluation command")
+     from core.pit_optimization_contract import (
+         PatchBounds,
+         build_prepare_command,
+         build_subset_manifest,
+         write_optimizer_manifest,
+@@ -1383,21 +1381,20 @@ def main(argv: Sequence[str] | None = None) -> int:
+     print(
+         "PIT_OPTIMIZER_MANIFEST="
+         + json.dumps(
+             {
+                 "artifact": str(written),
+                 "sha256": digest,
+                 "manifest": manifest.to_primitive(),
+                 "authorization": {
+                     "max_calls": manifest.authorization_requirement.max_calls,
+                     "max_tokens": manifest.authorization_requirement.max_tokens,
+-                    "max_usd": manifest.authorization_requirement.max_usd,
+                 },
+             },
+             sort_keys=True,
+             separators=(",", ":"),
+             ensure_ascii=False,
+             allow_nan=False,
+         )
+     )
+     print("PIT_OPTIMIZER_PREPARE_COMMAND=" + command)
+     return 0

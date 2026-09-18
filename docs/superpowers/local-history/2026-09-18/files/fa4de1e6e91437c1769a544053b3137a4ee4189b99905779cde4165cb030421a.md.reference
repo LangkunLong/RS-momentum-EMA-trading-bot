@@ -1,0 +1,27 @@
+# H3a existing controller response authentication
+
+## Scope delivered
+
+Implemented H3a only in `core/pit_optimizer_v5/controller_roles.py` and `core/pit_optimizer_v5/development_preparation.py`. No summary path was activated.
+
+`_classify_controller_response_v5(*, persisted, reference, raw)` is now a module-level pure classifier. Its body is AST-identical to the former `_terminal` body after `_sealed`: it retains the 4 MiB bound, unique JSON keys, exact envelope/schema and call/request bindings, response parsing, schema versus evidence-binding classification, zero usage, artifact digest, attempt facts, terminal authority and returned package. `_terminal` still calls `_sealed` first and delegates the returned reference and bytes.
+
+`_authenticate_controller_request` now accepts keyword `repair: bool = True` and forwards it to both `campaign-launch` and `campaign-round-started` typed-state reads. Existing callers retain the operational default. `authenticate_existing_controller_packages_v5(repository, manifest, packages) -> None` requires provider-free development scope and controller terminal authority, derives the persisted request reference from the exact existing request bytes, authenticates with `repair=False`, loads the already sealed response exactly once, rejects absence, classifies those exact returned bytes and requires exact package equality. Empty collections still authenticate the manifest scope; H3c owns lifecycle eligibility.
+
+## Boundary and preservation evidence
+
+The complete static result is `h3a-static-verification.json`. It proves the only changed existing controller definition is `_terminal`; constructor, `_incoming_path`, `_sealed`, `invoke_once` and `reconcile_once` are byte-identical to the saved preimage. The operational `authenticate_controller_packages_v5` definition is byte-identical. The new callgraph contains no invoker construction, `Path`, incoming directory, `_sealed`, invoke/reconcile, append or other write call. Its only typed-state path is one literal `repair=False` call into `_authenticate_controller_request`, whose two reads both forward that value.
+
+Exact preimages are `pre-h3a-controller_roles.py` (7,672 bytes, SHA-256 `11f32aba5c0552ec6ad498bc579eefa7452e01a5289534e485e593953222b897`) and `pre-h3a-development_preparation.py` (36,576 bytes, `7e4ed9b069f42193c0c9c594fae55ea5e931ff40decc9378c202633fd4bb3205`). Final sources are respectively 7,725 bytes at `62f7414dd31a7970d08bcbf7fcc7faaeb19e5ee806cba5363311aef338b15b1f` and 37,867 bytes at `7e9427839eff441831dc83a9737f2a638efc0fa279a2e8e241f9dd3296ab29bd`. Original LF/CRLF styles are preserved. `h3a-source.diff` is the exact narrow preimage diff.
+
+The 56-file evaluator map is unchanged at digest `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4`. Scoped Ruff and Python 3.13 in-memory compilation passed; diff whitespace and final-newline checks passed.
+
+## Existing archive validation
+
+Using runtime04's original typed manifest, five packages were collected only from actual journal `RoleCompletionPayloadV5` entries and `repository.load_role_invocation`: round 1 investigator/author/critic and round 2 investigator/author. `authenticate_existing_controller_packages_v5` accepted all five from immutable sealed evidence. Package identities are recorded in `h3a-actual-auth-results.json`; no authority substitute was constructed.
+
+Full maps used asserted extended Windows roots before and after authentication. Runtime04 stayed 579 files / 69,994,319 bytes at tree digest `1988b37428bcbf647d468ec163b7ca235b99b26b2a7bcee80d7de733e19f8aa9`. Provider-runtime-06 (actual06 preservation control) stayed 83 files / 68,980,002 bytes at `2c411970b0a2d9cdfd2499afa01aed14fa723bb3ae5f4d44baee0d539b923f16`. No path changed.
+
+Evidence files are `h3a-source-hashes.json`, `h3a-evaluator-source-map.json`, `h3a-actual-auth-results.json`, `h3a-preservation-check.json`, the four complete archive maps, `h3a-ruff.txt`, `h3a-compile.txt` and `h3a-diff-check.txt`.
+
+No tests, synthetic records, negative or missing-state cases, mocks, providers, credentials, environment reads, external calls, campaigns, summaries, Git operations beyond read-only diff/status, installs or commits were used. Negative and missing-state behavior has static-only evidence. H3a is frozen for independent review.

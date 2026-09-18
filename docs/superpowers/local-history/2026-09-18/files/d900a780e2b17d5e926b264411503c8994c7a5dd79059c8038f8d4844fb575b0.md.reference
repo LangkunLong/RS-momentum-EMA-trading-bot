@@ -1,0 +1,113 @@
+# Task 5 Report: Corrected PIT Baseline Authority Verification
+
+## Delivered files
+
+- `core/pit_diagnosis/baseline.py`: offline immutable authority, streaming
+  manifest-artifact verification, ledger reconciliation, and compact fresh-run
+  reproduction comparison.
+- `tests/test_pit_diagnosis_baseline.py`: synthetic hash-bound authority,
+  tamper, non-finite, reconciliation, and reproduction regressions.
+
+## Authority and boundary evidence
+
+- Frozen bundle SHA-256:
+  `1af306ef1e46797473cd186fc48938ed6694ae25f5943c9f1905b528307cc2eb`.
+- Frozen baseline source commit: `eb93437c185152bb98974303a8c485d08b3ba779`.
+- Corrected replay recorded Git identity:
+  `d555f7f4c7727d9c6a440bba50cced0fbe9f3095`.
+- Corrected replay manifest SHA-256:
+  `efeb8c3e9b0189131f04361122395f8ea89adfd0f8bcbb781e333a9359d43bd3`.
+- The verifier stream-hashes every manifest-listed artifact before parsing.
+  It deliberately never deserializes `canslim_signals.csv` (343 MB) or
+  `portfolio_checkpoint.json` (710 MB); their exact artifact hashes remain the
+  authority. No provider, broker, scheduler, paper, live, or agent-controller
+  imports were added.
+- The verifier requires non-link regular files, fixed date/source/bundle
+  identities, finite JSON/CSV values, frozen summary facts, and reconciliation
+  of the daily funnel, entry outcomes, and buy transactions. The reproduction
+  result exposes only pass/fail, mismatch codes, and both manifest hashes.
+
+## TDD evidence
+
+Initial RED command:
+
+```powershell
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_baseline.py
+```
+
+Result: expected collection failure,
+`ModuleNotFoundError: No module named 'core.pit_diagnosis.baseline'`.
+
+## Final verification
+
+```powershell
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_baseline.py tests/test_task6_corrected_replay_audit.py
+python -m ruff check core/pit_diagnosis/baseline.py tests/test_pit_diagnosis_baseline.py
+git diff --check
+python -c "from pathlib import Path; from core.pit_diagnosis.baseline import canonical_authority, verify_baseline_run; value = verify_baseline_run(Path('.artifacts/task-6-corrected-replay-20260824T100045Z/run-20260824T100213Z-1af306ef1e46'), canonical_authority()); print(value.manifest_sha256)"
+```
+
+Results: pytest `20 passed` (only the pre-existing unknown `cache_dir` and
+third-party websocket deprecation warnings); Ruff `All checks passed!`; diff
+check exited zero; real corrected replay verification printed
+`efeb8c3e9b0189131f04361122395f8ea89adfd0f8bcbb781e333a9359d43bd3`.
+
+## Commit
+
+`b668112 feat: verify corrected PIT diagnosis authority`
+
+## Concerns
+
+- The corrected replay records runner commit `d555f7f...`, while the frozen
+  baseline source commit is `eb93437...`; they are preserved as separate,
+  exact authority facts. The verifier therefore binds the replay manifest to
+  its recorded runner identity and freezes the source commit in the authority,
+  rather than imposing a false Git-ancestry requirement.
+- The report is plan-scoped evidence and intentionally not included in the
+  requested two-file implementation commit.
+
+## Round 1 remediation (2026-08-24)
+
+- `BaselineSnapshot` now retains `replay_git_head`, and reproduction comparison
+  treats differing replay Git SHA or run-manifest SHA as an identity mismatch.
+  Both manifest hashes are still returned for audit correlation.
+- `BaselineAuthority` freezes normalized, order-sensitive hashes for the entry
+  outcome and transaction ledgers. The normalization uses the Task 6 number
+  representation (finite numbers formatted with `.17g`), and verification
+  rejects a row mutation even when its containing artifact and manifest digest
+  have been deliberately rehashed in the test fixture.
+- The daily funnel now requires every session's `qualified_count` to cover its
+  outcome-derived attempts, in addition to the existing exact daily
+  attempted/executed/rejected reconciliation and global authority totals.
+- The large signal ledger and checkpoint journal remain stream-hashed only;
+  Round 1 introduced no provider, broker, scheduler, paper/live, or agent
+  imports.
+
+Round-1 RED command:
+
+```powershell
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_baseline.py
+```
+
+Result before the remediation: `3 failed, 4 passed`. The failures were exactly
+the missing `replay_git_head` snapshot field, acceptance of a transaction row
+mutation after rehashing the artifact identity, and acceptance of a shifted
+per-session `qualified_count` with an unchanged global total. A second RED
+authority assertion rejected the placeholder entry-outcome row hash.
+
+Round-1 final verification:
+
+```powershell
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_baseline.py tests/test_task6_corrected_replay_audit.py
+python -m ruff check core/pit_diagnosis/baseline.py tests/test_pit_diagnosis_baseline.py
+git diff --check
+python -c "from pathlib import Path; from core.pit_diagnosis.baseline import canonical_authority, verify_baseline_run; result = verify_baseline_run(Path('.artifacts/task-6-corrected-replay-20260824T100045Z/run-20260824T100213Z-1af306ef1e46'), canonical_authority()); print(result.manifest_sha256, result.replay_git_head, result.entry_outcome_row_sha256, result.transaction_row_sha256)"
+```
+
+Result: `23 passed`; Ruff `All checks passed!`; diff check exited zero; the real
+replay printed manifest `efeb8c3e9b0189131f04361122395f8ea89adfd0f8bcbb781e333a9359d43bd3`,
+replay SHA `d555f7f4c7727d9c6a440bba50cced0fbe9f3095`, entry-outcome row hash
+`8b479ef13e693a2fc101dc3c8b1bdb0204e71122c6701fc5a7e23cd67cf3f3aa`, and
+transaction row hash `603ccc01141cf55447412d1caa40e9942c5f59745c73183644be8d9b65ab72c5`.
+
+Round-1 commit: `24a9519 fix: harden PIT baseline reproduction authority`.

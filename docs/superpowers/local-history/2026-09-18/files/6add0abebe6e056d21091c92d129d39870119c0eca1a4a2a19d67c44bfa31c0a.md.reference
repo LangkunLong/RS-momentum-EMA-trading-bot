@@ -1,0 +1,106 @@
+# Task 5 implementation report: raw and PIT-exposed leader recall
+
+## Commit and scope
+
+- Commit: `f7a7c103fc54e3e00bb5bd007f18b8a700fbc51c` (`feat: report raw and PIT leader recall`)
+- Branch/worktree: `codex/pit-fundamental-corrections` / `pit-fundamental-corrections`
+- Production files changed: `core/pit_baseline_report.py`, `pit_baseline.py`
+- No baseline replay, data regeneration, or artifact mutation was performed.
+
+## Implementation
+
+- Added `member_at_start` to the `leader_recall.csv` schema and every recall row.
+- Added deterministic five-year raw/all and `member_at_start=True` PIT-exposed populations.  Each exposes `denominator_count`, `signaled_count`, `executed_count`, `signal_recall_pct`, and `execution_recall_pct`; zero denominators return `0.0` percentages.
+- Added rolling raw/all and `member_at_evaluation=True` PIT-exposed signal populations.  Each exposes `denominator_count`, `signaled_count`, and `signal_recall_pct`.  No rolling execution attribution was added.
+- Retained the established caller-provided alias map, which groups only same-issuer continuity kinds; successor-reset identities remain distinct.
+- Corrected the legacy `signal_recall_pct` and `execution_recall_pct` values to genuine raw/all percentages.  Retained `top100_signaled` and `top100_executed` as explicitly documented deprecated raw-count aliases, and recorded compatibility mappings in `summary.json`.
+- Updated `summary.json` construction, `report.md` recall prose (with numerator/denominator rendering), and `run_manifest.json` consistently.  All new values are native finite ints/floats compatible with canonical `allow_nan=False` JSON publication.
+
+## Focused verification
+
+- Direct synthetic functional probe passed for a mixed three-label population: raw five-year recall `2/3` signaled and `1/3` executed, PIT-exposed five-year recall `1/1` and `1/1`, raw rolling signal recall `2/3`, and PIT-exposed rolling signal recall `1/1`.
+- The same probe verified a same-issuer alias signal is recalled while a deliberately separate successor-reset predecessor signal is not; it also verified zero-denominator output and JSON serialization with `allow_nan=False`.
+- `python -m ruff check core/pit_baseline_report.py pit_baseline.py` passed.
+- `python -m py_compile core/pit_baseline_report.py pit_baseline.py` passed.
+- `git diff --check 75ddddbb5d794f7c09b5644bb94c6e126e06f0e9..HEAD` passed.
+- Reviewed the full `75ddddbb5d794f7c09b5644bb94c6e126e06f0e9..f7a7c103fc54e3e00bb5bd007f18b8a700fbc51c` production diff; worktree is clean.
+
+## Compatibility and concerns
+
+- Existing raw top-100 count keys remain available and are documented by `deprecated_raw_count_aliases`; no raw count is named with a `_pct` suffix.
+- `rolling_label_recall_pct` remains as a deprecated raw/all percentage helper alias.
+- Unit tests and the broad suite were intentionally not run, per the operator sequencing instruction.  No implementation concerns identified.
+
+## Fix round 1/5 (independent-review findings)
+
+- Fix commit: `95e7616decc856cb6dd9375b1ee519a6c242d5ef` (`fix: preserve empty PIT leader recall`).
+- Covering files: `core/pit_baseline_report.py`, `pit_baseline.py`.
+- Restored empty-input behavior: `rolling_label_recall_summary((), pd.DataFrame())` now returns both shaped zero populations, and `rolling_label_recall_pct((), pd.DataFrame())` returns `0.0`.  An empty signal frame is zero signals; non-empty frames still require all three rolling fields.
+- Rebuilt the net Task 5 diff without unrelated formatter changes.  The final `75ddddbb5d794f7c09b5644bb94c6e126e06f0e9..HEAD` diff is 185 additions and 18 deletions, limited to the recall schema/helpers plus summary, report, and manifest paths.
+
+Reproducible focused probe command (run from `pit-fundamental-corrections`):
+
+```powershell
+@'
+from datetime import date
+import json, math
+import pandas as pd
+from core.leader_evaluation import FiveYearLeader, RollingLeaderObservation
+from core.pit_baseline_report import build_leader_recall_frame, five_year_leader_recall_summary, rolling_label_recall_pct, rolling_label_recall_summary
+
+start = date(2024, 1, 2)
+leaders = (
+    FiveYearLeader("RENAME", start, date(2024, 2, 1), 50.0, 1, True, start),
+    FiveYearLeader("LATE", start, date(2024, 2, 1), 40.0, 2, False, date(2024, 1, 10)),
+    FiveYearLeader("RESET", start, date(2024, 2, 1), 30.0, 3, False, None),
+)
+def signal(symbol):
+    return {"symbol": symbol, "signal_date": "2024-01-02", "buy_signal": True, "current_growth": 30, "annual_growth": 30, "rs_score": 90, "has_breakout": True, "has_volume_surge": True, "in_buy_zone": True, "entry_composite_score": 80}
+signals = pd.DataFrame([signal("OLD"), signal("LATE"), signal("PREDECESSOR")])
+aliases = {"RENAME": ("RENAME", "OLD"), "LATE": ("LATE",), "RESET": ("RESET",)}
+recall = build_leader_recall_frame(leaders, signals, pd.DataFrame([{"Ticker": "RENAME", "Date": "2024-01-03", "Action": "BUY"}]), start_date=start, min_c_a_growth=25.0, min_rs_score=80.0, min_canslim_score=75.0, leader_aliases=aliases)
+five = five_year_leader_recall_summary(recall)
+labels = (
+    RollingLeaderObservation(date(2024, 1, 10), date(2025, 1, 10), "RENAME", 20.0, 1, True, True),
+    RollingLeaderObservation(date(2024, 1, 10), date(2025, 1, 10), "LATE", 10.0, 2, False, True),
+    RollingLeaderObservation(date(2024, 1, 10), date(2025, 1, 10), "RESET", 5.0, 3, False, True),
+)
+rolling = rolling_label_recall_summary(labels, signals, label_aliases=aliases)
+empty = rolling_label_recall_summary((), pd.DataFrame())
+assert recall["member_at_start"].tolist() == [True, False, False]
+assert five["raw_all"]["denominator_count"] == 3 and five["raw_all"]["signaled_count"] == 2 and five["raw_all"]["executed_count"] == 1
+assert math.isclose(five["raw_all"]["signal_recall_pct"], 66.66666666666667)
+assert five["pit_exposed_member_at_start"]["denominator_count"] == 1 and five["pit_exposed_member_at_start"]["signal_recall_pct"] == 100.0
+assert rolling["raw_all"]["denominator_count"] == 3 and rolling["raw_all"]["signaled_count"] == 2
+assert rolling["pit_exposed_member_at_evaluation"] == {"denominator_count": 1, "signaled_count": 1, "signal_recall_pct": 100.0}
+assert empty == {"raw_all": {"denominator_count": 0, "signaled_count": 0, "signal_recall_pct": 0.0}, "pit_exposed_member_at_evaluation": {"denominator_count": 0, "signaled_count": 0, "signal_recall_pct": 0.0}}
+assert rolling_label_recall_pct((), pd.DataFrame()) == 0.0
+try:
+    rolling_label_recall_summary((), pd.DataFrame({"buy_signal": [True]}))
+except ValueError:
+    pass
+else:
+    raise AssertionError("non-empty signal log did not validate required columns")
+json.dumps({"five_year": five, "rolling": rolling, "empty": empty}, allow_nan=False, sort_keys=True)
+print("PASS: mixed exposure, alias/reset isolation, empty inputs, JSON safety, and compatibility alias")
+'@ | python -
+```
+
+Captured output:
+
+```text
+PASS: mixed exposure, alias/reset isolation, empty inputs, JSON safety, and compatibility alias
+```
+
+Additional focused checks captured after the probe:
+
+```text
+python -m ruff check core/pit_baseline_report.py pit_baseline.py
+All checks passed!
+
+python -m py_compile core/pit_baseline_report.py pit_baseline.py
+(exit 0)
+
+git diff 75ddddbb5d794f7c09b5644bb94c6e126e06f0e9 --check
+(exit 0)
+```

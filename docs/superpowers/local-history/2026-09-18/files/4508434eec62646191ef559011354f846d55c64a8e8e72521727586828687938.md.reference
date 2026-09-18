@@ -1,0 +1,346 @@
+# Task 2 Report: Independent Fold Warmup and Pre-Extraction Parity Reference
+
+## Status
+
+DONE_WITH_CONCERNS. The fold/warmup boundary, fold contracts, parity schemas, capture/verify command paths, and authenticated pre-extraction reference are implemented. The corrected reference capture succeeded and the artifact remains ignored and untracked. One first capture attempt failed closed before publication because the harness initially used the engine's five-session signal cadence instead of the readiness-authenticated one-session cadence; the controller explicitly authorized exactly one corrected retry, which succeeded.
+
+## Commits
+
+- `3ca78ef675ab9d5bbaf76e7a8a4bd5b4b37d787e` — `feat: isolate causal warmup from fold trading`
+- `032a4304b819768a547e6bf4297ed118323abd35` — `fix: bind parity capture signal cadence`
+
+The successful reference binds clean committed HEAD `032a4304b819768a547e6bf4297ed118323abd35`.
+
+## Files Changed
+
+- `core/backtest_engine.py`
+  - Added `history_start_date` to `PortfolioSimulator.run`.
+  - Separated causal data loading from the evaluation/trading window.
+  - Bound both trade and history start dates into checkpoint fingerprints and result config.
+  - Added one run-start reset covering cash, positions, trades, pending-entry counters, output collections, diagnostics, regime state, strict-PIT caches, ticker-industry state, and the future injected policy-client slot.
+- `core/pit_optimizer_evaluation.py`
+  - Added validated immutable `FoldSpec`, `FoldManifest`, `AggregateMetric`, and `FoldAggregateSummary` contracts.
+  - Enforced exactly two 60-session discovery folds and one 60-session hidden fold, unique/non-overlapping sessions, chronology, purposes, warmup ordering, and canonical manifest hashing.
+- `core/pit_policy_parity.py`
+  - Added canonical parity transaction, entry-outcome, equity, evidence, reference, and attestation schemas.
+  - Added nested self-digest verification, canonical create-only persistence/load, evidence equality attestation, fixed fold-calendar construction, result-to-evidence conversion, authenticated source/readiness/bundle handling, and `capture`/`verify` CLI commands.
+  - The hidden fold is constructed from `SPY` session labels only and is never submitted to the evaluator.
+  - Added readiness-authenticated simulator cadence binding after the first failed-closed attempt exposed the missing constructor input.
+- `tests/test_backtest_open_causality.py`
+  - Added synthetic history-window and consecutive-run coverage proving warmup loading, in-fold-only equity/transactions, next-open execution, last-session signal non-execution, deterministic final-fold liquidation, and state reset.
+- `tests/test_pit_policy_parity.py`
+  - Added fold validation, independent digest oracle, canonical create-only artifact, nested evidence, equality fail-closed, fixed calendar, aggregate evidence, discovery-only capture, and authenticated cadence tests.
+
+## Behavior-First TDD Evidence
+
+### Warmup boundary RED
+
+Command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_policy_parity.py tests/test_backtest_open_causality.py
+```
+
+Relevant output:
+
+```text
+.F.......
+TypeError: PortfolioSimulator.run() got an unexpected keyword argument 'history_start_date'
+1 failed, 8 passed, 2 warnings in 0.91s
+```
+
+The failure was the intended missing public boundary, not a fixture or syntax failure.
+
+### Warmup boundary GREEN
+
+Same command after the minimal engine separation/reset implementation:
+
+```text
+.........
+9 passed, 2 warnings in 0.90s
+```
+
+### Fold/parity schema RED progression
+
+The new behavior tests were introduced before each production layer:
+
+- Missing `core.pit_optimizer_evaluation`: collection failed with `ModuleNotFoundError`.
+- Missing `core.pit_policy_parity`: collection failed with `ModuleNotFoundError`.
+- Missing `build_fixed_fold_manifest` / `build_fold_evidence`: collection failed on the missing imports.
+- Missing `capture_from_authenticated_inputs`: collection failed on the missing orchestration boundary.
+
+Each missing boundary was then implemented minimally before proceeding to the next behavior.
+
+### Fold/parity schema GREEN progression
+
+Focused command results progressed through:
+
+```text
+13 passed, 2 warnings in 0.93s
+15 passed, 2 warnings in 0.97s
+16 passed, 2 warnings in 0.94s
+```
+
+### Corrected-capture cadence regression RED
+
+After the first real capture failed closed, a focused regression test was written first:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_policy_parity.py -k authenticated_signal_cadence
+```
+
+Output:
+
+```text
+ImportError: cannot import name 'simulator_kwargs_from_readiness'
+1 error during collection
+```
+
+The authenticated readiness leaf was then bound into simulator construction.
+
+### Corrected-capture cadence regression GREEN
+
+Same command:
+
+```text
+.
+1 passed, 7 deselected, 2 warnings in 0.58s
+```
+
+### Final focused GREEN
+
+Fresh post-capture command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_policy_parity.py tests/test_backtest_open_causality.py
+```
+
+Output:
+
+```text
+.................
+17 passed, 2 warnings in 0.96s
+```
+
+## Additional Verification
+
+- `python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_threshold_authority.py tests/test_task11_effective_policy_contract.py`
+  - `40 passed, 2 warnings in 0.79s`
+- `python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_backtest_engine.py tests/test_backtest_custom_strategy_contract.py`
+  - `40 passed, 2 warnings in 1.75s`
+- `python -B -m compileall -q core/backtest_engine.py core/pit_optimizer_evaluation.py core/pit_policy_parity.py tests/test_pit_policy_parity.py tests/test_backtest_open_causality.py`
+  - Exit 0, no output.
+- `python -B -m ruff check core/backtest_engine.py core/pit_optimizer_evaluation.py core/pit_policy_parity.py tests/test_pit_policy_parity.py tests/test_backtest_open_causality.py`
+  - `All checks passed!`
+- Commit hooks on both commits:
+  - Ruff passed.
+  - Trailing-whitespace, EOF, YAML, and merge-conflict checks passed/skipped as applicable.
+
+The recurring warnings are an existing `PytestConfigWarning` for unknown `cache_dir` and an upstream `websockets.legacy` deprecation; neither is introduced by Task 2.
+
+## Real Capture Attempts
+
+### First attempt — failed closed, no artifact
+
+The command used the supplied absolute read-only readiness and sealed bundle inputs and the worktree-local output. Duration: 15.1 seconds.
+
+It evaluated only the two discovery folds, then failed before persistence with:
+
+```text
+ValueError: captured fold effective policy differs from readiness
+```
+
+Metadata-only diagnosis (no replay) found exactly one differing effective-policy leaf:
+
+- Authenticated readiness: `entry_policy.signal_every_n_days.value = 1`
+- Initial capture harness simulator default: `5`
+- Readiness digest: `deb22b16752fc293adbd3aa64f087d39876c3573e651bd3651821ba76c077f39`
+- Incorrect harness digest: `81622e4707e4657ecb7793d1b8b476e51edf2296b32866316a21eb9ae4ddbc3c`
+
+No reference file existed after this failure. The controller then explicitly authorized exactly one corrected retry and prohibited a third attempt.
+
+### Corrected retry — succeeded
+
+The corrected capture ran from clean committed HEAD `032a4304b819768a547e6bf4297ed118323abd35`. Duration: 27.7 seconds.
+
+Output:
+
+```text
+PIT_POLICY_PARITY_REFERENCE sha256=12afddb213b95f63fc72d5278f4ebda7d60a5dd0a48022bde932b7f61b541dad discovery=discovery_1:2021-06-25..2021-09-20,discovery_2:2021-09-21..2021-12-14 hidden_unevaluated=hidden_1:2021-12-15..2022-03-11
+```
+
+Artifact:
+
+- Path: `C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.worktrees\pit-optimizer-implementation\.artifacts\pit-policy-parity-v2\reference.json`
+- SHA-256: `12afddb213b95f63fc72d5278f4ebda7d60a5dd0a48022bde932b7f61b541dad`
+- Fold-manifest SHA-256: `1ed07bde7cc358f67f8f2e88c7f13de43ecd01467e954f540f40c3879b503aac`
+- Universe count: 25
+- Discovery fold 1: 60 sessions, 60 equity points, nested evidence SHA-256 `017f3a9213622bed8b70743e2956d5bab309cae0c46eae5eefd85842541d4561`
+- Discovery fold 2: 60 sessions, 60 equity points, nested evidence SHA-256 `de8f04c8c9201cec44169c2ee1a7f5c946d9b68e25417308ca8854d7e9fa498b`
+- Hidden fold: exactly 60 sealed session labels; no hidden `ParityFoldEvidence` exists.
+
+The module loader recomputed and verified the artifact digest, fold-manifest digest, and both nested evidence digests. `Get-FileHash` independently returned the same artifact byte hash. `git check-ignore -v` confirmed `.gitignore:34:.artifacts/`; the reference was not added to Git.
+
+## Prohibited-Path Confirmation
+
+- No hidden price, return, trade, baseline metric, or objective value was evaluated or inspected.
+- The only hidden-period access was the permitted bundle query of `SPY.trade_date` session labels used to seal `FoldSpec.sessions`.
+- No provider client, OpenRouter call, network data fetch, or provider retry was invoked.
+- No Docker command or process was invoked.
+- No long/full replay was invoked; only the two fixed 60-session discovery folds were evaluated per attempt.
+- No upload, push, merge, cloud action, or original-checkout write occurred.
+- The readiness and 68 MB sealed bundle were read in place by absolute path and were not copied.
+
+## Process Cleanup
+
+- Both capture commands ran in the foreground and exited; no capture Python process remains.
+- No background Python process was started by this task.
+- One unrelated persistent Python process was observed after commit, PID 17460. `psutil` identified it as `chroma-mcp.exe --client-type persistent --data-dir C:/Users/llong/.claude-mem/chroma`, cwd `C:\Users\llong`, with its own parent PID. It was not terminated because it is an external persistent service, not a task process.
+
+## Self-Review
+
+- Daily engine ordering remains unchanged: pending opens, exits, signals, equity, and final liquidation retain their original sequence.
+- Prehistory affects only loaded data and indicator/regime context; `trading_days`, benchmark normalization, equity, signals, entry attempts, and transactions are restricted to the evaluation fold.
+- Consecutive runs reuse the simulator object but reset all mutable portfolio/fold state and reproduce identical outputs.
+- Canonical artifact hashes include externally supplied readiness/bundle/baseline/policy identities and exclude only runtime `artifact_path` and the artifact's own self-digest. Nested evidence excludes only its own digest.
+- References and attestations are create-only and embed retrievable evidence rather than substituting hashes.
+- Verification refuses publication unless transactions, entry outcomes, equity, funnels/aggregates, and effective policy are all equal.
+- Hidden fold construction is calendar-only and the capture orchestration iterates `manifest.discovery_folds`, never `hidden_fold`.
+- The successful artifact is ignored/untracked and the tracked worktree is clean.
+
+## Concerns
+
+1. The first real capture attempt consumed one bounded two-fold evaluation before failing closed on the missing cadence binding. The controller reviewed the exact cause and explicitly authorized the single corrected retry; no third attempt occurred.
+2. The existing pytest configuration and websockets deprecation warnings remain, but do not affect Task 2 behavior or artifact identity.
+
+## Fix Round 1 — Parity Trust-Boundary Review
+
+Commit: `1d7fb1c01780f81705d39b75efc2cc545cfa3e49` (`fix: harden PIT parity trust boundaries`)
+
+### Changes
+
+- Verification now rejects the capture HEAD itself and proves the reference HEAD is an ancestor of the later final HEAD before opening the bundle or evaluating a fold.
+- Readiness authentication now requires the producer's closed top-level contract; validates schema, gate, phase, fixed baseline/bundle/date authorities, budget/evaluation/scope identities, evidence/invariant IDs, sealed-input cross-links, prior-feedback identity, exact source-authored candidate catalog, effective-policy digest/catalog, provider projection, and live entry-contract source identity through the existing readiness validator.
+- Source cleanliness now includes every non-ignored untracked file. Capture and verification both re-read clean status, HEAD, and committed-tree fingerprint immediately after evaluation and before their create-only write.
+- Reference construction/loading now cross-links manifest bundle/universe identities, requires every fold's equity index to equal its 60 sealed sessions, requires top-level and aggregate funnels to agree, and rejects transaction/signal/entry dates outside the associated fold.
+- Test evidence fixtures now model the full 60-session fold rather than accepting a one-point equity series.
+
+Tracked files changed:
+
+- `core/pit_policy_parity.py`
+- `tests/test_pit_policy_parity.py`
+
+The existing ignored `reference.json` and this report were not added to Git.
+
+### Strict TDD Evidence
+
+Same-HEAD and ancestry tests:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_policy_parity.py -k "attestation_rejects_the_reference_source_head or verification_rejects_a_non_descendant_source_head"
+```
+
+RED: `2 failed, 8 deselected`; same HEAD did not raise, and `_require_later_descendant_source` did not exist.
+
+GREEN: `2 passed, 8 deselected, 2 warnings in 1.11s`.
+
+Closed readiness test:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_policy_parity.py -k readiness_authentication_rejects_a_canonical_incomplete_contract
+```
+
+RED: `1 failed, 10 deselected`; `_authenticated_readiness` did not accept a `source_root`, reflecting the missing full validator path.
+
+GREEN: `1 passed, 10 deselected, 2 warnings in 0.59s`.
+
+Exact candidate-catalog cross-check added during self-review:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q --tb=short tests/test_pit_policy_parity.py -k readiness_authentication_rejects_tampered_candidate_catalog
+```
+
+RED: `1 failed, 21 deselected`; a structurally complete canonical mapping with a known candidate ID and tampered edit record did not raise.
+
+GREEN: `1 passed, 21 deselected, 2 warnings in 0.61s`.
+
+Clean-source and post-evaluation race tests:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_policy_parity.py -k "source_identity_rejects_nonignored_untracked_files or capture_rechecks_source_after_evaluation_before_write or attestation_rechecks_source_after_evaluation_before_write"
+```
+
+RED: `3 failed, 11 deselected`; an untracked source file was accepted and both composition functions lacked a pre-persistence check.
+
+GREEN: `3 passed, 11 deselected, 2 warnings in 0.87s`.
+
+Manifest/evidence cross-link tests:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_policy_parity.py -k "reference_rejects_manifest_identity_crosslink_mismatch or reference_rejects_fold_evidence_crosslink_mismatch"
+```
+
+RED: all seven parameter cases failed because no mismatch raised: bundle identity, universe identity, equity sessions, funnel, transaction date, signal date, and entry date.
+
+GREEN: `7 passed, 14 deselected, 2 warnings in 0.62s`.
+
+### Final GREEN Verification
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q --tb=short tests/test_pit_policy_parity.py tests/test_backtest_open_causality.py
+...............................
+31 passed, 2 warnings in 1.83s
+```
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q --tb=short tests/test_pit_optimization_contract.py -k "prepare_synthetic_success_is_provider_free_and_publishes_authenticated_readiness or prepare_rolls_back_new_readiness_if_post_publication_reauthentication_fails"
+..
+2 passed, 51 deselected, 2 warnings in 0.82s
+```
+
+```text
+python -B -m ruff check core/pit_policy_parity.py tests/test_pit_policy_parity.py
+All checks passed!
+```
+
+`git diff --check` passed (only Git's Windows LF-to-CRLF advisory), `python -B -m compileall -q core/pit_policy_parity.py tests/test_pit_policy_parity.py` exited 0, and all commit hooks passed.
+
+One initially selected broader canary mutation test remains incompatible with its own fixture and did not exercise this change:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q --tb=short tests/test_pit_optimization_contract.py -k canary_rejects_readiness_or_sealed_input_mutation_before_another_call
+```
+
+It failed `1 failed, 52 deselected` because the fixture raises `canary readiness evaluation contract is absent`, while the test regex accepts only `readiness artifact` or `sealed optimization input`. The two direct readiness publication/reauthentication tests above are green. No Task 2 production frame appears in this failure.
+
+### Existing-Artifact Metadata/Load Validation
+
+No capture, replay, simulator, or bundle evaluation was run in this fix round. After commit, from clean HEAD `1d7fb1c01780f81705d39b75efc2cc545cfa3e49`, metadata-only authentication and loading returned:
+
+```text
+current_fingerprint=f645bada099e21b17d757d0b607da00f171332824613aa44e8937f686e9cf3e2
+reference_sha256=12afddb213b95f63fc72d5278f4ebda7d60a5dd0a48022bde932b7f61b541dad
+reference_source_head=032a4304b819768a547e6bf4297ed118323abd35
+readiness_sha256=d3cbfcb22900384ddd2ca5a2c66170af901773dd408480cfa1779b5119ba9f4f
+discovery_folds=2
+hidden_evidence_records=0
+unchanged=true
+```
+
+The loader accepted the stricter manifest/evidence invariants; the authenticated readiness accepted the stricter closed contract. A before/after byte hash assertion proved the existing reference remained unchanged. `git merge-base --is-ancestor` also confirmed that its source HEAD is an ancestor of this fix commit.
+
+### Prohibited Paths and Cleanup
+
+- No hidden prices, returns, metrics, outcomes, or objectives were evaluated or inspected.
+- No provider/OpenRouter, network, Docker, replay, capture, upload, push, merge, cloud, or original-checkout write occurred.
+- Both supplied external inputs remained read-only; the 68 MB bundle was not opened or copied during this round.
+- Every test/validation command ran singly in the foreground. No background Python process was started or left by this round.
+- The tracked worktree was clean after commit; ignored artifact/report files remain outside Git.
+
+### Self-Review and Concerns
+
+- The ancestry gate precedes bundle authentication/evaluation; both low-level equality protection and repository ancestry protection fail before persistence.
+- Re-authentication uses the same clean-source routine as the initial identity, so a non-ignored untracked file, staged/unstaged change, HEAD move, or tree-fingerprint change fails closed.
+- The unavoidable filesystem interval between the final identity check and create-only open is kept to the immediately adjacent call; no evaluation or other application work occurs between them.
+- Readiness validation delegates producer rules to `_readiness_identity` and supplements it only with closed outer fields and externally fixed/cross-linked authorities, minimizing duplicated policy logic.
+- The only concern is the unrelated broader canary mutation test fixture/regex incompatibility documented above. The required focused suites and the narrow readiness validator tests relied upon are green.

@@ -1,0 +1,292 @@
+diff --git a/tests/test_leader_basket.py b/tests/test_leader_basket.py
+new file mode 100644
+index 0000000..ad22e6a
+--- /dev/null
++++ b/tests/test_leader_basket.py
+@@ -0,0 +1,32 @@
++"""Execution/leader-recall reconciliation regressions."""
++
++from __future__ import annotations
++
++from datetime import date
++
++import pandas as pd
++
++from core.leader_evaluation import FiveYearLeader
++from core.pit_baseline_report import build_leader_recall_frame, reconcile_signals_to_transactions
++
++
++def test_recall_and_execution_reconciliation_counts_each_gate_once() -> None:
++    """Break caught: leaders signaled, cash-blocked, or failing gates were conflated."""
++    leaders = tuple(FiveYearLeader(symbol, date(2024, 1, 2), date(2024, 2, 1), 50.0 - rank, rank, True, date(2024, 1, 2)) for rank, symbol in enumerate(("AAA", "BBB", "CCC", "DDD"), 1))
++    signals = pd.DataFrame([
++        {"symbol": "AAA", "signal_date": "2024-01-02", "buy_signal": True, "current_growth": 30, "annual_growth": 30, "rs_score": 90, "has_breakout": True, "has_volume_surge": True, "in_buy_zone": True, "canslim_score": 90},
++        {"symbol": "BBB", "signal_date": "2024-01-02", "buy_signal": True, "current_growth": 30, "annual_growth": 30, "rs_score": 90, "has_breakout": True, "has_volume_surge": True, "in_buy_zone": True, "canslim_score": 90},
++        {"symbol": "CCC", "signal_date": "2024-01-02", "buy_signal": False, "current_growth": 10, "annual_growth": 10, "rs_score": 40, "has_breakout": False, "has_volume_surge": False, "in_buy_zone": False, "canslim_score": 40},
++        {"symbol": "DDD", "signal_date": "2024-01-02", "buy_signal": False, "current_growth": None, "annual_growth": None, "rs_score": 90, "has_breakout": True, "has_volume_surge": True, "in_buy_zone": True, "canslim_score": 90},
++    ])
++    transactions = pd.DataFrame([{"Date": "2024-01-03", "Ticker": "AAA", "Action": "BUY"}])
++    recall = build_leader_recall_frame(leaders, signals, transactions, start_date=date(2024, 1, 2), min_c_a_growth=25, min_rs_score=80, min_canslim_score=75, blocked_for_cash={"BBB": 1})
++    assert recall[["ticker", "buy_signal_count", "entry_count", "blocked_for_cash_count", "c_fail_count", "missing_fundamentals_count"]].to_dict("records") == [
++        {"ticker": "AAA", "buy_signal_count": 1, "entry_count": 1, "blocked_for_cash_count": 0, "c_fail_count": 0, "missing_fundamentals_count": 0},
++        {"ticker": "BBB", "buy_signal_count": 1, "entry_count": 0, "blocked_for_cash_count": 1, "c_fail_count": 0, "missing_fundamentals_count": 0},
++        {"ticker": "CCC", "buy_signal_count": 0, "entry_count": 0, "blocked_for_cash_count": 0, "c_fail_count": 1, "missing_fundamentals_count": 0},
++        {"ticker": "DDD", "buy_signal_count": 0, "entry_count": 0, "blocked_for_cash_count": 0, "c_fail_count": 0, "missing_fundamentals_count": 1},
++    ]
++    diagnostics = {"buy_signal_rows": 2, "entries_executed": 1, "entry_attempts": 2, "entry_rejected_no_cash": 1, "entry_rejected_already_open": 0, "entry_rejected_capacity": 0, "entry_rejected_missing_data": 0, "entry_rejected_invalid_price": 0, "entry_rejected_invalid_risk": 0, "buy_signal_rows_when_entries_allowed": 2, "buy_signal_rows_blocked_by_regime": 0, "buy_signal_rows_blocked_by_market": 0, "buy_signal_rows_blocked_by_both": 0, "capacity_truncated_signals": 0}
++    result = reconcile_signals_to_transactions(signals, transactions, diagnostics, trading_days=["2024-01-02", "2024-01-03"])
++    assert result["blocked_for_cash_by_symbol"] == {"BBB": 1}
+diff --git a/tests/test_leader_evaluation.py b/tests/test_leader_evaluation.py
+index fdcc951..01e68d5 100644
+--- a/tests/test_leader_evaluation.py
++++ b/tests/test_leader_evaluation.py
+@@ -1,23 +1,27 @@
+ """Pure tests for point-in-time leader labels and signal recall."""
+ 
+ from __future__ import annotations
+ 
+ from datetime import date
+ 
+ import pandas as pd
+ import pytest
+ 
+ from core.leader_evaluation import (
++    LeaderIdentityContract,
+     LeaderLabel,
++    LeaderPriceIdentity,
+     MembershipEvent,
+     PointInTimeUniverse,
++    label_five_year_leaders,
++    label_rolling_leaders,
+     label_future_leaders,
+     score_leader_recall,
+ )
+ 
+ 
+ def test_membership_is_point_in_time_and_rejects_duplicate_transitions() -> None:
+     universe = PointInTimeUniverse.from_rows(
+         [
+             {"effective_date": "2024-01-01", "ticker": "AAA", "member": "true"},
+             {"effective_date": "2025-01-01", "ticker": "AAA", "member": "false"},
+@@ -67,10 +71,40 @@ def test_recall_report_counts_only_signals_before_labeled_leaders() -> None:
+         [
+             {"signal_date": "2024-01-05", "symbol": "AAA", "buy_signal": True},
+             {"signal_date": "2024-01-05", "symbol": "CCC", "buy_signal": True},
+         ]
+     )
+     report = score_leader_recall(signal_log, labels, lookback_days=10)
+     assert report.future_index_leaders == 1
+     assert report.leaders_recalled == 1
+     assert report.recall_rate_pct == 100.0
+     assert report.false_positive_signals == 1
++
++
++def test_five_year_and_rolling_labels_preserve_membership_facts_without_changing_eligibility() -> None:
++    """Break caught: outcome labels silently filtered late members or accepted short/missing history."""
++    dates = pd.bdate_range("2021-01-01", periods=800)
++    closes = pd.DataFrame({
++        "SPY": range(100, 900),
++        "AAA": range(100, 900),
++        "BBB": range(100, 900),
++        "CCC": range(100, 900),
++        "DDD": [float("nan")] * 100 + list(range(100, 800)),
++        "EEE": [float("nan")] * 22 + list(range(122, 900)),
++    }, index=dates, dtype=float)
++    universe = PointInTimeUniverse.from_rows([
++        {"effective_date": "2021-01-01", "ticker": ticker, "member": "true"}
++        for ticker in ("AAA", "CCC", "DDD", "EEE")
++    ] + [
++        {"effective_date": "2022-01-03", "ticker": "BBB", "member": "true"},
++        {"effective_date": "2023-01-03", "ticker": "CCC", "member": "false"},
++    ])
++    contract = LeaderIdentityContract("0" * 64, "1" * 64, {
++        ticker: LeaderPriceIdentity(ticker, dates[0].date(), dates[-1].date(), ticker, "standalone")
++        for ticker in ("AAA", "BBB", "CCC", "DDD", "EEE")
++    })
++    leaders = label_five_year_leaders(closes, universe, start_date=dates[0].date(), end_date=dates[-1].date(), identity_contract=contract, top_n=10)
++    assert {item.ticker for item in leaders} == {"AAA", "BBB", "CCC"}
++    assert next(item for item in leaders if item.ticker == "BBB").member_at_start is False
++    assert universe.members_at(dates[0].date()) == frozenset({"AAA", "CCC", "DDD", "EEE"})
++    rolling = label_rolling_leaders(closes, universe, start_date=dates[0].date(), end_date=dates[-1].date(), identity_contract=contract, forward_trading_days=20, top_n=10)
++    assert any(item.ticker == "BBB" and item.member_at_evaluation is False for item in rolling)
+diff --git a/tests/test_pit_baseline.py b/tests/test_pit_baseline.py
+new file mode 100644
+index 0000000..8ecfc9e
+--- /dev/null
++++ b/tests/test_pit_baseline.py
+@@ -0,0 +1,21 @@
++"""Offline publication guards for the immutable PIT baseline runner."""
++
++from __future__ import annotations
++
++import hashlib
++from pathlib import Path
++
++import pytest
++
++import pit_baseline
++
++
++def test_baseline_artifacts_are_hashed_and_never_overwritten(tmp_path: Path) -> None:
++    """Break caught: a rerun silently replaced an existing baseline artifact."""
++    artifact = tmp_path / "run" / "summary.json"
++    artifact.parent.mkdir()
++    payload = pit_baseline._json_bytes({"status": "complete", "symbols": ["AAA", "SPY"]})
++    pit_baseline._write_bytes(artifact, payload)
++    assert pit_baseline.sha256_file(artifact) == hashlib.sha256(payload).hexdigest()
++    with pytest.raises(FileExistsError):
++        pit_baseline._write_bytes(artifact, payload)
+diff --git a/tests/test_pit_data.py b/tests/test_pit_data.py
+new file mode 100644
+index 0000000..07a1c6d
+--- /dev/null
++++ b/tests/test_pit_data.py
+@@ -0,0 +1,42 @@
++"""Offline trust-boundary tests for confined price-cache imports."""
++
++from __future__ import annotations
++
++import hashlib
++from pathlib import Path
++import sqlite3
++
++import pytest
++
++import export_pit_prices as exporter
++
++
++def _cache(path: Path, *, extra_table: bool = False) -> str:
++    with sqlite3.connect(path) as conn:
++        conn.execute("CREATE TABLE dataset_cache (cache_key TEXT PRIMARY KEY, cache_kind TEXT NOT NULL, created_at TEXT NOT NULL, payload BLOB NOT NULL)")
++        conn.execute("INSERT INTO dataset_cache VALUES (?, ?, ?, ?)", ("price::1d::2024-01-01::2024-01-02::AAPL,SPY", "price", "2024-01-03T00:00:00Z", b"not-a-pickle"))
++        if extra_table:
++            conn.execute("CREATE TABLE surprise (payload BLOB)")
++    return hashlib.sha256(path.read_bytes()).hexdigest()
++
++
++def test_cache_copy_validates_sqlite_schema_without_deserializing_worker_payload(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++    """Break caught: host unpickled worker-controlled cache payloads before schema validation."""
++    source = tmp_path / "worker.sqlite3"
++    digest = _cache(source)
++    monkeypatch.setattr("pickle.loads", lambda *_: (_ for _ in ()).throw(AssertionError("payload deserialized")))
++    destination = tmp_path / "copy"
++    destination.mkdir()
++    snapshot = exporter._copy_and_validate_cache(source, digest, destination)
++    assert snapshot.key_count == 1
++    assert snapshot.path.read_bytes() == source.read_bytes()
++
++
++@pytest.mark.parametrize("wrong_hash,extra_table,expected", [(True, False, "cache changed"), (False, True, "unexpected SQLite")])
++def test_cache_copy_rejects_bad_hash_and_extra_schema(tmp_path: Path, wrong_hash: bool, extra_table: bool, expected: str) -> None:
++    source = tmp_path / "worker.sqlite3"
++    digest = _cache(source, extra_table=extra_table)
++    destination = tmp_path / "copy"
++    destination.mkdir()
++    with pytest.raises(ValueError, match=expected):
++        exporter._copy_and_validate_cache(source, "0" * 64 if wrong_hash else digest, destination)
+diff --git a/tests/test_public_membership.py b/tests/test_public_membership.py
+index 4b3eb65..821bcc9 100644
+--- a/tests/test_public_membership.py
++++ b/tests/test_public_membership.py
+@@ -1,17 +1,18 @@
+ import hashlib
+ from datetime import date
+ from pathlib import Path
+ 
+ import fetch_sp500_membership as command
+ import core.public_membership as membership
+-from core.public_membership import _normalize, load_symbol_map
++import pytest
++from core.public_membership import _normalize, canonical_ticker, load_symbol_map
+ 
+ 
+ _PINNED_URL = "https://example.com/index?oldid=123"
+ 
+ 
+ def test_reviewed_map_projects_snapshot_ticker_to_evaluation_cutoff(tmp_path: Path) -> None:
+     """A post-cutoff snapshot label must not leak backward into PIT membership."""
+     raw = b"""
+     <table>
+       <tr><th>Symbol</th><th>Security</th></tr>
+@@ -239,10 +240,33 @@ def test_fetch_membership_defaults_to_tracked_reviewed_map(monkeypatch) -> None:
+     monkeypatch.setattr(membership, "_normalize", lambda *_args, **_kwargs: sentinel)
+ 
+     result = membership.fetch_membership(
+         _PINNED_URL,
+         date(2021, 1, 1),
+         date(2025, 12, 31),
+     )
+ 
+     assert result is sentinel
+     assert observed == [None]
++
++
++def test_reverse_replay_derives_seed_and_rejects_inconsistent_history() -> None:
++    """Break caught: rewind accepted duplicate swaps or changed the historical seed."""
++    raw = b"""
++    <table><tr><th>Symbol</th><th>Security</th></tr>
++    <tr><td>AAA</td><td>Alpha</td></tr><tr><td>BBB</td><td>Beta</td></tr><tr><td>CCC</td><td>Gamma</td></tr></table>
++    <table><tr><th>Effective Date</th><th>Added Ticker</th><th>Added Security</th><th>Removed Ticker</th><th>Removed Security</th></tr>
++    <tr><td>2024-01-03</td><td>CCC</td><td>Gamma</td><td>DDD</td><td>Delta</td></tr>
++    <tr><td>2024-01-02</td><td>BBB</td><td>Beta</td><td>EEE</td><td>Epsilon</td></tr></table>
++    """
++    export = _normalize(raw, _PINNED_URL, date(2024, 1, 1), date(2024, 1, 3), mappings={})
++    state = set()
++    for event in export.events:
++        state.add(event.ticker) if event.member else state.remove(event.ticker)
++    assert {event.ticker for event in export.events if event.effective_date == date(2024, 1, 1)} == {"AAA", "DDD", "EEE"}
++    assert state == {"AAA", "BBB", "CCC"}
++
++    duplicated = raw.replace(b"<td>EEE</td>", b"<td>BBB</td>")
++    with pytest.raises(ValueError, match="addition already active"):
++        _normalize(duplicated, _PINNED_URL, date(2024, 1, 1), date(2024, 1, 3), mappings={})
++    with pytest.raises(ValueError, match="unreviewed punctuation alias"):
++        canonical_ticker("ACME.A")
+diff --git a/tests/test_sec_pit_fundamentals.py b/tests/test_sec_pit_fundamentals.py
+new file mode 100644
+index 0000000..d665f68
+--- /dev/null
++++ b/tests/test_sec_pit_fundamentals.py
+@@ -0,0 +1,42 @@
++"""Offline accession/public-date regressions for the SEC PIT normalizer."""
++
++from __future__ import annotations
++
++from collections import Counter
++from datetime import date, datetime, timezone
++import json
++from pathlib import Path
++import zipfile
++
++import core.sec_pit_fundamentals as sec
++
++
++def test_companyfacts_accession_dates_are_next_session_and_amendments_are_later(tmp_path: Path) -> None:
++    """Break caught: period end or filed date leaked a 10-Q before it was public."""
++    payload = {
++        "cik": "1",
++        "facts": {"us-gaap": {"EarningsPerShareBasic": {"units": {"USD/shares": [
++            {"accn": "0000000001-24-000001", "form": "10-Q", "filed": "2024-04-30", "end": "2024-03-31", "start": "2024-01-01", "fy": "2024", "fp": "Q1", "frame": "CY2024Q1", "val": 1.0},
++            {"accn": "0000000001-24-000002", "form": "10-Q/A", "filed": "2024-05-10", "end": "2024-03-31", "start": "2024-01-01", "fy": "2024", "fp": "Q1", "frame": "CY2024Q1", "val": 1.1},
++            {"accn": "0000000001-24-000003", "form": "10-Q", "filed": "2024-05-13", "end": "2024-03-31", "start": "2024-01-01", "fy": "2024", "fp": "Q1", "frame": "CY2024Q1", "val": 1.2},
++        ]}}}},
++    }
++    archive = tmp_path / "companyfacts.zip"
++    with zipfile.ZipFile(archive, "x") as handle:
++        handle.writestr("CIK0000000001.json", json.dumps(payload))
++    handle, members = sec._zip_members(archive)
++    try:
++        fact_payload = sec._json_member(handle, members["CIK0000000001.json"])
++    finally:
++        handle.close()
++    acceptances = {
++        "000000000124000001": sec.FilingAcceptance("000000000124000001", "10-Q", date(2024, 4, 30), datetime(2024, 4, 30, 22, tzinfo=timezone.utc)),
++        "000000000124000002": sec.FilingAcceptance("000000000124000002", "10-Q/A", date(2024, 5, 10), datetime(2024, 5, 10, 22, tzinfo=timezone.utc)),
++    }
++    counters: Counter[str] = Counter()
++    candidates = sec._candidates_for_cik(fact_payload, cik="0000000001", acceptances=acceptances,
++        spy_days=(date(2024, 4, 30), date(2024, 5, 1), date(2024, 5, 10), date(2024, 5, 13), date(2024, 5, 14)),
++        start_date=date(2024, 4, 1), end_date=date(2024, 5, 14), counters=counters)
++    dates = {item.accession: item.public_date for item in candidates}
++    assert dates == {"000000000124000001": date(2024, 5, 1), "000000000124000002": date(2024, 5, 13), "000000000124000003": date(2024, 5, 14)}
++    assert counters["filed_date_fallback_fact_count"] == 1

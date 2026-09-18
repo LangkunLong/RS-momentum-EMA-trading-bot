@@ -1,0 +1,48 @@
+# Task 5 — Provider-free complete production-composition proof
+
+## Purpose
+
+Prove the completed schema-v3 optimizer architecture runs the full two-iteration feedback loop through production composition before any live provider or Docker attempt. This task changes no tracked source and adds/modifies no test files.
+
+## Hard boundaries
+
+- Work in `C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-implementation` at reviewed commit `adcda5f`.
+- Do not modify tracked files, tests, manifests, or production source.
+- Do not call OpenRouter or any provider, access network, start Docker, open hidden data, run a full replay, push, or upload.
+- Temporary harness/evidence may live only under this plan's ignored SDD workspace and must be removed or retained there as clearly labeled local evidence. It is not a repository test.
+- Do not dispatch subagents.
+
+## Required verification
+
+1. Run the existing production-composition node once if it can collect quickly:
+   `python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py::test_dispatch_with_production_composition_completes_mocked_two_iteration_canary`
+   Do not edit tests if it fails because fixtures still encode schema v2; report the exact aggregate cause and proceed to a temporary production-composition harness.
+2. Exercise the active production entrypoints, not a reimplementation:
+   - `_dispatch_pit_optimizer_v3`
+   - `_build_pit_optimizer_v3_live_run` or the same production controller/service objects it constructs
+   - `run_pit_optimizer_v3`
+   Use an in-memory fake OpenRouter transport and fake disposable policy-worker/evaluator boundary. Reuse safe existing fake/helper structures when possible, adapting only in the ignored harness.
+3. Run exactly two investigator/author/critic iterations and exactly six accepted role-call records in order. Provider retries/automatic healing remain zero.
+4. Exercise schema-v3 authorization, one-shot reservations, resource-ledger reconciliation, durable audit/artifact writes, and production controller feedback lineage.
+5. Role responses report complete accounting and deliberately high valid costs totaling at least 2.0 USD; cost must be recorded and never stop the run. Run available-pricing and unavailable-pricing variants if the harness can do so without duplicating substantial setup.
+6. Prove first-iteration aggregate evaluator/critic feedback reaches the second investigator input.
+7. Make the fake discovery evaluator deterministically show a candidate improvement over baseline so the controller selects/confirms a discovery winner. This proves selection plumbing only; label it simulated, not real invested-return evidence.
+8. Require:
+   - outer schema version 3;
+   - iterations started/completed = 2;
+   - API calls = 6;
+   - accounting complete and canonical authoritative USD present;
+   - source_modified=false;
+   - cleanup_complete=true;
+   - hidden_validation_opened=false;
+   - long_replay_eligible=null;
+   - hidden worker/evaluator call count = 0;
+   - no full replay artifact/process.
+9. Verify the feature worktree remains clean afterward and exact temporary process/resources are gone.
+
+## Report
+
+Write the detailed report to:
+`C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-implementation/.superpowers/sdd/2026-08-28-pit-optimizer-audit-only-usd/task-5-report.md`
+
+Include commands, concise outputs, exact entrypoints exercised, call/iteration/accounting/feedback/discovery/hidden/cleanup assertions, any stale-test failure, and any blocker. Return status, one-line result, concerns, and report path. Make no commit because tracked source must remain unchanged.

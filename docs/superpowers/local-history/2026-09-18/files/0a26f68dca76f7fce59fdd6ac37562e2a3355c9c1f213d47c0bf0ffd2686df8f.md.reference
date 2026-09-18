@@ -1,0 +1,46 @@
+# Task 1 Report — Schema-v3 Resource-Only Manifest
+
+## Behavior changed
+
+- Active PIT optimizer run manifests now require and construct `schema_version=3`.
+- `PitOptimizerCallBudget`, `AuthorizationRequirement`, and `PitOptimizerGateConfig` no longer contain or validate enforcing `max_usd` fields.
+- Closed manifest parsing now rejects legacy `max_usd` keys because each affected closed dataclass no longer permits them.
+- The subset canary accepts exactly two ordered investigator/author/critic iterations with the approved resource-only role tuples and exactly 448,000 total input-plus-output tokens.
+- The provider-free manifest CLI no longer defines or reads per-role `--*-max-usd` arguments, and its prepare command carries calls, tokens, and iterations without an optimizer `--max-usd` option.
+
+## Verification
+
+Command:
+
+```powershell
+python -B -m py_compile core/pit_optimization_contract.py core/pit_optimizer_evaluation.py
+python -B -c "...provider-free construction smoke..."
+```
+
+Output:
+
+```text
+smoke: schema-v3 resource plan validated; CLI has no role USD flags
+```
+
+`git diff --check` completed successfully. The commit hook checks also passed: ruff, trailing whitespace, end-of-file, YAML, and merge-conflict checks.
+
+## Files changed
+
+- `core/pit_optimization_contract.py`
+- `core/pit_optimizer_evaluation.py`
+
+## Commit
+
+`d474d92 Migrate PIT optimizer manifest to resource-only v3`
+
+## Self-review
+
+- Confirmed the exact approved role tuple is the only accepted call profile, repeated in the required two-iteration role order.
+- Confirmed hard limits remain: six calls, 448,000 tokens, `provider_retries=0`, and `apply=false`.
+- Confirmed the two-file diff does not remove legacy USD controls outside the active PIT optimizer manifest/prepare path.
+- No tests were added or modified, per the explicit production-first instruction. No provider call, Docker operation, hidden-data access, push, upload, or subagent dispatch occurred.
+
+## Concerns
+
+The follow-on schema-v3 units must update the authorization, controller, and service-composition modules that consume the removed active optimizer USD fields. Those production routes were intentionally left untouched in this focused unit.

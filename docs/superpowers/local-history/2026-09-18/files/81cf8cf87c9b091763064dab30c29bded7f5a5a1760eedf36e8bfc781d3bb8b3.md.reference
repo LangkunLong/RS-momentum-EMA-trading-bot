@@ -1,0 +1,330 @@
+# Task 6 Fix Round 2 Re-review
+
+**Base:** `5cebaf9`  
+**Head:** `696980b`  
+**Verdict:** **NEEDS FIXES — Critical 2, Important 2, Minor 1**
+
+## Scope and method
+
+This was a fresh read-only review of the full Fix Round 2 section of
+`task-6-report.md`, the full supplied `review-5cebaf9..696980b.diff`, the open
+items from `task-6-rereview-1.md`, the Task 6 contract, and the relevant current
+source/tests. No tracked file was edited. No provider, network, live pricing,
+real SDK, replay, Docker, background process, or permanent ledger was used.
+
+One fake/temp reproducer was attempted solely to exercise the capability issue,
+but the managed Windows ACL denied fixture setup before the manifest or any
+ledger was created. The exact temporary root was removed immediately. Findings
+below therefore rely on quoted control-flow evidence and precise fake/temp RED
+shapes; no product test result is claimed from this re-review.
+
+The round closes live pricing reauthentication and the advertised `Pricing`
+contract. It also materially improves byte capture and nonaccepted terminal
+atomicity. It is not ready because the code that labels an input
+“controller-originated” is an unrestricted public issuer, the live sealed call
+plan can still drift after preflight and reservation, and the durable terminal
+receipt/recovery boundary is incomplete.
+
+## Prior-finding adjudication
+
+| Prior open item | Verdict | Evidence |
+|---|---|---|
+| Critical 1 — exact manifest-to-wire bytes and non-source provenance | **PARTIAL; OPEN** | The exact captured role bytes are now sized and sent (`agent_loop.py:3357-3385`, `3552-3573`), and source scope is rebuilt/authenticated from those bytes (`core/pit_optimizer_authorization.py:566-681`). However `bind_controller_role_input` is itself an unrestricted capability issuer (`core/pit_optimizer_authorization.py:705-723`). For critic bytes the snapshot authenticates only common manifest fields and a string hypothesis ID (`689-695`), not controller origin or predecessor identities. A relabeled foreign package can call the binder and then pass capture. The new test omits the bind call and therefore proves only “unbound objects reject” (`tests/test_pit_optimizer_v2.py:4121-4176`). |
+| Critical 2 — exact pricing and mandatory fresh gateway freeze | **ADDRESSED** | `_verified_pit_optimizer_pricing_snapshot` copies the live model/Decimal fields, recomputes the canonical digest, and compares live, gateway, and lease commitments (`agent_loop.py:3092-3127`). The wrapper repeats this after its first injected clock and uses only the first verified copy for preflight/facts (`3353-3391`, `3432`). Direct and first-clock mutation tests target the actual cached object (`tests/test_pit_optimizer_v2.py:4271-4336`). No later code rereads live rates. |
+| Important 1 — durable terminal fence and all-`BaseException` recovery | **PARTIAL; OPEN** | Budget then audit then authorization ordering is improved (`agent_loop.py:3209-3279`), and nonaccepted reconciliation plus close is one authorization replacement (`core/pit_optimizer_authorization.py:1863-1896`). But the stored “terminal audit” digest is only the provider JSON file digest, not the terminal event digest, and an existing audit run cannot be reopened for crash recovery. Accepted post-publication interruption also has a reentrant next-plan window. See Important findings 1 and 2. |
+| Minor 1 — advertised `Pricing` compatibility | **ADDRESSED** | Legacy finite float fields convert through `Decimal(repr(value))`, while exact mappings still reject float/bool (`agent_loop.py:1533-1584`). The focused compatibility test is honest for the advertised `Pricing(1.0, 2.0)` case (`tests/test_pit_optimizer_v2.py:4339-4349`). |
+| Minor 2 — report metadata/evidence | **PARTIAL; OPEN** | Round 1 and Round 2 base/head metadata are now correct (`task-6-report.md:110-116`, `174-178`), and Round 1 claims are narrowed. Round 2 still claims all findings closed and claims crash/reopen plus provenance evidence that its tests do not establish (`178-186`, `193-195`, `219-223`). |
+
+## Actionable findings
+
+### Critical 1 — any caller can mint the alleged controller-origin capability
+
+**Confidence: 10/10.**
+
+`_snapshot_role_input` captures canonical bytes and checks the manifest digest,
+iteration, and immutable IDs (`core/pit_optimizer_authorization.py:583-610`). It
+fully reconstructs/authenticates the source bundle for investigator/author, but
+for critic it records only `primitive["hypothesis_id"]` (`689-695`). The only
+claimed non-source origin proof is then:
+
+```python
+snapshot = self._snapshot_role_input(dynamic_input, plan)
+self._role_input_capabilities[id(dynamic_input)] = (
+    dynamic_input, plan.call_index, snapshot.canonical_bytes
+)
+```
+
+at `core/pit_optimizer_authorization.py:705-723`. There is no controller-only
+token, authenticated predecessor receipt, private issuer, or one-capability-per-
+plan rule. Multiple objects for the same call index can be registered until the
+global six-entry count is exhausted. `capture_controller_role_input` proves only
+that this same public method previously registered the object (`725-743`).
+
+The claimed RED at `tests/test_pit_optimizer_v2.py:4121-4176` constructs a
+relabeled foreign critic but never calls `bind_controller_role_input`. Every
+accepted-path test does call that method (for example `5188-5199`). Adding the
+same bind to the foreign case satisfies the implemented capability check and
+allows the exact foreign bytes to reach the fake client.
+
+**Impact:** A copied or foreign author/critic package can change valid nested
+summaries, relabel only `run_manifest_sha256`, self-register, and become provider
+input. Exact byte capture is real, but the captured bytes are not proven to have
+originated in this run's controller lineage.
+
+**Required fix:** Make issuance unforgeable and plan-exclusive. Consume a
+controller-sealed role-input/receipt whose origin is created at the derivation
+site, or accept authenticated predecessor artifact identities and rebuild the
+complete role object from the captured bytes. A public “bind this object” method
+cannot itself establish controller origin. Bind exactly one immutable byte
+snapshot to one exact manifest call and consume it once.
+
+**Exact fake/temp RED:** After two accepted fake/temp reservations, construct a
+valid critic for run B with a distinct valid `author_manifest` summary, replace
+only its run digest with run A's manifest digest, call
+`authorization.bind_controller_role_input(relabeled, plan_3)`, then invoke the
+wrapper. Require pre-effect `AuthorizationError`, zero fake calls, no BudgetLedger
+reservation, no new authorization record, and no audit event. Current code binds
+and transmits it. Add a sibling assertion that two distinct objects cannot both
+be bound to the same plan.
+
+**Why Task 6, not Task 7:** Task 7 can choose when to request a capability, but
+Task 6 defines both the issuer and the final paid-boundary consumer. With the
+current unrestricted issuer, Task 7 would provide only a call-site convention;
+it cannot make Task 6's authorization proof unforgeable.
+
+### Critical 2 — a later clock callback can change the SDK token cap after preflight and both reservations
+
+**Confidence: 10/10.**
+
+The wrapper snapshots role bytes and pricing, but not `PitOptimizerCallBudget`.
+It preflights with the live plan at `agent_loop.py:3385-3391`, reserves Budget
+and Authorization values at `3509-3517`, then invokes the caller-supplied clock
+three more times at `3536`, `3549`, and `3559`. The SDK request rereads the live
+object at `3564-3570`:
+
+```python
+max_tokens=call_budget.max_output_tokens
+```
+
+`PitOptimizerCallBudget` is a frozen dataclass (`core/pit_optimization_contract.py:454-489`),
+but this round explicitly treats `object.__setattr__` as a real mutation threat
+for the other frozen inputs. A clock can mutate an equal copy of the sealed plan
+on its fourth request-time invocation, after authorization accepted the original
+values, and the SDK receives the larger value. Later facts also reread the drifted
+plan (`agent_loop.py:3426-3451`, `3631-3639`), so finalization may fail closed only
+after an under-reserved request could have started.
+
+**Impact:** The sole provider request can carry a `max_tokens` ceiling never used
+in conservative USD/token preflight or either reservation. This defeats the
+complete-before-send accounting boundary even though pricing itself is fixed.
+
+**Required fix:** Capture/reconstruct one exact call-plan snapshot from the
+authenticated manifest before the first callback. Use only that snapshot for
+role binding, preflight, both reservations, audit facts, SDK arguments, response
+caps, and the returned role call. Never reread the caller's live plan after a
+callback. AuthorizationLedger should likewise compare against its own canonical
+manifest snapshot rather than caller-owned live dataclass references.
+
+**Exact fake/temp RED:** Pass `replace(manifest.call_budgets[0])` as an initially
+equal plan. Bind a valid investigator input to it. On the fourth request-time
+clock call, use `object.__setattr__(plan, "max_output_tokens", original * 100)`.
+Require the fake SDK's single request to retain exactly `original`, all facts and
+reservations to retain the original plan, and no drift error. Current code sends
+the mutated value; alternatively a stricter implementation may reject before
+any reservation, in which case require zero effects.
+
+**Why Task 6, not Task 7:** `request_pit_optimizer_once` owns the injected clock,
+preflight, reservations, and final SDK arguments. Task 7 cannot stop Task 6 from
+rereading a mutable-at-runtime object after Task 6's own callback.
+
+### Important 1 — the authorization receipt does not bind the terminal event, and crash recovery cannot reopen it
+
+**Confidence: 10/10.**
+
+`AuditTrail.append_event` computes and returns the terminal event's
+`event_sha256` (`agent_loop.py:11325-11348`). `write_provider_call` instead
+computes the provider JSON file digest at `11406`, discards the return value from
+`append_event` at `11472-11480`, and returns the provider file digest as the
+second tuple item at `11484`. Authorization persists that value under the name
+`terminal_audit_sha256` (`core/pit_optimizer_authorization.py:1863-1872`). The
+new success test explicitly asserts it equals `sha256(provider_path)`
+(`tests/test_pit_optimizer_v2.py:5222-5228`).
+
+Thus the authorization chain binds the immutable provider record, not the
+required terminal audit event. Loss/truncation of the final event after
+authorization publication is not detectable from the authorization receipt.
+Direct ledger tests also pass arbitrary `"b" * 64` strings, so they do not prove
+an authenticated audit receipt.
+
+Recovery is not implemented either. `AuditTrail.__init__` always creates the run
+directory with create-only `mkdir` and fails if it already exists
+(`agent_loop.py:11184-11203`); it never loads/validates the existing event chain.
+`recover_active_reservation` returns only the reservation
+(`core/pit_optimizer_authorization.py:1918-1951`). After a crash between terminal
+audit and authorization reconciliation, there is no supported way to reopen the
+audit, recover the exact terminal receipt/facts, and complete the transition.
+The active reservation is a safe fence, but it is permanent rather than the
+report's “recoverable” state.
+
+**Impact:** The next accepted plan can rely on an authorization record that has
+no durable link to the terminal event, while a real crash in the opposite phase
+leaves a one-shot lease irrecoverably wedged instead of terminally completed or
+closed.
+
+**Required fix:** Return/store an immutable terminal audit receipt containing at
+least run/call identity, provider-record digest, and terminal-event digest. Make
+the authorization transition consume that authenticated receipt. Add create-or-
+open audit replay that verifies the whole existing chain and an idempotent
+restart finalizer that reconstructs the exact closed facts/receipt for the one
+active reservation. Keep next-call reservation blocked until this succeeds.
+
+**Exact fake/temp REDs:**
+
+1. Complete one accepted fake call and require the authorization record to bind
+   both the provider file SHA-256 and `audit._events[-1]["event_sha256"]`. Current
+   code stores only the former.
+2. Publish Budget reconciliation plus the provider file and terminal event, then
+   simulate process loss before authorization reconciliation. Reopen the same
+   audit root and authorization ledger, recover the sole reservation, verify the
+   receipt, complete reconciliation, and permit/close exactly as the facts
+   require. Current `AuditTrail` refuses the existing run directory and exposes
+   no restart finalizer.
+
+**Why Task 6, not Task 7:** Task 6 owns `AuditTrail`, the receipt returned by
+`write_provider_call`, AuthorizationLedger's reconciliation schema, and the
+phase ordering. Task 7 may invoke recovery, but cannot recover an event digest or
+open an audit run that Task 6 does not expose.
+
+### Important 2 — accepted post-publication interruption can unlock a reentrant next call before cancellation closure
+
+**Confidence: 9/10.**
+
+Accepted `reconcile_call` removes the active reservation and publishes no close
+(`core/pit_optimizer_authorization.py:1756-1804`, `1885-1894`). A next plan can
+then reserve at `1636-1705`. If the reconcile operation publishes, a synchronous
+wrapper reserves plan two, and then the operation raises `BaseException`,
+`_finalize_pit_optimizer_call` verifies the accepted reconciliation and reraises
+the post-publication exception (`agent_loop.py:3247-3279`). The inner verifier
+deliberately leaves `finalized=False` for accepted facts (`3480-3504`), so the
+outer handler tries to retroactively close the lease as cancelled/failed
+(`3746-3808`). That close cannot publish with plan two active; ledger replay
+rejects a close with an active reservation
+(`core/pit_optimizer_authorization.py:969-976`). Cleanup then only adds a note
+and propagates (`agent_loop.py:3809-3832`).
+
+The added post-publication test covers only a nonaccepted parser failure, whose
+reconciliation and close are already atomic (`tests/test_pit_optimizer_v2.py:4949-5015`).
+It does not exercise the accepted unlock path.
+
+**Impact:** A concurrent/reentrant second gateway can reserve and potentially
+send plan two even though plan one's wrapper ultimately propagates cancellation
+and fails to close the lease. Authorization and Budget reservations can remain
+active under a run the first caller believes terminated.
+
+**Required fix:** Define one durable accepted-finalization state machine. Either
+keep accepted reconciliation fenced until the wrapper's no-fail commit point,
+or treat a verified accepted publication as final and never attempt a conflicting
+retroactive close. Any cancellation path that promises terminal closure must
+atomically prevent a later reservation. Recovery must identify and resolve this
+state, not merely note it.
+
+**Exact fake/temp RED:** Wrap `authorization.reconcile_call` for a normal accepted
+call so it invokes the real method, synchronously attempts
+`reserve_call(lease, plan_2)`, then raises `KeyboardInterrupt` every time. Require
+the reentrant reserve to reject and, after propagation, either an exact accepted
+commit with no cancellation claim or one cancelled close with no plan-two
+reservation. Current code admits plan two and cannot publish the close.
+
+**Why Task 6, not Task 7:** The unlock, postcondition verifier, and cancellation
+cleanup are all Task 6 methods. Task 7 serialization cannot make a public Task 6
+lease transition atomic against another authorized caller.
+
+## New breakage
+
+- **Critical 2 is newly identified in integrated behavior.** It is not caused by
+  the Decimal pricing fix, but Round 2's explicit frozen-object mutation threat
+  makes the unsnapshotted call plan the same paid-boundary class of defect.
+- No additional Critical/Important regression was found in exact Decimal pricing,
+  old grant isolation, named-grant ceilings, atomic nonaccepted reconciliation,
+  role/model selection, one-request behavior, or legacy ProviderCallRecord
+  readability.
+
+## Requirement coverage
+
+| Task 6 requirement | Status after Round 2 |
+|---|---|
+| Hash chain, exclusive lock, grant+window atomic replacement | **Meets; unchanged.** Round 2 uses the same complete-image replace primitive for atomic terminal reconciliation/close. |
+| Old 20/19 isolation, explicit named grants, most-restrictive ceilings | **Meets; unchanged.** No touched path weakens named-capacity accounting. |
+| Authenticated manifest/requirement/source scope; non-secret approval | **Partial.** Source reconstruction from captured bytes meets. Non-source role provenance is self-issuable (Critical 1), and the call plan itself can drift after authentication (Critical 2). |
+| One-shot key, concurrent/reopen rules, no-spend lease open | **Meets at open; terminal transition partial.** Open remains no-spend and one-shot. Accepted post-publication interruption can race the next plan (Important 2). |
+| Frozen Decimal R1 price identity, mandatory fresh run freeze, no post-freeze drift | **Meets.** Live rates are re-digested into an isolated copy before use; gateway/ledger/lease commitments converge. |
+| Next-call-only reservation, exact call indexes/iterations/roles | **Partial.** Ordinary sequential records meet. Live plan fields used by SDK/facts are not the exact preflight snapshot (Critical 2). |
+| Complete bytes/tokens/USD before SDK, ledger, or start side effect | **Blocked.** Role/pricing snapshots are complete, but a late callback can change the transmitted output-token ceiling after both reservations. |
+| BudgetLedger and AuthorizationLedger consistency under every exception/cancellation | **Blocked.** Nonaccepted paths improve; durable restart and accepted post-publication/reentrant paths remain incomplete (Important 1/2). |
+| All-R1 isolated role profile; one SDK request; `max_retries=0`; no healing/recovery | **Meets in reviewed code.** No Round 2 change adds retry, alternate model, healing, or recovery generation. |
+| Iteration-aware closed ProviderCallRecord/audit; legacy readability | **Partial.** Closed records and legacy readers remain. The authorization receipt binds the provider file, not the terminal event (Important 1). |
+| Terminal lease closure / no disguised retry | **Partial / blocked.** Nonaccepted reconciliation closes atomically. Persistent crash and accepted post-publication races do not always reach a coherent terminal lease. |
+| Content, credential, source, provider-response secrecy | **Meets in reviewed persistence paths.** Exact role/source bytes remain process-local/provider-bound and are absent from provider accounting records/events. |
+| Record-grant CLI cannot infer authority, combine stale capacity, or touch provider credentials | **Meets; unchanged.** Round 2 does not alter the explicit manifest/grant/window CLI boundary. |
+
+## Test and report audit
+
+- All new product tests are fake/temp-only by construction. No test imports a real
+  SDK or live-pricing/provider path.
+- The role-mutation and byte-for-byte accepted wire tests honestly cover capture
+  before the first callback and exact dynamic message content.
+- The live pricing tests honestly mutate the actual cached pricing object both
+  before the request and from the first request-time clock. The implementation's
+  isolated pricing copy makes later live-object mutation non-operative.
+- The relabeled-critic test is not evidence of authenticated controller origin:
+  it omits the new binder, so it only exercises absence from the registry.
+- The audit-time reentrant test attempts plan two before the original audit write,
+  while the first authorization reservation is necessarily still active. It does
+  not cover accepted post-publication unlock.
+- The crash/reopen test reopens only after nonaccepted reconciliation and close
+  have already published atomically. It does not reopen AuditTrail or recover a
+  crash between terminal audit and authorization reconciliation.
+- The post-publication test covers a nonaccepted terminal transition only.
+- The accepted-path test asserts the provider file digest under the name
+  `terminal_audit_sha256`; it does not bind the terminal event digest.
+- Report base/head and file-count metadata are correct. The “all findings
+  resolved,” provenance, crash/reopen, and exact terminal-audit claims are not.
+- The reported `197 passed` and Ruff output were inspected but not independently
+  rerun. No broad suite was run during this re-review.
+
+## Resource and secrecy audit
+
+- Review execution used no provider/network/live pricing/SDK/replay/container,
+  background process, user authorization, or permanent ledger.
+- The one attempted temp harness failed before fixture setup because of the known
+  managed Windows private-directory ACL behavior. Its exact temp root was
+  verified and removed; no helper process or external temp root remains.
+- No tracked file changed. This review report is under the ignored SDD workspace.
+- Provider records/events remain closed over lifecycle, accounting, model,
+  pricing, and digests. Prompt/source/raw response/header/credential/approval text
+  is not written to the reviewed terminal artifacts.
+- The bounded process-local role registry retains source bytes in memory, not on
+  disk. Its origin semantics are unsafe (Critical 1), but no new persistence leak
+  was found.
+
+## Out-of-scope observations
+
+- Live provider/OpenRouter SDK compatibility remains intentionally untested.
+- `_load_current_pricing` still performs an unbounded response read; this predates
+  Round 2 and remains a separate live-endpoint resource hardening item.
+- Windows directory-fsync/power-loss strengthening for atomic replaces remains
+  a platform-specific deferred item. It makes binding the actual terminal event
+  digest more important, but is not itself a new Round 2 finding.
+- Task 7 still owns orchestration, artifact sequencing, and when to invoke a
+  restart path. It does not own capability authenticity, exact paid-plan
+  consumption, audit receipts, or ledger transition atomicity; those Task 6
+  blockers cannot be deferred as wiring.
+
+## Final disposition
+
+**NEEDS FIXES.** Round 2 fixes the exact live pricing commitment, captured role
+bytes, advertised legacy pricing value, and ordinary nonaccepted terminal
+transaction. It remains blocked by two paid-boundary authorization defects and
+two durable finalization defects: self-issued non-source provenance, mutable
+post-preflight call ceilings, a non-terminal audit digest with no restart replay,
+and accepted post-publication reentrant unlock.

@@ -1,0 +1,129 @@
+"""Create-only import of authenticated local S&P and SEC sources for V5."""
+import csv
+from datetime import date, datetime, timezone
+import hashlib
+import io
+import json
+from pathlib import Path
+import sys
+
+ROOT = Path.cwd()
+sys.path.insert(0, str(ROOT))
+from core.public_membership import _normalize, load_symbol_map
+from fetch_sp500_membership import _csv_text, _spot_checks, _symbol_map_provenance
+from normalize_pit_universe_membership import _source_rows, _validate_source_provenance
+
+OLD = ROOT.parent / 'five-year-public-pit'
+DEST = ROOT / '.artifacts/pit-optimizer-v5/data'
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+def write(path, raw):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open('xb') as stream:
+        stream.write(raw)
+
+def json_bytes(value):
+    return (json.dumps(value, indent=2, sort_keys=True) + '\n').encode()
+
+def verified_bytes(path, expected):
+    before = path.stat()
+    raw = path.read_bytes()
+    after = path.stat()
+    if path.is_symlink() or (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns) or digest(raw) != expected:
+        raise ValueError('Local source authentication failed: ' + path.name)
+    return raw
+
+def import_sp500():
+    old = OLD / 'exports/pit'
+    original_raw = (old / 'membership_provenance.json').read_bytes()
+    original = json.loads(original_raw)
+    pairs = {'membership.csv': 'membership_sha256', 'membership_raw.html': 'raw_sha256', 'membership_spot_checks.json': 'membership_spot_checks_sha256', 'security_names.csv': 'security_names_sha256'}
+    raw_files = {name: verified_bytes(old / name, original[key]) for name, key in pairs.items()}
+    map_path = OLD / 'config/pit_membership_symbol_map.csv'
+    map_raw = verified_bytes(map_path, original['symbol_map_sha256'])
+    mappings = load_symbol_map(map_path)
+    if _symbol_map_provenance(mappings)['reviewed_symbol_mappings'] != original['reviewed_symbol_mappings']:
+        raise ValueError('Reviewed mapping records differ from original provenance')
+    original_export = _normalize(raw_files['membership_raw.html'], original['source_url'], date(2021, 1, 1), date(2025, 12, 31), mappings=mappings)
+    def membership_bytes(export):
+        return _csv_text([(e.effective_date.isoformat(), e.ticker, int(e.member)) for e in export.events], ('effective_date', 'ticker', 'member')).encode()
+    if membership_bytes(original_export) != raw_files['membership.csv']:
+        raise ValueError('Original source does not reproduce original membership')
+    if json_bytes(_spot_checks(original_export.events)) != raw_files['membership_spot_checks.json']:
+        raise ValueError('Original source does not reproduce official spot checks')
+    export = _normalize(raw_files['membership_raw.html'], original['source_url'], date(2021, 1, 4), date(2025, 12, 31), mappings=mappings)
+    result = membership_bytes(export)
+    expected_rows = [(max(e.effective_date.isoformat(), '2021-01-04'), e.ticker, int(e.member)) for e in original_export.events]
+    if result != _csv_text(expected_rows, ('effective_date', 'ticker', 'member')).encode():
+        raise ValueError('Reseeding unexpectedly changes historical events')
+    cache = DEST / 'acquisition/raw/local-sp500'
+    cache.mkdir(parents=True, exist_ok=False)
+    for name, raw in {**raw_files, 'membership_provenance.json': original_raw, 'pit_membership_symbol_map.csv': map_raw}.items():
+        write(cache / name, raw)
+    output = DEST / 'source/sp500_membership.csv'
+    provenance_path = DEST / 'source/sp500_provenance.json'
+    if output.exists() or provenance_path.exists():
+        raise ValueError('V5 S&P output already exists')
+    provenance = {
+        **original,
+        'schema_version': 1,
+        'universe_id': 'sp500',
+        'source_kind': 'immutable_wikipedia_revision_replayed_with_reviewed_symbol_map',
+        'membership_sha256': digest(result),
+        'event_count': len(export.events),
+        'symbol_count': len({e.ticker for e in export.events}),
+        'first_effective_date': export.events[0].effective_date.isoformat(),
+        'last_effective_date': export.events[-1].effective_date.isoformat(),
+        'data_cutoff': '2025-12-31',
+        'imported_at_utc': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+        'adaptation': 'Replayed authenticated immutable HTML and reviewed identity map with seed at first evaluation trading session 2021-01-04; all subsequent membership events identical to authenticated original; no exclusions.',
+        'original_provenance_sha256': digest(original_raw),
+        'original_membership_sha256': original['membership_sha256'],
+        'raw_acquisition_directory': str(cache.relative_to(DEST)).replace('\\', '/'),
+        'adapter_sha256': digest(Path(__file__).read_bytes()),
+        'normalizer_source_sha256': digest((ROOT / 'core/public_membership.py').read_bytes()),
+        'validation': {'original_membership_reproduced_byte_for_byte': True, 'original_official_spot_checks_reproduced_byte_for_byte': True, 'seed_only_change_verified': True, 'official_spot_check_count': len(_spot_checks(export.events)), 'full_index_provider_certification': False},
+    }
+    write(output, result)
+    rows = _source_rows(output, universe_id='sp500')
+    _validate_source_provenance(universe_id='sp500', membership_path=output, rows=rows, provenance=provenance)
+    write(provenance_path, json_bytes(provenance))
+    print(json.dumps({'sp500_source_pair': 'authenticated', 'events': len(rows), 'symbols': provenance['symbol_count'], 'seed': rows[0][0], 'sha256': provenance['membership_sha256']}), flush=True)
+
+def import_sec_archives():
+    source = OLD / '.artifacts/sec-pit'
+    raw_manifest = (source / 'sec_archives_provenance.json').read_bytes()
+    manifest = json.loads(raw_manifest)
+    cache = DEST / 'acquisition/raw/sec-bulk'
+    cache.mkdir(parents=True, exist_ok=False)
+    imported = []
+    for name in ('companyfacts.zip', 'submissions.zip'):
+        expected = manifest['archives'][name]
+        path = source / name
+        before = path.stat()
+        if path.is_symlink() or before.st_size != expected['byte_length']:
+            raise ValueError('SEC source shape mismatch')
+        sha = hashlib.sha256()
+        count = 0
+        with path.open('rb') as incoming, (cache / name).open('xb') as outgoing:
+            while chunk := incoming.read(8 * 1024 * 1024):
+                outgoing.write(chunk)
+                sha.update(chunk)
+                count += len(chunk)
+        after = path.stat()
+        if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns) or count != expected['byte_length'] or sha.hexdigest() != expected['sha256']:
+            raise ValueError('SEC source hash mismatch; staged output must remain unadmitted')
+        with (cache / name).open('rb') as stream:
+            copied_digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+        if copied_digest != expected['sha256']:
+            raise ValueError('SEC copied archive authentication failed')
+        imported.append({'name': name, 'byte_length': count, 'sha256': copied_digest, 'source_url': expected['url']})
+        print(json.dumps({'sec_archive': name, 'authenticated': True, 'bytes': count, 'sha256': copied_digest}), flush=True)
+    write(cache / 'sec_archives_provenance.json', raw_manifest)
+    write(cache / 'import-provenance.json', json_bytes({'schema_version': 1, 'imported_at_utc': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'), 'source_kind': 'authenticated_local_copy_of_SEC_EDGAR_official_bulk_archives', 'original_local_directory': str(source), 'source_manifest_sha256': digest(raw_manifest), 'archives': imported, 'admission_status': 'raw_material_only_pending_complete_universe_identity_and_publication_date_export'}))
+
+if __name__ == '__main__':
+    import_sp500()
+    import_sec_archives()

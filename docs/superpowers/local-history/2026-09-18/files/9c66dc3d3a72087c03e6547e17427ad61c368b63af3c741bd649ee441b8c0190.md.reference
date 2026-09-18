@@ -1,0 +1,131 @@
+# Task 1 report — V5 closed learning/search contracts
+
+## Outcome
+
+Implemented and committed the closed V5 target, search, provider, artifact, panel, resource,
+campaign, evidence, and role contracts as commit `a4d5ecf`
+(`feat: define optimizer v5 contracts`). The commit contains exactly:
+
+- `core/pit_optimizer_v5/__init__.py`
+- `core/pit_optimizer_v5/contracts.py`
+
+No tests were created, modified, or expanded.
+
+## Contract behavior
+
+- Added the requested frozen, slotted records with their declared fields and exported them from
+  `core.pit_optimizer_v5`: `AnnualizedReturnTargetV5`, `SearchCapabilitiesV5`,
+  `ProviderCapabilitiesV5`, `ArtifactRefV5`, `EpisodePlanV5`, `CampaignPanelPlanV5`,
+  `ResourceCapabilitiesV5`, `CampaignManifestV5`, `MetricPredictionV5`,
+  `ValidationResultV5`, `EpisodeEvaluationV5`, `CampaignEvidenceV5`, `HypothesisV5`,
+  `InvestigatorArtifactV5`, `CriticReviewV5`, and `CriticArtifactV5`.
+- `AnnualizedReturnTargetV5` is independent of the V4 production factory. It accepts positive
+  finite two-decimal values, round-trips canonical two-decimal text/primitive payloads, and hashes
+  that exact canonical representation. No `AnnualizedReturnTarget.production()` reference exists
+  anywhere in the V5 package.
+- Search and resource defaults match the brief: 3 hypotheses, 4 tunable axes, 12 variants,
+  6 discovery survivors, archive capacity 8, 10 feedback rounds, full-source escape enabled,
+  2 parallel evaluations, and all declared stage/wall/cleanup timeouts. Provider retries and schema
+  repair calls default to zero.
+- `ArtifactRefV5` rejects absolute, empty/root, traversal, normalized-alias, Windows-drive,
+  alternate-separator, and non-canonical POSIX paths without touching the filesystem. It also
+  requires a lowercase SHA-256 digest.
+- Added `AuthenticatedArtifactV5`, canonical `ArtifactIndexV5`, typed
+  `ArtifactGraphFailureV5`/`ArtifactGraphVerificationV5`, and the `ArtifactGraphVerifierV5`
+  boundary. The verifier contract requires implementations to remain under the authenticated
+  `.artifacts/pit-optimizer-v5` root, accept only regular non-symlink files, authenticate bytes
+  before decoding, recursively walk index children, and return typed `missing`, `relocated`,
+  `cycle`, or `digest_mismatch` outcomes. No constructor probes an arbitrary path.
+- Campaign panel plans require exactly four discovery episodes with ordinals `(1, 2, 3, 4)`,
+  unique IDs, and distinct discovery panel identities. `validate_episode_plan_panel_v5` requires
+  the concrete validated `EvaluationPanelSpec` and binds its semantic digest, dates, and ordered
+  security-lineage IDs to the episode.
+- `CampaignEvidenceV5` is built directly on the existing `PanelEvaluationV5`; evaluator records
+  were not duplicated. Construction requires four ordinal episodes, pairwise-disjoint intervals,
+  distinct panel identities, one evaluator identity, one policy identity, one selected scenario,
+  and the exact selected-scenario closed-trade sum.
+- `validate_campaign_evidence_v5` additionally binds the evidence to the canonical discovery-plan
+  digest and checks every episode ID, ordinal, date range, panel digest, evaluator, sandbox,
+  policy, and selected scenario. `validate_campaign_manifest_bindings_v5` closes the duplicated
+  target, panel-plan, evaluator, PIT bundle, prices provenance, execution-profile, and sandbox
+  identities across authenticated artifacts.
+- Investigator cardinality and contiguous ranks are validated against the supplied manifest, not
+  a hard-coded default. `investigator_hypothesis_schema_bounds_v5` returns that same manifest value
+  for provider `minItems` and `maxItems`. Hypothesis and critic evidence IDs must resolve against
+  the exact issued `RoleEvidenceV5`; critic reviews must match the complete ordered testable
+  experiment batch exactly once.
+
+## Verification evidence
+
+Commands were run from the isolated worktree.
+
+1. Initial direct smoke failed before implementation with the expected import error for missing
+   `AnnualizedReturnTargetV5`.
+2. Final in-memory deterministic contract smoke (no file created):
+   - Output: `V5_CONTRACT_SMOKE_OK targets=4 defaults=1 artifacts=1 panels=4 evidence=4 roles=2`
+   - Covered four valid target round trips (`10.00`, `20.00`, `50.00`, `37.25`), invalid targets,
+     exact defaults, canonical artifact containment/rejection, authenticated bytes, canonical
+     child indexes, typed graph results, four discovery episodes, concrete panel binding,
+     manifest/evaluator/policy/scenario bindings, selected-scenario closed trades, variable
+     investigator cardinality/schema bounds, unresolved evidence rejection, and strict critic
+     experiment ordering.
+3. The exact planned command
+   `python -B -m pytest tests/test_pit_optimizer_v5_evaluator.py -q` could not run because that test
+   file does not exist in base commit `2f62f3c`; pytest reported `file or directory not found`.
+4. Existing relevant evaluator/holdout tests:
+   `python -B -m pytest tests/test_pit_optimizer_subset_reference.py tests/test_pit_optimizer_holdout.py -q`
+   - Result: `6 passed`.
+   - Non-failing warnings: upstream `websockets.legacy` deprecation and inability to write the
+     ignored pytest cache beneath `.artifacts` in this sandbox.
+5. `python -B -m ruff check core/pit_optimizer_v5/contracts.py core/pit_optimizer_v5/__init__.py`
+   - Output: `All checks passed!`
+6. `python -B -m py_compile core/pit_optimizer_v5/contracts.py core/pit_optimizer_v5/__init__.py`
+   - Exit code 0, no output.
+7. Final audits:
+   - `git diff --check` passed.
+   - Forbidden V4 production-target reference was absent.
+   - Changed and staged source scope was exactly the two authorized files.
+   - Output: `FINAL_VERIFY_OK tests=6 ruff=clean compile=clean diff=clean scope=2 forbidden_ref=absent`.
+8. Commit hooks passed Ruff, trailing-whitespace, end-of-file, YAML applicability, and
+   merge-conflict checks.
+
+No provider call, Docker evaluation, data access, qualification, replay, push, or merge was run.
+
+## Boundary note
+
+Filesystem regular-file, symlink, relocation, and resolved-root checks intentionally remain behind
+`ArtifactGraphVerifierV5`, consistent with the pure-domain module ruling. Task 1 defines the closed
+typed inputs, authenticated-byte node, canonical recursive index, and failure result required for a
+later owned adapter; it does not make dataclass construction inspect caller-controlled paths.
+
+## Targeted review fix
+
+Commit `7fbcda0` (`fix: reject overlapping v5 discovery plans`) resolves the P1 finding in
+`task-1-review.md`.
+
+- Added one shared ordered-disjoint date-interval validator and invoked it from both
+  `CampaignPanelPlanV5` and `CampaignEvidenceV5`.
+- Date ranges use inclusive semantics. In canonical ordinal order `(1, 2, 3, 4)`, each episode's
+  `end_date` must be strictly earlier than the next episode's `start_date`. A shared boundary date
+  therefore overlaps and is rejected; `2024-01-01..2024-01-10` followed by
+  `2024-01-11..2024-01-20` is accepted.
+- Discovery inputs are never silently reordered. A tuple whose ordinals are not exactly
+  `(1, 2, 3, 4)` is rejected by the existing cardinality/ordinal guard, while canonical ordinals
+  paired with reverse-chronological date ranges are rejected by the new interval guard.
+- Planning now fails before `discovery_plan_sha256` can be issued for overlapping episodes.
+  `CampaignEvidenceV5` retains independent revalidation as defense in depth before scoring.
+
+Focused direct smoke output:
+
+`DISCOVERY_INTERVAL_SMOKE_OK overlap_rejected=1 shared_date_rejected=1 adjacent_accepted=1 ordinals_unsorted_rejected=1 dates_unsorted_rejected=1 evidence_revalidated=1`
+
+Final review-fix verification:
+
+- Existing relevant evaluator/holdout tests: `6 passed`.
+- Ruff: `All checks passed!`
+- `py_compile`: exit code 0.
+- `git diff --check`: exit code 0.
+- Source and staged scope: only `core/pit_optimizer_v5/contracts.py`.
+- Output: `REWORK_VERIFY_OK tests=6 ruff=clean compile=clean diff=clean scope=1`.
+- Commit hooks passed Ruff, whitespace, end-of-file, YAML applicability, and merge-conflict checks.
+- No tests, providers, Docker, data, replay, qualification, push, or merge were changed or run.

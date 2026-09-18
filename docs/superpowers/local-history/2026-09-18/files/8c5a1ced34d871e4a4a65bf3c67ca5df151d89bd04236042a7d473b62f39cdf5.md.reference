@@ -1,0 +1,4 @@
+# Source preimages
+
+H1 adds one new source file from /dev/null. No existing source file was edited, so there is no existing-source preimage. The allowed optional helper change in development_preparation.py was not used. Its pre-existing worktree modifications were preserved untouched.
+

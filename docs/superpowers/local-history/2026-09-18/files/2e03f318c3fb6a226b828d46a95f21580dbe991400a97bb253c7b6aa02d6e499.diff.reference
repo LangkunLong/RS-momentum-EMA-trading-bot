@@ -1,0 +1,341 @@
+--- review-freeze-03-exact/prepare_c_c_campaign.py
++++ prepare_c_c_campaign.py
+@@ -15,6 +15,7 @@
+ import os
+ from pathlib import Path, PurePosixPath
+ import re
++import stat
+ import sys
+ 
+ 
+@@ -72,6 +73,10 @@
+ EXPECTED_LAUNCHER_RESOLUTION = (
+     PACKAGE_ROOT.parent / "preparation-tool-files-launcher-resolution.json",
+     "11caf55b22bcdf85fefe9f8b599ffa63c97013f636ad2b4f15bf8e24164312dc",
++)
++EXPECTED_LONG_PATH_FINDING = (
++    PACKAGE_ROOT / "windows-long-path-preflight-finding.md",
++    "2a87c254726cc52cac1069cb8b8997195c27f2885ff59318a965929962ce64e2",
+ )
+ EXECUTABLES = {
+     "git": (
+@@ -213,35 +218,90 @@
+     return sha256(raw).hexdigest()
+ 
+ 
++def windows_extended_path(path: Path) -> str | Path:
++    if os.name != "nt":
++        return path
++    value = str(path)
++    if value.startswith("\\\\?\\"):
++        return value
++    if value.startswith("\\\\"):
++        return "\\\\?\\UNC\\" + value[2:]
++    return "\\\\?\\" + value
++
++
++def path_lstat(path: Path) -> os.stat_result:
++    return os.lstat(windows_extended_path(path))
++
++
++def path_exists(path: Path) -> bool:
++    try:
++        path_lstat(path)
++    except FileNotFoundError:
++        return False
++    return True
++
++
++def metadata_identity(metadata: os.stat_result) -> tuple[int, int]:
++    return metadata.st_dev, metadata.st_ino
++
++
++def read_regular_link_free(path: Path, label: str) -> bytes:
++    try:
++        before = path_lstat(path)
++        attributes = getattr(before, "st_file_attributes", 0)
++        if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode) or attributes & _REPARSE_POINT:
++            raise RuntimeError(f"{label} is not a regular link-free file: {path}")
++        descriptor = os.open(
++            windows_extended_path(path),
++            os.O_RDONLY | getattr(os, "O_BINARY", 0),
++        )
++        try:
++            opened = os.fstat(descriptor)
++            if not stat.S_ISREG(opened.st_mode) or metadata_identity(opened) != metadata_identity(before):
++                raise RuntimeError(f"{label} changed while opening: {path}")
++            chunks = []
++            while chunk := os.read(descriptor, 1024 * 1024):
++                chunks.append(chunk)
++        finally:
++            os.close(descriptor)
++        after = path_lstat(path)
++        if metadata_identity(after) != metadata_identity(before):
++            raise RuntimeError(f"{label} changed while reading: {path}")
++        return b"".join(chunks)
++    except RuntimeError:
++        raise
++    except OSError as exc:
++        raise RuntimeError(f"{label} is unavailable: {path}") from exc
++
++
+ def read_exact(path: Path, expected_sha256: str, label: str) -> bytes:
+-    if not path.is_file() or path.is_symlink() or is_reparse(path):
+-        raise RuntimeError(f"{label} is not a regular link-free file: {path}")
+-    raw = path.read_bytes()
++    raw = read_regular_link_free(path, label)
+     if digest(raw) != expected_sha256:
+         raise RuntimeError(f"{label} digest mismatch: {path}")
+     return raw
+ 
+ 
+ def is_reparse(path: Path) -> bool:
+-    attributes = getattr(path.lstat(), "st_file_attributes", 0)
+-    is_junction = getattr(path, "is_junction", None)
+-    return bool(attributes & _REPARSE_POINT) or bool(is_junction and is_junction())
++    metadata = path_lstat(path)
++    attributes = getattr(metadata, "st_file_attributes", 0)
++    return stat.S_ISLNK(metadata.st_mode) or bool(attributes & _REPARSE_POINT)
+ 
+ 
+ def require_absolute_link_free_directory(path_text: str, label: str) -> Path:
+     supplied = Path(path_text)
+     if not supplied.is_absolute():
+         raise RuntimeError(f"{label} must be an absolute directory")
+-    resolved = supplied.resolve(strict=True)
+-    if not resolved.is_dir():
+-        raise RuntimeError(f"{label} is not a directory: {resolved}")
+-    anchor = Path(resolved.anchor)
++    normalized = Path(os.path.abspath(supplied))
++    anchor = Path(normalized.anchor)
+     current = anchor
+-    for component in resolved.parts[1:]:
++    for component in normalized.parts[1:]:
+         current /= component
+-        if current.is_symlink() or is_reparse(current):
++        metadata = path_lstat(current)
++        if is_reparse(current):
+             raise RuntimeError(f"{label} contains a link or reparse point: {current}")
+-    return resolved
++    if not stat.S_ISDIR(metadata.st_mode):
++        raise RuntimeError(f"{label} is not a directory: {normalized}")
++    return normalized
+ 
+ 
+ def require_under(child: Path, parent: Path, label: str) -> None:
+@@ -254,7 +314,7 @@
+ 
+ 
+ def require_empty(path: Path, label: str) -> None:
+-    if any(path.iterdir()):
++    if directory_names(path):
+         raise RuntimeError(f"{label} must be genuinely fresh and empty: {path}")
+ 
+ 
+@@ -272,10 +332,11 @@
+ 
+ 
+ def file_identity(path: Path) -> dict[str, object]:
+-    status = path.stat()
++    raw = read_regular_link_free(path, "identity file")
++    status = path_lstat(path)
+     return {
+         "path": str(path),
+-        "sha256": digest(path.read_bytes()),
++        "sha256": digest(raw),
+         "size_bytes": status.st_size,
+         "device": status.st_dev,
+         "inode": status.st_ino,
+@@ -283,7 +344,7 @@
+ 
+ 
+ def native_python_alias_identity() -> dict[str, object]:
+-    status = os.lstat(PYTHON_NATIVE_ALIAS)
++    status = path_lstat(PYTHON_NATIVE_ALIAS)
+     attributes = getattr(status, "st_file_attributes", None)
+     reparse_tag = getattr(status, "st_reparse_tag", None)
+     if (
+@@ -304,17 +365,36 @@
+ 
+ 
+ def snapshot_files(root: Path) -> dict[str, str]:
+-    return {
+-        path.relative_to(root).as_posix(): digest(path.read_bytes())
+-        for path in sorted(root.rglob("*"))
+-        if path.is_file()
+-    }
++    result = {}
++    pending = [root]
++    while pending:
++        directory = pending.pop()
++        entries = sorted(os.scandir(windows_extended_path(directory)), key=lambda item: item.name)
++        for entry in entries:
++            logical = directory / entry.name
++            metadata = path_lstat(logical)
++            if is_reparse(logical):
++                raise RuntimeError(f"snapshot contains a link or reparse point: {logical}")
++            if stat.S_ISDIR(metadata.st_mode):
++                pending.append(logical)
++            elif stat.S_ISREG(metadata.st_mode):
++                result[logical.relative_to(root).as_posix()] = digest(
++                    read_regular_link_free(logical, "snapshot file")
++                )
++            else:
++                raise RuntimeError(f"snapshot contains a non-regular entry: {logical}")
++    return dict(sorted(result.items()))
++
++
++def directory_names(path: Path) -> tuple[str, ...]:
++    return tuple(sorted(entry.name for entry in os.scandir(windows_extended_path(path))))
+ 
+ 
+ def write_exclusive(path: Path, raw: bytes) -> None:
+-    path.parent.mkdir(parents=True, exist_ok=True)
++    os.makedirs(windows_extended_path(path.parent), exist_ok=True)
++    require_absolute_link_free_directory(str(path.parent), "exclusive-write parent")
+     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+-    descriptor = os.open(path, flags, 0o600)
++    descriptor = os.open(windows_extended_path(path), flags, 0o600)
+     try:
+         written = 0
+         while written < len(raw):
+@@ -322,6 +402,7 @@
+         os.fsync(descriptor)
+     finally:
+         os.close(descriptor)
++    read_regular_link_free(path, "exclusive-write result")
+ 
+ 
+ def parse_arguments() -> argparse.Namespace:
+@@ -434,10 +515,16 @@
+         launcher_resolution_sha,
+         "reviewed Python launcher resolution evidence",
+     )
++    long_path_finding_path, long_path_finding_sha = EXPECTED_LONG_PATH_FINDING
++    long_path_finding_raw = read_exact(
++        long_path_finding_path.resolve(strict=True),
++        long_path_finding_sha,
++        "principal Windows long-path preflight finding",
++    )
+ 
+     source_before = {
+-        relative: digest((SOURCE_ROOT / relative).read_bytes())
+-        for relative in SOURCE_SHA256_BY_PATH
++        relative: digest(read_exact(SOURCE_ROOT / relative, expected, f"reviewed source {relative}"))
++        for relative, expected in SOURCE_SHA256_BY_PATH.items()
+     }
+     if source_before != SOURCE_SHA256_BY_PATH:
+         raise RuntimeError("one or more of the 22 independently reviewed source files changed")
+@@ -459,6 +546,8 @@
+         "interpreter_correction_sha256": digest(correction_raw),
+         "launcher_resolution_path": str(launcher_resolution_path.resolve(strict=True)),
+         "launcher_resolution_sha256": digest(launcher_resolution_raw),
++        "long_path_finding_path": str(long_path_finding_path.resolve(strict=True)),
++        "long_path_finding_sha256": digest(long_path_finding_raw),
+         "source_sha256_by_path": source_before,
+     }
+ 
+@@ -469,7 +558,7 @@
+         "authorized main-repository artifact root",
+     )
+     development = require_absolute_link_free_directory(str(DEVELOPMENT_ROOT), "development artifact parent")
+-    if ARTIFACT_ROOT.exists() or RESOURCE_PARENT.exists():
++    if path_exists(ARTIFACT_ROOT) or path_exists(RESOURCE_PARENT):
+         raise RuntimeError("selected fresh artifact or resource root already exists")
+     if ARTIFACT_ROOT.parent.resolve(strict=True) != development:
+         raise RuntimeError("selected fresh artifact root has an unexpected parent")
+@@ -562,10 +651,10 @@
+ 
+ 
+ def create_fresh_roots(source_payloads: dict[str, bytes]) -> dict[str, Path]:
+-    os.mkdir(ARTIFACT_ROOT)
+-    os.mkdir(RESOURCE_PARENT)
++    os.mkdir(windows_extended_path(ARTIFACT_ROOT))
++    os.mkdir(windows_extended_path(RESOURCE_PARENT))
+     for root in RESOURCE_ROOTS.values():
+-        os.mkdir(root)
++        os.mkdir(windows_extended_path(root))
+     roots = {
+         "artifact_root": require_absolute_link_free_directory(str(ARTIFACT_ROOT), "fresh artifact root"),
+         **{
+@@ -583,7 +672,7 @@
+             FIXED_DEPENDENCY_SHA256_BY_PATH[relative],
+             f"fresh mounted data resource {name}",
+         )
+-    if {item.name for item in roots["data_root"].iterdir()} != {
++    if set(directory_names(roots["data_root"])) != {
+         "pit_bundle.sqlite3",
+         "prices_provenance.json",
+     }:
+@@ -592,7 +681,7 @@
+ 
+ 
+ def require_prelaunch_absence(artifact_root: Path) -> None:
+-    present = {item.name for item in artifact_root.iterdir()}
++    present = set(directory_names(artifact_root))
+     forbidden = sorted(present & FORBIDDEN_RUNTIME_TOP_LEVEL)
+     if forbidden:
+         raise RuntimeError(f"preparation created prohibited runtime state: {forbidden}")
+@@ -932,17 +1021,23 @@
+         manifest_ref=original_manifest_ref,
+     )
+     source_after = {
+-        relative: digest((SOURCE_ROOT / relative).read_bytes())
+-        for relative in SOURCE_SHA256_BY_PATH
++        relative: digest(read_exact(SOURCE_ROOT / relative, expected, f"reviewed source {relative}"))
++        for relative, expected in SOURCE_SHA256_BY_PATH.items()
+     }
+     if original_after != original or source_after != SOURCE_SHA256_BY_PATH:
+         raise RuntimeError("source authority changed during preparation")
+     for readiness in gates["readiness"].values():
+-        if digest(Path(readiness["path"]).read_bytes()) != readiness["sha256"]:
++        if digest(
++            read_exact(
++                Path(readiness["path"]),
++                readiness["sha256"],
++                "updated readiness approval",
++            )
++        ) != readiness["sha256"]:
+             raise RuntimeError("updated readiness approval changed during preparation")
+ 
+     review_directory = artifact_root / paths["review_package"]
+-    if review_directory.exists():
++    if path_exists(review_directory):
+         raise RuntimeError("review output package already exists")
+     request_path = review_directory / "initial-investigator-request.json"
+     messages_path = review_directory / "initial-investigator-wire-messages.json"
+--- review-freeze-03-exact/implementation-report.md
++++ implementation-report.md
+@@ -1,12 +1,12 @@
+ # C-c native campaign preparation driver report
+ 
+-Status: **STATIC IMPLEMENTATION COMPLETE; DRIVER NOT EXECUTED.**
++Status: **STATIC FIX 3 COMPLETE; CORRECTED DRIVER NOT EXECUTED.**
+ 
+-The bounded driver is `prepare_c_c_campaign.py`, 53,367 bytes, SHA-256 `3ca3a90c81380b99532d5fd79dda18de14a2d49700ac20dbfb06425ef0c8d2da`. It is frozen for bounded independent re-review. The earlier approved direct installed-binary start was rejected by Windows before Python or the driver ran; no campaign/root/resource/config/manifest/policy/preview was created.
++The bounded driver is `prepare_c_c_campaign.py`, 57,121 bytes, SHA-256 `2ca91a126701fdbd692c79181a6ef28a1dc9d4d81dc6a54b102b1f04e91ff5be`. It is frozen for bounded independent re-review. The earlier approved direct installed-binary start was rejected by Windows before Python ran. A later approved start through `py -3.13 -B` authenticated the review and interpreter gates, then stopped in the pre-import preflight when ordinary Windows path handling falsely reported an existing 264-character original blob path as absent. Python raised before project imports or destination writes, and the selected artifact and resource roots remained absent. The corrected driver has not been executed.
+ 
+ ## Fixed authority and execution gate
+ 
+-The driver pins the final P1-P4 independent source review `4e4991b0dfcdcfe980b2bd2655ba5bf88af6300c956c179d2e258014dd1fef4b`, reviewed-source authority `d896bce97945b9438bed6f4837fd16213530338563e3bbd728eafaa8a9fbbe09`, all 22 exact source hashes, principal readiness `14f385172f29dccf258d4be4802137724774e57b267ebbac4201a4945c01aed2`, independent readiness `50cd6d863fb3f6235af3a47fcf90fe4d21a5425c8852055b470abe9c95634f3a`, preparation-tool evidence `c329ade7d4f50a705bd6992da477870f4d1e0c3e4862feffe0f855d7c3fb243d`, native-launch notes `1ea2eabd612c94d3992f0485a9cc5ec387e4fd465e44fb1c48a97abbc06ef49c`, principal interpreter correction `10b7a1468bcc0e4f31bf9c73432be9f29eab5510df6c34a8c849e53466a76fe5`, and launcher-resolution evidence `11caf55b22bcdf85fefe9f8b599ffa63c97013f636ad2b4f15bf8e24164312dc`.
++The driver pins the final P1-P4 independent source review `4e4991b0dfcdcfe980b2bd2655ba5bf88af6300c956c179d2e258014dd1fef4b`, reviewed-source authority `d896bce97945b9438bed6f4837fd16213530338563e3bbd728eafaa8a9fbbe09`, all 22 exact source hashes, principal readiness `14f385172f29dccf258d4be4802137724774e57b267ebbac4201a4945c01aed2`, independent readiness `50cd6d863fb3f6235af3a47fcf90fe4d21a5425c8852055b470abe9c95634f3a`, preparation-tool evidence `c329ade7d4f50a705bd6992da477870f4d1e0c3e4862feffe0f855d7c3fb243d`, native-launch notes `1ea2eabd612c94d3992f0485a9cc5ec387e4fd465e44fb1c48a97abbc06ef49c`, principal interpreter correction `10b7a1468bcc0e4f31bf9c73432be9f29eab5510df6c34a8c849e53466a76fe5`, launcher-resolution evidence `11caf55b22bcdf85fefe9f8b599ffa63c97013f636ad2b4f15bf8e24164312dc`, and the principal Windows long-path finding `2a87c254726cc52cac1069cb8b8997195c27f2885ff59318a965929962ce64e2`.
+ 
+ Execution additionally requires explicit command-line pins for the fixed source review, source authority, both readiness reviews, this exact driver SHA, and a new `campaign-preparation-driver/independent-review.md` SHA. The independent review must contain this exact driver SHA and an explicit approval verdict. Python bytecode suppression is mandatory. All gates, all 22 current source-byte checks, exact tool-file checks, source inventory reads, quick-evidence reads, and selected-path absence checks precede project imports and every destination write.
+ 
+@@ -30,6 +30,8 @@
+ 
+ Repository hashes are compared before/after preview construction and before/after command rendering. The eventual output package saves exact canonical request, wire-message, and wire-schema bytes outside role/state namespaces, along with hashes, sizes, prospective token accounting, graph/parent/quick references, native config/tool identities, the policy-pinned command, and explicit `maximum_usd: null` / absent price authority. Later author and critic request bytes remain explicitly unknown because they depend on actual authorized responses and evaluation evidence.
+ 
++The driver now converts absolute Windows paths to the native `\\?\` or `\\?\UNC\` form only at the filesystem-call boundary. Exact reads use extended-path `lstat`/`open`/`fstat` with regular-file, reparse-point, and stable file-identity checks. Driver-owned snapshot traversal, directory enumeration, fresh-root creation, destination parent creation, exclusive `O_EXCL` writes, post-write authentication, and existence checks use the same extended-path boundary. Logical `Path` values, relative artifact references, repository-root identity inputs, containment comparisons, and report paths remain unchanged. Link/reparse rejection and create-only behavior remain fail closed; there is no truncation or missing-file bypass.
++
+ The source contains no round/campaign runner, provider call, evaluator call, Docker invocation, ledger reservation, role append, admission binding, or enrollment call. It does not write or run an awake/credential launcher.
+ 
+ ## Static verification
+@@ -37,6 +39,7 @@
+ - Scoped Ruff: PASS.
+ - AST parse and in-memory compile: PASS. Static binding inspection confirms `ExecutionProfileV5` comes from `core.backtest_fills` and `PolicyRevisionIdentityV5` / `SourceBundleV5` come from `core.pit_optimizer_v5.candidate_ir`.
+ - Static interpreter inspection confirms the correction pins the launcher, native alias metadata, base prefix, installed binary and version before project imports; the former direct installed-binary `samefile` requirement is absent, and native renderer use of `sys.executable` is unchanged.
++- Static filesystem inspection confirms long-path-capable operations for exact reads, snapshots, driver-owned directory traversal and root/destination writes. No direct `Path.read_bytes`, `Path.iterdir`, `Path.rglob`, `Path.exists`, `Path.is_file`, or ordinary-path destination `os.open` / `os.mkdir` remains.
+ - Static call inspection found the required native preparation calls and none of `run_feedback_round_v5`, `_run_campaign_v5`, `create_campaign_admission_v5`, `reserve_role_slot`, or role-request append calls.
+ - Project imports occur only after `authenticate_review_gates` and `preflight_paths_and_inputs`.
+ - Current reviewed source map: 22/22 match, zero mismatches.

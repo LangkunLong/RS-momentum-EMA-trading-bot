@@ -1,0 +1,136 @@
+# Task 6A: Close the Remaining Trusted Terminal Lifecycle Gaps
+
+Task 6A is a separately authorized, bounded remediation task after Task 6 reached
+its five-round review ceiling. It closes exactly the two load-bearing Important
+findings and the one report-only Minor finding in `task-6-rereview-5.md`. It does
+not reopen already closed Task 6 findings or begin Task 7 orchestration.
+
+## Files
+
+- Modify as required: `core/pit_optimizer_authorization.py`
+- Modify as required: `agent_loop.py`
+- Modify: `tests/test_pit_optimizer_v2.py`
+- Modify only if directly required by the same lifecycle contract:
+  `core/pit_optimization_contract.py` and `tests/test_agent_loop.py`
+- Correct: ignored SDD report `task-6-report.md`
+- Create/update: ignored SDD report `task-6a-report.md`
+
+## Requirement 1: trusted terminal-package commitment
+
+The AuthorizationLedger is the trusted, exclusive-lock, hash-chained origin
+anchor. Add a private gateway-owned durable terminal commitment that binds the
+exact terminal package used for normal reconciliation or restart recovery. The
+commitment must bind, directly or through canonical digests, all of:
+
+- exact authorization reservation identity and primitive;
+- provider-record digest;
+- budget-recovery digest;
+- terminal-event digest;
+- audit run and manifest identities;
+- call index, iteration, and role;
+- usage and charge basis;
+- terminal outcome and terminal code;
+- payload digest.
+
+Normal reconciliation and recovery must require this commitment. Audit-local
+self-consistency is insufficient. A crash before the terminal commitment must
+remain fail-closed and must not be auto-resealed from untrusted audit files.
+Prefer an idempotent locked AuthorizationLedger operation that commits the
+terminal package and reconciles the authorization reservation together, so a
+replay either verifies the exact same package or fails closed.
+
+### Mandatory RED
+
+Start from the existing `_task6_crash_after_terminal_audit` fake/temp helper.
+Preserve the genuine reserved/start events and their AuthorizationLedger
+commitments byte-for-byte. Rewrite the provider record from genuine usage
+100/50/150 and `$0.001` to a different closed authoritative usage 120/60/180
+and `$0.002`. Rewrite the matching budget recovery snapshot/reconciliation and
+the terminal event's provider digest, budget digest, snapshot, and terminal
+hash, while keeping the genuine authorization ID, reservation/start digests,
+lifecycle digest, role, and ordering.
+
+Reopen a fresh AuditTrail, AuthorizationLedger, and zero BudgetLedger, then
+call public `recover_pit_optimizer_finalization`. Before implementation, prove
+the current code accepts the rewritten package. After implementation require:
+
+- rejection before any BudgetLedger restore;
+- no authorization reconciliation;
+- plan 2 remains fenced;
+- genuine, fully committed terminal recovery remains idempotent.
+
+## Requirement 2: conservative started boundary across commitment failure
+
+A durably published start event is the conservative request-start boundary even
+when start-commitment binding raises before the ordinary caller marks the call
+as possibly sent. Cleanup must not classify that state as before-send or release
+its reservation.
+
+For a one-shot exception after the genuine started commitment is durably
+written, cleanup must retry the exact idempotent commitment and finalize the
+call as uncertain/started with the full reservation retained. It must publish
+one matching authorization reconciliation, close the lease as `cancelled`, and
+must never invoke the SDK or transmit a replacement request.
+
+### Mandatory RED
+
+Extend the existing synchronous phase test with
+`phase="start_commitment"`. Wrap the injected AuthorizationLedger's
+`_bind_gateway_lifecycle_commitment`: on the first call whose lifecycle has a
+non-null `started_event_sha256`, call the genuine method and then raise
+`KeyboardInterrupt("start_commitment")`.
+
+Before implementation prove the current code leaves the ledgers divergent.
+After implementation require:
+
+- zero SDK calls;
+- exactly one uncertain/started terminal record;
+- the complete reservation retained in BudgetLedger;
+- one matching authorization reconciliation;
+- lease closure is `cancelled`;
+- fresh reopen verifies the same terminal idempotently;
+- no same-plan retry or replacement send is possible.
+
+Do not weaken the invariant merely to catch this injected exception. The
+durable start event and exact idempotent commitment are the evidence boundary.
+
+## Requirement 3: evidence wording only
+
+Correct the Fix Round 5 report claim. It may say the focused tests cover every
+lifecycle code, one representative public optimizer state, and one cross-role
+semantic relabel, with the remaining state closure established by the shared
+set/mapping logic. It must not claim every lifecycle-state or role/state
+permutation is directly parameterized.
+
+## Compatibility and safety constraints
+
+- Preserve schema-v1 readers and fail-closed handling of older schema-v2
+  histories that lack the newly required trusted commitment.
+- Preserve the one-shot all-R1 gateway, frozen pricing, exact call plan, strict
+  parser, canonical wire bytes, provider retries at zero, and no response
+  healing or disguised retry.
+- Preserve secrecy: no prompt, candidate source, raw provider response,
+  credential, header, API key, or operator approval content in durable records,
+  tests, reports, or output.
+- All tests use injected fake clients/responses/pricing and pytest temporary
+  paths only. Do not make provider calls, access network or live pricing,
+  construct the real SDK, run replay/parity, start Docker, use permanent
+  ledgers, or create background processes.
+- Keep all work local. Do not push, upload, merge, deploy, or create cloud work.
+- Do not begin Task 7.
+
+## Verification and deliverable
+
+Use strict RED -> GREEN for both mandatory regressions. Then run the exact
+focused Task 6 suite:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py tests/test_pit_optimizer_v2.py -k "pit_optimizer_v2 or call_budget or provider_call or budget_reservation"
+```
+
+Also run a dedicated focused slice containing both new regressions, focused
+Ruff, `py_compile`, and `git diff --check`. Run no broader replay or full
+repository suite. Commit the tracked changes on
+`codex/pit-optimizer-implementation`, leave the tracked worktree clean, and
+write `task-6a-report.md` with exact RED/GREEN commands and outputs, files
+changed, commit, self-review, resource/secrecy evidence, and any concern.

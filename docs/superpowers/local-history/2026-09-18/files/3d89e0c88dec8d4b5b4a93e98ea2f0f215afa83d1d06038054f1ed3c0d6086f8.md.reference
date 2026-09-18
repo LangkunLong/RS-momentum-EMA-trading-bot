@@ -1,0 +1,39 @@
+# V5 source prerequisite audit
+
+Audit baseline: `3b5666e6f30c4031a80a04e1915efa99ed5b39a4`; existing branch/worktree retained. This is a source inventory and cross-plan record check, not runtime or performance evidence.
+
+## Plan coverage
+
+| Plan | Source completion evidence | Remaining stage |
+| --- | --- | --- |
+| Strategy/universe | Ledger records Tasks 1-6 complete with independent review. | Task 7 needs twelve authenticated local data/provenance files before normalization/build/verification. |
+| Evaluator truth | Ledger records Tasks 1-5 complete with independent review. Task 6 source repair at `5cb81b7` passed independent spec and quality review with both original findings addressed and no new findings. | Actual baseline capture and Task 7 deterministic runtime proof require bundle/panels/profiles/image. |
+| Learning/search | All nine tasks and the final fix wave/scoped review are recorded complete through `3548feb`. | Runtime evidence using actual local authorities remains separate. |
+| Campaign | Tasks 1-3 and source adapters for Tasks 6-8 are recorded complete with independent review. | Task 4 actual authority/adapter preparation and exact approval, Task 5 live discovery, then separately decided held-out stages and replay. |
+
+Read-only inventory extracted `Create` and `Modify` Python paths from the four authoritative plans, removed line annotations, excluded test and market-artifact paths, and checked each exact source path. All 48 distinct named source deliverables exist. Existing ledgers name the reviewed completion commits; no completed task was redispatched.
+
+The four ledgers contain 60 distinct seven-character commit references. All 60 resolve within the current HEAD ancestry (`git rev-list HEAD`), with zero missing/non-ancestor references.
+
+After source repair commit `5cb81b78435c519bcfd14bd5ba5303d8e465c43a`, controller verification used Python 3.13 with `-B` and Python's in-memory `compile()` for all 48 named modules: all passed, with no test file access and no bytecode output. `git diff --check 3b5666e..5cb81b7` passed; the source diff is confined to `artifacts.py`, `baseline.py`, and the consequential Windows pin fix in `readiness.py`. Independent review is recorded separately from this inventory.
+
+## Integration boundaries still requiring real authorities
+
+- `ProductionV5CommandServices._execute` requires an explicit authenticated `ProductionAdapterConfigV5` for `run` and `resume`, then constructs `ProductionRoundFactoryV5`; the runnable production path exists.
+- `render_discovery_command_v5` deliberately emits `adapter_composition="pending"` and `executable=False`. It is a manifest scope projection, as recorded by the campaign ledger ruling. Task 4 must bind/render the exact host adapter and approved command before it can be called executable or authorization-ready. No runnable command or provider allowance was fabricated by this audit.
+- The unchanged-source baseline authority's two open source findings are repaired and independently cleared at `5cb81b7`; no actual baseline authority was captured.
+- File presence and old review records do not establish compatibility with a real V5 bundle, evaluator image, or measured return improvement.
+
+## Constraints honored
+
+No tests were read, added, changed, or run. No data/artifact contents, providers, Docker, credentials, held-out panels, or replay were accessed. No merge, push, upload, or worktree materialization occurred. The existing seven-line unstaged campaign ruling was preserved.
+
+## User-confirmed local prerequisite status
+
+The user confirmed during this continuation that the intended V5 data root is this worktree's `.artifacts/pit-optimizer-v5/data/`. None of the twelve exact required files exists there, in the main checkout equivalent, or in any of the 34 local checkout roots already inspected. This paragraph records the user's findings, not a new broad filesystem/data search by this controller.
+
+Older partial prices/provenance exist in the `five-year-public-pit` checkout's `exports/pit/` and adaptive O'Neil canary artifacts; older fundamentals/provenance exist in SEC-PIT artifact directories. They have not been assembled and authenticated together under V5. No matching three-universe historical membership/provenance set or industry/provenance pair was found. Do not relabel these partial exports as valid V5 inputs.
+
+The user also confirmed no authenticated V5 sandbox profile exists in the inspected checkouts and Docker's engine is currently unreachable. Potential dormant image layers in Docker Desktop's managed Linux image store do not establish the required immutable image/runtime-source authority. This controller did not inspect Docker.
+
+The next data-dependent stage therefore requires deliberately acquiring/importing or adapting trusted local sources, sealing all twelve inputs, building/verifying the schema-V3 bundle, and building/recording the digest-pinned evaluator image. It is an input/provenance and runtime prerequisite, not a misplaced-bundle problem. Existing instructions still forbid fetching or synthesizing missing data during source implementation.

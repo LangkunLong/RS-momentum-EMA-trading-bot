@@ -1,0 +1,104 @@
+# Task 4 regeneration readiness
+
+Status: **READY**
+
+Audit scope was read-only at `codex/pit-fundamental-corrections` HEAD
+`3779b5431262b683ab3f7915fbcd20dc5da0b0e3`; the worktree was clean. No
+regeneration, replay, network call, unit test, or broad test was run.
+
+## Preconditions and pinned inputs
+
+The following exact script-bound paths exist and are regular files:
+
+- Source archives and provenance under
+  `C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.worktrees\five-year-public-pit\.artifacts\sec-pit\`:
+  `submissions.zip` (1,559,612,838 bytes), `companyfacts.zip` (1,407,131,132
+  bytes), `sec_archives_provenance.json` (850 bytes), all six normalized files,
+  and `fundamentals_publication.json`.
+- PIT inputs under
+  `C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.worktrees\five-year-public-pit\exports\pit\`:
+  `membership.csv` (12,284 bytes), `security_names.csv` (16,838),
+  `spy_trading_days.csv` (16,599), `prices.csv` (43,650,461),
+  `membership_provenance.json` (14,755), and `prices_provenance.json`
+  (265,269).
+- Current correction-worktree helpers and identity manifest:
+  `config\pit_price_identity_map.csv` (5,414 bytes),
+  `fetch_sec_pit_fundamentals.py` (26,678), `build_pit_bundle.py` (29,232),
+  and `verify_pit_bundle.py` (3,190).
+- The required Python executable exists at
+  `C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.agent-venv\Scripts\python.exe`.
+
+The archive SHA-256 values match the script and provenance exactly:
+
+- `submissions.zip`: `928d67221c6e6183bc343e7234c1391448c15cd1dd644d36b425db2f99ba4350`
+- `companyfacts.zip`: `d7b4b3c5f2fe014a203bdaef2197d2cba5683f434e965fc9bced1023a43c82ca`
+
+The preserved source publication is intentionally the pre-correction
+comparison truth: 568 security-master rows, 39 exclusions, and 142,329
+fundamental/audit rows, with XOM currently bound to `0002115436`. The script
+expects the fresh corrected totals of 568, 39, and 142,538, with XOM contributing
+209 rows and FRC the sole no-fundamental symbol. This is a coherent +209-row
+delta, not a stale-count blocker.
+
+## Script and interface audit
+
+The PowerShell parser reported `AST_ERRORS=0` for
+`task-4-regenerate.ps1`; the script itself was not invoked. Its guards are
+coherent at the audited HEAD:
+
+- mandatory absolute source/output/Python parameters; exact sibling source
+  worktree enforcement; regular-file/directory and reparse-point rejection;
+- output root must be new, outside both `five-year-public-pit` and the active
+  `canonical-canslim-entry` worktree; archive, normalized, bundle, manifest,
+  and audit targets are create-only;
+- exact archive manifest fields, byte lengths, ZIP counts/expanded-byte bounds,
+  and SHA-256 checks before copy, after copy, and after normalization;
+- `Copy-Item` is used for archive staging, so staged archives are copies rather
+  than hardlinks; the normalizer sees a complete local archive transaction and
+  therefore takes its verified reuse branch before any request session is made;
+- preserved provenance/marker hashes are checked, fresh normalized full counts
+  are checked, canonical non-XOM rows must remain identical, XOM must be exactly
+  `0000034088:reviewed_baseline_cik` with 209 rows split 71 quarterly/30
+  annual/108 balance, and FRC must be the sole unresolved-fundamental ticker;
+- bundle creation and verification use the unchanged CLI interfaces and record
+  the bundle and manifest hashes in a create-only audit JSON.
+
+At current HEAD, `core/sec_pit_fundamentals.py` declares `XOM -> 0000034088`
+and applies the reviewed-baseline override after current-ticker/name/chain
+resolution. The Task 5 reporting commit `3779b543` changed only
+`.superpowers\sdd\2026-08-23-canonical-canslim-entry\progress.md`; the SEC,
+bundle-builder, and bundle-verifier interfaces were not changed.
+
+## Capacity
+
+Observed source archive total is 2,966,743,970 bytes (2.763 GiB); preserved
+normalized outputs total 151,958,286 bytes (144.919 MiB); PIT input files total
+43,976,206 bytes (41.939 MiB); the existing baseline SQLite is 63,332,352 bytes
+(60.398 MiB). A fresh run needs roughly 3 GiB for copied archives, staged
+normalized outputs, and SQLite/temp publication space. C: had
+842,938,736,640 bytes free (about 785 GiB), so capacity is plausibly ample.
+No files were copied.
+
+## Exact invocation and expected outputs
+
+After the active replay is complete, run this exact command with the output root
+still absent (it was absent during this audit):
+
+```powershell
+& 'C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.worktrees\pit-fundamental-corrections\.superpowers\sdd\2026-08-23-canonical-canslim-entry\task-4-regenerate.ps1' `
+  -SourceWorktree 'C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.worktrees\five-year-public-pit' `
+  -OutputRoot 'C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.artifacts\task-4-regeneration-20260823T223000Z' `
+  -PythonExe 'C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.agent-venv\Scripts\python.exe' `
+  -SecUserAgent 'RS-momentum-EMA-trading-bot/1.0 (langkunlong@gmail.com)'
+```
+
+Expected publication/audit outputs are:
+
+- `<OutputRoot>\sec-pit\`: the two copied archives, archive provenance,
+  security master, exclusions, fundamentals, fundamentals audit, coverage,
+  provenance, and `fundamentals_publication.json`;
+- `<OutputRoot>\pit-bundle\pit_baseline.sqlite3` and `bundle_manifest.json`;
+- `<OutputRoot>\task-4-regeneration-audit.json`, containing all input/output
+  hashes, validated counts, no-network/non-XOM/XOM/bundle verification results.
+
+No blocker was found. Readiness report: this file.

@@ -1,0 +1,33 @@
+# Task 8 Scoped Re-review 2
+
+## Verdict
+
+**Approved with a nonblocking verification limitation.** The single open Important from Round 1 is **ADDRESSED**. The Round 2 diff introduces **0 new Critical** and **0 new Important** findings.
+
+## Original Finding Verdict
+
+### Important: production source authentication bypasses the explicit Git executable — ADDRESSED
+
+Production prepare and canary now authenticate source through the explicit `GitCapability` only:
+
+- `_execute_cli_run` constructs the capability from `config.git_executable` before source preflight or v2 dispatch, then passes that same capability into preflight and the v2 closures (`agent_loop.py:19621-19631`, `agent_loop.py:19652-19701`). A missing executable fails during capability construction; a regular but unusable executable fails during source preflight, before either prepare or canary dispatch.
+- `_pit_optimizer_source_identity` adapts the capability to `authenticated_source_identity` by invoking `_git(..., git=git)` (`agent_loop.py:5339-5349`). `_git` revalidates the approved executable identity and bytes, executes its absolute path without a shell, supplies fixed hardening arguments and a credential/config-free allowlisted environment, captures output, and enforces a timeout (`agent_loop.py:5158-5168`, `agent_loop.py:5183-5235`, `agent_loop.py:5265-5322`). Its default timeout for these identity calls is 15 seconds.
+- Prepare creates one capability-bound `v2_source_identity` closure, uses it for the outer source check, and passes it through the public adapter into the controller's second authentication (`agent_loop.py:19656-19682`; `core/pit_optimization.py:3260-3282`; `core/pit_optimizer_controller.py:670-706`). The controller no longer imports or calls the ambient helper.
+- Canary's authenticated preauthorization callback calls the same capability adapter (`agent_loop.py:18475-18502`). That callback is wired into the live-run preauthorization path (`agent_loop.py:19048-19057`) and executes before pricing freeze, all six conservative preflights, and lease mutation (`agent_loop.py:18215-18231`).
+- `authenticated_source_identity` has no default or ambient branch: callers must supply a Git-command callable, and the shared identity algorithm invokes only that callable (`core/pit_policy_parity.py:758-780`, `core/pit_policy_parity.py:797-806`). The private legacy `_source_identity` still contains ambient Git for pre-existing non-optimizer parity/manifest callers (`core/pit_policy_parity.py:783-794`), but scoped call-site inspection found no route from either production optimizer phase to it.
+
+The new tests meaningfully target the production behavior. `_forbid_ambient_git` poisons inherited Git state while leaving the approved absolute executable usable (`tests/test_pit_optimizer_loop.py:145-156`). The prepare regression enters `_execute_cli_run` and requires successful readiness with no ambient trace (`tests/test_pit_optimizer_loop.py:426-470`). The existing production-composition canary now applies the same poison and requires no trace after the complete mocked two-iteration run (`tests/test_pit_optimizer_loop.py:2532-2580`). The missing/invalid configured-executable matrix replaces live services, Docker configuration, and provider construction with forbidden sentinels, then asserts the closed failure stage, zero boundary calls, and unchanged runtime/artifact bytes (`tests/test_pit_optimizer_loop.py:473-559`). Because capability construction and source preflight are common to v2 prepare and canary, this early-failure property applies to both phases.
+
+## New Critical/Important Breakage
+
+None found in the five-file Round 2 package. The source-identity algorithm remains the same; the change only factors its Git execution seam and threads the approved capability through production composition. Repository call-site inspection found all changed required signatures updated.
+
+## Verification Limitation
+
+I independently ran the three focused fake/temp-only regression nodes. The two parametrized missing/invalid-executable cases passed. The prepare and production-composition positive cases could not reach the changed logic in this managed sandbox: `Path.resolve(strict=True)` raised `WinError 5` on each test-created controller temp directory at `agent_loop.py:5726`. Redirecting `TEMP` and `TMP` into the writable workspace produced the same host restriction. These are environment failures before source authentication, not contradictory product failures.
+
+The implementer report records the identical focus as `4 passed` and the combined mocked-integration/legacy suite as `411 passed`; those positive results were not independently reproduced here. Static inspection provides complete path proof, while positive runtime execution remains **⚠️ cannot verify in this sandbox**. `git diff --check 284b04f..5eb00d5` completed cleanly.
+
+## Resources and Effects
+
+This rereview read the prior finding, the supplied Round 2 diff package, the appended Round 2 report, and only directly relevant production/test call paths. It ran no Docker, provider/OpenRouter/network operation, SDK construction, live pricing, replay, parity run, backtest, permanent-ledger mutation, background process, upload, push, merge, deploy, or cloud action. The focused pytest attempts used local fake/temp-only boundaries. They left two ignored, sandbox-inaccessible controller-temp directories under `.artifacts/pytest/tmp_test_roots`; their contents could not be inspected or removed under the read-only/sandbox constraints. The only intentional filesystem write is this ignored rereview report. Tracked files, index, HEAD, and branch remain unchanged.

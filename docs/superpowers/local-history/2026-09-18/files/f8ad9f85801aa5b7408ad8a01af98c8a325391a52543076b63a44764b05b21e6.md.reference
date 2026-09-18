@@ -1,0 +1,80 @@
+# Task 3 — Optimizer-only resource ledger and best-effort pricing (production first)
+
+## Authority and dependency
+
+Read the approved spec:
+`C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-implementation/docs/superpowers/specs/2026-08-28-pit-optimizer-audit-only-usd-design.md`
+
+This task will start only after Task 2 is committed and reviewed. Consume its final `OptimizerPricingSnapshot`, schema-v3 lease/reservation, and provider-facts interfaces. Do not modify tests. Do not call a provider, start Docker, open hidden data, push, or upload.
+
+## Production files
+
+- Modify `agent_loop.py`.
+- A narrow edit in `core/pit_optimizer_authorization.py` is authorized only to
+  replace its hard-bound import/call to
+  `BudgetLedger._pit_optimizer_reservation_primitive` with the dedicated
+  `PitOptimizerResourceLedger` serializer. Make no other authorization change.
+
+## Required resource ledger
+
+Keep the generic/legacy `BudgetLedger`, `BudgetWindow`, diagnosis, proposal-batch, and legacy `pit_optimization` USD enforcement unchanged. Move the active optimizer-only methods and recovery serialization to a dedicated calls/tokens ledger:
+
+```python
+@dataclass(frozen=True)
+class PitOptimizerResourceReservation:
+    reservation_id: str
+    projected_cost_usd: Decimal | None
+    prompt_bytes: int
+    completion_allowance: int
+    token_upper_bound: int
+
+class PitOptimizerResourceLedger:
+    def __init__(self, *, max_calls: int, max_tokens: int) -> None:
+        self.max_calls = max_calls
+        self.max_tokens = max_tokens
+        self.calls = 0
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.total_tokens = 0
+        self.reserved_tokens = 0
+        self.authoritative_usd = 0.0
+        self.retained_reservation_tokens = 0
+        self.incomplete_accounting_calls = 0
+```
+
+Provide `reserve_pit_optimizer(rendered_prompt_bytes, max_output_tokens, projected_cost_usd)`, `reconcile_pit_optimizer(reservation, usage, request_started)`, and `verify_pit_optimizer_reconciliation(...)`.
+
+- Reserve capacity using calls and conservative tokens only.
+- Before-send failures release calls/tokens.
+- Complete accounting validates non-negative finite cost and exact `prompt + completion == total`, commits actual tokens/cost, and raises only after durably committing any call/token overage.
+- Missing accounting after request start retains the call and full token reservation, increments incomplete accounting, never invents actual cost, and is terminal.
+- A valid high projected or actual USD amount is audit data only and never causes exhaustion.
+- Serialize `projected_cost_usd` as canonical decimal text or null in optimizer recovery state; remove reserved/retained USD from optimizer recovery shapes.
+- Update/relocate `_pit_optimizer_reservation_primitive`, recovery snapshot validation, and restore logic to the new ledger. Remove optimizer-only methods from generic `BudgetLedger` after all active optimizer callers use the dedicated ledger.
+
+## Required pricing and gateway behavior
+
+1. `preflight_pit_optimizer_call` validates role/model/plan identity, static/dynamic/prompt bytes, conservative input tokens, output allowance, and pricing-snapshot identity. It returns `Decimal | None` projection and never compares cost magnitude.
+2. `freeze_pit_optimizer_pricing` caches one run-bound `OptimizerPricingSnapshot`. Catch `Exception` (never `BaseException`) from the pricing loader; if wall deadline/cancellation is still valid, return `OptimizerPricingSnapshot.unavailable(model=...)`. Preserve deadline and cancellation failures.
+3. `request_pit_optimizer_once` uses the calls/tokens resource ledger and schema-v3 authorization reservation, forwarding the same advisory projection to both.
+4. Keep exactly one provider attempt (`max_attempts=1`), strict response schema/byte/model/source checks, durable audit publication, and complete provider usage/cost validation.
+5. Remove every runtime comparison of optimizer projected/actual cost against per-call or ledger USD ceilings. Provider responses fail for call/token/byte/schema/accounting/identity/sandbox/audit reasons, never merely high cost.
+6. Provider facts use `pricing_snapshot_sha256` and no retained-reservation USD field.
+7. Update optimizer recovery/audit call sites throughout `agent_loop.py` to compile against schema v3. Do not yet perform the broader controller/CLI schema-v3 rename assigned to Task 4 unless necessary for this file to compile; if a minimal compatibility edit is unavoidable, explain it in the report.
+8. Do not expose credentials, provider content, raw hashes, or secrets in summaries/logs.
+
+## Verification and commit
+
+- Run `python -B -m py_compile agent_loop.py`.
+- Run import-only or provider-free in-memory smoke checks if practical; do not modify tests.
+- Run `git diff --check` and inspect the diff for accidental legacy USD weakening.
+- Commit `agent_loop.py` and the narrow authorized lifecycle-binding edit in
+  `core/pit_optimizer_authorization.py` with subject:
+  `Use call-token ledger for PIT optimizer`.
+
+## Report
+
+Write the detailed report to:
+`C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-implementation/.superpowers/sdd/2026-08-28-pit-optimizer-audit-only-usd/task-3-report.md`
+
+Include behavior changed, verification command/output, files changed, commit, self-review, any unavoidable Task-4-adjacent edits, and concerns. Return only status, commit, one-line verification, concerns, and report path. Do not dispatch subagents.

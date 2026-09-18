@@ -1,0 +1,68 @@
+"""Record observed vendor web-form receipts; this script sends nothing."""
+from datetime import datetime, timezone
+import hashlib
+import json
+from pathlib import Path
+import re
+
+root = Path.cwd()
+acquisition = root / '.artifacts/pit-optimizer-v5/data/acquisition'
+draft_path = acquisition / 'vendor-membership-request.md'
+draft_bytes = draft_path.read_bytes()
+draft = draft_bytes.decode('utf-8').replace('\r\n', '\n')
+lseg_message = draft[draft.index('Subject: Russell 2000'):draft.index('\n## Nasdaq Global')].strip()
+nasdaq_message = re.sub(r'\n+', ' ', draft[draft.index('Subject: Nasdaq-100'):].strip())
+stamp = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+receipts = {
+    'schema_version': 1,
+    'record_kind': 'observed_vendor_web_inquiry_submissions',
+    'recorded_at_utc': stamp,
+    'operator_authorization': 'User instructed proceed with LSEG and Nasdaq after approving the prepared quote inquiries; supplied phone and Canada; confirmed Langkun Long and Individual/Independent researcher.',
+    'approved_draft_sha256': hashlib.sha256(draft_bytes).hexdigest(),
+    'scope': 'Coverage, licensing, sample and price inquiries only; no purchase or subscription.',
+    'submissions': [
+        {
+            'vendor': 'LSEG / FTSE Russell',
+            'status': 'submission_confirmed',
+            'channel': 'official_public_web_form',
+            'form_url': 'https://www.lseg.com/en/ftse-russell/index-resources/indices-subscribe-data',
+            'confirmation_url': 'https://www.lseg.com/en/ftse-russell/thank-you',
+            'observed_confirmation': ['Thank you for contacting us.', 'We have received your details and will be in touch shortly.'],
+            'evidence_kind': 'browser accessibility state after Submit and completed redirect',
+            'vendor_reference_number': None,
+            'contact_fields': {'first_name': 'Langkun', 'last_name': 'Long', 'email': 'langkunlong@gmail.com', 'phone': '7787884496', 'country': 'Canada', 'company': 'Individual', 'job_title': 'Independent researcher'},
+            'optional_marketing_opt_in': False,
+            'message': lseg_message,
+            'message_sha256': hashlib.sha256(lseg_message.encode()).hexdigest(),
+        },
+        {
+            'vendor': 'Nasdaq',
+            'status': 'submission_confirmed',
+            'channel': 'official_GIDS_product_web_form',
+            'form_url': 'https://www.nasdaq.com/products/global-indexes/data/gids',
+            'confirmation_url': 'https://www.nasdaq.com/products/global-indexes/data/gids#Contact-Us_1378',
+            'observed_confirmation': ['Success', 'Thank You!'],
+            'evidence_kind': 'browser accessibility state after Submit; input form replaced by success heading',
+            'vendor_reference_number': None,
+            'contact_fields': {'first_name': 'Langkun', 'last_name': 'Long', 'email': 'langkunlong@gmail.com', 'country': 'Canada', 'company': 'Individual', 'job_title': 'Independent researcher', 'job_role': 'Research', 'data_interest': 'Equities Data'},
+            'optional_phone': 'left_blank',
+            'optional_marketing_opt_in': False,
+            'message_format_adaptation': 'Line breaks replaced with spaces for the single-line 2000-character comments field; no content omitted.',
+            'message': nasdaq_message,
+            'message_sha256': hashlib.sha256(nasdaq_message.encode()).hexdigest(),
+        },
+    ],
+    'mailbox_accessed': False,
+    'purchases_or_subscriptions': False,
+    'data_or_source_files_uploaded': False,
+    'automatic_review_events': [
+        {'action': 'Open Gmail to check sending access', 'result': 'rejected', 'stated_reason': 'Private mailbox exposure needs separate account-access authorization.', 'resolution': 'No retry or mailbox access; both inquiries completed through public vendor forms.'},
+        {'action': 'Append email/phone to LSEG fields', 'result': 'rejected', 'stated_reason': 'Fields already populated; appending would duplicate contact values.', 'resolution': 'No append performed; screenshot verified existing correct entries before submission.'},
+    ],
+    'current_dependency': 'Await vendor responses and review coverage, licensing/retention, sample and total fees before any data purchase. No response yet observed; mailbox monitoring is not configured or authorized.',
+}
+destination = acquisition / 'vendor-inquiry-submissions-20260907.json'
+with destination.open('x', encoding='utf-8', newline='\n') as stream:
+    json.dump(receipts, stream, indent=2, sort_keys=True)
+    stream.write('\n')
+print(json.dumps({'receipt_file': str(destination.relative_to(root)), 'sha256': hashlib.sha256(destination.read_bytes()).hexdigest(), 'confirmed_submissions': 2, 'mailbox_accessed': False, 'purchase_or_subscription': False}, sort_keys=True))

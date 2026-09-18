@@ -1,0 +1,145 @@
+# Next Luna session: B4b lifecycle completion and finalized-round authority
+
+Work in C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.worktrees\pit-optimizer-v5-architecture.
+
+A through B4a are principal-architect approved. Read the recovery design/plan and `.artifacts/pit-optimizer-v5/development/luna-recovery-b4a/principal-architect-review.md` plus `principal-architect-verification.json`.
+
+Implement B4b only and stop for review before B4c. This increment makes nonempty no-testable rounds complete with their real untestable records, checkpoint and cleanup, and authenticates complete rounds containing rejection records. It must not fabricate a critic, evaluated result, source authority or promotion.
+
+## 1. Capture exact source scope
+
+Expected edits:
+- runtime.py: run's critic/no-testable/finalization control flow; a narrowly justified completion/recovery fix only if the audit finds one necessary.
+- artifacts.py: _verify_finalized_discovery_rounds and minimal private helpers for exact record/event/role binding.
+
+Save exact preimages in a fresh `.artifacts/pit-optimizer-v5/development/luna-recovery-b4b` package. Confirm all source hashes against B4a principal verification. Expected runtime SHA is 097b5c1e67e2f4c2852a8033e1a3f30d14254f0e2d18b4a899589d555e61d1f3; artifacts SHA is 33a124043338d834fe3b60508b533c777df5c4fefbbdfb52ac812ab5eda0ca4f.
+
+Preserve B4a rejection routing/helper, B3 constructors/publication checks, B2/B3b repository authority, serialized schemas, contracts.py, candidate_ir.py, evaluator/image/data identities, provider/budget logic and historical artifacts. No test files may be read or changed. Read reducer/recovery source where needed, but do not change unrelated modules merely to simplify this implementation.
+
+## 2. Share finalization across critic-required and no-testable batches
+
+In run, retain the nonempty candidate batch and quick_ready failure guard. Keep exact materialized/testable critic filtering and ordering from B4a.
+
+If testable candidates exist, retain the existing request, paid role completion, accepted artifact, exact review IDs, critic reference and critic-unavailable failure path. Failed or missing critic authority for a testable candidate remains a terminal failure/outcome; it must never fall through as a completed no-critic round.
+
+If no testable candidates exist, require a nonempty batch of supported untestable carriers. Set critic and critic_ref to None. Do not create a critic request, invocation, role completion or artifact. This includes rejected carriers and existing materialized untestable outcomes; do not misclassify quick_ready or other testable statuses as untestable.
+
+Both successful branches then use the same existing finalization sequence once:
+1. existing finalization deadline;
+2. independent _expected_records;
+3. CanonicalExperimentRecordFactoryV5 via the dependency protocol;
+4. _require_exact_records;
+5. existing finished/deadline check;
+6. _publish;
+7. _completed_result and owned cleanup.
+
+Do not duplicate record publication or checkpoint logic. No-testable records have the B3a fields appropriate to their actual status. Rejected records retain their B3b-authenticated rejection event refs and no downstream evidence.
+
+Remove the live no_testable_experiments abort at this decision point, but keep old failure-code literals/decoding intact so historical terminal journals still load. Do not write a RoundOutcomePayloadV5 for a successfully checkpointed completed round: the current completed lifecycle uses checkpoint-owned records plus cleanup.
+
+## 3. Audit completion, scheduling and recovery without resetting authority
+
+Trace _publish, _completed_result, _adopt_completed_projection, _recover_projection, _cleanup, LocalArchiveReducerFactoryV5 and CandidateArchiveReducerV5.
+
+The current _completed_result already checks checkpoint/record authority and performs cleanup; it has no direct critic requirement. CandidateArchiveReducerV5.apply already advances next_round_index and records the hypothesis novelty key for every record while archive eligibility remains restricted. Preserve those mechanisms if sufficient.
+
+Required outcomes:
+- Rejected-only publication advances the lifecycle round and retains the invalid records/hypothesis in checkpoint-owned history, while producing no archive source authority or performance candidate.
+- With a committed checkpoint but incomplete cleanup, resume adopts the existing records/checkpoint and retries only the existing owned cleanup as allowed; it does not reissue paid roles or republish records.
+- With a valid uncommitted journal prefix, reuse the accepted author and exact rejection events through B4a. Create-only persistence must tolerate already-written identical records according to existing repository semantics, not replace them.
+- Existing terminal actual06 returns its original failure/cleanup path. Do not migrate or reopen it, even though new source could handle its old author differently.
+- Never create a fresh runtime solely to obtain a longer deadline, refresh saved campaign limits, or bypass cancellation/expiration. Preserve existing recovery-versus-new-work gates.
+
+Explain the actual call paths. If a narrow code adjustment is necessary, document the concrete invariant and keep it in scope; do not redesign scheduling or deadlines. Detailed feedback content is B4c.
+
+## 4. Authenticate the complete finalized event chain
+
+Update artifacts.py._verify_finalized_discovery_rounds. Retain all existing canonical event-path/bytes/hash, campaign/round, ordered record-ref, cleanup and no-primary-terminal-outcome checks.
+
+Require the supplied finalized event references to describe the exact durable chain for that campaign/round, not an arbitrary subset. Reuse load_round_events, which performs the existing fold plus corrected B2 rejection context validation, and compare its canonical event references/order to the supplied closure. Keep accepted role invocation authentication and B3b record loading; do not introduce a weaker standalone replay path.
+
+Successful finalized rounds require nonempty exact record authority and complete final cleanup. Do not let a failed RoundOutcomePayloadV5 become completed by omitting its event or relabeling it. Do not skip B2 validation on rejection-containing finalized chains.
+
+## 5. Bind finalized candidates through assignments and identity type
+
+Do NOT simply replace the old rendered-only ID set comparison with a union of rendered/rejected IDs. Existing materialized validation failures are represented by:
+- a rendered_variant event with a post-validation experiment ID;
+- a validation-invalid/failed candidate stage under that rendered ID;
+- a final invalid ExperimentRecordV5 with a different pre-validation-invalid ID.
+
+Build an explicit one-to-one mapping between each finalized record and its authenticated candidate-origin event using the accepted template and exact typed assignment. Preserve all current intent-to-record comparisons: parent revision/fingerprint, scope/mode, complete hypothesis, discovery plan and full accepted author template.
+
+For rendering rejection records:
+- Require the exact render_rejected event named by the record and the same invalid identity, assignment, template and code; B3b's shared record validator supplies the detailed semantic check.
+- Do not accept any rendered, validation or evaluation event for that rejected assignment/identity. Keep B2's conflict checks.
+
+For materialized non-invalid records:
+- Require one exact RenderedVariantPayloadV5 with the record's post-validation identity/experiment ID, policy revision and typed assignment, and retain the required stage/record evidence bindings.
+
+For existing materialized invalid records:
+- Require the matching rendered assignment under the same accepted template/intent and its actual validation-invalid or validation-failed stage.
+- Require the rendered and validation payload references to be present in the record as produced by _initial_candidate; bind the record's ValidationResultV5 exactly to that actual stage.
+- Derive/recheck the pre-validation-invalid identity using the existing helper and authenticated intent/template/assignment/round/plan. Do not require equality to the rendered post-validation ID, invent render_rejected authority, or reinterpret the old validation event format.
+
+Reject duplicate assignments, missing/extra/unmatched records or candidate-origin events, cross-form collisions and any candidate lacking the required authority. Use canonical typed assignment bytes/hashes, not ordinary bool/int value equality.
+
+Use bounded_variant_assignments_v5 with the accepted author's authenticated maximum to check the complete intended bounded assignment set/order. Confirm that maximum agrees with this manifest's authoritative variant limit. Do not enumerate an uncapped product or silently change the order. Candidate-origin events should follow that bounded order even though their later stage events interleave; canonical record refs are sorted separately and must not be mistaken for candidate order.
+
+This is authority verification, not a new evaluator or renderer execution. Reuse existing types, identity helpers and bounded enumeration; do not alter candidate_ir.py or canonical schemas.
+
+## 6. Make finalized critic authority depend on testability
+
+Derive testable records through is_testable_experiment_status_v5 and the authenticated candidate-origin order, not by status == evaluated alone and not by sorted record filename order.
+
+For a round with any testable records:
+- Require the existing accepted investigator, author and critic role sequence, canonical role positions and authenticated invocation packages.
+- Require the critic request binding's experiment IDs and accepted artifact reviews to equal exactly the testable IDs in that order. Rejected/untestable IDs must be absent.
+- Require every testable record's critic_ref/review to match that accepted critic. Keep exact parent/hypothesis/discovery/campaign/round bindings.
+
+For a nonempty round with no testable records:
+- Require accepted investigator and author completions only, with their normal positions and exact authority.
+- Require no critic completion and no critic fields in any record. Do not generate an empty critic or waive an existing failed critic invocation as if it were absent.
+
+A materialized untestable record is not automatically a rendering rejection. Use its own status/validation authority from step 5. Preserve B2/B3b rejection-specific checks.
+
+## 7. Preserve campaign and promotion boundaries
+
+FinalizedDiscoveryRoundV5/FinalizedDiscoveryCampaignV5 can retain their existing schemas. Keep manifest round-count limits, checkpoint generation/reference agreement and canonical full-round ordering intact.
+
+Completion here means an authenticated lifecycle round, not an evaluated experiment. An all-rejected campaign can have completed lifecycle history but still has no candidate champion to promote. Keep evaluated/zero_trade archive admission and confirmation/readiness requirements unchanged; do not insert the parent or a fake candidate into an empty archive.
+
+Do not change summary labels or next-investigator evidence in this increment. B4c will audit counts and expose bounded rejection metrics while preserving failed-hypothesis history. The user's success milestone remains two real evaluated feedback rounds with the required critic/checkpoint/cleanup evidence.
+
+## 8. Verify using only existing real artifacts and static review
+
+Run scoped Ruff, in-memory compilation and exact-preimage diff checks. Recompute the evaluator source identity and require all 56 covered files to remain at 005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4. Verify untouched approved source hashes. Do not rebuild the evaluator or reseal old evidence.
+
+Read-only compatibility input:
+- repository .artifacts/pit-optimizer-v5/development/runtime-04;
+- record records/9e2a2dfdf35ce55653a3b9ec0d39ce87740a69a940ad5f3e473fd38ea629390d.json;
+- SHA af6c73e632a3dc47cb344ecf3d1a55f9f58ba3e755e29fe992e0c03d0da103ac;
+- evaluated round 1, four discovery episodes, bound critic, unchanged canonical bytes.
+
+You may inspect that real round's authenticated events and record together. Do not invent a FinalizedDiscoveryCampaignV5 wrapper, new event, record, checkpoint or critic to exercise the new verifier. If no suitable real finalized campaign exists, say its new finalization branches were statically reviewed only.
+
+Actual06's unchanged manifest, terminal journal, author and pure rendering outcome may also be inspected read-only. Do not call run_feedback_round_v5 or the new rejection helper, run a campaign, append any runtime evidence, or claim that actual06 now completed.
+
+Produce a static lifecycle/authority table for:
+- rejected-only and mixed rejected/materialized/testable batches;
+- materialized-validation-invalid and duplicate/equivalent untestable batches;
+- required critic absent/failed/wrong order/wrong IDs;
+- missing/extra/conflicting candidate origin or record;
+- wrong round/mode/parent/template/assignment;
+- checkpoint committed before cleanup and valid prefix before checkpoint;
+- cleanup retry, cancellation/deadline and unchanged terminal actual06;
+- lifecycle completion without evaluated-round success or a promotable champion.
+
+Distinguish reviewed source paths from executed read-only compatibility. New no-testable completion, record publication, cleanup/resume and finalized rejection paths remain unexecuted until a separate authorized real campaign.
+
+No tests may be read, created, changed or run. No synthetic probes, events, records, fixtures or responses; no model/API calls, credentials, candidate evaluations, campaign launch/resume, evaluator rebuild, commits, pushes or deployment.
+
+## 9. Return the B4b checkpoint
+
+Save exact preimages, narrow implementation diffs with repo-relative labels, hashes, precise changed-symbol list, lifecycle/authority table, recovery call graph, real-artifact verification, evaluator identity and all verification limits.
+
+Stop for principal architect review before B4c. This authorizes local implementation only; no new campaign or external-call budget is granted.

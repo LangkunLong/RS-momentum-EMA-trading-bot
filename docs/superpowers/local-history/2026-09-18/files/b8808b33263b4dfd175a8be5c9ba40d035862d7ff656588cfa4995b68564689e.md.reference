@@ -1,0 +1,12 @@
+# Awake-host wrapper review
+
+**PASS.** Static review found no concrete issue in the intended invocation.
+
+Reviewed `run-with-awake-host.py`, SHA-256 `586275112854b4f4c68a22f13ccb67f7ababd3c3edece50b8989dedb9c7b5eea`.
+
+- WinDLL uses the Windows calling convention, and c_uint32 matches the DWORD-sized EXECUTION_STATE argument/return. Zero return prevents launching the helper. The flags request continuous system availability without requiring the display.
+- Setting and restoring the execution state occur on the same thread. `runpy.run_path` executes the helper synchronously there; the finally block restores argv and the previous continuous request even on normal exceptions or SystemExit. Failed restoration is reported and the process-scoped request ends on exit.
+- For the intended `py -B -c` invocation through runpy from the repository cwd, running these regular script files does not replace the cwd import entry with the SDD directory. Existing `core` imports remain available. The wrapper forwards the helper path as argv[0] and the remaining arguments, then restores the original argv object. It does not modify cwd, sys.path, PATH or campaign clocks.
+- No persistent power setting or deadline is changed. Explicit lid sleep, manual sleep, shutdown and battery protection remain outside this idle-sleep request, as disclosed. The host still needs the lid open and suitable power for the actual bounded run.
+
+The Microsoft documentation reference was supplied as already checked by the controller. No network lookup, wrapper/application execution, tests, probes or power-state change was performed during review. Only this receipt was written; actual launches remain controller-owned.

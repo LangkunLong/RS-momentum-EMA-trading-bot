@@ -1,0 +1,41 @@
+# Task 9B Report — Manifest and Provider-Free Prepare Handoff
+
+## Status
+
+DONE_WITH_CONCERNS. The current-source manifest and readiness package are
+prepared locally. The canary command is emitted but deliberately not run.
+
+## Manifest lineage
+
+- Commit `f29d69f` fixed manifest construction to use the authoritative
+  effective-engine-policy digest; focused regression and independent review
+  were clean.
+- Commit `7560be2` records the corrected parity version. The v6 manifest binds
+  the clean implementation HEAD, sealed PIT bundle, baseline manifest, v4
+  parity attestation, current policy source, and pinned sandbox image.
+- The sealed plan is six all-R1 calls over two iterations, at most 448000
+  tokens and USD 0.40, with `apply=false` and the three-file/12-hunk/80-line/
+  8192-byte candidate bounds.
+
+## Prepare result
+
+- The first v6 prepare stopped before controller initialization because its
+  controller-temp parent was below a dotenv-bearing repository ancestor. No
+  provider or run record was created by that failure.
+- A dedicated system-temp parent passed the same elevated local source
+  preflight, and the exact provider-free prepare then succeeded.
+- Readiness is written below the ignored local `.worktrees/pit-optimizer-v6-runs`
+  directory. It is schema v2, covers two discovery folds, records two local
+  discovery-exposure entries, and reports cleanup complete with the source
+  unchanged.
+- The emitted canary is an inert handoff only. No gateway, grant, lease,
+  pricing lookup, Docker container, hidden evaluation, or replay was started.
+
+## Accounting and gate
+
+The current prepare used zero OpenRouter calls and zero spend. Historical local
+optimizer artifacts contain 19 role-call attempt records across eight runs, with
+17 accepted, one rejected, and two failed. Those historical records must be
+reconciled against the coordinator's separate authorization grants rather than
+double-counted. The full-window replay remains blocked until a subset canary
+produces a candidate that satisfies every aggregate gate.

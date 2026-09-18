@@ -1,0 +1,44 @@
+# Task 1 — Seal the schema-v3 call/token manifest (production first)
+
+## Authority
+
+Read the approved spec first:
+`C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-implementation/docs/superpowers/specs/2026-08-28-pit-optimizer-audit-only-usd-design.md`
+
+The user explicitly directed us not to add more tests until the optimizer is confirmed working and can produce discovery-return evidence. That overrides the plan's TDD/test-edit steps for this implementation pass. Do not modify any test file. Do not make provider calls, start Docker, open hidden data, push, or upload anything.
+
+## Production files
+
+- Modify `core/pit_optimization_contract.py`.
+- Modify `core/pit_optimizer_evaluation.py`.
+
+## Required production behavior
+
+1. Active PIT optimizer manifests use `schema_version=3`.
+2. Remove `max_usd` from `PitOptimizerCallBudget`, `AuthorizationRequirement`, `PitOptimizerGateConfig`, active manifest parsing/validation, subset manifest construction, and prepare-command rendering.
+3. Do not use infinity, a sentinel, or nullable cost ceiling.
+4. Preserve legacy `pit_optimization`, diagnosis, proposal-batch, and generic cost gates outside the active PIT optimizer path.
+5. The exact two-iteration role plan is six ordered calls (investigator, author, critic, then repeat) and exactly 448,000 input-plus-output tokens.
+6. Exact per-role tuple `(max_static_input_bytes, max_dynamic_input_bytes, max_input_tokens, max_output_tokens, max_response_bytes)`:
+   - investigator `(8000, 78000, 86000, 16000, 8192)`
+   - author `(12000, 48500, 72000, 14000, 16384)`
+   - critic `(8000, 24000, 32000, 4000, 8192)`
+7. `provider_retries=0`, `apply=false`, maximum calls=6, maximum tokens=448000 remain hard validations.
+8. Closed-contract parsing must reject unknown legacy USD keys rather than silently accept them.
+9. `core.pit_optimizer_evaluation` manifest CLI must not define or consume per-role `--*-max-usd` arguments.
+10. The generated provider-free prepare command must carry calls/tokens/iterations and no optimizer `--max-usd` option.
+11. Keep source/fold/parity/policy identity checks and all byte/token/candidate bounds unchanged.
+
+## Verification and commit
+
+- Run `python -B -m py_compile core/pit_optimization_contract.py core/pit_optimizer_evaluation.py`.
+- Run import-only or construction smoke checks if useful, but do not add or modify tests.
+- Inspect your diff for accidental legacy-route USD removals.
+- Commit only the two production files with subject: `Migrate PIT optimizer manifest to resource-only v3`.
+
+## Report
+
+Write the detailed report to:
+`C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-implementation/.superpowers/sdd/2026-08-28-pit-optimizer-audit-only-usd/task-1-report.md`
+
+Include behavior changed, verification command/output, files changed, commit, self-review, and concerns. Return only status, commit, one-line verification, concerns, and report path. Do not dispatch subagents.

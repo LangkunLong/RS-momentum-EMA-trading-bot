@@ -1,0 +1,134 @@
+# Task 3 Report: Hash-Pinned PIT Price Export
+
+## Status
+
+`DONE_WITH_CONCERNS / BLOCKED_BY_APPROVED_CACHE`
+
+The strict exporter is implemented and committed. The required first 2020-2025 export was correctly rejected before publication because the approved hash-pinned cache does not contain the required 2020 warm-up prices and achieves only 84.90755026% full-calendar member coverage. No coverage gate was relaxed and no external source was introduced.
+
+## Commit
+
+- `da9837f feat: export validated PIT price bars`
+
+Only the requested source files were committed:
+
+- `export_pit_prices.py`
+- `tools/export_price_cache_worker.py`
+
+## Implemented trust boundary
+
+The host controller:
+
+- requires `--cache-sha256` and a repository-and-SHA256 digest-pinned worker image;
+- accepts only regular non-link cache, membership, worker, and Docker executable files;
+- captures the cache into a fresh private temporary directory while hashing it and detecting concurrent source changes;
+- rejects SQLite sidecars, unexpected schema objects, schema drift, malformed keys, payload lengths, and cache kinds other than `price`/`closes`;
+- never imports `pickle` and never reads payload BLOB values;
+- writes a canonical JSON request for the sorted membership union plus `SPY` and the exact inclusive 2020-01-01 through 2025-12-31 window;
+- creates and inspects a disposable Docker container before starting it, requiring `network=none`, read-only rootfs, read-only worker/request/cache mounts, dropped capabilities, `no-new-privileges`, a fixed unprivileged UID/GID, bounded CPU/memory/PIDs, and a digest-pinned image;
+- accepts only the exact content-free completion envelope and one `prices.csv` worker artifact;
+- independently validates every emitted CSV row and computes full-calendar coverage before publishing any final artifact;
+- discovers and removes its uniquely labelled container even if creation/start/worker execution fails.
+
+The isolated worker is the only process that imports `pickle` or calls `pickle.loads`. It validates canonical request bytes, uses immutable read-only SQLite access, validates selected price frames for monotonic unique date indexes, finite positive OHLC, finite nonnegative volume, and emits sorted unique `ticker`/`trade_date` rows. For overlapping cache entries, it selects the valid candidate with the greatest in-window coverage for each ticker; newer entries win ties. Invalid duplicate candidates are never cleansed, selected, or emitted.
+
+On a successful future source, the host would publish exactly:
+
+- `prices.csv` with `trade_date,ticker,open,high,low,close,volume`;
+- `spy_trading_days.csv` with `trade_date`;
+- `prices_provenance.json` with `source_kind` exactly `existing_hash_pinned_cache`, source/output digests, cache-key digest/count, and required coverage fields.
+
+## Functional export evidence
+
+Approved source:
+
+- Path: `C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.artifacts\cache\backtest\historical_data.sqlite3`
+- Required and freshly observed SHA-256: `1ac1a08341e103d594a14f8ba53f628925a45c3e2362864da710a22d7d2ae850`
+- Worker image: `localhost/rs-agent-loop@sha256:7ecfb4ebb3b327940bef347e4c82e82fb4a0e8b40fc63b92b2536fe8c83acf1c`
+
+The final full offline conversion reached the host coverage gate and was rejected with:
+
+```text
+SPY coverage is incomplete for 2020-01-01 through 2025-12-31;
+observed SPY: 2021-04-22 through 2025-12-31;
+observed prices: 2021-04-22 through 2025-12-31;
+member coverage: 536586/631965 (84.90755026%);
+first missing trading day: 2020-01-02
+```
+
+Exact coverage evidence:
+
+- `member_trading_day_pairs`: `631965`
+- `covered_member_trading_day_pairs`: `536586`
+- `coverage_pct`: `84.90755026`
+- `spy_first_date`: `2021-04-22`
+- `spy_last_date`: `2025-12-31`
+- Overall selected validated price range: `2021-04-22` through `2025-12-31`
+- Safely validated selected cache data containing any 2020 row: none
+
+This source cannot satisfy complete SPY coverage or the minimum 98% member/trading-day coverage. A reviewed replacement cache/source and digest are required; that work is intentionally outside Task 3.
+
+## Fail-closed and immutability proof
+
+- Final source SHA-256 after all worker runs remained `1ac1a08341e103d594a14f8ba53f628925a45c3e2362864da710a22d7d2ae850`.
+- The worker received only the private snapshot, mounted read-only; the original source was never mounted into the container.
+- Container inspection passed the exact network/read-only/mount/capability contract before execution.
+- Final owned-container count after rejection: `0`.
+- Published partial price artifact count after rejection: `0`.
+- `prices.csv`, `spy_trading_days.csv`, and `prices_provenance.json` remain absent.
+- Generated export artifacts are ignored and uncommitted.
+
+## Validation
+
+Fresh final checks:
+
+- `python -m ruff check export_pit_prices.py tools/export_price_cache_worker.py` — passed.
+- `python -m py_compile export_pit_prices.py tools/export_price_cache_worker.py` — passed.
+- Host AST/import check — passed; the host has no `pickle` import.
+- `python export_pit_prices.py --help` — exited zero.
+- `git diff --check` — passed before commit.
+- Pre-commit Ruff, whitespace, EOF, YAML, and merge-conflict hooks — passed.
+- Source digest verification — passed.
+- Worker cleanup verification — passed, zero owned containers.
+- No-partial-publication verification — passed, zero price outputs.
+
+Broad unit tests remain deferred to Task 7 as required by the task brief.
+
+## Concerns and follow-up
+
+The approved cache's best validated frames begin on 2021-04-22, so it is structurally incapable of producing the mandated 2020 warm-up. Task 3B should provide a reviewed public archive source (or another approved complete cache) with its own pinned provenance. The Task 3 exporter should remain strict and unchanged unless that source introduces a separately reviewed input adapter.
+
+## Fix Round 1
+
+Status: complete. Commit: `2e01492 fix: harden PIT price export boundaries`.
+
+All four review findings were addressed without changing the approved source, date contract, complete-SPY gate, or 98% coverage gate:
+
+1. Final artifacts are now written to unique staging files on the destination filesystem. Each staging file is opened with exclusive creation, flushed, and `fsync`ed. Installation uses same-filesystem hard links, which atomically fail rather than clobber an existing destination. Staging and installed-final identities are registered before subsequent fallible operations; rollback removes every still-owned staging/final inode after write failures, post-link attestation failures, and destination races. A raced file not owned by this process is preserved.
+2. The controller now inspects the digest-pinned image locally before container creation, requires the exact repository digest in `RepoDigests`, binds the container to the inspected image ID, and passes Docker `--pull never`. An absent or mismatched local image fails before any container is created.
+3. The worker source is copied into the private temporary root. On native POSIX the unpredictable root remains `0700`, worker/request/cache inputs are `0444`, and the output bind is `0733`; this permits fixed UID/GID `65532:65532` to read only the mounted inputs and create the known output without exposing directory contents through the private host parent. The worker explicitly leaves its output `0644` for host validation. Windows retains read-only input handling without being used as evidence for POSIX behavior.
+4. Container inspection now requires exact integer `PidsLimit=64`, `Memory=2147483648`, and `NanoCpus=2000000000`. `/tmp` must be the sole tmpfs entry with exactly `rw,noexec,nosuid,nodev` and a size that normalizes to `67108864` bytes; harmless option order and `64m`/byte size representations normalize, while missing, duplicate, or extra options fail closed.
+
+Focused deterministic validation added in `tests/test_export_pit_prices.py` covers:
+
+- destination races and preservation of the non-owned racer;
+- staging/final cleanup after partial install and post-link identity failure;
+- file `fsync` before installation and absence of staging residue;
+- rejection of a non-local digest-pinned image;
+- exact `--pull never`, PID, memory, CPU, and tmpfs create arguments;
+- requested POSIX access-mode operations and effective on-disk POSIX modes;
+- type/value drift for PID, memory, CPU, and tmpfs inspection;
+- normalized tmpfs option order and size.
+
+Fresh Fix Round 1 checks:
+
+- Windows focused tests: `12 passed, 1 skipped` (the native-POSIX effective-mode test is intentionally skipped on Windows).
+- Offline digest-pinned Linux focused tests: `13 passed`; the real effective POSIX mode assertions ran.
+- Ruff for exporter, worker, and focused tests: passed.
+- `py_compile` for exporter, worker, and focused tests: passed.
+- Host no-pickle AST check: passed.
+- `git diff --check`: passed before commit.
+- Pre-commit Ruff, whitespace, EOF, YAML, and merge-conflict checks: passed.
+- Final full local-only offline cache run passed image/resource/mount/network attestation and reached the unchanged expected coverage rejection: observed SPY and prices `2021-04-22` through `2025-12-31`, coverage `536586/631965` (`84.90755026%`), first missing trading day `2020-01-02`.
+- Post-run source SHA-256: `1ac1a08341e103d594a14f8ba53f628925a45c3e2362864da710a22d7d2ae850`.
+- Post-run published final count: `0`; destination staging count: `0`; owned container count: `0`.

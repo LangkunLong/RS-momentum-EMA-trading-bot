@@ -1,0 +1,51 @@
+# Task 5 Re-review — Fix Round 5 of 5
+
+**Range:** `f34379006e395fbffde909038ccb3f30b7e53be1..822241a032d488bb25767eacd72bd6ed2a6ea92d`  
+**Verdict:** **READY**  
+**Open findings:** Critical 0, Important 0, Minor 0
+
+This was a read-only review except for this requested artifact. I read the full Fix Round 5 report and complete 509-line scoped review package, inspected the integrated capability and cleanup paths, and ran one narrow fake-only test slice. No provider, network, pricing, replay, real Docker, background process, subagent, or broad suite was used.
+
+## Finding Verdict
+
+### Important — returned capability fields could replace the primary and stop cleanup: **ADDRESSED**
+
+`agent_loop.py:4593-4597` introduces an internal normalized cleanup result containing only controller-created booleans. `_cleanup_owned_policy_daemon.control` at `agent_loop.py:4687-4730` now:
+
+- catches the injected runner call;
+- rejects anything whose exact type is not `ProcessResult` before any subclass field access;
+- reads required fields inside a `BaseException` shield;
+- requires `timed_out` to be exactly `bool` and `returncode` exactly `int`, excluding hostile scalars and `bool` return codes before truth testing or comparison;
+- requires final-query `stdout` to be exactly `str` before `.strip()`; and
+- exposes only normalized `timed_out`, `nonzero`, and `stdout_present` values to later logic.
+
+Malformed returns become closed `INVALID_RESULT` or `EXCEPTION` evidence local to that action. Kill, wait, rm, and the final full-ID query remain independent at `agent_loop.py:4732-4760`. A failed or malformed query produces `daemon_absence_verify/unverified`; only a valid, successful empty exact string establishes absence at lines 4761-4781.
+
+The integrated regressions are complete and honest:
+
+- `tests/test_agent_loop.py:1449-1545` supplies an exact `ProcessResult` with a hostile non-integer return code and proves its comparison is never invoked, the exact malformed-protocol primary object/type/message survives, closed evidence is attached, all four daemon actions run, and the package tree is removed.
+- `tests/test_agent_loop.py:1548-1622` rejects hostile `ProcessResult` subclasses before either the cleanup `timed_out` getter or final-query `stdout` getter can run; the invalid query also retains the separate unverified-absence evidence.
+- `tests/test_agent_loop.py:1625-1689` supplies a hostile timeout scalar during explicit close and proves the scalar is never truth-tested, all cleanup actions and tree removal finish, the raised value is exactly the generic unchained `SandboxError`, and the second close is idempotent only after the first cleanup completed.
+
+The requested focused command passed **16 tests, 506 deselected**, with only the repository's pre-existing unknown `cache_dir` warning.
+
+## New Breakage
+
+None. The scoped production change is confined to normalization of daemon cleanup results. It does not weaken full-ID targeting, safe note construction, cleanup ordering, or explicit-close signaling.
+
+## Prior Task 5 Closure Audit
+
+- Value-free secondary evidence, hostile `__str__`, unbound and shielded `add_note`, sentinel redaction, and note count/byte ceilings remain unchanged and covered by the passing slice.
+- Typed timeout/nonzero status handling, kill/wait/rm ordering, and ID-only absence verification remain closed for well-formed results.
+- Discovery, tentative ownership, inspect validation, authenticated identity, active-primary preservation, and private-tree cleanup are not weakened by this diff.
+- Candidate identity, canonical path ordering, Git rollback, AST grammar, source packaging, authenticated protocol, and isolated-runtime determinism production paths are untouched. No Task 1-4 contract code changed.
+- `git diff --check f343790..822241a` and tracked/untracked status were clean before this ignored review artifact was written.
+
+## Out-of-Scope Observations
+
+- Real Docker lifecycle and replay/parity remain intentionally deferred and were not exercised.
+- No hypothetical behavior outside the injected `ProcessRunner -> ProcessResult` contract was used to widen this review.
+
+## Final Verdict
+
+**READY — Critical 0, Important 0, Minor 0.** Fix Round 5 closes the final Task 5 blocker: capability results are normalized under a shield before any hostile operation, cleanup continues through every owner action and private-tree removal, active primaries remain exact with bounded closed evidence, and explicit close remains generic and unchained.

@@ -1,0 +1,70 @@
+# Task 7 verification report
+
+## Scope
+
+Added deterministic, offline-only regressions in the six Task 7 test files. No production logic, strategy behavior, documentation, data artifacts, or network access changed.
+
+## Coverage added
+
+- Membership rewind/replay derives its seed from a three-symbol current snapshot with two historical swaps, rejects inconsistent transitions, and rejects an unknown punctuation alias.
+- SEC companyfacts ZIP fixture proves 10-Q public availability is the next SPY session after accession acceptance, an amendment appears only at its later public date, and an unmatched accession uses the filed-date fallback counter.
+- Confined worker-cache fixture proves the host validates SQLite structure without deserializing a worker payload; bad digests and extra schema objects fail closed.
+- Five-year and rolling-label fixture covers a stable member, a later addition, a delisted leader, too-short price history, and a name whose valid history begins after the allowed start window; membership facts remain independent from label eligibility.
+- Reconciliation fixture distinguishes one entered leader, one cash-blocked signal, multi-gate failures, and missing fundamentals with exact recall counts.
+- Publication primitive regression proves byte artifacts hash deterministically and exclusive writes refuse an overwrite.
+
+## Verification
+
+- Focused command: `19 passed`.
+- Required static checks: ruff, compileall, and `git diff --check` all exited zero.
+- Broader command: `76 passed`.
+
+The test environment emitted pre-existing third-party `websockets.legacy` deprecation and pytest-cache access warnings; they did not affect results. A literal tiny strict bundle cannot satisfy the fixed production runner contract (exact 2020-01-01 through 2025-12-31 dates, at least 756 SPY sessions, 495--510 members per session, 100 five-year leaders, and 4,800 rolling labels), so Fix round 1 uses a test-only dependency seam while retaining the production CLI/gate behavior.
+
+## Fix round 1
+
+Review findings were addressed without production changes. `tests/test_pit_baseline.py` now invokes `pit_baseline.main()` with the production fixed CLI arguments and its real publication path; test-only domain doubles satisfy the expensive full-contract data dependencies. It verifies every published artifact, each run-manifest artifact digest, completion status, and a same-target second invocation failing closed. The price fixture now contains valid SPY/AAPL rows and separately rejects bad cache SHA, extra SQLite objects, duplicate bars, invalid OHLC, missing SPY, and partial AAPL coverage without deserializing payload bytes. The SEC fixture now parses a submissions ZIP into accession records and materializes companyfacts ZIP output for as-of period-end/public-date/amendment/fallback cases. The leader fixture uses `SimulationResult` and asserts signal/execution/cash-blocked plus every requested gate/missing-data count. Membership has a separate repeated-removal rejection.
+
+Exact verification commands and outputs:
+
+```powershell
+python -m pytest tests/test_public_membership.py tests/test_sec_pit_fundamentals.py tests/test_pit_data.py tests/test_leader_evaluation.py tests/test_leader_basket.py tests/test_pit_baseline.py -q --no-cov
+# 24 passed, 2 warnings in 0.88s
+
+python -m ruff check core/public_membership.py core/sec_pit_fundamentals.py core/pit_data.py core/leader_evaluation.py core/leader_basket.py core/pit_baseline_report.py fetch_sp500_membership.py fetch_sec_pit_fundamentals.py export_pit_prices.py pit_baseline.py
+python -m compileall -q core fetch_sp500_membership.py fetch_sec_pit_fundamentals.py export_pit_prices.py pit_baseline.py
+git diff --check
+# All checks passed! (git emitted only CRLF working-copy warnings.)
+
+python -m pytest tests/test_backtest_engine.py tests/test_backtest_pnl.py tests/test_backtest_logic.py tests/test_pit_data.py tests/test_leader_evaluation.py tests/test_leader_basket.py tests/test_pit_baseline.py -q --no-cov
+# 80 passed, 2 warnings in 1.27s
+```
+
+The two warnings are the existing third-party `websockets.legacy` deprecation and pytest-cache access warning; no test failed.
+
+## Final-fix evidence
+
+`tests/test_pit_baseline.py` now asserts the manifest covers exactly every required publication artifact except `run_manifest.json`, snapshots the complete run-directory filename-to-bytes mapping before the duplicate-target invocation, and requires the identical mapping after the expected collision failure. Its test-only `_write_bytes` observer also proves the collision made no publication writes.
+
+```powershell
+python -m pytest tests/test_pit_baseline.py -q --no-cov
+# 1 passed, 2 warnings in 0.57s
+
+python -m pytest tests/test_public_membership.py tests/test_sec_pit_fundamentals.py tests/test_pit_data.py tests/test_leader_evaluation.py tests/test_leader_basket.py tests/test_pit_baseline.py -q --no-cov
+# 24 passed, 2 warnings in 0.85s
+
+git diff --check
+# exited 0; only CRLF working-copy warnings were emitted
+```
+
+## Dependency-contract fix
+
+`lxml==6.1.2` is now declared as a runtime dependency in `requirements.txt` and `pyproject.toml`, and is pinned to the tested version in `requirements-lock.txt`. This supplies the parser backend required by `pandas.read_html` in the project-declared environment; no package installation or network access was used.
+
+```powershell
+python -c "import pathlib,tomllib; project=tomllib.loads(pathlib.Path('pyproject.toml').read_text(encoding='utf-8')); assert 'lxml==6.1.2' in project['project']['dependencies']; runtime=pathlib.Path('requirements.txt').read_text(encoding='utf-8').splitlines(); locked=pathlib.Path('requirements-lock.txt').read_text(encoding='utf-8').splitlines(); assert runtime.count('lxml==6.1.2') == 1; assert locked.count('lxml==6.1.2') == 1; print('lxml dependency declarations are coherent')"
+# lxml dependency declarations are coherent
+
+git diff --check
+# exited 0; only CRLF working-copy warnings were emitted
+```

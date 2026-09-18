@@ -1,0 +1,67 @@
+# Task 4 review — evaluator truth
+
+## Spec Compliance
+
+The V5-only evidence envelope is isolated on `SimulationResultV5` at
+`core/backtest_engine.py:747-754`; legacy `SimulationResult` is unchanged. Entries
+create immutable quantity evidence at `core/backtest_engine.py:4220-4244`; all normal,
+gap-stop, intraday-stop, policy, eviction, and terminal close routes converge through
+`_close_trade`/`_finalize_v5_position_episode` at `core/backtest_engine.py:4180-4186`,
+`4666-4701`, `4740-4774`, and `5055-5259`. Completed-bar extrema are updated only in
+the after-close V5 phase (`4776-4803`), with high used for maxima and low for minima
+(`5191-5222`), so opening/intraday exits do not consume an incomplete bar.
+
+Checkpoints carry completed/open episode evidence, observations, fill totals, and policy
+counts (`core/backtest_engine.py:2580-2638`, `3387-3417`); state-log recovery rewrites
+the terminal observation (`1793-1861`). `summarize_panel_result` is the functional
+report builder and validates panel/equity/benchmark/observation/fill/episode/policy
+evidence before reporting (`core/pit_optimizer_v5/diagnostics.py:614-860`). The unchanged
+Task-3 evaluator call site accepts the exact keyword interface
+(`core/pit_optimizer_v5/evaluator.py:47-55`, `418-422`).
+
+Role evidence uses stable IDs, only aggregate candidates, and validates both the 96-item
+and serialized 16-KiB bounds for every tentative projection
+(`core/pit_optimizer_v5/diagnostics.py:862-955`,
+`core/pit_optimizer_v5/contracts.py:530-602`). Source identity requires the closed
+source map and now includes diagnostics (`core/pit_optimizer_v5/contracts.py:24-46`,
+`149-189`).
+
+## Strengths
+
+- Report construction fail-closes on curve/session, terminal-cash, fill-friction,
+  episode/trade, entry-outcome, and policy-outcome mismatches
+  (`core/pit_optimizer_v5/diagnostics.py:123-380`, `614-650`). Net remains the report's
+  portfolio metric while gross is a cost-add-back diagnostic (`651-665`, `826-835`).
+- Zero-observation trade metrics are explicitly `None`, while cash drag remains an
+  honest zero when there is no invested sleeve (`693-715`, `745-755`).
+- Causal regime/year slices and month-end rolling windows are derived from authenticated
+  observations/sessions (`515-612`), and provider projection deliberately omits rolling
+  end dates (`924-933`).
+
+## Issues Critical
+
+None.
+
+## Issues Important
+
+- `core/pit_optimizer_v5/diagnostics.py:361-371` — `_validate_episodes` checks only
+  that a quantity path starts with `entry`, ends at zero, has the declared add-on count,
+  and uses panel sessions. It does not reconcile each quantity-path transition's
+  action, session, execution price, or before/after quantity to the corresponding
+  `EpisodeId` fill rows. The preceding aggregate buy/sell checks (`343-359`) therefore
+  allow a checkpoint/result with a fabricated scale-out or add-on path to produce a
+  report, despite mismatched fill evidence. This violates the required fail-closed
+  reconciliation of quantity paths. Reconstruct the cumulative position quantity from
+  fills in chronological order and require a one-for-one match with every path entry
+  (including action/session/execution price), rejecting any mismatch. Confidence: 9/10.
+
+## Issues Minor
+
+None.
+
+## Assessment
+
+**DONE_WITH_CONCERNS.** The implementation covers the requested V5 causal evidence,
+close-path finalization, checkpoint preservation, reconciled reporting, source identity,
+and bounded aggregate role projection. Address the quantity-path-to-fill reconciliation
+gap before treating the report as fully fail-closed.

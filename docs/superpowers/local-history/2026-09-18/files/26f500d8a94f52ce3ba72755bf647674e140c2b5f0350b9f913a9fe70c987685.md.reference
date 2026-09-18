@@ -1,0 +1,358 @@
+# Task 6 re-review — Fix Round 4
+
+Date: 2026-08-28  
+Review base: `1f3040d`  
+Review head: `ae5d837`  
+Disposition: **NEEDS FIXES**  
+Open findings: **1 Critical, 3 Important, 1 Minor**
+
+## Scope and method
+
+This was a fresh read-only review of the complete Fix Round 4 section of
+`task-6-report.md`, all 3,829 lines of `review-1f3040d..ae5d837.diff`, every
+open finding in `task-6-rereview-3.md`, the Task 6 brief and approved design,
+and the relevant current authorization, gateway, budget, audit, recovery, and
+focused-test code. I did not rerun a test: static evidence was sufficient, and
+the review constraint prohibited broad suites. No provider, network, live
+pricing, real SDK, replay/parity, Docker, background process, permanent ledger,
+or user authorization was used.
+
+The threat model was calibrated as requested: untrusted model-authored code is
+confined to the isolated policy worker and cannot import controller internals.
+No finding relies on reflection, importing a private underscore name, or
+mutating a private registry. Critical 1 uses only supported public Task 6
+methods and public data contracts. Direct arbitrary corruption of the trusted
+authorization ledger is not assumed.
+
+Round 4 materially improves the normal path. The specialized provider writer
+now requires a live gateway lifecycle; serialized receipts are cross-verified
+against reopened audit evidence; reserved/start/terminal linkage and ordering
+are substantially replayed; a genuine fresh BudgetLedger can restore; exact
+terminal codes survive restart; and role snapshot bind/capture/consume is
+synchronized. The implementation is still not ready because a second public
+generic audit writer bypasses the lifecycle boundary, and restart replay can
+mutate accounting before authorization, accept linked evidence, and ignore the
+declared lifecycle state.
+
+## Prior-finding adjudication
+
+| Prior item | Round 4 verdict | Evidence |
+|---|---|---|
+| Critical 1 — gateway-owned, plan-exclusive predecessor receipt | **PARTIAL; OPEN.** `write_provider_call`, `write_provider_call_receipt`, and `verify_provider_call_receipt` now require the exact live lifecycle (`agent_loop.py:12131-12175`, `12972-13009`), and successor bind re-verifies the receipt (`core/pit_optimizer_authorization.py:901-1010`). The public generic `write_handoff_metadata` method can nevertheless write or replace the exact protected provider and budget filenames, while public `append_event` can publish the lifecycle. See Critical 1. |
+| Important 1 — cross-ledger semantic replay | **PARTIAL; OPEN.** Run/call/role/outcome, reservation identities, provider/event digests, event ordering, lifecycle edges, budget recomputation, and no-post-terminal rules are now checked (`agent_loop.py:12648-12927`). Replay still does not authenticate the origin of protected files, reject hardlinks/reparse points on those files, or verify the `state` of any lifecycle event. See Critical 1 and Important 2/3. |
+| Important 2 — true fresh BudgetLedger restore and exact terminal code | **PARTIAL; OPEN.** Genuine fresh-ledger recovery and `cancelled`/`budget_exhausted`/`failed` preservation are implemented and honestly tested. Recovery restores the durable budget image before the receipt is cross-verified against the authentic authorization reservation, leaving a fresh ledger mutated after rejected evidence. See Important 1. |
+| Minor 1 — synchronized bind/capture/consume | **ADDRESSED.** One lock protects bind insertion, capture pop, and consumed-snapshot verification (`core/pit_optimizer_authorization.py:656`, `1077-1127`); the forced race test is targeted (`tests/test_pit_optimizer_v2.py:4188-4254`). |
+| Minor 2 — report accuracy | **PARTIAL; OPEN.** The base and reported commands are internally consistent, but the closure, regular-file, restart-order, and test-coverage claims are broader than the code and tests. See Minor 1. |
+
+## Actionable findings
+
+### Critical 1 — the public generic audit writer can mint the protected provider/budget evidence and an accepted predecessor
+
+**Confidence: 10/10.**
+
+Round 4 protects the specialized optimizer writer with a private live lifecycle,
+but does not reserve its durable namespace. `_AUDIT_NAME_RE` permits ordinary
+hyphenated names (`agent_loop.py:11348`). The supported public method
+`AuditTrail.write_handoff_metadata(value, name=...)` accepts any mapping and
+writes `run_root / f"{name}.json"` (`agent_loop.py:13125-13133`). `_write_json`
+uses the general atomic writer, which replaces an existing private regular file
+(`11959-11963`, `11845-11869`). Therefore the valid public names
+`provider-call-0001` and `provider-budget-0001` write the exact files that
+optimizer receipt recovery trusts.
+
+The verifier reads those fixed paths as authoritative
+(`agent_loop.py:12457-12499`, `12546-12646`). Public `append_event` accepts a
+closed state/event/details mapping and produces a valid hash chain
+(`12061-12096`). Recovery then derives facts and a receipt from those
+self-published provider, budget, and event values (`12648-13070`), and public
+`AuthorizationLedger.reconcile_call` accepts them after checking that same
+audit directory (`core/pit_optimizer_authorization.py:2149-2220`). A public
+`PitOptimizerRoleCall` can then carry the invented accepted artifact into the
+author binder (`399-431`, `901-1010`). No private lifecycle object, underscore
+method, real provider response, or investigator SDK request is required.
+
+The hash chain and two receipt digests prove only that the attacker-supplied
+audit package is internally consistent; they do not prove that the gateway
+created it. AuthorizationLedger durably records the reservation, but no
+gateway-origin commitment for the reserved/start transition exists outside the
+same publicly writable audit namespace. Consequently a supported controller
+path can turn one ordinary authorization reservation into an invented accepted
+investigator and unlock the next paid role.
+
+**Required fix:** Reserve all optimizer-owned filenames and prefixes across
+every public generic AuditTrail writer, not only the specialized provider
+writer. Protected provider/budget/receipt artifacts must be creatable only by
+the typed gateway-owned transition. Also bind a gateway-origin lifecycle
+commitment (exact plan, both reservation identities/digests, audit run, and
+reserved/start event digest) into the trusted authorization transaction so
+that recomputing an audit-local hash chain cannot establish origin. Receipt
+verification and successor bind must require that commitment. Preserve the
+legacy generic handoff API only in a disjoint namespace.
+
+**Exact fake/temp RED:** In a pytest `tmp_path`, create the normal authenticated
+manifest, grant/window/lease, fake frozen pricing, empty fake client, BudgetLedger,
+AuthorizationLedger, and AuditTrail. Using public methods only:
+
+1. reserve plan 1 in AuthorizationLedger and its one-call exposure in
+   BudgetLedger, then reconcile the budget reservation with invented but
+   self-consistent accepted `Usage`; do not call the SDK;
+2. construct the canonical schema-v2 `ProviderCallRecord` and budget recovery
+   mapping from the public reservations/contracts;
+3. call `audit.write_handoff_metadata(provider_mapping,
+   name="provider-call-0001")` and the same public method with
+   `name="provider-budget-0001"`;
+4. use public `audit.append_event` for exact reserved, started, and accepted
+   records, then call public `recover_pit_optimizer_terminal` and
+   `authorization.reconcile_call`;
+5. create the public investigator `PitOptimizerRoleCall`, bind the author input,
+   and attempt the author wrapper call.
+
+Require rejection before any accepted call-1 reconciliation, author budget
+reservation, audit event, or SDK request; require the fake client to have zero
+calls. Current code accepts the invented predecessor and can transmit the one
+author fake request even though no investigator request occurred.
+
+**Why Task 6, not Task 7:** Task 6 owns both public writers, semantic recovery,
+authorization reconciliation, predecessor issuance, and the paid gateway.
+Task 7 can choose the intended call order, but it cannot make these supported
+self-authenticating Task 6 primitives origin-authentic.
+
+### Important 1 — restart restores BudgetLedger before authenticating the receipt against AuthorizationLedger
+
+**Confidence: 10/10.**
+
+`recover_pit_optimizer_finalization` obtains the durable authorization
+reservation and audit-derived facts/receipt/state, calls
+`BudgetLedger._restore_pit_optimizer_recovery_state`, and only afterwards calls
+`AuthorizationLedger.reconcile_call` (`agent_loop.py:3929-3975`). The first
+cross-check of the receipt's authorization reservation ID and sealed maximum
+against the authentic reservation occurs inside reconciliation
+(`core/pit_optimizer_authorization.py:2174-2220`; `agent_loop.py:12894-12926`).
+The restore assigns every aggregate and optimizer reservation/reconciliation
+map once the target is fresh (`agent_loop.py:2198-2345`).
+
+Thus a canonical, internally self-consistent audit package can mutate a fresh
+BudgetLedger before a wrong authorization reservation ID or exposure is
+rejected. If that package encodes a different valid usage/snapshot from the
+genuine terminal package, the same gateway cannot retry after the evidence is
+corrected: the ledger is now nonfresh and different. Authorization retains the
+active reservation, so the next call remains fenced while recovery is wedged.
+This violates cross-ledger consistency under recovery exceptions.
+
+**Required fix:** Before any mutation, call the receipt verifier with the
+authentic recovered authorization reservation and provider facts, and use the
+budget state returned by that successful verification. Only then restore the
+fresh BudgetLedger and publish the idempotent authorization transition. If the
+authorization append fails after verification, retry must accept exactly the
+same restored image and keep the next-call fence. A mismatched receipt must
+leave all BudgetLedger fields and maps bit-for-bit at the entry snapshot.
+
+**Exact fake/temp RED:** Create a genuine fake accepted call and inject
+`KeyboardInterrupt` after terminal audit publication but before authorization
+publication. Discard the gateway and BudgetLedger. In the temporary audit
+package, replace the provider/budget/terminal values with a different valid,
+self-consistent usage/snapshot and a shape-valid but wrong authorization
+reservation ID; recompute all audit-local digests. Reopen with a fresh zero
+BudgetLedger and call recovery. Require `AuditError`/`AuthorizationError` and
+assert every budget aggregate, active map, and reconciliation map is still
+zero/empty. Restore the genuine package and call recovery again on that same
+ledger; require exact completion and next-plan availability. Current code
+mutates the ledger before the first rejection, then rejects the genuine retry
+as a different nonfresh state.
+
+**Why Task 6, not Task 7:** The ordering and idempotence boundary is wholly
+inside Task 6's restart finalizer. No controller sequencing can make a method
+that mutates before its own authentication failure atomic.
+
+### Important 2 — protected provider/budget replay accepts hardlinks/reparse files and hashes a different open from the parsed bytes
+
+**Confidence: 10/10.**
+
+The provider reader checks only `is_file()` and `is_symlink()`, parses one
+`read_bytes()` result, then computes `_file_sha256(path)` through another open
+(`agent_loop.py:12457-12499`). The budget verifier similarly checks only
+`is_file()`/`is_symlink()`, hashes first, and reads later
+(`12546-12576`). Neither path uses `lstat`, `_has_reparse_point`, `st_nlink == 1`,
+a bounded single read, or a same-file identity check. The idempotent existing
+artifact branch has the same omission (`12191-12218`). This contradicts the
+report's claim that protected evidence must be a regular non-link file.
+
+The repository already contains the required pattern: `_atomic_write_audit`
+rejects nonregular, symlink, reparse, and multi-link targets
+(`agent_loop.py:11845-11880`), and `verify_audit_chain` applies the equivalent
+checks with a size limit (`13139-13196`). A hardlink added after publication
+still passes the optimizer readers. It gives a second pathname write access to
+the supposedly private evidence; the separate parse/hash opens also permit a
+TOCTOU substitution or mutation.
+
+**Required fix:** Use one protected-artifact reader for provider and budget
+files. Inspect the exact path with `lstat`; require a private regular file,
+no symlink/reparse point, `st_nlink == 1`, correct parent/canonical identity,
+and a strict size bound; open/read once; derive both JSON and SHA-256 from those
+same bytes; and recheck identity if the platform requires it. Apply the same
+guard to the existing-artifact/idempotence branch.
+
+**Exact fake/temp RED:** Produce a genuine fake terminal-before-authorization
+crash. Add an external hardlink to `provider-call-0001.json` (parameterize the
+same test for `provider-budget-0001.json`), discard live objects, and reopen the
+audit, authorization ledger, and a fresh BudgetLedger. Recovery must fail before
+budget restore or authorization publication, and a next-plan reservation must
+remain fenced. Current code accepts the linked artifact, completes recovery,
+and unlocks the next plan. Add the equivalent Windows file-reparse case when
+the test host supports it, plus a deterministic fake that swaps/mutates bytes
+between the two current opens and proves parsed bytes and hashed bytes cannot
+differ.
+
+**Why Task 6, not Task 7:** Task 6 declares these files durable evidence and
+implements the reader that authorizes restart and the next call. The controller
+cannot repair evidence identity after Task 6 has accepted it.
+
+### Important 3 — semantic replay never verifies the exact LoopState of reserved, started, or terminal events
+
+**Confidence: 9/10.**
+
+`_pit_optimizer_event_matches` selects events solely by the three detail fields
+`call_index`, `iteration`, and `role` (`agent_loop.py:12535-12544`).
+`_verify_pit_optimizer_terminal_semantics` checks event codes, count, ordering,
+details, digests, and terminal outcome, but never reads `event["state"]`
+(`12648-12856`). The writer emits the exact role state
+(`12223-12325`), yet replay accepts an investigator lifecycle whose three events
+all declare `CALL_AUTHOR` (or another valid LoopState) as long as the details
+and recomputed edge digests still say investigator. Receipt verification adds
+no state check (`12858-12927`). This does not satisfy Task 6's exact closed
+iteration-aware role/state history.
+
+**Required fix:** Derive the one expected optimizer LoopState from
+`record.role`, and require every matching reserved, optional started, and
+terminal event to carry exactly that state before accepting any receipt or
+budget recovery. Keep the existing exact detail and ordering checks.
+
+**Exact fake/temp RED:** Create a genuine fake investigator terminal crash
+before authorization publication. Rewrite the temporary hash chain so the
+reserved, started, and terminal records use `call_author` while their exact
+details remain call 1 / iteration 1 / investigator; recompute the event hashes,
+reserved-to-start edge, lifecycle digest, and terminal digest. Reopen and call
+recovery. Require `AuditError` before budget restore or reconciliation and keep
+plan 2 fenced. Current replay accepts the relabeled states, completes call 1,
+and allows the author reservation.
+
+**Why Task 6, not Task 7:** AuditTrail's Task 6 semantic verifier is the durable
+authority for role/state history. Task 7 cannot detect a relabel after Task 6
+has converted it into an accepted authorization receipt.
+
+### Minor 1 — the Round 4 report and tests overstate closure
+
+**Confidence: 10/10.**
+
+- `task-6-report.md:388-390` says all prior findings are closed. The alternate
+  public writer leaves the predecessor boundary open.
+- `task-6-report.md:422-434` says provider/budget artifacts are regular and
+  non-link and semantic receipt replay is exact. The optimizer readers omit the
+  repository's hardlink/reparse/single-read checks and omit LoopState.
+- `task-6-report.md:435-447` says recovery cross-verifies the active
+  authorization reservation and receipt, then restores BudgetLedger. The code
+  performs those operations in the opposite security order.
+- `test_pit_optimizer_v2_public_audit_writer_cannot_mint_a_predecessor`
+  (`tests/test_pit_optimizer_v2.py:5596-5690`) targets only the specialized
+  `write_provider_call_receipt` method and even obtains its record through the
+  private `_pit_optimizer_record` helper. It never exercises public
+  `write_handoff_metadata` with a protected name.
+- The digest/run relabel, post-terminal retry, wrong-lifecycle, fresh-restart,
+  and cancellation tests (`5692-6057`) are useful and honest for their asserted
+  cases. They do not cover generic namespace collision, hardlink/reparse
+  evidence, wrong event state, or no-mutation-before-authentication.
+- The reported `214 passed`, dedicated `8 passed`, Ruff, and compilation output
+  were inspected as recorded evidence but were not independently rerun in this
+  constrained review.
+
+Update the report after the REDs above fail on the current code and pass on the
+fix. Describe the specialized lifecycle writer as closed only after every
+public writer is namespace-safe, and state the exact verification-before-restore
+order.
+
+## New Breakage
+
+- Important 1 is a new ordering defect in the Round 4 fresh-ledger restore
+  implementation.
+- Critical 1 and Important 2/3 are incomplete closures of the prior
+  receipt-origin and semantic-replay findings. The private lifecycle itself is
+  no longer treated as forgeable under the calibrated worker threat model.
+- No other new Critical or Important regression was found in grant/window
+  durability, source authentication, pricing freeze lifecycle, canonical wire
+  bytes, ordinary call accounting, accepted post-publication semantics, role
+  synchronization, or legacy closed-record compatibility.
+
+## Requirement coverage
+
+| Task 6 requirement | Result |
+|---|---|
+| Hash-chain/exclusive-lock durability; atomic grant + window | **Meets; unchanged.** Authorization records remain exclusively locked and complete-image replaced. Audit framing/hash replay is intact; optimizer semantic/origin replay remains partial. |
+| Old 20/19 grant isolation; named grant; most-restrictive ceilings | **Meets; unchanged.** No path infers authorization or combines stale capacity. |
+| Authenticated manifest/requirement/source scope; non-secret approval | **Partial.** Manifest/call-plan and reverse-diff/source reconstruction remain authenticated, and approval values stay absent. Non-source predecessor authority remains publicly self-publishable (Critical 1). |
+| One-shot run key; concurrency/reopen; no-spend lease open | **Meets at lease open.** Role bind synchronization is fixed. Terminal reopen remains unsafe for rejected evidence (Important 1/2/3). |
+| Frozen Decimal R1 pricing identity; no post-freeze drift | **Meets.** Round 4 does not weaken canonical exact pricing, fresh gateway reauthentication, or callback-mutation protection. |
+| Next-call-only reservation; exact indexes/iterations/roles | **Partial.** Genuine calls consume the canonical next plan. A fabricated accepted predecessor can unlock the next role (Critical 1). |
+| Authoritative/overage/before-send/uncertain reconciliation | **Meets in the ordinary wrapper; partial on restart.** Genuine terminal evidence restores exact usage/retention/code, but rejected evidence can mutate the fresh ledger first (Important 1). |
+| Complete conservative bytes/tokens/USD before SDK/ledger/start effects | **Meets.** Captured canonical request bytes and frozen pricing still drive all preflight values before paid effects. |
+| BudgetLedger/AuthorizationLedger consistency for every exception/cancellation | **Partial.** Genuine cancellation and accepted post-publication paths are coherent. Authentication failure during restart can leave the ledgers divergent (Important 1). |
+| All-R1 isolated profile; one SDK request; `max_retries=0`; no healing/recovery | **Meets in the reviewed wrapper.** No alternate model, retry, healing, or generation recovery was introduced. Critical 1 is a capability-origin bypass, not a second SDK call. |
+| Iteration-aware closed ProviderCallRecord/audit; legacy compatibility | **Partial.** Closed provider facts and legacy readability remain. Protected-file identity and exact event-state replay are incomplete (Important 2/3). |
+| Terminal lease closure; no disguised retry | **Partial.** Normal and genuine recovered terminal transitions are exact; unauthenticated/relabeled evidence can complete or wedge recovery. |
+| Content/credential/source/provider-response secrecy | **Meets.** Reviewed provider, budget, receipt, and event records contain only closed accounting/lifecycle/model/pricing/digest facts. |
+| Record-grant CLI cannot infer authority, combine capacity, or touch credentials | **Meets; unchanged.** The CLI remains a non-provider administrative recorder and does not load provider credentials. |
+
+## Test/Report Audit
+
+- All Round 4 product tests inspected use pytest temporary roots, fake clients,
+  fake responses, and injected fake pricing. No test imports or invokes a live
+  provider/pricing path.
+- The fresh restart test genuinely discards gateway, BudgetLedger, AuditTrail,
+  AuthorizationLedger, and pricing objects before reopening
+  (`tests/test_pit_optimizer_v2.py:5877-5975`). The cancelled-terminal test
+  accurately checks the exact recovered code (`5977-6057`). These close the
+  specific old fresh-object and terminal-code failures on genuine evidence.
+- The replay tests correctly cover receipt provider-digest/audit-run relabel,
+  post-terminal retry, and wrong lifecycle digest (`5692-5875`). They do not
+  cover origin through the generic public writer or all semantic/file identity
+  properties.
+- The synchronization test is a meaningful forced race and matches the lock
+  implementation (`4188-4254`).
+- No added test uses a permanent ledger, real SDK, network, background worker,
+  replay/parity engine, or Docker. The missing REDs can remain fully
+  synchronous, fake-only, and temporary.
+
+## Resource/Secrecy Audit
+
+- This review performed only filesystem/code reads and wrote this ignored SDD
+  report. It started no provider/network/live-pricing/SDK/replay/container or
+  background action, created no permanent authorization/accounting state, and
+  ran no tests.
+- No temporary reproducer or helper process was created, so there is no cleanup
+  residue.
+- No prompt, source, raw provider response, request header, credential, API key,
+  or operator approval text is added to the reviewed durable artifacts. The
+  public namespace defect is an authority failure, not a content disclosure.
+
+## Out-of-Scope Observations
+
+- Live provider/SDK compatibility remains intentionally untested and is not a
+  Task 6 readiness blocker at this safety boundary.
+- Pre-Round-4 optimizer histories that lack the new lifecycle/budget/terminal
+  facts intentionally fail closed. A migration or terminal disposition may be
+  needed operationally, but automatic resealing is not required here.
+- Arbitrary private-name imports/reflection by the isolated policy worker were
+  excluded by the explicit threat model. No severity depends on those paths.
+- Task 7 still owns orchestration and should supply genuine predecessor calls.
+  It does not own public capability origin, audit artifact identity/semantics,
+  or cross-ledger recovery atomicity.
+
+## Final disposition
+
+**NEEDS FIXES.** Round 4 closes the specialized public receipt writer, ordinary
+receipt cross-verification, genuine fresh-ledger restore, exact recovered
+terminal code, and the role-registry race. It remains blocked by one Critical
+supported-public-path predecessor forgery and three Important durability gaps:
+verification must precede BudgetLedger restore, protected evidence must be read
+as a private single-open regular file, and replay must enforce the exact role
+LoopState. Add the focused fake/temp REDs above and correct the report before
+Task 6 is ready.

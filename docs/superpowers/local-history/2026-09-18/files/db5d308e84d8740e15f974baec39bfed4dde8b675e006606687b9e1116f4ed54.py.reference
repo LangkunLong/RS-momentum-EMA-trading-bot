@@ -1,0 +1,447 @@
+from __future__ import annotations
+
+import ast
+import difflib
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+
+ROOT = Path.cwd()
+sys.path.insert(0, str(ROOT))
+
+from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5
+from core.pit_optimizer_v5.contracts import ArtifactRefV5, CampaignManifestV5, canonical_sha256_v5
+from core.pit_optimizer_v5.development_preparation import authenticate_existing_controller_packages_v5
+from core.pit_optimizer_v5.memory import RoleCompletionPayloadV5
+from core.pit_optimizer_v5.provider import ControllerRoleTerminalAuthorityV5
+
+
+PACKAGE = ROOT / ".artifacts/pit-optimizer-v5/development/increment-c-history-h3"
+CONTROLLER = ROOT / "core/pit_optimizer_v5/controller_roles.py"
+CONTROLLER_PRE = PACKAGE / "pre-h3a-controller_roles.py"
+PREPARATION = ROOT / "core/pit_optimizer_v5/development_preparation.py"
+PREPARATION_PRE = PACKAGE / "pre-h3a-development_preparation.py"
+RUNTIME = ROOT / ".artifacts/pit-optimizer-v5/development/runtime-04"
+PROVIDER = ROOT / ".artifacts/pit-optimizer-v5/development/provider-runtime-06"
+MANIFEST_REF = ArtifactRefV5(
+    "campaigns/development-controller-two-rounds-20260907-04/manifest.json",
+    "8fcae0423117f3a234e64391c277bd7efe5cbb775ff61ec879d8cbeb5659d37c",
+)
+
+
+def digest(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def newline_style(raw: bytes) -> str:
+    if b"\r\n" in raw and b"\n" not in raw.replace(b"\r\n", b""):
+        return "crlf"
+    if b"\r" not in raw:
+        return "lf"
+    return "mixed"
+
+
+def write_json(name: str, value: object) -> None:
+    (PACKAGE / name).write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def extended_root(path: Path) -> str:
+    absolute = str(path.resolve())
+    if os.name != "nt" or absolute.startswith("\\\\?\\"):
+        raise RuntimeError("H3a archive evidence requires a non-extended Windows root")
+    value = f"\\\\?\\{absolute}"
+    if not value.startswith("\\\\?\\"):
+        raise RuntimeError("extended Windows root assertion failed")
+    return value
+
+
+def archive_map(path: Path) -> dict[str, object]:
+    root = extended_root(path)
+    files: dict[str, dict[str, object]] = {}
+    for directory, directories, names in os.walk(root):
+        directories.sort()
+        for name in sorted(names):
+            absolute = os.path.join(directory, name)
+            relative = os.path.relpath(absolute, root).replace(os.sep, "/")
+            with open(absolute, "rb") as handle:
+                raw = handle.read()
+            files[relative] = {"sha256": digest(raw), "bytes": len(raw)}
+    files = dict(sorted(files.items()))
+    tree = digest(json.dumps(files, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    return {
+        "archive_root": path.relative_to(ROOT).as_posix(),
+        "extended_root": root,
+        "extended_root_asserted": root.startswith("\\\\?\\"),
+        "file_count": len(files),
+        "byte_count": sum(int(item["bytes"]) for item in files.values()),
+        "tree_sha256": tree,
+        "canonicalization": "sorted ordinal relative path keys; compact UTF-8 JSON object of sha256 and byte count",
+        "files": files,
+    }
+
+
+def snapshots(suffix: str) -> None:
+    runtime = archive_map(RUNTIME)
+    provider = archive_map(PROVIDER)
+    if runtime["file_count"] != 579 or provider["file_count"] != 83:
+        raise RuntimeError("archive file count differs from the sealed scope")
+    write_json(f"h3a-runtime-04-{suffix}.json", runtime)
+    write_json(f"h3a-provider-runtime-06-{suffix}.json", provider)
+    print(runtime["file_count"], runtime["tree_sha256"])
+    print(provider["file_count"], provider["tree_sha256"])
+
+
+def definitions(raw: bytes) -> tuple[dict[str, bytes], dict[str, ast.FunctionDef]]:
+    tree = ast.parse(raw)
+    lines = raw.splitlines(keepends=True)
+    values: dict[str, bytes] = {}
+    nodes: dict[str, ast.FunctionDef] = {}
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef):
+            values[node.name] = b"".join(lines[node.lineno - 1 : node.end_lineno])
+            nodes[node.name] = node
+        elif isinstance(node, ast.ClassDef):
+            for child in node.body:
+                if isinstance(child, ast.FunctionDef):
+                    name = f"{node.name}.{child.name}"
+                    values[name] = b"".join(lines[child.lineno - 1 : child.end_lineno])
+                    nodes[name] = child
+    return values, nodes
+
+
+def call_name(node: ast.Call) -> str | None:
+    if isinstance(node.func, ast.Name):
+        return node.func.id
+    if isinstance(node.func, ast.Attribute):
+        return node.func.attr
+    return None
+
+
+def ast_statements(statements: list[ast.stmt]) -> str:
+    return ast.dump(ast.Module(body=statements, type_ignores=[]), include_attributes=False)
+
+
+def static_evidence() -> None:
+    controller_pre_raw = CONTROLLER_PRE.read_bytes()
+    controller_raw = CONTROLLER.read_bytes()
+    preparation_pre_raw = PREPARATION_PRE.read_bytes()
+    preparation_raw = PREPARATION.read_bytes()
+    controller_pre_values, controller_pre_nodes = definitions(controller_pre_raw)
+    controller_values, controller_nodes = definitions(controller_raw)
+    preparation_pre_values, preparation_pre_nodes = definitions(preparation_pre_raw)
+    preparation_values, preparation_nodes = definitions(preparation_raw)
+
+    controller_added = set(controller_values) - set(controller_pre_values)
+    controller_removed = set(controller_pre_values) - set(controller_values)
+    controller_changed = {
+        name
+        for name in set(controller_pre_values) & set(controller_values)
+        if controller_pre_values[name] != controller_values[name]
+    }
+    preparation_added = set(preparation_values) - set(preparation_pre_values)
+    preparation_removed = set(preparation_pre_values) - set(preparation_values)
+    preparation_changed = {
+        name
+        for name in set(preparation_pre_values) & set(preparation_values)
+        if preparation_pre_values[name] != preparation_values[name]
+    }
+
+    classifier = controller_nodes["_classify_controller_response_v5"]
+    old_terminal = controller_pre_nodes["FileBackedControllerRoleInvokerV5._terminal"]
+    terminal = controller_nodes["FileBackedControllerRoleInvokerV5._terminal"]
+    classifier_calls = sorted(
+        {name for child in ast.walk(classifier) if isinstance(child, ast.Call) and (name := call_name(child))}
+    )
+    classifier_forbidden_names = sorted(
+        {
+            child.id
+            for child in ast.walk(classifier)
+            if isinstance(child, ast.Name)
+            and child.id
+            in {
+                "repository",
+                "self",
+                "Path",
+                "FileBackedControllerRoleInvokerV5",
+                "ControllerRoleResponsePendingV5",
+            }
+        }
+    )
+    classifier_forbidden_calls = sorted(
+        set(classifier_calls)
+        & {
+            "append_controller_role_response",
+            "append_binary_state",
+            "load_controller_role_response",
+            "open",
+            "_incoming_path",
+            "_sealed",
+            "invoke_once",
+            "reconcile_once",
+        }
+    )
+
+    request_auth = preparation_nodes["_authenticate_controller_request"]
+    existing_auth = preparation_nodes["authenticate_existing_controller_packages_v5"]
+    state_reads = [
+        child
+        for child in ast.walk(request_auth)
+        if isinstance(child, ast.Call) and call_name(child) == "load_typed_state"
+    ]
+    state_read_repairs = []
+    for call in state_reads:
+        values = [keyword.value for keyword in call.keywords if keyword.arg == "repair"]
+        state_read_repairs.append(
+            {
+                "line": call.lineno,
+                "repair_parameter_forwarded": len(values) == 1 and isinstance(values[0], ast.Name) and values[0].id == "repair",
+            }
+        )
+    auth_request_calls = [
+        child
+        for child in ast.walk(existing_auth)
+        if isinstance(child, ast.Call) and call_name(child) == "_authenticate_controller_request"
+    ]
+    auth_request_repairs = []
+    for call in auth_request_calls:
+        values = [keyword.value for keyword in call.keywords if keyword.arg == "repair"]
+        auth_request_repairs.append(
+            {
+                "line": call.lineno,
+                "repair_is_literal_false": len(values) == 1 and isinstance(values[0], ast.Constant) and values[0].value is False,
+            }
+        )
+    existing_calls = [
+        {"line": child.lineno, "call": call_name(child)}
+        for child in ast.walk(existing_auth)
+        if isinstance(child, ast.Call)
+    ]
+    existing_call_names = [item["call"] for item in existing_calls]
+    forbidden_existing_calls = sorted(
+        {
+            str(name)
+            for name in existing_call_names
+            if name
+            in {
+                "FileBackedControllerRoleInvokerV5",
+                "Path",
+                "append_controller_role_response",
+                "append_typed_state",
+                "append_binary_state",
+                "invoke_once",
+                "reconcile_once",
+                "_incoming_path",
+                "_sealed",
+            }
+        }
+    )
+    sealed_load_count = existing_call_names.count("load_controller_role_response")
+
+    accepted_map = json.loads(
+        (ROOT / ".artifacts/pit-optimizer-v5/development/increment-c-history-h1/evaluator-source-map.json").read_text(
+            encoding="utf-8"
+        )
+    )["source_sha256_by_path"]
+    evaluator_map = {path: digest((ROOT / path).read_bytes()) for path in accepted_map}
+    evaluator = {
+        "count": len(evaluator_map),
+        "sha256": canonical_sha256_v5(evaluator_map),
+        "source_sha256_by_path": evaluator_map,
+    }
+    write_json("h3a-evaluator-source-map.json", evaluator)
+
+    checks = {
+        "controller_adds_only_pure_classifier": controller_added == {"_classify_controller_response_v5"},
+        "controller_removes_no_definitions": not controller_removed,
+        "controller_changes_only_terminal": controller_changed == {"FileBackedControllerRoleInvokerV5._terminal"},
+        "classifier_body_is_exact_old_post_sealed_body": ast_statements(classifier.body) == ast_statements(old_terminal.body[1:]),
+        "terminal_has_only_sealed_then_classifier_delegate": len(terminal.body) == 2
+        and call_name(terminal.body[0].value) == "_sealed"
+        and isinstance(terminal.body[1], ast.Return)
+        and isinstance(terminal.body[1].value, ast.Call)
+        and call_name(terminal.body[1].value) == "_classify_controller_response_v5",
+        "classifier_has_no_repository_filesystem_invoker_or_capability_names": not classifier_forbidden_names,
+        "classifier_has_no_write_or_operational_calls": not classifier_forbidden_calls,
+        "preparation_adds_only_existing_authenticator": preparation_added == {"authenticate_existing_controller_packages_v5"},
+        "preparation_removes_no_definitions": not preparation_removed,
+        "preparation_changes_only_request_authenticator": preparation_changed == {"_authenticate_controller_request"},
+        "operational_authenticator_is_byte_identical": preparation_values["authenticate_controller_packages_v5"]
+        == preparation_pre_values["authenticate_controller_packages_v5"],
+        "request_authenticator_default_repair_is_true": len(request_auth.args.kw_defaults) == 1
+        and isinstance(request_auth.args.kw_defaults[0], ast.Constant)
+        and request_auth.args.kw_defaults[0].value is True,
+        "request_authenticator_has_two_typed_state_reads": len(state_reads) == 2,
+        "request_authenticator_forwards_repair_to_both_reads": len(state_read_repairs) == 2
+        and all(item["repair_parameter_forwarded"] for item in state_read_repairs),
+        "existing_authenticator_passes_literal_false": len(auth_request_repairs) == 1
+        and auth_request_repairs[0]["repair_is_literal_false"],
+        "existing_authenticator_loads_sealed_response_once": sealed_load_count == 1,
+        "existing_authenticator_has_no_write_or_operational_calls": not forbidden_existing_calls,
+        "controller_newline_style_preserved": newline_style(controller_pre_raw) == newline_style(controller_raw) == "lf",
+        "preparation_newline_style_preserved": newline_style(preparation_pre_raw)
+        == newline_style(preparation_raw)
+        == "crlf",
+        "evaluator_closure_is_56_files": len(evaluator_map) == 56,
+        "evaluator_digest_is_fixed": evaluator["sha256"]
+        == "005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4",
+        "evaluator_files_are_unchanged": evaluator_map == accepted_map,
+    }
+    evidence = {
+        "checks": checks,
+        "pass": all(checks.values()),
+        "source_hashes": {
+            "controller_preimage": {"sha256": digest(controller_pre_raw), "bytes": len(controller_pre_raw)},
+            "controller_source": {"sha256": digest(controller_raw), "bytes": len(controller_raw)},
+            "preparation_preimage": {"sha256": digest(preparation_pre_raw), "bytes": len(preparation_pre_raw)},
+            "preparation_source": {"sha256": digest(preparation_raw), "bytes": len(preparation_raw)},
+        },
+        "definition_changes": {
+            "controller_added": sorted(controller_added),
+            "controller_removed": sorted(controller_removed),
+            "controller_changed": sorted(controller_changed),
+            "preparation_added": sorted(preparation_added),
+            "preparation_removed": sorted(preparation_removed),
+            "preparation_changed": sorted(preparation_changed),
+        },
+        "protected_controller_methods": {
+            name: digest(controller_values[name])
+            for name in (
+                "FileBackedControllerRoleInvokerV5.__init__",
+                "FileBackedControllerRoleInvokerV5._incoming_path",
+                "FileBackedControllerRoleInvokerV5._sealed",
+                "FileBackedControllerRoleInvokerV5.invoke_once",
+                "FileBackedControllerRoleInvokerV5.reconcile_once",
+            )
+        },
+        "classifier_calls": classifier_calls,
+        "classifier_forbidden_names": classifier_forbidden_names,
+        "classifier_forbidden_calls": classifier_forbidden_calls,
+        "existing_authenticator_callgraph": {
+            "authenticate_existing_controller_packages_v5": existing_calls,
+            "_authenticate_controller_request": [
+                {"line": child.lineno, "call": call_name(child)}
+                for child in ast.walk(request_auth)
+                if isinstance(child, ast.Call)
+            ],
+        },
+        "typed_state_reads": state_read_repairs,
+        "request_authentication_calls": auth_request_repairs,
+        "sealed_response_load_count": sealed_load_count,
+        "forbidden_existing_calls": forbidden_existing_calls,
+        "newline_styles": {
+            "controller_preimage": newline_style(controller_pre_raw),
+            "controller_source": newline_style(controller_raw),
+            "preparation_preimage": newline_style(preparation_pre_raw),
+            "preparation_source": newline_style(preparation_raw),
+        },
+        "evaluator": {"count": evaluator["count"], "sha256": evaluator["sha256"]},
+    }
+    write_json("h3a-static-verification.json", evidence)
+    write_json("h3a-source-hashes.json", evidence["source_hashes"])
+
+    diffs: list[str] = []
+    for pre_raw, raw, path in (
+        (controller_pre_raw, controller_raw, "core/pit_optimizer_v5/controller_roles.py"),
+        (preparation_pre_raw, preparation_raw, "core/pit_optimizer_v5/development_preparation.py"),
+    ):
+        diffs.extend(
+            difflib.unified_diff(
+                pre_raw.decode("utf-8").splitlines(keepends=True),
+                raw.decode("utf-8").splitlines(keepends=True),
+                fromfile=f"a/{path}.pre-h3a",
+                tofile=f"b/{path}",
+            )
+        )
+    (PACKAGE / "h3a-source.diff").write_text("".join(diffs), encoding="utf-8", newline="")
+    print(json.dumps(evidence, indent=2, sort_keys=True))
+    if not evidence["pass"]:
+        raise SystemExit(1)
+
+
+def authenticate_actual() -> None:
+    repository = LocalArtifactRepositoryV5(RUNTIME.resolve())
+    manifest = repository.load_typed_artifact(MANIFEST_REF, value_type=CampaignManifestV5)
+    packages = []
+    rows = []
+    for round_index in range(1, manifest.search.max_feedback_rounds + 1):
+        round_packages = []
+        for event in repository.load_round_events(campaign_id=manifest.campaign_id, round_index=round_index):
+            payload = repository.load_round_payload(event.payload_ref, expected_kind=event.event_kind)
+            if type(payload) is RoleCompletionPayloadV5:
+                package = repository.load_role_invocation(payload)
+                round_packages.append(package)
+                packages.append(package)
+        rows.append(
+            {
+                "round_index": round_index,
+                "package_count": len(round_packages),
+                "roles": [package.call.role for package in round_packages],
+                "package_sha256": [package.sha256 for package in round_packages],
+            }
+        )
+    authenticate_existing_controller_packages_v5(repository, manifest, tuple(packages))
+    evidence = {
+        "archive_root": RUNTIME.relative_to(ROOT).as_posix(),
+        "manifest_sha256": manifest.sha256,
+        "package_count": len(packages),
+        "all_controller_terminal_authority": all(
+            type(package.terminal_authority) is ControllerRoleTerminalAuthorityV5 for package in packages
+        ),
+        "rounds": rows,
+        "pass": len(packages) == 5
+        and all(type(package.terminal_authority) is ControllerRoleTerminalAuthorityV5 for package in packages),
+    }
+    write_json("h3a-actual-auth-results.json", evidence)
+    print(json.dumps(evidence, indent=2, sort_keys=True))
+    if not evidence["pass"]:
+        raise SystemExit(1)
+
+
+def preservation() -> None:
+    def compare(prefix: str) -> dict[str, object]:
+        before = json.loads((PACKAGE / f"h3a-{prefix}-before.json").read_text(encoding="utf-8"))
+        after = json.loads((PACKAGE / f"h3a-{prefix}-after.json").read_text(encoding="utf-8"))
+        before_files = before["files"]
+        after_files = after["files"]
+        changed = sorted(
+            path
+            for path in set(before_files) | set(after_files)
+            if before_files.get(path) != after_files.get(path)
+        )
+        return {
+            "before_file_count": before["file_count"],
+            "after_file_count": after["file_count"],
+            "before_byte_count": before["byte_count"],
+            "after_byte_count": after["byte_count"],
+            "before_tree_sha256": before["tree_sha256"],
+            "after_tree_sha256": after["tree_sha256"],
+            "extended_roots_asserted": before["extended_root_asserted"] and after["extended_root_asserted"],
+            "unchanged": not changed,
+            "changed_paths": changed,
+        }
+
+    runtime = compare("runtime-04")
+    provider = compare("provider-runtime-06")
+    evidence = {"runtime_04": runtime, "provider_runtime_06": provider, "pass": runtime["unchanged"] and provider["unchanged"]}
+    write_json("h3a-preservation-check.json", evidence)
+    print(json.dumps(evidence, indent=2, sort_keys=True))
+    if not evidence["pass"]:
+        raise SystemExit(1)
+
+
+if len(sys.argv) != 2:
+    raise SystemExit("usage: h3a_evidence.py before|static|auth|after|preservation")
+mode = sys.argv[1]
+if mode in {"before", "after"}:
+    snapshots(mode)
+elif mode == "static":
+    static_evidence()
+elif mode == "auth":
+    authenticate_actual()
+elif mode == "preservation":
+    preservation()
+else:
+    raise SystemExit("unknown evidence mode")

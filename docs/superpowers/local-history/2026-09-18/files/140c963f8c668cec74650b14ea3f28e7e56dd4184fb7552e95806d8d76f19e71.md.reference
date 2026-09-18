@@ -1,0 +1,35 @@
+# Runtime-04 deadline investigation
+
+**High-confidence primary cause: host Modern Standby during the final discovery evaluation.** Direct Windows System events overlap almost the entire anomalous interval. This is not evidence of a two-hour CPU-bound evaluator regression.
+
+All times below are UTC on 2026-09-07:
+
+| Evidence | Time |
+| --- | --- |
+| Campaign saved start | 11:10:51.038 |
+| Round 2 saved start | 12:26:10.408 |
+| Final container created, durable identity | 13:19:55.969924743 |
+| Kernel-Power 506: entering Modern Standby, reason Lid | 13:21:25.0262555 |
+| Last rapid standby transition, event 506 | 13:21:28.8484157 |
+| Original round-2 deadline (7200 seconds) | 14:26:10.408 |
+| Original campaign deadline (14400 seconds) | 15:10:51.038 |
+| Kernel-Power 507: exiting Modern Standby, reason Lid | 15:13:46.2383809 |
+| Final collected artifact filesystem timestamp | 15:30:14 |
+
+The created-to-collected interval is approximately 130 minutes 18 seconds. Standby covers approximately 112 minutes 21 seconds (112 minutes 17 seconds using the last entry), leaving about 18 minutes outside that interval. This subtraction is an explanatory wall-time estimate, not measured CPU time. Both the saved round and campaign deadlines had expired before the lid-triggered wake.
+
+The four refreshed real parent verification receipts under `runtime-parent-discovery30-4acebbc4abd4-N` record 823.648052, 839.990818, 845.585082 and 845.997324 seconds: approximately 13m44s-14m06s. Earlier runtime-04 identity-to-collected filesystem intervals likewise run about 13m39s-14m19s for discovery-sized work. These are consistent with ordinary evaluation durations plus the observed host suspension explaining the outlier. They do not prove identical compute cost for this candidate.
+
+## Why container success and round failure are consistent
+
+Command `b0ba2f425e3ef727abe5f0152c3cc6d60064be7f49676e7d04225a6a2bd58d21` has a durable succeeded terminal, exit 0, and output SHA-256 `ce4c3b5f6957e67b2221aa91abd09eb220c181ffdaec3819e2dff633d2eedea2`. The exact container identity is `d47a061db709fafb4d875ca6416df0661801f53b06931792f7c57b76313cce74`. That proves the container eventually produced output, not that the result arrived within the runtime's deadline.
+
+The pre-application runtime source snapshots in `provider-staging/originals/` preserve the code used by this campaign while integration is being applied elsewhere. `runtime.py:1049-1067` caps a stage deadline at the remaining round deadline and rejects completion observed after expiry. Discovery performs its post-evaluation deadline check at lines 2468/2476. `operations.py:429-435,554-567` derives remaining campaign/round allowance from the original persisted starts and passes the shortened deadline into the runtime. Late successful container output therefore cannot override deadline failure. The exact internal wait/VM timing behavior during sleep is not established by these records; no claim is made that all standby time was CPU inactivity or that the timeout mechanism was sampled during suspension.
+
+`resume-05-result.json` truthfully records round 2 failed with `discovery_evaluation:deadline_exceeded`, cleanup complete, checkpoint generation 1, and one evaluated experiment. Preserve this terminal history and late output as diagnostic evidence; do not promote it to an in-budget completed experiment or refresh this campaign's deadlines.
+
+## Smallest remedy for a fresh campaign
+
+Run the newly prepared campaign on an awake, AC-powered host with the lid open, preventing automatic sleep/Modern Standby for the bounded run. Restore any temporary power override afterward. Keep the current 1200-second discovery, 7200-second round and 14400-second campaign semantics initially; the observed awake durations do not by themselves justify enlarging limits. A fresh campaign gets its own original start/deadline records. If an awake run still overruns, use that new actual evidence to assess limits before another launch rather than changing the failed campaign.
+
+Read-only investigation used campaign receipts, filesystem timestamps, exact source snapshots and filtered Windows Kernel-Power events (506/507). No tests, synthetic probes, restarts, Docker, network calls or source changes occurred. Only this report was written. Host standby is supported with high confidence; its exact contribution to evaluator versus controller scheduling is not separately measured.

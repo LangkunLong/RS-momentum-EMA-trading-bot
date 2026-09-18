@@ -1,0 +1,123 @@
+# Task 1 Report: Seal the Three Non-Tradable Market References
+
+## Status
+
+DONE
+
+Commit: `52837cd feat: seal PIT market reference symbols`
+
+## Implementation
+
+- Added the canonical `PIT_NON_TRADABLE_REFERENCE_SYMBOLS = ("IWM", "QQQ", "SPY")` boundary and shared newline-terminated canonical JSON/SHA-256 helpers in `core/pit_provenance.py`.
+- Updated the cache request, completed price-identity contracts, Alpaca split/raw request boundaries, membership-count arithmetic, returned membership counts, and final price validation to include all three references. Every reference must now have the same exact expected session calendar.
+- Added exporter provenance for the sealed reference JSON/digest and per-reference first date, last date, and session count.
+- Added schema-v2 bundle metadata (`canslim_pit_v2`, schema `2`, sealed reference JSON/digest, and `source_universe=sp500`). The builder rejects references in membership/fundamentals, rejects price symbols outside membership plus references, requires all three reference price calendars to be identical, and requires identity contracts to cover membership plus references exactly.
+- Updated `PITDataBundle` to materialize immutable tradable, reference, and actual price-symbol sets. Added `tradable_symbols()`, `reference_symbols()`, and `price_symbols()` while retaining `symbols()` as the schema-v2 compatibility alias. Legacy schema-v1 loading and manifest behavior remain intact.
+- Added authenticated canonical `security_lineage_id` access, plus an immutable bulk mapping, populated only after the exact prices-provenance digest and identity contracts are authenticated. Values derive directly from validated price-identity `chain_id` fields.
+- Added schema-v2 manifest fields for the exact reference list and each reference's first date, last date, and session count.
+- Updated `verify_pit_bundle.py` to rebuild the reference coverage from the exact prices CSV, compare it to both bundle manifest and prices provenance, and only then compare the manifest-last marker. The schema-v1 legacy verification path is unchanged.
+- Extended only existing test fixtures/assertions with IWM/QQQ rows, sealed request expectations, completed identity contract expectations, and per-reference coverage assertions. No test file or test function was added.
+
+## Files Changed
+
+- `core/pit_provenance.py`
+- `core/pit_data.py`
+- `core/alpaca_pit_backfill.py`
+- `export_pit_prices.py`
+- `build_pit_bundle.py`
+- `verify_pit_bundle.py`
+- `tests/test_pit_data.py`
+- `tests/test_export_pit_prices.py`
+
+## Verification
+
+Baseline before edits:
+
+```powershell
+python -B -m compileall -q core/pit_provenance.py core/pit_data.py core/alpaca_pit_backfill.py export_pit_prices.py build_pit_bundle.py verify_pit_bundle.py
+python -B -m ruff check core/pit_provenance.py core/pit_data.py core/alpaca_pit_backfill.py export_pit_prices.py build_pit_bundle.py verify_pit_bundle.py --no-cache
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_data.py tests/test_export_pit_prices.py
+```
+
+Result: compile passed; Ruff reported `All checks passed!`; pytest reported `30 passed, 1 skipped, 2 warnings in 0.71s`.
+
+TDD RED evidence after fixture/assertion updates: focused pytest failed during collection because the shared reference constant did not yet exist; after adding that foundation, it reported four intended behavioral failures because QQQ/IWM were rejected as unrequested, reference coverage facts were absent, and completed identity contracts contained only SPY.
+
+Final exact verification on the committed tree content:
+
+```powershell
+python -B -m compileall -q core/pit_provenance.py core/pit_data.py core/alpaca_pit_backfill.py export_pit_prices.py build_pit_bundle.py verify_pit_bundle.py
+python -B -m ruff check core/pit_provenance.py core/pit_data.py core/alpaca_pit_backfill.py export_pit_prices.py build_pit_bundle.py verify_pit_bundle.py --no-cache
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_data.py tests/test_export_pit_prices.py
+```
+
+Result: compile passed; Ruff reported `All checks passed!`; pytest reported `30 passed, 1 skipped, 2 warnings in 0.68s`.
+
+Additional legacy compatibility selection:
+
+```powershell
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_data.py tests/test_export_pit_prices.py tests/test_task11_pit_transport_contract.py tests/test_task11_diagnostic_contract.py -k "bundle or transport or pit or worker or price or publish or cache or provider or chain or container or native or manifest"
+```
+
+Result: `44 passed, 1 skipped, 9 deselected, 2 warnings in 1.70s`.
+
+Repository pre-commit hooks also passed: Ruff, trailing whitespace, end-of-files, YAML (skipped because none), and merge-conflict checks.
+
+The two warnings are the known environment warnings explicitly excluded from scope: unsupported pytest `cache_dir` and third-party `websockets.legacy` deprecation.
+
+## Self-Review
+
+- Confirmed the canonical provenance constant order is exactly `(IWM, QQQ, SPY)` and did not introduce the later MarketContext presentation order.
+- Confirmed all changed production and test files are exactly the eight Task 1 files.
+- Confirmed no candidate-policy source, Task 2 caller, schema-v3 artifact, external service, Docker invocation, or provider invocation was touched.
+- Confirmed membership counts use set difference against the complete reference set rather than SPY-only subtraction.
+- Confirmed schema-v1 readers/manifests retain legacy behavior; only newly built schema-v2 bundles gain the new reference contract.
+- Confirmed lineage access is unavailable until the exact prices provenance is authenticated and rejects references/non-tradables.
+- Confirmed `git diff --check` passed before commit.
+
+## Concerns
+
+None. The only non-clean output is the two known pre-existing environment warnings described above.
+
+## Review Fix Round 1: Exact Schema-v2 Price Universe
+
+Commit: `6455d4f fix: require complete PIT price universe`
+
+### Finding and Root Cause
+
+Schema-v2 construction treated a declared price exclusion as satisfying a missing membership price, while the schema-v2 reader validated only that actual price symbols were a subset of tradables plus references. Both checks were asymmetric and therefore permitted an authenticated bundle whose price surface omitted a tradable membership identity.
+
+### Changes
+
+- `build_pit_bundle.py`: rejects every non-empty price-exclusion set for schema-v2 construction and requires `price_symbols == membership_symbols ∪ {IWM, QQQ, SPY}`. The failure reports missing and outside symbols.
+- `core/pit_data.py`: requires the materialized schema-v2 price-symbol set to equal the immutable tradable-symbol set union the immutable reference-symbol set exactly. The schema-v1 legacy branch was not changed.
+- `tests/test_pit_data.py`: extended the existing PIT price-boundary test in place to prove schema-v2 construction rejects a non-empty exclusion. No test function or test file was added.
+
+### TDD Evidence
+
+The amended existing test was run before the fix:
+
+```powershell
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_data.py::test_pit_price_reader_rejects_invalid_ohlc_rows_and_schema_v2_exclusions
+```
+
+RED result: `1 failed, 2 warnings`; the builder continued past the exclusion and failed later on an unrelated identity-contract check, proving the exclusion was still accepted.
+
+After the fix, the same command reported `1 passed, 2 warnings in 0.51s`.
+
+### Final Verification
+
+```powershell
+python -B -m compileall -q core/pit_provenance.py core/pit_data.py core/alpaca_pit_backfill.py export_pit_prices.py build_pit_bundle.py verify_pit_bundle.py
+python -B -m ruff check core/pit_provenance.py core/pit_data.py core/alpaca_pit_backfill.py export_pit_prices.py build_pit_bundle.py verify_pit_bundle.py --no-cache
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_data.py tests/test_export_pit_prices.py
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_task11_pit_transport_contract.py tests/test_task11_diagnostic_contract.py -k "bundle or transport or pit"
+```
+
+Results: compilation passed; Ruff reported `All checks passed!`; focused Task 1 pytest reported `30 passed, 1 skipped, 2 warnings in 0.70s`; precise schema-v1 compatibility selection reported `12 passed, 11 deselected, 2 warnings in 1.46s`.
+
+The separate commit's pre-commit hooks passed Ruff, trailing-whitespace, end-of-files, YAML (no files), and merge-conflict checks. `git diff --check` passed before commit. The two warnings remain the known unsupported pytest `cache_dir` and third-party `websockets.legacy` deprecation warnings.
+
+### Fix-Round Concerns
+
+None.

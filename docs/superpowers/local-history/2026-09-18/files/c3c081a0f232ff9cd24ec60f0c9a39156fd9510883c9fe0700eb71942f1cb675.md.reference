@@ -1,0 +1,36 @@
+# P1 implementation report
+
+## Status
+
+P1 implementation is complete and source-frozen at `core/pit_optimizer_v5/campaign_admission.py`, SHA-256 `7e15ed500121b4c85df7a838feab51750e1f476a3e5427b9d1a0b1f0f58a89d9`.
+
+## Implemented
+
+- Added the exact frozen/slotted `CampaignAdmissionPolicyV5`, `CampaignAdmissionBindingV5`, and `AuthenticatedCampaignAdmissionV5` shapes without changing any existing serialized type.
+- Added prepared-policy authentication for the exact paid development manifest graph, policy/config digests, provider config type, repository root identity, single-candidate search, zero retries/repairs, target/call/token capacity, and conservative finite-USD capacity.
+- Added immutable selected-enrollment discovery across the union of value and authority namespaces. It enforces canonical manifest keys, detects foreign-key bindings, rejects missing/corrupt halves, honors an exact expected policy pin, and makes its sole typed-state read with `repair=False`.
+- Added the pure exact role-envelope check using `prospective_role_usage_v5`. It also requires the request's fixed output cap to match the provider authority.
+- Added the pure campaign-boundary decision with target-first completion and conservative missing-round attempt/call/token/USD reserve checks. Actual over-cap counters are treated as insufficient reserve rather than rejected as impossible history.
+- Finite-USD arithmetic applies the greater authenticated unit price to the maximum input/output split, preserves the provider's explicit 50-digit `ROUND_CEILING` operation chain, computes required call products under the same conservative context, and compares the cap to `sum_cost_usd_v5` rather than subtracting under ambient Decimal context.
+
+## Verification
+
+- Scoped Ruff: PASS, `All checks passed!`
+- In-memory compile of the source text: PASS
+- AST/interface inspection: exact three dataclass field lists and four required public signatures; zero create/append/recovery calls; one `load_typed_state` call and one explicit `repair=False`; one `sum_cost_usd_v5` call; zero `maximum_usd` subtraction expressions.
+- Full immutable baseline-map comparison through Windows extended paths: runtime-04 579/579 unchanged; provider-runtime-06 83/83 unchanged.
+- Evaluator source closure: 56/56 hashes unchanged; canonical map remains `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4`.
+- Five read-only dependency files retain their recorded preimage hashes. No existing production schema or digest implementation changed.
+
+The policy-positive and finite-USD decision branches are verified statically only. No tests, synthetic/fake inputs, imports to exercise behavior, archive readers/summaries, evaluator/provider/model calls, campaign preparation/execution, credentials/environment reads, or Git mutations were performed.
+
+## Review and self-review
+
+The first independent review found two finite-USD precision issues in the original freeze. Fix round 1 addresses both through the principal's exact conservative arithmetic ruling and fixed-output requirement. Self-review after the fix found no additional source issue. Scoped independent re-review returned spec PASS and quality APPROVE. The exact intermediate review-freeze bytes were not copied before the fix; the evidence retains that freeze's verified hash/size/newline census and the review's complete-source assessment, and states this limitation without claiming a unified fix diff.
+
+## Files changed
+
+- Production: new `core/pit_optimizer_v5/campaign_admission.py` only.
+- Evidence: files under `.artifacts/pit-optimizer-v5/development/increment-c-campaign-proposal/admission-p1/` only.
+
+No commit was created, as required.

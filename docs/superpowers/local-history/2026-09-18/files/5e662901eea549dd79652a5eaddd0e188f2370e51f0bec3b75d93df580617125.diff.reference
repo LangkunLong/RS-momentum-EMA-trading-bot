@@ -1,0 +1,4513 @@
+# Review package: 458ba55..5cebaf9
+
+## Commits
+5cebaf9 fix: close optimizer accounting boundaries
+
+## Files changed
+ agent_loop.py                       |  951 ++++++++++--------
+ core/pit_optimization_contract.py   |   89 ++
+ core/pit_optimizer_authorization.py |  282 +++++-
+ tests/test_pit_optimizer_v2.py      | 1820 +++++++++++++++++++++++++++++++----
+ 4 files changed, 2502 insertions(+), 640 deletions(-)
+
+## Diff
+diff --git a/agent_loop.py b/agent_loop.py
+index 4a8b4df..cae9f1b 100644
+--- a/agent_loop.py
++++ b/agent_loop.py
+@@ -25,21 +25,21 @@ import textwrap
+ import threading
+ import time
+ import secrets
+ import unicodedata
+ import urllib.error
+ import urllib.request
+ from urllib.parse import quote
+ from contextlib import closing
+ from dataclasses import asdict, dataclass, replace
+ from datetime import date, datetime, timezone
+-from decimal import Decimal
++from decimal import Decimal, InvalidOperation
+ from enum import Enum
+ from pathlib import Path
+ from types import MappingProxyType
+ from typing import (
+     TYPE_CHECKING,
+     Any,
+     BinaryIO,
+     Callable,
+     ClassVar,
+     Generic,
+@@ -1484,20 +1484,33 @@ class ProviderCallRecord:
+             ):
+                 raise ConfigurationError("optimizer uncertain call claims exact usage")
+             if (
+                 self.retained_reservation_usd != self.maximum_exposure_usd
+                 or self.retained_reservation_tokens != self.maximum_exposure_tokens
+                 or self.exposure_basis != "retained_reservation"
+             ):
+                 raise ConfigurationError("optimizer uncertain reservation is inconsistent")
+         if self.outcome == "accepted" and not self.response_schema_valid:
+             raise ConfigurationError("accepted optimizer response must be schema-valid")
++        if self.outcome == "accepted" and not (
++            self.request_started
++            and self.response_received
++            and self.returned_model == self.requested_model
++            and self.finish_reason == "stop"
++            and self.response_schema_valid
++            and self.accounting_complete
++            and self.locally_accounted
++            and self.authoritative_spend_known
++        ):
++            raise ConfigurationError(
++                "accepted optimizer provider record is not fully closed"
++            )
+         if self.outcome == "schema_invalid" and self.response_schema_valid:
+             raise ConfigurationError("invalid optimizer response cannot be schema-valid")
+ 
+ 
+ @dataclass(frozen=True)
+ class Pricing:
+     """OpenRouter price rates in USD per one million tokens."""
+ 
+     prompt_per_million: float
+     completion_per_million: float
+@@ -1518,36 +1531,60 @@ class Pricing:
+ 
+ 
+ def freeze_pricing_record(
+     model: str,
+     value: Mapping[str, Any] | Pricing,
+ ) -> "FrozenModelPricing":
+     """Normalize one provider price response into an immutable Decimal identity."""
+ 
+     from core.pit_optimizer_authorization import FrozenModelPricing
+ 
+-    parsed = Pricing.from_value(value)
+-    payload = {
+-        "model": model,
+-        "prompt_per_million": str(parsed.prompt_per_million),
+-        "completion_per_million": str(parsed.completion_per_million),
+-    }
+-    payload_bytes = json.dumps(
+-        payload,
+-        sort_keys=True,
+-        separators=(",", ":"),
+-    ).encode("utf-8")
+-    return FrozenModelPricing(
++    if isinstance(value, Pricing):
++        raw_rates: tuple[object, object] = (
++            value.prompt_per_million,
++            value.completion_per_million,
++        )
++    elif isinstance(value, Mapping):
++        try:
++            raw_rates = (value["prompt"], value["completion"])
++        except KeyError as exc:
++            raise ConfigurationError(
++                "optimizer pricing must contain prompt and completion rates"
++            ) from exc
++    else:
++        raise ConfigurationError("optimizer pricing must be an exact rate mapping")
++
++    def exact_decimal(raw: object) -> Decimal:
++        if isinstance(raw, bool) or isinstance(raw, float):
++            raise ConfigurationError("optimizer pricing must use exact numeric values")
++        if isinstance(raw, Decimal):
++            parsed = raw
++        elif type(raw) is int:
++            parsed = Decimal(raw)
++        elif isinstance(raw, str) and raw == raw.strip() and raw:
++            if re.fullmatch(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?", raw) is None:
++                raise ConfigurationError("optimizer pricing text is not canonical")
++            try:
++                parsed = Decimal(raw)
++            except InvalidOperation as exc:
++                raise ConfigurationError("optimizer pricing is not numeric") from exc
++        else:
++            raise ConfigurationError("optimizer pricing must use exact numeric values")
++        if not parsed.is_finite() or parsed < 0:
++            raise ConfigurationError("optimizer pricing rates must be finite non-negative")
++        return parsed
++
++    prompt, completion = (exact_decimal(raw) for raw in raw_rates)
++    return FrozenModelPricing.from_rates(
+         model=model,
+-        prompt_per_million=Decimal(payload["prompt_per_million"]),
+-        completion_per_million=Decimal(payload["completion_per_million"]),
+-        pricing_payload_sha256=hashlib.sha256(payload_bytes).hexdigest(),
++        prompt_per_million=prompt,
++        completion_per_million=completion,
+     )
+ 
+ 
+ def conservative_call_cost_usd(
+     *,
+     rendered_prompt_bytes: int,
+     max_output_tokens: int,
+     pricing: "FrozenModelPricing",
+ ) -> Decimal:
+     """Price the byte-as-token input bound and full output allowance exactly."""
+@@ -1689,20 +1726,23 @@ class BudgetLedger:
+         self.reserved_usd = 0.0
+         self._reserved_usd_decimal = Decimal("0")
+         self.spent_usd = 0.0
+         self.authoritative_usd = 0.0
+         self.retained_reservation_usd = 0.0
+         self.retained_reservation_tokens = 0
+         self.incomplete_accounting_calls = 0
+         self._pit_optimizer_reservations: dict[
+             str, PitOptimizerBudgetReservation
+         ] = {}
++        self._pit_optimizer_reconciliations: dict[
++            str, tuple[Usage, bool]
++        ] = {}
+ 
+     @property
+     def committed_usd(self) -> float:
+         """Return the conservative amount unavailable for subsequent calls."""
+         return self.reserved_usd
+ 
+     def _check_window(
+         self,
+         window: BudgetWindow | None,
+         *,
+@@ -1802,40 +1842,52 @@ class BudgetLedger:
+         usage: Usage,
+         *,
+         request_started: bool,
+     ) -> None:
+         """Release before-send failures or durably retain/commit one started call."""
+ 
+         if (
+             not isinstance(reservation, PitOptimizerBudgetReservation)
+             or not isinstance(usage, Usage)
+             or type(request_started) is not bool
+-            or self._pit_optimizer_reservations.get(reservation.reservation_id)
++        ):
++            raise ConfigurationError("optimizer budget reconciliation is invalid")
++        prior = self._pit_optimizer_reconciliations.get(reservation.reservation_id)
++        if prior is not None:
++            if prior == (usage, request_started):
++                return
++            raise ConfigurationError("optimizer budget reconciliation differs from prior facts")
++        if (
++            self._pit_optimizer_reservations.get(reservation.reservation_id)
+             != reservation
+         ):
+             raise ConfigurationError("optimizer budget reconciliation is invalid")
+         if not request_started:
+             if any(
+                 value is not None
+                 for value in (
+                     usage.prompt_tokens,
+                     usage.completion_tokens,
+                     usage.total_tokens,
+                     usage.cost_usd,
+                 )
+             ):
+                 raise ConfigurationError("before-send reconciliation cannot claim usage")
+             del self._pit_optimizer_reservations[reservation.reservation_id]
+             self.calls -= 1
+             self.reserved_tokens -= reservation.token_upper_bound
+             self._reserved_usd_decimal -= reservation.amount_usd
+             self.reserved_usd = float(self._reserved_usd_decimal)
++            self._pit_optimizer_reconciliations[reservation.reservation_id] = (
++                usage,
++                request_started,
++            )
+             return
+ 
+         complete = all(
+             value is not None
+             for value in (
+                 usage.prompt_tokens,
+                 usage.completion_tokens,
+                 usage.total_tokens,
+                 usage.cost_usd,
+             )
+@@ -1874,20 +1926,24 @@ class BudgetLedger:
+         if complete:
+             self.authoritative_usd += float(charged_usd)
+             assert usage.prompt_tokens is not None
+             assert usage.completion_tokens is not None
+             self.prompt_tokens += usage.prompt_tokens
+             self.completion_tokens += usage.completion_tokens
+         else:
+             self.retained_reservation_usd += float(charged_usd)
+             self.retained_reservation_tokens += charged_tokens
+             self.incomplete_accounting_calls += 1
++        self._pit_optimizer_reconciliations[reservation.reservation_id] = (
++            usage,
++            request_started,
++        )
+ 
+         # The call already started: authoritative overage stays committed before
+         # fail-closed termination, and uncertainty retains the full reservation.
+         if self.reserved_usd > self.max_usd:
+             raise BudgetExceededError("provider reported cost exceeds the hard USD budget")
+         if self.reserved_tokens > self.max_tokens:
+             raise BudgetExceededError("provider reported tokens exceed the hard token budget")
+ 
+     def reconcile(
+         self,
+@@ -2361,46 +2417,58 @@ def _controller_dotenv_values(controller_root: Path) -> dict[str, str]:
+         name = name.strip().removeprefix("export ").strip()
+         if name in {"OPENROUTER_API_KEY", "OPENROUTER"}:
+             values[name] = value.strip().strip('"').strip("'")
+     return values
+ 
+ 
+ def _load_current_pricing(
+     model: str,
+     *,
+     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+-) -> Mapping[str, float]:
++) -> Mapping[str, Decimal]:
+     """Load current model pricing and normalize OpenRouter's per-token values to per-million."""
+     if (
+         type(timeout_seconds) not in {int, float}
+         or not math.isfinite(timeout_seconds)
+         or timeout_seconds <= 0
+     ):
+         raise ConfigurationError("OpenRouter pricing timeout is invalid")
+     request = urllib.request.Request(f"{OPENROUTER_BASE_URL}/models", method="GET")
+     try:
+         with urllib.request.urlopen(request, timeout=float(timeout_seconds)) as response:  # noqa: S310
+-            payload = json.loads(response.read().decode("utf-8"))
++            payload = json.loads(
++                response.read().decode("utf-8"),
++                parse_float=Decimal,
++            )
+     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+         raise ConfigurationError("could not load current OpenRouter pricing") from exc
+     models = payload.get("data") if isinstance(payload, Mapping) else None
+     if not isinstance(models, list):
+         raise ConfigurationError("OpenRouter pricing response has no model list")
+     for item in models:
+         if isinstance(item, Mapping) and item.get("id") == model and isinstance(item.get("pricing"), Mapping):
+             pricing = item["pricing"]
+             try:
++                def per_million(raw: object) -> Decimal:
++                    if isinstance(raw, bool):
++                        raise InvalidOperation
++                    parsed = raw if isinstance(raw, Decimal) else Decimal(str(raw))
++                    if not parsed.is_finite() or parsed < 0:
++                        raise InvalidOperation
++                    parts = parsed.as_tuple()
++                    return Decimal((parts.sign, parts.digits, parts.exponent + 6))
++
+                 return {
+-                    "prompt": float(pricing["prompt"]) * 1_000_000,
+-                    "completion": float(pricing["completion"]) * 1_000_000,
++                    "prompt": per_million(pricing["prompt"]),
++                    "completion": per_million(pricing["completion"]),
+                 }
+-            except (KeyError, TypeError, ValueError) as exc:
++            except (InvalidOperation, KeyError, TypeError, ValueError) as exc:
+                 raise ConfigurationError("OpenRouter model pricing is not numeric") from exc
+     raise ConfigurationError(f"OpenRouter did not return pricing for {model}")
+ 
+ 
+ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+     """Make all generation-accounting redirects terminal before headers can be copied."""
+ 
+     def redirect_request(
+         self,
+         req: object,
+@@ -2710,20 +2778,22 @@ class OpenRouterGateway:
+         self.app_name = app_name
+         self.timeout_seconds = timeout_seconds
+         self.max_attempts = max_attempts
+         self._pricing_cache: dict[str, Pricing] = {}
+         self._generation_loader_is_builtin = generation_loader is None and client is None
+         self._generation_loader = generation_loader
+         self._generation_sleeper = generation_sleeper
+         self.authorization_ledger = authorization_ledger
+         self.audit_trail = audit_trail
+         self._pit_optimizer_frozen_pricing: "FrozenModelPricing | None" = None
++        self._pit_optimizer_frozen_manifest_sha256: str | None = None
++        self._pit_optimizer_frozen_authorization_ledger: object | None = None
+ 
+     def _get_client(self) -> Any:
+         """Construct the SDK client lazily, only after configuration has succeeded."""
+         if self._client is None:
+             from openai import OpenAI
+ 
+             headers: dict[str, str] = {}
+             if self.app_url:
+                 headers["HTTP-Referer"] = self.app_url
+             if self.app_name:
+@@ -2909,38 +2979,61 @@ class OpenRouterGateway:
+         if (
+             model != REASONER_MODEL
+             or type(wall_deadline) not in {int, float}
+             or not math.isfinite(wall_deadline)
+             or not callable(monotonic)
+         ):
+             raise ConfigurationError("optimizer pricing freeze inputs are invalid")
+         if _remaining_wall_seconds(float(wall_deadline), monotonic) <= 0:
+             raise BudgetExceededError("PIT optimizer pricing deadline reached")
+         frozen = self._pit_optimizer_frozen_pricing
++        if (
++            frozen is not None
++            and self._pit_optimizer_frozen_authorization_ledger
++            is not self.authorization_ledger
++        ):
++            frozen = None
++            self._pit_optimizer_frozen_pricing = None
++            self._pit_optimizer_frozen_manifest_sha256 = None
++            self._pit_optimizer_frozen_authorization_ledger = None
+         if frozen is not None:
+             if frozen.model != model:
+                 raise AuthorizationError("frozen pricing model mismatch")
+             return frozen
+         remaining = _remaining_wall_seconds(float(wall_deadline), monotonic)
+         try:
+-            value = self._pricing_for_model(
+-                model,
+-                timeout_seconds=min(DEFAULT_TIMEOUT_SECONDS, self.timeout_seconds, remaining),
+-            )
++            if self._pricing_loader_is_builtin:
++                value = self.pricing_loader(
++                    model,
++                    timeout_seconds=min(
++                        DEFAULT_TIMEOUT_SECONDS,
++                        self.timeout_seconds,
++                        remaining,
++                    ),
++                )
++            else:
++                value = self.pricing_loader(model)
+         except Exception as exc:
+             if _remaining_wall_seconds(float(wall_deadline), monotonic) <= 0:
+                 raise BudgetExceededError("PIT optimizer pricing deadline reached") from exc
+             raise
+         if _remaining_wall_seconds(float(wall_deadline), monotonic) <= 0:
+             raise BudgetExceededError("PIT optimizer pricing deadline reached")
+         frozen = freeze_pricing_record(model, value)
+         self._pit_optimizer_frozen_pricing = frozen
++        ledger = self.authorization_ledger
++        self._pit_optimizer_frozen_authorization_ledger = ledger
++        self._pit_optimizer_frozen_manifest_sha256 = (
++            ledger.manifest.sha256
++            if ledger is not None and hasattr(ledger, "manifest")
++            else None
++        )
+         return frozen
+ 
+     @staticmethod
+     def _pit_optimizer_audit_state(role: str) -> "LoopState":
+         return {
+             "investigator": LoopState.CALL_INVESTIGATOR,
+             "author": LoopState.CALL_AUTHOR,
+             "critic": LoopState.CALL_CRITIC,
+         }[role]
+ 
+@@ -3001,72 +3094,64 @@ class OpenRouterGateway:
+ 
+     def _finalize_pit_optimizer_call(
+         self,
+         *,
+         budget_reservation: PitOptimizerBudgetReservation,
+         authorization_reservation: "AuthorizationCallReservation",
+         authorization_lease: "AuthorizationRunLease",
+         facts: "PitOptimizerProviderFacts",
+         usage: Usage,
+         payload_sha256: str | None = None,
++        terminal_code: str | None = None,
+     ) -> None:
+         """Reconcile both ledgers, persist terminal audit, then close failures."""
+ 
+         from core.pit_optimizer_authorization import AuthorizationError
+ 
+-        errors: list[Exception] = []
++        expected_overage = False
+         try:
+             self.ledger.reconcile_pit_optimizer(
+                 budget_reservation,
+                 usage,
+                 request_started=facts.request_started,
+             )
+-        except Exception as exc:
+-            errors.append(exc)
++        except BudgetExceededError:
++            if facts.outcome != "budget_exceeded":
++                raise
++            expected_overage = True
+         try:
+             self.authorization_ledger.reconcile_call(
+                 authorization_reservation,
+                 facts,
+             )
+-        except Exception as exc:
+-            errors.append(exc)
+-        try:
+-            self.audit_trail.write_provider_call(
+-                self._pit_optimizer_record(facts, authorization_reservation),
+-                payload_sha256=payload_sha256,
++        except AuthorizationError as exc:
++            if facts.outcome != "budget_exceeded" or "overage was committed" not in str(
++                exc
++            ):
++                raise
++            expected_overage = True
++        self.audit_trail.write_provider_call(
++            self._pit_optimizer_record(facts, authorization_reservation),
++            payload_sha256=payload_sha256,
++        )
++        if facts.outcome != "accepted" or terminal_code is not None or expected_overage:
++            self.authorization_ledger.close_run_lease(
++                authorization_lease,
++                terminal_code=(
++                    terminal_code
++                    or (
++                        "budget_exhausted"
++                        if facts.outcome == "budget_exceeded"
++                        else "failed"
++                    )
++                ),
+             )
+-        except Exception as exc:
+-            errors.append(exc)
+-        if facts.outcome != "accepted" or errors:
+-            try:
+-                self.authorization_ledger.close_run_lease(
+-                    authorization_lease,
+-                    terminal_code="budget_exhausted"
+-                    if facts.outcome == "budget_exceeded"
+-                    else "failed",
+-                )
+-            except Exception as exc:
+-                errors.append(exc)
+-        if errors:
+-            expected_overage = facts.outcome == "budget_exceeded"
+-            unexpected = [
+-                error
+-                for error in errors
+-                if not expected_overage
+-                or not (
+-                    isinstance(error, BudgetExceededError)
+-                    or isinstance(error, AuthorizationError)
+-                    and "overage was committed" in str(error)
+-                )
+-            ]
+-            if unexpected:
+-                raise unexpected[0]
+ 
+     def request_pit_optimizer_once(
+         self,
+         role: str,
+         dynamic_input: object,
+         parser: Callable[[str], PayloadT],
+         *,
+         call_budget: "PitOptimizerCallBudget",
+         authorization_lease: "AuthorizationRunLease",
+         frozen_pricing: "FrozenModelPricing",
+@@ -3077,23 +3162,25 @@ class OpenRouterGateway:
+ 
+         from core.pit_optimization_contract import (
+             AuthorArtifact,
+             AuthorInput,
+             CriticArtifact,
+             CriticInput,
+             InvestigatorArtifact,
+             InvestigatorInput,
+             PIT_OPTIMIZER_V2_SYSTEM_PROMPTS,
+             PitOptimizerCallBudget,
++            authenticate_policy_source_bundle,
+             pit_optimizer_response_format,
+         )
+         from core.pit_optimizer_authorization import (
++            AuthorizationError,
+             AuthorizationCallReservation,
+             AuthorizationLedger,
+             AuthorizationRunLease,
+             FrozenModelPricing,
+             PitOptimizerProviderFacts,
+             PitOptimizerRoleCall,
+         )
+ 
+         role_inputs = {
+             "investigator": InvestigatorInput,
+@@ -3105,485 +3192,481 @@ class OpenRouterGateway:
+             or not isinstance(call_budget, PitOptimizerCallBudget)
+             or call_budget.role != role
+             or call_budget.model != REASONER_MODEL
+             or not isinstance(dynamic_input, role_inputs[role])
+             or dynamic_input.iteration != call_budget.iteration
+             or not isinstance(authorization_lease, AuthorizationRunLease)
+             or not isinstance(frozen_pricing, FrozenModelPricing)
+             or type(wall_deadline) not in {int, float}
+             or not math.isfinite(wall_deadline)
+             or not callable(monotonic)
++            or not callable(parser)
+         ):
++            if not callable(parser):
++                raise ConfigurationError("optimizer provider parser must be callable")
+             raise ConfigurationError("optimizer provider call inputs are invalid")
+         if not isinstance(self.authorization_ledger, AuthorizationLedger):
+             raise ConfigurationError("optimizer authorization ledger is required")
+         if not isinstance(self.audit_trail, AuditTrail):
+             raise ConfigurationError("optimizer audit trail is required")
++        manifest = self.authorization_ledger.manifest
++        if authorization_lease.run_manifest_sha256 != manifest.sha256:
++            raise AuthorizationError("authorization lease run manifest mismatch")
++        if dynamic_input.run_manifest_sha256 != manifest.sha256:
++            raise AuthorizationError("optimizer role input run manifest mismatch")
++        if (
++            self._pit_optimizer_frozen_pricing is None
++            or frozen_pricing is not self._pit_optimizer_frozen_pricing
++            or self._pit_optimizer_frozen_manifest_sha256 != manifest.sha256
++            or self._pit_optimizer_frozen_authorization_ledger
++            is not self.authorization_ledger
++        ):
++            raise AuthorizationError("gateway run-local frozen pricing is required")
++        if authorization_lease.frozen_pricing_sha256 != frozen_pricing.pricing_sha256:
++            raise AuthorizationError("lease-bound frozen pricing identity drift")
++        if (
++            dynamic_input.immutable_constraint_ids
++            != manifest.immutable_constraint_ids
++        ):
++            raise AuthorizationError("optimizer role input differs from run manifest")
++        if role in {"investigator", "author"}:
++            if (
++                dynamic_input.policy_interface_version
++                != manifest.policy_interface_version
++                or dynamic_input.candidate_bounds != manifest.candidate_bounds
++            ):
++                raise AuthorizationError("optimizer source input differs from run manifest")
++            try:
++                authenticate_policy_source_bundle(
++                    scope=manifest.policy_source_scope,
++                    bundle=dynamic_input.source_bundle,
++                )
++            except ValueError as exc:
++                raise AuthorizationError(
++                    "policy source bundle differs from authorized scope"
++                ) from exc
+         if _remaining_wall_seconds(float(wall_deadline), monotonic) <= 0:
+             raise BudgetExceededError("PIT optimizer wall deadline reached")
+ 
+         response_format = pit_optimizer_response_format(role)
+         static_bytes = PIT_OPTIMIZER_V2_SYSTEM_PROMPTS[role].encode("utf-8")
+         static_bytes += json.dumps(
+             response_format,
+             sort_keys=True,
+             separators=(",", ":"),
+             ensure_ascii=False,
+         ).encode("utf-8")
+         dynamic_bytes = dynamic_input.canonical_json_bytes()
+         conservative_cost = preflight_pit_optimizer_call(
+             static_bytes=static_bytes,
+             dynamic_bytes=dynamic_bytes,
+             call_budget=call_budget,
+             lease=authorization_lease,
+             pricing=frozen_pricing,
+         )
+-        budget_reservation = self.ledger.reserve_pit_optimizer(
+-            rendered_prompt_bytes=len(static_bytes) + len(dynamic_bytes),
+-            max_output_tokens=call_budget.max_output_tokens,
+-            conservative_cost_usd=conservative_cost,
+-        )
+-        try:
+-            authorization_reservation = self.authorization_ledger.reserve_call(
+-                authorization_lease,
+-                call_budget,
+-            )
+-        except Exception:
+-            self.ledger.reconcile_pit_optimizer(
+-                budget_reservation,
+-                Usage(),
+-                request_started=False,
+-            )
+-            raise
+-        assert isinstance(authorization_reservation, AuthorizationCallReservation)
++        budget_reservation: PitOptimizerBudgetReservation | None = None
++        authorization_reservation: AuthorizationCallReservation | None = None
++        audit_sha256 = hashlib.sha256(
++            f"{manifest.sha256}:{call_budget.call_index}:reserved".encode("utf-8")
++        ).hexdigest()
++        possibly_sent = False
++        response_received = False
++        returned_model: str | None = None
++        finish_reason: str | None = None
++        finalized = False
++        pending_facts: PitOptimizerProviderFacts | None = None
++        pending_usage = Usage()
++        pending_payload_sha256: str | None = None
++        pending_terminal_code: str | None = None
+         state = self._pit_optimizer_audit_state(role)
+-        try:
+-            reserved_event = self.audit_trail.append_event(
+-                state,
+-                "provider_call_reserved",
+-                {
+-                    "call_index": call_budget.call_index,
+-                    "iteration": call_budget.iteration,
+-                    "role": role,
+-                },
+-            )
+-        except Exception:
+-            fallback_audit_sha256 = hashlib.sha256(
+-                authorization_reservation.reservation_id.encode("utf-8")
+-            ).hexdigest()
+-            facts = PitOptimizerProviderFacts(
+-                call_index=call_budget.call_index,
+-                iteration=call_budget.iteration,
+-                role=role,
+-                requested_model=REASONER_MODEL,
+-                returned_model=None,
+-                frozen_pricing_sha256=frozen_pricing.pricing_sha256,
+-                outcome="failed_before_send",
+-                request_started=False,
+-                response_received=False,
+-                finish_reason=None,
+-                response_schema_valid=False,
+-                accounting_complete=True,
+-                prompt_tokens=0,
+-                completion_tokens=0,
+-                total_tokens=0,
+-                cost_usd=0.0,
+-                retained_reservation_tokens=0,
+-                retained_reservation_usd=0.0,
+-                audit_sha256=fallback_audit_sha256,
+-            )
+-            self._finalize_pit_optimizer_call(
+-                budget_reservation=budget_reservation,
+-                authorization_reservation=authorization_reservation,
+-                authorization_lease=authorization_lease,
+-                facts=facts,
+-                usage=Usage(),
+-            )
+-            raise
+-        reserved_audit_sha256 = str(reserved_event["event_sha256"])
++        zero_usage = Usage(
++            prompt_tokens=0,
++            completion_tokens=0,
++            total_tokens=0,
++            cost_usd=0.0,
++        )
+ 
+         def provider_facts(
+             *,
+             outcome: str,
+             request_started: bool,
+             response_received: bool,
+             returned_model: str | None,
+             finish_reason: str | None,
+             response_schema_valid: bool,
+             usage: Usage | None,
+-            audit_sha256: str,
+         ) -> PitOptimizerProviderFacts:
++            assert authorization_reservation is not None
+             complete = usage is not None
+             return PitOptimizerProviderFacts(
+                 call_index=call_budget.call_index,
+                 iteration=call_budget.iteration,
+                 role=role,
+                 requested_model=REASONER_MODEL,
+                 returned_model=returned_model,
+                 frozen_pricing_sha256=frozen_pricing.pricing_sha256,
+                 outcome=outcome,
+                 request_started=request_started,
+                 response_received=response_received,
+                 finish_reason=finish_reason,
+                 response_schema_valid=response_schema_valid,
+                 accounting_complete=complete,
+-                prompt_tokens=(
+-                    usage.prompt_tokens if usage is not None else None
+-                ),
++                prompt_tokens=usage.prompt_tokens if usage is not None else None,
+                 completion_tokens=(
+                     usage.completion_tokens if usage is not None else None
+                 ),
+                 total_tokens=usage.total_tokens if usage is not None else None,
+                 cost_usd=usage.cost_usd if usage is not None else None,
+                 retained_reservation_tokens=(
+-                    0
+-                    if usage is not None
+-                    else authorization_reservation.reserved_tokens
++                    0 if usage is not None else authorization_reservation.reserved_tokens
+                 ),
+                 retained_reservation_usd=(
+-                    0.0
+-                    if usage is not None
+-                    else authorization_reservation.reserved_usd
++                    0.0 if usage is not None else authorization_reservation.reserved_usd
+                 ),
+                 audit_sha256=audit_sha256,
+             )
+ 
+-        zero_usage = Usage(
+-            prompt_tokens=0,
+-            completion_tokens=0,
+-            total_tokens=0,
+-            cost_usd=0.0,
+-        )
+-        try:
+-            client = self._get_client()
+-        except Exception as exc:
+-            facts = provider_facts(
+-                outcome="failed_before_send",
+-                request_started=False,
+-                response_received=False,
+-                returned_model=None,
+-                finish_reason=None,
+-                response_schema_valid=False,
+-                usage=zero_usage,
+-                audit_sha256=reserved_audit_sha256,
+-            )
++        def finalize(
++            facts: PitOptimizerProviderFacts,
++            usage: Usage,
++            *,
++            payload_sha256: str | None = None,
++            terminal_code: str | None = None,
++        ) -> None:
++            nonlocal finalized
++            nonlocal pending_facts, pending_usage, pending_payload_sha256
++            nonlocal pending_terminal_code
++            assert budget_reservation is not None
++            assert authorization_reservation is not None
++            pending_facts = facts
++            pending_usage = usage
++            pending_payload_sha256 = payload_sha256
++            pending_terminal_code = terminal_code
+             self._finalize_pit_optimizer_call(
+                 budget_reservation=budget_reservation,
+                 authorization_reservation=authorization_reservation,
+                 authorization_lease=authorization_lease,
+                 facts=facts,
+-                usage=Usage(),
++                usage=usage,
++                payload_sha256=payload_sha256,
++                terminal_code=terminal_code,
+             )
+-            raise GatewayError(
+-                "OpenRouter SDK construction failed",
+-                status_code=_status_code(exc),
+-            ) from exc
+-        remaining = _remaining_wall_seconds(float(wall_deadline), monotonic)
+-        if remaining <= 0:
+-            facts = provider_facts(
+-                outcome="failed_before_send",
+-                request_started=False,
+-                response_received=False,
+-                returned_model=None,
+-                finish_reason=None,
+-                response_schema_valid=False,
+-                usage=zero_usage,
+-                audit_sha256=reserved_audit_sha256,
++            finalized = True
++
++        try:
++            budget_reservation = self.ledger.reserve_pit_optimizer(
++                rendered_prompt_bytes=len(static_bytes) + len(dynamic_bytes),
++                max_output_tokens=call_budget.max_output_tokens,
++                conservative_cost_usd=conservative_cost,
+             )
+-            self._finalize_pit_optimizer_call(
+-                budget_reservation=budget_reservation,
+-                authorization_reservation=authorization_reservation,
+-                authorization_lease=authorization_lease,
+-                facts=facts,
+-                usage=Usage(),
++            authorization_reservation = self.authorization_ledger.reserve_call(
++                authorization_lease,
++                call_budget,
+             )
+-            raise BudgetExceededError("PIT optimizer wall deadline reached")
+-        try:
++            assert isinstance(authorization_reservation, AuthorizationCallReservation)
++            reserved_event = self.audit_trail.append_event(
++                state,
++                "provider_call_reserved",
++                {
++                    "call_index": call_budget.call_index,
++                    "iteration": call_budget.iteration,
++                    "role": role,
++                },
++            )
++            audit_sha256 = str(reserved_event["event_sha256"])
++            try:
++                client = self._get_client()
++            except Exception as exc:
++                raise GatewayError(
++                    "OpenRouter SDK construction failed",
++                    status_code=_status_code(exc),
++                ) from exc
++            if _remaining_wall_seconds(float(wall_deadline), monotonic) <= 0:
++                raise BudgetExceededError("PIT optimizer wall deadline reached")
+             started_event = self.audit_trail.append_event(
+                 state,
+                 "provider_call_started",
+                 {
+                     "call_index": call_budget.call_index,
+                     "iteration": call_budget.iteration,
+                     "role": role,
+-                    "reservation_event_sha256": reserved_audit_sha256,
++                    "reservation_event_sha256": audit_sha256,
+                 },
+             )
+-        except Exception:
+-            facts = provider_facts(
+-                outcome="failed_before_send",
+-                request_started=False,
+-                response_received=False,
+-                returned_model=None,
+-                finish_reason=None,
+-                response_schema_valid=False,
+-                usage=zero_usage,
+-                audit_sha256=reserved_audit_sha256,
+-            )
+-            self._finalize_pit_optimizer_call(
+-                budget_reservation=budget_reservation,
+-                authorization_reservation=authorization_reservation,
+-                authorization_lease=authorization_lease,
+-                facts=facts,
+-                usage=Usage(),
+-            )
+-            raise
+-        started_audit_sha256 = str(started_event["event_sha256"])
+-        messages = [
+-            {
+-                "role": "system",
+-                "content": PIT_OPTIMIZER_V2_SYSTEM_PROMPTS[role],
+-            },
+-            {"role": "user", "content": dynamic_bytes.decode("utf-8")},
+-        ]
+-        try:
+-            response = client.chat.completions.create(
+-                model=REASONER_MODEL,
+-                messages=messages,
+-                response_format=response_format,
+-                stream=False,
+-                max_tokens=call_budget.max_output_tokens,
+-                timeout=min(self.timeout_seconds, remaining),
+-                extra_headers={"X-Session-Id": f"{self.run_id}:{role}"},
+-                extra_body={"provider": {"require_parameters": True}},
+-            )
+-        except Exception as exc:
+-            facts = provider_facts(
+-                outcome="uncertain_accounting",
+-                request_started=True,
+-                response_received=False,
+-                returned_model=None,
+-                finish_reason=None,
+-                response_schema_valid=False,
+-                usage=None,
+-                audit_sha256=started_audit_sha256,
+-            )
+-            self._finalize_pit_optimizer_call(
+-                budget_reservation=budget_reservation,
+-                authorization_reservation=authorization_reservation,
+-                authorization_lease=authorization_lease,
+-                facts=facts,
+-                usage=Usage(),
++            audit_sha256 = str(started_event["event_sha256"])
++            remaining = _remaining_wall_seconds(float(wall_deadline), monotonic)
++            if remaining <= 0:
++                raise BudgetExceededError("PIT optimizer wall deadline reached")
++            messages = [
++                {
++                    "role": "system",
++                    "content": PIT_OPTIMIZER_V2_SYSTEM_PROMPTS[role],
++                },
++                {"role": "user", "content": dynamic_bytes.decode("utf-8")},
++            ]
++            remaining = _remaining_wall_seconds(float(wall_deadline), monotonic)
++            if remaining <= 0:
++                raise BudgetExceededError("PIT optimizer wall deadline reached")
++            possibly_sent = True
++            try:
++                response = client.chat.completions.create(
++                    model=REASONER_MODEL,
++                    messages=messages,
++                    response_format=response_format,
++                    stream=False,
++                    max_tokens=call_budget.max_output_tokens,
++                    timeout=min(self.timeout_seconds, remaining),
++                    extra_headers={"X-Session-Id": f"{self.run_id}:{role}"},
++                    extra_body={"provider": {"require_parameters": True}},
++                )
++            except Exception as exc:
++                raise GatewayError(
++                    "OpenRouter request accounting is uncertain",
++                    status_code=_status_code(exc),
++                ) from exc
++            response_received = True
++            raw_model = _read_field(response, "model")
++            returned_model = (
++                raw_model
++                if isinstance(raw_model, str)
++                and _MODEL_SLUG_RE.fullmatch(raw_model) is not None
++                else None
+             )
+-            raise GatewayError(
+-                "OpenRouter request accounting is uncertain",
+-                status_code=_status_code(exc),
+-            ) from exc
+-        raw_model = _read_field(response, "model")
+-        returned_model = (
+-            raw_model
+-            if isinstance(raw_model, str)
+-            and _MODEL_SLUG_RE.fullmatch(raw_model) is not None
+-            else None
+-        )
+-        choices = _read_field(response, "choices")
+-        raw_finish_reason = (
+-            _read_field(choices[0], "finish_reason")
+-            if isinstance(choices, (list, tuple)) and len(choices) == 1
+-            else None
+-        )
+-        finish_reason = (
+-            "stop"
+-            if raw_finish_reason == "stop"
+-            else "non_stop"
+-            if raw_finish_reason is not None
+-            else "unknown"
+-        )
+-        try:
+-            usage = _usage_from_response(response, require_complete=True)
+-        except (AccountingValidationError, ResponseValidationError) as exc:
+-            facts = provider_facts(
+-                outcome="uncertain_accounting",
+-                request_started=True,
+-                response_received=True,
+-                returned_model=returned_model,
+-                finish_reason=finish_reason,
+-                response_schema_valid=False,
+-                usage=None,
+-                audit_sha256=started_audit_sha256,
++            choices = _read_field(response, "choices")
++            raw_finish_reason = (
++                _read_field(choices[0], "finish_reason")
++                if isinstance(choices, (list, tuple)) and len(choices) == 1
++                else None
+             )
+-            self._finalize_pit_optimizer_call(
+-                budget_reservation=budget_reservation,
+-                authorization_reservation=authorization_reservation,
+-                authorization_lease=authorization_lease,
+-                facts=facts,
+-                usage=Usage(),
++            finish_reason = (
++                "stop"
++                if raw_finish_reason == "stop"
++                else "non_stop"
++                if raw_finish_reason is not None
++                else "unknown"
+             )
+-            raise AccountingValidationError(
+-                "optimizer response accounting is uncertain",
+-                code=AccountingFailureCode.INLINE_USAGE_INVALID,
+-            ) from exc
+-        assert usage.prompt_tokens is not None
+-        assert usage.completion_tokens is not None
+-        assert usage.total_tokens is not None
+-        assert usage.cost_usd is not None
+-        prospective_ledger_usd = (
+-            self.ledger._reserved_usd_decimal
+-            - budget_reservation.amount_usd
+-            + Decimal(str(usage.cost_usd))
+-        )
+-        prospective_ledger_tokens = (
+-            self.ledger.reserved_tokens
+-            - budget_reservation.token_upper_bound
+-            + usage.total_tokens
+-        )
+-        if (
+-            usage.prompt_tokens > call_budget.max_input_tokens
+-            or usage.completion_tokens > call_budget.max_output_tokens
+-            or usage.total_tokens
+-            > call_budget.max_input_tokens + call_budget.max_output_tokens
+-            or Decimal(str(usage.cost_usd)) > Decimal(str(call_budget.max_usd))
+-            or prospective_ledger_usd > Decimal(str(self.ledger.max_usd))
+-            or prospective_ledger_tokens > self.ledger.max_tokens
+-        ):
+-            facts = provider_facts(
+-                outcome="budget_exceeded",
+-                request_started=True,
+-                response_received=True,
+-                returned_model=returned_model,
+-                finish_reason=finish_reason,
+-                response_schema_valid=False,
+-                usage=usage,
+-                audit_sha256=started_audit_sha256,
++            try:
++                usage = _usage_from_response(response, require_complete=True)
++            except (AccountingValidationError, ResponseValidationError) as exc:
++                facts = provider_facts(
++                    outcome="uncertain_accounting",
++                    request_started=True,
++                    response_received=True,
++                    returned_model=returned_model,
++                    finish_reason=finish_reason,
++                    response_schema_valid=False,
++                    usage=None,
++                )
++                finalize(facts, Usage())
++                raise AccountingValidationError(
++                    "optimizer response accounting is uncertain",
++                    code=AccountingFailureCode.INLINE_USAGE_INVALID,
++                ) from exc
++            assert usage.prompt_tokens is not None
++            assert usage.completion_tokens is not None
++            assert usage.total_tokens is not None
++            assert usage.cost_usd is not None
++            prospective_ledger_usd = (
++                self.ledger._reserved_usd_decimal
++                - budget_reservation.amount_usd
++                + Decimal(str(usage.cost_usd))
+             )
+-            self._finalize_pit_optimizer_call(
+-                budget_reservation=budget_reservation,
+-                authorization_reservation=authorization_reservation,
+-                authorization_lease=authorization_lease,
+-                facts=facts,
+-                usage=usage,
++            prospective_ledger_tokens = (
++                self.ledger.reserved_tokens
++                - budget_reservation.token_upper_bound
++                + usage.total_tokens
+             )
+-            raise BudgetExceededError("optimizer per-call provider cap exceeded")
+-        content = choices
+-        content = (
+-            _read_field(content[0], "message", "content")
+-            if isinstance(content, (list, tuple)) and len(content) == 1
+-            else None
+-        )
+-        try:
+             if (
+-                not isinstance(content, str)
+-                or len(content.encode("utf-8")) > call_budget.max_response_bytes
++                usage.prompt_tokens > call_budget.max_input_tokens
++                or usage.completion_tokens > call_budget.max_output_tokens
++                or usage.total_tokens
++                > call_budget.max_input_tokens + call_budget.max_output_tokens
++                or Decimal(str(usage.cost_usd)) > Decimal(str(call_budget.max_usd))
++                or prospective_ledger_usd > Decimal(str(self.ledger.max_usd))
++                or prospective_ledger_tokens > self.ledger.max_tokens
+             ):
+-                raise ResponseValidationError("optimizer response byte cap exceeded")
+-            completion = self._validate_response(
+-                response,
+-                parser,
+-                require_complete_accounting=True,
+-                expected_model=REASONER_MODEL,
+-                usage=usage,
+-            )
+-        except GatewayError:
+-            facts = provider_facts(
+-                outcome="provider_failed",
+-                request_started=True,
+-                response_received=True,
+-                returned_model=returned_model,
+-                finish_reason=finish_reason,
+-                response_schema_valid=False,
+-                usage=usage,
+-                audit_sha256=started_audit_sha256,
+-            )
+-            self._finalize_pit_optimizer_call(
+-                budget_reservation=budget_reservation,
+-                authorization_reservation=authorization_reservation,
+-                authorization_lease=authorization_lease,
+-                facts=facts,
+-                usage=usage,
+-            )
+-            raise
+-        except (ResponseValidationError, ValueError, TypeError) as exc:
+-            facts = provider_facts(
+-                outcome="schema_invalid",
+-                request_started=True,
+-                response_received=True,
+-                returned_model=returned_model,
+-                finish_reason=finish_reason,
+-                response_schema_valid=False,
+-                usage=usage,
+-                audit_sha256=started_audit_sha256,
+-            )
+-            self._finalize_pit_optimizer_call(
+-                budget_reservation=budget_reservation,
+-                authorization_reservation=authorization_reservation,
+-                authorization_lease=authorization_lease,
+-                facts=facts,
+-                usage=usage,
+-            )
+-            raise ResponseValidationError("optimizer response schema is invalid") from exc
+-        expected_payload_type = {
+-            "investigator": InvestigatorArtifact,
+-            "author": AuthorArtifact,
+-            "critic": CriticArtifact,
+-        }[role]
+-        if not isinstance(completion.payload, expected_payload_type):
+-            facts = provider_facts(
+-                outcome="schema_invalid",
+-                request_started=True,
+-                response_received=True,
+-                returned_model=returned_model,
+-                finish_reason=finish_reason,
+-                response_schema_valid=False,
+-                usage=usage,
+-                audit_sha256=started_audit_sha256,
+-            )
+-            self._finalize_pit_optimizer_call(
+-                budget_reservation=budget_reservation,
+-                authorization_reservation=authorization_reservation,
+-                authorization_lease=authorization_lease,
+-                facts=facts,
+-                usage=usage,
++                facts = provider_facts(
++                    outcome="budget_exceeded",
++                    request_started=True,
++                    response_received=True,
++                    returned_model=returned_model,
++                    finish_reason=finish_reason,
++                    response_schema_valid=False,
++                    usage=usage,
++                )
++                finalize(facts, usage, terminal_code="budget_exhausted")
++                raise BudgetExceededError("optimizer per-call provider cap exceeded")
++            content = (
++                _read_field(choices[0], "message", "content")
++                if isinstance(choices, (list, tuple)) and len(choices) == 1
++                else None
+             )
+-            raise ResponseValidationError("optimizer parser returned the wrong artifact type")
+-        validator = getattr(dynamic_input, "validate_artifact", None)
+-        if validator is not None:
+             try:
+-                validator(completion.payload)
+-            except ValueError as exc:
++                if (
++                    not isinstance(content, str)
++                    or len(content.encode("utf-8")) > call_budget.max_response_bytes
++                ):
++                    raise ResponseValidationError(
++                        "optimizer response byte cap exceeded"
++                    )
++                completion = self._validate_response(
++                    response,
++                    parser,
++                    require_complete_accounting=True,
++                    expected_model=REASONER_MODEL,
++                    usage=usage,
++                )
++            except GatewayError:
++                facts = provider_facts(
++                    outcome="provider_failed",
++                    request_started=True,
++                    response_received=True,
++                    returned_model=returned_model,
++                    finish_reason=finish_reason,
++                    response_schema_valid=False,
++                    usage=usage,
++                )
++                finalize(facts, usage)
++                raise
++            except (ResponseValidationError, ValueError, TypeError) as exc:
+                 facts = provider_facts(
+                     outcome="schema_invalid",
+                     request_started=True,
+                     response_received=True,
+                     returned_model=returned_model,
+                     finish_reason=finish_reason,
+                     response_schema_valid=False,
+                     usage=usage,
+-                    audit_sha256=started_audit_sha256,
+                 )
+-                self._finalize_pit_optimizer_call(
+-                    budget_reservation=budget_reservation,
+-                    authorization_reservation=authorization_reservation,
+-                    authorization_lease=authorization_lease,
+-                    facts=facts,
++                finalize(facts, usage)
++                raise ResponseValidationError(
++                    "optimizer response schema is invalid"
++                ) from exc
++            expected_payload_type = {
++                "investigator": InvestigatorArtifact,
++                "author": AuthorArtifact,
++                "critic": CriticArtifact,
++            }[role]
++            if not isinstance(completion.payload, expected_payload_type):
++                facts = provider_facts(
++                    outcome="schema_invalid",
++                    request_started=True,
++                    response_received=True,
++                    returned_model=returned_model,
++                    finish_reason=finish_reason,
++                    response_schema_valid=False,
+                     usage=usage,
+                 )
+-                raise ResponseValidationError("optimizer artifact differs from its input") from exc
+-        facts = provider_facts(
+-            outcome="accepted",
+-            request_started=True,
+-            response_received=True,
+-            returned_model=completion.model,
+-            finish_reason=finish_reason,
+-            response_schema_valid=True,
+-            usage=usage,
+-            audit_sha256=started_audit_sha256,
+-        )
+-        payload_digest = hashlib.sha256(completion.payload.canonical_json_bytes()).hexdigest()
+-        self._finalize_pit_optimizer_call(
+-            budget_reservation=budget_reservation,
+-            authorization_reservation=authorization_reservation,
+-            authorization_lease=authorization_lease,
+-            facts=facts,
+-            usage=usage,
+-            payload_sha256=payload_digest,
+-        )
+-        return PitOptimizerRoleCall(call_budget, completion.payload, facts)
++                finalize(facts, usage)
++                raise ResponseValidationError(
++                    "optimizer parser returned the wrong artifact type"
++                )
++            validator = getattr(dynamic_input, "validate_artifact", None)
++            if validator is not None:
++                try:
++                    validator(completion.payload)
++                except ValueError as exc:
++                    facts = provider_facts(
++                        outcome="schema_invalid",
++                        request_started=True,
++                        response_received=True,
++                        returned_model=returned_model,
++                        finish_reason=finish_reason,
++                        response_schema_valid=False,
++                        usage=usage,
++                    )
++                    finalize(facts, usage)
++                    raise ResponseValidationError(
++                        "optimizer artifact differs from its input"
++                    ) from exc
++            facts = provider_facts(
++                outcome="accepted",
++                request_started=True,
++                response_received=True,
++                returned_model=completion.model,
++                finish_reason=finish_reason,
++                response_schema_valid=True,
++                usage=usage,
++            )
++            payload_digest = hashlib.sha256(
++                completion.payload.canonical_json_bytes()
++            ).hexdigest()
++            finalize(facts, usage, payload_sha256=payload_digest)
++            return PitOptimizerRoleCall(call_budget, completion.payload, facts)
++        except BaseException as original:
++            outer_terminal_code = (
++                "cancelled"
++                if not isinstance(original, Exception)
++                else "budget_exhausted"
++                if isinstance(original, BudgetExceededError)
++                else "failed"
++            )
++            if not finalized and budget_reservation is not None:
++                if authorization_reservation is None:
++                    try:
++                        authorization_reservation = (
++                            self.authorization_ledger.recover_active_reservation(
++                                authorization_lease,
++                                call_budget,
++                            )
++                        )
++                    except BaseException:
++                        authorization_reservation = None
++                if authorization_reservation is None:
++                    try:
++                        self.ledger.reconcile_pit_optimizer(
++                            budget_reservation,
++                            Usage(),
++                            request_started=False,
++                        )
++                    except BaseException:
++                        pass
++                    try:
++                        self.authorization_ledger.close_run_lease(
++                            authorization_lease,
++                            terminal_code=outer_terminal_code,
++                        )
++                    except BaseException:
++                        pass
++                else:
++                    if pending_facts is None:
++                        pending_facts = provider_facts(
++                            outcome=(
++                                "uncertain_accounting"
++                                if possibly_sent
++                                else "failed_before_send"
++                            ),
++                            request_started=possibly_sent,
++                            response_received=(
++                                response_received if possibly_sent else False
++                            ),
++                            returned_model=(returned_model if possibly_sent else None),
++                            finish_reason=(finish_reason if possibly_sent else None),
++                            response_schema_valid=False,
++                            usage=None if possibly_sent else zero_usage,
++                        )
++                        pending_usage = Usage()
++                        pending_terminal_code = outer_terminal_code
++                    elif pending_terminal_code is None:
++                        pending_terminal_code = outer_terminal_code
++                    for _attempt in range(2):
++                        try:
++                            finalize(
++                                pending_facts,
++                                pending_usage,
++                                payload_sha256=pending_payload_sha256,
++                                terminal_code=pending_terminal_code,
++                            )
++                            break
++                        except BaseException:
++                            continue
++            raise
+ 
+     def preload_pricing(
+         self,
+         roles: Sequence[str] = ("orchestrator", "reasoner", "coder"),
+         *,
+         wall_deadline: float | None = None,
+         monotonic: Callable[[], float] = time.monotonic,
+     ) -> None:
+         """Load and freeze one price record per selected role model before paid calls."""
+         if wall_deadline is not None and (
+@@ -11136,21 +11219,27 @@ class AuditTrail:
+         """Persist one exact paid-call record without any provider content or headers."""
+         if not isinstance(record, ProviderCallRecord):
+             raise AuditError("provider call audit requires a validated record")
+         if record.outcome == "accepted":
+             if payload_sha256 is None or _SHA256_RE.fullmatch(payload_sha256) is None:
+                 raise AuditError("accepted provider call requires a validated payload digest")
+         elif payload_sha256 is not None:
+             raise AuditError("rejected provider call cannot bind a validated payload digest")
+         path = self.run_root / f"provider-call-{record.call_index:04d}.json"
+         try:
+-            self._write_json(path, asdict(record))
++            primitive = _sanitize_audit_value(asdict(record), self._known_secrets)
++            if path.exists():
++                existing = json.loads(path.read_bytes())
++                if existing != primitive:
++                    raise AuditError("provider call audit record is immutable")
++            else:
++                self._write_json(path, primitive)
+             digest = _file_sha256(path)
+         except Exception as exc:
+             raise ProviderCallAuditError(
+                 PitProviderFailurePhase.PROVIDER_RECORD_WRITE
+             ) from exc
+         state = {
+             "orchestrator": LoopState.CALL_ORCHESTRATOR,
+             "reasoner": LoopState.CALL_REASONER,
+             "coder": LoopState.CALL_CODER,
+             "investigator": LoopState.CALL_INVESTIGATOR,
+@@ -11204,21 +11293,27 @@ class AuditTrail:
+                 }
+             )
+             if record.retained_reservation_usd is not None:
+                 details["retained_reservation_usd"] = record.retained_reservation_usd
+                 details["retained_reservation_tokens"] = record.retained_reservation_tokens
+         event = {
+             "accepted": "provider_call_accepted",
+             "failed": "provider_call_failed",
+         }.get(record.outcome, "provider_call_rejected")
+         try:
+-            self.append_event(state, event, details)
++            if not any(
++                item.get("event") == event
++                and item.get("state") == state.value
++                and item.get("details") == details
++                for item in self._events
++            ):
++                self.append_event(state, event, details)
+         except Exception as exc:
+             raise ProviderCallAuditError(
+                 PitProviderFailurePhase.TERMINAL_AUDIT_WRITE
+             ) from exc
+         return path, digest
+ 
+     def write_provider_evidence(
+         self, evidence: ProviderGateEvidence, *, name: str = "provider-evidence"
+     ) -> tuple[Path, str]:
+         """Persist the exact closed facts disclosed to model roles for this run."""
+diff --git a/core/pit_optimization_contract.py b/core/pit_optimization_contract.py
+index dc895e1..8d4a953 100644
+--- a/core/pit_optimization_contract.py
++++ b/core/pit_optimization_contract.py
+@@ -1651,20 +1651,98 @@ def validate_policy_source_bundle_descendant(
+         record.path
+         for record in bundle.files
+         if record.text != initial_texts[record.path]
+     ):
+         raise ValueError("policy source cumulative diff paths differ from files")
+     supplied_texts = {record.path: record.text for record in bundle.files}
+     if resulting_texts != supplied_texts:
+         raise ValueError("policy source cumulative diff resulting source texts differ")
+ 
+ 
++def _reverse_unified_diff(unified_diff: str) -> str:
++    """Reverse one already closed unified diff without trusting omitted source context."""
++
++    output: list[str] = []
++    remaining_old = 0
++    remaining_new = 0
++    in_hunk = False
++    for line in unified_diff.splitlines(keepends=True):
++        if not in_hunk:
++            match = _HUNK_RE.fullmatch(line)
++            if match is None:
++                output.append(line)
++                continue
++            old_start = int(match.group(1))
++            old_count = int(match.group(2) or "1")
++            new_start = int(match.group(3))
++            new_count = int(match.group(4) or "1")
++            closing_marker = line.find("@@", 2)
++            if closing_marker < 0:
++                raise ValueError("policy source cumulative diff hunk is invalid")
++            suffix = line[closing_marker + 2 :]
++            output.append(
++                f"@@ -{new_start},{new_count} +{old_start},{old_count} @@{suffix}"
++            )
++            remaining_old = old_count
++            remaining_new = new_count
++            in_hunk = remaining_old > 0 or remaining_new > 0
++            continue
++        if not line or line[0] not in {" ", "+", "-"}:
++            raise ValueError("policy source cumulative diff body is invalid")
++        prefix = line[0]
++        if prefix in {" ", "-"}:
++            remaining_old -= 1
++        if prefix in {" ", "+"}:
++            remaining_new -= 1
++        if remaining_old < 0 or remaining_new < 0:
++            raise ValueError("policy source cumulative diff counts are invalid")
++        output.append({"+": "-", "-": "+"}.get(prefix, prefix) + line[1:])
++        in_hunk = remaining_old > 0 or remaining_new > 0
++    if in_hunk:
++        raise ValueError("policy source cumulative diff is truncated")
++    return "".join(output)
++
++
++def authenticate_policy_source_bundle(
++    *,
++    scope: PolicySourceScope,
++    bundle: PolicySourceBundle,
++) -> None:
++    """Bind actual initial/current policy bytes to one exact authorized source scope."""
++
++    if not isinstance(scope, PolicySourceScope) or not isinstance(
++        bundle, PolicySourceBundle
++    ):
++        raise ValueError("policy source authentication contracts are invalid")
++    current_texts = {record.path: record.text for record in bundle.files}
++    if bundle.cumulative_diff:
++        initial_texts, _stats = _apply_unified_diff(
++            current_texts,
++            _reverse_unified_diff(bundle.cumulative_diff),
++            bounds=scope.hard_patch_bounds,
++        )
++    else:
++        initial_texts = current_texts
++    try:
++        initial_bundle = initial_policy_source_bundle(
++            scope=scope,
++            source_texts=initial_texts,
++        )
++    except ValueError as exc:
++        raise ValueError("initial policy source hashes differ from scope") from exc
++    validate_policy_source_bundle_descendant(
++        scope=scope,
++        initial_bundle=initial_bundle,
++        bundle=bundle,
++    )
++
++
+ @dataclass(frozen=True, slots=True)
+ class CandidateDefinition:
+     """One controller-owned one-line entry-contract alternative."""
+ 
+     candidate_id: str
+     constant_name: str
+     policy_field: str
+     old_value: float
+     new_value: float
+     old_line: str
+@@ -2870,45 +2948,49 @@ class IterationFeedbackSummary(_V2Canonical):
+         _v2_text(self.critic_next_direction, "feedback critic next direction")
+         _require_bool(self.incumbent_changed, "feedback incumbent_changed")
+         if len(self.canonical_json_bytes()) > MAX_ITERATION_FEEDBACK_BYTES:
+             raise ValueError("iteration feedback exceeds its byte cap")
+ 
+ 
+ def _validate_role_common(
+     *,
+     schema_version: int,
+     iteration: int,
++    run_manifest_sha256: str,
+     immutable_constraint_ids: tuple[str, ...],
+ ) -> None:
+     if schema_version != 2:
+         raise ValueError("optimizer role input schema is unsupported")
+     _require_positive_int(iteration, "optimizer role iteration")
++    _require_digest(run_manifest_sha256, "optimizer role run manifest SHA-256")
+     _v2_string_tuple(immutable_constraint_ids, "immutable constraint IDs")
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class InvestigatorInput(_V2Canonical):
+     schema_version: int
+     iteration: int
++    run_manifest_sha256: str
+     policy_interface_version: int
+     immutable_constraint_ids: tuple[str, ...]
+     candidate_bounds: PatchBounds
+     rule_summary: StrategyRuleSummary
+     source_bundle: PolicySourceBundle
+     baseline_discovery: DiscoveryEvidenceSummary
+     incumbent_summary: IncumbentSummary
+     prior_iterations: tuple[IterationFeedbackSummary, ...]
+ 
+     def __post_init__(self) -> None:
+         _validate_role_common(
+             schema_version=self.schema_version,
+             iteration=self.iteration,
++            run_manifest_sha256=self.run_manifest_sha256,
+             immutable_constraint_ids=self.immutable_constraint_ids,
+         )
+         _require_positive_int(self.policy_interface_version, "policy interface version")
+         if not isinstance(self.candidate_bounds, PatchBounds):
+             raise ValueError("investigator candidate bounds are invalid")
+         if not isinstance(self.rule_summary, StrategyRuleSummary):
+             raise ValueError("investigator rule summary is invalid")
+         if not isinstance(self.source_bundle, PolicySourceBundle):
+             raise ValueError("investigator source bundle is invalid")
+         if self.source_bundle.policy_interface_version != self.policy_interface_version:
+@@ -2932,30 +3014,32 @@ class InvestigatorInput(_V2Canonical):
+         if len(_v2_canonical_bytes(self.prior_iterations)) > MAX_ITERATION_HISTORY_BYTES:
+             raise ValueError("investigator iteration history exceeds its byte cap")
+         if len(self.canonical_json_bytes()) > MAX_INVESTIGATOR_DYNAMIC_BYTES:
+             raise ValueError("investigator dynamic input exceeds its byte cap")
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class AuthorInput(_V2Canonical):
+     schema_version: int
+     iteration: int
++    run_manifest_sha256: str
+     policy_interface_version: int
+     immutable_constraint_ids: tuple[str, ...]
+     candidate_bounds: PatchBounds
+     investigator: InvestigatorArtifact
+     source_bundle: PolicySourceBundle
+ 
+     def __post_init__(self) -> None:
+         _validate_role_common(
+             schema_version=self.schema_version,
+             iteration=self.iteration,
++            run_manifest_sha256=self.run_manifest_sha256,
+             immutable_constraint_ids=self.immutable_constraint_ids,
+         )
+         _require_positive_int(self.policy_interface_version, "policy interface version")
+         if not isinstance(self.candidate_bounds, PatchBounds):
+             raise ValueError("author candidate bounds are invalid")
+         if not isinstance(self.investigator, InvestigatorArtifact):
+             raise ValueError("author investigator artifact is invalid")
+         if not isinstance(self.source_bundle, PolicySourceBundle):
+             raise ValueError("author source bundle is invalid")
+         if self.source_bundle.policy_interface_version != self.policy_interface_version:
+@@ -2974,32 +3058,34 @@ class AuthorInput(_V2Canonical):
+             bounds=self.candidate_bounds,
+         )
+         if stats.paths != artifact.changed_paths:
+             raise ValueError("author changed paths differ from candidate unified diff")
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class CriticInput(_V2Canonical):
+     schema_version: int
+     iteration: int
++    run_manifest_sha256: str
+     immutable_constraint_ids: tuple[str, ...]
+     hypothesis_id: str
+     investigator_summary: InvestigatorArtifact
+     author_manifest: AuthorManifestSummary
+     validation: CandidateValidationSummary
+     candidate_vs_baseline: CandidateComparisonSummary | None
+     candidate_vs_incumbent: CandidateComparisonSummary | None
+ 
+     def __post_init__(self) -> None:
+         _validate_role_common(
+             schema_version=self.schema_version,
+             iteration=self.iteration,
++            run_manifest_sha256=self.run_manifest_sha256,
+             immutable_constraint_ids=self.immutable_constraint_ids,
+         )
+         _v2_identifier(self.hypothesis_id, "critic input hypothesis ID")
+         if not isinstance(self.investigator_summary, InvestigatorArtifact):
+             raise ValueError("critic investigator summary is invalid")
+         if not isinstance(self.author_manifest, AuthorManifestSummary):
+             raise ValueError("critic author manifest is invalid")
+         if not isinstance(self.validation, CandidateValidationSummary):
+             raise ValueError("critic validation summary is invalid")
+         if not all(
+@@ -3208,41 +3294,44 @@ def render_worst_iteration_two_role_inputs(
+             diagnostics=(AggregateMetric("d" + maximized(count), 1),),
+             _controller_seal=_CANDIDATE_COMPARISON_SEAL,
+         ),
+         MAX_CANDIDATE_COMPARISON_BYTES,
+     )
+     validation = _successful_candidate_validation()
+     dynamic_values = {
+         "investigator": {
+             "schema_version": 2,
+             "iteration": 2,
++            "run_manifest_sha256": "0" * 64,
+             "policy_interface_version": scope.policy_interface_version,
+             "immutable_constraint_ids": immutable_constraint_ids,
+             "candidate_bounds": scope.candidate_bounds,
+             "rule_summary": rule_summary,
+             "source_bundle": source_bundle,
+             "baseline_discovery": discovery,
+             "incumbent_summary": incumbent,
+             "prior_iterations": (feedback,),
+         },
+         "author": {
+             "schema_version": 2,
+             "iteration": 2,
++            "run_manifest_sha256": "0" * 64,
+             "policy_interface_version": scope.policy_interface_version,
+             "immutable_constraint_ids": immutable_constraint_ids,
+             "candidate_bounds": scope.candidate_bounds,
+             "investigator": investigator_artifact,
+             "source_bundle": source_bundle,
+         },
+         "critic": {
+             "schema_version": 2,
+             "iteration": 2,
++            "run_manifest_sha256": "0" * 64,
+             "immutable_constraint_ids": immutable_constraint_ids,
+             "hypothesis_id": investigator_artifact.hypothesis_id,
+             "investigator_summary": investigator_artifact,
+             "author_manifest": author_manifest,
+             "validation": validation,
+             "candidate_vs_baseline": comparison,
+             "candidate_vs_incumbent": comparison,
+         },
+     }
+     rendered = {
+diff --git a/core/pit_optimizer_authorization.py b/core/pit_optimizer_authorization.py
+index fda23a9..e12b039 100644
+--- a/core/pit_optimizer_authorization.py
++++ b/core/pit_optimizer_authorization.py
+@@ -79,20 +79,49 @@ def _canonical_json_bytes(value: object) -> bytes:
+             value,
+             sort_keys=True,
+             separators=(",", ":"),
+             allow_nan=False,
+             ensure_ascii=False,
+         ).encode("utf-8")
+         + b"\n"
+     )
+ 
+ 
++def _canonical_decimal_text(value: Decimal) -> str:
++    if value.is_zero():
++        return "0"
++    rendered = format(value, "f")
++    if "." in rendered:
++        rendered = rendered.rstrip("0").rstrip(".")
++    return rendered
++
++
++def _frozen_pricing_digest(
++    model: str,
++    prompt_per_million: Decimal,
++    completion_per_million: Decimal,
++) -> str:
++    payload = {
++        "model": model,
++        "prompt_per_million": _canonical_decimal_text(prompt_per_million),
++        "completion_per_million": _canonical_decimal_text(completion_per_million),
++    }
++    return hashlib.sha256(
++        json.dumps(
++            payload,
++            sort_keys=True,
++            separators=(",", ":"),
++            ensure_ascii=False,
++        ).encode("utf-8")
++    ).hexdigest()
++
++
+ def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+     value: dict[str, object] = {}
+     for key, item in pairs:
+         if key in value:
+             raise AuthorizationError("authorization ledger contains duplicate JSON keys")
+         value[key] = item
+     return value
+ 
+ 
+ def _approval_reference_sha256(value: object) -> str:
+@@ -167,20 +196,45 @@ class FrozenModelPricing:
+     completion_per_million: Decimal
+     pricing_payload_sha256: str
+ 
+     def __post_init__(self) -> None:
+         if not isinstance(self.model, str) or _MODEL_RE.fullmatch(self.model) is None:
+             raise ValueError("frozen pricing model is invalid")
+         for value in (self.prompt_per_million, self.completion_per_million):
+             if not isinstance(value, Decimal) or not value.is_finite() or value < 0:
+                 raise ValueError("frozen pricing rates must be finite non-negative Decimals")
+         _require_digest(self.pricing_payload_sha256, "frozen pricing payload SHA-256")
++        if self.pricing_payload_sha256 != _frozen_pricing_digest(
++            self.model,
++            self.prompt_per_million,
++            self.completion_per_million,
++        ):
++            raise ValueError("frozen pricing digest differs from model and rates")
++
++    @classmethod
++    def from_rates(
++        cls,
++        *,
++        model: str,
++        prompt_per_million: Decimal,
++        completion_per_million: Decimal,
++    ) -> "FrozenModelPricing":
++        return cls(
++            model=model,
++            prompt_per_million=prompt_per_million,
++            completion_per_million=completion_per_million,
++            pricing_payload_sha256=_frozen_pricing_digest(
++                model,
++                prompt_per_million,
++                completion_per_million,
++            ),
++        )
+ 
+     @property
+     def pricing_sha256(self) -> str:
+         return self.pricing_payload_sha256
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class AuthorizationRunLease:
+     lease_id: str
+     one_shot_key_sha256: str
+@@ -314,20 +368,29 @@ class PitOptimizerProviderFacts:
+                 raise ValueError("incomplete optimizer accounting must retain its reservation")
+         if not self.request_started:
+             if (
+                 self.outcome != "failed_before_send"
+                 or self.response_received
+                 or not self.accounting_complete
+                 or self.total_tokens != 0
+                 or self.cost_usd != 0
+             ):
+                 raise ValueError("before-send optimizer failure facts are inconsistent")
++        if self.outcome == "accepted" and not (
++            self.request_started
++            and self.response_received
++            and self.returned_model == self.requested_model
++            and self.finish_reason == "stop"
++            and self.response_schema_valid
++            and self.accounting_complete
++        ):
++            raise ValueError("accepted optimizer provider facts are not fully closed")
+         _require_digest(self.audit_sha256, "optimizer provider audit SHA-256")
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class PitOptimizerRoleCall:
+     """One schema-v2 role artifact paired with sealed plan and durable facts."""
+ 
+     plan: PitOptimizerCallBudget
+     payload: InvestigatorArtifact | AuthorArtifact | CriticArtifact
+     facts: PitOptimizerProviderFacts
+@@ -428,20 +491,26 @@ class AuthorizationLedger:
+         ):
+             raise AuthorizationError("authorization ledger path is invalid")
+         if not isinstance(manifest, PitOptimizerRunManifest):
+             raise AuthorizationError("authorization ledger manifest is invalid")
+         self._path = candidate.resolve()
+         self._lock_path = self._path.with_suffix(self._path.suffix + ".lock")
+         self._manifest = manifest
+         with _authorization_file_lock(self._lock_path):
+             self._read_records()
+ 
++    @property
++    def manifest(self) -> PitOptimizerRunManifest:
++        """Return the immutable manifest authenticated by this ledger instance."""
++
++        return self._manifest
++
+     @staticmethod
+     def _record_digest(record: dict[str, object]) -> str:
+         preimage = dict(record)
+         preimage.pop("record_sha256", None)
+         return hashlib.sha256(_canonical_json_bytes(preimage)).hexdigest()
+ 
+     def _read_records(self) -> list[dict[str, object]]:
+         if not self._path.exists():
+             return []
+         if self._path.is_symlink() or not self._path.is_file():
+@@ -696,27 +765,68 @@ class AuthorizationLedger:
+         self,
+         records: list[dict[str, object]],
+         primitives: Sequence[dict[str, object]],
+     ) -> list[dict[str, object]]:
+         appended: list[dict[str, object]] = []
+         working = list(records)
+         for primitive in primitives:
+             record = self._build_record(working, primitive)
+             appended.append(record)
+             working.append(record)
+-        payload = b"".join(_canonical_json_bytes(record) for record in appended)
+-        with self._path.open("ab") as handle:
+-            handle.write(payload)
+-            handle.flush()
+-            os.fsync(handle.fileno())
++        expected_existing = b"".join(
++            _canonical_json_bytes(record) for record in records
++        )
++        actual_existing = self._path.read_bytes() if self._path.exists() else b""
++        if actual_existing != expected_existing:
++            raise AuthorizationError("authorization ledger changed during append")
++        payload = b"".join(_canonical_json_bytes(record) for record in working)
++        temporary = self._path.with_name(
++            f".auth-{os.urandom(4).hex()}.tmp"
++        )
++        try:
++            with temporary.open("xb") as handle:
++                self._write_all(handle, payload)
++                if handle.tell() != len(payload):
++                    raise OSError("authorization ledger write was incomplete")
++                handle.flush()
++                os.fsync(handle.fileno())
++            if temporary.read_bytes() != payload:
++                raise OSError("authorization ledger write was incomplete")
++            os.replace(temporary, self._path)
++            if self._path.read_bytes() != payload:
++                raise AuthorizationError("authorization ledger atomic replace was incomplete")
++            if os.name != "nt":
++                directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
++                directory_fd = os.open(self._path.parent, directory_flags)
++                try:
++                    os.fsync(directory_fd)
++                finally:
++                    os.close(directory_fd)
++        finally:
++            temporary.unlink(missing_ok=True)
+         return appended
+ 
++    @staticmethod
++    def _write_all(handle: object, payload: bytes) -> None:
++        """Write every byte or fail without publishing the temporary ledger."""
++
++        offset = 0
++        while offset < len(payload):
++            written = handle.write(payload[offset:])  # type: ignore[attr-defined]
++            if (
++                type(written) is not int
++                or written <= 0
++                or written > len(payload) - offset
++            ):
++                raise OSError("authorization ledger write was incomplete")
++            offset += written
++
+     def _validate_grant(
+         self,
+         grant: OperatorAuthorizationGrant,
+         records: list[dict[str, object]],
+     ) -> None:
+         if not isinstance(grant, OperatorAuthorizationGrant):
+             raise AuthorizationError("authorization grant is invalid")
+         requirement = self._manifest.authorization_requirement
+         if grant.policy_source_scope_sha256 != self._manifest.policy_source_scope.sha256:
+             raise AuthorizationError("policy source scope mismatch")
+@@ -924,20 +1034,57 @@ class AuthorizationLedger:
+         grant: OperatorAuthorizationGrant,
+         window: OperatorAuthorizationWindow,
+         requirement: AuthorizationRequirement,
+         operator_approval_reference: str,
+     ) -> None:
+         """Append one grant and its sole window under one exclusive lock."""
+ 
+         approval_sha256 = _approval_reference_sha256(operator_approval_reference)
+         with _authorization_file_lock(self._lock_path):
+             records = self._read_records()
++            existing_grant = next(
++                (
++                    record
++                    for record in records
++                    if record.get("record_type") == "grant"
++                    and isinstance(record.get("grant"), dict)
++                    and record["grant"].get("grant_id") == grant.grant_id
++                ),
++                None,
++            )
++            existing_window = next(
++                (
++                    record
++                    for record in records
++                    if record.get("record_type") == "window"
++                    and isinstance(record.get("window"), dict)
++                    and record["window"].get("window_id") == window.window_id
++                ),
++                None,
++            )
++            if existing_grant is not None or existing_window is not None:
++                if (
++                    existing_grant is not None
++                    and existing_window is not None
++                    and _canonical_json_bytes(existing_grant["grant"])
++                    == _canonical_json_bytes(asdict(grant))
++                    and _canonical_json_bytes(existing_window["window"])
++                    == _canonical_json_bytes(asdict(window))
++                    and existing_grant.get("operator_approval_reference_sha256")
++                    == approval_sha256
++                    and existing_window.get("operator_approval_reference_sha256")
++                    == approval_sha256
++                ):
++                    return
++                raise AuthorizationError(
++                    "authorization grant/window retry differs from recorded authority"
++                )
+             self._validate_grant(grant, records)
+             grant_record = self._build_record(
+                 records,
+                 {
+                     "record_type": "grant",
+                     "grant": asdict(grant),
+                     "operator_approval_reference_sha256": approval_sha256,
+                 },
+             )
+             self._validate_window(window, requirement, [*records, grant_record])
+@@ -1250,21 +1397,31 @@ class AuthorizationLedger:
+                 raise AuthorizationError("authorization reservation is absent")
+             try:
+                 stored_reservation = AuthorizationCallReservation(
+                     **reservation_record["reservation"]
+                 )
+             except (TypeError, ValueError) as exc:
+                 raise AuthorizationError("authorization reservation record is invalid") from exc
+             if stored_reservation != reservation:
+                 raise AuthorizationError("authorization reservation identity mismatch")
+             if reservation.reservation_id in self._reconciled_ids(records):
+-                raise AuthorizationError("authorization reservation is already reconciled")
++                existing = next(
++                    item
++                    for item in records
++                    if item.get("record_type") == "reconciliation"
++                    and item.get("reservation_id") == reservation.reservation_id
++                )
++                if existing.get("provider_facts") == asdict(provider_facts):
++                    return
++                raise AuthorizationError(
++                    "authorization reservation reconciliation differs from prior facts"
++                )
+             lease_record = next(
+                 item
+                 for item in records
+                 if item.get("record_type") == "lease_open"
+                 and isinstance(item.get("lease"), dict)
+                 and item["lease"].get("lease_id") == reservation.lease_id
+             )
+             lease = AuthorizationRunLease(**lease_record["lease"])
+             if reservation.call_index > len(self._manifest.call_budgets):
+                 raise AuthorizationError("authorization reservation call index is invalid")
+@@ -1335,52 +1492,155 @@ class AuthorizationLedger:
+             overage = (
+                 charged_tokens > reservation.reserved_tokens
+                 or charged_usd > Decimal(str(reservation.reserved_usd))
+                 or prior_calls + charged_calls > lease.max_calls
+                 or prior_tokens + charged_tokens > lease.max_tokens
+                 or prior_usd + charged_usd > Decimal(str(lease.max_usd))
+             )
+         if overage:
+             raise AuthorizationError("authoritative provider overage was committed")
+ 
++    def recover_active_reservation(
++        self,
++        lease: AuthorizationRunLease,
++        plan: PitOptimizerCallBudget,
++    ) -> AuthorizationCallReservation | None:
++        """Recover the one durable active reservation after an interrupted reserve call."""
++
++        if not isinstance(lease, AuthorizationRunLease) or not isinstance(
++            plan, PitOptimizerCallBudget
++        ):
++            raise AuthorizationError("authorization reservation recovery is invalid")
++        with _authorization_file_lock(self._lock_path):
++            records = self._read_records()
++            self._lease_from_records(records, lease)
++            reconciled = self._reconciled_ids(records)
++            matches: list[AuthorizationCallReservation] = []
++            for item in self._reservation_records(records, lease.lease_id):
++                primitive = item.get("reservation")
++                if not isinstance(primitive, dict):
++                    raise AuthorizationError("authorization reservation record is invalid")
++                reservation = AuthorizationCallReservation(**primitive)
++                if (
++                    reservation.reservation_id not in reconciled
++                    and (
++                        reservation.call_index,
++                        reservation.iteration,
++                        reservation.role,
++                    )
++                    == (plan.call_index, plan.iteration, plan.role)
++                ):
++                    matches.append(reservation)
++            if len(matches) > 1:
++                raise AuthorizationError("authorization lease has concurrent reservations")
++            return matches[0] if matches else None
++
+     def close_run_lease(
+         self,
+         lease: AuthorizationRunLease,
+         *,
+         terminal_code: str,
+     ) -> None:
+         """Permanently close a one-shot lease and release only unused future allowance."""
+ 
+         if terminal_code not in {
+             "completed",
+             "failed",
+             "cancelled",
+             "early_stop",
+             "budget_exhausted",
+         }:
+             raise AuthorizationError("authorization lease terminal code is invalid")
+         with _authorization_file_lock(self._lock_path):
+             records = self._read_records()
+             self._lease_from_records(records, lease)
+-            if any(
+-                item.get("record_type") == "lease_close"
+-                and item.get("lease_id") == lease.lease_id
+-                for item in records
+-            ):
++            prior_close = next(
++                (
++                    item
++                    for item in records
++                    if item.get("record_type") == "lease_close"
++                    and item.get("lease_id") == lease.lease_id
++                ),
++                None,
++            )
++            if prior_close is not None:
++                if prior_close.get("terminal_code") == terminal_code:
++                    return
+                 raise AuthorizationError("authorization lease is already closed")
+             reservations = self._reservation_records(records, lease.lease_id)
+             reconciled = self._reconciled_ids(records)
+             if any(
+                 item["reservation"].get("reservation_id") not in reconciled
+                 for item in reservations
+             ):
+                 raise AuthorizationError("authorization lease has an active call reservation")
++            if terminal_code in {"completed", "early_stop"}:
++                accepted_plans: list[PitOptimizerCallBudget] = []
++                for offset, item in enumerate(reservations):
++                    primitive = item.get("reservation")
++                    if not isinstance(primitive, dict):
++                        raise AuthorizationError(
++                            "authorization reservation record is invalid"
++                        )
++                    reservation = AuthorizationCallReservation(**primitive)
++                    if offset >= len(self._manifest.call_budgets):
++                        raise AuthorizationError(
++                            "authorization completed plan has excess calls"
++                        )
++                    plan = self._manifest.call_budgets[offset]
++                    if (
++                        reservation.call_index,
++                        reservation.iteration,
++                        reservation.role,
++                    ) != (plan.call_index, plan.iteration, plan.role):
++                        raise AuthorizationError(
++                            "authorization completed plan order differs"
++                        )
++                    reconciliation = next(
++                        record
++                        for record in records
++                        if record.get("record_type") == "reconciliation"
++                        and record.get("reservation_id")
++                        == reservation.reservation_id
++                    )
++                    facts_primitive = reconciliation.get("provider_facts")
++                    if not isinstance(facts_primitive, dict):
++                        raise AuthorizationError(
++                            "authorization provider facts are invalid"
++                        )
++                    facts = PitOptimizerProviderFacts(**facts_primitive)
++                    if not (
++                        facts.outcome == "accepted"
++                        and facts.request_started
++                        and facts.response_received
++                        and facts.finish_reason == "stop"
++                        and facts.returned_model == plan.model
++                        and facts.requested_model == plan.model
++                        and facts.response_schema_valid
++                        and facts.accounting_complete
++                    ):
++                        raise AuthorizationError(
++                            "authorization completed plan has a non-accepted call"
++                        )
++                    accepted_plans.append(plan)
++                if terminal_code == "completed" and len(accepted_plans) != len(
++                    self._manifest.call_budgets
++                ):
++                    raise AuthorizationError(
++                        "authorization completed lease requires the exact call plan"
++                    )
++                if terminal_code == "early_stop" and not (
++                    0 < len(accepted_plans) < len(self._manifest.call_budgets)
++                ):
++                    raise AuthorizationError(
++                        "authorization early stop requires an accepted partial plan"
++                    )
+             self._append_records(
+                 records,
+                 [
+                     {
+                         "record_type": "lease_close",
+                         "lease_id": lease.lease_id,
+                         "terminal_code": terminal_code,
+                     }
+                 ],
+             )
+diff --git a/tests/test_pit_optimizer_v2.py b/tests/test_pit_optimizer_v2.py
+index d31d685..611231e 100644
+--- a/tests/test_pit_optimizer_v2.py
++++ b/tests/test_pit_optimizer_v2.py
+@@ -1058,32 +1058,34 @@ def test_role_schema_inputs_are_exact_bounded_provider_projections(
+         author_summary="Reduced concentration.",
+         validation_code="valid",
+         discovery_score=None,
+         critic_disposition="refine",
+         critic_next_direction="Use a smaller adjustment.",
+         incumbent_changed=False,
+     )
+     investigator_input = contract.InvestigatorInput(
+         schema_version=2,
+         iteration=2,
++        run_manifest_sha256="0" * 64,
+         policy_interface_version=1,
+         immutable_constraint_ids=("causal_only", "no_external_io"),
+         candidate_bounds=bounds,
+         rule_summary=rule_summary,
+         source_bundle=source_bundle,
+         baseline_discovery=discovery,
+         incumbent_summary=incumbent,
+         prior_iterations=(feedback,),
+     )
+     author_input = contract.AuthorInput(
+         schema_version=2,
+         iteration=2,
++        run_manifest_sha256="0" * 64,
+         policy_interface_version=1,
+         immutable_constraint_ids=("causal_only", "no_external_io"),
+         candidate_bounds=bounds,
+         investigator=investigator,
+         source_bundle=source_bundle,
+     )
+     author_artifact = contract.AuthorArtifact.from_json(
+         _canonical_text(_author_payload()),
+         max_diff_bytes=8 * 1024,
+         max_total_bytes=16 * 1024,
+@@ -1106,61 +1108,65 @@ def test_role_schema_inputs_are_exact_bounded_provider_projections(
+         original_baseline_sha256=baseline_sha256,
+         expected_original_baseline_sha256=baseline_sha256,
+         discovery_exposure=proof,
+         expected_window_identities=proof.window_identities,
+         expected_metadata=proof.metadata,
+         diagnostics=(AggregateMetric("entry_quality_delta", 0.2),),
+     )
+     critic_input = contract.CriticInput(
+         schema_version=2,
+         iteration=2,
++        run_manifest_sha256="0" * 64,
+         immutable_constraint_ids=("causal_only", "no_external_io"),
+         hypothesis_id="hypothesis_1",
+         investigator_summary=investigator,
+         author_manifest=author_manifest,
+         validation=contract.CandidateValidationSummary(
+             failure_code=None,
+             syntax_ok=True,
+             imports_ok=True,
+             purity_ok=True,
+             deterministic_ok=True,
+             worker_ok=True,
+             replay_attempted=True,
+         ),
+         candidate_vs_baseline=comparison,
+         candidate_vs_incumbent=comparison,
+     )
+ 
+     assert tuple(field.name for field in fields(contract.InvestigatorInput)) == (
+         "schema_version",
+         "iteration",
++        "run_manifest_sha256",
+         "policy_interface_version",
+         "immutable_constraint_ids",
+         "candidate_bounds",
+         "rule_summary",
+         "source_bundle",
+         "baseline_discovery",
+         "incumbent_summary",
+         "prior_iterations",
+     )
+     assert tuple(field.name for field in fields(contract.AuthorInput)) == (
+         "schema_version",
+         "iteration",
++        "run_manifest_sha256",
+         "policy_interface_version",
+         "immutable_constraint_ids",
+         "candidate_bounds",
+         "investigator",
+         "source_bundle",
+     )
+     assert tuple(field.name for field in fields(contract.CriticInput)) == (
+         "schema_version",
+         "iteration",
++        "run_manifest_sha256",
+         "immutable_constraint_ids",
+         "hypothesis_id",
+         "investigator_summary",
+         "author_manifest",
+         "validation",
+         "candidate_vs_baseline",
+         "candidate_vs_incumbent",
+     )
+     for role_input in (investigator_input, author_input, critic_input):
+         rendered = role_input.canonical_json_bytes().decode("utf-8")
+@@ -2174,20 +2180,167 @@ def test_pit_optimizer_v2_record_grant_appends_one_named_window_atomically(
+     lines = ledger_path.read_bytes().splitlines(keepends=True)
+     assert len(lines) == 2
+     records = [json.loads(line) for line in lines]
+     assert [item["record_type"] for item in records] == ["grant", "window"]
+     assert records[0]["grant"]["grant_id"] == "grant-v2"
+     assert records[1]["window"]["grant_ids"] == ["grant-v2"]
+     assert records[1]["previous_record_sha256"] == records[0]["record_sha256"]
+     assert b"approval-ticket-v2" not in ledger_path.read_bytes()
+ 
+ 
++@pytest.mark.parametrize("raise_after_prefix", [False, True])
++def test_pit_optimizer_v2_grant_window_short_write_is_atomic_and_retryable(
++    tmp_path: Path,
++    v2_manifest: contract.PitOptimizerRunManifest,
++    monkeypatch: pytest.MonkeyPatch,
++    raise_after_prefix: bool,
++) -> None:
++    """Break caught: a crash between grant/window bytes could leave half-authority."""
++    from core.pit_optimizer_authorization import (
++        AuthorizationLedger,
++        OperatorAuthorizationGrant,
++        OperatorAuthorizationWindow,
++    )
++
++    runtime = tmp_path / "authorization-runtime-short-write"
++    runtime.mkdir()
++    ledger_path = runtime / "pit_optimizer_authorization_ledger.jsonl"
++    ledger = AuthorizationLedger(ledger_path, v2_manifest)
++    requirement = v2_manifest.authorization_requirement
++    grant = OperatorAuthorizationGrant(
++        grant_id="grant-short-write",
++        additional_calls=requirement.max_calls,
++        additional_tokens=requirement.max_tokens,
++        additional_usd=requirement.max_usd,
++        policy_source_scope_sha256=requirement.policy_source_scope_sha256,
++    )
++    window = OperatorAuthorizationWindow(
++        window_id=requirement.window_id,
++        grant_ids=(grant.grant_id,),
++        authorization_requirement_sha256=requirement.sha256,
++        max_calls=requirement.max_calls,
++        max_tokens=requirement.max_tokens,
++        max_usd=requirement.max_usd,
++        policy_source_scope_sha256=requirement.policy_source_scope_sha256,
++    )
++    original_write_all = ledger._write_all
++
++    def write_prefix_then_crash(handle: object, payload: bytes) -> None:
++        first_record = payload.splitlines(keepends=True)[0]
++        handle.write(first_record)  # type: ignore[attr-defined]
++        if raise_after_prefix:
++            raise OSError("injected temporary short write")
++
++    monkeypatch.setattr(ledger, "_write_all", write_prefix_then_crash)
++    expected_message = (
++        "injected temporary short write"
++        if raise_after_prefix
++        else "write was incomplete"
++    )
++    with pytest.raises(OSError, match=expected_message):
++        ledger.record_grant_and_window(
++            grant=grant,
++            window=window,
++            requirement=requirement,
++            operator_approval_reference="approval-short-write",
++        )
++
++    assert not ledger_path.exists()
++    assert list(runtime.glob(".auth-*.tmp")) == []
++    monkeypatch.setattr(ledger, "_write_all", original_write_all)
++    ledger.record_grant_and_window(
++        grant=grant,
++        window=window,
++        requirement=requirement,
++        operator_approval_reference="approval-short-write",
++    )
++    ledger.record_grant_and_window(
++        grant=grant,
++        window=window,
++        requirement=requirement,
++        operator_approval_reference="approval-short-write",
++    )
++    records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
++    assert [record["record_type"] for record in records] == ["grant", "window"]
++
++
++def test_pit_optimizer_v2_grant_window_partial_tail_is_rejected(
++    tmp_path: Path,
++    v2_manifest: contract.PitOptimizerRunManifest,
++) -> None:
++    """Break caught: a truncated ledger tail could be treated as absent and retried."""
++    from core.pit_optimizer_authorization import AuthorizationError, AuthorizationLedger
++
++    _ledger, ledger_path, _window = _task6_authorized_ledger(
++        tmp_path,
++        v2_manifest,
++        grant_id="grant-partial-tail",
++    )
++    ledger_path.write_bytes(ledger_path.read_bytes() + b"{")
++
++    with pytest.raises(AuthorizationError, match="partial record"):
++        AuthorizationLedger(ledger_path, v2_manifest)
++
++
++def test_pit_optimizer_v2_concurrent_identical_grant_window_is_one_transaction(
++    tmp_path: Path,
++    v2_manifest: contract.PitOptimizerRunManifest,
++) -> None:
++    """Break caught: retrying controllers could duplicate one semantic authorization."""
++    from core.pit_optimizer_authorization import (
++        AuthorizationLedger,
++        OperatorAuthorizationGrant,
++        OperatorAuthorizationWindow,
++    )
++
++    runtime = tmp_path / "authorization-runtime-concurrent-grant"
++    runtime.mkdir()
++    ledger_path = runtime / "pit_optimizer_authorization_ledger.jsonl"
++    requirement = v2_manifest.authorization_requirement
++    grant = OperatorAuthorizationGrant(
++        grant_id="grant-concurrent-retry",
++        additional_calls=requirement.max_calls,
++        additional_tokens=requirement.max_tokens,
++        additional_usd=requirement.max_usd,
++        policy_source_scope_sha256=requirement.policy_source_scope_sha256,
++    )
++    window = OperatorAuthorizationWindow(
++        window_id=requirement.window_id,
++        grant_ids=(grant.grant_id,),
++        authorization_requirement_sha256=requirement.sha256,
++        max_calls=requirement.max_calls,
++        max_tokens=requirement.max_tokens,
++        max_usd=requirement.max_usd,
++        policy_source_scope_sha256=requirement.policy_source_scope_sha256,
++    )
++    barrier = threading.Barrier(2)
++
++    def record() -> str:
++        ledger = AuthorizationLedger(ledger_path, v2_manifest)
++        barrier.wait(timeout=5)
++        ledger.record_grant_and_window(
++            grant=grant,
++            window=window,
++            requirement=requirement,
++            operator_approval_reference="approval-concurrent-retry",
++        )
++        return "recorded"
++
++    with ThreadPoolExecutor(max_workers=2) as pool:
++        assert [future.result() for future in (pool.submit(record), pool.submit(record))] == [
++            "recorded",
++            "recorded",
++        ]
++    records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
++    assert [record["record_type"] for record in records] == ["grant", "window"]
++
++
+ def test_pit_optimizer_v2_record_grant_rejects_stale_scope_and_implicit_values(
+     tmp_path: Path,
+     v2_manifest: contract.PitOptimizerRunManifest,
+ ) -> None:
+     """Break caught: missing or mismatched explicit ceilings could inherit old allowance."""
+     from core.pit_optimizer_authorization import (
+         AuthorizationError,
+         OperatorAuthorizationGrant,
+         record_authorized_grant,
+     )
+@@ -2326,36 +2479,36 @@ def _task6_authorized_ledger(
+ def test_pit_optimizer_v2_frozen_pricing_has_one_canonical_decimal_identity() -> None:
+     """Break caught: a later float/rate reinterpretation could change reserved cost."""
+     from agent_loop import freeze_pricing_record
+ 
+     pricing = freeze_pricing_record(
+         "deepseek/deepseek-r1",
+         {"prompt": 2, "completion": 8},
+     )
+     expected_payload = {
+         "model": "deepseek/deepseek-r1",
+-        "prompt_per_million": "2.0",
+-        "completion_per_million": "8.0",
++        "prompt_per_million": "2",
++        "completion_per_million": "8",
+     }
+     expected_digest = hashlib.sha256(
+         json.dumps(
+             expected_payload,
+             sort_keys=True,
+             separators=(",", ":"),
+         ).encode("utf-8")
+     ).hexdigest()
+ 
+     assert pricing.prompt_per_million == Decimal("2.0")
+     assert pricing.completion_per_million == Decimal("8.0")
+     assert pricing.pricing_sha256 == expected_digest
+     assert pricing.pricing_payload_sha256 == expected_digest
+-    with pytest.raises(ValueError, match="finite non-negative"):
++    with pytest.raises(ValueError, match="exact numeric"):
+         freeze_pricing_record(
+             "deepseek/deepseek-r1",
+             {"prompt": float("nan"), "completion": 8},
+         )
+     with pytest.raises(ValueError, match="finite non-negative"):
+         freeze_pricing_record(
+             "deepseek/deepseek-r1",
+             {"prompt": 2, "completion": -1},
+         )
+ 
+@@ -2782,20 +2935,207 @@ def _task6_provider_facts(
+         prompt_tokens=prompt_tokens,
+         completion_tokens=completion_tokens,
+         total_tokens=total_tokens,
+         cost_usd=cost_usd,
+         retained_reservation_tokens=retained_tokens,
+         retained_reservation_usd=retained_usd,
+         audit_sha256="a" * 64,
+     )
+ 
+ 
++@pytest.mark.parametrize(
++    "changes",
++    (
++        {"response_received": False, "returned_model": None},
++        {"finish_reason": "non_stop"},
++        {"returned_model": "other/model"},
++    ),
++)
++def test_pit_optimizer_v2_accepted_facts_are_fully_closed(
++    changes: dict[str, object],
++) -> None:
++    """Break caught: an accepted fact could omit a response or accept model/finish drift."""
++    from core.pit_optimizer_authorization import FrozenModelPricing
++
++    pricing = FrozenModelPricing.from_rates(
++        model=contract.PIT_OPTIMIZER_R1_MODEL,
++        prompt_per_million=Decimal("2"),
++        completion_per_million=Decimal("8"),
++    )
++    reservation = SimpleNamespace(
++        call_index=1,
++        iteration=1,
++        role="investigator",
++    )
++    valid = _task6_provider_facts(reservation, pricing)
++
++    with pytest.raises(ValueError, match="accepted"):
++        replace(valid, **changes)
++
++
++@pytest.mark.parametrize(
++    "changes",
++    (
++        {"response_received": False},
++        {"finish_reason": "non_stop"},
++        {"returned_model": "other/model"},
++    ),
++)
++def test_pit_optimizer_v2_accepted_audit_record_is_fully_closed(
++    changes: dict[str, object],
++) -> None:
++    """Break caught: durable accepted audit facts were weaker than provider facts."""
++    from agent_loop import BudgetSnapshot, ConfigurationError, ProviderCallRecord
++
++    valid = ProviderCallRecord(
++        schema_version=2,
++        call_index=1,
++        iteration=1,
++        role="investigator",
++        api_backend="openrouter",
++        requested_model=contract.PIT_OPTIMIZER_R1_MODEL,
++        returned_model=contract.PIT_OPTIMIZER_R1_MODEL,
++        outcome="accepted",
++        finish_reason="stop",
++        response_schema_valid=True,
++        accounting_complete=True,
++        prompt_tokens=100,
++        cached_tokens=None,
++        completion_tokens=50,
++        reasoning_tokens=None,
++        total_tokens=150,
++        cost_usd=0.01,
++        accounting_source="inline",
++        request_started=True,
++        response_received=True,
++        locally_accounted=True,
++        authoritative_spend_known=True,
++        maximum_exposure_usd=0.05,
++        maximum_exposure_tokens=1_000,
++        exposure_basis="authoritative",
++        ledger_snapshot=BudgetSnapshot(
++            api_calls=1,
++            prompt_tokens=100,
++            completion_tokens=50,
++            total_tokens=150,
++            reserved_tokens=150,
++            reserved_usd=0.01,
++            spent_usd=0.01,
++            authoritative_usd=0.01,
++            retained_reservation_usd=0.0,
++            retained_reservation_tokens=0,
++            incomplete_accounting_calls=0,
++            accounting_basis="authoritative",
++        ),
++        frozen_pricing_sha256="b" * 64,
++    )
++
++    with pytest.raises(ConfigurationError, match="accepted"):
++        replace(valid, **changes)
++
++
++def test_pit_optimizer_v2_completed_requires_exact_authoritative_plan(
++    tmp_path: Path,
++    v2_manifest: contract.PitOptimizerRunManifest,
++) -> None:
++    """Break caught: a partial accepted prefix could be relabeled completed."""
++    from core.pit_optimizer_authorization import AuthorizationError
++
++    ledger, ledger_path, lease, pricing = _task6_open_lease(tmp_path, v2_manifest)
++    with pytest.raises(AuthorizationError, match="completed"):
++        ledger.close_run_lease(lease, terminal_code="completed")
++    first = ledger.reserve_call(lease, v2_manifest.call_budgets[0])
++    ledger.reconcile_call(first, _task6_provider_facts(first, pricing))
++
++    with pytest.raises(AuthorizationError, match="completed"):
++        ledger.close_run_lease(lease, terminal_code="completed")
++
++    ledger.close_run_lease(lease, terminal_code="early_stop")
++    records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
++    assert records[-1]["terminal_code"] == "early_stop"
++
++
++def test_pit_optimizer_v2_completed_accepts_only_full_ordered_plan(
++    tmp_path: Path,
++    v2_manifest: contract.PitOptimizerRunManifest,
++) -> None:
++    """Break caught: the strict completion rule rejected a real six-call accepted run."""
++    ledger, ledger_path, lease, pricing = _task6_open_lease(tmp_path, v2_manifest)
++    for plan in v2_manifest.call_budgets:
++        reservation = ledger.reserve_call(lease, plan)
++        ledger.reconcile_call(
++            reservation,
++            _task6_provider_facts(
++                reservation,
++                pricing,
++                prompt_tokens=10,
++                completion_tokens=5,
++                total_tokens=15,
++                cost_usd=0.001,
++            ),
++        )
++
++    ledger.close_run_lease(lease, terminal_code="completed")
++    records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
++    assert records[-1]["terminal_code"] == "completed"
++
++
++@pytest.mark.parametrize("nonaccepted_outcome", ["schema_invalid", "uncertain_accounting"])
++def test_pit_optimizer_v2_nonaccepted_full_plan_cannot_be_completed(
++    tmp_path: Path,
++    v2_manifest: contract.PitOptimizerRunManifest,
++    nonaccepted_outcome: str,
++) -> None:
++    """Break caught: call count alone could conceal a rejected or uncertain role."""
++    from core.pit_optimizer_authorization import AuthorizationError
++
++    ledger, _ledger_path, lease, pricing = _task6_open_lease(tmp_path, v2_manifest)
++    for index, plan in enumerate(v2_manifest.call_budgets):
++        reservation = ledger.reserve_call(lease, plan)
++        if index == 2 and nonaccepted_outcome == "uncertain_accounting":
++            facts = _task6_provider_facts(
++                reservation,
++                pricing,
++                outcome="uncertain_accounting",
++                response_received=False,
++                schema_valid=False,
++                accounting_complete=False,
++                prompt_tokens=None,
++                completion_tokens=None,
++                total_tokens=None,
++                cost_usd=None,
++                retained_tokens=reservation.reserved_tokens,
++                retained_usd=reservation.reserved_usd,
++            )
++        else:
++            facts = _task6_provider_facts(
++                reservation,
++                pricing,
++                outcome=(
++                    "schema_invalid"
++                    if index == 2 and nonaccepted_outcome == "schema_invalid"
++                    else "accepted"
++                ),
++                schema_valid=not (
++                    index == 2 and nonaccepted_outcome == "schema_invalid"
++                ),
++                prompt_tokens=10,
++                completion_tokens=5,
++                total_tokens=15,
++                cost_usd=0.001,
++            )
++        ledger.reconcile_call(reservation, facts)
++
++    with pytest.raises(AuthorizationError, match="completed"):
++        ledger.close_run_lease(lease, terminal_code="completed")
++
++
+ def test_pit_optimizer_v2_budget_reservation_is_exact_sequential_and_released(
+     tmp_path: Path,
+     v2_manifest: contract.PitOptimizerRunManifest,
+ ) -> None:
+     """Break caught: future calls or a second active call could be pre-reserved."""
+     from core.pit_optimizer_authorization import AuthorizationError
+ 
+     ledger, ledger_path, lease, pricing = _task6_open_lease(tmp_path, v2_manifest)
+     first_plan, second_plan = v2_manifest.call_budgets[:2]
+ 
+@@ -3012,21 +3352,21 @@ def test_pit_optimizer_v2_call_preflight_rejects_sections_and_pricing_drift() ->
+         freeze_pricing_record,
+         preflight_pit_optimizer_call,
+     )
+     from core.pit_optimizer_authorization import (
+         AuthorizationError,
+         AuthorizationRunLease,
+     )
+ 
+     pricing = freeze_pricing_record(
+         "deepseek/deepseek-r1",
+-        {"prompt": 0.1, "completion": 0.2},
++        {"prompt": "0.1", "completion": "0.2"},
+     )
+     budget = contract.PitOptimizerCallBudget(
+         call_index=1,
+         iteration=1,
+         role="investigator",
+         model="deepseek/deepseek-r1",
+         max_static_input_bytes=4,
+         max_dynamic_input_bytes=6,
+         max_input_tokens=10,
+         max_output_tokens=2,
+@@ -3173,145 +3513,1250 @@ def _task6_fake_response(
+             prompt_tokens=prompt_tokens,
+             completion_tokens=completion_tokens,
+             total_tokens=prompt_tokens + completion_tokens,
+             prompt_tokens_details=SimpleNamespace(cached_tokens=0),
+             completion_tokens_details=SimpleNamespace(reasoning_tokens=0),
+             cost=cost,
+         ),
+     )
+ 
+ 
+-def _task6_investigator_parser(raw: str) -> contract.InvestigatorArtifact:
+-    return contract.InvestigatorArtifact.from_json(
+-        raw,
+-        max_total_bytes=contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
+-    )
+-
+-
+-def test_pit_optimizer_v2_gateway_freezes_pricing_once_without_sdk_or_role_call(
+-    monkeypatch: pytest.MonkeyPatch,
+-) -> None:
+-    """Break caught: setup pricing could transmit source or construct a paid SDK client."""
+-    from agent_loop import BudgetLedger, OpenRouterGateway
++def _task6_manifest_source_bundle(
++    manifest: contract.PitOptimizerRunManifest,
++    *,
++    alternate_same_size: bool = False,
++) -> contract.PolicySourceBundle:
++    """Rebuild the exact synthetic manifest source, or an equal-sized foreign scope."""
+ 
+-    pricing_calls: list[str] = []
+-    gateway = OpenRouterGateway(
+-        client=object(),
+-        pricing_loader=lambda model: (
+-            pricing_calls.append(model) or {"prompt": 2, "completion": 8}
++    source_texts = {
++        "core/strategy_policy/entry.py": (
++            "raise RuntimeError('must not import')\n"
++            "def evaluate_entry(snapshot):\n"
++            "    return None\n"
+         ),
+-        ledger=BudgetLedger(max_usd=1.0),
+-        max_attempts=1,
+-    )
+-    monkeypatch.setattr(
+-        gateway,
+-        "_get_client",
+-        lambda: pytest.fail("pricing freeze constructed the SDK client"),
++        "core/strategy_policy/risk.py": (
++            "raise RuntimeError('must not import')\n"
++            "def recommend_capacity(snapshot):\n"
++            "    return 1\n"
++        ),
++        "core/strategy_policy/exit.py": (
++            "raise RuntimeError('must not import')\n"
++            "def evaluate_exit(snapshot):\n"
++            "    return None\n"
++        ),
++    }
++    scope = manifest.policy_source_scope
++    if alternate_same_size:
++        source_texts = {
++            path: text.replace("must not import", "must not imporu")
++            for path, text in source_texts.items()
++        }
++        scope = replace(
++            scope,
++            initial_policy_source_sha256s=tuple(
++                (path, hashlib.sha256(text.encode("utf-8")).hexdigest())
++                for path, text in source_texts.items()
++            ),
++        )
++    return contract.initial_policy_source_bundle(
++        scope=scope,
++        source_texts=source_texts,
+     )
+ 
+-    first = gateway.freeze_pit_optimizer_pricing(
+-        model="deepseek/deepseek-r1",
+-        wall_deadline=10.0,
+-        monotonic=lambda: 1.0,
+-    )
+-    second = gateway.freeze_pit_optimizer_pricing(
+-        model="deepseek/deepseek-r1",
+-        wall_deadline=10.0,
+-        monotonic=lambda: 2.0,
++
++def _task6_manifest_investigator_input(
++    manifest: contract.PitOptimizerRunManifest,
++    *,
++    source_bundle: contract.PolicySourceBundle | None = None,
++) -> contract.InvestigatorInput:
++    return replace(
++        _task5_investigator_input(iteration=1, prior_iterations=()),
++        run_manifest_sha256=manifest.sha256,
++        source_bundle=(
++            source_bundle
++            if source_bundle is not None
++            else _task6_manifest_source_bundle(manifest)
++        ),
+     )
+ 
+-    assert first is second
+-    assert pricing_calls == ["deepseek/deepseek-r1"]
+ 
++def _task6_manifest_author_input(
++    manifest: contract.PitOptimizerRunManifest,
++    *,
++    source_bundle: contract.PolicySourceBundle | None = None,
++) -> contract.AuthorInput:
++    return contract.AuthorInput(
++        schema_version=2,
++        iteration=1,
++        run_manifest_sha256=manifest.sha256,
++        policy_interface_version=manifest.policy_interface_version,
++        immutable_constraint_ids=manifest.immutable_constraint_ids,
++        candidate_bounds=manifest.candidate_bounds,
++        investigator=_investigator_artifact(),
++        source_bundle=(
++            source_bundle
++            if source_bundle is not None
++            else _task6_manifest_source_bundle(manifest)
++        ),
++    )
+ 
+-def test_pit_optimizer_v2_gateway_preflight_has_zero_mutable_or_sdk_effects(
+-    tmp_path: Path,
+-    v2_manifest: contract.PitOptimizerRunManifest,
+-) -> None:
+-    """Break caught: an over-budget role call could reserve, audit, or transmit first."""
+-    from agent_loop import AuditTrail, BudgetExceededError, BudgetLedger, OpenRouterGateway
+-    from agent_loop import freeze_pricing_record
+ 
+-    authorization, ledger_path, window = _task6_authorized_ledger(
++def _task6_manifest_critic_input(
++    manifest: contract.PitOptimizerRunManifest,
++    *,
++    run_manifest_sha256: str | None = None,
++) -> contract.CriticInput:
++    investigator = _investigator_artifact()
++    return contract.CriticInput(
++        schema_version=2,
++        iteration=1,
++        run_manifest_sha256=(run_manifest_sha256 or manifest.sha256),
++        immutable_constraint_ids=manifest.immutable_constraint_ids,
++        hypothesis_id=investigator.hypothesis_id,
++        investigator_summary=investigator,
++        author_manifest=contract.AuthorManifestSummary(
++            hypothesis_id=investigator.hypothesis_id,
++            behavioral_summary="bounded author summary",
++            changed_paths=("core/strategy_policy/entry.py",),
++            changed_symbols=("core.strategy_policy.entry.evaluate_entry",),
++        ),
++        validation=contract.CandidateValidationSummary(
++            failure_code=None,
++            syntax_ok=True,
++            imports_ok=True,
++            purity_ok=True,
++            deterministic_ok=True,
++            worker_ok=True,
++            replay_attempted=True,
++        ),
++        candidate_vs_baseline=None,
++        candidate_vs_incumbent=None,
++    )
++
++
++def _task6_gateway_context(
++    tmp_path: Path,
++    manifest: contract.PitOptimizerRunManifest,
++    *,
++    grant_id: str,
++    outcomes: list[object],
++    prompt_rate: Decimal = Decimal("2"),
++    completion_rate: Decimal = Decimal("8"),
++):
++    import agent_loop
++
++    authorization, ledger_path, window = _task6_authorized_ledger(
++        tmp_path,
++        manifest,
++        grant_id=grant_id,
++    )
++    budget = agent_loop.BudgetLedger(max_usd=1.0, max_calls=6, max_tokens=448_000)
++    audit_suffix = hashlib.sha256(grant_id.encode("utf-8")).hexdigest()[:10]
++    audit = agent_loop.AuditTrail(
++        tmp_path / f"audit-{audit_suffix}",
++        f"pit-{audit_suffix}",
++    )
++    client = _Task6FakeClient(outcomes)
++    gateway = agent_loop.OpenRouterGateway(
++        client=client,
++        pricing_loader=lambda _model: {
++            "prompt": prompt_rate,
++            "completion": completion_rate,
++        },
++        ledger=budget,
++        authorization_ledger=authorization,
++        audit_trail=audit,
++        max_attempts=1,
++    )
++    pricing = gateway.freeze_pit_optimizer_pricing(
++        model=contract.PIT_OPTIMIZER_R1_MODEL,
++        wall_deadline=10.0,
++        monotonic=lambda: 1.0,
++    )
++    lease = authorization.open_run_lease(
++        window_id=window.window_id,
++        authorization_requirement_sha256=manifest.authorization_requirement.sha256,
++        run_manifest_sha256=manifest.sha256,
++        frozen_pricing_sha256=pricing.pricing_sha256,
++    )
++    return (
++        authorization,
++        ledger_path,
++        lease,
++        pricing,
++        budget,
++        audit,
++        client,
++        gateway,
++    )
++
++
++def test_pit_optimizer_v2_exact_one_cent_preflight_has_zero_effects(
++    tmp_path: Path,
++    v2_manifest: contract.PitOptimizerRunManifest,
++) -> None:
++    """Prove exact $0.010000 conservative cost rejects a $0.009999 sealed cap."""
++    import agent_loop
++
++    first_plan = replace(
++        v2_manifest.call_budgets[0],
++        max_usd=0.009999,
++    )
++    call_budgets = (first_plan, *v2_manifest.call_budgets[1:])
++    manifest = replace(
++        v2_manifest,
++        call_budgets=call_budgets,
++    )
++    (
++        _authorization,
++        ledger_path,
++        lease,
++        pricing,
++        budget,
++        audit,
++        client,
++        gateway,
++    ) = _task6_gateway_context(
++        tmp_path,
++        manifest,
++        grant_id="grant-exact-one-cent",
++        outcomes=[_task6_fake_response(_canonical_text(_investigator_payload()))],
++        prompt_rate=Decimal("0"),
++        completion_rate=Decimal("2.5"),
++    )
++
++    with pytest.raises(agent_loop.BudgetExceededError, match="per-call USD"):
++        gateway.request_pit_optimizer_once(
++            "investigator",
++            _task6_manifest_investigator_input(manifest),
++            _task6_investigator_parser,
++            call_budget=first_plan,
++            authorization_lease=lease,
++            frozen_pricing=pricing,
++            wall_deadline=10.0,
++            monotonic=lambda: 1.0,
++        )
++
++    assert client.completions.calls == []
++    assert budget.calls == 0
++    assert budget.committed_usd == pytest.approx(0.0)
++    assert audit._events == []
++    records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
++    assert not any(record["record_type"] == "reservation" for record in records)
++
++
++def _task6_investigator_parser(raw: str) -> contract.InvestigatorArtifact:
++    return contract.InvestigatorArtifact.from_json(
++        raw,
++        max_total_bytes=contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
++    )
++
++
++def test_pit_optimizer_v2_gateway_rejects_equal_shaped_foreign_source_pre_effect(
++    tmp_path: Path,
++    v2_manifest: contract.PitOptimizerRunManifest,
++) -> None:
++    """Break caught: scope A could transmit equal-sized source bytes from scope B."""
++    import agent_loop
++    from core.pit_optimizer_authorization import AuthorizationError
++
++    authorization, ledger_path, window = _task6_authorized_ledger(
++        tmp_path,
++        v2_manifest,
++        grant_id="grant-foreign-source",
++    )
++    budget = agent_loop.BudgetLedger(max_usd=1.0, max_calls=6, max_tokens=448_000)
++    audit = agent_loop.AuditTrail(tmp_path / "audit-foreign-source", "pit-v2-source")
++    client = _Task6FakeClient(
++        [_task6_fake_response(_canonical_text(_investigator_payload()))]
++    )
++    gateway = agent_loop.OpenRouterGateway(
++        client=client,
++        run_id=v2_manifest.run_id,
++        pricing_loader=lambda _model: {
++            "prompt": Decimal("2"),
++            "completion": Decimal("8"),
++        },
++        ledger=budget,
++        authorization_ledger=authorization,
++        audit_trail=audit,
++        max_attempts=1,
++    )
++    pricing = gateway.freeze_pit_optimizer_pricing(
++        model=contract.PIT_OPTIMIZER_R1_MODEL,
++        wall_deadline=10.0,
++        monotonic=lambda: 1.0,
++    )
++    lease = authorization.open_run_lease(
++        window_id=window.window_id,
++        authorization_requirement_sha256=(
++            v2_manifest.authorization_requirement.sha256
++        ),
++        run_manifest_sha256=v2_manifest.sha256,
++        frozen_pricing_sha256=pricing.pricing_sha256,
++    )
++
++    with pytest.raises(AuthorizationError, match="policy source"):
++        gateway.request_pit_optimizer_once(
++            "investigator",
++            _task6_manifest_investigator_input(
++                v2_manifest,
++                source_bundle=_task6_manifest_source_bundle(
++                    v2_manifest,
++                    alternate_same_size=True,
++                ),
++            ),
++            _task6_investigator_parser,
++            call_budget=v2_manifest.call_budgets[0],
++            authorization_lease=lease,
++            frozen_pricing=pricing,
++            wall_deadline=10.0,
++            monotonic=lambda: 1.0,
++        )
++
++    assert client.completions.calls == []
++    assert budget.calls == 0
++    assert audit._events == []
++    records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
++    assert not any(record["record_type"] == "reservation" for record in records)
++
++
++def test_pit_optimizer_v2_gateway_rejects_foreign_author_source_pre_effect(
++    tmp_path: Path,
++    v2_manifest: contract.PitOptimizerRunManifest,
++) -> None:
++    """Break caught: the author role could transmit source outside the leased scope."""
++    import agent_loop
++    from core.pit_optimizer_authorization import AuthorizationError
++
++    authorization, ledger_path, window = _task6_authorized_ledger(
++        tmp_path,
++        v2_manifest,
++        grant_id="grant-foreign-author",
++    )
++    budget = agent_loop.BudgetLedger(max_usd=1.0, max_calls=6, max_tokens=448_000)
++    audit = agent_loop.AuditTrail(tmp_path / "audit-foreign-author", "pit-v2-author")
++    client = _Task6FakeClient(
++        [_task6_fake_response(_canonical_text(_author_payload()))]
++    )
++    gateway = agent_loop.OpenRouterGateway(
++        client=client,
++        pricing_loader=lambda _model: {
++            "prompt": Decimal("2"),
++            "completion": Decimal("8"),
++        },
++        ledger=budget,
++        authorization_ledger=authorization,
++        audit_trail=audit,
++        max_attempts=1,
++    )
++    pricing = gateway.freeze_pit_optimizer_pricing(
++        model=contract.PIT_OPTIMIZER_R1_MODEL,
++        wall_deadline=10.0,
++        monotonic=lambda: 1.0,
++    )
++    lease = authorization.open_run_lease(
++        window_id=window.window_id,
++        authorization_requirement_sha256=(
++            v2_manifest.authorization_requirement.sha256
++        ),
++        run_manifest_sha256=v2_manifest.sha256,
++        frozen_pricing_sha256=pricing.pricing_sha256,
++    )
++    first = authorization.reserve_call(lease, v2_manifest.call_budgets[0])
++    authorization.reconcile_call(first, _task6_provider_facts(first, pricing))
++    before_records = len(ledger_path.read_bytes().splitlines())
++
++    with pytest.raises(AuthorizationError, match="policy source"):
++        gateway.request_pit_optimizer_once(
++            "author",
++            _task6_manifest_author_input(
++                v2_manifest,
++                source_bundle=_task6_manifest_source_bundle(
++                    v2_manifest,
++                    alternate_same_size=True,
++                ),
++            ),
++            lambda raw: contract.AuthorArtifact.from_json(
++                raw,
++                max_diff_bytes=8 * 1024,
++                max_total_bytes=16 * 1024,
++            ),
++            call_budget=v2_manifest.call_budgets[1],
++            authorization_lease=lease,
++            frozen_pricing=pricing,
++            wall_deadline=10.0,
++            monotonic=lambda: 1.0,
++        )
++
++    assert client.completions.calls == []
++    assert budget.calls == 0
++    assert audit._events == []
++    assert len(ledger_path.read_bytes().splitlines()) == before_records
++
++
++def test_pit_optimizer_v2_gateway_rejects_cross_run_critic_summary_pre_effect(
++    tmp_path: Path,
++    v2_manifest: contract.PitOptimizerRunManifest,
++) -> None:
++    """Break caught: a non-source summary package could be copied across run manifests."""
++    import agent_loop
++    from core.pit_optimizer_authorization import AuthorizationError
++
++    authorization, ledger_path, window = _task6_authorized_ledger(
++        tmp_path,
++        v2_manifest,
++        grant_id="grant-foreign-summary",
++    )
++    budget = agent_loop.BudgetLedger(max_usd=1.0, max_calls=6, max_tokens=448_000)
++    audit = agent_loop.AuditTrail(tmp_path / "audit-foreign-summary", "pit-v2-summary")
++    client = _Task6FakeClient(
++        [_task6_fake_response(_canonical_text(_critic_payload()))]
++    )
++    gateway = agent_loop.OpenRouterGateway(
++        client=client,
++        pricing_loader=lambda _model: {
++            "prompt": Decimal("2"),
++            "completion": Decimal("8"),
++        },
++        ledger=budget,
++        authorization_ledger=authorization,
++        audit_trail=audit,
++        max_attempts=1,
++    )
++    pricing = gateway.freeze_pit_optimizer_pricing(
++        model=contract.PIT_OPTIMIZER_R1_MODEL,
++        wall_deadline=10.0,
++        monotonic=lambda: 1.0,
++    )
++    lease = authorization.open_run_lease(
++        window_id=window.window_id,
++        authorization_requirement_sha256=(
++            v2_manifest.authorization_requirement.sha256
++        ),
++        run_manifest_sha256=v2_manifest.sha256,
++        frozen_pricing_sha256=pricing.pricing_sha256,
++    )
++    for plan in v2_manifest.call_budgets[:2]:
++        reservation = authorization.reserve_call(lease, plan)
++        authorization.reconcile_call(
++            reservation,
++            _task6_provider_facts(reservation, pricing),
++        )
++    before_records = len(ledger_path.read_bytes().splitlines())
++
++    with pytest.raises(AuthorizationError, match="run manifest"):
++        gateway.request_pit_optimizer_once(
++            "critic",
++            _task6_manifest_critic_input(
++                v2_manifest,
++                run_manifest_sha256="f" * 64,
++            ),
++            lambda raw: contract.CriticArtifact.from_json(
++                raw,
++                max_total_bytes=contract.MAX_CRITIC_ARTIFACT_BYTES,
++            ),
++            call_budget=v2_manifest.call_budgets[2],
++            authorization_lease=lease,
++            frozen_pricing=pricing,
++            wall_deadline=10.0,
++            monotonic=lambda: 1.0,
++        )
++
++    assert client.completions.calls == []
++    assert budget.calls == 0
++    assert audit._events == []
++    assert len(ledger_path.read_bytes().splitlines()) == before_records
++
++
++def test_pit_optimizer_v2_authenticates_current_descendant_from_exact_scope() -> None:
++    """Break caught: current source could claim ancestry from hashes it did not descend from."""
++
++    initial = _source_bundle()
++    scope = _source_scope(initial)
++    initial_texts = {record.path: record.text for record in initial.files}
++    current_texts = dict(initial_texts)
++    current_texts["core/strategy_policy/entry.py"] = current_texts[
++        "core/strategy_policy/entry.py"
++    ].replace("return None", "return snapshot")
++    cumulative_diff = "".join(
++        line
++        for path in scope.editable_paths
++        if current_texts[path] != initial_texts[path]
++        for line in difflib.unified_diff(
++            initial_texts[path].splitlines(keepends=True),
++            current_texts[path].splitlines(keepends=True),
++            fromfile=f"a/{path}",
++            tofile=f"b/{path}",
++            n=3,
++            lineterm="\n",
++        )
++    )
++    current = contract.PolicySourceBundle(
++        policy_interface_version=scope.policy_interface_version,
++        cumulative_diff_sha256=hashlib.sha256(
++            cumulative_diff.encode("utf-8")
++        ).hexdigest(),
++        cumulative_diff=cumulative_diff,
++        files=tuple(
++            contract.PolicySourceRecord(
++                path=path,
++                sha256=hashlib.sha256(current_texts[path].encode("utf-8")).hexdigest(),
++                declared_symbols=record.declared_symbols,
++                text=current_texts[path],
++            )
++            for path, record in zip(scope.editable_paths, initial.files, strict=True)
++        ),
++        _controller_seal=contract._POLICY_SOURCE_BUNDLE_SEAL,
++    )
++
++    contract.authenticate_policy_source_bundle(
++        scope=scope,
++        bundle=current,
++    )
++    foreign_scope = replace(
++        scope,
++        initial_policy_source_sha256s=tuple(
++            (path, "f" * 64) for path in scope.editable_paths
++        ),
++    )
++    with pytest.raises(ValueError, match="initial policy source hashes"):
++        contract.authenticate_policy_source_bundle(
++            scope=foreign_scope,
++            bundle=current,
++        )
++
++
++def test_pit_optimizer_v2_frozen_pricing_digest_commits_to_exact_decimal_rates() -> None:
++    """Break caught: copied pricing digests could authenticate mutated or rounded rates."""
++    from agent_loop import ConfigurationError, freeze_pricing_record
++
++    prompt = Decimal("0.12345678901234567890123456789")
++    pricing = freeze_pricing_record(
++        contract.PIT_OPTIMIZER_R1_MODEL,
++        {"prompt": prompt, "completion": Decimal("2")},
++    )
++    expected_payload = {
++        "model": contract.PIT_OPTIMIZER_R1_MODEL,
++        "prompt_per_million": "0.12345678901234567890123456789",
++        "completion_per_million": "2",
++    }
++    expected_digest = hashlib.sha256(
++        json.dumps(
++            expected_payload,
++            sort_keys=True,
++            separators=(",", ":"),
++        ).encode("utf-8")
++    ).hexdigest()
++
++    assert pricing.prompt_per_million == prompt
++    assert pricing.completion_per_million == Decimal("2")
++    assert pricing.pricing_sha256 == expected_digest
++    with pytest.raises(ValueError, match="digest"):
++        replace(pricing, prompt_per_million=Decimal("0"))
++    with pytest.raises(ConfigurationError, match="pricing"):
++        freeze_pricing_record(
++            contract.PIT_OPTIMIZER_R1_MODEL,
++            {"prompt": True, "completion": Decimal("2")},
++        )
++
++
++def test_pit_optimizer_v2_builtin_pricing_json_preserves_exact_decimal(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Break caught: JSON numeric rates could round through binary float before freezing."""
++    import agent_loop
++
++    class PricingResponse:
++        def __enter__(self) -> "PricingResponse":
++            return self
++
++        def __exit__(self, *_args: object) -> None:
++            return None
++
++        def read(self) -> bytes:
++            return (
++                b'{"data":[{"id":"deepseek/deepseek-r1","pricing":'
++                b'{"prompt":0.00000012345678901234567890123456789,'
++                b'"completion":0.000002}}]}'
++            )
++
++    monkeypatch.setattr(
++        agent_loop.urllib.request,
++        "urlopen",
++        lambda _request, *, timeout: PricingResponse(),
++    )
++
++    rates = agent_loop._load_current_pricing(
++        contract.PIT_OPTIMIZER_R1_MODEL,
++        timeout_seconds=1.0,
++    )
++
++    assert rates["prompt"] == Decimal("0.12345678901234567890123456789")
++    assert rates["completion"] == Decimal("2")
++
++
++@pytest.mark.parametrize("freeze_gateway", [False, True])
++def test_pit_optimizer_v2_gateway_requires_its_own_fresh_pricing_record_pre_effect(
++    tmp_path: Path,
++    v2_manifest: contract.PitOptimizerRunManifest,
++    freeze_gateway: bool,
++) -> None:
++    """Break caught: an unfrozen or separately forged record could authorize a paid call."""
++    import agent_loop
++    from core.pit_optimizer_authorization import AuthorizationError, FrozenModelPricing
++
++    authorization, ledger_path, window = _task6_authorized_ledger(
++        tmp_path,
++        v2_manifest,
++        grant_id=f"grant-pricing-{str(freeze_gateway).lower()}",
++    )
++    budget = agent_loop.BudgetLedger(max_usd=1.0, max_calls=6, max_tokens=448_000)
++    audit = agent_loop.AuditTrail(
++        tmp_path / f"audit-pricing-{freeze_gateway}",
++        f"pit-v2-pricing-{freeze_gateway}",
++    )
++    client = _Task6FakeClient(
++        [_task6_fake_response(_canonical_text(_investigator_payload()))]
++    )
++    gateway = agent_loop.OpenRouterGateway(
++        client=client,
++        run_id=v2_manifest.run_id,
++        pricing_loader=lambda _model: {
++            "prompt": Decimal("2"),
++            "completion": Decimal("8"),
++        },
++        ledger=budget,
++        authorization_ledger=authorization,
++        audit_trail=audit,
++        max_attempts=1,
++    )
++    direct = agent_loop.freeze_pricing_record(
++        contract.PIT_OPTIMIZER_R1_MODEL,
++        {"prompt": Decimal("2"), "completion": Decimal("8")},
++    )
++    if freeze_gateway:
++        gateway_pricing = gateway.freeze_pit_optimizer_pricing(
++            model=contract.PIT_OPTIMIZER_R1_MODEL,
++            wall_deadline=10.0,
++            monotonic=lambda: 1.0,
++        )
++        assert gateway_pricing == direct
++        supplied = FrozenModelPricing(
++            model=direct.model,
++            prompt_per_million=direct.prompt_per_million,
++            completion_per_million=direct.completion_per_million,
++            pricing_payload_sha256=direct.pricing_payload_sha256,
++        )
++    else:
++        supplied = direct
++    lease = authorization.open_run_lease(
++        window_id=window.window_id,
++        authorization_requirement_sha256=(
++            v2_manifest.authorization_requirement.sha256
++        ),
++        run_manifest_sha256=v2_manifest.sha256,
++        frozen_pricing_sha256=supplied.pricing_sha256,
++    )
++
++    with pytest.raises(AuthorizationError, match="gateway.*frozen pricing"):
++        gateway.request_pit_optimizer_once(
++            "investigator",
++            _task6_manifest_investigator_input(v2_manifest),
++            _task6_investigator_parser,
++            call_budget=v2_manifest.call_budgets[0],
++            authorization_lease=lease,
++            frozen_pricing=supplied,
++            wall_deadline=10.0,
++            monotonic=lambda: 1.0,
++        )
++
++    assert client.completions.calls == []
++    assert budget.calls == 0
++    assert audit._events == []
++    records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
++    assert not any(record["record_type"] == "reservation" for record in records)
++
++
++def test_pit_optimizer_v2_gateway_rejects_cross_run_pricing_cache_reuse(
++    tmp_path: Path,
++    v2_manifest: contract.PitOptimizerRunManifest,
++) -> None:
++    """Break caught: a same-manifest second ledger could inherit another run's freeze."""
++    import agent_loop
++    from core.pit_optimizer_authorization import AuthorizationError
++
++    first, _first_path, _first_window = _task6_authorized_ledger(
++        tmp_path,
++        v2_manifest,
++        grant_id="grant-pricing-run-a",
++    )
++    second, second_path, second_window = _task6_authorized_ledger(
++        tmp_path,
++        v2_manifest,
++        grant_id="grant-pricing-run-b",
++    )
++    budget = agent_loop.BudgetLedger(max_usd=1.0, max_calls=6, max_tokens=448_000)
++    audit = agent_loop.AuditTrail(tmp_path / "audit-pricing-cross-run", "pit-cross-run")
++    client = _Task6FakeClient(
++        [_task6_fake_response(_canonical_text(_investigator_payload()))]
++    )
++    gateway = agent_loop.OpenRouterGateway(
++        client=client,
++        pricing_loader=lambda _model: {
++            "prompt": Decimal("2"),
++            "completion": Decimal("8"),
++        },
++        ledger=budget,
++        authorization_ledger=first,
++        audit_trail=audit,
++        max_attempts=1,
++    )
++    pricing = gateway.freeze_pit_optimizer_pricing(
++        model=contract.PIT_OPTIMIZER_R1_MODEL,
++        wall_deadline=10.0,
++        monotonic=lambda: 1.0,
++    )
++    gateway.authorization_ledger = second
++    lease = second.open_run_lease(
++        window_id=second_window.window_id,
++        authorization_requirement_sha256=v2_manifest.authorization_requirement.sha256,
++        run_manifest_sha256=v2_manifest.sha256,
++        frozen_pricing_sha256=pricing.pricing_sha256,
++    )
++
++    with pytest.raises(AuthorizationError, match="run-local frozen pricing"):
++        gateway.request_pit_optimizer_once(
++            "investigator",
++            _task6_manifest_investigator_input(v2_manifest),
++            _task6_investigator_parser,
++            call_budget=v2_manifest.call_budgets[0],
++            authorization_lease=lease,
++            frozen_pricing=pricing,
++            wall_deadline=10.0,
++            monotonic=lambda: 1.0,
++        )
++
++    assert client.completions.calls == []
++    assert budget.calls == 0
++    assert audit._events == []
++    records = [json.loads(line) for line in second_path.read_bytes().splitlines()]
++    assert not any(record["record_type"] == "reservation" for record in records)
++
++
++def test_pit_optimizer_v2_gateway_rejects_noncallable_parser_pre_effect(
++    tmp_path: Path,
++    v2_manifest: contract.PitOptimizerRunManifest,
++) -> None:
++    """Break caught: a local parser configuration error could consume a paid call."""
++    import agent_loop
++
++    authorization, ledger_path, window = _task6_authorized_ledger(
++        tmp_path,
++        v2_manifest,
++        grant_id="grant-parser-preflight",
++    )
++    budget = agent_loop.BudgetLedger(max_usd=1.0, max_calls=6, max_tokens=448_000)
++    audit = agent_loop.AuditTrail(tmp_path / "audit-parser", "pit-v2-parser")
++    client = _Task6FakeClient(
++        [_task6_fake_response(_canonical_text(_investigator_payload()))]
++    )
++    gateway = agent_loop.OpenRouterGateway(
++        client=client,
++        run_id=v2_manifest.run_id,
++        pricing_loader=lambda _model: {
++            "prompt": Decimal("2"),
++            "completion": Decimal("8"),
++        },
++        ledger=budget,
++        authorization_ledger=authorization,
++        audit_trail=audit,
++        max_attempts=1,
++    )
++    pricing = gateway.freeze_pit_optimizer_pricing(
++        model=contract.PIT_OPTIMIZER_R1_MODEL,
++        wall_deadline=10.0,
++        monotonic=lambda: 1.0,
++    )
++    lease = authorization.open_run_lease(
++        window_id=window.window_id,
++        authorization_requirement_sha256=(
++            v2_manifest.authorization_requirement.sha256
++        ),
++        run_manifest_sha256=v2_manifest.sha256,
++        frozen_pricing_sha256=pricing.pricing_sha256,
++    )
++
++    with pytest.raises(agent_loop.ConfigurationError, match="parser"):
++        gateway.request_pit_optimizer_once(
++            "investigator",
++            _task6_manifest_investigator_input(v2_manifest),
++            None,  # type: ignore[arg-type]
++            call_budget=v2_manifest.call_budgets[0],
++            authorization_lease=lease,
++            frozen_pricing=pricing,
++            wall_deadline=10.0,
++            monotonic=lambda: 1.0,
++        )
++
++    assert client.completions.calls == []
++    assert budget.calls == 0
++    assert audit._events == []
++    records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
++    assert not any(record["record_type"] == "reservation" for record in records)
++
++
++class _Task6ExplodingResponse:
++    def __init__(self, error: BaseException) -> None:
++        self._error = error
++
++    @property
++    def model(self) -> object:
++        raise self._error
++
++
++@pytest.mark.parametrize(
++    ("phase", "possibly_sent"),
++    (
++        ("authorization_reservation", False),
++        ("reservation_audit", False),
++        ("sdk_construction", False),
++        ("start_audit", False),
++        ("sdk_invocation", True),
++        ("response_processing", True),
++    ),
++)
++def test_pit_optimizer_v2_keyboard_interrupt_finalizes_by_provider_phase(
++    tmp_path: Path,
++    v2_manifest: contract.PitOptimizerRunManifest,
++    monkeypatch: pytest.MonkeyPatch,
++    phase: str,
++    possibly_sent: bool,
++) -> None:
++    """Break caught: cancellation could strand an active reservation and one-shot lease."""
++    outcomes: list[object]
++    if phase == "sdk_invocation":
++        outcomes = [KeyboardInterrupt(phase)]
++    elif phase == "response_processing":
++        outcomes = [_Task6ExplodingResponse(KeyboardInterrupt(phase))]
++    else:
++        outcomes = [
++            _task6_fake_response(_canonical_text(_investigator_payload()))
++        ]
++    (
++        authorization,
++        ledger_path,
++        lease,
++        pricing,
++        budget,
++        audit,
++        client,
++        gateway,
++    ) = _task6_gateway_context(
++        tmp_path,
++        v2_manifest,
++        grant_id=f"grant-interrupt-{phase.replace('_', '-')}",
++        outcomes=outcomes,
++    )
++
++    if phase == "authorization_reservation":
++        original_reserve = authorization.reserve_call
++
++        def reserve_then_interrupt(*args: object, **kwargs: object) -> object:
++            original_reserve(*args, **kwargs)
++            raise KeyboardInterrupt(phase)
++
++        monkeypatch.setattr(authorization, "reserve_call", reserve_then_interrupt)
++    elif phase in {"reservation_audit", "start_audit"}:
++        target_event = (
++            "provider_call_reserved"
++            if phase == "reservation_audit"
++            else "provider_call_started"
++        )
++        original_append = audit.append_event
++        interrupted = False
++
++        def interrupt_one_audit(
++            state: object,
++            event: str,
++            details: dict[str, object] | None = None,
++        ) -> dict[str, object]:
++            nonlocal interrupted
++            if event == target_event and not interrupted:
++                interrupted = True
++                raise KeyboardInterrupt(phase)
++            return original_append(state, event, details)
++
++        monkeypatch.setattr(audit, "append_event", interrupt_one_audit)
++    elif phase == "sdk_construction":
++        monkeypatch.setattr(
++            gateway,
++            "_get_client",
++            lambda: (_ for _ in ()).throw(KeyboardInterrupt(phase)),
++        )
++
++    with pytest.raises(KeyboardInterrupt, match=phase):
++        gateway.request_pit_optimizer_once(
++            "investigator",
++            _task6_manifest_investigator_input(v2_manifest),
++            _task6_investigator_parser,
++            call_budget=v2_manifest.call_budgets[0],
++            authorization_lease=lease,
++            frozen_pricing=pricing,
++            wall_deadline=10.0,
++            monotonic=lambda: 1.0,
++        )
++
++    records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
++    assert records[-2]["record_type"] == "reconciliation"
++    assert records[-2]["charge_basis"] == (
++        "retained_reservation" if possibly_sent else "before_send_release"
++    )
++    assert records[-1]["record_type"] == "lease_close"
++    assert records[-1]["terminal_code"] == "cancelled"
++    assert (audit.run_root / "provider-call-0001.json").is_file()
++    assert audit._events[-1]["event"] == "provider_call_rejected"
++    if possibly_sent:
++        assert budget.calls == 1
++        assert budget.incomplete_accounting_calls == 1
++        assert budget.retained_reservation_tokens > 0
++        assert len(client.completions.calls) == 1
++    else:
++        assert budget.calls == 0
++        assert budget.reserved_tokens == 0
++        assert budget.committed_usd == pytest.approx(0.0)
++        assert client.completions.calls == []
++
++
++@pytest.mark.parametrize("failure_phase", ["response_property", "parser"])
++def test_pit_optimizer_v2_unexpected_runtime_error_retains_uncertain_call(
++    tmp_path: Path,
++    v2_manifest: contract.PitOptimizerRunManifest,
++    failure_phase: str,
++) -> None:
++    """Break caught: unexpected post-invocation code could exit without closed accounting."""
++    if failure_phase == "response_property":
++        outcomes: list[object] = [
++            _Task6ExplodingResponse(RuntimeError(failure_phase))
++        ]
++        parser = _task6_investigator_parser
++    else:
++        outcomes = [
++            _task6_fake_response(_canonical_text(_investigator_payload()))
++        ]
++
++        def parser(_raw: str) -> contract.InvestigatorArtifact:
++            raise RuntimeError(failure_phase)
++
++    (
++        _authorization,
++        ledger_path,
++        lease,
++        pricing,
++        budget,
++        audit,
++        client,
++        gateway,
++    ) = _task6_gateway_context(
++        tmp_path,
++        v2_manifest,
++        grant_id=f"grant-runtime-{failure_phase.replace('_', '-')}",
++        outcomes=outcomes,
++    )
++
++    with pytest.raises(RuntimeError, match=failure_phase):
++        gateway.request_pit_optimizer_once(
++            "investigator",
++            _task6_manifest_investigator_input(v2_manifest),
++            parser,
++            call_budget=v2_manifest.call_budgets[0],
++            authorization_lease=lease,
++            frozen_pricing=pricing,
++            wall_deadline=10.0,
++            monotonic=lambda: 1.0,
++        )
++
++    records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
++    assert records[-2]["charge_basis"] == "retained_reservation"
++    assert records[-2]["provider_facts"]["outcome"] == "uncertain_accounting"
++    assert records[-1]["record_type"] == "lease_close"
++    assert budget.incomplete_accounting_calls == 1
++    assert len(client.completions.calls) == 1
++    assert (audit.run_root / "provider-call-0001.json").is_file()
++
++
++@pytest.mark.parametrize(
++    "phase",
++    (
++        "budget_reconciliation",
++        "authorization_reconciliation",
++        "terminal_audit",
++        "lease_close",
++    ),
++)
++def test_pit_optimizer_v2_keyboard_interrupt_during_finalizer_is_retryable(
++    tmp_path: Path,
++    v2_manifest: contract.PitOptimizerRunManifest,
++    monkeypatch: pytest.MonkeyPatch,
++    phase: str,
++) -> None:
++    """Break caught: finalizer cancellation could publish stale facts or misclose the lease."""
++    (
++        authorization,
++        ledger_path,
++        lease,
++        pricing,
++        budget,
++        audit,
++        client,
++        gateway,
++    ) = _task6_gateway_context(
+         tmp_path,
+         v2_manifest,
+-        grant_id="grant-preflight-zero",
+-    )
+-    pricing = freeze_pricing_record(
+-        "deepseek/deepseek-r1",
+-        {"prompt": 1_000_000, "completion": 1_000_000},
+-    )
+-    lease = authorization.open_run_lease(
+-        window_id=window.window_id,
+-        authorization_requirement_sha256=v2_manifest.authorization_requirement.sha256,
+-        run_manifest_sha256=v2_manifest.sha256,
+-        frozen_pricing_sha256=pricing.pricing_sha256,
++        grant_id=f"grant-final-{phase[:3]}",
++        outcomes=[_task6_fake_response(_canonical_text(_investigator_payload()))],
++    )
++    parser: object = _task6_investigator_parser
++    interrupted = False
++
++    def interrupt_once(operation: object) -> object:
++        def wrapped(*args: object, **kwargs: object) -> object:
++            nonlocal interrupted
++            if not interrupted:
++                interrupted = True
++                raise KeyboardInterrupt(phase)
++            return operation(*args, **kwargs)  # type: ignore[operator]
++
++        return wrapped
++
++    if phase == "budget_reconciliation":
++        monkeypatch.setattr(
++            budget,
++            "reconcile_pit_optimizer",
++            interrupt_once(budget.reconcile_pit_optimizer),
++        )
++    elif phase == "authorization_reconciliation":
++        monkeypatch.setattr(
++            authorization,
++            "reconcile_call",
++            interrupt_once(authorization.reconcile_call),
++        )
++    elif phase == "terminal_audit":
++        monkeypatch.setattr(
++            audit,
++            "write_provider_call",
++            interrupt_once(audit.write_provider_call),
++        )
++    else:
++        parser = lambda _raw: object()
++        monkeypatch.setattr(
++            authorization,
++            "close_run_lease",
++            interrupt_once(authorization.close_run_lease),
++        )
++
++    with pytest.raises(KeyboardInterrupt, match=phase):
++        gateway.request_pit_optimizer_once(
++            "investigator",
++            _task6_manifest_investigator_input(v2_manifest),
++            parser,  # type: ignore[arg-type]
++            call_budget=v2_manifest.call_budgets[0],
++            authorization_lease=lease,
++            frozen_pricing=pricing,
++            wall_deadline=10.0,
++            monotonic=lambda: 1.0,
++        )
++
++    records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
++    reconciliation = next(
++        record for record in records if record["record_type"] == "reconciliation"
+     )
+-    budget_ledger = BudgetLedger(max_usd=1.0, max_calls=6, max_tokens=448_000)
+-    client = _Task6FakeClient([])
+-    audit = AuditTrail(tmp_path / "audit-preflight", "pit-v2-preflight")
++    expected_outcome = "schema_invalid" if phase == "lease_close" else "accepted"
++    assert reconciliation["charge_basis"] == "authoritative"
++    assert reconciliation["provider_facts"]["outcome"] == expected_outcome
++    assert records[-1]["record_type"] == "lease_close"
++    assert records[-1]["terminal_code"] == "cancelled"
++    provider_record = json.loads(
++        (audit.run_root / "provider-call-0001.json").read_bytes()
++    )
++    assert provider_record["outcome"] == expected_outcome
++    assert budget.calls == 1
++    assert budget.incomplete_accounting_calls == 0
++    assert budget.reserved_tokens == budget.total_tokens
++    assert len(client.completions.calls) == 1
++
++
++def test_pit_optimizer_v2_deadline_expiry_after_start_intent_sends_nothing(
++    tmp_path: Path,
++    v2_manifest: contract.PitOptimizerRunManifest,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Break caught: stale pre-audit remaining time could start a request after deadline."""
++    import agent_loop
++
++    (
++        _authorization,
++        ledger_path,
++        lease,
++        pricing,
++        budget,
++        audit,
++        client,
++        gateway,
++    ) = _task6_gateway_context(
++        tmp_path,
++        v2_manifest,
++        grant_id="grant-deadline-start",
++        outcomes=[_task6_fake_response(_canonical_text(_investigator_payload()))],
++    )
++    clock = SimpleNamespace(now=1.0)
++    original_append = audit.append_event
++
++    def advance_after_start(
++        state: object,
++        event: str,
++        details: dict[str, object] | None = None,
++    ) -> dict[str, object]:
++        result = original_append(state, event, details)
++        if event == "provider_call_started":
++            clock.now = 11.0
++        return result
++
++    monkeypatch.setattr(audit, "append_event", advance_after_start)
++
++    with pytest.raises(agent_loop.BudgetExceededError, match="wall deadline"):
++        gateway.request_pit_optimizer_once(
++            "investigator",
++            _task6_manifest_investigator_input(v2_manifest),
++            _task6_investigator_parser,
++            call_budget=v2_manifest.call_budgets[0],
++            authorization_lease=lease,
++            frozen_pricing=pricing,
++            wall_deadline=10.0,
++            monotonic=lambda: clock.now,
++        )
++
++    assert client.completions.calls == []
++    assert budget.calls == 0
++    records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
++    assert records[-2]["charge_basis"] == "before_send_release"
++    assert records[-1]["record_type"] == "lease_close"
++    assert (audit.run_root / "provider-call-0001.json").is_file()
++
++
++
++
++def test_pit_optimizer_v2_gateway_freezes_pricing_once_without_sdk_or_role_call(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Break caught: setup pricing could transmit source or construct a paid SDK client."""
++    from agent_loop import BudgetLedger, OpenRouterGateway
++
++    pricing_calls: list[str] = []
+     gateway = OpenRouterGateway(
+-        client=client,
+-        pricing_loader=lambda _model: pytest.fail("live pricing was consulted"),
+-        ledger=budget_ledger,
+-        authorization_ledger=authorization,
+-        audit_trail=audit,
++        client=object(),
++        pricing_loader=lambda model: (
++            pricing_calls.append(model) or {"prompt": 2, "completion": 8}
++        ),
++        ledger=BudgetLedger(max_usd=1.0),
+         max_attempts=1,
+     )
++    monkeypatch.setattr(
++        gateway,
++        "_get_client",
++        lambda: pytest.fail("pricing freeze constructed the SDK client"),
++    )
++
++    first = gateway.freeze_pit_optimizer_pricing(
++        model="deepseek/deepseek-r1",
++        wall_deadline=10.0,
++        monotonic=lambda: 1.0,
++    )
++    second = gateway.freeze_pit_optimizer_pricing(
++        model="deepseek/deepseek-r1",
++        wall_deadline=10.0,
++        monotonic=lambda: 2.0,
++    )
++
++    assert first is second
++    assert pricing_calls == ["deepseek/deepseek-r1"]
++
++
++def test_pit_optimizer_v2_gateway_preflight_has_zero_mutable_or_sdk_effects(
++    tmp_path: Path,
++    v2_manifest: contract.PitOptimizerRunManifest,
++) -> None:
++    """Break caught: an over-budget role call could reserve, audit, or transmit first."""
++    from agent_loop import BudgetExceededError
++
++    (
++        _authorization,
++        ledger_path,
++        lease,
++        pricing,
++        budget_ledger,
++        audit,
++        client,
++        gateway,
++    ) = _task6_gateway_context(
++        tmp_path,
++        v2_manifest,
++        grant_id="grant-preflight-zero",
++        outcomes=[],
++        prompt_rate=Decimal("1000000"),
++        completion_rate=Decimal("1000000"),
++    )
+ 
+     with pytest.raises(BudgetExceededError, match="per-call USD"):
+         gateway.request_pit_optimizer_once(
+             "investigator",
+-            _task5_investigator_input(iteration=1, prior_iterations=()),
++            _task6_manifest_investigator_input(v2_manifest),
+             _task6_investigator_parser,
+             call_budget=v2_manifest.call_budgets[0],
+             authorization_lease=lease,
+             frozen_pricing=pricing,
+             wall_deadline=10.0,
+             monotonic=lambda: 1.0,
+         )
+ 
+     assert client.completions.calls == []
+     assert budget_ledger.calls == 0
+     assert audit._events == []
+     records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
+     assert not any(item["record_type"] == "reservation" for item in records)
+ 
+ 
+ def test_pit_optimizer_v2_gateway_sends_one_all_r1_call_without_healing(
+     tmp_path: Path,
+     v2_manifest: contract.PitOptimizerRunManifest,
+ ) -> None:
+     """Break caught: the isolated wrapper could retry, route Qwen, or heal output."""
+-    from agent_loop import AuditTrail, BudgetLedger, OpenRouterGateway
+-
+-    authorization, ledger_path, lease, pricing = _task6_open_lease(
++    plan = v2_manifest.call_budgets[0]
++    (
++        _authorization,
++        ledger_path,
++        lease,
++        pricing,
++        _budget,
++        audit,
++        client,
++        gateway,
++    ) = _task6_gateway_context(
+         tmp_path,
+         v2_manifest,
+-    )
+-    plan = v2_manifest.call_budgets[0]
+-    client = _Task6FakeClient(
+-        [_task6_fake_response(_canonical_text(_investigator_payload()))]
+-    )
+-    audit = AuditTrail(tmp_path / "audit-accepted", "pit-v2-accepted")
+-    gateway = OpenRouterGateway(
+-        client=client,
+-        pricing_loader=lambda _model: pytest.fail("live pricing was consulted"),
+-        ledger=BudgetLedger(max_usd=1.0, max_calls=6, max_tokens=448_000),
+-        authorization_ledger=authorization,
+-        audit_trail=audit,
+-        max_attempts=2,
++        grant_id="grant-accepted-call",
++        outcomes=[_task6_fake_response(_canonical_text(_investigator_payload()))],
+     )
+ 
+     result = gateway.request_pit_optimizer_once(
+         "investigator",
+-        _task5_investigator_input(iteration=1, prior_iterations=()),
++        _task6_manifest_investigator_input(v2_manifest),
+         _task6_investigator_parser,
+         call_budget=plan,
+         authorization_lease=lease,
+         frozen_pricing=pricing,
+         wall_deadline=10.0,
+         monotonic=lambda: 1.0,
+     )
+ 
+     assert result.plan == plan
+     assert isinstance(result.payload, contract.InvestigatorArtifact)
+@@ -3362,173 +4807,155 @@ def test_pit_optimizer_v2_role_profile_is_all_r1_without_legacy_drift() -> None:
+ 
+ 
+ def test_pit_optimizer_v2_lazy_sdk_is_fake_and_sets_max_retries_zero(
+     tmp_path: Path,
+     v2_manifest: contract.PitOptimizerRunManifest,
+     monkeypatch: pytest.MonkeyPatch,
+ ) -> None:
+     """Break caught: the SDK could apply a hidden retry beneath the one-shot wrapper."""
+     import agent_loop
+ 
+-    authorization, _ledger_path, lease, pricing = _task6_open_lease(
++    authorization, _ledger_path, window = _task6_authorized_ledger(
+         tmp_path,
+         v2_manifest,
++        grant_id="grant-lazy-sdk",
+     )
+     fake_client = _Task6FakeClient(
+         [_task6_fake_response(_canonical_text(_investigator_payload()))]
+     )
+     sdk_arguments: list[dict[str, object]] = []
+ 
+     def fake_openai(**kwargs: object) -> object:
+         sdk_arguments.append(kwargs)
+         return fake_client
+ 
+     monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=fake_openai))
+     audit = agent_loop.AuditTrail(tmp_path / "audit-sdk", "pit-v2-sdk")
+     gateway = agent_loop.OpenRouterGateway(
+         client=None,
+         api_key="[REDACTED ARCHIVE CREDENTIAL-LIKE LITERAL]",
+-        pricing_loader=lambda _model: pytest.fail("live pricing was consulted"),
++        pricing_loader=lambda _model: {
++            "prompt": Decimal("2"),
++            "completion": Decimal("8"),
++        },
+         ledger=agent_loop.BudgetLedger(
+             max_usd=1.0,
+             max_calls=6,
+             max_tokens=448_000,
+         ),
+         authorization_ledger=authorization,
+         audit_trail=audit,
+         max_attempts=2,
+     )
++    pricing = gateway.freeze_pit_optimizer_pricing(
++        model=contract.PIT_OPTIMIZER_R1_MODEL,
++        wall_deadline=10.0,
++        monotonic=lambda: 1.0,
++    )
++    lease = authorization.open_run_lease(
++        window_id=window.window_id,
++        authorization_requirement_sha256=v2_manifest.authorization_requirement.sha256,
++        run_manifest_sha256=v2_manifest.sha256,
++        frozen_pricing_sha256=pricing.pricing_sha256,
++    )
+ 
+     gateway.request_pit_optimizer_once(
+         "investigator",
+-        _task5_investigator_input(iteration=1, prior_iterations=()),
++        _task6_manifest_investigator_input(v2_manifest),
+         _task6_investigator_parser,
+         call_budget=v2_manifest.call_budgets[0],
+         authorization_lease=lease,
+         frozen_pricing=pricing,
+         wall_deadline=10.0,
+         monotonic=lambda: 1.0,
+     )
+ 
+     assert len(sdk_arguments) == 1
+     assert sdk_arguments[0]["max_retries"] == 0
+     assert len(fake_client.completions.calls) == 1
+ 
+ 
+ def test_pit_optimizer_v2_gateway_accounts_all_three_r1_roles_in_order(
+     tmp_path: Path,
+     v2_manifest: contract.PitOptimizerRunManifest,
+ ) -> None:
+     """Break caught: author/critic could bypass the one-shot wrapper or iteration facts."""
+-    import agent_loop
+-
+-    investigator = _investigator_artifact()
+-    author_artifact = contract.AuthorArtifact.from_json(
+-        _canonical_text(_author_payload()),
+-        max_diff_bytes=8 * 1024,
+-        max_total_bytes=16 * 1024,
+-    )
+-    author_input = contract.AuthorInput(
+-        schema_version=2,
+-        iteration=1,
+-        policy_interface_version=1,
+-        immutable_constraint_ids=("causal_only", "no_external_io"),
+-        candidate_bounds=contract.PatchBounds(3, 12, 80, 8 * 1024),
+-        investigator=investigator,
+-        source_bundle=_source_bundle(),
+-    )
+-    critic_input = contract.CriticInput(
+-        schema_version=2,
+-        iteration=1,
+-        immutable_constraint_ids=("causal_only", "no_external_io"),
+-        hypothesis_id=investigator.hypothesis_id,
+-        investigator_summary=investigator,
+-        author_manifest=contract.AuthorManifestSummary(
+-            hypothesis_id=author_artifact.hypothesis_id,
+-            behavioral_summary=author_artifact.behavioral_summary,
+-            changed_paths=author_artifact.changed_paths,
+-            changed_symbols=author_artifact.changed_symbols,
+-        ),
+-        validation=contract.CandidateValidationSummary(
+-            failure_code=None,
+-            syntax_ok=True,
+-            imports_ok=True,
+-            purity_ok=True,
+-            deterministic_ok=True,
+-            worker_ok=True,
+-            replay_attempted=True,
++    author_payload = {
++        **_author_payload(),
++        "unified_diff": (
++            "--- a/core/strategy_policy/entry.py\n"
++            "+++ b/core/strategy_policy/entry.py\n"
++            "@@ -2,2 +2,2 @@\n"
++            " def evaluate_entry(snapshot):\n"
++            "-    return None\n"
++            "+    return True\n"
+         ),
+-        candidate_vs_baseline=None,
+-        candidate_vs_incumbent=None,
+-    )
++    }
+     inputs = (
+-        _task5_investigator_input(iteration=1, prior_iterations=()),
+-        author_input,
+-        critic_input,
++        _task6_manifest_investigator_input(v2_manifest),
++        _task6_manifest_author_input(v2_manifest),
++        _task6_manifest_critic_input(v2_manifest),
+     )
+     parsers = (
+         _task6_investigator_parser,
+         lambda raw: contract.AuthorArtifact.from_json(
+             raw,
+             max_diff_bytes=8 * 1024,
+             max_total_bytes=16 * 1024,
+         ),
+         lambda raw: contract.CriticArtifact.from_json(
+             raw,
+             max_total_bytes=contract.MAX_CRITIC_ARTIFACT_BYTES,
+         ),
+     )
+     responses = (
+         _investigator_payload(),
+-        _author_payload(),
++        author_payload,
+         _critic_payload(),
+     )
+-    authorization, _ledger_path, lease, pricing = _task6_open_lease(
++    (
++        authorization,
++        _ledger_path,
++        lease,
++        pricing,
++        _budget,
++        _audit,
++        client,
++        gateway,
++    ) = _task6_gateway_context(
+         tmp_path,
+         v2_manifest,
+-    )
+-    client = _Task6FakeClient(
+-        [_task6_fake_response(_canonical_text(payload)) for payload in responses]
+-    )
+-    audit = agent_loop.AuditTrail(tmp_path / "audit-all-roles", "pit-v2-all-roles")
+-    gateway = agent_loop.OpenRouterGateway(
+-        client=client,
+-        pricing_loader=lambda _model: pytest.fail("live pricing was consulted"),
+-        ledger=agent_loop.BudgetLedger(
+-            max_usd=1.0,
+-            max_calls=6,
+-            max_tokens=448_000,
+-        ),
+-        authorization_ledger=authorization,
+-        audit_trail=audit,
+-        max_attempts=2,
++        grant_id="grant-all-three-roles",
++        outcomes=[
++            _task6_fake_response(_canonical_text(payload)) for payload in responses
++        ],
+     )
+ 
+     results = tuple(
+         gateway.request_pit_optimizer_once(
+             plan.role,
+             role_input,
+             parser,
+             call_budget=plan,
+             authorization_lease=lease,
+             frozen_pricing=pricing,
+             wall_deadline=10.0,
+             monotonic=lambda: 1.0,
+         )
+         for plan, role_input, parser in zip(
+             v2_manifest.call_budgets[:3],
+             inputs,
+             parsers,
+             strict=True,
+         )
+     )
+-    authorization.close_run_lease(lease, terminal_code="completed")
++    authorization.close_run_lease(lease, terminal_code="early_stop")
+ 
+     assert tuple(result.plan.role for result in results) == contract.OPTIMIZER_V2_ROLES
+     assert tuple(result.facts.iteration for result in results) == (1, 1, 1)
+     assert [call["model"] for call in client.completions.calls] == [
+         "deepseek/deepseek-r1",
+         "deepseek/deepseek-r1",
+         "deepseek/deepseek-r1",
+     ]
+     assert all(
+         call["extra_body"] == {"provider": {"require_parameters": True}}
+@@ -3557,44 +4984,41 @@ def test_pit_optimizer_v2_gateway_terminal_failures_close_without_retry(
+     tmp_path: Path,
+     v2_manifest: contract.PitOptimizerRunManifest,
+     outcome: object,
+     provider_outcome: str,
+     error_type: str,
+     charge_basis: str,
+ ) -> None:
+     """Break caught: malformed/uncertain calls could leak a reservation or retry."""
+     import agent_loop
+ 
+-    authorization, ledger_path, lease, pricing = _task6_open_lease(
++    (
++        _authorization,
++        ledger_path,
++        lease,
++        pricing,
++        _budget,
++        audit,
++        client,
++        gateway,
++    ) = _task6_gateway_context(
+         tmp_path,
+         v2_manifest,
+-    )
+-    client = _Task6FakeClient([outcome])
+-    audit = agent_loop.AuditTrail(tmp_path / "audit-terminal", "pit-v2-terminal")
+-    gateway = agent_loop.OpenRouterGateway(
+-        client=client,
+-        pricing_loader=lambda _model: pytest.fail("live pricing was consulted"),
+-        ledger=agent_loop.BudgetLedger(
+-            max_usd=1.0,
+-            max_calls=6,
+-            max_tokens=448_000,
+-        ),
+-        authorization_ledger=authorization,
+-        audit_trail=audit,
+-        max_attempts=2,
++        grant_id=f"grant-terminal-{provider_outcome.replace('_', '-')}",
++        outcomes=[outcome],
+     )
+ 
+     expected_error = getattr(agent_loop, error_type)
+     with pytest.raises(expected_error):
+         gateway.request_pit_optimizer_once(
+             "investigator",
+-            _task5_investigator_input(iteration=1, prior_iterations=()),
++            _task6_manifest_investigator_input(v2_manifest),
+             _task6_investigator_parser,
+             call_budget=v2_manifest.call_budgets[0],
+             authorization_lease=lease,
+             frozen_pricing=pricing,
+             wall_deadline=10.0,
+             monotonic=lambda: 1.0,
+         )
+ 
+     assert len(client.completions.calls) == 1
+     records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
+@@ -3606,48 +5030,45 @@ def test_pit_optimizer_v2_gateway_terminal_failures_close_without_retry(
+ 
+ 
+ def test_pit_optimizer_v2_gateway_sdk_failure_releases_both_reservations(
+     tmp_path: Path,
+     v2_manifest: contract.PitOptimizerRunManifest,
+     monkeypatch: pytest.MonkeyPatch,
+ ) -> None:
+     """Break caught: local SDK construction could be misreported as paid spend."""
+     import agent_loop
+ 
+-    authorization, ledger_path, lease, pricing = _task6_open_lease(
++    (
++        _authorization,
++        ledger_path,
++        lease,
++        pricing,
++        budget_ledger,
++        _audit,
++        _client,
++        gateway,
++    ) = _task6_gateway_context(
+         tmp_path,
+         v2_manifest,
+-    )
+-    audit = agent_loop.AuditTrail(tmp_path / "audit-before-send", "pit-v2-before-send")
+-    budget_ledger = agent_loop.BudgetLedger(
+-        max_usd=1.0,
+-        max_calls=6,
+-        max_tokens=448_000,
+-    )
+-    gateway = agent_loop.OpenRouterGateway(
+-        client=object(),
+-        pricing_loader=lambda _model: pytest.fail("live pricing was consulted"),
+-        ledger=budget_ledger,
+-        authorization_ledger=authorization,
+-        audit_trail=audit,
+-        max_attempts=1,
++        grant_id="grant-sdk-before-send",
++        outcomes=[],
+     )
+     monkeypatch.setattr(
+         gateway,
+         "_get_client",
+         lambda: (_ for _ in ()).throw(RuntimeError("synthetic SDK failure")),
+     )
+ 
+     with pytest.raises(agent_loop.GatewayError):
+         gateway.request_pit_optimizer_once(
+             "investigator",
+-            _task5_investigator_input(iteration=1, prior_iterations=()),
++            _task6_manifest_investigator_input(v2_manifest),
+             _task6_investigator_parser,
+             call_budget=v2_manifest.call_budgets[0],
+             authorization_lease=lease,
+             frozen_pricing=pricing,
+             wall_deadline=10.0,
+             monotonic=lambda: 1.0,
+         )
+ 
+     assert (budget_ledger.calls, budget_ledger.reserved_tokens) == (0, 0)
+     assert budget_ledger.committed_usd == pytest.approx(0.0)
+@@ -3657,51 +5078,46 @@ def test_pit_optimizer_v2_gateway_sdk_failure_releases_both_reservations(
+     assert records[-1]["record_type"] == "lease_close"
+ 
+ 
+ def test_pit_optimizer_v2_gateway_commits_authoritative_per_call_overage(
+     tmp_path: Path,
+     v2_manifest: contract.PitOptimizerRunManifest,
+ ) -> None:
+     """Break caught: an over-cap provider response could be released before rejection."""
+     import agent_loop
+ 
+-    authorization, ledger_path, lease, pricing = _task6_open_lease(
++    plan = v2_manifest.call_budgets[0]
++    (
++        _authorization,
++        ledger_path,
++        lease,
++        pricing,
++        _budget,
++        _audit,
++        _client,
++        gateway,
++    ) = _task6_gateway_context(
+         tmp_path,
+         v2_manifest,
+-    )
+-    plan = v2_manifest.call_budgets[0]
+-    client = _Task6FakeClient(
+-        [
++        grant_id="grant-authoritative-overage",
++        outcomes=[
+             _task6_fake_response(
+                 _canonical_text(_investigator_payload()),
+                 cost=plan.max_usd + 0.01,
+             )
+-        ]
+-    )
+-    audit = agent_loop.AuditTrail(tmp_path / "audit-overage", "pit-v2-overage")
+-    gateway = agent_loop.OpenRouterGateway(
+-        client=client,
+-        pricing_loader=lambda _model: pytest.fail("live pricing was consulted"),
+-        ledger=agent_loop.BudgetLedger(
+-            max_usd=1.0,
+-            max_calls=6,
+-            max_tokens=448_000,
+-        ),
+-        authorization_ledger=authorization,
+-        audit_trail=audit,
+-        max_attempts=1,
++        ],
+     )
+ 
+     with pytest.raises(agent_loop.BudgetExceededError, match="per-call"):
+         gateway.request_pit_optimizer_once(
+             "investigator",
+-            _task5_investigator_input(iteration=1, prior_iterations=()),
++            _task6_manifest_investigator_input(v2_manifest),
+             _task6_investigator_parser,
+             call_budget=plan,
+             authorization_lease=lease,
+             frozen_pricing=pricing,
+             wall_deadline=10.0,
+             monotonic=lambda: 1.0,
+         )
+ 
+     records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
+     assert records[-2]["provider_facts"]["outcome"] == "budget_exceeded"
+@@ -4438,20 +5854,21 @@ def test_candidate_identity_reverse_diff_sections_share_canonical_path_order(
+                 "changed_symbols": list(identity.changed_symbols),
+                 "unified_diff": reverse_diff,
+             }
+         ),
+         max_diff_bytes=64 * 1024,
+         max_total_bytes=72 * 1024,
+     )
+     author_input = contract.AuthorInput(
+         schema_version=2,
+         iteration=1,
++        run_manifest_sha256="0" * 64,
+         policy_interface_version=1,
+         immutable_constraint_ids=("causal_only", "no_external_io"),
+         candidate_bounds=contract.PatchBounds(3, 12, 200, 64 * 1024),
+         investigator=_investigator_artifact(),
+         source_bundle=initial_bundle,
+     )
+     author_input.validate_artifact(author)
+     validate_author_manifest(author, identity)
+ 
+ 
+@@ -4922,20 +6339,21 @@ def _task5_feedback(iteration: int) -> contract.IterationFeedbackSummary:
+ 
+ 
+ def _task5_investigator_input(
+     *,
+     iteration: int,
+     prior_iterations: tuple[contract.IterationFeedbackSummary, ...],
+ ) -> contract.InvestigatorInput:
+     return contract.InvestigatorInput(
+         schema_version=2,
+         iteration=iteration,
++        run_manifest_sha256="0" * 64,
+         policy_interface_version=1,
+         immutable_constraint_ids=("causal_only", "no_external_io"),
+         candidate_bounds=contract.PatchBounds(3, 12, 80, 8 * 1024),
+         rule_summary=contract.StrategyRuleSummary(
+             records=(
+                 contract.RuleSummaryRecord(
+                     "rule.entry",
+                     "Use causal entry inputs.",
+                 ),
+             )

@@ -1,0 +1,81 @@
+### Task 3: Add `MarketContextV1` and Preserve Causal Timing
+
+**Files:**
+
+- Create: `core/strategy_policy/market_context.py`
+- Modify: `core/strategy_policy/contracts.py`
+- Modify: `core/strategy_policy/__init__.py`
+- Modify: `core/strategy_policy/runtime.py`
+- Modify: `core/strategy_policy/worker.py`
+- Modify: `core/strategy_policy/entry.py`
+- Modify: `core/strategy_policy/risk.py`
+- Modify: `core/strategy_policy/exit.py`
+- Modify: `core/backtest_engine.py`
+- Modify: `tests/test_strategy_policy.py`
+- Modify: `tests/test_backtest_engine.py`
+- Modify: `tests/test_backtest_open_causality.py`
+
+**Interfaces:**
+
+- Produces:
+
+  ```python
+  @dataclass(frozen=True, slots=True)
+  class BenchmarkContextV1:
+      symbol: str
+      close_to_sma_50_fraction: float
+      close_to_sma_200_fraction: float
+      realized_volatility_20d_fraction: float
+
+  @dataclass(frozen=True, slots=True)
+  class MarketContextV1:
+      schema_version: int
+      session: str
+      oneil_regime: str
+      distribution_days: int
+      follow_through: bool
+      benchmarks: tuple[BenchmarkContextV1, ...]
+      active_constituent_count: int
+      breadth_above_50_fraction: float
+      breadth_50_coverage_fraction: float
+      breadth_above_200_fraction: float
+      breadth_200_coverage_fraction: float
+      median_rs_score: float
+      rs_at_least_80_fraction: float
+      rs_coverage_fraction: float
+  ```
+
+- Changes: `POLICY_INTERFACE_VERSION = 2`; `market: MarketContextV1` in `EntrySnapshot`, `CapacitySnapshot`, `AllocationSnapshot`, `EvictionSnapshot`, and `ExitSnapshot`; `market` in `PendingEntry`; portfolio checkpoint schema 4.
+
+- [ ] **Step 1: Add closed nested context contracts without weakening risk validators.**
+
+  Add a zero-allowing unit-fraction validator for breadth/coverage fields; keep `_fraction` behavior used by positive risk/stop fields unchanged. Require benchmark order `("SPY", "QQQ", "IWM")`, unique symbols, `schema_version == 1`, finite values, ISO session text, and coverage/count consistency. Remove `market_regime`, `distribution_days`, and `follow_through` only from `EntrySnapshot`.
+
+- [ ] **Step 2: Build one trusted context per completed session.**
+
+  Implement `build_market_context(...) -> MarketContextV1` in the new protected module. Use `close / SMA - 1`; use 21 closes for 20 close-to-close returns, sample standard deviation (`ddof=1`), and `sqrt(252)`; use full active PIT membership for breadth and RS; compute independent 50/200/RS coverage denominators; fail after warmup if any reference window or eligible cross-section is absent. Cache the result by session inside the simulator.
+
+- [ ] **Step 3: Reorder the daily loop to respect decision time.**
+
+  After the regime tracker consumes the just-completed benchmark bar, build the current context. Process pending next-open eviction/allocation using only `pending.market`. Process exits using the current completed-session context. Process entry qualification and capacity with that same current context, then store it in every returned `PendingEntry`.
+
+- [ ] **Step 4: Update every snapshot builder and checkpoint round trip.**
+
+  Thread `market` through `_entry_policy_snapshot`, `_build_entry_snapshot`, `_resolve_capacity`, `_evaluate_signals`, `_build_eviction_snapshot`, `_project_entry_transition`, allocation construction, `_build_exit_snapshot`, and `_check_exits`. Retire the `_enter_position` fallback that constructs a `PendingEntry` without explicit market context. Serialize/deserialize `PendingEntry.market` canonically and reject checkpoint schemas below 4 for interface-v2 resumes.
+
+- [ ] **Step 5: Preserve baseline policy behavior.**
+
+  Change `entry.py` to read regime fields from `snapshot.market`; let the baseline risk and exit policies ignore their new market field. Update existing nested-contract, pending-entry, allocation, exit, and causality fixtures in place. Do not alter trading thresholds in this migration.
+
+- [ ] **Step 6: Verify and commit.**
+
+  ```powershell
+  python -B -m compileall -q core/strategy_policy core/backtest_engine.py
+  python -B -m ruff check core/strategy_policy core/backtest_engine.py --no-cache
+  python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_strategy_policy.py tests/test_backtest_engine.py tests/test_backtest_open_causality.py
+  git add core/strategy_policy core/backtest_engine.py tests/test_strategy_policy.py tests/test_backtest_engine.py tests/test_backtest_open_causality.py
+  git commit -m "feat: add causal adaptive market context"
+  ```
+
+  Expected: policy interface v2 round-trips exact nested values, pending decisions retain the signal-session context, and existing baseline behavior remains unchanged on equivalent fixture data.
+

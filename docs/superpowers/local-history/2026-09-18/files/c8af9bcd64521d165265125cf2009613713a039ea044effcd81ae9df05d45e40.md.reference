@@ -1,0 +1,39 @@
+# Independent B4a static review: APPROVED
+
+No actionable findings in the reviewed B4a source change. Approval covers this bounded runtime-routing increment only; it does not establish executed rejection lifecycle behavior or authorize a campaign.
+
+Reviewed the binding B4a prompt, recovery design/plan, B3b principal approval and verification, B4a report/diff/verification and archived-input inspection script, plus the relevant runtime, rendering, identity, payload, repository, selection and record-construction source paths. No production code was changed.
+
+## Exact scope
+
+Independently read and hashed the current runtime and exact preimage:
+
+- Preimage: `1c4c4dd2a3c7082982866e6ed820336e5afeb9755b0005fb80e65224bcc0d462`.
+- Current runtime: `097b5c1e67e2f4c2852a8033e1a3f30d14254f0e2d18b4a899589d555e61d1f3`.
+- Saved implementation diff: `808412c3d70eead7f12a2c48743a91a24c1dd17dc1d5510cd8632228ee120929`.
+
+A fresh read-only preimage diff, ignoring line-ending differences, matches the submitted change: imports, `_existing_payload` annotation, added `_Journal.event_reference` and `_Runtime._rejected_candidate`, rendering/screening union routing, discovery union routing, and the exact candidate-type critic filter. All seven protected source hashes independently match the B3b principal verification: artifacts.py, candidate_ir.py, contracts.py, memory.py, production_runtime.py, provider.py and rendering.py.
+
+## Source conclusions
+
+| Reviewed path | Conclusion |
+| --- | --- |
+| `runtime.py:2460` `_render_and_quick_screen` | Calls the approved outcome renderer with the same authenticated parent bundle, revision, template and manifest cap. Existing exception-to-failure handling, nonempty/cap checks and rendering deadline remain. Exact rendered outcomes enter unchanged `_initial_candidate`; exact rejected outcomes enter the dedicated helper; unsupported outcomes abort. Returned order is preserved. |
+| `runtime.py:2377` `_rejected_candidate` | Requires the accepted current-round author completion and its actual artifact reference. Stored invocation loading authenticates the package; runtime additionally checks campaign/round/role, complete canonical template and full author-hypothesis hash. Identity uses the existing derivation and actual parent, hypothesis, template, assignment, round and plan. No author/provider work is repeated. |
+| `runtime.py:2426` rejection recovery | Unique identity lookup and related identity/assignment scan reject duplicate or conflicting authority. Full canonical payload bytes bind identity, typed assignment, author reference and failure code. This does not rely on Python bool/integer equality. An exact existing rejection reuses its event; a fresh rejection checks cancellation and the supplied rendering deadline before append. |
+| `runtime.py:994` `_Journal.event_reference` | Finds exactly one same-type, canonical-payload match in paired authenticated journal entries and requires the current campaign/round. Builds the canonical event path from that actual event's sequence and SHA. It neither guesses a future sequence nor uses a payload SHA as the event SHA. Existing append/payload-reference behavior is preserved. |
+| `runtime.py:1027` `_Journal.append` and `artifacts.py:2896` | Existing append persists the event before exposing it in the in-memory journal. Repository append/replay still enforce the corrected B2 author/intent/bounded-assignment, rendered/rejected conflict, terminal candidate and critic-exclusion checks. The new helper does not duplicate enumeration or introduce raw filesystem operations. |
+| `runtime.py:2502` screening and `runtime.py:2539` discovery | Only exact materialized quick-ready carriers supply quick inputs. Rejections short-circuit materialized/fingerprint/evidence accesses, retain their position, and pass unchanged through discovery. Unsupported discovery carriers abort. Existing survivor selection still handles empty eligible input by returning no survivors; no default is manufactured. Materialized discovery body and episode/failure recovery remain unchanged. |
+| `runtime.py:3100` critic filtering | Only exact materialized carriers with existing testable statuses supply critic candidates in original order. Rejected IDs cannot reach critic requests or precritic evidence. The existing empty-testable abort remains. |
+| `runtime.py:2900` `_publish` | B3b safeguards are unchanged: supported carrier types, unique IDs, identity/status pairing, and source authority only for checked materialized evaluated/zero-trade records. Independent expected-record equality and the B3a factories are unchanged. |
+| `runtime.py:2975` `run` and deferred methods | Early terminal handling remains before new role requests/rendering, so this diff does not reopen terminal actual06. Completion/projection recovery/cleanup, role budgeting, finalized-round authority and investigator feedback were not changed. B4b/B4c remain deferred. |
+
+Rejected carriers create no rendered variant, validation-stage, execution, or lease event and cannot invoke materialization, validation, semantic probes, quick evaluation or discovery evaluation. Their only new candidate event is the dedicated durable rejection payload, followed by the existing closed invalid carrier.
+
+## Evidence limits
+
+The implementation report correctly distinguishes its executed pure rendering/identity inspection of the archived actual06 author and parent, and its historical runtime-04 record compatibility check, from unexecuted B4a append/recovery/routing paths. The inspection script contains no new runtime/rejection-journal call. Actual06 has no rejection event, so those archived checks do not prove new event publication or lifecycle completion. This review did not rerun that script, Ruff, compilation, or evaluator identity computation; their reported results remain implementation evidence, while this review independently checked source hashes and the exact diff.
+
+No tests were read, created, changed or run. No synthetic input/event/reference/record/probe, model/API/credential/evaluator/candidate/campaign activity, commit, push or deployment occurred. The only write was this requested review document.
+
+B4b must still complete no-testable publication/checkpoint/cleanup and exact finalized-round/recovery authority. B4c must still retain invalid hypothesis history and supply bounded rejection feedback. Two rejected lifecycle rounds do not satisfy the original two evaluated feedback rounds.

@@ -1,0 +1,179 @@
+# Task 5 report — authenticated ticker transitions in evaluator paths
+
+## Outcome
+
+Implemented and committed Task 5 as `1c5529b` (`fix: bind optimizer evaluations to ticker transitions`).
+The commit contains exactly the three authorized source files:
+
+- `core/pit_policy_parity.py`
+- `agent_loop.py`
+- `core/pit_optimizer_v5/evaluator.py`
+
+No tests were created or modified. No historical artifacts were edited. No provider, Docker,
+replay, qualification, push, or merge operation was performed.
+
+## V4 parity and audit composition
+
+- The authenticated parity boundary now loads one `PriceIdentityTransitionContract`, validates
+  its exact prices-provenance digest against the discovery plan, validates both its claimed and
+  canonically recomputed request-contract identity against the PIT bundle, and only then enters
+  panel evaluation.
+- Quick and discovery parity panels pass that exact loaded object to `PortfolioSimulator`.
+- `build_panel_evidence_v4` accepts an optional transition contract. Legacy callers that omit it
+  retain their prior byte shape. Authenticated V4 parity calls newly emit
+  `prices_provenance_sha256` and `identity_transition_contract_sha256`, and those values participate
+  in `evidence_sha256`.
+- Newly captured V4 reference and attestation artifacts also emit
+  `identity_transition_contract_sha256`. The existing permissive V4 reader remains unchanged, so
+  old artifacts are not rewritten or reinterpreted. A future rerun must match the new transition-
+  aware evidence rather than silently treating historical output as transition-aware.
+- The agent-loop V4 evaluator resolves the original prices-provenance path from the baseline run
+  manifest, verifies the baseline input digest against the authenticated discovery plan, verifies
+  the manifest bundle identity, rechecks the provenance file bytes, loads and canonically validates
+  the transition contract, and does all of this before candidate worker-factory construction or
+  simulator construction. The exact loaded contract is passed to every baseline/candidate panel
+  simulator.
+
+## V5 preflight
+
+- Existing Task 3 behavior already loaded the transition contract once during evaluator
+  construction, compared its declared provenance and request-contract identities to
+  `EvaluatorContractV5`, and passed the exact object to every fresh scenario simulator before
+  candidate provenance was attached and validated.
+- Task 5 hardens that boundary by hashing the actual provenance file bytes and recomputing the
+  canonical request-contract identity from the loaded identity map. A loader cannot satisfy
+  preflight merely by returning substituted contents with copied digest fields.
+- Missing loaders, substituted provenance bytes, substituted request-contract contents, and
+  mismatched claimed identities fail before any baseline/candidate worker or simulator is created.
+- Task 3 candidate root, policy identity, worker binding, and result provenance checks are
+  unchanged.
+
+## Transition lifecycle evidence
+
+A provider-free deterministic smoke exercised the Task 2 lifecycle with an `OLD -> NEW` transition:
+
+- the open `Trade` moved to `NEW` on the effective date;
+- the same mutable trade and V5 episode state objects survived the transfer;
+- episode ID `episode-1`, entry symbol `OLD`, existing add-on count, and quantity path were preserved;
+- pending entry and pending policy-exit symbols remapped to `NEW`;
+- the successor was marked and later closed normally under `NEW`;
+- the finalized episode retained entry symbol `OLD`, exit symbol `NEW`, the original episode ID,
+  add-on evidence, and a terminal zero-quantity exit transition; and
+- the transaction evidence contained exactly one `TRANSFER`, which is the Task 4 diagnostic source
+  for `identity_transition_count`.
+
+Smoke output:
+
+```text
+{'transfer': 1, 'pending_entry': 'NEW', 'pending_exit': 'NEW', 'episode': 'episode-1', 'exit_symbol': 'NEW', 'closed': 1}
+```
+
+The repository has no separate pending-add-on carrier. Existing add-on state is represented by the
+trade/episode quantity path and `add_on_count`; both were preserved by the transfer smoke.
+
+## Fail-fast smoke evidence
+
+V5 construction smoke:
+
+```text
+{'exact_object': True, 'missing_pre_sim': True, 'substituted_contract_pre_sim': True, 'substituted_provenance_pre_sim': True, 'simulator_calls': 0}
+```
+
+V4 authenticated parity smoke after canonical-identity hardening:
+
+```text
+{'exact': True, 'missing_pre_sim': True, 'substituted_pre_sim': True, 'evaluation_calls': 1}
+```
+
+V4 agent-loop audit composition smoke verified that a valid exact contract reached the simulator,
+while missing/substituted contracts left both worker and simulator counters unchanged after the one
+valid control call:
+
+```text
+{'exact_contract_to_audit_simulator': True, 'missing_pre_worker_sim': True, 'substituted_pre_worker_sim': True, 'worker_calls': 1, 'simulator_calls': 1}
+```
+
+## Static and focused verification
+
+- `python -B -m ruff check core/pit_policy_parity.py core/pit_optimizer_v5/evaluator.py agent_loop.py`
+  — passed.
+- `python -B -m py_compile core/pit_policy_parity.py core/pit_optimizer_v5/evaluator.py agent_loop.py`
+  — passed.
+- `git diff --check` and staged `git diff --cached --check` — passed.
+- `python -B -m pytest tests/test_pit_policy_parity.py -k "transition or identity" -q`
+  — 4 passed, 22 deselected.
+- `python -B -m pytest tests/test_backtest_engine.py -k "transition or identity" -q`
+  — 5 passed, 50 deselected.
+- `tests/test_pit_optimizer_evaluator_v5.py` does not exist in this worktree, consistent with the
+  controller ruling that Tasks 1–5 must not create tests.
+- Pytest emitted only the existing `websockets.legacy` deprecation and sandbox-denied pytest cache
+  warnings; neither affected test outcomes.
+- Commit hooks passed Ruff, whitespace, end-of-file, YAML, and merge-conflict checks.
+
+## Compatibility decision
+
+The frozen/slotted V4 `PanelAggregateSummary` and its exact-key reader live outside Task 5's source
+scope. Adding a transition field there would be a backward-incompatible artifact-schema change.
+Accordingly, aggregate readers remain unchanged. V4 audit simulations are explicitly transition-
+aware and are transitively bound through the authenticated plan/provenance/bundle identities, while
+the newly emitted parity panel/reference/attestation evidence carries the explicit optional
+transition identity. This preserves old readers and changes future authenticated reruns only.
+
+## Self-review
+
+- Reviewed the final committed diff for ordering: transition/provenance validation precedes worker
+  and simulator construction in authenticated V4 and V5 paths.
+- Confirmed every newly constructed authenticated parity/audit/V5 simulator receives the exact
+  loaded contract explicitly.
+- Confirmed legacy simulator defaults and legacy `build_panel_evidence_v4` calls remain opt-in and
+  unchanged when no transition contract is supplied.
+- Confirmed source commit scope is exactly the three authorized files.
+
+## Critical review follow-up: sealed-manifest path containment
+
+The Critical issue in `task-5-review.md` was corrected in separate commit `8769fb7`
+(`fix: contain optimizer provenance paths`), containing only `agent_loop.py`.
+The V4 audit composition now treats authenticated `config.source_root` as the provenance boundary:
+
+- relative manifest values are joined lexically to that root and any `..` component is rejected;
+- absolute values must already be lexically contained by the root;
+- the root and every selected component are inspected with `lstat()` before resolution;
+- symlinks and Windows reparse points/junctions are rejected at the root, intermediate-directory,
+  and leaf positions;
+- missing components, non-directory intermediate components, and non-regular leaves are rejected;
+  and
+- only after that walk is the path strictly resolved, containment is rechecked, and the existing
+  digest and transition-contract identity checks run.
+
+These checks remain ahead of PIT bundle loading, candidate worker-factory construction, simulator
+construction, hashing, and transition-contract loading. The prior exact-object transition wiring
+and digest/identity checks are unchanged.
+
+The hardened direct smoke used the real repository `core/pit_provenance.py` as the in-root regular
+file and its byte-identical main-checkout counterpart as an outside duplicate-digest file. Results:
+
+```text
+{'valid_relative': True, 'dotdot': True, 'outside_absolute': True,
+ 'duplicate_digest_equal': True, 'outside_duplicate_rejected': True,
+ 'leaf_reparse': True, 'intermediate_reparse': True, 'exact_contract': True,
+ 'valid_v4': True, 'v4_dotdot_preflight': True, 'v4_outside_preflight': True,
+ 'v4_reparse_preflight': True,
+ 'calls': {'bundle': 1, 'simulator': 1, 'worker': 0}}
+```
+
+The single bundle/simulator call is the valid control. All traversal, outside-absolute, duplicate-
+digest, and reparse cases left the counters unchanged; no candidate worker was constructed. Windows
+denied creation of real test symlinks in this sandbox (`OSError`), so leaf and intermediate reparse
+branches were additionally exercised by controlling the established `_has_reparse_point` boundary
+against real existing path components.
+
+Fresh follow-up verification:
+
+- `python -B -m ruff check agent_loop.py core/pit_policy_parity.py core/pit_optimizer_v5/evaluator.py`
+  — passed.
+- `python -B -m py_compile agent_loop.py core/pit_policy_parity.py core/pit_optimizer_v5/evaluator.py`
+  — passed.
+- `git diff --check` — passed.
+- `python -B -m pytest tests/test_pit_policy_parity.py -k "transition or identity" -q`
+  — 4 passed, 22 deselected; only the existing deprecation and sandbox-denied pytest-cache warnings
+  were emitted.

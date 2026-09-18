@@ -1,0 +1,81 @@
+--- a/core/pit_optimizer_v5/provider.py
++++ b/core/pit_optimizer_v5/provider.py
+@@ -1995,7 +1995,9 @@
+     return result
+ 
+ 
+-def wire_role_schema_v5(schema: Mapping[str, object]) -> dict[str, object]:
++def wire_role_schema_v5(
++    schema: Mapping[str, object], *, allow_full_source_escape: bool | None = None
++) -> dict[str, object]:
+     """Project schema nodes for transport without changing local schema authority.
+ 
+     Uniqueness is still enforced by the canonical schema/parser. Current oneOf
+@@ -2004,6 +2006,8 @@
+     """
+     if not isinstance(schema, Mapping):
+         raise ValueError("role transport schema must be an object")
++    if allow_full_source_escape is not None and type(allow_full_source_escape) is not bool:
++        raise ValueError("role transport authoring permission must be boolean or absent")
+ 
+     def project(node, *, root=False):
+         if type(node) is bool:
+@@ -2037,6 +2041,15 @@
+ 
+     result = project(schema, root=True)
+     authority = schema.get("x-pit-optimizer-v5-authority")
++    if (
++        isinstance(authority, Mapping)
++        and authority.get("role") == "investigator"
++        and allow_full_source_escape is False
++    ):
++        # This permission comes from the authenticated manifest, not the author-only
++        # RoleSchemaAuthority flag. None preserves historical/superset projection.
++        mode = result["properties"]["artifact"]["properties"]["hypotheses"]["items"]["properties"]["authoring_mode"]
++        mode["enum"] = ["symbol_edits"]
+     if isinstance(authority, Mapping) and authority.get("role") == "author":
+         # Match the existing local qualified-symbol contract at generation time.
+         # Never normalize a received artifact or change its canonical authority.
+--- a/core/pit_optimizer_v5/production_provider.py
++++ b/core/pit_optimizer_v5/production_provider.py
+@@ -132,6 +132,7 @@
+             response_schema_json=response_schema_json,
+             max_output_tokens=max_output_tokens,
+             wall_deadline=deadline_monotonic,
++            allow_full_source_escape=self._ledger.manifest.search.allow_full_source_escape,
+         )
+         if type(result) is not CompletionResultV5:
+             raise ValueError("OpenRouter V5 gateway returned an invalid completion")
+--- a/agent_loop.py
++++ b/agent_loop.py
+@@ -3865,6 +3865,7 @@
+         response_schema_json: bytes,
+         max_output_tokens: int,
+         wall_deadline: float,
++        allow_full_source_escape: bool | None = None,
+     ) -> object:
+         """Perform one retry-free V5 JSON-schema completion without owning its ledger."""
+ 
+@@ -3912,7 +3913,7 @@
+                 "json_schema": {
+                     "name": "pit_optimizer_v5_role",
+                     "strict": True,
+-                    "schema": wire_role_schema_v5(schema),
++                    "schema": wire_role_schema_v5(schema, allow_full_source_escape=allow_full_source_escape),
+                 },
+             },
+             stream=False,
+--- a/.superpowers/sdd/2026-09-04-pit-optimizer-v5-campaign/prepare-provider-development.py
++++ b/.superpowers/sdd/2026-09-04-pit-optimizer-v5-campaign/prepare-provider-development.py
+@@ -176,7 +176,10 @@
+         raise ValueError("Initial outbound request exceeds the proposed token ceiling")
+     save("initial-role-request.json", request.to_primitive())
+     save("initial-response-schema.json", json.loads(request.schema_authority.canonical_schema_json))
+-    wire_schema = wire_role_schema_v5(json.loads(request.schema_authority.canonical_schema_json))
++    wire_schema = wire_role_schema_v5(
++        json.loads(request.schema_authority.canonical_schema_json),
++        allow_full_source_escape=final.manifest.search.allow_full_source_escape,
++    )
+     save("initial-wire-response-schema.json", wire_schema)
+     wire = {"model": provider.model, "messages": wire_role_messages_v5(request.messages),
+             "response_format": {"type": "json_schema", "json_schema": {"name": "pit_optimizer_v5_role", "strict": True,

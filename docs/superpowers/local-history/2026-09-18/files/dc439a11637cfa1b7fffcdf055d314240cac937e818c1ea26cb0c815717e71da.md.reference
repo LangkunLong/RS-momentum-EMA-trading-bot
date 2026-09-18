@@ -1,0 +1,19 @@
+# Independent development-semantics review
+
+Commit reviewed: `0985d9bae74162ec1da8a7268bd54e47f21b0b85` against parent `993f4a96c8b2f4c7d9a779ee711ed9d55d1bd385`.
+
+## Spec-compliance verdict: FAIL
+
+### [P1] Finalized disabled-development campaigns cannot be authenticated — `core/pit_optimizer_v5/artifacts.py:1329`
+
+`verify_finalized_campaign` reconstructs `CandidateArchiveReducerV5` without passing the finalized manifest's `pit_data_scope` and `semantic_mode`. The reducer therefore defaults to `production` / `required`. When the finalized campaign contains the newly authorized `development_sp500_v2` / `disabled_development` records, `reduce_experiment_journal_v5` calls `CandidateArchiveReducerV5.apply`, whose new cross-binding rejects every such record with `ArchiveAuthorityMismatchV5`. Thus a disabled-development campaign can persist records and a checkpoint but its final archive cannot pass the repository's canonical finalized-campaign verification. This contradicts the required durable record/history/recovery support and the implementation report's claim that every archive reducer construction uses the manifest mode. Construct this reducer with `pit_data_scope=manifest.pit_data_scope` and `semantic_mode=manifest.semantic_mode`, as the three runtime reducer factory paths already do.
+
+## Code-quality verdict: FAIL
+
+### [P2] Required-mode quick candidates accept missing semantic evidence — `core/pit_optimizer_v5/selection.py:133`
+
+`QuickScreenCandidateV5.__post_init__` rejects a fingerprint in disabled mode, but it does not enforce the converse: `semantic_mode="required"` still accepts `semantic_fingerprint=None`. The prior contract required a concrete `SemanticFingerprintV5`, and the brief says production required semantics must remain strict. A malformed required-mode candidate now survives construction and is silently treated as ineligible by `is_eligible`; this converts missing required evidence into ordinary selection rejection instead of an authority/schema failure. Enforce `(semantic_fingerprint is None) == (semantic_mode == "disabled_development")`, matching the invariant already used by `QuickEvidencePayloadV5` and the parent contracts.
+
+## Review boundaries
+
+The review read the exact source/docs diff and necessary source context only. No tests, synthetic probes, application imports, Docker, network/provider calls, or source edits were performed.

@@ -1,0 +1,22 @@
+# Scoped Windows long-path review
+
+**PASS.** No concrete findings in the two-file unstaged fix. Spec and quality pass for this bounded filesystem change.
+
+Reviewed `git diff -- core/pit_optimizer_artifacts.py core/pit_optimizer_v5/production_fs.py` and necessary surrounding source only. The previously reviewed staged integration and summary fix were excluded.
+
+- `_windows_extended_path` now recognizes an existing extended prefix before ordinary UNC handling. Existing extended paths remain unchanged; ordinary UNC and drive-absolute paths retain their respective extended encodings.
+- The affected pinned artifact operations consistently convert Windows paths at OS boundaries: directory pre/post-open metadata and reparse checks, child existence checks, directory creation, exclusive artifact creation, temporary-file creation, replace and unlink. This includes the formerly unprefixed exclusive `os.open` at `core/pit_optimizer_artifacts.py:812`, the concrete reported failure boundary.
+- `_DirectoryAccess.path`, returned artifact paths and stored repository references are not rewritten. Temporary-file creation uses an extended directory argument but returns only the temporary basename to the existing replace/cleanup flow. Payload bytes and digest construction remain unchanged.
+- Parent identity rechecks and component handle pinning remain in place. `production_fs.py:136` and `:157` now use the same extended spelling for metadata checks that the existing Windows regular-file opener already uses. Regular-file mode, reparse rejection, single-link requirement, pre/open/post identity comparison and handle-sharing flags are unchanged.
+- Every new OS-path conversion is inside the Windows path, or explicitly conditional on `os.name == "nt"`. POSIX descriptor-relative opens, metadata operations, creation, rename, unlink and no-follow flags remain unchanged.
+
+Source SHA-256 values independently match the dispatch:
+
+| Source | SHA-256 |
+| --- | --- |
+| `core/pit_optimizer_artifacts.py` | `db794919689fcaee11d63870a56a8c62e2235fcadf022337170251c49c0c7dcd` |
+| `core/pit_optimizer_v5/production_fs.py` | `26e744b81bd9ab9b2b241980657ce924f13783aeb06372f4d4f1db447a02b06a` |
+
+This is approval of these unstaged source bytes, not evidence that the interrupted runtime resumed successfully. The controller-reported orphan start is not changed or removed by this diff; recovery remains a separate actual execution. No image build or image-closure verification was performed in this review.
+
+No tests were read, created, changed or run. No probes, application execution/imports, Docker, network, agents, commits, staging or hook changes occurred. Only this report was written.

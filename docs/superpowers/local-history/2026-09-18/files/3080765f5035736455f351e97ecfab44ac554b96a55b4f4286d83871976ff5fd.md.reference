@@ -1,0 +1,81 @@
+# Task 5 Report: Integrated Offline Acceptance and Exposure Audit
+
+## Status
+
+COMPLETE. The build compiles, the sealed Task 11 artifact diagnosis reconciles unchanged, the final reviewed C/A provenance evidence is authenticated and reused, and the current effective-policy surface matches the source-attested inventory.
+
+No parameters were selected, no return was improved, no drawdown was reduced, and no optimizer/backtest was run. CANSLIM remains the feature basis; the multi-agent backtest loop owns later return/drawdown optimization.
+
+## Narrow integration correction
+
+The Step 1 command initially failed before artifact reads because `diagnose-task11-artifacts` required an absolute `--baseline-run`, while the approved command uses a repository-relative path. `pit_diagnosis.py` was changed only at that parser argument from `_absolute_path` to `Path`, matching the Task 3 route. Immutable baseline verification remains inside the diagnosis. The exact approved command then passed.
+
+## Fresh sealed artifact evidence
+
+Command:
+
+```powershell
+python -B pit_diagnosis.py diagnose-task11-artifacts --baseline-run ".artifacts/task-11-prefix-replay-20260826T001500Z/run-20260826T002913Z-1af306ef1e46" --baseline-profile strict-proper-base-task11
+```
+
+Exit code: `0`. The profile is still `strict-proper-base-task11`, `fidelity_incomplete`, and not optimal: it omits production PIT institutional and industry-leadership evidence. Sealed identity remains manifest SHA-256 `f99eb6aade8b567b319accb95dadd80789064aacf1cb8b85d0cc31379caf6382` and bundle SHA-256 `1af306ef1e46797473cd186fc48938ed6694ae25f5943c9f1905b528307cc2eb`.
+
+For 2023-01-01 through 2025-12-31 the fresh output reports:
+
+- 375,703 evaluated symbol-days; 8,439 technical setups.
+- C: 1,926 pass, 5,712 finite-below, 801 unavailable.
+- Conditional A: 627 pass, 1,136 finite-below, 163 unavailable.
+- 238 RS passes; 173 composite-qualified/attempted; 131 executed; 42 next-open buy-zone rejections.
+- Average cash 67.60512426994353%, average open holdings 2.821656050955414, maximum eight.
+
+For 2021-01-01 through 2025-12-31 it reports 598,696 evaluated symbol-days, 12,291 technical setups, 233 qualified/attempted signals, 176 executions, and 57 next-open buy-zone rejections. Capacity, no-cash, invalid-risk, invalid-price, missing-data, and already-open rejections are zero. Execution remains next-session open with buy-zone validation.
+
+## Reused final C/A provenance evidence
+
+Per the binding Task 5 ruling, the five-minute C/A command was not rerun. Task 3 fix round 2 already ran the final full reconciliation from authenticated immutable bundle bytes deserialized into query-only in-memory SQLite. Tasks 4–5 did not alter parsed bytes or reconciliation semantics; the final Task 3 report/review therefore remains exact authority.
+
+That final run verified all six source-chain objects by canonical digest and returned aggregate-only output with zero mismatches:
+
+- C: 8,439 cohort, 1,926 pass, 5,712 finite-below, 801 unavailable.
+- Conditional A: 1,926 cohort, 627 pass, 1,136 finite-below, 163 unavailable.
+- Scalar/availability rows checked: C 8,439; A 1,926; `passed=true`.
+
+C by year (cohort/pass/below/unavailable): 2023 `2791/599/1890/302`, 2024 `2998/705/2003/290`, 2025 `2650/622/1819/209`. A by year: 2023 `599/198/346/55`, 2024 `705/220/430/55`, 2025 `622/209/360/53`.
+
+C metric-family outcomes, diluted EPS/net income, are pass `1885/41`, finite-below `5542/170`, unavailable `502/26`, plus unavailable-family `273`. A outcomes are pass `615/12`, finite-below `1118/18`, unavailable `154/9`. C unavailable reasons: negative-prior 511, no-visible-observation 273, zero-prior 17. A: negative-prior 155, insufficient-annual-history 8. C public-date visibility: both 8166, neither 273. A: both 1918, current-only 8. No private row identity, filing identifier, path, URL, raw metric, or archive data was published.
+
+## Effective-policy audit
+
+A direct non-fetching default built-in audit passed. All 126 policy leaves have valid classification/candidate flags and nonempty source references. Digest:
+
+```text
+744104da98b205d73b827d9ecd90e610dbc9d830eb11adc09b31cc034b3a006a
+```
+
+Classification counts: active fixed 81, active tunable 25, advisory/unsupported 8, causal invariant 12.
+
+The policy confirms `strategy_basis=CANSLIM-derived`, owner `multi_agent_backtest_loop`, objective `maximize_return_and_minimize_drawdown`, and `optimization_executed_by_this_build=false`. CANSLIM thresholds/weights are active-fixed optimizer candidates, not universal hard constraints. PIT visibility, completed-session facts, next-open/revalidation, and cash/no-leverage are causal invariants. Supported market/regime controls are active tunables; hard-coded behavior-bearing rules are active fixed.
+
+The audit confirmed actual sizing `portfolio_equity * position_risk_pct / stop_loss_pct` and scale tiers `[[0.1, 0.25], [0.15, 0.25], [0.2, 0.25]]`. The seven inert compatibility fields are all advisory/unsupported: `min_rs_score`, `min_canslim_score`, `min_technical_score`, `position_size_pct`, `take_profit_pct`, `scale_out_fraction`, and `min_c_a_growth`. `take_profit_pct=0.41` rejects before data access.
+
+Injected-strategy checks also passed: opaque custom strategies are declared `engine_owned_envelope_only` with unattested internals; a JSON-safe declared identity expands scope only to `engine_owned_envelope_plus_declared_custom_identity`.
+
+## Verification
+
+```powershell
+python -B -m py_compile core/canslim/earnings_trace.py core/canslim/c_current_earnings.py core/canslim/a_annual_earnings.py core/pit_data.py core/pit_diagnosis/task11_ca_provenance.py core/pit_diagnosis/task11_artifact_diagnosis.py core/pit_diagnosis/baseline.py core/engine_policy.py core/backtest_engine.py pit_baseline.py pit_diagnosis.py
+git diff --check
+git status --short
+```
+
+All exited `0`. Diff check had only repository LF-to-CRLF notices and no whitespace errors. The status shows expected uncommitted Task 11 implementation/pre-existing dirty files; nothing was staged, committed, pushed, merged, deleted, or reset.
+
+No pytest or unit tests were run and no test file was edited. Formal regression testing remains deliberately deferred until the user ends the build phase.
+
+## Files changed in this task
+
+- `pit_diagnosis.py` — the isolated relative-path parser compatibility fix.
+- This handoff report.
+
+No network/provider access, dataset download, cache refresh, PIT baseline, portfolio backtest, optimizer/process change, Git write, or sealed-artifact mutation occurred.
+

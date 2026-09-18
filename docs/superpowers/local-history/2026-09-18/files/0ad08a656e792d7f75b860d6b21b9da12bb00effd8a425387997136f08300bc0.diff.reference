@@ -1,0 +1,1219 @@
+# Review package: 5526e02..9115cdb
+
+## Commits
+9115cdb fix: complete PIT optimizer identity and envelope proofs
+
+## Files changed
+ core/pit_optimization_contract.py | 256 +++++++++++++++++++-------
+ core/pit_optimizer_evaluation.py  |  49 +++++
+ tests/test_pit_optimizer_v2.py    | 372 +++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 603 insertions(+), 74 deletions(-)
+
+## Diff
+diff --git a/core/pit_optimization_contract.py b/core/pit_optimization_contract.py
+index 193a321..465ad63 100644
+--- a/core/pit_optimization_contract.py
++++ b/core/pit_optimization_contract.py
+@@ -16,20 +16,22 @@ from decimal import Decimal
+ from pathlib import Path
+ from types import MappingProxyType
+ from typing import Mapping
+ 
+ from core.pit_optimizer_evaluation import (
+     AggregateMetric,
+     DiscoveryExposureProof,
+     DiscoveryScore,
+     FoldAggregateSummary,
+     FoldManifest,
++    ValidationExposureMetadata,
++    ValidationWindowIdentity,
+     discovery_score_from_folds,
+ )
+ 
+ 
+ ENTRY_CONTRACT_PATH = "core/canslim/entry_contract.py"
+ FULL_START_DATE = "2021-01-01"
+ FULL_END_DATE = "2025-12-31"
+ HOLDOUT_START_DATE = "2025-01-01"
+ HOLDOUT_END_DATE = FULL_END_DATE
+ PIT_BUNDLE_SHA256 = "1af306ef1e46797473cd186fc48938ed6694ae25f5943c9f1905b528307cc2eb"
+@@ -1459,26 +1461,30 @@ def _apply_unified_diff(
+         result: list[str] = []
+         source_index = 0
+         file_hunks = 0
+         while index < len(lines) and not lines[index].startswith("--- a/"):
+             header = lines[index]
+             match = _HUNK_RE.fullmatch(header)
+             if match is None:
+                 raise ValueError("candidate unified diff hunk header is invalid")
+             old_start = int(match.group(1))
+             old_count = int(match.group(2) or "1")
++            new_start = int(match.group(3))
+             new_count = int(match.group(4) or "1")
+-            target_index = max(old_start - 1, 0)
++            target_index = old_start if old_count == 0 else max(old_start - 1, 0)
+             if target_index < source_index or target_index > len(original):
+                 raise ValueError("candidate unified diff hunk location is invalid")
+             result.extend(original[source_index:target_index])
+             source_index = target_index
++            expected_new_start = len(result) + (0 if new_count == 0 else 1)
++            if new_start != expected_new_start:
++                raise ValueError("candidate unified diff new hunk location is invalid")
+             index += 1
+             observed_old = 0
+             observed_new = 0
+             while index < len(lines) and not lines[index].startswith(("@@ ", "--- a/")):
+                 line = lines[index]
+                 if line.startswith("\\ No newline at end of file"):
+                     raise ValueError("candidate unified diff newline markers are unsupported")
+                 if not line or line[0] not in {" ", "+", "-"}:
+                     raise ValueError("candidate unified diff body is invalid")
+                 payload = line[1:]
+@@ -2568,20 +2574,22 @@ def _controller_cumulative_diff(
+         )
+     )
+ 
+ 
+ def materialize_policy_source_descendant(
+     *,
+     scope: PolicySourceScope,
+     initial_bundle: PolicySourceBundle,
+     current_bundle: PolicySourceBundle,
+     artifact: AuthorArtifact,
++    immutable_constraint_ids: tuple[str, ...],
++    call_budgets: tuple[PitOptimizerCallBudget, ...],
+ ) -> PolicySourceMaterialization:
+     if not isinstance(artifact, AuthorArtifact):
+         raise ValueError("policy source materialization author artifact is invalid")
+     validate_policy_source_bundle_descendant(
+         scope=scope,
+         initial_bundle=initial_bundle,
+         bundle=current_bundle,
+     )
+     current_texts = {record.path: record.text for record in current_bundle.files}
+     resulting_texts, stats = _apply_unified_diff(
+@@ -2612,47 +2620,63 @@ def materialize_policy_source_descendant(
+     )
+     primitive = {
+         "policy_interface_version": scope.policy_interface_version,
+         "cumulative_diff_sha256": hashlib.sha256(
+             cumulative_diff.encode("utf-8")
+         ).hexdigest(),
+         "cumulative_diff": cumulative_diff,
+         "files": records,
+     }
+     if len(_v2_canonical_bytes(primitive)) > scope.max_policy_source_bundle_bytes:
+-        return PolicySourceMaterialization(
+-            bundle=None,
+-            validation=CandidateValidationSummary(
+-                failure_code="next_context_oversize",
+-                syntax_ok=True,
+-                imports_ok=True,
+-                purity_ok=True,
+-                deterministic_ok=True,
+-                worker_ok=True,
+-                replay_attempted=True,
+-            ),
+-        )
++        return _next_context_oversize_materialization()
+     bundle = PolicySourceBundle(
+         **primitive,
+         _controller_seal=_POLICY_SOURCE_BUNDLE_SEAL,
+     )
+     validate_policy_source_bundle_descendant(
+         scope=scope,
+         initial_bundle=initial_bundle,
+         bundle=bundle,
+     )
++    try:
++        render_worst_iteration_two_role_inputs(
++            scope=scope,
++            source_texts=resulting_texts,
++            immutable_constraint_ids=immutable_constraint_ids,
++            call_budgets=call_budgets,
++            prospective_source_bundle=bundle,
++        )
++    except ValueError as exc:
++        if str(exc).startswith("worst iteration-2"):
++            return _next_context_oversize_materialization()
++        raise
+     return PolicySourceMaterialization(
+         bundle=bundle,
+         validation=_successful_candidate_validation(),
+     )
+ 
+ 
++def _next_context_oversize_materialization() -> PolicySourceMaterialization:
++    return PolicySourceMaterialization(
++        bundle=None,
++        validation=CandidateValidationSummary(
++            failure_code="next_context_oversize",
++            syntax_ok=True,
++            imports_ok=True,
++            purity_ok=True,
++            deterministic_ok=True,
++            worker_ok=True,
++            replay_attempted=True,
++        ),
++    )
++
++
+ @dataclass(frozen=True, slots=True)
+ class CandidateComparisonSummary(_V2Canonical):
+     folds: tuple[FoldAggregateSummary, ...]
+     score: DiscoveryScore | None
+     diagnostics: tuple[AggregateMetric, ...]
+     _controller_seal: InitVar[object] = None
+ 
+     def __post_init__(self, _controller_seal: object) -> None:
+         if _controller_seal is not _CANDIDATE_COMPARISON_SEAL:
+             raise ValueError("candidate comparison must be controller derived")
+@@ -2682,25 +2706,45 @@ class CandidateComparisonSummary(_V2Canonical):
+             raise ValueError("candidate comparison exceeds its byte cap")
+ 
+ 
+ def candidate_comparison_from_fixed_baseline(
+     *,
+     candidate_folds: tuple[FoldAggregateSummary, ...],
+     original_baseline_folds: tuple[FoldAggregateSummary, ...],
+     original_baseline_sha256: str,
+     expected_original_baseline_sha256: str,
+     discovery_exposure: DiscoveryExposureProof,
++    expected_window_identities: tuple[
++        ValidationWindowIdentity,
++        ValidationWindowIdentity,
++    ],
++    expected_metadata: ValidationExposureMetadata,
+     diagnostics: tuple[AggregateMetric, ...],
+     supplied_score: DiscoveryScore | None = None,
+ ) -> CandidateComparisonSummary:
+     if not isinstance(discovery_exposure, DiscoveryExposureProof):
+         raise ValueError("candidate comparison discovery exposure is invalid")
++    if (
++        type(expected_window_identities) is not tuple
++        or len(expected_window_identities) != 2
++        or any(
++            not isinstance(item, ValidationWindowIdentity)
++            for item in expected_window_identities
++        )
++        or discovery_exposure.window_identities != expected_window_identities
++    ):
++        raise ValueError("candidate comparison expected window identities differ")
++    if (
++        not isinstance(expected_metadata, ValidationExposureMetadata)
++        or discovery_exposure.metadata != expected_metadata
++    ):
++        raise ValueError("candidate comparison expected metadata lineage differs")
+     if tuple(item.fold_id for item in candidate_folds) != discovery_exposure.fold_ids:
+         raise ValueError("candidate comparison folds differ from ledger exposure")
+     score = discovery_score_from_folds(
+         candidate_folds,
+         original_baseline_folds,
+         original_baseline_sha256=original_baseline_sha256,
+         expected_original_baseline_sha256=expected_original_baseline_sha256,
+     )
+     if supplied_score is not None and supplied_score != score:
+         raise ValueError("candidate comparison supplied score differs from fixed baseline")
+@@ -2908,126 +2952,198 @@ class CriticInput(_V2Canonical):
+         if artifact.hypothesis_id != self.hypothesis_id:
+             raise ValueError("critic hypothesis differs from its input")
+ 
+ 
+ def render_worst_iteration_two_role_inputs(
+     *,
+     scope: PolicySourceScope,
+     source_texts: Mapping[str, str],
+     immutable_constraint_ids: tuple[str, ...],
+     call_budgets: tuple[PitOptimizerCallBudget, ...],
++    prospective_source_bundle: PolicySourceBundle | None = None,
+ ) -> Mapping[str, bytes]:
+     """Render complete bounded iteration-2 role inputs before a manifest is sealed."""
+ 
+     if not isinstance(scope, PolicySourceScope):
+         raise ValueError("worst role input source scope is invalid")
+     _v2_string_tuple(immutable_constraint_ids, "worst role immutable constraints")
+     if tuple(source_texts) != scope.editable_paths:
+         raise ValueError("worst role source paths differ from scope")
+-    grown_texts = dict(source_texts)
+-    grown_texts[scope.editable_paths[0]] += "s" * scope.candidate_bounds.max_diff_bytes
+-    cumulative_diff = "d" * scope.candidate_bounds.max_diff_bytes
+-    source_bundle = PolicySourceBundle(
+-        policy_interface_version=scope.policy_interface_version,
+-        cumulative_diff_sha256=hashlib.sha256(
+-            cumulative_diff.encode("utf-8")
+-        ).hexdigest(),
+-        cumulative_diff=cumulative_diff,
+-        files=tuple(
++    if prospective_source_bundle is None:
++        grown_texts = dict(source_texts)
++        worst_escaped_bytes = "\\" * scope.candidate_bounds.max_diff_bytes
++        grown_texts[scope.editable_paths[0]] += worst_escaped_bytes
++        cumulative_diff = worst_escaped_bytes
++        source_records = tuple(
+             PolicySourceRecord(
+                 path=path,
+                 sha256=hashlib.sha256(grown_texts[path].encode("utf-8")).hexdigest(),
+                 declared_symbols=_POLICY_DECLARED_SYMBOLS[path],
+                 text=grown_texts[path],
+             )
+             for path in scope.editable_paths
+-        ),
+-        _controller_seal=_POLICY_SOURCE_BUNDLE_SEAL,
+-    )
+-    rule_summary = StrategyRuleSummary(
+-        records=(
+-            RuleSummaryRecord("rule_1", "r" * 3_800),
+-            RuleSummaryRecord("rule_2", "s" * 3_800),
+         )
+-    )
++        source_primitive = {
++            "policy_interface_version": scope.policy_interface_version,
++            "cumulative_diff_sha256": hashlib.sha256(
++                cumulative_diff.encode("utf-8")
++            ).hexdigest(),
++            "cumulative_diff": cumulative_diff,
++            "files": source_records,
++        }
++        if (
++            len(_v2_canonical_bytes(source_primitive))
++            > scope.max_policy_source_bundle_bytes
++        ):
++            raise ValueError("worst iteration-2 source bundle exceeds source cap")
++        source_bundle = PolicySourceBundle(
++            **source_primitive,
++            _controller_seal=_POLICY_SOURCE_BUNDLE_SEAL,
++        )
++    else:
++        if not isinstance(prospective_source_bundle, PolicySourceBundle):
++            raise ValueError("worst role prospective source bundle is invalid")
++        if (
++            prospective_source_bundle.policy_interface_version
++            != scope.policy_interface_version
++            or tuple(record.path for record in prospective_source_bundle.files)
++            != scope.editable_paths
++            or {
++                record.path: record.text
++                for record in prospective_source_bundle.files
++            }
++            != dict(source_texts)
++        ):
++            raise ValueError("worst role prospective source bundle differs from source")
++        if (
++            len(prospective_source_bundle.canonical_json_bytes())
++            > scope.max_policy_source_bundle_bytes
++        ):
++            raise ValueError("worst iteration-2 source bundle exceeds source cap")
++        source_bundle = prospective_source_bundle
+     folds = tuple(
+         FoldAggregateSummary(
+             fold_id=fold_id,
+             total_return_pct=1.0,
+             excess_total_return_pp=0.0,
+             max_drawdown_pct=-1.0,
+             sharpe_ratio=1.0,
+             closed_trades=1,
+             turnover_pct=1.0,
+             average_exposure_pct=1.0,
+             entry_funnel=(AggregateMetric("entries_executed", 1),),
+             exit_attribution=(AggregateMetric("end_of_test", 1),),
+         )
+         for fold_id in ("discovery_1", "discovery_2")
+     )
+-    discovery = DiscoveryEvidenceSummary(
+-        folds=folds,
+-        score=None,
+-        evidence_ids=("e" * 3_000, "f" * 3_000),
++
++    def maximize_contract(factory: object, cap: int) -> object:
++        if not callable(factory):
++            raise ValueError("worst role section factory is invalid")
++        best: object | None = None
++        best_size = -1
++        low = 0
++        high = MAX_ROLE_TEXT_BYTES
++        while low <= high:
++            count = (low + high) // 2
++            try:
++                candidate = factory(count)
++                size = len(_v2_canonical_bytes(candidate))
++            except ValueError:
++                size = cap + 1
++                candidate = None
++            if size <= cap:
++                best = candidate
++                best_size = size
++                low = count + 1
++            else:
++                high = count - 1
++        if best is None or best_size < cap - 1:
++            raise ValueError("worst role section cannot reach its canonical cap")
++        return best
++
++    def escaped(count: int) -> str:
++        return "\\" * count
++    rule_summary = maximize_contract(
++        lambda count: StrategyRuleSummary(
++            records=(RuleSummaryRecord("rule_1", "r" + escaped(count)),)
++        ),
++        MAX_DISCOVERY_EVIDENCE_BYTES,
++    )
++    discovery = maximize_contract(
++        lambda count: DiscoveryEvidenceSummary(
++            folds=folds,
++            score=None,
++            evidence_ids=("e" + escaped(count), "evidence_2"),
++        ),
++        MAX_DISCOVERY_EVIDENCE_BYTES,
+     )
+     incumbent = IncumbentSummary(
+         candidate_identity_sha256="1" * 64,
+         accepted_iteration=1,
+-        behavioral_summary="b" * 3_000,
++        behavioral_summary="\\" * MAX_ROLE_TEXT_BYTES,
+         discovery=discovery,
+     )
+-    feedback = IterationFeedbackSummary(
+-        iteration=1,
+-        hypothesis_id="hypothesis_1",
+-        family="entry",
+-        author_summary="a" * 1_700,
+-        validation_code="valid",
+-        discovery_score=None,
+-        critic_disposition="refine",
+-        critic_next_direction="n" * 1_700,
+-        incumbent_changed=True,
+-    )
+-    investigator_artifact = InvestigatorArtifact(
+-        hypothesis_id="hypothesis_2",
+-        family="entry",
+-        evidence_ids=("evidence_1",),
+-        causal_rationale="c" * 3_000,
+-        target_paths=(scope.editable_paths[0],),
+-        target_symbols=(_POLICY_DECLARED_SYMBOLS[scope.editable_paths[0]][0],),
+-        expected_diagnostic_changes=("d" * 1_000,),
+-        known_risks=("k" * 1_000,),
+-        author_instructions=("i" * 1_000,),
++    feedback = maximize_contract(
++        lambda count: IterationFeedbackSummary(
++            iteration=1,
++            hypothesis_id="hypothesis_1",
++            family="entry",
++            author_summary="a" + escaped(count),
++            validation_code="valid",
++            discovery_score=None,
++            critic_disposition="refine",
++            critic_next_direction="next",
++            incumbent_changed=True,
++        ),
++        scope.max_iteration_feedback_bytes,
+     )
+-    author_manifest = AuthorManifestSummary(
+-        hypothesis_id=investigator_artifact.hypothesis_id,
+-        behavioral_summary="b" * 4_000,
+-        changed_paths=(scope.editable_paths[0],),
+-        changed_symbols=(_POLICY_DECLARED_SYMBOLS[scope.editable_paths[0]][0],),
++    investigator_artifact = maximize_contract(
++        lambda count: InvestigatorArtifact(
++            hypothesis_id="hypothesis_2",
++            family="entry",
++            evidence_ids=("evidence_1",),
++            causal_rationale="c" + escaped(count),
++            target_paths=(scope.editable_paths[0],),
++            target_symbols=(_POLICY_DECLARED_SYMBOLS[scope.editable_paths[0]][0],),
++            expected_diagnostic_changes=("diagnostic",),
++            known_risks=("risk",),
++            author_instructions=("instruction",),
++        ),
++        MAX_INVESTIGATOR_ARTIFACT_BYTES,
+     )
+-    diagnostics = tuple(
+-        AggregateMetric(f"diagnostic_{index:02d}_" + ("x" * 80), index)
+-        for index in range(MAX_ROLE_LIST_ITEMS)
++    author_manifest = maximize_contract(
++        lambda count: AuthorManifestSummary(
++            hypothesis_id=investigator_artifact.hypothesis_id,
++            behavioral_summary="b" + escaped(count),
++            changed_paths=(scope.editable_paths[0],),
++            changed_symbols=(_POLICY_DECLARED_SYMBOLS[scope.editable_paths[0]][0],),
++        ),
++        MAX_AUTHOR_NON_DIFF_ARTIFACT_BYTES,
+     )
+     synthetic_baseline_sha256 = hashlib.sha256(
+         _v2_canonical_bytes([_v2_primitive(item) for item in folds]) + b"\n"
+     ).hexdigest()
+     comparison_score = discovery_score_from_folds(
+         folds,
+         folds,
+         original_baseline_sha256=synthetic_baseline_sha256,
+         expected_original_baseline_sha256=synthetic_baseline_sha256,
+     )
+-    comparison = CandidateComparisonSummary(
+-        folds=folds,
+-        score=comparison_score,
+-        diagnostics=diagnostics,
+-        _controller_seal=_CANDIDATE_COMPARISON_SEAL,
++    comparison = maximize_contract(
++        lambda count: CandidateComparisonSummary(
++            folds=folds,
++            score=comparison_score,
++            diagnostics=(AggregateMetric("d" + escaped(count), 1),),
++            _controller_seal=_CANDIDATE_COMPARISON_SEAL,
++        ),
++        MAX_CANDIDATE_COMPARISON_BYTES,
+     )
+     validation = _successful_candidate_validation()
+     dynamic_values = {
+         "investigator": {
+             "schema_version": 2,
+             "iteration": 2,
+             "policy_interface_version": scope.policy_interface_version,
+             "immutable_constraint_ids": immutable_constraint_ids,
+             "candidate_bounds": scope.candidate_bounds,
+             "rule_summary": rule_summary,
+diff --git a/core/pit_optimizer_evaluation.py b/core/pit_optimizer_evaluation.py
+index c9710f9..0987a5d 100644
+--- a/core/pit_optimizer_evaluation.py
++++ b/core/pit_optimizer_evaluation.py
+@@ -465,29 +465,55 @@ class ValidationReservation:
+         )
+         _require_digest(
+             self.reservation_record_sha256,
+             "validation reservation record SHA-256",
+         )
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class DiscoveryExposureProof:
+     fold_ids: tuple[str, str]
++    window_identities: tuple[ValidationWindowIdentity, ValidationWindowIdentity]
++    metadata: ValidationExposureMetadata
+     reservation_record_sha256s: tuple[str, str]
+     ledger_head_sha256: str
+     _controller_seal: InitVar[object] = None
+ 
+     def __post_init__(self, _controller_seal: object) -> None:
+         if _controller_seal is not _DISCOVERY_EXPOSURE_SEAL:
+             raise ValueError("discovery exposure proof must be ledger derived")
+         if self.fold_ids != ("discovery_1", "discovery_2"):
+             raise ValueError("discovery exposure proof fold IDs are invalid")
++        if (
++            type(self.window_identities) is not tuple
++            or len(self.window_identities) != 2
++            or any(
++                not isinstance(item, ValidationWindowIdentity)
++                for item in self.window_identities
++            )
++        ):
++            raise ValueError("discovery exposure proof window identities are invalid")
++        if not isinstance(self.metadata, ValidationExposureMetadata):
++            raise ValueError("discovery exposure proof metadata is invalid")
++        left, right = self.window_identities
++        if (
++            left.pit_bundle_sha256,
++            left.universe_sha256,
++            left.benchmark,
++            left.warmup_contract_sha256,
++        ) != (
++            right.pit_bundle_sha256,
++            right.universe_sha256,
++            right.benchmark,
++            right.warmup_contract_sha256,
++        ):
++            raise ValueError("discovery exposure proof window lineage is inconsistent")
+         if type(self.reservation_record_sha256s) is not tuple:
+             raise ValueError("discovery exposure proof reservations are invalid")
+         for digest in (*self.reservation_record_sha256s, self.ledger_head_sha256):
+             _require_digest(digest, "discovery exposure proof SHA-256")
+ 
+ 
+ def _reject_duplicate_record_keys(
+     pairs: list[tuple[str, object]],
+ ) -> dict[str, object]:
+     value: dict[str, object] = {}
+@@ -744,20 +770,22 @@ class ValidationLedger:
+             raise ValueError("discovery exposure fold manifest is invalid")
+         if (
+             type(reservations) is not tuple
+             or len(reservations) != 2
+             or any(not isinstance(item, ValidationReservation) for item in reservations)
+         ):
+             raise ValueError("discovery exposure reservations are invalid")
+         with _validation_file_lock(self._lock_path):
+             records = self._read_records()
+             selected: list[dict[str, object]] = []
++            selected_identities: list[ValidationWindowIdentity] = []
++            selected_metadata: list[ValidationExposureMetadata] = []
+             for fold, reservation in zip(
+                 fold_manifest.discovery_folds,
+                 reservations,
+                 strict=True,
+             ):
+                 record = next(
+                     (
+                         item
+                         for item in records
+                         if item.get("record_type") == "consumption"
+@@ -784,27 +812,48 @@ class ValidationLedger:
+                     != fold_manifest.data_identity_sha256
+                     or identity.get("universe_sha256")
+                     != fold_manifest.universe_sha256
+                     or identity.get("benchmark") != fold_manifest.benchmark
+                     or identity.get("sessions_sha256") != expected_sessions_sha256
+                     or identity.get("session_count") != len(fold.sessions)
+                     or identity.get("first_session") != fold.start_date
+                     or identity.get("last_session") != fold.end_date
+                 ):
+                     raise ValueError("discovery exposure reservation differs from fold")
++                closed_identity = ValidationWindowIdentity(**identity)
++                closed_metadata = ValidationExposureMetadata(**metadata)
+                 selected.append(record)
++                selected_identities.append(closed_identity)
++                selected_metadata.append(closed_metadata)
+             if not records:
+                 raise ValueError("discovery exposure ledger is empty")
++            left, right = selected_identities
++            if (
++                left.pit_bundle_sha256,
++                left.universe_sha256,
++                left.benchmark,
++                left.warmup_contract_sha256,
++            ) != (
++                right.pit_bundle_sha256,
++                right.universe_sha256,
++                right.benchmark,
++                right.warmup_contract_sha256,
++            ):
++                raise ValueError("discovery exposure window lineage differs")
++            if selected_metadata[0] != selected_metadata[1]:
++                raise ValueError("discovery exposure metadata lineage differs")
+             return DiscoveryExposureProof(
+                 fold_ids=tuple(
+                     fold.fold_id for fold in fold_manifest.discovery_folds
+                 ),
++                window_identities=tuple(selected_identities),
++                metadata=selected_metadata[0],
+                 reservation_record_sha256s=tuple(
+                     str(item["record_sha256"]) for item in selected
+                 ),
+                 ledger_head_sha256=str(records[-1]["record_sha256"]),
+                 _controller_seal=_DISCOVERY_EXPOSURE_SEAL,
+             )
+ 
+     def record_outcome(
+         self,
+         reservation: ValidationReservation,
+diff --git a/tests/test_pit_optimizer_v2.py b/tests/test_pit_optimizer_v2.py
+index 6fc38ba..d026936 100644
+--- a/tests/test_pit_optimizer_v2.py
++++ b/tests/test_pit_optimizer_v2.py
+@@ -343,20 +343,22 @@ def test_controller_materializes_only_bounds_valid_source_descendants() -> None:
+     )
+     entry_path = "core/strategy_policy/entry.py"
+     risk_path = "core/strategy_policy/risk.py"
+     entry_text = initial.files[0].text.replace("return None", "return True")
+     valid_diff = _diff_for_changes(initial, {entry_path: entry_text})
+     valid = contract.materialize_policy_source_descendant(
+         scope=scope,
+         initial_bundle=initial,
+         current_bundle=initial,
+         artifact=_artifact_for_diff(valid_diff, (entry_path,)),
++        immutable_constraint_ids=("causal_only", "no_external_io"),
++        call_budgets=_call_budgets(),
+     )
+     assert valid.validation.failure_code is None
+     assert valid.bundle is not None
+     contract.validate_policy_source_bundle_descendant(
+         scope=scope,
+         initial_bundle=initial,
+         bundle=valid.bundle,
+     )
+ 
+     arbitrary_record = replace(
+@@ -377,20 +379,22 @@ def test_controller_materializes_only_bounds_valid_source_descendants() -> None:
+     )
+     with pytest.raises(ValueError, match="max_files"):
+         contract.materialize_policy_source_descendant(
+             scope=replace(
+                 scope,
+                 candidate_bounds=contract.PatchBounds(1, 12, 80, 8 * 1024),
+             ),
+             initial_bundle=initial,
+             current_bundle=initial,
+             artifact=_artifact_for_diff(two_file_diff, (entry_path, risk_path)),
++            immutable_constraint_ids=("causal_only", "no_external_io"),
++            call_budgets=_call_budgets(),
+         )
+ 
+     five_lines = "a\nb\nc\nd\ne\n"
+     expanded_initial_texts = {
+         record.path: (five_lines if record.path == entry_path else record.text)
+         for record in initial.files
+     }
+     expanded_hashes = tuple(
+         (path, hashlib.sha256(text.encode("utf-8")).hexdigest())
+         for path, text in expanded_initial_texts.items()
+@@ -408,63 +412,242 @@ def test_controller_materializes_only_bounds_valid_source_descendants() -> None:
+     )
+     with pytest.raises(ValueError, match="max_hunks"):
+         contract.materialize_policy_source_descendant(
+             scope=replace(
+                 expanded_scope,
+                 candidate_bounds=contract.PatchBounds(3, 1, 80, 8 * 1024),
+             ),
+             initial_bundle=expanded_initial,
+             current_bundle=expanded_initial,
+             artifact=_artifact_for_diff(two_hunk_diff, (entry_path,)),
++            immutable_constraint_ids=("causal_only", "no_external_io"),
++            call_budgets=_call_budgets(),
+         )
+     with pytest.raises(ValueError, match="max_changed_lines"):
+         contract.materialize_policy_source_descendant(
+             scope=replace(
+                 expanded_scope,
+                 candidate_bounds=contract.PatchBounds(3, 12, 3, 8 * 1024),
+             ),
+             initial_bundle=expanded_initial,
+             current_bundle=expanded_initial,
+             artifact=_artifact_for_diff(two_hunk_diff, (entry_path,)),
++            immutable_constraint_ids=("causal_only", "no_external_io"),
++            call_budgets=_call_budgets(),
+         )
+     with pytest.raises(ValueError, match="max_diff_bytes"):
+         contract.materialize_policy_source_descendant(
+             scope=replace(
+                 expanded_scope,
+                 candidate_bounds=contract.PatchBounds(
+                     3,
+                     12,
+                     80,
+                     len(two_hunk_diff.encode("utf-8")) - 1,
+                 ),
+             ),
+             initial_bundle=expanded_initial,
+             current_bundle=expanded_initial,
+             artifact=_artifact_for_diff(two_hunk_diff, (entry_path,)),
++            immutable_constraint_ids=("causal_only", "no_external_io"),
++            call_budgets=_call_budgets(),
+         )
+ 
+     overflow_scope = replace(
+         scope,
+         max_policy_source_bundle_bytes=len(initial.canonical_json_bytes()) + 32,
+     )
+     overflow_text = initial.files[0].text.replace("return None", "return " + "1" * 256)
+     overflow_diff = _diff_for_changes(initial, {entry_path: overflow_text})
+     overflow = contract.materialize_policy_source_descendant(
+         scope=overflow_scope,
+         initial_bundle=initial,
+         current_bundle=initial,
+         artifact=_artifact_for_diff(overflow_diff, (entry_path,)),
++        immutable_constraint_ids=("causal_only", "no_external_io"),
++        call_budgets=_call_budgets(),
+     )
+     assert overflow.bundle is None
+     assert overflow.validation.failure_code == "next_context_oversize"
+ 
+ 
++def test_controller_applies_middle_insertion_only_hunk_at_declared_position() -> None:
++    """Break caught: a zero-old-count hunk was inserted one source line too early."""
++    initial = _source_bundle()
++    scope = _source_scope(initial)
++    entry_path = "core/strategy_policy/entry.py"
++    insertion = (
++        f"--- a/{entry_path}\n"
++        f"+++ b/{entry_path}\n"
++        "@@ -1,0 +2,1 @@\n"
++        "+    marker = True\n"
++    )
++
++    materialized = contract.materialize_policy_source_descendant(
++        scope=scope,
++        initial_bundle=initial,
++        current_bundle=initial,
++        artifact=_artifact_for_diff(insertion, (entry_path,)),
++        immutable_constraint_ids=("causal_only", "no_external_io"),
++        call_budgets=_call_budgets(),
++    )
++
++    assert materialized.bundle is not None
++    assert materialized.bundle.files[0].text == (
++        "def evaluate_entry(snapshot):\n"
++        "    marker = True\n"
++        "    return None\n"
++    )
++
++
++@pytest.mark.parametrize(
++    ("hunk", "expected"),
++    (
++        (
++            "@@ -0,0 +1,1 @@\n+# first\n",
++            "# first\ndef evaluate_entry(snapshot):\n    return None\n",
++        ),
++        (
++            "@@ -2,0 +3,1 @@\n+# last\n",
++            "def evaluate_entry(snapshot):\n    return None\n# last\n",
++        ),
++        (
++            "@@ -2,1 +2,1 @@\n-    return None\n+    return True\n",
++            "def evaluate_entry(snapshot):\n    return True\n",
++        ),
++        (
++            "@@ -2,1 +1,0 @@\n-    return None\n",
++            "def evaluate_entry(snapshot):\n",
++        ),
++    ),
++)
++def test_controller_preserves_boundary_insertion_replacement_and_deletion_semantics(
++    hunk: str,
++    expected: str,
++) -> None:
++    initial = _source_bundle()
++    scope = _source_scope(initial)
++    entry_path = "core/strategy_policy/entry.py"
++    patch = f"--- a/{entry_path}\n+++ b/{entry_path}\n{hunk}"
++
++    materialized = contract.materialize_policy_source_descendant(
++        scope=scope,
++        initial_bundle=initial,
++        current_bundle=initial,
++        artifact=_artifact_for_diff(patch, (entry_path,)),
++        immutable_constraint_ids=("causal_only", "no_external_io"),
++        call_budgets=_call_budgets(),
++    )
++
++    assert materialized.bundle is not None
++    assert materialized.bundle.files[0].text == expected
++
++
++def test_controller_rejects_inconsistent_new_range_location() -> None:
++    initial = _source_bundle()
++    scope = _source_scope(initial)
++    entry_path = "core/strategy_policy/entry.py"
++    inconsistent = (
++        f"--- a/{entry_path}\n"
++        f"+++ b/{entry_path}\n"
++        "@@ -1,0 +1,1 @@\n"
++        "+    marker = True\n"
++    )
++
++    with pytest.raises(ValueError, match="new hunk location"):
++        contract.materialize_policy_source_descendant(
++            scope=scope,
++            initial_bundle=initial,
++            current_bundle=initial,
++            artifact=_artifact_for_diff(inconsistent, (entry_path,)),
++            immutable_constraint_ids=("causal_only", "no_external_io"),
++            call_budgets=_call_budgets(),
++        )
++
++
++@pytest.mark.parametrize(
++    ("source_padding", "expected_failure_code"),
++    ((10_000, None), (45_000, "next_context_oversize")),
++)
++def test_candidate_materialization_checks_exact_next_role_envelope(
++    source_padding: int,
++    expected_failure_code: str | None,
++) -> None:
++    """Break caught: a source-cap-valid incumbent could overflow the next role input."""
++    base = _source_bundle()
++    entry_path = "core/strategy_policy/entry.py"
++    padded_texts = {
++        record.path: (
++            "# "
++            + ("p" * source_padding)
++            + "\n# spacer_1\n# spacer_2\n# spacer_3\n# spacer_4\n"
++            + record.text
++            if record.path == entry_path
++            else record.text
++        )
++        for record in base.files
++    }
++    padded_hashes = tuple(
++        (path, hashlib.sha256(text.encode("utf-8")).hexdigest())
++        for path, text in padded_texts.items()
++    )
++    scope = replace(
++        _source_scope(base),
++        initial_policy_source_sha256s=padded_hashes,
++    )
++    initial = contract.initial_policy_source_bundle(
++        scope=scope,
++        source_texts=padded_texts,
++    )
++    changed = padded_texts[entry_path].replace("return None", "return True")
++    patch = _diff_for_changes(initial, {entry_path: changed}, context=0)
++    independently_derived_cumulative = _diff_for_changes(
++        initial,
++        {entry_path: changed},
++    )
++    candidate_records = [
++        {
++            "path": record.path,
++            "sha256": hashlib.sha256(
++                (changed if record.path == entry_path else record.text).encode("utf-8")
++            ).hexdigest(),
++            "declared_symbols": list(record.declared_symbols),
++            "text": changed if record.path == entry_path else record.text,
++        }
++        for record in initial.files
++    ]
++    candidate_bundle = {
++        "policy_interface_version": initial.policy_interface_version,
++        "cumulative_diff_sha256": hashlib.sha256(
++            independently_derived_cumulative.encode("utf-8")
++        ).hexdigest(),
++        "cumulative_diff": independently_derived_cumulative,
++        "files": candidate_records,
++    }
++    assert (
++        len(_canonical_text(candidate_bundle).encode("utf-8"))
++        <= scope.max_policy_source_bundle_bytes
++    )
++
++    result = contract.materialize_policy_source_descendant(
++        scope=scope,
++        initial_bundle=initial,
++        current_bundle=initial,
++        artifact=_artifact_for_diff(patch, (entry_path,)),
++        immutable_constraint_ids=("causal_only", "no_external_io"),
++        call_budgets=_call_budgets(),
++    )
++
++    assert result.validation.failure_code == expected_failure_code
++    assert (result.bundle is None) == (expected_failure_code is not None)
++
++
+ def _fold_summary(fold_id: str, excess: float) -> FoldAggregateSummary:
+     return FoldAggregateSummary(
+         fold_id=fold_id,
+         total_return_pct=excess + 1.0,
+         excess_total_return_pp=excess,
+         max_drawdown_pct=-2.0,
+         sharpe_ratio=1.0,
+         closed_trades=2,
+         turnover_pct=10.0,
+         average_exposure_pct=20.0,
+@@ -502,39 +685,181 @@ def _discovery_exposure_proof(tmp_path: Path) -> evaluation.DiscoveryExposurePro
+         candidate_identity_sha256=None,
+         exposure_kind="provider_context",
+     )
+     reservations = tuple(
+         ledger.mark_discovery(_validation_identity(fold, fold.fold_id), metadata)
+         for fold in manifest.discovery_folds
+     )
+     return ledger.seal_discovery_folds(manifest, reservations)
+ 
+ 
++def test_discovery_exposure_proof_retains_complete_identity_and_lineage(
++    tmp_path: Path,
++) -> None:
++    """Break caught: proof output dropped warmup identity and release lineage."""
++    ledger = evaluation.ValidationLedger(
++        tmp_path / "pit_optimizer_validation_ledger.jsonl"
++    )
++    manifest = _fold_manifest()
++    identities = tuple(
++        _validation_identity(fold, fold.fold_id)
++        for fold in manifest.discovery_folds
++    )
++    metadata = evaluation.ValidationExposureMetadata(
++        run_id="run_1",
++        source_head="1" * 40,
++        baseline_policy_sha256="d" * 64,
++        candidate_identity_sha256="f" * 64,
++        exposure_kind="provider_context",
++    )
++    reservations = tuple(
++        ledger.mark_discovery(identity, metadata) for identity in identities
++    )
++
++    proof = ledger.seal_discovery_folds(manifest, reservations)
++
++    assert getattr(proof, "window_identities", None) == identities
++    assert getattr(proof, "metadata", None) == metadata
++
++
++def test_discovery_exposure_proof_rejects_warmup_identity_discontinuity(
++    tmp_path: Path,
++) -> None:
++    ledger = evaluation.ValidationLedger(
++        tmp_path / "pit_optimizer_validation_ledger.jsonl"
++    )
++    manifest = _fold_manifest()
++    identities = tuple(
++        _validation_identity(fold, fold.fold_id)
++        for fold in manifest.discovery_folds
++    )
++    metadata = evaluation.ValidationExposureMetadata(
++        run_id="run_1",
++        source_head="1" * 40,
++        baseline_policy_sha256="d" * 64,
++        candidate_identity_sha256="f" * 64,
++        exposure_kind="provider_context",
++    )
++    reservations = (
++        ledger.mark_discovery(identities[0], metadata),
++        ledger.mark_discovery(
++            replace(identities[1], warmup_contract_sha256="9" * 64),
++            metadata,
++        ),
++    )
++
++    with pytest.raises(ValueError, match="window lineage"):
++        ledger.seal_discovery_folds(manifest, reservations)
++
++
++@pytest.mark.parametrize(
++    ("field", "value"),
++    (
++        ("run_id", "run_2"),
++        ("source_head", "2" * 40),
++        ("baseline_policy_sha256", "e" * 64),
++        ("candidate_identity_sha256", "e" * 64),
++        ("exposure_kind", "candidate_validation"),
++    ),
++)
++def test_discovery_exposure_proof_rejects_metadata_lineage_discontinuity(
++    tmp_path: Path,
++    field: str,
++    value: str,
++) -> None:
++    ledger = evaluation.ValidationLedger(
++        tmp_path / "pit_optimizer_validation_ledger.jsonl"
++    )
++    manifest = _fold_manifest()
++    identities = tuple(
++        _validation_identity(fold, fold.fold_id)
++        for fold in manifest.discovery_folds
++    )
++    metadata = evaluation.ValidationExposureMetadata(
++        run_id="run_1",
++        source_head="1" * 40,
++        baseline_policy_sha256="d" * 64,
++        candidate_identity_sha256="f" * 64,
++        exposure_kind="provider_context",
++    )
++    reservations = (
++        ledger.mark_discovery(identities[0], metadata),
++        ledger.mark_discovery(identities[1], replace(metadata, **{field: value})),
++    )
++
++    with pytest.raises(ValueError, match="metadata lineage"):
++        ledger.seal_discovery_folds(manifest, reservations)
++
++
++def test_candidate_comparison_requires_expected_window_and_metadata_lineage(
++    tmp_path: Path,
++) -> None:
++    proof = _discovery_exposure_proof(tmp_path)
++    candidate = (
++        _fold_summary("discovery_1", 0.5),
++        _fold_summary("discovery_2", 0.25),
++    )
++    baseline = (
++        _fold_summary("discovery_1", 0.0),
++        _fold_summary("discovery_2", 0.0),
++    )
++    baseline_sha256 = _aggregate_sha256(baseline)
++
++    with pytest.raises(ValueError, match="expected metadata lineage"):
++        contract.candidate_comparison_from_fixed_baseline(
++            candidate_folds=candidate,
++            original_baseline_folds=baseline,
++            original_baseline_sha256=baseline_sha256,
++            expected_original_baseline_sha256=baseline_sha256,
++            discovery_exposure=proof,
++            expected_window_identities=proof.window_identities,
++            expected_metadata=replace(proof.metadata, run_id="run_other"),
++            diagnostics=(),
++        )
++    with pytest.raises(ValueError, match="expected window identities"):
++        contract.candidate_comparison_from_fixed_baseline(
++            candidate_folds=candidate,
++            original_baseline_folds=baseline,
++            original_baseline_sha256=baseline_sha256,
++            expected_original_baseline_sha256=baseline_sha256,
++            discovery_exposure=proof,
++            expected_window_identities=tuple(
++                replace(identity, warmup_contract_sha256="9" * 64)
++                for identity in proof.window_identities
++            ),
++            expected_metadata=proof.metadata,
++            diagnostics=(),
++        )
++
++
+ def test_candidate_comparison_structurally_rejects_hidden_fold_identity(
+     tmp_path: Path,
+ ) -> None:
+     """Break caught: a caller could serialize hidden validation evidence for a role."""
+     baseline = (
+         _fold_summary("discovery_1", 0.0),
+         _fold_summary("discovery_2", 0.0),
+     )
+     baseline_sha256 = _aggregate_sha256(baseline)
++    proof = _discovery_exposure_proof(tmp_path)
+     with pytest.raises(ValueError, match="ledger exposure"):
+         contract.candidate_comparison_from_fixed_baseline(
+             candidate_folds=(
+                 _fold_summary("discovery_1", 0.5),
+                 _fold_summary("hidden_1", 99.0),
+             ),
+             original_baseline_folds=baseline,
+             original_baseline_sha256=baseline_sha256,
+             expected_original_baseline_sha256=baseline_sha256,
+-            discovery_exposure=_discovery_exposure_proof(tmp_path),
++            discovery_exposure=proof,
++            expected_window_identities=proof.window_identities,
++            expected_metadata=proof.metadata,
+             diagnostics=(),
+         )
+ 
+ 
+ def test_candidate_validation_codes_are_closed_and_match_stage_flags() -> None:
+     """Break caught: arbitrary or contradictory failure labels could reach a role."""
+     with pytest.raises(ValueError, match="failure code is not closed"):
+         contract.CandidateValidationSummary(
+             failure_code="invented_failure",
+             syntax_ok=False,
+@@ -631,26 +956,29 @@ def test_role_schema_inputs_are_exact_bounded_provider_projections(
+         hypothesis_id="hypothesis_1",
+         behavioral_summary=author_artifact.behavioral_summary,
+         changed_paths=author_artifact.changed_paths,
+         changed_symbols=author_artifact.changed_symbols,
+     )
+     original_baseline = (
+         _fold_summary("discovery_1", 0.0),
+         _fold_summary("discovery_2", 0.0),
+     )
+     baseline_sha256 = _aggregate_sha256(original_baseline)
++    proof = _discovery_exposure_proof(tmp_path)
+     comparison = contract.candidate_comparison_from_fixed_baseline(
+         candidate_folds=discovery.folds,
+         original_baseline_folds=original_baseline,
+         original_baseline_sha256=baseline_sha256,
+         expected_original_baseline_sha256=baseline_sha256,
+-        discovery_exposure=_discovery_exposure_proof(tmp_path),
++        discovery_exposure=proof,
++        expected_window_identities=proof.window_identities,
++        expected_metadata=proof.metadata,
+         diagnostics=(AggregateMetric("entry_quality_delta", 0.2),),
+     )
+     critic_input = contract.CriticInput(
+         schema_version=2,
+         iteration=2,
+         immutable_constraint_ids=("causal_only", "no_external_io"),
+         hypothesis_id="hypothesis_1",
+         investigator_summary=investigator,
+         author_manifest=author_manifest,
+         validation=contract.CandidateValidationSummary(
+@@ -1369,20 +1697,53 @@ def test_manifest_builder_is_provider_free_canonical_and_source_budgeted(
+     assert len(_canonical_text(worst_iteration_2_bundle).encode("utf-8")) <= 64 * 1024
+     assert manifest.policy_source_sha256s == tuple(
+         (record["path"], record["sha256"]) for record in source_records
+     )
+     rendered = contract.render_worst_iteration_two_role_inputs(
+         scope=manifest.policy_source_scope,
+         source_texts=expected["source_texts"],
+         immutable_constraint_ids=manifest.immutable_constraint_ids,
+         call_budgets=manifest.call_budgets,
+     )
++    rendered_values = {
++        role: json.loads(payload.decode("utf-8"))
++        for role, payload in rendered.items()
++    }
++    cap_derived_sections = (
++        (
++            rendered_values["investigator"]["rule_summary"],
++            contract.MAX_DISCOVERY_EVIDENCE_BYTES,
++        ),
++        (
++            rendered_values["investigator"]["baseline_discovery"],
++            contract.MAX_DISCOVERY_EVIDENCE_BYTES,
++        ),
++        (
++            rendered_values["investigator"]["prior_iterations"][0],
++            manifest.policy_source_scope.max_iteration_feedback_bytes,
++        ),
++        (
++            rendered_values["author"]["investigator"],
++            contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
++        ),
++        (
++            rendered_values["critic"]["author_manifest"],
++            contract.MAX_AUTHOR_NON_DIFF_ARTIFACT_BYTES,
++        ),
++        (
++            rendered_values["critic"]["candidate_vs_baseline"],
++            contract.MAX_CANDIDATE_COMPARISON_BYTES,
++        ),
++    )
++    for section, cap in cap_derived_sections:
++        section_bytes = len(_canonical_text(section).encode("utf-8"))
++        assert cap - 1 <= section_bytes <= cap
+     for budget in manifest.call_budgets:
+         static_bytes = len(
+             contract.PIT_OPTIMIZER_V2_SYSTEM_PROMPTS[budget.role].encode("utf-8")
+         ) + len(
+             _canonical_text(contract.pit_optimizer_response_format(budget.role)).encode(
+                 "utf-8"
+             )
+         )
+         assert static_bytes <= budget.max_static_input_bytes
+         assert static_bytes + budget.max_dynamic_input_bytes <= budget.max_input_tokens
+@@ -1426,21 +1787,21 @@ def test_manifest_builder_requires_complete_authenticated_v1_readiness(
+ 
+     with pytest.raises(ValueError, match="closed readiness contract"):
+         contract.build_subset_manifest(**inputs)
+ 
+ 
+ def test_manifest_builder_renders_and_rejects_oversized_iteration_two_envelope(
+     tmp_path: Path,
+     monkeypatch: pytest.MonkeyPatch,
+ ) -> None:
+     """Break caught: declared arithmetic could hide an oversized actual role message."""
+-    inputs, _expected = _builder_fixture(tmp_path, source_padding=1_750)
++    inputs, _expected = _builder_fixture(tmp_path, source_padding=1_000)
+     _patch_authenticated_readiness(monkeypatch, inputs)
+ 
+     with pytest.raises(ValueError, match="worst iteration-2 investigator"):
+         contract.build_subset_manifest(**inputs)
+ 
+ 
+ def test_gate_and_prepare_command_authenticate_without_granting_authority(
+     tmp_path: Path,
+     monkeypatch: pytest.MonkeyPatch,
+ ) -> None:
+@@ -1643,26 +2004,29 @@ def test_discovery_objective_derives_excess_from_authenticated_fixed_baseline(
+     assert score.median_excess_return_pp == Decimal("0.87")
+     assert score.worst_excess_return_pp == Decimal("0.50")
+     with pytest.raises(ValueError, match="fixed baseline identity"):
+         evaluation.discovery_score_from_folds(
+             candidate,
+             original_baseline,
+             original_baseline_sha256=baseline_sha256,
+             expected_original_baseline_sha256="f" * 64,
+         )
+     with pytest.raises(ValueError, match="supplied score differs"):
++        proof = _discovery_exposure_proof(tmp_path)
+         contract.candidate_comparison_from_fixed_baseline(
+             candidate_folds=candidate,
+             original_baseline_folds=original_baseline,
+             original_baseline_sha256=baseline_sha256,
+             expected_original_baseline_sha256=baseline_sha256,
+-            discovery_exposure=_discovery_exposure_proof(tmp_path),
++            discovery_exposure=proof,
++            expected_window_identities=proof.window_identities,
++            expected_metadata=proof.metadata,
+             diagnostics=(),
+             supplied_score=replace(
+                 score,
+                 worst_excess_return_pp=score.worst_excess_return_pp
+                 + Decimal("0.01"),
+             ),
+         )
+ 
+ 
+ def test_holdout_gate_uses_return_trades_and_completeness_without_sharpe() -> None:

@@ -1,0 +1,9 @@
+# Role contract guidance repair
+
+Cause reproduced against unchanged campaign05 response: replacement_source lacks final LF. The wire schema previously allowed any nonempty string.
+
+Only provider.py wire_role_schema_v5 changed. It adds source-format constraints and role bookkeeping guidance, plus preserving non-targeted market gates/ranking. The canonical schema and request identity, local parser, received response, ledger rules and evaluator are unchanged. Repeated tagged-literal alternatives share a $defs reference; this avoids increasing historical recomputed reservation bounds. All23 actual archived schemas, including critic requests, remain under their canonical byte bounds. Enabled full-source handling was reviewed statically, not exercised through fabricated requests.
+
+Actual05 Python compiles but remains rejected by the unchanged parser and now violates the wire pattern too. Its dataclass references appear valid, but it changes market gates and removes broad entry gates; compilation does not establish strategy fidelity. No response correction or replay occurred.
+
+Verification: hashes.json, change.patch, verification.json and root-review.json. Scoped Ruff and in-memory compile passed. Independent reviewer approved exact final bytes. No tests, synthetic probes, provider calls, evaluator rebuild or baseline reruns.

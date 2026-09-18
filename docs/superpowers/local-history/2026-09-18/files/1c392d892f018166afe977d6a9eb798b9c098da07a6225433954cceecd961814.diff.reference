@@ -1,0 +1,167 @@
+# Review package: 52837cd..6455d4f
+
+## Commits
+6455d4f fix: require complete PIT price universe
+
+## Files changed
+ build_pit_bundle.py    | 18 +++++++++---------
+ core/pit_data.py       | 13 +++++--------
+ tests/test_pit_data.py | 20 ++++++++++++++++++--
+ 3 files changed, 32 insertions(+), 19 deletions(-)
+
+## Diff
+diff --git a/build_pit_bundle.py b/build_pit_bundle.py
+index 9376fc0..ac8fc25 100644
+--- a/build_pit_bundle.py
++++ b/build_pit_bundle.py
+@@ -317,36 +317,36 @@ def _integrity_gate(
+     eval_date = date.fromisoformat(evaluation_start)
+     warmup_date = date.fromisoformat(warmup_start)
+     if not warmup_date < eval_date <= cutoff_date:
+         raise ValueError("date contract must satisfy warmup_start < evaluation_start <= data_cutoff")
+     if cutoff != "2025-12-31":
+         raise ValueError("five-year baseline data_cutoff must be 2025-12-31")
+     membership_symbols = {row[1] for row in membership}
+     price_symbols = {row[1] for row in prices}
+     fundamental_symbols = {row[0] for row in fundamentals}
+     reference_symbols = set(PIT_NON_TRADABLE_REFERENCE_SYMBOLS)
+-    missing_prices = membership_symbols.difference(price_symbols, price_exclusions)
+-    if missing_prices:
+-        raise ValueError(f"membership tickers lack prices or explicit exclusion: {sorted(missing_prices)}")
+-    if not price_exclusions.issubset(membership_symbols) or price_exclusions.intersection(price_symbols):
+-        raise ValueError("price exclusions must be membership-only symbols without price rows")
++    if price_exclusions:
++        raise ValueError("price exclusions are not permitted in schema-v2 bundles")
+     outside = fundamental_symbols.difference(membership_symbols)
+     if outside:
+         raise ValueError(f"fundamental tickers are outside membership: {sorted(outside)}")
+     if reference_symbols.intersection(membership_symbols):
+         raise ValueError("market references must not exist in membership")
+     if reference_symbols.intersection(fundamental_symbols):
+         raise ValueError("market references must not exist in fundamentals")
+-    if not reference_symbols.issubset(price_symbols):
+-        raise ValueError("IWM, QQQ, and SPY must all exist in prices")
+-    if not price_symbols.issubset(membership_symbols.union(reference_symbols)):
+-        raise ValueError("prices contain symbols outside membership plus references")
++    required_price_symbols = membership_symbols.union(reference_symbols)
++    if price_symbols != required_price_symbols:
++        raise ValueError(
++            "price symbols must exactly equal membership plus references; "
++            f"missing={sorted(required_price_symbols - price_symbols)}, "
++            f"outside={sorted(price_symbols - required_price_symbols)}"
++        )
+     raw_contracts = prices_provenance.get("price_identity_request_contracts")
+     if not isinstance(raw_contracts, dict) or {
+         _ticker(value) for value in raw_contracts
+     } != membership_symbols.union(reference_symbols):
+         raise ValueError(
+             "price identity request contracts do not exactly cover membership plus references"
+         )
+     first_price = date.fromisoformat(min(row[0] for row in prices))
+     if first_price < warmup_date or first_price > date(2020, 1, 2):
+         raise ValueError("earliest price must be within warmup start through 2020-01-02")
+diff --git a/core/pit_data.py b/core/pit_data.py
+index 4a1cfc4..48a9fa9 100644
+--- a/core/pit_data.py
++++ b/core/pit_data.py
+@@ -500,30 +500,27 @@ class PITDataBundle:
+                 ).fetchall()
+             }
+             if self._reference_symbols.intersection(self._tradable_symbols):
+                 raise ValueError(
+                     "point-in-time bundle references must not appear in membership"
+                 )
+             if self._reference_symbols.intersection(fundamental_symbols):
+                 raise ValueError(
+                     "point-in-time bundle references must not appear in fundamentals"
+                 )
+-            if not self._reference_symbols.issubset(self._price_symbols):
+-                raise ValueError(
+-                    "point-in-time bundle prices do not contain every market reference"
+-                )
+-            outside_prices = self._price_symbols.difference(
+-                self._tradable_symbols.union(self._reference_symbols)
++            required_price_symbols = self._tradable_symbols.union(
++                self._reference_symbols
+             )
+-            if outside_prices:
++            if self._price_symbols != required_price_symbols:
+                 raise ValueError(
+-                    "point-in-time bundle prices contain symbols outside tradables and references"
++                    "point-in-time bundle price symbols must exactly equal "
++                    "tradables plus references"
+                 )
+             reference_calendars = {
+                 reference: tuple(
+                     str(row[0])
+                     for row in self._connection.execute(
+                         "SELECT trade_date FROM price WHERE ticker=? ORDER BY trade_date",
+                         (reference,),
+                     ).fetchall()
+                 )
+                 for reference in PIT_NON_TRADABLE_REFERENCE_SYMBOLS
+diff --git a/tests/test_pit_data.py b/tests/test_pit_data.py
+index 1535764..4d192e4 100644
+--- a/tests/test_pit_data.py
++++ b/tests/test_pit_data.py
+@@ -4,20 +4,21 @@ from __future__ import annotations
+ 
+ import csv
+ import hashlib
+ from pathlib import Path
+ import sqlite3
+ from types import SimpleNamespace
+ 
+ import pandas as pd
+ import pytest
+ 
++import build_pit_bundle as bundle_builder
+ import export_pit_prices as exporter
+ from core.pit_data import PITDataBundle
+ from core.pit_provenance import PIT_NON_TRADABLE_REFERENCE_SYMBOLS
+ 
+ 
+ def _cache(path: Path, *, extra_table: bool = False) -> str:
+     with sqlite3.connect(path) as conn:
+         conn.execute(
+             "CREATE TABLE dataset_cache (cache_key TEXT PRIMARY KEY, cache_kind TEXT NOT NULL, "
+             "created_at TEXT NOT NULL, payload BLOB NOT NULL)"
+@@ -119,21 +120,36 @@ def test_worker_cache_rejects_bad_hash_and_extra_schema(
+ )
+ def test_worker_price_export_rejects_duplicate_missing_spy_and_partial_member_coverage(
+     tmp_path: Path, rows: list[tuple[object, ...]], expected: str,
+ ) -> None:
+     path = tmp_path / "prices.csv"
+     _write_prices(path, rows)
+     with pytest.raises(ValueError, match=expected):
+         exporter._validate_prices(path, _membership(), pd.Timestamp("2024-01-02").date(), pd.Timestamp("2024-01-05").date())
+ 
+ 
+-def test_pit_price_reader_rejects_invalid_ohlc_rows() -> None:
+-    """Break caught: an apparently positive bar let high fall below close."""
++def test_pit_price_reader_rejects_invalid_ohlc_rows_and_schema_v2_exclusions() -> None:
++    """Break caught: invalid bars or excluded v2 tradables weakened the price surface."""
+     connection = sqlite3.connect(":memory:")
+     try:
+         connection.execute("CREATE TABLE price (trade_date TEXT, ticker TEXT, open REAL, high REAL, low REAL, close REAL, volume REAL)")
+         connection.execute("INSERT INTO price VALUES ('2024-01-02', 'AAPL', 100, 99, 98, 101, 1)")
+         bundle = SimpleNamespace(_connection=connection, data_cutoff=pd.Timestamp("2024-01-02"))
+         with pytest.raises(ValueError, match="high does not contain"):
+             PITDataBundle._query_prices(bundle, ("AAPL",), pd.Timestamp("2024-01-02"), pd.Timestamp("2024-01-02"))
+     finally:
+         connection.close()
++    with pytest.raises(ValueError, match="price exclusions are not permitted"):
++        bundle_builder._integrity_gate(
++            cutoff="2025-12-31",
++            evaluation_start="2021-01-01",
++            warmup_start="2020-01-01",
++            membership=[("2021-01-01", "AAPL", 1)],
++            prices=[
++                ("2020-01-02", reference)
++                for reference in PIT_NON_TRADABLE_REFERENCE_SYMBOLS
++            ],
++            fundamentals=[("AAPL",)],
++            price_exclusions={"AAPL"},
++            membership_provenance={},
++            prices_provenance={},
++        )

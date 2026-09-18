@@ -1,0 +1,115 @@
+# C-c fresh preparation inventory
+
+Read-only preparation design from actual06's accepted fixed authority and the approved campaign-admission spec/plan. This document does not create a campaign, configuration, admission policy, preview request or launch. P1–P4 source review and updated readiness must finish before principal preparation. Principal chooses all fresh names and paths.
+
+The approved admission spec supersedes the earlier launch-budget note's dynamic stage reserve suggestion: admission checks the settled prior-round prefix, while the common per-role envelope and total-cap invariant cover author/critic continuation without new stage reserve state.
+
+## Minimal immutable graph
+
+Selected original repository, relative to the architecture worktree: `.artifacts/pit-optimizer-v5/development/provider-runtime-06`.
+
+Original selection authority is `campaigns/development-provider-two-rounds-20260907-06/manifest.json`, SHA-256 `d90ed717c0d6b34d4cfa6bf7e2dd1f753e68c43b1127b200a66d2a9f930dfdf6`. Authenticate it read-only as the source of fixed dependencies; do not copy that manifest into the fresh campaign's operational graph.
+
+The new graph has 14 existing fixed dependency files plus a new manifest and new policy-scope file. Its immutable dependency paths must remain exactly as below to retain the baseline/panel/source digests. Strict minimum pre-build import is 13 files: `build_campaign_manifest_v5` expressly allows the baseline policy descriptor to be absent and creates its exact existing accepted bytes itself. Importing all 14 is also valid; that create-only call reauthenticates the already present descriptor.
+
+| Original relative path | Exact SHA-256 |
+| --- | --- |
+| `preparation-seed/execution-profile.json` | `93ced32086727384e67f36c5bdfa8ebfd3211a7fe47e25e7356b170a3bacb3af` |
+| `preparation-seed/evaluator-contract.json` | `73a4a914ca3a6088e6275eb1ab83f32fdfb26a24474c69a886313b30a75ccde4` |
+| `preparation-seed/sandbox-profile.json` | `0923e93f56e06fc982c9db00815329d1cdc936c0a0b9a140d287b7611ad5b1c9` |
+| `preparation-seed/baseline-parent.json` | `1f23034024f3b5caa55604cb21b561cb941e92d54bc09969935bea856a54dd6e` |
+| `preparation-seed/source-bundle.json` | `109a61992ac79317446861c4cb2053f2704239eb1f8eacfe2b2d27ca2cf7456e` |
+| `preparation-seed/policy-revision.json` | `5d2a95ba2572e71dab448934544cef22130415fcc1691c9a98deb820d40a1fa9` |
+| `preparation-seed/panel-plan.json` | `34fd3430ce952fa7115ec8802a4998cd6e940df5052c2dcfd92a1fb1a87843d5` |
+| `panels/specs/quick.json` | `bfa5c7767c74f0757442cc47a2cda8aaee9f43193a2ebe041b1bffbb0328cc05` |
+| `preparation-seed/panels/discovery-1.json` | `7fac6df621ef1d2eee4953a9e77870d5d5d074097052dcc353ee2a6337ab8be0` |
+| `preparation-seed/panels/discovery-2.json` | `2a67df05f796cdba0f3df464f9523a61b1c60160e235da826676da2e9f0323da` |
+| `preparation-seed/panels/discovery-3.json` | `09ae5201ed57186a9ac77444bc5cef9cf0f389b7364d8e7ec1f725b2ca364840` |
+| `preparation-seed/panels/discovery-4.json` | `1d76bae18728586aa1f14a4bea9228eb00bb4e7a023c53cba7dd9cc6a3fa4b73` |
+| `data/pit_bundle.sqlite3` | `cf729b47d762ae86287bb8a87c28a1664e7475c74ef1aca736fbc240111349de` |
+| `data/prices_provenance.json` | `97dad8197d1fcc0d7a8cedb1a0bc13b76d7169b56a8b9c0a0e836c0a25c4f8a2` |
+
+The plan uses the same quick panel twice, for `development-quick` and `development-mechanics-unexecuted`; this is one file and no claim that mechanics was executed. Four discovery windows are 2021-01-04–2021-02-16, 2021-02-17–2021-03-30, 2021-03-31–2021-05-12 and 2021-05-13–2021-06-24. The fixed discovery-plan digest is `3570d0168e9872044545c6ba70a919b51854cca91b2ea6bac448a9fc4337ad4b`. The fixed target is 10% absolute portfolio annualized return, target digest `83843c6441df61749b5381ea733971d69501d3bce7586072fa3117bed6e34df2`; changing target would require a different plan binding.
+
+`confirmation-unexecuted.json` and `qualification-unexecuted.json` are not manifest graph edges: the plan carries their digest values rather than file references. They are optional copies of existing explanatory evidence, not required fresh runtime artifacts. There is no reason to create new disabled descriptors. Neither seed manifest nor either old policy-scope file is needed.
+
+## Actual parent provenance and separate quick evidence
+
+Carry the original `preparation-seed/parent-provenance.json` (`65cdc2349e3f63540bf60e1c09e3ab15d97164ebcdd674fe9af094c06053d3e5`) and its eight actual original blobs as an evidence supplement. Their presence is useful for independently reviewing the new proposal, but the native manifest build authenticates baseline aggregate/source/plan authority, not this provenance sidecar by implication. Keep the explicit actual pair authentication in preparation review.
+
+Each digest below has original path `adapter-blobs/development-parent-originals/<digest>.bin`; this is an exact path template for the named existing content, not an invented request. The sidecar stores each full reference.
+
+| Episode | Actual request digest | Actual output digest |
+| --- | --- | --- |
+| discovery-1 | `a15e1ba2ea3139efa700f5172c0ce4a709a83a188b27859825ee56ce2d61fbc6` | `8a38323a3cddc585214f8c36a9f669b8d5d0ea877af304a4d1a8253a77c1f24a` |
+| discovery-2 | `63d472c3821e70db68d708e52573c42422afbb6733dffb2a67fed95e0de4e363` | `d21eb4b6833f35f32ba531b891c559168700018b997c705bb250ee1a4763fda6` |
+| discovery-3 | `e80fe1c375894f409788a792e577007464c1cb97beca8ee79c0130dd316e9a80` | `045de2d770e228fe92568b36dbe25e67cd9d9bb38a9ee6b3896587bb5295eb33` |
+| discovery-4 | `af3d2983a167e0038dd0479bc2f6bd4cc4a2da76885b9552e776c0389d762771` | `ec05b032c65311f3dffa6a3b05952b79bee2dd020810f529c5c0c7ff651fbe6f` |
+
+Native exact-byte import for these eight files is `append_binary_state(namespace='development-parent-originals', key=actual_digest, content=authenticated_original_bytes)`, verifying that the returned reference equals the original. This copies evidence only; do not copy surrounding adapter state or state indexes. The sidecar can be copied byte-for-byte with exclusive creation after authentication, or use the repository's existing create-only canonical primitive method and compare its returned digest. No request reconstruction is needed.
+
+Existing actual quick files, relative to this worktree, are under `.artifacts/pit-optimizer-v5/development/runs/runtime-parent-quick-005064e57e80-01/`:
+
+| File | SHA-256 |
+| --- | --- |
+| `request/panel-request.json` | `46827813aa0afcf47a1de3b70a167a8db0e5a5df41bc3ce929f6f5e2cb1ba28c` |
+| `output/panel-evaluation.json` | `ee52964453c9831f371ca7539a6d30d5c47707d5c0e6cf3d16436e15c28c5716` |
+| `verification-record.json` | `30cd7f6c5048b535f864ae657d9292064d1e3739e07caff954bccd2d1d987843` |
+
+Reference these unchanged in proposal evidence; copying them into the runtime graph is unnecessary. The actual request episode is `development-first-loop-2021q1`, whereas the plan label is `development-quick`; panel digest equality does not erase that distinction. Quick output is not an extra parent-provenance edge. All accepted discovery baselines and quick base results report zero trades and zero returns. That does not establish the cause or the outcome of any future candidate.
+
+## Native fresh preparation procedure, after source readiness
+
+1. Create one genuinely fresh artifact root at the principal's selected absolute path. `LocalArtifactRepositoryV5` requires an existing absolute link-free directory and pins its actual filesystem identity; it does not choose/create the root. Record original archive file hashes separately so copying evidence cannot obscure source preservation.
+2. Authenticate actual06 with `authenticate_campaign_manifest_v5` and its exact original manifest ref. Select only the 14 fixed dependency references above. Copy exact authenticated bytes with exclusive destination creation and destination digest verification, or load/create exact native typed artifacts and compare returned refs. The native typed classes are `ExecutionProfileV5`, `EvaluatorContractV5`, `SandboxProfileV5`, `BaselineParentAuthorityV5`, `SourceBundleV5`, `PolicyRevisionIdentityV5`, and `CampaignPanelPlanV5`. For five panel specs use `load_evaluation_panel_spec` / `create_evaluation_panel_spec` so their established panel serialization is retained. There is no generic public raw data importer in `LocalArtifactRepositoryV5`; ordinary exclusive exact-byte file copying followed by `authenticate_raw_artifact` is appropriate for the two data files. Do not serialize SQLite or prices provenance through the dataclass codec.
+3. Capture the real immutable four policy blobs using `capture_development_policy_v5(source_root=..., git_executable=..., expected_source_commit='0985d9bae74162ec1da8a7268bd54e47f21b0b85')`. This performs local read-only Git blob commands when principal actually prepares; it was not called here. It intentionally allows host HEAD to advance independently. Verify its snapshot against the authenticated full baseline source bundle/revision; do not build a new snapshot by merely asserting old digests.
+4. Call `build_campaign_manifest_v5` directly with fresh campaign ID, fresh manifest/policy-scope paths, actual snapshot, the five fixed execution/evaluator/baseline/plan/sandbox refs and the original target. Use approved actual new capabilities: paid development, semantic disabled, three attempts; one hypothesis/axis/variant/survivor; archive capacity 2; memory 98,304 bytes; no full-source escape; eight calls; 600,000 tokens; 8,192 output; 4,096 input overhead; zero retries/repairs. Source selection in the existing proposal is `openai/gpt-5.4`; selecting that identifier does not assert current availability/pricing. No dollar ceiling/price quote is supplied by this inventory. Set resources to the approved 21,600-second campaign / 7,200-second round, 1,200-second discovery, 600-second quick, 300-second role, 60-second mechanics and cleanup, 1-second policy method and 30-second startup; retain exact sandbox CPU/memory/PID/output limits. The builder writes the accepted policy descriptor if needed, new policy scope and new manifest, then fully reauthenticates the graph. It does not evaluate a parent.
+5. Call native `prepare_development_adapter_config_v5` with this authenticated manifest, fresh config path, the real existing source/resource/tool paths, round 1 and one fresh owner digest. Allow the native preparation to create a fresh owner if desired; never reuse actual06's owner. It checks the mounted data directory contains exactly the two expected regular non-symlink files with exact hashes, captures immutable policy blobs, derives the real paid adapter graph and persists the exact config. It creates no campaign start, model call or evaluation. Its current returned `resume_command` is not permission to resume a nonexistent launch; separately render the final command as `run-campaign` after policy preparation.
+6. Following final reviewed P1 interfaces, create only the immutable `CampaignAdmissionPolicyV5` artifact: schema 5/revision 1, new manifest ref, new round-1 config ref, fresh owner, actual fresh repository-root identity, target 2 and prospective envelope 75,000. Call `authenticate_prepared_campaign_policy_v5` with the exact ref. Do not create `CampaignAdmissionBindingV5` or append `campaign-admission` enrollment during preparation. Enrollment belongs under the existing launch transition at actual authorized execution. P1–P4 APIs must be rechecked after source freeze; the approved spec/plan is the design authority here, not a claim those hooks already exist.
+7. Produce the actual initial preview as described below, check its exact packet against the authenticated prepared policy with `require_role_envelope_v5`, and save review-only bytes/hash/size outside `roles/` and state namespaces. Record the approved native boundary decision from the real fresh counters if needed; do not call predicates with synthetic future counters to exercise branches.
+8. Use final reviewed `render_production_command_v5(command='run-campaign', campaign_policy_ref=exact_prepared_policy_ref, ...)` with the fresh manifest/config/owner/root. Save its native argv/PowerShell string plus working directory/executable/source/policy/environment identities. The final proposal independently pins that expected policy ref. Rendering is preparation, not a campaign launch. All final bytes must be reviewed before the separate fresh execution/budget grant.
+
+`prepare_development_campaign_v5` is not the right helper for this task: its current search construction hardcodes `max_feedback_rounds=2` and reconstructs a seed from four actual pairs. Direct native manifest building reuses the already authenticated fixed graph without a temporary two-attempt manifest, extra seed or changes to old files. Do not edit the helper just to prepare this campaign.
+
+## Source, mounted resources, tool and environment identities
+
+Actual source root remains `C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-v5-architecture`. A fresh artifact repository may live inside that worktree, as actual06 did. Candidate workspace, mounted data, output and control roots must be disjoint from the source root and from one another. Therefore the fresh artifact repository's internal `data/` directory cannot also be the mounted data root when the repository is under this source tree.
+
+Principal should choose fresh sibling resource directories outside the source worktree, typically under a newly named resource parent in `C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.artifacts/`: separate `workspaces`, `output`, `control`, and optionally `data`. Do not reuse actual06's mutable resource directories. The existing actual shared data root was `C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.artifacts/pit-v5-controller-runtime-20260907/data`; it may be reused only as authenticated unchanged read-only data, or its exact two bytesets may be copied to a fresh disjoint data directory. Folder names/locations are principal choices; none were created here. Native mount/executor constructors reject overlapping roots and pin directory/device/inode identities; replacing a directory later changes authority even if its name is identical.
+
+Existing actual tool paths, from actual06 config/launch metadata:
+
+- Git: `C:/Program Files/Git/bin/git.exe`.
+- Docker CLI: `C:/Users/llong/AppData/Local/Programs/DockerDesktop/resources/bin/docker.exe`.
+- Python: `C:/Users/llong/AppData/Local/Microsoft/WindowsApps/PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0/python.exe`.
+
+These are inspected historical paths, not fresh existence, version or executable-hash verification. Principal preparation should use its selected actual interpreter and explicit resolved Git/Docker paths and record current file digests/identities without executing Docker. `LocalGitWorkspaceDriverV5` hashes Git and binds real root identities/source commit/export mode; `LocalContainerExecutorV5` hashes Docker and binds manifest/profile/owner/mount/control root/repository/runtime contract and control environment. A changed tool or environment requires a new coherent preparation, not old identity substitution.
+
+The container executor takes the sorted present values of six non-secret control keys internally: `PATH`, `SYSTEMROOT`, `WINDIR`, `COMSPEC`, `PATHEXT`, `SYSTEMDRIVE` (`production_sandbox.py:1696–1723`). Publish only the resulting native executor identity and, if principal chooses an explicit component pin, a digest computed in the real preparation environment with a named canonical domain. Never print/store the values or dump `_base_environment`. The owner/config/repository/driver/mount/gateway/ledger/audit/executor hashes are already public non-secret authority fields; retain them exactly in the review. Credential authority is the handle name `OPENROUTER_API_KEY` only, and secret resolution remains lazy at paid invocation. This inventory read no environment values or credentials.
+
+A digest is not a reversible environment snapshot and cannot reconstruct an old process environment. Preparation and the one eventual launch need the same real environment under the ordinary live checks. Avoid a new PATH-modifying wrapper or a different interpreter launcher between composition and execution; do not neutralize identity checks to compensate. The intended work deadline is persisted on the actual launch, not when the command is rendered. Keep AC/lid/session handling explicit in the review and preserve the original deadline after any recovery.
+
+Fixed evaluator identity is the unchanged 56-file closure `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4`, with image `pit-optimizer-v5-evaluator@sha256:4e85b19aa8c135362ae8796e4d33a410ec5af650d296c358ae6a7737d5b05b6a`. No image rebuild, parent reevaluation or evaluator-source mutation follows from the new host admission code.
+
+## Initial nonpersisting preview
+
+Use only the actual fresh prepared repository and real authenticated manifest/baseline. There must be no launch, binding, checkpoint, role request/completion/reservation, candidate record or started round. Obtain the ordinary round-1 composition through `DevelopmentRoundFactoryV5` with its exact config/owner and retain `validate_for`; do not build substitute dependencies. `LocalArchiveReducerFactoryV5.recovery_reducer(inputs).initial()` describes the actual empty history. Use its actual `SearchProjectionV5(checkpoint=None, state=initial_state, stored_records=())` and normal `select_parent_v5` with the authenticated baseline/plan/evaluator, then call the real request factory's `investigator_request`.
+
+The resulting baseline evidence is the real four discovery reports, including their present zero entry counts; history and rejection feedback are absent because that is the real initial state. This is not a hypothetical future round. Under the admission design the factory reloads enrollment when used; prepared preview has none, so the exact packet is separately subjected to `authenticate_prepared_campaign_policy_v5` and its pure envelope predicate. Do not enroll early to obtain preview coverage or invoke a round to create the request.
+
+Save exact canonical request bytes and wire-message/schema projections, their digests, sizes, allowed source paths/contracts and the prospective input/output accounting. `prospective_role_usage_v5` includes wire message bytes, the larger canonical/wire schema length and declared overhead; require input bound plus 8,192 output to be at most 75,000. The first investigator packet does not contain the actual later author's selected source edit or the later critic's evaluation results. Document those later packet contracts and source scope now; exact response-dependent bytes must come from actual authorized execution, not a fabricated preview.
+
+Actual parent policy scope is four immutable paths with digests:
+
+| Path | SHA-256 |
+| --- | --- |
+| `core/strategy_policy/v3/entry.py` | `83f75bec59daaa74af1f02f335abd8bdbaa03eb97cd8a5e91addd4156ea01b85` |
+| `core/strategy_policy/v3/risk.py` | `32098cc02d13c2fbede053818bb99686b9659639b976108d9730adbfcf6cfe20` |
+| `core/strategy_policy/v3/position.py` | `8a9d0b790c0e3b7bc70a45d9e10b06f9b3c0337ebad662d8111f8abc35886cd1` |
+| `core/strategy_policy/v3/exit.py` | `61b07c9e42813e5d58a4ce7d669f06466e9bf5b6b4cf2872d624022959d8f837` |
+
+## Freshness and inspection limits
+
+Do not wholesale-copy actual06 or any earlier root. Exclude all old manifests/scopes/configs/launch files, campaign/round launch or start state, admission state, roles, authorization/ledger/receipt/index/lock files, owner tokens, workspace leases/mount/container/control reservations, checkpoints/archive/records/critics, responses and runtime result files. The only `adapter-blobs` imports described here are the eight exact original parent request/output evidence blobs. No old operational authority or novelty history is inherited.
+
+Inspection used only source text, approved design/plan/readiness evidence and selected actual artifact metadata. No source imports/execution, tests, summaries, campaign/request/policy/capability construction, provider/API/Docker/evaluation/environment/credential access or archive/source mutations occurred. Only this document was written. Tables transcribe accepted references and observed metadata; they are not a new full authentication run or current resource liveness claim.

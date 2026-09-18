@@ -1,0 +1,92 @@
+# Task 1 Report — Pure Strategy-Policy Boundary
+
+Status: DONE
+
+Commit: `7a59244 feat: define pure strategy policy boundary`
+
+## What changed
+
+- Added the closed `core.strategy_policy` package with policy interface version 1, a typed client protocol/factory, frozen slot-based primitive contracts, canonical JSON serialization, and trusted output validators.
+- Added baseline pure entry, capacity, allocation, eviction, and exit policies. They preserve the fixed CANSLIM gates, uncapped capacity behavior, configured sizing inputs, two-pass eviction selection, tiered exits, early-winner behavior, stop ratchets, and EMA/time-stop ordering.
+- Added focused behavioral tests for every snapshot/decision contract, JSON round trips, closed schema validation, immutable collections, finite strict scalars, enum validation, policy behavior, and exit-plan validation.
+
+## Files
+
+- `core/strategy_policy/__init__.py`
+- `core/strategy_policy/contracts.py`
+- `core/strategy_policy/entry.py`
+- `core/strategy_policy/risk.py`
+- `core/strategy_policy/exit.py`
+- `tests/test_strategy_policy.py`
+
+## Test evidence
+
+Required command used throughout:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_strategy_policy.py
+```
+
+RED evidence:
+
+- Initial contract test run: collection failed as required with `ModuleNotFoundError: No module named 'core.strategy_policy'`.
+- After contracts/export scaffolding: collection failed on missing `core.strategy_policy.entry`.
+- Capacity/eviction slice: `2 failed` with `NotImplementedError` from both baseline risk functions.
+- Allocation slice: `2 failed` with `NotImplementedError` from the allocation function.
+- Exit slice: `3 failed` with `NotImplementedError` from the exit function.
+
+GREEN evidence:
+
+- Entry slice: `9 passed, 17 deselected`.
+- Capacity/eviction slice: `4 passed, 22 deselected`.
+- Allocation slice: `3 passed, 23 deselected`.
+- Exit slice: `7 passed, 19 deselected`.
+- Final focused file: `26 passed` in 0.06s.
+- The commit hooks also passed `ruff`, trailing-whitespace, EOF, YAML, and merge-conflict checks.
+
+The pytest environment emits one pre-existing configuration warning: `Unknown config option: cache_dir`; it does not affect test execution.
+
+## Self-review
+
+- Reviewed the staged diff and ran `git diff --check`; no whitespace errors remained.
+- Confirmed the policy modules have no I/O, simulator/data imports, or mutable state.
+- Confirmed snapshots contain only scalar/tuple contract data and decisions expose no candidate-provided fill price.
+- Confirmed baseline capacity preserves `None`, eviction resolves only opaque slots, and exit validation constrains actions and stop candidates against trusted facts.
+
+## Concerns
+
+None. The only observed issue was the existing pytest configuration warning noted above.
+
+## Fix Round 1 — Close inherited instance storage
+
+Commit: `205ad2d fix: close strategy policy instances`
+
+### Changed code
+
+- Added `__slots__ = ()` to `_CanonicalContract`, preventing frozen slotted contract subclasses from inheriting a mutable instance `__dict__`.
+- Added `test_contract_instances_have_no_mutable_instance_dictionary`, which instantiates every snapshot, decision, and nested policy contract and asserts none exposes `__dict__`.
+
+### Test evidence
+
+RED command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_strategy_policy.py -k "mutable_instance_dictionary"
+```
+
+RED result: `1 failed, 26 deselected`. The new regression failed at `assert all(not hasattr(contract, "__dict__") for contract in contracts)`, proving the inherited mutable dictionary existed.
+
+GREEN commands:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_strategy_policy.py -k "mutable_instance_dictionary"
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_strategy_policy.py
+```
+
+GREEN results: the narrow regression reported `1 passed, 26 deselected`; the complete focused policy file reported `27 passed`. Both invocations emitted only the pre-existing pytest `cache_dir` configuration warning.
+
+### Self-review
+
+- Reviewed the two-file diff and ran `git diff --check`; no whitespace errors were present.
+- Confirmed the fix is limited to base-class instance layout, so all descendants now lack an inherited `__dict__` without changing serializers, validators, or policy behavior.
+- Commit hooks passed ruff, trailing-whitespace, EOF, YAML, and merge-conflict checks.

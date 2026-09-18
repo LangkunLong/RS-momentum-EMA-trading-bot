@@ -1,0 +1,252 @@
+diff --git a/core/pit_optimizer_v5/baseline_preparation.py b/core/pit_optimizer_v5/baseline_preparation.py
+new file mode 100644
+index 0000000..a2c1028
+--- /dev/null
++++ b/core/pit_optimizer_v5/baseline_preparation.py
+@@ -0,0 +1,109 @@
++"""Host-only composition of the existing V5 baseline capture authority."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++import hashlib
++
++from core.pit_optimizer_v5.artifacts import _extract_artifact_refs, _strict_json_object
++from core.pit_optimizer_v5.baseline import BaselineCaptureInputsV5, authenticate_baseline_inputs_v5
++from core.pit_optimizer_v5.contracts import ArtifactRefV5, AuthenticatedArtifactV5, canonical_json_bytes_v5
++
++
++@dataclass(frozen=True, slots=True)
++class PreparedBaselineInputsV5:
++    """Content-free result of baseline input preparation."""
++
++    inputs_ref: ArtifactRefV5
++    capture_argv: tuple[str, ...]
++
++
++def prepare_baseline_inputs_v5(
++    *,
++    repository,
++    output_path: str,
++    evaluator_contract_ref: ArtifactRefV5,
++    execution_profile_ref: ArtifactRefV5,
++    sandbox_profile_ref: ArtifactRefV5,
++    panel_plan_ref: ArtifactRefV5,
++    baseline_policy_revision_ref: ArtifactRefV5,
++    source_bundle_ref: ArtifactRefV5,
++    policy_scope_ref: ArtifactRefV5,
++    evaluator_source_ref: ArtifactRefV5,
++    identity_transition_ref: ArtifactRefV5,
++    resources_ref: ArtifactRefV5,
++) -> PreparedBaselineInputsV5:
++    """Authenticate and create-only publish one complete baseline input graph.
++
++    The pending root is authenticated in memory before publication. Every child
++    is consequently read only at its explicitly supplied path and digest.
++    """
++
++    inputs = BaselineCaptureInputsV5(
++        schema_version=5,
++        evaluator_contract_ref=evaluator_contract_ref,
++        execution_profile_ref=execution_profile_ref,
++        sandbox_profile_ref=sandbox_profile_ref,
++        panel_plan_ref=panel_plan_ref,
++        baseline_policy_revision_ref=baseline_policy_revision_ref,
++        source_bundle_ref=source_bundle_ref,
++        policy_scope_ref=policy_scope_ref,
++        evaluator_source_ref=evaluator_source_ref,
++        identity_transition_ref=identity_transition_ref,
++        resources_ref=resources_ref,
++    )
++    raw = canonical_json_bytes_v5(inputs)
++    pending_ref = ArtifactRefV5(output_path, hashlib.sha256(raw).hexdigest())
++
++    class PendingInputsRepository:
++        def authenticate_exact(self, reference):
++            if reference == pending_ref:
++                return AuthenticatedArtifactV5(
++                    reference,
++                    raw,
++                    _extract_artifact_refs(_strict_json_object(raw, reference)),
++                )
++            return repository.authenticate_exact(reference)
++
++        def __getattr__(self, name):
++            return getattr(repository, name)
++
++    authenticated = authenticate_baseline_inputs_v5(repository=PendingInputsRepository(), inputs_ref=pending_ref)
++    if authenticated.inputs != inputs:
++        raise ValueError("prepared baseline inputs changed during authentication")
++    created = repository.create_baseline_artifact(output_path, inputs)
++    if created != pending_ref:
++        raise ValueError("prepared baseline input identity differs")
++    if authenticate_baseline_inputs_v5(repository=repository, inputs_ref=created).inputs != inputs:
++        raise ValueError("published baseline inputs failed authentication")
++    capture_argv = (
++        "python",
++        "-B",
++        "-m",
++        "core.pit_optimizer_v5.cli",
++        "capture-baseline",
++        "--artifact-root",
++        "<ABSOLUTE_ARTIFACT_ROOT>",
++        "--capture-inputs-path",
++        created.relative_path,
++        "--capture-inputs-sha256",
++        created.sha256,
++        "--output-path",
++        "evaluator/baseline-authority.json",
++        "--source-root",
++        "<ABSOLUTE_CLEAN_SOURCE_ROOT>",
++        "--scratch-root",
++        "<ABSOLUTE_SCRATCH_ROOT>",
++        "--trusted-git-executable",
++        "<ABSOLUTE_GIT_EXECUTABLE>",
++        "--trusted-git-sha256",
++        "<GIT_SHA256>",
++        "--docker-executable",
++        "<ABSOLUTE_DOCKER_EXECUTABLE>",
++        "--docker-sha256",
++        "<DOCKER_SHA256>",
++    )
++    return PreparedBaselineInputsV5(created, capture_argv)
++
++
++__all__ = ["PreparedBaselineInputsV5", "prepare_baseline_inputs_v5"]
+diff --git a/core/pit_optimizer_v5/cli.py b/core/pit_optimizer_v5/cli.py
+index eb8518f..aba3e35 100644
+--- a/core/pit_optimizer_v5/cli.py
++++ b/core/pit_optimizer_v5/cli.py
+@@ -107,6 +107,7 @@ _BASELINE_COMMANDS = frozenset(
+     {
+         "write-execution-profile",
+         "build-sandbox-profile",
++        "prepare-baseline-inputs",
+         "capture-baseline",
+         "verify-baseline",
+     }
+@@ -1240,6 +1241,21 @@ def build_parser_v5() -> argparse.ArgumentParser:
+                 "docker-sha256",
+             ):
+                 command.add_argument(f"--{option}", required=True)
++        if name == "prepare-baseline-inputs":
++            for prefix in (
++                "evaluator-contract",
++                "execution-profile",
++                "sandbox-profile",
++                "panel-plan",
++                "baseline-policy-revision",
++                "source-bundle",
++                "policy-scope",
++                "evaluator-source",
++                "identity-transition",
++                "resources",
++            ):
++                command.add_argument(f"--{prefix}-path", required=True)
++                command.add_argument(f"--{prefix}-sha256", required=True)
+         if name == "build-sandbox-profile":
+             command.add_argument("--image-name", required=True)
+             command.add_argument(
+@@ -1757,6 +1773,36 @@ def dispatch_baseline_cli_v5(
+                         output_path=args.output_path,
+                         worker_factory=selected_factory,
+                     )
++            elif args.command == "prepare-baseline-inputs":
++                from core.pit_optimizer_v5.baseline_preparation import prepare_baseline_inputs_v5
++
++                prepared = prepare_baseline_inputs_v5(
++                    repository=repository,
++                    output_path=args.output_path,
++                    evaluator_contract_ref=ArtifactRefV5(args.evaluator_contract_path, args.evaluator_contract_sha256),
++                    execution_profile_ref=ArtifactRefV5(args.execution_profile_path, args.execution_profile_sha256),
++                    sandbox_profile_ref=ArtifactRefV5(args.sandbox_profile_path, args.sandbox_profile_sha256),
++                    panel_plan_ref=ArtifactRefV5(args.panel_plan_path, args.panel_plan_sha256),
++                    baseline_policy_revision_ref=ArtifactRefV5(
++                        args.baseline_policy_revision_path, args.baseline_policy_revision_sha256
++                    ),
++                    source_bundle_ref=ArtifactRefV5(args.source_bundle_path, args.source_bundle_sha256),
++                    policy_scope_ref=ArtifactRefV5(args.policy_scope_path, args.policy_scope_sha256),
++                    evaluator_source_ref=ArtifactRefV5(args.evaluator_source_path, args.evaluator_source_sha256),
++                    identity_transition_ref=ArtifactRefV5(
++                        args.identity_transition_path, args.identity_transition_sha256
++                    ),
++                    resources_ref=ArtifactRefV5(args.resources_path, args.resources_sha256),
++                )
++                payload = {
++                    "schema_version": 5,
++                    "status": "created",
++                    "artifact_ref": prepared.inputs_ref,
++                    "capture_argv": prepared.capture_argv,
++                    "provider_calls": 0,
++                    "evaluation_performed": False,
++                }
++                ref = None
+             elif args.command == "write-execution-profile":
+                 ref = write_execution_profile_v5(repository=repository, output_path=args.output_path)
+             else:
+@@ -1768,7 +1814,8 @@ def dispatch_baseline_cli_v5(
+                     image_digest=args.image_digest,
+                     output_path=args.output_path,
+                 )
+-            payload = {"schema_version": 5, "status": "created", "artifact_ref": ref}
++            if args.command != "prepare-baseline-inputs":
++                payload = {"schema_version": 5, "status": "created", "artifact_ref": ref}
+         exit_code = 0
+     except Exception:
+         # Includes bounded process timeouts and malformed graph metadata; do
+diff --git a/docs/pit-optimizer-v5-operations.md b/docs/pit-optimizer-v5-operations.md
+index 9dd13ea..ad9ba01 100644
+--- a/docs/pit-optimizer-v5-operations.md
++++ b/docs/pit-optimizer-v5-operations.md
+@@ -10,7 +10,50 @@ The source, workspace, data, output, and control directories must already exist
+ 
+ Preparation checks the clean source commit and policy bytes, hashes the two data files without querying market or held-out domains, and constructs the actual production adapters to capture their identities. It does not start Docker or check daemon/image readiness. Before execution, make the manifest-pinned image available locally and configure `OPENROUTER_API_KEY` in the launch environment. The runtime uses the pinned image with pulling disabled.
+ 
+-If no real manifest exists yet, first complete the upstream data, panel, and baseline work. `capture-baseline` already accepts `--capture-inputs-path` and `--capture-inputs-sha256`, but there is currently no `prepare-baseline-inputs` CLI builder. Its existing `BaselineCaptureInputsV5` must reference the real evaluator contract, execution profile, sandbox profile, discovery panel plan, baseline policy revision, source bundle, policy scope, evaluator source, identity transitions, and resource capabilities. Persist and authenticate those inputs, run the existing baseline capture/verification, and then use `build-manifest`. A provisional single-panel evaluation does not establish the full baseline or discovery campaign authority.
++If no real manifest exists yet, first complete the upstream data and panel work. The baseline input descriptor must reference the real evaluator contract, execution profile, sandbox profile, discovery panel plan, baseline policy revision, source bundle, policy scope, evaluator source, identity transitions, and resource capabilities. `prepare-baseline-inputs` authenticates that complete exact-path graph before publishing the descriptor create-only. It performs no evaluation, Docker action, provider call, directory scan, or held-out panel read. A provisional single-panel evaluation does not establish the full baseline or discovery campaign authority.
++
++## Prepare and capture the baseline
++
++Supply each existing artifact as a path relative to the canonical artifact root plus its SHA-256 digest. The command does not accept unverified identity placeholders. The final V3 PIT bundle, prices provenance, and discovery panels must already be reachable from the supplied discovery panel plan. The source bundle, policy revision, policy scope, evaluator contract, evaluator source map, identity-transition contract, and resource authority also need to have been built and persisted upstream; no safe production builder currently derives those artifacts from the panel plan alone.
++
++```powershell
++Set-Location 'C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.worktrees\pit-optimizer-v5-architecture'
++$python = (Get-Command python.exe).Source
++$artifactRoot = Read-Host 'Absolute artifact repository directory'
++$baselineArgs = @(
++    '--artifact-root', $artifactRoot,
++    '--output-path', 'evaluator/baseline-capture-inputs.json',
++    '--evaluator-contract-path', '<path>', '--evaluator-contract-sha256', '<sha256>',
++    '--execution-profile-path', '<path>', '--execution-profile-sha256', '<sha256>',
++    '--sandbox-profile-path', '<path>', '--sandbox-profile-sha256', '<sha256>',
++    '--panel-plan-path', '<path>', '--panel-plan-sha256', '<sha256>',
++    '--baseline-policy-revision-path', '<path>', '--baseline-policy-revision-sha256', '<sha256>',
++    '--source-bundle-path', '<path>', '--source-bundle-sha256', '<sha256>',
++    '--policy-scope-path', '<path>', '--policy-scope-sha256', '<sha256>',
++    '--evaluator-source-path', '<path>', '--evaluator-source-sha256', '<sha256>',
++    '--identity-transition-path', '<path>', '--identity-transition-sha256', '<sha256>',
++    '--resources-path', '<path>', '--resources-sha256', '<sha256>'
++)
++$preparedLine = & $python -B -m core.pit_optimizer_v5.cli prepare-baseline-inputs @baselineArgs
++if ($LASTEXITCODE -ne 0) { $preparedLine; throw 'Baseline input preparation failed' }
++$prepared = ($preparedLine -replace '^PIT_OPTIMIZER_V5_BASELINE=', '') | ConvertFrom-Json
++
++# Fill the explicit host paths and executable hashes shown as placeholders in
++# $prepared.capture_argv, then run that argv. Equivalently:
++& $python -B -m core.pit_optimizer_v5.cli capture-baseline `
++    --artifact-root $artifactRoot `
++    --capture-inputs-path $prepared.artifact_ref.relative_path `
++    --capture-inputs-sha256 $prepared.artifact_ref.sha256 `
++    --output-path 'evaluator/baseline-authority.json' `
++    --source-root '<absolute-clean-source-root>' `
++    --scratch-root '<absolute-disjoint-scratch-root>' `
++    --trusted-git-executable '<absolute-git-executable>' `
++    --trusted-git-sha256 '<git-sha256>' `
++    --docker-executable '<absolute-docker-executable>' `
++    --docker-sha256 '<docker-sha256>'
++```
++
++Baseline capture requires a clean checkout at the exact source commit named by the policy scope, a disjoint empty scratch root, the locally available digest-pinned evaluator image, and authenticated Git and Docker executable hashes. It runs two fresh network-disabled full-grid evaluations and publishes authority only after byte-identical results and cleanup. Verify the resulting reference with `verify-baseline`, then pass that authority to `build-manifest`.
+ 
+ ## Prepare the local adapter configuration
+ 

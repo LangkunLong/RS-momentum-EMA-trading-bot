@@ -1,0 +1,15 @@
+# P2 source freezes
+
+P2 production source was first frozen after implementation and static verification on 2026-09-08. Independent review found five bounded issues. Root retained the exact first freeze in `review-freeze-01/`, including its source authority and reviewed diff. The table below records the subsequent fix-round-1 freeze.
+
+| Source | Principal preimage SHA-256 | Fix-round-1 SHA-256 | Frozen bytes | LF | CRLF |
+| --- | --- | --- | ---: | ---: | ---: |
+| `core/pit_optimizer_v5/campaign_admission.py` | `7e15ed500121b4c85df7a838feab51750e1f476a3e5427b9d1a0b1f0f58a89d9` | `c42b07adc2d14fd00300acf2c76fb15669cade0ad4b149d7d92cbe9666c88d5e` | 45,903 | 1,167 | 0 |
+| `core/pit_optimizer_v5/production_runtime.py` | `1a232da79f5ddf0c01e48f39dd94008f6ad3b34ed08af385c3787e4f4555e070` | `9d1fad0710037a64b46d1745d107203d114483baac215563e49e1c28e8892f83` | 75,591 | 1,752 | 1,581 |
+| `core/pit_optimizer_v5/production_provider.py` | `6077f0a716fa5d64594f5760d86b00f3b2865b605ca25bf3ab57bed07793b94f` | `e8aa63d92f48574bfb082f20a15f253f06c4e304d9afee95f0b02ed7954b80f4` | 57,635 | 1,243 | 1,206 |
+
+`actual-task.diff` is the updated unified diff generated directly from the three principal preimages to the fix-round-1 postimages. It is 41,781 bytes, contains 1,020 LF delimiters, and has SHA-256 `a0318c2c8f7659b4c77dfe8b95c76d0d9d15f9fedf12959c7c79de2df3bb7994`.
+
+`fix-round-1.diff` is the narrow unified correction from the exact `review-freeze-01` source to the fix-round-1 postimages. It is 4,917 bytes, contains 111 LF delimiters, and has SHA-256 `053f3fcc07c49503d9d080574987a8786f79a808ebfcc6f15f957509157bc7a7`.
+
+No further production edit belongs to this freeze unless an independent P2 review returns a bounded correction.

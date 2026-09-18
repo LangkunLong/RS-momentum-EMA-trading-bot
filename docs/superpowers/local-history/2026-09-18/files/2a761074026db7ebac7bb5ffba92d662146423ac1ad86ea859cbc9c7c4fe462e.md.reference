@@ -1,0 +1,60 @@
+# Task 8C1 report — bounded V5 workspace adapter
+
+## Outcome
+
+Implemented `core/pit_optimizer_v5/workspace.py` as a pure, injected-driver boundary. It does not
+execute Git or perform direct filesystem mutation. Package exports were added in
+`core/pit_optimizer_v5/__init__.py`.
+
+## Implemented boundary
+
+- Frozen campaign/round/controller owner, canonical roots, path-inspection, workspace-lease,
+  materialization, and sanitized failure contracts.
+- `GitWorkspaceDriverV5` Protocol for exact path inspection, byte reads, disposable checkout
+  creation, the four closed policy writes, lease lookup, controller-liveness proof, exact removal,
+  and lease retirement.
+- Parent authority is checked against all four source files before checkout creation. The created
+  workspace is re-read and checked against the same parent before any candidate write.
+- Only `EDITABLE_POLICY_PATHS_V5` are written. The resulting four-file bundle is re-read, its child
+  revision is independently derived with the parent's trusted-runtime and immutable-constraint
+  identities, and both source bytes and policy identity must match the rendered variant.
+- The returned lease binds owner, round, exact contained path, opaque lease token digest, parent,
+  and child. It adapts directly to Task 8B's `OwnedLeaseV5` and `MaterializedVariantV5` shapes.
+- Cleanup requires the exact registered lease, exact canonical resolved path, link/reparse-free
+  path chain, containment under the configured root, and matching token. It is idempotent.
+- Stale reclaim accepts only an explicit tuple of exact authenticated leases for the supplied
+  campaign owner and requires the controller lease to be proven dead. Foreign and still-live
+  leases fail closed.
+- A context-manager API performs exact owned cleanup on exit. Failed post-create identity checks
+  attempt only lease-authorized exact cleanup and never broaden cleanup authority.
+
+## Direct fake verification
+
+A temporary in-memory driver harness (removed after execution) produced
+`V5_WORKSPACE_FAKE_SMOKE_OK`. It covered successful parent/child materialization and runtime
+adaptation, parent mismatch before creation, child mismatch after write with exact cleanup,
+foreign-owner rejection, live-controller stale-reclaim rejection, link/reparse containment
+rejection, authenticated dead-controller reclaim, and repeated idempotent cleanup.
+
+Final source checks passed: `py_compile`, Ruff check, Ruff format check, package export import,
+forbidden Git/Docker/provider/subprocess coupling scan, and `git diff --check`. No test files were
+created or modified, and no provider, Docker, subprocess, Git materialization, replay, market data,
+network, push, or merge operation ran.
+
+## Final-review correction
+
+- Replaced free absolute candidate paths with driver-acquired `WorkspaceRootHandleV5` and
+  `OwnedWorkspaceHandleV5` capabilities. Only canonical root acquisition accepts an absolute
+  string. Workspace presence, reads, closed writes, reopening, and atomic no-follow removal all use
+  the root-bound opaque handle and closed relative policy paths.
+- Source and workspace roots are now rejected when equal or nested in either direction using
+  case-insensitive Windows path semantics. Acquired canonical roots are checked again.
+- Every lease now authenticates the exact workspace-root identity, canonical-root-path digest, and
+  single relative workspace component. A lease issued under a narrower root cannot be replayed
+  against a broader containing adapter root.
+- Cleanup now handles the removal/retirement crash boundary: an exact registered lease whose exact
+  root-relative directory is already absent is safely retired, while an unregistered present path
+  is rejected. Repeated cleanup remains a no-op.
+- The replacement fake smoke produced `V5_WORKSPACE_REVIEW_SMOKE_OK` for both root-nesting
+  directions (including case aliases), a simulated reparse swap, broader-root lease replay, a crash
+  after removal but before lease retirement, and valid/idempotent cleanup.

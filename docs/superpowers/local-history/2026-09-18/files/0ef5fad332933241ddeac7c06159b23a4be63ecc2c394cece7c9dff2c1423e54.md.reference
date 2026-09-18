@@ -1,0 +1,76 @@
+# Task 11 Final-Fix Senior Review
+
+## Verdict
+
+**PASS — 0 Critical, 0 Important, 0 Minor.**
+
+All five Important findings from the original final review are resolved in the frozen post-fix snapshot. The fixes are integrated consistently with the Task 11 specification, preserve legacy evaluator behavior, and introduce no new Critical or Important regression within the requested review boundary.
+
+## Reviewed snapshot
+
+The five post-fix files were read in their current exact form and rehashed at the end of the review:
+
+| File | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `core/backtest_engine.py` | 146830 | `03b26fa40419b2295ffb376917153fca3f77003e1334cea555f47d8d3b1ad67f` |
+| `core/canslim/c_current_earnings.py` | 13539 | `fab32b0ad09d1c2a9ad2c938dc92bfa1143f37e6c19bd24b3cf52ecb58449b11` |
+| `core/engine_policy.py` | 45376 | `e8c0f5966401984d338673b235362ec2fbe3f394332362a4dc848edc509a834d` |
+| `core/pit_diagnosis/baseline.py` | 46814 | `4a312aef7eeb1772efe9f66646606a577502c5da4e4d28f4c535acb2bb740996` |
+| `core/pit_diagnosis/task11_artifact_diagnosis.py` | 39092 | `4dbccfa6711cb1dc9cb812668c53c91fdf437917346a4c1d33b3533a9e6fd47b` |
+
+The final `git status --short` remains the same 13-file Task 11 scope: seven tracked modifications and six intended untracked Task 11 implementation/specification files. No out-of-scope file appeared during review.
+
+## Critical
+
+None.
+
+## Important
+
+None.
+
+## Minor
+
+None.
+
+## Resolution of the five original findings
+
+### 1. Industry filtering is now mode-aware and causally truthful
+
+`core/engine_policy.py:225-286` rejects an enabled industry filter in technical-only and PIT modes, classifies those modes as unsupported/advisory, and exposes it as an optimizer candidate only in the normal provider-backed mode where the current cached industry taxonomy is actually available. `core/backtest_engine.py:1420-1422` keeps the default disabled. Policy capture occurs before provider data access (`core/backtest_engine.py:1534`), the cache is then cleared before the run (`core/backtest_engine.py:1546`), industry data is loaded only at the provider-mode call site (`core/backtest_engine.py:1677-1680`), and live policy drift is checked both at setup (`core/backtest_engine.py:1503-1514`) and during the run (`core/backtest_engine.py:1737`). This closes the PIT/current-taxonomy causality leak without changing the normal default strategy path.
+
+### 2. Completed checkpoint results are bound to the effective live policy
+
+Before returning a completed result, `core/backtest_engine.py:2179-2215` requires a mapping-shaped stored policy, verifies the embedded digest against a fresh digest of that mapping, verifies both against the live effective-policy digest, and requires the stored policy object itself to equal the live policy. Origin-request compatibility is also checked at `core/backtest_engine.py:2216-2230`; only then is the stored result returned at `core/backtest_engine.py:2251-2256`. A completed checkpoint can therefore no longer bypass policy drift detection.
+
+### 3. Missing-C trace metadata retains the matched comparison observation
+
+The final C evaluator fix is correct. `_c_unavailable_observation` returns the highest-priority metric family's newest matched comparison, including both known fiscal periods and raw observations (`core/canslim/c_current_earnings.py:154-186`). The fallback path normalizes both values and applies a deterministic reason order—missing current period, missing prior period, non-finite current, non-finite prior, then zero/negative prior (`core/canslim/c_current_earnings.py:220-241`). It independently attaches public dates for every known period and retains period/date/value fields in the trace (`core/canslim/c_current_earnings.py:244-262`). The selected-row path uses the same comparator-first precedence (`core/canslim/c_current_earnings.py:278-289`), while `_trace_float` guarantees finite-or-null numeric trace output (`core/canslim/c_current_earnings.py:145-151`). Fiscal-period matching already retains the prior match (`core/canslim/fiscal_periods.py:142-148`), and public-date resolution is period-specific (`core/canslim/earnings_trace.py:98-112`). The legacy scalar API still delegates to the same core and returns only the established tuple (`core/canslim/c_current_earnings.py:384-387`), so the metadata correction does not change entry/exit evaluation semantics.
+
+### 4. Baseline and aggregate artifact reads are descriptor-bound and same-byte authenticated
+
+The baseline boundary now constructs a lexical absolute path without resolving through links, rejects UNC/device namespaces, and checks every path component for symlink/reparse substitution (`core/pit_diagnosis/baseline.py:646-690`). It opens the file, validates the descriptor as a bounded regular file, compares descriptor and path identities, and checks size/timestamps again before acceptance (`core/pit_diagnosis/baseline.py:703-738`). Authentication hashes the exact bytes copied into a bounded spool, and parsers consume only that spool (`core/pit_diagnosis/baseline.py:783-831`). Manifest/artifact verification uses this path (`core/pit_diagnosis/baseline.py:434-528`).
+
+`compare_reproduction` keeps large artifacts in digest/identity-only comparison and reopens only the selected small semantic CSV/JSON artifacts (`core/pit_diagnosis/baseline.py:579-608`); those semantic reads authenticate the exact parsed bytes against the snapshot digest (`core/pit_diagnosis/baseline.py:998-1033`). The configured caps (`core/pit_diagnosis/baseline.py:87-109`) accommodate the sealed canonical files, including the approximately 343 MB signal artifact under the 512 MiB cap and approximately 711 MB state artifact under the 768 MiB cap.
+
+Aggregate diagnosis imports the shared hardened readers (`core/pit_diagnosis/task11_artifact_diagnosis.py:22-33`) and uses them at its source boundary (`core/pit_diagnosis/task11_artifact_diagnosis.py:254-292`). The dependency remains acyclic: baseline does not import aggregate diagnosis, while the CLI may import both. Aggregate schema and rendering remain intact (`core/pit_diagnosis/task11_artifact_diagnosis.py:185-213`, `core/pit_diagnosis/task11_artifact_diagnosis.py:769-853`).
+
+### 5. Effective-policy taxonomy and optimizer ownership are now truthful
+
+Proper-base handling is active and tunable rather than incorrectly invariant (`core/engine_policy.py:339-344`). Fundamental attestation is mode-specific: technical-only mode truthfully says fundamentals are not consumed (`core/engine_policy.py:370-402`); custom nontechnical engines are opaque/unattested (`core/engine_policy.py:404-430`); built-in PIT mode attests causal bundle visibility (`core/engine_policy.py:432-452`); and the normal provider path distinguishes provider revision filtering and current-profile shares fallback without calling them causal invariants (`core/engine_policy.py:454-480`). Custom-engine attestation scope is explicit at `core/engine_policy.py:564-598`.
+
+C/A metric priorities are active-fixed implementation choices and future optimizer candidates, not causal invariants (`core/engine_policy.py:635-647`). The top-level policy states the intended distinction correctly: CANSLIM is the design basis, supported strategy choices may later be optimized for return and drawdown, causal/execution/accounting rules remain invariant, and this build performs no optimization (`core/engine_policy.py:1173-1185`).
+
+## Regression assessment
+
+- No reviewed fix changes default entry/exit calculations or introduces strategy optimization.
+- Legacy C/A scalar evaluation remains routed through the shared evaluator cores.
+- Fundamental, technical-only, PIT, normal-provider, built-in, and custom-engine policy claims are separated according to what the engine can actually attest.
+- Checkpoint completion, future PIT publication, and live immutable-policy checks share the same digest lifecycle rather than independent claims.
+- Artifact hardening preserves output structure, closes resources through scoped handles, avoids reparsing unauthenticated live-path bytes, and avoids loading the two largest canonical artifacts for semantic comparison.
+- No circular import was introduced by sharing the hardened artifact-reader boundary.
+
+## Readiness
+
+This exact frozen snapshot is ready for Task 11 closure. The review found no remaining production blocker in the five repaired areas and no new Critical, Important, or Minor issue within the focused boundary.
+
+Per the user's explicit constraint, no tests, backtests, provider/network/download operations, cache operations, or optimizer runs were performed. This report does not claim that tests passed; it records a source-level and snapshot-integrity review only.

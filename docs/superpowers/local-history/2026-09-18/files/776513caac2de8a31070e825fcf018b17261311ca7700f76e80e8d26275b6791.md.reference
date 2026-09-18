@@ -1,0 +1,21 @@
+# Fundamental provenance cache review
+
+## Verdict
+
+PASS. No actionable findings in the scoped source diff from `42716a84a0df10f729c8afdfa82e2c534bf64404` to `cbd0d8dcec5a9830087b233cc4cbb87fd58dc07d`.
+
+## Review findings
+
+None.
+
+## Scope checked
+
+- `core/pit_data.py:425-429`: provider state is keyed by `(ticker, include_provenance)`, preserving the ordinary `include_provenance=False` default while isolating provenance-bearing state.
+- `core/pit_data.py:1381-1427`: each mode receives its own immutable history state and mode-correct initial snapshot.
+- `core/pit_data.py:1429-1445`: provenance-bearing cached returns deep-copy each DataFrame, independently copy `PIT_PUBLIC_DATES_ATTR`, and copy `company_info`, preventing caller mutation from changing later feature inputs.
+- `core/pit_data.py:1447-1502`: cutoff validation remains before cache access; chronological requests advance through complete exact public-date boundaries only; unchanged sessions reuse the snapshot; and earlier requests fall back to `fundamentals_as_of` with the requested provenance mode without rewinding cached state.
+- `core/pit_data.py:1287-1355`: both cached modes retain the authoritative snapshot builder's statement selection, stable period/public-date ordering, same-period revision choice, columns, NULL preservation, invalid-NaN propagation, and provenance mapping semantics.
+- `core/pit_data.py:431-437`: `close()` clears the single per-bundle cache containing both modes.
+- `core/pit_feature_snapshot.py:77-136`: entry feature construction keeps the existing schema-V3 and explicit schema-V2-development validation path and now routes its fundamental lookup through `fundamentals_provider(..., include_provenance=True)`.
+
+Per the review constraint, no tests were read, created, modified, or run. No synthetic probes, evaluator runs, Docker, network, or provider calls were performed. The controller's rebuilt-image report parity and real-runtime comparison remain the required execution evidence.

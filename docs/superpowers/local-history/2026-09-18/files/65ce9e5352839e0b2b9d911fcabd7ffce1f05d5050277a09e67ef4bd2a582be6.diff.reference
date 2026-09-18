@@ -1,0 +1,2605 @@
+# Review package: b9c4371..7dd0f16
+
+## Commits
+7dd0f16 fix: complete adaptive optimizer live state
+
+## Files changed
+ .../task-8-report.md                               |  31 +
+ agent_loop.py                                      | 947 ++++++++++++++++++++-
+ core/pit_optimization.py                           |  11 +-
+ core/pit_optimization_contract.py                  |  48 +-
+ core/pit_optimizer_authorization.py                | 194 ++++-
+ core/pit_optimizer_controller.py                   | 187 ++--
+ tests/test_pit_optimizer_v2.py                     |   1 +
+ 7 files changed, 1298 insertions(+), 121 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-31-adaptive-oneil-optimizer-core-loop/task-8-report.md b/.superpowers/sdd/2026-08-31-adaptive-oneil-optimizer-core-loop/task-8-report.md
+new file mode 100644
+index 0000000..3c62006
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-31-adaptive-oneil-optimizer-core-loop/task-8-report.md
+@@ -0,0 +1,31 @@
++# Task 8 report
++
++Implemented and committed the initial schema-v4 adaptive optimizer state loop in
++`b9c4371`, then completed the production composition and durability review fixes.
++
++The fix round authenticates every retained diff and exact three-file source bundle
++before role projection, cleans all materialized capabilities on exceptional paths,
++publishes imported seed state only after its artifacts and initial checkpoint are
++durable, and reports checkpoint presence only after an actual successful write.
++Schema-v4 CLI execution now selects a concrete provider-gated live builder, publishes
++the audit manifest before pricing or lease authority, uses an explicit authorization
++window bound to the sealed authoring scope and full call plan, and closes the one-shot
++lease once with exact attempt/skip accounting. Existing readiness may be reused only
++when its canonical bytes are identical; resumed candidates are reconstructed,
++authenticated, deterministically re-parented, reminted, and reevaluated with the
++Decimal-safe panel artifact representation.
++
++Verification:
++
++- Compileall for the five changed production modules: passed.
++- Ruff for the five changed production modules: passed (`All checks passed!`).
++- Retained-parent tamper rejection and workspace cleanup smoke: passed.
++- Seed checkpoint-write failure absent/aborted smoke: passed.
++- Schema-v4 authorization open/close smoke: passed (9 calls, 2,340,000-token authority).
++- Readiness reuse smoke: identical bytes accepted; differing evidence rejected.
++- Injected canary dispatch smoke: live branch selected, 3 invalid investigator
++  attempts and 6 dependent skips settled, finalizer/lease close invoked once with
++  `iteration_limit`.
++
++No provider request, Docker execution, Task 9 qualification/replay, remote operation,
++secret access, source apply, or progress-file edit was performed.
+diff --git a/agent_loop.py b/agent_loop.py
+index 3a93c41..26b21a6 100644
+--- a/agent_loop.py
++++ b/agent_loop.py
+@@ -4639,47 +4639,55 @@ class OpenRouterGateway:
+         role: str,
+         dynamic_input: object,
+         parser: Callable[[str], PayloadT],
+         *,
+         call_budget: "PitOptimizerCallBudget",
+         authorization_lease: "AuthorizationRunLease",
+         frozen_pricing: "OptimizerPricingSnapshot",
+         wall_deadline: float,
+         monotonic: Callable[[], float],
+     ) -> "PitOptimizerRoleAttempt":
+-        """Perform exactly one all-R1 schema-v3 call with durable accounting."""
++        """Perform exactly one all-R1 optimizer call with durable accounting."""
+ 
+         from core.pit_optimization_contract import (
+             AuthorArtifact,
++            AuthorArtifactV4,
+             AuthorInput,
++            AuthorInputV4,
+             CriticArtifact,
++            CriticArtifactV4,
+             CriticInput,
++            CriticInputV4,
+             InvestigatorArtifact,
++            InvestigatorArtifactV4,
+             InvestigatorInput,
++            InvestigatorInputV4,
+             PIT_OPTIMIZER_V2_SYSTEM_PROMPTS,
++            PIT_OPTIMIZER_V4_SYSTEM_PROMPTS,
+             PitOptimizerCallBudget,
+             pit_optimizer_response_format,
++            pit_optimizer_v4_response_format,
+         )
+         from core.pit_optimizer_authorization import (
+             AuthorizationError,
+             AuthorizationCallReservation,
+             AuthorizationLedger,
+             AuthorizationRunLease,
+             OptimizerPricingSnapshot,
+             PitOptimizerProviderFacts,
+             PitOptimizerRoleAttempt,
+         )
+ 
+         role_inputs = {
+-            "investigator": InvestigatorInput,
+-            "author": AuthorInput,
+-            "critic": CriticInput,
++            "investigator": (InvestigatorInput, InvestigatorInputV4),
++            "author": (AuthorInput, AuthorInputV4),
++            "critic": (CriticInput, CriticInputV4),
+         }
+         if (
+             role not in role_inputs
+             or not isinstance(call_budget, PitOptimizerCallBudget)
+             or call_budget.role != role
+             or call_budget.model != REASONER_MODEL
+             or not isinstance(dynamic_input, role_inputs[role])
+             or dynamic_input.iteration != call_budget.iteration
+             or not isinstance(authorization_lease, AuthorizationRunLease)
+             or not isinstance(frozen_pricing, OptimizerPricingSnapshot)
+@@ -4722,22 +4730,35 @@ class OpenRouterGateway:
+             plan_snapshot,
+             role_snapshot,
+         )
+         recaptured_pricing = self._verified_pit_optimizer_pricing_snapshot(
+             frozen_pricing,
+             authorization_lease,
+         )
+         if recaptured_pricing != pricing_snapshot:
+             raise AuthorizationError("optimizer pricing changed after authentication")
+ 
+-        response_format = pit_optimizer_response_format(role)
+-        static_bytes = PIT_OPTIMIZER_V2_SYSTEM_PROMPTS[role].encode("utf-8")
++        is_v4 = isinstance(
++            dynamic_input,
++            (InvestigatorInputV4, AuthorInputV4, CriticInputV4),
++        )
++        response_format = (
++            pit_optimizer_v4_response_format(role)
++            if is_v4
++            else pit_optimizer_response_format(role)
++        )
++        system_prompt = (
++            PIT_OPTIMIZER_V4_SYSTEM_PROMPTS[role]
++            if is_v4
++            else PIT_OPTIMIZER_V2_SYSTEM_PROMPTS[role]
++        )
++        static_bytes = system_prompt.encode("utf-8")
+         static_bytes += json.dumps(
+             response_format,
+             sort_keys=True,
+             separators=(",", ":"),
+             ensure_ascii=False,
+         ).encode("utf-8")
+         dynamic_bytes = role_snapshot.canonical_bytes
+         conservative_cost = preflight_pit_optimizer_call(
+             static_bytes=static_bytes,
+             dynamic_bytes=dynamic_bytes,
+@@ -4899,21 +4920,21 @@ class OpenRouterGateway:
+                     status_code=_status_code(exc),
+                 ) from exc
+             if _remaining_wall_seconds(float(wall_deadline), monotonic) <= 0:
+                 raise BudgetExceededError("PIT optimizer wall deadline reached")
+             remaining = _remaining_wall_seconds(float(wall_deadline), monotonic)
+             if remaining <= 0:
+                 raise BudgetExceededError("PIT optimizer wall deadline reached")
+             messages = [
+                 {
+                     "role": "system",
+-                    "content": PIT_OPTIMIZER_V2_SYSTEM_PROMPTS[role],
++                    "content": system_prompt,
+                 },
+                 {"role": "user", "content": dynamic_bytes.decode("utf-8")},
+             ]
+             remaining = _remaining_wall_seconds(float(wall_deadline), monotonic)
+             if remaining <= 0:
+                 raise BudgetExceededError("PIT optimizer wall deadline reached")
+             remaining = _remaining_wall_seconds(float(wall_deadline), monotonic)
+             if remaining <= 0:
+                 raise BudgetExceededError("PIT optimizer wall deadline reached")
+             audit_sha256 = self._ensure_pit_optimizer_started_event(lifecycle)
+@@ -5143,25 +5164,33 @@ class OpenRouterGateway:
+                     response_validation_code=response_validation_code,
+                     accounting_source=usage.accounting_source,
+                 )
+                 finalize(facts, usage)
+                 return PitOptimizerRoleAttempt(
+                     plan=plan_snapshot,
+                     facts=facts,
+                     payload=None,
+                 )
+             accounting_stage = "artifact_binding"
+-            expected_payload_type = {
+-                "investigator": InvestigatorArtifact,
+-                "author": AuthorArtifact,
+-                "critic": CriticArtifact,
+-            }[role]
++            expected_payload_type = (
++                {
++                    "investigator": InvestigatorArtifactV4,
++                    "author": AuthorArtifactV4,
++                    "critic": CriticArtifactV4,
++                }[role]
++                if is_v4
++                else {
++                    "investigator": InvestigatorArtifact,
++                    "author": AuthorArtifact,
++                    "critic": CriticArtifact,
++                }[role]
++            )
+             if not isinstance(completion.payload, expected_payload_type):
+                 facts = provider_facts(
+                     outcome="schema_invalid",
+                     request_started=True,
+                     response_received=True,
+                     returned_model=returned_model,
+                     finish_reason=finish_reason,
+                     response_schema_valid=False,
+                     usage=usage,
+                     response_validation_code=(
+@@ -13498,21 +13527,24 @@ class AuditTrail:
+         source_fingerprint_sha256: str,
+     ) -> Path:
+         if self._manifest_written:
+             raise AuditError("audit manifest is immutable once written")
+         if not isinstance(config, LoopConfig):
+             raise AuditError("audit manifest requires LoopConfig")
+         if re.fullmatch(r"[0-9a-f]{40,64}", source_head) is None:
+             raise AuditError("audit manifest source head is invalid")
+         if _SHA256_RE.fullmatch(source_fingerprint_sha256) is None:
+             raise AuditError("audit manifest source fingerprint is invalid")
+-        from core.pit_optimization import PitOptimizationGateConfig
++        from core.pit_optimization import (
++            PitOptimizationGateConfig,
++            PitOptimizerGateConfigV4,
++        )
+ 
+         if isinstance(config.gate, TestGateConfig):
+             gate: dict[str, object] = {
+                 "kind": "test",
+                 "selectors": config.gate.selectors,
+             }
+         elif isinstance(config.gate, BacktestGateConfig):
+             gate = {
+                 "kind": "backtest",
+                 "tickers": config.gate.tickers,
+@@ -13536,20 +13568,52 @@ class AuditTrail:
+                 "max_usd": config.gate.max_usd,
+                 "max_api_calls": config.gate.max_api_calls,
+                 "max_iterations": config.gate.max_iterations,
+                 "apply": config.gate.apply,
+                 "verification_subset": config.gate.verification_subset,
+                 "prior_discovery_feedback": config.gate.prior_discovery_feedback,
+                 "prior_discovery_feedback_sha256": (
+                     config.gate.prior_discovery_feedback_sha256
+                 ),
+             }
++        elif isinstance(config.gate, PitOptimizerGateConfigV4):
++            gate = {
++                "kind": "pit_optimizer_v4",
++                "phase": config.gate.phase,
++                "baseline_run": config.gate.baseline_run,
++                "pit_bundle": config.gate.pit_bundle,
++                "pit_bundle_sha256": config.gate.pit_bundle_sha256,
++                "optimizer_manifest": config.gate.optimizer_manifest,
++                "optimizer_manifest_sha256": config.gate.optimizer_manifest_sha256,
++                "discovery_panel_plan": config.gate.discovery_panel_plan,
++                "discovery_panel_plan_sha256": (
++                    config.gate.discovery_panel_plan_sha256
++                ),
++                "readiness_artifact": config.gate.readiness_artifact,
++                "readiness_sha256": config.gate.readiness_sha256,
++                "campaign_checkpoint": config.gate.campaign_checkpoint,
++                "campaign_checkpoint_sha256": (
++                    config.gate.campaign_checkpoint_sha256
++                ),
++                "authorization_window_id": config.gate.authorization_window_id,
++                "authorization_requirement_sha256": (
++                    config.gate.authorization_requirement_sha256
++                ),
++                "source_transmission_authorized": (
++                    config.gate.source_transmission_authorized
++                ),
++                "max_api_calls": config.gate.max_api_calls,
++                "max_tokens": config.gate.max_tokens,
++                "max_iterations": config.gate.max_iterations,
++                "apply": config.gate.apply,
++                "sandbox_image": config.gate.sandbox_image,
++            }
+         else:
+             gate = {
+                 "kind": "pit_diagnosis",
+                 "diagnosis_run": config.gate.diagnosis_run,
+                 "diagnosis_manifest_sha256": config.gate.diagnosis_manifest_sha256,
+                 "baseline_run": config.gate.baseline_run,
+                 "pit_bundle": config.gate.pit_bundle,
+                 "pit_bundle_sha256": config.gate.pit_bundle_sha256,
+                 "fact_cache": config.gate.fact_cache,
+                 "fact_cache_sha256": config.gate.fact_cache_sha256,
+@@ -19519,20 +19583,49 @@ def _build_pit_optimizer_v4_config(namespace: argparse.Namespace) -> object:
+     except ValueError as exc:
+         raise ConfigurationError(str(exc)) from exc
+     checkpoint = getattr(namespace, "campaign_checkpoint", None)
+     checkpoint_sha256 = getattr(namespace, "campaign_checkpoint_sha256", None)
+     if (checkpoint is None) != (checkpoint_sha256 is None):
+         raise ConfigurationError(
+             "campaign checkpoint path and SHA-256 must be supplied together"
+         )
+     if manifest.seed_checkpoint_sha256 != checkpoint_sha256:
+         raise ConfigurationError("optimizer v4 manifest checkpoint differs")
++    supplied_requirement = getattr(
++        namespace,
++        "optimizer_authorization_requirement_sha256",
++        None,
++    )
++    authorization_window_id = getattr(
++        namespace,
++        "optimizer_authorization_window_id",
++        None,
++    )
++    if supplied_requirement not in {
++        None,
++        manifest.authorization_requirement.sha256,
++    }:
++        raise ConfigurationError(
++            "optimizer v4 authorization requirement differs from manifest"
++        )
++    if phase == "prepare":
++        if authorization_window_id is not None:
++            raise ConfigurationError(
++                "optimizer v4 prepare cannot carry an authorization window"
++            )
++    elif (
++        authorization_window_id != manifest.authorization_requirement.window_id
++        or supplied_requirement != manifest.authorization_requirement.sha256
++    ):
++        raise ConfigurationError(
++            "optimizer v4 canary authority differs from manifest"
++        )
+     artifact_root = _absolute_cli_path(
+         getattr(namespace, "artifact_root", None),
+         "artifact root",
+     )
+     readiness_artifact = artifact_root / f"{manifest.campaign_id}.readiness.json"
+     try:
+         return PitOptimizerGateConfigV4(
+             phase=phase,
+             baseline_run=_absolute_cli_path(
+                 getattr(namespace, "baseline_run", None),
+@@ -19548,20 +19641,24 @@ def _build_pit_optimizer_v4_config(namespace: argparse.Namespace) -> object:
+             discovery_panel_plan=panel_path,
+             discovery_panel_plan_sha256=panel_sha256,
+             readiness_artifact=readiness_artifact,
+             readiness_sha256=getattr(namespace, "readiness_sha256", None),
+             campaign_checkpoint=(
+                 None
+                 if checkpoint is None
+                 else _absolute_cli_path(checkpoint, "campaign checkpoint")
+             ),
+             campaign_checkpoint_sha256=checkpoint_sha256,
++            authorization_window_id=authorization_window_id,
++            authorization_requirement_sha256=(
++                manifest.authorization_requirement.sha256
++            ),
+             source_transmission_authorized=getattr(
+                 namespace,
+                 "authorize_policy_source_transmission",
+                 False,
+             ),
+             max_api_calls=getattr(namespace, "max_api_calls", None),
+             max_tokens=getattr(namespace, "max_tokens", None),
+             max_iterations=getattr(namespace, "max_iterations", None),
+             apply=getattr(namespace, "apply", None),
+             source_root=_absolute_cli_path(
+@@ -20759,20 +20856,783 @@ def _dispatch_pit_optimizer_v3(
+     if not isinstance(live, PitOptimizerLiveRun):
+         raise ConfigurationError("PIT optimizer live services are invalid")
+     from core.pit_optimization import run_pit_optimizer_v3
+ 
+     return run_pit_optimizer_v3(
+         readiness=live.readiness,
+         services=live.optimizer_services,
+     )
+ 
+ 
++def _v4_policy_sources(root: Path) -> tuple[object, ...]:
++    from core.pit_optimization_contract import AuthorSourceFile
++
++    paths = (
++        "core/strategy_policy/entry.py",
++        "core/strategy_policy/risk.py",
++        "core/strategy_policy/exit.py",
++    )
++    result = []
++    for relative in paths:
++        raw = (root / relative).read_bytes()
++        if b"\r" in raw or not raw.endswith(b"\n"):
++            raise ConfigurationError("optimizer v4 policy source is not canonical LF")
++        try:
++            source = raw.decode("utf-8")
++        except UnicodeDecodeError as exc:
++            raise ConfigurationError("optimizer v4 policy source is not UTF-8") from exc
++        result.append(AuthorSourceFile.from_source(path=relative, source=source))
++    return tuple(result)
++
++
++def _v4_worker_runner(
++    config: object,
++    *,
++    limits: PitOptimizerLoopLimits,
++    deadline: float,
++) -> PolicyWorkerRunner:
++    docker = configure_docker_executable(
++        config.docker_executable,
++        source_root=config.source_root,
++        controller_root=config.controller_temp_parent,
++        permanent_runtime_root=config.permanent_runtime_root,
++    )
++    return PolicyWorkerRunner(
++        image=config.sandbox_image,
++        engine=docker,
++        temp_parent=config.controller_temp_parent,
++        fold_timeout_seconds=limits.child_timeout_seconds,
++        output_limit_bytes=min(
++            _MAX_POLICY_WORKER_SESSION_OUTPUT_BYTES,
++            limits.output_limit_bytes,
++        ),
++        wall_deadline=deadline,
++    )
++
++
++def _evaluate_v4_panel(
++    config: object,
++    *,
++    manifest: object,
++    panel: object,
++    candidate_root: Path | None = None,
++    runner: object | None = None,
++    run_label: str,
++) -> object:
++    from core.backtest_engine import PortfolioSimulator
++    from core.pit_data import PITDataBundle
++    from core.pit_optimizer_evaluation import panel_aggregate_summary_from_primitive
++    from core.pit_policy_parity import build_panel_evidence_v4
++    from core.strategy_policy.contracts import CapacitySnapshot
++    from core.strategy_policy.worker import PolicyDeterminismProbe
++
++    tickers = tuple(
++        sorted(
++            {
++                ticker
++                for lineage in panel.lineages
++                for ticker in lineage.executable_tickers
++            }
++        )
++    )
++    if not tickers:
++        raise ConfigurationError("optimizer v4 panel has no executable tickers")
++    policy_client_factory = None
++    if candidate_root is not None:
++        client_factory = getattr(runner, "client_factory", None)
++        if not callable(client_factory):
++            raise ConfigurationError("optimizer v4 worker capability is absent")
++        policy_client_factory = client_factory(
++            candidate_root=candidate_root,
++            interface_version=manifest.policy_interface_version,
++            fold_run_id=run_label,
++            determinism_probes=(
++                PolicyDeterminismProbe(
++                    "recommend_capacity",
++                    CapacitySnapshot(None, 25, 0, 3, 1.0, False),
++                    CapacitySnapshot(5, 25, 2, 1, 0.5, True),
++                ),
++            ),
++        )
++    with PITDataBundle(
++        config.pit_bundle,
++        expected_sha256=config.pit_bundle_sha256,
++    ) as bundle:
++        if not set(tickers).issubset(bundle.tradable_symbols()):
++            raise ConfigurationError("optimizer v4 panel escapes tradable membership")
++        simulator = PortfolioSimulator(
++            pit_bundle=bundle,
++            benchmark_symbol="SPY",
++            signal_every_n_days=1,
++            policy_client_factory=policy_client_factory,
++        )
++        result = simulator.run(
++            list(tickers),
++            start_date=panel.start_date,
++            end_date=panel.end_date,
++            history_start_date=str(bundle.metadata["warmup_start"]),
++            benchmark_symbol="SPY",
++        )
++    evidence = build_panel_evidence_v4(panel=panel, result=result)
++    return panel_aggregate_summary_from_primitive(evidence["aggregate"])
++
++
++def _prepare_pit_optimizer_v4_production(
++    config: object,
++    *,
++    source_state: SourceState,
++    git_capability: GitCapability,
++    limits: PitOptimizerLoopLimits,
++    restored_diffs: dict[str, str] | None = None,
++) -> object:
++    from core.pit_optimization import PitOptimizerGateConfigV4, prepare_pit_optimizer_v4
++    from core.pit_optimization_contract import load_pit_optimizer_manifest_v4
++    from core.pit_optimizer_evaluation import load_discovery_panel_plan
++
++    if not isinstance(config, PitOptimizerGateConfigV4):
++        raise ConfigurationError("optimizer v4 production gate is invalid")
++    plan = load_discovery_panel_plan(config.discovery_panel_plan)
++    manifest = load_pit_optimizer_manifest_v4(
++        config.optimizer_manifest,
++        expected_sha256=config.optimizer_manifest_sha256,
++        discovery_panel_plan=plan,
++    )
++    source_head, source_fingerprint = _pit_optimizer_source_identity(
++        config.source_root,
++        git_capability,
++    )
++    if (
++        (source_head, source_fingerprint)
++        != (manifest.source_head, manifest.source_fingerprint_sha256)
++        or source_state.head != source_head
++        or recheck_source_unchanged(source_state).source_modified
++        or manifest.authorization_requirement.sha256
++        != config.authorization_requirement_sha256
++    ):
++        raise ConfigurationError("optimizer v4 authenticated inputs differ")
++    baseline_sources = _v4_policy_sources(config.source_root)
++    if tuple(
++        (item.path, item.source_sha256) for item in baseline_sources
++    ) != manifest.policy_authoring_scope.initial_policy_source_sha256s:
++        raise ConfigurationError("optimizer v4 baseline sources differ")
++    deadline = time.monotonic() + limits.wall_timeout_seconds
++    restore_runner = (
++        None
++        if config.campaign_checkpoint is None
++        else _v4_worker_runner(config, limits=limits, deadline=deadline)
++    )
++
++    def verify_inputs(supplied_manifest: object, supplied_plan: object) -> None:
++        if supplied_manifest is not manifest or supplied_plan is not plan:
++            raise ConfigurationError("optimizer v4 readiness inputs changed")
++        if (
++            _pit_optimizer_source_identity(config.source_root, git_capability)
++            != (manifest.source_head, manifest.source_fingerprint_sha256)
++            or recheck_source_unchanged(source_state).source_modified
++        ):
++            raise CandidateMutationError("optimizer v4 source changed")
++
++    def read_seed_artifact(
++        checkpoint_root: Path,
++        relative: object,
++        digest: object,
++    ) -> bytes:
++        if (
++            not isinstance(relative, str)
++            or not isinstance(digest, str)
++            or _SHA256_RE.fullmatch(digest) is None
++        ):
++            raise ConfigurationError("optimizer v4 seed artifact identity is invalid")
++        path = Path(relative)
++        if path.is_absolute() or ".." in path.parts:
++            raise ConfigurationError("optimizer v4 seed artifact path is invalid")
++        resolved = (checkpoint_root / path).resolve()
++        try:
++            resolved.relative_to(checkpoint_root.resolve())
++        except ValueError as exc:
++            raise ConfigurationError("optimizer v4 seed artifact escaped") from exc
++        if resolved.is_symlink() or not resolved.is_file():
++            raise ConfigurationError("optimizer v4 seed artifact is absent")
++        raw = resolved.read_bytes()
++        if hashlib.sha256(raw).hexdigest() != digest:
++            raise ConfigurationError("optimizer v4 seed artifact digest differs")
++        return raw
++
++    def restore_seed(
++        kind: str,
++        primitive: Mapping[str, object],
++        checkpoint_root: Path,
++        supplied_plan: object,
++    ) -> object:
++        from core.pit_optimizer_artifacts import SearchCandidateState, canonical_json_bytes
++        from core.pit_optimizer_candidate import validate_candidate_sources
++        from core.pit_optimization_contract import SelectedParentIdentity
++        from core.pit_optimizer_controller import (
++            CandidateEvaluationFailure,
++            _panel_v4_artifact,
++        )
++
++        identity_value = primitive.get("candidate_identity")
++        if not isinstance(identity_value, Mapping):
++            raise ConfigurationError("optimizer v4 seed identity is invalid")
++        diff_raw = read_seed_artifact(
++            checkpoint_root,
++            primitive.get("cumulative_diff_artifact"),
++            primitive.get("cumulative_diff_sha256"),
++        )
++        try:
++            cumulative_diff = diff_raw.decode("utf-8")
++        except UnicodeDecodeError as exc:
++            raise ConfigurationError("optimizer v4 seed diff is invalid") from exc
++        if hashlib.sha256(cumulative_diff.encode("utf-8")).hexdigest() != identity_value.get(
++            "cumulative_diff_sha256"
++        ):
++            raise ConfigurationError("optimizer v4 seed diff identity differs")
++        source_raw = read_seed_artifact(
++            checkpoint_root,
++            primitive.get("source_bundle_artifact"),
++            primitive.get("source_bundle_sha256"),
++        )
++        try:
++            source_artifact = json.loads(source_raw)
++        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
++            raise ConfigurationError("optimizer v4 seed source is invalid") from exc
++        if source_raw != canonical_json_bytes(source_artifact):
++            raise ConfigurationError("optimizer v4 seed source is not canonical")
++        replacement_sources = source_artifact.get("policy_sources")
++        if not isinstance(replacement_sources, Mapping):
++            raise ConfigurationError("optimizer v4 seed source bundle is invalid")
++        reconstructed = export_candidate(source_state)
++        try:
++            _git(
++                reconstructed.root,
++                "apply",
++                "--check",
++                "--whitespace=error-all",
++                "-",
++                input_bytes=cumulative_diff.encode("utf-8"),
++                git=git_capability,
++            )
++            _git(
++                reconstructed.root,
++                "apply",
++                "--whitespace=error-all",
++                "-",
++                input_bytes=cumulative_diff.encode("utf-8"),
++                git=git_capability,
++            )
++            reconstructed_sources = {
++                item.path: item.source for item in _v4_policy_sources(reconstructed.root)
++            }
++            if reconstructed_sources != dict(replacement_sources):
++                raise ConfigurationError(
++                    "optimizer v4 seed diff and source bundle differ"
++                )
++            reconstructed_sha256s = tuple(
++                (item.path, item.source_sha256)
++                for item in _v4_policy_sources(reconstructed.root)
++            )
++            old_sha256s = identity_value.get("editable_file_sha256s")
++            if (
++                not isinstance(old_sha256s, list)
++                or tuple(tuple(item) for item in old_sha256s)
++                != reconstructed_sha256s
++            ):
++                raise ConfigurationError(
++                    "optimizer v4 seed sources differ from retained identity"
++                )
++        finally:
++            dispose_candidate(reconstructed)
++        seed_parent = SelectedParentIdentity.issue(
++            parent_kind="baseline",
++            parent_id="baseline_policy",
++            source_head=manifest.source_head,
++            policy_sources=baseline_sources,
++        )
++        candidate = export_candidate(source_state)
++        try:
++            identity, reminted_diff = validate_candidate_sources(
++                authenticated_base_root=config.source_root,
++                candidate_root=candidate.root,
++                replacement_sources=replacement_sources,
++                git=git_capability,
++                source_commit=manifest.source_head,
++                policy_interface_version=manifest.policy_interface_version,
++                immutable_constraints_sha256=manifest.immutable_constraints_sha256,
++                discovery_panel_plan_sha256=supplied_plan.sha256,
++                parent_identity_sha256=seed_parent.parent_identity_sha256,
++            )
++            if restored_diffs is not None:
++                restored_diffs[identity.identity_sha256] = reminted_diff
++            quick = _evaluate_v4_panel(
++                config,
++                manifest=manifest,
++                panel=supplied_plan.quick_panel,
++                candidate_root=candidate.root,
++                runner=restore_runner,
++                run_label=f"restore-{kind}-quick",
++            )
++            discovery = _evaluate_v4_panel(
++                config,
++                manifest=manifest,
++                panel=supplied_plan.discovery_panel,
++                candidate_root=candidate.root,
++                runner=restore_runner,
++                run_label=f"restore-{kind}-discovery",
++            )
++        except ValueError as exc:
++            raise CandidateEvaluationFailure("evaluation_failed") from exc
++        finally:
++            dispose_candidate(candidate)
++        quick_digest = hashlib.sha256(
++            canonical_json_bytes({"evidence": _panel_v4_artifact(quick)})
++        ).hexdigest()
++        discovery_digest = hashlib.sha256(
++            canonical_json_bytes({"evidence": _panel_v4_artifact(discovery)})
++        ).hexdigest()
++        return SearchCandidateState(
++            candidate_identity=identity,
++            cumulative_diff_artifact=f"restored-{kind}.diff",
++            cumulative_diff_sha256=hashlib.sha256(
++                reminted_diff.encode("utf-8")
++            ).hexdigest(),
++            source_bundle_artifact=f"restored-{kind}-source.json",
++            source_bundle_sha256=hashlib.sha256(
++                canonical_json_bytes({"policy_sources": dict(replacement_sources)})
++            ).hexdigest(),
++            discovery_evidence_artifact=f"restored-{kind}-discovery.json",
++            discovery_evidence_sha256=discovery_digest,
++            discovery_evidence=discovery,
++            hypothesis=str(primitive.get("hypothesis")),
++            behavioral_summary=str(primitive.get("behavioral_summary")),
++            originating_run_id=str(primitive.get("originating_run_id")),
++            originating_iteration=int(primitive.get("originating_iteration", 0)),
++            quick_evidence_artifact=f"restored-{kind}-quick.json",
++            quick_evidence_sha256=quick_digest,
++            quick_evidence=quick,
++        )
++
++    readiness = prepare_pit_optimizer_v4(
++        manifest=manifest,
++        discovery_panel_plan=plan,
++        baseline_sources=baseline_sources,
++        artifact_path=config.readiness_artifact,
++        evaluate_baseline=lambda panel: _evaluate_v4_panel(
++            config,
++            manifest=manifest,
++            panel=panel,
++            run_label=f"baseline-{panel.purpose}",
++        ),
++        verify_inputs=verify_inputs,
++        campaign_checkpoint_path=config.campaign_checkpoint,
++        campaign_checkpoint_sha256=config.campaign_checkpoint_sha256,
++        restore_seed=restore_seed,
++    )
++    if config.phase == "canary" and readiness.readiness_sha256 != config.readiness_sha256:
++        raise ConfigurationError("optimizer v4 readiness identity differs")
++    return readiness
++
++
++def _build_pit_optimizer_v4_live_run(
++    config: object,
++    *,
++    loop_config: LoopConfig,
++    limits: PitOptimizerLoopLimits,
++    source_state: SourceState,
++    git_capability: GitCapability,
++    gateway_factory: Callable[..., OpenRouterGateway] | None = None,
++) -> PitOptimizerLiveRunV4:
++    from core.pit_optimization import PitOptimizerGateConfigV4
++    from core.pit_optimization_contract import (
++        PIT_OPTIMIZER_V4_SYSTEM_PROMPTS,
++        load_pit_optimizer_manifest_v4,
++        pit_optimizer_v4_response_format,
++    )
++    from core.pit_optimizer_artifacts import IncrementalArtifactStore
++    from core.pit_optimizer_authorization import AuthorizationLedger
++    from core.pit_optimizer_candidate import validate_candidate_sources
++    from core.pit_optimizer_controller import (
++        CandidateParentV4,
++        CandidateValidationOutcomeV4,
++        CandidateWorkspace,
++        PitOptimizerCleanup,
++        PitOptimizerServicesV4,
++    )
++
++    if not isinstance(config, PitOptimizerGateConfigV4) or config.phase != "canary":
++        raise ConfigurationError("optimizer v4 live gate is invalid")
++    if not isinstance(loop_config, LoopConfig) or loop_config.gate is not config:
++        raise ConfigurationError("optimizer v4 live loop configuration changed")
++    if (
++        config.authorization_window_id is None
++        or config.authorization_window_id
++        != load_pit_optimizer_manifest_v4(
++            config.optimizer_manifest,
++            expected_sha256=config.optimizer_manifest_sha256,
++        ).authorization_requirement.window_id
++    ):
++        raise ConfigurationError("optimizer v4 live authority differs")
++    restored_diffs: dict[str, str] = {}
++    readiness = _prepare_pit_optimizer_v4_production(
++        config,
++        source_state=source_state,
++        git_capability=git_capability,
++        limits=limits,
++        restored_diffs=restored_diffs,
++    )
++    manifest = readiness.manifest
++    authorization = AuthorizationLedger(
++        config.permanent_runtime_root / "pit_optimizer_authorization_ledger.jsonl",
++        manifest,
++    )
++    authorization.authenticate_window(
++        window_id=config.authorization_window_id,
++        authorization_requirement_sha256=config.authorization_requirement_sha256,
++    )
++    budget = PitOptimizerResourceLedger(
++        max_calls=config.max_api_calls,
++        max_tokens=config.max_tokens,
++    )
++    dotenv_values = _controller_dotenv_values(config.source_root)
++    known_secrets = tuple(
++        value
++        for value in {
++            os.getenv("OPENROUTER_API_KEY"),
++            os.getenv("OPENROUTER"),
++            dotenv_values.get("OPENROUTER_API_KEY"),
++            dotenv_values.get("OPENROUTER"),
++        }
++        if isinstance(value, str) and value
++    )
++    audit = AuditTrail(
++        config.artifact_root,
++        manifest.campaign_id,
++        known_secrets=known_secrets,
++    )
++    audit.write_manifest(
++        loop_config,
++        source_head=manifest.source_head,
++        source_fingerprint_sha256=manifest.source_fingerprint_sha256,
++    )
++    gateway = (gateway_factory or OpenRouterGateway)(
++        run_id=manifest.campaign_id,
++        pit_optimizer_ledger=budget,
++        timeout_seconds=limits.api_timeout_seconds,
++        max_attempts=1,
++        controller_root=config.source_root,
++        authorization_ledger=authorization,
++        audit_trail=audit,
++    )
++    if not isinstance(gateway, OpenRouterGateway):
++        raise ConfigurationError("optimizer v4 gateway capability is invalid")
++    deadline = time.monotonic() + limits.wall_timeout_seconds
++    pricing = gateway.freeze_pit_optimizer_pricing(
++        model=manifest.model,
++        wall_deadline=deadline,
++        monotonic=time.monotonic,
++    )
++    projections: list[Decimal | None] = []
++    for plan in manifest.call_budgets:
++        static_bytes = PIT_OPTIMIZER_V4_SYSTEM_PROMPTS[plan.role].encode("utf-8")
++        static_bytes += json.dumps(
++            pit_optimizer_v4_response_format(plan.role),
++            sort_keys=True,
++            separators=(",", ":"),
++            ensure_ascii=False,
++        ).encode("utf-8")
++        if len(static_bytes) > plan.max_static_input_bytes:
++            raise BudgetExceededError("optimizer v4 static role input exceeds plan")
++        projections.append(
++            conservative_call_cost_usd(
++                rendered_prompt_bytes=len(static_bytes) + plan.max_dynamic_input_bytes,
++                max_output_tokens=plan.max_output_tokens,
++                pricing=pricing,
++            )
++        )
++    projected_plan_usd = (
++        sum((item for item in projections if item is not None), Decimal("0"))
++        if pricing.lookup_status == "available"
++        else None
++    )
++    if (pricing.lookup_status == "available") != all(
++        item is not None for item in projections
++    ):
++        raise ConfigurationError("optimizer v4 pricing projection is incomplete")
++    runner = _v4_worker_runner(config, limits=limits, deadline=deadline)
++    store = IncrementalArtifactStore(audit.run_root)
++    capabilities: dict[str, Candidate] = {}
++    candidate_diffs = dict(restored_diffs)
++    settled: dict[int, object] = {}
++    finalization_started = False
++
++    def materialize_parent(kind: str, retained: object | None) -> CandidateParentV4:
++        candidate = export_candidate(source_state)
++        try:
++            cumulative_diff = ""
++            if retained is not None:
++                identity_sha256 = retained.candidate_identity.identity_sha256
++                cumulative_diff = candidate_diffs.get(identity_sha256, "")
++                if not cumulative_diff:
++                    raise CandidateMutationError(
++                        "optimizer v4 retained candidate diff is unavailable"
++                    )
++                encoded = cumulative_diff.encode("utf-8")
++                _git(
++                    candidate.root,
++                    "apply",
++                    "--check",
++                    "--whitespace=error-all",
++                    "-",
++                    input_bytes=encoded,
++                    git=git_capability,
++                )
++                _git(
++                    candidate.root,
++                    "apply",
++                    "--whitespace=error-all",
++                    "-",
++                    input_bytes=encoded,
++                    git=git_capability,
++                )
++                observed = derive_authenticated_cumulative_diff(
++                    git=git_capability,
++                    authenticated_base_root=config.source_root,
++                    candidate_root=candidate.root,
++                    editable_paths=manifest.editable_paths,
++                )
++                if not hmac.compare_digest(observed, cumulative_diff):
++                    raise CandidateMutationError(
++                        "optimizer v4 retained candidate reconstruction differs"
++                    )
++            workspace = CandidateWorkspace(
++                workspace_id=f"workspace_{secrets.token_hex(16)}",
++                root=candidate.root.resolve(),
++            )
++            capabilities[workspace.workspace_id] = candidate
++            return CandidateParentV4(
++                workspace=workspace,
++                cumulative_diff=cumulative_diff,
++                policy_sources=_v4_policy_sources(candidate.root),
++            )
++        except BaseException:
++            dispose_candidate(candidate)
++            raise
++
++    def resolve(workspace: CandidateWorkspace) -> Candidate:
++        candidate = capabilities.get(workspace.workspace_id)
++        if candidate is None or candidate.root.resolve() != workspace.root:
++            raise CandidateMutationError("optimizer v4 workspace capability is absent")
++        return candidate
++
++    def validate_and_apply(
++        workspace: CandidateWorkspace,
++        author: object,
++        parent_identity: object,
++    ) -> CandidateValidationOutcomeV4:
++        candidate = resolve(workspace)
++        try:
++            identity, cumulative_diff = validate_candidate_sources(
++                authenticated_base_root=config.source_root,
++                candidate_root=candidate.root,
++                replacement_sources={
++                    item.path: item.source for item in author.policy_sources
++                },
++                git=git_capability,
++                source_commit=manifest.source_head,
++                policy_interface_version=manifest.policy_interface_version,
++                immutable_constraints_sha256=manifest.immutable_constraints_sha256,
++                discovery_panel_plan_sha256=manifest.discovery_panel_plan_sha256,
++                parent_identity_sha256=parent_identity.parent_identity_sha256,
++            )
++        except ValueError as exc:
++            message = str(exc)
++            failure = (
++                "syntax_failed"
++                if "syntax" in message
++                else "imports_failed"
++                if "import" in message
++                else "purity_failed"
++                if "forbidden" in message or "immutable" in message
++                else "source_invalid"
++            )
++            return CandidateValidationOutcomeV4(False, failure, "", None)
++        candidate_diffs[identity.identity_sha256] = cumulative_diff
++        return CandidateValidationOutcomeV4(
++            True,
++            None,
++            cumulative_diff,
++            identity,
++        )
++
++    evaluation_sequence = 0
++
++    def evaluate_candidate(
++        workspace: CandidateWorkspace,
++        identity: object,
++        panel: object,
++    ) -> object:
++        nonlocal evaluation_sequence
++        candidate = resolve(workspace)
++        evaluation_sequence += 1
++        try:
++            return _evaluate_v4_panel(
++                config,
++                manifest=manifest,
++                panel=panel,
++                candidate_root=candidate.root,
++                runner=runner,
++                run_label=f"candidate-{evaluation_sequence:03d}-{panel.purpose}",
++            )
++        except (PolicyWorkerOperationalFailure, ValueError) as exc:
++            from core.pit_optimizer_controller import CandidateEvaluationFailure
++
++            raise CandidateEvaluationFailure("worker_failed") from exc
++
++    def dispose_workspace(workspace: CandidateWorkspace) -> PitOptimizerCleanup:
++        candidate = capabilities.pop(workspace.workspace_id, None)
++        if candidate is None:
++            raise CandidateMutationError("optimizer v4 cleanup capability is absent")
++        dispose_candidate(candidate)
++        modified = recheck_source_unchanged(source_state).source_modified
++        return PitOptimizerCleanup(
++            candidate_removed=not workspace.root.exists(),
++            worker_stopped=True,
++            source_modified=modified,
++        )
++
++    def call_role(
++        plan: object,
++        role_input: object,
++        parser: Callable[[str], object],
++    ) -> object:
++        if plan.role == "investigator":
++            predecessors = tuple(settled[index] for index in range(1, plan.call_index))
++        elif plan.role == "author":
++            predecessors = (settled[plan.call_index - 1],)
++        else:
++            predecessors = (
++                settled[plan.call_index - 2],
++                settled[plan.call_index - 1],
++            )
++        authorization.bind_controller_role_input(
++            role_input,
++            plan,
++            predecessor_attempts=predecessors,
++        )
++        attempt = gateway.request_pit_optimizer_once(
++            plan.role,
++            role_input,
++            parser,
++            call_budget=plan,
++            authorization_lease=lease,
++            frozen_pricing=pricing,
++            wall_deadline=deadline,
++            monotonic=time.monotonic,
++        )
++        settled[plan.call_index] = attempt
++        return attempt
++
++    def settle_invalid_investigator(
++        triggering_plan: object,
++        plans: tuple[object, ...],
++    ) -> object:
++        triggering_attempt = settled.get(triggering_plan.call_index)
++        skips = authorization.skip_unstarted_plans(
++            lease,
++            plans,
++            triggering_attempt=triggering_attempt,
++        )
++        for skip in skips:
++            settled[skip.call_index] = skip
++        return skips
++
++    def verify_inputs(supplied: object) -> None:
++        if supplied is not readiness:
++            raise CandidateMutationError("optimizer v4 readiness capability changed")
++        if (
++            _pit_optimizer_source_identity(config.source_root, git_capability)
++            != (manifest.source_head, manifest.source_fingerprint_sha256)
++            or recheck_source_unchanged(source_state).source_modified
++        ):
++            raise CandidateMutationError("optimizer v4 authenticated inputs changed")
++
++    def finalize_run(
++        attempts: tuple[object, ...],
++        skips: tuple[object, ...],
++        terminal_code: str,
++    ) -> None:
++        nonlocal finalization_started
++        if finalization_started:
++            raise ConfigurationError("optimizer v4 finalizer was reused")
++        finalization_started = True
++        supplied = {
++            item.plan.call_index: item for item in attempts
++        } | {item.call_index: item for item in skips}
++        if supplied != settled:
++            raise ConfigurationError("optimizer v4 final accounting differs")
++        mapped = {
++            "iteration_limit": "completed",
++            "cancelled": "cancelled",
++            "budget_exhausted": "budget_exhausted",
++            "authorization_exhausted": "budget_exhausted",
++        }.get(terminal_code, "failed")
++        authorization.close_run_lease(lease, terminal_code=mapped)
++        snapshot = _pit_optimizer_resource_snapshot(budget)
++        facts = tuple(item.facts for item in attempts)
++        if (
++            snapshot.api_calls != sum(1 for item in facts if item.request_started)
++            or snapshot.total_tokens != sum(item.total_tokens or 0 for item in facts)
++            or snapshot.incomplete_accounting_calls
++            != sum(1 for item in facts if not item.accounting_complete)
++        ):
++            raise ConfigurationError("optimizer v4 resource accounting differs")
++
++    lease = authorization.open_run_lease(
++        window_id=config.authorization_window_id,
++        authorization_requirement_sha256=config.authorization_requirement_sha256,
++        run_manifest_sha256=manifest.sha256,
++        pricing_snapshot=pricing,
++        projected_plan_usd=projected_plan_usd,
++    )
++    try:
++        services = PitOptimizerServicesV4(
++            call_role=call_role,
++            materialize_parent=materialize_parent,
++            validate_and_apply=validate_and_apply,
++            evaluate_candidate=evaluate_candidate,
++            dispose_candidate=dispose_workspace,
++            settle_invalid_investigator=settle_invalid_investigator,
++            verify_inputs=verify_inputs,
++            cancellation_requested=lambda: False,
++            prepare_iteration_artifacts=store.prepare_iteration,
++            write_json_artifact=store.write_json_artifact,
++            write_diff_artifact=store.write_diff_artifact,
++            finalize_run=finalize_run,
++        )
++        return PitOptimizerLiveRunV4(
++            readiness=readiness,
++            optimizer_services=services,
++        )
++    except BaseException:
++        for candidate in tuple(capabilities.values()):
++            try:
++                dispose_candidate(candidate)
++            except BaseException:
++                pass
++        capabilities.clear()
++        try:
++            authorization.close_run_lease(lease, terminal_code="failed")
++        except BaseException:
++            pass
++        raise
++
++
+ def _dispatch_pit_optimizer_v4(
+     config: object,
+     limits: PitOptimizerLoopLimits,
+     *,
+     prepare: Callable[[object], object],
+     build_live_services: Callable[
+         [object, PitOptimizerLoopLimits], PitOptimizerLiveRunV4
+     ],
+ ) -> object:
+     """Keep provider construction strictly behind authenticated v4 readiness."""
+@@ -21095,25 +21955,23 @@ def _build_cli_config(
+         )
+         try:
+             manifest_schema = json.loads(manifest_path.read_bytes()).get(
+                 "schema_version"
+             )
+         except (AttributeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+             raise ConfigurationError("optimizer manifest is invalid JSON") from exc
+         if manifest_schema == 4:
+             if namespace.verified_parity is not None or (
+                 namespace.verified_parity_sha256 is not None
+-            ) or namespace.optimizer_authorization_window_id is not None or (
+-                namespace.optimizer_authorization_requirement_sha256 is not None
+             ):
+                 raise ConfigurationError(
+-                    "legacy optimizer authority cannot be supplied to schema v4"
++                    "legacy optimizer parity cannot be supplied to schema v4"
+                 )
+             gate = _build_pit_optimizer_v4_config(namespace)
+         else:
+             if any(
+                 value is not None
+                 for value in (
+                     namespace.discovery_panel_plan,
+                     namespace.discovery_panel_plan_sha256,
+                     namespace.campaign_checkpoint,
+                     namespace.campaign_checkpoint_sha256,
+@@ -21430,30 +22288,87 @@ def _execute_cli_run(
+         except PreflightError as exc:
+             raise ControllerInitializationError(
+                 _closed_source_preflight_stage(exc)
+             ) from exc
+         from core.pit_optimization import (
+             PitOptimizationCanaryServices,
+             PitOptimizationCleanup,
+             PitOptimizationGateConfig,
+             PitOptimizationLoopResult,
+             PitOptimizationRoleCall,
++            PitOptimizerGateConfigV4,
+             prepare_pit_optimizer_v3,
+             prepare_pit_optimization,
+             run_pit_optimization_canary,
+             verify_sealed_baseline_artifacts,
+         )
+         from core.pit_optimization_contract import PitOptimizerGateConfig
+         from core.pit_optimizer_controller import (
+             PitOptimizerReadiness,
++            PitOptimizerReadinessV4,
+             PitOptimizerResult,
++            PitOptimizerResultV4,
+         )
++        if isinstance(config.gate, PitOptimizerGateConfigV4):
++            if not isinstance(config.limits, PitOptimizerLoopLimits):
++                raise ConfigurationError(
++                    "PIT optimizer v4 execution limits are invalid"
++                )
++            if state.fingerprint is None:
++                raise ConfigurationError("preflight source fingerprint is absent")
++
++            def prepare_v4(gate: object) -> PitOptimizerReadinessV4:
++                nonlocal stage
++                if not isinstance(gate, PitOptimizerGateConfigV4):
++                    raise ConfigurationError("PIT optimizer v4 gate changed")
++                stage = "pit_optimizer_v4_prepare"
++                return _prepare_pit_optimizer_v4_production(
++                    gate,
++                    source_state=state,
++                    git_capability=git_capability,
++                    limits=config.limits,
++                )
++
++            def build_v4(
++                gate: object,
++                limits: PitOptimizerLoopLimits,
++            ) -> PitOptimizerLiveRunV4:
++                nonlocal stage
++                if not isinstance(gate, PitOptimizerGateConfigV4):
++                    raise ConfigurationError("PIT optimizer v4 gate changed")
++                stage = "pit_optimizer_v4_canary"
++                return _build_pit_optimizer_v4_live_run(
++                    gate,
++                    loop_config=config,
++                    limits=limits,
++                    source_state=state,
++                    git_capability=git_capability,
++                )
++
++            v4_result = _dispatch_pit_optimizer_v4(
++                config.gate,
++                config.limits,
++                prepare=prepare_v4,
++                build_live_services=build_v4,
++            )
++            if isinstance(v4_result, PitOptimizerReadinessV4):
++                if recheck_source_unchanged(state).source_modified:
++                    raise CandidateMutationError(
++                        "source changed during PIT optimizer v4 readiness publication"
++                    )
++            elif not isinstance(v4_result, PitOptimizerResultV4):
++                raise ConfigurationError("PIT optimizer v4 returned an invalid result")
++            state.close()
++            state = None
++            loop_returned = True
++            return v4_result
++
+         if isinstance(config.gate, PitOptimizerGateConfig):
+             if not isinstance(config.limits, PitOptimizerLoopLimits):
+                 raise ConfigurationError(
+                     "PIT optimizer execution limits are invalid"
+                 )
+             if state.fingerprint is None:
+                 raise ConfigurationError("preflight source fingerprint is absent")
+ 
+             def v3_source_identity(root: Path) -> tuple[str, str]:
+                 return _pit_optimizer_source_identity(root, git_capability)
+diff --git a/core/pit_optimization.py b/core/pit_optimization.py
+index a4d40f1..1b20f02 100644
+--- a/core/pit_optimization.py
++++ b/core/pit_optimization.py
+@@ -288,20 +288,22 @@ class PitOptimizerGateConfigV4:
+     pit_bundle: Path
+     pit_bundle_sha256: str
+     optimizer_manifest: Path
+     optimizer_manifest_sha256: str
+     discovery_panel_plan: Path
+     discovery_panel_plan_sha256: str
+     readiness_artifact: Path
+     readiness_sha256: str | None
+     campaign_checkpoint: Path | None
+     campaign_checkpoint_sha256: str | None
++    authorization_window_id: str | None
++    authorization_requirement_sha256: str
+     source_transmission_authorized: bool
+     max_api_calls: int
+     max_tokens: int
+     max_iterations: int
+     apply: bool
+     source_root: Path
+     permanent_runtime_root: Path
+     controller_temp_parent: Path
+     artifact_root: Path
+     git_executable: Path
+@@ -323,20 +325,21 @@ class PitOptimizerGateConfigV4:
+             "artifact_root",
+             "git_executable",
+             "docker_executable",
+         ):
+             path = _absolute_path(getattr(self, name), f"optimizer v4 {name}")
+             object.__setattr__(self, name, path)
+         for name in (
+             "pit_bundle_sha256",
+             "optimizer_manifest_sha256",
+             "discovery_panel_plan_sha256",
++            "authorization_requirement_sha256",
+         ):
+             if _SHA256_RE.fullmatch(getattr(self, name) or "") is None:
+                 raise ValueError(f"optimizer v4 {name} is invalid")
+         checkpoint_pair = (
+             self.campaign_checkpoint is not None,
+             self.campaign_checkpoint_sha256 is not None,
+         )
+         if checkpoint_pair[0] != checkpoint_pair[1]:
+             raise ValueError("optimizer v4 checkpoint path and digest must be paired")
+         if self.campaign_checkpoint is not None:
+@@ -344,24 +347,30 @@ class PitOptimizerGateConfigV4:
+                 self,
+                 "campaign_checkpoint",
+                 _absolute_path(
+                     self.campaign_checkpoint,
+                     "optimizer v4 campaign checkpoint",
+                 ),
+             )
+             if _SHA256_RE.fullmatch(self.campaign_checkpoint_sha256 or "") is None:
+                 raise ValueError("optimizer v4 campaign checkpoint digest is invalid")
+         if self.phase == "prepare":
+-            if self.readiness_sha256 is not None or self.source_transmission_authorized:
++            if (
++                self.readiness_sha256 is not None
++                or self.source_transmission_authorized
++                or self.authorization_window_id is not None
++            ):
+                 raise ValueError("optimizer v4 prepare cannot carry live authority")
+         elif (
+             _SHA256_RE.fullmatch(self.readiness_sha256 or "") is None
++            or not isinstance(self.authorization_window_id, str)
++            or not self.authorization_window_id
+             or self.source_transmission_authorized is not True
+         ):
+             raise ValueError("optimizer v4 canary requires readiness and source authority")
+         if (
+             type(self.max_iterations) is not int
+             or self.max_iterations <= 0
+             or self.max_api_calls != 3 * self.max_iterations
+             or type(self.max_tokens) is not int
+             or self.max_tokens <= 0
+             or self.apply is not False
+diff --git a/core/pit_optimization_contract.py b/core/pit_optimization_contract.py
+index 95c3d37..8a5a9ed 100644
+--- a/core/pit_optimization_contract.py
++++ b/core/pit_optimization_contract.py
+@@ -1645,24 +1645,24 @@ def build_subset_manifest(
+         immutable_constraint_ids=constraint_ids,
+         candidate_bounds=candidate_bounds,
+         call_budgets=call_budgets,
+         max_iterations=max_iterations,
+         non_improving_limit=max_iterations,
+         authorization_requirement=authorization,
+     )
+ 
+ 
+ def write_optimizer_manifest(
+-    manifest: PitOptimizerRunManifest,
++    manifest: PitOptimizerRunManifest | PitOptimizerRunManifestV4,
+     output: Path,
+ ) -> tuple[Path, str]:
+-    if not isinstance(manifest, PitOptimizerRunManifest):
++    if not isinstance(manifest, (PitOptimizerRunManifest, PitOptimizerRunManifestV4)):
+         raise ValueError("optimizer manifest writer requires a closed manifest")
+     path = Path(output)
+     if not path.is_absolute():
+         raise ValueError("optimizer manifest output must be absolute")
+     parent = _resolved_directory(path.parent, "optimizer manifest parent")
+     resolved = parent / path.name
+     payload = manifest.canonical_json_bytes() + b"\n"
+     with resolved.open("xb") as handle:
+         handle.write(payload)
+         handle.flush()
+@@ -4478,20 +4478,21 @@ class PitOptimizerRunManifestV4(_V2Canonical):
+     seed_checkpoint_sha256: str | None
+     editable_paths: tuple[str, ...]
+     policy_authoring_scope: PolicyAuthoringScopeV4
+     immutable_constraints_sha256: str
+     immutable_constraint_ids: tuple[str, ...]
+     sandbox_image: str
+     call_budgets: tuple[PitOptimizerCallBudget, ...]
+     max_iterations: int
+     apply: bool
+     provider_retries: int
++    authorization_requirement: AuthorizationRequirement
+ 
+     def __post_init__(self) -> None:
+         if self.schema_version != 4:
+             raise ValueError("optimizer v4 manifest schema is unsupported")
+         _v2_identifier(self.campaign_id, "optimizer v4 campaign ID")
+         _require_positive_int(self.campaign_sequence, "optimizer v4 campaign sequence")
+         if self.model != PIT_OPTIMIZER_R1_MODEL:
+             raise ValueError("optimizer v4 model is invalid")
+         if re.fullmatch(r"[0-9a-f]{40}", self.source_head or "") is None:
+             raise ValueError("optimizer v4 source HEAD is invalid")
+@@ -4535,35 +4536,51 @@ class PitOptimizerRunManifestV4(_V2Canonical):
+             raise ValueError("optimizer v4 editable paths are invalid")
+         if not isinstance(self.policy_authoring_scope, PolicyAuthoringScopeV4):
+             raise ValueError("optimizer v4 policy authoring scope is invalid")
+         if (
+             self.policy_authoring_scope.policy_interface_version
+             != self.policy_interface_version
+             or self.policy_authoring_scope.editable_paths != self.editable_paths
+             or self.policy_authoring_scope.call_budgets != self.call_budgets
+         ):
+             raise ValueError("optimizer v4 authoring scope differs from manifest")
++        if self.apply is not False:
++            raise ValueError("optimizer v4 apply must be false")
++        if self.provider_retries != 0:
++            raise ValueError("optimizer v4 provider retries must be zero")
++        if not isinstance(self.authorization_requirement, AuthorizationRequirement):
++            raise ValueError("optimizer v4 authorization requirement is invalid")
++        total_tokens = sum(
++            item.max_input_tokens + item.max_output_tokens
++            for item in self.call_budgets
++        )
++        if (
++            self.authorization_requirement.policy_source_scope_sha256
++            != self.policy_authoring_scope.sha256
++            or self.authorization_requirement.max_calls != len(self.call_budgets)
++            or self.authorization_requirement.max_tokens != total_tokens
++            or self.authorization_requirement.provider_retries
++            != self.provider_retries
++            or self.authorization_requirement.apply != self.apply
++        ):
++            raise ValueError("optimizer v4 authorization requirement differs")
+         _v2_string_tuple(self.immutable_constraint_ids, "optimizer v4 constraint IDs")
+         expected_constraints = hashlib.sha256(
+             _v2_canonical_bytes(self.immutable_constraint_ids) + b"\n"
+         ).hexdigest()
+         if self.immutable_constraints_sha256 != expected_constraints:
+             raise ValueError("optimizer v4 immutable constraint identity differs")
+         if re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", self.sandbox_image or "") is None:
+             raise ValueError("optimizer v4 sandbox image must be digest pinned")
+         _validate_v4_call_plan(self.call_budgets, max_iterations=self.max_iterations)
+         if any(item.model != self.model for item in self.call_budgets):
+             raise ValueError("optimizer v4 call model differs from manifest")
+-        if self.apply is not False:
+-            raise ValueError("optimizer v4 apply must be false")
+-        if self.provider_retries != 0:
+-            raise ValueError("optimizer v4 provider retries must be zero")
+         for budget in self.call_budgets:
+             static_bytes = len(PIT_OPTIMIZER_V4_SYSTEM_PROMPTS[budget.role].encode("utf-8"))
+             static_bytes += len(
+                 _v2_canonical_bytes(pit_optimizer_v4_response_format(budget.role))
+             )
+             if static_bytes > budget.max_static_input_bytes:
+                 raise ValueError("optimizer v4 static role context exceeds call cap")
+ 
+     @classmethod
+     def from_discovery_plan(
+@@ -4574,27 +4591,39 @@ class PitOptimizerRunManifestV4(_V2Canonical):
+         source_head: str,
+         source_fingerprint_sha256: str,
+         discovery_panel_plan: DiscoveryPanelPlan,
+         policy_authoring_scope: PolicyAuthoringScopeV4,
+         immutable_constraint_ids: tuple[str, ...],
+         sandbox_image: str,
+         seed_checkpoint_sha256: str | None = None,
+         model: str = PIT_OPTIMIZER_R1_MODEL,
+         apply: bool = False,
+         provider_retries: int = 0,
++        authorization_window_id: str,
+     ) -> "PitOptimizerRunManifestV4":
+         if not isinstance(discovery_panel_plan, DiscoveryPanelPlan):
+             raise ValueError("optimizer v4 discovery plan is invalid")
+         constraint_sha256 = hashlib.sha256(
+             _v2_canonical_bytes(immutable_constraint_ids) + b"\n"
+         ).hexdigest()
+         max_iterations = max(item.iteration for item in policy_authoring_scope.call_budgets)
++        authorization = AuthorizationRequirement(
++            window_id=authorization_window_id,
++            max_calls=len(policy_authoring_scope.call_budgets),
++            max_tokens=sum(
++                item.max_input_tokens + item.max_output_tokens
++                for item in policy_authoring_scope.call_budgets
++            ),
++            policy_source_scope_sha256=policy_authoring_scope.sha256,
++            provider_retries=provider_retries,
++            apply=apply,
++        )
+         result = cls(
+             schema_version=4,
+             campaign_id=campaign_id,
+             campaign_sequence=campaign_sequence,
+             model=model,
+             source_head=source_head,
+             source_fingerprint_sha256=source_fingerprint_sha256,
+             source_clean=True,
+             policy_interface_version=2,
+             pit_bundle_sha256=discovery_panel_plan.pit_bundle_sha256,
+@@ -4606,20 +4635,21 @@ class PitOptimizerRunManifestV4(_V2Canonical):
+             seed_checkpoint_sha256=seed_checkpoint_sha256,
+             editable_paths=_POLICY_EDITABLE_PATHS,
+             policy_authoring_scope=policy_authoring_scope,
+             immutable_constraints_sha256=constraint_sha256,
+             immutable_constraint_ids=immutable_constraint_ids,
+             sandbox_image=sandbox_image,
+             call_budgets=policy_authoring_scope.call_budgets,
+             max_iterations=max_iterations,
+             apply=apply,
+             provider_retries=provider_retries,
++            authorization_requirement=authorization,
+         )
+         result.validate_discovery_plan(discovery_panel_plan)
+         return result
+ 
+     def validate_discovery_plan(self, plan: DiscoveryPanelPlan) -> None:
+         if (
+             not isinstance(plan, DiscoveryPanelPlan)
+             or plan.schema_version != 4
+             or plan.sha256 != self.discovery_panel_plan_sha256
+             or plan.pit_bundle_sha256 != self.pit_bundle_sha256
+@@ -4659,20 +4689,26 @@ def _pit_optimizer_manifest_v4_from_primitive(
+         scope["editable_paths"] = tuple(scope["editable_paths"])
+         scope["call_budgets"] = tuple(
+             PitOptimizerCallBudget(**item) for item in scope["call_budgets"]
+         )
+         expected_target = _v2_primitive(AnnualizedReturnTarget.production())
+         if target_value != expected_target:
+             raise ValueError("optimizer v4 target contract is invalid")
+         values["annualized_return_target"] = AnnualizedReturnTarget.production()
+         values["editable_paths"] = tuple(values["editable_paths"])
+         values["policy_authoring_scope"] = PolicyAuthoringScopeV4(**scope)
++        authorization_value = values["authorization_requirement"]
++        if not isinstance(authorization_value, dict):
++            raise ValueError("optimizer v4 authorization requirement is invalid")
++        values["authorization_requirement"] = AuthorizationRequirement(
++            **authorization_value
++        )
+         values["immutable_constraint_ids"] = tuple(
+             values["immutable_constraint_ids"]
+         )
+         values["call_budgets"] = tuple(
+             PitOptimizerCallBudget(**item) for item in values["call_budgets"]
+         )
+         manifest = PitOptimizerRunManifestV4(**values)
+         if discovery_panel_plan is not None:
+             manifest.validate_discovery_plan(discovery_panel_plan)
+         return manifest
+diff --git a/core/pit_optimizer_authorization.py b/core/pit_optimizer_authorization.py
+index 3d7c4d5..616d281 100644
+--- a/core/pit_optimizer_authorization.py
++++ b/core/pit_optimizer_authorization.py
+@@ -18,32 +18,36 @@ from pathlib import Path
+ import re
+ import threading
+ from types import MappingProxyType
+ from typing import Iterator, Mapping, Sequence
+ 
+ from core.pit_optimization_contract import (
+     AuthorizationRequirement,
+     AuthorArtifact,
+     AuthorArtifactV4,
+     AuthorInput,
++    AuthorInputV4,
+     AuthorManifestSummary,
+     AuthorManifestSummaryV4,
+     CriticArtifact,
+     CriticArtifactV4,
+     CriticInput,
++    CriticInputV4,
+     InvestigatorArtifact,
+     InvestigatorArtifactV4,
+     InvestigatorInput,
++    InvestigatorInputV4,
+     OPTIMIZER_V2_ROLES,
+     PatchBounds,
+     PitOptimizerCallBudget,
+     PitOptimizerRunManifest,
++    PitOptimizerRunManifestV4,
+     PolicySourceBundle,
+     PolicySourceRecord,
+     RoleOutputInvalidSummary,
+     authenticate_policy_source_bundle,
+ )
+ import core.pit_optimization_contract as _contract
+ 
+ 
+ _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+ _ID_RE = re.compile(r"[a-z][a-z0-9_.-]{0,127}")
+@@ -1104,62 +1108,104 @@ class AuthorizationPlanSkip:
+ @dataclass(frozen=True, slots=True)
+ class AuthenticatedRoleInputSnapshot:
+     """One controller-originated role input, closed over its exact wire bytes."""
+ 
+     role: str
+     iteration: int
+     canonical_bytes: bytes
+     expected_hypothesis_id: str | None = None
+     source_bundle: PolicySourceBundle | None = None
+     candidate_bounds: PatchBounds | None = None
++    schema_version: int = 3
+ 
+     def validate_artifact(
+         self,
+-        artifact: InvestigatorArtifact | AuthorArtifact | CriticArtifact,
++        artifact: (
++            InvestigatorArtifact
++            | AuthorArtifact
++            | CriticArtifact
++            | InvestigatorArtifactV4
++            | AuthorArtifactV4
++            | CriticArtifactV4
++        ),
+     ) -> None:
+         """Validate response relationships only against the authenticated snapshot."""
+ 
+-        expected_type = {
+-            "investigator": InvestigatorArtifact,
+-            "author": AuthorArtifact,
+-            "critic": CriticArtifact,
+-        }[self.role]
++        expected_type = (
++            {
++                "investigator": InvestigatorArtifactV4,
++                "author": AuthorArtifactV4,
++                "critic": CriticArtifactV4,
++            }[self.role]
++            if self.schema_version == 4
++            else {
++                "investigator": InvestigatorArtifact,
++                "author": AuthorArtifact,
++                "critic": CriticArtifact,
++            }[self.role]
++        )
+         if not isinstance(artifact, expected_type):
+             raise ValueError("optimizer response has an invalid type")
+-        if self.role == "author":
++        if self.schema_version == 4:
++            if self.role == "critic" and (
++                not isinstance(artifact, CriticArtifactV4)
++                or artifact.hypothesis_id != self.expected_hypothesis_id
++            ):
++                raise ValueError("critic hypothesis differs from its input")
++        elif self.role == "author":
+             assert isinstance(artifact, AuthorArtifact)
+             # The author proposal is structurally parsed before this point.
+             # Its one authoritative applicability check runs later against the
+             # disposable candidate checkout with Git.  Repeating that check
+             # against an in-memory source bundle changes line-ending semantics
+             # and can reject a diff that Git correctly accepts, so metadata and
+             # diff applicability remain controller-derived at that boundary.
+         elif self.role == "critic":
+             assert isinstance(artifact, CriticArtifact)
+             if artifact.hypothesis_id != self.expected_hypothesis_id:
+                 raise ValueError("critic hypothesis differs from its input")
+ 
+ 
++def _authorization_scope_sha256(
++    manifest: PitOptimizerRunManifest | PitOptimizerRunManifestV4,
++) -> str:
++    if isinstance(manifest, PitOptimizerRunManifest):
++        return manifest.policy_source_scope.sha256
++    if isinstance(manifest, PitOptimizerRunManifestV4):
++        return manifest.policy_authoring_scope.sha256
++    raise AuthorizationError("authorization manifest is invalid")
++
++
++def _authorization_run_id(
++    manifest: PitOptimizerRunManifest | PitOptimizerRunManifestV4,
++) -> str:
++    if isinstance(manifest, PitOptimizerRunManifest):
++        return manifest.run_id
++    if isinstance(manifest, PitOptimizerRunManifestV4):
++        return manifest.campaign_id
++    raise AuthorizationError("authorization manifest is invalid")
++
++
+ def require_authorized_policy_source_scope(
+-    manifest: PitOptimizerRunManifest,
++    manifest: PitOptimizerRunManifest | PitOptimizerRunManifestV4,
+     requirement: AuthorizationRequirement,
+     window: OperatorAuthorizationWindow,
+ ) -> str:
+     """Authenticate one window against the exact manifest policy-source scope."""
+ 
+-    if not isinstance(manifest, PitOptimizerRunManifest):
++    if not isinstance(manifest, (PitOptimizerRunManifest, PitOptimizerRunManifestV4)):
+         raise AuthorizationError("authorization manifest is invalid")
+     if not isinstance(requirement, AuthorizationRequirement):
+         raise AuthorizationError("authorization requirement is invalid")
+     if not isinstance(window, OperatorAuthorizationWindow):
+         raise AuthorizationError("authorization window is invalid")
+-    expected = manifest.policy_source_scope.sha256
++    expected = _authorization_scope_sha256(manifest)
+     if requirement.sha256 != manifest.authorization_requirement.sha256:
+         raise AuthorizationError("authorization requirement mismatch")
+     if window.authorization_requirement_sha256 != requirement.sha256:
+         raise AuthorizationError("authorization window requirement mismatch")
+     if (
+         requirement.policy_source_scope_sha256 != expected
+         or window.policy_source_scope_sha256 != expected
+     ):
+         raise AuthorizationError("policy source scope mismatch")
+     return expected
+@@ -1189,41 +1235,54 @@ def _authorization_file_lock(path: Path) -> Iterator[None]:
+             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+             try:
+                 yield
+             finally:
+                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+ 
+ 
+ class AuthorizationLedger:
+     """Permanent hash-chained grant/window ledger for one authenticated manifest."""
+ 
+-    def __init__(self, path: Path, manifest: PitOptimizerRunManifest) -> None:
++    def __init__(
++        self,
++        path: Path,
++        manifest: PitOptimizerRunManifest | PitOptimizerRunManifestV4,
++    ) -> None:
+         candidate = Path(path)
+         if (
+             not candidate.is_absolute()
+             or candidate.name != "pit_optimizer_authorization_ledger.jsonl"
+             or not candidate.parent.is_dir()
+             or candidate.parent.is_symlink()
+             or candidate.is_symlink()
+         ):
+             raise AuthorizationError("authorization ledger path is invalid")
+-        if not isinstance(manifest, PitOptimizerRunManifest):
++        if not isinstance(
++            manifest,
++            (PitOptimizerRunManifest, PitOptimizerRunManifestV4),
++        ):
+             raise AuthorizationError("authorization ledger manifest is invalid")
+         try:
+             manifest_primitive = json.loads(
+                 manifest.canonical_json_bytes(),
+                 object_pairs_hook=_reject_duplicate_keys,
+             )
+             if not isinstance(manifest_primitive, dict):
+                 raise ValueError("optimizer manifest snapshot is invalid")
+-            manifest_snapshot = _contract._pit_optimizer_manifest_from_primitive(
+-                manifest_primitive
++            manifest_snapshot = (
++                _contract._pit_optimizer_manifest_v4_from_primitive(
++                    manifest_primitive
++                )
++                if manifest.schema_version == 4
++                else _contract._pit_optimizer_manifest_from_primitive(
++                    manifest_primitive
++                )
+             )
+         except (AuthorizationError, TypeError, ValueError, json.JSONDecodeError) as exc:
+             raise AuthorizationError(
+                 "authorization ledger manifest snapshot is invalid"
+             ) from exc
+         self._path = candidate.resolve()
+         self._lock_path = self._path.with_suffix(self._path.suffix + ".lock")
+         self._manifest = manifest_snapshot
+         self._call_plan_snapshots = tuple(
+             PitOptimizerCallBudget(**item.to_primitive())
+@@ -1236,35 +1295,35 @@ class AuthorizationLedger:
+             int,
+             tuple[object, AuthenticatedRoleInputSnapshot],
+         ] = {}
+         self._consumed_role_input_plans: set[int] = set()
+         self._role_input_lock = threading.Lock()
+         self._audit_trail: object | None = None
+         with _authorization_file_lock(self._lock_path):
+             self._read_records()
+ 
+     @property
+-    def manifest(self) -> PitOptimizerRunManifest:
++    def manifest(self) -> PitOptimizerRunManifest | PitOptimizerRunManifestV4:
+         """Return the immutable manifest authenticated by this ledger instance."""
+ 
+         return self._manifest
+ 
+     def attach_audit_trail(self, audit_trail: object) -> None:
+         """Bind and cross-verify the one AuditTrail backing durable receipts."""
+ 
+         # The import stays local so the authorization contract remains usable by
+         # manifest tooling without importing the provider controller at startup.
+         from agent_loop import AuditTrail
+ 
+         if not isinstance(audit_trail, AuditTrail):
+             raise AuthorizationError("authorization audit trail is invalid")
+-        if audit_trail.run_id != self._manifest.run_id:
++        if audit_trail.run_id != _authorization_run_id(self._manifest):
+             raise AuthorizationError(
+                 "authorization audit run differs from manifest"
+             )
+         if self._audit_trail is not None and self._audit_trail is not audit_trail:
+             raise AuthorizationError("authorization audit trail is already bound")
+         with _authorization_file_lock(self._lock_path):
+             records = self._read_records()
+         reservations: dict[str, AuthorizationCallReservation] = {}
+         for item in records:
+             if item.get("record_type") != "reservation":
+@@ -1435,23 +1494,23 @@ class AuthorizationLedger:
+         return PitOptimizerCallBudget(**expected.to_primitive())
+ 
+     def _snapshot_role_input(
+         self,
+         dynamic_input: object,
+         plan: PitOptimizerCallBudget,
+     ) -> AuthenticatedRoleInputSnapshot:
+         """Capture first, then authenticate provenance from those exact bytes."""
+ 
+         expected_types = {
+-            "investigator": InvestigatorInput,
+-            "author": AuthorInput,
+-            "critic": CriticInput,
++            "investigator": (InvestigatorInput, InvestigatorInputV4),
++            "author": (AuthorInput, AuthorInputV4),
++            "critic": (CriticInput, CriticInputV4),
+         }
+         if (
+             not isinstance(plan, PitOptimizerCallBudget)
+             or not isinstance(dynamic_input, expected_types.get(plan.role, ()))
+         ):
+             raise AuthorizationError("optimizer role input contract is invalid")
+         try:
+             canonical_bytes = dynamic_input.canonical_json_bytes()
+             primitive = json.loads(
+                 canonical_bytes,
+@@ -1464,33 +1523,57 @@ class AuthorizationLedger:
+             or canonical_bytes
+             != json.dumps(
+                 primitive,
+                 sort_keys=True,
+                 separators=(",", ":"),
+                 allow_nan=False,
+                 ensure_ascii=False,
+             ).encode("utf-8")
+         ):
+             raise AuthorizationError("optimizer role input snapshot is not canonical")
++        schema_version = primitive.get("schema_version")
++        expected_schema_version = 4 if isinstance(
++            self._manifest, PitOptimizerRunManifestV4
++        ) else 2
+         if (
+-            primitive.get("schema_version") != 2
++            schema_version != expected_schema_version
+             or primitive.get("iteration") != plan.iteration
+             or primitive.get("run_manifest_sha256") != self._manifest.sha256
+             or primitive.get("immutable_constraint_ids")
+             != list(self._manifest.immutable_constraint_ids)
+         ):
+             raise AuthorizationError("optimizer role input differs from run manifest")
+ 
+         source_bundle: PolicySourceBundle | None = None
+         candidate_bounds: PatchBounds | None = None
+         expected_hypothesis_id: str | None = None
+-        if plan.role in {"investigator", "author"}:
++        if isinstance(self._manifest, PitOptimizerRunManifestV4):
++            try:
++                dynamic_input.validate_budget(
++                    plan,
++                    scope=self._manifest.policy_authoring_scope,
++                    manifest=self._manifest,
++                )
++            except (AttributeError, TypeError, ValueError) as exc:
++                raise AuthorizationError(
++                    "optimizer v4 role input differs from run manifest"
++                ) from exc
++            if plan.role == "author":
++                investigator = primitive.get("investigator")
++                if not isinstance(investigator, dict):
++                    raise AuthorizationError(
++                        "optimizer v4 author input provenance is invalid"
++                    )
++                expected_hypothesis_id = investigator.get("hypothesis_id")
++            elif plan.role == "critic":
++                expected_hypothesis_id = primitive.get("hypothesis_id")
++        elif plan.role in {"investigator", "author"}:
+             if (
+                 primitive.get("policy_interface_version")
+                 != self._manifest.policy_interface_version
+                 or primitive.get("candidate_bounds")
+                 != self._manifest.candidate_bounds.to_primitive()
+             ):
+                 raise AuthorizationError(
+                     "optimizer source input differs from run manifest"
+                 )
+             source = primitive.get("source_bundle")
+@@ -1564,20 +1647,21 @@ class AuthorizationLedger:
+             expected_hypothesis_id, str
+         ):
+             raise AuthorizationError("optimizer role input provenance is invalid")
+         return AuthenticatedRoleInputSnapshot(
+             role=plan.role,
+             iteration=plan.iteration,
+             canonical_bytes=canonical_bytes,
+             expected_hypothesis_id=expected_hypothesis_id,
+             source_bundle=source_bundle,
+             candidate_bounds=candidate_bounds,
++            schema_version=expected_schema_version,
+         )
+ 
+     def bind_controller_role_input(
+         self,
+         dynamic_input: object,
+         plan: PitOptimizerCallBudget,
+         *,
+         predecessor_calls: Sequence[
+             PitOptimizerRoleCall | PitOptimizerRoleAttempt | AuthorizationPlanSkip
+         ] = (),
+@@ -1725,21 +1809,42 @@ class AuthorizationLedger:
+             if isinstance(item, PitOptimizerRoleCall)
+             else PitOptimizerRoleCall(item.plan, item.payload, item.facts)
+             for item in predecessors
+             if not isinstance(item, AuthorizationPlanSkip)
+             and item.payload is not None
+             and isinstance(
+                 item.payload,
+                 (InvestigatorArtifact, AuthorArtifact, CriticArtifact),
+             )
+         )
+-        if canonical_plan.role == "investigator" and canonical_plan.iteration > 1:
++        is_v4 = snapshot.schema_version == 4
++        if (
++            is_v4
++            and canonical_plan.role == "investigator"
++            and canonical_plan.iteration > 1
++        ):
++            prior_hypotheses = primitive.get("prior_hypotheses")
++            valid_history = isinstance(prior_hypotheses, list) and all(
++                isinstance(item, dict) for item in prior_hypotheses
++            )
++            if valid_history:
++                assert isinstance(prior_hypotheses, list)
++                valid_history = (
++                    len(prior_hypotheses) == canonical_plan.iteration - 1
++                    and tuple(item.get("iteration") for item in prior_hypotheses)
++                    == tuple(range(1, canonical_plan.iteration))
++                )
++            if not valid_history:
++                raise AuthorizationError(
++                    "optimizer v4 role input predecessor artifact differs"
++                )
++        elif canonical_plan.role == "investigator" and canonical_plan.iteration > 1:
+             feedbacks = primitive.get("prior_iterations")
+             if not isinstance(feedbacks, list):
+                 raise AuthorizationError(
+                     "optimizer role input predecessor artifact differs"
+                 )
+             complete_groups: list[tuple[PitOptimizerRoleCall, ...]] = []
+             for offset in range(canonical_plan.iteration - 1):
+                 group = predecessors[
+                     offset * len(OPTIMIZER_V2_ROLES) :
+                     (offset + 1) * len(OPTIMIZER_V2_ROLES)
+@@ -1787,25 +1892,39 @@ class AuthorizationLedger:
+                     investigator_payload.hypothesis_id,
+                     investigator_payload.family,
+                     author_payload.behavioral_summary,
+                     critic_payload.disposition,
+                     critic_payload.next_direction,
+                 ):
+                     raise AuthorizationError(
+                         "optimizer role input predecessor artifact differs"
+                     )
+         elif canonical_plan.role == "author":
+-            if (
+-                len(legacy_calls) != 1
+-                or primitive.get("investigator")
+-                != legacy_calls[0].payload.to_primitive()
+-            ):
++            predecessor_payloads = tuple(
++                item.payload
++                for item in predecessors
++                if not isinstance(item, AuthorizationPlanSkip)
++            )
++            if is_v4:
++                valid_author_lineage = (
++                    len(predecessor_payloads) == 1
++                    and isinstance(predecessor_payloads[0], InvestigatorArtifactV4)
++                    and primitive.get("investigator")
++                    == predecessor_payloads[0].to_primitive()
++                )
++            else:
++                valid_author_lineage = (
++                    len(legacy_calls) == 1
++                    and primitive.get("investigator")
++                    == legacy_calls[0].payload.to_primitive()
++                )
++            if not valid_author_lineage:
+                 raise AuthorizationError(
+                     "optimizer role input predecessor artifact differs"
+                 )
+         elif canonical_plan.role == "critic":
+             if len(predecessors) != 2 or any(
+                 isinstance(item, AuthorizationPlanSkip) for item in predecessors
+             ):
+                 raise AuthorizationError(
+                     "optimizer critic predecessor lineage is invalid"
+                 )
+@@ -1974,21 +2093,21 @@ class AuthorizationLedger:
+             != (
+                 reservation.call_index,
+                 reservation.iteration,
+                 reservation.role,
+                 reservation.reserved_tokens,
+             )
+             or run_manifest_sha256 != lease.run_manifest_sha256
+             or not isinstance(audit_run_id, str)
+             or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{7,63}", audit_run_id)
+             is None
+-            or audit_run_id != self._manifest.run_id
++            or audit_run_id != _authorization_run_id(self._manifest)
+             or not isinstance(budget_reservation_id, str)
+             or re.fullmatch(
+                 r"optimizer_budget_[0-9a-f]{32}",
+                 budget_reservation_id,
+             )
+             is None
+         ):
+             raise AuthorizationError(
+                 "authorization gateway lifecycle commitment differs"
+             )
+@@ -2500,21 +2619,21 @@ class AuthorizationLedger:
+                 primitive = value.get("grant")
+                 if not isinstance(primitive, dict):
+                     raise AuthorizationError("authorization grant record is malformed")
+                 try:
+                     grant = OperatorAuthorizationGrant(**primitive)
+                 except (TypeError, ValueError) as exc:
+                     raise AuthorizationError("authorization grant record is invalid") from exc
+                 requirement = self._manifest.authorization_requirement
+                 if (
+                     grant.policy_source_scope_sha256
+-                    != self._manifest.policy_source_scope.sha256
++                    != _authorization_scope_sha256(self._manifest)
+                     or grant.additional_calls > requirement.max_calls
+                     or grant.additional_tokens > requirement.max_tokens
+                 ):
+                     raise AuthorizationError(
+                         "authorization grant differs from manifest authority"
+                     )
+                 if grant.grant_id in grants:
+                     raise AuthorizationError("authorization grant ID is already recorded")
+                 grants[grant.grant_id] = grant
+             elif record_type == "window":
+@@ -3245,21 +3364,23 @@ class AuthorizationLedger:
+             offset += written
+ 
+     def _validate_grant(
+         self,
+         grant: OperatorAuthorizationGrant,
+         records: list[dict[str, object]],
+     ) -> None:
+         if not isinstance(grant, OperatorAuthorizationGrant):
+             raise AuthorizationError("authorization grant is invalid")
+         requirement = self._manifest.authorization_requirement
+-        if grant.policy_source_scope_sha256 != self._manifest.policy_source_scope.sha256:
++        if grant.policy_source_scope_sha256 != _authorization_scope_sha256(
++            self._manifest
++        ):
+             raise AuthorizationError("policy source scope mismatch")
+         if (
+             grant.additional_calls > requirement.max_calls
+             or grant.additional_tokens > requirement.max_tokens
+         ):
+             raise AuthorizationError("authorization grant exceeds manifest ceilings")
+         if any(
+             record.get("record_type") == "grant"
+             and isinstance(record.get("grant"), dict)
+             and record["grant"].get("grant_id") == grant.grant_id
+@@ -4827,75 +4948,80 @@ class AuthorizationLedger:
+                         "lease_id": lease.lease_id,
+                         "terminal_code": terminal_code,
+                     }
+                 ],
+             )
+ 
+ 
+ def _load_authenticated_manifest(
+     manifest_path: Path,
+     manifest_sha256: str,
+-) -> PitOptimizerRunManifest:
++) -> PitOptimizerRunManifest | PitOptimizerRunManifestV4:
+     path = Path(manifest_path)
+     if (
+         not path.is_absolute()
+         or not path.is_file()
+         or path.is_symlink()
+         or _SHA256_RE.fullmatch(manifest_sha256 or "") is None
+     ):
+         raise AuthorizationError("authorization manifest path or digest is invalid")
+     raw = path.read_bytes()
+     if hashlib.sha256(raw).hexdigest() != manifest_sha256:
+         raise AuthorizationError("authorization manifest digest mismatch")
+     try:
+         primitive = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+     except (UnicodeDecodeError, json.JSONDecodeError, AuthorizationError) as exc:
+         raise AuthorizationError("authorization manifest is invalid JSON") from exc
+     if not isinstance(primitive, dict) or raw != _canonical_json_bytes(primitive):
+         raise AuthorizationError("authorization manifest is not canonical JSON")
+     try:
+-        manifest = _contract._pit_optimizer_manifest_from_primitive(primitive)
++        manifest = (
++            _contract._pit_optimizer_manifest_v4_from_primitive(primitive)
++            if primitive.get("schema_version") == 4
++            else _contract._pit_optimizer_manifest_from_primitive(primitive)
++        )
+     except ValueError as exc:
+         raise AuthorizationError("authorization manifest contract is invalid") from exc
+     if manifest.sha256 != manifest_sha256:
+         raise AuthorizationError("authorization manifest closed identity mismatch")
+     return manifest
+ 
+ 
+ def record_authorized_grant(
+     *,
+     ledger_path: Path,
+     manifest_path: Path,
+     manifest_sha256: str,
+     grant: OperatorAuthorizationGrant,
+     operator_approval_reference: str,
+ ) -> OperatorAuthorizationWindow:
+     """Authenticate a manifest and atomically append one explicit grant/window."""
+ 
+     manifest = _load_authenticated_manifest(manifest_path, manifest_sha256)
+     if not isinstance(grant, OperatorAuthorizationGrant):
+         raise AuthorizationError("authorization grant is invalid")
+-    if grant.policy_source_scope_sha256 != manifest.policy_source_scope.sha256:
++    scope_sha256 = _authorization_scope_sha256(manifest)
++    if grant.policy_source_scope_sha256 != scope_sha256:
+         raise AuthorizationError("policy source scope mismatch")
+     requirement = manifest.authorization_requirement
+     if (
+         grant.additional_calls > requirement.max_calls
+         or grant.additional_tokens > requirement.max_tokens
+     ):
+         raise AuthorizationError("authorization grant exceeds manifest ceilings")
+     window = OperatorAuthorizationWindow(
+         window_id=requirement.window_id,
+         grant_ids=(grant.grant_id,),
+         authorization_requirement_sha256=requirement.sha256,
+         max_calls=min(requirement.max_calls, grant.additional_calls),
+         max_tokens=min(requirement.max_tokens, grant.additional_tokens),
+-        policy_source_scope_sha256=manifest.policy_source_scope.sha256,
++        policy_source_scope_sha256=scope_sha256,
+     )
+     ledger = AuthorizationLedger(Path(ledger_path), manifest)
+     ledger.record_grant_and_window(
+         grant=grant,
+         window=window,
+         requirement=requirement,
+         operator_approval_reference=operator_approval_reference,
+     )
+     return window
+ 
+diff --git a/core/pit_optimizer_controller.py b/core/pit_optimizer_controller.py
+index e6f533b..78505e6 100644
+--- a/core/pit_optimizer_controller.py
++++ b/core/pit_optimizer_controller.py
+@@ -2901,20 +2901,24 @@ class PitOptimizerServicesV4:
+     dispose_candidate: Callable[[CandidateWorkspace], PitOptimizerCleanup]
+     settle_invalid_investigator: Callable[
+         [PitOptimizerCallBudget, tuple[PitOptimizerCallBudget, ...]],
+         tuple[AuthorizationPlanSkip, ...],
+     ]
+     verify_inputs: Callable[[PitOptimizerReadinessV4], None]
+     cancellation_requested: Callable[[], bool]
+     prepare_iteration_artifacts: Callable[[int], Path]
+     write_json_artifact: Callable[[str, Mapping[str, object]], tuple[Path, str]]
+     write_diff_artifact: Callable[[str, str], tuple[Path, str]]
++    finalize_run: Callable[
++        [tuple[PitOptimizerRoleAttempt, ...], tuple[AuthorizationPlanSkip, ...], str],
++        None,
++    ]
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class PitOptimizerResultV4:
+     schema_version: int
+     status: str
+     terminal_code: str
+     campaign_id: str
+     target_cagr_pct: str
+     baseline_cagr_pct: str
+@@ -2922,21 +2926,21 @@ class PitOptimizerResultV4:
+     branch_cagr_pct: str | None
+     iterations_started: int
+     iterations_completed: int
+     calls: int
+     tokens: int
+     cost_usd: str
+     checkpoint_present: bool
+     apply: bool
+     cleanup_complete: bool
+     source_modified: bool
+-    checkpoint: CampaignCheckpoint
++    checkpoint: CampaignCheckpoint | None
+     artifact_paths: tuple[tuple[Path, str], ...]
+ 
+     def to_public_artifact(self) -> Mapping[str, object]:
+         return {
+             "schema_version": self.schema_version,
+             "status": self.status,
+             "terminal_reason": self.terminal_code,
+             "campaign_id": self.campaign_id,
+             "target_cagr_pct": self.target_cagr_pct,
+             "baseline_cagr_pct": self.baseline_cagr_pct,
+@@ -3092,21 +3096,28 @@ def prepare_pit_optimizer_v4(
+         "baseline_quick": _panel_v4_artifact(quick),
+         "baseline_discovery": _panel_v4_artifact(discovery),
+         "seed_checkpoint_sha256": campaign_checkpoint_sha256,
+         "seed_champion_identity": (
+             None if champion is None else champion.candidate_identity.identity_sha256
+         ),
+         "seed_branch_identity": (
+             None if branch is None else branch.candidate_identity.identity_sha256
+         ),
+     }
+-    output, digest = write_create_only_json(Path(artifact_path), primitive)
++    try:
++        output, digest = write_create_only_json(Path(artifact_path), primitive)
++    except FileExistsError:
++        output = Path(artifact_path)
++        raw = output.read_bytes()
++        if raw != canonical_json_bytes(primitive):
++            raise ValueError("optimizer v4 readiness artifact differs") from None
++        digest = hashlib.sha256(raw).hexdigest()
+     return PitOptimizerReadinessV4(
+         schema_version=4,
+         manifest=manifest,
+         discovery_panel_plan=discovery_panel_plan,
+         readiness_sha256=digest,
+         artifact_path=output,
+         baseline_sources=baseline_sources,
+         baseline_quick=quick,
+         baseline_discovery=discovery,
+         seed_champion=champion,
+@@ -3284,26 +3295,37 @@ def _baseline_parent_summary(
+ 
+ def _candidate_parent_summary(
+     *,
+     readiness: PitOptimizerReadinessV4,
+     kind: str,
+     candidate: SearchCandidateState,
+     sources: tuple[AuthorSourceFile, ...],
+ ) -> SelectedParentSummary:
+     if candidate.quick_evidence is None:
+         raise IdentityDrift("retained candidate lacks exact quick evidence")
++    candidate_identity = candidate.candidate_identity
++    try:
++        validate_candidate_identity(candidate_identity)
++    except ValueError as exc:
++        raise IdentityDrift("retained candidate identity is unauthenticated") from exc
++    actual_source_sha256s = tuple(
++        (item.path, item.source_sha256) for item in sources
++    )
++    if actual_source_sha256s != candidate_identity.editable_file_sha256s:
++        raise IdentityDrift("retained candidate sources differ from identity")
+     identity = SelectedParentIdentity.issue(
+         parent_kind=kind,
+         parent_id=candidate.candidate_identity.identity_sha256,
+         source_head=readiness.manifest.source_head,
+         policy_sources=sources,
+     )
++    identity.validate_sources(sources)
+     return SelectedParentSummary(
+         identity=identity,
+         hypothesis_id=candidate.hypothesis,
+         behavioral_summary=candidate.behavioral_summary,
+         quick_panel=candidate.quick_evidence,
+         discovery_panel=candidate.discovery_evidence,
+     )
+ 
+ 
+ def _selected_parent_kind(state: _V4RunState) -> str:
+@@ -3340,62 +3362,86 @@ def _materialize_v4_context(
+     SelectedParentSummary,
+     SelectedParentSummary | None,
+     SelectedParentSummary | None,
+ ]:
+     kind = _selected_parent_kind(state)
+     selected_candidate = (
+         state.active_branch
+         if kind == "branch"
+         else state.champion if kind == "champion" else None
+     )
+-    selected = services.materialize_parent(kind, selected_candidate)
+-    if not isinstance(selected, CandidateParentV4):
+-        raise SandboxIntegrityFailure("optimizer v4 parent materialization is invalid")
+-    baseline = _baseline_parent_summary(readiness)
+-    if kind == "baseline":
+-        if selected.policy_sources != readiness.baseline_sources:
+-            raise IdentityDrift("optimizer v4 baseline sources differ")
+-        selected_summary = baseline
+-    else:
+-        assert selected_candidate is not None
+-        selected_summary = _candidate_parent_summary(
+-            readiness=readiness,
+-            kind=kind,
+-            candidate=selected_candidate,
+-            sources=selected.policy_sources,
+-        )
+-    champion_summary: SelectedParentSummary | None = None
+-    if state.champion is not None:
+-        if kind == "champion":
+-            champion_summary = selected_summary
++    selected_workspace: CandidateWorkspace | None = None
++    try:
++        selected = services.materialize_parent(kind, selected_candidate)
++        if not isinstance(selected, CandidateParentV4):
++            raise SandboxIntegrityFailure("optimizer v4 parent materialization is invalid")
++        selected_workspace = selected.workspace
++        baseline = _baseline_parent_summary(readiness)
++        if kind == "baseline":
++            if selected.policy_sources != readiness.baseline_sources:
++                raise IdentityDrift("optimizer v4 baseline sources differ")
++            selected_summary = baseline
+         else:
+-            champion_parent = services.materialize_parent("champion", state.champion)
+-            try:
+-                champion_summary = _candidate_parent_summary(
+-                    readiness=readiness,
+-                    kind="champion",
+-                    candidate=state.champion,
+-                    sources=champion_parent.policy_sources,
+-                )
+-            finally:
+-                _dispose_v4(services, state, champion_parent.workspace)
+-    branch_summary = selected_summary if kind == "branch" else None
+-    state.selected_parent = selected_summary.identity
+-    return (
+-        kind,
+-        selected_candidate,
+-        selected,
+-        selected_summary,
+-        baseline,
+-        champion_summary,
+-        branch_summary,
+-    )
++            assert selected_candidate is not None
++            if (
++                hashlib.sha256(selected.cumulative_diff.encode("utf-8")).hexdigest()
++                != selected_candidate.candidate_identity.cumulative_diff_sha256
++            ):
++                raise IdentityDrift("retained candidate diff differs from identity")
++            selected_summary = _candidate_parent_summary(
++                readiness=readiness,
++                kind=kind,
++                candidate=selected_candidate,
++                sources=selected.policy_sources,
++            )
++        champion_summary: SelectedParentSummary | None = None
++        if state.champion is not None:
++            if kind == "champion":
++                champion_summary = selected_summary
++            else:
++                champion_parent = services.materialize_parent("champion", state.champion)
++                if not isinstance(champion_parent, CandidateParentV4):
++                    raise SandboxIntegrityFailure(
++                        "optimizer v4 champion materialization is invalid"
++                    )
++                try:
++                    if (
++                        hashlib.sha256(
++                            champion_parent.cumulative_diff.encode("utf-8")
++                        ).hexdigest()
++                        != state.champion.candidate_identity.cumulative_diff_sha256
++                    ):
++                        raise IdentityDrift(
++                            "retained champion diff differs from identity"
++                        )
++                    champion_summary = _candidate_parent_summary(
++                        readiness=readiness,
++                        kind="champion",
++                        candidate=state.champion,
++                        sources=champion_parent.policy_sources,
++                    )
++                finally:
++                    _dispose_v4(services, state, champion_parent.workspace)
++        branch_summary = selected_summary if kind == "branch" else None
++        state.selected_parent = selected_summary.identity
++        return (
++            kind,
++            selected_candidate,
++            selected,
++            selected_summary,
++            baseline,
++            champion_summary,
++            branch_summary,
++        )
++    except BaseException:
++        _dispose_v4(services, state, selected_workspace)
++        raise
+ 
+ 
+ def _checkpoint_v4(
+     *,
+     readiness: PitOptimizerReadinessV4,
+     completed_iterations: int,
+     champion: SearchCandidateState | None,
+     active_branch: SearchCandidateState | None,
+     feedback_tail: Sequence[PriorHypothesisSummaryV4],
+ ) -> CampaignCheckpoint:
+@@ -4066,39 +4112,41 @@ def run_pit_optimizer_v4(
+     readiness: PitOptimizerReadinessV4,
+     services: PitOptimizerServicesV4,
+ ) -> PitOptimizerResultV4:
+     """Run the bounded schema-v4 search without qualification or replay."""
+ 
+     if not isinstance(readiness, PitOptimizerReadinessV4) or not isinstance(
+         services,
+         PitOptimizerServicesV4,
+     ):
+         raise ValueError("optimizer v4 run composition is invalid")
+-    services.verify_inputs(readiness)
+     state = _V4RunState(
+         champion=None,
+         active_branch=None,
+         feedback_tail=[],
+     )
+     terminal_code = "iteration_limit"
+     checkpoint: CampaignCheckpoint | None = None
+-    active_workspace: CandidateWorkspace | None = None
++    durable_checkpoint_written = False
+     try:
++        services.verify_inputs(readiness)
++        seed_champion: SearchCandidateState | None = None
++        seed_active_branch: SearchCandidateState | None = None
+         if readiness.seed_champion is not None:
+-            state.champion = _copy_seed_v4(
++            seed_champion = _copy_seed_v4(
+                 kind="champion",
+                 candidate=readiness.seed_champion,
+                 state=state,
+                 services=services,
+             )
+         if readiness.seed_active_branch is not None:
+-            state.active_branch = _copy_seed_v4(
++            seed_active_branch = _copy_seed_v4(
+                 kind="branch",
+                 candidate=readiness.seed_active_branch,
+                 state=state,
+                 services=services,
+             )
+         for name, primitive in (
+             (
+                 "run.json",
+                 {
+                     "schema_version": 4,
+@@ -4125,69 +4173,67 @@ def run_pit_optimizer_v4(
+                     "discovery": _panel_v4_artifact(readiness.baseline_discovery),
+                     "parity_use": "engine_equivalence_only",
+                 },
+             ),
+             ("accounting.json", _v4_accounting_artifact(state)),
+         ):
+             _record_v4_artifact(
+                 state,
+                 services.write_json_artifact(name, primitive),
+             )
+-        checkpoint = _checkpoint_v4(
++        initial_checkpoint = _checkpoint_v4(
+             readiness=readiness,
+             completed_iterations=0,
+-            champion=state.champion,
+-            active_branch=state.active_branch,
++            champion=seed_champion,
++            active_branch=seed_active_branch,
+             feedback_tail=state.feedback_tail,
+         )
+         _record_v4_artifact(
+             state,
+-            services.write_json_artifact("checkpoint.json", checkpoint.to_primitive()),
++            services.write_json_artifact(
++                "checkpoint.json", initial_checkpoint.to_primitive()
++            ),
+         )
++        checkpoint = initial_checkpoint
++        durable_checkpoint_written = True
++        # The imported seed becomes live only after all create-only copies and the
++        # initial atomic checkpoint are durable.
++        state.champion = seed_champion
++        state.active_branch = seed_active_branch
+         for iteration in range(1, readiness.manifest.max_iterations + 1):
+             if services.cancellation_requested():
+                 terminal_code = "cancelled"
+                 break
+             directory = services.prepare_iteration_artifacts(iteration)
+             if (
+                 not isinstance(directory, Path)
+                 or not directory.is_absolute()
+                 or not directory.is_dir()
+             ):
+                 raise AuditFailure("optimizer v4 iteration directory is not durable")
+             state.iterations_started = iteration
+             checkpoint = _run_v4_iteration(
+                 readiness=readiness,
+                 state=state,
+                 services=services,
+                 iteration=iteration,
+             )
++            durable_checkpoint_written = True
+     except BaseException as exc:
+         terminal_code, _detail = _terminal_from_exception(exc)
+         if terminal_code in {
+             "iteration_limit",
+             "budget_exhausted",
+             "stagnation_limit",
+             "cancelled",
+         }:
+             terminal_code = "audit_failure"
+-    finally:
+-        _dispose_v4(services, state, active_workspace)
+-
+-    if checkpoint is None:
+-        checkpoint = _checkpoint_v4(
+-            readiness=readiness,
+-            completed_iterations=state.iterations_completed,
+-            champion=state.champion,
+-            active_branch=state.active_branch,
+-            feedback_tail=state.feedback_tail,
+-        )
+     try:
+         services.verify_inputs(readiness)
+     except BaseException:
+         terminal_code = "identity_drift"
+     facts = tuple(attempt.facts for attempt in state.call_attempts)
+     cleanup_complete = all(
+         item.candidate_removed and item.worker_stopped and not item.source_modified
+         for item in state.cleanup_observations
+     )
+     source_modified = any(item.source_modified for item in state.cleanup_observations)
+@@ -4231,30 +4277,43 @@ def run_pit_optimizer_v4(
+             sum(
+                 (
+                     Decimal(str(item.cost_usd or 0))
+                     for item in facts
+                     if item.accounting_complete
+                 ),
+                 Decimal("0"),
+             ),
+             "f",
+         ),
+-        checkpoint_present=True,
++        checkpoint_present=durable_checkpoint_written,
+         apply=False,
+         cleanup_complete=cleanup_complete,
+         source_modified=source_modified,
+         checkpoint=checkpoint,
+         artifact_paths=tuple(state.artifact_paths),
+     )
+     try:
+         _record_v4_artifact(
+             state,
+             services.write_json_artifact("summary.json", result.to_public_artifact()),
+         )
+     except BaseException:
+-        return replace(
++        result = replace(
++            result,
++            status="aborted",
++            terminal_code="audit_failure",
++            cleanup_complete=False,
++        )
++    try:
++        services.finalize_run(
++            tuple(state.call_attempts),
++            tuple(state.skips),
++            result.terminal_code,
++        )
++    except BaseException:
++        result = replace(
+             result,
+             status="aborted",
+             terminal_code="audit_failure",
+             cleanup_complete=False,
+         )
+     return replace(result, artifact_paths=tuple(state.artifact_paths))
+diff --git a/tests/test_pit_optimizer_v2.py b/tests/test_pit_optimizer_v2.py
+index 11734b2..b3faef8 100644
+--- a/tests/test_pit_optimizer_v2.py
++++ b/tests/test_pit_optimizer_v2.py
+@@ -1989,20 +1989,21 @@ def _v4_manifest() -> tuple[
+     plan = _v4_discovery_plan()
+     manifest = contract.PitOptimizerRunManifestV4.from_discovery_plan(
+         campaign_id="adaptive_oneil_1",
+         campaign_sequence=1,
+         source_head="f" * 40,
+         source_fingerprint_sha256="1" * 64,
+         discovery_panel_plan=plan,
+         policy_authoring_scope=scope,
+         immutable_constraint_ids=("causal_only", "no_external_io"),
+         sandbox_image="example.invalid/pit-optimizer@sha256:" + "2" * 64,
++        authorization_window_id="window_v4_manifest_test",
+     )
+     return manifest, plan
+ 
+ 
+ def _independent_digest(value: object) -> str:
+     payload = (
+         json.dumps(
+             asdict(value),
+             sort_keys=True,
+             separators=(",", ":"),

@@ -1,0 +1,17 @@
+# Task 3 rereview — a9219a1..a06ccf2
+
+## Finding Verdict
+
+**Resolved.** `evaluate_candidate` canonicalizes the supplied root and requires the caller to provide that canonical form (`core/pit_optimizer_v5/evaluator.py:315`). Its replacement factory contract receives both the canonical root and requested policy digest (`evaluator.py:109`), and every scenario invokes it with those exact values before simulator construction (`evaluator.py:369`). The returned frozen binding validates canonical root, policy digest, and client shape (`evaluator.py:68`), and a root/identity mismatch closes that client before the simulator is constructed (`evaluator.py:375`). The simulator can receive only the bound client through the one-use factory (`evaluator.py:385`), while result provenance includes root digest, policy digest, and derived binding digest (`evaluator.py:101`) and is checked before report/evidence creation (`evaluator.py:409`, `:474`).
+
+## New Breakage
+
+None found in the fix-only scope. Fresh-worker semantics remain: each scenario creates a new binding/factory, the one-use wrapper rejects repeated allocation, and cross-scenario client-object reuse remains rejected (`core/pit_optimizer_v5/evaluator.py:117`, `:364`, `:388`). Mismatched candidate bindings close the client in a `finally` block before raising (`evaluator.py:377`). The current mutable result API supports the explicit provenance attachment (`core/backtest_engine.py:481`, `:658`).
+
+## Out-of-Scope
+
+No tests were run, per instruction. The review did not revisit the earlier evaluator contracts, providers, Docker, replay, or unrelated source.
+
+## Verdict
+
+Accept the fix for the prior candidate-root/policy-identity finding.

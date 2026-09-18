@@ -1,0 +1,54 @@
+# P2 static verification
+
+All checks below ran against the frozen P2 source. No test was read, created, modified, discovered, or run. No module import, fake request, artifact reader, summary, provider, evaluator, campaign, Docker, credential, or environment probe was executed.
+
+The same scoped Ruff and in-memory compile commands passed again after fix round 1.
+
+## Ruff
+
+Command:
+
+```text
+python -m ruff check core/pit_optimizer_v5/campaign_admission.py core/pit_optimizer_v5/production_runtime.py core/pit_optimizer_v5/production_provider.py
+```
+
+Output: `All checks passed!`
+
+## In-memory compile
+
+The exact bytes of the three scoped files were passed to `compile(..., "exec")` under `python -B`; no import or bytecode-file write was performed.
+
+Output: `in-memory compile: PASS`
+
+## Source and AST assertions
+
+A source-only AST check passed all of these assertions:
+
+- Every P1 top-level class/function AST in the exact `campaign_admission.py` preimage remains identical.
+- Every `production_runtime.py` top-level definition outside `LocalRoleRequestFactoryV5` remains identical. Every preexisting method in that class outside the three request methods remains identical; `_guarded_request` is the sole new method.
+- The factory class contains exactly three `_guarded_request` calls. Each of `investigator_request`, `author_request`, and `critic_request` has one returned guard around its existing `build_role_request_v5` expression.
+- Every `production_provider.py` top-level definition outside `LocalRoleAuthorizationLedgerV5` remains identical. Every preexisting method in that class outside `reserve_role_slot` remains identical.
+- The enrolled ledger path retains the legacy content-only lookup and orders the relevant operations at frozen lines 810, 852, 857, 870, 877, and 892: content lookup, enrollment discovery, exact unique-entry resolution, shared live guard, reservation construction, reservation append.
+- `reserve_role_slot` still has one existing transition and contains one enrolled admission discovery, one exact-entry lookup, and one shared guard.
+- Every P2 `load_typed_state` call explicitly uses `repair=False`; the projection verifier also uses `repair=False`.
+- The shared module does not call `_authenticate_completed_history_census_v5`, `recover_typed_state_index`, or construct `LocalRoleAuthorizationLedgerV5`.
+
+Output: `static AST/protection checks: PASS`; `guarded factory returns: 3`.
+
+## Fix-round-1 assertions
+
+A focused source-only check against the exact first review freeze passed these additional assertions:
+
+- `production_runtime.py` is byte-identical to freeze 01.
+- All provider definitions except `reserve_role_slot`, and all other methods in its class, remain AST-identical to freeze 01.
+- The enrolled reservation branch compares incoming `attempt_kind` and `attempt_index` to the exact persisted primary call.
+- A new current role and any supported later tail require all preceding current packages to be accepted; the exact completed-role replay path remains separate.
+- Prior round outcomes allow only the native continuable `no_novel_hypothesis` terminal without committed records. Any other outcome fails with stop precedence, including when records coexist. A completed prior round remains the no-outcome path with committed records.
+- Referenced round-config authentication is no longer inside an exception-swallowing `try`; missing, corrupt, or incompatible authority propagates failure.
+- The two deadline validations occur after the boundary decision. The final validation contains the sole fresh `time.time_ns()` read and is the last live check before return.
+
+Output: `fix-round-1 AST/protection checks: PASS`.
+
+## Static preservation
+
+The accepted immutable maps were checked with direct byte hashing and extended Windows paths. Results: `runtime-04` 579 files and 69,994,319 bytes pass; `provider-runtime-06` 83 files and 68,980,002 bytes pass; all 56 evaluator source paths pass. Total archive files preserved: 662.

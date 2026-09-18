@@ -1,0 +1,11 @@
+# B4a architect handoff
+
+Status: B4a implementation and independent static review are complete. Stop here for principal architect review; B4b and B4c are not authorized by this package.
+
+`runtime.py` now uses B1's ordered rendering outcomes at the existing screening boundary. A rendered outcome follows the unchanged materialized path. A rejected outcome is bound to the accepted author package, derives the existing pre-validation invalid identity, appends or exactly reuses the durable B2 rejection event, and becomes the B3a rejected carrier only after its event reference is available. The screening, discovery, and critic paths explicitly retain that carrier without materialization; critic input remains exact materialized testable candidates only. B3b publication safeguards are unchanged.
+
+The real archived inspection authenticated terminal actual06, which has no rejection event, and its pure B1 rendering result is the closed rejection. That identity is inspection evidence only: no new runtime helper, journal event, record, checkpoint, candidate evaluation, or campaign was executed. The historical runtime-04 evaluated record still authenticates with canonical bytes, four discovery episodes, and its critic binding.
+
+Review [implementation-report.md](implementation-report.md), [narrow diff](implementation.diff), [verification](verification.json), [independent task review](task-review.md), and [architect verification](architect-verification.json). The exact preimage is retained under `preimages/`.
+
+The unchanged `no_testable_experiments` abort remains intentional. B4b must add no-testable lifecycle completion and finalized/recovery authority; B4c must add retained-history and bounded feedback behavior. Campaign06 remains terminal and both required evaluated feedback rounds remain unfinished.

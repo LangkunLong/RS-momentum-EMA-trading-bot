@@ -1,0 +1,1116 @@
+# Review package: 38c4bde..f343790
+
+## Commits
+f343790 fix: close policy cleanup evidence
+
+## Files changed
+ agent_loop.py            | 320 ++++++++++++++++++++++++++++++++++--------
+ tests/test_agent_loop.py | 356 +++++++++++++++++++++++++++++++++++++++++++----
+ 2 files changed, 591 insertions(+), 85 deletions(-)
+
+## Diff
+diff --git a/agent_loop.py b/agent_loop.py
+index 0507b79..27dbe20 100644
+--- a/agent_loop.py
++++ b/agent_loop.py
+@@ -4540,110 +4540,258 @@ def _approved_docker_executable(
+ class _OwnedPolicyDaemon:
+     engine_path: Path
+     control_runner: ProcessRunner
+     environment: Mapping[str, str]
+     container_id: str
+     container_name: str
+     owner_token: str
+     image: str
+ 
+ 
+-def _cleanup_unowned_policy_process(process: Any) -> list[BaseException]:
++class _PolicySecondaryPhase(Enum):
++    CLEANUP = "cleanup"
++    DISCOVERY = "discovery"
++    INSPECT = "inspect"
++
++
++class _PolicySecondaryAction(Enum):
++    STDIN_CLOSE = "stdin_close"
++    PROCESS_POLL = "process_poll"
++    PROCESS_TERMINATE = "process_terminate"
++    PROCESS_WAIT = "process_wait"
++    PROCESS_KILL = "process_kill"
++    STDOUT_CLOSE = "stdout_close"
++    STDERR_CLOSE = "stderr_close"
++    STDOUT_THREAD_JOIN = "stdout_thread_join"
++    STDERR_THREAD_JOIN = "stderr_thread_join"
++    DAEMON_DISCOVER = "daemon_discover"
++    DAEMON_INSPECT = "daemon_inspect"
++    DAEMON_KILL = "daemon_kill"
++    DAEMON_WAIT = "daemon_wait"
++    DAEMON_RM = "daemon_rm"
++    DAEMON_ABSENCE_QUERY = "daemon_absence_query"
++    DAEMON_ABSENCE_VERIFY = "daemon_absence_verify"
++    PRIVATE_TREE_REMOVE = "private_tree_remove"
++
++
++class _PolicySecondaryReason(Enum):
++    EXCEPTION = "exception"
++    INVALID_RESULT = "invalid_result"
++    TIMEOUT = "timeout"
++    NONZERO = "nonzero"
++    STILL_RUNNING = "still_running"
++    PRESENT = "present"
++    UNVERIFIED = "unverified"
++
++
++@dataclass(frozen=True, slots=True)
++class _PolicySecondaryFailure:
++    phase: _PolicySecondaryPhase
++    action: _PolicySecondaryAction
++    reason: _PolicySecondaryReason
++
++
++_MAX_POLICY_SECONDARY_NOTES = 32
++_MAX_POLICY_SECONDARY_NOTE_BYTES = 128
++
++
++def _cleanup_unowned_policy_process(process: Any) -> list[_PolicySecondaryFailure]:
+     """Attempt every local-client cleanup action without masking the primary error."""
+-    errors: list[BaseException] = []
++    errors: list[_PolicySecondaryFailure] = []
+ 
+-    def attempt(action: Callable[[], object]) -> None:
++    def attempt(
++        action: _PolicySecondaryAction,
++        operation: Callable[[], object],
++    ) -> None:
+         try:
+-            action()
+-        except BaseException as exc:
+-            errors.append(exc)
++            operation()
++        except BaseException:
++            errors.append(
++                _PolicySecondaryFailure(
++                    _PolicySecondaryPhase.CLEANUP,
++                    action,
++                    _PolicySecondaryReason.EXCEPTION,
++                )
++            )
+ 
+     stdin = getattr(process, "stdin", None)
+     if stdin is not None and not getattr(stdin, "closed", False):
+-        attempt(stdin.close)
++        attempt(_PolicySecondaryAction.STDIN_CLOSE, stdin.close)
+     try:
+         running = process.poll() is None
+-    except BaseException as exc:
+-        errors.append(exc)
++    except BaseException:
++        errors.append(
++            _PolicySecondaryFailure(
++                _PolicySecondaryPhase.CLEANUP,
++                _PolicySecondaryAction.PROCESS_POLL,
++                _PolicySecondaryReason.EXCEPTION,
++            )
++        )
+         running = True
+     if running:
+-        attempt(process.terminate)
+-    attempt(lambda: process.wait(timeout=5))
++        attempt(_PolicySecondaryAction.PROCESS_TERMINATE, process.terminate)
++    attempt(
++        _PolicySecondaryAction.PROCESS_WAIT,
++        lambda: process.wait(timeout=5),
++    )
+     try:
+         running = process.poll() is None
+-    except BaseException as exc:
+-        errors.append(exc)
++    except BaseException:
++        errors.append(
++            _PolicySecondaryFailure(
++                _PolicySecondaryPhase.CLEANUP,
++                _PolicySecondaryAction.PROCESS_POLL,
++                _PolicySecondaryReason.EXCEPTION,
++            )
++        )
+         running = True
+     if running:
+-        attempt(process.kill)
+-        attempt(lambda: process.wait(timeout=5))
+-    for stream in (getattr(process, "stdout", None), getattr(process, "stderr", None)):
++        attempt(_PolicySecondaryAction.PROCESS_KILL, process.kill)
++        attempt(
++            _PolicySecondaryAction.PROCESS_WAIT,
++            lambda: process.wait(timeout=5),
++        )
++    for stream, action in (
++        (getattr(process, "stdout", None), _PolicySecondaryAction.STDOUT_CLOSE),
++        (getattr(process, "stderr", None), _PolicySecondaryAction.STDERR_CLOSE),
++    ):
+         if stream is not None and not getattr(stream, "closed", False):
+-            attempt(stream.close)
++            attempt(action, stream.close)
+     return errors
+ 
+ 
+-def _cleanup_owned_policy_daemon(daemon: _OwnedPolicyDaemon) -> list[BaseException]:
++def _cleanup_owned_policy_daemon(
++    daemon: _OwnedPolicyDaemon,
++) -> list[_PolicySecondaryFailure]:
+     """Force-remove one authenticated daemon object and verify exact owner absence."""
+-    errors: list[BaseException] = []
++    errors: list[_PolicySecondaryFailure] = []
+ 
+-    def control(*args: str) -> ProcessResult | None:
++    def control(
++        action: _PolicySecondaryAction,
++        *args: str,
++    ) -> ProcessResult | None:
+         try:
+             result = daemon.control_runner(
+                 (str(daemon.engine_path), *args),
+                 env=daemon.environment,
+                 timeout=10.0,
+                 output_limit=64 * 1024,
+             )
+-            if not isinstance(result, ProcessResult):
+-                raise SandboxError("policy daemon control result is invalid")
+-            if result.timed_out or result.returncode != 0:
+-                errors.append(
+-                    SandboxError(f"policy daemon {args[0]} action failed")
++        except BaseException:
++            errors.append(
++                _PolicySecondaryFailure(
++                    _PolicySecondaryPhase.CLEANUP,
++                    action,
++                    _PolicySecondaryReason.EXCEPTION,
+                 )
+-            return result
+-        except BaseException as exc:
+-            errors.append(exc)
++            )
+             return None
++        if not isinstance(result, ProcessResult):
++            errors.append(
++                _PolicySecondaryFailure(
++                    _PolicySecondaryPhase.CLEANUP,
++                    action,
++                    _PolicySecondaryReason.INVALID_RESULT,
++                )
++            )
++            return None
++        if result.timed_out:
++            errors.append(
++                _PolicySecondaryFailure(
++                    _PolicySecondaryPhase.CLEANUP,
++                    action,
++                    _PolicySecondaryReason.TIMEOUT,
++                )
++            )
++        elif result.returncode != 0:
++            errors.append(
++                _PolicySecondaryFailure(
++                    _PolicySecondaryPhase.CLEANUP,
++                    action,
++                    _PolicySecondaryReason.NONZERO,
++                )
++            )
++        return result
+ 
+-    control("kill", "--signal", "KILL", daemon.container_id)
+-    control("wait", daemon.container_id)
+-    control("rm", "--force", daemon.container_id)
++    control(
++        _PolicySecondaryAction.DAEMON_KILL,
++        "kill",
++        "--signal",
++        "KILL",
++        daemon.container_id,
++    )
++    control(
++        _PolicySecondaryAction.DAEMON_WAIT,
++        "wait",
++        daemon.container_id,
++    )
++    control(
++        _PolicySecondaryAction.DAEMON_RM,
++        "rm",
++        "--force",
++        daemon.container_id,
++    )
+     absence = control(
++        _PolicySecondaryAction.DAEMON_ABSENCE_QUERY,
+         "container",
+         "ls",
+         "--all",
+         "--quiet",
+         "--no-trunc",
+         "--filter",
+         f"id={daemon.container_id}",
+     )
+     if (
+         absence is None
+         or absence.timed_out
+         or absence.returncode != 0
+-        or absence.stdout.strip()
+     ):
+-        errors.append(SandboxError("owned policy daemon absence was not verified"))
++        errors.append(
++            _PolicySecondaryFailure(
++                _PolicySecondaryPhase.CLEANUP,
++                _PolicySecondaryAction.DAEMON_ABSENCE_VERIFY,
++                _PolicySecondaryReason.UNVERIFIED,
++            )
++        )
++    elif absence.stdout.strip():
++        errors.append(
++            _PolicySecondaryFailure(
++                _PolicySecondaryPhase.CLEANUP,
++                _PolicySecondaryAction.DAEMON_ABSENCE_VERIFY,
++                _PolicySecondaryReason.PRESENT,
++            )
++        )
+     return errors
+ 
+ 
+ def _record_policy_secondary_errors(
+     primary: BaseException,
+-    phase: str,
+-    errors: Sequence[BaseException],
++    errors: Sequence[_PolicySecondaryFailure],
+ ) -> None:
+-    for error in errors:
+-        primary.add_note(
+-            "policy daemon "
+-            f"{phase} secondary failure: {type(error).__name__}: {error}"
+-        )
++    try:
++        for index, error in enumerate(errors):
++            if index >= _MAX_POLICY_SECONDARY_NOTES:
++                break
++            try:
++                note = (
++                    "policy_worker_secondary_failure "
++                    f"phase={error.phase.value} "
++                    f"action={error.action.value} "
++                    f"reason={error.reason.value}"
++                )
++                if len(note.encode("ascii")) > _MAX_POLICY_SECONDARY_NOTE_BYTES:
++                    continue
++                BaseException.add_note(primary, note)
++            except BaseException:
++                continue
++    except BaseException:
++        return
+ 
+ 
+ class PolicyWorkerSession:
+     """One bounded authenticated JSON-lines session owned by a single fold."""
+ 
+     def __init__(
+         self,
+         *,
+         process: Any,
+         package_root: Path,
+@@ -4783,41 +4931,80 @@ class PolicyWorkerSession:
+                 self.call(probe.method, probe.repeated_snapshot)
+         except BaseException as exc:
+             self.close(primary_error=exc)
+             raise
+ 
+     def close(self, *, primary_error: BaseException | None = None) -> None:
+         if self._closed:
+             return
+         self._closed = True
+         errors = _cleanup_unowned_policy_process(self._process)
+-        for thread in (self._stdout_thread, self._stderr_thread):
++        for thread, action in (
++            (
++                self._stdout_thread,
++                _PolicySecondaryAction.STDOUT_THREAD_JOIN,
++            ),
++            (
++                self._stderr_thread,
++                _PolicySecondaryAction.STDERR_THREAD_JOIN,
++            ),
++        ):
+             try:
+                 thread.join(timeout=5)
+-                if thread.is_alive():
+-                    raise SandboxError("policy worker output thread did not stop")
+-            except BaseException as exc:
+-                errors.append(exc)
++            except BaseException:
++                errors.append(
++                    _PolicySecondaryFailure(
++                        _PolicySecondaryPhase.CLEANUP,
++                        action,
++                        _PolicySecondaryReason.EXCEPTION,
++                    )
++                )
++            else:
++                try:
++                    alive = thread.is_alive()
++                except BaseException:
++                    errors.append(
++                        _PolicySecondaryFailure(
++                            _PolicySecondaryPhase.CLEANUP,
++                            action,
++                            _PolicySecondaryReason.EXCEPTION,
++                        )
++                    )
++                else:
++                    if alive:
++                        errors.append(
++                            _PolicySecondaryFailure(
++                                _PolicySecondaryPhase.CLEANUP,
++                                action,
++                                _PolicySecondaryReason.STILL_RUNNING,
++                            )
++                        )
+         errors.extend(_cleanup_owned_policy_daemon(self._daemon))
+         temporary_root = self.package_root.parent
+         try:
+             if temporary_root.exists():
+                 _remove_private_tree(temporary_root)
+-        except BaseException as exc:
+-            errors.append(exc)
++        except BaseException:
++            errors.append(
++                _PolicySecondaryFailure(
++                    _PolicySecondaryPhase.CLEANUP,
++                    _PolicySecondaryAction.PRIVATE_TREE_REMOVE,
++                    _PolicySecondaryReason.EXCEPTION,
++                )
++            )
+         if errors:
+             if primary_error is not None:
+-                _record_policy_secondary_errors(primary_error, "cleanup", errors)
++                _record_policy_secondary_errors(primary_error, errors)
+             else:
+                 raise SandboxError(
+                     "policy worker cleanup could not be fully verified"
+-                ) from errors[0]
++                ) from None
+ 
+ 
+ class PolicyWorkerRunner:
+     """Build and launch one policy-only, capability-injected Docker worker per fold."""
+ 
+     def __init__(
+         self,
+         *,
+         image: str,
+         engine: DockerCapability | None = None,
+@@ -5135,40 +5322,50 @@ class PolicyWorkerRunner:
+ 
+             def recover_failed_create(
+                 primary_error: BaseException,
+             ) -> _OwnedPolicyDaemon | None:
+                 try:
+                     tentative = self._discover_tentative_owned_daemon(
+                         environment=environment,
+                         container_name=container_name,
+                         owner_token=owner_token,
+                     )
+-                except BaseException as discovery_error:
++                except BaseException:
+                     _record_policy_secondary_errors(
+                         primary_error,
+-                        "discovery",
+-                        (discovery_error,),
++                        (
++                            _PolicySecondaryFailure(
++                                _PolicySecondaryPhase.DISCOVERY,
++                                _PolicySecondaryAction.DAEMON_DISCOVER,
++                                _PolicySecondaryReason.EXCEPTION,
++                            ),
++                        ),
+                     )
+                     return None
+                 if tentative is not None:
+                     try:
+                         self._inspect_owned_daemon(
+                             environment=environment,
+                             container_id=tentative.container_id,
+                             container_name=container_name,
+                             owner_token=owner_token,
+                         )
+-                    except BaseException as inspect_error:
++                    except BaseException:
+                         _record_policy_secondary_errors(
+                             primary_error,
+-                            "inspect",
+-                            (inspect_error,),
++                            (
++                                _PolicySecondaryFailure(
++                                    _PolicySecondaryPhase.INSPECT,
++                                    _PolicySecondaryAction.DAEMON_INSPECT,
++                                    _PolicySecondaryReason.EXCEPTION,
++                                ),
++                            ),
+                         )
+                 return tentative
+ 
+             create_error: BaseException | None = None
+             try:
+                 created = self._control_runner(
+                     create_argv,
+                     env=environment,
+                     timeout=10.0,
+                     output_limit=64 * 1024,
+@@ -5235,33 +5432,38 @@ class PolicyWorkerRunner:
+                 fold_timeout_seconds=self.fold_timeout_seconds,
+             )
+             try:
+                 process.stdin.write(bootstrap.to_json().encode("utf-8") + b"\n")
+                 process.stdin.flush()
+             except BaseException as exc:
+                 session.close(primary_error=exc)
+                 raise
+             return session
+         except BaseException as primary_error:
+-            cleanup_errors: list[BaseException] = []
++            cleanup_errors: list[_PolicySecondaryFailure] = []
+             if process is not None and session is None:
+                 cleanup_errors.extend(_cleanup_unowned_policy_process(process))
+             if daemon is not None and session is None:
+                 cleanup_errors.extend(_cleanup_owned_policy_daemon(daemon))
+             try:
+                 if temporary_root.exists():
+                     _remove_private_tree(temporary_root)
+-            except BaseException as cleanup_error:
+-                cleanup_errors.append(cleanup_error)
++            except BaseException:
++                cleanup_errors.append(
++                    _PolicySecondaryFailure(
++                        _PolicySecondaryPhase.CLEANUP,
++                        _PolicySecondaryAction.PRIVATE_TREE_REMOVE,
++                        _PolicySecondaryReason.EXCEPTION,
++                    )
++                )
+             _record_policy_secondary_errors(
+                 primary_error,
+-                "cleanup",
+                 cleanup_errors,
+             )
+             raise
+ 
+     def client_factory(
+         self,
+         *,
+         candidate_root: Path,
+         interface_version: int,
+         fold_run_id: str,
+diff --git a/tests/test_agent_loop.py b/tests/test_agent_loop.py
+index 29b2fc8..8a5202f 100644
+--- a/tests/test_agent_loop.py
++++ b/tests/test_agent_loop.py
+@@ -5,20 +5,21 @@ import hashlib
+ import json
+ import os
+ import queue
+ import re
+ import shutil
+ import stat
+ import subprocess
+ import sys
+ import tempfile
+ import time
++import traceback
+ from dataclasses import asdict, dataclass, replace
+ from pathlib import Path
+ from types import SimpleNamespace
+ from typing import Any
+ 
+ import pytest
+ 
+ 
+ def _suite_conftest_module() -> Any:
+     target = Path(__file__).with_name("conftest.py").resolve()
+@@ -612,21 +613,20 @@ def _task5_policy_candidate(tmp_path: Path) -> Path:
+ 
+ 
+ @pytest.mark.parametrize("operation", ("kill", "wait", "rm"))
+ @pytest.mark.parametrize("failure_kind", ("nonzero", "timeout"))
+ def test_policy_daemon_cleanup_checks_status_and_exact_id(
+     operation: str,
+     failure_kind: str,
+ ) -> None:
+     """Break caught: a label-filtered query hid a known full-ID daemon after rm failed."""
+     from agent_loop import (
+-        SandboxError,
+         _OwnedPolicyDaemon,
+         _cleanup_owned_policy_daemon,
+     )
+ 
+     control = _Task5FakeDockerControl(
+         nonzero_operations=(
+             frozenset({operation}) if failure_kind == "nonzero" else frozenset()
+         ),
+         timed_out_operations=(
+             frozenset({operation}) if failure_kind == "timeout" else frozenset()
+@@ -643,23 +643,37 @@ def test_policy_daemon_cleanup_checks_status_and_exact_id(
+         environment={},
+         container_id=control.container_id,
+         container_name=control.name,
+         owner_token=control.owner,
+         image=control.image,
+     )
+ 
+     errors = _cleanup_owned_policy_daemon(daemon)
+ 
+     assert control.exists is (operation == "rm")
+-    assert all(isinstance(error, SandboxError) for error in errors)
+-    assert any(operation in str(error) for error in errors)
+-    assert any("absence" in str(error) for error in errors) is (operation == "rm")
++    expected = {
++        (
++            "cleanup",
++            {
++                "kill": "daemon_kill",
++                "wait": "daemon_wait",
++                "rm": "daemon_rm",
++            }[operation],
++            failure_kind,
++        )
++    }
++    if operation == "rm":
++        expected.add(("cleanup", "daemon_absence_verify", "present"))
++    assert {
++        (error.phase.value, error.action.value, error.reason.value)
++        for error in errors
++    } == expected
+     absence_query = control.calls[-1]
+     assert f"id={control.container_id}" in absence_query
+     assert not any("label=" in value for value in absence_query)
+     control.exists = False
+ 
+ 
+ def _task5_create_directory_link(target: Path, link: Path) -> None:
+     try:
+         os.symlink(target, link, target_is_directory=True)
+         return
+@@ -1132,32 +1146,62 @@ def test_policy_worker_cleanup_faults_preserve_primary_and_attempt_every_owner_a
+     monkeypatch.setattr(process.stdout, "close", stdout_close)
+     monkeypatch.setattr(process.stderr, "close", stderr_close)
+     monkeypatch.setattr(session._stdout_thread, "join", stdout_join)
+     monkeypatch.setattr(agent_loop, "_remove_private_tree", remove_then_fail)
+ 
+     with pytest.raises(ValueError, match="fields") as captured:
+         session.call(
+             "recommend_capacity",
+             CapacitySnapshot(None, 25, 0, 3, 1.0, False),
+         )
+-    notes = getattr(captured.value, "__notes__", ())
+-    for evidence in (
+-        "stdin close fault",
+-        "terminate fault",
+-        "wait fault",
+-        "kill fault",
+-        "stdout close fault",
+-        "stderr close fault",
+-        "thread join fault",
+-        "private removal fault",
+-    ):
+-        assert any(evidence in note for note in notes)
++    assert set(getattr(captured.value, "__notes__", ())) >= {
++        (
++            "policy_worker_secondary_failure phase=cleanup "
++            "action=stdin_close reason=exception"
++        ),
++        (
++            "policy_worker_secondary_failure phase=cleanup "
++            "action=process_terminate reason=exception"
++        ),
++        (
++            "policy_worker_secondary_failure phase=cleanup "
++            "action=process_wait reason=exception"
++        ),
++        (
++            "policy_worker_secondary_failure phase=cleanup "
++            "action=process_kill reason=exception"
++        ),
++        (
++            "policy_worker_secondary_failure phase=cleanup "
++            "action=stdout_close reason=exception"
++        ),
++        (
++            "policy_worker_secondary_failure phase=cleanup "
++            "action=stderr_close reason=exception"
++        ),
++        (
++            "policy_worker_secondary_failure phase=cleanup "
++            "action=stdout_thread_join reason=exception"
++        ),
++        (
++            "policy_worker_secondary_failure phase=cleanup "
++            "action=private_tree_remove reason=exception"
++        ),
++        (
++            "policy_worker_secondary_failure phase=cleanup "
++            "action=daemon_kill reason=exception"
++        ),
++        (
++            "policy_worker_secondary_failure phase=cleanup "
++            "action=daemon_wait reason=exception"
++        ),
++    }
+     assert local_actions == [
+         "stdin",
+         "terminate",
+         "wait-1",
+         "kill",
+         "wait-2",
+         "stdout",
+         "stderr",
+         "thread-join",
+         "tree",
+@@ -1165,20 +1209,220 @@ def test_policy_worker_cleanup_faults_preserve_primary_and_attempt_every_owner_a
+     assert [call[1] for call in control.calls][-4:] == [
+         "kill",
+         "wait",
+         "rm",
+         "container",
+     ]
+     assert not control.exists
+     assert not package_parent.exists()
+ 
+ 
++def test_policy_worker_cleanup_evidence_never_stringifies_secondary_error(
++    tmp_path: Path,
++) -> None:
++    """Break caught: a hostile cleanup __str__ replaced malformed-protocol primary."""
++    from agent_loop import PolicyWorkerRunner
++    from core.strategy_policy.contracts import CapacitySnapshot
++
++    class BrokenStringCleanupError(BaseException):
++        def __str__(self) -> str:
++            raise RuntimeError("secondary stringification escaped")
++
++    control = _Task5FakeDockerControl(
++        failures={"kill": BrokenStringCleanupError()}
++    )
++    process = _Task5FakeProcess()
++    writes = 0
++
++    def malformed_after_bootstrap(_value: bytes) -> None:
++        nonlocal writes
++        writes += 1
++        if writes > 1:
++            process.stdout.values.put(b"{}\n")
++
++    process.stdin.callback = malformed_after_bootstrap
++    runner = PolicyWorkerRunner(
++        image="example.invalid/policy@sha256:" + "a" * 64,
++        injected_engine_path=Path("C:/fake/docker.exe"),
++        process_factory=lambda _argv, **_kwargs: process,
++        control_runner=control,
++        temp_parent=tmp_path,
++    )
++    session = runner.start(
++        candidate_root=_task5_policy_candidate(tmp_path),
++        interface_version=1,
++        fold_run_id="broken_cleanup_string",
++    )
++
++    with pytest.raises(ValueError) as captured:
++        session.call(
++            "recommend_capacity",
++            CapacitySnapshot(None, 25, 0, 3, 1.0, False),
++        )
++
++    assert type(captured.value) is ValueError
++    assert captured.value.args == ("policy JSON fields are invalid",)
++    assert getattr(captured.value, "__notes__", ()) == [
++        (
++            "policy_worker_secondary_failure phase=cleanup "
++            "action=daemon_kill reason=exception"
++        )
++    ]
++    assert [call[1] for call in control.calls][-4:] == [
++        "kill",
++        "wait",
++        "rm",
++        "container",
++    ]
++    assert not control.exists
++    assert not tuple(tmp_path.glob("pw-*"))
++
++
++def test_policy_worker_cleanup_evidence_bypasses_cancellation_add_note_override(
++    tmp_path: Path,
++) -> None:
++    """Break caught: virtual add_note dispatch replaced a cancellation primary."""
++    from agent_loop import PolicyWorkerRunner
++    from core.strategy_policy.contracts import CapacitySnapshot
++
++    class HostileCancellation(KeyboardInterrupt):
++        def add_note(self, note: str) -> None:
++            del note
++            raise RuntimeError("virtual add_note escaped")
++
++    primary = HostileCancellation("cancel primary")
++    control = _Task5FakeDockerControl(nonzero_operations=frozenset({"rm"}))
++    process = _Task5FakeProcess()
++    writes = 0
++
++    def cancel_after_bootstrap(_value: bytes) -> None:
++        nonlocal writes
++        writes += 1
++        if writes > 1:
++            raise primary
++
++    process.stdin.callback = cancel_after_bootstrap
++    runner = PolicyWorkerRunner(
++        image="example.invalid/policy@sha256:" + "a" * 64,
++        injected_engine_path=Path("C:/fake/docker.exe"),
++        process_factory=lambda _argv, **_kwargs: process,
++        control_runner=control,
++        temp_parent=tmp_path,
++    )
++    session = runner.start(
++        candidate_root=_task5_policy_candidate(tmp_path),
++        interface_version=1,
++        fold_run_id="hostile_cancel_note",
++    )
++
++    with pytest.raises(HostileCancellation) as captured:
++        session.call(
++            "recommend_capacity",
++            CapacitySnapshot(None, 25, 0, 3, 1.0, False),
++        )
++
++    assert captured.value is primary
++    assert captured.value.args == ("cancel primary",)
++    assert set(getattr(captured.value, "__notes__", ())) == {
++        (
++            "policy_worker_secondary_failure phase=cleanup "
++            "action=daemon_rm reason=nonzero"
++        ),
++        (
++            "policy_worker_secondary_failure phase=cleanup "
++            "action=daemon_absence_verify reason=present"
++        ),
++    }
++    assert [call[1] for call in control.calls][-4:] == [
++        "kill",
++        "wait",
++        "rm",
++        "container",
++    ]
++    assert control.exists
++    assert not tuple(tmp_path.glob("pw-*"))
++    control.exists = False
++
++
++def test_policy_worker_cleanup_evidence_redacts_timeout_capability_values(
++    tmp_path: Path,
++) -> None:
++    """Break caught: TimeoutExpired argv and secrets leaked through primary notes."""
++    from agent_loop import PolicyWorkerRunner
++    from core.strategy_policy.contracts import CapacitySnapshot
++
++    sentinels = (
++        "C:/host/private/sentinel-docker.exe",
++        "d" * 64,
++        "sentinel-secret-token",
++        "sentinel-stderr-value",
++    )
++    timeout = subprocess.TimeoutExpired(
++        cmd=[sentinels[0], "rm", sentinels[1], "--token", sentinels[2]],
++        timeout=5,
++        stderr=sentinels[3].encode("utf-8"),
++    )
++    control = _Task5FakeDockerControl(failures={"rm": timeout})
++    process = _Task5FakeProcess()
++    writes = 0
++
++    def malformed_after_bootstrap(_value: bytes) -> None:
++        nonlocal writes
++        writes += 1
++        if writes > 1:
++            process.stdout.values.put(b"{}\n")
++
++    process.stdin.callback = malformed_after_bootstrap
++    runner = PolicyWorkerRunner(
++        image="example.invalid/policy@sha256:" + "a" * 64,
++        injected_engine_path=Path("C:/fake/docker.exe"),
++        process_factory=lambda _argv, **_kwargs: process,
++        control_runner=control,
++        temp_parent=tmp_path,
++    )
++    session = runner.start(
++        candidate_root=_task5_policy_candidate(tmp_path),
++        interface_version=1,
++        fold_run_id="timeout_redaction",
++    )
++
++    with pytest.raises(ValueError) as captured:
++        session.call(
++            "recommend_capacity",
++            CapacitySnapshot(None, 25, 0, 3, 1.0, False),
++        )
++
++    rendered = "".join(traceback.format_exception(captured.value))
++    assert all(sentinel not in rendered for sentinel in sentinels)
++    notes = getattr(captured.value, "__notes__", ())
++    assert set(notes) == {
++        (
++            "policy_worker_secondary_failure phase=cleanup "
++            "action=daemon_rm reason=exception"
++        ),
++        (
++            "policy_worker_secondary_failure phase=cleanup "
++            "action=daemon_absence_verify reason=present"
++        ),
++    }
++    assert all(len(note.encode("utf-8")) <= 128 for note in notes)
++    assert [call[1] for call in control.calls][-4:] == [
++        "kill",
++        "wait",
++        "rm",
++        "container",
++    ]
++    assert control.exists
++    assert not tuple(tmp_path.glob("pw-*"))
++    control.exists = False
++
++
+ def test_policy_worker_protocol_primary_retains_unverified_daemon_cleanup(
+     tmp_path: Path,
+ ) -> None:
+     """Break caught: malformed protocol hid rm/absence failures behind its primary."""
+     from agent_loop import PolicyWorkerRunner
+     from core.strategy_policy.contracts import CapacitySnapshot
+ 
+     control = _Task5FakeDockerControl()
+     process = _Task5FakeProcess()
+     writes = 0
+@@ -1204,22 +1448,30 @@ def test_policy_worker_protocol_primary_retains_unverified_daemon_cleanup(
+     )
+     control.nonzero_operations = frozenset({"rm"})
+ 
+     with pytest.raises(ValueError, match="fields") as captured:
+         session.call(
+             "recommend_capacity",
+             CapacitySnapshot(None, 25, 0, 3, 1.0, False),
+         )
+ 
+     notes = getattr(captured.value, "__notes__", ())
+-    assert any("rm" in note for note in notes)
+-    assert any("absence" in note for note in notes)
++    assert set(notes) == {
++        (
++            "policy_worker_secondary_failure phase=cleanup "
++            "action=daemon_rm reason=nonzero"
++        ),
++        (
++            "policy_worker_secondary_failure phase=cleanup "
++            "action=daemon_absence_verify reason=present"
++        ),
++    }
+     assert control.exists
+     assert [call[1] for call in control.calls][-4:] == [
+         "kill",
+         "wait",
+         "rm",
+         "container",
+     ]
+     assert not tuple(tmp_path.glob("pw-*"))
+     control.exists = False
+ 
+@@ -1256,22 +1508,30 @@ def test_policy_worker_cancellation_retains_unverified_daemon_cleanup(
+     )
+     control.nonzero_operations = frozenset({"rm"})
+ 
+     with pytest.raises(KeyboardInterrupt, match="cancel primary") as captured:
+         session.call(
+             "recommend_capacity",
+             CapacitySnapshot(None, 25, 0, 3, 1.0, False),
+         )
+ 
+     notes = getattr(captured.value, "__notes__", ())
+-    assert any("rm" in note for note in notes)
+-    assert any("absence" in note for note in notes)
++    assert set(notes) == {
++        (
++            "policy_worker_secondary_failure phase=cleanup "
++            "action=daemon_rm reason=nonzero"
++        ),
++        (
++            "policy_worker_secondary_failure phase=cleanup "
++            "action=daemon_absence_verify reason=present"
++        ),
++    }
+     assert control.exists
+     assert [call[1] for call in control.calls][-4:] == [
+         "kill",
+         "wait",
+         "rm",
+         "container",
+     ]
+     assert not tuple(tmp_path.glob("pw-*"))
+     control.exists = False
+ 
+@@ -1504,21 +1764,26 @@ def test_policy_worker_create_primary_survives_discovery_inspection_failure(
+         process_factory=lambda _argv, **_kwargs: _Task5FakeProcess(),
+         control_runner=control,
+         temp_parent=tmp_path,
+     )
+     with pytest.raises(OSError, match="create primary") as captured:
+         runner.start(
+             candidate_root=_task5_policy_candidate(tmp_path),
+             interface_version=1,
+             fold_run_id=f"inspect_{inspect_mode}",
+         )
+-    assert any("inspect" in note for note in getattr(captured.value, "__notes__", ()))
++    assert getattr(captured.value, "__notes__", ()) == [
++        (
++            "policy_worker_secondary_failure phase=inspect "
++            "action=daemon_inspect reason=exception"
++        )
++    ]
+     assert not control.exists
+     assert [call[1] for call in control.calls][-4:] == [
+         "kill",
+         "wait",
+         "rm",
+         "container",
+     ]
+     assert not tuple(tmp_path.glob("pw-*"))
+ 
+ 
+@@ -1540,21 +1805,26 @@ def test_policy_worker_create_primary_survives_discovery_list_failure(
+         process_factory=lambda _argv, **_kwargs: _Task5FakeProcess(),
+         control_runner=control,
+         temp_parent=tmp_path,
+     )
+     with pytest.raises(OSError, match="create primary") as captured:
+         runner.start(
+             candidate_root=_task5_policy_candidate(tmp_path),
+             interface_version=1,
+             fold_run_id="list_fault",
+         )
+-    assert any("discovery" in note for note in getattr(captured.value, "__notes__", ()))
++    assert getattr(captured.value, "__notes__", ()) == [
++        (
++            "policy_worker_secondary_failure phase=discovery "
++            "action=daemon_discover reason=exception"
++        )
++    ]
+     assert not control.exists
+     assert not tuple(tmp_path.glob("pw-*"))
+ 
+ 
+ def test_policy_worker_invalid_create_identity_retains_tentative_owner(
+     tmp_path: Path,
+ ) -> None:
+     """Break caught: invalid create output lost a discovered owner when inspect failed."""
+     from agent_loop import PolicyWorkerRunner, SandboxError
+ 
+@@ -1568,21 +1838,26 @@ def test_policy_worker_invalid_create_identity_retains_tentative_owner(
+         process_factory=lambda _argv, **_kwargs: _Task5FakeProcess(),
+         control_runner=control,
+         temp_parent=tmp_path,
+     )
+     with pytest.raises(SandboxError, match="invalid full identity") as captured:
+         runner.start(
+             candidate_root=_task5_policy_candidate(tmp_path),
+             interface_version=1,
+             fold_run_id="invalid_identity",
+         )
+-    assert any("inspect" in note for note in getattr(captured.value, "__notes__", ()))
++    assert getattr(captured.value, "__notes__", ()) == [
++        (
++            "policy_worker_secondary_failure phase=inspect "
++            "action=daemon_inspect reason=exception"
++        )
++    ]
+     assert not control.exists
+     assert [call[1] for call in control.calls][-4:] == [
+         "kill",
+         "wait",
+         "rm",
+         "container",
+     ]
+     assert not tuple(tmp_path.glob("pw-*"))
+ 
+ 
+@@ -1612,21 +1887,42 @@ def test_policy_worker_create_primary_records_cleanup_failure(
+         control_runner=control,
+         temp_parent=tmp_path,
+     )
+     with pytest.raises(OSError, match="create primary") as captured:
+         runner.start(
+             candidate_root=_task5_policy_candidate(tmp_path),
+             interface_version=1,
+             fold_run_id=f"cleanup_{cleanup_operation}",
+         )
+     notes = getattr(captured.value, "__notes__", ())
+-    assert any("cleanup" in note for note in notes)
++    if cleanup_operation == "rm":
++        assert set(notes) == {
++            (
++                "policy_worker_secondary_failure phase=cleanup "
++                "action=daemon_rm reason=exception"
++            ),
++            (
++                "policy_worker_secondary_failure phase=cleanup "
++                "action=daemon_absence_verify reason=present"
++            ),
++        }
++    else:
++        assert set(notes) == {
++            (
++                "policy_worker_secondary_failure phase=cleanup "
++                "action=daemon_absence_query reason=exception"
++            ),
++            (
++                "policy_worker_secondary_failure phase=cleanup "
++                "action=daemon_absence_verify reason=unverified"
++            ),
++        }
+     assert [call[1] for call in control.calls][-4:] == [
+         "kill",
+         "wait",
+         "rm",
+         "container",
+     ]
+     if cleanup_operation == "rm":
+         assert control.exists
+         control.exists = False
+     else:
+@@ -1765,22 +2061,30 @@ def test_policy_worker_tampered_identity_primary_retains_live_daemon_evidence(
+     )
+ 
+     with pytest.raises(SandboxError, match="identity or ownership") as captured:
+         runner.start(
+             candidate_root=_task5_policy_candidate(tmp_path),
+             interface_version=1,
+             fold_run_id="tampered_live",
+         )
+ 
+     notes = getattr(captured.value, "__notes__", ())
+-    assert any("rm" in note for note in notes)
+-    assert any("absence" in note for note in notes)
++    assert set(notes) == {
++        (
++            "policy_worker_secondary_failure phase=cleanup "
++            "action=daemon_rm reason=nonzero"
++        ),
++        (
++            "policy_worker_secondary_failure phase=cleanup "
++            "action=daemon_absence_verify reason=present"
++        ),
++    }
+     cleanup_query = control.calls[-1]
+     assert f"id={control.container_id}" in cleanup_query
+     assert not any("label=" in value for value in cleanup_query)
+     observable = control(
+         (
+             "C:/fake/docker.exe",
+             "container",
+             "ls",
+             "--all",
+             "--quiet",

@@ -1,0 +1,93 @@
+"""Prepare a distinct real development campaign after terminal runtime-03 and four refreshed baseline reports."""
+import hashlib
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+source = Path.cwd().resolve()
+old = source / '.artifacts/pit-optimizer-v5/development/runtime-03'
+root = source / '.artifacts/pit-optimizer-v5/development/runtime-04'
+terminal = json.loads((old / 'resume-08-result.json').read_text())
+assert terminal['status'] == 'completed' and terminal['summary']['cleanup_complete']
+development = source / '.artifacts/pit-optimizer-v5/development'
+plan = json.loads((development / 'runtime-parent-discovery30-4acebbc4abd4-baseline-plan.json').read_text())
+parents = []
+for window in plan['window_selection']['windows']:
+    ordinal = window['ordinal']
+    run = development / 'runs' / ('runtime-parent-discovery30-4acebbc4abd4-' + str(ordinal))
+    receipt = json.loads((run / 'verification-record.json').read_text())
+    cleanup = json.loads((run / 'cleanup-record.json').read_text())
+    if (receipt['sandbox_sha256'] != plan['profile_sha256']
+            or receipt['image_reference'] != plan['image_reference']
+            or receipt['panel_sha256'] != window['panel_sha256']
+            or receipt['episode_ordinal'] != ordinal
+            or receipt['scenario_ids'] != ['gross', 'base', 'stress']
+            or not receipt['canonical_output_and_source_verified']
+            or not cleanup['removed']
+            or cleanup['container_id'] != receipt['container_id']
+            or hashlib.sha256((run / 'output/panel-evaluation.json').read_bytes()).hexdigest() != receipt['output_sha256']):
+        raise ValueError('All four actual refreshed baseline reports must be verified and cleaned')
+    parents.append({'request_path': str(run / 'request/panel-request.json'),
+                    'output_path': str(run / 'output/panel-evaluation.json')})
+    if ordinal == 1:
+        contract_sha = receipt['evaluator_contract_sha256']
+    elif receipt['evaluator_contract_sha256'] != contract_sha:
+        raise ValueError('Baseline evaluator contracts differ')
+assert not root.exists(), 'This create-only preparation must not be repeated'
+root.mkdir()
+
+def save(name, value):
+    with (root / name).open('x') as stream:
+        json.dump(value, stream, indent=2)
+
+assets = json.loads((old / 'asset-import.json').read_text())['assets']
+receipts = []
+for asset in assets:
+    data = (old / asset['target']).read_bytes()
+    assert hashlib.sha256(data).hexdigest() == asset['sha256']
+    target = root / asset['target']
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open('xb') as stream:
+        stream.write(data)
+    assert hashlib.sha256(target.read_bytes()).hexdigest() == asset['sha256']
+    receipts.append(dict(asset, source=str(old / asset['target'])))
+save('asset-import.json', {'assets': receipts, 'prior_attempt_repository': str(old), 'prior_attempt_preserved': True})
+inputs = json.loads((old / 'import-development-input.json').read_text())
+inputs['campaign_id'] = 'development-controller-two-rounds-20260907-04'
+inputs['git_executable'] = r'C:\Program Files\Git\bin\git.exe'
+inputs['parent_results'] = parents
+inputs['evaluator_contract_sha256'] = contract_sha
+inputs['sandbox_profile_sha256'] = plan['profile_sha256']
+inputs['output_prefix'] = 'campaigns/' + inputs['campaign_id']
+save('import-development-input.json', inputs)
+paths = json.loads((old / 'operator-paths.json').read_text())
+for key in ('workspace_root', 'output_root', 'control_root', 'response_directory'):
+    paths[key] = paths[key].replace('runtime-20260907-03', 'runtime-20260907-04')
+    Path(paths[key]).mkdir(parents=True, exist_ok=False)
+save('operator-paths.json', paths)
+
+def cli(label, arguments):
+    with (root / (label + '-stdout.txt')).open('x') as out, (root / (label + '-stderr.txt')).open('x') as err:
+        result = subprocess.run([sys.executable, '-B', '-m', 'core.pit_optimizer_v5.cli', *arguments], stdout=out, stderr=err)
+    stdout = (root / (label + '-stdout.txt')).read_text()
+    if result.returncode:
+        print(stdout)
+        print((root / (label + '-stderr.txt')).read_text())
+        raise SystemExit(result.returncode)
+    records = [json.loads(line.split('=', 1)[1]) for line in stdout.splitlines() if line.startswith('PIT_OPTIMIZER_V5_')]
+    return records[-1]
+
+args = ['import-development', '--artifact-root', str(root), '--input-file', str(root / 'import-development-input.json')]
+cli('validate', args + ['--validate-only'])
+imported = cli('import', args)
+save('import-result.json', imported)
+print(json.dumps(imported), flush=True)
+manifest = imported['manifest_ref']
+args = ['prepare-development', '--artifact-root', str(root), '--manifest-path', manifest['relative_path'], '--manifest-sha256', manifest['sha256']]
+for key, value in paths.items():
+    args.extend(['--' + key.replace('_', '-'), value])
+args.extend(['--output-path', inputs['output_prefix'] + '/adapter-config.json'])
+prepared = cli('prepare', args)
+save('campaign-launch-input.json', prepared)
+print(json.dumps(prepared), flush=True)

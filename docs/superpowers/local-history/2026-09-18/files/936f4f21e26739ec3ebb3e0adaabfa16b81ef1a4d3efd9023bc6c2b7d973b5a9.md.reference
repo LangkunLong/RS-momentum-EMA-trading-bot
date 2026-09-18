@@ -1,0 +1,11 @@
+# Independent review of Increment C-a
+
+Review the completed diagnostic and proposed architecture against section 10 of docs/superpowers/plans/2026-09-08-pit-optimizer-v5-transition.md. The deliverable is a concrete finding or narrow design, not source implementation or a campaign-readiness decision.
+
+Read package-review.diff once, then the evidence paths it identifies where needed. Source lookups are permitted only for concrete provenance/design risks. Review the authority-trace report independently from the principal diagnosis. Verify that per-round saved config identity is a defensible authority anchor, that summaries and component-only evidence are accurately distinguished, and that the proposed boundary preserves live guards/default callers and fails closed on incomplete history.
+
+Binding constraints: no tests read/created/modified/run, synthetic inputs/events/records, credentials/environment values, external requests, evaluation/campaign/Docker operations, production edits, historical writes, commits or Git manipulation. Do not rerun the one-shot summary scripts. Use only saved real evidence, source/AST/hash reads. Do not delegate. Write only independent-review.md in this package.
+
+Return two verdicts: spec compliance and diagnostic/design quality. Cite file/line for actionable findings and source checks. Evaluate the package's acknowledged incorrect initial cross-encoding comparison and its corrected superseding evidence; do not treat either a claimed correction or a report assertion as proven without inspecting evidence. Identify any unresolved component or trust assumption that is misstated. No broad rereview of accepted B4c or unrelated dirty branch work.
+
+This is the sole full-package review for this read-only increment, including the delegated authority task. The package contains added artifacts rather than new commits; base and HEAD remain a068e0aed40ecbe5e0078924071f374e7809b8c2. The diff explicitly covers only newly authored documentation and diagnostics.

@@ -1,0 +1,32 @@
+# Independent C-b consolidated readiness review
+
+Verdict: **PASS for preparing C-c's concrete fresh campaign proposal.** No source or evidence blocker was found within this consolidation scope. This is not execution approval, a successful-campaign verdict, or whole-branch acceptance.
+
+## Finding
+
+**Resolved P2 — Entry-count wording corrected.** The initial report incorrectly described the available entry counts as nonzero. The inspected `production_runtime.py:651–654` includes present allowlisted counts even when zero; only the subsequent cumulative rejection count is omitted at zero. The principal corrected the report to distinguish available closed-allowlist counts from zero-rejection omission, including the dynamic-coverage limitation. I confirmed the correction. Source and evidence remain unchanged. No actionable consolidated finding remains.
+
+## Independent evidence checks
+
+Read the consolidated readiness report, fixed-authority report/JSON, request report/JSON, H3c independent review, principal pre-summary source check, comparison plan, full H3 source authority, both actual returned-summary results, and complete saved before/after maps. Read transition plan sections 11–12 for the readiness exit and next boundary only. Accepted H1/H2a/H2b/H3a/H3b/H3c source reviews remain dependencies; this review does not reopen them.
+
+The readiness identity table matches the fixed-authority evidence. Eleven path-bound identities, including the original actual06 manifest, data bundle, prices provenance, profiles, source/policy, baseline and parent provenance, also match the complete saved actual06 map. The fixed authority remains evaluator `005064e57e80...`, image `4e85b19aa8c1...`, profile `0923e93f56e0...`, development bundle `cf729b47d762...`, source bundle `109a61992ac7...`, and parent revision `5d2a95ba2572...`. Its recorded 16-edge authentication and original four discovery request/output bindings are supplied evidence, not authentications rerun by this reviewer.
+
+Runtime04 retains its older `4acebbc4...` evaluator, `364d460e...` profile and `901b1ed2...` policy graph. Its archived request metrics must not become a newly executed fixed-actual06 packet. The quick output and verification digests are transcribed correctly; the shared quick-panel digest does not erase the distinct request/plan episode labels or create a parent-provenance edge. Four discovery baselines and quick base results are zero-trade/zero-return observations, without a demonstrated cause.
+
+Independently hashed all 21 supplied host source paths and all 56 evaluator paths: every current file matches the H3 result authority map, and the host map matches the pre-summary source check. The H3c review digest is exactly `9a7c698b42702c2a7a8b63f6a7e9ed51229552564a37a25b215a793cbd01b26e`. The evaluator's full canonical aggregate digest is recorded as unchanged in the supplied collector evidence; this reviewer did not rerun its implementation.
+
+Independently compared the complete saved before/after maps with C-a's original maps: runtime04 has 579 files and actual06 83, with identical key sets and hashes. These checks compare saved maps; they do not claim a new live archive census or concurrent-writer protection.
+
+Verified both original summary-baseline file digests against the comparison plan. Recompared the actual returned objects against those baselines, numerically for Decimal fields and exactly for other fields: all 23 runtime04 non-command fields and all 27 actual06 fields match. Runtime04's original `resume` versus returned `summarize` label is correctly preserved as an explicit difference. New counts remain 1/1/0 and 0/0/0. Runtime04 still failed round 2 with `discovery_evaluation:deadline_exceeded`; actual06 still failed with `rendering:stage_failed`, two calls, 8,596 tokens and USD 0.04234. Both report completed cleanup, no qualification and no replay. Actual06 has no committed render-rejected experiment. Runtime04's zero provider-accounted role calls does not imply absence of controller role packages.
+
+## Coverage and approval boundary
+
+The 6,700/22,071-byte archived requests, 10,305/27,370 input bounds and 16 headline items per request match the supplied evidence. The 64 available entry counts and possible 80-item current projection have static-source plus authenticated historical-input support; current packet composition and zero-rejection omission have no claimed dynamic execution. Historical six-call/448,000-token capabilities and reservation arithmetic support only the described archived-request comparison. They provide neither a future packet bound nor renewed spending authority.
+
+Lifecycle attempts, evaluated rounds and rejection records remain distinct. Two failed historical archives do not satisfy the future requirement for two distinct evaluated rounds with critic, checkpoint and successful cleanup evidence. The listed rejection, duplicate, positive-metric, finalization, absence/error and novelty branches remain unexecuted where stated. No production three-universe, held-out qualification, replay or promotion validity follows from this provisional SP500 development evidence.
+
+C-c may now prepare a distinct campaign/root, exact manifest/config and initial outbound packets with hashes/sizes, coherent finite call/token and lifecycle reserves, affordable rejection handling, fixed environment/deadline/cleanup authority, explicit stop conditions and one saved launch. It must then obtain the fresh separate user execution grant required by section 12. Historical remaining budget is not replacement-run authorization.
+
+No tests, synthetic cases, archive authentication or summary reruns, provider/API/Docker calls, environment/credential reads, campaigns, operational Git actions, source edits or subagents were used. Only this review document was written.
+

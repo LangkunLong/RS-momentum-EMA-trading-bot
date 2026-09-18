@@ -1,0 +1,372 @@
+diff --git "a/C:\\Projects\\trading_bot\\RS-momentum-EMA-trading-bot\\.worktrees\\pit-optimizer-v5-architecture\\.artifacts\\pit-optimizer-v5\\development\\luna-recovery-b2\\preimages\\memory.py" "b/C:\\Projects\\trading_bot\\RS-momentum-EMA-trading-bot\\.worktrees\\pit-optimizer-v5-architecture\\core\\pit_optimizer_v5\\memory.py"
+index 4a21860..8f1f057 100644
+--- "a/C:\\Projects\\trading_bot\\RS-momentum-EMA-trading-bot\\.worktrees\\pit-optimizer-v5-architecture\\.artifacts\\pit-optimizer-v5\\development\\luna-recovery-b2\\preimages\\memory.py"
++++ "b/C:\\Projects\\trading_bot\\RS-momentum-EMA-trading-bot\\.worktrees\\pit-optimizer-v5-architecture\\core\\pit_optimizer_v5\\memory.py"
+@@ -51,6 +51,7 @@ RoundEventKindV5 = Literal[
+     "round_intent",
+     "role_completion",
+     "rendered_variant",
++    "render_rejected",
+     "candidate_stage_result",
+     "quick_evidence",
+     "episode_evidence",
+@@ -66,6 +67,7 @@ RoundOutcomeKindV5 = Literal[
+     "runtime_failed",
+ ]
+ CandidateStageV5 = Literal["validation", "semantic_probe", "quick_evaluation", "discovery_evaluation"]
++RenderRejectionFailureCodeV5 = Literal["policy_source_unbounded_or_stateful"]
+ CandidateStageOutcomeV5 = Literal[
+     "validation_valid",
+     "validation_invalid",
+@@ -144,6 +146,7 @@ _EVENT_KINDS = frozenset(
+         "round_intent",
+         "role_completion",
+         "rendered_variant",
++        "render_rejected",
+         "candidate_stage_result",
+         "quick_evidence",
+         "episode_evidence",
+@@ -715,6 +718,32 @@ class RenderedVariantPayloadV5:
+             raise ValueError("rendered-variant payload is invalid")
+ 
+ 
++@dataclass(frozen=True, slots=True)
++class RenderRejectionPayloadV5:
++    """One closed host-side source rejection before variant materialization."""
++
++    experiment_identity: PreValidationInvalidExperimentIdentityV5
++    assignment: VariantAssignmentV5
++    author_artifact_ref: ArtifactRefV5
++    failure_code: RenderRejectionFailureCodeV5
++
++    def __post_init__(self) -> None:
++        if type(self.experiment_identity) is not PreValidationInvalidExperimentIdentityV5:
++            raise ValueError("render rejection identity is invalid")
++        if type(self.assignment) is not VariantAssignmentV5:
++            raise ValueError("render rejection assignment is invalid")
++        if self.experiment_identity.assignment_sha256 != self.assignment.sha256:
++            raise ValueError("render rejection assignment differs from its identity")
++        if (
++            type(self.author_artifact_ref) is not ArtifactRefV5
++            or self.author_artifact_ref.relative_path
++            != f"roles/artifacts/author/{self.experiment_identity.template_sha256}.json"
++        ):
++            raise ValueError("render rejection author artifact reference is invalid")
++        if type(self.failure_code) is not str or self.failure_code != "policy_source_unbounded_or_stateful":
++            raise ValueError("render rejection failure code is invalid")
++
++
+ @dataclass(frozen=True, slots=True)
+ class CandidateStageResultPayloadV5:
+     """One indexed, durable local candidate-stage result."""
+@@ -1203,6 +1232,7 @@ RoundEventPayloadV5 = (
+     RoundIntentPayloadV5
+     | RoleCompletionPayloadV5
+     | RenderedVariantPayloadV5
++    | RenderRejectionPayloadV5
+     | CandidateStageResultPayloadV5
+     | QuickEvidencePayloadV5
+     | EpisodeEvidencePayloadV5
+@@ -1216,6 +1246,7 @@ _PAYLOAD_TYPES: dict[str, type[object]] = {
+     "round_intent": RoundIntentPayloadV5,
+     "role_completion": RoleCompletionPayloadV5,
+     "rendered_variant": RenderedVariantPayloadV5,
++    "render_rejected": RenderRejectionPayloadV5,
+     "candidate_stage_result": CandidateStageResultPayloadV5,
+     "quick_evidence": QuickEvidencePayloadV5,
+     "episode_evidence": EpisodeEvidencePayloadV5,
+@@ -1249,6 +1280,13 @@ def round_event_payload_primitive_v5(
+                 "policy_revision": payload.variant.policy_revision.to_primitive(),
+             }
+         }
++    elif isinstance(payload, RenderRejectionPayloadV5):
++        body = {
++            "experiment_identity": payload.experiment_identity.to_primitive(),
++            "assignment": _assignment_artifact_primitive(payload.assignment),
++            "author_artifact_ref": payload.author_artifact_ref.to_primitive(),
++            "failure_code": payload.failure_code,
++        }
+     elif isinstance(payload, CandidateStageResultPayloadV5):
+         body = {
+             "experiment_id": payload.experiment_id,
+@@ -1314,6 +1352,7 @@ class RoundEventV5:
+             _digest(self.experiment_id, "round-event experiment ID")
+         if self.event_kind in {
+             "rendered_variant",
++            "render_rejected",
+             "candidate_stage_result",
+             "quick_evidence",
+             "episode_evidence",
+@@ -1342,6 +1381,9 @@ class RoundEventV5:
+         if isinstance(payload, (CandidateStageResultPayloadV5, QuickEvidencePayloadV5, EpisodeEvidencePayloadV5)):
+             if payload.experiment_id != self.experiment_id:
+                 raise ValueError("round-event experiment differs from its payload")
++        if isinstance(payload, RenderRejectionPayloadV5):
++            if payload.experiment_identity.sha256 != self.experiment_id:
++                raise ValueError("round-event experiment differs from its rejection identity")
+         if isinstance(payload, CandidateExecutionAuthorityV5):
+             if (
+                 payload.campaign_id != self.campaign_id
+@@ -1414,6 +1456,7 @@ class RecoveryStepV5:
+             raise ValueError("only role recovery steps carry role bindings")
+         if self.event_kind in {
+             "rendered_variant",
++            "render_rejected",
+             "candidate_stage_result",
+             "quick_evidence",
+             "episode_evidence",
+@@ -1477,6 +1520,7 @@ def _validate_candidate_stage_chain_v5(
+                 payload,
+                 (
+                     RenderedVariantPayloadV5,
++                    RenderRejectionPayloadV5,
+                     CandidateStageResultPayloadV5,
+                     QuickEvidencePayloadV5,
+                     EpisodeEvidencePayloadV5,
+@@ -1509,6 +1553,12 @@ def _validate_candidate_stage_chain_v5(
+             states[experiment_id] = "rendered"
+             episode_ordinals[experiment_id] = set()
+             continue
++        if isinstance(payload, RenderRejectionPayloadV5):
++            assert experiment_id is not None
++            if experiment_id in states:
++                raise ValueError("render rejection conflicts with an existing candidate")
++            states[experiment_id] = "terminal"
++            continue
+         if isinstance(payload, CandidateStageResultPayloadV5):
+             assert experiment_id is not None
+             state = states.get(experiment_id)
+@@ -2065,6 +2115,8 @@ __all__ = [
+     "ProjectionLineageAuthorityV5",
+     "QuickEvidencePayloadV5",
+     "RecoveryStepV5",
++    "RenderRejectionFailureCodeV5",
++    "RenderRejectionPayloadV5",
+     "RenderedVariantPayloadV5",
+     "ResourceLeasePayloadV5",
+     "RoleCompletionPayloadV5",
+diff --git "a/C:\\Projects\\trading_bot\\RS-momentum-EMA-trading-bot\\.worktrees\\pit-optimizer-v5-architecture\\.artifacts\\pit-optimizer-v5\\development\\luna-recovery-b2\\preimages\\artifacts.py" "b/C:\\Projects\\trading_bot\\RS-momentum-EMA-trading-bot\\.worktrees\\pit-optimizer-v5-architecture\\core\\pit_optimizer_v5\\artifacts.py"
+index 4a71215..85df3aa 100644
+--- "a/C:\\Projects\\trading_bot\\RS-momentum-EMA-trading-bot\\.worktrees\\pit-optimizer-v5-architecture\\.artifacts\\pit-optimizer-v5\\development\\luna-recovery-b2\\preimages\\artifacts.py"
++++ "b/C:\\Projects\\trading_bot\\RS-momentum-EMA-trading-bot\\.worktrees\\pit-optimizer-v5-architecture\\core\\pit_optimizer_v5\\artifacts.py"
+@@ -39,6 +39,7 @@ from core.pit_optimizer_v5.candidate_ir import (
+     SourceOperationV5,
+     StructuralTemplateV5,
+     VariantAssignmentV5,
++    derive_pre_validation_invalid_experiment_identity_v5,
+ )
+ from core.pit_optimizer_v5.contracts import (
+     AnnualizedReturnTargetV5,
+@@ -73,6 +74,7 @@ from core.pit_optimizer_v5.memory import (
+     ExperimentRecordV5,
+     QuickEvidencePayloadV5,
+     RecoveryStepV5,
++    RenderRejectionPayloadV5,
+     RenderedVariantPayloadV5,
+     ResourceLeasePayloadV5,
+     RoleCompletionPayloadV5,
+@@ -89,6 +91,7 @@ from core.pit_optimizer_v5.memory import (
+     round_event_payload_primitive_v5,
+ )
+ from core.pit_optimizer_v5.probes import ProbeObservationV5, SemanticFingerprintV5
++from core.pit_optimizer_v5.rendering import bounded_variant_assignments_v5
+ from core.pit_optimizer_v5.search import ArchiveEntryV5, SearchStateV5
+ from core.pit_optimizer_v5.provider import (
+     AuthorizedRoleSlotV5,
+@@ -831,6 +834,20 @@ def _decode_round_payload(expected_kind: str, value: object) -> RoundEventPayloa
+     if expected_kind == "rendered_variant":
+         item = _exact_keys(body, {"variant"})
+         return RenderedVariantPayloadV5(variant=_decode_rendered_variant(item["variant"]))
++    if expected_kind == "render_rejected":
++        item = _exact_keys(
++            body,
++            {"experiment_identity", "assignment", "author_artifact_ref", "failure_code"},
++        )
++        identity = _decode_identity("pre_validation_invalid", item["experiment_identity"])
++        if type(identity) is not PreValidationInvalidExperimentIdentityV5:
++            raise ArtifactSchemaFailureV5()
++        return RenderRejectionPayloadV5(
++            experiment_identity=identity,
++            assignment=_decode_assignment(item["assignment"]),
++            author_artifact_ref=_decode_dataclass(ArtifactRefV5, item["author_artifact_ref"]),
++            failure_code=item["failure_code"],  # type: ignore[arg-type]
++        )
+     if expected_kind == "candidate_stage_result":
+         item = _exact_keys(
+             body,
+@@ -2762,6 +2779,89 @@ class LocalArtifactRepositoryV5:
+         if canonical_json_bytes_v5(expected) != authenticated.content:
+             raise ArtifactNonCanonicalV5(payload.failure_ref)
+ 
++    def _validate_render_rejection_context(
++        self,
++        *,
++        events: tuple[RoundEventV5, ...],
++        payloads: tuple[RoundEventPayloadV5, ...],
++    ) -> None:
++        """Authenticate every rejection against the prior intent and author package."""
++
++        if len(events) != len(payloads):
++            raise ValueError("render rejection context events and payloads differ")
++        for position, (event, payload) in enumerate(zip(events, payloads, strict=True)):
++            if type(payload) is not RenderRejectionPayloadV5:
++                continue
++            if event.event_kind != "render_rejected" or event.experiment_id != payload.experiment_identity.sha256:
++                raise ArtifactSchemaFailureV5(event.payload_ref)
++
++            prior_payloads = payloads[:position]
++            intents = tuple(item for item in prior_payloads if type(item) is RoundIntentPayloadV5)
++            author_completions = tuple(
++                item
++                for item in prior_payloads
++                if type(item) is RoleCompletionPayloadV5 and item.role == "author"
++            )
++            if len(intents) != 1 or len(author_completions) != 1:
++                raise ArtifactSchemaFailureV5(event.payload_ref)
++            intent = intents[0]
++            author_completion = author_completions[0]
++            if author_completion.outcome != "accepted" or author_completion.artifact_ref != payload.author_artifact_ref:
++                raise ArtifactSchemaFailureV5(event.payload_ref)
++            try:
++                package = self.load_role_invocation(author_completion)
++            except ArtifactRepositoryFailureV5:
++                raise
++            except (TypeError, ValueError, ArithmeticError):
++                raise ArtifactSchemaFailureV5(event.payload_ref) from None
++            template = package.artifact
++            binding = package.request.expected_binding
++            if (
++                not package.accepted
++                or type(template) is not StructuralTemplateV5
++                or package.call.campaign_id != event.campaign_id
++                or package.call.round_index != event.round_index
++                or package.call.role != "author"
++                or package.request.role != "author"
++                or author_completion.artifact_sha256 != template.sha256
++                or template.parent_revision_sha256 != intent.parent_revision_sha256
++                or template.hypothesis_id != intent.hypothesis.hypothesis_id
++                or binding.parent_revision_sha256 != intent.parent_revision_sha256
++                or binding.hypothesis_id != intent.hypothesis.hypothesis_id
++                or binding.discovery_plan_sha256 != intent.discovery_plan_sha256
++            ):
++                raise ArtifactSchemaFailureV5(event.payload_ref)
++            try:
++                expected_identity = derive_pre_validation_invalid_experiment_identity_v5(
++                    parent_revision_sha256=intent.parent_revision_sha256,
++                    hypothesis=intent.hypothesis,
++                    template=template,
++                    assignment=payload.assignment,
++                    round_index=event.round_index,
++                    discovery_plan_sha256=intent.discovery_plan_sha256,
++                )
++                assignments = bounded_variant_assignments_v5(
++                    template=template,
++                    maximum=package.request.schema_authority.max_variants,
++                )
++                assignment_bytes = canonical_json_bytes_v5(payload.assignment.to_primitive())
++                assignment_is_permitted = any(
++                    canonical_json_bytes_v5(item.to_primitive()) == assignment_bytes for item in assignments
++                )
++            except (TypeError, ValueError, ArithmeticError):
++                raise ArtifactSchemaFailureV5(event.payload_ref) from None
++            conflicts_with_rendered_variant = any(
++                type(item) is RenderedVariantPayloadV5
++                and canonical_json_bytes_v5(item.variant.assignment.to_primitive()) == assignment_bytes
++                for item in payloads
++            )
++            if (
++                payload.experiment_identity != expected_identity
++                or not assignment_is_permitted
++                or conflicts_with_rendered_variant
++            ):
++                raise ArtifactSchemaFailureV5(event.payload_ref)
++
+     def append_round_event(self, event: RoundEventV5) -> ArtifactRefV5:
+         if type(event) is not RoundEventV5:
+             raise ValueError("round event must use the V5 schema")
+@@ -2789,6 +2889,10 @@ class LocalArtifactRepositoryV5:
+             events=(*prior, event),
+             payloads=(*prior_payloads, payload),
+         )
++        self._validate_render_rejection_context(
++            events=(*prior, event),
++            payloads=(*prior_payloads, payload),
++        )
+         campaign = _safe_component(event.campaign_id, "round event campaign")
+         path = f"events/{campaign}/{event.round_index:04d}/{event.sequence:06d}.json"
+         reference = self._create_only(path, event.to_primitive())
+@@ -2840,6 +2944,7 @@ class LocalArtifactRepositoryV5:
+             events.append(event)
+             payloads.append(payload)
+         fold_round_events_v5(events=tuple(events), payloads=tuple(payloads))
++        self._validate_render_rejection_context(events=tuple(events), payloads=tuple(payloads))
+         return tuple(events)
+ 
+     def load_candidate_executions(
+diff --git "a/C:\\Projects\\trading_bot\\RS-momentum-EMA-trading-bot\\.worktrees\\pit-optimizer-v5-architecture\\.artifacts\\pit-optimizer-v5\\development\\luna-recovery-b2\\preimages\\runtime.py" "b/C:\\Projects\\trading_bot\\RS-momentum-EMA-trading-bot\\.worktrees\\pit-optimizer-v5-architecture\\core\\pit_optimizer_v5\\runtime.py"
+index 223aa8f..59d9290 100644
+--- "a/C:\\Projects\\trading_bot\\RS-momentum-EMA-trading-bot\\.worktrees\\pit-optimizer-v5-architecture\\.artifacts\\pit-optimizer-v5\\development\\luna-recovery-b2\\preimages\\runtime.py"
++++ "b/C:\\Projects\\trading_bot\\RS-momentum-EMA-trading-bot\\.worktrees\\pit-optimizer-v5-architecture\\core\\pit_optimizer_v5\\runtime.py"
+@@ -53,6 +53,7 @@ from core.pit_optimizer_v5.memory import (
+     NoveltyExhaustedAuthorityV5,
+     PreCriticEvidenceIdentityV5,
+     QuickEvidencePayloadV5,
++    RenderRejectionPayloadV5,
+     RenderedVariantPayloadV5,
+     ResourceLeasePayloadV5,
+     RoleCompletionPayloadV5,
+@@ -952,6 +953,7 @@ class _Journal:
+                 RoleCompletionPayloadV5: "role_completion",
+                 RoundIntentPayloadV5: "round_intent",
+                 RenderedVariantPayloadV5: "rendered_variant",
++                RenderRejectionPayloadV5: "render_rejected",
+                 CandidateStageResultPayloadV5: "candidate_stage_result",
+                 QuickEvidencePayloadV5: "quick_evidence",
+                 EpisodeEvidencePayloadV5: "episode_evidence",
+diff --git "a/C:\\Projects\\trading_bot\\RS-momentum-EMA-trading-bot\\.worktrees\\pit-optimizer-v5-architecture\\.artifacts\\pit-optimizer-v5\\development\\luna-recovery-b2\\preimages\\rendering.py" "b/C:\\Projects\\trading_bot\\RS-momentum-EMA-trading-bot\\.worktrees\\pit-optimizer-v5-architecture\\core\\pit_optimizer_v5\\rendering.py"
+index 6bd173a..48b8e15 100644
+--- "a/C:\\Projects\\trading_bot\\RS-momentum-EMA-trading-bot\\.worktrees\\pit-optimizer-v5-architecture\\.artifacts\\pit-optimizer-v5\\development\\luna-recovery-b2\\preimages\\rendering.py"
++++ "b/C:\\Projects\\trading_bot\\RS-momentum-EMA-trading-bot\\.worktrees\\pit-optimizer-v5-architecture\\core\\pit_optimizer_v5\\rendering.py"
+@@ -393,6 +393,25 @@ def _ordered_assignments(
+     )
+ 
+ 
++def bounded_variant_assignments_v5(
++    *,
++    template: StructuralTemplateV5,
++    maximum: int,
++) -> tuple[VariantAssignmentV5, ...]:
++    """Return the renderer's exact capped assignment order without source rendering."""
++
++    if type(template) is not StructuralTemplateV5:
++        raise ValueError("variant template must use the V5 structural schema")
++    if type(maximum) is not int or maximum <= 0:
++        raise ValueError("variant maximum must be a positive integer")
++    assignments: list[VariantAssignmentV5] = []
++    for assignment in _ordered_assignments(template.axes):
++        assignments.append(assignment)
++        if len(assignments) == maximum:
++            break
++    return tuple(assignments)
++
++
+ def _source_map(bundle: SourceBundleV5) -> dict[str, str]:
+     return {item.path: item.source for item in bundle.files}
+ 
+@@ -627,7 +646,7 @@ def _render_variant_outcomes(
+         tuple[tuple[str, str], ...],
+         tuple[tuple[str, type[object], object], ...],
+     ] = {}
+-    for assignment in _ordered_assignments(template.axes):
++    for assignment in bounded_variant_assignments_v5(template=template, maximum=maximum):
+         if template.source_operations:
+             rendered_sources = _render_operation_sources(
+                 parent_sources=parent_sources,
+@@ -726,6 +745,7 @@ def render_variants(
+ __all__ = [
+     "RejectedVariantV5",
+     "VariantRenderingCollisionV5",
++    "bounded_variant_assignments_v5",
+     "render_variant_outcomes_v5",
+     "render_variants",
+ ]

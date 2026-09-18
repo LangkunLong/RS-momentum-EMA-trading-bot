@@ -1,0 +1,17 @@
+{
+  "actual_author_request": ".artifacts\\pit-optimizer-v5\\development\\provider-runtime-03\\roles\\requests\\19264495c66505c8d73fee0b9350eb42858b93f1139eabd51e9b4eef673a9723.json",
+  "canonical_schema_bytes": 3264,
+  "wire_schema_bytes": 3193,
+  "prior_input_bound_unchanged": true,
+  "name_schema": {
+    "minLength": 1,
+    "type": "string",
+    "pattern": "^core\\.strategy_policy\\.v3\\.[a-z_]+\\.[A-Za-z_]\\w*$",
+    "description": "Fully qualified module.symbol from each source_operation: remove .py, replace / with ., append .symbol."
+  },
+  "source_sha256": "e8dee588b7d4fedf5681b45686550f1ada729b1c85b864e86f3296e86aac01ac",
+  "runtime_source_sha256": "005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4",
+  "ruff": "passed",
+  "in_memory_compile": "passed",
+  "provider_calls": 0
+}

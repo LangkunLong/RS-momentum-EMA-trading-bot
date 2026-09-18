@@ -1,0 +1,59 @@
+# Task 7 — repair legacy-readiness descendant authentication
+
+## Confirmed failure and root cause
+
+The exact provider-free schema-v3 manifest build reproducibly fails before
+writing `manifest.json` with `legacy readiness source identity differs from
+source root`. The legacy schema-v1 readiness is canonical and authenticated but
+was created before the model-authored policy extraction and rounded-stop safety
+fix. The final parity attestation is specifically the authenticated bridge from
+a later corrected reference commit to the current clean source. The manifest
+builder incorrectly requires the legacy source identity itself to equal the
+current source, then later also requires parity's final identity to equal that
+legacy identity. That rejects every legitimate descendant migration.
+
+## Boundaries
+
+- Worktree: `C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-implementation`.
+- Required clean base HEAD: `b62411b2c84cfe690406aa1af48f51bcae1b9c66`.
+- Modify only `core/pit_optimization_contract.py` unless a compile-only import
+  adjustment is strictly required.
+- Do not add or modify tests/docs/manifests. Do not touch the rounded-stop clamp.
+- Do not create/overwrite optimizer manifest/readiness/parity artifacts, call a
+  provider/network/pricing service, start Docker, open hidden data, grant,
+  evaluate a candidate, run replay, push, or merge.
+- Preserve every existing PIT bundle/baseline/effective-policy/fold/parity
+  equality gate and schema-v3 calls/tokens/retries/apply/USD contracts.
+
+## Required correction
+
+1. Keep canonical legacy-readiness authentication through
+   `_authenticated_readiness` and its retained source/policy/data identities.
+2. Require the legacy readiness source head and the parity reference source head
+   to be valid, distinct local Git commits, with the legacy source an ancestor
+   of the parity reference source.
+3. Require the parity reference source to be an ancestor of the parity final
+   source/current source (the normal verifier already proves this; recheck at
+   manifest sealing for defense in depth).
+4. Require parity `final_source_head` and
+   `final_source_fingerprint_sha256` to equal the current clean source identity.
+5. Stop requiring legacy readiness source head/fingerprint to equal current
+   source. Still require its fingerprint to be a valid retained digest through
+   existing readiness validation.
+6. In the later parity identity-graph check, compare parity's final identity to
+   the actual current source, while retaining exact PIT bundle, baseline,
+   effective-policy, and discovery-fold-manifest equality.
+7. Fail closed on missing/divergent/non-ancestor commits or any Git ancestry
+   verification error. Do not weaken create-only output behavior.
+
+## Verification and handoff
+
+- Use the already recorded exact failing manifest invocation as the pre-fix
+  reproduction; do not spend time creating a permanent test.
+- Compile the changed production module and run `git diff --check`.
+- Run a bounded provider-free one-off pre-write identity smoke proving the
+  canonical legacy source is accepted only through the two-link ancestry chain,
+  the current source equals parity final, and a reversed/divergent chain is
+  rejected. It must not write `manifest.json`.
+- Self-review, commit the production file, verify clean status, and write the
+  ignored report `.superpowers/sdd/2026-08-28-pit-optimizer-audit-only-usd/task-7-report.md`.

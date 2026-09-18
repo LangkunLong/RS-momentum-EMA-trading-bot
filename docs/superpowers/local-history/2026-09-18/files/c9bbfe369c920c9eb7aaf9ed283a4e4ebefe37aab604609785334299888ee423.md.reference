@@ -1,0 +1,28 @@
+## Spec Compliance: ❌
+
+The five baseline entry points and the decision-validation shape follow the brief, and the new policy modules are side-effect free with no prohibited imports. ⚠️ The purported frozen, slotted, closed contracts retain a mutable `__dict__`, so they do not actually meet the immutable-snapshot boundary requirement.
+
+## Strengths
+
+- The public protocol and the ten contract types match the requested fields, use strict primitive validation, canonical JSON conversion, and bounded tuple collections.
+- `risk.py` preserves the configured capacity exactly (including `None`) and implements the required two-pass, deterministic eviction selection.
+- `exit.py` retains engine-owned pricing: policy actions only express tiers/reasons and choose from trusted stop candidates. The validation code checks tier crossing, remaining quantity, and stop membership.
+- Focused tests cover JSON round trips, rejected unknown constructor keys, invalid scalar values, uncapped capacity, tier ordering, and exit-plan validation. The reported focused suite result is plausible; I did not rerun it broadly.
+
+## Issues
+
+### Critical
+
+None.
+
+### Important
+
+- [core/strategy_policy/contracts.py:63](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-implementation/core/strategy_policy/contracts.py:63) — `_CanonicalContract` is not slotted. Every `@dataclass(frozen=True, slots=True)` subclass therefore inherits a mutable `__dict__`; for example, `EntryDecision(...).__dict__["symbol"] = "AAPL"` succeeds. This defeats the specified immutable, closed scalar/tuple snapshot boundary even though ordinary attribute assignment raises. Make the base class slot-only (for example, `__slots__ = ()`) and add a regression test asserting no contract instance has `__dict__` and that injected attributes cannot be added.
+
+### Minor
+
+None.
+
+## Assessment
+
+Task quality: **Needs fixes**. The implementation is otherwise well scoped and policy behavior is thoughtfully covered, but the mutable inherited instance dictionary is a material contract-boundary violation that must be closed before this task is accepted.

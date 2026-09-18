@@ -1,0 +1,15 @@
+## Finding Verdicts
+
+- **FIXED.** `QualificationAttemptCommitmentV5` now explicitly declares `scenario_grid_ref: ArtifactRefV5` immediately after `evaluator_contract_ref` (`docs/superpowers/plans/2026-09-04-pit-optimizer-v5-campaign.md:120-133`). This completes the previously missing authenticated binding. Combined with the existing qualification requirements to authenticate and compare the attempt, baseline, and candidate scenario-grid identities, the contract and implementation guidance are now aligned.
+
+## New Breakage
+
+None. The fix is a single, correctly scoped field addition to the qualification commitment. It matches the corresponding confirmation commitment and does not alter provider authorization, retirement behavior, or replay boundaries.
+
+## Out-of-Scope Observations
+
+None. This re-review was restricted to the stated finding and the one-commit fix diff; no tests, Git commands, provider calls, Docker/replay operations, or unrelated files were examined.
+
+## Verdict
+
+**ACCEPT.** The qualification attempt can now bind the authenticated friction/scenario-grid identity that its baseline/candidate equality checks require.

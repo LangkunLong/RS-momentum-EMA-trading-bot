@@ -1,0 +1,46 @@
+### Task 2: Prevent Reference Symbols from Becoming Holdings
+
+**Files:**
+
+- Modify: `core/backtest_engine.py`
+- Modify: `pit_baseline.py`
+- Modify: `core/pit_optimization.py`
+- Modify: `agent_loop.py`
+- Modify: `pit_optimizer_holdout.py`
+- Modify: `core/leader_basket.py`
+- Modify: `core/pit_diagnosis/fact_cache.py`
+- Modify: `tests/test_backtest_engine.py`
+- Modify: `tests/test_pit_optimizer_subset_reference.py`
+
+**Interfaces:**
+
+- Consumes: `PITDataBundle.tradable_symbols()`, `reference_symbols()`, and `price_symbols()` from Task 1.
+- Produces: explicit separation between `tradable_tickers`, `market_reference_tickers`, and `market_context_universe` in simulator/evaluator setup.
+
+- [ ] **Step 1: Migrate every trading-universe construction to `tradable_symbols()`.**
+
+  Replace `bundle.symbols()` and `ticker != "SPY"` filters in the listed files. Explicit user ticker lists must fail closed if they contain SPY, QQQ, or IWM. Candidate panels and holdings may contain only tradable membership symbols.
+
+- [ ] **Step 2: Load reference prices only as observations.**
+
+  In `PortfolioSimulator.run`, include all three references in `ticker_ohlcv` regardless of panel, keep them out of `tickers`, include full tradable membership plus references in `all_closes`, and bind both sets into checkpoint identity. Record tradable/reference/context counts in result configuration.
+
+- [ ] **Step 3: Remove evaluator-side SPY arithmetic.**
+
+  Update `_build_verification_scope` and the v3/v4 evaluator compositions so panel symbols are selected from `tradable_symbols()` and the separate full active membership universe is available for market context. Do not select v4 panel members from baseline trading activity.
+
+- [ ] **Step 4: Rewrite existing reference-exclusion assertions.**
+
+  Expand current subset-reference and bundle-backed simulator cases to prove none of SPY/QQQ/IWM can enter a panel, signal list, holding, or trade. Do not add a new test function.
+
+- [ ] **Step 5: Verify and commit.**
+
+  ```powershell
+  python -B -m compileall -q core/backtest_engine.py core/pit_optimization.py core/leader_basket.py core/pit_diagnosis/fact_cache.py pit_baseline.py pit_optimizer_holdout.py agent_loop.py
+  python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_backtest_engine.py tests/test_pit_optimizer_subset_reference.py
+  git add core/backtest_engine.py core/pit_optimization.py core/leader_basket.py core/pit_diagnosis/fact_cache.py pit_baseline.py pit_optimizer_holdout.py agent_loop.py tests/test_backtest_engine.py tests/test_pit_optimizer_subset_reference.py
+  git commit -m "fix: isolate PIT references from tradable universes"
+  ```
+
+  Expected: focused checks pass and every strategic caller has explicit reference/tradable semantics.
+

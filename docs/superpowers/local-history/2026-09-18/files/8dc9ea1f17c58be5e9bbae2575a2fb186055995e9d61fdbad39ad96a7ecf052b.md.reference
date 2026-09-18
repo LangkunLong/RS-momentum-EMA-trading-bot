@@ -1,0 +1,45 @@
+# C-c native campaign preparation driver report
+
+Status: **STATIC IMPLEMENTATION COMPLETE; DRIVER NOT EXECUTED.**
+
+The bounded driver is `prepare_c_c_campaign.py`, 48,796 bytes, SHA-256 `05a12300be6b9b1253c55cdfaff0b55005cb18a0fe520e31f95fe609093e9831`. It is frozen for independent static review. No campaign/root/resource/config/manifest/policy/preview was created by this work.
+
+## Fixed authority and execution gate
+
+The driver pins the final P1-P4 independent source review `4e4991b0dfcdcfe980b2bd2655ba5bf88af6300c956c179d2e258014dd1fef4b`, reviewed-source authority `d896bce97945b9438bed6f4837fd16213530338563e3bbd728eafaa8a9fbbe09`, all 22 exact source hashes, principal readiness `14f385172f29dccf258d4be4802137724774e57b267ebbac4201a4945c01aed2`, independent readiness `50cd6d863fb3f6235af3a47fcf90fe4d21a5425c8852055b470abe9c95634f3a`, preparation-tool evidence `c329ade7d4f50a705bd6992da477870f4d1e0c3e4862feffe0f855d7c3fb243d`, and native-launch notes `1ea2eabd612c94d3992f0485a9cc5ec387e4fd465e44fb1c48a97abbc06ef49c`.
+
+Execution additionally requires explicit command-line pins for the fixed source review, source authority, both readiness reviews, this exact driver SHA, and a new `campaign-preparation-driver/independent-review.md` SHA. The independent review must contain this exact driver SHA and an explicit approval verdict. Python bytecode suppression is mandatory. All gates, all 22 current source-byte checks, exact tool-file checks, source inventory reads, quick-evidence reads, and selected-path absence checks precede project imports and every destination write.
+
+The selected physical Python, Git, and Docker files are pinned to the paths and hashes in `preparation-tool-files.json`. The process must already be running under that physical Python executable; the WindowsApps launcher alias is not hashed or accepted as the launch executable. Docker is hashed as a file and supplied to native composition but never executed by the driver. No environment values are published. Credential authority remains only the native `OPENROUTER_API_KEY` handle, with lazy resolution.
+
+## Exact preparation
+
+The driver fixes campaign ID `development-provider-two-evaluated-admission-20260908-01`, fresh artifact root `.artifacts/pit-optimizer-v5/development/provider-admission-20260908-01` in the architecture worktree, and fresh disjoint resource roots under the main repository `.artifacts/pit-v5-admission-20260908-01`. It requires both selected parents to be absent, creates them exclusively after authentication of actual06, and rejects link/reparse roots, overlap, unexpected parents, or prior content. The fresh mounted data directory receives only the two authenticated data files.
+
+It authenticates actual06's fixed manifest graph and imports exactly the 14 inventory dependencies plus the parent provenance sidecar and eight original request/output blobs. Typed dependencies and panel specs use their native repository loaders/writers; raw data uses exclusive exact-byte writes followed by native raw authentication; parent blobs use `append_binary_state` only in `development-parent-originals`. No old manifest, scope, config, launch/start/admission state, role state, ledger/reservation, owner, lease, checkpoint, archive, record, critic, response, or result is imported.
+
+It then uses the reviewed native calls in this order:
+
+1. `capture_development_policy_v5` at immutable commit `0985d9bae74162ec1da8a7268bd54e47f21b0b85`, checking the four exact policy blob hashes.
+2. Direct `build_campaign_manifest_v5` with the fixed target/evaluator/profile/panel/baseline authorities and the approved C-c search, provider, token, and resource limits.
+3. `prepare_development_adapter_config_v5` for native round-1 composition and a newly generated owner digest.
+4. Native create-only `CampaignAdmissionPolicyV5` followed by `authenticate_prepared_campaign_policy_v5`; no binding or enrollment is created.
+5. `DevelopmentRoundFactoryV5`, `LocalArchiveReducerFactoryV5.recovery_reducer(...).initial()`, an actual empty `SearchProjectionV5`, `select_parent_v5`, and the composed normal request factory's `investigator_request`.
+6. `require_role_envelope_v5` plus `prospective_role_usage_v5` for the exact nonpersisting preview.
+7. `render_production_command_v5(command="run-campaign", campaign_policy_ref=...)` for the native saved command.
+
+Repository hashes are compared before/after preview construction and before/after command rendering. The eventual output package saves exact canonical request, wire-message, and wire-schema bytes outside role/state namespaces, along with hashes, sizes, prospective token accounting, graph/parent/quick references, native config/tool identities, the policy-pinned command, and explicit `maximum_usd: null` / absent price authority. Later author and critic request bytes remain explicitly unknown because they depend on actual authorized responses and evaluation evidence.
+
+The source contains no round/campaign runner, provider call, evaluator call, Docker invocation, ledger reservation, role append, admission binding, or enrollment call. It does not write or run an awake/credential launcher.
+
+## Static verification
+
+- Scoped Ruff: PASS.
+- AST parse and in-memory compile: PASS.
+- Static call inspection found the required native preparation calls and none of `run_feedback_round_v5`, `_run_campaign_v5`, `create_campaign_admission_v5`, `reserve_role_slot`, or role-request append calls.
+- Project imports occur only after `authenticate_review_gates` and `preflight_paths_and_inputs`.
+- Current reviewed source map: 22/22 match, zero mismatches.
+- `git diff --check`: PASS.
+- Selected artifact and resource roots remained absent after all checks.
+
+No tests were read, created, modified, or run. No source import probe, synthetic request/result/record, API/model/provider activity, Docker/evaluation/campaign activity, Git mutation, archive mutation, credential access, `.env` access, or environment-value dump occurred.

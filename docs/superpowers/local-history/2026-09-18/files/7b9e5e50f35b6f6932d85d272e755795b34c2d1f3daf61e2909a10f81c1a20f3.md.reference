@@ -1,0 +1,21 @@
+# Scoped Docker 29 inspection review
+
+**PASS.** No concrete findings in the scoped unstaged compatibility diff. Spec and quality pass for the observed schema and the source-level lifecycle handling reviewed here.
+
+Reviewed only the diff in `core/pit_optimizer_v5/production_sandbox.py`, necessary inspection/attestation/lifecycle source context, and the saved `.artifacts/pit-optimizer-v5/development/runtime-02/created-container-inspect.json`. The source SHA-256 independently matches `4724102f9e8425862ae63e5728816a0c2c019344bd73a065fa0ac8268c20965c`.
+
+## Compatibility and preserved checks
+
+- The saved container is `created`, not running, with exact `Storage.RootFS.Snapshot.Name=overlayfs`, no `GraphDriver`, and empty engine-generated hosts/resolver paths. The new top-level branch accepts this closed storage shape, requires exactly one of Storage/GraphDriver, rejects additional top-level fields, and retains the legacy graph-driver branch. Modern storage with another driver or additional storage content fails the exact equality check.
+- Empty engine paths are permitted only for modern storage in created state. Otherwise each path must be a bounded NUL-free string containing the container identity. The modern stable attestation normalizes those lifecycle-allocated path values to that identity, so allocation at start does not itself invalidate the created attestation. Full container ID, name, creation timestamp, image ID, command, labels and the rest of the stable authority remain bound. State validation and private-none-network lifecycle checks still run separately on every inspection; the normalization does not authorize an arbitrary state transition.
+- The limited omitted-default allowlists match fields absent from the supplied Config/HostConfig. Present non-default values still fail equality checks; fields outside the closed known sets still fail. Privileged mode, capability additions, writable root filesystem, devices, extra networking and resource changes are not exempted. Exact CPU, memory, swap, PID, isolation, security options and temporary-filesystem expectations remain intact.
+- The saved output bind omits HostConfig ReadOnly and resolves to RW=true; candidate/data/request mounts explicitly retain ReadOnly=true and resolve to RW=false. Defaulting the omitted field to false still compares each resulting source/target/write-permission tuple with the exact reservation. Accepting resolved Mode="" likewise retains the required boolean RW, exact tuple match, bind-only type, rprivate propagation, count and uniqueness checks. Explicit ro/rw strings must still agree with RW.
+- MaskedPaths permits reordered existing masks, optionally plus the observed `/proc/interrupts`, with duplicates rejected. Every baseline mask remains required; unrelated additions or omissions do not pass normalization. ReadonlyPaths remain unchanged.
+- The saved NetworkSettings contains the four now-required modern fields. Removed legacy fields default only to their previously required empty values. Any present connectivity value still fails, unknown fields still fail, and the exact none-network subobject checks remain. Running state still requires a populated private none-network identity; created state requires it empty.
+- Inspection canonicalization does not rewrite terminal results or alter failure persistence. The frozen failed evaluation remains failed; this patch alone does not retry it or claim cleanup completion.
+
+## Evidence limits
+
+The saved created-state JSON directly supports the compatibility cases above. No running/exited Docker inspection was obtained by this review, and no parser invocation, actual cleanup, next evaluation or successful lifecycle transition was executed. These remain controller-owned. The primary Moby API 1.52 explanation linked in the dispatch was supplied as controller-verified context; it was not fetched because this review explicitly prohibited network access. No image rebuild or image-closure check was performed.
+
+No tests were read, created, changed or run. No probes, application imports/execution, Docker calls, network, agents, commits or staging occurred. Only this report was written. The verdict applies to the identified unstaged source bytes, not to a new commit or completed runtime recovery.

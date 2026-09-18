@@ -1,0 +1,17 @@
+# SDD ledger — plan: .artifacts/pit-optimizer-v5/development/luna-recovery-b3b/next-luna-prompt-b4a.md
+
+## Preflight interface and constraint scan
+
+| Scope/task | Produces | Consumes/preserves | Finding |
+| --- | --- | --- | --- |
+| B4a runtime routing | runtime-only outcome-to-rejected-carrier routing and union filtering | approved B1 outcomes, B2 event/payload authority, B3a carrier, B3b record/publication guard | Clean: the prompt explicitly defers lifecycle/finalization/feedback changes to B4b/B4c. |
+| B4a rendering/rejection recovery | one durable journal event for a fresh rejection, or reuse of its exact existing event | existing authenticated accepted author and current journal | Clean: B2 owns context validation; B4a must use it rather than modify it. |
+| B4a screening/discovery/critic | rejected carrier passes through without materialization; critic input contains only materialized testable candidates | existing CandidateEvidenceV5 pipeline and no_testable abort | Clean: the no-testable abort remains intentionally unchanged. |
+
+Ruling: use this B4a review package as the SDD ledger and exact-preimage review surface rather than the generic SDD commit/range workflow — the user expressly forbids commits and requires a fresh artifact package with a runtime preimage; if wrong, the review may lack generic commit metadata but retains the exact scoped source diff required by the architect.
+
+Ruling: do not create or run tests despite generic TDD/baseline guidance — the approved B4a prompt explicitly prohibits reading, creating, changing, or running tests; if wrong, static review/archived inputs may miss behavioral defects, which the architect has accepted as the checkpoint tradeoff.
+
+Task B4a: in progress (base source hash 1c4c4dd2a3c7082982866e6ed820336e5afeb9755b0005fb80e65224bcc0d462; no commits permitted)
+
+Task B4a: complete (no commits permitted; exact-preimage review clean; independent static review clean)

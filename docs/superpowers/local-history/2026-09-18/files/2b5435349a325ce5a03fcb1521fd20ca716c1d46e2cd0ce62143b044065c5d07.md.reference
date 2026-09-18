@@ -1,0 +1,37 @@
+# Task 11A report — strict proper-base authority profile
+
+## Delivered
+
+- Added a closed, immutable `strict-proper-base-task11` profile for the completed
+  Task 11 replay, with its exact manifest, artifact, normalized-row, ledger, and
+  summary identities.
+- Preserved the existing Task 6 authority and default CLI behavior.
+- Added offline `verify-baseline` for artifact-only verification of the selected
+  authority profile.
+- Refused to run Task 11 through the cached D0–D4 path because that path is not
+  production-contract-faithful to Task 11.
+- Marked Task 11 explicitly `fidelity_incomplete`; it cannot be combined with
+  `--strict-canslim`.
+- Bound the manifest SHA-256 before parsing so a field-preserving manifest rewrite
+  cannot pass verification.
+
+## Validation performed
+
+- Direct immutable Task 11 verification accepted manifest
+  `f99eb6aade8b567b319accb95dadd80789064aacf1cb8b85d0cc31379caf6382`
+  and reconciled 233 qualified, 176 executed, 57 next-open rejects, and zero cash
+  rejects.
+- Default Task 6 profile resolution remained unchanged.
+- Unknown profiles, Task 11 cached execution, and Task 11 plus `--strict-canslim`
+  fail closed.
+- `tools/rebind_pit_diagnosis_checkpoints.py` remains compatible with the original
+  three-value `_context()` return contract.
+- `py_compile` and `git diff --check` passed. No unit tests were added or run,
+  following the user's explicit defer-tests instruction.
+
+## Review
+
+Fresh task review accepted the final diff. Deferred only for the later test phase:
+`tests/test_pit_diagnosis_baseline.py:148` must set its synthetic authority manifest
+digest to exercise the new manifest-binding invariant.
+

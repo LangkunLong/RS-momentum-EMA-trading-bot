@@ -1,0 +1,39 @@
+# Task 7 report — legacy-readiness descendant authentication
+
+## Outcome
+
+Task 7 is complete at commit `205df8d` (`Repair PIT readiness descendant authentication`). The required clean base was confirmed before editing. The only tracked production file changed was `core/pit_optimization_contract.py`.
+
+The manifest builder now:
+
+- retains canonical legacy-readiness authentication through `_authenticated_readiness`;
+- requires the legacy readiness source commit to be a distinct local ancestor of the parity reference commit;
+- rechecks that the parity reference commit is a distinct local ancestor of parity final;
+- requires parity final head and tree fingerprint to equal the actual current clean source identity;
+- seals that current identity, rather than the historical readiness identity, into the schema-v3 manifest.
+
+The existing PIT bundle, baseline manifest, effective-policy, discovery-fold-manifest, and parity equality gates remain unchanged. Schema-v3 call/token limits, zero retries, `apply=false`, audit-only behavior, and create-only manifest writing were not changed.
+
+## Bounded verification
+
+| Check | Result |
+|---|---|
+| Required base HEAD and clean status | PASS |
+| In-memory compile of `core/pit_optimization_contract.py` | PASS |
+| `git diff --check` and staged diff check | PASS |
+| Pre-write identity smoke with canonical retained readiness/parity | PASS |
+| Legacy → parity-reference → parity-final ancestry | PASS |
+| Parity-final/current committed identity equality | PASS |
+| Reversed/non-ancestor chain rejection | PASS |
+| Schema-v3 six-call / 448,000-token / zero-retry / `apply=false` invariants | PASS |
+| `manifest.json` absent before and after smoke | PASS |
+| Commit hooks | PASS |
+| Post-commit tracked status | CLEAN |
+
+The smoke invoked the real pre-write manifest builder in memory through a controlled source-identity seam so the uncommitted module under review did not masquerade as a clean source. It authenticated the retained canonical inputs and exercised every pre-write bundle, policy, fold, parity, and ancestry gate. It did not call the manifest writer.
+
+## Boundaries and residual risk
+
+No test, tracked documentation, manifest, readiness/parity artifact, policy source, or rounded-stop clamp was changed. No provider, pricing, network, Docker, hidden-fold, grant, candidate, replay, push, or merge action occurred.
+
+No permanent regression test was added under the explicit Task 7 boundary. Because this production fix advances the committed source identity, provider-free parity must be regenerated against this new clean commit before a real schema-v3 manifest/readiness package can be created; the retained pre-fix parity artifact must not be reused as current-source authority.

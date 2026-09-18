@@ -1,0 +1,104 @@
+# P3 enrollment and campaign-boundary preparation
+
+Read-only preparation only. No production source was edited or executed. Inputs were the accepted P3 plan/spec, the principal native-prefix notes, unchanged `operations.py`/`cli.py`, focused immutable repository APIs, and the P1 frozen preimage at `admission-p2/principal-preimages/campaign_admission.py` (SHA-256 `7e15ed500121b4c85df7a838feab51750e1f476a3e5427b9d1a0b1f0f58a89d9`). I did not read the moving live admission/runtime/provider sources. The inspected unchanged source hashes were `operations.py` `8164379a88d045c795ce3487683c5d5d911e56583d0555a01551e934cdea2bcc` and `cli.py` `59044289f6f8cd3050e5f3604c30813f7f627fd221651af6ea76c74b4a6feb22`.
+
+## Public plumbing and compatibility
+
+- Extend `_run_campaign_v5` with `campaign_policy_ref: ArtifactRefV5 | None = None`. Existing `**kwargs` production/development wrappers keep forwarding it.
+- Extend `render_production_command_v5` with the same optional argument and default. Preserve all existing return keys and launch/summary schemas; enrollment is pinned in rendered `argv`/PowerShell command.
+- For `run-campaign` and `resume-campaign`, add the exact optional pair `--campaign-policy-path` and `--campaign-policy-sha256`. Both absent means `None`; exactly one present is an invalid request; both present are passed through `ArtifactRefV5` so the existing closed path/digest grammar applies. Do not add these options to prepare or single-round commands.
+- Dispatch passes the parsed optional reference to the selected campaign operation. An omitted pair remains the exact legacy default. A supplied pair is an expectation, never an authority substitute.
+- A fresh enrolled `run-campaign` rendering includes the explicit prepared policy ref. Every enrolled pending-response `resume_command` includes the binding's independently authenticated `policy_ref`, even when the current resume invocation omitted the pair. A legacy resume renders no policy flags.
+- Do not change `CampaignLaunchV5` or `CampaignRoundLaunchV5` fields, defaults, canonical bytes, keys, or identity formulas. Fresh launch remains the same `CampaignLaunchV5(authenticated.manifest_ref, adapter_config_ref, token, started_epoch_ms)` under key `manifest.sha256`. Round configuration/start values remain unchanged.
+
+## Enrollment state machine inside the launch lock
+
+All selection, authentication, freshness, enrollment, and launch publication remain inside the existing `adapter_state_transition(namespace="campaign-launch", key=manifest.sha256)` lock. Adapter composition/validation remains the first read-only host-identity check.
+
+1. Discover campaign launch and admission state without implicit typed-state repair. Authenticate supplied policy bytes before constructing any binding. Require exact equality to the invocation's original `authenticated.manifest_ref`, `adapter_config_ref`, owner digest, and repository-root identity, in addition to the frozen P1 prepared-policy checks.
+2. Existing launch plus `resume=False` keeps the current “use resume-campaign” failure. Existing launch plus `resume=True` authenticates the original launch tuple first, then discovers enrollment even when `campaign_policy_ref` is omitted. If supplied, it must equal the enrolled binding ref. No binding plus omitted ref is legacy. No binding plus supplied ref fails; never enroll an already launched legacy campaign.
+3. No launch plus `resume=True` keeps the current “use run-campaign” failure. It must not turn a binding-only interrupted publication into a resume operation.
+4. No launch plus omitted ref takes the unchanged legacy fresh-launch path. It must not accept an existing binding: a binding-only state requires the same explicit policy pin to continue.
+5. No launch plus explicit ref is the only enrollment path. Before the first possible write, authenticate the expected binding identities and a real fresh/no-start/no-spend census: no contradictory launch half, no round configuration or round-start state for this campaign, no round journal, no checkpoint/committed record, no request or invocation, no reservation/response/terminal/charged usage, and no resource/candidate state indicating a begun round. Retain the existing local graph/ledger verification as an additional check; do not use it instead of the focused immutable census.
+6. With freshness proved, publish or authenticate exactly `CampaignAdmissionBindingV5(5, explicit_policy_ref, authenticated.manifest_ref, adapter_config_ref, token, repository.root_identity_sha256)` under namespace `campaign-admission`, key `manifest.sha256`. Then append the unchanged campaign launch. Never overwrite either value.
+
+The explicit crash cases are closed as follows:
+
+- Both binding halves absent: create the exact binding, then launch.
+- Exact binding value and index present, launch absent: accept only the same explicit policy after repeating all identity and freshness checks, then append launch.
+- Exact binding value present with only its authority index missing: after the same checks and before launch, call `recover_typed_state_index` with the exact expected binding. This helper may publish only the missing index. Re-read admission with `repair=False` and require exact equality before launch.
+- Authority without value, changed/noncanonical value, different policy/binding, foreign key, malformed namespace member, contradictory/orphan launch, or any start/spend evidence: fail closed with no write.
+
+Do not catch a broad authentication failure and call recovery. Recovery is permitted only for the independently identified sole missing binding-index case. In particular, all policy/config/manifest/root/owner and freshness reads must complete before recovery. P1 admission discovery remains immutable and is not changed to repair implicitly.
+
+## Facts required from reviewed P2
+
+P3 must consume P2's reviewed data-only immutable facts; it must not recreate ledger arithmetic, filter the repository, call whole completed-history authentication on a partial campaign, or infer a round from request content. Exact names/signatures are intentionally deferred to the P2 review. P3 needs the reviewed facts/composition to provide:
+
+- authenticated original manifest/config/owner/root and campaign launch/deadline identities;
+- a union census of campaign-round configuration and campaign-round-started value/index members, with canonical keys, exact pair agreement, and rejection of malformed, orphan, foreign, conflicting, gapped, or out-of-range state;
+- all observed started round indices, whether each is settled, and whether successful cleanup exists, so no target success can hide a later pending/failed started round;
+- a prefix view for the candidate round that excludes an existing unstarted candidate from prior attempted/spend counters and preserves the original admission for an already started continuation;
+- exact `evaluated_feedback_rounds`, `attempted_rounds`, `external_attempts`, `total_tokens`, and finite `Decimal cost_usd` for `campaign_boundary_decision_v5`;
+- evaluated count as distinct round indices having an authenticated committed `status == "evaluated"` record with campaign evidence, intersected with actual successful-cleanup indices;
+- authenticated request/invocation/ledger usage and settlement facts, including all real prior packages and earlier roles in an active round, without a fake current package;
+- explicit contradiction/failure state rather than a permissive partial result.
+
+The enrollment freshness use needs the same immutable census specialized to zero launch/start/spend. If P2 does not expose enough to establish this without reconstructing its private rules, P3 must stop for a focused P2 interface extension and review; it must not guess the interface or copy its logic.
+
+## Boundary placement and state transitions
+
+Legacy (`admission is None`) follows the current loop byte-for-behavior: reconcile, reuse, deadline/provider checks, configuration/start publication, runtime, cleanup/failure handling, final verification and the existing `max_feedback_rounds` result.
+
+For enrollment, reload/authenticate admission and settled facts at each decision; do not cache absence. Apply the pure P1 decision only at a settled boundary:
+
+1. Reconcile existing paid roles for the current observed round first.
+2. Authenticate ownership/integrity, journal/ledger/resource facts, terminal/committed state, and cleanup. Existing pending, runtime/provider, cleanup, authority, clock/deadline, and status/novelty failures keep their current return/break reason before policy stopping.
+3. Before reporting target success, inspect the global observed-start census. Every observed started round must have been reconciled and settled with successful cleanup, and no later pending/failed/contradictory start may be hidden by an earlier reused round.
+4. After every accepted settled round, reused or newly executed, recompute facts and the policy decision. This is required even on the final manifest round so reaching the target there reports `evaluated_feedback_target_reached` instead of falling through to `max_feedback_rounds`.
+5. Before creating a missing next-round adapter config or `campaign-round` state, recompute the decision from the settled prior prefix. A non-`admit` result causes no config, state, request, or synthetic outcome write.
+6. For an already existing configuration with no start, validate the unchanged configuration/owner shape, recheck existing deadline/provider precedence, then recompute from the prior prefix immediately before appending `campaign-round-started`. A non-`admit` result leaves the pre-start configuration observed and performs no further write.
+7. For an already started current round, do not rerun new-round admission using current-round spend. Continue only under its authenticated original start/admission and persisted campaign/round deadlines; P2 request/ledger guards own per-call continuation.
+
+The boundary call receives the reviewed facts verbatim:
+
+```python
+decision = campaign_boundary_decision_v5(
+    policy=admission.policy,
+    manifest=manifest,
+    evaluated_feedback_rounds=facts.evaluated_feedback_rounds,
+    attempted_rounds=facts.attempted_rounds,
+    external_attempts=facts.external_attempts,
+    total_tokens=facts.total_tokens,
+    cost_usd=facts.cost_usd,
+)
+```
+
+`evaluated_feedback_target_reached` returns outer `status="completed"` with that distinct reason. `insufficient_milestone_reserve` returns `status="stopped"`. Neither appends a round outcome, cleanup, finalizer, denial package, request, or other evidence. Existing summaries and count formulas are untouched. Existing failure-class exit-code behavior remains unchanged; the two policy reasons are successful operational exits unless the current CLI contract is independently ruled otherwise.
+
+## Implementation/review checks for the follow-up
+
+- Save fresh source preimages before the one-writer P3 edit; the hashes above are preparation observations, not authorization to overwrite changed source.
+- Source/AST inspection must show: one optional operation argument and one optional renderer argument; exact CLI pair validation; enrollment append before unchanged launch append under the same lock; no implicit repair before freshness; only exact binding-index recovery; checks before config creation and before first start; checks after both reused and new settlements; and enrolled resume rendering pinned to the selected policy.
+- Diff inspection must show no changes to old dataclasses, summary formulas, single-round commands, runtime/provider/cleanup logic, or legacy defaults. Scoped Ruff and in-memory compile are deferred to the authorized P3 implementation/review; no tests, imports, synthetic artifacts, readers, summaries, provider calls, or execution belong to this preparation.
+
+No architectural ruling is requested. The only implementation dependency is the reviewed P2 facts surface described above.
+
+## Frozen P2 interface refresh
+
+This addendum supersedes the preceding suggestion that a missing composed boundary interface would require a separate P2 task. The inspected P2 review freeze is `admission-p2/review-freeze-01/campaign_admission.py`, SHA-256 `07fdea2f5aa8d86b58a1f7537306253dc63fcb8ed6ed2290ddf745ad643e5d14`. P2 is still under independent review; these are preparation mappings, not approval of that source.
+
+The concrete reusable private surface is:
+
+- `_state_names_v5(repository, namespace) -> tuple[str, ...]`: immutable value/index union census with closed key grammar.
+- `_selected_campaign_launch_v5(*, repository, manifest, admission) -> CampaignLaunchV5`: global selected-launch census, `repair=False`, foreign-key rejection, and exactly-one requirement. Its exactly-one wrapper is for launched execution; P3 freshness needs a narrow zero-or-one census extracted from the same selection logic rather than duplicating it.
+- `_selected_round_states_v5(*, repository, manifest, admission, namespace) -> dict[int, CampaignRoundLaunchV5]`: global immutable selection for `campaign-round` and `campaign-round-started`, including foreign-key, duplicate, and out-of-range rejection. P3 can pass the in-memory expected admission before binding publication.
+- `_require_round_config_matches_original_v5(original, current) -> None`: preserves all non-derived original configuration identities.
+- `_load_campaign_round_authority_v5(*, repository, manifest, admission, round_index, owner_token_sha256) -> _LiveCampaignRoundAuthorityV5`: exact launched/started prefix, original config/owner/root, and stored deadline authentication. It remains the already-started live path and cannot represent a pre-start boundary.
+- `_campaign_event_rounds_v5(repository, manifest) -> tuple[int, ...]`: canonical global round-journal directory census.
+- `_role_packages_v5(*, repository, manifest, round_index, payloads, policy)`: exact role-call/journal binding, primary-position prefix, and envelope authentication.
+- `_load_live_role_prefix_v5(*, repository, manifest, authority, request, round_index) -> _LiveRolePrefixV5`: reviewed request-specific prior prefix. It returns prior evaluated/attempted/receipt counters plus replay, but deliberately requires an actual started current round and real request. P3 must not call it with a synthetic request or reinterpret its `attempted_rounds=round_index - 1` result as a post-settlement boundary.
+
+The concrete architecture gap is limited: no frozen P2 composition represents (a) enrollment freshness before any launch, (b) an existing configuration before first start, or (c) counters after a newly/reused settled round, including a whole-campaign observed-start check. P3 may add focused data-only freshness/boundary facts in `campaign_admission.py` under P3 review. That composition must reuse the selectors/package/resource/ledger proof already used by P2, keep `_load_campaign_round_authority_v5`, `_load_live_role_prefix_v5`, and `require_live_role_admission_v5` behavior unchanged, and avoid copied ledger arithmetic.
+
+Freshness is scoped to selected operational authority for this manifest: launch/round/start state, journals, requests/invocations, ledger reservations/terminals/charged usage, and begun resource/candidate authority must be absent. Authenticated prepared-policy, source, fixed-parent, manifest/config, and other required evidence artifacts are legitimate and must not be rejected merely because the repository is not byte-empty. Legacy launch loading retains its existing operational repair behavior and order; only new enrolled selection/freshness uses immutable reads before its explicitly gated binding-index recovery.

@@ -1,0 +1,26 @@
+# Task 6 Review — Baseline V3 Policy Bundle
+
+## Verdict
+
+**APPROVED**
+
+Commit `2f62f3c` satisfies the Task 6 brief against base `ec29dcf`.
+
+## Scope and interface evidence
+
+- The commit changes exactly the six authorized source files. V1/V2 sources and all tests are absent from the diff.
+- `core/strategy_policy/v3/entry.py`, `risk.py`, and `exit.py` each pass the exact V2 snapshot at `snapshot.base` to the corresponding V2 policy function. This is deterministic parity delegation for entry, capacity, allocation, eviction, and exit.
+- `core/strategy_policy/v3/position.py` returns exactly the requested inert `AddOnDecisionV3`: `add=False`, `risk_fraction=0.0`, `notional_fraction_cap=None`, and `reason_code="baseline_no_add_on"`.
+- `core/strategy_policy/v3/__init__.py` exposes interface version `3` and the six required policy functions. The trusted `InProcessPolicyClientV3` imports the four module paths and accepts their dispatch shape.
+- `EDITABLE_POLICY_PATHS_V5` is the ordered immutable four-path tuple required by the brief. Its read-only export map binds those paths to the exact six required functions, and `POLICY_INTERFACE_VERSION_V5` resolves to V3.
+- Normal-mode validation authorizes only required exported functions or public uppercase module constants, rejects unknown paths/functions, rejects malformed and duplicate edits, and requires exactly one authoring mode.
+- Full-source validation rejects strings, non-iterables, reordering, partial bundles, and mixed normal/full-source modes. It only accepts the complete ordered four-file tuple, so the escape is explicit and atomic. Repository search found no second V5 policy-authoring scope.
+
+## Verification run
+
+- `python -B -m pytest tests/test_strategy_policy.py -q` — 41 passed (two existing warnings: `websockets.legacy` deprecation and a sandbox-denied pytest-cache write).
+- `python -B -m compileall -q core/strategy_policy/v3 core/pit_optimizer_v5/policy_scope.py` — passed.
+- `python -B -m ruff check core/strategy_policy/v3 core/pit_optimizer_v5/policy_scope.py` — all checks passed.
+- Direct runtime/scope smoke — passed: V3 interface and in-process loader shape, valid normal function/constant edits, the full ordered escape bundle, and rejection of empty, partial, mixed, and unlisted-function requests.
+
+No implementation or test files were modified during this review.

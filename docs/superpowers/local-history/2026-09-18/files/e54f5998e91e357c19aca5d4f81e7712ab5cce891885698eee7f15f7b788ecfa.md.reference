@@ -1,0 +1,9 @@
+# P2 immutable preservation report
+
+The complete accepted archive maps in `increment-c-history-verifier/current-verifier-evidence.json` were compared with current bytes and paths through Windows extended paths. The map itself retained SHA-256 `b1b648418bfaa66f830f056570964851880a0c7181ef6adbf0a901d9179c0a3b`.
+
+- `runtime-04`: 579 expected and observed files, 69,994,319 bytes, every SHA-256 unchanged, no missing or added path.
+- `provider-runtime-06`: 83 expected and observed files, 68,980,002 bytes, every SHA-256 unchanged, no missing or added path.
+- Evaluator closure: all 56 paths in `increment-c-history-h3/h3b-evaluator-source-map.json` match their recorded SHA-256 values; the map remains pinned by SHA-256 `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4`.
+
+This was a static direct-byte comparison. No archive reader, repair, historical summary, evaluator, provider, model, or campaign execution was invoked.

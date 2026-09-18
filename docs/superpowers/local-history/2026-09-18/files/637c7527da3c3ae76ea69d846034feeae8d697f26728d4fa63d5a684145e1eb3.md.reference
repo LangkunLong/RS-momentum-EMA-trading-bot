@@ -1,0 +1,25 @@
+# B2 authority-correction architect checkpoint
+
+## Scope
+
+This correction changes only `core/pit_optimizer_v5/artifacts.py`. It preserves the approved B2 payload/event schemas, exact decoder, B1 rendering behavior, runtime mapping, `memory.py` terminal-state fold, `candidate_ir.py`, and Increment A source.
+
+The correction package started from the architect-verified B2 hashes. `preimages/artifacts.py` is the exact starting source; `correction-diff.patch` is the sole production diff against that preimage.
+
+## Corrected rejection authority
+
+After authenticating the accepted author invocation, `_validate_render_rejection_context` now explicitly narrows `request.role_input` to `AuthorRoleInputV5` and requires `author_input.hypothesis.sha256 == intent.hypothesis.sha256`. Thus an author request with the same hypothesis ID but different instructions, claims, predictions, or evidence fails before identity derivation. Existing parent, discovery-plan, campaign/round, accepted artifact, template, assignment, cap, and rendered-assignment conflict checks are retained.
+
+Only after every rejection has passed the existing context authentication does the validator collect rejected identity hashes. With none, it returns without loading any critic packages. Otherwise, it authenticates every persisted critic completion, including failed ones. It verifies the completion/event and stored call/request are critic authority for the same campaign and round, then rejects an intersection between the critic request's bound experiment IDs and the rejected identities. A critic whose bound IDs are exclusively other candidates is allowed.
+
+Both `append_round_event` and `load_round_events` invoke this shared validator after the existing fold. Consequently the complete-hypothesis and critic-exclusion rules apply to append and replay without recursive event loading. The existing fold still blocks candidate work after critic completion; the B2 rendered-assignment conflict and absent-to-terminal checks are unchanged.
+
+## Verification limits
+
+Read-only actual06 inspection authenticated the manifest graph, durable intent, accepted author invocation, typed `AuthorRoleInputV5`, and cap-one assignment. The author-input and intent complete hypothesis hashes match at `a075e27c21a40c71b4dc8e67cf49a0dbffc42f6c528717c905173b2b5da9eea5`; the same invalid identity was derived without writing an event.
+
+Actual06 has zero `render_rejected` events and zero critic completions. It therefore proves neither new append/replay branch nor mixed-round critic exclusion. Those invariants were reviewed statically through the shared-validator call paths; no synthetic event, fake response, candidate evaluation, or campaign activity was used.
+
+Scoped Ruff, in-memory compilation, and diff checking passed. Evaluator identity remains `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4` across 56 covered files.
+
+No tests, model/API calls, credential reads, candidate evaluations, campaign restarts, commits, pushes, or deployment occurred. B3 and B4 remain out of scope and unimplemented.

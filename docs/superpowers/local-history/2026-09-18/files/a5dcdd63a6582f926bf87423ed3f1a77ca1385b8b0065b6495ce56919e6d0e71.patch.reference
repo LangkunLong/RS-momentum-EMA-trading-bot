@@ -1,0 +1,91 @@
+diff --git a/core/pit_optimizer_v5/production_runtime.py.artifacts/pit-optimizer-v5/development/luna-recovery-b3a/preimages/production_runtime.py b/core/pit_optimizer_v5/production_runtime.pycore/pit_optimizer_v5/production_runtime.py
+index 38588fb..af6f329 100644
+--- a/core/pit_optimizer_v5/production_runtime.py.artifacts/pit-optimizer-v5/development/luna-recovery-b3a/preimages/production_runtime.py
++++ b/core/pit_optimizer_v5/production_runtime.pycore/pit_optimizer_v5/production_runtime.py
+@@ -88,9 +88,11 @@ from core.pit_optimizer_v5.provider import (
+ )
+ from core.pit_optimizer_v5.runtime import (
+     CandidateEvidenceV5,
++    CandidateRecordEvidenceV5,
+     FeedbackRoundInputV5,
+     MaterializedVariantV5,
+     OwnedLeaseV5,
++    RejectedCandidateEvidenceV5,
+     SearchProjectionV5,
+     StageDeadlineV5,
+ )
+@@ -1203,16 +1205,67 @@ class CanonicalExperimentRecordFactoryV5:
+         parent: ParentCandidateV5,
+         decision: ScheduledHypothesisV5,
+         template: StructuralTemplateV5,
+-        candidates: tuple[CandidateEvidenceV5, ...],
+-        critic: CriticArtifactV5,
+-        critic_ref: ArtifactRefV5,
++        candidates: tuple[CandidateRecordEvidenceV5, ...],
++        critic: CriticArtifactV5 | None,
++        critic_ref: ArtifactRefV5 | None,
+     ) -> tuple[ExperimentRecordV5, ...]:
+-        reviews = {item.experiment_id: item for item in critic.reviews}
+-        expected_ids = tuple(item.experiment_id for item in candidates if is_testable_experiment_status_v5(item.status))
+-        if tuple(reviews) != expected_ids:
+-            raise ValueError("critic reviews differ from finalized experiment order")
++        if type(candidates) is not tuple or not candidates:
++            raise ValueError("record construction requires a nonempty candidate batch")
++        expected_ids: list[str] = []
++        for candidate in candidates:
++            if type(candidate) is CandidateEvidenceV5:
++                if is_testable_experiment_status_v5(candidate.status):
++                    expected_ids.append(candidate.experiment_id)
++            elif type(candidate) is not RejectedCandidateEvidenceV5:
++                raise ValueError("record candidate carrier is invalid")
++        if (critic is None) != (critic_ref is None):
++            raise ValueError("critic artifact and reference must be present together")
++        if critic is not None and (type(critic) is not CriticArtifactV5 or type(critic_ref) is not ArtifactRefV5):
++            raise ValueError("critic artifact binding is invalid")
++        if expected_ids:
++            if critic is None or critic_ref is None:
++                raise ValueError("testable records require a complete critic binding")
++            reviews = {item.experiment_id: item for item in critic.reviews}
++            if tuple(reviews) != tuple(expected_ids):
++                raise ValueError("critic reviews differ from finalized experiment order")
++        else:
++            if critic is not None or critic_ref is not None:
++                raise ValueError("untestable records must not carry a critic binding")
++            reviews = {}
+         records: list[ExperimentRecordV5] = []
+         for candidate in candidates:
++            if type(candidate) is RejectedCandidateEvidenceV5:
++                if candidate.template != template or candidate.template.sha256 != template.sha256:
++                    raise ValueError("rejected candidate template differs from record construction template")
++                records.append(
++                    ExperimentRecordV5(
++                        candidate.experiment_id,
++                        candidate.experiment_identity,
++                        inputs.round_index,
++                        parent.policy_identity_sha256,
++                        parent.semantic_fingerprint_sha256,
++                        decision.hypothesis,
++                        template,
++                        template.sha256,
++                        candidate.assignment,
++                        None,
++                        None,
++                        "invalid",
++                        candidate.validation,
++                        None,
++                        (),
++                        None,
++                        None,
++                        None,
++                        candidate.artifact_refs,
++                        None,
++                        pit_data_scope=inputs.manifest.pit_data_scope,
++                        semantic_mode=inputs.manifest.semantic_mode,
++                    )
++                )
++                continue
++            if type(candidate) is not CandidateEvidenceV5:
++                raise ValueError("record candidate carrier is invalid")
+             testable = is_testable_experiment_status_v5(candidate.status)
+             campaign = candidate.campaign_evidence
+             records.append(

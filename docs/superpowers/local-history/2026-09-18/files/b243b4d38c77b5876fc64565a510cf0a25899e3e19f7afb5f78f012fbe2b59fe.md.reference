@@ -1,0 +1,59 @@
+# Task 8 Fix Round 1 Re-review
+
+## Finding Verdicts
+
+### 1. Critical C1 — ADDRESSED
+
+The full authenticated fold-evidence identity now crosses the production boundary consistently. `FoldEvaluationResult` requires `evidence_sha256` (`core/pit_optimizer_evaluation.py:387-406`), the production evaluator carries `ParityFoldEvidence.evidence_sha256` into each discovery fold (`agent_loop.py:18772-18778`), and incumbent promotion persists those exact fold identities rather than manufacturing aggregate-only hashes (`core/pit_optimizer_controller.py:1736-1742`). Final determinism compares the promoted identity with a repeated full-evidence identity (`agent_loop.py:18798-18811`; `core/pit_optimizer_controller.py:1915-1929`).
+
+The tests now exercise both the identity transition and the formerly broken production path: `test_incumbent_transition_replaces_diff_only_after_critic_and_fixed_score` (`tests/test_pit_optimizer_loop.py:2430`) asserts the promoted full digests, `test_discovery_repeat_requires_byte_identical_incumbent_evidence` (`tests/test_pit_optimizer_loop.py:3007`) covers mismatch rejection, and the production-composition integration (`tests/test_pit_optimizer_loop.py:2051`) reaches an improving incumbent, deterministic repeat, and hidden validation. The report contains the focused four-test command and recorded `4 passed` output; that result was not independently rerun.
+
+### 2. Important I1 — ADDRESSED
+
+The main CLI now preserves and inspects the caller’s lexical absolute path before resolution. It walks every existing component with `lstat`, rejects symbolic links and Windows reparse points, fails closed on inspection/resolution errors, and only then canonicalizes (`agent_loop.py:17939-17969`). Authenticated input separation also uses `os.path.samefile` in addition to canonical equality, so hard-link aliases cannot represent one target as two inputs (`core/pit_optimization_contract.py:864-889`).
+
+The new tests target a final file link, linked directory ancestor, and hard-link alias (`tests/test_pit_optimizer_v2.py:2090-2150`). The report records that the two symbolic-link primitives were unavailable and skipped on this Windows host, while the hard-link test reached the intended overlap rejection. Static inspection verifies the missing symlink/reparse behavior even though those two host-dependent tests did not execute.
+
+### 3. Important I2 — ADDRESSED
+
+Exact first-canary authority is now a closed-manifest invariant. `PitOptimizerRunManifest.__post_init__` invokes `_require_first_call_plan` and requires exactly six calls, 448000 tokens, and USD 0.40 (`core/pit_optimization_contract.py:730-747`). `_require_first_call_plan` seals two iterations and every investigator/author/critic static-byte, dynamic-byte, input-token, output-token, response-byte, model, and per-call USD cap (`core/pit_optimization_contract.py:1145-1168`). Primitive reconstruction therefore cannot bypass the same checks.
+
+The canonical-deserialization and direct-canary matrices mutate all four global ceilings, call order, and all six per-role fields (`tests/test_pit_optimizer_v2.py:1609-1660`). The report includes the RED result (`17 failed, 6 passed`) and final recorded 47-case GREEN focus; these outputs were not independently rerun.
+
+### 4. Important I3 — ADDRESSED
+
+One early route guard now rejects every schema-v2 identity field and the source-transmission boolean on any non-`pit_optimizer` gate, and rejects the boolean on any v2 phase other than canary (`agent_loop.py:19149-19166`). This closes `test`, `backtest`, `pit_diagnosis`, legacy `pit_optimization`, and v2 prepare while preserving the required v2 prepare manifest/parity inputs.
+
+The parameterized foreign-route test covers both a v2 identity field and the authorization boolean across all four foreign gates, and a separate test covers the prepare-phase boolean (`tests/test_agent_loop.py:278-315`). The report’s RED/GREEN commands and recorded `10 passed` output exist and target the production config builder; they were not independently rerun.
+
+### 5. Important I4 — ADDRESSED
+
+The new integration enters through `_dispatch_pit_optimizer_v2` and invokes the actual `_build_pit_optimizer_v2_live_run` (`tests/test_pit_optimizer_loop.py:2051-2388`). Only the true external boundaries are injected: an actual `OpenRouterGateway` receives a fake client/pricing loader, the policy-worker boundary is fake, and the evaluator-data boundary returns closed `ParityFoldEvidence`. Authorization ledger/window authentication, six reservations and reconciliations, budget/audit, candidate registry and cumulative-diff validation, determinism, hidden reservation/outcome, artifacts, summary, and cleanup remain production implementations (`agent_loop.py:18225-19027`).
+
+The test asserts one gateway, six transport calls, one worker/evaluator construction, two private candidate roots and their removal, one lease open/close, six real reservations/reconciliations, hidden exposure/outcome records, long-replay eligibility, clean source, and the closed summary (`tests/test_pit_optimizer_loop.py:2350-2420`). The report contains the isolated RED history and final recorded `1 passed` result plus the prescribed suite’s recorded `408 passed`; these claims were not independently rerun.
+
+## New Breakage
+
+### Important (1): production source authentication bypasses the explicit Git executable
+
+The fix newly calls `authenticated_source_identity(config.source_root)` in both canary authentication and prepare (`agent_loop.py:18473-18478`, `agent_loop.py:19640-19657`). That adapter delegates to `_source_identity`, whose subprocess argv begins with the bare string `"git"` (`core/pit_policy_parity.py:758-780`, especially line 763). It therefore resolves Git from inherited `PATH`, without the configured `GitCapability`, approved executable path, hardened Git environment, or bounded command timeout. This occurs after the CLI has explicitly constructed the approved capability from `config.git_executable` (`agent_loop.py:19611`).
+
+**Impact:** A valid invocation can fail or hang when the configured Git executable is usable but `PATH` Git is absent/different. More seriously, a PATH-shadowed executable is run against the authenticated source during both provider-free prepare and canary, defeating the explicit executable trust boundary and allowing fabricated identity output or arbitrary local process behavior before pricing/controller execution.
+
+**Repair:** Thread the approved `GitCapability` (or a narrow injected Git command callable) into the parity-compatible source-identity calculation and execute `status`, `rev-parse`, and `ls-tree` through the existing bounded/hardened `_git` path. Add a focused test with a valid configured executable and a failing/spying PATH `git`; prepare and canary must succeed without invoking the PATH binary.
+
+No new Critical breakage was found in the fix diff.
+
+## Out-of-Scope Observations
+
+- Original Docker Minor M1 was not re-reviewed and retains its prior disposition.
+- The two previously disclosed Docker/live-verification limitations were not reopened and remain nonblocking for this scoped round.
+- Host-unavailable symbolic-link tests remain an explicit evidence limitation for I1, not an open code finding because the fail-closed component walk is present in the reviewed fix.
+
+## Verdict
+
+**Needs fixes.** All five original findings are addressed: C1 and I1-I4 have no remaining open blocker. Fix Round 1 introduces one new Important production-composition defect, so the round is not approved until source identity uses the explicitly configured Git capability. Open findings after this round: **0 Critical, 1 Important**.
+
+## Resources and Effects
+
+This rereview read the original review, Task 8 brief, appended implementer report, and the supplied `cbbc9c9..284b04f` fix package as the primary view, followed only by scoped source/test lines and directly affected call contracts needed to verify C1/I1-I4 and the new composition issue. I ran no pytest, Docker, provider/OpenRouter/network operation, real SDK construction, live pricing, replay, parity execution, backtest, permanent-ledger mutation, background process, upload, push, merge, deploy, or cloud action. The only filesystem write was this ignored rereview report. Tracked files, index, HEAD, and branch were not changed.

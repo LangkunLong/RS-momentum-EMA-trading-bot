@@ -1,0 +1,39 @@
+# P3 independent task review brief
+
+Review P3 enrollment, native campaign boundaries and command plumbing against the campaign-admission design and P3 plan. The design is the binding architecture. This is a task-scoped spec AND code-quality gate; P4 owns historical integration and final broad review.
+
+## Authoritative inputs
+
+- Design: docs/superpowers/specs/2026-09-08-pit-optimizer-v5-campaign-admission-design.md
+- Plan: docs/superpowers/plans/2026-09-08-pit-optimizer-v5-campaign-admission.md (P3 and Global constraints)
+- Implementer report: admission-p3/task-report.md (under this proposal directory)
+- Exact task diff: admission-p3/actual-task.diff (must exist before actual review)
+- Actual original source bytes: admission-p3/principal-preimages/operations.py, cli.py, campaign_admission.py; authority JSONs alongside.
+
+There are no commits for this task. Compare actual retained preimages to the frozen postimages/diff; do not substitute a HEAD diff containing preexisting changes. Read the diff once. If a hunk is cut off mid-function, inspect only the required complete function and identify this in the report. Focused unchanged dependency reads are allowed for a concrete named risk. No broad crawl or test discovery. Verify reported freeze hashes directly; do not import source to inspect it.
+
+## Binding constraints
+
+- Work only in the existing codex/pit-optimizer-v5-architecture worktree. Do not reset, stash, clean, rebase, switch, commit or push.
+- No tests may be read, created, modified or run. No synthetic requests, outcomes, records, probes, mocks or fake future coverage.
+- No credentials, environment value dumps, provider/API/model calls, Docker/evaluation execution, image rebuild, campaign launch or new historical bindings during this subplan.
+- Preserve all 579 runtime-04 and 83 actual06 archive files and the 56-file evaluator closure 005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4.
+- Historical typed-state reads use repair=False transitively. No operational adapter, capability, nonce, clock or migration in completed-history verification.
+- Preserve existing dataclass fields/defaults, canonical digest domains, default legacy behavior, original owners/configs/deadlines and source newline bytes outside approved spans.
+- Static verification only until full source review: scoped Ruff, in-memory compile, source/AST/diff/hash inspection. No py_compile, imports for probes or test discovery.
+- C-c limits: target 2 evaluated rounds, 3 attempts, 8 calls, 600000 tokens, 75000 prospective total tokens per role, 8192 max output, zero retries/repair, one hypothesis/axis/variant/survivor, no source escape.
+- Preserve honest provider overage/failure accounting. No invented denied package or round outcome. Distinct operational stop reasons do not alter summary schemas/count formulas.
+
+## Review scope and named integration risks
+
+1. Enrollment under existing campaign-launch lock: explicit expected policy, exact original manifest/config/owner/root, selected no-start/no-spend freshness before every write; binding before unchanged launch. No enrollment of already launched legacy. Same explicit policy and freshness for interrupted binding-before-launch; only exact missing binding-index recovery, no catch-all repair or overwrite. Resume discovers enrollment even without an argument; supplied mismatch fails.
+2. New data-only freshness/boundary composition must reuse immutable P2 selectors/resources/packages/ledger proof, preserve P2 live semantics, avoid fake requests/clocks, and preserve optional legacy behavior. New extracted helpers may be reviewed for equivalent previous behavior against the actual P2 preimage.
+3. Boundary stopping before missing next config, before first start of an existing config, and after both reused and new settlements including final cap round. Current started continuation retains original admission rather than subtracting current spending as a fresh three-call admission.
+4. Reconciliation, integrity, owned cleanup, provider/runtime/deadline/novelty failures precede target success. Global observed-start census must prevent success hiding a later pending or failed round. No manufactured outcomes or altered old summary formulas. Target reason maps completed; insufficient reserve maps stopped.
+5. Exact paired --campaign-policy-path / --campaign-policy-sha256 options for run/resume campaign only, validated ArtifactRef, forwarded optional argument, and every enrolled generated resume command pins discovered policy even if input omitted it. Legacy rendering keys and flags unchanged.
+
+P2 approved fixes to preserve: exact incoming versus persisted primary attempt slot; accepted current predecessor packages for new-role continuation; prior runtime/critic/novelty-exhaustion blocks later round even empty journal; failed config authentication propagates; actual clock rechecked after heavy live facts before guard return/reservation. Approved runtime and provider source are outside P3 scope.
+
+## Review output
+
+Write admission-p3/independent-review.md with separate Spec Compliance and Task quality verdicts, evidence and file:line references, Critical/Important/Minor findings, and any exact cross-task fact that cannot be verified from this diff. Review source read-only; only your review report may be written. Do not spawn agents. No tests or operational execution override the generic review template. Static approval must not imply executed policy-positive behavior.

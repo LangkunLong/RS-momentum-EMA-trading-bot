@@ -1,0 +1,448 @@
+diff --git a/core/pit_optimizer_v5/runtime.py b/core/pit_optimizer_v5/runtime.py
+index 6978215..a656de6 100644
+--- a/core/pit_optimizer_v5/runtime.py
++++ b/core/pit_optimizer_v5/runtime.py
+@@ -3095,7 +3095,7 @@ class _Runtime:
+ 
+         candidates = self._render_and_quick_screen(parent=parent, decision=decision, template=template)
+         candidates = self._evaluate_discovery(candidates)
+-        if any(item.status == "quick_ready" for item in candidates):
++        if not candidates or any(item.status == "quick_ready" for item in candidates):
+             raise _RuntimeAbort(RuntimeFailureV5("discovery_evaluation", "invalid_dependency_result"))
+         critic_candidates = tuple(
+             item
+@@ -3104,43 +3104,50 @@ class _Runtime:
+             and item.status != "quick_ready"
+             and is_testable_experiment_status_v5(item.status)
+         )
+-        if not critic_candidates:
+-            raise _RuntimeAbort(RuntimeFailureV5("critic", "no_testable_experiments", role="critic"))
+-        experiment_ids = tuple(item.experiment_id for item in critic_candidates)
+-        critic_request = self.dependencies.requests.critic_request(
+-            self.inputs,
+-            projection,
+-            decision,
+-            critic_candidates,
+-        )
+-        critic_package = self._complete_role(
+-            request=critic_request,
+-            role="critic",
+-            parent=parent,
+-            hypothesis_id=decision.hypothesis.hypothesis_id,
+-            experiment_ids=experiment_ids,
+-        )
+-        if not critic_package.accepted:
+-            authority = CriticUnavailableAuthorityV5(
+-                outcome="critic_unavailable",
+-                discovery_plan_sha256=self.inputs.panel_plan.discovery_plan_sha256,
+-                search_state_before_sha256=canonical_sha256_v5(projection.state.to_primitive()),
+-                search_state_after_sha256=canonical_sha256_v5(state_after_novelty.to_primitive()),
+-                parent_revision_sha256=parent.policy_identity_sha256,
++        critic: CriticArtifactV5 | None = None
++        critic_ref: ArtifactRefV5 | None = None
++        if critic_candidates:
++            experiment_ids = tuple(item.experiment_id for item in critic_candidates)
++            critic_request = self.dependencies.requests.critic_request(
++                self.inputs,
++                projection,
++                decision,
++                critic_candidates,
++            )
++            critic_package = self._complete_role(
++                request=critic_request,
++                role="critic",
++                parent=parent,
+                 hypothesis_id=decision.hypothesis.hypothesis_id,
+-                critic_request_sha256=critic_request.sha256,
+-                critic_evidence_sha256=critic_request.role_evidence.sha256,
+-                critic_attempt_sha256s=(critic_package.attempt.sha256,),
+                 experiment_ids=experiment_ids,
+-                precritic_evidence=self._precritic_evidence(critic_candidates),
+             )
+-            return self._terminal_result(authority)
+-        if type(critic_package.artifact) is not CriticArtifactV5:
+-            raise _RuntimeAbort(RuntimeFailureV5("critic", "invalid_dependency_result", role="critic"))
+-        critic = critic_package.artifact
+-        if tuple(item.experiment_id for item in critic.reviews) != experiment_ids:
++            if not critic_package.accepted:
++                authority = CriticUnavailableAuthorityV5(
++                    outcome="critic_unavailable",
++                    discovery_plan_sha256=self.inputs.panel_plan.discovery_plan_sha256,
++                    search_state_before_sha256=canonical_sha256_v5(projection.state.to_primitive()),
++                    search_state_after_sha256=canonical_sha256_v5(state_after_novelty.to_primitive()),
++                    parent_revision_sha256=parent.policy_identity_sha256,
++                    hypothesis_id=decision.hypothesis.hypothesis_id,
++                    critic_request_sha256=critic_request.sha256,
++                    critic_evidence_sha256=critic_request.role_evidence.sha256,
++                    critic_attempt_sha256s=(critic_package.attempt.sha256,),
++                    experiment_ids=experiment_ids,
++                    precritic_evidence=self._precritic_evidence(critic_candidates),
++                )
++                return self._terminal_result(authority)
++            if type(critic_package.artifact) is not CriticArtifactV5:
++                raise _RuntimeAbort(RuntimeFailureV5("critic", "invalid_dependency_result", role="critic"))
++            critic = critic_package.artifact
++            if tuple(item.experiment_id for item in critic.reviews) != experiment_ids:
++                raise _RuntimeAbort(RuntimeFailureV5("critic", "invalid_dependency_result", role="critic"))
++            critic_ref = self.dependencies.persistence.append_critic(critic)
++        elif any(
++            type(item) not in {CandidateEvidenceV5, RejectedCandidateEvidenceV5}
++            or is_testable_experiment_status_v5(item.status)
++            for item in candidates
++        ) or self.journal.role_completion("critic") is not None:
+             raise _RuntimeAbort(RuntimeFailureV5("critic", "invalid_dependency_result", role="critic"))
+-        critic_ref = self.dependencies.persistence.append_critic(critic)
+ 
+         deadline = self._deadline("finalization", self.inputs.manifest.resources.round_wall_timeout_seconds)
+         expected_records = self._expected_records(
+diff --git a/core/pit_optimizer_v5/artifacts.py b/core/pit_optimizer_v5/artifacts.py
+index 24882f2..03365f1 100644
+--- a/core/pit_optimizer_v5/artifacts.py
++++ b/core/pit_optimizer_v5/artifacts.py
+@@ -39,6 +39,7 @@ from core.pit_optimizer_v5.candidate_ir import (
+     SourceOperationV5,
+     StructuralTemplateV5,
+     VariantAssignmentV5,
++    derive_experiment_identity_v5,
+     derive_pre_validation_invalid_experiment_identity_v5,
+ )
+ from core.pit_optimizer_v5.contracts import (
+@@ -57,6 +58,7 @@ from core.pit_optimizer_v5.contracts import (
+     EvaluatorContractV5,
+     FinalizedDiscoveryCampaignV5,
+     HypothesisV5,
++    InvestigatorArtifactV5,
+     PanelEvaluationV5,
+     ValidationResultV5,
+     canonical_json_bytes_v5,
+@@ -1398,64 +1400,292 @@ class LocalArtifactRepositoryV5:
+         records: tuple[StoredExperimentRecordV5, ...],
+     ) -> None:
+         """Bind complete round chains, completed role slots, candidates, and cleanup."""
++        panel_plan = self.load_typed_artifact(manifest.panel_plan_ref, value_type=CampaignPanelPlanV5)
+         for closed_round in finalization.rounds:
+-            events, payloads = [], []
+-            for sequence, reference in enumerate(closed_round.event_refs):
+-                expected_path = f"events/{manifest.campaign_id}/{closed_round.round_index:04d}/{sequence:06d}.json"
+-                if reference.relative_path != expected_path:
+-                    raise ArtifactSchemaFailureV5(reference)
+-                raw = self.authenticate(reference).content
+-                event = _decode_round_event(_strict_json_object(raw, reference))
+-                if event.sha256 != reference.sha256 or canonical_json_bytes_v5(event.to_primitive()) != raw:
+-                    raise ArtifactSchemaFailureV5(reference)
+-                if event.campaign_id != manifest.campaign_id or event.round_index != closed_round.round_index:
+-                    raise ArtifactSchemaFailureV5(reference)
+-                events.append(event)
+-                payloads.append(self.load_round_payload(event.payload_ref, expected_kind=event.event_kind))
+-            fold_round_events_v5(events=tuple(events), payloads=tuple(payloads))
++            # The durable loader authenticates canonical bytes, the complete fold,
++            # and B2 rejection context. A supplied prefix/subset cannot close a round.
++            events = self.load_round_events(
++                campaign_id=manifest.campaign_id, round_index=closed_round.round_index
++            )
++            event_refs = tuple(
++                ArtifactRefV5(
++                    f"events/{manifest.campaign_id}/{closed_round.round_index:04d}/{event.sequence:06d}.json",
++                    event.sha256,
++                )
++                for event in events
++            )
++            failure_ref = closed_round.event_refs[-1]
++            if event_refs != closed_round.event_refs or any(
++                event.campaign_id != manifest.campaign_id or event.round_index != closed_round.round_index
++                for event in events
++            ):
++                raise ArtifactSchemaFailureV5(failure_ref)
++            payloads = tuple(
++                self.load_round_payload(event.payload_ref, expected_kind=event.event_kind) for event in events
++            )
+             current = tuple(item for item in records if item.record.round_index == closed_round.round_index)
+             if (
+-                tuple(item.reference for item in current) != closed_round.record_refs
++                not current
++                or tuple(item.reference for item in current) != closed_round.record_refs
+                 or not payloads
+                 or type(payloads[-1]) is not CleanupResultPayloadV5
+                 or not payloads[-1].cleanup_complete
+                 or any(type(item) is RoundOutcomePayloadV5 for item in payloads)
+-                or {item.experiment_id for item in events if item.event_kind == "rendered_variant"}
+-                != {item.record.experiment_id for item in current}
+             ):
+-                raise ArtifactSchemaFailureV5(closed_round.event_refs[-1])
++                raise ArtifactSchemaFailureV5(failure_ref)
++            first_cleanup = next(index for index, item in enumerate(payloads) if type(item) is CleanupResultPayloadV5)
++            if any(type(item) is not CleanupResultPayloadV5 for item in payloads[first_cleanup:]):
++                raise ArtifactSchemaFailureV5(failure_ref)
+             completions = tuple(item for item in payloads if type(item) is RoleCompletionPayloadV5)
+-            if tuple(item.role for item in completions) != ("investigator", "author", "critic"):
+-                raise ArtifactSchemaFailureV5(closed_round.event_refs[-1])
++            testable_present = any(is_testable_experiment_status_v5(item.record.status) for item in current)
++            expected_roles = ("investigator", "author", "critic") if testable_present else ("investigator", "author")
++            if tuple(item.role for item in completions) != expected_roles:
++                raise ArtifactSchemaFailureV5(failure_ref)
++            self._verify_finalized_role_requests(
++                campaign_id=manifest.campaign_id, round_index=closed_round.round_index, completions=completions
++            )
+             packages = tuple(self.load_role_invocation(completion) for completion in completions)
+-            for completion, package in zip(completions, packages, strict=True):
++            intents = tuple(item for item in payloads if type(item) is RoundIntentPayloadV5)
++            if len(intents) != 1:
++                raise ArtifactSchemaFailureV5(failure_ref)
++            intent = intents[0]
++            for position, (completion, package) in enumerate(zip(completions, packages, strict=True), 1):
++                binding = package.request.expected_binding
+                 if (
+                     completion.outcome != "accepted"
+                     or not package.accepted
++                    or completion.role_position != position
++                    or package.call.role_position != position
+                     or package.call.campaign_id != manifest.campaign_id
+                     or package.call.round_index != closed_round.round_index
++                    or binding.parent_revision_sha256 != intent.parent_revision_sha256
++                    or binding.discovery_plan_sha256 != intent.discovery_plan_sha256
++                    or binding.hypothesis_id != (None if position == 1 else intent.hypothesis.hypothesis_id)
+                 ):
+                     raise ArtifactSchemaFailureV5(completion.request_ref)
+-            intents = tuple(item for item in payloads if type(item) is RoundIntentPayloadV5)
+-            if len(intents) != 1 or any(
+-                item.record.parent_revision_sha256 != intents[0].parent_revision_sha256
+-                or item.record.parent_semantic_fingerprint_sha256 != intents[0].parent_semantic_fingerprint_sha256
+-                or item.record.pit_data_scope != intents[0].pit_data_scope
+-                or item.record.semantic_mode != intents[0].semantic_mode
+-                or item.record.hypothesis != intents[0].hypothesis
+-                or item.record.experiment_identity.discovery_plan_sha256 != intents[0].discovery_plan_sha256
+-                or item.record.template != packages[1].artifact
+-                for item in current
++            investigator, author = packages[:2]
++            template = author.artifact
++            author_input = author.request.role_input
++            if (
++                type(investigator.artifact) is not InvestigatorArtifactV5
++                or intent.hypothesis.sha256 not in {item.sha256 for item in investigator.artifact.hypotheses}
++                or type(template) is not StructuralTemplateV5
++                or type(author_input) is not AuthorRoleInputV5
++                or author_input.hypothesis.sha256 != intent.hypothesis.sha256
++                or template.parent_revision_sha256 != intent.parent_revision_sha256
++                or template.hypothesis_id != intent.hypothesis.hypothesis_id
++                or author.request.schema_authority.max_variants != manifest.search.max_variants_per_template
++                or intent.pit_data_scope != manifest.pit_data_scope
++                or intent.semantic_mode != manifest.semantic_mode
++                or intent.discovery_plan_sha256 != panel_plan.discovery_plan_sha256
+             ):
+-                raise ArtifactSchemaFailureV5(closed_round.event_refs[-1])
+-            critic = packages[-1].artifact
+-            if type(critic) is not CriticArtifactV5 or any(
+-                item.record.critic_artifact_ref is None
+-                or item.record.critic_artifact_ref.sha256 != critic.sha256
++                raise ArtifactSchemaFailureV5(completions[1].request_ref)
++            if any(
++                item.record.parent_revision_sha256 != intent.parent_revision_sha256
++                or item.record.parent_semantic_fingerprint_sha256 != intent.parent_semantic_fingerprint_sha256
++                or item.record.pit_data_scope != intent.pit_data_scope
++                or item.record.semantic_mode != intent.semantic_mode
++                or item.record.hypothesis.sha256 != intent.hypothesis.sha256
++                or item.record.experiment_identity.discovery_plan_sha256 != intent.discovery_plan_sha256
++                or canonical_json_bytes_v5(item.record.template.to_primitive())
++                != canonical_json_bytes_v5(template.to_primitive())
+                 for item in current
+-                if is_testable_experiment_status_v5(item.record.status)
+             ):
+-                raise ArtifactSchemaFailureV5(completions[-1].artifact_ref)
++                raise ArtifactSchemaFailureV5(failure_ref)
++
++            origins = tuple(
++                (event, payload)
++                for event, payload in zip(events, payloads, strict=True)
++                if type(payload) in {RenderedVariantPayloadV5, RenderRejectionPayloadV5}
++            )
++            assignments = bounded_variant_assignments_v5(
++                template=template, maximum=author.request.schema_authority.max_variants
++            )
++            expected_assignments = tuple(canonical_json_bytes_v5(item.to_primitive()) for item in assignments)
++            origin_assignments = tuple(
++                canonical_json_bytes_v5(
++                    (
++                        payload.variant.assignment if type(payload) is RenderedVariantPayloadV5 else payload.assignment
++                    ).to_primitive()
++                )
++                for _, payload in origins
++            )
++            by_assignment = {
++                canonical_json_bytes_v5(item.record.variant_assignment.to_primitive()): item for item in current
++            }
++            role_positions = tuple(event.sequence for event in events if event.event_kind == "role_completion")
++            intent_position = next(event.sequence for event in events if event.event_kind == "round_intent")
++            if (
++                not origins
++                or origin_assignments != expected_assignments
++                or len(set(origin_assignments)) != len(origins)
++                or len(by_assignment) != len(current)
++                or set(by_assignment) != set(expected_assignments)
++                or not role_positions[0] < intent_position < role_positions[1] < origins[0][0].sequence
++                or (testable_present and origins[-1][0].sequence >= role_positions[2])
++            ):
++                raise ArtifactSchemaFailureV5(failure_ref)
++            ordered_records = tuple(by_assignment[key] for key in origin_assignments)
++            for (event, payload), stored in zip(origins, ordered_records, strict=True):
++                self._verify_finalized_candidate_origin(
++                    stored=stored,
++                    origin=event,
++                    payload=payload,
++                    intent=intent,
++                    template=template,
++                    events=events,
++                    payloads=payloads,
++                )
++            testable = tuple(
++                item.record for item in ordered_records if is_testable_experiment_status_v5(item.record.status)
++            )
++            if not testable:
++                if any(
++                    item.record.critic_artifact_ref is not None or item.record.critic_review is not None
++                    for item in current
++                ):
++                    raise ArtifactSchemaFailureV5(failure_ref)
++                continue
++            critic = packages[2].artifact
++            experiment_ids = tuple(item.experiment_id for item in testable)
++            if (
++                type(critic) is not CriticArtifactV5
++                or packages[2].request.expected_binding.experiment_ids != experiment_ids
++                or tuple(review.experiment_id for review in critic.reviews) != experiment_ids
++                or any(
++                    record.critic_artifact_ref != ArtifactRefV5(f"critics/{critic.sha256}.json", critic.sha256)
++                    or record.critic_review != review
++                    for record, review in zip(testable, critic.reviews, strict=True)
++                )
++            ):
++                raise ArtifactSchemaFailureV5(completions[2].artifact_ref)
++
++    def _verify_finalized_role_requests(
++        self,
++        *,
++        campaign_id: str,
++        round_index: int,
++        completions: tuple[RoleCompletionPayloadV5, ...],
++    ) -> None:
++        """Do not hide an unindexed or failed invocation behind a no-critic closure."""
++        expected = {item.request_ref for item in completions}
++        actual: set[ArtifactRefV5] = set()
++        for name in self._names(("roles", "requests")):
++            if re.fullmatch(r"[0-9a-f]{64}\.json", name) is None:
++                raise ArtifactSchemaFailureV5()
++            relative = f"roles/requests/{name}"
++            raw = self._read_relative(relative)
++            reference = ArtifactRefV5(relative, hashlib.sha256(raw).hexdigest())
++            call, _ = self._load_role_request_entry(reference)
++            if call.campaign_id == campaign_id and call.round_index == round_index:
++                actual.add(reference)
++        if actual != expected:
++            raise ArtifactSchemaFailureV5(completions[-1].request_ref)
++
++    def _verify_finalized_candidate_origin(
++        self,
++        *,
++        stored: StoredExperimentRecordV5,
++        origin: RoundEventV5,
++        payload: RenderedVariantPayloadV5 | RenderRejectionPayloadV5,
++        intent: RoundIntentPayloadV5,
++        template: StructuralTemplateV5,
++        events: tuple[RoundEventV5, ...],
++        payloads: tuple[RoundEventPayloadV5, ...],
++    ) -> None:
++        """Bind one typed assignment through its rejection or materialized identity."""
++        record = stored.record
++        if type(payload) is RenderRejectionPayloadV5:
++            event_ref = ArtifactRefV5(
++                f"events/{origin.campaign_id}/{origin.round_index:04d}/{origin.sequence:06d}.json", origin.sha256
++            )
++            if (
++                record.artifact_refs != (event_ref,)
++                or record.experiment_identity != payload.experiment_identity
++                or record.experiment_id != origin.experiment_id
++            ):
++                raise ArtifactSchemaFailureV5(stored.reference)
++            self._validate_experiment_render_rejection_binding(record, record_reference=stored.reference)
++            return
++
++        variant = payload.variant
++        rendered_identity = derive_experiment_identity_v5(
++            policy_revision=variant.policy_revision,
++            parent_revision_sha256=intent.parent_revision_sha256,
++            hypothesis=intent.hypothesis,
++            template=template,
++            assignment=variant.assignment,
++            round_index=origin.round_index,
++            discovery_plan_sha256=intent.discovery_plan_sha256,
++        )
++        if origin.experiment_id != rendered_identity.sha256:
++            raise ArtifactSchemaFailureV5(origin.payload_ref)
++        candidate_payloads = tuple(
++            (event, item)
++            for event, item in zip(events, payloads, strict=True)
++            if event.experiment_id == origin.experiment_id
++        )
++        stages = tuple(item for _, item in candidate_payloads if type(item) is CandidateStageResultPayloadV5)
++        validation = tuple(item for item in stages if item.stage == "validation")
++        if len(validation) != 1 or validation[0].validation != record.validation:
++            raise ArtifactSchemaFailureV5(stored.reference)
++        evidence_kinds = {"rendered_variant", "candidate_stage_result", "quick_evidence", "episode_evidence"}
++        expected_refs = {event.payload_ref for event, _ in candidate_payloads if event.event_kind in evidence_kinds}
++        expected_refs.update(item.failure_ref for item in stages if item.failure_ref is not None)
++        actual_refs = {
++            ref
++            for ref in record.artifact_refs
++            if any(ref.relative_path.startswith(f"payloads/{kind}/") for kind in evidence_kinds)
++            or ref.relative_path.startswith("inputs/typed_failure/")
++        }
++        if actual_refs != expected_refs:
++            raise ArtifactSchemaFailureV5(stored.reference)
++        if record.status == "invalid":
++            expected_invalid = derive_pre_validation_invalid_experiment_identity_v5(
++                parent_revision_sha256=intent.parent_revision_sha256,
++                hypothesis=intent.hypothesis,
++                template=template,
++                assignment=variant.assignment,
++                round_index=origin.round_index,
++                discovery_plan_sha256=intent.discovery_plan_sha256,
++            )
++            if (
++                validation[0].outcome not in {"validation_invalid", "validation_failed"}
++                or record.experiment_identity != expected_invalid
++                or type(record.experiment_identity) is not PreValidationInvalidExperimentIdentityV5
++            ):
++                raise ArtifactSchemaFailureV5(stored.reference)
++            return
++        if (
++            type(record.experiment_identity) is not ExperimentIdentityV5
++            or record.experiment_identity != rendered_identity
++            or record.policy_revision != variant.policy_revision
++            or validation[0].outcome != "validation_valid"
++        ):
++            raise ArtifactSchemaFailureV5(stored.reference)
++        semantics = tuple(item for item in stages if item.stage == "semantic_probe")
++        quick = tuple(item for _, item in candidate_payloads if type(item) is QuickEvidencePayloadV5)
++        episodes = tuple(
++            sorted(
++                (item.episode for _, item in candidate_payloads if type(item) is EpisodeEvidencePayloadV5),
++                key=lambda item: item.episode_ordinal,
++            )
++        )
++        if (
++            len(semantics) != 1
++            or semantics[0].semantic_fingerprint != record.semantic_fingerprint
++            or tuple(item.evaluation for item in quick) != (() if record.quick_evidence is None else (record.quick_evidence,))
++            or episodes != record.discovery_episodes
++        ):
++            raise ArtifactSchemaFailureV5(stored.reference)
++        if record.status in {"exact_duplicate", "behavioral_equivalent", "sibling_equivalent"}:
++            if semantics[0].outcome != record.status:
++                raise ArtifactSchemaFailureV5(stored.reference)
++        elif record.status in {"timed_out", "cancelled", "evaluation_failed"}:
++            if len(tuple(item for item in stages if item.failure_ref is not None)) != 1:
++                raise ArtifactSchemaFailureV5(stored.reference)
++        elif any(item.failure_ref is not None for item in stages):
++            raise ArtifactSchemaFailureV5(stored.reference)
+ 
+     def _create_only_with_status(
+         self,

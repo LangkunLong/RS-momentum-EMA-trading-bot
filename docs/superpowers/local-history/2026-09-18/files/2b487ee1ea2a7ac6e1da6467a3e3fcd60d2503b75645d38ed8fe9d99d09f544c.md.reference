@@ -1,0 +1,78 @@
+# C-c launch and budget design — principal decision required
+
+This is a source-only design assessment, not a prepared campaign or execution grant. C-b's readiness and independent readiness reviews PASS preparation. Transition sections 12–13 still require one concrete reviewed launch followed by a fresh separate paid grant. No existing archive or remaining grant supplies that authority.
+
+## Conclusion
+
+There is no existing supported `run-campaign` configuration that simultaneously permits a finite rejection allowance, stops immediately after two actual evaluated feedback rounds, and protects the reserve needed to finish those rounds. `max_feedback_rounds` is an attempt cap. Increasing it and the provider budget permits rejection recovery but also permits a third evaluated round after the milestone. Keeping it at two prevents reaching two evaluated rounds after a rejection.
+
+The smallest actual missing facility is an authenticated campaign stopping policy at the existing operations loop checkpoints, plus a defined token-reserve rule. This needs a principal design decision before fresh manifest/config/launch preparation. It must preserve the exact live factory and adapter validation. A callback exception or replacement cancellation/request/provider dependency is not a supported substitute.
+
+## Existing launch and control path
+
+Source references below are repository-relative to this worktree.
+
+1. `operations.py:302` renders the real saved command using the supplied immutable manifest/config/owner and a validated round composition. The CLI path remains `core.pit_optimizer_v5.cli run-campaign`, dispatched to `run_development_campaign_v5` and `_run_campaign_v5` (`operations.py:374`, `:648`, `:655`). No second campaign is required for ordinary consecutive attempts.
+2. `_run_campaign_v5` loads config, constructs/validates the original first composition, then enters a campaign transition. Freshness rejects an existing launch, checkpoint, journal state or unjournaled paid reservation. It persists the original start, manifest/config refs and owner. Resume must use those exact identities. A fresh run is not a disguised resume of a terminal archive.
+3. The persisted campaign epoch is converted to a remaining monotonic deadline; a round's own persisted epoch independently limits its remaining time. Later attempts derive owner-bound configs from the same paths and validate each exact composition. A resume cannot refresh either original deadline (`operations.py:432–574`).
+4. Before attempting new work, paid reservations are reconciled. Settled rounds with completed cleanup can be reused without paid calls. In the new-entry branch the loop checks campaign time, then a current-runtime summary and whether cumulative calls/tokens/cost have already reached their caps (`operations.py:445–494`). This is not a prospective reserve for even three roles, much less all remaining evaluated rounds.
+5. The exact next role request is persisted only in `_Runtime._complete_role` (`runtime.py:1179–1250`). The real ledger then computes `prospective_role_usage_v5` and refuses the individual request if prior usage plus one call / that request's input bound plus output cap / optional cost bound exceeds authority (`production_provider.py:791–850`). That protects the hard total cap, but does not reserve later author/critic or future-round requests. It can stop after spending on an investigator whose author is unaffordable.
+6. After each actual round, the launcher performs live `_verify_local_run`, emits an observer row, checks cleanup, and stops unless status is `completed` or `no_novel_hypothesis` (`operations.py:578–618`). It does not inspect `evaluated_feedback_rounds` to stop for success. Exhausting attempts reports outer status `completed` with reason `max_feedback_rounds`; that is not milestone success.
+
+The observer `emit_round` returns `None` by contract; its return is ignored. It is called before the launcher's cleanup-status branch and is skipped for reused rounds. Raising an exception there exits normal launch finalization and summary; it is not a stop directive. Do not use an observer exception as the designed stopping mechanism.
+
+`ControllerCancellationV5` is a per-composition `threading.Event` with `cancel()` / `is_cancelled()` (`production_runtime.py:1623`). The launcher does not expose the currently executing composition or a campaign cancellation channel. Setting the first composition's event does not control the separately composed later execution. Development validation requires the exact `ControllerCancellationV5`, clock, request factory, novelty resolver, cleanup and paid adapter graph (`development_preparation.py:146–224`). Do not substitute wrappers. A custom direct round driver would need to reproduce persisted campaign/round launch authority and cannot honestly be presented as the existing saved launch path.
+
+## Existing stops and their limits
+
+- **Deadline:** stage entry checks cancellation/time and binds each stage to the remaining round/campaign deadline; role completion time is checked again. Rendering also checks cancellation directly. Cleanup remains possible after ordinary work expires. See `runtime.py:1134–1153`, `:1587–1744`, `:2386`, `:2447`, `:3183–3277`. A process interruption is not a successful milestone stop, and killing it is not cleanup evidence.
+- **Hard paid cap:** the ledger reserves each exact request before external execution, including output tokens and conservative input bound. The operations pre-attempt check only detects already-exhausted cumulative usage. Reconciliation preserves uncertainty rather than silently rerunning a paid request.
+- **Credentials/credit:** the gateway resolves the local secret lazily at actual invocation; absent handle fails (`production_provider.py:603–609`). Construction does not need credential values. Development requires zero automatic retries and zero schema repairs (`development_preparation.py:47–50`). Provider errors do not authorize fallback retries, a budget refill or another launch. No local credit-availability guarantee or quote was established here.
+- **Authority/cleanup:** exact factory/config/owner checks remain live. Cleanup missing, false or failed stops the loop. Unexpected identity/authentication failure aborts rather than repairing old authority.
+- **Novelty:** `no_novel_hypothesis` advances to another authenticated parent where one remains. The resolver yields `novelty_exhausted` only after its authenticated chain covers the parent schedule (`production_runtime.py:1190–1229`), which the operations loop stops on. Neither outcome is evaluated success. The single investigator call still counts against allowance.
+- **Other terminal outcomes:** failed runtime, rejected role package and unavailable critic stop. A committed render-rejected lifecycle can be `completed`, have checkpoint/cleanup, consume investigator plus author, and have no critic. An evaluated record requires real candidate execution and critic; these are separate accounting facts (`runtime.py:3089–3179`).
+
+The existing summary supplies useful authenticated counts: `evaluated_feedback_rounds` is the intersection of distinct record rounds with evaluated records/campaign evidence and rounds with successful cleanup (`summary.py:224–248`, `:339–342`). Its current-runtime path verifies the archive and development history. A new success gate should use that authority, preserving critic and checkpoint authentication, instead of counting emitted rows, experiments or `status=completed` alone. Two variants from one attempt are still one feedback round.
+
+## Coherent finite proposal for the principal to decide
+
+The following numbers are a proposed control contract, not created capabilities, measured future request sizes or an approved run:
+
+| Item | Proposed finite value / meaning |
+| --- | --- |
+| Success target | 2 distinct authenticated evaluated feedback rounds, each with critic, committed checkpoint and successful cleanup |
+| Lifecycle attempt cap | 3 |
+| Total external role calls | 8 = 2 × 3 successful-round roles + 1 × 2 render-rejection roles |
+| Automatic retries / schema repairs | 0 / 0 |
+| Output cap per role | 8,192 tokens, including provider reasoning tokens as accounted by existing contract |
+| Proposed prospective envelope per role | 75,000 total tokens = at most 66,808 conservative input-bound tokens + 8,192 output tokens |
+| Total token cap | 600,000 = 8 × 75,000 |
+| Campaign / round wall limits | 21,600 / 7,200 seconds; no refresh on resume |
+| Cleanup timeout | 60 seconds per existing owned cleanup contract; cleanup may extend past the work deadline |
+| Variants / discovery survivors | 1 / 1, retaining a simple one-candidate attempt |
+
+This affords one two-call render-rejection attempt plus two three-call evaluated attempts in any order, conditional on all admitted actual packets fitting the proposed envelope and on successful execution/critic/cleanup. It does not promise an optimizer can find two evaluable candidates. Two rejections, a three-call unevaluated outcome, partial provider failure, or novelty-only attempts may exhaust the ability to finish earlier. Such cases must stop truthfully, not be called success or funded by an automatic replacement.
+
+For settled state with `E` authenticated evaluated rounds, let `M=max(0,2-E)`. Before any new attempt, require at least `M` attempt slots, `3*M` call slots and `3*M*75,000` tokens under the declared prospective envelope. Success (`M=0`) stops before any new request/config/start. Cleanup/authority failures take precedence over success. An actual two-call rejection consumes the one extra attempt and two-call allowance; a second leaves too few attempt/call slots and must stop before a third futile attempt. Non-rejection unevaluated attempts consume the same finite slack; they do not create additional allowance.
+
+**Required design decision:** no current field enforces the 75,000-token per-role envelope. Merely writing the arithmetic into a review does not reserve it. If selected, the actual request's existing `prospective_role_usage_v5` bound must be checked at an authenticated pre-paid boundary, and future-role reserve must remain protected. For a current attempt expected to supply one remaining success, roles still required are `3*M` before investigator, `3*M-1` before author and `3*M-2` before critic; reserve accounting must be explicit and recomputed after the actual settled outcome. An oversized actual request stops before a paid call. It cannot be silently trimmed or granted a larger budget.
+
+An alternative is to prove conservative role-specific ceilings from the real configuration and schemas, then reserve those ceilings; that proof is not supplied by historical packets and was not manufactured here. The 98,304-byte memory setting in actual06 is a historical fact and by itself does not prove a 66,808-token future input bound. Future author/critic requests depend on genuine model/evaluator output and cannot be previewed now.
+
+Implement the chosen policy through a narrow authenticated host source change: operations pre-attempt and post-cleanup gates, durable/immutable policy binding that resume cannot alter, explicit success/insufficient-reserve reasons, and the actual role reservation boundary if the per-role envelope is selected. Apply the checks to settled reuse as well as newly completed attempts. Preserve historical decoding and original launch/config refs; do not add required fields to old durable dataclasses without a compatibility decision. After source review, prepare the single fresh launch using the existing factory/CLI route. No fabricated dependency graph or live validation bypass is needed or acceptable.
+
+No dollar estimate is given. Actual06's old caps/model and historical paid usage do not establish current prices or spending authority. The proposed call/token grant is the only numerical paid scope described here.
+
+## Exact initial investigator preview without durable role persistence
+
+**Yes, for a genuinely prepared fresh campaign:** the existing local request factory can produce the exact first investigator request from its actual authenticated baseline and empty actual history, without appending a role request or invoking a provider. This does not require inventing a hypothetical future evaluated/rejected record. No preview was constructed or executed in this assessment.
+
+The source-supported sequence is: authenticate the real fresh manifest; obtain its real `FeedbackRoundInputV5` from the validated development composition; verify absence of checkpoint, campaign/round activity and paid reservations; use `LocalArchiveReducerFactoryV5.recovery_reducer(inputs)` and its existing `initial()` state for the actual empty repository; form the corresponding actual `SearchProjectionV5` with no checkpoint/records; use `select_parent_v5` on the actual baseline/panel/evaluator authority; call the existing `LocalRoleRequestFactoryV5.investigator_request(inputs, projection, parent)` (`production_runtime.py:571–839`, `:1394`; `search.py:765`; `selection.py:471`). At first launch the baseline is the actual selected parent and `_parent_campaign` reads its actual four discovery results. No paid investigator hypothesis is invented.
+
+The request factory builds deterministic messages, role input, issued evidence, binding and schema. Persistence is a later operation in `_Runtime._complete_role`, specifically `append_role_request` at `runtime.py:1216`, followed by `invoke_once`. Do not call either, `run_feedback_round_v5`, or `run-campaign` to obtain the preview. `recover_projection` returns `reducer.initial()` when no checkpoint exists (`artifacts.py:3765`); on nonfresh repositories it may repair an archive, so do not treat it as a general read-only preview API.
+
+Save review bytes/hash/size outside durable `roles/` and launch-state namespaces in the preparation review package. Measure both canonical request encoding and actual `wire_role_messages_v5` / `wire_role_schema_v5` projections, and use `prospective_role_usage_v5` for budget accounting. The input bound sums wire-message bytes, the larger canonical/wire schema representation, and the declared overhead (`provider.py:2105–2130`); request-file length alone is not the paid-input bound. The later launch must reproduce the reviewed initial request under unchanged authority/environment. Previewing cannot certify a hypothetical author, critic or second investigator request.
+
+## Inspection scope
+
+Read the two C-b readiness reviews, transition sections 12–13 and relevant existing source. Read only selected historical actual06 manifest/preparation metadata to distinguish old authority from a proposal. No source modules were imported or executed. No tests were read/created/run; no future role requests, rounds, capabilities, events or records were constructed. No credentials/environment values, external/provider/API/Docker/evaluation calls, campaign roots/configs/launches, commits or source edits were made. Only this documentation directory and document were created.

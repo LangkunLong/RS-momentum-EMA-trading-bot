@@ -1,0 +1,157 @@
+# Task 2 Report — Authenticated Three-Universe Bundle Inputs
+
+## Outcome
+
+Implemented schema-V3 membership normalization, immutable bundle construction, and exact bundle
+verification on `codex/pit-optimizer-v5-architecture` from accepted base `2f8f84c`.
+
+The committed source scope is exactly:
+
+- `normalize_pit_universe_membership.py` (new)
+- `build_pit_bundle.py` (modified)
+- `verify_pit_bundle.py` (modified)
+
+No tests, market-data inputs, `.artifacts` data, provider paths, Docker/replay surfaces,
+qualification state, push, or merge were changed. All generated verification fixtures were
+disposable synthetic files below the worktree and were removed.
+
+## CLI compatibility choice
+
+The builder now accepts `--schema-version {2,3}` with default `2`. The two industry arguments are
+accepted by the parser but required only for explicit schema 3, and rejected for schema 2. The
+verifier similarly requires `--industry-csv`, `--industry-provenance`, and `--report-output` only
+after it authenticates a schema-V3 bundle. With the new V3 arguments absent, the legacy verifier
+continues through its original V1/V2 source and manifest checks.
+
+This keeps historical invocations and the schema-2 SQLite layout unchanged while making every new
+V3 input explicit.
+
+## Normalizer
+
+- Requires the exact three source membership/provenance pairs, prices provenance, and two output
+  paths specified by the task.
+- Accepts only exact `effective_date,ticker,member` source headers, canonical V3 tickers and dates,
+  canonical source ordering, integer `0`/`1` state changes, and non-empty streams.
+- Rejects duplicate JSON keys, non-finite JSON values, malformed provenance, source-universe
+  mismatches, byte-digest/count/date inconsistencies, reference symbols, absent ticker identities,
+  events outside authenticated identity bounds, invalid identity chains, ambiguous transition
+  graphs, and noncanonical membership state.
+- Authenticates the price request-contract digest and explicit transition rows. Every identity chain
+  is closed, contiguous, single-rooted/single-terminal, and has one terminal factor anchor.
+- Resolves each source ticker to its authenticated `chain_id`. A same-day predecessor removal plus
+  successor addition is omitted only when one explicit same-lineage transition authenticates that
+  exact pair and date; the provenance records the coalesced count.
+- Emits exact columns
+  `effective_date,security_lineage_id,universe_id,member`, ordered by
+  `(effective_date, security_lineage_id, universe_id)`, retaining one row per affiliation so
+  overlaps remain explicit.
+- Publishes the CSV and canonical compact JSON together with no-clobber hard links. The provenance
+  binds all seven input byte digests, each source's declared kind/retrieval time, identity and
+  transition digests, merged CSV digest, row/lineage/universe counts, per-universe counts, date
+  bounds, and coalesced-transition count.
+
+## Schema-V3 builder
+
+- Creates the exact requested `membership_v3` columns and composite primary key
+  `(effective_date, security_lineage_id, universe_id)`.
+- Stores canonical `source_universes_json=["nasdaq100","russell2000","sp500"]` and preserves
+  the schema-2 `source_universe=sp500` path unchanged.
+- Uses the established six-column dated `industry_group_snapshots` contract and seals industry CSV
+  and provenance identities into bundle metadata and manifest coverage.
+- Requires complete provenance bindings and exact source counts for membership, prices,
+  fundamentals, and industry. V3 JSON parsing rejects duplicate/non-finite data.
+- Requires authenticated price identities and price rows to exactly equal the deduplicated lineage
+  identity surface plus IWM/QQQ/SPY, with references excluded from membership, fundamentals, and
+  industry. Fundamental symbols exactly cover tradable identities.
+- Requires every universe to have causal seed state at evaluation start. Each industry snapshot
+  exactly covers the active lineage union at that date, group member declarations reconcile, and
+  all membership lineages receive dated industry coverage.
+- Opens and validates the staged schema-V3 bundle with the exact prices provenance before the
+  existing no-clobber bundle/manifest publication step.
+
+## Schema-V3 verifier and evidence
+
+- Recomputes and checks all eight data/provenance file digests against bundle metadata, reparses all
+  V3 contracts, reruns the builder integrity gates, and compares every SQLite row in membership,
+  price, fundamentals, and industry tables to its exact authenticated CSV.
+- Independently reconstructs each universe at every membership boundary, verifies the deduplicated
+  union against `PITDataBundle`, validates explicit overlaps and reference separation, and rejects
+  an empty post-seed universe. No S&P-size constraint is applied to Nasdaq-100 or Russell 2000.
+- Rejects future membership/fundamental/industry rows, incomplete exact coverage, invalid explicit
+  price transitions, input mutation during verification, bundle mutation, and manifest drift.
+- Writes one compact canonical, create-only report only after every check passes. It binds the
+  bundle digest, manifest digest, every checked source/provenance digest, and deterministic
+  membership/overlap counts.
+
+## Verification evidence
+
+1. Disposable three-universe synthetic end-to-end flow: passed
+   (`task2 synthetic V3 smoke: ok`). It covered explicit S&P/Nasdaq overlap, Russell membership,
+   authenticated `DUAL -> DUAL2` coalescing, exact normalized ordering, schema/table/primary-key
+   inspection, canonical source-universe metadata, industry-table coverage, valid verification, and
+   canonical create-only reporting.
+2. Bounded negative synthetic cases: passed. The normalizer rejected source-universe provenance
+   mismatch, a ticker absent from the authenticated identity contract, reference-symbol membership,
+   and output overwrite. The V3 gates/verifier rejected future membership, incomplete industry
+   coverage, and a tampered bundle.
+3. `python -B -m pytest tests/test_pit_data.py -q`: **7 passed**. Existing warnings were dependency
+   deprecations/resource warnings and a sandbox-denied pytest cache write only.
+4. `python -B -m py_compile normalize_pit_universe_membership.py build_pit_bundle.py verify_pit_bundle.py`:
+   passed.
+5. `python -B -m ruff check normalize_pit_universe_membership.py build_pit_bundle.py verify_pit_bundle.py`:
+   passed (`All checks passed!`).
+6. All three CLIs rendered `--help` successfully, confirming the exact normalizer flags, opt-in
+   builder schema flag, and schema-V3 verifier report/industry arguments.
+7. `git diff --check`: passed with only the existing Windows LF-to-CRLF notice.
+
+## Self-review
+
+- Confirmed the normalizer never infers lineage or rename continuity from membership rows.
+- Confirmed rename coalescing cannot hide a genuine membership removal/addition or cross-universe
+  transition.
+- Confirmed V3 price/fundamental/industry symbol coverage is exact and references remain price-only.
+- Confirmed V3 reads explicit price transitions and all output paths are create-only.
+- Confirmed the V1/V2 builder table path, schema-2 default, legacy integrity gate, and legacy
+  verification behavior remain separate.
+- Confirmed no tests or persistent data artifacts were created or modified.
+
+## Commit
+
+`bbc4f20` — `feat: build authenticated three-universe PIT bundles`
+
+## Review fix round
+
+Resolved all four Important findings from `task-2-review.md` without changing the
+normalizer, tests, or any source outside the original three-file boundary:
+
+- The V3 builder now accepts only the normalizer's exact three ordered nested source
+  bindings. Each binding must be an object with exactly `event_count`,
+  `membership_sha256`, `provenance_sha256`, `retrieved_at_utc`, `source_kind`, and
+  `universe_id`; types, lowercase digests, timestamps, event-count/coalescence arithmetic,
+  and universe order are validated before the aggregate membership input digest is derived.
+- V3 manifests are emitted as canonical compact newline-terminated JSON. The verifier hashes
+  the regular manifest before parsing, parses it with duplicate-key/non-finite rejection,
+  rejects noncanonical bytes, includes the manifest in both identity snapshots, revalidates
+  all checked bytes immediately before report publication, and reports the initially
+  authenticated manifest digest.
+- Exact-table reads now form the immutable read-only SQLite URI from `Path.as_uri()`, safely
+  preserving filesystem path characters such as `#` through URI encoding.
+- Legacy schema-2 manifest formatting/parsing and the builder's default schema selection
+  remain unchanged.
+
+Review-fix verification evidence:
+
+1. Direct disposable smoke: passed (`task2 review negative/URI/mutation smokes: ok`). It
+   accepted the exact valid three-binding schema; rejected forged digest, missing key, extra
+   key, and non-object bindings; rejected duplicate-key, non-finite, and noncanonical V3
+   manifests; opened a SQLite filename containing `#`; and rejected a manifest mutated after
+   comparison without publishing a report.
+2. `python -B -m pytest tests/test_pit_data.py -q`: **7 passed**. Warnings were the same
+   dependency resource/deprecation notices and sandbox-denied pytest-cache write described
+   above.
+3. `python -m py_compile normalize_pit_universe_membership.py build_pit_bundle.py verify_pit_bundle.py`,
+   Ruff over the same files, and `git diff --check`: passed before the final commit.
+
+The first disposable smoke invocation encountered a Windows file-lock cleanup error because
+the smoke itself retained its setup connection; that harness-only issue was corrected and the
+product checks then passed. Both failed-run temp directories and the smoke script were removed.

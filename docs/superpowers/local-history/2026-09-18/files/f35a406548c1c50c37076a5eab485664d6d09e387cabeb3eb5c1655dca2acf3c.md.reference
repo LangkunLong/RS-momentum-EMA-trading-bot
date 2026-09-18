@@ -1,0 +1,9 @@
+# Architect checkpoint A: APPROVED
+
+No blocking findings. The implementation matches the closed16-counter scope, reads authenticated selected-scenario reports, omits absent counters, and places all evaluator evidence before archive/history citations. Per-episode interleaving is acceptable; preserving saved requests matters, not preserving future generated IDs.
+
+Independent reconstruction matched the saved request byte for byte. All64 new counts match the four authenticated parent reports;80 evidence items are correctly cited. Source/preimage hashes and unchanged provider/evaluator identity verified. Input upper bound28549, or36741 including maximum output8192; this remains within the existing per-campaign cap. Historical actual06 request hashes remain unchanged.
+
+Provided Ruff/compilation and read-only terminal-summary receipts were reviewed. No paid run occurred. Archive/history ordering and absent-counter behavior were inspected statically; the actual preview is first-round and all selected counters are present.
+
+Next Luna session: B1 only. Add explicit rendering outcomes while preserving the strict old API. Return actual06 source-rejection verification and a scoped diff. Do not implement journal/runtime finalization yet, restart campaigns or make external calls.

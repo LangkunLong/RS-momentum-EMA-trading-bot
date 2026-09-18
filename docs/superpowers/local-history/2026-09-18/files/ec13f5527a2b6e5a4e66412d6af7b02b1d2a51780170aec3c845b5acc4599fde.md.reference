@@ -1,0 +1,226 @@
+# Task 3 Report — Optimizer Resource Ledger and Best-Effort Pricing
+
+## Status
+
+Completed and committed.
+
+Commit: `09ed47675d211a4e20752a1f476c908ac8425ead` (`Use call-token ledger for PIT optimizer`)
+
+No tests were added, modified, or run. No provider, Docker, hidden-data, network, push, upload, or subagent action was used.
+
+## Behavior changed
+
+- Added the dedicated `PitOptimizerResourceReservation`, `PitOptimizerResourceSnapshot`, and `PitOptimizerResourceLedger` runtime boundary.
+- Optimizer reservations now enforce only API-call and conservative token capacity. `projected_cost_usd` is optional audit evidence, serialized as canonical decimal text or `null`, and is never compared to a ceiling.
+- Before-send failures release the reserved call and tokens.
+- Complete started calls require exact prompt/completion/total accounting and a finite non-negative actual cost. Actual tokens and authoritative USD are committed before a token-overage exception is reported.
+- Incomplete started calls retain the full token reservation, increment incomplete accounting, record no invented cost, and make the resource ledger terminal to further reservations.
+- Optimizer recovery state is schema v3 and contains calls/tokens, authoritative actual USD, optional projected cost evidence, active reservations, and reconciliations. It contains no optimizer `max_usd`, reserved USD, or retained-reservation USD shape.
+- Generic `BudgetLedger`, `BudgetWindow`, diagnosis, proposal-batch, and legacy `pit_optimization` USD enforcement remain in place. Optimizer-only state and methods were removed from `BudgetLedger` after active optimizer callers were moved to the dedicated ledger.
+- Pricing freeze now caches one run-bound `OptimizerPricingSnapshot`. Ordinary pricing-loader exceptions fall back to an authenticated unavailable snapshot while `BaseException` cancellation and expired deadlines retain precedence.
+- Optimizer preflight validates role/model/lease identity plus byte/token bounds, returns `Decimal | None`, and does not gate on projected cost magnitude.
+- The one-shot optimizer gateway forwards the same advisory projection to the resource and authorization reservations, preserves one provider attempt, strict model/schema/byte/accounting validation, and publishes schema-v3 provider/audit/recovery evidence without retained USD.
+- Schema-v1/v2 provider serialization omits the newly added schema-v3 pricing field so legacy durable record shapes remain unchanged.
+
+## Files changed
+
+- `agent_loop.py`
+  - Added the calls/tokens resource ledger and schema-v3 optimizer recovery/audit path.
+  - Migrated optimizer pricing/preflight/gateway/live-composition call sites to `OptimizerPricingSnapshot` and advisory projections.
+  - Preserved generic USD accounting and enforcement.
+- `core/pit_optimizer_authorization.py`
+  - Narrow authorized seam only: `_bind_gateway_lifecycle_commitment` now uses `PitOptimizerResourceLedger._pit_optimizer_reservation_primitive` instead of the hard-bound generic ledger serializer.
+
+## Unavoidable Task-4-adjacent compatibility edit
+
+`_build_pit_optimizer_v2_config` no longer passes `max_usd` into `PitOptimizerGateConfig`, because the dependency's schema-v3 constructor has already removed that field. Local live-run callback annotations and calls were minimally adapted to the new pricing/lease interfaces so `agent_loop.py` compiles. Broader controller/CLI naming and result-summary migration remains assigned to Task 4; existing `v2` function/parameter names were intentionally left in place.
+
+## Verification
+
+Post-commit production compilation:
+
+```text
+python -B -m py_compile agent_loop.py core\pit_optimizer_authorization.py
+exit 0; no output
+```
+
+Post-commit lint:
+
+```text
+python -B -m ruff check agent_loop.py core\pit_optimizer_authorization.py
+All checks passed!
+```
+
+Provider-free resource-ledger smoke:
+
+```text
+resource-ledger smoke: audit-only USD, terminal uncertainty, recovery, and commit-before-overage validated
+```
+
+This covered high projected/actual USD acceptance, before-send release, terminal incomplete accounting, USD-free recovery/restore, and durable token-overage accounting.
+
+Provider-free pricing smoke:
+
+```text
+pricing smoke: high/unknown projections are advisory; fallback, deadline, and cancellation precedence validated
+```
+
+Provider-free audit-shape smoke:
+
+```text
+audit-shape smoke: canonical schema-v3 projection and unchanged legacy fields validated
+```
+
+Legacy-ledger AST comparison against the pre-task commit:
+
+```text
+legacy ledger AST comparison: generic USD logic unchanged; optimizer-only state/methods removed
+```
+
+Diff and commit checks:
+
+```text
+git diff --cached --check
+exit 0; no output
+
+git show --check --oneline --stat HEAD
+09ed476 Use call-token ledger for PIT optimizer
+```
+
+Commit hooks also passed Ruff, trailing-whitespace, end-of-file, YAML, and merge-conflict checks.
+
+## Self-review
+
+- Confirmed active optimizer callers use `PitOptimizerResourceLedger`; `BudgetLedger` no longer exposes optimizer reserve/reconcile/recovery methods.
+- Structurally compared the generic ledger against the dependency commit. Its constructor differs only by removal of the optimizer-only maps; its generic constructor validation, window checks, reserve logic, reconciliation, and USD/token overage gates are unchanged.
+- Searched for stale optimizer `FrozenModelPricing`, `PitOptimizerBudgetReservation`, generic optimizer-ledger dispatch, and optimizer USD-ceiling comparisons; none remain on the active schema-v3 path.
+- Confirmed the schema-v3 provider primitive omits retired maximum/retained USD and frozen-pricing fields while preserving the legacy schema-v1/v2 field shape.
+- Confirmed resource reconciliation is idempotent, recovery is identity-bound and aggregate-recomputed, and uncertain accounting prevents continuation.
+- Confirmed the authorization change is limited to the approved serializer import/call seam.
+
+## Concerns / follow-up
+
+- Full optimizer controller/CLI schema-v3 integration is intentionally deferred to Task 4. This task verified `agent_loop.py` imports and compiles against the committed dependencies but did not execute the current broader controller flow.
+- Production provider and Docker paths were deliberately not exercised under the task constraints. The verification here is compile, lint, static legacy comparison, and provider-free in-memory behavior only.
+
+---
+
+## Fix round 1 — 2026-08-29
+
+### Status and commit
+
+Completed in commit `183f0d090ad4741f5610ae752d5949db51ad6db9` (`Fix PIT optimizer resource accounting`).
+
+Only `agent_loop.py` changed in this fix commit. The previously authorized four-line serializer seam in `core/pit_optimizer_authorization.py` was not changed. No tests were added, modified, or run, and no provider, Docker, hidden-data, network, push, upload, or subagent action was used.
+
+### Review findings resolved
+
+1. The last wall-deadline check now occurs before `_ensure_pit_optimizer_started_event` and before `possibly_sent` becomes true. Expiration at that boundary remains a before-send failure, releases the resource call/tokens, publishes `failed_before_send` / `request_started=False`, and never invokes the transport.
+2. A started call with partial fields or a conflicting `prompt + completion != total` tuple now commits terminal uncertainty before raising: the active reservation is removed, its full token upper bound is retained, `incomplete_accounting_calls` increments, the exact invalid `Usage` evidence is stored for reconciliation/recovery, and later reservations are rejected. Recovery aggregate validation recognizes those stored partial/conflicting tuples as terminal retained-token accounting instead of rejecting the evidence.
+3. Optimizer cumulative authoritative USD is now held internally as `Decimal`. `PitOptimizerResourceSnapshot.authoritative_usd`, provider-record snapshot primitives, and recovery snapshots expose canonical non-negative decimal text. Multiple individually finite costs can therefore be summed, finalized, snapshotted, and restored without float overflow. Per-call authoritative `cost_usd` remains the validated provider float; only the cumulative schema-v3 summary shape changed.
+
+### Public-shape change
+
+The optimizer-only schema-v3 resource snapshot changed from:
+
+```text
+authoritative_usd: float
+```
+
+to:
+
+```text
+authoritative_usd: canonical decimal string
+```
+
+Examples are `"0"`, `"999999"`, or a full non-exponent decimal spelling for very large finite cumulative amounts. Numeric values, exponent spellings, negative values, non-finite values, and non-canonical strings fail closed. Generic `BudgetSnapshot` and all legacy USD shapes remain numeric and unchanged.
+
+### Verification commands and exact outputs
+
+Compilation:
+
+```text
+python -B -m py_compile agent_loop.py core\pit_optimizer_authorization.py
+exit 0; no output
+```
+
+Lint:
+
+```text
+python -B -m ruff check agent_loop.py core\pit_optimizer_authorization.py
+All checks passed!
+```
+
+Committed diff and status:
+
+```text
+git status --short; git log -2 --oneline; git show --check --oneline --stat HEAD
+183f0d0 Fix PIT optimizer resource accounting
+09ed476 Use call-token ledger for PIT optimizer
+183f0d0 Fix PIT optimizer resource accounting
+```
+
+Generic-ledger structural comparison:
+
+```text
+python -B -c "import ast,subprocess,pathlib; old=ast.parse(subprocess.check_output(['git','show','HEAD^:agent_loop.py'],text=True,encoding='utf-8')); new=ast.parse(pathlib.Path('agent_loop.py').read_text(encoding='utf-8')); pick=lambda tree: next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=='BudgetLedger'); assert ast.dump(pick(old),include_attributes=False)==ast.dump(pick(new),include_attributes=False); print('legacy ledger AST comparison: generic BudgetLedger unchanged')"
+legacy ledger AST comparison: generic BudgetLedger unchanged
+```
+
+The following provider-free inline `python -B -c` smoke commands were run directly against committed HEAD. Their assertions covered the stated state transitions, not merely imports. The long inline harnesses are identified by their complete asserted inputs and postconditions below; the exact process output is reproduced verbatim.
+
+```text
+# Last-deadline harness: injected a five-reading monotonic clock, an unavailable
+# pricing snapshot, fake authorization/audit capabilities, and a transport that
+# records any attempted call. The fifth read expired at the last pre-transport
+# check and assertions required no started transition, no transport call,
+# calls == 0, reserved_tokens == 0, failed_before_send, and request_started=False.
+python -B -c "<deadline harness described above>"
+last-deadline smoke: reservation released with not-started semantics before transport
+```
+
+```text
+# Terminal-accounting harness: reconciled one partial tuple and one mismatched
+# complete tuple, required ResponseValidationError only after retained-token
+# state was committed, rejected a subsequent reservation, and restored both
+# canonical recovery images. It also directly summed two sys.float_info.max
+# costs and required the exact Decimal/canonical snapshot to restore.
+python -B -c "<terminal-accounting harness described above>"
+terminal/exact-accounting smoke: partial and conflicting usage retained; overflowing float sum remained canonical and recoverable
+```
+
+```text
+# Finalization harness: called the real _finalize_pit_optimizer_call twice with
+# individually finite sys.float_info.max costs, captured the real resource
+# recovery snapshot from each seal, and restored the final snapshot.
+python -B -c "<high-cost finalization harness described above>"
+high-cost finalization smoke: two overflowing-float costs finalized, snapshotted, and recovered exactly
+```
+
+The original Task 3 focused smokes were also rerun against committed HEAD:
+
+```text
+python -B -c "<resource-ledger regression harness from the initial Task 3 verification>"
+resource-ledger smoke: audit-only USD, terminal uncertainty, recovery, and commit-before-overage validated
+
+python -B -c "<advisory-pricing regression harness from the initial Task 3 verification>"
+pricing smoke: high/unknown projections are advisory; fallback, deadline, and cancellation precedence validated
+
+python -B -c "<audit-shape regression harness from the initial Task 3 verification>"
+audit-shape smoke: canonical schema-v3 projection/actual USD and unchanged legacy fields validated
+```
+
+Commit hooks passed Ruff, trailing-whitespace, end-of-file, YAML, and merge-conflict checks.
+
+### Fix-round self-review
+
+- Confirmed the final deadline read precedes both the durable started event and `possibly_sent=True`, while the latest positive `remaining` value is still used as the transport timeout bound.
+- Confirmed invalid started accounting mutates the ledger and records reconciliation before raising, and idempotent verification succeeds afterward.
+- Confirmed recovery recomputation treats only an exact complete tuple as authoritative; missing, partial, or token-conflicting tuples retain the full reservation and contribute no invented cost.
+- Confirmed the exact `Decimal` accumulator is converted to canonical text at the public snapshot boundary and back to `Decimal` only after snapshot validation during restore.
+- Confirmed `ProviderCallRecord`, audit details, recovery evidence, and hidden-accounting call sites accept the canonical resource snapshot without numeric arithmetic.
+- Confirmed the generic `BudgetLedger` AST is identical to the pre-fix commit and the fix commit contains no `core/pit_optimizer_authorization.py` change.
+
+### Remaining concern
+
+The separately deferred Minor recovery-key issue is unchanged. This round necessarily touched optimizer recovery aggregate classification and cumulative-USD serialization, but did not alter the unrelated recovery-key admission/validation logic. That item remains for its assigned follow-up scope.

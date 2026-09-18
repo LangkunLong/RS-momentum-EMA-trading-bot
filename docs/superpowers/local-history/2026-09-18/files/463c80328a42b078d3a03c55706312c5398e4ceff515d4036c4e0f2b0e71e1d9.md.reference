@@ -1,0 +1,33 @@
+# Spec Compliance
+
+❌ The implementation is not fully compliant. It deliberately relaxes the fixed 1% position-risk and 8% stop-distance ceilings for compatibility paths, permits replacement entries when a policy cap is already below current holdings, and can leak a newly created client when interface validation fails.
+
+✅ The diff otherwise preserves the closed identity-free snapshot boundary, carries capacity through checkpoints, keeps hard-stop and fill/accounting authority in the engine, leaves `core/engine_policy.py` and the Task 2 reference untouched, records interface version separately, and does not add a real parity replay.
+
+⚠️ Per the review brief, I did not rerun the reported 149-test suite. The findings below are directly established by the authoritative diff.
+
+# Strengths
+
+- The five-call `InProcessPolicyClient` is a small, auditable delegate, and run-local client reuse is correctly applied through the normal success/failure path.
+- Entry, capacity, allocation, eviction, and exit decisions use frozen closed contracts with exact-type validation; dates, symbols, frames, `Trade`, simulator state, and fill prices are not exposed to policy decisions.
+- Eviction uses stable insertion-order slots, entry projection seals portfolio state before apply, and exit hard stops execute before policy invocation.
+- Capacity decisions are serialized with pending entries and restored for next-session execution. Policy interface identity is separate from schema-v1 effective-policy bytes.
+
+# Issues
+
+## Critical
+
+- `core/backtest_engine.py:3320-3336` — The engine raises `maximum_position_risk_fraction` above 1% and `maximum_stop_fraction` above 8% for direct-entry calls and injected-strategy runs using the baseline client. `validate_allocation_decision` and `_validate_entry_transition` then treat those relaxed values as the engine ceilings (`core/backtest_engine.py:3346-3352`). A configured 2% risk or 10% stop can therefore pass, directly violating the binding fixed safety ceilings. Keep the engine maxima unconditionally at `0.01` and `0.08`; compatibility behavior cannot override hard risk controls.
+
+## Important
+
+- `core/backtest_engine.py:2691-2694`, `core/backtest_engine.py:2854-2863` — A policy limit below current holdings is treated the same as exactly-full capacity. With two holdings, `max_positions=1`, and eviction enabled, the engine admits one candidate, selects an incumbent slot, and performs a sell-plus-buy replacement. The brief requires an over-capacity decision to block new entries without liquidating anything. Distinguish `len(open_positions) > limit` from `== limit`; only the exactly-full case may admit one eviction candidate. The purported regression test at `tests/test_backtest_engine.py:920-933` uses `eviction_enabled=False` and never calls signal evaluation or entry, so it cannot catch this path.
+- `core/backtest_engine.py:1731-1734` — Interface-version validation occurs before the `try/finally`. A factory-created client with a mismatched version, or a failing `interface_version` property, exits without `close()` and without the guaranteed cleanup path. Move interface validation and activation inside a `try` whose `finally` always closes the created client and clears `_policy_client`; add the mismatch lifecycle case to `tests/test_backtest_engine.py:51-73`.
+
+## Minor
+
+- `tests/test_backtest_engine.py:1119-1138` — The test named `byte_stable` snapshots positions and trades only with shallow containers. Both sides retain the same mutable `Trade` objects, so an in-place mutation can still compare equal and the test would pass. Compare serialized checkpoint primitives or a deep copy to make the atomicity claim honest.
+
+# Assessment
+
+Task quality: **Needs fixes**

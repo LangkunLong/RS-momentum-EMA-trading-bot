@@ -1,0 +1,118 @@
+# Task 7 report — recover accounted optimizer role output
+
+Date: 2026-09-01
+
+## Scope completed
+
+- Added `PitOptimizerRoleAttempt`, which preserves accepted payloads but represents
+  a fully accounted schema-invalid response with `payload=None`. Recovery requires
+  a received response, an allowed validation code, complete authoritative
+  accounting, and no retained reservation.
+- Added exact, hash-chained `AuthorizationPlanSkip` records and
+  `AuthorizationLedger.skip_unstarted_plans(...)`. Only the contiguous unstarted
+  author/critic remainder of an invalid investigator iteration can be settled;
+  skips create no reservation and carry no call, token, cost, or provider content.
+- Changed authorization replay, next-call reservation, predecessor receipt
+  binding, completion/early-stop verification, and finalization recovery to use
+  settled plan indices. A plan slot is settled by exactly one reconciled attempt
+  or authenticated skip. Accounted schema-invalid attempts consume one real call;
+  skips consume zero.
+- Kept the gateway one-shot. Parse, type, and input-binding rejections now finish
+  durable accounting and return a content-free invalid attempt. Transport failure
+  and incomplete/uncertain accounting still close terminally without retry.
+- Added create-only schema-v4 invalid-role and authorization-skip artifacts. They
+  contain only the sealed plan, provider facts, null payload, and authenticated
+  skip records. Rejected provider content is never persisted in these artifacts.
+- Generalized `RoleOutputInvalidSummary` to bind any v4 role to its deterministic
+  plan slot while retaining the invalid-author XOR contract used by the critic.
+- Updated existing authorization/gateway/receipt fixtures and assertions in
+  place. No test file, test function, or test class was added. Task 8
+  champion/branch/checkpoint control flow and Task 9 qualification were not added.
+
+## Files changed
+
+- `core/pit_optimizer_authorization.py`
+- `core/pit_optimization_contract.py`
+- `core/pit_optimizer_artifacts.py`
+- `agent_loop.py`
+- `tests/test_pit_optimizer_v2.py`
+- `tests/test_pit_optimizer_loop.py`
+- `.superpowers/sdd/2026-08-31-adaptive-oneil-optimizer-core-loop/task-7-report.md`
+
+`tests/test_agent_loop.py` was included in the required selection but left
+unchanged; its selected failures are the documented generic state-machine Temp
+permission failures and not Task 7 optimizer gateway behavior.
+
+## Verification
+
+- Exact pre-edit baseline selection:
+  `python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py tests/test_pit_optimizer_loop.py tests/test_agent_loop.py -k "schema_invalid or malformed or skip or receipt or accounting or retry"`
+  — `25 failed, 63 passed, 5 skipped, 799 deselected`.
+- Required selection after the production implementation:
+  the same command — `16 failed, 72 passed, 5 skipped, 799 deselected`.
+  Task 7 introduced no new failing class and made nine selected cases pass. The
+  residuals are pre-existing schema-v3 fixture/controller drift (`max_usd`, the
+  removed `prepare_pit_optimizer_v2` path, old budget reconciliation names and
+  record fields), one interface-v1 worker fixture, and five Windows sandbox Temp
+  permission failures in generic agent-loop tests.
+- Final production compile:
+  `python -B -m compileall -q core/pit_optimizer_authorization.py core/pit_optimization_contract.py core/pit_optimizer_artifacts.py agent_loop.py`
+  — exit 0.
+- Final production lint:
+  `python -B -m ruff check core/pit_optimizer_authorization.py core/pit_optimization_contract.py core/pit_optimizer_artifacts.py agent_loop.py --no-cache`
+  — `All checks passed!`.
+- Final focused recovery/lineage/artifact check:
+  `python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py tests/test_pit_optimizer_loop.py -k "terminal_reconciliation_fences_reopened_lease or nonaccepted_full_plan_cannot_be_completed or gateway_terminal_failures_close_without_retry or next_investigator_requires_prior_iteration_receipts or artifact_initialization_store_is_create_only_and_accounting_replaceable"`
+  — `7 passed, 347 deselected`.
+- `git diff --check` — exit 0; only the repository's Windows LF-to-CRLF notices.
+
+The pytest warnings are pre-existing: unknown option `cache_dir` and the
+third-party `websockets.legacy` deprecation.
+
+## Trust/accounting self-review
+
+1. Null-payload recovery cannot represent transport, before-send, provider, or
+   uncertain-accounting failure. It requires a response-validation code,
+   authoritative accounting source, exact usage/cost, and zero retained tokens.
+2. Skip creation authenticates the trigger plan against the sealed manifest,
+   requires its durable schema-invalid reconciliation, rejects active
+   reservations, and atomically appends the exact remaining same-iteration plan
+   slots. Skip parsing is closed over exact keys and verifies both chain hashes.
+3. Replay rejects duplicate settlement, noncontiguous coverage, skip/plan role or
+   iteration drift, absent or non-investigator triggers, and any attempt to bypass
+   a live reservation. Completion requires the full settled plan; early stop
+   requires a nonempty strict prefix.
+4. Receipt binding checks provider facts, plan identity, null versus accepted
+   payload digest, lifecycle commitments, and the durable audit event. A
+   recoverable schema-invalid receipt cannot carry a lease terminal code.
+5. Gateway parse/type/binding failures finalize before returning and make exactly
+   one provider request. Incomplete or uncertain accounting retains its bounded
+   reservation and remains terminal.
+
+## Concerns / handoff
+
+- The required broad selection remains red only for documented pre-Task-7
+  fixture/controller drift and sandbox Temp permissions; the final narrow Task 7
+  recovery and lineage checks are green.
+- Task 8 must consume these attempts/skips when implementing v4 search state and
+  the invalid-investigator/author/critic controller transitions. This task does
+  not mutate champion, branch, checkpoint, decision, or qualification state.
+- No provider call, Docker/replay run, secret inspection, remote operation, push,
+  progress-ledger edit, or original-checkout mutation was performed.
+
+## Fix round 1 — invalid author critic lineage
+
+- `bind_controller_role_input` now authenticates the critic's accepted
+  investigator plus an exact XOR of an accepted author artifact or an accounted
+  schema-invalid author attempt.
+- The invalid-author branch requires null author payload and manifest and an
+  exact content-free `RoleOutputInvalidSummary` bound to the durable author's
+  iteration, call index, role, and response-validation code. A transport or
+  uncertain-accounting attempt cannot satisfy the branch.
+- The accepted v4 branch independently rebuilds the author manifest from the
+  authenticated author artifact and selected-parent identity. Legacy accepted
+  critic lineage remains unchanged.
+- Verification: production compile and Ruff passed; the focused v4 role-input
+  smoke passed (`1 passed, 283 deselected`) and also rejected a tampered invalid
+  summary validation code; `git diff --check` passed with only Windows line-ending
+  notices.

@@ -1,0 +1,159 @@
+# Task 2 Report: Prevent Reference Symbols from Becoming Holdings
+
+Status: complete
+
+## Implementation
+
+- Replaced strategic PIT trading-universe construction with the explicit
+  `tradable_symbols()`, `reference_symbols()`, and `price_symbols()` APIs.
+- `PortfolioSimulator.run` now rejects explicit reference inputs, loads every
+  sealed reference as observation OHLCV, uses the complete price universe for
+  context closes, records the distinct universe sets/counts, and binds those
+  sets into the checkpoint fingerprint.
+- PIT baseline, leader basket, fact-cache construction, verification scope,
+  full candidate evaluation, and v3/holdout evaluator composition now keep
+  references outside tradable panels and holdings.
+- Verification scopes reject all sealed references, not only SPY.  The
+  simulator's RS eligibility is intersected with authenticated membership.
+- Updated existing focused test assertions to reject IWM/QQQ/SPY explicitly
+  and to verify a bundle-backed simulation limits panels, signals, holdings,
+  transactions, and trades to the tradable symbol.
+
+## Verification
+
+Passed:
+
+```powershell
+python -B -m compileall -q core/backtest_engine.py core/pit_optimization.py core/leader_basket.py core/pit_diagnosis/fact_cache.py pit_baseline.py pit_optimizer_holdout.py agent_loop.py
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_backtest_engine.py tests/test_pit_optimizer_subset_reference.py
+python -m ruff check core/backtest_engine.py core/pit_optimization.py core/leader_basket.py core/pit_diagnosis/fact_cache.py pit_baseline.py pit_optimizer_holdout.py agent_loop.py
+git diff --check
+```
+
+Result: compile completed successfully; pytest reported `57 passed` (with the
+pre-existing pytest cache-dir and websockets deprecation warnings); Ruff and
+`git diff --check` passed.
+
+## Files changed
+
+- `core/backtest_engine.py`
+- `pit_baseline.py`
+- `core/pit_optimization.py`
+- `agent_loop.py`
+- `pit_optimizer_holdout.py`
+- `core/leader_basket.py`
+- `core/pit_diagnosis/fact_cache.py`
+- `tests/test_backtest_engine.py`
+- `tests/test_pit_optimizer_subset_reference.py`
+
+## Self-review
+
+- Confirmed no remaining `bundle.symbols()` or SPY-only ticker-exclusion
+  construction in the task's named production modules.
+- Confirmed reference input failure occurs before price access and that only
+  tradable symbols can pass panel selection.
+- Kept the verification-scope schema and existing apply/audit paths intact;
+  no Task 3 market-context contract was introduced.
+
+## Concerns
+
+None.
+
+## Review fix round 1
+
+- Replaced the verification-panel dependency on baseline
+  `entry_attempt_outcomes.csv` with a fixed discovery window and deterministic
+  hash ranking over the authenticated active `tradable_symbols()` membership.
+  The resulting panel is therefore independent of baseline trading activity.
+- Removed the parity-reference check that required the v4 selected universe to
+  equal the legacy readiness scope.  The attested fold manifest continues to
+  bind its independent selected universe and bundle identity.
+- Carried distinct panel, full tradable, market-reference, and market-context
+  universe tuples through the live evaluator and holdout composition.  Both
+  now validate the simulator result's separately recorded universe identities
+  before producing fold evidence.
+
+### Verification added for review fix
+
+Passed:
+
+```powershell
+python -B -m compileall -q core/backtest_engine.py core/pit_optimization.py core/pit_optimization_contract.py core/leader_basket.py core/pit_diagnosis/fact_cache.py pit_baseline.py pit_optimizer_holdout.py agent_loop.py
+python -m ruff check core/backtest_engine.py core/pit_optimization.py core/pit_optimization_contract.py core/leader_basket.py core/pit_diagnosis/fact_cache.py pit_baseline.py pit_optimizer_holdout.py agent_loop.py
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_backtest_engine.py tests/test_pit_optimizer_subset_reference.py
+git diff --check
+```
+
+Result: compile, Ruff, and diff checks passed; pytest reported `57 passed`
+with the existing pytest cache-dir and websockets deprecation warnings.
+
+Attempted additionally:
+
+```powershell
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_backtest_engine.py tests/test_pit_optimizer_subset_reference.py tests/test_pit_optimizer_loop.py
+```
+
+The first two modules passed (57 tests), but all 40 `test_pit_optimizer_loop`
+cases failed during that module's shared fixture setup before the amended
+evaluator factory.  The pre-existing fixture passes the retired `max_usd`
+keyword to `AuthorizationRequirement`, whose current constructor rejects it.
+This was not changed because repairing that unrelated contract/fixture drift
+is outside the review-fix scope.
+
+### Files changed in review fix
+
+- `core/pit_optimization.py`
+- `core/pit_optimization_contract.py`
+- `agent_loop.py`
+- `pit_optimizer_holdout.py`
+- `tests/test_pit_optimizer_loop.py`
+
+### Review-fix self-review
+
+- Confirmed `_build_verification_scope` has no dependency on baseline attempt
+  files and only ranks active authenticated tradable membership.
+- Confirmed the parity path retained the independently attested selected
+  universe with bundle and benchmark attestation; round 2 restored its exact
+  equality binding to the independently derived readiness scope.
+- Confirmed evaluator and holdout panels are subsets of full tradables, market
+  references remain disjoint, and market context is exactly their union.
+
+## Review fix round 2
+
+- Restored the fail-closed equality binding between the parity reference's
+  selected universe and the independently derived verification-scope symbols
+  authenticated in readiness.  A stale parity artifact with the former
+  baseline-activity-derived panel now fails rather than changing the replay
+  panel silently.
+- Added the matching canonical selected-universe hash check to hidden holdout
+  setup.  Live evaluation already performs this check, so discovery and hidden
+  replay now both use the same universe identity as the subset fold manifest.
+
+### Verification added for review fix round 2
+
+Passed:
+
+```powershell
+python -B -m compileall -q core/pit_optimization_contract.py pit_optimizer_holdout.py
+python -m ruff check core/pit_optimization_contract.py pit_optimizer_holdout.py
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_subset_reference.py
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "manifest_builder_is_provider_free_canonical_and_source_budgeted"
+git diff --check
+```
+
+Result: compile, Ruff, and diff checks passed; direct parity tests reported
+`2 passed`, and the focused manifest-builder test reported `1 passed`
+(`281 deselected`).  The existing pytest cache-dir and websockets warnings
+remain non-blocking.
+
+### Files changed in review fix round 2
+
+- `core/pit_optimization_contract.py`
+- `pit_optimizer_holdout.py`
+
+### Review-fix-round-2 self-review
+
+- Verified the parity branch compares the ordered selected universe, not a set,
+  so the exact canonical universe hash used by the fold manifest is preserved.
+- Verified live and hidden evaluation both fail before replay if independently
+  derived scope symbols do not match the fold-manifest universe hash.

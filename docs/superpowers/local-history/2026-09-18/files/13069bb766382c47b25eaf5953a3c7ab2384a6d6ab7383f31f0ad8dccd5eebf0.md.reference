@@ -1,0 +1,49 @@
+# P4 and combined admission review preparation
+
+Preparation only; no P4 or combined spec/quality verdict. Read the binding admission design and full plan, P4 brief/preparation notes, original preimage authority documents, P1/P2 independent verdicts and their evidence limits, P2/P3 preparation provenance, and P3's initial independent review. No moving production source or task diff was read. Retained preimage bytes were hashed without source execution; all hashes and byte counts below match their authority documents.
+
+## Exact retained comparison authority
+
+All paths below are relative to `increment-c-campaign-proposal/`; production filenames map to `core/pit_optimizer_v5/`. No Git baseline or previously accepted H1-H3/B4c diff substitutes for these admission preimages.
+
+| Combined production file | Retained original admission baseline | Bytes | SHA-256 |
+| --- | --- | ---: | --- |
+| `campaign_admission.py` | Original absence, recorded in `admission-p1/preimage-report.md` | absent | none |
+| `production_runtime.py` | `admission-p2/principal-preimages/production_runtime.py` | 74672 | `1a232da79f5ddf0c01e48f39dd94008f6ad3b34ed08af385c3787e4f4555e070` |
+| `production_provider.py` | `admission-p2/principal-preimages/production_provider.py` | 56151 | `6077f0a716fa5d64594f5760d86b00f3b2865b605ca25bf3ab57bed07793b94f` |
+| `operations.py` | `admission-p3/principal-preimages/operations.py` | 33342 | `8164379a88d045c795ce3487683c5d5d911e56583d0555a01551e934cdea2bcc` |
+| `cli.py` | `admission-p3/principal-preimages/cli.py` | 103288 | `59044289f6f8cd3050e5f3604c30813f7f627fd221651af6ea76c74b4a6feb22` |
+| `development_preparation.py` | `admission-p4/principal-preimages/development_preparation.py` | 42987 | `e7f7e2c0d6c4b66eefd31b031cc18cf53f3924a013b39a318d613ccff75b72f8` |
+| `historical_verification.py` | `admission-p4/principal-preimages/historical_verification.py` | 93049 | `978c0bd83ddbafecc9ef388420c23634429f32a5f6473eef441c09db4c6c521b` |
+
+P4's narrow task comparison uses the last two preimages above plus an exact `campaign_admission.py` preimage captured **after P3 correction approval**. That P4 admission baseline is pending. P3 freeze-01 hash `e6b3a9b5362df18d670acd65469e4f4667247743fb93f803ce26041f1cb0dc38` in the preparation addendum is an interface snapshot, not an approved P4 baseline. Historical verification may remain unchanged; include its protection proof even if absent from the final diff.
+
+Increment continuity anchors independently rehashed here: approved P1 admission retained in `admission-p2/principal-preimages/campaign_admission.py`, 17227 bytes, `7e15ed500121b4c85df7a838feab51750e1f476a3e5427b9d1a0b1f0f58a89d9`; approved P2 admission retained in `admission-p3/principal-preimages/campaign_admission.py`, 45903 bytes, `c42b07adc2d14fd00300acf2c76fb15669cade0ad4b149d7d92cbe9666c88d5e`. These support incremental preservation, not the combined module's original baseline.
+
+## Named integration risks for frozen review
+
+1. **Original historical authority first.** Both public historical entries must share one private immutable composition after the existing original launch/config provenance, full round/resource/request/execution/reservation census, actual role history and projection authentication. Optional enrollment cannot short-circuit that path. Preserve the existing public signature and exact `None` return; explicit expected-reference compliance must require enrollment and matching durable policy, never replace original authority with caller input. No public recursion or duplicate resource/ledger authentication.
+
+2. **Logical prefix versus live frontier.** The preparation addendum identifies a live settled-frontier loader that cannot represent an earlier historical prefix once later rounds exist. Review the final pure prefix extraction against approved counter semantics: authenticate the complete ledger/package corpus once, then select only prior rounds and terminal receipts for each fresh start. Require contiguous configured/started rounds and no unfinished publication. Preserve selected value/index-union census, reject gaps/foreign/orphan state, and bind all shared facts to the original history aggregate. Do not subtract current-round author/critic usage as a fresh three-call admission.
+
+3. **One arithmetic and evidence contract.** Retain P1 exact frozen policy identities/types, prospective total-token calculation and conservative finite-USD rounding chain. Every actual enrolled request must satisfy the same envelope predicate used by all three factory returns and native ledger reservation. Evaluated counts mean distinct committed rounds with accepted authenticated critic binding and successful cleanup. Calls/tokens/USD derive from authenticated receipts; actual provider overage/failure stays historical fact. The report's final policy decision is not campaign success.
+
+4. **Native guard and enrollment continuity.** Combined review must retain call-time enrollment discovery, factory checks before request persistence, exact persisted call/primary attempt binding before reservation append, accepted current predecessors and original owner/root/config/start/deadlines. Check fresh launch and narrow binding-before-launch recovery under the existing transition, exact explicit pin and no-start/no-spend authority, no enrollment of launched legacy campaigns, omitted-argument resume discovery, and paired command/resume policy pinning. Preserve completed-request replay without another paid reservation.
+
+5. **Global settlement and failure precedence.** Policy checks must precede next config/start and follow reused/new settlements, including the cap's final round. Later pending/failed starts and missing/failed cleanup cannot be hidden by an earlier target-reaching prefix. Preserve runtime/provider/authority/deadline/novelty failure precedence and honest accounting without invented denied packages or outcomes. P3 initial review I1 remains a gate: recheck the original campaign deadline after heavy settled-fact authentication and before success in both reused/new paths. Await its frozen correction verdict; do not assume resolution from implementation activity.
+
+6. **Timeless historical scope.** Audit both historical public callgraphs transitively for explicit `repair=False`, no recovery/write/migration, and no adapter/capability/nonce/clock/provider construction or execution. Validate stored start epochs against original campaign epochs/deadlines. The new data-only report must expose actual usage/evaluated rounds, policy pin, final decision, verified logical-prefix eligibility, stored epoch scope, and unavailable global publication timestamps. Never claim cleanup/checkpoint/critic bytes existed before a later start from timestamps that were not stored.
+
+7. **Compatibility and bounded preservation.** Compare old fields/defaults, digest domains, legacy absence paths, original summary schemas/count formulas, and newline bytes outside authorized spans against retained preimages. Shared extraction must preserve approved P1/P2/P3 functions where behavior is not intentionally changed. H1-H3/B4c need focused dependency inspection only for a named admission integration risk, not repeated broad review.
+
+## Prior verdicts, evidence limits, and next gate
+
+P1 PASS/APPROVE resolved both monetary findings; its correction review was a targeted source comparison without a retained byte-for-byte fix diff. P2 APPROVE resolved all five findings and reports zero remaining within P2. Its independent review rehashed frozen sources/diffs; full archive/evaluator preservation was accepted from implementer evidence, not rerun by that reviewer. P3's initial verdict is FAIL/CHANGES REQUIRED solely for settled deadline-before-success I1. None of these verdicts establishes executed positive-policy behavior.
+
+Await the principal's explicit final freeze, P3 correction approval, P4 task report/diff, combined admission diff, exact source authority, static/protection evidence and complete immutable-read callgraph. The final report must give separate P4 spec and quality verdicts plus combined assessment with exact frozen file:line findings. Current work produced only this preparation document; no tests, imports/probes, synthetic facts, real readers/summaries, credentials/environment values, providers/APIs, Docker/evaluation/campaign activity, Git mutations or archive edits occurred.
+
+Static source approval precedes a separately reviewed collector package. It does not execute that collector. The later actual gate is one fresh immutable summary per original archive, prior runtime04 23-field/actual06 27-field comparisons, all 579+83 archive files unchanged, and the 56-file evaluator closure `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4`. No enrollment is added to old archives. Keep that later execution/readiness evidence separate from the frozen source approval.
+
+## Subsequent scoped P3 correction approval
+
+After the preparation above, the principal authorized a separate frozen I1 delta review. `../admission-p3/scoped-fix-review.md` now records final P3 spec PASS and quality APPROVE, relying explicitly on the initial full review plus the exact two-line operational deadline correction. This supersedes the pending-I1 status above; no P3 issue remains open from those reviews. Frozen admission remained unchanged at `e6b3a9b5362df18d670acd65469e4f4667247743fb93f803ce26041f1cb0dc38`, and freeze-02 operations is `02249f02dfad345ef3b6cca59a378f5bc0a211517427991f4c661158e9883942`. The principal still must capture/identify the exact approved admission preimage for P4 and provide final P4/combined freeze authority. The additional source reads were exclusively frozen operations correction context, with no moving production source read or P4 verdict begun.

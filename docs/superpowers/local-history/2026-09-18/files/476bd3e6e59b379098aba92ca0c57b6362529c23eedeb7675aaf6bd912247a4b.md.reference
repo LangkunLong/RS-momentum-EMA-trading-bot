@@ -1,0 +1,191 @@
+# Task 5 report — persist complete optimizer V5 learning
+
+## Outcome
+
+Implemented the pure durable-memory domain and the contained local artifact repository within the
+three-file Task 5 scope. No provider, Docker, replay, market-data, Git mutation outside the final
+focused commit, or test-file change was performed.
+
+Source scope:
+
+- Created `core/pit_optimizer_v5/memory.py`.
+- Created `core/pit_optimizer_v5/artifacts.py`.
+- Modified the infrastructure-free dependency leaf `core/pit_optimizer_v5/contracts.py` only to
+  expose its existing canonical primitive/JSON/digest convention, add canonical artifact-ref
+  serialization, and expose stable hypothesis/critic digests.
+
+## Domain and identity contracts
+
+- `ExperimentRecordV5` uses the real identity union:
+  `ExperimentIdentityV5 | PreValidationInvalidExperimentIdentityV5`. Only `status="invalid"` with
+  failed validation accepts the pre-validation identity and null policy revision. Every other
+  status requires a valid post-validation identity and exact non-null revision.
+- Record construction re-derives and compares the parent, full hypothesis, structural template,
+  strict assignment, round, discovery-plan digest, and optional policy-revision bindings. The
+  duplicated template digest, parent, changed-symbol set, evidence policy identities, campaign
+  episode tuple, campaign discovery-plan digest, experiment ID, and critic experiment ID must all
+  agree.
+- Status/evidence combinations are closed. Exact duplicates must use the parent policy identity;
+  suite-equivalent candidates must carry the exact parent semantic fingerprint; a status claiming
+  behavioral distinction rejects that parent fingerprint. Quick rejection, complete zero-trade
+  campaign, complete evaluated campaign, and partial timeout/cancellation/failure outcomes each
+  admit only their intended evidence shape.
+- Artifact serialization preserves strict variant literal types with explicit bool/int/float/str
+  tags. This avoids conflating a numeric axis value with text while leaving all existing valid V4
+  and candidate/experiment identity digests unchanged.
+- The complete per-experiment `CriticReviewV5` remains inline in the immutable record. A separate
+  `critic_artifact_ref` names the content-addressed full batch artifact exactly once. Repository
+  append and load require that artifact to contain exactly one byte-equivalent review for the
+  record's experiment, preserving the batch comparative assessment, next-campaign direction, and
+  top-level evidence IDs without duplicating the full batch.
+
+## Event journal, recovery, and archive boundary
+
+- The closed event payload union covers exactly the brief's six kinds: round intent, rendered
+  variant, quick evidence, one episode evidence item, owned resource lease, and cleanup result.
+  Event kind is bound both to its canonical payload path and its decoded concrete payload class.
+- `RoundEventV5` binds campaign, round, contiguous sequence, predecessor event digest, kind,
+  optional experiment, and payload reference. Recovery authenticates the complete contiguous
+  stream, canonicalizes it independently of execution consumers, and returns only declared local
+  steps not already present. Resource recovery keys include both resource kind and lease ID, so
+  several owned workspaces/workers/evaluators/containers cannot collapse to one completed step.
+- Final experiment records are the immutable rebuildable experiment journal; the event-kind set was
+  not expanded to create a competing finalization journal. The checkpoint's authenticated,
+  canonically ordered, append-only set of final record references is the promotion/commit
+  authority. Orphan critic or record files written before checkpoint publication remain durable but
+  unpromoted.
+- `ArchiveReducerV5` is a typed Task-6-owned reducer/projection boundary. Task 5 defines no archive
+  scoring or admission policy. Archive reconstruction folds only checkpoint-authorized records in
+  canonical round/experiment order.
+- Archive bytes are durably replaced before checkpoint bytes. Checkpoint generation advances
+  exactly once, cannot forget finalized records, and permits an exact idempotent replay. Recovery
+  treats the checkpoint as authority: an archive-ahead crash is repaired from its prior authorized
+  record set, while a checkpoint durably replaced before a caller-side failure is recovered as
+  committed.
+
+## Local artifact repository
+
+- Every reference is root-relative canonical POSIX text under the authenticated repository root.
+  The concrete grammar additionally rejects colons in every component, Windows reserved names,
+  and trailing dot/space forms.
+- Reads hold the existing hardened component-relative directory capabilities. POSIX uses
+  no-follow directory descriptors; Windows holds non-reparse directory handles without delete
+  sharing. Final targets must be single-link regular files, remain the same filesystem object
+  across the read, and stay within a fixed byte bound.
+- Inputs, typed payloads, events, records, and critic objects are create-only and fsynced. Only
+  `archive.json` and `checkpoint.json` use same-directory fsynced temporary files plus atomic
+  replace. The existing V4 store behavior was not modified.
+- Bytes are authenticated before parsing, JSON rejects duplicate keys and noncanonical encodings,
+  and reconstruction re-runs every domain invariant. Recursive graph verification performs
+  deterministic DFS and returns the existing typed missing/relocated/cycle/digest-mismatch result.
+
+## Investigator projection
+
+- Durable records are never truncated or overwritten.
+- The bounded projection first includes complete selected-parent lineage feedback (full hypothesis,
+  validation, measured evidence digests/target gap, every critic-review field, and authenticated
+  refs), then as much complete relevant-mechanism feedback as fits, then digest-backed summaries for
+  other experiments.
+- If the mandatory selected-parent lineage itself cannot fit, projection fails with
+  `ProjectionBudgetTooSmallV5`; it never silently truncates complete feedback. Ordering and bytes
+  are stable under reversed input order.
+
+## Verification evidence
+
+All commands ran from the isolated V5 architecture worktree.
+
+1. Final deterministic direct smoke:
+   `V5_MEMORY_FINAL_SMOKE_OK record=complete critic=all_fields payloads=6 recovery=missing_only projection=bounded_stable crash=before_after integrity=5 checkpoint=monotonic`.
+   It covered an evaluated record with quick evidence, four discovery episodes, a complete campaign,
+   an 11-observation semantic fingerprint, every critic review and batch field, all six payload
+   schemas, typed missing-step recovery with separate leases, bounded/reordered lineage projection,
+   idempotent/monotonic checkpoints, both sides of the checkpoint crash boundary, digest tamper,
+   missing file, relocated file, cycle detection, and lexical path escape/alternate-stream forms.
+2. A focused Windows symlink/reparse smoke attempted to create the link but the sandboxed host did
+   not grant link creation. The reused containment primitive's existing Windows reparse path is
+   unchanged; synthetic relocation and the no-follow/reparse rejection branches passed. This was
+   reported as `reparse=skipped`, not treated as executed coverage.
+3. The planned command
+   `python -B -m pytest tests/test_pit_optimizer_v5_domain.py -k "memory or artifact or checkpoint or tamper" -q`
+   could not run because that future test file is absent at this HEAD. No replacement test was added
+   under the user override.
+4. Stable existing evaluator/holdout/strategy-policy compatibility checks:
+   `python -B -m pytest tests/test_pit_optimizer_subset_reference.py tests/test_pit_optimizer_holdout.py tests/test_strategy_policy.py -q --no-cov`
+   — `47 passed`.
+5. Stable existing V4 artifact create-only/failure cleanup checks — `2 passed`.
+6. A broader legacy artifact selection produced `3 passed, 1 skipped, 2 failed`. The two failures
+   are stale at this HEAD: one still supplies schema version 2 to a store that accepts 3/4, and the
+   other expects an injected final-open race after the hardened Windows parent handle already blocks
+   component replacement. Neither failure enters the new V5 modules or reflects a V4 source change.
+7. Ruff check — `All checks passed!`; Ruff format check — all three scoped files already formatted.
+8. Python compilation and `git diff --check` passed. Pytest emitted only the existing websockets
+   deprecation and sandbox-denied pytest-cache warnings.
+
+The direct smoke's ordinary task directories were removed after verification. One directory created
+by a failed `tempfile` experiment inherited a sandbox-denied ACL and could not be removed from inside
+the sandbox; it is ignored under `.artifacts` and contains no experiment/provider/data content.
+
+## Explicitly deferred integration items
+
+These findings are real but belong to later plan owners and were not implemented here:
+
+- Task 6 must supply the archive reducer, campaign-CAGR recomputation, zero-trade eligibility,
+  top-K admission, novelty key, and target-gap authority. Task 5 stores the complete inputs/outcomes
+  and refuses to invent a competing policy.
+- Task 7/8 must persist and role-bind the issued investigator/critic evidence artifacts, add typed
+  stage-specific provider/runtime failure facts, and wire event/record/checkpoint calls into the
+  authorized runtime. Generic supplemental artifact refs remain available, but Task 5 does not
+  fabricate later role-envelope types.
+- The evaluator's baseline/candidate policy-identity convention, V3 client surface/default, and
+  evaluator source-map omissions are separate evaluator/runtime defects. They require focused
+  changes outside this task's three-file scope.
+- Semantic fingerprints intentionally exclude source/policy identity per Task 4. The immutable
+  experiment record binds the suite fingerprint to the revision that produced it; it never upgrades
+  suite-local equivalence to global equivalence.
+
+## Delivery
+
+- Focused implementation commit: `9928961` (`feat: persist complete optimizer v5 learning`).
+- Focused review-correction commit: `b3a20bf` (`fix: bind v5 critic memory authority`).
+- The commit contains only `contracts.py`, `artifacts.py`, and `memory.py`; this report and the
+  progress ledger are local SDD records and are intentionally ignored by Git.
+
+## Review correction
+
+The three review findings were reproduced and corrected within the original three-file boundary:
+
+- The public `is_testable_experiment_status_v5` predicate defines the final matrix. Invalid,
+  exact-duplicate, and suite-local behavioral-equivalent records are finalizable but untestable and
+  reject critic fields. Quick-rejected, zero-trade, timed-out, cancelled, evaluation-failed, and
+  evaluated records are testable and require both their exact review and full critic-artifact
+  reference at construction. Repository append/load repeats this gate, authenticates the canonical
+  content-addressed critic, and proves exactly one embedded review match before a record can be
+  created or returned.
+- Checkpoint publication and recovery group checkpoint-authorized records by round. Every testable
+  record in a round must share one critic artifact, and that artifact's unique review-ID set must
+  exactly equal the round's testable record-ID set. Raw journal loading deliberately remains able to
+  observe a crash-partial batch, but no partial/split/extra-review batch can become checkpoint
+  authority.
+- `ArtifactRefV5` now applies the repository's portable component grammar at contract construction:
+  every component rejects ADS colons, Windows device basenames, trailing dot/space, non-ASCII or
+  otherwise unsupported characters, overlength names, and noncanonical POSIX structure.
+- Investigator projection now requires `selected_parent_record_ref`. A non-null reference must be
+  one of the supplied checkpoint-authorized records, have evaluated status, bind the requested
+  selected revision, and represent a non-no-op producer; null explicitly denotes an external or
+  baseline parent and creates no journal-derived ancestry. Revision ownership is list-valued,
+  same-revision feedback is preserved in deterministic root-to-selected group order, and conflicting
+  parent lineage or immutable revision identity fails with a typed ambiguity. Exact-duplicate and
+  unpromoted records can contribute feedback but cannot advance ancestry.
+
+Fresh correction smoke:
+`V5_TASK5_REWORK_SMOKE_OK statuses=9 critic_matrix=exact batch=shared_once precritic=blocked tamper=1 path_rejections=11 lineage_records=3 lineage_order=stable ambiguity=typed budget=closed baseline=null`.
+
+Fresh compatibility/static evidence after the correction: `47 passed` for the stable evaluator,
+holdout, and strategy-policy selection; `2 passed` for the V4 artifact durability checks; Ruff,
+Ruff format verification, Python compilation, staged-diff checks, and commit hooks all passed.
+
+The controller's stricter post-critic final-record ruling supersedes the stale Task 8 plan fallback
+at `docs/superpowers/plans/2026-09-04-pit-optimizer-v5-learning-search.md:943-947`. Task 8 must keep
+authenticated pre-critic work as events/evidence, emit its own typed critic-unavailable runtime
+outcome when no separately authorized critic slot remains, create no `ExperimentRecordV5`, and
+leave the archive unchanged.

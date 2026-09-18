@@ -1,0 +1,19 @@
+# Architect checkpoint B3a: APPROVED
+
+B3a is approved at these exact source hashes:
+- runtime.py: `d331fd540b84a8bad160bd2dd85dc4a01803362511668503411eb7f44abd17df`
+- production_runtime.py: `78da0dc5efcf5cf94541a465e0a3c212221c843dade07f680ddc5e1508fdc476`
+
+No actionable findings were identified in the final scoped changes. RejectedCandidateEvidenceV5 is frozen and separate from materialized CandidateEvidenceV5, binds its template/assignment/parent hashes, and requires the exact closed invalid validation result. Its event-file reference check is a shape check only. B3b must authenticate that reference before record persistence; B3a does not claim to do so.
+
+The protocol, concrete factory and independent expected-record constructor agree on the explicit union, nonempty batch, critic pair, and exact ordered reviews for testable materialized candidates. Rejected records use their direct assignment and contain no candidate policy revision, candidate fingerprint, evaluation evidence or critic fields. The existing parent authority is retained. No fabricated critic artifact or materialization is introduced. _require_exact_records remains independent.
+
+The changed-existing-function comparison confirms only the record-factory protocol, _expected_records and concrete record factory changed, apart from line endings. CandidateEvidenceV5.experiment_id has a CRLF-to-LF difference only. The live run path, strict renderer call, materialization/evaluation, _publish, recovery and completion functions remain unchanged. The approved-A projection region was separately compared as exact bytes: 47,615 bytes, SHA `11e952e9c75573844ec5de81c4f9b21c84de432373de929cb031dc8182fd65a8`.
+
+Independent scoped Ruff, in-memory compilation, diff checks, source/preimage/patch hashes and the 56-file evaluator identity passed. Evaluator identity remains `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4`. See architect-verification.json.
+
+Read-only actual06 verification authenticated the manifest graph, author invocation and complete hypothesis binding, then reproduced one B1 rejection and the strict legacy AST ValueError using the archived author and authenticated four-file parent. Actual06 has no durable rejection event. The new B3a carrier/record paths remain statically reviewed and unexecuted.
+
+An existing real evaluated record from `.artifacts/pit-optimizer-v5/development/runtime-04` was also independently loaded through the repository. Its reference is `records/9e2a2dfdf35ce55653a3b9ec0d39ce87740a69a940ad5f3e473fd38ea629390d.json`, SHA `af6c73e632a3dc47cb344ecf3d1a55f9f58ba3e755e29fe992e0c03d0da103ac`: round 1, evaluated, four discovery episodes and bound critic. Its artifact refs use adapter-state/payloads, not event files. This is a useful B3b compatibility input; it does not establish new rejection persistence behavior or fulfill the two-round milestone.
+
+Next: B3b only, using next-luna-prompt-b3b.md. Add shared append/load semantic authentication for rejected records and narrowly prepare _publish to accept the explicit union without accessing materialization for invalid candidates. Keep B4 activation, lifecycle/recovery/finalized-campaign changes and feedback projection deferred. No production source was modified in this review, and no tests, synthetic probes, credentials, external calls, evaluations, campaigns, commits, pushes or deployment occurred.

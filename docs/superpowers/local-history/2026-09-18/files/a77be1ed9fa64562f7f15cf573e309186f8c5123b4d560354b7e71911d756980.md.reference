@@ -1,0 +1,30 @@
+# Task 11 preflight report
+
+Status: DONE
+
+## Production unblock
+
+- Added the schema-v4 readiness summary and successful readiness exit path in `agent_loop.py`.
+- Added the schema-v4 inert canary command renderer, bound to the authenticated v4 manifest, readiness artifact, discovery panel plan, qualification panel plan, qualification ledger snapshot, optional campaign checkpoint, authorization identities, and execution limits.
+- The emitted v4 command uses the canonical command renderer, includes source-transmission authorization, omits `--max-usd`, and omits `--apply` so the closed `apply=false` contract remains in force. No provider credentials are emitted.
+- Added an exact three-file `.gitattributes` LF rule for the v4 editable policy files and normalized their current working bytes to LF without semantic changes.
+- The live controller/service contract was not changed.
+
+## Verification
+
+- `python -m compileall -q agent_loop.py core/strategy_policy/entry.py core/strategy_policy/risk.py core/strategy_policy/exit.py`: passed.
+- `python -m ruff check agent_loop.py core/strategy_policy/entry.py core/strategy_policy/risk.py core/strategy_policy/exit.py`: passed.
+- `git diff --check`: passed (Git emitted only its existing LF-to-CRLF working-copy warning for `agent_loop.py`).
+- `python -c "import agent_loop; print('import ok')"`: passed.
+- No tests, provider calls, Docker, network, replay, qualification, or market-artifact operations were run.
+
+## Concerns
+
+- None. The separate Task 11 canary execution remains unopened and must be performed only from the exact emitted command.
+
+## Reviewer round 1 fix
+
+- Removed the invalid `PitOptimizerGateConfigV4.validate()` call; the v4 dataclass constructor already closes its validation contract.
+- Renderer checks now bind both authenticated discovery and qualification plan ledger-snapshot identities to the configured ledger snapshot. The readiness ledger head remains allowed to advance through later unrelated retirements.
+- Kept execution limits generic; no Task 11-specific hard-coded iteration, call, or token values were added.
+- Verification: `python -m compileall -q agent_loop.py`, `python -m ruff check agent_loop.py`, `git diff --check`, import smoke, and provider-free v4 readiness-render smoke all passed.

@@ -1,0 +1,205 @@
+# Task 5 report — atomic schema-v4 optimizer roles
+
+Date: 2026-08-31
+
+## Scope completed
+
+- Added an additive schema-v4 optimizer manifest and canonical v4 loader while
+  retaining schema-v3 dataclasses, prompts, response schemas, parser, and call
+  budgets unchanged for legacy audit loading.
+- Bound v4 campaign/sequence, clean source identity, policy interface 2, PIT
+  bundle, exact discovery-plan digest, qualification-plan commitment,
+  `AnnualizedReturnTarget`, optional seed-checkpoint digest, ordered editable
+  paths, immutable constraints, digest-pinned sandbox, a complete `3 * N` role
+  call plan, `apply=false`, and zero provider retries. Run lengths greater than
+  two iterations are accepted.
+- Added `PolicyAuthoringScopeV4` with hashes for exactly three initial policy
+  sources, an actual escaped canonical source-envelope byte count, finite
+  feedback/history/headroom and per-call response/token bounds, and descendant
+  rule `authenticated_parent_plus_atomic_full_sources`. No patch, hunk, changed
+  line, diff-byte, file-choice, 64-KiB change, or USD limit is present in v4.
+- Added self-authenticating baseline/champion/branch
+  `SelectedParentIdentity`, aggregate-only `SelectedParentSummary`, and bound
+  investigator/author/critic inputs. Source bundles are checked against the
+  selected parent's ordered per-file digests and canonical bundle digest.
+- Added strict investigator and critic v4 outputs. Investigator focus areas are
+  one to three values from `entry`, `risk_sizing`, and `exit` in canonical
+  order. Critic disposition is exactly `promote`, `refine`, or `abandon`, with
+  no v3 alias normalization.
+- Added the atomic `AuthorArtifactV4` response: exactly the three complete
+  editable sources, strict recursive duplicate-key rejection, strict UTF-8
+  including surrogate rejection, LF-only/no-NUL/no-CR/final-LF source rules,
+  canonical internal path order, parent binding, and at least one source change
+  versus the authenticated parent. It exposes no candidate workspace or patch.
+- Added panel/CAGR feedback contracts, compact prior hypotheses, validation
+  status, content-free `AuthorManifestSummaryV4`, author-only
+  `RoleOutputInvalidSummary`, and the valid-author-manifest XOR invalid-author
+  branch in `CriticInputV4`. Critic inputs contain no policy source text.
+- Added versioned v4 prompts, strict local response parsers, closed response
+  schemas, and prompt/schema/source-aware byte validation.
+- Exposed closed primitive decoders for the Task-4 annualized target and
+  `PanelAggregateSummary`; aggregate decoding requires exact keys and nested
+  metrics and reuses the Task-4 production CAGR/0.01 validation.
+- Updated only existing test functions/helpers and assertions; no test file,
+  test function, or test class was added. Legacy loop/controller wiring was
+  intentionally not changed because candidate writes, authorization, control
+  flow, accounting, checkpointing, and qualification belong to Tasks 6–9.
+
+## Files changed
+
+- `core/pit_optimization_contract.py`
+- `core/pit_optimizer_evaluation.py`
+- `tests/test_pit_optimizer_v2.py`
+- `.superpowers/sdd/2026-08-31-adaptive-oneil-optimizer-core-loop/task-5-report.md`
+
+`tests/test_pit_optimizer_loop.py` was exercised by the required command but
+left unchanged: its failures are the documented pre-Task-5 legacy controller
+fixture drift, and changing controller-era names/authorization fields here
+would cross the Tasks 6–9 boundary.
+
+## Verification
+
+TDD/scoped checks:
+
+- The first focused v4 role checks failed before the v4 types existed, then
+  passed after implementation.
+- Focused manifest/input check:
+  `python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "role_schema_inputs_are_exact_bounded_provider_projections or manifest_identity_binds_scope_budget_order_and_authorization"`
+  — `2 passed, 280 deselected`.
+- Final narrow v4 check after self-review hardening:
+  `python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "manifest_identity_binds_scope_budget_order_and_authorization or role_schema_inputs_are_exact_bounded_provider_projections or investigator_role_artifact_is_closed_and_bounded or author_role_artifact_is_closed_and_diff_bounded or critic_role_artifact_is_closed_and_advisory"`
+  — `2 passed, 280 deselected` (the repository's actual test names caused two
+  existing functions to match this expression).
+
+Exact Task-5 commands:
+
+- `python -B -m compileall -q core/pit_optimization_contract.py core/pit_optimizer_evaluation.py`
+  — exit 0.
+- `python -B -m ruff check core/pit_optimization_contract.py core/pit_optimizer_evaluation.py --no-cache`
+  — `All checks passed!`.
+- `python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py tests/test_pit_optimizer_loop.py -k "manifest or role or source or response or context"`
+  — `65 passed, 21 failed, 266 deselected, 2 warnings` in 88.66 seconds.
+  The exact base at `3481c73` was `64 passed, 22 failed, 266 deselected`; Task 5
+  introduced no new failing class and made one selected existing assertion pass.
+  Remaining failures are the documented legacy fixture drift: removed
+  `max_usd` arguments/properties in authorization/gateway fixtures, stale
+  `prepare_pit_optimizer_v2`/`run_pit_optimizer_v2` controller names and
+  schema-v3 loop setup, an expected builder dictionary missing the existing
+  `parity_reference=None`, and related pre-existing interface-v1 worker/context
+  assumptions. These are not v4 contract failures and were not chased into the
+  Task 6–9 controller/authorization scope.
+- `git diff --check` — exit 0; Git emitted only the repository's Windows
+  LF-to-CRLF working-copy notices, with no whitespace errors.
+
+The two pytest warnings are pre-existing: unknown pytest option `cache_dir` and
+the third-party `websockets.legacy` deprecation warning.
+
+## Self-review against Task 5
+
+1. Schema-v4 is additive; v3 remains separately parseable for audit and its
+   production definitions were not retrofitted.
+2. V4 authoring scope measures the escaped source envelope and has no patch or
+   financial ceiling.
+3. Parent identities self-authenticate; role and author-result bindings check
+   parent/source digests; baseline is explicit and non-null.
+4. Author parsing is closed and atomic across exactly three complete sources,
+   validates all text before return, and rejects a no-op bundle.
+5. V4 feedback is panel/CAGR-only, validates quick/discovery IDs and Decimal
+   CAGR, and the invalid-author critic alternative is content-free and XOR.
+6. V4 prompts/schemas are versioned, strict, and locally revalidated; v4 critic
+   literals have no aliases while v3 behavior remains untouched.
+7. No controller, candidate workspace, authorization/accounting, checkpoint,
+   rollback, or qualification behavior was added.
+
+## Concerns / handoff
+
+- The required combined test selection is not fully green because of the
+  explicitly documented pre-existing legacy fixture drift above. Its result is
+  better than the exact base and all Task-5-owned v4 checks are green.
+- Task 6 must consume the new full-source parser before creating a candidate
+  workspace. Tasks 7–9 must migrate legacy loop/authorization fixtures and wire
+  the v4 manifest/roles without making schema-v3 resumable.
+- No provider call, Docker/replay run, secret inspection, push, or original
+  checkout mutation was performed.
+
+## Review fix round 1
+
+### Scope and files
+
+The review fixes remain additive schema-v4 contract work. They modify only
+`core/pit_optimization_contract.py` and existing assertions/helpers in
+`tests/test_pit_optimizer_v2.py`; no new test file, test function, or test class
+was added. `core/pit_optimizer_evaluation.py` did not need a production change
+because the Task-4 panel and target primitives already supply the required
+identity and precision contracts. No Task 6–9 controller, candidate-write,
+authorization, checkpoint, rollback, or qualification behavior was wired.
+
+### Review findings resolved
+
+- Added the Task-4 quick- and discovery-panel digests to the v4 manifest and
+  every role context, deriving them directly from `DiscoveryPanelPlan` and
+  authenticating them against the supplied manifest during call-budget
+  validation. Investigator selected/baseline/champion/branch summaries and
+  critic selected/candidate/baseline/champion summaries now require the exact
+  expected panel digest and purpose. `TargetProgressV4` is recomputed from the
+  exact discovery summaries and compared field-for-field, including all CAGR
+  scalars and the target gap. Parent selection is deterministic: an active
+  branch wins, otherwise the champion wins, otherwise the baseline wins.
+- Made the v4 feedback/history declarations operational. Scope construction
+  rejects investigator source+feedback+history, author source+feedback, or
+  critic feedback declarations that exceed the corresponding dynamic call
+  cap. Each role budget check now requires the exact manifest, scope digest,
+  ordered call-budget slot, and canonical serialized feedback/history
+  envelopes, while retaining the full canonical input-payload cap. These are
+  finite byte/call/token caps only; no patch, diff, changed-line, USD, or old
+  64-KiB policy-change ceiling was introduced.
+- Extended the content-free `RoleOutputInvalidSummary` with its positive
+  iteration and deterministic author `call_index`. Critic construction binds
+  both values to the current iteration's author slot. The invalid-author branch
+  requires `invalid/author_output_invalid` and cannot carry candidate evidence;
+  every `valid` status requires both quick and discovery panels, while invalid
+  and not-evaluated statuses reject both.
+- Restored DeepSeek/OpenRouter compatibility by making
+  `pit_optimizer_v4_response_format()` return generic JSON-object mode. The
+  versioned closed role schemas remain available through
+  `pit_optimizer_v4_response_schema()` for local introspection. Authoritative
+  local dataclass constructors and parsers now enforce the schema limits,
+  including 256-character narrative/behavior fields and 96-character compact
+  list items; 257- and 97-character values are rejected.
+
+### Verification
+
+- `python -B -m compileall -q core/pit_optimization_contract.py core/pit_optimizer_evaluation.py`
+  — exit 0.
+- `python -B -m ruff check core/pit_optimization_contract.py core/pit_optimizer_evaluation.py --no-cache`
+  — `All checks passed!`.
+- `python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "role_schema_investigator_output_is_closed_and_bounded or role_schema_author_output_has_independent_diff_and_metadata_caps or role_schema_critic_output_is_advisory_closed_and_bounded or manifest_identity_binds_scope_budget_order_and_authorization or role_schema_inputs_are_exact_bounded_provider_projections"`
+  — `5 passed, 277 deselected, 2 warnings` in 1.12 seconds. These existing
+  tests cover the four review findings, including exact boundary rejections.
+- `python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py tests/test_pit_optimizer_loop.py -k "manifest or role or source or response or context"`
+  — `65 passed, 21 failed, 266 deselected, 2 warnings` in 84.14 seconds. This is
+  identical to the pre-fix Task-5 result and retains no new failure class. The
+  failures remain the documented legacy Task 6–9 fixture/interface drift
+  (`max_usd`, renamed v2 controller entry points, schema-v3 loop setup,
+  `parity_reference=None`, and interface-v1 worker/context assumptions).
+- `git diff --check` — exit 0 with only Git's Windows LF-to-CRLF notices and no
+  whitespace errors.
+
+The pytest warnings remain the pre-existing unknown `cache_dir` option and
+third-party `websockets.legacy` deprecation.
+
+### Self-review and concerns
+
+- Schema-v3 dataclasses/loaders/prompts/budgets remain untouched and v3 remains
+  audit-only; all new binding and transport behavior is v4-only.
+- Qualification data is not present in any role input. Only the already
+  authorized discovery-plan digest remains in role context, while the manifest
+  retains the qualification commitment required by Task 4.
+- Panel identities use the Task-4 `EvaluationPanelSpec.sha256` dialect; source
+  bundles retain their distinct newline-committed canonical digest dialect.
+- Call validation authenticates both declared component envelopes and the full
+  canonical role payload, so envelope accounting does not replace the actual
+  transport cap.
+- Remaining red tests are outside Task 5 ownership and were intentionally not
+  chased. No provider call, Docker/replay run, secret inspection, push,
+  progress-ledger edit, or original-checkout mutation occurred.

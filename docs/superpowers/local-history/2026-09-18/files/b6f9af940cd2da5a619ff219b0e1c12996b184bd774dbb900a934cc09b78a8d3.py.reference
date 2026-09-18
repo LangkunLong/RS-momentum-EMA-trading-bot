@@ -1,0 +1,113 @@
+"""Verify B1 only against the authenticated, unchanged actual06 author artifact."""
+
+from pathlib import Path
+import sys
+
+
+SOURCE_ROOT = Path.cwd().resolve()
+if not (SOURCE_ROOT / 'core').is_dir():
+    raise ValueError('run this verification from the source worktree')
+sys.path.insert(0, str(SOURCE_ROOT))
+
+from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5
+from core.pit_optimizer_v5.candidate_ir import StructuralTemplateV5
+from core.pit_optimizer_v5.contracts import ArtifactRefV5, canonical_json_bytes_v5
+from core.pit_optimizer_v5.manifest import authenticate_campaign_manifest_v5
+from core.pit_optimizer_v5.rendering import RejectedVariantV5, render_variant_outcomes_v5, render_variants
+
+
+ARTIFACT_ROOT = (SOURCE_ROOT / '.artifacts/pit-optimizer-v5/development/provider-runtime-06').resolve()
+PACKAGE = (SOURCE_ROOT / '.artifacts/pit-optimizer-v5/development/luna-recovery-b1').resolve()
+MANIFEST_REF = ArtifactRefV5(
+    'campaigns/development-provider-two-rounds-20260907-06/manifest.json',
+    'd90ed717c0d6b34d4cfa6bf7e2dd1f753e68c43b1127b200a66d2a9f930dfdf6',
+)
+AUTHOR_ARTIFACT_REF = ArtifactRefV5(
+    'roles/artifacts/author/98445c0e22a90e95482d40a77706b77780d2dd1e8e097092a81f9363c020e9f7.json',
+    'ad979279cdf09db2bd4ee6250d7b40103db2f5b89749e898dcd6ac234d5f06f2',
+)
+KNOWN_AST_ERROR = 'V5 policy AST contains an unbounded or stateful construct'
+
+
+def save_exclusive(name: str, value: object) -> None:
+    with (PACKAGE / name).open('xb') as handle:
+        handle.write(canonical_json_bytes_v5(value))
+
+
+def main() -> None:
+    repository = LocalArtifactRepositoryV5(ARTIFACT_ROOT)
+    authenticated = authenticate_campaign_manifest_v5(repository=repository, manifest_ref=MANIFEST_REF)
+    request = repository.load_unique_role_request_by_sha256(
+        '09564719a54cfd10a0b6edbc5b61996e7a68015866f1e0b538859c542d158c0f'
+    )
+    if request.role != 'author':
+        raise ValueError('actual06 request is not the accepted author request')
+    template = repository.load_role_artifact(AUTHOR_ARTIFACT_REF, role='author')
+    if type(template) is not StructuralTemplateV5:
+        raise ValueError('actual06 author artifact is not a structural template')
+    parent = authenticated.baseline_authority.source_bundle
+    parent_revision = authenticated.baseline_authority.policy_revision
+    if parent.sha256 != '109a61992ac79317446861c4cb2053f2704239eb1f8eacfe2b2d27ca2cf7456e':
+        raise ValueError('actual06 parent source bundle differs from the fixed authority')
+    if parent_revision.sha256 != '5d2a95ba2572e71dab448934544cef22130415fcc1691c9a98deb820d40a1fa9':
+        raise ValueError('actual06 parent policy revision differs from the fixed authority')
+
+    maximum = authenticated.manifest.search.max_variants_per_template
+    outcomes = render_variant_outcomes_v5(
+        parent=parent,
+        parent_revision=parent_revision,
+        template=template,
+        maximum=maximum,
+    )
+    if len(outcomes) != maximum or len(outcomes) != 1 or type(outcomes[0]) is not RejectedVariantV5:
+        raise ValueError('actual06 did not yield exactly one closed rejection outcome')
+    outcome = outcomes[0]
+    if outcome.failure_code != 'policy_source_unbounded_or_stateful':
+        raise ValueError('actual06 rejection code differs from the closed B1 code')
+    if hasattr(outcome, 'source_bundle') or hasattr(outcome, 'policy_revision'):
+        raise ValueError('actual06 rejection materialized source or policy identity')
+
+    strict_error = None
+    try:
+        render_variants(
+            parent=parent,
+            parent_revision=parent_revision,
+            template=template,
+            maximum=maximum,
+        )
+    except ValueError as exc:
+        strict_error = str(exc)
+    if strict_error != KNOWN_AST_ERROR:
+        raise ValueError('strict legacy rendering did not preserve the exact AST failure')
+
+    save_exclusive(
+        'actual06-outcome-verification.json',
+        {
+            'status': 'actual_archived_input_local_verification',
+            'provider_calls': 0,
+            'candidate_evaluations': 0,
+            'artifact_graph_verified': authenticated.graph.verified,
+            'manifest_ref': MANIFEST_REF.to_primitive(),
+            'author_request_sha256': request.sha256,
+            'author_response_text_sha256': '2c6d37ce6e8bc4eb65f021d70e289ac6c53612d7faba45c8ab1208489dad3d93',
+            'author_artifact_ref': AUTHOR_ARTIFACT_REF.to_primitive(),
+            'author_template_sha256': template.sha256,
+            'parent_source_bundle_sha256': parent.sha256,
+            'parent_policy_revision_sha256': parent_revision.sha256,
+            'maximum_variants': maximum,
+            'outcome_count': len(outcomes),
+            'outcome_type': type(outcome).__name__,
+            'outcome_assignment_sha256': outcome.assignment.sha256,
+            'outcome_failure_code': outcome.failure_code,
+            'rejection_has_no_source_bundle': not hasattr(outcome, 'source_bundle'),
+            'rejection_has_no_policy_revision': not hasattr(outcome, 'policy_revision'),
+            'legacy_render_variants_error': strict_error,
+            'legacy_render_variants_raised_value_error': True,
+            'author_artifact_authenticated': True,
+            'synthetic_inputs': 0,
+        },
+    )
+
+
+if __name__ == '__main__':
+    main()

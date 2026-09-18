@@ -1,0 +1,24 @@
+# Task 10 report
+
+Status: complete
+
+## Local canary inputs
+
+- Built and authenticated the local schema-v2 S&P-membership PIT bundle at `.artifacts/adaptive-oneil-core-canary-0c1aef43af24/bundle/pit_canary.sqlite3`.
+- Bundle identity: `480590727be9c5bf05dd17dda60f447d2051beb7a6457da3d5844949035770b2`.
+- The bundle contains 609 symbols and complete SPY, QQQ, and IWM non-tradable reference histories for 1,508 sessions from 2020-01-02 through 2025-12-31.
+- Published the 12-lineage quick, 48-lineage discovery, and sealed 24-lineage qualification plans. The qualification ledger remains at its genesis record and no qualification lineage was opened.
+
+## Baseline parity
+
+- Captured the provider-free v4 quick/discovery reference with digest `4fdb1ae035add6c22c56762785708429e6631a330d0c577bfdf98fb4d609cb02`.
+- Repeated both panels independently and produced an equal parity attestation with digest `cb13612cc72cec56816b1e8b892752d0e3fedde918555e2bbe4eb44a47330a4d`.
+- Both artifacts report two panels and policy interface 2.
+
+## Verification and cleanup
+
+- No OpenRouter role call, qualification, or replay was started.
+- Tracked source was clean after the artifact run.
+- Final process inspection found zero parity/optimizer Python processes.
+- Final name-only Docker inspection found zero PIT/agent-loop containers.
+- Task 11 subsequently added the load-bearing v4 CLI/LF preflight fix at `149fdc5`; the v4 parity contract binds the evaluated panel outputs and policy behavior rather than Git metadata, so the completed evidence remains applicable.

@@ -1,0 +1,65 @@
+# Task 1 implementation report
+
+## Files changed
+
+- `core/pit_diagnosis/__init__.py`: public exports for the PIT diagnosis rulebook API.
+- `core/pit_diagnosis/models.py`: frozen enums and dataclasses, recursively immutable mappings/policies, and field validation.
+- `core/pit_diagnosis/rulebook.py`: duplicate-key-safe canonical JSON loading, canonical SHA-256, rulebook construction, one-of N.NEWNESS resolution, and fail-closed fidelity assessment.
+- `config/pit_canslim_rulebook_v1.json`: version `pit-canslim-v1`, five approved source citations, and all 23 approved rule records with fixed policies.
+- `tests/test_pit_diagnosis_rulebook.py`: rulebook schema, one-of N, missing/unknown evidence, canonical JSON, and proxy validation tests.
+
+## Design decisions
+
+The public model types are frozen dataclasses. Rulebook and policy mappings are `MappingProxyType`; nested policy objects/lists are recursively converted to immutable mappings/tuples. Enum constructors reject values outside the closed contract. Canonical JSON rejects duplicate keys and non-finite constants, and hashes sorted compact UTF-8 JSON with `allow_nan=False`. Fidelity evaluation rejects unknown or missing outcome IDs, resolves `N.NEWNESS` only from a passed catalyst or passed new-high branch, validates approved proxy IDs against declared proxy rules, and never marks failed, unavailable, unimplemented, or unapproved required rules promotion-eligible.
+
+## Verification
+
+Commands and outputs:
+
+```text
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_rulebook.py
+.....                                                                    [100%]
+5 passed, 1 warning in 0.03s
+
+python -m ruff check core/pit_diagnosis/models.py core/pit_diagnosis/rulebook.py tests/test_pit_diagnosis_rulebook.py
+All checks passed!
+
+git diff --check
+(no output; passed)
+```
+
+The warning is the repository's pre-existing `PytestConfigWarning` for the unknown `cache_dir` configuration option. Commit hooks also passed Ruff, whitespace, EOF, YAML, conflict, and related checks.
+
+## Commit
+
+`5c1ab168b947ca27f5db26e751aca476f8fd5940` (`feat: add PIT CANSLIM fidelity rulebook`)
+
+## Concerns
+
+No functional concerns. The five source URLs are recorded as citation identities; no network access or external provider was used.
+
+## Round 1 review fixes
+
+Addressed all three reviewer findings:
+
+- `evaluate_fidelity` now requires every supplied value to be a `RuleOutcome` whose embedded `rule_id` exactly matches its mapping key.
+- `Rulebook` now validates a lowercase 64-character SHA-256 digest, string mapping keys, and `RuleSource`/`RuleRecord` value types before dereferencing them.
+- `N.NEWNESS` is failed only when every alternative fails; a failed plus unavailable/unimplemented alternative remains unavailable/incomplete rather than being misclassified as failed.
+
+Added regression tests for embedded identity mismatch, malformed rulebook fields, and mixed one-of outcomes.
+
+Fix verification commands and outputs:
+
+```text
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_rulebook.py
+........                                                                 [100%]
+8 passed, 1 warning in 0.04s
+
+python -m ruff check core/pit_diagnosis/models.py core/pit_diagnosis/rulebook.py tests/test_pit_diagnosis_rulebook.py
+All checks passed!
+
+git diff --check
+(no output; passed)
+```
+
+The same pre-existing pytest `cache_dir` warning remains. Fix commit: `85f445242699eb4c018b1903271636aac2667888` (`fix: harden PIT CANSLIM fidelity validation`).

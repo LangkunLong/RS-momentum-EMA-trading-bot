@@ -1,0 +1,138 @@
+# Task 3 Report: Causal RS Ratings and Structured Proper-Base Evidence
+
+## Status
+
+Completed and committed as `e0cc69d feat: add causal proper-base evidence`.
+
+## Files
+
+- Modified `core/momentum_analysis.py`
+  - Added public `calculate_rs_snapshot(...)` by moving the previous engine logic unchanged in behavior.
+  - Added a local finite-number helper so the public function still excludes stale/non-finite event values.
+- Modified `core/backtest_engine.py`
+  - Kept `_calculate_rs_snapshot(...)` as the compatibility delegate to the public function.
+- Added `core/pit_diagnosis/patterns.py`
+  - Added immutable canonical policy boundaries, pattern-kind and pattern-evidence structures.
+  - Added fail-closed flat-base and cup-with-handle detection using only rows strictly before the event session.
+  - Added deterministic SHA-256 input identity and structured N.NEW_HIGH entry evaluation.
+- Added `tests/test_pit_diagnosis_patterns.py`
+  - Covers auditable pre-event flat base, event-bar rejection, cup-with-handle bounds, no-base blocking, and successful entry evidence.
+- Modified `tests/test_backtest_open_causality.py`
+  - Covers equality between the public RS snapshot and the legacy engine delegate.
+
+## Decisions
+
+- A malformed pattern input is rejected with `ValueError`: missing OHLC fields, non-finite values, duplicate/unsorted session labels, fewer than 25 sessions, and event/future rows cannot be silently repaired or truncated.
+- Flat bases are 25--65 sessions and at most 15% deep. Cup-with-handle bases are 35--130 sessions, 15--33% deep, have a handle no deeper than 12%, and require the right lip within ±5% of the left lip.
+- Pattern pivots come from the pre-event `High` column (base high for flat bases; handle high for cups), not a generic historical-close high.
+- `evaluate_new_high_entry(None, ...)` returns `RuleOutcome.unimplemented("N.NEW_HIGH", "E.PROPER_BASE")`; it cannot pass as a proximity/new-high substitute.
+- Passing N.NEW_HIGH outcomes carry `E.PROPER_BASE`, `E.PIVOT`, `E.BUY_ZONE`, `S.VOLUME_CONFIRMATION`, and `N.NEW_HIGH` evidence IDs.
+
+## Verification
+
+RED phase:
+
+```powershell
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_patterns.py tests/test_backtest_open_causality.py -k "proper_base or near_high or public_rs"
+```
+
+Output: failed collection as expected because `core.pit_diagnosis.patterns` and public `calculate_rs_snapshot` did not yet exist.
+
+Cup detector RED phase:
+
+```powershell
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_patterns.py -k cup_with_handle
+```
+
+Output: `1 failed`; the initial detector incorrectly selected a flat base for the constructed cup-with-handle. The handle segmentation was then corrected.
+
+Focused public/delegate and proper-base verification:
+
+```powershell
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_patterns.py tests/test_backtest_open_causality.py -k "proper_base or near_high or public_rs"
+```
+
+Output: `3 passed, 9 deselected`.
+
+Legacy RS checkpoint verification:
+
+```powershell
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_backtest_engine.py tests/test_session_freshness.py -k "rs_snapshot or rs_scores"
+```
+
+Output: `1 passed, 35 deselected`.
+
+Required final checks:
+
+```powershell
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_patterns.py tests/test_backtest_open_causality.py
+```
+
+Output: `13 passed`.
+
+```powershell
+python -m ruff check core/momentum_analysis.py core/backtest_engine.py core/pit_diagnosis/patterns.py tests/test_pit_diagnosis_patterns.py
+```
+
+Output: `All checks passed!`.
+
+```powershell
+git diff --check
+git diff --cached --check
+```
+
+Output: no diff errors.
+
+## Commit
+
+`e0cc69d feat: add causal proper-base evidence`
+
+## Concerns
+
+- Pytest emitted two pre-existing environment/configuration warnings (`cache_dir` and deprecated `websockets.legacy`); no test failures or source/lint findings remain.
+- This task deliberately adds evidence primitives only. It does not alter legacy signal gates or promote/apply the new evidence to any live or agent-facing workflow.
+
+## Review Round 1 Remediation
+
+### Findings addressed
+
+- Flat-base certification now requires a chronological consolidation: the base pivot must precede its low, the low cannot be the final session, and price must recover at least halfway from that low toward the pivot. This rejects a shallow but uninterrupted rally.
+- Cup-with-handle certification now requires the handle's closing price to retrace below the identifiable pre-handle right-lip close. Intrabar high/low range alone cannot manufacture a pullback, so a flat post-lip plateau is rejected.
+
+### RED evidence
+
+```powershell
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_patterns.py -k "monotonic_rally or without_handle_pullback"
+```
+
+Output before the remediation: `2 failed`.
+
+- `test_monotonic_rally_is_not_a_flat_base` received `BaseKind.FLAT_BASE`.
+- `test_cup_recovery_without_handle_pullback_is_not_a_proper_base` received `BaseKind.CUP_WITH_HANDLE`.
+
+### GREEN and final verification
+
+```powershell
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_patterns.py -k "monotonic_rally or without_handle_pullback"
+```
+
+Output: `2 passed, 5 deselected`.
+
+```powershell
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_patterns.py -k cup_with_handle
+```
+
+Output: `1 passed, 6 deselected`.
+
+```powershell
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_patterns.py tests/test_backtest_open_causality.py tests/test_pivot_detector.py
+```
+
+Output: `27 passed`.
+
+```powershell
+python -m ruff check core/pit_diagnosis/patterns.py tests/test_pit_diagnosis_patterns.py core/momentum_analysis.py core/backtest_engine.py tests/test_backtest_open_causality.py
+git diff --check
+```
+
+Output: `All checks passed!`; no diff errors.

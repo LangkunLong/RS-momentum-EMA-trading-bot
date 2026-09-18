@@ -1,0 +1,32 @@
+# Task 3 Independent Review — `f4e489c..48c9946`
+
+## Spec Compliance
+
+The frozen V3 records and keyword-only builders match the Task 3 brief exactly.  The diff keeps sector leadership explicitly `None`, uses right-inclusive public-date and classification-date predicates, requires RS coverage for the complete active union, excludes reference symbols from that union, uses canonical sorted affiliations, and adds no composite score.  The technical formulas use the completed session and adequate bar counts; their positive-denominator checks are sound.  The new industry query is parameterized and its behavior is additive relative to the legacy group and leader APIs.
+
+Two important boundary failures remain: missing numeric source facts fail instead of producing unavailable feature values, and holding subjects are not resolved through the authenticated V3 identity/lineage contract.
+
+## Strengths
+
+- `core/pit_feature_snapshot.py:107-132` reads fundamentals through `fundamentals_as_of(..., include_provenance=True)` and deliberately leaves `sector_rs` unavailable rather than inferring current taxonomy.
+- `core/industry_group.py:69-100` uses a bound session parameter, only considers classifications through that date, and rejects ambiguous same-date assignments.
+- `core/canslim/l_leader_laggard.py:19-61` rejects boolean/non-finite RS inputs and requires all active-union RS observations.  `calculate_group_rs` then limits its denominator to that union.
+- `core/pit_feature_snapshot.py:211-222` rejects timezone-aware, duplicate, non-normalized, stale, and future price rows, and requires the completed session row.
+
+## Issues Critical
+
+None.
+
+## Issues Important
+
+1. `core/pit_feature_snapshot.py:224-229` — Any `None` in any supplied OHLCV column raises via `_required_number`, including a fact outside the window or column needed by the requested feature.  This conflicts with the frozen requirement that missing numeric facts be explicit `None`; a partial price record must make each dependent feature unavailable, while bool/NaN/inf remain rejected.  Preserve `None` through validation and have ATR/gap/ADV/high-distance/volume-ratio return `None` when a required input in their own lookback is missing.
+
+2. `core/pit_feature_snapshot.py:145-168` and `core/pit_feature_snapshot.py:189-203` — Holding construction merely checks uppercase spelling and intentionally allows non-active symbols, but never calls the authenticated V3 open-holding/lineage resolver.  A retired predecessor (or an arbitrary uppercase ticker) can therefore be paired with caller-provided prices and an extra RS value, yielding a valid-looking snapshot after its price identity ended.  Resolve or reject the subject against the V3 identity-transition contract at `session` before loading assignments, validating prices, or reading RS; require all supplied subject facts to correspond to the resolved active identity.
+
+## Issues Minor
+
+None.
+
+## Assessment
+
+Do not accept Task 3 as complete until the two Important issues are corrected.  No tests were run, per the review assignment; the test-edit waiver does not affect these source-boundary findings.

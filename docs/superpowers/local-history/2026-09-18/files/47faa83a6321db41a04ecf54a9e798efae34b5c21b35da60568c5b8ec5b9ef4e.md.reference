@@ -1,0 +1,108 @@
+# Next Luna session: C1 exact-duplicate record invariant correction only
+
+Work in C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.worktrees\pit-optimizer-v5-architecture.
+
+Read:
+- .artifacts/pit-optimizer-v5/development/luna-recovery-b4b/principal-architect-review.md
+- .artifacts/pit-optimizer-v5/development/luna-recovery-b4b/principal-architect-verification.json
+- docs/superpowers/plans/2026-09-07-pit-optimizer-v5-luna-recovery.md, including its latest C1 decision
+
+The principal has chosen a narrow invariant correction. B4b is held until this correction is reviewed. Do not narrow the supported lifecycle guarantee to exclude exact duplicates, and do not start B4c.
+
+## 1. Capture the precise starting state
+
+Only production file permitted to change: core/pit_optimizer_v5/memory.py.
+Only expected behavior change: ExperimentRecordV5._validate_post_validation_identity's changed-symbol guard.
+
+Expected starting memory.py SHA:
+99e084eeff284d39a651e899e9562780e2581eb936ce7ff1f3f0542ed7b523aa
+
+Preserve B4b runtime.py SHA d834eae8e3e120355b4479c77f87ebe46519a0b82a52cc072abe1dab60943aec and artifacts.py SHA 2bab516e4945976d9bf6bb356934289cd14d9b87c25088521a043c8ac5cfa2c2, plus every other protected hash in principal verification. Save an exact memory.py preimage in a fresh `.artifacts/pit-optimizer-v5/development/luna-recovery-c1` package. If current files differ unexpectedly, inspect before editing and preserve other work.
+
+This principal instruction explicitly supersedes the earlier memory.py preservation restriction for this one guard only. It does not authorize changing record fields or encoding, other memory invariants, candidate_ir.py, contracts.py, runtime.py, artifacts.py, production_runtime.py, selection.py, rendering.py or provider.py.
+
+## 2. Confirm the source distinction
+
+Read the actual source around:
+- candidate_ir.py StructuralTemplateV5.changed_symbols nonempty guard;
+- production_runtime.py's actual derive_changed_symbols_v5 validation;
+- runtime.py's expected empty symbols for a parent-identical revision and exact_duplicate short-circuit;
+- memory.py _validate_post_validation_identity and _validate_status_evidence;
+- artifacts.py _verify_finalized_candidate_origin's exact actual validation comparison;
+- selection.py QuickScreenCandidateV5's changed-symbol equality, and why exact duplicates never reach it.
+
+Do not construct an identical replacement or candidate to demonstrate the path. This is a static review of existing source.
+
+## 3. Correct the one record invariant
+
+Keep the existing exact ExperimentIdentityV5 type check and valid policy/validation prerequisites. Replace the unconditional template-symbol equality with this rule:
+
+```python
+parent_identical_duplicate = (
+    self.status == "exact_duplicate"
+    and self.experiment_identity.policy_revision_sha256
+    == self.parent_revision_sha256
+)
+expected_changed_symbols = (
+    () if parent_identical_duplicate else self.template.changed_symbols
+)
+if self.validation.changed_symbols != expected_changed_symbols:
+    raise ValueError("validation changed symbols differ from the expected candidate change")
+```
+
+Use equivalent clear formatting if required by scoped linting. The existing subsequent validate_post_validation_experiment_identity_v5 and full identity derivation bind that identity field to the actual PolicyRevisionIdentityV5. The existing exact_duplicate status guard separately requires the policy revision itself to equal the parent and prohibits candidate fingerprint/quick/episodes/campaign/target-gap evidence. Preserve all of those checks exactly.
+
+The exception is conjunctive: both exact_duplicate status and parent policy identity equality are required. A status label alone or an empty tuple on a changed-policy candidate must not bypass the declared-change check.
+
+For a parent-identical exact_duplicate, require the empty tuple strictly. Do not accept either empty OR declared symbols, do not copy the nonempty template tuple into validation, and do not rewrite a stored validation stage. All other post-validation statuses retain the original template-equality rule. Invalid pre-validation records keep their separate existing validation path.
+
+A short code comment may explain that the template declares edit scope while no-op validation reports no actual changes. Avoid a schema redesign or shared helper across modules for this one condition.
+
+## 4. Preserve all downstream truth and identities
+
+Do not:
+- set template.changed_symbols to empty or relax StructuralTemplateV5;
+- alter actual ValidationResultV5, semantic-stage outcome or durable evidence;
+- relabel exact_duplicate as invalid/render_rejected/evaluated;
+- fabricate critic, evaluation, source revision, changed symbols or campaign metrics;
+- modify record-factory output, finalized validation comparisons, identity hashing, canonical serialization, schema versions or historical files;
+- allow a different-parent policy to be accepted as exact_duplicate.
+
+Both independent record constructors should work through the corrected common ExperimentRecordV5 invariant without edits. The B4b finalizer will still require the record's empty validation to match its actual durable empty validation stage. The record keeps its real post-validation identity and parent-equal policy revision, with no critic or performance evidence.
+
+## 5. Review the narrow behavior statically
+
+Provide a concise decision table:
+- exact_duplicate + parent-equal policy + empty actual symbols: permitted by the corrected guard, with remaining identity/evidence guards still required;
+- exact_duplicate + parent-equal policy + nonempty symbols: rejected;
+- exact_duplicate + different policy: rejected by the complete guard chain;
+- changed-policy non-duplicate + declared symbols: original behavior preserved;
+- changed-policy non-duplicate + empty/mismatched symbols: rejected;
+- pre-validation invalid/render-rejected record: unchanged;
+- duplicate-only or mixed batch record construction: actual validation retained, no fabricated evidence, required critic for other testable candidates preserved.
+
+Trace how _expected_records, the concrete factory, record decoding and finalized validation all use the same corrected invariant. Do not execute synthetic cases or create records/events/wrappers to populate this table.
+
+## 6. Verify with allowed evidence
+
+Run scoped Ruff, in-memory compilation and exact-preimage diff checking for memory.py. Compare the exact changed function set: only ExperimentRecordV5._validate_post_validation_identity should change. Confirm all payload unions, journal folds, serialization methods and other functions remain unchanged, apart from unavoidable line-ending representation.
+
+Recompute evaluator_source_map_v5/evaluator_source_sha256. The principal verified memory.py is host-only and absent from the 56-file closure. Require the identity to remain 005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4. Do not rebuild or reseal the evaluator/baselines.
+
+Read-only historical compatibility:
+- repository .artifacts/pit-optimizer-v5/development/runtime-04;
+- record records/9e2a2dfdf35ce55653a3b9ec0d39ce87740a69a940ad5f3e473fd38ea629390d.json;
+- SHA af6c73e632a3dc47cb344ecf3d1a55f9f58ba3e755e29fe992e0c03d0da103ac;
+- preserve canonical bytes, evaluated status, four discovery episodes and exact critic binding.
+
+Actual06 may be authenticated read-only to confirm its unchanged terminal journal. Do not execute its runtime or generate new records from its author.
+
+The principal's local inventory found four experiment records under this worktree's PIT V5 artifacts: one evaluated, three evaluation_failed, no exact_duplicate. No real positive C1 record is available there. Do not fabricate one; explicitly report the new positive branch as statically reviewed and unexecuted. If your bounded inspection discovers an existing exact-duplicate record elsewhere in the authorized worktree, inspect/report its provenance and compatibility without migrating or modifying it.
+
+No tests may be read, created, changed or run. No synthetic probes/events/records/wrappers/templates, fake responses, model/API calls, credentials, candidate evaluations, campaign launch/resume, evaluator rebuild, commits, pushes or deployment.
+
+## 7. Return the C1 checkpoint
+
+Save exact preimage, narrow diff with repo-relative labels, final source hashes, decision table, unchanged-function/schema evidence, scoped check results, historical compatibility, evaluator identity and verification limits.
+
+Stop for principal architect review before B4c. The original two real evaluated feedback rounds remain unfinished. This is local C1 implementation scope only and grants no new campaign or external-call budget.

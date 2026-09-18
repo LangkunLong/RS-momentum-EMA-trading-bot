@@ -1,0 +1,33 @@
+# H1 task report
+
+## Implementation
+
+Added `core/pit_optimizer_v5/historical_verification.py` with `authenticate_historical_round_v5(*, repository, manifest, round_index)` and a frozen internal `HistoricalRoundAuthorityV5` result. The function requires exact local repository and V5 manifest types, a positive in-cap round, and the existing supported development scope.
+
+The resolver loads the original campaign launch, round launch, and started record with `repair=False`; authenticates the manifest graph from the launch's exact manifest reference; and requires exact manifest equality. It derives the canonical round key, validates the owner token, positive start, launch/start equality after removing only `started_epoch_ms`, and the round-one config reference.
+
+It loads the campaign and round configs through `load_development_config_v5`. Their concrete types and every field must agree except the four approved round-derived identities. It derives the exact `WorkspaceOwnerV5` with the existing controller lease derivation, then constructs only the read-only local workspace driver and mount factory. Their current identities must equal the saved round config.
+
+The resolver reads the exact round journal and candidate-execution index, authenticates every workspace lease history and output history, and requires each output source to link to an authenticated workspace. Each container reservation is loaded directly with `repair=False` and must bind the original executor digest, owner, request, canonical command, output mount, and derived execution lease IDs. The returned value stores immutable configs, references, owners, lease states, execution authorities, reservations, and source identities. It stores no live adapter or operational capability.
+
+No summary or runtime entry point imports this module, so H1 activates no behavior. Future public history entry points must call the authenticator themselves; the dataclass is a result container and is not an authorization boundary.
+
+## Permitted verification
+
+Scoped Ruff passed, the new source compiled in memory under Python 3.13, and `git diff --check` passed. The final source SHA-256 is `0f8383eac885cd03257b4316a80f720d25b8d216c7a0753ec5ad4c2d65c0ac82`. The complete 56-file evaluator map digest is `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4`.
+
+The real runtime-04 archive authenticated successfully for rounds 1 and 2. Each round produced one authenticated workspace history and five authenticated execution/reservation/output bindings. Both rounds matched their independently saved executor, workspace, and mount identities; all ten output sources linked to their journaled workspace. The archive tree digest was unchanged before and after authentication: `c3d3e13dbeccbce4d9e6e15066cefdc7260694be643dbc2474ee3e5383aa4e0e` across 517 files and 69,973,199 bytes.
+
+## Scope and limitations
+
+The only H1 source change is the new module. `development_preparation.py` and every protected production file remain untouched by this task. Existing dirty worktree changes were preserved.
+
+Negative branches received static self-review only, as required. No malformed or fabricated archives were created. H1 does not infer completed-history success, phase completeness, panel/output/control predicates, cleanup completion, role provenance, or summary eligibility; those remain H2/H3 work. Provider runtime-06 was not needed because runtime-04 supplied the required real resource history.
+
+## Independent review fix 1/5
+
+The P2 workspace-history boundary is corrected. `authenticate_lease_history` still performs the existing read-only authentication internally, but the returned authority now projects each result into a frozen `_HistoricalWorkspaceResourceV5`. The projection retains only the validated resource payload and reference, lease/owner/root/token/revision digests, relative path, lifecycle, and source identity. It does not retain `WorkspaceLeaseStateV5`, `WorkspaceLeaseV5`, an opaque handle, or any method that can issue `OwnedLeaseV5`.
+
+Scoped Ruff, in-memory compilation, and both real runtime-04 round authentications pass after the fix. Each round still has one projected workspace history, five execution histories, and complete source linkage. Boundary inspection confirms the projection has no `lease` field and no `as_owned_lease` method. The exact pre-fix source and `fix.diff` are preserved in this package; the final source SHA-256 is `1833ae0f443d5cb4d55cc1c05110e4f0d957f52afd540d480689a7b7967d0ba0`.
+
+The earlier 517-file digest covered only the narrower runtime-04 repository-root enumeration and is not complete archive coverage. `principal-preservation-check.json` is the authoritative preservation result: all 579 runtime-04 files and all 83 provider-runtime-06 files were unchanged. No new full archive hash was needed for this source-only fix.

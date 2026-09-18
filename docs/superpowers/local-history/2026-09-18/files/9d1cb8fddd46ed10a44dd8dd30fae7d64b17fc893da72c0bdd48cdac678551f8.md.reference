@@ -1,0 +1,16 @@
+# Controller roles review
+
+Verdict: **PASS**
+
+Reviewed the exact `controller-roles-review.patch` against `controller-roles-brief.md` and `controller-roles-report.md`, with narrow adjacent production-source reads limited to the controller invoker, role completion/recovery boundary, terminal-authority persistence, and feedback-round return boundary. No tests or synthetic probes were read, created, modified, or run.
+
+The change satisfies the bounded task:
+
+- `ControllerRoleTerminalAuthorityV5` is a distinct closed-union provenance variant. Its invocation validation binds the exact call digest, request digest, attempt digest, immutable raw-response reference/digest, parsed artifact digest when present, and exact zero-provider usage facts. It introduces no fixture identity, provider/model identity, paid receipt, cost, or semantic fingerprint.
+- Controller input is selected by the exact call-key digest and its envelope independently confirms both call and request digests. The first submitted bytes are sealed create-only under that call identity; subsequent invocation and terminal-authority loading authenticate and use the sealed artifact rather than rereading changed input.
+- Valid responses pass through the existing schema/evidence binder. Malformed and evidence-mismatched submissions become truthful zero-provider terminal attempts with no parsed artifact.
+- Missing input raises the narrow pending signal after the request is durably appended. The runtime returns `awaiting_controller_response` with exact role/call/request/request-reference data and without a role completion, terminal outcome, experiment, checkpoint, cleanup, or fabricated completion. Resume follows the same persisted request.
+- Runtime acceptance checks both newly produced and recovered terminal packages by manifest scope: provider-free development accepts controller authority, provider-free production accepts fixture authority, and paid production accepts ledger authority. Existing fixture and ledger encodings remain unchanged.
+- The operations documentation accurately describes the response envelope, immutable sealing, resume behavior, and the distinction from fixtures and external-model execution.
+
+Unverifiable cross-task dependency: construction of the full development campaign, wiring this invoker into that composition, higher-level handling of the pending result, real parent-episode collection, and the later semantic-skip work are intentionally outside this diff and remain for subsequent tasks. This does not affect the verdict on the present scope.

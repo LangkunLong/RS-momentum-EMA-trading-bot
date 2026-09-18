@@ -1,0 +1,64 @@
+# Task 2 — Calls/tokens-only authorization with advisory pricing (production first)
+
+## Authority
+
+Read the approved spec first:
+`C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-implementation/docs/superpowers/specs/2026-08-28-pit-optimizer-audit-only-usd-design.md`
+
+Task 1 commit `d474d92` supplies the active schema-v3 manifest without USD authority. The user explicitly directed us not to add more tests until the optimizer is confirmed working and produces discovery-return evidence. Do not modify tests. Do not call a provider, start Docker, open hidden data, push, or upload.
+
+## Production file
+
+- Modify only `core/pit_optimizer_authorization.py`.
+
+## Required active schema-v3 shapes
+
+Implement `OptimizerPricingSnapshot` with:
+
+- `model: str`
+- `lookup_status: str` exactly `available` or `unavailable`
+- `prompt_per_million: Decimal | None`
+- `completion_per_million: Decimal | None`
+- `pricing_payload_sha256: str`
+- `available(...)`, `unavailable(...)`, and `projected_call_usd(prompt_bytes, output_tokens) -> Decimal | None`.
+
+Available snapshots require finite non-negative rates; unavailable snapshots require both rates `None`. Its digest covers model, status, and canonical decimal rate strings. Projection is advisory and cannot gate capacity.
+
+Use these exact active authorization dataclass fields:
+
+- `OperatorAuthorizationGrant(grant_id, additional_calls, additional_tokens, policy_source_scope_sha256)`
+- `OperatorAuthorizationWindow(window_id, grant_ids, authorization_requirement_sha256, max_calls, max_tokens, policy_source_scope_sha256)`
+- `AuthorizationRunLease(lease_id, one_shot_key_sha256, window_id, run_manifest_sha256, pricing_snapshot_sha256, pricing_status, projected_plan_usd, max_calls, max_tokens)`
+- `AuthorizationCallReservation(reservation_id, lease_id, call_index, iteration, role, reserved_tokens, projected_call_usd)`
+- `PitOptimizerProviderFacts(call_index, iteration, role, requested_model, returned_model, pricing_snapshot_sha256, outcome, request_started, response_received, finish_reason, response_schema_valid, accounting_complete, prompt_tokens, completion_tokens, total_tokens, cost_usd, retained_reservation_tokens, audit_sha256)`
+
+## Required ledger behavior
+
+1. Active `AuthorizationLedger` records use `schema_version=3` and accept only the exact v3 closed keys.
+2. No active grant/window/lease/reservation or capacity comparison may contain `max_usd`, `additional_usd`, `reserved_usd`, retained USD, a nullable ceiling, infinity, or a sentinel.
+3. `open_run_lease` atomically appends a `pricing_snapshot` record and `lease_open` record. It validates only calls/tokens, identities, one-shot state, and exact manifest/requirement scope. It stores canonical advisory `projected_plan_usd` or null and the pricing status/digest.
+4. `reserve_call(lease, plan, projected_call_usd=...)` validates only call/token capacity and ordered plan identity. It stores canonical advisory projection or null and never compares its magnitude.
+5. Reconciliation:
+   - request not started: charged calls/tokens 0, actual cost 0, status `not_started`;
+   - complete valid accounting: charged call 1, charged tokens actual total, actual cost authoritative, status `authoritative`;
+   - request started but accounting incomplete: charged call 1, retain full reserved tokens, actual cost null, status `unavailable`, and terminal/fail-closed.
+6. Valid high actual cost is recorded but never capacity exhaustion. Invalid/missing/negative/non-finite/conflicting token or cost accounting remains terminal and durable.
+7. Overage consists only of reserved/actual token overflow or calls/tokens beyond the lease. Commit terminal facts before raising where the existing durable protocol requires it.
+8. Update terminal receipt cross-checks, recovery, charged totals, record validation, and hash-chain canonicalization to exact v3 fields. Preserve one-shot/replay/audit guarantees.
+9. Add `read_legacy_authorization_history(path)` that verifies canonical JSON, record indices, record hashes, and hash chain for immutable schema-v2 records, returning immutable mappings. Never translate, rewrite, resume, or append to schema-v2 history. Opening an active v3 `AuthorizationLedger` on v2 history must fail clearly as not resumable.
+10. Remove `--additional-usd` from the optimizer `record-grant` CLI. Calls/tokens/scope/approval reference remain required.
+11. Keep credentials, provider payloads, raw secrets, and provider responses out of records and output.
+
+## Verification and commit
+
+- Run `python -B -m py_compile core/pit_optimizer_authorization.py`.
+- Run a provider-free local construction/ledger smoke check if practical, using no test-file edits.
+- Run `git diff --check` and self-review the durable record keys and migration boundary.
+- Commit only the production file with subject: `Make PIT optimizer USD accounting audit-only`.
+
+## Report
+
+Write the detailed report to:
+`C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-implementation/.superpowers/sdd/2026-08-28-pit-optimizer-audit-only-usd/task-2-report.md`
+
+Include exact record/API changes, verification command/output, files changed, commit, self-review, and concerns. Return only status, commit, one-line verification, concerns, and report path. Do not dispatch subagents.

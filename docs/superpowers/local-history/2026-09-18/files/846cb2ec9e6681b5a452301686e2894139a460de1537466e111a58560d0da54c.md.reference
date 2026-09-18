@@ -1,0 +1,325 @@
+# Task 1 Report: Shared C/A Trace Cores With Legacy Parity
+
+## STATUS
+
+DONE
+
+## Files changed
+
+- `core/canslim/earnings_trace.py` (created)
+- `core/canslim/c_current_earnings.py`
+- `core/canslim/a_annual_earnings.py`
+- `.superpowers/sdd/2026-08-26-task11-engine-fidelity-observability/task-1-report.md` (created)
+
+## Implementation summary
+
+- Added the closed `MetricFamily` and `TraceReason` vocabularies and frozen,
+  slotted `CTrace` and `ATrace` dataclasses.
+- Added the PIT provenance attribute constant and non-mutating ISO-date mapping
+  readers. Absent provenance leaves trace public-date fields as `None`; supplied
+  malformed provenance or a supplied mapping missing a selected period triggers
+  the trace core's broad `EVALUATOR_EXCEPTION` fallback.
+- Added `evaluate_c_with_trace` and `evaluate_a_with_trace`, retaining the
+  existing metric precedence, matching/annual selection, scoring, clipping,
+  weights, and broad exception behavior. Their terminal reasons classify the
+  selected value pair without treating below-target finite growth as unavailable.
+- Replaced each legacy evaluator body with the required trace-core delegation.
+
+## Verification
+
+Command:
+
+```powershell
+python -B -m py_compile core/canslim/earnings_trace.py core/canslim/c_current_earnings.py core/canslim/a_annual_earnings.py
+```
+
+Output: no output; exit code 0.
+
+Command:
+
+```powershell
+git diff --check -- core/canslim/earnings_trace.py core/canslim/c_current_earnings.py core/canslim/a_annual_earnings.py
+```
+
+Output:
+
+```text
+warning: in the working copy of 'core/canslim/a_annual_earnings.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'core/canslim/c_current_earnings.py', LF will be replaced by CRLF the next time Git touches it
+```
+
+Exit code 0; no whitespace errors were reported.
+
+Command:
+
+```powershell
+@'
+import pandas as pd
+
+from core.canslim.a_annual_earnings import evaluate_a, evaluate_a_with_trace
+from core.canslim.c_current_earnings import evaluate_c, evaluate_c_with_trace
+from core.canslim.earnings_trace import PIT_PUBLIC_DATES_ATTR
+
+quarterly = pd.DataFrame(
+    [[1.0, 2.0, 1.5, 3.0]],
+    index=["Diluted EPS"],
+    columns=pd.to_datetime(["2024-03-31", "2024-06-30", "2025-03-31", "2025-06-30"]),
+)
+quarterly.attrs[PIT_PUBLIC_DATES_ATTR] = {
+    "2024-03-31": "2024-05-01",
+    "2024-06-30": "2024-08-01",
+    "2025-03-31": "2025-05-01",
+    "2025-06-30": "2025-08-01",
+}
+annual = pd.DataFrame(
+    [[1.0, 1.5, 2.5]],
+    index=["Diluted EPS"],
+    columns=pd.to_datetime(["2022-12-31", "2023-12-31", "2024-12-31"]),
+)
+annual.attrs[PIT_PUBLIC_DATES_ATTR] = {
+    "2022-12-31": "2023-02-01",
+    "2023-12-31": "2024-02-01",
+    "2024-12-31": "2025-02-01",
+}
+
+c_trace = evaluate_c_with_trace(quarterly)
+a_trace = evaluate_a_with_trace(annual)
+assert evaluate_c(quarterly) == (c_trace.score, c_trace.current_growth)
+assert evaluate_a(annual) == (a_trace.score, a_trace.annual_growth, a_trace.roe)
+print("trace parity probe: PASS")
+'@ | python -B -
+```
+
+Output:
+
+```text
+trace parity probe: PASS
+```
+
+Exit code 0.
+
+## Self-review findings
+
+- The legacy public functions consist solely of delegation and tuple projection.
+- The core preserves the old row-selection helpers and score calculations, so
+  ordinary frames without the optional provenance attribute retain scalar output.
+- The selected C trace uses the existing newest-first fiscal matching result;
+  selected A dates are the actual two latest non-null, sorted annual columns.
+- No test file was created or run, per the task constraint. No network, provider,
+  backtest, cache, optimizer, git-write, or other unrelated operation was used.
+
+## Concerns
+
+- None.
+
+## Pre-review correction: strict trace provenance
+
+The trace evaluators now run a single shared evaluator core in strict-provenance
+mode. A supplied malformed mapping, or a supplied mapping missing either
+selected period, propagates `ValueError` from `evaluate_c_with_trace` or
+`evaluate_a_with_trace`. The legacy wrappers use the same core with provenance
+disabled, so optional frame attributes cannot affect their scalar tuple.
+
+Re-run command:
+
+```powershell
+python -B -m py_compile core/canslim/earnings_trace.py core/canslim/c_current_earnings.py core/canslim/a_annual_earnings.py
+```
+
+Output: no output; exit code 0.
+
+Re-run command:
+
+```powershell
+git diff --check -- core/canslim/earnings_trace.py core/canslim/c_current_earnings.py core/canslim/a_annual_earnings.py
+```
+
+Output:
+
+```text
+warning: in the working copy of 'core/canslim/a_annual_earnings.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'core/canslim/c_current_earnings.py', LF will be replaced by CRLF the next time Git touches it
+```
+
+Exit code 0; no whitespace errors were reported.
+
+Re-run command: the inline `trace parity probe` command in the Verification
+section above, unchanged.
+
+Output:
+
+```text
+trace parity probe: PASS
+```
+
+Exit code 0.
+
+Command:
+
+```powershell
+@'
+import pandas as pd
+
+from core.canslim.a_annual_earnings import evaluate_a, evaluate_a_with_trace
+from core.canslim.c_current_earnings import evaluate_c, evaluate_c_with_trace
+from core.canslim.earnings_trace import PIT_PUBLIC_DATES_ATTR
+
+quarterly = pd.DataFrame(
+    [[1.0, 2.0]], index=["Diluted EPS"],
+    columns=pd.to_datetime(["2024-06-30", "2025-06-30"]),
+)
+annual = pd.DataFrame(
+    [[1.0, 2.0]], index=["Diluted EPS"],
+    columns=pd.to_datetime(["2023-12-31", "2024-12-31"]),
+)
+for frame, legacy, traced in (
+    (quarterly, evaluate_c, evaluate_c_with_trace),
+    (annual, evaluate_a, evaluate_a_with_trace),
+):
+    baseline = frame.copy()
+    for provenance in (
+        {"2025-06-30": "not-an-iso-date"},
+        {"2025-06-30": "2025-08-01"},
+    ):
+        tagged = frame.copy()
+        tagged.attrs[PIT_PUBLIC_DATES_ATTR] = provenance
+        try:
+            traced(tagged)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("strict trace accepted invalid provenance")
+        assert legacy(tagged) == legacy(baseline)
+print("malformed provenance probe: PASS")
+'@ | python -B -
+```
+
+Output:
+
+```text
+malformed provenance probe: PASS
+```
+
+Exit code 0. The probe covers both malformed ISO data and a supplied mapping
+missing selected periods, for both C and A.
+
+## Fix round 1: legacy A parity and incomplete-observation provenance
+
+### Changes
+
+- Kept A's original selected-row object intact for shared scalar scoring. Trace
+  period coercion and metadata extraction now occur only in strict trace mode,
+  so duplicate selected rows and sortable non-date fiscal labels retain legacy
+  scalar results.
+- Updated incomplete C and A paths to retain the highest-priority visible
+  observation, including its metric family, value, period end where representable,
+  and public date. Strict trace mode validates supplied provenance for that
+  visible period before returning an incomplete trace.
+
+### Verification
+
+Command:
+
+```powershell
+python -B -m py_compile core/canslim/earnings_trace.py core/canslim/c_current_earnings.py core/canslim/a_annual_earnings.py
+```
+
+Output: no output; exit code 0.
+
+Command:
+
+```powershell
+git diff --check -- core/canslim/earnings_trace.py core/canslim/c_current_earnings.py core/canslim/a_annual_earnings.py
+```
+
+Output:
+
+```text
+warning: in the working copy of 'core/canslim/a_annual_earnings.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'core/canslim/c_current_earnings.py', LF will be replaced by CRLF the next time Git touches it
+```
+
+Exit code 0; no whitespace errors were reported.
+
+Command:
+
+```powershell
+@'
+import pandas as pd
+
+from core.canslim.a_annual_earnings import evaluate_a, evaluate_a_with_trace
+from core.canslim.c_current_earnings import evaluate_c, evaluate_c_with_trace
+from core.canslim.earnings_trace import PIT_PUBLIC_DATES_ATTR, MetricFamily, TraceReason
+
+duplicate_a = pd.DataFrame(
+    [[1.0, 2.0], [1.0, 2.0]],
+    index=["Diluted EPS", "Diluted EPS"],
+    columns=pd.to_datetime(["2023-12-31", "2024-12-31"]),
+)
+assert evaluate_a(duplicate_a) == (0.0, None, None)
+fy_a = pd.DataFrame([[1.0, 2.0]], index=["Diluted EPS"], columns=["FY2023", "FY2024"])
+assert evaluate_a(fy_a) == (0.8, 1.0, None)
+
+unmatched_c = pd.DataFrame(
+    [[2.0]], index=["Diluted EPS"], columns=pd.to_datetime(["2025-06-30"])
+)
+unmatched_c.attrs[PIT_PUBLIC_DATES_ATTR] = {"2025-06-30": "2025-08-01"}
+c_trace = evaluate_c_with_trace(unmatched_c)
+assert c_trace.metric_family is MetricFamily.DILUTED_EPS
+assert c_trace.terminal_reason is TraceReason.NO_COMPARABLE_PRIOR_PERIOD
+assert str(c_trace.current_period_end) == "2025-06-30"
+assert str(c_trace.current_public_date) == "2025-08-01"
+assert c_trace.current_value == 2.0
+missing_c = unmatched_c.copy()
+missing_c.attrs[PIT_PUBLIC_DATES_ATTR] = {}
+try:
+    evaluate_c_with_trace(missing_c)
+except ValueError:
+    pass
+else:
+    raise AssertionError("unmatched C accepted missing selected-period provenance")
+baseline_c = unmatched_c.copy()
+baseline_c.attrs = {}
+assert evaluate_c(missing_c) == evaluate_c(baseline_c)
+
+one_a = pd.DataFrame(
+    [[2.0]], index=["Diluted EPS"], columns=pd.to_datetime(["2024-12-31"])
+)
+one_a.attrs[PIT_PUBLIC_DATES_ATTR] = {"2024-12-31": "2025-02-01"}
+a_trace = evaluate_a_with_trace(one_a)
+assert a_trace.metric_family is MetricFamily.DILUTED_EPS
+assert a_trace.terminal_reason is TraceReason.INSUFFICIENT_ANNUAL_HISTORY
+assert str(a_trace.current_period_end) == "2024-12-31"
+assert str(a_trace.current_public_date) == "2025-02-01"
+assert a_trace.current_value == 2.0
+missing_a = one_a.copy()
+missing_a.attrs[PIT_PUBLIC_DATES_ATTR] = {}
+try:
+    evaluate_a_with_trace(missing_a)
+except ValueError:
+    pass
+else:
+    raise AssertionError("one-observation A accepted missing selected-period provenance")
+baseline_a = one_a.copy()
+baseline_a.attrs = {}
+assert evaluate_a(missing_a) == evaluate_a(baseline_a)
+print("Task 1 fix round 1 probe: PASS")
+'@ | python -B -
+```
+
+Output:
+
+```text
+Task 1 fix round 1 probe: PASS
+```
+
+Exit code 0.
+
+### Self-review
+
+- The only A calculation performed before the shared score path is the legacy
+  `sort_index().dropna()` expression; duplicate rows are no longer collapsed.
+- Scalar mode does not call `_period_end` or PIT lookup helpers, preserving
+  legacy behavior for non-date labels and optional metadata.
+- Strict trace mode validates visible incomplete observations before their early
+  returns. No test file was created or run.

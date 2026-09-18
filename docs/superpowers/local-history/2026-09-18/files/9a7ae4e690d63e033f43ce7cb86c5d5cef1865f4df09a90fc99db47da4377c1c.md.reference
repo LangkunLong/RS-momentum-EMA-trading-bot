@@ -1,0 +1,87 @@
+# Task 2: Opt-In PIT Public-Date Provenance — Implementation Report
+
+## Status
+
+Complete.
+
+## Files changed
+
+- `core/pit_data.py`
+- `.superpowers/sdd/2026-08-26-task11-engine-fidelity-observability/task-2-report.md`
+
+## Implementation summary
+
+- Imported `PIT_PUBLIC_DATES_ATTR` from `core.canslim.earnings_trace`.
+- Added keyword-only `include_provenance: bool = False` to `fundamentals_as_of`, `iter_fundamental_state_boundaries`, `_fundamental_snapshot`, and `_statement_frame`, and threaded it through snapshot construction.
+- After the existing stable sort and latest-amendment-per-period selection, captured selected period/public-date pairs and, only when requested, attached their ISO-date mapping to the final statement frame's `attrs`.
+- In provenance mode, empty statement selections receive `{}` under `PIT_PUBLIC_DATES_ATTR`; default frames remain attribute-free.
+- Kept cached production-provider snapshots explicitly provenance-free in `_fundamentals_provider_state` and `fundamentals_provider`.
+
+## Verification commands and output
+
+```powershell
+python -B -m py_compile core/pit_data.py
+```
+
+Output: no output; exit code 0.
+
+```powershell
+git diff --check -- core/pit_data.py
+```
+
+Output:
+
+```text
+warning: in the working copy of 'core/pit_data.py', LF will be replaced by CRLF the next time Git touches it
+```
+
+Exit code 0; no diff-whitespace errors.
+
+The local read-only parity probe located a local SQLite PIT bundle, computed its SHA-256, supplied that exact digest to the bundle constructor, opened it read-only, and closed it in `finally`:
+
+```powershell
+python -B -c 'import hashlib, inspect; from pathlib import Path; import core.pit_data as pit; bundle_class = next(cls for _name, cls in inspect.getmembers(pit, inspect.isclass) if cls.__module__ == pit.__name__ and all(hasattr(cls, member) for member in ("fundamentals_as_of", "close"))); bundle = None; candidates = (path for path in Path(".").rglob("*") if ".git" not in path.parts and path.is_file() and path.suffix.lower() in (".db", ".sqlite", ".sqlite3"));
+for candidate in candidates:
+    expected_sha256 = hashlib.sha256(candidate.read_bytes()).hexdigest()
+    try:
+        bundle = bundle_class(candidate, expected_sha256=expected_sha256)
+        break
+    except Exception:
+        bundle = None
+if bundle is None: raise RuntimeError("no locally validated PIT bundle found")
+try:
+    symbol = next(iter(bundle.symbols()))
+    default_snapshot = bundle.fundamentals_as_of(symbol, bundle.data_cutoff)
+    provenance_snapshot = bundle.fundamentals_as_of(symbol, bundle.data_cutoff, include_provenance=True)
+    for statement in ("quarterly_income", "annual_income", "balance_sheet"):
+        default_frame = default_snapshot[statement]; provenance_frame = provenance_snapshot[statement]
+        assert default_frame.index.equals(provenance_frame.index)
+        assert default_frame.columns.equals(provenance_frame.columns)
+        assert default_frame.equals(provenance_frame)
+        assert pit.PIT_PUBLIC_DATES_ATTR not in default_frame.attrs
+        assert pit.PIT_PUBLIC_DATES_ATTR in provenance_frame.attrs
+    print("PIT provenance frame parity: PASS")
+finally:
+    bundle.close()'
+```
+
+Output:
+
+```text
+PIT provenance frame parity: PASS
+```
+
+An initial version of this same read-only probe addressed `bundle.symbols` as a property and stopped before snapshot comparison with `TypeError: 'method' object is not iterable`. It made no writes; the corrected invocation above passed.
+
+## Self-review
+
+- Default invocations leave `include_provenance=False`, preserving statement cells, indexes, columns, dtypes, and frame attributes.
+- Provenance is added only after amendment selection, with no added data row or column.
+- The mapping contains only ISO period-end to ISO public-date entries from the selected records.
+- Provider-cache construction calls `_fundamental_snapshot(..., include_provenance=False)` explicitly.
+- No tests, provider/network calls, cache refreshes, backtests, optimizer operations, commits, pushes, merges, or branch switches were performed.
+
+## Concerns
+
+- `git diff --check` emitted the repository's LF-to-CRLF warning, but exited successfully with no whitespace errors.
+- No automated tests were added or run, as required by the task brief; validation is limited to the prescribed compile, diff, and local read-only parity checks.

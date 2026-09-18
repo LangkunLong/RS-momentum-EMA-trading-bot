@@ -1,0 +1,26 @@
+Spec Compliance: FAIL — one important qualification-comparison gap remains.
+
+## Strengths
+
+- The five planning documents consistently identify the approved V5 specification: the roadmap does so at `docs/superpowers/plans/2026-09-04-pit-optimizer-v5-roadmap.md:17`, while the four detailed plans do so at `...-campaign.md:11`, `...-evaluator-truth.md:11`, `...-learning-search.md:11`, and `...-strategy-universe.md:11`.
+- The roadmap preserves the compatibility and opt-in boundaries: V2–V4 history remains read-only and discovery is `apply=false` (`docs/superpowers/plans/2026-09-04-pit-optimizer-v5-roadmap.md:21-24`). It also explicitly defers live provider execution during the provider-free proof (`...roadmap.md:223-225`).
+- Holdout isolation and one-use handling are concrete rather than aspirational. The discovery plan contains only holdout digests; search/runtime receives neither path nor deserializer, and opening is restricted to later commands (`docs/superpowers/plans/2026-09-04-pit-optimizer-v5-campaign.md:181-191`). The ledger procedure requires a pre-open state match and terminal chained events (`...campaign.md:193-198`).
+- Confirmation is correctly detached from discovery feedback and requires the same panel, evaluator, sandbox, execution profile, and friction grid for baseline and candidate (`...campaign.md:474-495`). Qualification is separately operator-gated and retired whether it succeeds or fails (`...campaign.md:591-602`, `...campaign.md:673-675`).
+
+## Issues
+
+### Critical
+
+None.
+
+### Important
+
+- `docs/superpowers/plans/2026-09-04-pit-optimizer-v5-campaign.md:119-132,566-575` — Qualification does not explicitly bind or verify a friction/scenario-grid identity shared by baseline and candidate. The qualification commitment has plan, execution, evaluator, baseline, and sandbox references, and the implementation text requires the same execution/sandbox profiles, but it neither carries a scenario/friction reference nor requires equality of that identity. This differs from the explicit confirmation requirement at `...campaign.md:481-495`. As written, qualification could compare results under different cost scenarios while still satisfying its listed checks, violating the global same-execution-and-friction-identity constraint. Add an authenticated friction/scenario-grid reference (or an explicit immutable inclusion in the evaluator contract) to `QualificationAttemptCommitmentV5`, require equality for both evidence records, and add it to the qualification assertions and outcome verification.
+
+### Minor
+
+None.
+
+## Assessment
+
+Task Quality: NEEDS REVISION. The six requested documentation files, cross-plan specification references, opt-in behavior, local-artifact boundary, provider-free implementation phase, and sealed one-use holdout design are all present. Resolve the qualification friction-identity omission before treating the roadmap as implementation-ready; no replay, provider, Docker, or qualification execution is needed for this documentation correction.

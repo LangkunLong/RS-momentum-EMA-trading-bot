@@ -1,0 +1,17 @@
+# Task 4 Fix Re-review 2
+
+Reviewed only the appended reports and `review-72ba31e..561bd37.diff`. No tests were rerun.
+
+## Verdict
+
+**Resolved.** `core/strategy_policy/contracts_v3.py:282-292` now separates structural zero-gross validation from floating-point reconciliation:
+
+- exact `gross == 0.0` rejects every nonempty sector or industry tuple before the tolerance is consulted;
+- positive gross rejects either empty classification tuple; and
+- only nonempty positive-gross totals reach `_same()` at `:292`, retaining the intended reconciliation tolerance.
+
+This closes the prior `5e-13` positive-exposure-at-zero-gross case and introduces no apparent contract regression: a genuine all-cash portfolio remains representable with two empty tuples, while every invested portfolio must carry complete classifications. The supplied diff changes only V3 contract validation; V2 source and framing remain untouched.
+
+## Assessment
+
+The remaining Task 4 finding is fixed. No new issue identified in this bounded re-review.

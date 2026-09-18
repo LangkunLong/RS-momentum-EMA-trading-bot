@@ -1,0 +1,572 @@
+# Review package: b0367d48a848b1cbaea64683c9220efe7ef55ff5..f30032b7578e326be7b4cbf67f726d89cda987f6
+
+## Commits
+f30032b fix: preserve schema-v3 candidate identity
+
+## Files changed
+ core/pit_optimizer_candidate.py | 166 +++++++++++++++++++++++++++++++++-------
+ tests/test_pit_optimizer_v2.py  |  71 ++++++++++-------
+ 2 files changed, 183 insertions(+), 54 deletions(-)
+
+## Diff
+diff --git a/core/pit_optimizer_candidate.py b/core/pit_optimizer_candidate.py
+index a9b9522..17ff5b5 100644
+--- a/core/pit_optimizer_candidate.py
++++ b/core/pit_optimizer_candidate.py
+@@ -173,22 +173,21 @@ _ALLOWED_AST_NODES = (
+ 
+ @dataclass(frozen=True, slots=True, weakref_slot=True)
+ class CandidateIdentity:
+     source_commit: str
+     policy_interface_version: int
+     cumulative_diff_sha256: str
+     editable_file_sha256s: tuple[tuple[str, str], ...]
+     changed_paths: tuple[str, ...]
+     changed_symbols: tuple[str, ...]
+     immutable_constraints_sha256: str
+-    discovery_panel_plan_sha256: str
+-    parent_identity_sha256: str
++    discovery_manifest_sha256: str
+     identity_sha256: str
+     _controller_seal: InitVar[object] = None
+ 
+     def __post_init__(self, _controller_seal: object) -> None:
+         if _controller_seal is not _CANDIDATE_IDENTITY_CONSTRUCTION_SEAL:
+             raise ValueError("candidate identity must be controller derived")
+         _validate_candidate_identity_fields(self)
+ 
+     def to_primitive(self) -> dict[str, object]:
+         return {
+@@ -197,29 +196,57 @@ class CandidateIdentity:
+         }
+ 
+     def to_canonical_json(self) -> str:
+         return json.dumps(
+             self.to_primitive(),
+             sort_keys=True,
+             separators=(",", ":"),
+             allow_nan=False,
+         ) + "\n"
+ 
+-    @property
+-    def discovery_manifest_sha256(self) -> str:
+-        """Compatibility alias for schema-v3 audit consumers."""
+ 
+-        return self.discovery_panel_plan_sha256
++@dataclass(frozen=True, slots=True, weakref_slot=True)
++class CandidateIdentityV4:
++    source_commit: str
++    policy_interface_version: int
++    cumulative_diff_sha256: str
++    editable_file_sha256s: tuple[tuple[str, str], ...]
++    changed_paths: tuple[str, ...]
++    changed_symbols: tuple[str, ...]
++    immutable_constraints_sha256: str
++    discovery_panel_plan_sha256: str
++    parent_identity_sha256: str
++    identity_sha256: str
++    _controller_seal: InitVar[object] = None
++
++    def __post_init__(self, _controller_seal: object) -> None:
++        if _controller_seal is not _CANDIDATE_IDENTITY_CONSTRUCTION_SEAL:
++            raise ValueError("candidate identity must be controller derived")
++        _validate_candidate_identity_v4_fields(self)
++
++    def to_primitive(self) -> dict[str, object]:
++        return {
++            **_candidate_identity_v4_values(self),
++            "identity_sha256": self.identity_sha256,
++        }
++
++    def to_canonical_json(self) -> str:
++        return json.dumps(
++            self.to_primitive(),
++            sort_keys=True,
++            separators=(",", ":"),
++            allow_nan=False,
++        ) + "\n"
+ 
+ 
+ _AUTHENTICATED_CANDIDATE_IDENTITIES: WeakValueDictionary[
+-    int, CandidateIdentity
++    int, CandidateIdentity | CandidateIdentityV4
+ ] = WeakValueDictionary()
+ 
+ 
+ def _immutable_literal(value: object) -> bool:
+     if value is None or type(value) in {bool, int, float, str}:
+         return True
+     return type(value) is tuple and all(_immutable_literal(item) for item in value)
+ 
+ 
+ def _root_name(node: ast.AST) -> str | None:
+@@ -589,34 +616,125 @@ def _identity_digest(fields: Mapping[str, object]) -> str:
+             fields,
+             sort_keys=True,
+             separators=(",", ":"),
+             allow_nan=False,
+         ).encode("utf-8")
+         + b"\n"
+     ).hexdigest()
+ 
+ 
+ def _candidate_identity_values(candidate: CandidateIdentity) -> dict[str, object]:
++    return {
++        "source_commit": candidate.source_commit,
++        "policy_interface_version": candidate.policy_interface_version,
++        "cumulative_diff_sha256": candidate.cumulative_diff_sha256,
++        "editable_file_sha256s": candidate.editable_file_sha256s,
++        "changed_paths": candidate.changed_paths,
++        "changed_symbols": candidate.changed_symbols,
++        "immutable_constraints_sha256": candidate.immutable_constraints_sha256,
++        "discovery_manifest_sha256": candidate.discovery_manifest_sha256,
++    }
++
++
++def _candidate_identity_v4_values(
++    candidate: CandidateIdentityV4,
++) -> dict[str, object]:
+     return {
+         "source_commit": candidate.source_commit,
+         "policy_interface_version": candidate.policy_interface_version,
+         "cumulative_diff_sha256": candidate.cumulative_diff_sha256,
+         "editable_file_sha256s": candidate.editable_file_sha256s,
+         "changed_paths": candidate.changed_paths,
+         "changed_symbols": candidate.changed_symbols,
+         "immutable_constraints_sha256": candidate.immutable_constraints_sha256,
+         "discovery_panel_plan_sha256": candidate.discovery_panel_plan_sha256,
+         "parent_identity_sha256": candidate.parent_identity_sha256,
+     }
+ 
+ 
+ def _validate_candidate_identity_fields(candidate: CandidateIdentity) -> None:
++    if re.fullmatch(r"[0-9a-f]{40}", candidate.source_commit or "") is None:
++        raise ValueError("candidate identity source commit is invalid")
++    if (
++        type(candidate.policy_interface_version) is not int
++        or candidate.policy_interface_version <= 0
++    ):
++        raise ValueError("candidate identity interface version is invalid")
++    for value in (
++        candidate.cumulative_diff_sha256,
++        candidate.immutable_constraints_sha256,
++        candidate.discovery_manifest_sha256,
++        candidate.identity_sha256,
++    ):
++        if _SHA256_RE.fullmatch(value or "") is None:
++            raise ValueError("candidate identity digest is invalid")
++    if (
++        type(candidate.editable_file_sha256s) is not tuple
++        or tuple(path for path, _digest in candidate.editable_file_sha256s)
++        != EDITABLE_POLICY_PATHS
++        or any(
++            _SHA256_RE.fullmatch(digest or "") is None
++            for _path, digest in candidate.editable_file_sha256s
++        )
++    ):
++        raise ValueError("candidate identity editable hashes are invalid")
++    canonical_paths = tuple(
++        path for path in EDITABLE_POLICY_PATHS if path in candidate.changed_paths
++    )
++    if (
++        type(candidate.changed_paths) is not tuple
++        or not candidate.changed_paths
++        or candidate.changed_paths != canonical_paths
++    ):
++        raise ValueError("candidate identity changed paths are invalid")
++    if (
++        type(candidate.changed_symbols) is not tuple
++        or not candidate.changed_symbols
++        or len(candidate.changed_symbols) != len(set(candidate.changed_symbols))
++        or any(not isinstance(symbol, str) for symbol in candidate.changed_symbols)
++    ):
++        raise ValueError("candidate identity changed symbols are invalid")
++    allowed = {
++        symbol
++        for path in candidate.changed_paths
++        for symbol in _DECLARED_SYMBOLS[path]
++    }
++    constant_prefixes = tuple(
++        f"{path.removesuffix('.py').replace('/', '.')}."
++        for path in candidate.changed_paths
++    )
++    if any(
++        symbol not in allowed
++        and not any(
++            symbol.startswith(prefix)
++            and (
++                re.fullmatch(
++                    r"[A-Z][A-Z0-9_]*", symbol.removeprefix(prefix)
++                )
++                is not None
++                or re.fullmatch(
++                    r"_[A-Za-z][A-Za-z0-9_]*", symbol.removeprefix(prefix)
++                )
++                is not None
++            )
++            for prefix in constant_prefixes
++        )
++        for symbol in candidate.changed_symbols
++    ):
++        raise ValueError("candidate identity changed symbols are invalid")
++    if candidate.identity_sha256 != _identity_digest(
++        _candidate_identity_values(candidate)
++    ):
++        raise ValueError("candidate identity self-digest is invalid")
++
++
++def _validate_candidate_identity_v4_fields(candidate: CandidateIdentityV4) -> None:
+     if re.fullmatch(r"[0-9a-f]{40}", candidate.source_commit or "") is None:
+         raise ValueError("candidate identity source commit is invalid")
+     if (
+         type(candidate.policy_interface_version) is not int
+         or candidate.policy_interface_version <= 0
+     ):
+         raise ValueError("candidate identity interface version is invalid")
+     for value in (
+         candidate.cumulative_diff_sha256,
+         candidate.immutable_constraints_sha256,
+@@ -672,30 +790,35 @@ def _validate_candidate_identity_fields(candidate: CandidateIdentity) -> None:
+                     r"_[A-Za-z][A-Za-z0-9_]*", symbol.removeprefix(prefix)
+                 )
+                 is not None
+             )
+             for prefix in constant_prefixes
+         )
+         for symbol in candidate.changed_symbols
+     ):
+         raise ValueError("candidate identity changed symbols are invalid")
+     if candidate.identity_sha256 != _identity_digest(
+-        _candidate_identity_values(candidate)
++        _candidate_identity_v4_values(candidate)
+     ):
+         raise ValueError("candidate identity self-digest is invalid")
+ 
+ 
+-def validate_candidate_identity(candidate: CandidateIdentity) -> None:
++def validate_candidate_identity(
++    candidate: CandidateIdentity | CandidateIdentityV4,
++) -> None:
+     """Authenticate one exact controller-created identity object at consumption."""
+-    if not isinstance(candidate, CandidateIdentity):
++    if isinstance(candidate, CandidateIdentity):
++        _validate_candidate_identity_fields(candidate)
++    elif isinstance(candidate, CandidateIdentityV4):
++        _validate_candidate_identity_v4_fields(candidate)
++    else:
+         raise ValueError("candidate identity is invalid")
+-    _validate_candidate_identity_fields(candidate)
+     if _AUTHENTICATED_CANDIDATE_IDENTITIES.get(id(candidate)) is not candidate:
+         raise ValueError("candidate identity is not authenticated")
+ 
+ 
+ def materialize_author_candidate_diff(
+     *,
+     candidate_root: Path,
+     author: AuthorArtifact,
+     bounds: PatchBounds,
+ ) -> str:
+@@ -1027,35 +1150,21 @@ def validate_candidate_diff(
+         values: dict[str, object] = {
+             "source_commit": source_commit,
+             "policy_interface_version": policy_interface_version,
+             "cumulative_diff_sha256": hashlib.sha256(
+                 cumulative_diff.encode("utf-8")
+             ).hexdigest(),
+             "editable_file_sha256s": editable_hashes,
+             "changed_paths": changed_paths,
+             "changed_symbols": changed_symbols,
+             "immutable_constraints_sha256": immutable_constraints_sha256,
+-            "discovery_panel_plan_sha256": discovery_manifest_sha256,
+-            "parent_identity_sha256": _identity_digest(
+-                {
+-                    "source_commit": source_commit,
+-                    "editable_file_sha256s": tuple(
+-                        (
+-                            path,
+-                            hashlib.sha256(
+-                                before_sources[path].encode("utf-8")
+-                            ).hexdigest(),
+-                        )
+-                        for path in EDITABLE_POLICY_PATHS
+-                    ),
+-                }
+-            ),
++            "discovery_manifest_sha256": discovery_manifest_sha256,
+         }
+         identity = CandidateIdentity(
+             **values,
+             identity_sha256=_identity_digest(values),
+             _controller_seal=_CANDIDATE_IDENTITY_CONSTRUCTION_SEAL,
+         )
+         _AUTHENTICATED_CANDIDATE_IDENTITIES[id(identity)] = identity
+         return identity, cumulative_diff
+     except BaseException as exc:
+         if applied:
+@@ -1070,21 +1179,21 @@ def validate_candidate_sources(
+     *,
+     authenticated_base_root: Path,
+     candidate_root: Path,
+     replacement_sources: Mapping[str, str],
+     git: object,
+     source_commit: str,
+     policy_interface_version: int,
+     immutable_constraints_sha256: str,
+     discovery_panel_plan_sha256: str,
+     parent_identity_sha256: str,
+-) -> tuple[CandidateIdentity, str]:
++) -> tuple[CandidateIdentityV4, str]:
+     """Atomically validate and publish one complete three-source candidate."""
+     from agent_loop import PreflightError, _git, derive_authenticated_cumulative_diff
+ 
+     if re.fullmatch(r"[0-9a-f]{40}", source_commit or "") is None:
+         raise ValueError("candidate source commit is invalid")
+     if type(policy_interface_version) is not int or policy_interface_version <= 0:
+         raise ValueError("candidate policy interface version is invalid")
+     for value, label in (
+         (immutable_constraints_sha256, "immutable constraint"),
+         (discovery_panel_plan_sha256, "discovery panel plan"),
+@@ -1258,21 +1367,21 @@ def validate_candidate_sources(
+             "cumulative_diff_sha256": hashlib.sha256(
+                 cumulative_diff.encode("utf-8")
+             ).hexdigest(),
+             "editable_file_sha256s": editable_hashes,
+             "changed_paths": changed_paths,
+             "changed_symbols": changed_symbols,
+             "immutable_constraints_sha256": immutable_constraints_sha256,
+             "discovery_panel_plan_sha256": discovery_panel_plan_sha256,
+             "parent_identity_sha256": parent_identity_sha256,
+         }
+-        identity = CandidateIdentity(
++        identity = CandidateIdentityV4(
+             **values,
+             identity_sha256=_identity_digest(values),
+             _controller_seal=_CANDIDATE_IDENTITY_CONSTRUCTION_SEAL,
+         )
+         _AUTHENTICATED_CANDIDATE_IDENTITIES[id(identity)] = identity
+         return identity, cumulative_diff
+     except BaseException as exc:
+         rollback_errors: list[OSError] = []
+         if write_started:
+             for path, content in before_bytes.items():
+@@ -1389,20 +1498,21 @@ def require_source_context_fit(
+     )
+     if (
+         static_bytes > role_budget.max_static_input_bytes
+         or len(rendered) > role_budget.max_dynamic_input_bytes
+         or static_bytes + len(rendered) > role_budget.max_input_tokens
+     ):
+         raise ValueError("context_budget_exhausted")
+     return rendered
+ __all__ = [
+     "CandidateIdentity",
++    "CandidateIdentityV4",
+     "EDITABLE_POLICY_PATHS",
+     "LEGACY_PATCH_BOUNDS",
+     "PIT_OPTIMIZER_PATCH_BOUNDS",
+     "build_policy_source_bundle",
+     "derive_changed_symbols",
+     "require_source_context_fit",
+     "validate_author_manifest",
+     "validate_candidate_diff",
+     "validate_candidate_sources",
+     "validate_candidate_identity",
+diff --git a/tests/test_pit_optimizer_v2.py b/tests/test_pit_optimizer_v2.py
+index 517462c..ee1e8b6 100644
+--- a/tests/test_pit_optimizer_v2.py
++++ b/tests/test_pit_optimizer_v2.py
+@@ -9879,20 +9879,22 @@ def _task5_create_directory_link(target: Path, link: Path) -> None:
+             "directory-link creation unavailable: "
+             f"{completed.stderr or completed.stdout}"
+         )
+ 
+ 
+ def test_candidate_identity_is_git_derived_and_author_manifest_must_match(
+     tmp_path: Path,
+ ) -> None:
+     """Break caught: a partial author map could replace the atomic controller identity."""
+     from core.pit_optimizer_candidate import (
++        CandidateIdentityV4,
++        validate_candidate_identity,
+         validate_candidate_sources,
+     )
+ 
+     authenticated, candidate_root, git = _task5_policy_roots(tmp_path)
+     replacement_sources = {
+         path: (candidate_root / path).read_text("utf-8") for path in _POLICY_PATHS
+     }
+     replacement_sources["core/strategy_policy/entry.py"] = replacement_sources[
+         "core/strategy_policy/entry.py"
+     ].replace(
+@@ -9921,20 +9923,22 @@ def test_candidate_identity_is_git_derived_and_author_manifest_must_match(
+         "diff",
+         "--no-ext-diff",
+         "--no-color",
+         "HEAD",
+         "--",
+         *_POLICY_PATHS,
+     )
+     assert identity.source_commit == source_commit
+     assert identity.parent_identity_sha256 == "c" * 64
+     assert identity.discovery_panel_plan_sha256 == "b" * 64
++    assert isinstance(identity, CandidateIdentityV4)
++    validate_candidate_identity(identity)
+     assert identity.cumulative_diff_sha256 == hashlib.sha256(
+         cumulative_diff.encode("utf-8")
+     ).hexdigest()
+     assert identity.changed_paths == ("core/strategy_policy/entry.py",)
+     assert identity.changed_symbols == (
+         "core.strategy_policy.entry.evaluate_entry",
+     )
+     assert tuple(path for path, _digest in identity.editable_file_sha256s) == tuple(
+         _POLICY_PATHS
+     )
+@@ -9978,84 +9982,100 @@ def _task5_authenticated_identity(
+             }
+         ),
+         max_diff_bytes=64 * 1024,
+         max_total_bytes=72 * 1024,
+     )
+     return identity, author
+ 
+ 
+ def test_candidate_identity_rejects_direct_unsealed_construction() -> None:
+     """Break caught: a caller could construct an identity without Git/source derivation."""
+-    from core.pit_optimizer_candidate import CandidateIdentity
++    from core.pit_optimizer_candidate import CandidateIdentity, CandidateIdentityV4
++
++    shared = {
++        "source_commit": "a" * 40,
++        "policy_interface_version": 1,
++        "cumulative_diff_sha256": "b" * 64,
++        "editable_file_sha256s": tuple(
++            (path, "c" * 64) for path in _POLICY_PATHS
++        ),
++        "changed_paths": ("core/strategy_policy/entry.py",),
++        "changed_symbols": ("core.strategy_policy.entry.evaluate_entry",),
++        "immutable_constraints_sha256": "d" * 64,
++        "identity_sha256": "f" * 64,
++    }
+ 
+     with pytest.raises(ValueError, match="controller derived"):
+         CandidateIdentity(
+-            source_commit="a" * 40,
+-            policy_interface_version=1,
+-            cumulative_diff_sha256="b" * 64,
+-            editable_file_sha256s=tuple(
+-                (path, "c" * 64) for path in _POLICY_PATHS
+-            ),
+-            changed_paths=("core/strategy_policy/entry.py",),
+-            changed_symbols=("core.strategy_policy.entry.evaluate_entry",),
+-            immutable_constraints_sha256="d" * 64,
++            **shared,
++            discovery_manifest_sha256="e" * 64,
++        )
++    with pytest.raises(ValueError, match="controller derived"):
++        CandidateIdentityV4(
++            **shared,
+             discovery_panel_plan_sha256="e" * 64,
+             parent_identity_sha256="f" * 64,
+-            identity_sha256="f" * 64,
+         )
+ 
+ 
+ def test_candidate_identity_has_exact_public_nine_field_json_shape(
+     tmp_path: Path,
+ ) -> None:
+-    """Break caught: the construction seal leaked into persisted identity data."""
++    """Break caught: v4 identity fields changed archived schema-v3 reconstruction."""
+     from core.pit_optimizer_candidate import CandidateIdentity
+ 
+     identity, _author = _task5_authenticated_identity(tmp_path)
+     expected_fields = (
+         "source_commit",
+         "policy_interface_version",
+         "cumulative_diff_sha256",
+         "editable_file_sha256s",
+         "changed_paths",
+         "changed_symbols",
+         "immutable_constraints_sha256",
+-        "discovery_panel_plan_sha256",
+-        "parent_identity_sha256",
++        "discovery_manifest_sha256",
+         "identity_sha256",
+     )
+     assert tuple(item.name for item in fields(CandidateIdentity)) == expected_fields
+-    primitive = identity.to_primitive()
+-    assert tuple(primitive) == expected_fields
+-    assert primitive == asdict(identity)
+-    assert not any(key.startswith("_") for key in primitive)
+-    rendered = identity.to_canonical_json()
+-    assert rendered.endswith("\n")
+-    assert json.loads(rendered) == json.loads(json.dumps(primitive))
+-    assert "controller_seal" not in rendered
++    legacy_values = {
++        "source_commit": identity.source_commit,
++        "policy_interface_version": identity.policy_interface_version,
++        "cumulative_diff_sha256": identity.cumulative_diff_sha256,
++        "editable_file_sha256s": identity.editable_file_sha256s,
++        "changed_paths": identity.changed_paths,
++        "changed_symbols": identity.changed_symbols,
++        "immutable_constraints_sha256": identity.immutable_constraints_sha256,
++        "discovery_manifest_sha256": identity.discovery_manifest_sha256,
++    }
++    expected_digest = hashlib.sha256(_canonical_file_bytes(legacy_values)).hexdigest()
++    expected_bytes = _canonical_file_bytes(
++        {**legacy_values, "identity_sha256": expected_digest}
++    )
++    assert identity.identity_sha256 == expected_digest
++    assert identity.to_canonical_json().encode("utf-8") == expected_bytes
++    assert identity.to_primitive() == asdict(identity)
+ 
+ 
+ @pytest.mark.parametrize(
+     ("field", "value"),
+     (
+         ("source_commit", "f" * 40),
+         ("policy_interface_version", True),
+         ("cumulative_diff_sha256", "f" * 64),
+         (
+             "editable_file_sha256s",
+             tuple((path, "f" * 64) for path in _POLICY_PATHS),
+         ),
+         ("changed_paths", ("core/strategy_policy/risk.py",)),
+         ("changed_symbols", ("core.strategy_policy.risk.recommend_capacity",)),
+         ("immutable_constraints_sha256", "f" * 64),
+-        ("discovery_panel_plan_sha256", "f" * 64),
+-        ("parent_identity_sha256", "f" * 64),
++        ("discovery_manifest_sha256", "f" * 64),
+         ("identity_sha256", "f" * 64),
+     ),
+ )
+ def test_candidate_identity_tampering_fails_before_manifest_comparison(
+     tmp_path: Path,
+     field: str,
+     value: object,
+ ) -> None:
+     """Break caught: a mutated identity was trusted when advisory scope still matched."""
+     from core.pit_optimizer_candidate import validate_author_manifest
+@@ -10078,22 +10098,21 @@ def test_candidate_identity_rejects_attacker_recomputed_digest(
+ 
+     identity, author = _task5_authenticated_identity(tmp_path)
+     forged_fields = {
+         "source_commit": "f" * 40,
+         "policy_interface_version": identity.policy_interface_version,
+         "cumulative_diff_sha256": identity.cumulative_diff_sha256,
+         "editable_file_sha256s": identity.editable_file_sha256s,
+         "changed_paths": identity.changed_paths,
+         "changed_symbols": identity.changed_symbols,
+         "immutable_constraints_sha256": identity.immutable_constraints_sha256,
+-        "discovery_panel_plan_sha256": identity.discovery_panel_plan_sha256,
+-        "parent_identity_sha256": identity.parent_identity_sha256,
++        "discovery_manifest_sha256": identity.discovery_manifest_sha256,
+     }
+     recomputed = hashlib.sha256(
+         json.dumps(
+             forged_fields,
+             sort_keys=True,
+             separators=(",", ":"),
+             allow_nan=False,
+         ).encode("utf-8")
+         + b"\n"
+     ).hexdigest()

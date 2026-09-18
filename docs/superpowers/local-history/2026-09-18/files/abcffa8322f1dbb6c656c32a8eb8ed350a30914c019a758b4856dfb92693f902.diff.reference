@@ -1,0 +1,203 @@
+diff --git a/core/pit_optimizer_v5/artifacts.py b/core/pit_optimizer_v5/artifacts.py
+index 6666d2e..3220ca3 100644
+--- a/core/pit_optimizer_v5/artifacts.py
++++ b/core/pit_optimizer_v5/artifacts.py
+@@ -3229,12 +3229,120 @@ class LocalArtifactRepositoryV5:
+                 raise ArtifactSchemaFailureV5(record_reference)
+             raise ValueError("experiment review differs from its full critic artifact")
+ 
+-    def append_experiment(self, record: ExperimentRecordV5) -> ArtifactRefV5:
++    def _load_experiment_event_reference(self, reference: ArtifactRefV5) -> RoundEventV5:
++        """Authenticate an event-file edge before using its event kind for routing."""
++
++        authenticated = self.authenticate(reference)
++        try:
++            event = _decode_round_event(_strict_json_object(authenticated.content, reference))
++        except ArtifactRepositoryFailureV5:
++            raise
++        except (TypeError, ValueError, ArithmeticError):
++            raise ArtifactSchemaFailureV5(reference) from None
++        if canonical_json_bytes_v5(event.to_primitive()) != authenticated.content or event.sha256 != reference.sha256:
++            raise ArtifactNonCanonicalV5(reference)
++        campaign = _safe_component(event.campaign_id, "round event campaign")
++        if reference.relative_path != f"events/{campaign}/{event.round_index:04d}/{event.sequence:06d}.json":
++            raise ValueError("experiment event reference differs from its canonical journal path")
++        return event
++
++    def _validate_experiment_render_rejection_binding(
++        self,
++        record: ExperimentRecordV5,
++        *,
++        record_reference: ArtifactRefV5 | None = None,
++    ) -> None:
++        """Bind rejected records to a durable event and its authenticated round authority."""
++
++        try:
++            rejection_events = tuple(
++                (reference, event)
++                for reference in record.artifact_refs
++                if reference.relative_path.startswith("events/")
++                if (event := self._load_experiment_event_reference(reference)).event_kind == "render_rejected"
++            )
++            payload_substitution = any(
++                reference.relative_path.startswith("payloads/render_rejected/") for reference in record.artifact_refs
++            )
++            if (
++                record.validation.failure_code != "policy_source_unbounded_or_stateful"
++                and not rejection_events
++                and not payload_substitution
++            ):
++                return
++            if len(rejection_events) != 1 or payload_substitution:
++                raise ValueError("render-rejected experiment requires one durable rejection event")
++            event_ref, event = rejection_events[0]
++            if (
++                record.artifact_refs != (event_ref,)
++                or record.status != "invalid"
++                or type(record.experiment_identity) is not PreValidationInvalidExperimentIdentityV5
++            ):
++                raise ValueError("render-rejected experiment form differs from its event authority")
++            events = self.load_round_events(campaign_id=event.campaign_id, round_index=event.round_index)
++            if (
++                event.sequence >= len(events)
++                or any(item.campaign_id != event.campaign_id or item.round_index != event.round_index for item in events)
++                or events[event.sequence] != event
++                or events[event.sequence].sha256 != event_ref.sha256
++                or canonical_json_bytes_v5(events[event.sequence].to_primitive())
++                != canonical_json_bytes_v5(event.to_primitive())
++            ):
++                raise ValueError("render-rejected experiment event is not its exact durable journal entry")
++            payload = self.load_round_payload(event.payload_ref, expected_kind="render_rejected")
++            prior_payloads = tuple(
++                self.load_round_payload(item.payload_ref, expected_kind=item.event_kind)
++                for item in events[:event.sequence]
++            )
++            intents = tuple(item for item in prior_payloads if type(item) is RoundIntentPayloadV5)
++            authors = tuple(
++                item for item in prior_payloads if type(item) is RoleCompletionPayloadV5 and item.role == "author"
++            )
++            if type(payload) is not RenderRejectionPayloadV5 or len(intents) != 1 or len(authors) != 1:
++                raise ValueError("render-rejected experiment lacks its unique intent and author")
++            intent = intents[0]
++            author = authors[0]
++            package = self.load_role_invocation(author)
++            template = package.artifact
++            if (
++                not package.accepted
++                or author.outcome != "accepted"
++                or author.artifact_ref != payload.author_artifact_ref
++                or type(template) is not StructuralTemplateV5
++                or record.experiment_id != event.experiment_id
++                or record.experiment_id != payload.experiment_identity.sha256
++                or record.experiment_identity != payload.experiment_identity
++                or record.round_index != event.round_index
++                or record.parent_revision_sha256 != intent.parent_revision_sha256
++                or record.parent_semantic_fingerprint_sha256 != intent.parent_semantic_fingerprint_sha256
++                or record.pit_data_scope != intent.pit_data_scope
++                or record.semantic_mode != intent.semantic_mode
++                or record.hypothesis.sha256 != intent.hypothesis.sha256
++                or record.experiment_identity.discovery_plan_sha256 != intent.discovery_plan_sha256
++                or record.template_sha256 != template.sha256
++                or canonical_json_bytes_v5(record.template.to_primitive())
++                != canonical_json_bytes_v5(template.to_primitive())
++                or canonical_json_bytes_v5(record.variant_assignment.to_primitive())
++                != canonical_json_bytes_v5(payload.assignment.to_primitive())
++                or record.validation.valid is not False
++                or record.validation.failure_code != payload.failure_code
++                or record.validation.changed_symbols != ()
++            ):
++                raise ValueError("render-rejected experiment differs from its authenticated round authority")
++        except ArtifactRepositoryFailureV5:
++            raise
++        except (TypeError, ValueError, ArithmeticError):
++            if record_reference is not None:
++                raise ArtifactSchemaFailureV5(record_reference) from None
++            raise ValueError("experiment render-rejection binding is invalid") from None
++
++    def append_experiment(self, record: ExperimentRecordV5) -> ArtifactRefV5:
+         if type(record) is not ExperimentRecordV5:
+             raise ValueError("experiment record must use the V5 schema")
+-        for reference in record.artifact_refs:
+-            self.authenticate(reference)
+-        self._validate_experiment_critic_binding(record)
++        for reference in record.artifact_refs:
++            self.authenticate(reference)
++        self._validate_experiment_critic_binding(record)
++        self._validate_experiment_render_rejection_binding(record)
+         path = f"records/{record.experiment_id}.json"
+         reference = self._create_only(path, record.to_primitive())
+         if reference.sha256 != record.sha256:
+@@ -3252,8 +3360,9 @@ class LocalArtifactRepositoryV5:
+             raise ArtifactSchemaFailureV5(reference) from None
+         if record.canonical_json_bytes() != authenticated.content or record.sha256 != reference.sha256:
+             raise ArtifactNonCanonicalV5(reference)
+-        self._validate_experiment_critic_binding(record, record_reference=reference)
+-        return record
++        self._validate_experiment_critic_binding(record, record_reference=reference)
++        self._validate_experiment_render_rejection_binding(record, record_reference=reference)
++        return record
+ 
+     def load_experiment_journal(self) -> tuple[StoredExperimentRecordV5, ...]:
+         try:
+diff --git a/core/pit_optimizer_v5/runtime.py b/core/pit_optimizer_v5/runtime.py
+index fe771a2..095707a 100644
+--- a/core/pit_optimizer_v5/runtime.py
++++ b/core/pit_optimizer_v5/runtime.py
+@@ -2773,27 +2773,44 @@ class _Runtime:
+         if not matches:
+             self.journal.append(payload)
+ 
+-    def _publish(
+-        self,
+-        *,
+-        projection: SearchProjectionV5,
+-        candidates: tuple[CandidateEvidenceV5, ...],
+-        records: tuple[ExperimentRecordV5, ...],
+-    ) -> tuple[tuple[ArtifactRefV5, ...], RepositoryCheckpointV5]:
+-        refs = tuple(self.dependencies.persistence.append_experiment(record) for record in records)
++    def _publish(
++        self,
++        *,
++        projection: SearchProjectionV5,
++        candidates: tuple[CandidateRecordEvidenceV5, ...],
++        records: tuple[ExperimentRecordV5, ...],
++    ) -> tuple[tuple[ArtifactRefV5, ...], RepositoryCheckpointV5]:
++        if any(type(item) not in {CandidateEvidenceV5, RejectedCandidateEvidenceV5} for item in candidates):
++            raise _RuntimeAbort(RuntimeFailureV5("checkpoint", "invalid_dependency_result"))
++        candidates_by_id = {item.experiment_id: item for item in candidates}
++        source_candidates: dict[str, CandidateEvidenceV5] = {}
++        if len(candidates_by_id) != len(candidates):
++            raise _RuntimeAbort(RuntimeFailureV5("checkpoint", "invalid_dependency_result"))
++        for record in records:
++            candidate = candidates_by_id.get(record.experiment_id)
++            if (
++                candidate is None
++                or candidate.experiment_identity != record.experiment_identity
++                or candidate.status != record.status
++            ):
++                raise _RuntimeAbort(RuntimeFailureV5("checkpoint", "invalid_dependency_result"))
++            if record.status in {"evaluated", "zero_trade"}:
++                if type(candidate) is not CandidateEvidenceV5:
++                    raise _RuntimeAbort(RuntimeFailureV5("checkpoint", "invalid_dependency_result"))
++                source_candidates[record.experiment_id] = candidate
++        refs = tuple(self.dependencies.persistence.append_experiment(record) for record in records)
+         stored = tuple(
+             StoredExperimentRecordV5(reference=reference, record=record)
+             for reference, record in zip(refs, records, strict=True)
+         )
+-        candidates_by_id = {item.experiment_id: item for item in candidates}
+-        authorities = tuple(
++        authorities = tuple(
+             sorted(
+                 (
+                     ArchiveRecordAuthorityV5(
+                         experiment_id=item.record.experiment_id,
+                         experiment_record_ref=item.reference,
+-                        source_bundle=candidates_by_id[item.record.experiment_id].materialized.variant.source_bundle,
+-                        source_bundle_ref=candidates_by_id[item.record.experiment_id].materialized.source_bundle_ref,
++                        source_bundle=source_candidates[item.record.experiment_id].materialized.variant.source_bundle,
++                        source_bundle_ref=source_candidates[item.record.experiment_id].materialized.source_bundle_ref,
+                     )
+                     for item in stored
+                     if item.record.status in {"evaluated", "zero_trade"}
+

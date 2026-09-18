@@ -1,0 +1,20 @@
+# Task 7 Local Bundle Preflight
+
+Status: blocked on local-only inputs; source implementation may continue.
+
+Read-only preflight on 2026-09-04 found all twelve required regular-file inputs absent from both the isolated worktree artifact root and the main checkout artifact root:
+
+- `source/sp500_membership.csv`
+- `source/sp500_provenance.json`
+- `source/nasdaq100_membership.csv`
+- `source/nasdaq100_provenance.json`
+- `source/russell2000_membership.csv`
+- `source/russell2000_provenance.json`
+- `prices.csv`
+- `prices_provenance.json`
+- `fundamentals.csv`
+- `fundamentals_provenance.json`
+- `industry.csv`
+- `industry_provenance.json`
+
+No market data was fetched, synthesized, copied, uploaded, or written. No bundle build or verifier was started. This blocker is confined to Task 7's local artifact construction and does not block later source-architecture tasks.

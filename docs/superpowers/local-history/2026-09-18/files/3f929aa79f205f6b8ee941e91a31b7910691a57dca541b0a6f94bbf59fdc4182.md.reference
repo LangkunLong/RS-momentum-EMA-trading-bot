@@ -1,0 +1,89 @@
+# B4a implementation checkpoint
+
+Status: DONE_WITH_CONCERNS. B4a is implemented for architect review. Runtime rejection append/recovery, mixed routing, and critic exclusion were reviewed statically only. No real rejection event exists in the allowed archived input, and no such event was manufactured. B4b/B4c and the original two evaluated feedback rounds remain unfinished.
+
+## Scope and source changes
+
+Production edits are confined to `core/pit_optimizer_v5/runtime.py`, made with `apply_patch` in the existing linked worktree on `codex/pit-optimizer-v5-architecture`. All eight B3b principal source hashes matched before editing. The supplied exact runtime preimage remains untouched in `preimages/runtime.py`.
+
+The executing-plans skill supplied the bounded implementation/checkpoint workflow. The referenced worktree skill confirmed the existing isolation; no new checkout was created. Explicit task restrictions superseded generic tests, setup, delegation, commits and integration steps. No subdelegation occurred.
+
+Added symbols:
+
+- `_Journal.event_reference`: canonical payload comparison selects exactly one paired loaded/just-appended event in this campaign and round. The reference uses that event's actual sequence and event SHA, with repository path formatting `events/{campaign}/{round:04d}/{sequence:06d}.json`. It does not return the payload reference, predict a sequence, accept arbitrary campaign text, or access the filesystem.
+- `_Runtime._rejected_candidate`: validates the accepted stored author completion/package, compares complete canonical template bytes and the complete author hypothesis hash, derives the existing pre-validation identity, detects duplicate/conflicting rejection authority, appends a fresh rejection or reuses an exact existing payload, and constructs the existing B3a carrier with its durable event reference.
+
+Changed existing symbols:
+
+- `_Runtime._existing_payload`: accepted payload-type annotation adds `RenderRejectionPayloadV5`; lookup behavior is unchanged.
+- `_Runtime._render_and_quick_screen`: adopts the B1 outcome API using the existing parent/revision/template/cap arguments, dispatches exact outcome types in order, builds quick-screen inputs only for exact materialized quick-ready candidates, and passes rejections through survivor selection.
+- `_Runtime._evaluate_discovery`: accepts/returns the explicit record carrier union, passes exact rejected carriers through first, rejects unsupported carriers, and preserves existing materialized discovery behavior.
+- `_Runtime.run`: the critic-candidate comprehension additionally requires exact `CandidateEvidenceV5`. Testable-status filtering and input order are preserved.
+
+Imports add the B1 rejection/outcome API, exact author input type, canonical JSON bytes and existing payload serialization helper. An AST comparison against the exact preimage confirmed the above four changed methods and two added methods, with no removed methods. In particular, `_initial_candidate`, `_materialized_variant`, `_publish`, B3a constructors/factories, `_precritic_evidence`, `_completed_result`, `_adopt_completed_projection`, `_recover_projection`, and `_cleanup` retain their preimage behavior.
+
+## Durable authority and routing
+
+The rejection helper reads the author completion already in the authenticated runtime journal. It requires accepted status, current campaign/round, the actual template artifact hash and an actual artifact reference. `persistence.load_role_invocation` authenticates the stored request/attempt/terminal/artifact package; the helper also checks exact package type, acceptance, current campaign/round/role, complete template bytes, exact `AuthorRoleInputV5`, and the full scheduled hypothesis hash. It never persists another author artifact or invokes a provider.
+
+The expected payload uses the existing invalid identity derivation with the current parent revision, complete scheduled hypothesis, actual template, typed outcome assignment, round and discovery-plan hash. The closed failure code comes directly from the B1 outcome. Neither source bytes nor a policy revision are constructed for a rejection.
+
+Lookup uses the current authenticated journal. Duplicate identities are rejected by the existing unique payload lookup. A scan also checks any rejection with the same identity or assignment hash and rejects duplicates or differing canonical payload bytes. Canonical serialization preserves literal types, so Python bool/integer equality cannot authorize an assignment. The existing-payload branch compares the entire expected payload again and reuses its unique event. A fresh branch checks cancellation and the existing rendering deadline immediately before `_Journal.append(expected, experiment_id=identity.sha256)`. `_Journal.append` persists the event before adding it to the journal lists, so the carrier is exposed only after persistence succeeds.
+
+B2 remains authoritative for repository append/replay validation, complete round-intent/author binding, bounded assignment membership, rendered/rejected conflicts, rejected-identity terminality and critic exclusion. Its code and enumeration were not duplicated or modified. Repository authentication/append failures propagate; mismatched runtime bindings use the existing typed recovery invalid-dependency abort. Existing strict rendering/fatal-error handling remains at the renderer call boundary.
+
+The existing `_Journal.append` return value and `payload_reference` semantics are unchanged. B3b reauthenticates the event-file edge and journal membership when rejected records are persisted. No new persistence schema or raw filesystem access was added to runtime.
+
+## Static flow table — reasoning from source, not execution evidence
+
+| Situation | Function and source reasoning |
+| --- | --- |
+| Ordinary rendered variant | `_render_and_quick_screen` dispatches exact `RenderedVariantV5` to unchanged `_initial_candidate`. The existing materialization, validation, duplicate/semantic, quick and discovery pipeline applies. Rejected outcomes cannot enter this exact-type branch. |
+| Fresh rejection | `_rejected_candidate` authenticates author/template/hypothesis, derives the invalid identity, checks conflicts and current cancellation/deadline, then appends only `RenderRejectionPayloadV5`. The resulting carrier has closed invalid validation and the persisted event reference. No rendered/stage/execution/lease event or materialized candidate is created. |
+| Matching existing rejection | `_existing_payload` and `_rejected_candidate` require uniqueness and exact canonical payload agreement, then `_Journal.event_reference` returns the existing event's canonical path/SHA. No append, author invocation, deadline refresh, validation or evaluation occurs. |
+| Conflicting existing rejection | Duplicate identity, duplicate related assignment, missing identity match for a related assignment, or differing canonical expected payload causes a typed recovery abort. B2 separately rejects rendered/rejected conflicts and forbidden later work. No rejected source is materialized. |
+| Mixed output order | `_render_and_quick_screen` appends each exact returned outcome in order; survivor selection maps over the same order. `_evaluate_discovery` appends rejected carriers unchanged at their original positions; materialized logic retains its prior order. Rejections never expose a materialized variant or fingerprint. |
+| No quick-ready candidates/survivors | Quick-screen comprehension includes only exact materialized quick-ready carriers. The existing selector still receives an empty tuple when appropriate; no default survivor is invented. Rejected carriers and non-quick-ready materialized carriers pass through. Rejections cannot become survivors or acquire quick evidence. |
+| Critic filtering | `run` selects only exact materialized `CandidateEvidenceV5` with existing testable statuses, in input order. Rejected IDs cannot reach `critic_request` or `_precritic_evidence`. If no testable candidates remain, the unchanged `no_testable_experiments` abort occurs. |
+| Cancellation/deadline | The renderer retains its existing deadline creation, parent validation, exception handling, nonempty/cap checks and post-render deadline check. `_rejected_candidate` checks cancellation/current deadline on entry and again before a fresh append, using the supplied rendering deadline. No fresh runtime or timeout is created. A rejection is never evaluated even if the deadline expires. |
+| Already-terminal actual06 | `run` still checks the loaded terminal outcome before parent selection/role requests/rendering. The archived failure remains terminal; this source change does not reopen it. The terminal path itself was not run during this session. |
+
+## Actual archived-input inspection executed
+
+`inspect_archived_inputs.py` is a read-only inspection script. It calls existing repository authentication/load helpers and the pure B1 renderer; it does not import/call the new runtime helper, append any event, build a carrier/record, publish a checkpoint, or start/resume a campaign. Its actual results are recorded in `verification.json`.
+
+Actual06 manifest `campaigns/development-provider-two-rounds-20260907-06/manifest.json` authenticated at SHA `d90ed717c0d6b34d4cfa6bf7e2dd1f753e68c43b1127b200a66d2a9f930dfdf6`, with graph verification true. The journal contains exactly the existing role completion, round intent, role completion, round outcome and cleanup result sequence, with zero rejection events. The accepted author request remains `09564719a54cfd10a0b6edbc5b61996e7a68015866f1e0b538859c542d158c0f`, and its artifact reference has file SHA `ad979279cdf09db2bd4ee6250d7b40103db2f5b89749e898dcd6ac234d5f06f2`. Full author hypothesis and template authority were checked against the stored intent/completion.
+
+The unchanged authenticated parent bundle `109a61992ac79317446861c4cb2053f2704239eb1f8eacfe2b2d27ca2cf7456e`, revision `5d2a95ba2572e71dab448934544cef22130415fcc1691c9a98deb820d40a1fa9`, and author template yield one B1 `RejectedVariantV5`, failure `policy_source_unbounded_or_stateful`, assignment SHA `8138e5e9bb95f27b029fa5e119d99c2e9a6b7f44c8a07faada29f295b76297d3`. Pure identity derivation yields invalid experiment ID `18ea7a802fed21683eef0d31354f6d656e07af576199c27819bdacde25faeb7f`. This is an inspected identity only, with no real rejection event/reference or record constructed.
+
+The exact B3b-approved runtime-04 record reference `records/9e2a2dfdf35ce55653a3b9ec0d39ce87740a69a940ad5f3e473fd38ea629390d.json`, SHA `af6c73e632a3dc47cb344ecf3d1a55f9f58ba3e755e29fe992e0c03d0da103ac`, loaded through `LocalArtifactRepositoryV5.load_experiment` as evaluated with four discovery episodes. Authenticated bytes before/after equal the decoded canonical record bytes. This checks real legacy compatibility only; it does not exercise any new B4a routing.
+
+## Checks and exact identities
+
+- `py -3.13 -B -m ruff check core/pit_optimizer_v5/runtime.py`: passed.
+- In-memory `compile(Path('core/pit_optimizer_v5/runtime.py').read_bytes(), ..., 'exec')`: passed; no execution of runtime contents or bytecode output for this check.
+- Exact preimage AST symbol comparison: passed for precisely the four changed/two added methods listed above, no deleted methods.
+- Exact preimage `git diff --no-index --check`: no whitespace diagnostics; exit 1 represents the differing files. The saved narrow diff uses repository-relative labels and ignores end-of-line style only, since the approved source already mixes CRLF/LF and `apply_patch` preserves existing content while adding LF lines. Final exact bytes are identified by SHA below.
+- Existing `evaluator_source_map_v5(Path.cwd())` and `evaluator_source_sha256`: 56 covered files, unchanged identity `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4`.
+- All seven untouched approved source hashes match the B3b principal verification exactly. No evaluator rebuild was performed.
+
+| Source or artifact | SHA256 |
+| --- | --- |
+| runtime.py preimage | `1c4c4dd2a3c7082982866e6ed820336e5afeb9755b0005fb80e65224bcc0d462` |
+| runtime.py final | `097b5c1e67e2f4c2852a8033e1a3f30d14254f0e2d18b4a899589d555e61d1f3` |
+| implementation.diff | `808412c3d70eead7f12a2c48743a91a24c1dd17dc1d5510cd8632228ee120929` |
+| artifacts.py unchanged B3b | `33a124043338d834fe3b60508b533c777df5c4fefbbdfb52ac812ab5eda0ca4f` |
+| production_runtime.py unchanged B3a/A | `78da0dc5efcf5cf94541a465e0a3c212221c843dade07f680ddc5e1508fdc476` |
+| memory.py unchanged B2 | `99e084eeff284d39a651e899e9562780e2581eb936ce7ff1f3f0542ed7b523aa` |
+| rendering.py unchanged B1/B2 | `bd726b9a32ddaf675a9883aade2099747a8682ab6be5f36d465de77542e93464` |
+| provider.py unchanged | `d9b17d62a6c8b485ba6ae6abb22a9e87f9d908b3c96409ba6e21f86eb691e937` |
+| contracts.py unchanged | `5ec3278af501f4abf285716bbd4d211fe5cd34c873e1644b63e3d43daa3de398` |
+| candidate_ir.py unchanged | `a437d9536fb57d48c7e9c9c6fab2f8a29ac9bea0666be61caeb2baf583b13f1b` |
+
+## B4b/B4c limits
+
+The intermediate no-testable abort is intentionally retained. Rejection-only lifecycle completion is not implemented or claimed. B4b must add valid no-testable record publication/checkpoint/cleanup without a critic; exact finalized-round candidate/role authority for mixed and rejection-only records; and resume behavior without duplicate provider work or deadline extension. `_verify_finalized_discovery_rounds` retains its rendered-only IDs and mandatory three-role tuple. `_completed_result` itself has no direct critic check; audit it with its callers rather than assuming one. Existing completion, recovery, cleanup, summaries and role budgeting were not edited.
+
+B4c must retain invalid hypotheses in history/novelty and provide bounded closed numeric rejection feedback to the next investigator. Two rejection-only lifecycle rounds do not count as two evaluated feedback rounds. Current campaign budgets/readiness still prohibit a new campaign from this checkpoint.
+
+No tests were read, created, changed or run. No synthetic probes, events, references, records or responses were fabricated. No model/API calls, credentials, candidate evaluation, campaign launch/resume/poll, evaluator rebuild, commits, pushes or deployment occurred. All older review packages and archived artifacts were preserved.

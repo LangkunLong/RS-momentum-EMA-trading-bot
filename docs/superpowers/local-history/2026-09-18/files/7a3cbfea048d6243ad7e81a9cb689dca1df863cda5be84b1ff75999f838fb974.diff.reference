@@ -1,0 +1,1210 @@
+diff --git "a/.artifacts\\pit-optimizer-v5\\development\\increment-c-campaign-proposal\\admission-p3\\principal-preimages\\operations.py" b/core/pit_optimizer_v5/operations.py
+index 87112a5..2197a0a 100644
+--- "a/.artifacts\\pit-optimizer-v5\\development\\increment-c-campaign-proposal\\admission-p3\\principal-preimages\\operations.py"
++++ b/core/pit_optimizer_v5/operations.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++from argparse import Namespace
+ from dataclasses import dataclass, replace
+ import hashlib
+ import os
+@@ -21,6 +22,18 @@ from core.pit_optimizer_v5.cli import (
+     _compose_production_round_from_paths_v5,
+     build_parser_v5,
+ )
++from core.pit_optimizer_v5.campaign_admission import (
++    AuthenticatedCampaignAdmissionV5,
++    CampaignAdmissionBindingV5,
++    _campaign_admission_enrollment_state_v5,
++    _campaign_observed_started_rounds_v5,
++    _load_campaign_boundary_facts_v5,
++    _require_campaign_enrollment_freshness_v5,
++    _selected_campaign_launch_v5,
++    authenticate_prepared_campaign_policy_v5,
++    campaign_boundary_decision_v5,
++    load_campaign_admission_v5,
++)
+ from core.pit_optimizer_v5.contracts import ArtifactRefV5, canonical_json_bytes_v5, canonical_sha256_v5
+ from core.pit_optimizer_v5.manifest import (
+     AuthenticatedCampaignManifestV5,
+@@ -299,6 +312,68 @@ def _scope_adapters(authenticated):
+     return ProductionV5CommandServices._adapter_config, ProductionRoundFactoryV5
+ 
+ 
++def _expected_campaign_admission_v5(
++    *,
++    repository: LocalArtifactRepositoryV5,
++    authenticated: AuthenticatedCampaignManifestV5,
++    adapter_config_ref: ArtifactRefV5,
++    owner_token_sha256: str,
++    campaign_policy_ref: ArtifactRefV5,
++) -> AuthenticatedCampaignAdmissionV5:
++    policy = authenticate_prepared_campaign_policy_v5(
++        repository=repository,
++        manifest=authenticated.manifest,
++        policy_ref=campaign_policy_ref,
++    )
++    if (
++        policy.manifest_ref != authenticated.manifest_ref
++        or policy.adapter_config_ref != adapter_config_ref
++        or policy.owner_token_sha256 != owner_token_sha256
++        or policy.repository_root_identity_sha256
++        != repository.root_identity_sha256
++    ):
++        raise ProductionOperationFailureV5(
++            "Campaign policy differs from the supplied manifest, config, owner, or repository root"
++        )
++    return AuthenticatedCampaignAdmissionV5(
++        binding=CampaignAdmissionBindingV5(
++            5,
++            campaign_policy_ref,
++            authenticated.manifest_ref,
++            adapter_config_ref,
++            owner_token_sha256,
++            repository.root_identity_sha256,
++        ),
++        policy=policy,
++    )
++
++
++def _authenticated_resume_admission_v5(
++    *,
++    repository: LocalArtifactRepositoryV5,
++    authenticated: AuthenticatedCampaignManifestV5,
++    adapter_config_ref: ArtifactRefV5,
++    owner_token_sha256: str,
++    expected_policy_ref: ArtifactRefV5 | None,
++) -> AuthenticatedCampaignAdmissionV5 | None:
++    admission = load_campaign_admission_v5(
++        repository=repository,
++        manifest=authenticated.manifest,
++        expected_policy_ref=expected_policy_ref,
++    )
++    if admission is not None and (
++        admission.binding.manifest_ref != authenticated.manifest_ref
++        or admission.binding.adapter_config_ref != adapter_config_ref
++        or admission.binding.owner_token_sha256 != owner_token_sha256
++        or admission.binding.repository_root_identity_sha256
++        != repository.root_identity_sha256
++    ):
++        raise ProductionOperationFailureV5(
++            "Campaign admission differs from the original manifest, config, owner, or repository root"
++        )
++    return admission
++
++
+ def render_production_command_v5(
+     *,
+     repository: LocalArtifactRepositoryV5,
+@@ -308,6 +383,7 @@ def render_production_command_v5(
+     round_index: int,
+     owner_token_sha256: str,
+     command: str = "run",
++    campaign_policy_ref: ArtifactRefV5 | None = None,
+ ) -> dict[str, object]:
+     """Return argv plus a PowerShell command after verifying the local adapter graph."""
+     if command not in {"run", "resume", "run-campaign", "resume-campaign"}:
+@@ -316,6 +392,8 @@ def render_production_command_v5(
+         raise ProductionOperationFailureV5("development uses run-campaign or resume-campaign")
+     if command.endswith("campaign") and round_index != 1:
+         raise ProductionOperationFailureV5("Campaign launch uses the round 1 configuration and owner")
++    if not command.endswith("campaign") and campaign_policy_ref is not None:
++        raise ProductionOperationFailureV5("Campaign policy is valid only for campaign commands")
+     token = _owner_token(owner_token_sha256)
+     authorities = _authorities(authenticated)
+     load_config, factory = _scope_adapters(authenticated)
+@@ -334,6 +412,24 @@ def render_production_command_v5(
+         owner_token_sha256=token,
+         adapter_config=config,
+     )
++    selected_policy_ref = campaign_policy_ref
++    if command == "run-campaign" and campaign_policy_ref is not None:
++        _expected_campaign_admission_v5(
++            repository=repository,
++            authenticated=authenticated,
++            adapter_config_ref=adapter_config_ref,
++            owner_token_sha256=token,
++            campaign_policy_ref=campaign_policy_ref,
++        )
++    elif command == "resume-campaign":
++        admission = _authenticated_resume_admission_v5(
++            repository=repository,
++            authenticated=authenticated,
++            adapter_config_ref=adapter_config_ref,
++            owner_token_sha256=token,
++            expected_policy_ref=campaign_policy_ref,
++        )
++        selected_policy_ref = None if admission is None else admission.binding.policy_ref
+     argv = [
+         sys.executable,
+         "-B",
+@@ -346,13 +442,26 @@ def render_production_command_v5(
+         authenticated.manifest_ref.relative_path,
+         "--manifest-sha256",
+         authenticated.manifest_ref.sha256,
+-        "--adapter-config-path",
+-        adapter_config_ref.relative_path,
+-        "--adapter-config-sha256",
+-        adapter_config_ref.sha256,
+-        "--owner-token-sha256",
+-        token,
+     ]
++    if selected_policy_ref is not None:
++        argv.extend(
++            (
++                "--campaign-policy-path",
++                selected_policy_ref.relative_path,
++                "--campaign-policy-sha256",
++                selected_policy_ref.sha256,
++            )
++        )
++    argv.extend(
++        (
++            "--adapter-config-path",
++            adapter_config_ref.relative_path,
++            "--adapter-config-sha256",
++            adapter_config_ref.sha256,
++            "--owner-token-sha256",
++            token,
++        )
++    )
+     if not command.endswith("campaign"):
+         argv.extend(("--round-index", str(round_index)))
+     return {
+@@ -379,6 +488,7 @@ def _run_campaign_v5(
+     owner_token_sha256: str,
+     resume: bool = False,
+     emit_round: Callable[[dict[str, object]], None] | None = None,
++    campaign_policy_ref: ArtifactRefV5 | None = None,
+ ) -> dict[str, object]:
+     """Run existing rounds sequentially under the original persisted campaign deadline."""
+     manifest = authenticated.manifest
+@@ -404,27 +514,153 @@ def _run_campaign_v5(
+             owner_token_sha256=token,
+             adapter_config=config,
+         )
+-        launch = repository.load_typed_state(namespace="campaign-launch", key=key, value_type=CampaignLaunchV5)
+-        if launch is None:
+-            if resume:
++        admission: AuthenticatedCampaignAdmissionV5 | None
++        if campaign_policy_ref is None:
++            # Preserve the legacy operational repair and error order when no
++            # explicit enrollment is being created.
++            launch = repository.load_typed_state(
++                namespace="campaign-launch",
++                key=key,
++                value_type=CampaignLaunchV5,
++            )
++            if launch is None:
++                if resume:
++                    raise ProductionOperationFailureV5(
++                        "No campaign launch state exists; use run-campaign for a fresh campaign"
++                    )
++                if repository.load_checkpoint() is not None or any(
++                    repository.load_round_events(
++                        campaign_id=manifest.campaign_id,
++                        round_index=index,
++                    )
++                    for index in range(1, manifest.search.max_feedback_rounds + 1)
++                ):
++                    raise ProductionOperationFailureV5(
++                        "Campaign already has round state; use its original resume command"
++                    )
++                # An unjournaled paid reservation also makes a campaign non-fresh.
++                ProductionV5CommandServices._verify_local_run(
++                    repository,
++                    authorities,
++                    config,
++                )
++                admission = _authenticated_resume_admission_v5(
++                    repository=repository,
++                    authenticated=authenticated,
++                    adapter_config_ref=adapter_config_ref,
++                    owner_token_sha256=token,
++                    expected_policy_ref=None,
++                )
++                if admission is not None:
++                    raise ProductionOperationFailureV5(
++                        "An interrupted enrolled launch requires its explicit campaign policy"
++                    )
++                launch = CampaignLaunchV5(
++                    authenticated.manifest_ref,
++                    adapter_config_ref,
++                    token,
++                    time.time_ns() // 1_000_000,
++                )
++                repository.append_typed_state(
++                    namespace="campaign-launch",
++                    key=key,
++                    value=launch,
++                )
++            elif not resume:
+                 raise ProductionOperationFailureV5(
+-                    "No campaign launch state exists; use run-campaign for a fresh campaign"
++                    "Campaign launch already exists; use resume-campaign with the original config and owner"
+                 )
+-            if repository.load_checkpoint() is not None or any(
+-                repository.load_round_events(campaign_id=manifest.campaign_id, round_index=index)
+-                for index in range(1, manifest.search.max_feedback_rounds + 1)
+-            ):
+-                raise ProductionOperationFailureV5("Campaign already has round state; use its original resume command")
+-            # An unjournaled paid reservation also makes a campaign non-fresh.
+-            ProductionV5CommandServices._verify_local_run(repository, authorities, config)
+-            launch = CampaignLaunchV5(
+-                authenticated.manifest_ref, adapter_config_ref, token, time.time_ns() // 1_000_000
++            admission = _authenticated_resume_admission_v5(
++                repository=repository,
++                authenticated=authenticated,
++                adapter_config_ref=adapter_config_ref,
++                owner_token_sha256=token,
++                expected_policy_ref=None,
+             )
+-            repository.append_typed_state(namespace="campaign-launch", key=key, value=launch)
+-        elif not resume:
+-            raise ProductionOperationFailureV5(
+-                "Campaign launch already exists; use resume-campaign with the original config and owner"
++        else:
++            expected_admission = _expected_campaign_admission_v5(
++                repository=repository,
++                authenticated=authenticated,
++                adapter_config_ref=adapter_config_ref,
++                owner_token_sha256=token,
++                campaign_policy_ref=campaign_policy_ref,
++            )
++            enrollment_state = _campaign_admission_enrollment_state_v5(
++                repository=repository,
++                manifest=manifest,
++                expected=expected_admission,
++            )
++            launch = repository.load_typed_state(
++                namespace="campaign-launch",
++                key=key,
++                value_type=CampaignLaunchV5,
++                repair=False,
+             )
++            if launch is None:
++                if resume:
++                    raise ProductionOperationFailureV5(
++                        "No campaign launch state exists; use run-campaign for a fresh campaign"
++                    )
++                _require_campaign_enrollment_freshness_v5(
++                    repository=repository,
++                    manifest=manifest,
++                    expected=expected_admission,
++                )
++                ProductionV5CommandServices._verify_local_run(
++                    repository,
++                    authorities,
++                    config,
++                )
++                if enrollment_state == "absent":
++                    repository.append_typed_state(
++                        namespace="campaign-admission",
++                        key=key,
++                        value=expected_admission.binding,
++                    )
++                elif enrollment_state == "missing_index":
++                    repository.recover_typed_state_index(
++                        namespace="campaign-admission",
++                        key=key,
++                        expected_value=expected_admission.binding,
++                    )
++                admission = _authenticated_resume_admission_v5(
++                    repository=repository,
++                    authenticated=authenticated,
++                    adapter_config_ref=adapter_config_ref,
++                    owner_token_sha256=token,
++                    expected_policy_ref=campaign_policy_ref,
++                )
++                if admission != expected_admission:
++                    raise ProductionOperationFailureV5(
++                        "Campaign enrollment differs after publication recovery"
++                    )
++                launch = CampaignLaunchV5(
++                    authenticated.manifest_ref,
++                    adapter_config_ref,
++                    token,
++                    time.time_ns() // 1_000_000,
++                )
++                repository.append_typed_state(
++                    namespace="campaign-launch",
++                    key=key,
++                    value=launch,
++                )
++            else:
++                if not resume:
++                    raise ProductionOperationFailureV5(
++                        "Campaign launch already exists; use resume-campaign with the original config and owner"
++                    )
++                if enrollment_state != "enrolled":
++                    raise ProductionOperationFailureV5(
++                        "A launched campaign cannot be newly enrolled during resume"
++                    )
++                admission = _authenticated_resume_admission_v5(
++                    repository=repository,
++                    authenticated=authenticated,
++                    adapter_config_ref=adapter_config_ref,
++                    owner_token_sha256=token,
++                    expected_policy_ref=campaign_policy_ref,
++                )
+         if (launch.manifest_ref, launch.adapter_config_ref, launch.owner_token_sha256) != (
+             authenticated.manifest_ref,
+             adapter_config_ref,
+@@ -433,6 +669,14 @@ def _run_campaign_v5(
+             raise ProductionOperationFailureV5(
+                 "Resume must use the original campaign manifest, adapter config, and owner"
+             )
++        if admission is not None and _selected_campaign_launch_v5(
++            repository=repository,
++            manifest=manifest,
++            admission=admission,
++        ) != launch:
++            raise ProductionOperationFailureV5(
++                "Campaign admission selects a different original launch"
++            )
+         now_ms = time.time_ns() // 1_000_000
+         if now_ms < launch.started_epoch_ms:
+             raise ProductionOperationFailureV5(
+@@ -440,6 +684,45 @@ def _run_campaign_v5(
+             )
+         remaining = manifest.resources.campaign_wall_timeout_seconds - (now_ms - launch.started_epoch_ms) / 1000
+         deadline = time.monotonic() + remaining
++        enrolled_policy_ref = None if admission is None else admission.binding.policy_ref
++
++        def reload_admission() -> AuthenticatedCampaignAdmissionV5 | None:
++            current = _authenticated_resume_admission_v5(
++                repository=repository,
++                authenticated=authenticated,
++                adapter_config_ref=adapter_config_ref,
++                owner_token_sha256=token,
++                expected_policy_ref=enrolled_policy_ref,
++            )
++            if enrolled_policy_ref is None and current is not None:
++                raise ProductionOperationFailureV5(
++                    "A legacy campaign cannot acquire enrollment after launch"
++                )
++            return current
++
++        def policy_boundary(next_round_index: int) -> str | None:
++            current = reload_admission()
++            if current is None:
++                return None
++            facts = _load_campaign_boundary_facts_v5(
++                repository=repository,
++                manifest=manifest,
++                admission=current,
++                owner_token_sha256=token,
++                next_round_index=next_round_index,
++            )
++            if time.monotonic() >= deadline:
++                return "campaign_deadline_exhausted"
++            return campaign_boundary_decision_v5(
++                policy=current.policy,
++                manifest=manifest,
++                evaluated_feedback_rounds=facts.evaluated_feedback_rounds,
++                attempted_rounds=facts.attempted_rounds,
++                external_attempts=facts.external_attempts,
++                total_tokens=facts.total_tokens,
++                cost_usd=facts.cost_usd,
++            )
++
+         rounds = []
+         reason = "max_feedback_rounds"
+         for round_index in range(1, manifest.search.max_feedback_rounds + 1):
+@@ -467,6 +750,21 @@ def _run_campaign_v5(
+                 if status not in {"completed", "no_novel_hypothesis"}:
+                     reason = status
+                     break
++                current_admission = reload_admission()
++                if current_admission is not None:
++                    observed_started = _campaign_observed_started_rounds_v5(
++                        repository=repository,
++                        manifest=manifest,
++                        admission=current_admission,
++                        owner_token_sha256=token,
++                    )
++                    if any(index > round_index for index in observed_started):
++                        continue
++                    decision = policy_boundary(round_index + 1)
++                    if decision != "admit":
++                        assert decision is not None
++                        reason = decision
++                        break
+                 continue
+             round_key = canonical_sha256_v5({"campaign_manifest_sha256": key, "round_index": round_index})
+             entry = repository.load_typed_state(
+@@ -491,6 +789,13 @@ def _run_campaign_v5(
+                 ):
+                     reason = "provider_budget_exhausted"
+                     break
++                decision = policy_boundary(round_index)
++                if enrolled_policy_ref is not None and time.monotonic() >= deadline:
++                    reason = "campaign_deadline_exhausted"
++                    break
++                if decision is not None and decision != "admit":
++                    reason = decision
++                    break
+                 round_config = (
+                     config
+                     if round_index == 1
+@@ -509,6 +814,9 @@ def _run_campaign_v5(
+                         },
+                     )
+                 )
++                if enrolled_policy_ref is not None and time.monotonic() >= deadline:
++                    reason = "campaign_deadline_exhausted"
++                    break
+                 round_ref = (
+                     adapter_config_ref
+                     if round_index == 1
+@@ -560,10 +868,40 @@ def _run_campaign_v5(
+                 owner_token_sha256=entry.owner_token_sha256,
+                 adapter_config=round_config,
+             )
+-            now_ms = time.time_ns() // 1_000_000
+             if started is None:
++                if enrolled_policy_ref is not None:
++                    usage = summarize_repository_v5(
++                        repository=repository,
++                        manifest=manifest,
++                        command="summarize",
++                        readiness_code="ready",
++                    )
++                    provider = manifest.provider
++                    if provider is not None and (
++                        usage.role_calls >= provider.maximum_role_calls
++                        or usage.total_tokens >= provider.maximum_total_tokens
++                        or (
++                            provider.maximum_usd is not None
++                            and usage.cost_usd >= provider.maximum_usd
++                        )
++                    ):
++                        reason = "provider_budget_exhausted"
++                        break
++                    decision = policy_boundary(round_index)
++                    if time.monotonic() >= deadline:
++                        reason = "campaign_deadline_exhausted"
++                        break
++                    if decision is not None and decision != "admit":
++                        reason = decision
++                        break
++                if enrolled_policy_ref is not None and time.monotonic() >= deadline:
++                    reason = "campaign_deadline_exhausted"
++                    break
++                now_ms = time.time_ns() // 1_000_000
+                 started = replace(entry, started_epoch_ms=now_ms)
+                 repository.append_typed_state(namespace="campaign-round-started", key=round_key, value=started)
++            else:
++                now_ms = time.time_ns() // 1_000_000
+             if now_ms < started.started_epoch_ms:
+                 raise ProductionOperationFailureV5(
+                     "Host clock precedes persisted round start; correct the clock before resuming"
+@@ -608,6 +946,7 @@ def _run_campaign_v5(
+                         round_index=1,
+                         owner_token_sha256=token,
+                         command="resume-campaign",
++                        campaign_policy_ref=enrolled_policy_ref,
+                     ),
+                 }
+             if result.cleanup is None or not result.cleanup.cleanup_complete or result.cleanup_failure is not None:
+@@ -616,6 +955,20 @@ def _run_campaign_v5(
+             if result.status not in {"completed", "no_novel_hypothesis"}:
+                 reason = result.status
+                 break
++            current_admission = reload_admission()
++            if current_admission is not None:
++                observed_started = _campaign_observed_started_rounds_v5(
++                    repository=repository,
++                    manifest=manifest,
++                    admission=current_admission,
++                    owner_token_sha256=token,
++                )
++                if not any(index > round_index for index in observed_started):
++                    decision = policy_boundary(round_index + 1)
++                    if decision != "admit":
++                        assert decision is not None
++                        reason = decision
++                        break
+         # Defer the complete ledger/journal check until pending runtime recovery
+         # has had its opportunity to reconcile a paid reservation.
+         ProductionV5CommandServices._verify_local_run(repository, authorities, config)
+@@ -629,7 +982,9 @@ def _run_campaign_v5(
+         )
+         return {
+             "schema_version": 5,
+-            "status": "completed" if reason == "max_feedback_rounds" else "stopped",
++            "status": "completed"
++            if reason in {"max_feedback_rounds", "evaluated_feedback_target_reached"}
++            else "stopped",
+             "reason": reason,
+             "manifest_ref": authenticated.manifest_ref,
+             "rounds": tuple(rounds),
+@@ -650,6 +1005,16 @@ def run_development_campaign_v5(**kwargs):
+     return _run_campaign_v5(**kwargs)
+ 
+ 
++def _campaign_policy_ref_from_args_v5(args: Namespace) -> ArtifactRefV5 | None:
++    path = args.campaign_policy_path
++    sha256 = args.campaign_policy_sha256
++    if (path is None) != (sha256 is None):
++        raise ProductionOperationFailureV5(
++            "Campaign policy path and SHA-256 must be supplied together"
++        )
++    return None if path is None else ArtifactRefV5(path, sha256)
++
++
+ def dispatch_production_operations_cli_v5(argv: Sequence[str], *, emit: Callable[[str], None] = print) -> int:
+     try:
+         args = build_parser_v5().parse_args(tuple(argv))
+@@ -686,6 +1051,7 @@ def dispatch_production_operations_cli_v5(argv: Sequence[str], *, emit: Callable
+                 owner_token_sha256=args.owner_token_sha256,
+                 resume=args.command == "resume-campaign",
+                 emit_round=lambda row: emit("PIT_OPTIMIZER_V5_ROUND=" + canonical_json_bytes_v5(row).decode("utf-8")),
++                campaign_policy_ref=_campaign_policy_ref_from_args_v5(args),
+             )
+         emit("PIT_OPTIMIZER_V5_OPERATIONS=" + canonical_json_bytes_v5(result).decode("utf-8"))
+         return (
+diff --git "a/.artifacts\\pit-optimizer-v5\\development\\increment-c-campaign-proposal\\admission-p3\\principal-preimages\\cli.py" b/core/pit_optimizer_v5/cli.py
+index cd1043e..c6dcd8e 100644
+--- "a/.artifacts\\pit-optimizer-v5\\development\\increment-c-campaign-proposal\\admission-p3\\principal-preimages\\cli.py"
++++ b/core/pit_optimizer_v5/cli.py
+@@ -1212,6 +1212,8 @@ def build_parser_v5() -> argparse.ArgumentParser:
+         else:
+             command.add_argument("--adapter-config-path", required=True)
+             command.add_argument("--adapter-config-sha256", required=True)
++            command.add_argument("--campaign-policy-path")
++            command.add_argument("--campaign-policy-sha256")
+     for name in ("import-development", "controller-request", "controller-response"):
+         command = commands.add_parser(name, allow_abbrev=False)
+         command.add_argument("--artifact-root", required=True)
+diff --git "a/.artifacts\\pit-optimizer-v5\\development\\increment-c-campaign-proposal\\admission-p3\\principal-preimages\\campaign_admission.py" b/core/pit_optimizer_v5/campaign_admission.py
+index d76240e..52d0147 100644
+--- "a/.artifacts\\pit-optimizer-v5\\development\\increment-c-campaign-proposal\\admission-p3\\principal-preimages\\campaign_admission.py"
++++ b/core/pit_optimizer_v5/campaign_admission.py
+@@ -28,6 +28,7 @@ from core.pit_optimizer_v5.manifest import (
+ )
+ from core.pit_optimizer_v5.memory import (
+     CleanupResultPayloadV5,
++    ExperimentRecordV5,
+     RoleCompletionPayloadV5,
+     RoundOutcomePayloadV5,
+ )
+@@ -178,6 +179,26 @@ class _LiveRolePrefixV5:
+     replay: bool
+ 
+ 
++@dataclass(frozen=True, slots=True)
++class _CampaignRoundStateCensusV5:
++    authenticated_manifest: AuthenticatedCampaignManifestV5
++    campaign_launch: CampaignLaunchV5
++    original_config: ProviderDevelopmentAdapterConfigV5
++    launches: tuple[tuple[int, CampaignRoundLaunchV5], ...]
++    starts: tuple[tuple[int, CampaignRoundLaunchV5], ...]
++
++
++@dataclass(frozen=True, slots=True)
++class _CampaignBoundaryFactsV5:
++    evaluated_feedback_rounds: int
++    attempted_rounds: int
++    external_attempts: int
++    total_tokens: int
++    cost_usd: Decimal
++    observed_started_rounds: tuple[int, ...]
++    prestart_round_index: int | None
++
++
+ def _worst_role_envelope_cost_v5(
+     *,
+     policy: CampaignAdmissionPolicyV5,
+@@ -482,29 +503,39 @@ def _round_state_key_v5(manifest: CampaignManifestV5, round_index: int) -> str:
+     )
+ 
+ 
+-def _state_names_v5(
++def _state_name_sets_v5(
+     repository: LocalArtifactRepositoryV5,
+     namespace: str,
+-) -> tuple[str, ...]:
+-    names: set[str] = set()
++) -> tuple[frozenset[str], frozenset[str]]:
++    groups: list[frozenset[str]] = []
+     for root in ("adapter-state", "adapter-state-authority"):
+         try:
+             observed = repository._names((root, namespace))
+         except ArtifactMissingV5:
+             observed = ()
++        names: set[str] = set()
+         for name in observed:
+             if re.fullmatch(r"[0-9a-f]{64}\.json", name) is None:
+                 raise ValueError("campaign admission state member is noncanonical")
+             names.add(name[:-5])
+-    return tuple(sorted(names))
++        groups.append(frozenset(names))
++    return groups[0], groups[1]
+ 
+ 
+-def _selected_campaign_launch_v5(
++def _state_names_v5(
++    repository: LocalArtifactRepositoryV5,
++    namespace: str,
++) -> tuple[str, ...]:
++    value_names, authority_names = _state_name_sets_v5(repository, namespace)
++    return tuple(sorted(value_names | authority_names))
++
++
++def _selected_campaign_launches_v5(
+     *,
+     repository: LocalArtifactRepositoryV5,
+     manifest: CampaignManifestV5,
+     admission: AuthenticatedCampaignAdmissionV5,
+-) -> CampaignLaunchV5:
++) -> tuple[CampaignLaunchV5, ...]:
+     from core.pit_optimizer_v5.operations import CampaignLaunchV5
+ 
+     selected: list[CampaignLaunchV5] = []
+@@ -527,6 +558,20 @@ def _selected_campaign_launch_v5(
+         if key != manifest.sha256:
+             raise ValueError("campaign launch is stored under a foreign key")
+         selected.append(launch)
++    return tuple(selected)
++
++
++def _selected_campaign_launch_v5(
++    *,
++    repository: LocalArtifactRepositoryV5,
++    manifest: CampaignManifestV5,
++    admission: AuthenticatedCampaignAdmissionV5,
++) -> CampaignLaunchV5:
++    selected = _selected_campaign_launches_v5(
++        repository=repository,
++        manifest=manifest,
++        admission=admission,
++    )
+     if len(selected) != 1:
+         raise ValueError("campaign admission requires one original campaign launch")
+     return selected[0]
+@@ -594,6 +639,130 @@ def _selected_round_states_v5(
+     return selected
+ 
+ 
++def _campaign_admission_enrollment_state_v5(
++    *,
++    repository: LocalArtifactRepositoryV5,
++    manifest: CampaignManifestV5,
++    expected: AuthenticatedCampaignAdmissionV5,
++) -> Literal["absent", "enrolled", "missing_index"]:
++    """Observe one exact prepared enrollment without repairing it."""
++
++    if (
++        type(repository) is not LocalArtifactRepositoryV5
++        or type(manifest) is not CampaignManifestV5
++        or type(expected) is not AuthenticatedCampaignAdmissionV5
++        or expected.policy.manifest_ref.sha256 != manifest.sha256
++    ):
++        raise ValueError("campaign admission enrollment authority is invalid")
++    value_names, authority_names = _state_name_sets_v5(
++        repository,
++        _ADMISSION_NAMESPACE_V5,
++    )
++    key = manifest.sha256
++    if key in authority_names and key not in value_names:
++        raise ValueError("campaign admission authority lacks its immutable value")
++    if key in value_names and key not in authority_names:
++        for other_key in sorted((value_names | authority_names) - {key}):
++            binding = repository.load_typed_state(
++                namespace=_ADMISSION_NAMESPACE_V5,
++                key=other_key,
++                value_type=CampaignAdmissionBindingV5,
++                repair=False,
++            )
++            if binding is None or binding.manifest_ref.sha256 != other_key:
++                raise ValueError("campaign admission namespace member is incomplete")
++        expected_ref = ArtifactRefV5(
++            f"adapter-state/{_ADMISSION_NAMESPACE_V5}/{key}.json",
++            canonical_sha256_v5(expected.binding),
++        )
++        observed = repository.load_typed_artifact(
++            expected_ref,
++            value_type=CampaignAdmissionBindingV5,
++        )
++        if observed != expected.binding:
++            raise ValueError("campaign admission orphan differs from the expected binding")
++        return "missing_index"
++
++    admission = load_campaign_admission_v5(
++        repository=repository,
++        manifest=manifest,
++        expected_policy_ref=None if key not in value_names else expected.binding.policy_ref,
++    )
++    if admission is None:
++        return "absent"
++    if admission != expected:
++        raise ValueError("campaign admission enrollment differs from the expected binding")
++    return "enrolled"
++
++
++def _require_campaign_enrollment_freshness_v5(
++    *,
++    repository: LocalArtifactRepositoryV5,
++    manifest: CampaignManifestV5,
++    expected: AuthenticatedCampaignAdmissionV5,
++) -> None:
++    """Require no selected launch, round, request, checkpoint, or paid ledger state."""
++
++    from core.pit_optimizer_v5.historical_verification import (
++        _existing_campaign_role_requests_v5,
++    )
++    from core.pit_optimizer_v5.production_provider import (
++        _load_verified_role_ledger_v5,
++        _role_ledger_read_identity_v5,
++    )
++
++    if _selected_campaign_launches_v5(
++        repository=repository,
++        manifest=manifest,
++        admission=expected,
++    ):
++        raise ValueError("campaign admission enrollment requires an absent launch")
++    if _selected_round_states_v5(
++        repository=repository,
++        manifest=manifest,
++        admission=expected,
++        namespace="campaign-round",
++    ) or _selected_round_states_v5(
++        repository=repository,
++        manifest=manifest,
++        admission=expected,
++        namespace="campaign-round-started",
++    ):
++        raise ValueError("campaign admission enrollment observed round authority")
++    if _campaign_event_rounds_v5(repository, manifest):
++        raise ValueError("campaign admission enrollment observed a round journal")
++    if repository.load_checkpoint() is not None:
++        raise ValueError("campaign admission enrollment observed a checkpoint")
++    if _existing_campaign_role_requests_v5(repository, manifest):
++        raise ValueError("campaign admission enrollment observed a role request")
++
++    authenticated_manifest = authenticate_campaign_manifest_v5(
++        repository=repository,
++        manifest_ref=expected.policy.manifest_ref,
++    )
++    if authenticated_manifest.manifest != manifest:
++        raise ValueError("campaign admission enrollment manifest differs")
++    original_config = load_development_config_v5(
++        repository,
++        authenticated_manifest,
++        expected.policy.adapter_config_ref,
++    )
++    if type(original_config) is not ProviderDevelopmentAdapterConfigV5:
++        raise ValueError("campaign admission enrollment config differs")
++    identity = _role_ledger_read_identity_v5(
++        repository,
++        manifest,
++        api_key_environment_variable=original_config.api_key_environment_variable,
++    )
++    reservations, terminals = _load_verified_role_ledger_v5(
++        repository=repository,
++        manifest=manifest,
++        identity=identity,
++    )
++    if reservations or terminals:
++        raise ValueError("campaign admission enrollment observed paid role state")
++
++
+ def _require_round_config_matches_original_v5(
+     original: ProviderDevelopmentAdapterConfigV5,
+     current: ProviderDevelopmentAdapterConfigV5,
+@@ -608,6 +777,120 @@ def _require_round_config_matches_original_v5(
+         raise ValueError("campaign round config differs outside derived identities")
+ 
+ 
++def _load_campaign_round_state_census_v5(
++    *,
++    repository: LocalArtifactRepositoryV5,
++    manifest: CampaignManifestV5,
++    admission: AuthenticatedCampaignAdmissionV5,
++    owner_token_sha256: str,
++) -> _CampaignRoundStateCensusV5:
++    """Authenticate the global launched/started frontier without repairing state."""
++
++    _digest(owner_token_sha256, "campaign boundary owner token")
++    authenticated_manifest = authenticate_campaign_manifest_v5(
++        repository=repository,
++        manifest_ref=admission.policy.manifest_ref,
++    )
++    if authenticated_manifest.manifest != manifest:
++        raise ValueError("campaign boundary manifest differs")
++    campaign_launch = _selected_campaign_launch_v5(
++        repository=repository,
++        manifest=manifest,
++        admission=admission,
++    )
++    if (
++        campaign_launch.manifest_ref != admission.policy.manifest_ref
++        or campaign_launch.adapter_config_ref != admission.policy.adapter_config_ref
++        or campaign_launch.owner_token_sha256 != admission.policy.owner_token_sha256
++        or campaign_launch.owner_token_sha256 != owner_token_sha256
++    ):
++        raise ValueError("campaign boundary launch authority differs")
++    original_config = load_development_config_v5(
++        repository,
++        authenticated_manifest,
++        admission.policy.adapter_config_ref,
++    )
++    if type(original_config) is not ProviderDevelopmentAdapterConfigV5:
++        raise ValueError("campaign boundary requires the original provider config")
++
++    launches = _selected_round_states_v5(
++        repository=repository,
++        manifest=manifest,
++        admission=admission,
++        namespace="campaign-round",
++    )
++    starts = _selected_round_states_v5(
++        repository=repository,
++        manifest=manifest,
++        admission=admission,
++        namespace="campaign-round-started",
++    )
++    expected_starts = set(range(1, len(starts) + 1))
++    if set(starts) != expected_starts or frozenset(launches) not in {
++        frozenset(expected_starts),
++        frozenset(expected_starts | {len(starts) + 1}),
++    }:
++        raise ValueError("campaign boundary round authority is gapped or later")
++    if len(launches) > manifest.search.max_feedback_rounds:
++        raise ValueError("campaign boundary exceeds lifecycle authority")
++
++    campaign_deadline_epoch_ms = (
++        campaign_launch.started_epoch_ms
++        + manifest.resources.campaign_wall_timeout_seconds * 1000
++    )
++    for index, launch in launches.items():
++        started = starts.get(index)
++        if (
++            launch.round_index != index
++            or launch.owner_token_sha256 != campaign_launch.owner_token_sha256
++            or launch.started_epoch_ms is not None
++            or (
++                started is not None
++                and (
++                    started.started_epoch_ms is None
++                    or replace(started, started_epoch_ms=None) != launch
++                    or started.started_epoch_ms < campaign_launch.started_epoch_ms
++                    or started.started_epoch_ms >= campaign_deadline_epoch_ms
++                )
++            )
++        ):
++            raise ValueError("campaign boundary round launch/start differs")
++        if index == 1 and launch.adapter_config_ref != admission.policy.adapter_config_ref:
++            raise ValueError("campaign boundary first round differs from the original config")
++        round_config = load_development_config_v5(
++            repository,
++            authenticated_manifest,
++            launch.adapter_config_ref,
++        )
++        if type(round_config) is not ProviderDevelopmentAdapterConfigV5:
++            raise ValueError("campaign boundary round config type differs")
++        _require_round_config_matches_original_v5(original_config, round_config)
++
++    return _CampaignRoundStateCensusV5(
++        authenticated_manifest=authenticated_manifest,
++        campaign_launch=campaign_launch,
++        original_config=original_config,
++        launches=tuple(sorted(launches.items())),
++        starts=tuple(sorted(starts.items())),
++    )
++
++
++def _campaign_observed_started_rounds_v5(
++    *,
++    repository: LocalArtifactRepositoryV5,
++    manifest: CampaignManifestV5,
++    admission: AuthenticatedCampaignAdmissionV5,
++    owner_token_sha256: str,
++) -> tuple[int, ...]:
++    census = _load_campaign_round_state_census_v5(
++        repository=repository,
++        manifest=manifest,
++        admission=admission,
++        owner_token_sha256=owner_token_sha256,
++    )
++    return tuple(index for index, _started in census.starts)
++
++
+ def _load_campaign_round_authority_v5(
+     *,
+     repository: LocalArtifactRepositoryV5,
+@@ -804,6 +1087,47 @@ def _role_packages_v5(
+     return tuple(result)
+ 
+ 
++def _evaluated_round_indices_v5(
++    *,
++    records: tuple[ExperimentRecordV5, ...],
++    completed_by_round: dict[
++        int,
++        tuple[tuple[RoleCompletionPayloadV5, RoleInvocationPackageV5], ...],
++    ],
++    round_indices: range,
++) -> tuple[int, ...]:
++    evaluated_rounds: list[int] = []
++    for index in round_indices:
++        evaluated_records = tuple(
++            record
++            for record in records
++            if record.round_index == index
++            and record.status == "evaluated"
++            and record.campaign_evidence is not None
++        )
++        if not evaluated_records:
++            continue
++        critics = tuple(
++            package
++            for _payload, package in completed_by_round[index]
++            if package.call.role == "critic"
++        )
++        if (
++            len(critics) != 1
++            or not critics[0].accepted
++            or type(critics[0].artifact) is not CriticArtifactV5
++            or any(
++                record.critic_artifact_ref is None
++                or canonical_sha256_v5(critics[0].artifact)
++                != record.critic_artifact_ref.sha256
++                for record in evaluated_records
++            )
++        ):
++            raise ValueError("evaluated campaign round lacks its authenticated critic")
++        evaluated_rounds.append(index)
++    return tuple(evaluated_rounds)
++
++
+ def _load_live_role_prefix_v5(
+     *,
+     repository: LocalArtifactRepositoryV5,
+@@ -1055,34 +1379,11 @@ def _load_live_role_prefix_v5(
+         raise ValueError("campaign admission prior round has an incomplete reservation")
+     prior_receipt = None if prior_call_count == 0 else terminals[prior_call_count - 1].receipt
+ 
+-    evaluated_rounds: set[int] = set()
+-    for index in range(1, round_index):
+-        evaluated_records = tuple(
+-            record
+-            for record in records
+-            if record.round_index == index
+-            and record.status == "evaluated"
+-            and record.campaign_evidence is not None
+-        )
+-        if not evaluated_records:
+-            continue
+-        critics = tuple(
+-            package
+-            for _payload, package in completed_by_round[index]
+-            if package.call.role == "critic"
+-        )
+-        if (
+-            len(critics) != 1
+-            or not critics[0].accepted
+-            or type(critics[0].artifact) is not CriticArtifactV5
+-            or any(
+-                record.critic_artifact_ref is None
+-                or canonical_sha256_v5(critics[0].artifact) != record.critic_artifact_ref.sha256
+-                for record in evaluated_records
+-            )
+-        ):
+-            raise ValueError("evaluated campaign round lacks its authenticated critic")
+-        evaluated_rounds.add(index)
++    evaluated_rounds = _evaluated_round_indices_v5(
++        records=records,
++        completed_by_round=completed_by_round,
++        round_indices=range(1, round_index),
++    )
+ 
+     return _LiveRolePrefixV5(
+         evaluated_feedback_rounds=len(evaluated_rounds),
+@@ -1096,6 +1397,182 @@ def _load_live_role_prefix_v5(
+     )
+ 
+ 
++def _load_campaign_boundary_facts_v5(
++    *,
++    repository: LocalArtifactRepositoryV5,
++    manifest: CampaignManifestV5,
++    admission: AuthenticatedCampaignAdmissionV5,
++    owner_token_sha256: str,
++    next_round_index: int,
++) -> _CampaignBoundaryFactsV5:
++    """Authenticate one settled global frontier without repair or a fake request."""
++
++    from core.pit_optimizer_v5.historical_verification import (
++        _existing_campaign_role_requests_v5,
++        authenticate_completed_historical_round_resources_v5,
++    )
++    from core.pit_optimizer_v5.production_provider import (
++        _authenticate_role_invocations_v5,
++        _load_verified_role_ledger_v5,
++        _role_ledger_read_identity_v5,
++    )
++    from core.pit_optimizer_v5.production_runtime import LocalArchiveReducerFactoryV5
++
++    if (
++        type(next_round_index) is not int
++        or next_round_index < 1
++        or next_round_index > manifest.search.max_feedback_rounds + 1
++    ):
++        raise ValueError("campaign boundary next round is invalid")
++    census = _load_campaign_round_state_census_v5(
++        repository=repository,
++        manifest=manifest,
++        admission=admission,
++        owner_token_sha256=owner_token_sha256,
++    )
++    launches = dict(census.launches)
++    starts = dict(census.starts)
++    expected_started = tuple(range(1, next_round_index))
++    if tuple(starts) != expected_started:
++        raise ValueError("campaign boundary does not follow every observed start")
++    permitted_launches = set(expected_started)
++    if next_round_index <= manifest.search.max_feedback_rounds:
++        permitted_launches.add(next_round_index)
++    if frozenset(launches) not in {
++        frozenset(expected_started),
++        frozenset(permitted_launches),
++    }:
++        raise ValueError("campaign boundary has unsupported pre-start state")
++    event_rounds = _campaign_event_rounds_v5(repository, manifest)
++    if event_rounds != expected_started:
++        raise ValueError("campaign boundary journal differs from observed starts")
++
++    completed_rounds = tuple(
++        authenticate_completed_historical_round_resources_v5(
++            repository=repository,
++            manifest=manifest,
++            round_index=index,
++        )
++        for index in expected_started
++    )
++    if any(
++        completed.round_authority.authenticated_manifest
++        != census.authenticated_manifest
++        or completed.round_authority.campaign_launch != census.campaign_launch
++        or completed.round_authority.original_config_ref
++        != admission.policy.adapter_config_ref
++        or completed.round_authority.original_config != census.original_config
++        or completed.round_authority.owner.owner_token_sha256
++        != census.campaign_launch.owner_token_sha256
++        for completed in completed_rounds
++    ):
++        raise ValueError("campaign boundary completed-round authority differs")
++
++    LocalArchiveReducerFactoryV5(repository).verify_projection(
++        manifest=manifest,
++        panel_plan=census.authenticated_manifest.panel_plan,
++        evaluator_contract=census.authenticated_manifest.evaluator_contract,
++        repair=False,
++    )
++    checkpoint = repository.load_checkpoint()
++    records = (
++        ()
++        if checkpoint is None
++        else tuple(
++            repository.load_experiment(reference)
++            for reference in checkpoint.record_refs
++        )
++    )
++    if any(record.round_index not in starts for record in records):
++        raise ValueError("campaign boundary checkpoint is outside the settled prefix")
++
++    journal_entries: list[
++        tuple[RoleCompletionPayloadV5, RoleInvocationPackageV5]
++    ] = []
++    completed_by_round: dict[
++        int,
++        tuple[tuple[RoleCompletionPayloadV5, RoleInvocationPackageV5], ...],
++    ] = {}
++    for index, completed in zip(expected_started, completed_rounds, strict=True):
++        entries = _role_packages_v5(
++            repository=repository,
++            manifest=manifest,
++            round_index=index,
++            payloads=completed.payloads,
++            policy=admission.policy,
++        )
++        completed_by_round[index] = entries
++        journal_entries.extend(entries)
++        round_records = tuple(record for record in records if record.round_index == index)
++        round_outcomes = tuple(
++            payload
++            for payload in completed.payloads
++            if type(payload) is RoundOutcomePayloadV5
++        )
++        if round_outcomes and (
++            len(round_outcomes) != 1
++            or round_outcomes[0].outcome != "no_novel_hypothesis"
++            or bool(round_records)
++        ):
++            raise ValueError("campaign boundary prior round has a stopping outcome")
++        if not round_records and not round_outcomes:
++            raise ValueError("campaign boundary prior round lacks committed settlement")
++
++    observed_requests = _existing_campaign_role_requests_v5(repository, manifest)
++    journal_requests = {
++        package.call.sha256: (payload.request_ref, package.call, package.request)
++        for payload, package in journal_entries
++    }
++    observed_by_call = {
++        call.sha256: (reference, call, request)
++        for reference, call, request in observed_requests
++    }
++    if (
++        len(journal_requests) != len(journal_entries)
++        or len(observed_by_call) != len(observed_requests)
++        or observed_by_call != journal_requests
++    ):
++        raise ValueError("campaign boundary requests differ from the settled journal")
++
++    identity = _role_ledger_read_identity_v5(
++        repository,
++        manifest,
++        api_key_environment_variable=census.original_config.api_key_environment_variable,
++    )
++    reservations, terminals = _load_verified_role_ledger_v5(
++        repository=repository,
++        manifest=manifest,
++        identity=identity,
++    )
++    _authenticate_role_invocations_v5(
++        repository=repository,
++        manifest=manifest,
++        identity=identity,
++        packages=tuple(package for _payload, package in journal_entries),
++        reservations=reservations,
++        terminals=terminals,
++    )
++    evaluated_rounds = _evaluated_round_indices_v5(
++        records=records,
++        completed_by_round=completed_by_round,
++        round_indices=range(1, next_round_index),
++    )
++    receipt = None if not terminals else terminals[-1].receipt
++    return _CampaignBoundaryFactsV5(
++        evaluated_feedback_rounds=len(evaluated_rounds),
++        attempted_rounds=len(starts),
++        external_attempts=(
++            0 if receipt is None else receipt.cumulative_external_attempts
++        ),
++        total_tokens=(0 if receipt is None else receipt.cumulative_total_tokens),
++        cost_usd=(Decimal("0") if receipt is None else receipt.cumulative_cost_usd),
++        observed_started_rounds=tuple(starts),
++        prestart_round_index=(
++            next_round_index if next_round_index in launches else None
++        ),
++    )
++
++
+ def require_live_role_admission_v5(
+     *,
+     repository: LocalArtifactRepositoryV5,

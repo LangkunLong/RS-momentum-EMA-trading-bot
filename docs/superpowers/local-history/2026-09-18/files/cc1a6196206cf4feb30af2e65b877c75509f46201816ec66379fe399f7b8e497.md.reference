@@ -1,0 +1,251 @@
+# Task 6 report — deterministic PIT diagnosis experiments
+
+## Architecture
+
+Added three offline diagnosis modules:
+
+- `metrics.py` supplies frozen, finite evidence records for rule stages, entry and exit funnels, trades, performance, and leader recall.  They reject malformed counts, percentages, unsupported outcome codes, inconsistent totals, and unsorted evidence IDs.
+- `strategy.py` evaluates only an exact cache `(symbol, session)` row.  The cached strategy does not request or recalculate provider data.  It retains unavailable I and industry-group outcomes, evaluates the observed CANSLIM reference, and isolates catalog exit variants in `DiagnosisPortfolioSimulator` while delegating the current package to production.
+- `experiments.py` supplies deterministic D0–D4 runners, rejects default D5 and locked-evaluation calls, computes cache-only attribution/metrics, binds identities to source/cache/rulebook/catalog/baseline/strategy inputs, and atomically checkpoints completed identities.
+
+Leader labels are consumed only when constructing `LeaderRecallEvidence`; they are absent from the transaction-path hash.  The current-package attribution carries the immutable full-period baseline exit cluster: 97 stop-loss, 92 moving-average, 30 time-stop, and 6 end-of-test exits, including the 15.22% / -2.86% MA evidence.  Promotion remains false whenever fidelity is incomplete, including unavailable I or group evidence.
+
+## Tests
+
+Added `tests/test_pit_diagnosis_experiments.py` with behavioral coverage for the monotone rule funnel and unavailable I, the known MA-exit loss cluster, and output-only leader labels.
+
+The required RED command was run before implementation:
+
+```text
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_experiments.py
+ERROR ... ModuleNotFoundError: No module named 'core.pit_diagnosis.experiments'
+```
+
+Final verification commands and outputs:
+
+```text
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_experiments.py
+3 passed, 2 warnings in 0.55s
+
+python -m ruff check core/pit_diagnosis/metrics.py core/pit_diagnosis/strategy.py core/pit_diagnosis/experiments.py tests/test_pit_diagnosis_experiments.py
+All checks passed!
+
+git diff --check
+(no output; passed)
+```
+
+The two pytest warnings are pre-existing environment/configuration warnings (`cache_dir` pytest option and `websockets.legacy` deprecation), not test failures.
+
+## Commit
+
+`4945410 feat: run deterministic CANSLIM diagnosis experiments`
+
+## Concerns
+
+The diagnosis APIs intentionally reject locked evaluation and D5 composition.  D5 remains controller-owned and needs two measured parent hashes supplied by that controller.  The full current-exit reason breakdown is immutable baseline authority for diagnosis; discovery and validation remain separately partitioned and no 2025 execution is available through the default runner.
+
+The full repository suite was also attempted as part of branch finalization.  It stops at the pre-existing, unrelated `tests/test_agent_loop.py::test_task3_source_snapshot_reads_only_approved_candidate_text`: the sandbox denies `resolve()` access to a temporary controller directory under `C:\Users\llong\AppData\Local\Temp`.  The failure occurs in `agent_loop._validate_controller_temp_parent`, not in Task 6 files; the focused Task 6 suite remains green after the commit.
+
+## Round 1 review corrections
+
+The runner now requires a `BaselineReproduction` whose manifest identities match the context snapshots and whose exact comparison is verified before any D1–D4 run.  D0 remains the only default path available before that context state exists.
+
+Experiment metrics now come from a deterministic replay that materializes cache facts, evaluates `CachedDiagnosisStrategy` at each exact row, queues only next-session opens, and runs `DiagnosisPortfolioSimulator` exit behavior.  The replay hash binds emitted signals, entry outcomes, and transactions.  Rule variants therefore alter the actual entry funnel (the RS-85 regression proves this).
+
+`D4.CURRENT_EXIT_PACKAGE` reads terminal trades from the verified baseline snapshot's transaction ledger and partitions them by exit date.  It cross-checks the immutable 225-trade full-period cluster (97 stop, 92 MA, 30 time, 6 end; MA 15.22% / -2.86%) and rejects ledger tampering.  The removal variant preserves stop, scale-out, and protective-stop behavior while omitting only time-stop and EMA exits.
+
+Promotion checks now include all non-worse return/annualized/Sharpe/drawdown and PIT-recall checks, strict improvement, fidelity, D0 reproduction, and sample floors.  Catalog resume checks identity and deserializes the atomic checkpoint before reading facts or invoking a runner; an incomplete batch is materialized once and reused.
+
+Round 1 RED evidence:
+
+```text
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_experiments.py
+FAILED tests/test_pit_diagnosis_experiments.py::test_d1_to_d4_require_a_verified_d0_reproduction
+Failed: DID NOT RAISE <class 'ValueError'>
+```
+
+Final Round 1 verification:
+
+```text
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_experiments.py
+9 passed, 2 warnings in 0.68s
+
+python -m ruff check core/pit_diagnosis/metrics.py core/pit_diagnosis/strategy.py core/pit_diagnosis/experiments.py tests/test_pit_diagnosis_experiments.py
+All checks passed!
+
+git diff --check
+(no output; passed)
+```
+
+Round 1 commit: `f9f744e fix: enforce PIT diagnosis experiment evidence`.
+
+## Round 2 review corrections
+
+Both direct experiment dispatch and catalog dispatch now run the same verified-D0 guard: the supplied `BaselineReproduction` must be passed, must bind to the authority/reproduced snapshot manifest hashes, and must still pass `compare_reproduction`.  A raw context containing a forged `passed=True` reproduction cannot bypass the guard.
+
+D4 reads its transaction ledger only after checking the immutable snapshot's normalized transaction-row SHA-256 and, when present, the artifact file SHA-256.  Current-package trade statistics, exit attribution, and performance all derive from the same verified, partition-filtered terminal-trade population; cache replay equity is not mixed into those D4 metrics.  The immutable full-period exit cluster remains an additional cross-check.
+
+Promotion now consumes `partition_baseline_performance` and `partition_baseline_recall` context evidence.  Missing partition references make their checks false; return, annualized return, Sharpe, drawdown, recall, and strict improvement are actual comparisons against the matching partition, never against the full-period snapshot.
+
+Round 2 RED evidence:
+
+```text
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_experiments.py
+FAILED ... test_dispatch_rejects_a_forged_passed_d0_reproduction
+Failed: DID NOT RAISE <class 'ValueError'>
+FAILED ... test_current_exit_rejects_a_ledger_hash_mismatch_before_metrics
+Failed: DID NOT RAISE <class 'ValueError'>
+```
+
+Final Round 2 verification:
+
+```text
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_experiments.py
+12 passed, 2 warnings in 0.84s
+
+python -m ruff check core/pit_diagnosis/metrics.py core/pit_diagnosis/strategy.py core/pit_diagnosis/experiments.py tests/test_pit_diagnosis_experiments.py
+All checks passed!
+
+git diff --check
+(no output; passed)
+```
+
+Round 2 commit: `393b887 fix: bind diagnosis evidence to verified baseline`.
+
+## Round 3 review corrections
+
+D4 portfolio performance is no longer populated from a completed-position average.  It now requires the snapshot-artifact-hash-bound `equity_curve.csv` partition series with date, portfolio, benchmark, and cash values; it computes total and annualized return, Sharpe, drawdown, average cash, and benchmark deltas from that one series.  If the required verified partition series is missing, malformed, or lacks cash, D4 emits no performance evidence and all performance/promotion checks fail closed.
+
+The canonical partition baseline performance and recall mappings are now represented in `promotion_evidence_sha256`, which is included in the experiment/checkpoint identity.  A resume under changed promotion evidence produces a different identity and does not reuse the prior result.
+
+Round 3 RED evidence:
+
+```text
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_experiments.py
+FAILED ... test_current_exit_package_explains_the_known_ma_loss_cluster
+assert 0.3594666666666749 != 0.3594666666666749
+FAILED ... test_d4_fails_closed_when_verified_partition_equity_series_is_missing
+D1-D4 require a verified D0 baseline reproduction
+FAILED ... test_catalog_identity_changes_when_partition_promotion_evidence_changes
+assert identical experiment identities differ
+```
+
+Final Round 3 verification:
+
+```text
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_experiments.py
+14 passed, 2 warnings in 0.91s
+
+python -m ruff check core/pit_diagnosis/metrics.py core/pit_diagnosis/strategy.py core/pit_diagnosis/experiments.py core/pit_diagnosis/catalog.py tests/test_pit_diagnosis_experiments.py
+All checks passed!
+
+git diff --check
+(no output; passed)
+```
+
+Round 3 commit: `f01a3d7 fix: bind D4 performance and promotion identity`.
+
+## Round 4 review corrections
+
+The D4 equity reader now consumes the verified baseline's real producer schema:
+`date`, `portfolio`, and `benchmark`.  The regression fixture is generated by
+`pit_baseline._equity_frame` through a real `SimulationResult`, so it can no
+longer invent a `cash` column that the baseline does not emit.  D4 still
+computes the hash-bound partition total return, annualized return, Sharpe,
+drawdown, and benchmark deltas.  `PerformanceEvidence.average_cash_pct` is
+explicitly `None` when the ledger cannot supply it; `performance_complete`
+remains true and only the `average_cash_available` promotion check fails for
+that missing field.
+
+`result_sha256` now hashes a versioned canonical payload containing every
+`ExperimentResult` field except the digest itself, including performance,
+leader recall, promotion checks, trade statistics, and exit attribution.  The
+versioned checkpoint artifact digest independently covers the experiment
+identity, result digest, and complete serialized result.  Resume verifies both
+digests and their cross-links before deserializing or returning cached evidence.
+The checkpoint schema is intentionally bumped, so weak-hash checkpoints from
+earlier rounds fail closed and must be regenerated.
+
+Round 4 RED evidence:
+
+```text
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_experiments.py
+...FF.......FFFFF..                                                      [100%]
+7 failed, 12 passed, 2 warnings in 1.32s
+```
+
+The failures were the expected missing D4 performance on the three-column
+baseline schema and successful resume after tampering with recall, promotion,
+trade-statistic, and exit-attribution evidence.  The performance tamper case
+could not yet mutate its target because D4 performance was `None`.
+
+Round 4 final verification:
+
+```text
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_experiments.py
+...................                                                      [100%]
+19 passed, 2 warnings in 1.17s
+
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_experiments.py tests/test_pit_diagnosis_baseline.py tests/test_pit_baseline.py
+...........................                                              [100%]
+27 passed, 2 warnings in 1.43s
+
+python -m ruff check core/pit_diagnosis/metrics.py core/pit_diagnosis/strategy.py core/pit_diagnosis/experiments.py tests/test_pit_diagnosis_experiments.py
+All checks passed!
+
+git diff --check
+(no output; passed)
+```
+
+The two warnings remain the pre-existing unknown `cache_dir` pytest option and
+the `websockets.legacy` deprecation warning.
+
+## Round 5 review correction
+
+D4 now reads cash exposure from the baseline producer's authoritative,
+manifest-hash-bound `weekly_holdings.csv`, while continuing to read portfolio
+and benchmark returns from the three-column `equity_curve.csv`.  It validates
+the real `Week_Ending`, `Cash`, and `Total_Equity` fields, partitions weekly
+observations to the requested D4 partition, and reports the hand-defined
+`mean(Cash / Total_Equity) * 100`.  Missing, empty, malformed, out-of-order,
+duplicate, negative, or impossible cash evidence fails closed with no D4
+performance evidence; a holdings artifact hash mismatch is rejected.
+
+`PerformanceEvidence.average_cash_pct` is required and finite again.  The
+non-predeclared `average_cash_available` promotion gate was removed; average
+cash remains reported evidence and does not independently satisfy strict
+improvement.  The versioned complete-result and checkpoint digests are
+unchanged and continue to cover the now-required cash value.
+
+Round 5 RED evidence:
+
+```text
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_experiments.py -k "actual_verified_equity_schema or partition_cash_evidence"
+FF                                                                       [100%]
+FAILED ... test_d4_computes_performance_from_the_actual_verified_equity_schema
+E assert None == 26.6666666667 ± 2.7e-05
+FAILED ... test_d4_fails_closed_when_verified_partition_cash_evidence_is_malformed
+E assert PerformanceEvidence(...) is None
+2 failed, 18 deselected, 2 warnings in 0.74s
+```
+
+Round 5 final verification:
+
+```text
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_experiments.py
+......................                                                   [100%]
+22 passed, 2 warnings in 1.31s
+
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_experiments.py tests/test_pit_diagnosis_baseline.py tests/test_pit_baseline.py
+..............................                                           [100%]
+30 passed, 2 warnings in 1.64s
+
+python -m ruff check core/pit_diagnosis/metrics.py core/pit_diagnosis/strategy.py core/pit_diagnosis/experiments.py tests/test_pit_diagnosis_experiments.py
+All checks passed!
+
+git diff --check
+(no output; passed)
+```
+
+The two warnings remain the pre-existing unknown `cache_dir` pytest option and
+the `websockets.legacy` deprecation warning.

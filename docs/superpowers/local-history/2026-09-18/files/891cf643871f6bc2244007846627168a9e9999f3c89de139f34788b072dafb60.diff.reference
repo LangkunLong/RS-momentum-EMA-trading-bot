@@ -1,0 +1,301 @@
+# Review package: 264d4c78914f03e2d479a5af9040e742e0a972ad..0080d5d465483c2bb228e092da8616cfee473e60
+
+## Commits
+0080d5d fix: authorize invalid author critic input
+
+## Files changed
+ core/pit_optimizer_authorization.py | 126 +++++++++++++++++++++++++++++++++---
+ tests/test_pit_optimizer_v2.py      |  57 ++++++++++++++++
+ 2 files changed, 175 insertions(+), 8 deletions(-)
+
+## Diff
+diff --git a/core/pit_optimizer_authorization.py b/core/pit_optimizer_authorization.py
+index 89da88d..3d7c4d5 100644
+--- a/core/pit_optimizer_authorization.py
++++ b/core/pit_optimizer_authorization.py
+@@ -19,32 +19,34 @@ import re
+ import threading
+ from types import MappingProxyType
+ from typing import Iterator, Mapping, Sequence
+ 
+ from core.pit_optimization_contract import (
+     AuthorizationRequirement,
+     AuthorArtifact,
+     AuthorArtifactV4,
+     AuthorInput,
+     AuthorManifestSummary,
++    AuthorManifestSummaryV4,
+     CriticArtifact,
+     CriticArtifactV4,
+     CriticInput,
+     InvestigatorArtifact,
+     InvestigatorArtifactV4,
+     InvestigatorInput,
+     OPTIMIZER_V2_ROLES,
+     PatchBounds,
+     PitOptimizerCallBudget,
+     PitOptimizerRunManifest,
+     PolicySourceBundle,
+     PolicySourceRecord,
++    RoleOutputInvalidSummary,
+     authenticate_policy_source_bundle,
+ )
+ import core.pit_optimization_contract as _contract
+ 
+ 
+ _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+ _ID_RE = re.compile(r"[a-z][a-z0-9_.-]{0,127}")
+ _MODEL_RE = re.compile(
+     r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}/[A-Za-z0-9][A-Za-z0-9._:-]{0,127}"
+ )
+@@ -811,20 +813,126 @@ class PitOptimizerRoleAttempt:
+         ):
+             raise ValueError(
+                 "optimizer role attempt without payload is not an accounted invalid response"
+             )
+ 
+     @property
+     def recoverable_schema_invalid(self) -> bool:
+         return self.payload is None
+ 
+ 
++def _require_critic_predecessor_attempt_lineage(
++    primitive: Mapping[str, object],
++    investigator_attempt: PitOptimizerRoleCall | PitOptimizerRoleAttempt,
++    author_attempt: PitOptimizerRoleCall | PitOptimizerRoleAttempt,
++) -> None:
++    """Authenticate the critic's accepted-investigator/author-outcome XOR."""
++
++    investigator_payload = investigator_attempt.payload
++    author_payload = author_attempt.payload
++    if (
++        investigator_attempt.facts.outcome != "accepted"
++        or not isinstance(
++            investigator_payload,
++            (InvestigatorArtifact, InvestigatorArtifactV4),
++        )
++    ):
++        raise AuthorizationError(
++            "optimizer critic requires an accepted investigator artifact"
++        )
++    accepted_author = (
++        author_attempt.facts.outcome == "accepted"
++        and isinstance(author_payload, (AuthorArtifact, AuthorArtifactV4))
++    )
++    invalid_author = (
++        isinstance(author_attempt, PitOptimizerRoleAttempt)
++        and author_attempt.recoverable_schema_invalid
++        and author_attempt.plan.role == "author"
++    )
++    if accepted_author == invalid_author:
++        raise AuthorizationError(
++            "optimizer critic author predecessor outcome is ambiguous"
++        )
++    if isinstance(investigator_payload, InvestigatorArtifact):
++        if not accepted_author or not isinstance(author_payload, AuthorArtifact):
++            raise AuthorizationError(
++                "legacy optimizer critic requires an accepted author artifact"
++            )
++        _require_critic_predecessor_lineage(
++            primitive,
++            investigator_payload,
++            author_payload,
++        )
++        return
++    if primitive.get("investigator_summary") != investigator_payload.to_primitive():
++        raise AuthorizationError("optimizer critic investigator artifact differs")
++    if invalid_author:
++        validation_code = author_attempt.facts.response_validation_code
++        assert validation_code is not None
++        expected_invalid = RoleOutputInvalidSummary(
++            iteration=author_attempt.plan.iteration,
++            call_index=author_attempt.plan.call_index,
++            role="author",
++            validation_code=validation_code,
++        )
++        if (
++            primitive.get("author_manifest") is not None
++            or primitive.get("author_output_invalid")
++            != expected_invalid.to_primitive()
++            or any(
++                primitive.get(name) is not None
++                for name in ("author", "author_payload")
++            )
++        ):
++            raise AuthorizationError(
++                "optimizer critic invalid-author summary differs"
++            )
++        return
++    if not isinstance(author_payload, AuthorArtifactV4):
++        raise AuthorizationError(
++            "optimizer critic accepted-author schema differs"
++        )
++    selected_parent = primitive.get("selected_parent_identity")
++    if not isinstance(selected_parent, dict):
++        raise AuthorizationError(
++            "optimizer critic selected parent identity is invalid"
++        )
++    try:
++        parent_identity = _contract.SelectedParentIdentity(
++            schema_version=selected_parent["schema_version"],
++            parent_kind=selected_parent["parent_kind"],
++            parent_id=selected_parent["parent_id"],
++            source_head=selected_parent["source_head"],
++            policy_interface_version=selected_parent["policy_interface_version"],
++            policy_source_sha256s=tuple(
++                tuple(item) for item in selected_parent["policy_source_sha256s"]
++            ),
++            source_bundle_sha256=selected_parent["source_bundle_sha256"],
++            parent_identity_sha256=selected_parent["parent_identity_sha256"],
++        )
++        expected_manifest = AuthorManifestSummaryV4.from_artifact(
++            author_payload,
++            selected_parent=parent_identity,
++        )
++    except (KeyError, TypeError, ValueError) as exc:
++        raise AuthorizationError(
++            "optimizer critic accepted-author manifest is invalid"
++        ) from exc
++    if (
++        primitive.get("author_manifest") != expected_manifest.to_primitive()
++        or primitive.get("author_output_invalid") is not None
++    ):
++        raise AuthorizationError(
++            "optimizer critic accepted-author manifest differs"
++        )
++
++
+ @dataclass(frozen=True, slots=True)
+ class TerminalAuditReceipt:
+     """Durable identity cross-verified against one immutable AuditTrail event."""
+ 
+     audit_run_id: str
+     run_manifest_sha256: str
+     call_index: int
+     iteration: int
+     role: str
+     outcome: str
+@@ -1688,31 +1796,33 @@ class AuthorizationLedger:
+         elif canonical_plan.role == "author":
+             if (
+                 len(legacy_calls) != 1
+                 or primitive.get("investigator")
+                 != legacy_calls[0].payload.to_primitive()
+             ):
+                 raise AuthorizationError(
+                     "optimizer role input predecessor artifact differs"
+                 )
+         elif canonical_plan.role == "critic":
+-            if len(legacy_calls) != 2:
++            if len(predecessors) != 2 or any(
++                isinstance(item, AuthorizationPlanSkip) for item in predecessors
++            ):
+                 raise AuthorizationError(
+-                    "optimizer critic requires accepted predecessor artifacts"
++                    "optimizer critic predecessor lineage is invalid"
+                 )
+-            investigator_call, author_call = legacy_calls
+-            author_payload = author_call.payload
+-            assert isinstance(author_payload, AuthorArtifact)
+-            _require_critic_predecessor_lineage(
++            investigator_attempt, author_attempt = predecessors
++            assert not isinstance(investigator_attempt, AuthorizationPlanSkip)
++            assert not isinstance(author_attempt, AuthorizationPlanSkip)
++            _require_critic_predecessor_attempt_lineage(
+                 primitive,
+-                investigator_call.payload,
+-                author_payload,
++                investigator_attempt,
++                author_attempt,
+             )
+         with self._role_input_lock:
+             if canonical_plan.call_index in self._consumed_role_input_plans:
+                 raise AuthorizationError("optimizer role input plan was already consumed")
+             prior = self._role_input_capabilities.get(canonical_plan.call_index)
+             if prior is not None and (
+                 prior[0] is not dynamic_input
+                 or prior[1].canonical_bytes != snapshot.canonical_bytes
+             ):
+                 raise AuthorizationError("optimizer role input plan is already bound")
+diff --git a/tests/test_pit_optimizer_v2.py b/tests/test_pit_optimizer_v2.py
+index f1276df..11734b2 100644
+--- a/tests/test_pit_optimizer_v2.py
++++ b/tests/test_pit_optimizer_v2.py
+@@ -1630,20 +1630,77 @@ def test_role_schema_inputs_are_exact_bounded_provider_projections(
+         author_manifest=None,
+         author_output_invalid=invalid_author,
+         validation_status=contract.CandidateValidationStatusV4(
+             status="invalid",
+             failure_code="author_output_invalid",
+         ),
+         candidate_quick=None,
+         candidate_discovery=None,
+     )
+     assert invalid_critic_input.author_output_invalid == invalid_author
++    from core import pit_optimizer_authorization as authorization
++
++    investigator_facts = authorization.PitOptimizerProviderFacts(
++        call_index=1,
++        iteration=1,
++        role="investigator",
++        requested_model=contract.PIT_OPTIMIZER_R1_MODEL,
++        returned_model=contract.PIT_OPTIMIZER_R1_MODEL,
++        pricing_snapshot_sha256="7" * 64,
++        outcome="accepted",
++        request_started=True,
++        response_received=True,
++        finish_reason="stop",
++        response_schema_valid=True,
++        accounting_complete=True,
++        prompt_tokens=1,
++        completion_tokens=1,
++        total_tokens=2,
++        cost_usd=0.0,
++        retained_reservation_tokens=0,
++        audit_sha256="8" * 64,
++        accounting_source="inline",
++    )
++    investigator_attempt = authorization.PitOptimizerRoleAttempt(
++        plan=v4_scope.call_budgets[0],
++        facts=investigator_facts,
++        payload=investigator_v4,
++    )
++    author_attempt = authorization.PitOptimizerRoleAttempt(
++        plan=v4_scope.call_budgets[1],
++        facts=replace(
++            investigator_facts,
++            call_index=2,
++            role="author",
++            outcome="schema_invalid",
++            response_schema_valid=False,
++            response_validation_code="payload_schema_invalid",
++        ),
++        payload=None,
++    )
++    invalid_critic_primitive = json.loads(
++        invalid_critic_input.canonical_json_bytes()
++    )
++    authorization._require_critic_predecessor_attempt_lineage(
++        invalid_critic_primitive,
++        investigator_attempt,
++        author_attempt,
++    )
++    invalid_critic_primitive["author_output_invalid"][
++        "validation_code"
++    ] = "payload_binding_invalid"
++    with pytest.raises(authorization.AuthorizationError, match="summary differs"):
++        authorization._require_critic_predecessor_attempt_lineage(
++            invalid_critic_primitive,
++            investigator_attempt,
++            author_attempt,
++        )
+     with pytest.raises(ValueError, match="exactly one"):
+         replace(invalid_critic_input, author_manifest=author_manifest_v4)
+     with pytest.raises(ValueError, match="exactly one"):
+         replace(critic_input_v4, author_manifest=None)
+     with pytest.raises(ValueError, match="selected parent source"):
+         replace(
+             author_input_v4,
+             selected_parent_source_bundle_sha256="4" * 64,
+         )
+     with pytest.raises(ValueError, match="authenticated panel"):

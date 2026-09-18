@@ -1,0 +1,31 @@
+# Architect checkpoint A review package
+
+## Scope and source change
+
+Tasks A1-A3 only are represented here. The only production-file change is `core/pit_optimizer_v5/production_runtime.py`.
+
+The investigator now keeps the existing four per-episode headline metrics, then projects a closed ordered tuple of entry-funnel integer counts from the authenticated selected scenario. Projection occurs before archive or historical evidence. It emits `episode.{ordinal}.entry.{source_metric_id}`, omits absent metrics, and does not relax provider validation or alter any role input, schema, evaluator, or historical request.
+
+All source lines remain CRLF. The exact preimage is `production_runtime.py.preimage`; `scoped-diff.patch` is its narrow diff against the final source.
+
+## Authenticated actual06 preview
+
+The preview authenticates the complete actual06 manifest graph through `authenticate_campaign_manifest_v5`, then uses `LocalArtifactRepositoryV5`, the existing recovery reducer, selected baseline parent, and `LocalRoleRequestFactoryV5`. It is saved as `future-investigator-request.json` and is explicitly future/unexecuted.
+
+`future-investigator-request-verification.json` records all 64 projected counter rows: 16 allowlisted counters in tuple order across each of the four actual parent episodes. Every projected value is an existing integer, every entry evidence ID belongs to `aggregate_evaluator_evidence`, the complete issued order is deterministic, and no raw labels, symbols, dates, reason strings, or rows are projected.
+
+The first actual parent window verifies the required overlap facts: evaluated rows 960, market pass 960, composite-score blocks 932, buy signals 0, and entries executed 0. Counts are recorded as non-causal overlapping funnel facts.
+
+The future preview SHA-256 is `3dfce23e0e540fd072c9ad482be0e907e62de992eaf65df23a2ed31df81e9afa`; it differs from both authenticated stored actual06 request hashes. Those archived hashes reloaded unchanged before and after preview construction.
+
+## Verification
+
+Scoped Ruff passed for `production_runtime.py`. Its bytes also compiled in memory with `compile(bytes, path, 'exec')`; no file was executed or compiled to bytecode. Evaluator identity before and after is the fixed `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4`.
+
+`actual06-summarize-result.json` records the required read-only CLI `summarize` result. It confirms terminal failed state, cleanup complete, zero evaluated experiments, two role calls, and `rendering:stage_failed`. The saved resume argv was converted only to `summarize`, with the owner-token argument and value omitted.
+
+No test or synthetic probe ran. No provider/model/API call, candidate evaluation, campaign restart, credential-value read, commit, push, or deployment occurred. Existing source modifications and historical artifacts were left intact. `provider.py` was not edited by this increment.
+
+## Architect decisions needed
+
+Review the allowlist semantics, evidence provenance, 80-item first-round evaluator sequence (four retained headlines plus 16 entry counts per actual episode), request-size effect, and compatibility implications. The optional investigator wire-description guidance was not added, so historical role-schema byte bounds are unchanged by this increment. Increment B remains entirely unimplemented; this preview does not exercise rendering rejection, journaling, invalid records, or any campaign lifecycle behavior.

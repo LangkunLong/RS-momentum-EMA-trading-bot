@@ -1,0 +1,437 @@
+"""Immutable campaign admission authority and pure budget decisions."""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from decimal import Context, Decimal, ROUND_CEILING, localcontext
+from typing import Literal
+
+from core.pit_optimizer_v5.artifacts import ArtifactMissingV5, LocalArtifactRepositoryV5
+from core.pit_optimizer_v5.contracts import (
+    ArtifactRefV5,
+    CampaignManifestV5,
+    canonical_sha256_v5,
+)
+from core.pit_optimizer_v5.development_preparation import (
+    ProviderDevelopmentAdapterConfigV5,
+    load_development_config_v5,
+)
+from core.pit_optimizer_v5.manifest import authenticate_campaign_manifest_v5
+from core.pit_optimizer_v5.provider import (
+    RoleRequestV5,
+    prospective_role_usage_v5,
+    sum_cost_usd_v5,
+)
+
+
+_ADMISSION_NAMESPACE_V5 = "campaign-admission"
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_THREE_ROLE_CALLS_PER_ROUND_V5 = 3
+_USD_TOKEN_DENOMINATOR_V5 = Decimal(1_000_000)
+
+def _digest(value: object, label: str) -> str:
+    if type(value) is not str or _SHA256_RE.fullmatch(value) is None:
+        raise ValueError(f"{label} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _positive_integer(value: object, label: str) -> int:
+    if type(value) is not int or value < 1:
+        raise ValueError(f"{label} must be a positive integer")
+    return value
+
+
+def _nonnegative_integer(value: object, label: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{label} must be a nonnegative integer")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class CampaignAdmissionPolicyV5:
+    schema_version: int
+    policy_revision: int
+    manifest_ref: ArtifactRefV5
+    adapter_config_ref: ArtifactRefV5
+    owner_token_sha256: str
+    repository_root_identity_sha256: str
+    target_evaluated_feedback_rounds: int
+    prospective_total_tokens_per_role: int
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 5:
+            raise ValueError("campaign admission policy schema must be V5")
+        if type(self.policy_revision) is not int or self.policy_revision != 1:
+            raise ValueError("campaign admission policy revision must be 1")
+        if type(self.manifest_ref) is not ArtifactRefV5:
+            raise ValueError("campaign admission manifest reference is invalid")
+        if type(self.adapter_config_ref) is not ArtifactRefV5:
+            raise ValueError("campaign admission adapter config reference is invalid")
+        _digest(self.owner_token_sha256, "campaign admission owner token")
+        _digest(
+            self.repository_root_identity_sha256,
+            "campaign admission repository root identity",
+        )
+        _positive_integer(
+            self.target_evaluated_feedback_rounds,
+            "campaign admission evaluated-feedback target",
+        )
+        _positive_integer(
+            self.prospective_total_tokens_per_role,
+            "campaign admission prospective role-token envelope",
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CampaignAdmissionBindingV5:
+    schema_version: int
+    policy_ref: ArtifactRefV5
+    manifest_ref: ArtifactRefV5
+    adapter_config_ref: ArtifactRefV5
+    owner_token_sha256: str
+    repository_root_identity_sha256: str
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 5:
+            raise ValueError("campaign admission binding schema must be V5")
+        if type(self.policy_ref) is not ArtifactRefV5:
+            raise ValueError("campaign admission policy reference is invalid")
+        if type(self.manifest_ref) is not ArtifactRefV5:
+            raise ValueError("campaign admission manifest reference is invalid")
+        if type(self.adapter_config_ref) is not ArtifactRefV5:
+            raise ValueError("campaign admission adapter config reference is invalid")
+        _digest(self.owner_token_sha256, "campaign admission owner token")
+        _digest(
+            self.repository_root_identity_sha256,
+            "campaign admission repository root identity",
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AuthenticatedCampaignAdmissionV5:
+    binding: CampaignAdmissionBindingV5
+    policy: CampaignAdmissionPolicyV5
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.binding) is not CampaignAdmissionBindingV5
+            or type(self.policy) is not CampaignAdmissionPolicyV5
+        ):
+            raise ValueError("authenticated campaign admission values are invalid")
+        if self.binding.policy_ref.sha256 != canonical_sha256_v5(self.policy):
+            raise ValueError("campaign admission policy digest differs from its binding")
+        if (
+            self.binding.manifest_ref != self.policy.manifest_ref
+            or self.binding.adapter_config_ref != self.policy.adapter_config_ref
+            or self.binding.owner_token_sha256 != self.policy.owner_token_sha256
+            or self.binding.repository_root_identity_sha256
+            != self.policy.repository_root_identity_sha256
+        ):
+            raise ValueError("campaign admission binding differs from its policy")
+
+
+def _worst_role_envelope_cost_v5(
+    *,
+    policy: CampaignAdmissionPolicyV5,
+    manifest: CampaignManifestV5,
+) -> Decimal | None:
+    provider = manifest.provider
+    if provider is None or provider.maximum_usd is None:
+        return None
+    price = provider.price_upper_bound
+    if price is None:
+        raise ValueError("finite provider USD authority lacks model prices")
+    maximum_unit_price = max(
+        price.input_usd_per_million_tokens,
+        price.output_usd_per_million_tokens,
+    )
+    maximum_output_tokens = provider.maximum_output_tokens_per_role
+    maximum_input_tokens = (
+        policy.prospective_total_tokens_per_role - maximum_output_tokens
+    )
+    with localcontext(Context(prec=50, rounding=ROUND_CEILING)):
+        return (
+            (
+                Decimal(maximum_input_tokens) * maximum_unit_price
+                + Decimal(maximum_output_tokens) * maximum_unit_price
+            )
+            / _USD_TOKEN_DENOMINATOR_V5
+        )
+
+
+def _required_role_envelope_cost_v5(
+    *,
+    policy: CampaignAdmissionPolicyV5,
+    manifest: CampaignManifestV5,
+    role_calls: int,
+) -> Decimal | None:
+    worst_role_cost = _worst_role_envelope_cost_v5(
+        policy=policy,
+        manifest=manifest,
+    )
+    if worst_role_cost is None:
+        return None
+    with localcontext(Context(prec=50, rounding=ROUND_CEILING)):
+        return Decimal(role_calls) * worst_role_cost
+
+
+def _validate_policy_manifest_v5(
+    *,
+    policy: CampaignAdmissionPolicyV5,
+    manifest: CampaignManifestV5,
+) -> None:
+    if type(policy) is not CampaignAdmissionPolicyV5:
+        raise ValueError("campaign admission policy is invalid")
+    if type(manifest) is not CampaignManifestV5:
+        raise ValueError("campaign manifest is invalid")
+    if (
+        manifest.pit_data_scope != "development_sp500_v2"
+        or manifest.semantic_mode != "disabled_development"
+        or manifest.provider is None
+        or manifest.apply
+        or manifest.qualification_allowed
+        or manifest.full_replay_allowed
+    ):
+        raise ValueError("campaign admission requires a paid development manifest")
+    if policy.manifest_ref.sha256 != manifest.sha256:
+        raise ValueError("campaign admission policy manifest digest differs")
+
+    search = manifest.search
+    provider = manifest.provider
+    if (
+        search.hypotheses_per_investigator != 1
+        or search.max_tunable_axes != 1
+        or search.max_variants_per_template != 1
+        or search.max_discovery_survivors_per_template != 1
+        or search.allow_full_source_escape
+    ):
+        raise ValueError("campaign admission requires the single-candidate lifecycle")
+    if provider.automatic_retries != 0 or provider.schema_repair_calls != 0:
+        raise ValueError("campaign admission requires zero retries and repair calls")
+    if policy.target_evaluated_feedback_rounds > search.max_feedback_rounds:
+        raise ValueError("campaign admission target exceeds lifecycle capacity")
+    if (
+        provider.maximum_role_calls
+        < _THREE_ROLE_CALLS_PER_ROUND_V5 * policy.target_evaluated_feedback_rounds
+    ):
+        raise ValueError("campaign admission target exceeds role-call capacity")
+    if provider.maximum_output_tokens_per_role > policy.prospective_total_tokens_per_role:
+        raise ValueError("provider output bound exceeds the prospective role envelope")
+    if (
+        provider.maximum_total_tokens
+        < provider.maximum_role_calls * policy.prospective_total_tokens_per_role
+    ):
+        raise ValueError("provider token capacity cannot fund every role envelope")
+    required_role_cost = _required_role_envelope_cost_v5(
+        policy=policy,
+        manifest=manifest,
+        role_calls=provider.maximum_role_calls,
+    )
+    if required_role_cost is not None and (
+        provider.maximum_usd is None
+        or provider.maximum_usd < required_role_cost
+    ):
+        raise ValueError("provider USD capacity cannot fund every role envelope")
+
+
+def authenticate_prepared_campaign_policy_v5(
+    *,
+    repository: LocalArtifactRepositoryV5,
+    manifest: CampaignManifestV5,
+    policy_ref: ArtifactRefV5,
+) -> CampaignAdmissionPolicyV5:
+    """Authenticate one prepared policy without requiring or writing enrollment."""
+
+    if type(repository) is not LocalArtifactRepositoryV5:
+        raise ValueError("campaign admission repository is invalid")
+    if type(manifest) is not CampaignManifestV5:
+        raise ValueError("campaign manifest is invalid")
+    if type(policy_ref) is not ArtifactRefV5:
+        raise ValueError("campaign admission policy reference is invalid")
+    policy = repository.load_typed_artifact(
+        policy_ref,
+        value_type=CampaignAdmissionPolicyV5,
+    )
+    if policy_ref.sha256 != canonical_sha256_v5(policy):
+        raise ValueError("campaign admission policy reference differs from its bytes")
+    authenticated_manifest = authenticate_campaign_manifest_v5(
+        repository=repository,
+        manifest_ref=policy.manifest_ref,
+    )
+    if authenticated_manifest.manifest != manifest:
+        raise ValueError("campaign admission policy selects a different manifest")
+    _validate_policy_manifest_v5(policy=policy, manifest=manifest)
+    config = load_development_config_v5(
+        repository,
+        authenticated_manifest,
+        policy.adapter_config_ref,
+    )
+    if (
+        type(config) is not ProviderDevelopmentAdapterConfigV5
+        or policy.adapter_config_ref.sha256 != canonical_sha256_v5(config)
+        or config.campaign_manifest_sha256 != manifest.sha256
+        or config.repository_root_identity_sha256 != repository.root_identity_sha256
+        or policy.repository_root_identity_sha256 != repository.root_identity_sha256
+    ):
+        raise ValueError("campaign admission adapter configuration authority differs")
+    return policy
+
+
+def _campaign_admission_bindings_v5(
+    repository: LocalArtifactRepositoryV5,
+) -> tuple[tuple[str, CampaignAdmissionBindingV5], ...]:
+    keys: set[str] = set()
+    for root in ("adapter-state", "adapter-state-authority"):
+        try:
+            names = repository._names((root, _ADMISSION_NAMESPACE_V5))
+        except ArtifactMissingV5:
+            names = ()
+        for name in names:
+            if re.fullmatch(r"[0-9a-f]{64}\.json", name) is None:
+                raise ValueError("campaign admission namespace member is invalid")
+            keys.add(name[:-5])
+
+    bindings: list[tuple[str, CampaignAdmissionBindingV5]] = []
+    for key in sorted(keys):
+        binding = repository.load_typed_state(
+            namespace=_ADMISSION_NAMESPACE_V5,
+            key=key,
+            value_type=CampaignAdmissionBindingV5,
+            repair=False,
+        )
+        if binding is None:
+            raise ValueError("campaign admission namespace member is incomplete")
+        if binding.manifest_ref.sha256 != key:
+            raise ValueError("campaign admission binding is stored under a foreign key")
+        bindings.append((key, binding))
+    return tuple(bindings)
+
+
+def load_campaign_admission_v5(
+    *,
+    repository: LocalArtifactRepositoryV5,
+    manifest: CampaignManifestV5,
+    expected_policy_ref: ArtifactRefV5 | None = None,
+) -> AuthenticatedCampaignAdmissionV5 | None:
+    """Discover and authenticate selected enrollment without repairing state."""
+
+    if type(repository) is not LocalArtifactRepositoryV5:
+        raise ValueError("campaign admission repository is invalid")
+    if type(manifest) is not CampaignManifestV5:
+        raise ValueError("campaign manifest is invalid")
+    if expected_policy_ref is not None and type(expected_policy_ref) is not ArtifactRefV5:
+        raise ValueError("expected campaign admission policy reference is invalid")
+
+    manifest_key = manifest.sha256
+    selected = tuple(
+        binding
+        for key, binding in _campaign_admission_bindings_v5(repository)
+        if key == manifest_key
+    )
+    if not selected:
+        if expected_policy_ref is not None:
+            raise ValueError("expected campaign admission enrollment is missing")
+        return None
+    if len(selected) != 1:
+        raise ValueError("campaign admission enrollment is ambiguous")
+    binding = selected[0]
+    if expected_policy_ref is not None and binding.policy_ref != expected_policy_ref:
+        raise ValueError("campaign admission enrollment selects a different policy")
+    policy = authenticate_prepared_campaign_policy_v5(
+        repository=repository,
+        manifest=manifest,
+        policy_ref=binding.policy_ref,
+    )
+    admission = AuthenticatedCampaignAdmissionV5(binding=binding, policy=policy)
+    if binding.manifest_ref.sha256 != manifest_key:
+        raise ValueError("campaign admission binding selects a different manifest")
+    return admission
+
+
+def require_role_envelope_v5(
+    *,
+    policy: CampaignAdmissionPolicyV5,
+    manifest: CampaignManifestV5,
+    request: RoleRequestV5,
+) -> None:
+    """Require an exact role request to fit the policy's prospective envelope."""
+
+    _validate_policy_manifest_v5(policy=policy, manifest=manifest)
+    if type(request) is not RoleRequestV5:
+        raise ValueError("campaign admission role request is invalid")
+    provider = manifest.provider
+    if provider is None:
+        raise ValueError("campaign admission requires provider capabilities")
+    if request.max_output_tokens != provider.maximum_output_tokens_per_role:
+        raise ValueError("role request output bound differs from provider authority")
+    input_bound, _cost_bound = prospective_role_usage_v5(request, provider)
+    if input_bound + request.max_output_tokens > policy.prospective_total_tokens_per_role:
+        raise ValueError("role request exceeds the campaign admission envelope")
+
+
+def campaign_boundary_decision_v5(
+    *,
+    policy: CampaignAdmissionPolicyV5,
+    manifest: CampaignManifestV5,
+    evaluated_feedback_rounds: int,
+    attempted_rounds: int,
+    external_attempts: int,
+    total_tokens: int,
+    cost_usd: Decimal,
+) -> Literal[
+    "admit",
+    "evaluated_feedback_target_reached",
+    "insufficient_milestone_reserve",
+]:
+    """Return the exact settled-boundary milestone admission decision."""
+
+    _validate_policy_manifest_v5(policy=policy, manifest=manifest)
+    _nonnegative_integer(evaluated_feedback_rounds, "evaluated feedback rounds")
+    _nonnegative_integer(attempted_rounds, "attempted rounds")
+    _nonnegative_integer(external_attempts, "external attempts")
+    _nonnegative_integer(total_tokens, "total tokens")
+    if type(cost_usd) is not Decimal or not cost_usd.is_finite() or cost_usd < 0:
+        raise ValueError("campaign cost must be a nonnegative finite Decimal")
+
+    missing = max(
+        0,
+        policy.target_evaluated_feedback_rounds - evaluated_feedback_rounds,
+    )
+    if missing == 0:
+        return "evaluated_feedback_target_reached"
+
+    provider = manifest.provider
+    if provider is None:
+        raise ValueError("campaign admission requires provider capabilities")
+    needed_calls = _THREE_ROLE_CALLS_PER_ROUND_V5 * missing
+    if (
+        manifest.search.max_feedback_rounds - attempted_rounds < missing
+        or provider.maximum_role_calls - external_attempts < needed_calls
+        or provider.maximum_total_tokens - total_tokens
+        < needed_calls * policy.prospective_total_tokens_per_role
+    ):
+        return "insufficient_milestone_reserve"
+
+    required_reserve = _required_role_envelope_cost_v5(
+        policy=policy,
+        manifest=manifest,
+        role_calls=needed_calls,
+    )
+    if required_reserve is not None and (
+        provider.maximum_usd is None
+        or provider.maximum_usd < sum_cost_usd_v5(cost_usd, required_reserve)
+    ):
+        return "insufficient_milestone_reserve"
+    return "admit"
+
+
+__all__ = [
+    "AuthenticatedCampaignAdmissionV5",
+    "CampaignAdmissionBindingV5",
+    "CampaignAdmissionPolicyV5",
+    "authenticate_prepared_campaign_policy_v5",
+    "campaign_boundary_decision_v5",
+    "load_campaign_admission_v5",
+    "require_role_envelope_v5",
+]

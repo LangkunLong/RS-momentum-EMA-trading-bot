@@ -1,0 +1,14 @@
+# Scoped real sell-quantity diagnostic review
+
+**PASS.** No concrete finding in the diagnostic-only change. Spec and quality pass for this scope.
+
+Read the appended `real-sell-quantity-report.md`, the diagnostics diff, and minimal quantity-type/validation and container error-bound context. Source SHA-256 independently matches `9811e16dc10066c473f5369edd691e73a8a76cd83d94b71a3c3dbeeaba34dd01`.
+
+- The existing `index == 0 or quantity > cumulative_quantity` rejection is unchanged. The diagnostic branch still raises the same causal ValueError; it does not round quantities for acceptance, modify accumulated quantities, or allow the invalid fill to continue. All successful-path arithmetic and checks are unchanged.
+- It reports nine fixed numeric fields: fill index, sell/open/excess, their normalizations, and current/previous quantity_after. The predecessor is accessed only when index is nonzero; the enclosing path/fill length check and loop bound make that index valid. Quantity inputs have already passed finite numeric validation, and quantity_after comes from validated position-size evidence.
+- `_q` quantization arithmetic errors are caught and represented by None fields, preserving the causal rejection. The normalized values are diagnostic context only. No symbols, issuer names, paths, episode identifiers, source text or environment fields are included.
+- Each value is truncated to at most 96 characters. Nine such values plus the fixed labels, separators and message prefix remain well below the container entry's 2048-character bound. The original quantity strings are shown separately from normalized quantities, so small excesses are not silently represented only by rounded values.
+
+This instrumentation does not establish whether the real failure is float/Decimal precision dust or a material oversell. The failed result remains failed. As this source is in the evaluator closure, the controller must rebuild/reseal the image before the separate actual diagnostic evaluation; this review did not perform that work.
+
+No tests were read, created or run. No probes, application imports/execution, Docker, network, agents, staging or commits occurred. Only this report was written. Verdict applies to the identified source bytes and makes no actual-run success claim.

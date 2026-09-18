@@ -1,0 +1,35 @@
+# Task 11 schema-normalization fix report
+
+Status: DONE_WITH_CONCERNS (focused reviewer requested before commit)
+
+## Failure evidence
+
+- Retry 5 closed cleanly at the two-iteration limit with complete accounting and cleanup.
+- Iteration 1 completed investigator, author, quick evaluation, critic, and transition, but discovery was collapsed to `worker_failed`.
+- The saved iteration-1 candidate subsequently completed the exact provider-free discovery subset after commit `720b0e2`, returning 0.55% annualized versus the 0.05% baseline, with cleanup complete and source unchanged.
+- A separate response-byte counter reproduced the prior failure at the former 32 MiB cumulative worker stdout ceiling after about 59,000 individually authenticated policy responses. The committed worker fix removes only the cumulative stdout total; per-response size, authentication, stderr, time, Docker, and source boundaries remain.
+- Iteration 2's investigator response was fully accounted, bounded, valid JSON with the expected top-level fields, but one advisory field produced `payload_field_invalid`; author and critic were skipped.
+
+## Working-tree changes under review
+
+- Treat bounded investigator output as semantic input: accept text or structured JSON for advisory values, normalize focus-area aliases, accept exact digit-leading evidence references, default omitted advisory fields, and discard unknown top-level metadata.
+- Preserve strict author authority: exact selected-parent binding, exact three policy source paths, at least one changed file, and downstream syntax/import/purity/determinism/sandbox validation are unchanged.
+- Normalize common critic disposition synonyms while retaining metric-owned promotion.
+- Preserve completed quick evidence for critic feedback when only discovery evaluation fails.
+- Refresh `accounting.json` immediately after authenticated plan skips.
+
+## Verification completed
+
+- `python -B -m compileall -q core\pit_optimization_contract.py core\pit_optimizer_controller.py`
+- `python -B -m ruff check core\pit_optimization_contract.py core\pit_optimizer_controller.py`
+- `git diff --check`
+- Synthetic semantic-normalization and canonical round-trip smoke checks passed.
+- Previously accepted retry-5 investigator and critic artifacts remain parse-compatible.
+- No new tests or test functions were added.
+
+## Constraints retained
+
+- `apply=false`, zero provider retries, finite declared role plan, complete accounting.
+- Exact three editable policy files; no checkout application.
+- No provider response prose, secrets, raw PIT rows, qualification data, or local paths in public output.
+- Qualification and full replay remain unopened/off.

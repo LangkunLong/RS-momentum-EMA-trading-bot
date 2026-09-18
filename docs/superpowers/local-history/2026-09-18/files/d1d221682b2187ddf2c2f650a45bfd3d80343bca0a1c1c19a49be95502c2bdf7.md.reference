@@ -1,0 +1,55 @@
+# Increment C-a design correction report
+
+Status: both independent-review findings are corrected in `historical-verification-design.md`. `principal-diagnosis.md`, reviewer output, evidence files, production source, and all `*.review-preimage.md` files were not edited.
+
+## Changed design sections
+
+### Decision
+
+Clarified that the authenticated per-round config pins the executor provenance expected on serialized historical records. It does not prove the exact historical host implementation, runtime-contract literal, process environment, or present execution authority.
+
+### Checkpoint H2
+
+Defined the supported completed-history interpretation as exact recognized serialized V5 semantics:
+
+- canonical typed record schemas;
+- closed saved command grammar and command digest;
+- defined phase-prefix and lifecycle transitions;
+- exact terminal, output, control, cleanup, owner, mount, and per-round-config bindings.
+
+The design now expressly declines to reconstruct or assert equality of the unsaved historical `control_environment`, runtime-contract literal, or host helper bytes. It does not infer a contract selector from schema version 5 or the policy-source commit. Unknown schema revisions, noncanonical or extra/missing fields, unrecognized command/phase/output forms, and semantically ambiguous evidence fail closed.
+
+### Checkpoint H3
+
+Made the strict read-only rule transitive rather than preflight-based. A later implementation must statically enumerate every call reachable from the explicit `completed_history` entry point and establish that each state read receives `repair=False` at the actual read. Missing authority indexes fail at observation time; append/create, index recovery, adapter transitions, and mutation-capable reconciliation are unreachable. Existing live defaults remain unchanged.
+
+Named two explicit role-authentication boundaries:
+
+1. Controller history propagates `repair=False` through `authenticate_controller_packages_v5` and `_authenticate_controller_request`. It must not call `FileBackedControllerRoleInvokerV5.reconcile_once`, because `_sealed` can append a response when the sealed blob is absent. An existing-only authenticator must load the sealed response once, require presence, and apply the same pure envelope/binding/terminal derivation without response-directory or append fallback.
+2. Paid history uses a dedicated paid-history authenticator with an allow-list of immutable package, ledger-record, unique-request, provider-response, and terminal-classification reads. Operational reservation, settlement, recovery, provider invocation, append, and migration-write paths are unreachable. Shared pure predicates must prevent verification drift.
+
+The transitive state-read and write-reachability audit is now an H3 implementation precondition. Archive preflight is explicitly insufficient against a missing-index race.
+
+## Named source reads
+
+The bounded source inspection supporting the correction covered:
+
+- `summary.py:172,257-265`: summary entry and development-history dispatch.
+- `development_preparation.py:344-390`: controller package authentication; campaign-launch and round-started state reads currently omit `repair=False`.
+- `controller_roles.py:95-108,179-185`: `reconcile_once` reaches `_sealed`; the absent-response branch can append.
+- `artifacts.py:1914-1974`: `load_typed_state` defaults to repair and may create an orphan authority index.
+- `artifacts.py:2808-2832`: controller response append and existing response load seams.
+- `cli.py:796-810,856-871`: package collection and controller/paid authentication dispatch.
+- `production_provider.py:154-195,330-430,512-570`: operational ledger construction, verified ledger reads, terminal classification, and package authentication.
+- `artifacts.py:2256-2350,2648-2685,2924-2936`: immutable provider-response, ledger-record, unique-request, and role-package loaders.
+
+No helper was executed.
+
+## Remaining concerns
+
+- The exact historical host runtime-contract and environment preimages remain unavailable; completed history cannot claim them.
+- The read-only controller and paid-history entry points are design requirements only; no production implementation exists yet.
+- Predicate extraction must keep operational and historical validation identical without exposing live capabilities.
+- A successful completed-history summary would authenticate supported serialized evidence only. It would not establish campaign readiness or two evaluated rounds.
+
+No tests, synthetic evidence, diagnostics, campaigns, Docker, external calls, credentials, environment values, source edits, or history mutations were performed.

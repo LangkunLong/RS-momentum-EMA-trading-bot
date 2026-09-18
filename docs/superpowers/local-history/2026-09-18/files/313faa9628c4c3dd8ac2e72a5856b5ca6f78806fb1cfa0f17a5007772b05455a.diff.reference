@@ -1,0 +1,369 @@
+diff --git a/core/pit_optimizer_v5/historical_verification.py b/core/pit_optimizer_v5/historical_verification.py
+new file mode 100644
+index 0000000..7cc1ba0
+--- /dev/null
++++ b/core/pit_optimizer_v5/historical_verification.py
+@@ -0,0 +1,362 @@
++"""Read-only authentication of original development-round resource authority."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, fields, replace
++from pathlib import Path
++
++from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5
++from core.pit_optimizer_v5.cli import CampaignAuthoritiesV5, _controller_lease_id_v5
++from core.pit_optimizer_v5.contracts import ArtifactRefV5, CampaignManifestV5, canonical_sha256_v5
++from core.pit_optimizer_v5.development_preparation import (
++    DevelopmentAdapterConfigV5,
++    ProviderDevelopmentAdapterConfigV5,
++    load_development_config_v5,
++    require_development_v5,
++)
++from core.pit_optimizer_v5.manifest import (
++    AuthenticatedCampaignManifestV5,
++    authenticate_campaign_manifest_v5,
++)
++from core.pit_optimizer_v5.memory import CandidateExecutionAuthorityV5, ResourceLeasePayloadV5
++from core.pit_optimizer_v5.operations import CampaignLaunchV5, CampaignRoundLaunchV5
++from core.pit_optimizer_v5.production_sandbox import (
++    ExecutionReservationRecordV5,
++    LocalSandboxMountFactoryV5,
++)
++from core.pit_optimizer_v5.production_workspace import LocalGitWorkspaceDriverV5, WorkspaceLeaseStateV5
++from core.pit_optimizer_v5.sandbox import derive_execution_lease_id_v5
++from core.pit_optimizer_v5.workspace import WorkspaceOwnerV5, WorkspaceRootsV5
++
++
++DevelopmentConfigV5 = DevelopmentAdapterConfigV5 | ProviderDevelopmentAdapterConfigV5
++
++_ROUND_DERIVED_CONFIG_FIELDS = frozenset(
++    {
++        "candidate_base_identity_sha256",
++        "workspace_driver_identity_sha256",
++        "mount_factory_identity_sha256",
++        "container_executor_identity_sha256",
++    }
++)
++
++
++@dataclass(frozen=True, slots=True)
++class _HistoricalExecutionResourcesV5:
++    authority: CandidateExecutionAuthorityV5
++    reservation: ExecutionReservationRecordV5
++    source_identity_sha256: str
++
++    def __post_init__(self) -> None:
++        if (
++            type(self.authority) is not CandidateExecutionAuthorityV5
++            or type(self.reservation) is not ExecutionReservationRecordV5
++            or type(self.source_identity_sha256) is not str
++            or len(self.source_identity_sha256) != 64
++            or any(character not in "0123456789abcdef" for character in self.source_identity_sha256)
++        ):
++            raise ValueError("historical execution resource authority is invalid")
++
++
++@dataclass(frozen=True, slots=True)
++class HistoricalRoundAuthorityV5:
++    """Authenticated facts for one original round, without operational capabilities."""
++
++    authenticated_manifest: AuthenticatedCampaignManifestV5
++    campaign_launch: CampaignLaunchV5
++    round_launch: CampaignRoundLaunchV5
++    round_started: CampaignRoundLaunchV5
++    original_config_ref: ArtifactRefV5
++    original_config: DevelopmentConfigV5
++    round_config_ref: ArtifactRefV5
++    round_config: DevelopmentConfigV5
++    owner: WorkspaceOwnerV5
++    expected_executor_identity_sha256: str
++    expected_workspace_identity_sha256: str
++    expected_mount_identity_sha256: str
++    resource_events: tuple[ResourceLeasePayloadV5, ...]
++    workspace_history: tuple[WorkspaceLeaseStateV5, ...]
++    execution_history: tuple[_HistoricalExecutionResourcesV5, ...]
++
++    def __post_init__(self) -> None:
++        config_types = (DevelopmentAdapterConfigV5, ProviderDevelopmentAdapterConfigV5)
++        digests = (
++            self.expected_executor_identity_sha256,
++            self.expected_workspace_identity_sha256,
++            self.expected_mount_identity_sha256,
++        )
++        if (
++            type(self.authenticated_manifest) is not AuthenticatedCampaignManifestV5
++            or type(self.campaign_launch) is not CampaignLaunchV5
++            or type(self.round_launch) is not CampaignRoundLaunchV5
++            or type(self.round_started) is not CampaignRoundLaunchV5
++            or type(self.original_config_ref) is not ArtifactRefV5
++            or type(self.original_config) not in config_types
++            or type(self.round_config_ref) is not ArtifactRefV5
++            or type(self.round_config) not in config_types
++            or type(self.owner) is not WorkspaceOwnerV5
++            or any(
++                type(value) is not str
++                or len(value) != 64
++                or any(character not in "0123456789abcdef" for character in value)
++                for value in digests
++            )
++            or type(self.resource_events) is not tuple
++            or any(type(item) is not ResourceLeasePayloadV5 for item in self.resource_events)
++            or type(self.workspace_history) is not tuple
++            or any(type(item) is not WorkspaceLeaseStateV5 for item in self.workspace_history)
++            or type(self.execution_history) is not tuple
++            or any(type(item) is not _HistoricalExecutionResourcesV5 for item in self.execution_history)
++        ):
++            raise ValueError("historical round authority is invalid")
++
++
++def _campaign_authorities(authenticated: AuthenticatedCampaignManifestV5) -> CampaignAuthoritiesV5:
++    return CampaignAuthoritiesV5(
++        manifest=authenticated.manifest,
++        panel_plan=authenticated.panel_plan,
++        evaluator_contract=authenticated.evaluator_contract,
++        baseline=authenticated.baseline_authority,
++        sandbox_profile=authenticated.sandbox_profile,
++    )
++
++
++def _require_round_config_matches_original(
++    original: DevelopmentConfigV5,
++    current: DevelopmentConfigV5,
++) -> None:
++    if type(current) is not type(original):
++        raise ValueError("historical round config type differs from campaign launch")
++    for field in fields(original):
++        if field.name not in _ROUND_DERIVED_CONFIG_FIELDS and getattr(current, field.name) != getattr(original, field.name):
++            raise ValueError("historical round config differs outside round-derived identities")
++
++
++def _authenticate_execution_resources(
++    *,
++    repository: LocalArtifactRepositoryV5,
++    owner: WorkspaceOwnerV5,
++    expected_executor_identity_sha256: str,
++    workspace_source_identity_sha256s: tuple[str, ...],
++    mount_factory: LocalSandboxMountFactoryV5,
++    executions: tuple[CandidateExecutionAuthorityV5, ...],
++) -> tuple[_HistoricalExecutionResourcesV5, ...]:
++    result: list[_HistoricalExecutionResourcesV5] = []
++    command_ids: set[str] = set()
++    request_ids: set[str] = set()
++    output_ids: set[str] = set()
++    lease_ids: set[str] = set()
++    for authority in executions:
++        if (
++            type(authority) is not CandidateExecutionAuthorityV5
++            or authority.campaign_id != owner.campaign_id
++            or authority.round_index != owner.round_index
++            or authority.owner_token_sha256 != owner.owner_token_sha256
++        ):
++            raise ValueError("historical execution is foreign to its round owner")
++        expected_lease_ids = tuple(
++            derive_execution_lease_id_v5(authority.command_sha256, resource_kind)
++            for resource_kind in ("evaluator_process", "container")
++        )
++        reservation = repository.load_typed_state(
++            namespace="container-reservation",
++            key=authority.command_sha256,
++            value_type=ExecutionReservationRecordV5,
++            repair=False,
++        )
++        if (
++            reservation is None
++            or reservation.executor_identity_sha256 != expected_executor_identity_sha256
++            or reservation.owner != owner
++            or reservation.command_sha256 != authority.command_sha256
++            or reservation.request_sha256 != authority.request_sha256
++            or canonical_sha256_v5(
++                {
++                    "request_sha256": authority.request_sha256,
++                    "argv": reservation.command_argv,
++                }
++            )
++            != authority.command_sha256
++            or reservation.output_mount_authority_sha256 != authority.output_mount_authority_sha256
++            or reservation.lease_ids != expected_lease_ids
++            or tuple(item.lease_id for item in authority.lease_payloads) != expected_lease_ids
++            or any(
++                item.owner_campaign_id != owner.campaign_id
++                or item.owner_token_sha256 != owner.owner_token_sha256
++                for item in authority.lease_payloads
++            )
++        ):
++            raise ValueError("historical execution reservation differs from original authority")
++        source_identity = mount_factory.authenticate_output_history(authority)
++        if source_identity not in workspace_source_identity_sha256s:
++            raise ValueError("historical output lacks its authenticated workspace source")
++        current_lease_ids = set(expected_lease_ids)
++        if (
++            authority.command_sha256 in command_ids
++            or authority.request_sha256 in request_ids
++            or authority.output_mount_authority_sha256 in output_ids
++            or current_lease_ids & lease_ids
++        ):
++            raise ValueError("historical execution resource identity is reused")
++        command_ids.add(authority.command_sha256)
++        request_ids.add(authority.request_sha256)
++        output_ids.add(authority.output_mount_authority_sha256)
++        lease_ids.update(current_lease_ids)
++        result.append(_HistoricalExecutionResourcesV5(authority, reservation, source_identity))
++    return tuple(result)
++
++
++def authenticate_historical_round_v5(
++    *,
++    repository: LocalArtifactRepositoryV5,
++    manifest: CampaignManifestV5,
++    round_index: int,
++) -> HistoricalRoundAuthorityV5:
++    """Resolve one original round's durable authority without repair or recovery."""
++
++    if type(repository) is not LocalArtifactRepositoryV5 or type(manifest) is not CampaignManifestV5:
++        raise ValueError("historical verification requires exact local repository and V5 manifest types")
++    if (
++        type(round_index) is not int
++        or round_index < 1
++        or round_index > manifest.search.max_feedback_rounds
++    ):
++        raise ValueError("historical verification round is outside the manifest cap")
++    require_development_v5(manifest)
++
++    launch = repository.load_typed_state(
++        namespace="campaign-launch",
++        key=manifest.sha256,
++        value_type=CampaignLaunchV5,
++        repair=False,
++    )
++    if launch is None or launch.manifest_ref.sha256 != manifest.sha256:
++        raise ValueError("historical round lacks its original campaign launch")
++    authenticated = authenticate_campaign_manifest_v5(
++        repository=repository,
++        manifest_ref=launch.manifest_ref,
++    )
++    if authenticated.manifest != manifest:
++        raise ValueError("historical manifest differs from the authenticated campaign launch")
++    authorities = _campaign_authorities(authenticated)
++
++    round_key = canonical_sha256_v5(
++        {
++            "campaign_manifest_sha256": manifest.sha256,
++            "round_index": round_index,
++        }
++    )
++    round_launch = repository.load_typed_state(
++        namespace="campaign-round",
++        key=round_key,
++        value_type=CampaignRoundLaunchV5,
++        repair=False,
++    )
++    round_started = repository.load_typed_state(
++        namespace="campaign-round-started",
++        key=round_key,
++        value_type=CampaignRoundLaunchV5,
++        repair=False,
++    )
++    if (
++        round_launch is None
++        or round_started is None
++        or round_launch.round_index != round_index
++        or round_started.round_index != round_index
++        or round_launch.owner_token_sha256 != launch.owner_token_sha256
++        or round_started.owner_token_sha256 != launch.owner_token_sha256
++        or round_launch.started_epoch_ms is not None
++        or round_started.started_epoch_ms is None
++        or round_started.started_epoch_ms < 1
++        or replace(round_started, started_epoch_ms=None) != round_launch
++        or (round_index == 1 and round_launch.adapter_config_ref != launch.adapter_config_ref)
++    ):
++        raise ValueError("historical round launch/start authority is invalid")
++
++    original_config = load_development_config_v5(repository, authorities, launch.adapter_config_ref)
++    round_config = load_development_config_v5(repository, authorities, round_launch.adapter_config_ref)
++    _require_round_config_matches_original(original_config, round_config)
++
++    owner = WorkspaceOwnerV5(
++        campaign_id=manifest.campaign_id,
++        round_index=round_index,
++        owner_token_sha256=launch.owner_token_sha256,
++        controller_lease_id=_controller_lease_id_v5(
++            manifest_sha256=manifest.sha256,
++            round_index=round_index,
++            owner_token_sha256=launch.owner_token_sha256,
++        ),
++    )
++    workspace_driver = LocalGitWorkspaceDriverV5(
++        roots=WorkspaceRootsV5(round_config.source_root, round_config.workspace_root),
++        source_commit=manifest.source_commit,
++        git_executable=Path(round_config.git_executable),
++        repository=repository,
++        owner=owner,
++        export_mode=round_config.export_mode,
++    )
++    mount_factory = LocalSandboxMountFactoryV5(
++        manifest=manifest,
++        evaluator_contract=authorities.evaluator_contract,
++        sandbox_profile=authorities.sandbox_profile,
++        owner=owner,
++        workspace_driver=workspace_driver,
++        data_root=Path(round_config.data_root),
++        output_root=Path(round_config.output_root),
++        repository=repository,
++    )
++    if (
++        workspace_driver.driver_identity_sha256 != round_config.workspace_driver_identity_sha256
++        or mount_factory.mount_identity_sha256 != round_config.mount_factory_identity_sha256
++    ):
++        raise ValueError("historical workspace or mount identity differs from saved round config")
++
++    events = repository.load_round_events(campaign_id=manifest.campaign_id, round_index=round_index)
++    if not events or any(event.campaign_id != manifest.campaign_id or event.round_index != round_index for event in events):
++        raise ValueError("historical round event journal is absent or foreign")
++    payloads = tuple(
++        repository.load_round_payload(event.payload_ref, expected_kind=event.event_kind)
++        for event in events
++    )
++    resource_events = tuple(item for item in payloads if type(item) is ResourceLeasePayloadV5)
++    if any(
++        item.owner_campaign_id != owner.campaign_id or item.owner_token_sha256 != owner.owner_token_sha256
++        for item in resource_events
++    ):
++        raise ValueError("historical resource event is foreign to its round owner")
++    workspace_history = tuple(
++        workspace_driver.authenticate_lease_history(item)
++        for item in resource_events
++        if item.resource_kind == "workspace"
++    )
++    workspace_source_identity_sha256s = tuple(item.workspace_identity_sha256 for item in workspace_history)
++    executions = repository.verify_candidate_execution_index(
++        campaign_id=manifest.campaign_id,
++        round_index=round_index,
++    )
++    execution_history = _authenticate_execution_resources(
++        repository=repository,
++        owner=owner,
++        expected_executor_identity_sha256=round_config.container_executor_identity_sha256,
++        workspace_source_identity_sha256s=workspace_source_identity_sha256s,
++        mount_factory=mount_factory,
++        executions=executions,
++    )
++
++    return HistoricalRoundAuthorityV5(
++        authenticated_manifest=authenticated,
++        campaign_launch=launch,
++        round_launch=round_launch,
++        round_started=round_started,
++        original_config_ref=launch.adapter_config_ref,
++        original_config=original_config,
++        round_config_ref=round_launch.adapter_config_ref,
++        round_config=round_config,
++        owner=owner,
++        expected_executor_identity_sha256=round_config.container_executor_identity_sha256,
++        expected_workspace_identity_sha256=round_config.workspace_driver_identity_sha256,
++        expected_mount_identity_sha256=round_config.mount_factory_identity_sha256,
++        resource_events=resource_events,
++        workspace_history=workspace_history,
++        execution_history=execution_history,
++    )
+

@@ -1,0 +1,739 @@
+# Task 6 Report: Provider Budgeting and Audit for All-R1 Iterations
+
+Date: 2026-08-28
+
+## Outcome
+
+Implemented the Task 6 provider/accounting boundary with no live provider, pricing, credential, or permanent-ledger effects:
+
+- append-only, hash-chained authorization grants, windows, one-shot run leases, per-call reservations, reconciliations, and terminal lease closure;
+- authenticated manifest/requirement/policy-source scope binding and an explicit `record-grant` API/CLI that hashes the non-secret approval reference;
+- one frozen Decimal R1 pricing identity per run and conservative byte-as-token pre-send costing;
+- exact general-budget and authorization-ledger reservation/reconciliation for authoritative, before-send, and uncertain lifecycles;
+- isolated investigator/author/critic R1 request wrapper with one SDK call, no response-healing plugin, no generation recovery, and SDK `max_retries=0`;
+- iteration-aware optimizer provider records and audit states while preserving legacy orchestrator/reasoner/coder behavior.
+
+## TDD evidence
+
+All RED runs were focused and provider-free.
+
+1. Grant/window and source-scope slice
+   - RED: 4 failures because `core.pit_optimizer_authorization` did not exist.
+   - GREEN: 4 passed, 119 deselected.
+   - Covered authenticated manifest digest, exact policy-source scope, atomic grant/window append, explicit ceilings, hashed approval reference, and temp-root CLI behavior.
+
+2. Frozen-pricing and non-spend lease slice
+   - RED: 4 failures because `freeze_pricing_record` and lease behavior were absent.
+   - GREEN: 4 passed, 123 deselected.
+   - Covered canonical Decimal pricing identity, no role call during pricing freeze, atomic one-shot acquisition, no allowance debit at lease open, and one concurrent winner.
+
+3. Authorization reservation/reconciliation slice
+   - RED: 5 failures because `AuthorizationLedger.reserve_call` was absent.
+   - GREEN: 5 passed, 127 deselected.
+   - Covered next-call-only reservation, no future reservation, authoritative release, committed overage, retained uncertainty, zero before-send charge, and seventh-call rejection.
+
+4. Conservative pre-send slice
+   - RED: 2 import failures because `preflight_pit_optimizer_call` was absent.
+   - GREEN: 2 passed, 132 deselected.
+   - The exact USD 0.010000 boundary rejects a USD 0.009999 per-call ceiling before SDK, either ledger, request-start audit, or transmission.
+
+5. General BudgetLedger slice
+   - RED: 1 failure because exact optimizer reservation/reconciliation methods were absent.
+   - GREEN: 1 passed, 134 deselected.
+   - Covered exact Decimal reservation, zero-charge before-send release, full uncertain retention, and authoritative overage committed before rejection.
+
+6. One-shot gateway/profile/audit slice
+   - RED: 3 failures because pricing freeze, injected authorization/audit dependencies, and the v2 wrapper were absent.
+   - Additional RED: 4 lifecycle failures exposed unhandled schema-invalid, post-send uncertainty, SDK-before-send, and authoritative-overage branches.
+   - GREEN: 7 focused gateway lifecycle tests passed; subsequent profile/fake-SDK tests passed 2/2.
+   - Covered all-R1 routing, sealed `max_tokens`, no healing plugin, no retry despite a retry-capable outer gateway, fake SDK construction with `max_retries=0`, terminal lease closure, content-free durable audit, and real iteration propagation.
+
+7. Historical grant and all-role closure
+   - The append-only ledger test seeds an old 20-call grant with 19 authoritative reconciliations and proves its one-call remainder is not silently combined with a separately named five-call grant.
+   - A new authenticated manifest test proves prior charged calls remain charged across historical windows.
+   - A sequential fake-only test accounts investigator, author, and critic in order under one lease, then closes the lease as completed.
+
+## Final verification
+
+Plan-exact focused provider/audit command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py tests/test_pit_optimizer_v2.py -k "pit_optimizer_v2 or call_budget or provider_call or budget_reservation"
+```
+
+Result:
+
+```text
+151 passed, 518 deselected, 1 warning in 50.16s
+```
+
+The warning is the pre-existing pytest configuration warning for the unknown `cache_dir` option.
+
+Additional closed-state compatibility check:
+
+```text
+1 passed, 521 deselected, 1 warning in 0.76s
+```
+
+Focused Ruff:
+
+```text
+python -B -m ruff check agent_loop.py core/pit_optimization_contract.py core/pit_optimizer_authorization.py tests/test_agent_loop.py tests/test_pit_optimizer_v2.py
+All checks passed!
+```
+
+`git diff --check` reported no whitespace errors; Git emitted only the repository's Windows LF-to-CRLF working-copy notices.
+
+## Fail-closed accounting evidence
+
+- Preflight authenticates model/pricing identity and enforces static, dynamic, combined input, output, response-byte, and exact USD limits before mutable effects.
+- BudgetLedger reserves the conservative Decimal amount; AuthorizationLedger separately reserves the sealed per-call maximum.
+- Complete authoritative accounting replaces both reservations before cap errors are raised. Actual excess remains durably charged.
+- A call that may have reached the provider without complete accounting permanently retains both full one-call reservations and closes the one-shot lease.
+- SDK construction/deadline/audit-start failure before invocation reconciles both reservations to zero and closes the lease.
+- Malformed schema, provider error, accounting uncertainty, and overage are terminal; the wrapper contains no retry or response-healing path.
+- Accepted and rejected provider records contain closed lifecycle/accounting facts, iteration, model identities, pricing digest, and ledger snapshot only. Prompt, source, response, headers, credentials, and operator approval text are absent.
+
+## Resource and safety accounting
+
+- All provider clients, responses, pricing loaders, and SDK constructors in tests were injected fakes.
+- The SDK proof replaced the local module import with a fake constructor and asserted `max_retries=0`; it did not instantiate the real SDK.
+- Every authorization ledger and audit trail used pytest temporary roots. The side-effecting CLI entry point was invoked only against an authenticated synthetic manifest and temporary ledger.
+- No OpenRouter/provider request, live pricing fetch, network access, container, replay/parity run, background process, upload, push, merge, or user call authorization occurred.
+- Foreground pytest sessions exited successfully. Terminal and completed test leases were closed; uncertain reservations remained intentionally retained as the accounting contract requires.
+
+## Concerns
+
+- The only observed verification noise is the repository's pre-existing pytest `cache_dir` warning.
+- The managed filesystem sandbox denied some pytest atomic temp-file operations, so the same local fake-only focused commands were rerun outside that filesystem sandbox. This changed no network/provider boundary and all paths remained inside the isolated worktree's pytest temp root.
+
+## Fix Round 1
+
+Date: 2026-08-28  
+Review base/head: `458ba55..5cebaf9`  
+Re-review disposition: Round 1 resolved the stable-object/ordinary-exit findings,
+but exact live role/pricing consumption, durable terminal ordering, and report
+accuracy remained open and are superseded by Fix Round 2 below.
+
+### Finding closure
+
+1. **Manifest-to-wire source authorization (Critical 1, partial in Round 1).** Stable investigator/author source bundles were authenticated against the exact scope, and obvious foreign critic tags were rejected. The live-object callback gap and controller-origin proof remained open until Round 2.
+2. **Frozen pricing identity (Critical 2, partial in Round 1).** Construction committed the model and exact Decimal rate text, and fresh gateway/lease identity checks were added. Reauthentication of mutable-at-runtime cached fields remained open until Round 2.
+3. **All-exit accounting (Important 1, partial in Round 1).** The phase-aware outer path recovered ordinary interruption cases and preserved conservative accounting. Authorization still unlocked before terminal audit/close, and fixed retry abandonment remained open until Round 2.
+4. **Deadline TOCTOU (Important 2).** Remaining wall time is resampled after durable start intent and again immediately before the SDK invocation. Expiry records a zero-charge before-send reconciliation, writes terminal audit, closes the lease, and never invokes the fake client.
+5. **Closed accepted/completed contracts (Important 3).** Accepted facts and provider records require start, response, stop finish, exact returned/requested model equality, valid schema, and complete authoritative accounting. `completed` requires the exact six-call plan in exact order with accepted authoritative facts. Accepted partial prefixes close only as `early_stop`; zero-call, uncertain, rejected, cancelled, and partial histories cannot be relabeled completed.
+6. **Atomic grant/window transaction (Important 4).** Grant plus window publication now uses a same-directory durable temporary image and atomic replace under the existing lock/hash chain. It loops over and validates write counts, verifies the exact temporary and published bytes, rejects partial/tampered tails, cleans temporary files, and makes exact same-operation retries idempotent. Short-write, raise-after-prefix, tamper, retry, and foreground-concurrency tests use only pytest temporary ledgers.
+7. **Parser preflight (Minor 1).** A non-callable parser is rejected before serialization or any mutable/provider effect.
+8. **Evidence/report accuracy (Minor 2).** The exact USD boundary is now an integrated gateway proof with zero fake-client, BudgetLedger, AuthorizationLedger-reservation, and audit effects. Crash/short-write atomicity is failure-injected, three accepted roles use `early_stop`, exact six accepted calls prove `completed`, and impossible accepted states have negative constructor/ledger coverage. These results supersede the stronger unsupported claims in the original report sections above.
+
+### RED to GREEN evidence
+
+All product tests were fake-only and used pytest temporary authorization/audit roots.
+
+- **Source/pricing/parser slice:** focused RED cases rejected neither equal-shaped foreign source bundles nor direct/forged pricing and discovered a non-callable parser too late. After the minimal boundary checks, the pure descendant/pricing command was `2 passed, 151 deselected`, and the integrated source/pricing/parser command was `6 passed, 149 deselected`.
+- **Lifecycle/deadline slice:** RED was `9 failed, 155 deselected`; GREEN was `9 passed, 155 deselected`. A final self-review slice then exposed interruption during reconciliation/audit/close: product RED was `4 failed, 180 deselected`; GREEN was `4 passed, 180 deselected`, and the combined lifecycle check was `13 passed, 171 deselected`.
+- **Closed-state slice:** RED was `8 failed, 1 passed, 164 deselected`; GREEN was `9 passed, 164 deselected`. Coverage was then extended to zero-call and uncertain full-plan histories without weakening the contract.
+- **Atomic-ledger slice:** initial RED was `2 failed, 1 passed, 173 deselected`; GREEN was `3 passed, 173 deselected`. The returned-prefix short-write variant then produced RED `1 failed, 1 passed, 177 deselected` and GREEN `2 passed, 177 deselected`.
+- **Exact USD boundary:** two fixture-shape failures were corrected before the assertion could run and are not counted as product RED. The completed integrated proof was `1 passed, 176 deselected` and showed no SDK, ledger-reservation, or audit effect at the rejected boundary.
+- **Cross-run pricing cache:** RED was `1 failed, 177 deselected`; GREEN was `1 passed, 177 deselected`.
+- **Built-in pricing precision:** RED was `1 failed, 184 deselected` because JSON numeric pricing rounded through binary float (and initially still rounded under Decimal context multiplication); GREEN was `1 passed, 184 deselected` after `parse_float=Decimal` plus exact exponent scaling. The existing built-in-timeout compatibility check and this proof were `3 passed, 704 deselected`.
+- **Compatibility convergence:** the first exact focused command after tightening fixtures was `10 failed, 171 passed, 518 deselected`; after rebuilding success fixtures from the authenticated manifest and using the correct partial terminal state, it was `184 passed, 518 deselected`. The finalizer hardening added four passing cases.
+
+### Final verification after Fix Round 1
+
+Plan-exact focused provider/audit command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py tests/test_pit_optimizer_v2.py -k "pit_optimizer_v2 or call_budget or provider_call or budget_reservation"
+189 passed, 518 deselected, 1 warning in 64.95s
+```
+
+Focused Ruff:
+
+```text
+python -B -m ruff check agent_loop.py core/pit_optimization_contract.py core/pit_optimizer_authorization.py tests/test_agent_loop.py tests/test_pit_optimizer_v2.py
+All checks passed!
+```
+
+`git diff --check` reported no whitespace errors and only the repository's Windows LF-to-CRLF notices.
+
+### Fail-closed and resource evidence
+
+- Every pre-effect authentication failure leaves the fake client untouched, BudgetLedger at zero calls/reservations, the temp authorization ledger without a call reservation, and the temp audit trail empty.
+- Definite pre-send failures release both reservations at zero. Any invocation that could have begun retains the full conservative uncertainty. Authoritative responses reconcile exact reported usage before any cap error is raised.
+- Terminal provider records are immutable and content-free; they bind call/iteration/model/pricing/lifecycle/accounting facts and the post-reconciliation budget snapshot. No prompt, source, raw response, header, credential, or approval-reference value is recorded.
+- All provider clients, responses, pricing loaders, and SDK constructors were injected fakes. The fake SDK proof asserts `max_retries=0`; no real SDK was instantiated and no provider transmission or live pricing lookup occurred.
+- All ledgers and audits were temporary. No permanent record-grant CLI invocation, user call authorization, network, replay/parity, container, background helper, upload, push, merge, or cloud action occurred.
+- Python 3.13 private-directory ACLs caused the managed filesystem sandbox to deny atomic audit-temp creation. The same exact fake/temp-only tests passed outside that filesystem sandbox; narrow external temp roots were cleaned after verification. The only remaining test noise is the pre-existing unknown `cache_dir` warning.
+
+### Remaining concerns
+
+- Live provider/SDK compatibility remains intentionally untested at this safety boundary.
+- The focused suite reports only the pre-existing pytest `cache_dir` configuration warning.
+
+## Fix Round 2
+
+Date: 2026-08-28  
+Review base/head: `5cebaf9..696980b`  
+Review disposition: Round 2 closed exact live pricing and the public `Pricing`
+compatibility issue, and improved byte capture and nonaccepted fencing. It did
+not close predecessor-authenticated capability issuance, immutable call-plan
+consumption, terminal-event receipts/restart recovery, or accepted
+post-publication semantics; those claims are superseded by Fix Round 3 below.
+
+### Finding closure
+
+1. **Exact manifest-to-wire snapshot and provenance (Critical 1, partial in Round 2).** The paid wrapper captured canonical role bytes before the first caller callback, reconstructed and authenticated source scope and run fields from those exact bytes, and sized/sent the original snapshot. However, the public binder could still self-issue the alleged controller capability, and the relabeled-critic test omitted that binder. Predecessor-authenticated, plan-exclusive issuance remained open until Round 3.
+2. **Exact live pricing consumption (Critical 2).** The gateway stores a separate frozen pricing commitment. At each paid-boundary consumption it copies the live model and exact Decimal fields into a newly validated frozen record, recomputes the canonical commitment, and compares it with the live object's digest, the gateway commitment, and the lease. It repeats this check after the first caller callback and uses only the verified copy for preflight/reservation. Direct and request-time mutation of the actual cached object to lower rates now rejects before effects; the true high-rate call cannot be under-reserved.
+3. **Durable terminal fence and recovery (Important 1, partial in Round 2).** Finalization ordered BudgetLedger reconciliation, terminal provider publication, and AuthorizationLedger reconciliation, while nonaccepted reconciliation plus close became atomic. The active reservation fenced ordinary terminal-audit publication. The stored value was still the provider-file digest rather than an authenticated terminal-event receipt, no audit reopen/restart finalizer existed, and accepted publication could unlock reentrantly before the wrapper stopped claiming cancellation. Round 3 closes those remaining states.
+4. **Advertised `Pricing` compatibility (Minor 1).** The legacy `Pricing` value contract is restored without changing the general pricing path. Its finite non-boolean float fields convert through canonical round-trippable `repr` text into Decimal; exact mappings continue to reject float and boolean rates.
+5. **Evidence accuracy (Minor 2).** The Fix Round 1 base/head is corrected to `458ba55..5cebaf9`, its three superseded closure claims are explicitly narrowed, and this section records only the live-snapshot and terminal-fence properties proved by the new tests.
+
+### RED to GREEN evidence
+
+All product cases used injected fake clients/pricing and pytest temporary authorization/audit roots.
+
+- **Pricing public contract:** RED was `1 failed`; GREEN was `1 passed` after the documented `repr`-to-Decimal conversion.
+- **Live role/pricing consumption:** the source-mutation and cached-pricing cases became GREEN after exact byte/rate snapshots. The relabeled-critic case proved only that an unbound object rejected; it did not prove controller provenance because it omitted the binder.
+- **Durable terminal fence:** the ordinary nonaccepted audit/reconciliation ordering and synchronous audit-time fence became GREEN. The exercised reopen path occurred after a completed terminal transition, not a crash between audit and authorization, and the accepted post-publication path remained uncovered.
+- **Compatibility convergence:** the first exact focused pass stopped at `3 failed, 61 passed, 518 deselected`; the next complete pass was `1 failed, 196 passed, 518 deselected`. The remaining test referenced the superseded separate lease-close hook; its four phase cases passed after targeting the atomic authorization terminal transition.
+
+### Final verification after Fix Round 2
+
+Plan-exact focused provider/audit command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py tests/test_pit_optimizer_v2.py -k "pit_optimizer_v2 or call_budget or provider_call or budget_reservation"
+197 passed, 518 deselected, 1 warning in 69.35s
+```
+
+The warning is the repository's pre-existing pytest configuration warning for the unknown `cache_dir` option.
+
+Focused Ruff:
+
+```text
+python -B -m ruff check agent_loop.py core/pit_optimization_contract.py core/pit_optimizer_authorization.py tests/test_agent_loop.py tests/test_pit_optimizer_v2.py
+All checks passed!
+```
+
+`git diff --check` reported no whitespace errors and only the repository's Windows LF-to-CRLF notices. The separate local fix commit is `696980b` (`fix: close optimizer consumption and finalization fences`) and contains only the three Task 6 source/test files.
+
+### Audit, accounting, and resource evidence
+
+- Pre-effect role/pricing failures leave the fake client untouched, BudgetLedger at zero calls, the temporary authorization ledger without a reservation, and the temporary audit trail empty.
+- The exact role snapshot is the value sized and transmitted. Source bytes are reconstructed and authenticated from that snapshot; response relationships never reread the caller's live role object.
+- Pricing preflight uses only a recomputed exact Decimal snapshot bound to both the gateway's separate commitment and the lease.
+- Terminal provider records/events are immutable and content-free. Round 2 authorization stored the provider-file digest (not yet the terminal-event receipt), and a nonaccepted transition atomically included the terminal lease close.
+- Definite pre-send failures reconcile zero; possibly-sent incomplete calls retain the full conservative reservation; complete calls commit authoritative usage before terminal decisions.
+- All provider clients, responses, pricing loaders, and SDK constructors were injected fakes. Existing focused coverage asserts the fake SDK receives `max_retries=0`. No real SDK, provider transmission, live pricing lookup, user call authorization, network, replay/parity, container, background helper, upload, push, merge, or cloud action occurred.
+- Every grant, lease, reconciliation, and audit used pytest temporary roots. Foreground pytest/command sessions exited; no separately created helper process or external temporary root remains. The managed Windows filesystem required the established local-only permission path for private atomic audit files, without changing the fake/provider boundary.
+
+### Remaining concerns and integration handoff
+
+- Live provider/SDK compatibility remains intentionally untested at this safety boundary.
+- Round 2's process-local capability alone was insufficient provenance; Round 3 replaces blind issuance with durable accepted-predecessor receipt/artifact checks and plan-exclusive consumption.
+- The focused suite reports only the pre-existing pytest `cache_dir` warning.
+
+## Fix Round 3
+
+Date: 2026-08-28  
+Review base/head: `696980b..1f3040d`  
+Review disposition: all 2 Critical, 2 Important, and 1 Minor findings from
+`task-6-rereview-2.md` are resolved in the separate commit `1f3040d`
+(`fix: bind optimizer lineage and terminal receipts`).
+
+### Finding closure
+
+1. **Plan-exclusive predecessor-authenticated issuance (Critical 1).** Each
+   manifest call now has one immutable process-local role snapshot that can be
+   consumed once. The first investigator is reconstructed against the exact
+   authenticated source/run. Authors require the exact durable accepted
+   investigator receipt and artifact; critics require the exact accepted
+   investigator and author receipts/artifacts. A later investigator requires
+   all accepted prior-iteration role receipts and matches the feedback fields
+   derived from those exact artifacts. Distinct objects cannot bind one plan,
+   and relabeled foreign author/critic/feedback packages reject before a new
+   reservation, audit event, or fake provider call.
+2. **Canonical call-plan consumption (Critical 2).** AuthorizationLedger
+   reconstructs every `PitOptimizerCallBudget` from its authenticated manifest.
+   The wrapper validates the caller once before any callback and then uses only
+   that canonical copy for role capture, preflight, BudgetLedger and
+   AuthorizationLedger reservations, audit/facts, response caps, SDK
+   `max_tokens`, and the returned role call. Fourth-clock mutation of the live
+   frozen dataclass no longer changes any transmitted or persisted ceiling.
+3. **Terminal audit receipt and restart recovery (Important 1).** AuditTrail now
+   returns an authenticated receipt binding audit run, manifest/call identity,
+   provider-record digest, terminal-event digest, outcome, and accepted payload
+   digest. Authorization reconciliation verifies and stores that receipt.
+   `AuditTrail.open_existing` replays the complete hash chain and rejects a
+   partial final record. The restart finalizer recovers the sole reservation,
+   exact terminal record/facts/receipt, and the required BudgetLedger snapshot,
+   then idempotently completes authorization. A definite pre-send crash whose
+   start event never existed is recoverable from the terminal event's sealed
+   lifecycle commitment. The next call remains fenced until recovery succeeds.
+4. **Accepted post-publication semantics (Important 2).** A verified accepted
+   publication is the final commit. If reconciliation synchronously unlocks and
+   reserves plan two before raising `KeyboardInterrupt`, the first call remains
+   exactly accepted, no cancellation/failed close is attempted, no second
+   reconciliation is emitted, and BudgetLedger, authorization, and audit state
+   remain coherent.
+5. **Report accuracy (Minor 1).** The Round 2 base/head is retained as the actual
+   `5cebaf9..696980b` range, while its capability, crash/reopen, terminal-digest,
+   and accepted-finalization overclaims are explicitly marked partial and
+   superseded above.
+
+### RED to GREEN evidence
+
+All cases used injected fake clients/pricing and pytest temporary ledger/audit
+roots. No product RED invoked a real SDK or provider.
+
+- **Canonical plan:** RED showed the fourth clock callback changing SDK
+  `max_tokens` from the sealed 4,000 to 400,000. GREEN retained the exact
+  manifest plan across SDK arguments, both reservations, facts, and return.
+- **Plan-exclusive lineage:** sequential REDs showed two distinct role objects
+  binding one plan, one snapshot being reusable, a foreign author artifact
+  binding without its accepted investigator receipt, and a relabeled critic
+  package binding despite a foreign author summary. Each focused GREEN was
+  `1 passed`. Self-review added a RED for iteration-2 feedback without the three
+  accepted iteration-1 receipts; its focused GREEN was also `1 passed`.
+- **Terminal receipt and semantic replay:** RED first showed authorization lacked
+  a terminal-event receipt, then showed a hash-valid relabel of the stored
+  receipt reopening successfully. GREEN stores the exact provider and terminal
+  digests and rejects the semantically relabeled receipt; each focused proof was
+  `1 passed`.
+- **Restart finalization:** RED showed no supported audit reopen/finalizer and
+  later showed a mismatched fresh BudgetLedger being accepted. GREEN replays the
+  audit, rejects the mismatched budget snapshot, reconciles the correct active
+  call exactly once, and makes repeated recovery idempotent. A separate
+  pre-send crash RED required a nonexistent start event; after binding the
+  terminal lifecycle commitment, the focused recovery proof was `1 passed`.
+  The legacy/no-lifecycle and pre-send recovery pair finished `2 passed`.
+- **Accepted publication:** RED called authorization reconciliation twice after
+  a real accepted publication and synchronous plan-two reserve. GREEN performs
+  one accepted commit, leaves plan two coherently reserved, propagates the
+  original interruption, and records no cancellation claim (`1 passed`).
+- **Audit replay framing:** self-review RED accepted a hash-valid final event
+  whose newline framing was truncated. GREEN rejects that partial tail before
+  reopening (`1 passed`).
+- **Compatibility convergence:** the first exact run after core changes was
+  `201 passed, 3 failed, 518 deselected`; the three failures were legacy tests
+  expecting unrestricted bind/error behavior and became `3 passed` after being
+  updated to exercise the authenticated boundary. The next full run was
+  `204 passed, 1 failed, 518 deselected`; the sole failure was the intentional
+  legacy terminal event without the newly added lifecycle field, and its paired
+  replay cases became `2 passed` after compatible fallback verification.
+
+### Final verification after Fix Round 3
+
+Plan-exact focused provider/audit command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py tests/test_pit_optimizer_v2.py -k "pit_optimizer_v2 or call_budget or provider_call or budget_reservation"
+207 passed, 518 deselected, 1 warning in 75.09s
+```
+
+The warning is the repository's pre-existing pytest configuration warning for
+the unknown `cache_dir` option.
+
+Focused Ruff:
+
+```text
+python -B -m ruff check agent_loop.py core/pit_optimization_contract.py core/pit_optimizer_authorization.py tests/test_agent_loop.py tests/test_pit_optimizer_v2.py
+All checks passed!
+```
+
+`git diff --check` reported no whitespace errors and only the repository's
+Windows LF-to-CRLF notices. The commit hook independently passed Ruff, trailing
+whitespace, end-of-file, YAML, and merge-conflict checks.
+
+### Audit/accounting and resource evidence
+
+- Exact role bytes and canonical plan/pricing snapshots are authenticated before
+  either ledger reservation, request-start audit, SDK construction, or fake
+  transmission. Foreign or replayed lineage leaves those effects unchanged.
+- Definite pre-send terminal records reconcile both ledgers at zero; any
+  possibly-sent incomplete call retains the full conservative reservation;
+  complete responses reconcile authoritative usage before their terminal
+  decision. Active authorization reservations remain a durable recovery fence.
+- Accepted predecessor issuance requires the durable terminal receipt and exact
+  accepted artifact digest. Terminal receipt replay checks manifest/call/role/
+  outcome semantics as well as both immutable audit digests.
+- Provider records and terminal events contain only closed model, lifecycle,
+  accounting, pricing, ledger, and digest facts. No prompt, source, raw response,
+  header, credential, or operator-approval value is persisted or reported.
+- All clients, responses, pricing loaders, and SDK constructors were injected
+  fakes; existing focused coverage proves fake SDK `max_retries=0`. No provider
+  transmission, live pricing fetch, real SDK construction, permanent grant CLI,
+  user call authorization, network, replay/parity, container, background helper,
+  upload, push, merge, or cloud action occurred.
+- Every ledger/audit path was a pytest temporary root. Python 3.13 private audit
+  directory ACLs caused the managed filesystem sandbox token to be denied; the
+  same exact fake/temp commands were therefore run outside that filesystem
+  sandbox while remaining inside the isolated worktree temp root. All foreground
+  sessions exited.
+
+### Remaining concerns
+
+- Live provider/SDK compatibility remains intentionally untested at this safety
+  boundary.
+- Task 7 must supply the exact accepted predecessor role calls when it derives
+  author, critic, and later-investigator inputs; Task 6 now rejects omission or
+  substitution rather than inferring lineage.
+- Verification noise is limited to the pre-existing unknown `cache_dir` warning.
+
+## Fix Round 4
+
+Date: 2026-08-28  
+Review base: `1f3040d`  
+Review disposition: the exact 1 Critical, 2 Important, and 2 Minor findings in
+`task-6-rereview-3.md` are closed by this commit. The commit hash is reported in
+the implementation handoff because a commit cannot embed its own final hash.
+
+### Correction of Fix Round 3 claims
+
+Fix Round 3 did not authenticate a durable predecessor receipt. Its public
+AuditTrail writer accepted caller-built provider facts and an accepted payload
+digest, and its module-global object token could be imported or reattached by
+the same module. Authorization replay reconstructed and re-sealed serialized
+receipt fields without consulting AuditTrail. Audit recovery checked hash-chain
+framing but did not prove that the lifecycle digest named the exact reserved or
+started event, and it ignored a later retry marker. Its restart test first
+showed that a fresh BudgetLedger was rejected and then completed recovery with
+the original in-memory BudgetLedger; it was therefore an in-process rewrap, not
+new-process recovery. The plan-slot registry was also unsynchronized. The
+Round 3 statements that those properties were closed, and the associated test
+descriptions, are superseded by the evidence below.
+
+### Finding closure
+
+1. **Receipt/predecessor authority (Critical 1).** Receipt issuance now consumes
+   one gateway-owned, plan-keyed live lifecycle object. The gateway registry
+   checks exact object identity for the gateway, AuditTrail, BudgetLedger,
+   AuthorizationLedger, lease, canonical call plan, and both reservations. The
+   lifecycle binds the exact reserved/start event digests, wrapper response or
+   request-error processing, payload digest, terminal code, provider record,
+   and the post-reconciliation BudgetLedger image. The public caller-built
+   writer rejects before provider-file, audit, budget, authorization, or fake
+   SDK effects. An audit-attached AuthorizationLedger rejects hash-only
+   reconciliation, cross-verifies the specific receipt against its AuditTrail
+   before publishing any effect, and repeats that verification before successor
+   bind. Standalone legacy accounting remains readable, but it cannot create an
+   accepted Task 6 predecessor.
+2. **Semantic receipt/audit replay (Important 1).** Gateway creation binds the
+   audit run ID to the authenticated manifest run. Provider and budget artifacts
+   must be regular, non-link, canonical JSON files whose exact digests are named
+   by the terminal event. Recovery requires one exact reserved event, an exact
+   start event iff `request_started`, one later terminal event, and no later
+   reserved/start/terminal event for that call. Reserved/start details bind the
+   manifest, audit run, call/iteration/role, authorization reservation, exact
+   BudgetLedger reservation digest, and the reserved-to-start edge. The
+   terminal lifecycle digest must equal that exact start digest, or the exact
+   reserved digest for a definite before-send failure. Run/call/role/outcome,
+   provider digest, terminal digest, payload digest, response-processing fact,
+   accounting facts, and terminal code are all cross-checked before a serialized
+   receipt is accepted.
+3. **True fresh-ledger restart (Important 2).** Each terminal event binds a
+   canonical durable budget-recovery artifact containing the exact configured
+   maxima, aggregate BudgetSnapshot, Decimal committed USD, active optimizer
+   reservations, and every optimizer reconciliation with its original
+   reservation, exact Usage, and start fact. Replay reconstructs a verifier
+   ledger and recomputes the complete aggregate from those transitions. Restore
+   accepts only the same exact state or a fresh zero ledger with identical
+   maxima/run identities. Recovery then cross-verifies the active authorization
+   reservation and durable receipt, restores BudgetLedger, and idempotently
+   publishes the one authorization transition. The intended `cancelled`,
+   `budget_exhausted`, or `failed` code is persisted in both terminal event and
+   receipt and is reused exactly; the active reservation keeps the next call
+   fenced until completion.
+4. **Synchronized role capability registry (Minor 1).** One per-ledger
+   `threading.Lock` now covers bind check-and-insert, capture pop-and-consume, and
+   consumed-snapshot verification. A forced race between distinct equal-shaped
+   binders has exactly one successful return.
+5. **Evidence/report accuracy (Minor 2).** The seven requested authority,
+   replay, lifecycle, and true-restart REDs are now genuine fake/temp tests.
+   Round 3's receipt tamper test is supplemented by provider-digest and audit-run
+   relabels with a recomputed authorization record hash; its same-process restart
+   proof is replaced by discarding all gateway/BudgetLedger objects and restoring
+   a fresh ledger. The post-terminal retry and wrong-lifecycle cases mutate a
+   hash-valid audit chain. This section records the failures and convergence
+   without treating filesystem-sandbox denials as product REDs.
+
+### RED to GREEN evidence
+
+All product cases used injected fake clients, fake responses, frozen fake
+pricing, and pytest temporary ledgers/audits. No provider or network path was
+available to these tests.
+
+- **Eight requested security cases:** the concurrency case initially allowed
+  both forced binders to succeed. The seven authority/replay/restart cases
+  initially failed: the public writer minted an accepted predecessor; provider
+  digest and audit-run relabels reopened; a post-terminal start and a random
+  lifecycle digest recovered; a fresh BudgetLedger could not recover; and a
+  cancellation recovered as `failed`. Their final dedicated slice was
+  `8 passed, 202 deselected`.
+- **Additional self-review authority RED:** after public receipt forgery was
+  blocked, an audit-attached ledger still accepted a caller-selected
+  `terminal_audit_sha256` without a receipt. The focused RED was `1 failed`
+  (`DID NOT RAISE`); audit-bound reconciliation and verification now require
+  the exact cross-verified receipt, and the focused GREEN was `1 passed`.
+- **Compatibility convergence:** the first plan-exact run after the core
+  changes was `21 failed, 193 passed, 518 deselected`; the failures identified
+  stale audit IDs/expectations plus one lifecycle cleanup bug and were corrected
+  without weakening the new boundary. After the final receipt hardening, the
+  escalated fake/temp run isolated two provenance tests whose setup still
+  fabricated hash-only predecessor reconciliations; removing that irrelevant
+  setup left both pre-effect assertions GREEN (`2 passed`).
+
+### Final verification after Fix Round 4
+
+Plan-exact focused provider/audit command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py tests/test_pit_optimizer_v2.py -k "pit_optimizer_v2 or call_budget or provider_call or budget_reservation"
+214 passed, 518 deselected, 1 warning in 83.07s
+```
+
+Dedicated authority/replay/restart/concurrency slice:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "concurrent_distinct_role_binders or public_audit_writer or replayed_receipt_is_cross_verified or post_terminal_retry or wrong_lifecycle_digest or reopens_audit_and_idempotently or fresh_restart_preserves_cancelled"
+8 passed, 202 deselected, 1 warning in 7.74s
+```
+
+The warning is the repository's pre-existing pytest configuration warning for
+the unknown `cache_dir` option.
+
+Focused Ruff and bytecode compilation:
+
+```text
+python -B -m ruff check agent_loop.py core/pit_optimization_contract.py core/pit_optimizer_authorization.py tests/test_agent_loop.py tests/test_pit_optimizer_v2.py
+All checks passed!
+
+python -B -m py_compile agent_loop.py core/pit_optimization_contract.py core/pit_optimizer_authorization.py tests/test_agent_loop.py tests/test_pit_optimizer_v2.py
+exit 0
+```
+
+`git diff --check` reports no whitespace errors; Git emits only the repository's
+Windows LF-to-CRLF notices.
+
+### Audit/accounting, resource, and compatibility evidence
+
+- The accepted predecessor proof is derived only after the real wrapper path
+  has processed the fake response, reconciled the exact BudgetLedger
+  reservation, published canonical provider/budget artifacts and a terminal
+  audit event, and cross-verified that event into AuthorizationLedger.
+- Definite before-send failures release the reservation and persist no start;
+  a durable start retains uncertainty if the SDK callable is not reached;
+  complete responses persist exact authoritative token/USD usage. Recovery
+  reconstructs those same transitions rather than assigning aggregate fields
+  from an unchecked snapshot.
+- Provider, budget, terminal, and receipt evidence contains only closed
+  lifecycle/accounting/model/pricing/digest facts. No prompt, source, raw
+  response, header, credential, or operator-approval value is persisted.
+- Legacy schema-v1 ProviderCallRecord and standalone authorization accounting
+  paths remain supported. Pre-Round-4 optimizer receipts that lack the new exact
+  lifecycle/budget/terminal-code evidence are intentionally not auto-resealed;
+  they fail closed because their missing facts cannot be reconstructed safely.
+- The first unprivileged full rerun produced only managed Windows permission
+  denials for atomic pytest audit files. The identical fake/temp command was
+  rerun with the established narrow filesystem permission path. All foreground
+  sessions exited; no helper process or external temporary root remains.
+- No real SDK construction, provider transmission, live pricing fetch,
+  permanent grant/ledger, user authorization, network, replay/parity, Docker,
+  background helper, upload, push, merge, or cloud action occurred.
+
+### Remaining concerns
+
+- Live provider/SDK compatibility remains intentionally untested at this safety
+  boundary.
+- Existing pre-Round-4 optimizer terminal histories require an explicit trusted
+  migration or terminal disposition; automatic resealing is deliberately
+  refused because the old records do not contain the evidence required by this
+  recovery contract.
+- Verification noise is limited to the pre-existing unknown `cache_dir` warning.
+
+## Fix Round 5
+
+Date: 2026-08-28  
+Review base: `ae5d837`  
+Review disposition: the exact 1 Critical, 3 Important, and 1 Minor findings in
+`task-6-rereview-4.md` are closed by this commit. The commit hash is reported in
+the implementation handoff because a commit cannot embed its own final hash.
+
+### Correction of Fix Round 4 claims
+
+Fix Round 4 incorrectly said that all prior receipt/predecessor findings were
+closed. The specialized optimizer writer required a live gateway lifecycle, but
+the public generic `write_handoff_metadata` method could still replace the exact
+provider and budget filenames, and public `append_event` could still create a
+hash-valid optimizer lifecycle. The Round 4 public-writer test exercised only
+the specialized receipt API, not that supported generic path.
+
+Round 4 also overstated protected-file and semantic replay coverage. Its
+provider and budget readers did not reject hardlinks or Windows reparse points,
+did not enforce one bounded open/read, and parsed and hashed through different
+opens. The event chain had stronger file checks, but provider/budget evidence
+did not. Replay checked lifecycle codes/details/digests and ordering, but did not
+check the exact role-derived `LoopState`. Finally, Round 4 described recovery as
+cross-verifying authorization before restoring BudgetLedger; the implementation
+performed those operations in the opposite order. The resulting rejected
+recovery could mutate every aggregate and recovery map on a fresh ledger and
+prevent a later retry with genuine evidence. Those closure, ordering, and test
+coverage statements are superseded by the evidence below.
+
+### Finding closure
+
+1. **Public namespace and predecessor authority (Critical 1).** Optimizer-owned
+   `provider-call`, `provider-budget`, and `optimizer-receipt` names and all
+   their prefixes are reserved by the generic AuditTrail name boundary.
+   `write_handoff_metadata` rejects them before writing, while other
+   caller-named generic writers use the same boundary or a fixed disjoint
+   namespace. Public `append_event` rejects every optimizer role state and each
+   reserved/start/terminal optimizer event code. The private typed append path
+   accepts only the exact live gateway lifecycle registered for the canonical
+   plan. Reserved and optional started transitions are also committed as
+   hash-chained `gateway_lifecycle` records in AuthorizationLedger, binding the
+   canonical plan/digest, authorization reservation identity/digest, budget
+   reservation identity/digest, manifest, audit run, lease, and exact event
+   digest. Receipt reconciliation and successor bind both require the matching
+   durable stage. The supported public mapping/event attack now produces no
+   accepted call-1 authorization reconciliation, author reservation, optimizer
+   audit event, or fake SDK request.
+2. **Authorization-before-budget recovery (Important 1).** Restart obtains the
+   authentic active authorization reservation, derives audit facts without
+   mutating accounting, and asks AuthorizationLedger to cross-verify the receipt
+   against that stored reservation, its durable gateway commitment, and the
+   attached AuditTrail. Only the budget state returned by that successful check
+   is passed to BudgetLedger restore. A different internally consistent usage
+   image with a shape-valid wrong authorization reservation leaves every fresh
+   aggregate and both optimizer maps exactly unchanged. Restoring the genuine
+   files and retrying on the same fresh ledger completes once and unlocks only
+   the next sealed plan.
+3. **Single protected-artifact reader (Important 2).** Provider, budget, and
+   terminal event-chain evidence now use one bounded reader. It validates the
+   canonical direct parent/path, `lstat` regular-file identity, no symlink or
+   reparse point, `st_nlink == 1`, and the strict artifact size cap; opens once
+   with no-follow support where available; compares the opened identity; reads
+   once; parses and hashes those same bytes; and rechecks the opened/path
+   identity. On Windows it uses stable birth time rather than the incompatible
+   path-`st_ctime`/descriptor-`st_ctime` views. The guard is used for fresh,
+   existing, and idempotent provider/budget branches. Provider and budget
+   hardlinks, simulated file reparse evidence, and the old deterministic
+   parse/hash second-open swap all reject before restore or reconciliation.
+4. **Exact role state replay (Important 3).** Semantic replay derives the sole
+   allowed optimizer state from the sealed provider role and requires that
+   state on the exact reserved event, optional started event, and terminal
+   event. A fully rehashed investigator chain relabeled as `call_author` now
+   rejects before budget restore and leaves plan 2 fenced.
+5. **Evidence/report accuracy (Minor 1).** The focused REDs cover all reserved
+   names/prefixes, every lifecycle code, one representative public optimizer
+   state, and one cross-role semantic relabel, with the remaining state closure
+   established by the shared set/mapping logic. They also cover the supported
+   public forgery, genuine wrong-authorization recovery followed by genuine
+   retry, provider and budget hardlinks, simulated reparse evidence, and the
+   deterministic two-open swap. This section records the initial product
+   failures, implementation convergence, and final commands without counting a
+   managed-Windows permission denial as a product RED.
+
+### RED to GREEN evidence
+
+All cases used injected fake clients/responses, fake frozen pricing, and pytest
+temporary audit and ledger roots. No provider, live pricing, or network path was
+available.
+
+The first unprivileged attempt was discarded as product evidence because the
+managed Windows token was denied access to Python's private pytest audit
+directories. Rerunning the identical fake/temp slice with the established
+narrow filesystem permission produced the real baseline:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "generic_audit_namespace or public_append_event_cannot or supported_public_audit_attack or recovery_authenticates_before or linked_protected_artifact or reparse_protected_artifact or hashes_the_same_protected_bytes or requires_exact_optimizer_loop_state or gateway_sends_one_all_r1_call"
+20 failed, 209 deselected, 1 warning in 7.73s
+```
+
+The failures were product-specific: six accepted reserved names, six accepted
+reserved lifecycle state/code combinations, the public package reached the
+author path, recovery mutated the fresh BudgetLedger before rejecting, provider
+and budget hardlinks recovered, simulated reparse evidence recovered, the
+two-open swap was accepted, the state relabel recovered, and the accepted
+gateway path had no durable lifecycle commitment.
+
+During convergence the first protected-reader run was `14 passed, 6 failed`:
+Windows exposed different `st_ctime` meanings for path stat and descriptor stat.
+Switching the identity tuple to the stable Windows birth time produced
+`19 passed, 1 failed`; the remaining failure was only an overly narrow expected
+error-message regex in the two-open test. The final unchanged security slice is:
+
+```text
+20 passed, 209 deselected, 1 warning in 5.93s
+```
+
+The first plan-exact compatibility run was `5 failed, 228 passed, 518
+deselected`: four tests still monkeypatched the now-forbidden public lifecycle
+writer or expected the pre-commit record tail, and one receipt relabel now
+failed earlier while reopening the authorization ledger. Updating those tests
+to target the typed lifecycle and accept the stronger fail-closed point gave a
+focused `10 passed, 219 deselected`, followed by the final exact result below.
+
+### Final verification after Fix Round 5
+
+Plan-exact focused provider/audit command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py tests/test_pit_optimizer_v2.py -k "pit_optimizer_v2 or call_budget or provider_call or budget_reservation"
+233 passed, 518 deselected, 1 warning in 87.95s
+```
+
+Dedicated Round 5 security slice:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "generic_audit_namespace or public_append_event_cannot or supported_public_audit_attack or recovery_authenticates_before or linked_protected_artifact or reparse_protected_artifact or hashes_the_same_protected_bytes or requires_exact_optimizer_loop_state or gateway_sends_one_all_r1_call"
+20 passed, 209 deselected, 1 warning in 5.93s
+```
+
+The warning is the repository's pre-existing pytest configuration warning for
+the unknown `cache_dir` option.
+
+Focused Ruff, bytecode compilation, and whitespace verification:
+
+```text
+python -B -m ruff check agent_loop.py core/pit_optimization_contract.py core/pit_optimizer_authorization.py tests/test_agent_loop.py tests/test_pit_optimizer_v2.py
+All checks passed!
+
+python -B -m py_compile agent_loop.py core/pit_optimization_contract.py core/pit_optimizer_authorization.py tests/test_agent_loop.py tests/test_pit_optimizer_v2.py
+exit 0
+
+git diff --check
+exit 0 (only repository Windows LF-to-CRLF notices)
+```
+
+### Audit/accounting, resource, and compatibility evidence
+
+- The genuine accepted fake path records reservation, reserved commitment,
+  started commitment, and reconciliation in that order and still sends exactly
+  one all-R1 fake request. Definite before-send, uncertain-start, authoritative
+  response, exact terminal-code, fresh restore, canonical plan/pricing/source,
+  and legacy schema-v1 behavior remain covered by the exact focus.
+- The recovery no-mutation assertion captures calls, prompt/completion/total and
+  reserved tokens, float and Decimal reserved USD, spent/authoritative/retained
+  USD, retained tokens, incomplete-accounting count, active reservations, and
+  reconciliation maps before and after rejected evidence.
+- Provider/budget/receipt evidence remains closed lifecycle, model, pricing,
+  accounting, reservation, and digest data. No prompt, policy source, raw model
+  response, credential, header, or operator approval is persisted or reported.
+- Every client, response, pricing loader, and SDK constructor was injected and
+  fake. Every ledger/audit path was under pytest temporary roots. The exact
+  foreground commands exited; no provider transmission, live pricing fetch,
+  real SDK construction, permanent ledger, replay/parity job, Docker, helper
+  process, upload, push, merge, or cloud action occurred.
+
+### Remaining concerns
+
+- Live provider/SDK compatibility remains intentionally untested at this safety
+  boundary.
+- Pre-Round-5 optimizer terminal histories do not contain the new trusted
+  gateway commitment and therefore cannot be auto-resealed; they fail closed
+  and require an explicit trusted migration or terminal disposition. Legacy
+  schema-v1 provider records and standalone authorization accounting remain
+  supported.
+- Verification noise is limited to the pre-existing unknown `cache_dir` warning.

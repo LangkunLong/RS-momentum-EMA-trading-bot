@@ -1,0 +1,10 @@
+"""Bounded primary evidence for dated ticker corrections."""
+import runpy
+from pathlib import Path
+acquire = runpy.run_path(str(Path(__file__).with_name('nasdaq-acquisition-download.py')))['acquire']
+for source in [
+    ('public-nasdaq-gehc-fisv-20230607.html','https://www.nasdaq.com/press-release/ge-healthcare-technologies-inc.-to-join-the-nasdaq-100-indexr-beginning-june-7-2023'),
+    ('public-nasdaq-fb-meta-ECA2022-125.html','https://www.nasdaqtrader.com/TraderNews.aspx?id=ECA2022-125'),
+    ('public-nasdaq-annual-20251222.html','https://www.nasdaq.com/press-release/annual-changes-nasdaq-100-indexr-2025-12-13'),
+]:
+    acquire(*source)

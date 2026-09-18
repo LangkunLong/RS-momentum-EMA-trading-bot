@@ -1,0 +1,173 @@
+# Task 5 Fresh Review: Candidate Confinement
+
+**Range:** `b2eb01c97869f6f3e3c700e3db418c0f60e436e7..e815b244c21ff4b570c25d7f49d47b1fc167efee`  
+**Verdict:** **NEEDS FIXES**  
+**Finding count:** Critical 0, Important 5, Minor 3
+
+The review was read-only except for this requested review artifact. No provider, network, Docker, replay, pricing, or broad-suite execution was used.
+
+## Required Fixes
+
+### Important 1 — Statelessness and determinism are not enforced at either boundary
+
+**Requirement:** Task 5 brief lines 249-254 and 261-291; approved design lines 468-481. Candidate modules may contain only pure functions and immutable constants, and validation must perform repeated identical-snapshot probes before and after unrelated calls.
+
+**Evidence:**
+
+- `core/pit_optimizer_candidate.py:301-320` rejects writes only when the assignment root is an input argument or a local function. Writes rooted in the allowed `math` module or imported contract classes are accepted. A focused reproducer confirmed that `validate_policy_ast` accepts `math.pi += 1.0` inside `evaluate_entry`; the same gap permits assignments such as `EntryDecision.to_primitive = _helper`.
+- `core/strategy_policy/worker.py:339-352` implements only a passive, unbounded cache of snapshots that happen to be called. `agent_loop.py:4591` constructs it and `agent_loop.py:4686` observes normal calls, but there is no code that schedules the required A-B-A probe.
+- `tests/test_pit_optimizer_v2.py:2982-2994` invokes `DecisionDeterminismGuard` directly. It does not cross `PolicyWorkerSession`, the authenticated protocol, or a validation path, so its name does not prove the required probe occurs.
+- `core/pit_optimizer_candidate.py:116-133` permits sets/set comprehensions and order-dependent loops, while the policy runner argv at `agent_loop.py:4888-4920` supplies no fixed `PYTHONHASHSEED` to the container. Fresh fold workers can therefore disagree even when each worker is internally stable.
+
+**Impact:** A candidate can retain process-global state or vary across fresh workers. The passive guard catches only a naturally repeated snapshot in one process; it neither proves purity nor bounds controller memory. This violates the principal untrusted-code invariant.
+
+**RED tests to add:**
+
+1. Assert AST rejection for attribute/subscript writes rooted in every imported capability, including `math.pi += 1.0` and `EntryDecision.to_primitive = _helper`.
+2. Drive an authenticated fake session through A, unrelated B, then A again with a stateful candidate response and require the closed `candidate_nondeterminism` result without invoking the guard directly.
+3. Prove cross-worker determinism for an otherwise valid policy that selects the first value from a string set, either by requiring a fixed container hash seed or by rejecting unordered iteration statically.
+4. Prove the probe state is explicitly bounded.
+
+**Required fix:** Close assignment/mutating-call roots to local ephemeral objects only; add an explicit, unavoidable bounded probe path at the fold-validation boundary; and fix the container hash seed or reject order-dependent constructs.
+
+### Important 2 — The context-fit helper permits silent feedback omission and does not measure the complete role input
+
+**Requirement:** Task 5 brief lines 255-260; approved design lines 331-334 and 381-382. Later investigators must receive all prior bounded summaries, and the exact complete canonical UTF-8 role input must be accepted or rejected without dropping sections.
+
+**Evidence:**
+
+- `core/pit_optimizer_candidate.py:691-698` imposes only upper bounds. For iteration 2 it rejects more than one summary but accepts zero summaries, a summary for the wrong iteration, and non-contiguous history. A focused reproducer confirmed that an iteration-2 investigator budget with `prior_iterations=()` is accepted.
+- `core/pit_optimizer_candidate.py:703-721` renders only `source_bundle` and `prior_iterations`; it omits the other dedicated investigator/author/critic fields from the measured payload. It also uses default `ensure_ascii=True`, unlike the approved canonical UTF-8 encoder in `core/pit_optimization_contract.py:320-327`.
+- `tests/test_pit_optimizer_v2.py:2789-2818` proves one prior summary succeeds and two fail, but never proves that zero, wrong-numbered, reordered, or gapped feedback fails, nor that the complete role input is measured.
+
+**Impact:** A future caller can silently omit critic/rejection feedback and still pass pre-call validation. The helper can also accept a partial payload that exceeds the sealed cap once the omitted role sections are added, or falsely reject Unicode due to noncanonical byte counting.
+
+**RED tests to add:**
+
+1. For the two-iteration canary, require exactly feedback iteration `(1,)` before investigator iteration 2; reject empty, `(2,)`, duplicates, reordering, and any prior summary on iteration 1.
+2. For the general eight-iteration contract, require the exact contiguous prefix `1..role_iteration-1`.
+3. Render the actual full role contract with all dedicated fields and compare its `canonical_json_bytes()` to the sealed section/total cap; include non-ASCII text.
+4. Exercise both classifications: candidate-attributable prospective growth is `next_context_oversize`, while an already-unfit pre-call payload is terminal `context_budget_exhausted`.
+
+**Required fix:** Validate exact retained-history lineage and reuse the complete canonical role-input renderer/contract instead of reconstructing a two-field approximation.
+
+### Important 3 — `CandidateIdentity` is forgeable and its self-digest is not authenticated at consumption
+
+**Requirement:** Task 5 brief lines 28-72 and the approved design's controller-derived identity boundary at lines 164-180.
+
+**Evidence:**
+
+- `core/pit_optimizer_candidate.py:157-167` is an unsealed dataclass with no field validation and no recomputation of `identity_sha256`.
+- `core/pit_optimizer_candidate.py:617-630` treats any `isinstance(candidate, CandidateIdentity)` as trusted and compares only paths and symbols.
+- A focused reproducer constructed a `CandidateIdentity` with `source_commit="forged"`, boolean interface version, invalid component digests, and an arbitrary identity hash; `validate_author_manifest` accepted it when paths/symbols matched.
+- `tests/test_pit_optimizer_v2.py:2465-2536` inspects only the object returned by `validate_candidate_diff`; it has no forged, tampered, or deserialized identity negative.
+
+**Impact:** Any later persistence/reload or internal call site can present an unattested identity while passing the advertised author-manifest trust boundary. A hash field that is never validated is not authentication.
+
+**RED tests to add:**
+
+1. Reject direct construction/consumption without a controller seal.
+2. Starting from a valid returned identity, independently alter every field and `identity_sha256`; each altered identity must fail before manifest equality is considered.
+3. Prove a recomputed digest over attacker-selected fields is still rejected unless the identity came from the authenticated Git/source derivation boundary.
+
+**Required fix:** Make controller derivation unforgeable (for example, a private seal plus strict field/digest validation), or reauthenticate every identity from trusted source inputs before any downstream use. `validate_author_manifest` must verify identity authenticity first.
+
+### Important 4 — Valid constant and multi-file candidates cannot produce one author manifest accepted by both contracts
+
+**Requirement:** Task 5 brief lines 33-35, 150-165, and 254: changed function/constant symbols are controller-derived and must exactly equal `AuthorArtifact`.
+
+**Evidence:**
+
+- `core/pit_optimizer_candidate.py:345-402` includes changed uppercase `Assign`/`AnnAssign` constants in `changed_symbols`, and `validate_policy_ast` intentionally accepts immutable module constants.
+- `core/pit_optimization_contract.py:103-116` and `core/pit_optimization_contract.py:426-435` allow `AuthorArtifact.changed_symbols` to contain only the five public callable symbols. A focused reproducer derived `core.strategy_policy.entry.VALUE` from an AST-valid constant edit, after which `AuthorArtifact` construction failed as outside scope.
+- `core/pit_optimizer_candidate.py:575-583` canonicalizes identity paths by sorting them, while `core/pit_optimization_contract.py:2932-2938` requires `AuthorArtifact.changed_paths` to equal unified-diff section order. For a valid two-file diff whose sections are not alphabetical, no single `changed_paths` tuple can pass both checks; `validate_author_manifest` compares tuples exactly at `core/pit_optimizer_candidate.py:626-629`.
+- Existing coverage uses one function in one file (`tests/test_pit_optimizer_v2.py:2465-2536`) and therefore misses both contradictions.
+
+**Impact:** The advertised immutable-constant edit surface and some otherwise valid two/three-file patches are deterministically rejected before replay. This is an internal schema mismatch, not candidate policy rejection.
+
+**RED tests to add:**
+
+1. Run a constant-only candidate through `validate_candidate_diff`, construct the exactly matching `AuthorArtifact`, and require manifest validation to succeed.
+2. Use a two-file diff in reverse lexical order and require the same artifact to pass both `AuthorInput.validate_artifact` and `validate_author_manifest`.
+
+**Required fix:** Separate closed callable interface declarations from the syntax allowed for controller-derived changed constants, and choose one canonical path ordering across diff validation, identity, author parsing, and manifest equality.
+
+### Important 5 — Worker cleanup manages only the Docker CLI process and aborts on cleanup errors
+
+**Requirement:** Task 5 brief lines 328-333; approved design lines 482-496. Cleanup must be unconditional across success, candidate error, timeout, cancellation, controller error, and initialization failure.
+
+**Evidence:**
+
+- `agent_loop.py:4888-4949` launches `docker run --rm --name ...` but retains only the Docker CLI `Popen`. No owned container ID/label is captured, and no daemon-side kill/wait/remove or absence check occurs.
+- `PolicyWorkerSession.close` at `agent_loop.py:4694-4720` terminates/waits/kills that CLI process only. Killing or abruptly terminating an attached CLI does not prove the daemon container stopped, especially after the escalation-to-`kill` path or on Windows.
+- `_cleanup_unowned_policy_process` at `agent_loop.py:4539-4561` does not catch `terminate()` failure and therefore never attempts `kill()`. A focused fake reproduced `CLEANUP_RAISED KILLED False`.
+- `PolicyWorkerSession.close` marks itself closed before cleanup and does not isolate errors between stdin close, terminate/wait/kill, stdout/stderr close, thread joins, and private-tree removal. One failing step can skip all later steps and makes retry impossible. The bootstrap-failure path at `agent_loop.py:4939-4949` can consequently mask the initiating error and leak process/tree state.
+- `tests/test_agent_loop.py:354-574` uses a fake whose `terminate()` immediately sets a terminal return code. It proves happy fake-handle cleanup, not daemon container cleanup, cleanup-error resilience, cancellation, malformed-response failure, bootstrap-write failure, thread-start failure, or fold-timeout cleanup.
+
+**Impact:** An untrusted candidate container can outlive its method/fold deadline, retain its bind mount, and continue consuming resources. Cleanup failures can also mask the original candidate/controller error.
+
+**RED tests to add:**
+
+1. Inject failures independently from stdin close, terminate, first wait, kill, stdout close, stderr close, thread start/join, and private-tree removal; assert every remaining cleanup action is still attempted and the primary error remains attributable.
+2. Cover bootstrap write/flush failure, malformed authenticated response, candidate exception/EOF, method timeout, fold timeout, and a `BaseException` cancellation path.
+3. Model an owned daemon container separately from the CLI process and require explicit kill/wait/remove plus a verified-absent postcondition on every exit path.
+
+**Required fix:** Reuse the existing owned-container lifecycle pattern (create/inspect/start, owner label and full ID, shielded finally, force-remove, verified absence) or implement an equivalent explicit daemon cleanup protocol. Make each local cleanup action independent and idempotent.
+
+## Minor Required Hardening
+
+### Minor 1 — JSON scalar types are not fully closed
+
+`core/strategy_policy/worker.py:103` uses `schema_version != 1`, so JSON `true` is accepted as schema version 1; a focused reproducer confirmed the resulting field remains `bool`. Request/response decoders at `core/strategy_policy/worker.py:244` and `core/strategy_policy/worker.py:318` likewise use equality only, so authenticated `true` or `1.0` sequences compare equal to integer 1. The envelope dataclasses at lines 134-151 have no validating `__post_init__`.
+
+Add RED cases for boolean/float schema and sequence values with correctly recomputed HMACs, then require `type(value) is int`, positive ranges, and strict envelope validation before constructing typed envelopes. This is explicitly part of schema/type closure, but it does not currently expose a new capability by itself.
+
+### Minor 2 — Intermediate host links/reparse points can escape candidate-root provenance
+
+`agent_loop.py:4767-4801` checks the final candidate root and final source files, but not every intermediate component. A path such as `candidate_root/core` implemented as a symlink/junction can lead to an outside `strategy_policy/*.py`; the final files themselves need not be links or reparse points. The same issue exists in `_read_policy_sources` at `core/pit_optimizer_candidate.py:429-438` and its caller at lines 640-655.
+
+Add a RED candidate with an intermediate directory symlink/junction to an outside valid policy tree and require both source bundling and worker packaging to reject it before reading. Resolve and lstat every component, prove each final file remains beneath the exact approved root, and revalidate trusted package inputs at copy time.
+
+### Minor 3 — The committed test/report evidence overstates coverage and records the wrong base
+
+`.superpowers/sdd/2026-08-27-model-authored-pit-optimizer/task-5-report.md:4` records `b2eb01c97869d27d90f090cc1e17a50f1f6479bb`, which is not a Git object in this worktree. The actual base is `b2eb01c97869f6f3e3c700e3db418c0f60e436e7`. Report lines 155-157 and 165-167 claim unconditional cleanup/cancellation rollback, state rejection, complete feedback, and strict typed protocol beyond what the code/tests prove.
+
+In addition to the RED tests above, the required negative matrix still lacks focused V2 coverage for hunk 13, protected `contracts.py`/`runtime.py`/`worker.py` targets, actual symlink/submodule/generated states, cumulative hunk/line/byte growth (the current cumulative test checks only file count), and rollback fault/cancellation injection. Existing legacy structural tests are not selected by the reported final Task 5 command. Add those cases and correct the report's provenance and claims.
+
+## Requirement Coverage
+
+| Area | Result | Evidence / action |
+|---|---|---|
+| Sole `PatchBounds`; legacy 4/25/400/256 KiB; PIT 3/12/200/64 KiB | Meets implementation requirement | Sole type remains in `core/pit_optimization_contract.py`; defaults and PIT ceilings are threaded through parser/validator. Complete the negative matrix in Minor 3. |
+| Git-derived cumulative diff and nominal rollback | Meets nominal implementation requirement | `agent_loop.py:3252-3273` derives from equal HEADs; `core/pit_optimizer_candidate.py:495-614` validates incremental and cumulative diffs with the same bounds and restores exact policy bytes after post-apply failures. Add cancellation/fault rollback evidence per Minor 3. |
+| Path/file/hunk/line/byte/binary/rename/symlink/submodule/no-op scope | Implementation is predominantly closed | Fixed three-file scope, tracked `100644` checks, structural parser, bounds, and no-op handling are present. Required focused negatives remain missing (Minor 3), and ancestor containment needs hardening (Minor 2). |
+| Authenticated candidate identity and exact author manifest | **Blocked** | Important 3 and Important 4. |
+| Closed AST/compile allowlist and statelessness | **Blocked** | Important 1 and Important 4. |
+| Complete source/context packaging and next-context classification | **Blocked** | Exact three-file bundles are sealed, but history/full-input enforcement is incomplete (Important 2). |
+| JSON-lines closure, HMAC/digest/sequence/chain/method/type binding | Partially meets | Duplicate/unknown fields, payload digests, HMACs, sequence/chain/request/method pairing, and 16-KiB framing exist. Scalar type closure and actual probe coverage remain open (Minor 1, Important 1). |
+| `JsonLinePolicyClient` typed dispatch and idempotent close | Meets requirement | All five exact snapshot/decision pairs are checked in `core/strategy_policy/runtime.py:40-103`; close delegates once. Session cleanup beneath it is blocked by Important 5. |
+| Worker capability, package, argv/env/mount/resource/stdio/time/cleanup | Partially meets | Production Docker capability validation, exact file package, list argv, requested flags, sanitized Docker-CLI environment, `close_fds=True`, bounded response/stderr retention, and time constants are present. Daemon ownership/cleanup and ancestor containment are open (Important 5, Minor 2). |
+| Tasks 1-4 regressions | No focused regression observed | The permitted Task 5 selection passed. No broad suite was run by design, so this is not a broad regression claim. |
+
+## Test/Report Audit
+
+- Reproduced the exact focused command: **80 passed, 472 deselected**, one pre-existing unknown-`cache_dir` warning, exit 0 in 8.81 seconds.
+- Reproduced the focused Ruff command: **All checks passed**, exit 0.
+- `git diff --check b2eb01c..e815b24` passed.
+- Tiny in-memory reproducers confirmed AST module mutation acceptance, iteration-2 empty-history acceptance, forged-identity acceptance, constant-manifest incompatibility, boolean schema acceptance, and cleanup abort before kill.
+- Passing tests do not override the gaps above: several test names assert helper/fake behavior rather than the complete trust-boundary behavior claimed by the plan/report.
+
+## Resource/Cleanup Audit
+
+- No credential/provider material is copied into the seven-file worker package; the HMAC key/nonce are freshly generated and sent only through bootstrap. The Docker CLI environment is allowlisted, and stdio is the only inherited process I/O surface.
+- The requested container flags, one read-only package mount, 1-second method timeout, 900-second fold timeout, 16-KiB line checks, and 64-KiB retained stderr ceiling are present.
+- Stderr is drained concurrently, but cleanup exceptions can skip stream closure/thread joins/tree removal. More importantly, the code never proves daemon-container termination or removal. Important 5 is therefore the controlling resource verdict.
+- No real Docker process or background process was started during this review.
+
+## Deferred Minor Observations
+
+None. The three Minor findings are lower-severity, but each maps directly to an approved Task 5 schema, path-validation, or audit requirement and should be closed with the required fixes.
+
+## Final Verdict
+
+**NEEDS FIXES — 0 Critical, 5 Important, 3 Minor.** The focused tests and lint are green, but the committed implementation does not yet enforce candidate statelessness, complete feedback, authenticated identity, representable manifest equality, or unconditional owned-container cleanup.

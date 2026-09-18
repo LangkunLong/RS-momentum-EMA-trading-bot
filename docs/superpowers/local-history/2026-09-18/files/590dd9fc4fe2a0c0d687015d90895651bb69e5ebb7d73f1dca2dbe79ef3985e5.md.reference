@@ -1,0 +1,27 @@
+# Actual historical summary comparison after H3c review
+
+This is verification preparation only. No summary has been run for H3c. Execute only after independent source and transitive immutable-callgraph review passes. Use the explicit completed_history direct API, command summarize, against the two original typed manifests. Call once per archive; do not construct a substituted manifest, request, role package, record or finalized wrapper. Do not invoke CLI runtime validation or operational adapters.
+
+The prepared collector is collect_actual_historical_summaries.py. Its static review is complete after correcting the keyword-only manifest loader argument. Invoke with py -3.13 -B and --approved-review-sha256 set to the accepted H3c review digest. Immediately before invocation, independently compare all final source hashes with the reviewed evidence; the review digest argument alone does not enforce source-byte equality. The collector has never been executed as of this preparation.
+
+Before either call, hash every file under both asserted extended-length Windows archive roots and require exact equality with the accepted C-a before_file_hashes maps. Preserve complete maps outside the archives. After the calls, hash both complete trees again and require exact equality, including filenames and counts (579 runtime04, 83 actual06). Recompute the full 56-file evaluator closure and capture current source hashes. If a call fails, preserve its actual exception chain and halt dependent readiness work; do not repair, bypass, or replace the result with derived counts.
+
+## Runtime04 comparison
+
+Original manifest: campaigns/development-controller-two-rounds-20260907-04/manifest.json, SHA 8fcae0423117f3a234e64391c277bd7efe5cbb775ff61ec879d8cbeb5659d37c.
+
+The original actual terminal result is runtime-04/resume-05-result.json, file SHA 8dc264db67938ca9f5e46e59f0b000f1185003ba942aeb304a87cef468e72581. Its summary has 24 fields. Preserve that original object. Compare the returned summary's 23 overlapping non-command fields, comparing Decimal-valued fields numerically and every other field exactly. Record the expected command-label difference explicitly: original resume, new summarize. Do not rewrite either command field to claim literal object equality.
+
+Check the three added fields separately against authenticated checkpoint/cleanup evidence: completed_lifecycle_rounds=1, evaluated_feedback_rounds=1, render_rejected_experiments=0. Round2 remains failed with discovery_evaluation:deadline_exceeded; it is not a second evaluated feedback round. The C-a full summary failed and is not a returned-summary baseline.
+
+## Actual06 comparison
+
+Original manifest: campaigns/development-provider-two-rounds-20260907-06/manifest.json, SHA d90ed717c0d6b34d4cfa6bf7e2dd1f753e68c43b1127b200a66d2a9f930dfdf6.
+
+The prior real returned summary is increment-c-history-verifier/current-verifier-evidence.json at archives[provider-runtime-06].full_summary.summary. Evidence file SHA is b1b648418bfaa66f830f056570964851880a0c7181ef6adbf0a901d9179c0a3b.
+
+Compare all 27 returned fields, including the same summarize command, with Decimal-valued fields compared numerically. Counts remain 0/0/0. Retain failed/runtime_failed, rendering:stage_failed, two calls, 8596 tokens and cost 0.04234. Do not use post-guidance-summary.json's empty stdout as a baseline or manufacture a render-rejected committed record.
+
+## Evidence and limits
+
+Save actual returned primitives, exact comparison results, callgraph-review reference, source/evaluator hashes and full preservation maps in a fresh H3 results package. Existing original result wrappers are evidence, not independently authenticated campaign authorities; the new public historical reader must authenticate original provenance before any summary is accepted. These two failed historical campaigns do not meet the future two-evaluated-round success condition. Passing comparisons supports C-b readiness review, not a paid execution grant.

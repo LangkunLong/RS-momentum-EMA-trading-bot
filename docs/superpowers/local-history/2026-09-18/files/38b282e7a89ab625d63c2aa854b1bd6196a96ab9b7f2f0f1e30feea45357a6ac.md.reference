@@ -1,0 +1,114 @@
+# Next Luna session: B3b durable rejected-record authority only
+
+Work in C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.worktrees\pit-optimizer-v5-architecture.
+
+A, B1, corrected B2 and B3a are architect-approved. Read:
+- docs/superpowers/plans/2026-09-07-pit-optimizer-v5-recovery-design.md
+- docs/superpowers/plans/2026-09-07-pit-optimizer-v5-luna-recovery.md, including the latest B3a decision
+- .artifacts/pit-optimizer-v5/development/luna-recovery-b3a/architect-review.md and architect-verification.json
+
+Implement B3b only and stop for architect review before B4. B3b authenticates rejected records against a durable journal event and prepares the existing publication boundary. It does not activate the new renderer or complete/recover rejected-only rounds.
+
+## 1. Capture the starting state
+
+Confirm all current source hashes match the B3a architect verification. Save exact preimages into a fresh `.artifacts/pit-optimizer-v5/development/luna-recovery-b3b` package before editing. Do not overwrite another session's changes or older review packages.
+
+Expected production scope:
+- artifacts.py: one shared rejected-record authority validator, plus calls from append_experiment/load_experiment and a minimal private event-reference authentication helper if needed.
+- runtime.py: _publish's union annotation and narrowly scoped source-authority/type guards.
+
+Preserve production_runtime.py, B3a carrier and constructors, B2 append/replay semantics, memory.py, rendering.py, provider.py, candidate_ir.py, contracts.py, all canonical schemas and historical artifacts. Do not change _verify_finalized_discovery_rounds yet; see the explicit B4 note below.
+
+## 2. Understand the two invalid-record forms
+
+B3a's rejected record has status invalid, closed validation code policy_source_unbounded_or_stateful, pre-validation-invalid identity, and exactly one artifact ref: its durable RoundEventV5 **event-file** reference. A payload hash alone is insufficient to prove the rejection was accepted in a round journal.
+
+Existing materialized-validation-invalid records use the older validation event path and artifact refs. Preserve that distinct path and old encodings. Do not impose the new render-rejected event requirement indiscriminately on every historical invalid record.
+
+Route to strict rejection authentication if either:
+- the validation code is the reserved rendering code; or
+- any referenced canonical event is a render_rejected event.
+
+Do not gate the second condition on record.status == invalid: a valid/evaluated record cannot carry rejection authority. Do not ignore an event reference because its bytes, path or schema are malformed, missing or inconsistent. Event-file refs must be authenticated and decoded before event-kind routing; repository errors must propagate. If a payload reference under payloads/render_rejected/ is supplied in place of the durable event-file ref, fail rather than accepting it as authority.
+
+This means removing the event reference from a closed-code record fails, changing the failure code while retaining a rejection reference fails, wrong status fails, and a bare payload cannot substitute for durable journal membership. Unrelated legacy records without rendering rejection authority retain their existing path. Avoid loading every historical journal for ordinary records.
+
+## 3. Authenticate the event file and journal membership
+
+Use repository safe reads and existing strict decoding/canonical helpers. Do not use raw filesystem traversal, guessed paths, raw exception text or a new schema.
+
+For the event reference:
+1. Authenticate exact bytes against ArtifactRefV5; strictly decode RoundEventV5 and verify canonical bytes plus SHA equality.
+2. Require event_kind render_rejected. Require the exact repository-generated path from the decoded campaign_id, round_index and sequence: `events/{campaign_id}/{round_index:04d}/{sequence:06d}.json`. This is exact canonical formatting, including values wider than the minimum widths; do not use only isdigit/len checks here. Let safe-component validation reject unsafe campaign IDs.
+3. Call load_round_events for that decoded campaign and round. Its existing fold and corrected B2 context validator authenticate sequence/predecessors, the prior intent, accepted author, full hypothesis, bounded assignment, rejected identity, conflicts and critic exclusion.
+4. Require that the referenced event is the exact event at its durable sequence, with matching bytes/hash/reference. Merely finding a self-consistent standalone event file is insufficient.
+5. Load its exact RenderRejectionPayloadV5 through the existing payload decoder. Do not implement another permissive decoder or another assignment enumeration.
+
+This validation must work for a valid open journal prefix: record append precedes checkpoint/cleanup. Do not require completed-round cleanup or a critic before a rejection record can be appended. When reading a completed journal, authenticate the actual current chain without modifying it.
+
+Avoid recursion: record authentication may load round events and role invocations; those paths must not load the same record/checkpoint again. Verify that call graph statically.
+
+## 4. Bind the full record to that authority
+
+From the authenticated round events/payloads, retrieve its unique intent and accepted author package. Reuse B2's context validation; do not weaken it. Require:
+- exactly `(rejection_event_ref,)` in this rejected record's artifact_refs;
+- status invalid and the pre-validation-invalid identity type;
+- record.experiment_id and complete experiment_identity equal the event/payload identity;
+- record.round_index equals event.round_index; the unique intent must come from that same authenticated round journal (RoundIntentPayloadV5 has no separate round_index field);
+- the record's parent revision, parent semantic fingerprint, pit_data_scope, semantic_mode, complete hypothesis hash and discovery-plan identity equal the intent;
+- record.template/template_sha256 match the authenticated accepted author's complete StructuralTemplateV5, not merely its textual hypothesis ID;
+- the assignment's canonical typed bytes match the rejection payload assignment; preserve distinctions such as bool versus integer;
+- validation is exactly False, the payload's one closed failure code, and empty changed symbols;
+- the existing invalid-record invariant still forbids policy revision, candidate fingerprint, quick/campaign evidence, target gap, critic fields and discovery episodes.
+
+Use existing dataclass invariants where sufficient and add repository comparisons where those invariants lack journal context. Avoid duplicating serialized authority fields. The event campaign is bound by the exact reference and journal; ExperimentRecordV5 has no standalone campaign field, so do not invent one.
+
+## 5. Apply the same validation to append and load
+
+Call one shared validator from:
+- append_experiment, before create-only record persistence;
+- load_experiment, after exact decoding/canonical authentication and before returning the record.
+
+Retain existing referenced-artifact and critic authentication. Preserve established error conventions: repository read/authentication failures propagate; decoded binding failures are fail-closed schema failures (with record reference on load) or the existing append validation convention. Do not swallow errors and fall back to the legacy path.
+
+Trace load_experiment_journal, _verify_record_refs, checkpoint loading and projection recovery through load_experiment to show they inherit the new record authentication. Avoid a separate weaker replay path. Do not publish a checkpoint or append a record during verification.
+
+## 6. Narrowly prepare _publish for the explicit union
+
+Change its candidates annotation to CandidateRecordEvidenceV5. Retain existing record and checkpoint ordering.
+
+Before any materialized/source access, require an archive-eligible record status (evaluated or zero_trade) and an exact CandidateEvidenceV5 with matching identity. Reject an impossible eligible-record/RejectedCandidateEvidenceV5 pairing using the existing typed runtime failure convention. Validate cheap candidate/record pairing before persistence where practical, so a known mismatch does not create partial records.
+
+Rejected invalid records remain part of stored records, checkpoint references and history, but yield no ArchiveRecordAuthorityV5, source bundle authority, promotion or performance entry. Do not fabricate optional materialization fields on the rejected carrier. Preserve the existing archive reducer's filtering; no general search/ranking rewrite is required.
+
+Do not call _publish with newly made rejected records in this increment. Runtime activation is B4.
+
+## 7. Keep the B4 boundary explicit
+
+Do not switch strict render_variants, append a rejection event, alter _candidate, invoke factories in a new live branch, remove no_testable_experiments, change critic requests, complete an all-invalid round, resume a campaign, refresh a deadline, or modify cleanup/feedback.
+
+Carry this known follow-up into the review package: artifacts.py._verify_finalized_discovery_rounds currently compares record IDs only to rendered_variant IDs and requires investigator/author/critic completions. _completed_result and recovery also have critic assumptions. B4 must handle valid rejection-inclusive/rejection-only closure while preserving all authority checks and mandatory critic for testable records. B3b is not an approval to relax these now or claim the end-to-end lifecycle works.
+
+## 8. Verify with real archived inputs and static review only
+
+Run scoped Ruff, in-memory compilation, and scoped diff checking for changed files. Recompute evaluator source identity; require 56 covered files and unchanged identity 005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4. Verify all untouched B3a/B2/B1/A and candidate_ir hashes.
+
+Read-only compatibility input already verified by the architect:
+- Repository root: .artifacts/pit-optimizer-v5/development/runtime-04 (the older provider-free actual evaluation, not provider-runtime-04).
+- Record ref: records/9e2a2dfdf35ce55653a3b9ec0d39ce87740a69a940ad5f3e473fd38ea629390d.json
+- SHA: af6c73e632a3dc47cb344ecf3d1a55f9f58ba3e755e29fe992e0c03d0da103ac
+- Expected: evaluated, round 1, four discovery episodes, complete critic binding; artifact refs have adapter-state/payloads prefixes.
+
+Load that record through the updated repository and confirm unchanged bytes/hash and facts. This is read-only historical compatibility, not a new evaluation. Do not execute its campaign, regenerate its evidence or call a provider.
+
+Actual06's manifest/intent/accepted author may also be authenticated read-only. It has no durable rejection event and no new invalid record. Do not invent an event/ref/record to exercise B3b. New rejected append/load and publication paths remain static-reviewed until suitable real authorized evidence exists.
+
+Provide a static invariant table covering valid rejection authority, missing event, standalone/wrong-journal event, noncanonical/wrong-round path, wrong template/assignment/hypothesis/mode/parent fingerprint, mismatched status/code, payload-only substitution, forbidden downstream evidence, and legacy-record compatibility. Describe expected code paths; do not execute fabricated cases.
+
+No tests may be read, created, changed or run. No synthetic probes/events/records, fake responses, model/API calls, credentials, candidate evaluations, campaigns, evaluator rebuilds, commits, pushes or deployment.
+
+## 9. Return a fresh B3b checkpoint package
+
+Save exact preimages, correction-scoped diffs with usable repo-relative labels, final hashes, symbol/change list, the append/load authentication call graph, static invariant table, actual historical compatibility evidence, scoped checks, evaluator identity and limitations.
+
+Stop for principal architect review before B4. The two real evaluated feedback rounds remain unfinished. This is local implementation scope, not a new external-call budget grant.

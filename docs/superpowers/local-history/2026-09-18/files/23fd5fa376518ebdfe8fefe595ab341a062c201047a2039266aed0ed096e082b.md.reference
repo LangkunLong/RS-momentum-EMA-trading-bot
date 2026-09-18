@@ -1,0 +1,11 @@
+# P1 immutable preservation report
+
+The complete per-file baseline maps were compared to current file bytes. Windows extended paths were constructed as `chr(92) * 2 + '?' + chr(92) + absolute_path`, and every file was enumerated through the extended root. The canonical baseline map is pinned by `.artifacts/pit-optimizer-v5/development/increment-c-history-verifier/current-verifier-evidence.json`, whose verified SHA-256 is `b1b648418bfaa66f830f056570964851880a0c7181ef6adbf0a901d9179c0a3b`.
+
+Results:
+
+- `runtime-04`: expected 579 files, actual 579 files, 69,994,319 bytes, zero changed/missing paths, zero added paths; baseline tree SHA-256 `1988b37428bcbf647d468ec163b7ca235b99b26b2a7bcee80d7de733e19f8aa9`.
+- `provider-runtime-06`: expected 83 files, actual 83 files, 68,980,002 bytes, zero changed/missing paths, zero added paths; baseline tree SHA-256 `2c411970b0a2d9cdfd2499afa01aed14fa723bb3ae5f4d44baee0d539b923f16`.
+- Evaluator closure: all 56 source paths in `increment-c-history-h3/h3b-evaluator-source-map.json` match their recorded SHA-256 values. Canonical map SHA-256 remains `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4`.
+
+This was a static full-map byte comparison. No archive reader, historical summary, evaluator, provider, model, or campaign execution was invoked.

@@ -1,0 +1,15 @@
+# Architect checkpoint B2 correction: APPROVED
+
+B2 is approved at artifacts.py SHA `135e006e892c6f32221d542bf5b9150c379d1a37713b3aa0e80307fe444174e1`. This supersedes the prior B2 corrections-required decision. Both findings are resolved; no additional actionable finding was identified in the correction diff and its shared append/replay call paths.
+
+The authenticated author input is explicitly narrowed to AuthorRoleInputV5 and its complete hypothesis hash must match the durable intent before invalid identity derivation. Existing campaign/round, parent, template, assignment, discovery-plan and accepted-author checks remain in place.
+
+Rejected hashes enter the set only after their context passes authentication. With no rejections, the new critic scan returns immediately. Otherwise every critic invocation is authenticated and checked regardless of acceptance or failure, and any bound rejected ID fails. Critics bound only to other candidates remain permitted by this check. The existing fold still rejects candidate work after critic completion. Both append and replay invoke the same validator; load_role_invocation does not recursively load round events.
+
+Independent verification matched the source and preimage hashes, correction patch, actual06 inspection file, unchanged A/B1/B2 guards, and the 56-file evaluator identity `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4`. Scoped Ruff, in-memory compilation and scoped diff checking passed. See `architect-verification.json` for the exact hashes.
+
+The actual06 manifest graph, durable intent and accepted author package were authenticated read-only. Complete author/intent hypothesis hashes match; cap-one assignment and invalid identity are unchanged. Actual06 has zero rejection and critic events. New rejection append/replay, mismatch rejection and mixed-round critic exclusion remain statically reviewed, not executed. This approval does not claim end-to-end campaign validation.
+
+Next scope is B3a only: a separate rejected-candidate carrier and record construction, including optional-critic handling at that construction boundary. B3b will add record-to-journal authentication and publication safeguards. B4 will connect rendering, completion, recovery and subsequent feedback. The new B3a split is an architect scoping decision to keep each Luna review bounded, not a claim that all of B3 is ready.
+
+Detailed next-session instructions are in `next-luna-prompt-b3a.md`. Return for architect review before B3b/B4. No production source, campaign, credentials, external calls, tests, candidate evaluations or deployment were touched during this architect review. The original two evaluated feedback rounds remain unfinished.

@@ -1,0 +1,39 @@
+# H2a task report — shared immutable execution-history predicates
+
+## Scope delivered
+
+H2a changes one production source: `core/pit_optimizer_v5/production_sandbox.py`. It adds nine private, pure `_v5` validators immediately after `ExecutionCleanupRecordV5` and delegates the matching predicate blocks from `LocalContainerExecutorV5.authenticate_execution_history` and `_authenticate_control_history_read_only`. No historical caller, saved-command interpreter, summary activation, schema, evaluator, sandbox protocol, or operational capability was changed.
+
+The helpers are:
+
+- `_validate_history_reservation_v5`
+- `_validate_history_panel_v5`
+- `_validate_history_phases_v5`
+- `_validate_history_terminal_v5`
+- `_validate_history_output_length_v5`
+- `_validate_history_cleanup_v5`
+- `_require_history_control_ready_v5`
+- `_validate_history_control_binding_v5`
+- `_validate_history_control_completion_v5`
+
+All signatures use existing immutable records and authenticated scalar/tuple values. None captures an executor, repository, callback, capability, or filesystem path handle. The cleanup and completed-control helpers return only the booleans needed to preserve the existing live branches.
+
+## Behavioral equivalence
+
+The reservation, panel, phase-prefix/identity/lifecycle, terminal/output, cleanup, readiness, binding, and completed-control conditions retain their original expression ordering and error strings. Live authority gating, state-load order, foreign checks, binary loading, active-control inspection, outer exception wrapping, and the pre-`try` readiness error position are unchanged.
+
+The optional control-created record received explicit short-circuit preservation. Root identity is not derived before creation exists and ready executor/command bindings match; transaction identity does not access `created.transaction_device` or `created.transaction_inode` before creation exists and the root binding matches; Docker identity is not derived before the transaction binding matches. Completion root identity is derived only after the original completed-branch presence/absence guard. Thus an absent creation record continues to produce the original `ValueError`, never an eager `AttributeError`.
+
+`h2a-static-verification.json` compares the sealed preimage with the result. It proves exactly the nine helpers were added; exactly the two designated methods changed; all other 115 functions/methods and all 10 record schemas are byte-identical; helper call sites are limited to the two designated methods; helper bodies do not capture `self` and use only the reviewed pure calls; and both methods retain the exact lexical sequence of effectful reads. `h2a-source.diff` is the narrow preimage diff.
+
+## Verification and preservation
+
+The exact preimage is `pre-h2a-production_sandbox.py`, SHA-256 `8912da187371efd6e01b7fd5a25775ba880dd53ad0db768bed59e0aafbdb8d7d` (201,374 bytes). The final source SHA-256 is `8dd79cef1e524a87cc324745ac7ee49fbbe5e1a91f271ce0d641451dc99337d7` (205,816 bytes). Both are CRLF-only; the final file has 4,623 CRLF sequences and zero bare LF.
+
+Scoped Ruff passed with `py -3.13 -B -m ruff check core/pit_optimizer_v5/production_sandbox.py`. Python 3.13 in-memory compilation and scoped `git diff --check` passed. Outputs are saved in `h2a-ruff.txt`, `h2a-compile.txt`, and `h2a-diff-check.txt`.
+
+The complete 56-file evaluator map remained at `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4`. Extended-length Windows roots were asserted for both real archives. Runtime-04 remained byte-for-byte unchanged across 579 files and 69,994,319 bytes, tree digest `1988b37428bcbf647d468ec163b7ca235b99b26b2a7bcee80d7de733e19f8aa9`. Provider-runtime-06 remained unchanged across 83 files and 68,980,002 bytes, tree digest `2c411970b0a2d9cdfd2499afa01aed14fa723bb3ae5f4d44baee0d539b923f16`. Full per-file before/after maps and `h2a-preservation-check.json` are in this package.
+
+## Limitations and self-review
+
+Per the H2a brief, no tests, synthetic records, mocks, probes, campaigns, evaluator or Docker execution, summaries, provider/API/external calls, credential/environment reads, installs, or commits were used. Predicate failures therefore have static equivalence evidence only. Self-review found no H2b/H3 activation, no changed error text, no schema drift, no effectful helper, and no production change outside the approved file.

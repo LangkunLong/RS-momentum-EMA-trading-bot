@@ -1,0 +1,794 @@
+# Task 5 Implementation Report: Candidate Confinement
+
+Date: 2026-08-28
+Base commit: `b2eb01c97869f6f3e3c700e3db418c0f60e436e7`
+Planned commit message: `feat: confine and attest optimizer candidates`
+
+## Outcome
+
+Implemented the Task 5 candidate-confinement boundary: PatchBounds-aware legacy and PIT patch validation, Git-derived candidate identity, author-manifest equality, closed AST purity and compile checks, bounded source/context packaging, authenticated JSON-lines request/response framing, the typed JSON-lines policy client, and a capability-injected policy-only worker runner. Task 4's schema-v2 contracts and controller seals were reused rather than duplicated or weakened.
+
+## Files changed
+
+- `agent_loop.py`
+  - Parameterized the existing parse/validate/apply path with the sole `PatchBounds` contract while preserving the legacy defaults.
+  - Added strict-UTF-8 Git-derived cumulative diff attestation.
+  - Added `PolicyWorkerSession` and `PolicyWorkerRunner`, including the exact Docker confinement argv, sanitized engine environment, policy-only package generation, timeout/stdio/stderr ceilings, deterministic response guard, and unconditional cleanup paths.
+- `core/pit_optimizer_candidate.py` (new)
+  - Added hard/legacy bounds, exact editable path scope, `CandidateIdentity`, Git-derived identity construction, before/after AST symbol derivation, author-manifest validation, closed AST validation, policy source bundling, and complete-context fit validation.
+- `core/strategy_policy/worker.py` (new)
+  - Added strict closed JSON-lines bootstrap and request/response envelopes, per-session nonce/key creation, payload digests, HMAC authentication, sequence/chain/request/method binding, typed contract parsing, five-method dispatch, line ceilings, and nondeterminism detection.
+- `core/strategy_policy/runtime.py`
+  - Added `JsonLinePolicyClient` with all five typed `StrategyPolicyClient` methods and idempotent session closure.
+- `tests/test_pit_optimizer_v2.py`
+  - Added Task 5 identity, cumulative-bound, author-manifest, AST-purity/compile, source packaging/context, protocol, client, and nondeterminism tests.
+- `tests/test_agent_loop.py`
+  - Added PatchBounds regression/ceiling tests and fake-only worker command, package allowlist, authenticated client-factory, timeout, stderr, descriptor, and cleanup tests.
+
+## TDD evidence
+
+All commands ran synchronously in the isolated worktree with `-p no:cacheprovider --no-cov`; no network, provider, Docker, replay, or broad-suite command was used.
+
+### Baseline
+
+Command:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py tests/test_agent_loop.py -k "policy_worker or patch_bounds or candidate_identity or ast_purity or source_bundle or pit_optimizer_v2"`
+
+Pre-change result: **38 passed, 472 deselected**, exit 0 (plus the repository's existing unknown-`cache_dir` pytest warning).
+
+### Slice 1: Patch bounds, Git-derived identity, author manifest
+
+RED command:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py tests/test_agent_loop.py -k "patch_bounds or candidate_identity or author_manifest"`
+
+RED result: **9 failed, 1 passed, 510 deselected**. Failures were missing `core.pit_optimizer_candidate` and the absent bounds-aware parser path.
+
+GREEN command: same command.
+
+GREEN result: **10 passed, 510 deselected**, exit 0.
+
+### Slice 2: Closed AST purity and before/after symbols
+
+RED command:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "ast_purity"`
+
+RED result: **19 failed**, because `validate_policy_ast` did not exist.
+
+GREEN command: same command.
+
+GREEN result: **19 passed, 43 deselected**, exit 0.
+
+Combined identity/AST checkpoint: **29 passed, 510 deselected**, exit 0.
+
+### Slice 3: Complete bounded source packaging and context fit
+
+RED command:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "source_bundle or source_context or next_context"`
+
+RED result: **3 failed, 2 passed**; the new bundle/context helpers were absent.
+
+GREEN command: same command.
+
+GREEN result: **5 passed, 60 deselected**, exit 0.
+
+The pre-existing schema-v2 sealing tests remain the source of truth for `initial_policy_bytes + 2 * max_diff_bytes + envelope_bytes <= 64 KiB`; Task 5 materializes the exact three-file bundle and rejects oversize prospective context without truncation.
+
+### Slice 4: Authenticated protocol, determinism, and typed client
+
+RED command:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "worker_protocol or worker_nondeterminism"`
+
+RED result: **5 failed**, because the worker protocol and JSON-lines runtime client were absent.
+
+GREEN command: same command.
+
+GREEN result: **5 passed, 65 deselected**, exit 0.
+
+### Slice 5: Capability-injected policy worker runner
+
+RED command:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py -k "policy_worker_command or policy_worker_cleanup or policy_worker_timeout"`
+
+RED result: **2 failed, 478 deselected**, because `PolicyWorkerRunner` did not exist.
+
+After implementation, the same command produced **2 passed, 478 deselected**, exit 0. The broader fake-only worker checkpoint:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py -k "policy_worker"`
+
+Result: **3 passed, 477 deselected**, exit 0, including a complete authenticated fake session and one-shot client factory.
+
+### Self-review regression slices
+
+Candidate rollback plus compile-level syntax RED:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "candidate_identity_rejects_git_derived_cumulative_scope_growth or ast_purity"`
+
+RED result: **2 failed, 19 passed, 50 deselected**. The applied entry edit survived a cumulative-bounds rejection, and an invalidly placed future import passed `ast.parse` without compile validation.
+
+GREEN result after the minimal fixes: **21 passed, 50 deselected**, exit 0.
+
+Post-launch ownership failure RED:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py -k "policy_worker_cleanup_after_process_start_failure"`
+
+RED result: **1 failed, 480 deselected**; a fake process remained alive when session construction rejected incomplete stdio.
+
+GREEN result after adding unowned-process cleanup: **1 passed, 480 deselected**, exit 0.
+
+The first full confinement run then found one closed classification regression: **79 passed, 1 failed, 472 deselected** because an identical replacement was reported as non-applicable rather than no-op. The targeted no-op/non-applicable rerun after narrowing classification to the failed-apply path produced **2 passed, 69 deselected**, exit 0.
+
+## Final verification
+
+Exact Task 5 focused command:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py tests/test_agent_loop.py -k "policy_worker or patch_bounds or candidate_identity or ast_purity or source_bundle or pit_optimizer_v2"`
+
+Result: **80 passed, 472 deselected**, exit 0 in 8.79 seconds. The only warning was the repository's existing unknown `cache_dir` pytest option.
+
+Focused Ruff command:
+
+`python -B -m ruff check agent_loop.py core/strategy_policy/runtime.py core/strategy_policy/worker.py core/pit_optimizer_candidate.py tests/test_pit_optimizer_v2.py tests/test_agent_loop.py`
+
+Result: **All checks passed**, exit 0.
+
+Diff check:
+
+`git diff --check`
+
+Result: exit 0 with no whitespace errors. Git emitted only LF-to-CRLF working-copy notices for four existing tracked files.
+
+## Capability and resource-cleanup audit
+
+- No real Docker/container launch occurred. Every command/stdio/process assertion used injected fake processes.
+- No OpenRouter/provider/pricing call, network access, replay/parity capture, cloud task, upload, push, or merge occurred.
+- The production runner requires a revalidated `DockerCapability`; the fake path is available only when a non-default injected process factory is supplied.
+- Docker argv is a list with no shell and includes the exact network, filesystem, user, capability, PID, memory, CPU, tmpfs, mount, and Python `-B` restrictions from the brief.
+- `close_fds=True`; only stdin/stdout/stderr are pipes. The engine environment is an allowlist and excludes the test credential.
+- The mounted package contains only `core/__init__.py`, strategy-policy `__init__.py`, trusted contracts/worker, and the three candidate policy modules. It excludes the repository, `.git`, PIT artifacts, credentials, and unrelated source.
+- Each worker uses a fresh 16-byte nonce and 32-byte HMAC key, delivered once through bootstrap; secrets are not written to the report or retained package.
+- Success, method timeout, and post-launch initialization failure tests all prove process wait/termination and private package-tree removal. Session closure is idempotent. Stderr is fully drained and hashed while retention is capped at 64 KiB.
+- Method timeout is capped at one second; fold timeout is fixed at 900 seconds. JSON-lines input/output is capped at 16 KiB.
+- Candidate-apply failure restores the three policy files to their exact pre-attempt bytes, including cumulative-bound and cancellation/error paths.
+
+## Self-review
+
+- Preserved the sole contract `PatchBounds` type and legacy 4/25/400/256-KiB defaults; PIT hard ceilings are 3/12/200/64-KiB and supplied canary bounds may only be tighter.
+- Both incremental and fresh Git-derived cumulative diffs are parsed and validated under the same supplied bounds.
+- Candidate identity contains authenticated commit/interface/constraint/discovery inputs, cumulative digest, exact final file hashes, controller-derived paths/symbols, and a canonical identity digest. Caller-authored cumulative text is never an identity input.
+- Author paths/symbols must equal controller-derived identity exactly and otherwise fail with `author_manifest_mismatch`.
+- AST validation is closed and compile-backed; it rejects ambient capabilities, mutation/state, reflection/dynamic execution, async/generator constructs, unknown public symbols, and non-allowlisted imports.
+- Provider context is complete-or-reject: exact three files, exact cumulative diff, feedback caps/history caps, no truncation, and distinct `next_context_oversize` versus `context_budget_exhausted` failures.
+- Protocol parsing is closed, duplicate-aware, canonical, typed, sequenced, chained, request/method bound, digest checked, and HMAC authenticated.
+- Final review fixed four issues found during implementation: cumulative-failure rollback, compile-only syntax errors, launched-but-unowned process cleanup, and precise no-op classification.
+
+## Concerns / follow-up notes
+
+- The project currently emits `PytestConfigWarning: Unknown config option: cache_dir`; it is pre-existing and did not affect exit status.
+- Git reports LF-to-CRLF normalization notices on Windows for four existing tracked files; `git diff --check` is clean.
+- Per the Task 5 safety boundary, real Docker integration and replay/parity validation were intentionally not run here and remain for their planned later tasks.
+
+## Fix Round 1 — Fresh-review findings
+
+Date: 2026-08-28
+Review range: `b2eb01c97869f6f3e3c700e3db418c0f60e436e7..e815b244c21ff4b570c25d7f49d47b1fc167efee`
+
+This section supersedes the initial report wherever the initial evidence claimed more than it proved. In particular, the initial report had not yet proved unavoidable A-B-A probing, exact retained-feedback lineage, identity authenticity at every consumer, or daemon-container cleanup under cancellation/faults. The base hash above was also corrected from the non-object recorded by the initial report. The claims are retained in the cumulative outcome only because this fix round adds the missing implementation and direct evidence below.
+
+### Files changed in Fix Round 1
+
+- `agent_loop.py`
+  - Added unavoidable authenticated/session A-B-A validation, fixed worker hash seeding, ancestor-safe source packaging, explicit create/inspect/start daemon ownership, full-ID/owner-label validation, create-failure discovery, independent local and daemon cleanup actions, force remove, and verified absence.
+- `core/pit_optimization_contract.py`
+  - Enforced exact contiguous retained-feedback lineage, made constant symbols representable, chose one interface-order path canonicalization, and accepted the conventional Git diff headers emitted by authenticated Git.
+- `core/pit_optimizer_candidate.py`
+  - Closed mutation roots and unordered AST constructs, bounded determinism state, measured the complete canonical role input, sealed and reauthenticated candidate identities at consumption, unified path/hash ordering, and rejected intermediate links/reparse points.
+- `core/strategy_policy/worker.py`
+  - Closed boolean/float protocol scalar aliases, added strict envelope validation, bounded deterministic observations, and introduced typed A-B-A probes.
+- `tests/test_pit_optimizer_v2.py`
+  - Added review reproductions for AST mutation/unordered behavior, exact lineage/full Unicode input sizing, identity forgery/tampering, constant/reverse-order manifests, scalar types, intermediate junctions, protected/generated/gitlink states, cumulative hunk/line/byte bounds, and rollback faults/cancellation.
+- `tests/test_agent_loop.py`
+  - Added review reproductions for hunk 13, authenticated stateful A-B-A, intermediate junction packaging, owned daemon identity/lifecycle, create/bootstrap/thread/EOF/timeout/cancellation paths, and independent cleanup faults.
+
+### Finding closure and TDD evidence
+
+Commands below ran singly and in the foreground. Tests used only injected fake process and Docker-control capabilities.
+
+#### Important 1 — closed state/determinism boundary
+
+RED:
+
+`python -m pytest -q tests/test_pit_optimizer_v2.py -k "ast_purity or determinism_observation_state"`
+
+Result: **4 failed, 20 passed**. Imported-object mutation, contract-class mutation, unordered set iteration, and bounded observation state were not closed.
+
+GREEN: same command, **24 passed, 50 deselected**.
+
+RED authenticated boundary:
+
+`python -m pytest -q tests/test_agent_loop.py -k "policy_worker_command or authenticated_stateful_aba_probe"`
+
+Result: **2 failed**. No authenticated A-B-A scheduling and no fixed worker hash seed.
+
+GREEN: same command, **2 passed, 480 deselected**. `client_factory` now requires bounded typed probes and executes A-B-A through authenticated session calls before returning a client; the container receives `PYTHONHASHSEED=0` and unordered AST constructs are rejected.
+
+#### Important 2 — exact feedback lineage and complete input sizing
+
+RED:
+
+`python -m pytest -q tests/test_pit_optimizer_v2.py -k "source_context_requires_exact or source_context_accepts_exact or source_context_fit_measures_complete"`
+
+Result: **6 failed, 1 passed**. Missing, wrong-numbered, reversed, and gapped histories plus complete Unicode role sizing exposed the partial helper.
+
+GREEN: same command, **7 passed, 74 deselected**. The exact prefix `1..iteration-1` is required, and the actual role contract's canonical UTF-8 bytes plus exact static prompt/schema bytes are compared with all sealed caps. Prospective candidate growth remains `next_context_oversize`; already-unfit calls remain `context_budget_exhausted`.
+
+#### Important 3 — candidate identity authenticity
+
+RED:
+
+`python -m pytest -q tests/test_pit_optimizer_v2.py -k "candidate_identity_rejects_direct or candidate_identity_tampering or candidate_identity_rejects_attacker or constant_symbol or reverse_diff_sections"`
+
+Result: **13 failed**. Direct construction, every-field tampering, recomputed attacker digests, constants, and reverse-order multi-file manifests reproduced the boundary gaps.
+
+GREEN: same command, **13 passed, 81 deselected**. Identity construction requires the controller seal, all fields and the self-digest are revalidated, and each consumer requires the exact controller-registered object.
+
+#### Important 4 — representable constants and canonical multi-file order
+
+The Important 3 RED/GREEN command contains both required end-to-end cases. A constant-only entry edit derives `core.strategy_policy.entry.ENTRY_FLOOR` and passes `AuthorArtifact` plus manifest validation. A risk-then-entry diff is normalized to fixed interface order identically by the diff contract, author input, candidate identity, file hashes, and manifest comparison.
+
+#### Important 5 — explicit owned daemon lifecycle
+
+RED:
+
+`python -m pytest -q tests/test_agent_loop.py -k "policy_worker_command_mount_allowlist"`
+
+Result: **1 failed** because `PolicyWorkerRunner` had no injected daemon-control capability and used one `docker run` client process without an authenticated daemon identity.
+
+GREEN: same command, **1 passed, 483 deselected**. The runner now uses create/inspect/start, a fresh 256-bit owner label, exact 64-hex container ID/name/image/label checks, and attached start by full ID.
+
+RED create-failure recovery:
+
+`python -m pytest -q tests/test_agent_loop.py -k "creation_failure_discovers"`
+
+Result: **1 failed** with the fake daemon still present after a failed create response.
+
+GREEN: same command, **1 passed, 487 deselected**. The runner discovers only the exact name plus owner label, re-inspects the full identity, and executes kill/wait/force-remove/verified-absence cleanup.
+
+Additional GREEN fault/cancellation evidence:
+
+- Independent stdin-close, terminate, first-wait, kill, stdout-close, stderr-close, thread-join, and private-tree-removal faults preserve the malformed-protocol primary error while every later action is attempted.
+- Thread-start failure, bootstrap-write failure, candidate EOF, method timeout, fold timeout, and `KeyboardInterrupt` cancellation all remove the fake local process, exact daemon owner, and package tree.
+- Tampered inspect ownership is rejected before attach and still cleaned by the exact controller-created owner tuple.
+
+#### Minor 1 — strict JSON scalars
+
+RED:
+
+`python -m pytest -q tests/test_pit_optimizer_v2.py -k "non_integer_sequences or bootstrap_has_closed_shape"`
+
+Result: **3 failed** for `true`/`1.0` schema or authenticated sequence aliases.
+
+GREEN: same command, **3 passed, 93 deselected**. Bootstrap and request/response envelopes require positive exact integers before equality or typed construction.
+
+#### Minor 2 — intermediate link/reparse provenance
+
+RED:
+
+`python -m pytest -q tests/test_pit_optimizer_v2.py tests/test_agent_loop.py -k "intermediate_policy_directory_link"`
+
+Result: **2 failed** using actual Windows directory junctions to an outside valid policy tree.
+
+GREEN: same command, **2 passed, 578 deselected**. Every existing path component is lstat-checked for symlink/reparse provenance before candidate source reads or worker launch; trusted contracts/worker inputs are revalidated at copy time.
+
+#### Minor 3 — focused negative matrix and evidence correction
+
+The new matrix covers hunk 13; protected `contracts.py`, `runtime.py`, and `worker.py`; generated paths; actual junction provenance; gitlink/submodule mode; cumulative hunk, changed-line, and UTF-8 byte growth; and injected rollback fault plus `KeyboardInterrupt`. The implementation already rejected several of these cases, so the honest characterization run was immediately GREEN rather than reported as a fabricated RED:
+
+`python -m pytest -q tests/test_agent_loop.py tests/test_pit_optimizer_v2.py -k "thirteenth_hunk or protected_or_generated_paths or gitlink_index_mode or cumulative_hunk_line_and_byte_growth or rolls_back_after_fault_or_cancellation"`
+
+Result: **11 passed, 580 deselected**.
+
+### Fix Round 1 final verification
+
+Exact Task 5 focused command:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py tests/test_agent_loop.py -k "policy_worker or patch_bounds or candidate_identity or ast_purity or source_bundle or pit_optimizer_v2"`
+
+First full rerun found one stale lexical-order expectation: **1 failed, 123 passed, 472 deselected**. The test was corrected to the approved fixed interface order; no production behavior was relaxed.
+
+Final result: **127 passed, 472 deselected**, exit 0 in 23.05 seconds. The only warning is the repository's existing unknown `cache_dir` pytest option.
+
+Focused Ruff:
+
+`python -B -m ruff check agent_loop.py core/strategy_policy/runtime.py core/strategy_policy/worker.py core/pit_optimizer_candidate.py tests/test_pit_optimizer_v2.py tests/test_agent_loop.py`
+
+Result: **All checks passed**, exit 0.
+
+Diff check:
+
+`git diff --check`
+
+Result: exit 0 with no whitespace errors; Git emitted only Windows LF-to-CRLF working-copy notices.
+
+### Fix Round 1 capability/resource cleanup audit
+
+- No provider/OpenRouter/pricing/network/replay/parity, real Docker/container, upload, push, merge, cloud, background helper, or broad-suite action was used.
+- All worker/container cases use injected fakes. The fake daemon is distinct from the fake attached CLI process and must be absent after every tested exit.
+- Production still requires the revalidated `DockerCapability`; tests must inject both a Docker-shaped endpoint and non-default process/control capabilities.
+- Daemon creation is pull-disabled and carries one full random owner label. Inspect authenticates full ID, exact name, digest-pinned image, and owner token before attachment.
+- Cleanup actions are independent and idempotent. The attached client is closed/terminated/waited/killed as needed. Fix Round 1 used an exact ID+expected-owner absence query; Fix Round 3 supersedes that proof because an inspect mismatch makes the expected label unsuitable for determining absence.
+- Cleanup failures cannot replace an active candidate/controller exception. An explicit close without a primary error reports unverified cleanup.
+- The package remains the seven-file policy-only allowlist; ancestor links/reparse points, credentials, repository metadata, and unrelated source cannot enter it.
+
+### Fix Round 1 self-review and concerns
+
+- Legacy `PatchBounds` behavior remains unchanged, while PIT incremental and cumulative diffs share the supplied tighter bounds.
+- The candidate identity registry intentionally authenticates only live controller-derived objects. Persisted/deserialized lookalikes must be rederived from trusted Git/source inputs rather than accepted by digest alone.
+- The A-B-A probe is mandatory at `client_factory`, crosses the authenticated protocol, and is capped to five methods/15 observations; the general guard retains at most 32 observations.
+- Complete role-input sizing uses canonical UTF-8 bytes. The existing budget field named `max_input_tokens` remains the sealed aggregate ceiling used by the approved schema; this task does not rename Task 4 fields.
+- Real Docker integration and replay/parity remain intentionally deferred to later planned tasks. The only current warning is the pre-existing pytest `cache_dir` option warning.
+
+## Fix Round 2 — Re-review 1 findings
+
+Date: 2026-08-28  
+Fix base: `278d41bcc02d88302d0b817ce06eab04d33ac4fe`  
+Planned commit message: `fix: close candidate confinement rereview findings`
+
+This section supersedes earlier statements that described all mutation roots or all failed-create cleanup paths as closed. It verified exception-based cleanup faults and explicit-close reporting, but did not yet inspect nonzero/timed-out typed daemon results or retain acquired-session cleanup evidence on an active primary. Fix Round 3 supersedes those residual claims.
+
+### Files changed in Fix Round 2
+
+- `agent_loop.py`
+  - Validates the complete bounded probe set before allocating a package/process/daemon.
+  - Closes an acquired session on every post-start `BaseException`, including client-constructor cancellation.
+  - Retains the tentative exact full-ID daemon handle immediately after unique name+owner discovery, independently inspects it, and cleans it even when inspect fails or reports tampering.
+  - Preserves create/invalid-identity failures as primary and records discovery/inspect/cleanup failures as secondary exception notes.
+- `core/pit_optimizer_candidate.py`
+  - Replaces historical mutable-name authority with single-binding baseline-list `.append` authority and rejects every attribute/subscript write.
+  - Arms exact three-file restoration before the mutating Git apply call.
+  - Restores the exact nine persisted `CandidateIdentity` dataclass fields with an `InitVar` construction seal and adds a public canonical primitive/JSON representation.
+- `core/strategy_policy/worker.py`
+  - Adds one exact, reusable determinism-probe validator used before allocation and again inside an acquired session's close-on-failure guard.
+- `tests/test_agent_loop.py`
+  - Adds fake-only authenticated alias rejection; invalid-probe preflight; post-start client cancellation; create-primary plus list/inspect/tamper/invalid-output faults; rm/absence faults; explicit-close cleanup failures; and two-fresh-session decision equality.
+- `tests/test_pit_optimizer_v2.py`
+  - Adds local mutable rebind/nested-alias AST regressions, real mutating-Git rollback fault/cancellation cases with exact three-file restoration, exact nine-field identity serialization, editable index modes 120000/160000, and V2 binary/rename/mode metadata negatives.
+
+### Finding-by-finding RED and GREEN evidence
+
+All commands ran singly, synchronously, and in the foreground. Worker/container behavior used only injected fake capabilities.
+
+#### Important 1 — closed AST mutation authority
+
+RED:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py tests/test_agent_loop.py -k "ast_purity_rejects_non_closed or alias_state_candidate"`
+
+Result: **4 failed, 22 passed, 577 deselected**. List-to-`math` rebinding, list-to-contract-class rebinding, `[math][0]` mutation, and an authenticated factory candidate were accepted; the factory case reached launch and timed out.
+
+After the initial production change, the same command honestly exposed two compatibility/message issues: **2 failed, 24 passed**. The baseline constructs its ephemeral list with `list(...)`, and the existing function-attribute diagnostic needed to remain specific.
+
+GREEN after the minimal correction: same command, **26 passed, 577 deselected**. Baseline AST checkpoint:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "ast_purity"`
+
+Result: **26 passed, 84 deselected**.
+
+The implemented rule rejects all attribute/subscript writes. Only `.append` on a name with exactly one local binding from the baseline-compatible list literal/`list(...)` construction is allowed; rebinding or mutation through an alias is rejected before worker launch.
+
+#### Important 2 — worker preflight, post-start safety, and tentative daemon ownership
+
+RED:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py -k "invalid_determinism_probes_before_start or client_initialization_cancellation or create_primary_survives or create_primary_records or explicit_close_reports"`
+
+Result: **9 failed, 2 passed, 493 deselected**. Empty/wrong/duplicate probes were accepted before allocation; client-constructor cancellation leaked the session; discovery inspect/list faults replaced create primaries or lost the owner; and cleanup faults were not retained as secondary evidence. The two existing explicit-close cases were already honest GREEN characterizations.
+
+GREEN after probe validation, post-start guarding, tentative-owner discovery, and secondary-error recording: same command, **11 passed, 493 deselected**.
+
+A subsequent self-review added the invalid-success-output path. RED:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py -k "invalid_create_identity_retains"`
+
+Result: **1 failed, 504 deselected** because inspect replaced the invalid-ID primary and the discovered object remained live.
+
+GREEN worker regression:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py -k "policy_worker"`
+
+Result: **27 passed, 478 deselected**. This includes invalid probe tuples before any launch, create exception/nonzero/invalid output, discovery list/inspect/tamper, daemon rm/absence exceptions, explicit-close failure, cancellation, and two fresh authenticated session wrappers returning the hard-coded fake's canonically identical decisions. It did not execute candidate policy across runtimes; Fix Round 3 adds that evidence.
+
+#### Important 3 — rollback armed before mutating apply
+
+RED:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "real_mutating_apply_raises"`
+
+Result: **2 failed, 110 deselected**. The wrapper called the real non-check Git apply, asserted that entry bytes changed, then raised `RuntimeError`/`KeyboardInterrupt`; entry remained changed because restoration was not armed.
+
+GREEN, including the existing later-fault cases:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "real_mutating_apply_raises or rolls_back_after_fault"`
+
+Result: **4 passed, 108 deselected**. All three editable files exactly matched their pre-call byte snapshots.
+
+#### Minor 1 — exact nine-field identity value contract
+
+RED:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "exact_public_nine_field"`
+
+Result: **1 failed, 112 deselected** because `_controller_seal` was a tenth persisted field.
+
+The first combined run then honestly found that an older attack test relied on `dataclasses.replace` copying the former field: **1 failed, 11 passed**. The test was corrected to construct a registry-unauthenticated nine-field object directly, which is the concrete attack being checked.
+
+GREEN:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "candidate_identity_has_exact_public or candidate_identity_rejects_direct or candidate_identity_tampering or attacker_recomputed"`
+
+Result: **12 passed, 101 deselected**. `dataclasses.fields` and `asdict` expose exactly nine JSON-serializable fields, the public canonical JSON contains no private seal, direct construction remains sealed, and every consumer still requires exact live-object registry authentication and a valid self-digest.
+
+#### Minor 2 — focused structural and cross-worker matrix
+
+Characterization command:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "non_regular_index_mode or v2_structural_diff_metadata"`
+
+Result: **5 passed, 112 deselected**. The existing implementation already rejected actual index mode `120000`, gitlink mode `160000`, and V2 binary/rename/mode metadata at the CandidateIdentity boundary; these were added as focused coverage without fabricating a RED.
+
+The worker GREEN command above compared two independently created authenticated session wrappers, but both received a hard-coded fake decision. Fix Round 3 replaces that overclaim with a packaged-candidate execution test.
+
+### Fix Round 2 final verification
+
+Exact Task 5 focused command:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py tests/test_agent_loop.py -k "policy_worker or patch_bounds or candidate_identity or ast_purity or source_bundle or pit_optimizer_v2"`
+
+Result: **150 passed, 472 deselected**, exit 0 in 27.39 seconds. The only warning is the repository's existing unknown `cache_dir` pytest option.
+
+Focused Ruff:
+
+`python -B -m ruff check agent_loop.py core/strategy_policy/runtime.py core/strategy_policy/worker.py core/pit_optimizer_candidate.py tests/test_pit_optimizer_v2.py tests/test_agent_loop.py`
+
+Result: **All checks passed**, exit 0.
+
+Diff check:
+
+`git diff --check`
+
+Result: exit 0 with no whitespace errors. Git emitted only Windows LF-to-CRLF working-copy notices for the five modified code/test files.
+
+### Fix Round 2 capability/resource cleanup audit
+
+- No provider/OpenRouter/pricing/network/replay/parity, real Docker/container, upload, push, merge, cloud task, background helper, unrelated process inspection, or broad-suite action was used.
+- All process/container lifecycle tests use an injected fake attached process and a separate fake Docker-control capability. Tests leave no fake live process, verified daemon, or `pw-*` package tree unless the test deliberately injects an `rm` failure; that test asserts the unverified live state, clears only its in-memory fake state, and verifies the production close reported failure.
+- Probe metadata is fully validated before package/daemon/process allocation. Once started, determinism validation and client construction are inside a close-on-`BaseException` guard.
+- A unique 64-hex ID returned by exact fresh name+256-bit-owner-label discovery immediately becomes the tentative cleanup handle. Inspect remains an authentication gate before attach, but inspect failure/tampering cannot discard cleanup authority.
+- Local process actions, daemon kill/wait/force-remove/absence query, thread/stream closure, and package removal are independent. In Fix Round 2, explicit close without a primary raised for exception/unverified cleanup; active acquired-session primaries did not yet retain those failures. Fix Round 3 closes that gap.
+- No secret values, live engine paths, or host-specific temporary paths were written to this report.
+
+### Fix Round 2 self-review and concerns
+
+- The AST rule deliberately supports only the baseline's single-binding ephemeral list building. Attribute/subscript assignment is closed even for local containers; expanding this language later requires a new provenance proof and RED tests.
+- CandidateIdentity serialization is a public nine-field value representation, but trust remains process-local: persisted/reloaded identities must be rederived from authenticated Git/source inputs and cannot authenticate by digest alone.
+- When create discovery itself cannot return a unique full ID, the controller cannot safely target a daemon by ambiguous name. It preserves the create primary, records discovery failure, removes local/package resources, and does not claim daemon absence. Once the unique full ID is known, all cleanup actions are attempted even if inspect fails or reports tampering.
+- Injected `rm` or absence-query faults correctly make cleanup unverified; the implementation reports them rather than promising physical removal that the capability could not prove.
+- Legacy `PatchBounds`, schema-v2 seals, exact feedback lineage/full canonical role sizing, constant symbols, and fixed multi-file ordering remain covered by the exact focused suite.
+- Real Docker integration and replay/parity remain intentionally deferred. The pre-existing pytest `cache_dir` warning and Windows line-ending notices remain the only observed tooling concerns.
+
+## Fix Round 3 — Re-review 2 findings
+
+Date: 2026-08-28  
+Fix base: `7bbb4b39cb9cfd4dde4c09849d27e483ee8bdccb`  
+Planned commit message: `fix: verify policy daemon cleanup evidence`
+
+This section supersedes the Fix Round 1/2 cleanup and cross-worker claims called out above. Verified absence now means a successful, empty query for the already-known full container ID without a label predicate. Typed status failures and exceptions remain secondary evidence, and an active candidate/controller primary carries all cleanup evidence in exception notes.
+
+### Files changed in Fix Round 3
+
+- `agent_loop.py`
+  - Checks `timed_out` and nonzero `returncode` for every daemon kill/wait/rm result while continuing all later actions.
+  - Verifies final absence by the known full container ID alone.
+  - Records typed secondary error messages on active acquired-session primaries while preserving their original type/message; explicit close retains its existing raised cleanup failure.
+- `core/pit_optimizer_candidate.py`
+  - Restricts the only allowed `.append` receiver to an exact single-bound local `ast.Name`; attribute/subscript/nested receivers are rejected.
+- `tests/test_agent_loop.py`
+  - Makes the fake Docker control honor ID/name/label filters and represent nonzero/timeouts separately from raised exceptions.
+  - Adds the full kill/wait/rm × nonzero/timeout status matrix, full-ID-only absence proof, inspect-label-mismatch plus nonzero-rm integration, protocol and cancellation primary-evidence cases, and assertions that all independent local cleanup failures remain attached.
+  - Adds a synchronous fake worker runtime that compiles and executes all three packaged candidate policy modules in fresh namespaces, then uses the real authenticated request/response protocol.
+- `tests/test_pit_optimizer_v2.py`
+  - Adds nested subscript and attribute `.append` receiver provenance regressions.
+
+### Finding-by-finding RED and GREEN evidence
+
+All commands ran singly and synchronously. No real Docker/container or external provider was used.
+
+#### Minor 2 — exact-name `.append` receiver
+
+RED:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "ast_purity_rejects_non_closed"`
+
+Result: **2 failed, 25 passed, 92 deselected**. `cache[0].append(...)` and `cache.member.append(...)` were accepted because receiver authorization used only the root name.
+
+GREEN baseline/provenance checkpoint:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "ast_purity"`
+
+Result: **28 passed, 91 deselected**. `.append` now requires `node.func.value` itself to be an authorized `ast.Name`; the baseline local-list construction remains valid.
+
+#### Important 1 and Important 2 — typed daemon results, ID-only absence, and acquired-session secondary evidence
+
+RED:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py -k "daemon_cleanup_rejects or protocol_primary_retains or cancellation_retains or tampered_identity_primary_retains"`
+
+Result: **4 failed, 505 deselected**. A nonzero rm was ignored; the expected-label filter hid the still-live full ID after inspect mismatch; and malformed-protocol plus `KeyboardInterrupt` primaries carried no rm/absence evidence.
+
+GREEN core cleanup and explicit-close checkpoint:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py -k "daemon_cleanup_rejects or protocol_primary_retains or cancellation_retains or tampered_identity_primary_retains or explicit_close_reports"`
+
+Result: **6 passed, 503 deselected**.
+
+Expanded typed-result characterization:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py -k "policy_daemon_cleanup_checks_status"`
+
+Result: **6 passed, 509 deselected**. Each kill/wait/rm action was independently exercised with both a nonzero result and `timed_out=True`; later actions still ran, and rm failure additionally retained the full-ID absence failure.
+
+The existing maximal cleanup-fault test was strengthened to require every stdin/terminate/wait/kill/stdout/stderr/thread/private-tree message on the unchanged malformed-protocol primary:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py -k "cleanup_faults_preserve_primary"`
+
+Result: **1 passed, 514 deselected**.
+
+Worker-wide GREEN:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py -k "policy_worker or policy_daemon_cleanup"`
+
+Result: **32 passed, 478 deselected**.
+
+#### Minor 1 — actual candidate execution across two fresh runtimes
+
+RED against the prior hard-coded fake:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py -k "two_fresh_runtimes_execute"`
+
+Result: **1 failed, 509 deselected**. The wrapper returned the fake's `CapacityDecision(None, False)` instead of the packaged candidate's `CapacityDecision(7, True)`, proving the previous equality assertion did not execute candidate code.
+
+GREEN after replacing that boundary with a synchronous executing fake runtime: same command, **1 passed, 509 deselected**. The final fixture deliberately edits the copied candidate to cap non-null capacity at `3`; each fresh runtime independently compiles the package bytes, executes candidate `recommend_capacity`, authenticates the response, and returns the literal expected `CapacityDecision(3, True)`. The canonical decision JSON is identical across runtimes.
+
+### Fix Round 3 final verification
+
+Exact Task 5 focused command:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py tests/test_agent_loop.py -k "policy_worker or patch_bounds or candidate_identity or ast_purity or source_bundle or pit_optimizer_v2"`
+
+Result: **156 passed, 478 deselected**, exit 0 in 27.42 seconds. The only warning is the repository's pre-existing unknown `cache_dir` pytest option.
+
+Focused Ruff:
+
+`python -B -m ruff check agent_loop.py core/strategy_policy/runtime.py core/strategy_policy/worker.py core/pit_optimizer_candidate.py tests/test_pit_optimizer_v2.py tests/test_agent_loop.py`
+
+Result: **All checks passed**, exit 0.
+
+Diff check:
+
+`git diff --check`
+
+Result: exit 0 with no whitespace errors; Git emitted only Windows LF-to-CRLF working-copy notices for the four modified code/test files.
+
+### Fix Round 3 capability/resource cleanup audit
+
+- No provider/OpenRouter/pricing/network/replay/parity, real Docker/container, upload, push, merge, cloud task, background helper, unrelated process inspection, or broad-suite action was used.
+- Container lifecycle remains exercised only through the injected synchronous fake control. It now models raised exceptions, typed nonzero statuses, typed timeouts, mismatched stored labels, and Docker-like filter behavior independently.
+- Kill, wait, rm, and the final ID-only query are always attempted in order. Each exception/nonzero/timeout is retained; the final query must itself succeed and return no full ID before absence is considered verified.
+- The owner label and exact name authorize/discover the tentative object before attach. Once the unique full ID is known, potentially untrusted inspect label data is not used to hide that object from the absence proof.
+- Acquired-session cleanup performs local process/stream/thread, daemon, and private-tree actions before attaching every secondary failure to the active primary. Protocol `ValueError` and cancellation `KeyboardInterrupt` keep their original type/message. Explicit close still raises `SandboxError` when any cleanup action or absence proof fails.
+- The executing fake worker starts no OS child or real container. Each runtime gets fresh candidate module globals, reads only the seven-file packaged mount, executes the actual candidate functions synchronously, and still crosses the real canonical digest/HMAC/sequence/request/method validation path.
+- Tests that deliberately leave the in-memory fake daemon observable after rm failure assert the unverified state and then clear only that test-owned fake state. No live process/container is left.
+
+### Fix Round 3 self-review and concerns
+
+- Cleanup error notes include each exception/result type and message so multiple failures remain distinguishable. The original primary remains the exception raised to the caller; no note content is written to provider-facing artifacts.
+- Status validation intentionally continues after kill/wait/rm failure; stopping early would remove the chance for force-remove or an authoritative absence observation.
+- Full-ID-only absence is safe because targeting authority was established earlier by create output or exact fresh name+owner discovery. The label is still checked before attach but is no longer part of the final observation.
+- The executing runtime shares trusted contract class definitions with the controller so the real typed protocol can encode/decode decisions; candidate module namespaces and globals are fresh for each runtime. This is stronger than a hard-coded response but remains a fake-isolated test, not real Docker integration.
+- The AST grammar now matches the report: only an exact single-bound local name may receive `.append`. Any future richer local mutation needs new provenance rules and RED tests.
+- Real Docker lifecycle and replay/parity remain intentionally deferred. The existing pytest `cache_dir` warning and Windows line-ending notices remain the only tooling concerns.
+
+## Fix Round 4 — Re-review 3 finding
+
+Date: 2026-08-28  
+Fix base: `38c4bde5ac1ec1da2a0414f6a431f48a987bf074`  
+Planned commit message: `fix: close policy cleanup evidence`
+
+This section supersedes the Fix Round 3 claim that cleanup notes contain exception types and messages. Raw secondary exception serialization was unsafe and was the open Important finding. Cleanup evidence is now deliberately value-free: it contains only closed controller-owned phase, action, and reason codes. It does not include exception messages or types, host paths, argv, container IDs, owner tokens, stderr, or other capability-returned values. The earlier unconditional claim that the original primary always remained was also ahead of its evidence; the integrated hostile-`__str__` and hostile-`add_note` cases below now exercise that boundary.
+
+### Files changed in Fix Round 4
+
+- `agent_loop.py`
+  - Replaces retained arbitrary cleanup exceptions with immutable enum-backed secondary-failure records at the point each action fails.
+  - Distinguishes exception, invalid-result, timeout, nonzero, still-running, present, and unverified reasons without carrying raw capability values.
+  - Caps attachment at 32 notes of at most 128 ASCII bytes each, invokes `BaseException.add_note(primary, note)` unbound, and shields iteration, note construction, and attachment from every `BaseException`.
+  - Preserves independent local process, stream, thread, daemon kill/wait/rm/query, and private-tree cleanup attempts. Explicit close now raises only its existing generic `SandboxError` without chaining an arbitrary cleanup exception.
+- `tests/test_agent_loop.py`
+  - Adds the three required fake-integrated regressions for hostile cleanup stringification, hostile cancellation note dispatch, and a sentinel-bearing `subprocess.TimeoutExpired`.
+  - Replaces assertions for raw injected cleanup messages with exact closed phase/action/reason notes and updates the typed daemon status matrix to inspect structured evidence without stringifying errors.
+
+### Finding closure and TDD evidence
+
+All commands ran singly, synchronously, and in the foreground. All worker and daemon behavior used injected in-memory fakes; no real process or container was started.
+
+RED command:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py -k "cleanup_evidence or cleanup_faults_preserve_primary"`
+
+RED result: **4 failed, 514 deselected**. The existing maximal cleanup test still expected raw messages; a cleanup `BaseException` whose `__str__` raised replaced the malformed-protocol `ValueError`; a `KeyboardInterrupt` subclass whose `add_note` override raised replaced the exact cancellation object; and sentinel engine path/full ID/secret values from `TimeoutExpired.cmd` appeared in rendered traceback notes.
+
+GREEN result after the minimal evidence-boundary change: same command, **4 passed, 514 deselected**. The malformed-protocol primary remains exact `ValueError("policy JSON fields are invalid")`; the exact hostile cancellation instance and message remain; daemon wait/rm/final-query actions still run after earlier failures; notes contain only the expected closed codes; and no engine-path, full-ID, secret, or stderr sentinel appears in formatted exception output.
+
+Worker cleanup regression:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py -k "policy_worker or policy_daemon_cleanup"`
+
+Result: **40 passed, 478 deselected**, exit 0.
+
+### Fix Round 4 final verification
+
+Exact Task 5 focused command:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py tests/test_agent_loop.py -k "policy_worker or patch_bounds or candidate_identity or ast_purity or source_bundle or pit_optimizer_v2"`
+
+Result: **159 passed, 478 deselected**, exit 0 in 27.68 seconds. The only warning is the repository's pre-existing unknown `cache_dir` pytest option.
+
+Focused Ruff:
+
+`python -B -m ruff check agent_loop.py core/strategy_policy/runtime.py core/strategy_policy/worker.py core/pit_optimizer_candidate.py tests/test_pit_optimizer_v2.py tests/test_agent_loop.py`
+
+Result: **All checks passed**, exit 0.
+
+Diff check:
+
+`git diff --check`
+
+Result: exit 0 with no whitespace errors; Git emitted only Windows LF-to-CRLF working-copy notices for `agent_loop.py` and `tests/test_agent_loop.py`.
+
+### Fix Round 4 self-review and concerns
+
+- Secondary records are constructed only from private enums. The recorder never accepts or formats an arbitrary exception object, and no optional exception-type token is emitted.
+- Note count and byte length are explicitly bounded. The unbound base implementation bypasses subclass overrides, while the inner and outer `BaseException` shields prevent evidence attachment or iteration faults from escaping over the active primary.
+- Timeout and nonzero results retain distinct closed reasons. A failed rm followed by a successful ID-only query that still observes the daemon records `daemon_rm` plus `daemon_absence_verify/present`; a failed query records its own reason plus `unverified`.
+- Cleanup evidence describes controller attempts and verification outcomes; it does not claim physical removal when rm/query fails. Tests that deliberately retain an in-memory fake owner clear only that test-owned state after asserting the unverified result.
+- No provider/OpenRouter/pricing/network/replay/parity, real Docker/container, upload, push, merge, cloud task, background helper, unrelated process inspection, or broad-suite action was used.
+- Real Docker lifecycle and replay/parity remain intentionally deferred. The pre-existing pytest `cache_dir` warning and Windows line-ending notices remain the only observed tooling concerns.
+
+## Fix Round 5 — Re-review 4 finding
+
+Date: 2026-08-28  
+Fix base: `f34379006e395fbffde909038ccb3f30b7e53be1`  
+Implementation commit: `822241a032d488bb25767eacd72bd6ed2a6ea92d`
+
+This section narrows the Fix Round 4 cleanup claim to the boundary actually
+enforced and tested. Docker-control cleanup results are now accepted only when
+the returned object is an exact `ProcessResult` and the fields required by that
+action have exact safe runtime types. A malformed return is retained as closed
+controller-owned evidence; it is not interpreted through attacker-controlled
+truth testing, comparison, descriptor access, or string methods. Physical
+daemon absence is claimed only after a valid final full-ID query reports an
+empty exact string.
+
+### Files changed in Fix Round 5
+
+- `agent_loop.py`
+  - Normalizes every kill, wait, remove, and full-ID absence-query result inside
+    a `BaseException` shield before status use.
+  - Requires the exact `ProcessResult` type, `timed_out` exactly `bool`, and
+    `returncode` exactly `int` (therefore excluding `bool`). The final query also
+    requires `stdout` exactly `str` before `.strip()` is called.
+  - Exposes only controller-created `timed_out`, `nonzero`, and
+    `stdout_present` booleans to later cleanup logic. Wrong shapes become
+    `INVALID_RESULT`; field-access faults become `EXCEPTION`.
+- `tests/test_agent_loop.py`
+  - Adds fake-integrated regressions for an exact `ProcessResult` containing a
+    hostile non-integer return code, hostile `ProcessResult` subclass getters
+    for `timed_out` and final-query `stdout`, and explicit close with a hostile
+    timeout scalar.
+  - Proves the exact malformed-protocol primary object/type/message survives,
+    evidence remains closed and bounded, kill/wait/rm/container ordering is
+    preserved, the private package tree is removed, and explicit close raises
+    only the existing generic unchained `SandboxError`.
+
+### Finding closure and TDD evidence
+
+All commands ran singly, synchronously, and in the foreground. Every process
+and Docker-control interaction used injected in-memory fakes.
+
+Baseline cleanup/status characterization:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py -k "cleanup_evidence or cleanup_faults_preserve_primary or explicit_close_reports or policy_daemon_cleanup_checks_status"`
+
+Result before the new tests: **12 passed, 506 deselected**.
+
+RED command:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py -k "hostile_returncode or hostile_result_getter or hostile_result_to_generic"`
+
+RED result against unchanged production code: **4 failed, 518 deselected**.
+The hostile return-code comparison, hostile `timed_out` getter, hostile final
+`stdout` getter, and hostile timeout truth test each escaped from cleanup at the
+reviewed field-use boundary and stopped later owner cleanup.
+
+GREEN result after the exact-shape normalization change: same command,
+**4 passed, 518 deselected**. The hostile scalar methods and subclass getters
+were not invoked. The two malformed-protocol cases retained the identical
+exception object observed at the session-close boundary, exact `ValueError`
+type and message, and only bounded closed-code notes. Explicit close returned
+the exact generic cleanup `SandboxError`; a second close remained idempotent
+only after the first attempted every action and removed the package tree.
+
+Combined prior/new cleanup regression:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py -k "cleanup_evidence or cleanup_faults_preserve_primary or explicit_close_reports or policy_daemon_cleanup_checks_status or hostile_returncode or hostile_result_getter or hostile_result_to_generic"`
+
+Result: **16 passed, 506 deselected**.
+
+Worker/daemon slice:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py -k "policy_worker or policy_daemon_cleanup"`
+
+Result: **44 passed, 478 deselected**.
+
+### Fix Round 5 final verification
+
+Exact Task 5 focused command:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py tests/test_agent_loop.py -k "policy_worker or patch_bounds or candidate_identity or ast_purity or source_bundle or pit_optimizer_v2"`
+
+Result: **163 passed, 478 deselected**, exit 0. The only warning is the
+repository's pre-existing unknown `cache_dir` pytest option.
+
+Focused Ruff:
+
+`python -B -m ruff check agent_loop.py core/strategy_policy/runtime.py core/strategy_policy/worker.py core/pit_optimizer_candidate.py tests/test_pit_optimizer_v2.py tests/test_agent_loop.py`
+
+Result: **All checks passed**, exit 0.
+
+Pre-commit diff check:
+
+`git diff --check`
+
+Result: exit 0 with no whitespace errors; Git emitted only the existing Windows
+LF-to-CRLF working-copy notices for `agent_loop.py` and
+`tests/test_agent_loop.py`.
+
+Committed range check:
+
+`git diff --check f34379006e395fbffde909038ccb3f30b7e53be1..822241a032d488bb25767eacd72bd6ed2a6ea92d`
+
+Result: exit 0 with no output. The committed range changes only
+`agent_loop.py` and `tests/test_agent_loop.py`; tracked worktree status is clean.
+
+### Fix Round 5 self-review and concerns
+
+- Exact-type rejection happens before any subclass field lookup, so a hostile
+  descriptor cannot run. Exact-object fields are read inside the shield and
+  type-checked before any truth test, integer comparison, or string stripping.
+- Every malformed kill/wait/rm result remains local to its action and cannot
+  suppress later actions. A malformed final query additionally records the
+  separate closed `daemon_absence_verify/unverified` outcome.
+- The final absence check still targets only the already-authenticated full
+  container ID. Invalid query evidence never claims physical absence, even if
+  the injected fake's internal state happens to be absent.
+- No provider/OpenRouter/pricing/network/replay/parity, real Docker/container,
+  upload, push, merge, cloud task, background helper, unrelated process
+  inspection, or broad-suite action was used.
+- Real Docker lifecycle and replay/parity remain intentionally deferred. The
+  pre-existing pytest `cache_dir` warning and Windows line-ending notices are
+  the only observed tooling concerns.

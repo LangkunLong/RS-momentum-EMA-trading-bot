@@ -1,0 +1,705 @@
+# Task 6 — Clean local schema-v3 readiness report
+
+- Recorded at: 2026-08-29T07:01:28Z
+- Aggregate status: **BLOCKED / FAIL CLOSED DURING AUTHORIZED PARITY RECONSTRUCTION**
+- Live boundary status: **NOT REACHED**
+- Source root: `C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-implementation`
+- Sealed evidence root: `C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.artifacts`
+
+## Preflight gates
+
+| Gate | Result | Evidence |
+|---|---|---|
+| Reviewed HEAD | PASS | Current HEAD exactly matched the required reviewed commit; raw identity omitted. |
+| `git diff --check` | PASS | Exit status 0. |
+| Tracked diff | PASS | `git diff --exit-code` returned 0. |
+| Cached diff | PASS | `git diff --cached --exit-code` returned 0. |
+| Worktree status | PASS | Porcelain status contained zero entries before any output creation. |
+| Isolated worktree | PASS | Git directory and common directory confirmed a linked worktree, not a submodule. |
+| New parity v10 root absent | PASS | `.artifacts/pit-policy-parity-v10` was absent. |
+| New optimizer v10 root absent | PASS | `.artifacts/pit-optimizer-v10` was absent. |
+| Controller temp parent absent | PASS | The explicit external temp parent was absent and therefore was not created. |
+
+## Sealed local inputs
+
+| Input | Required path | Result |
+|---|---|---|
+| Parity reference | `C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.artifacts/pit-policy-parity-v2/reference.json` | **BLOCKER: ABSENT** |
+| PIT bundle | Required main-repository Task 4 PIT bundle path | PRESENT |
+| Subset readiness | Required main-repository subset-readiness path | PRESENT |
+| Baseline run | Required main-repository Task 11 baseline-run path | PRESENT |
+| Prior authenticated optimizer manifest | `C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.artifacts/pit-optimizer-v7/manifest.json` | **BLOCKER: ABSENT** |
+
+Exact literal-path checks and directory enumeration confirmed that both missing inputs were genuinely absent, rather than inaccessible under a different path or case. No alternative parity evidence was selected. No digest-pinned sandbox image identity was inferred from unrelated artifacts, because the task requires fail-closed authenticated identity resolution.
+
+## Readiness and boundary gates
+
+| Gate | Result |
+|---|---|
+| Provider-free parity verification | NOT RUN — required parity input absent |
+| Parity matched | NOT ESTABLISHED |
+| Schema-v3 manifest | NOT BUILT |
+| Schema version 3 | NOT ESTABLISHED |
+| Maximum calls = 6 | NOT ESTABLISHED |
+| Maximum tokens = 448000 | NOT ESTABLISHED |
+| Iterations = 2 | NOT ESTABLISHED |
+| Provider retries = 0 | NOT ESTABLISHED |
+| Apply = false | NOT ESTABLISHED |
+| Enforcing USD authority absent | NOT ESTABLISHED |
+| Provider records absent | PASS FOR THIS TASK — no provider command or client was invoked |
+| Hidden result absent | PASS FOR THIS TASK — hidden data was not opened or evaluated |
+| Docker activity absent | PASS FOR THIS TASK — Docker was not started or invoked |
+| Network/provider activity absent | PASS FOR THIS TASK — no network, pricing, or provider operation was invoked |
+| Candidate evaluation / replay absent | PASS — neither was run |
+| Source modified = false | PASS — no tracked source, test, documentation, or manifest file was changed |
+| External temp cleanup | PASS / NOT APPLICABLE — temp parent remained absent |
+| Inert canary command emitted | NO — manifest preparation was not reached |
+| Authorization recorded | NO |
+| Canary command executed | NO |
+
+## Outputs
+
+- `.artifacts/pit-policy-parity-v10`: not created.
+- `.artifacts/pit-optimizer-v10`: not created.
+- Controller runtime/run directories: not created.
+- Provider-free prepare command: not emitted or executed.
+- Canary command: not emitted or executed.
+
+## Blocker
+
+The sealed parity reference and the preferred prior authenticated optimizer manifest required by the task do not exist under the mandated main-repository artifact root. Without the parity reference, local policy parity cannot be authenticated. Without the prior manifest, the digest-pinned sandbox image cannot be resolved under the required fail-closed rule. Execution therefore stopped before any v10 output or temp directory was created.
+
+No commit, push, upload, source edit, grant recording, provider/pricing/network call, Docker start, hidden-data access, candidate evaluation, or replay occurred.
+
+## Resumed recovery attempt
+
+- Recorded at: 2026-08-29T07:07:18Z
+- Recovery authority: the two recorded rulings appended to the Task 6 brief.
+- Outcome: **BLOCKED / FAIL CLOSED WITH AN EMPTY PARTIAL PARITY-V10 ROOT**
+
+The resumed preflight reconfirmed the reviewed HEAD and clean tracked/cached/status gates. The sealed readiness records a source identity that exists locally and is an ancestor of the reviewed HEAD; the raw identity is omitted. Both tracked provenance documents contain exactly one valid digest-pinned worker image reference, and the references are identical; the raw image digest is omitted.
+
+### Disposable detached capture worktree
+
+| Gate | Result |
+|---|---|
+| Exact capture path under `.worktrees` | PASS |
+| Path absent before creation | PASS |
+| Detached worktree created at sealed source identity | PASS |
+| Detached identity matched sealed readiness | PASS |
+| Discovery-only parity capture command invoked | YES, provider-free |
+| Capture completed | **FAIL — requested module is absent at the sealed source commit** |
+| Detached worktree clean before removal | PASS |
+| Removed with native `git worktree remove` | PASS |
+| Filesystem path absent after removal | PASS |
+| Git worktree registration absent after removal | PASS |
+
+The first sandboxed Git metadata write was denied before any filesystem or v10 output existed. Exact checks confirmed no partial state, then the worktree creation was completed with narrowly scoped escalation. Capture subsequently exited before evaluating folds or writing a reference because Python could not import `core.pit_policy_parity` from the detached sealed source. A Git object check independently confirmed that `core/pit_policy_parity.py` is absent at that sealed source commit.
+
+### Preserved partial output state
+
+Per the resumed no-overwrite/no-automatic-retry ruling, the partial output was not deleted or retried:
+
+- `.artifacts/pit-policy-parity-v10`: exists and is empty (zero entries).
+- `.artifacts/pit-policy-parity-v10/reference.json`: absent.
+- `.artifacts/pit-policy-parity-v10/verified-final.json`: absent.
+- `.artifacts/pit-optimizer-v10`: absent.
+- Controller temp parent: absent.
+
+### Resumed readiness gates
+
+| Gate | Result |
+|---|---|
+| Reconstructed discovery reference | NOT WRITTEN |
+| `hidden_unevaluated` | NOT ESTABLISHED — capture did not start evaluation |
+| Reviewed-HEAD parity verification | NOT RUN |
+| Parity matched | NOT ESTABLISHED |
+| Sandbox image identity recovery | PASS — identical valid tracked references, digest redacted |
+| Schema-v3 manifest | NOT BUILT |
+| Schema version / calls / tokens / retries / iterations / apply | NOT ESTABLISHED |
+| Enforcing USD authority absent | NOT ESTABLISHED IN A MANIFEST |
+| Provider records | ABSENT |
+| Hidden result | ABSENT |
+| Docker activity | ABSENT — Docker was not invoked or started |
+| Provider/pricing/network activity | ABSENT — no client or network command was invoked |
+| Candidate evaluation / replay | ABSENT |
+| Source modified | FALSE |
+| Reviewed HEAD unchanged and tracked/cached/status clean | PASS |
+| Inert canary command emitted | NO |
+| Authorization recorded / canary executed | NO / NO |
+
+### Resumed blocker
+
+The authorized recovery requires running `core.pit_policy_parity capture` inside the exact detached source recorded by the sealed readiness. That exact source does not contain the requested module, so it cannot execute the required capture command. The empty parity-v10 root is intentionally preserved as the exact partial state. No command was reconstructed from another source, and execution did not advance to parity verification, manifest building, preparation, authorization, or the canary boundary.
+
+## External-helper parity recovery attempt
+
+- Recorded at: 2026-08-29T07:13:05Z
+- Authority: external-helper parity ruling in the updated Task 6 brief and SDD ledger.
+- Outcome: **BLOCKED / FAIL CLOSED ON ANCESTOR ENGINE API INCOMPATIBILITY**
+- Attempts under this ruling: exactly one.
+
+### Harness and origin authentication
+
+An ignored harness was written only at `.superpowers/sdd/2026-08-28-pit-optimizer-audit-only-usd/task-6-parity-harness.py`. It placed the authenticated ancestor root first and the reviewed current root second on `sys.path`; it did not copy, add, or ignore any file inside the detached ancestor.
+
+| Module-origin gate | Result |
+|---|---|
+| `core.pit_optimization` under detached ancestor | PASS |
+| `core.backtest_engine` under detached ancestor | PASS |
+| `core.pit_data` under detached ancestor | PASS |
+| `core.engine_policy` under detached ancestor | PASS |
+| `core.pit_optimizer_evaluation` under reviewed current root | PASS |
+| `core.pit_policy_parity` under reviewed current root | PASS |
+
+All six origin assertions execute before the capture API call. The attempt reached `capture_parity_reference` discovery evaluation, which proves these assertions passed. The helper also completed its source/readiness/bundle authentication before constructing the ancestor `PortfolioSimulator` and attempting the first discovery-fold run.
+
+### Attempt result
+
+The single call to `capture_parity_reference(..., source_root=ancestor_root)` failed on the first simulator invocation because the current reviewed helper supplies `history_start_date`, while the authenticated ancestor's `PortfolioSimulator.run()` does not accept that parameter. An independent object-level inspection confirmed the ancestor engine source lacks that API parameter.
+
+The failure occurred before a simulator run completed, before either discovery evidence record was built, and before persistence:
+
+- Source/head/fingerprint authentication: PASS inside the closed capture helper up to evaluation.
+- PIT bundle/readiness authentication: PASS inside the closed capture helper up to evaluation.
+- Exactly two discovery folds captured: NO — evaluation stopped at the first invocation.
+- Hidden evaluated: NO.
+- Canonical reference written: NO.
+- Normal current-HEAD parity verification: NOT RUN because no reference exists.
+
+### Cleanup and preserved state
+
+| Gate | Result |
+|---|---|
+| Detached worktree exact authenticated commit | PASS; raw identity omitted |
+| Detached worktree clean before attempt | PASS |
+| Detached worktree clean before removal | PASS |
+| Native `git worktree remove` | PASS |
+| Detached path absent after removal | PASS |
+| Git worktree registration absent after removal | PASS |
+| Reviewed HEAD unchanged | PASS; raw identity omitted |
+| `git diff --check`, tracked diff, cached diff, status | PASS / clean |
+| Harness exists and is ignored | PASS |
+| Parity-v10 root | Exists and remains empty (zero entries) |
+| Reconstructed reference / final attestation | Absent / absent |
+| Optimizer-v10 root | Absent |
+| Controller temp parent | Absent |
+
+No second external-helper attempt was made. The empty parity-v10 root and ignored harness are preserved as exact evidence of the authorized attempt.
+
+### Live-boundary gates after external-helper attempt
+
+| Gate | Result |
+|---|---|
+| Schema-v3 manifest/readiness | NOT BUILT |
+| Schema/call/token/retry/apply/USD gates | NOT ESTABLISHED |
+| Provider records | ABSENT |
+| Hidden result | ABSENT |
+| Provider/pricing/network activity | ABSENT |
+| Docker activity | ABSENT |
+| Candidate evaluation / replay | ABSENT |
+| Source modified | FALSE |
+| Inert canary command emitted / executed | NO / NO |
+| Authorization recorded | NO |
+
+### Current blocker
+
+The external current helper and authenticated ancestor engine have an incompatible simulator call contract. Adapting either side, monkey-patching the API, or reconstructing a second attempt is outside the recorded ruling. Task 6 therefore remains stopped before parity verification and manifest preparation.
+
+## In-memory history-adapter recovery attempt
+
+- Recorded at: 2026-08-29T07:19:17Z
+- Authority: in-memory history-adapter ruling in the updated Task 6 brief and SDD ledger.
+- Outcome: **BLOCKED / FAIL CLOSED ON SOURCE-FINGERPRINT AUTHENTICATION**
+- Attempts under this ruling: exactly one.
+
+### Authorized compatibility behavior
+
+The ignored SDD harness retained the strict six-module origin checks. It saved the authenticated ancestor `PortfolioSimulator.run` method and replaced it only in process with a wrapper accepting `history_start_date`. For each discovery call, the wrapper:
+
+- preserved the original fold start/end supplied to the historical method;
+- required a present warmup strictly earlier than the fold;
+- temporarily replaced only `self.pit_bundle` with a delegating adapter;
+- overrode only `fetch_price_data` and `fetch_closes` so their requested start was replaced by the earlier warmup;
+- forwarded every other bundle attribute/method unchanged;
+- restored the original bundle in `finally`;
+- rejected hidden, unexpected, duplicate, missing, or late fold/warmup calls;
+- required each adapter instance to use exactly the two authorized override methods once.
+
+No ancestor file was copied, added, modified, or ignored. The original class method was restored in `finally` inside the harness process.
+
+### Capture gates
+
+| Gate | Result |
+|---|---|
+| Four engine module origins under authenticated ancestor | PASS |
+| Two helper module origins under reviewed current root | PASS |
+| Detached ancestor clean and exact authenticated commit | PASS; raw identity omitted |
+| Exactly two expected discovery fold/warmup pairs | PASS |
+| Missing/late/unexpected/duplicate warmup | ABSENT |
+| Adapter override set | PASS — only price-data and closes fetches |
+| Original fold start/end preserved | PASS |
+| Original bundle restored after each call | PASS |
+| Hidden call/evidence | ABSENT |
+| Discovery evidence records | 2 |
+| Canonical reference persisted and reloaded | PASS |
+| Reference source head equals sealed readiness | PASS; raw identity omitted |
+| Reference source fingerprint equals sealed readiness | **FAIL**; values omitted |
+
+The single attempt completed both discovery folds, persisted the reference, and successfully reloaded it through the current canonical reference loader. The harness then compared the captured source identity to the sealed readiness. The source commit identity matched, but the source fingerprint did not. This is a mandatory authentication failure, so normal reviewed-current parity verification was not run and the task did not proceed.
+
+### Preserved output and cleanup
+
+Per no-overwrite/no-retry rules, the written reference is preserved exactly:
+
+- `.artifacts/pit-policy-parity-v10`: exists with exactly one entry.
+- `.artifacts/pit-policy-parity-v10/reference.json`: exists, canonical, but failed the required sealed-readiness fingerprint equality gate.
+- `.artifacts/pit-policy-parity-v10/verified-final.json`: absent.
+- `.artifacts/pit-optimizer-v10`: absent.
+- Controller temp parent: absent.
+
+| Cleanup/source gate | Result |
+|---|---|
+| Detached worktree clean before removal | PASS |
+| Native worktree removal | PASS |
+| Detached filesystem path absent | PASS |
+| Git worktree registration absent | PASS |
+| Reviewed HEAD unchanged | PASS; raw identity omitted |
+| Diff check / tracked / cached / status | PASS / clean |
+| Tracked provenance image references equal and valid | PASS; digest omitted |
+
+### Boundary status
+
+| Gate | Result |
+|---|---|
+| Normal current-HEAD parity equality | NOT RUN — fingerprint gate failed first |
+| Schema-v3 manifest/readiness | NOT BUILT |
+| Schema/calls/tokens/retries/apply/USD gates | NOT ESTABLISHED |
+| Provider records / hidden result | ABSENT / ABSENT |
+| Provider/pricing/network activity | ABSENT |
+| Docker activity | ABSENT |
+| Candidate evaluation / replay | ABSENT |
+| Grant / canary execution | ABSENT / ABSENT |
+| Inert canary emitted | NO |
+
+### Current blocker after history adapter
+
+The compatibility adapter closed the historical warmup API gap and produced two discovery-only evidence records, but the resulting reference source fingerprint does not equal the authenticated fingerprint recorded in the sealed readiness. Continuing to verify, rebuilding the reference, or changing fingerprint semantics would bypass an explicit recovery gate. Task 6 remains stopped before current-HEAD parity verification and manifest preparation.
+
+## Historical branch-fingerprint authentication attempt
+
+- Recorded at: 2026-08-29T07:26:56Z
+- Authority: historical `agent_loop.source_fingerprint` ruling in the fully updated Task 6 brief and SDD ledger.
+- Outcome: **BLOCKED / FAIL CLOSED BEFORE CAPTURE — ZERO UNIQUE FINGERPRINT MATCHES**
+
+### Historical fingerprint method
+
+The exact authenticated ancestor `agent_loop` module was imported from the clean detached worktree and its Git executable capability was configured to the approved external Git binary. Local branches containing the sealed commit were enumerated without printing their names. For each candidate, the harness:
+
+- intercepted only `_git(..., "symbolic-ref", "--quiet", "--short", "HEAD")` to supply that candidate's local branch label;
+- delegated HEAD, index, tracked paths and bytes, file modes, untracked names, Git configuration, and every other historical fingerprint input to the clean detached ancestor;
+- required the returned historical head and simulated branch identity to remain exact;
+- compared the resulting digest to the sealed readiness without printing either value.
+
+Aggregate result:
+
+| Gate | Result |
+|---|---|
+| Local branches containing sealed commit | 3 |
+| Historical fingerprints evaluated | 3 |
+| Matches to sealed readiness fingerprint | **0** |
+| Required unique match count | 1 |
+| Unique historical fingerprint authentication | **FAIL** |
+
+The initial reconstruction invocation stopped on the unique-match requirement. A subsequent read-only count-only diagnostic repeated the same historical fingerprint enumeration and emitted only the aggregate candidate and match counts; it did not call capture or create an artifact.
+
+### Capture and parity status
+
+Because no candidate historical fingerprint matched:
+
+- the current helper's in-memory `_source_identity` binding was not installed;
+- the separately required current-helper clean HEAD/tree before/after capture checks were not reached;
+- the warmup adapter and discovery evaluation were not invoked in this attempt;
+- `reference-authenticated.json` was not written;
+- normal current parity verification was not run;
+- no equality attestation or parity mismatch exists for this attempt.
+
+The prior failed `reference.json` remains preserved and was not overwritten.
+
+### Cleanup and preserved state
+
+| Gate | Result |
+|---|---|
+| Detached ancestor exact and clean before fingerprinting | PASS |
+| Detached ancestor clean before removal | PASS |
+| Native worktree removal | PASS |
+| Detached path absent | PASS |
+| Git worktree registration absent | PASS |
+| Reviewed HEAD unchanged | PASS; raw identity omitted |
+| Diff check / tracked / cached / status | PASS / clean |
+| Parity-v10 entries | Exactly one: prior failed `reference.json` |
+| `reference-authenticated.json` | ABSENT |
+| `verified-final.json` | ABSENT |
+| Optimizer-v10 root | ABSENT |
+| Controller temp parent | ABSENT |
+
+### Boundary status
+
+| Gate | Result |
+|---|---|
+| Historical fingerprint uniquely authenticated | FAIL — zero of three candidates matched |
+| Authenticated capture | NOT RUN |
+| Normal current parity equality | NOT RUN |
+| Schema-v3 manifest/readiness | NOT BUILT |
+| Schema/calls/tokens/retries/apply/USD gates | NOT ESTABLISHED |
+| Provider records / hidden result | ABSENT / ABSENT |
+| Provider/pricing/network / Docker activity | ABSENT / ABSENT |
+| Candidate evaluation / replay | ABSENT / ABSENT |
+| Grant / canary | ABSENT / ABSENT |
+
+### Current blocker after historical branch simulation
+
+None of the three local branch labels containing the sealed commit reproduces the sealed readiness fingerprint under the exact authenticated ancestor algorithm while all non-branch inputs remain bound to the clean detached worktree. The unique-match gate therefore fails with zero matches. Guessing another branch label, changing another fingerprint input, or fabricating an attestation is not authorized, so Task 6 remains stopped before authenticated capture and current parity verification.
+
+## Legacy-fingerprint migration capture and parity verification
+
+- Recorded at: 2026-08-29T07:33:44Z
+- Authority: legacy-fingerprint migration ruling in the updated Task 6 brief and SDD ledger.
+- Outcome: **BLOCKED / REAL REVIEWED-CURRENT PARITY MISMATCH**
+
+### Tree-authenticated capture
+
+The prior failed `reference.json` was preserved. `reference-tree-authenticated.json` was confirmed absent before this attempt. A detached worktree was recreated at the exact canonical-readiness source commit and authenticated without printing its identity.
+
+| Migration gate | Result |
+|---|---|
+| Canonical readiness accepted by closed helper | PASS |
+| Sealed commit exists | PASS |
+| Sealed commit is ancestor of reviewed HEAD | PASS |
+| Detached worktree exact at sealed commit | PASS |
+| Tracked changes | 0 |
+| Staged changes | 0 |
+| Untracked changes | 0 |
+| Ancestor engine module origins | PASS for all four required modules |
+| Reviewed-current helper origins | PASS for both required helpers |
+| Current helper full-tree identity before capture | PASS |
+| Current helper full-tree identity unchanged during/after capture | PASS |
+| Existing readiness policy identity checks | PASS |
+| Existing readiness entry-contract identity checks | PASS |
+| Existing PIT-bundle identity checks | PASS |
+| Existing baseline identity checks | PASS |
+| History adapter override set | PASS — only price-data and closes fetches |
+| Expected discovery fold/warmup pairs | Exactly 2 |
+| Hidden call/evidence | ABSENT |
+| Discovery evidence records | Exactly 2 |
+| Canonical `reference-tree-authenticated.json` | WRITTEN AND RELOADED |
+
+The harness did not bind the reference to the unreconstructible legacy digest. It captured the clean ancestor commit and current helper deterministic full-tree identity, retaining all canonical readiness policy, source-contract, PIT-bundle, and baseline checks.
+
+### Detached worktree cleanup
+
+After capture, the detached worktree still had the exact source HEAD and zero tracked, staged, or untracked changes. Native removal succeeded; both its filesystem path and Git registration are absent.
+
+### Normal reviewed-current parity verification
+
+The normal current `core.pit_policy_parity verify` command was run against `reference-tree-authenticated.json` and the sealed PIT bundle. Both discovery folds were evaluated provider-free. The verifier rejected equality with these component results:
+
+| Equality component | Result |
+|---|---|
+| Transactions | **DIFFERENT** |
+| Entry outcomes | EQUAL |
+| Equity | **DIFFERENT** |
+| Funnels / aggregate | **DIFFERENT** |
+| Effective policy | EQUAL |
+
+This is a real parity mismatch between the authenticated ancestor reference and reviewed current implementation. It is not an adapter exception, source-authentication failure, or missing warmup. Because equality failed, the verifier did not write `verified-final.json`; no attestation was fabricated.
+
+### Preserved state and downstream boundary
+
+- `.artifacts/pit-policy-parity-v10/reference.json`: preserved earlier failed reference.
+- `.artifacts/pit-policy-parity-v10/reference-tree-authenticated.json`: preserved canonical migration reference.
+- `.artifacts/pit-policy-parity-v10/verified-final.json`: absent because equality failed.
+- `.artifacts/pit-optimizer-v10`: absent.
+- Controller temp parent: absent.
+- Reviewed HEAD/diff/cached/status: unchanged and clean.
+
+| Downstream gate | Result |
+|---|---|
+| Parity equality attestation | FAIL / ABSENT |
+| Tracked image-provenance continuation | NOT REACHED |
+| Schema-v3 manifest/readiness | NOT BUILT |
+| Schema/calls/tokens/retries/apply/USD gates | NOT ESTABLISHED |
+| Provider records / hidden result | ABSENT / ABSENT |
+| Provider/pricing/network / Docker activity | ABSENT / ABSENT |
+| Candidate evaluation / replay | ABSENT / ABSENT |
+| Grant / canary | ABSENT / ABSENT |
+| Inert canary command | NOT EMITTED |
+
+### Current blocker after migration capture
+
+Normal reviewed-current parity verification differs from the authenticated ancestor reference in transactions, equity, and funnels. Task 6 requires all equality gates before manifest/readiness construction, so execution stops at this real parity boundary.
+
+## Read-only parity mismatch diagnosis
+
+- Recorded at: 2026-08-29T07:42:17Z
+- Scope: two discovery folds only; hidden remained unevaluated.
+- Tracked source changes: none.
+- Diagnostic artifacts:
+  - `.artifacts/pit-policy-parity-v10/diagnostic-structural.json`
+  - `.artifacts/pit-policy-parity-v10/diagnostic-allocation.json`
+  - `.artifacts/pit-policy-parity-v10/diagnostic-allocation-first.json`
+
+### Reproduction and aggregate structural differences
+
+The reviewed current implementation was re-evaluated from the same tree-authenticated reference and sealed PIT bundle. Source identity was checked before and after each diagnostic run and remained stable.
+
+| Evidence family | Discovery fold 0 | Discovery fold 1 |
+|---|---:|---:|
+| Reference/current transactions | 15 / 15 | 10 / 10 |
+| Aligned differing transaction records | 10 | 8 |
+| Differing transaction fields | `quantity`, `value` only | `quantity`, `value` only |
+| Maximum absolute price delta | 0 | 0 |
+| Maximum absolute quantity delta | 0.122785 | 0.072257 |
+| Maximum absolute value delta | 9.04 | 5.82 |
+| Reference/current equity sessions | 60 / 60 | 60 / 60 |
+| Session-label mismatches | 0 | 0 |
+| Differing equity points | 43 | 36 |
+| Maximum absolute equity delta | 0.479947 | 0.536316 |
+| Entry outcomes | equal (7) | equal (5) |
+| Effective policy | equal | equal |
+| Raw funnel metrics | all 13 equal | all 13 equal |
+| Exit-attribution metrics | all 3 equal | all 3 equal |
+
+The differing aggregate scalar paths in both folds are:
+
+- `aggregate.average_exposure_pct`
+- `aggregate.excess_total_return_pp`
+- `aggregate.max_drawdown_pct`
+- `aggregate.sharpe_ratio`
+- `aggregate.total_return_pct`
+- `aggregate.turnover_pct`
+
+Maximum aggregate absolute deltas by fold were:
+
+| Field | Fold 0 | Fold 1 |
+|---|---:|---:|
+| Average exposure percentage | 0.002856 | 0.000643 |
+| Excess return percentage points | 0.000175 | 0.000485 |
+| Maximum drawdown percentage | 0.000174 | 0.000532 |
+| Sharpe ratio | 0.000150 | 0.000391 |
+| Total return percentage | 0.000175 | 0.000485 |
+| Turnover percentage | 0.03456 | 0.01676 |
+
+The first differing transaction in each fold retained the same `BUY` action, `Volume Breakout` reason category, and exact price. Only quantity and derived value differed. The current quantity was lower by approximately 0.000213 in fold 0 and 0.072257 in fold 1. No symbols, dates, raw prices, raw quantities, records, or identities were serialized.
+
+### Funnel and exit/history exclusions
+
+The verifier's combined `funnels` label is broader than the raw signal funnel: it requires both `left.funnel == right.funnel` **and** the complete fold aggregate to match. All raw funnel metric IDs and values are equal; the label failed because equity-derived aggregate scalars differ.
+
+Protective-stop and exit ordering are not the initiating cause:
+
+- transaction counts, actions, reasons, and prices are equal;
+- exit-attribution categories and counts are equal;
+- entry outcomes are equal;
+- the first mismatch is a BUY quantity before downstream SELL quantity propagation.
+
+History-start behavior is also not the initiating cause:
+
+- the ancestor adapter fetched the same earlier warmup used natively by current code;
+- both implementations retained the original fold evaluation sessions;
+- session labels, entry outcomes, raw funnel metrics, transaction counts, actions, reasons, and prices all agree.
+
+### Allocation root-cause trace
+
+Current reviewed allocation uses the same configured risk fraction and stop fraction as the ancestor. The divergence is introduced in `core/backtest_engine.py` inside `_validate_entry_transition`:
+
+1. Both paths compute the initial target notional as portfolio equity multiplied by risk fraction divided by stop fraction.
+2. Both paths round the protective stop price to cents.
+3. The ancestor sets quantity from target notional divided by entry price and does **not** resize quantity after rounding the stop.
+4. Current code recomputes `loss_per_share` from the rounded stop and then caps quantity again at `recommended_budget / loss_per_share` and `engine_budget / loss_per_share` (`core/backtest_engine.py` around lines 3055–3078).
+5. When cent rounding moves the stop downward, rounded loss per share becomes slightly larger than the configured fractional loss. The new cap reduces quantity even though the policy decision and entry price are unchanged.
+
+The first divergent BUY in each fold proves this is the initiating cause:
+
+| Gate | Fold 0 | Fold 1 |
+|---|---:|---:|
+| First divergent BUY ordinal | 2 | 1 |
+| Stop cent-rounding direction | lower | lower |
+| Absolute stop-rounding delta | 0.0006 | 0.0030 |
+| Rounded-stop cap active | yes | yes |
+| Ancestor formula matches reference quantity | yes | yes |
+| Rounded-stop formula matches current quantity | yes | yes |
+| Initial quantity reduction | 0.000213 | 0.072257 |
+
+Every current BUY quantity matched the new rounded-stop formula. The first reduction changes cash and position equity, which then propagates into later portfolio-equity-based sizing and matching SELL quantities. This explains why some later reference quantities no longer equal a formula recomputed from already-drifted current equity.
+
+### Smallest concrete code-level root cause
+
+The smallest causal change is the second quantity cap in `_validate_entry_transition` based on **cent-rounded** `loss_per_share`, not policy routing, history warmup, protective-stop ordering, or funnel computation. It changes the sizing semantics from “risk fraction over configured stop fraction, then round the execution stop” to “risk fraction over configured stop fraction, then resize again to the rounded execution stop.” The real parity mismatch is the deterministic downstream consequence of that one sizing-semantic change.
+
+No fix was applied. Manifest/readiness preparation remains blocked on parity equality.
+
+## Resumed post-rounded-stop recovery — 2026-08-29
+
+### Direct post-clamp parity capture
+
+The final reviewed HEAD was authenticated and clean. The recorded rounded-stop clamp commit existed locally, had the required subject, and was an ancestor of the reviewed HEAD.
+
+A disposable detached worktree was created at that authenticated commit. It was exact and clean, with no tracked, staged, or untracked changes. That commit's own `core.pit_policy_parity` CLI captured `reference-post-clamp.json` directly against the canonical sealed readiness and PIT bundle. The capture contained exactly two discovery folds, no hidden result, and a stable clean commit/tree identity.
+
+The detached worktree was then removed with native Git worktree operations. Its path and Git registration were both verified absent.
+
+Normal parity verification at the final reviewed HEAD wrote `verified-final.json` and passed every equality gate:
+
+- transactions equal;
+- entry outcomes equal;
+- equity equal;
+- funnels and fold aggregates equal;
+- effective policy equal;
+- reference and final output identities equal;
+- exactly two discovery evidence records.
+
+The earlier failed `reference.json` and `reference-tree-authenticated.json` were preserved unchanged.
+
+### Image provenance
+
+Each of the two required tracked provenance documents contained exactly one valid digest-pinned worker-image reference. The references were byte-for-byte identical. The raw image digest was not printed or copied into this report.
+
+### Schema-v3 manifest blocker
+
+The schema-v3 output paths were absent at preflight. The first provider-free build attempt was blocked before creating `manifest.json`; it left only the newly created empty `runtime` and `runs` directories under `.artifacts/pit-optimizer-v10` and an empty controller-temp parent. A scoped rerun with hardened local-handle access failed at the same pre-write stage.
+
+A read-only in-memory replay of the exact pre-write manifest gates identified the aggregate exception:
+
+```text
+ValueError: legacy readiness source identity differs from source root
+```
+
+This is a real fail-closed identity-graph mismatch between the sealed legacy readiness and the final reviewed source root, not a parity mismatch and not a sandbox/handle-access failure. No manifest was written, no schema-v3 readiness exists, and the emitted prepare/canary boundary was never reached.
+
+The partial ignored optimizer root was preserved exactly: it contains only empty `runtime` and `runs` directories. The exact controller-temp parent was verified empty, removed non-recursively, and verified absent. The final reviewed HEAD and tracked/untracked source cleanliness remained unchanged.
+
+No provider or pricing client was constructed; no network or Docker process was started; no grant, canary, role call, candidate evaluation, hidden evaluation, replay, source edit, test edit, commit, push, or upload occurred.
+
+## Post-Task-7 readiness regeneration — 2026-08-29
+
+### Clean source and fresh parity attestation
+
+The existing linked worktree was authenticated at the required post-Task-7 reviewed HEAD. It was not a submodule, and `git diff --check`, worktree diff, cached diff, and porcelain status were all clean.
+
+All prior parity references, failed migration evidence, diagnostics, and the stale prior final attestation were preserved. `reference-post-clamp.json` was present as a plain file and the absent-only target `verified-final-task7.json` was created using only the normal current verifier.
+
+The new attestation passed every required discovery-only equality gate:
+
+- transactions equal;
+- entry outcomes equal;
+- equity equal;
+- funnels and complete fold aggregates equal;
+- effective policy equal;
+- exactly two reference and final discovery outputs;
+- no hidden evaluation.
+
+### Schema-v3 manifest
+
+Before construction, `.artifacts/pit-optimizer-v10` contained only empty `runtime` and `runs` directories; `manifest.json` and readiness artifacts were absent. Each required tracked provenance document again contained exactly one valid digest-pinned image reference, and the two references were identical.
+
+The exact schema-v3 manifest build completed using `verified-final-task7.json`. The resulting manifest and emitted prepare command passed the closed aggregate checks:
+
+| Gate | Result |
+|---|---:|
+| Schema version | 3 |
+| Role calls | 6 |
+| Token envelope | 448,000 |
+| Iterations | 2 |
+| Provider retries | 0 |
+| Apply | false |
+| Enforcing USD fields | absent |
+| Cost-exhaustion authority | absent |
+| Prepare phase | provider-free |
+| Prepare interpreter | absolute and authenticated by the production regular non-link contract |
+
+The raw image digest, source identities, manifest identities, and emitted command were not printed or copied into this report.
+
+### Prepare blocker and live boundary
+
+The exact emitted provider-free prepare command was executed. The first shell capture was interrupted by PowerShell's terminating-native-error behavior after the parser wrote its first stderr line; it created no readiness or runtime record. With state still empty, the same byte-exact emitted command was allowed to return its complete parser result. It failed at this configuration gate:
+
+```text
+agent_loop.py: error: permanent runtime root must not overlap source_root
+```
+
+This is a real fail-closed path-contract conflict: the approved Task 6 plan supplies `.artifacts/pit-optimizer-v10/runtime` under the source root, while the current CLI rejects every permanent runtime root overlapping that source root. It was not an access-denied failure. No command variant or reconstructed command was executed.
+
+The schema-v3 manifest and new parity attestation are preserved. No schema-v3 readiness was written, no inert canary command was emitted, and the `runtime` and `runs` directories remain empty. The short command sidecar and exact controller-temp parent were validated under the OS temp directory, removed, and verified absent.
+
+No provider or pricing client was constructed; no network or Docker process was started; no grant, canary, role call, candidate evaluation, hidden evaluation, replay, source edit, test edit, commit, push, or upload occurred. The final reviewed HEAD and source cleanliness remained unchanged.
+
+## Final isolated-roots layout attempt — 2026-08-29
+
+The final create-only ruling was applied once. Preflight reconfirmed the required clean reviewed HEAD, exact Task-7 parity equality, identical dual-document image provenance, and preservation of all prior manifests, parity references, attestations, diagnostics, failed evidence, and empty roots. `manifest-isolated-roots.json` and all three final root targets were absent.
+
+Exactly three new empty roots were created:
+
+- a permanent runtime under the main repository's ignored `.artifacts` area;
+- a sibling run-artifact root under that ignored `.artifacts` area;
+- an exact controller-temp parent under the operating-system temp directory.
+
+Source, permanent runtime, run-artifact root, controller temp, sealed baseline run, and sealed PIT bundle were each required to be absolute and plain non-link directories/files as applicable. All 15 unordered pairs were checked for containment in both directions; the overlap count was zero. The three new roots were empty before build.
+
+The create-only `manifest-isolated-roots.json` build completed with the same authenticated parity, policy, data, baseline, image, and role envelope. Its manifest and emitted prepare command passed schema 3, six calls, 448,000 tokens, two iterations, zero retries, `apply=false`, no enforcing USD fields, no cost-exhaustion authority, exact final-root binding, provider-free prepare phase, and production-authenticated absolute interpreter checks.
+
+The exact emitted provider-free prepare command then stopped before readiness at the closed initialization stage:
+
+```text
+agent loop initialization failed: source_preflight_lock
+```
+
+This occurred after all requested layout gates passed and before any readiness, validation-ledger, provider, Docker, hidden, candidate, replay, grant, or canary action. The closed stage identifies source-lock acquisition but intentionally does not expose an underlying operating-system exception. Read-only inspection found no remaining `agent_loop.py` prepare/canary process. The Git-metadata lock path is a plain one-byte file, consistent with the source-lock protocol's persistent lock-file shape; it was not deleted or altered. Per the final-layout ruling, the command was not retried or escalated.
+
+All three manifests and all prior evidence were preserved. The new runtime and run-artifact roots remain empty; no readiness or inert canary command was emitted. The exact controller-temp parent was verified empty/plain, removed, and verified absent.
+
+No provider or pricing client was constructed; no network or Docker process was started; no grant, canary, role call, candidate evaluation, hidden evaluation, replay, source edit, test edit, commit, push, or upload occurred. The final reviewed HEAD and source cleanliness remained unchanged.
+
+## One-time external-runtime layout attempt — 2026-08-29
+
+The new ruling authorized one create-only permanent runtime under the main repository's ignored `.artifacts` directory. Preflight reconfirmed the required clean reviewed HEAD, the equal `verified-final-task7.json` attestation, identical dual-document image provenance, both preserved manifests/evidence sets, empty internal `runtime` and `runs`, and an absent `manifest-external-runtime.json` target.
+
+A task-specific external runtime and external controller-temp parent were created as absolute plain non-link directories. Canonical path checks proved that the runtime did not overlap the feature source, feature optimizer root, or controller temp, and that the controller temp did not overlap source or feature artifacts.
+
+The create-only `manifest-external-runtime.json` build completed with the same authenticated parity, policy, data, baseline, image, and resource envelope. It passed schema 3, six calls, 448,000 tokens, two iterations, zero retries, `apply=false`, no enforcing USD fields, no cost-exhaustion authority, provider-free prepare phase, and production-authenticated absolute interpreter checks. The original `manifest.json` was preserved unchanged.
+
+The new manifest's exact emitted provider-free prepare command then failed before writing readiness or runtime evidence:
+
+```text
+agent_loop.py: error: artifact_root must not overlap source, controller runtime, permanent runtime, or sealed PIT optimization inputs
+```
+
+The one-time external runtime fixed the previously reported permanent-runtime overlap, but the unchanged approved artifact root remains `.artifacts/pit-optimizer-v10/runs` inside `source_root`. The current CLI therefore rejects the artifact root at the next isolation gate. This is a new real path-contract blocker, not an access-denied failure. No retry or path variant was attempted.
+
+Both manifests, every parity/diagnostic artifact, and the new empty external runtime were preserved. Internal `runtime` and `runs` remain empty. No readiness or discovery-ledger record was written, and no inert canary command was emitted. The exact controller-temp directory and short command sidecar were verified empty/plain as applicable, removed, and verified absent.
+
+No provider or pricing client was constructed; no network or Docker process was started; no grant, canary, role call, candidate evaluation, hidden evaluation, replay, source edit, test edit, commit, push, or upload occurred. The final reviewed HEAD and source cleanliness remained unchanged.
+
+## One-time scoped SourceLock escalation — 2026-08-29
+
+The coordinator's read-only ownership audit found no running agent-loop, PIT optimizer, replay, or provider process. The persistent source-lock file was revalidated as a plain, regular, single-link, one-byte file and was left untouched. The reviewed HEAD, tracked cleanliness, Task-7 parity attestation, dual-document digest-pinned image provenance, isolated manifest, sealed inputs, and all path bindings were reconfirmed before execution.
+
+Because the exact prepare command had intentionally not been persisted, the production manifest loader and `build_prepare_command` were invoked twice in separate fresh processes using only the existing create-only `manifest-isolated-roots.json` and its previously authenticated executable, image, input, runtime, artifact, and controller paths. Both canonical emissions were byte-for-byte identical. Manifest, source, parity, readiness input, PIT bundle, baseline, and executable identities were unchanged before and after re-emission. Neither command nor any raw identity was written to this report.
+
+Exactly the second canonical emission was executed once with the documented filesystem-sandbox escalation, scoped solely to allowing `SourceLock` to open and lock the linked-worktree Git metadata. It exited successfully and emitted exactly one schema-v3 readiness result and exactly one inert canary command. The canary command was not executed.
+
+The resulting closed readiness passed the final audit:
+
+- schema version 3 in both readiness and embedded manifest;
+- six role calls with a combined 448,000-token envelope;
+- two iterations, zero provider retries, and `apply=false` under the sealed invocation;
+- no enforcing USD or cost-exhaustion authority;
+- exact equality for transactions, entry outcomes, equity, funnels and aggregate diagnostics, and effective policy;
+- exactly two discovery-fold evidence records and no hidden result;
+- no grant, provider record, pricing snapshot, or authorization lease.
+
+The isolated run-artifact root contains exactly the one readiness file. The isolated permanent runtime contains only the expected discovery validation ledger and its one-byte lock. The ledger contains exactly two canonical schema-2 consumption records, both limited to provider-context exposure with the expected discovery session count. The earlier internal `runtime` and `runs` directories remain empty.
+
+The exact controller-temp parent was verified plain and empty, removed, and verified absent. A final audit reconfirmed the reviewed HEAD, clean tracked source, unchanged one-byte single-link source lock, and absence of unexpected run-artifact or permanent-runtime entries.
+
+No provider or pricing client was constructed; no network or Docker process was started; no grant, canary execution, role call, candidate evaluation, hidden evaluation, replay, source edit, test edit, commit, push, or upload occurred. Task 6 stopped at the inert live boundary as required.

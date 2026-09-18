@@ -1,0 +1,228 @@
+### Task 2: Add Independent Fold Warmup and Capture the Pre-Extraction Reference
+
+**Files:**
+
+- Modify: core/backtest_engine.py
+- Create: core/pit_optimizer_evaluation.py
+- Create: core/pit_policy_parity.py
+- Create: tests/test_pit_policy_parity.py
+- Modify: tests/test_backtest_open_causality.py
+
+**Interfaces:**
+
+- Produces: FoldSpec/FoldManifest; the PortfolioSimulator.run history_start_date keyword; canonical parity capture/verify commands; authenticated reference and final-attestation schemas.
+- Consumes: one authenticated legacy readiness artifact, the sealed PIT bundle, a clean committed source identity, and the fixed local discovery/hidden date contract. It may read the bundle's benchmark session calendar to seal all FoldSpec.sessions, but evaluates only the two discovery folds and performs no provider call.
+
+**Fold and parity contracts created before first use:**
+
+    @dataclass(frozen=True, slots=True)
+    class FoldSpec:
+        fold_id: str
+        purpose: str
+        start_date: str
+        end_date: str
+        sessions: tuple[str, ...]
+
+    @dataclass(frozen=True, slots=True)
+    class FoldManifest:
+        data_identity_sha256: str
+        universe_sha256: str
+        benchmark: str
+        warmup_start_date: str
+        discovery_folds: tuple[FoldSpec, ...]
+        hidden_fold: FoldSpec
+
+        @property
+        def sha256(self) -> str
+
+    AggregateMetric(metric_id: str, value: float | int)
+    FoldAggregateSummary(
+        fold_id: str,
+        total_return_pct: float,
+        excess_total_return_pp: float | None,
+        max_drawdown_pct: float,
+        sharpe_ratio: float,
+        closed_trades: int,
+        turnover_pct: float,
+        average_exposure_pct: float,
+        entry_funnel: tuple[AggregateMetric, ...],
+        exit_attribution: tuple[AggregateMetric, ...],
+    )
+
+    ParityTransaction(
+        date: str,
+        symbol: str,
+        from_symbol: str | None,
+        action: str,
+        price: float,
+        quantity: float,
+        value: float,
+        reason: str,
+    )
+    ParityEntryOutcome(
+        symbol: str,
+        signal_date: str,
+        entry_date: str,
+        pivot: float | None,
+        buy_zone_lower: float | None,
+        buy_zone_upper: float | None,
+        entry_open: float | None,
+        outcome: str,
+    )
+    ParityEquityPoint(session: str, equity: float)
+    ParityFoldEvidence(
+        fold_id: str,
+        transactions: tuple[ParityTransaction, ...],
+        entry_outcomes: tuple[ParityEntryOutcome, ...],
+        equity: tuple[ParityEquityPoint, ...],
+        funnel: tuple[AggregateMetric, ...],
+        aggregate: FoldAggregateSummary,
+        effective_policy_sha256: str,
+        evidence_sha256: str,
+    )
+
+    @dataclass(frozen=True, slots=True)
+    class ParityReference:
+        schema_version: int
+        reference_source_head: str
+        reference_source_fingerprint_sha256: str
+        readiness_sha256: str
+        pit_bundle_sha256: str
+        baseline_manifest_sha256: str
+        effective_policy_sha256: str
+        fold_manifest: FoldManifest
+        universe: tuple[str, ...]
+        discovery_evidence: tuple[ParityFoldEvidence, ...]
+        discovery_output_sha256s: tuple[tuple[str, str], ...]
+        artifact_path: Path
+        artifact_sha256: str
+
+    @dataclass(frozen=True, slots=True)
+    class ParityAttestation:
+        schema_version: int
+        reference_artifact_sha256: str
+        reference_source_head: str
+        final_source_head: str
+        final_source_fingerprint_sha256: str
+        pit_bundle_sha256: str
+        baseline_manifest_sha256: str
+        effective_policy_sha256: str
+        discovery_fold_manifest_sha256: str
+        policy_interface_version: int
+        reference_output_sha256s: tuple[tuple[str, str], ...]
+        final_output_sha256s: tuple[tuple[str, str], ...]
+        final_discovery_evidence: tuple[ParityFoldEvidence, ...]
+        transactions_equal: bool
+        entry_outcomes_equal: bool
+        equity_equal: bool
+        funnels_equal: bool
+        effective_policy_equal: bool
+        artifact_path: Path
+        artifact_sha256: str
+
+For every canonical artifact/identity in this plan, externally supplied identity fields such as pit_bundle_sha256 remain inside the hashed content. Only the value's own self-digest and runtime artifact_path are excluded from its preimage. ParityFoldEvidence.evidence_sha256, CandidateIdentity.identity_sha256, PolicySourceScope.sha256, and FrozenModelPricing.pricing_sha256 hash their preceding fields; FoldManifest/PitOptimizerRunManifest/AuthorizationRequirement sha256 properties hash all dataclass fields; ParityReference/ParityAttestation artifact_sha256 hash their persisted JSON without artifact_path/artifact_sha256; PitOptimizerReadiness.readiness_sha256 hashes its persisted JSON without artifact_path/readiness_sha256. The artifact byte hash and logical self-digest are identical whenever they cover the same canonical content. Tests use one shared canonical_json_bytes_without_self_digest helper so a digest never recursively includes itself.
+
+**Engine signature change:**
+
+    PortfolioSimulator.run(
+        tickers,
+        lookback_weeks=DEFAULT_LOOKBACK_WEEKS,
+        *,
+        start_date=None,
+        end_date=None,
+        history_start_date=None,
+        benchmark_symbol=None,
+        checkpoint_path=None,
+        progress_log_path=None,
+        resume=False,
+        checkpoint_every_days=20,
+        checkpoint_code_identity=None,
+    ) -> SimulationResult
+
+history_start_date controls only data loaded for causal indicator prehistory. start_date remains the first session allowed to create pending entries, trades, equity observations, or benchmark normalization. The fingerprint and result config bind both dates.
+
+- [ ] **Step 1: Write failing synthetic fold tests.** Prove prehistory is visible to indicators, no pre-fold trade/equity/transaction is emitted, the first in-fold signal still executes only at the next in-fold open, the last-session signal does not execute, open positions are closed by the existing deterministic final-fold liquidation rule, and two consecutive runs on the same simulator reset cash, positions, and pending entries. In Task 3, extend this test with a counting policy_client_factory and require one new client plus one close per run; no policy instance is reused across folds.
+- [ ] **Step 2: Run only the new fold tests.**
+
+      python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_policy_parity.py tests/test_backtest_open_causality.py
+
+  Expected: the new history-start tests fail because run() cannot load prehistory separately.
+- [ ] **Step 3: Implement history_start_date without changing daily ordering.** Fetch PIT prices/RS closes from history_start_date through end_date, but iterate and normalize equity only from start_date through end_date. Add a private reset-at-run-start helper covering cash, open positions, pending entries, transaction/equity/diagnostic collections, regime state, and injected policy-client state. Run the synthetic tests; expected failures now concern missing FoldManifest/parity serialization only.
+
+  Keep the existing fetch and daily-loop bodies unchanged around this exact separation:
+
+  ```python
+  trade_start, end_ts = _resolve_window(
+      start_date=start_date,
+      end_date=end_date,
+      lookback_weeks=lookback_weeks,
+  )
+  history_start = (
+      trade_start
+      if history_start_date is None
+      else pd.Timestamp(history_start_date).normalize()
+  )
+  if history_start > trade_start:
+      raise ValueError("history_start_date must not follow start_date")
+  ticker_ohlcv = self.data_fetcher.fetch_price_data(
+      all_tickers, history_start, end_ts
+  )
+  all_closes = self.data_fetcher.fetch_rs_universe_closes(
+      universe, history_start, end_ts
+  )
+  evaluation_sessions = tuple(
+      session for session in benchmark_sessions
+      if trade_start <= session <= end_ts
+  )
+  ```
+- [ ] **Step 4: Implement FoldSpec, FoldManifest, AggregateMetric, and FoldAggregateSummary in core/pit_optimizer_evaluation.py.** Require exact 60-session discovery/discovery/hidden windows, one benchmark, one universe/warmup/data identity, non-overlap, chronology, and hidden strictly after discovery. Build sessions from the authenticated bundle calendar; do not read hidden prices, returns, trades, or baseline metrics.
+
+  Add this contract test before the dataclass validation:
+
+  ```python
+  def _fold(fold_id: str, purpose: str, start: str) -> FoldSpec:
+      sessions = tuple(
+          value.date().isoformat()
+          for value in pd.bdate_range(start=start, periods=60)
+      )
+      return FoldSpec(
+          fold_id=fold_id,
+          purpose=purpose,
+          start_date=sessions[0],
+          end_date=sessions[-1],
+          sessions=sessions,
+      )
+
+
+  def test_fold_manifest_rejects_reused_discovery_sessions():
+      first = _fold("discovery_1", "discovery", "2021-01-04")
+      second = replace(first, fold_id="discovery_2")
+      hidden = _fold("hidden_1", "hidden", "2022-01-03")
+      with pytest.raises(ValueError, match="overlap"):
+          FoldManifest(
+              data_identity_sha256="a" * 64,
+              universe_sha256="b" * 64,
+              benchmark="SPY",
+              warmup_start_date="2020-01-02",
+              discovery_folds=(first, second),
+              hidden_fold=hidden,
+          )
+  ```
+- [ ] **Step 5: Implement canonical ParityReference capture and ParityAttestation verification in core/pit_policy_parity.py.** Reference output embeds one exact ParityFoldEvidence per discovery fold: canonical transaction rows, EntryAttemptOutcome primitives, exact equity index/values, funnel counts, aggregate metrics, and schema-v1 effective-policy digest. Verification recomputes and embeds the final ParityFoldEvidence values at a later clean HEAD, verifies every nested evidence hash against the reference, and writes one create-only attestation only when every equality flag is true. Hashes never stand in for retrievable evidence.
+- [ ] **Step 6: Re-run the synthetic fold/parity tests to green.**
+
+      python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_policy_parity.py tests/test_backtest_open_causality.py
+
+- [ ] **Step 7: Commit the fold boundary, fold contract, and parity harness before capture.** Do not add a parity artifact.
+
+      git add core/backtest_engine.py core/pit_optimizer_evaluation.py core/pit_policy_parity.py tests/test_pit_policy_parity.py tests/test_backtest_open_causality.py
+      git commit -m "feat: isolate causal warmup from fold trading"
+
+- [ ] **Step 8: Require a clean committed source, then capture the authenticated inline-policy reference once before Task 3 switches authority.**
+
+      python -B -m core.pit_policy_parity capture --readiness .artifacts/pit-optimizer-subset-performance-20260827T200714Z/pit-optimization-readiness-d3cbfcb22900/readiness.json --pit-bundle .artifacts/task-4-regeneration-20260823T223000Z/pit-bundle/pit_baseline.sqlite3 --output .artifacts/pit-policy-parity-v2/reference.json
+
+  Expected: PIT_POLICY_PARITY_REFERENCE with the two evaluated discovery folds 2021-06-25..2021-09-20 and 2021-09-21..2021-12-14, plus a sealed but unevaluated hidden FoldSpec for 2021-12-15..2022-03-11. Each evaluated fold starts from normalized capital with no carryover. No provider or Docker process starts.
+
+---
+

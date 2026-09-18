@@ -1,0 +1,13 @@
+diff --git "a/.artifacts\\pit-optimizer-v5\\development\\increment-c-campaign-proposal\\admission-p3\\review-freeze-01\\operations.py" b/core/pit_optimizer_v5/operations.py
+index 131dcc4..2197a0a 100644
+--- "a/.artifacts\\pit-optimizer-v5\\development\\increment-c-campaign-proposal\\admission-p3\\review-freeze-01\\operations.py"
++++ b/core/pit_optimizer_v5/operations.py
+@@ -711,6 +711,8 @@ def _run_campaign_v5(
+                 owner_token_sha256=token,
+                 next_round_index=next_round_index,
+             )
++            if time.monotonic() >= deadline:
++                return "campaign_deadline_exhausted"
+             return campaign_boundary_decision_v5(
+                 policy=current.policy,
+                 manifest=manifest,

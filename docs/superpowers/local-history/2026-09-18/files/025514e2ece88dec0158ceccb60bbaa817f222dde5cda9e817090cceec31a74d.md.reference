@@ -1,0 +1,141 @@
+# Task 4 Fix Round 2 Independent Review
+
+## Verdict
+
+**FAIL — the custom-strategy finding is addressed, but the built-in inventory and nested built-in
+attestation findings remain open.**
+
+The fix materially improves both areas. The expanded RS/N/S/I inventory is largely exact, direct mutation
+of the owned strategy's duplicated fields/provider binding is now detected, and injected strategies have an
+honest optional identity contract. Two effective built-in rules are still described incorrectly or
+incompletely, however, and replacing the live owned strategy with another `CanslimStrategy` instance of the
+same type can still change execution without changing the policy object or digest.
+
+No new Critical or Minor finding was identified.
+
+## Prior open/new finding status
+
+### OPEN — Important: complete optimizer-relevant M/RS/N/S/I and technical-history inventory
+
+**Confidence: 10/10.**
+
+Most of the requested expansion is now present and correctly classified as active-fixed future optimizer
+policy rather than causal invariants:
+
+- RS records the quarterly settings, 60-session fallback eligibility, 252-session annualization, and the
+  ten-ranked-symbol gate (`core/engine_policy.py:360-403`). Those claims match the standard-history and
+  weighted-return implementation (`core/momentum_analysis.py:65-88`) and the fallback/universe gate
+  (`core/momentum_analysis.py:126-147`).
+- N records the growth formula, missing-component reweighting, and the exact 0.98/0.90/0.75 proximity
+  branches (`core/engine_policy.py:538-570`), matching `core/canslim/n_new_products.py:59-66` and
+  `125-159`.
+- The built-in technical gate/window is recorded as 60/252 (`core/engine_policy.py:572-579`), matching the
+  strategy's 60-session gate (`core/backtest_engine.py:739-752`) and the 252-session high calculation
+  (`backtest.py:194-215`).
+- S up/down-volume, float, and volume/breakout formulas and I ownership/trend bands are represented at
+  `core/engine_policy.py:594-683`; their consumers agree at
+  `core/canslim/s_supply_demand.py:143-216`, `281-323` and
+  `core/canslim/i_institutional.py:24-96`, `126-143`.
+
+The finding remains open for two exactness defects inside this same bounded surface:
+
+1. The stateful M mapping does not attest the actual bootstrap state machine. It records only EMA period
+   200/`adjust=False`, labels the initial regime `correction`, and then describes live transitions
+   (`core/engine_policy.py:712-735`). The executed tracker starts with a constructor default of correction,
+   but `bootstrap()` returns unchanged below two rows; otherwise it immediately selects confirmed-uptrend or
+   correction using `close > EMA(200, adjust=False)`, replays the distribution window, and can leave bootstrap
+   under pressure or in correction based on the seeded count
+   (`core/canslim/m_market_direction.py:49-61`, `68-116`). Bootstrap runs before the first simulated session
+   (`core/backtest_engine.py:1723-1725`). Thus the report's effective-policy statement that the stateful
+   “initial regime” is correction (`task-4-report.md:55-59`) is not generally true, and the policy omits the
+   `<2` fallback, strict EMA comparison, and distribution seeding that determine the effective starting
+   state. The stateless `<50` fallback, 30-session follow-through search, `-0.01` reset, and EWM adjustment
+   values themselves are now correct (`core/engine_policy.py:754-799` versus
+   `core/canslim/m_market_direction.py:252-316`, `378-418`).
+
+2. `s_power_gap_rule` claims `volume_baseline_sessions: 50`
+   (`core/engine_policy.py:581-592`), but the implementation averages
+   `volumes.iloc[-(lookback_days + 50):-(lookback_days + 1)]`
+   (`core/canslim/s_supply_demand.py:100-115`). That half-open slice contains 49 observations, not 50. This
+   changes the average used by the 1.5-volume gate and therefore is behavior-bearing optimizer policy. Task 4
+   cannot change the strategy calculation, so the attestation must describe the effective 49-session slice
+   truthfully.
+
+No causal timing/data-visibility rule in the reviewed surface was mislabeled tunable. The remaining defects
+are fixed strategy behavior that should stay `active_fixed_policy` and `optimizer_candidate=True`.
+
+### ADDRESSED — Important: injected-strategy compatibility and truthful identity/claims
+
+**Confidence: 9/10.**
+
+Python type is now advisory provenance only (`core/engine_policy.py:330-358`). For injected strategies,
+`effective_policy_identity` takes precedence over `checkpoint_identity`; either may be a value or callable,
+is canonical-JSON normalized, and raises a clear `ValueError` if access, evaluation, or serialization fails
+(`core/engine_policy.py:132-165`). The normalized identity and its source are digest-bound, while absence of
+an identity explicitly produces `engine_owned_envelope_only` and
+`custom_internals_opaque_unattested=true` (`core/engine_policy.py:404-438`). Because policy verification
+rebuilds this mapping live (`core/backtest_engine.py:1497-1510`), a changed declared identity changes the live
+object/digest and fails closed.
+
+The mode-specific engine-envelope wording is accurate. Technical-only canonicalization rebuilds completed-
+session entry facts and uses only their technical eligibility; full mode reapplies current/annual growth, RS,
+and non-M composite gates (`core/backtest_engine.py:2234-2323`). Built-in-only `min_c_a_growth` access remains
+guarded (`core/backtest_engine.py:1476-1485`), so opaque minimal custom strategies remain compatible. Invalid
+effective identities fail during constructor capture before default `DataFetcher` construction
+(`core/backtest_engine.py:1436-1437`).
+
+### OPEN — Important: live attestation of owned built-in strategy state
+
+**Confidence: 10/10.**
+
+Direct nested-field drift is addressed. Fresh capture synchronizes `technical_only`, market/base booleans,
+and the legacy/PIT provider binding from the simulator, while verification deliberately does not synchronize
+(`core/backtest_engine.py:1439-1455`, `1487-1511`). The policy records all four resulting owned-strategy
+facts (`core/engine_policy.py:445-467`). Provider mode construction compares only bound objects and does not
+call either provider (`core/engine_policy.py:168-184`). Consequently, ordinary post-capture mutation of one
+of those fields yields a different live mapping and fails.
+
+The ownership relationship itself is not attested. Construction initially makes `self.strategy` and
+`self._owned_builtin_strategy` the same object (`core/backtest_engine.py:1380-1398`), but synchronization and
+nested leaves later read only `_owned_builtin_strategy` (`core/backtest_engine.py:1439-1453`;
+`core/engine_policy.py:445-467`). Type provenance independently reads `self.strategy`, but only records its
+module and qualname (`core/engine_policy.py:330-358`). Execution explicitly tests object identity: when the
+objects differ it dispatches through `self.strategy` rather than the attested owned object
+(`core/backtest_engine.py:2394-2420`).
+
+Therefore replacing `simulator.strategy` after capture (or before the fresh run-start capture) with another
+same-type `CanslimStrategy` preserves strategy mode, type provenance, all old owned-field leaves, and the
+digest, while the replacement may use different technical-only, fundamental-provider, or proper-base state.
+The session-boundary verifier can pass and execution can change. Capture/verification must fail closed when
+built-in mode no longer satisfies `self.strategy is self._owned_builtin_strategy`, or bind an equivalent
+truthful relationship marker into the live policy.
+
+## Accepted behavior remains intact
+
+- Run start still replaces the snapshot before cache clearing/data access, and verification freshly compares
+  live object/digest, stored object/digest, and a rehash of the stored object
+  (`core/backtest_engine.py:1487-1511`, `1531-1544`). Verification remains at session, checkpoint fingerprint,
+  result, checkpoint-payload, and restored-result boundaries
+  (`core/backtest_engine.py:1194-1242`, `1732-1735`, `2055-2066`, `2122-2140`, `2170-2177`).
+- The repaired compatibility-validator calls are syntactically and structurally correct in both constructors
+  (`core/backtest_engine.py:633-655`, `1323-1351`). Constructor capture precedes default fetcher construction,
+  so inert requests and selected invalid custom identities still reject before data setup
+  (`core/backtest_engine.py:1436-1437`).
+- Result config still carries policy plus digest (`core/backtest_engine.py:2113-2119`). PIT publication invokes
+  live verification, authenticates result policy/digest, defines publication variables on every successful
+  path, and then places them in summary and manifest (`pit_baseline.py:1474-1489`, `1529-1546`). Rejection of
+  the stale unauthenticated `FakePortfolio` remains an intentional strengthened output contract, not a
+  production/DI regression.
+- Early-winner wording remains exact: only tiered scale-outs are suppressed, the flag clears before day-40
+  processing, and stop/stagnation/protective-stop/EMA handling stays active
+  (`core/engine_policy.py:896-917`; `core/backtest_engine.py:2691-2739`).
+- No scoring, signal, entry, sizing, capacity, or exit constant was tuned in the fix. Canonical hashing remains
+  sorted compact JSON with `allow_nan=False`, and `core.engine_policy` has no import from
+  `core.backtest_engine` (`core/engine_policy.py:1-20`, `63-96`, `974-997`). The scoped package contains no
+  sealed-artifact rewrite.
+
+## Review constraints observed
+
+The refreshed report's direct probes, compilation, and diff-check evidence were accepted without rerunning.
+No test, backtest, provider/network command, cache refresh, optimizer operation, download, or Git mutation was
+performed. Production sources were inspected read-only; only this review artifact was created.

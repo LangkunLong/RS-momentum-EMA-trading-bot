@@ -1,0 +1,454 @@
+### Task 4: Add Schema-v2 Roles, Manifest, Objective, and Validation Ledger
+
+**Files:**
+
+- Modify: core/pit_optimization_contract.py
+- Modify: core/pit_optimizer_evaluation.py
+- Create: tests/test_pit_optimizer_v2.py
+
+**Interfaces:**
+
+- Produces: versioned closed role input/output schemas; PitOptimizerCallBudget; one shared PatchBounds; AuthorizationRequirement; identity-complete PitOptimizerRunManifest/GateConfig; DiscoveryScore; HoldoutDecision; exposure-aware ValidationLedger; canonical manifest writer.
+- Consumes: Task 2 FoldManifest/ParityAttestation, closed canonical JSON, authenticated legacy readiness, sealed local paths/input identities, operator call budgets, permanent runtime root, and aggregate fold results. It never imports or executes candidate source.
+
+**New closed types:**
+
+    OPTIMIZER_V2_ROLES = ("investigator", "author", "critic")
+    MAX_ROLE_TEXT_BYTES = 4 * 1024
+    MAX_ROLE_LIST_ITEMS = 16
+    MAX_AUTHOR_DIFF_BYTES = 64 * 1024
+    MAX_POLICY_SOURCE_BUNDLE_BYTES = 64 * 1024
+    MAX_DISCOVERY_EVIDENCE_BYTES = 8 * 1024
+    MAX_INVESTIGATOR_ARTIFACT_BYTES = 8 * 1024
+    MAX_AUTHOR_NON_DIFF_ARTIFACT_BYTES = 8 * 1024
+    MAX_CRITIC_ARTIFACT_BYTES = 8 * 1024
+    MAX_ITERATION_FEEDBACK_BYTES = 4 * 1024
+    MAX_ITERATION_HISTORY_BYTES = 32 * 1024
+    MAX_INVESTIGATOR_DYNAMIC_BYTES = 112 * 1024
+    MAX_AUTHOR_DYNAMIC_BYTES = 96 * 1024
+    MAX_CRITIC_DYNAMIC_BYTES = 24 * 1024
+
+    @dataclass(frozen=True, slots=True)
+    class PitOptimizerCallBudget:
+        call_index: int
+        iteration: int
+        role: str
+        model: str
+        max_static_input_bytes: int
+        max_dynamic_input_bytes: int
+        max_input_tokens: int
+        max_output_tokens: int
+        max_response_bytes: int
+        max_usd: float
+
+    @dataclass(frozen=True, slots=True)
+    class PatchBounds:
+        max_files: int
+        max_hunks: int
+        max_changed_lines: int
+        max_diff_bytes: int
+
+    @dataclass(frozen=True, slots=True)
+    class PolicySourceScope:
+        schema_version: int
+        policy_interface_version: int
+        initial_policy_source_sha256s: tuple[tuple[str, str], ...]
+        editable_paths: tuple[str, ...]
+        max_policy_source_bundle_bytes: int
+        max_iteration_feedback_bytes: int
+        max_iteration_history_bytes: int
+        hard_patch_bounds: PatchBounds
+        candidate_bounds: PatchBounds
+        max_iterations: int
+        allowed_descendant_rule: str
+
+        @property
+        def sha256(self) -> str
+
+    @dataclass(frozen=True, slots=True)
+    class AuthorizationRequirement:
+        window_id: str
+        max_calls: int
+        max_tokens: int
+        max_usd: float
+        policy_source_scope_sha256: str
+        provider_retries: int
+        apply: bool
+
+        @property
+        def sha256(self) -> str
+
+    @dataclass(frozen=True, slots=True)
+    class DiscoveryScore:
+        median_excess_return_pp: Decimal
+        worst_excess_return_pp: Decimal
+        max_drawdown_magnitude_pp: Decimal
+
+        @property
+        def ordering_key(self) -> tuple[Decimal, Decimal, Decimal]:
+            return (
+                self.median_excess_return_pp,
+                self.worst_excess_return_pp,
+                -self.max_drawdown_magnitude_pp,
+            )
+
+    @dataclass(frozen=True, slots=True)
+    class HoldoutDecision:
+        excess_total_return_pp: Decimal
+        closed_trades: int
+        safety_complete: bool
+        integrity_complete: bool
+        accounting_complete: bool
+        long_replay_eligible: bool
+
+    @dataclass(frozen=True, slots=True)
+    class ValidationWindowIdentity:
+        pit_bundle_sha256: str
+        universe_sha256: str
+        benchmark: str
+        warmup_contract_sha256: str
+        sessions_sha256: str
+        session_count: int
+        first_session: str
+        last_session: str
+
+    @dataclass(frozen=True, slots=True)
+    class ValidationExposureMetadata:
+        run_id: str
+        source_head: str
+        baseline_policy_sha256: str
+        candidate_identity_sha256: str | None
+        exposure_kind: str
+
+    @dataclass(frozen=True, slots=True)
+    class ValidationReservation:
+        consumption_key_sha256: str
+        reservation_record_sha256: str
+
+    class ValidationLedger:
+        def mark_discovery(
+            self,
+            identity: ValidationWindowIdentity,
+            metadata: ValidationExposureMetadata,
+        ) -> ValidationReservation
+        def reserve_hidden(
+            self,
+            identity: ValidationWindowIdentity,
+            metadata: ValidationExposureMetadata,
+        ) -> ValidationReservation
+        def record_outcome(
+            self,
+            reservation: ValidationReservation,
+            *,
+            attempted: bool,
+            completed: bool,
+            failure_code: str | None,
+        ) -> None
+
+    @dataclass(frozen=True, slots=True)
+    class PitOptimizerRunManifest:
+        schema_version: int
+        run_id: str
+        run_kind: str
+        model: str
+        source_head: str
+        source_fingerprint_sha256: str
+        legacy_readiness_sha256: str
+        pit_bundle_sha256: str
+        baseline_manifest_sha256: str
+        effective_policy_sha256: str
+        policy_interface_version: int
+        policy_source_sha256s: tuple[tuple[str, str], ...]
+        editable_paths: tuple[str, ...]
+        policy_source_scope: PolicySourceScope
+        immutable_constraints_sha256: str
+        fold_manifest: FoldManifest
+        parity_attestation_sha256: str
+        sandbox_image: str
+        validation_ledger_name: str
+        immutable_constraint_ids: tuple[str, ...]
+        candidate_bounds: PatchBounds
+        call_budgets: tuple[PitOptimizerCallBudget, ...]
+        max_iterations: int
+        non_improving_limit: int
+        authorization_requirement: AuthorizationRequirement
+
+        @property
+        def sha256(self) -> str
+
+    @dataclass(frozen=True, slots=True)
+    class PitOptimizerGateConfig:
+        phase: str
+        baseline_run: Path
+        baseline_manifest_sha256: str
+        pit_bundle: Path
+        pit_bundle_sha256: str
+        effective_policy_sha256: str
+        optimizer_manifest: Path
+        optimizer_manifest_sha256: str
+        verified_parity_artifact: Path
+        verified_parity_sha256: str
+        readiness_artifact: Path | None
+        readiness_sha256: str | None
+        authorization_window_id: str | None
+        authorization_requirement_sha256: str
+        source_transmission_authorized: bool
+        max_usd: float
+        max_api_calls: int
+        max_tokens: int
+        max_iterations: int
+        apply: bool
+
+        def validate(self) -> None
+
+    def build_subset_manifest(
+        *,
+        legacy_readiness: Mapping[str, object],
+        legacy_readiness_path: Path,
+        parity_attestation: ParityAttestation,
+        verified_parity_path: Path,
+        pit_bundle: Path,
+        baseline_run: Path,
+        source_root: Path,
+        permanent_runtime_root: Path,
+        controller_temp_parent: Path,
+        artifact_root: Path,
+        sandbox_image: str,
+        call_budgets: tuple[PitOptimizerCallBudget, ...],
+        candidate_bounds: PatchBounds,
+        max_iterations: int,
+    ) -> PitOptimizerRunManifest
+
+    def write_optimizer_manifest(
+        manifest: PitOptimizerRunManifest,
+        output: Path,
+    ) -> tuple[Path, str]
+
+    def build_prepare_command(
+        manifest: PitOptimizerRunManifest,
+        *,
+        manifest_path: Path,
+        legacy_readiness_path: Path,
+        verified_parity_path: Path,
+        pit_bundle_path: Path,
+        baseline_run_path: Path,
+        repo_root: Path,
+        permanent_runtime_root: Path,
+        controller_temp_parent: Path,
+        artifact_root: Path,
+        git_executable: Path,
+        docker_executable: Path,
+        sandbox_image: str,
+    ) -> str
+
+    PolicySourceRecord(path: str, sha256: str, declared_symbols: tuple[str, ...], text: str)
+    PolicySourceBundle(
+        policy_interface_version: int,
+        cumulative_diff_sha256: str,
+        cumulative_diff: str,
+        files: tuple[PolicySourceRecord, ...],
+    )
+    RuleSummaryRecord(rule_id: str, text: str)
+    StrategyRuleSummary(records: tuple[RuleSummaryRecord, ...])
+    DiscoveryEvidenceSummary(
+        folds: tuple[FoldAggregateSummary, ...],
+        score: DiscoveryScore | None,
+        evidence_ids: tuple[str, ...],
+    )
+    ProviderSeed(
+        rule_summary: StrategyRuleSummary,
+        baseline_discovery: DiscoveryEvidenceSummary,
+    )
+    IncumbentSummary(
+        candidate_identity_sha256: str | None,
+        accepted_iteration: int | None,
+        behavioral_summary: str,
+        discovery: DiscoveryEvidenceSummary,
+    )
+    AuthorManifestSummary(
+        hypothesis_id: str,
+        behavioral_summary: str,
+        changed_paths: tuple[str, ...],
+        changed_symbols: tuple[str, ...],
+    )
+    CandidateValidationSummary(
+        failure_code: str | None,
+        syntax_ok: bool,
+        imports_ok: bool,
+        purity_ok: bool,
+        deterministic_ok: bool,
+        worker_ok: bool,
+        replay_attempted: bool,
+    )
+    CandidateComparisonSummary(
+        folds: tuple[FoldAggregateSummary, ...],
+        score: DiscoveryScore | None,
+        diagnostics: tuple[AggregateMetric, ...],
+    )
+    IterationFeedbackSummary(
+        iteration: int,
+        hypothesis_id: str,
+        family: str,
+        author_summary: str,
+        validation_code: str,
+        discovery_score: DiscoveryScore | None,
+        critic_disposition: str,
+        critic_next_direction: str,
+        incumbent_changed: bool,
+    )
+    InvestigatorInput(
+        schema_version: int,
+        iteration: int,
+        policy_interface_version: int,
+        immutable_constraint_ids: tuple[str, ...],
+        candidate_bounds: PatchBounds,
+        rule_summary: StrategyRuleSummary,
+        source_bundle: PolicySourceBundle,
+        baseline_discovery: DiscoveryEvidenceSummary,
+        incumbent_summary: IncumbentSummary,
+        prior_iterations: tuple[IterationFeedbackSummary, ...],
+    )
+    AuthorInput(
+        schema_version: int,
+        iteration: int,
+        policy_interface_version: int,
+        immutable_constraint_ids: tuple[str, ...],
+        candidate_bounds: PatchBounds,
+        investigator: InvestigatorArtifact,
+        source_bundle: PolicySourceBundle,
+    )
+    CriticInput(
+        schema_version: int,
+        iteration: int,
+        immutable_constraint_ids: tuple[str, ...],
+        hypothesis_id: str,
+        investigator_summary: InvestigatorArtifact,
+        author_manifest: AuthorManifestSummary,
+        validation: CandidateValidationSummary,
+        candidate_vs_baseline: CandidateComparisonSummary | None,
+        candidate_vs_incumbent: CandidateComparisonSummary | None,
+    )
+
+    InvestigatorArtifact(
+        hypothesis_id: str,
+        family: str,
+        evidence_ids: tuple[str, ...],
+        causal_rationale: str,
+        target_paths: tuple[str, ...],
+        target_symbols: tuple[str, ...],
+        expected_diagnostic_changes: tuple[str, ...],
+        known_risks: tuple[str, ...],
+        author_instructions: tuple[str, ...],
+    )
+    AuthorArtifact(
+        hypothesis_id: str,
+        behavioral_summary: str,
+        changed_paths: tuple[str, ...],
+        changed_symbols: tuple[str, ...],
+        unified_diff: str,
+        assumptions: tuple[str, ...],
+        validation_suggestions: tuple[str, ...],
+    )
+    CriticArtifact(
+        hypothesis_id: str,
+        prediction_vs_observation: str,
+        causal_explanation: str,
+        evidence_ids: tuple[str, ...],
+        disposition: str,
+        next_direction: str,
+    )
+    InvestigatorArtifact.from_json(
+        raw: str,
+        *,
+        max_total_bytes: int,
+    ) -> InvestigatorArtifact
+    AuthorArtifact.from_json(
+        raw: str,
+        *,
+        max_diff_bytes: int,
+        max_total_bytes: int,
+    ) -> AuthorArtifact
+    CriticArtifact.from_json(
+        raw: str,
+        *,
+        max_total_bytes: int,
+    ) -> CriticArtifact
+    pit_optimizer_response_format(role: str) -> dict[str, object]
+
+**First subset manifest:**
+
+- discovery_1: 2021-06-25 through 2021-09-20, 60 SPY sessions
+- discovery_2: 2021-09-21 through 2021-12-14, 60 SPY sessions
+- hidden_1: 2021-12-15 through 2022-03-11, 60 SPY sessions
+- same sealed 25-symbol universe and warmup convention for all folds
+
+The canonical run manifest has schema_version=2, run_kind=subset_canary, model=deepseek/deepseek-r1, the complete source/readiness/bundle/baseline/effective-policy/policy-files/constraints/fold/final-parity identity graph, one freshly generated AuthorizationRequirement, the complete local FoldManifest, immutable constraint IDs, candidate bounds, and one PitOptimizerCallBudget entry for every planned call. PolicySourceScope.sha256 is the canonical hash of every field shown above with only its own sha256 omitted; allowed_descendant_rule is exactly authenticated_initial_sources_plus_validated_cumulative_diff. An outbound source bundle is authorized only when its three files descend from those initial hashes by the controller-derived, bounds-valid cumulative diff and every scope cap still holds. Any initial hash/path/cap/bound/iteration/rule change produces a different scope and requires a new authorization. AuthorizationRequirement.policy_source_scope_sha256 must equal manifest.policy_source_scope.sha256. A two-iteration canary seals six entries in investigator/author/critic order. The complete manifest is controller-private; provider payload builders omit the hidden FoldSpec, exact dates, universe members, local paths, and validation-ledger facts. Generating the requirement/window ID grants no spending authority.
+
+The first proposed six-call manifest uses the same caps in both iterations:
+
+- investigator: 8,000 static bytes + 80,000 dynamic bytes, 88,000 input tokens, 4,000 output tokens, 8-KiB canonical response, USD 0.05;
+- author: 12,000 static bytes + 76,000 dynamic bytes, 88,000 input tokens, 8,000 output tokens, 16-KiB canonical response including at most an 8-KiB diff, USD 0.10;
+- critic: 8,000 static bytes + 24,000 dynamic bytes, 32,000 input tokens, 4,000 output tokens, 8-KiB canonical response, USD 0.05.
+
+The proposed cumulative maxima are six calls, 448,000 tokens, and USD 0.40. The first canary lowers candidate bounds to three files, 12 hunks, 80 changed lines, and 8 KiB. Before writing the manifest, measure the canonical initial policy-file text and exact source-bundle envelope and prove `initial_policy_bytes + (2 * max_diff_bytes) + envelope_bytes <= 64 KiB`: one max_diff term bounds worst-case source growth, and one binds the cumulative diff carried beside final source. Render the worst prospective iteration-2 bundle as a test fixture. Before accepting any incumbent, materialize and size its exact next-iteration PolicySourceBundle; an oversize candidate receives the closed next_context_oversize validation result and cannot become incumbent. These are preparation values, not spend authorization. The conservative input-token upper bound is the exact canonical UTF-8 byte length of all system messages, response schemas, and dynamic JSON; manifest construction proves each role's worst declared section sizes fit its input cap. If the operator later authorizes different ceilings, regenerate and reauthenticate the manifest/readiness before canary.
+
+- [ ] **Step 1: Write failing closed input/output schema tests.** Cover all exact role-input fields above, matching hypothesis IDs, family/disposition enums, unique bounded lists, source-file records, per-summary/history caps, total canonical response-byte caps, and unknown/duplicate-key rejection. Assert no input schema admits hidden identity/date/metrics, ledger facts, raw trades/holdings, credentials, local paths, or provider-audit bodies. Prove an oversized InvestigatorArtifact cannot overflow AuthorInput and an oversized Author/Critic artifact cannot enter a later envelope.
+- [ ] **Step 2: Implement versioned role contracts only.** Retain every v1 class/reader. Add v2 canonical serializers/parsers and response formats, then run `python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "role_schema"`; expected: role-schema cases pass.
+- [ ] **Step 3: Write failing manifest/identity/budget tests.** Require all identity fields above, sandbox image and exact candidate bounds, exactly three iteration-major R1 call records per declared iteration, call_index=3*(iteration-1)+role ordinal, positive caps, sums within AuthorizationRequirement, apply=false, retries=0, and PatchBounds within the hard 3-file/200-line/64-KiB ceiling. Require PolicySourceScope to bind the exact initial hashes, paths, bundle/history caps, hard/sealed bounds, iterations, and descendant rule; any expansion changes its digest and fails an existing authorization. Measure actual initial policy/envelope bytes and reject any bound for which `initial + 2*max_diff + envelope` exceeds the source cap. Render the complete worst-case iteration-2 static+dynamic messages from the total artifact caps and prove UTF-8 bytes fit max_input_tokens.
+
+  ```python
+  def test_policy_source_scope_digest_changes_on_expansion(v2_manifest):
+      scope = v2_manifest.policy_source_scope
+      expanded = replace(scope, max_iterations=scope.max_iterations + 1)
+      assert expanded.sha256 != scope.sha256
+      assert (
+          v2_manifest.authorization_requirement.policy_source_scope_sha256
+          == scope.sha256
+      )
+      assert (
+          v2_manifest.authorization_requirement.policy_source_scope_sha256
+          != expanded.sha256
+      )
+  ```
+- [ ] **Step 4: Implement GateConfig, PatchBounds, PolicySourceScope, AuthorizationRequirement, and manifest construction.** Authenticate the parity/fold/readiness/bundle/baseline/source graph, derive hidden sessions from the supplied sealed bundle calendar, validate all explicit local paths, write canonical create-only JSON, and emit its digest plus exact prepare command. Require every prospective source bundle to prove the sealed descendant rule before it can be rendered. It may seal hidden session identity but never evaluates hidden prices, baseline, candidate, or metrics. Run `python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "manifest or gate or input_budget or policy_source_scope"`; expected: identity/budget cases pass.
+- [ ] **Step 5: Write failing objective/holdout tests.** Cover Decimal(str(value)).quantize(Decimal("0.01"), ROUND_HALF_EVEN), two-fold median midpoint, worst fold, drawdown sign inversion in ordering_key, strict improvement only, at least one closed discovery trade per fold, and holdout eligibility at 0.10 point/three trades with safety/integrity/accounting and no Sharpe gate.
+
+  ```python
+  def test_discovery_score_is_quantized_lexicographic():
+      score = DiscoveryScore(
+          median_excess_return_pp=Decimal("1.235").quantize(
+              Decimal("0.01"), rounding=ROUND_HALF_EVEN
+          ),
+          worst_excess_return_pp=Decimal("0.50"),
+          max_drawdown_magnitude_pp=Decimal("4.00"),
+      )
+      assert score.ordering_key == (
+          Decimal("1.24"),
+          Decimal("0.50"),
+          Decimal("-4.00"),
+      )
+
+
+  def test_hidden_gate_has_no_sharpe_condition():
+      decision = HoldoutDecision(
+          excess_total_return_pp=Decimal("0.10"),
+          closed_trades=3,
+          safety_complete=True,
+          integrity_complete=True,
+          accounting_complete=True,
+          long_replay_eligible=True,
+      )
+      assert decision.long_replay_eligible is True
+      assert "sharpe" not in {field.name for field in fields(HoldoutDecision)}
+  ```
+- [ ] **Step 6: Implement DiscoveryScore and HoldoutDecision.** Candidate excess is always against the original authenticated fold baseline; incumbent deltas remain diagnostics. Run `python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "objective or holdout"`; expected: objective/holdout cases pass.
+- [ ] **Step 7: Write failing permanent-exposure ledger tests.** Key uniqueness uses only immutable bundle/universe/benchmark/warmup/session identity. Source, baseline policy, candidate, run, and exposure kind are stored metadata but never change uniqueness. Mark both discovery folds before baseline/reference aggregates can reach a role; assert a later run cannot reserve either as hidden. Reserve hidden before any baseline/candidate evaluation and leave it permanently consumed after injected failure.
+- [ ] **Step 8: Implement the hash-chained locked ValidationLedger.** Exposure kinds are exactly candidate_validation, provider_context, and hidden_validation. mark_discovery/reserve_hidden append a permanent consumed record under exclusive lock; record_outcome appends only attempted/completed and a closed failure code, never metrics. The ledger is never provider-projected. Run `python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "validation_ledger"`; expected: exposure/reuse cases pass.
+- [ ] **Step 9: Run the focused v2 tests and commit.**
+
+      python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py
+      git add core/pit_optimization_contract.py core/pit_optimizer_evaluation.py tests/test_pit_optimizer_v2.py
+      git commit -m "feat: define PIT optimizer v2 contracts"
+
+---
+

@@ -1,0 +1,29 @@
+# P3 implementation report
+
+Status: source frozen for independent review. Production source writes stopped after the hashes recorded in `authority.json` and `actual-task.diff`.
+
+## Implemented scope
+
+- `campaign_admission.py` now provides private immutable enrollment-state, freshness, round-census, observed-start, and settled-boundary fact composition. The readers authenticate existing repository state with `repair=False`; they do not construct requests, sample a clock, call providers, or write state.
+- `operations.py` enrolls an explicit prepared policy inside the existing campaign-launch transition. It authenticates manifest/config/owner/root and local run freshness before the first write, creates the binding before the unchanged launch record, and permits binding-only crash recovery only for the exact expected value after the same freshness checks. It never enrolls an already launched legacy campaign.
+- Resume discovers and pins an existing enrollment when the policy argument is omitted. An explicit resume reference must match the original binding. Generated resume commands carry the independently pinned path and SHA.
+- Settled-boundary decisions run after authentic reused and new settlements, before a new round configuration, and before the first start of an existing pre-start configuration. A global start census prevents target success while a later observed start remains unresolved. Existing started rounds continue under their original admission and deadline.
+- Terminal ordering preserves runtime/provider/cleanup failures and no-novelty results before settled stopping. Deadline checks remain before new start authority; enrolled pre-start policy reads are followed by another deadline check before configuration/start writes. Target completion uses status `completed`; reserve refusal uses `stopped`.
+- `cli.py` adds the paired `--campaign-policy-path` and `--campaign-policy-sha256` inputs to run/resume campaign parsing. Dispatch rejects one-sided pairs and builds an exact `ArtifactRefV5`.
+
+## Compatibility and protected behavior
+
+- Omitted policy on a fresh campaign follows the existing legacy launch-state load/repair order and launch shape.
+- Existing legacy launches remain unenrolled and keep the previous boundary behavior.
+- Old serialized policy/binding/authenticated-admission classes and the P1 boundary predicate are AST-identical to the approved P2 preimage.
+- Protected P2 state-membership, live-deadline, and public live-role-admission functions are AST-identical to the approved P2 preimage. The only P2-prefix refactor extracts its evaluated-round loop for shared data-only composition without changing public guard semantics.
+- `operations.py` and `cli.py` are CRLF in both preimage and frozen source, with zero bare LF. `campaign_admission.py` is LF in both, with zero CRLF.
+
+## Verification
+
+- Scoped Ruff: pass.
+- In-memory compilation of all three modified modules: pass.
+- Focused AST/source invariants: pass, including four boundary invocation sites, one exact typed-index recovery call, paired CLI flags, resume pinning, and exact protected-definition AST equality.
+- Tests, synthetic execution, runtime readers, providers, evaluator, Docker, credentials, environment values, and git mutations were not used, as required by the P3 authorization.
+
+The review authority is the exact source copies, hashes, and combined preimage-to-source diff in this directory.

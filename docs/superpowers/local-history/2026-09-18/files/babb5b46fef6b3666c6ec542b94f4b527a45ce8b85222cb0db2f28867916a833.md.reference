@@ -1,0 +1,175 @@
+# Task 3 Report — Causal O'Neil Feature Snapshots
+
+## Outcome
+
+Implemented the strategy-universe Task 3 feature boundary on branch
+`codex/pit-optimizer-v5-architecture` from accepted base `f4e489c`.
+
+The source commit is limited exactly to:
+
+- `core/pit_feature_snapshot.py` (new)
+- `core/industry_group.py` (modified)
+- `core/canslim/l_leader_laggard.py` (modified)
+
+No tests, bundle/provider builders, market-data artifacts, Docker/replay/qualification paths,
+policy code, or deployment paths were changed.
+
+## Frozen feature records and builders
+
+`core/pit_feature_snapshot.py` defines the exact frozen/slotted records from the brief:
+
+- `EntryFeaturesV3`, including canonical affiliations, group/sector leadership, growth
+  acceleration/freshness, volatility, gap, liquidity, and high-distance fields.
+- `HoldingFeaturesV3`, including current RS, group RS, ATR20, and volume behavior.
+
+It exposes the exact keyword-only builders:
+
+- `build_entry_features_v3(bundle, symbol, session, price_history, rs_snapshot)`
+- `build_holding_features_v3(bundle, symbol, session, price_history, rs_snapshot)`
+
+The builders require explicit schema V3, reject reference symbols as candidate/holding feature
+subjects, require an entry symbol to be active, and validate that the supplied RS snapshot covers
+the complete deduplicated active PIT union. Extra held-symbol observations do not enter group
+denominators. Affiliations are emitted as a canonical sorted tuple.
+
+## Causality and missingness
+
+- Price history must use unique, increasing, timezone-naive normalized session dates. Any row after
+  the requested session is rejected rather than truncated, and a non-empty history must end on the
+  completed session. This prevents a feature from depending on a future or stale prefix.
+- Observed OHLCV values are validated before calculation. Missing columns/insufficient lookback
+  produce explicit `None`; observed missing cells, booleans (including NumPy booleans), NaN, and
+  infinity are rejected. OHLC positivity/containment and nonnegative volume are also enforced.
+- Fundamentals come only from `PITDataBundle.fundamentals_as_of(...,
+  include_provenance=True)`. Acceleration uses only returned quarterly rows, whose filing/public
+  dates are validated against the session. Fundamental age uses the newest visible quarterly
+  public date, never period end.
+- `load_pit_industry_assignments_as_of()` is the permitted narrow local adapter for the bundle's
+  authenticated, query-only connection. Its SQL predicate reads only
+  `as_of_date <= session`, then selects the latest public/effective assignment for each requested
+  symbol. It never calls or reads the legacy current-provider cache.
+- The V3 industry table authenticates GICS-like sub-industry/group IDs but contains no independent
+  dated sector taxonomy. `sector_rs` is therefore explicitly `None`; no current profile or guessed
+  hierarchy is introduced.
+
+## Exact formulas
+
+- Industry-group RS = arithmetic mean of current RS scores for every active-union symbol whose
+  latest causal assignment equals the subject's group. Iteration is canonical-sorted for
+  determinism. Candidate panels, inactive identities, SPY, QQQ, and IWM do not enter the mean.
+- Earnings growth acceleration = newest quarterly YoY growth minus the immediately prior
+  quarter's YoY growth. Earnings metric priority is Diluted EPS, Basic EPS, then Net Income, matching
+  established CANSLIM semantics. Each YoY growth is `(current - prior) / abs(prior)` and is
+  unavailable when the prior value is missing or nonpositive.
+- Sales growth acceleration uses the same formula on `Total Revenue`.
+- Fundamental age days = `session - max(visible quarterly public_date)`.
+- ATR20 fraction = arithmetic mean of the last 20 true ranges divided by session close. True range
+  is `max(high-low, abs(high-prior_close), abs(low-prior_close))`; 21 bars are required so all 20
+  values have an observed prior close.
+- Breakout gap fraction = `(session_open - prior_close) / prior_close`, matching the repository's
+  established opening-gap convention.
+- Average dollar volume 50 = mean of `close * volume` over exactly the 50 sessions before the event,
+  consistent with the existing prior-50 entry-volume convention.
+- Distance from 52-week high = `session_close / max(high over last 252 sessions) - 1`, a signed
+  fraction with zero at the high and negative values below it.
+- Holding volume ratio = session volume divided by mean volume over exactly the prior 50 sessions.
+
+No composite or weighted strategy score was added.
+
+## Legacy compatibility
+
+The original `get_top_groups()`, `load_industry_map()`, and `evaluate_l()` implementations remain
+behaviorally unchanged. New behavior is isolated in additive helpers:
+
+- `PITIndustryAssignment` / `load_pit_industry_assignments_as_of()`
+- `finite_rs_snapshot()` / `calculate_group_rs()`
+
+Schema V1/V2 bundle dispatch and current-provider industry behavior were not touched.
+
+## Verification evidence
+
+1. Bounded direct synthetic smoke: passed (`task3 causal feature smoke: ok`). It proved that a
+   later fundamental filing and later industry reassignment were excluded from an earlier session;
+   a three-symbol active-union group mean was 80 instead of the 90 candidate-panel-only value;
+   affiliations were canonical; all formulas matched exact expected values; short histories and
+   absent fundamentals produced `None`; and a future price row, infinite price, boolean/NaN RS,
+   and incomplete active-union RS snapshot were rejected. It also exercised unchanged
+   `get_top_groups()` and `evaluate_l()` behavior. The disposable script and in-memory SQLite data
+   were removed.
+2. `python -B -m pytest tests/test_strategy_policy.py tests/test_industry_group.py
+   tests/test_canslim_logic.py -q`: **69 passed, 1 deselected**. Warnings were an existing websockets
+   deprecation and sandbox-denied pytest cache write only.
+3. `python -B -m ruff check core/pit_feature_snapshot.py core/industry_group.py
+   core/canslim/l_leader_laggard.py`: passed (`All checks passed!`).
+4. `python -B -m py_compile core/pit_feature_snapshot.py core/industry_group.py
+   core/canslim/l_leader_laggard.py`: passed.
+5. `git diff --check`: passed with only existing Windows LF-to-CRLF notices.
+6. Commit hooks passed Ruff, trailing-whitespace, end-of-file, YAML, and merge-conflict checks.
+
+## Self-review
+
+- Confirmed the source commit contains exactly the three authorized paths and no test edits.
+- Confirmed every as-of read uses a right-inclusive session/public-date predicate and no current
+  provider or global mutable cache.
+- Confirmed group calculations require the complete active union and exclude market references.
+- Confirmed record constructors cannot contain nonfinite/boolean numeric features and affiliations
+  are canonical.
+- Confirmed all technical features either use the exact completed session or remain unavailable;
+  future rows are never silently sliced away.
+- Confirmed no sector inference, composite score, provider call, data artifact, replay,
+  qualification, push, or merge was performed.
+
+## Commit
+
+`48c9946` — `feat: expose causal ONeil leadership features`
+
+## Independent-review fix round
+
+Resolved both Important findings from `task-3-review.md` within
+`core/pit_feature_snapshot.py`; the other two authorized source files and all tests remained
+unchanged.
+
+### Metric-local explicit missingness
+
+Price validation now preserves an observed SQL/Python `None` as explicit missingness. Every metric
+checks only the cells in its own exact dependency window:
+
+- ATR20: last 20 highs/lows and last 21 closes;
+- breakout gap: current open and immediately prior close;
+- ADV50: closes and volumes from the 50 sessions before the event;
+- 52-week distance: last 252 highs and current close; and
+- holding volume ratio: the prior 50 volumes and current volume.
+
+A required `None` returns `None` for the dependent metric only. A `None` in an older row or an
+unrelated column does not affect that metric. Observed booleans/NumPy booleans, NaN, infinity,
+nonpositive OHLC, negative volume, and invalid OHLC containment still fail closed across the
+supplied history. Structural session/date/order/future-row checks are unchanged.
+
+### Authenticated holding identity
+
+Before assignment, price-feature, or RS reads, holding construction now:
+
+1. calls `PITDataBundle.security_lineage_id(symbol)` to reject arbitrary/unbound symbols;
+2. resolves that lineage through `membership_v3.ticker_for_lineage_at(lineage_id, session)`, which
+   uses Task 1's explicit V3 price-identity transition contract; and
+3. requires the supplied symbol to equal the uniquely active identity at that session.
+
+This preserves an active former constituent holding when its current authenticated identity remains
+valid, accepts the successor on the transition date, and rejects the predecessor at and after that
+same right-inclusive boundary. It does not infer identity from current membership or silently
+rewrite caller-supplied facts to a successor ticker.
+
+### Review-fix verification
+
+1. Direct bounded smoke: passed (`task3 review-fix smoke: ok`). It proved metric-local `None`
+   propagation and out-of-window isolation for ATR, gap, ADV50, high distance, and volume ratio;
+   global bool/NumPy-bool/NaN/infinity rejection; pre-transition predecessor acceptance;
+   transition-date successor acceptance; and retired-predecessor/arbitrary-symbol rejection before
+   RS validation. The disposable script was removed.
+2. `python -B -m pytest tests/test_strategy_policy.py tests/test_industry_group.py
+   tests/test_canslim_logic.py -q`: **69 passed, 1 deselected**. Warnings remained the existing
+   websockets deprecation and sandbox-denied pytest-cache write only.
+3. Ruff, `py_compile`, and `git diff --check` over the original three-file source scope passed.
+4. Commit hooks passed Ruff, whitespace, end-of-file, YAML, and conflict checks.
+
+Review-fix commit: `ad43db4` — `fix: enforce causal feature identity and missingness`

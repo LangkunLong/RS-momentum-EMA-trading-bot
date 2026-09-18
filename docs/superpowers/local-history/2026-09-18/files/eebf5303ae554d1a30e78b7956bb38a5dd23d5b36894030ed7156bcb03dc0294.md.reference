@@ -1,0 +1,43 @@
+# P3 independent spec and task-quality review
+
+## Verdicts
+
+**Spec Compliance: FAIL — one Important finding (I1).** Enrollment, shared immutable boundary composition, native boundary placement, optional legacy behavior, and paired policy command plumbing substantially implement P3. The settled success paths omit the binding design's original-deadline precedence.
+
+**Task quality: CHANGES REQUIRED — one Important correctness finding (I1).** No Critical or additional Minor findings identified in this bounded review. Do not advance P3 as approved until the focused correction is frozen and reviewed.
+
+## Important finding I1: recheck the original deadline before accepting settled policy success
+
+Affected frozen source: `review-freeze-01/operations.py:761` (reused settlement), `:965` (new settlement), and shared `policy_boundary` at `:703`.
+
+Both settled branches call `policy_boundary(round_index + 1)` and immediately accept a non-admit result. When the target is reached, this sets `evaluated_feedback_target_reached`; the final mapping at `operations.py:983` returns `completed`. Neither branch checks the campaign deadline. `policy_boundary` only loads immutable facts and evaluates counts/reserves (`:707-722`). The census checks persisted start epochs against the original campaign interval (`campaign_admission.py:837-857`), but samples no current time. The existing pre-config and pre-start deadline checks cannot protect these earlier break paths.
+
+Consequently, resuming an enrolled campaign whose durable rounds already meet the target after its original campaign deadline can report target success. The same issue occurs when the remaining deadline expires during heavy settled-boundary authentication. This violates the design's explicit deadline-before-success precedence; it does not refresh or spend the budget, but reports the wrong terminal result.
+
+Correction: after the heavy facts are authenticated, enforce the original campaign deadline before either settled path consumes the policy decision. Preserve the original epoch and duration, keep clock access in the operational layer, and ensure both reused/new paths (including the final capped round) retain deadline failure precedence. Do not add a clock or synthetic request to the immutable shared fact reader. Re-review the frozen focused diff using source/AST/static checks only.
+
+## Scope and positive evidence
+
+- Enrollment remains inside the existing campaign-launch transition (`operations.py:500`). Explicit prepared identities are authenticated before enrollment; freshness checks select launch/round/start state, journals, checkpoints, requests and verified paid state (`campaign_admission.py:698`). The binding is published before the original launch shape (`operations.py:609-649`). Missing-index classification authenticates the exact expected orphan before the sole narrow repository recovery call; launched legacy state cannot acquire enrollment. No broad recovery exception was introduced.
+- Resume discovers admission without an optional input and validates an explicitly supplied reference. Rendering pins the discovered policy (`operations.py:424-455`); the pending resume command forwards the enrolled reference (`:939-947`). CLI flags occur only in run/resume campaign parsers (`cli.py:1195-1216`); one-sided input fails before ArtifactRef construction (`operations.py:1006-1013`).
+- Boundary decisions precede missing config creation and first start of an existing config (`operations.py:790`, `:888`) and follow both reused and new settlements (`:761`, `:965`). Global observed-start census postpones early target success until later starts are processed (`:753-760`, `:958-965`). The settled facts require exactly the observed start/journal frontier, authenticated completed resources and cleanup, projection, exact request/package census, ledger terminals and accepted critic linkage (`campaign_admission.py:1400-1575`). Already-started continuation does not invoke a fresh boundary reserve before its runtime continuation.
+- Runtime/terminal and cleanup checks precede the new-settlement decision (`operations.py:950-955`); reused terminal failures retain their existing stop branch (`:748-750`). Target/reserve results introduce no invented outcome or role record, and the original summary call/fields remain intact. The only reported precedence defect is I1.
+- The evaluated-round loop extraction retains its predicates, accepted-critic authentication and distinct-round count. Public P2 live admission remains unchanged, including its final real-clock recheck. Existing primary-attempt and accepted-predecessor logic remains in the unchanged portions of the retained live prefix; selected config authentication still propagates.
+
+## Verification and exact authority
+
+Reviewed the binding design, P3/global plan, brief and preparation map. Used the actual retained P2 preimages rather than HEAD or a commit diff. Independently verified frozen `actual-task.diff` SHA-256 `0c97fac7a512d153ee0bb307dc084b9ebcb9b3399d1e165cbcb69fa4b1508787` and these postimages:
+
+- operations: `3ef1ee11918ed9367af338c06628a336558e3b5bd136811ca477793385a1c4b5`
+- CLI: `cf127dba9914911e51b7c9a7bf907ed3208aaffa8fb81184e30b1a0e7debae74`
+- admission: `e6b3a9b5362df18d670acd65469e4f4667247743fb93f803ce26041f1cb0dc38`
+
+The combined diff was requested once; tool output truncated its middle. Focused frozen-source reads recovered the affected operations control flow/dispatch, new admission enrollment/selectors/census/fact helpers, and CLI parser context, rather than substituting another diff. Named unchanged dependency reads covered repository exact index recovery/transition semantics, immutable completed-resource cleanup authentication, projection scheduling, and paid journal/ledger binding. No broad crawl or tests were read.
+
+Independently compiled the three frozen source byte strings in memory without source imports or bytecode writes. Independently compared eleven protected contract/live definition ASTs against retained preimages; all matched, including both old campaign state dataclasses, all three public admission dataclasses, live round authority/deadline, selected round membership/state readers, role packages, and public live guard. Newline census independently matches the report: operations 716 to 1080 CRLF lines; CLI 2151 to 2153 CRLF lines; admission 1167 to 1644 LF lines, with no opposite newline style.
+
+Read the final frozen task report, Ruff/compile/static verification and protection evidence. Their SHA-256 values independently match `authority.json`: task report `c60b687b3bab00f5938eab97db26af2fb5a47d9aa1b197326c049db3780e06d6`; static verification `e749507c98c469fb91eea69da4bd3e1d6df425a1f58e4f9bea9fb7cb9eccbeb0`; protection evidence `838db63d9777595e75902493c8a78c4379af0f20732592bb63120914f5c89357`. Ruff pass is implementer evidence; compilation and the stated AST/newline checks were independently repeated. Evidence is no longer pending.
+
+## Limits and cross-task facts
+
+This is P3 review only. P4 historical integration, final broad review, and actual 662-file archive/56-file evaluator preservation verification remain outside this diff. The prior P2 independent-review hash is referenced by the implementer's authority but that prior review was not re-audited here; the retained exact P2 source is the comparison authority. No tests, synthetic behavior/probes, source imports, historical reader or summary execution, credentials/environment values, provider/evaluation/Docker/campaign activity, git mutations, or archive edits were performed. Only this review report was written during actual review. Static findings and future static approval do not imply executed policy-positive behavior.

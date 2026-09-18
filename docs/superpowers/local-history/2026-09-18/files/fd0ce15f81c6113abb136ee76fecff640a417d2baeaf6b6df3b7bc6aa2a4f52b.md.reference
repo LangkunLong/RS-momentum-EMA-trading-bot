@@ -1,0 +1,70 @@
+### Task 4: Replace Fold Ranking with Continuous-Panel CAGR
+
+**Files:**
+
+- Modify: `core/pit_optimizer_evaluation.py`
+- Modify: `core/pit_policy_parity.py`
+- Modify: `core/pit_optimization.py`
+- Modify: `tests/test_pit_policy_parity.py`
+- Modify: `tests/test_pit_optimizer_v2.py`
+
+**Interfaces:**
+
+- Produces:
+
+  ```python
+  AnnualizedReturnTarget(
+      metric_id="portfolio_annualized_return_pct",
+      formula_id="production_equity_cagr_365_calendar_days_v1",
+      basis="absolute",
+      target_pct=Decimal("10.00"),
+      milestones_pct=(Decimal("10.00"), Decimal("20.00"), Decimal("50.00")),
+      precision_pct=Decimal("0.01"),
+  )
+  ```
+
+- Produces: `PanelSecurityLineage`, `PanelStratumAllocation`, `PanelAllocationRuleV1`, `EvaluationPanelSpec`, `DiscoveryPanelPlan`, `QualificationPanelPlan`, `QualificationRetirementLedger`, `PanelAggregateSummary`, `DiscoveryPanelComparison`, and `QualificationDecision`.
+- Preserves: legacy `FoldSpec`, `FoldManifest`, `DiscoveryScore`, and `HoldoutDecision` readers for schema-v3 artifacts only.
+
+- [ ] **Step 1: Define closed panel and objective contracts.**
+
+  `PanelSecurityLineage.security_lineage_id` is exactly the stable value derived from the price-identity `chain_id`; it also binds executable ticker history and source-affiliation labels. A panel spec binds its sorted unique lineages, continuous start/end sessions, session digest, and panel purpose. A discovery plan contains only quick/discovery panels plus the SHA-256 commitment of a separately stored qualification plan; role-visible serialization must not include qualification members.
+
+- [ ] **Step 2: Implement deterministic current-bundle panel allocation.**
+
+  Add `sha256_lineage_stratified_v1`: hash `partition_seed_sha256 + security_lineage_id`, sort within the sealed affiliation stratum, assign exact declared counts, and reject aliases crossing panels. `PanelAllocationRuleV1` seals total quick/discovery/qualification counts, `remainder="unallocated"`, affiliation-bitset ordering, fixed panel-allocation order `("qualification", "discovery", "quick")`, and `largest_remainder_residual_capacity_v1` apportionment.
+
+  For each panel in that fixed order, compute quotas from each stratum's current residual capacity, floor them, distribute the remaining slots by descending fractional remainder with affiliation key as tie-break, cap every assignment by residual capacity, and decrement residual capacity before allocating the next panel. Reject total requested demand above total eligible capacity or any per-stratum sum above its eligible count. Persist `PanelStratumAllocation` with eligible, quick, discovery, qualification, and unallocated counts for every stratum. The manifest binds the rule, inputs, resulting allocations, and the proof that assigned plus unallocated equals eligible in every stratum.
+
+  The core canary's single `sp500` stratum receives 12 quick, 48 discovery, and 24 unopened retrospective-qualification lineages; all remaining lineages are explicitly `unallocated`. Future three-universe plans reuse the same closed allocator with the seven possible S&P/Nasdaq/Russell affiliation bitsets.
+
+  Add the provider-free `python -m core.pit_optimizer_evaluation build-panel-plans` parser branch with required bundle path/digest, prices provenance, continuous start/end dates, partition seed, exact quick/discovery/qualification counts, target, permanent qualification-retirement ledger, and one output root. `QualificationRetirementLedger` initializes one empty canonical schema-v4 ledger atomically when the requested permanent path is absent, authenticates its hash chain when present, and exposes an immutable snapshot. Under its lock, exclude every retired `security_lineage_id` before allocation and bind the ledger snapshot digest into both plans. Task 9 adds reservation/outcome mutations to this same ledger contract.
+
+  Publish `qualification-plan.json`, `discovery-plan.json`, and `publication.json` under the output root, with `publication.json` written last as the commit marker. The command creates the missing parent and a private staging root. If publication stops after either plan file is installed, a retry may resume only after authenticating every existing partial file against the exact requested inputs and ledger snapshot; conflicting partials fail closed. A completed publication root is immutable. Contract or I/O failure returns nonzero, and search readiness refuses any root without the final marker. Print only content-free plan digests/counts. The discovery artifact contains only quick/discovery lineages plus the qualification artifact digest; the qualification artifact is never loaded by the search controller.
+
+- [ ] **Step 3: Build continuous panel evidence from production metrics.**
+
+  `PanelAggregateSummary` records starting/ending equity, elapsed calendar days, annualized return, total return, benchmark return, drawdown, Sharpe, closed trades, turnover, exposure, entry funnel, and exit attribution. Recompute the annualized value from endpoints/dates and reject a mismatch. Zero trades are valid when the equity curve is valid.
+
+  Extend the existing `core.pit_policy_parity` parser/main dispatch with `capture-v4` and `verify-v4`. Both commands require the discovery-plan path, bundle path/digest, prices provenance, sandbox image, and create-only output root; create their missing parent only; refuse an existing run root; return nonzero on identity/parity/cleanup failure; and print only the final content-free attestation summary. They evaluate quick/discovery continuously and bind every output to policy interface 2; they never load the qualification artifact or call a provider.
+
+- [ ] **Step 4: Make annualized return the entire discovery score.**
+
+  `DiscoveryPanelComparison` stores candidate CAGR, fixed-baseline CAGR, their diagnostic delta, target gap, and whether the candidate strictly improves the current champion. Compare only the quantized candidate CAGR; retain the existing champion on a tie.
+
+- [ ] **Step 5: Define qualification without auxiliary return gates.**
+
+  `QualificationDecision.from_result` passes only when evaluation/integrity completed, candidate CAGR is at least the active target, and candidate CAGR is strictly above the baseline CAGR from the same qualification panel. Do not inspect trades, drawdown, Sharpe, turnover, or transaction costs in this return decision.
+
+- [ ] **Step 6: Update existing parity/objective assertions and verify.**
+
+  Rewrite the current fold/objective/holdout cases in place to assert the new v4 contracts while retaining explicit legacy-reader cases. Do not add test functions.
+
+  ```powershell
+  python -B -m compileall -q core/pit_optimizer_evaluation.py core/pit_policy_parity.py core/pit_optimization.py
+  python -B -m ruff check core/pit_optimizer_evaluation.py core/pit_policy_parity.py core/pit_optimization.py --no-cache
+  python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_policy_parity.py tests/test_pit_optimizer_v2.py -k "annualized or panel or objective or qualification or legacy"
+  git add core/pit_optimizer_evaluation.py core/pit_policy_parity.py core/pit_optimization.py tests/test_pit_policy_parity.py tests/test_pit_optimizer_v2.py
+  git commit -m "feat: rank optimizer panels by portfolio CAGR"
+  ```
+

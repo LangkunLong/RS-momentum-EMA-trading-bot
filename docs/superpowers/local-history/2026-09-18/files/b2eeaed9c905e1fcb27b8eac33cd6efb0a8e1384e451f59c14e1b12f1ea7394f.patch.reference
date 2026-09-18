@@ -1,0 +1,70 @@
+diff --git "a/C:\\Projects\\trading_bot\\RS-momentum-EMA-trading-bot\\.worktrees\\pit-optimizer-v5-architecture\\.artifacts\\pit-optimizer-v5\\development\\luna-recovery-b2-correction\\preimages\\artifacts.py" "b/C:\\Projects\\trading_bot\\RS-momentum-EMA-trading-bot\\.worktrees\\pit-optimizer-v5-architecture\\core\\pit_optimizer_v5\\artifacts.py"
+index 85df3aa..1f1661a 100644
+--- "a/C:\\Projects\\trading_bot\\RS-momentum-EMA-trading-bot\\.worktrees\\pit-optimizer-v5-architecture\\.artifacts\\pit-optimizer-v5\\development\\luna-recovery-b2-correction\\preimages\\artifacts.py"
++++ "b/C:\\Projects\\trading_bot\\RS-momentum-EMA-trading-bot\\.worktrees\\pit-optimizer-v5-architecture\\core\\pit_optimizer_v5\\artifacts.py"
+@@ -94,6 +94,7 @@ from core.pit_optimizer_v5.probes import ProbeObservationV5, SemanticFingerprint
+ from core.pit_optimizer_v5.rendering import bounded_variant_assignments_v5
+ from core.pit_optimizer_v5.search import ArchiveEntryV5, SearchStateV5
+ from core.pit_optimizer_v5.provider import (
++    AuthorRoleInputV5,
+     AuthorizedRoleSlotV5,
+     ControllerRoleTerminalAuthorityV5,
+     ExistingPersistedRoleRequestV5,
+@@ -2789,6 +2790,7 @@ class LocalArtifactRepositoryV5:
+ 
+         if len(events) != len(payloads):
+             raise ValueError("render rejection context events and payloads differ")
++        rejected_identity_hashes: set[str] = set()
+         for position, (event, payload) in enumerate(zip(events, payloads, strict=True)):
+             if type(payload) is not RenderRejectionPayloadV5:
+                 continue
+@@ -2816,6 +2818,9 @@ class LocalArtifactRepositoryV5:
+                 raise ArtifactSchemaFailureV5(event.payload_ref) from None
+             template = package.artifact
+             binding = package.request.expected_binding
++            author_input = package.request.role_input
++            if type(author_input) is not AuthorRoleInputV5:
++                raise ArtifactSchemaFailureV5(event.payload_ref)
+             if (
+                 not package.accepted
+                 or type(template) is not StructuralTemplateV5
+@@ -2829,6 +2834,7 @@ class LocalArtifactRepositoryV5:
+                 or binding.parent_revision_sha256 != intent.parent_revision_sha256
+                 or binding.hypothesis_id != intent.hypothesis.hypothesis_id
+                 or binding.discovery_plan_sha256 != intent.discovery_plan_sha256
++                or author_input.hypothesis.sha256 != intent.hypothesis.sha256
+             ):
+                 raise ArtifactSchemaFailureV5(event.payload_ref)
+             try:
+@@ -2861,6 +2867,31 @@ class LocalArtifactRepositoryV5:
+                 or conflicts_with_rendered_variant
+             ):
+                 raise ArtifactSchemaFailureV5(event.payload_ref)
++            rejected_identity_hashes.add(payload.experiment_identity.sha256)
++
++        if not rejected_identity_hashes:
++            return
++        for event, payload in zip(events, payloads, strict=True):
++            if type(payload) is not RoleCompletionPayloadV5 or payload.role != "critic":
++                continue
++            try:
++                package = self.load_role_invocation(payload)
++            except ArtifactRepositoryFailureV5:
++                raise
++            except (TypeError, ValueError, ArithmeticError):
++                raise ArtifactSchemaFailureV5(event.payload_ref) from None
++            if (
++                event.event_kind != "role_completion"
++                or payload.campaign_id != event.campaign_id
++                or payload.round_index != event.round_index
++                or package.call.campaign_id != event.campaign_id
++                or package.call.round_index != event.round_index
++                or package.call.role != "critic"
++                or package.request.role != "critic"
++            ):
++                raise ArtifactSchemaFailureV5(event.payload_ref)
++            if rejected_identity_hashes.intersection(package.request.expected_binding.experiment_ids):
++                raise ArtifactSchemaFailureV5(event.payload_ref)
+ 
+     def append_round_event(self, event: RoundEventV5) -> ArtifactRefV5:
+         if type(event) is not RoundEventV5:

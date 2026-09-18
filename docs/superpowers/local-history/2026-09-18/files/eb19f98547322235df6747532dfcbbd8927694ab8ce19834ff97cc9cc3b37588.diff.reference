@@ -1,0 +1,3782 @@
+# Review package: e435217..89bdea5
+
+## Commits
+89bdea5 feat: define PIT optimizer v2 contracts
+
+## Files changed
+ core/pit_optimization_contract.py | 1816 ++++++++++++++++++++++++++++++++++++-
+ core/pit_optimizer_evaluation.py  |  559 ++++++++++++
+ tests/test_pit_optimizer_v2.py    | 1277 ++++++++++++++++++++++++++
+ 3 files changed, 3651 insertions(+), 1 deletion(-)
+
+## Diff
+diff --git a/core/pit_optimization_contract.py b/core/pit_optimization_contract.py
+index 6c56f4c..17468b4 100644
+--- a/core/pit_optimization_contract.py
++++ b/core/pit_optimization_contract.py
+@@ -1,36 +1,108 @@
+ """Closed contracts for one bounded point-in-time optimization cycle."""
+ 
+ from __future__ import annotations
+ 
+ import hashlib
+ import json
+ import math
++import os
+ import re
+ import stat
+-from dataclasses import dataclass
++import subprocess
++import uuid
++from dataclasses import dataclass, fields, is_dataclass
++from decimal import Decimal
+ from pathlib import Path
+ from types import MappingProxyType
+ from typing import Mapping
+ 
++from core.pit_optimizer_evaluation import (
++    AggregateMetric,
++    DiscoveryScore,
++    FoldAggregateSummary,
++    FoldManifest,
++)
++
+ 
+ ENTRY_CONTRACT_PATH = "core/canslim/entry_contract.py"
+ FULL_START_DATE = "2021-01-01"
+ FULL_END_DATE = "2025-12-31"
+ HOLDOUT_START_DATE = "2025-01-01"
+ HOLDOUT_END_DATE = FULL_END_DATE
+ PIT_BUNDLE_SHA256 = "1af306ef1e46797473cd186fc48938ed6694ae25f5943c9f1905b528307cc2eb"
+ BASELINE_MANIFEST_SHA256 = "f99eb6aade8b567b319accb95dadd80789064aacf1cb8b85d0cc31379caf6382"
+ BASELINE_SOURCE_COMMIT = "515cb1e50d051e2ee4253603608f2fd3920004bc"
+ MAX_CANARY_CALLS = 3
+ MAX_CANARY_USD = 0.50
+ 
++OPTIMIZER_V2_ROLES = ("investigator", "author", "critic")
++MAX_ROLE_TEXT_BYTES = 4 * 1024
++MAX_ROLE_LIST_ITEMS = 16
++MAX_AUTHOR_DIFF_BYTES = 64 * 1024
++MAX_POLICY_SOURCE_BUNDLE_BYTES = 64 * 1024
++MAX_DISCOVERY_EVIDENCE_BYTES = 8 * 1024
++MAX_INVESTIGATOR_ARTIFACT_BYTES = 8 * 1024
++MAX_AUTHOR_NON_DIFF_ARTIFACT_BYTES = 8 * 1024
++MAX_CRITIC_ARTIFACT_BYTES = 8 * 1024
++MAX_ITERATION_FEEDBACK_BYTES = 4 * 1024
++MAX_ITERATION_HISTORY_BYTES = 32 * 1024
++MAX_INVESTIGATOR_DYNAMIC_BYTES = 112 * 1024
++MAX_AUTHOR_DYNAMIC_BYTES = 96 * 1024
++MAX_CRITIC_DYNAMIC_BYTES = 24 * 1024
++
++_INVESTIGATOR_FAMILIES = ("entry", "exit", "risk_sizing")
++_CRITIC_DISPOSITIONS = ("refine", "abandon", "change_family")
++_POLICY_EDITABLE_PATHS = (
++    "core/strategy_policy/entry.py",
++    "core/strategy_policy/risk.py",
++    "core/strategy_policy/exit.py",
++)
++_POLICY_DECLARED_SYMBOLS = MappingProxyType(
++    {
++        "core/strategy_policy/entry.py": (
++            "core.strategy_policy.entry.evaluate_entry",
++        ),
++        "core/strategy_policy/risk.py": (
++            "core.strategy_policy.risk.recommend_capacity",
++            "core.strategy_policy.risk.recommend_allocation",
++            "core.strategy_policy.risk.select_eviction",
++        ),
++        "core/strategy_policy/exit.py": (
++            "core.strategy_policy.exit.evaluate_exit",
++        ),
++    }
++)
++
++PIT_OPTIMIZER_V2_SYSTEM_PROMPTS = MappingProxyType(
++    {
++        "investigator": (
++            "You are the PIT optimizer investigator. Use only the supplied bounded source, "
++            "rules, aggregate discovery evidence, incumbent summary, and prior summaries. "
++            "Return one strict schema-v2 investigator object. Never request hidden data, "
++            "credentials, local paths, raw trades, holdings, or provider audit material."
++        ),
++        "author": (
++            "You are the PIT optimizer author. Implement only the supplied investigator "
++            "hypothesis within the immutable constraints and patch bounds. Return one strict "
++            "schema-v2 author object containing a unified diff; do not execute code or access "
++            "hidden data, credentials, local paths, or unrelated source."
++        ),
++        "critic": (
++            "You are the PIT optimizer critic. Analyze only the supplied sanitized validation "
++            "and aggregate discovery comparisons. Return one strict schema-v2 advisory object. "
++            "You cannot accept a candidate and must not request hidden results, credentials, "
++            "local paths, raw trades, holdings, or provider audit material."
++        ),
++    }
++)
++
+ _ID_RE = re.compile(r"[a-z][a-z0-9_.-]{0,127}")
+ _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+ _ROLE_DOMAINS = frozenset(
+     {"entry_funnel", "return_drawdown", "cash_exposure", "trade_quality"}
+ )
+ 
+ PIT_OPTIMIZATION_SYSTEM_PROMPTS = MappingProxyType(
+     {
+         "orchestrator": (
+             "You are the PIT Optimization Orchestrator. Route only. Return exactly one JSON "
+@@ -111,20 +183,1073 @@ def _parse_closed_object(raw: str, keys: frozenset[str]) -> dict[str, object]:
+         raise ValueError("provider payload is not bounded JSON text")
+     try:
+         value = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+     except (json.JSONDecodeError, ValueError) as exc:
+         raise ValueError("provider payload is malformed JSON") from exc
+     if not isinstance(value, dict) or set(value) != keys:
+         raise ValueError("provider payload has invalid keys")
+     return value
+ 
+ 
++def _parse_v2_closed_object(
++    raw: str,
++    keys: frozenset[str],
++    *,
++    max_total_bytes: int,
++) -> dict[str, object]:
++    if type(max_total_bytes) is not int or max_total_bytes <= 0:
++        raise ValueError("provider payload byte cap is invalid")
++    if not isinstance(raw, str) or len(raw.encode("utf-8")) > max_total_bytes:
++        raise ValueError("provider payload is not bounded JSON text")
++    try:
++        value = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
++    except json.JSONDecodeError as exc:
++        raise ValueError("provider payload is malformed JSON") from exc
++    if not isinstance(value, dict) or set(value) != keys:
++        raise ValueError("provider payload has invalid keys")
++    return value
++
++
++def _v2_text(value: object, field: str, *, allow_empty: bool = False) -> str:
++    if not isinstance(value, str) or value != value.strip() or "\x00" in value:
++        raise ValueError(f"{field} must be canonical text")
++    if not allow_empty and not value:
++        raise ValueError(f"{field} cannot be empty")
++    if len(value.encode("utf-8")) > MAX_ROLE_TEXT_BYTES:
++        raise ValueError(f"{field} is too large")
++    return value
++
++
++def _v2_string_list(
++    value: object,
++    field: str,
++    *,
++    allow_empty: bool = False,
++) -> tuple[str, ...]:
++    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
++        raise ValueError(f"{field} must be a JSON string array")
++    if len(value) > MAX_ROLE_LIST_ITEMS:
++        raise ValueError(f"{field} may contain at most {MAX_ROLE_LIST_ITEMS} items")
++    normalized = tuple(_v2_text(item, field) for item in value)
++    if len(normalized) != len(set(normalized)):
++        raise ValueError(f"{field} must contain unique values")
++    if not allow_empty and not normalized:
++        raise ValueError(f"{field} cannot be empty")
++    return normalized
++
++
++def _v2_string_tuple(
++    value: object,
++    field: str,
++    *,
++    allow_empty: bool = False,
++) -> tuple[str, ...]:
++    if type(value) is not tuple:
++        raise ValueError(f"{field} must be a tuple")
++    return _v2_string_list(list(value), field, allow_empty=allow_empty)
++
++
++def _v2_identifier(value: object, field: str) -> str:
++    text = _v2_text(value, field)
++    if _ID_RE.fullmatch(text) is None:
++        raise ValueError(f"{field} is invalid")
++    return text
++
++
++def _v2_blob(value: object, field: str, *, max_bytes: int) -> str:
++    if (
++        not isinstance(value, str)
++        or not value
++        or "\x00" in value
++        or len(value.encode("utf-8")) > max_bytes
++    ):
++        raise ValueError(f"{field} exceeds its byte cap")
++    return value
++
++
++def _v2_canonical_bytes(value: object) -> bytes:
++    return json.dumps(
++        _v2_primitive(value),
++        sort_keys=True,
++        separators=(",", ":"),
++        allow_nan=False,
++    ).encode("utf-8")
++
++
++def _v2_digest(value: object) -> str:
++    return hashlib.sha256(_v2_canonical_bytes(value) + b"\n").hexdigest()
++
++
++def _v2_primitive(value: object) -> object:
++    if isinstance(value, Decimal):
++        return format(value, "f")
++    if is_dataclass(value) and not isinstance(value, type):
++        return {
++            field.name: _v2_primitive(getattr(value, field.name))
++            for field in fields(value)
++        }
++    if isinstance(value, Mapping):
++        return {str(key): _v2_primitive(item) for key, item in value.items()}
++    if isinstance(value, (tuple, list)):
++        return [_v2_primitive(item) for item in value]
++    return value
++
++
++class _V2Canonical:
++    __slots__ = ()
++
++    def to_primitive(self) -> dict[str, object]:
++        primitive = _v2_primitive(self)
++        if not isinstance(primitive, dict):
++            raise ValueError("v2 contract is not an object")
++        return primitive
++
++    def canonical_json_bytes(self) -> bytes:
++        return _v2_canonical_bytes(self)
++
++    def to_json(self) -> str:
++        return self.canonical_json_bytes().decode("utf-8")
++
++
++def _require_digest(value: object, field: str) -> str:
++    if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
++        raise ValueError(f"{field} is invalid")
++    return value
++
++
++def _require_positive_int(value: object, field: str) -> int:
++    if type(value) is not int or value <= 0:
++        raise ValueError(f"{field} must be a positive integer")
++    return value
++
++
++def _require_bool(value: object, field: str) -> bool:
++    if type(value) is not bool:
++        raise ValueError(f"{field} must be boolean")
++    return value
++
++
++@dataclass(frozen=True, slots=True)
++class PatchBounds(_V2Canonical):
++    max_files: int
++    max_hunks: int
++    max_changed_lines: int
++    max_diff_bytes: int
++
++    def __post_init__(self) -> None:
++        for name in ("max_files", "max_hunks", "max_changed_lines", "max_diff_bytes"):
++            _require_positive_int(getattr(self, name), f"patch {name}")
++
++
++def _bounds_fit(inner: PatchBounds, outer: PatchBounds) -> bool:
++    return all(
++        getattr(inner, name) <= getattr(outer, name)
++        for name in ("max_files", "max_hunks", "max_changed_lines", "max_diff_bytes")
++    )
++
++
++def _validate_scoped_paths_symbols(
++    paths: tuple[str, ...],
++    symbols: tuple[str, ...],
++    label: str,
++) -> None:
++    if any(path not in _POLICY_EDITABLE_PATHS for path in paths):
++        raise ValueError(f"{label} paths are outside the editable scope")
++    allowed_symbols = {
++        symbol
++        for path in paths
++        for symbol in _POLICY_DECLARED_SYMBOLS[path]
++    }
++    if any(symbol not in allowed_symbols for symbol in symbols):
++        raise ValueError(f"{label} symbols are outside the editable scope")
++
++
++@dataclass(frozen=True, slots=True)
++class PitOptimizerCallBudget(_V2Canonical):
++    call_index: int
++    iteration: int
++    role: str
++    model: str
++    max_static_input_bytes: int
++    max_dynamic_input_bytes: int
++    max_input_tokens: int
++    max_output_tokens: int
++    max_response_bytes: int
++    max_usd: float
++
++    def __post_init__(self) -> None:
++        _require_positive_int(self.call_index, "optimizer call index")
++        _require_positive_int(self.iteration, "optimizer call iteration")
++        if self.role not in OPTIMIZER_V2_ROLES:
++            raise ValueError("optimizer call role is invalid")
++        _v2_text(self.model, "optimizer call model")
++        for name in (
++            "max_static_input_bytes",
++            "max_dynamic_input_bytes",
++            "max_input_tokens",
++            "max_output_tokens",
++            "max_response_bytes",
++        ):
++            _require_positive_int(getattr(self, name), f"optimizer call {name}")
++        if self.max_static_input_bytes + self.max_dynamic_input_bytes > self.max_input_tokens:
++            raise ValueError("optimizer call input sections exceed the input token cap")
++        if (
++            isinstance(self.max_usd, bool)
++            or type(self.max_usd) not in {int, float}
++            or not math.isfinite(float(self.max_usd))
++            or float(self.max_usd) <= 0
++        ):
++            raise ValueError("optimizer call USD cap must be positive and finite")
++
++
++@dataclass(frozen=True, slots=True)
++class PolicySourceScope(_V2Canonical):
++    schema_version: int
++    policy_interface_version: int
++    initial_policy_source_sha256s: tuple[tuple[str, str], ...]
++    editable_paths: tuple[str, ...]
++    max_policy_source_bundle_bytes: int
++    max_iteration_feedback_bytes: int
++    max_iteration_history_bytes: int
++    hard_patch_bounds: PatchBounds
++    candidate_bounds: PatchBounds
++    max_iterations: int
++    allowed_descendant_rule: str
++
++    def __post_init__(self) -> None:
++        if self.schema_version != 2:
++            raise ValueError("policy source scope schema is unsupported")
++        _require_positive_int(self.policy_interface_version, "policy source scope interface")
++        if type(self.editable_paths) is not tuple or self.editable_paths != _POLICY_EDITABLE_PATHS:
++            raise ValueError("policy source scope editable paths are invalid")
++        if (
++            type(self.initial_policy_source_sha256s) is not tuple
++            or tuple(path for path, _digest in self.initial_policy_source_sha256s)
++            != self.editable_paths
++        ):
++            raise ValueError("policy source scope initial identities are invalid")
++        for path, digest in self.initial_policy_source_sha256s:
++            _v2_text(path, "policy source scope path")
++            _require_digest(digest, "policy source scope initial SHA-256")
++        for name, ceiling in (
++            ("max_policy_source_bundle_bytes", MAX_POLICY_SOURCE_BUNDLE_BYTES),
++            ("max_iteration_feedback_bytes", MAX_ITERATION_FEEDBACK_BYTES),
++            ("max_iteration_history_bytes", MAX_ITERATION_HISTORY_BYTES),
++        ):
++            value = _require_positive_int(getattr(self, name), f"policy source scope {name}")
++            if value > ceiling:
++                raise ValueError(f"policy source scope {name} exceeds its hard ceiling")
++        if not isinstance(self.hard_patch_bounds, PatchBounds) or not isinstance(
++            self.candidate_bounds, PatchBounds
++        ):
++            raise ValueError("policy source scope patch bounds are invalid")
++        absolute_hard = PatchBounds(3, 12, 200, MAX_AUTHOR_DIFF_BYTES)
++        if not _bounds_fit(self.hard_patch_bounds, absolute_hard):
++            raise ValueError("policy source scope hard patch bounds exceed the absolute ceiling")
++        if not _bounds_fit(self.candidate_bounds, self.hard_patch_bounds):
++            raise ValueError("policy source scope candidate bounds exceed hard patch bounds")
++        if type(self.max_iterations) is not int or not 1 <= self.max_iterations <= 8:
++            raise ValueError("policy source scope iterations are invalid")
++        if (
++            self.allowed_descendant_rule
++            != "authenticated_initial_sources_plus_validated_cumulative_diff"
++        ):
++            raise ValueError("policy source scope descendant rule is invalid")
++
++    @property
++    def sha256(self) -> str:
++        return _v2_digest(self)
++
++
++@dataclass(frozen=True, slots=True)
++class AuthorizationRequirement(_V2Canonical):
++    window_id: str
++    max_calls: int
++    max_tokens: int
++    max_usd: float
++    policy_source_scope_sha256: str
++    provider_retries: int
++    apply: bool
++
++    def __post_init__(self) -> None:
++        _v2_identifier(self.window_id, "authorization window ID")
++        _require_positive_int(self.max_calls, "authorization call cap")
++        _require_positive_int(self.max_tokens, "authorization token cap")
++        if (
++            isinstance(self.max_usd, bool)
++            or type(self.max_usd) not in {int, float}
++            or not math.isfinite(float(self.max_usd))
++            or float(self.max_usd) <= 0
++        ):
++            raise ValueError("authorization USD cap must be positive and finite")
++        _require_digest(
++            self.policy_source_scope_sha256,
++            "authorization policy source scope SHA-256",
++        )
++        if self.provider_retries != 0:
++            raise ValueError("authorization provider retries must be zero")
++        if self.apply is not False:
++            raise ValueError("authorization apply must be false")
++
++    @property
++    def sha256(self) -> str:
++        return _v2_digest(self)
++
++
++@dataclass(frozen=True, slots=True)
++class PitOptimizerRunManifest(_V2Canonical):
++    schema_version: int
++    run_id: str
++    run_kind: str
++    model: str
++    source_head: str
++    source_fingerprint_sha256: str
++    legacy_readiness_sha256: str
++    pit_bundle_sha256: str
++    baseline_manifest_sha256: str
++    effective_policy_sha256: str
++    policy_interface_version: int
++    policy_source_sha256s: tuple[tuple[str, str], ...]
++    editable_paths: tuple[str, ...]
++    policy_source_scope: PolicySourceScope
++    immutable_constraints_sha256: str
++    fold_manifest: FoldManifest
++    parity_attestation_sha256: str
++    sandbox_image: str
++    validation_ledger_name: str
++    immutable_constraint_ids: tuple[str, ...]
++    candidate_bounds: PatchBounds
++    call_budgets: tuple[PitOptimizerCallBudget, ...]
++    max_iterations: int
++    non_improving_limit: int
++    authorization_requirement: AuthorizationRequirement
++
++    def __post_init__(self) -> None:
++        if self.schema_version != 2:
++            raise ValueError("optimizer run manifest schema is unsupported")
++        _v2_identifier(self.run_id, "optimizer run ID")
++        if self.run_kind != "subset_canary":
++            raise ValueError("optimizer run kind is invalid")
++        if self.model != "deepseek/deepseek-r1":
++            raise ValueError("optimizer model is invalid")
++        if not isinstance(self.source_head, str) or re.fullmatch(
++            r"[0-9a-f]{40}", self.source_head
++        ) is None:
++            raise ValueError("optimizer source HEAD is invalid")
++        for name in (
++            "source_fingerprint_sha256",
++            "legacy_readiness_sha256",
++            "pit_bundle_sha256",
++            "baseline_manifest_sha256",
++            "effective_policy_sha256",
++            "immutable_constraints_sha256",
++            "parity_attestation_sha256",
++        ):
++            _require_digest(getattr(self, name), f"optimizer {name}")
++        _require_positive_int(self.policy_interface_version, "optimizer policy interface")
++        if not isinstance(self.policy_source_scope, PolicySourceScope):
++            raise ValueError("optimizer policy source scope is invalid")
++        if self.policy_source_scope.policy_interface_version != self.policy_interface_version:
++            raise ValueError("optimizer policy interface differs from source scope")
++        if self.editable_paths != self.policy_source_scope.editable_paths:
++            raise ValueError("optimizer editable paths differ from source scope")
++        if self.policy_source_sha256s != self.policy_source_scope.initial_policy_source_sha256s:
++            raise ValueError("optimizer policy source identities differ from source scope")
++        if not isinstance(self.authorization_requirement, AuthorizationRequirement):
++            raise ValueError("optimizer authorization requirement is invalid")
++        if (
++            self.authorization_requirement.policy_source_scope_sha256
++            != self.policy_source_scope.sha256
++        ):
++            raise ValueError("optimizer source scope authorization is stale")
++        if not isinstance(self.fold_manifest, FoldManifest):
++            raise ValueError("optimizer fold manifest is invalid")
++        if self.fold_manifest.data_identity_sha256 != self.pit_bundle_sha256:
++            raise ValueError("optimizer fold and PIT bundle identities differ")
++        if re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", self.sandbox_image or "") is None:
++            raise ValueError("optimizer sandbox image must be digest pinned")
++        if self.validation_ledger_name != "pit_optimizer_validation_ledger.jsonl":
++            raise ValueError("optimizer validation ledger name is invalid")
++        _v2_string_tuple(self.immutable_constraint_ids, "immutable constraint IDs")
++        expected_constraints = hashlib.sha256(
++            _v2_canonical_bytes(self.immutable_constraint_ids) + b"\n"
++        ).hexdigest()
++        if self.immutable_constraints_sha256 != expected_constraints:
++            raise ValueError("optimizer immutable constraint identity differs from IDs")
++        if not isinstance(self.candidate_bounds, PatchBounds):
++            raise ValueError("optimizer candidate bounds are invalid")
++        absolute_hard = PatchBounds(3, 12, 200, MAX_AUTHOR_DIFF_BYTES)
++        if not _bounds_fit(self.candidate_bounds, absolute_hard):
++            raise ValueError("optimizer candidate exceeds hard patch bounds")
++        if self.candidate_bounds != self.policy_source_scope.candidate_bounds:
++            raise ValueError("optimizer candidate bounds differ from source scope")
++        if self.max_iterations != self.policy_source_scope.max_iterations:
++            raise ValueError("optimizer iteration limit differs from source scope")
++        if type(self.max_iterations) is not int or not 1 <= self.max_iterations <= 8:
++            raise ValueError("optimizer iteration limit is invalid")
++        if self.non_improving_limit != 3:
++            raise ValueError("optimizer non-improving limit is invalid")
++        if (
++            type(self.call_budgets) is not tuple
++            or len(self.call_budgets) != 3 * self.max_iterations
++            or any(not isinstance(item, PitOptimizerCallBudget) for item in self.call_budgets)
++        ):
++            raise ValueError("optimizer call plan is incomplete")
++        expected_order = tuple(
++            ((iteration - 1) * 3 + ordinal, iteration, role)
++            for iteration in range(1, self.max_iterations + 1)
++            for ordinal, role in enumerate(OPTIMIZER_V2_ROLES, start=1)
++        )
++        actual_order = tuple(
++            (item.call_index, item.iteration, item.role) for item in self.call_budgets
++        )
++        if actual_order != expected_order:
++            raise ValueError("optimizer call order is invalid")
++        if any(item.model != self.model for item in self.call_budgets):
++            raise ValueError("optimizer call model differs from manifest")
++        dynamic_ceilings = {
++            "investigator": MAX_INVESTIGATOR_DYNAMIC_BYTES,
++            "author": MAX_AUTHOR_DYNAMIC_BYTES,
++            "critic": MAX_CRITIC_DYNAMIC_BYTES,
++        }
++        for budget in self.call_budgets:
++            if budget.max_dynamic_input_bytes > dynamic_ceilings[budget.role]:
++                raise ValueError("optimizer call dynamic section exceeds its hard ceiling")
++            static_bytes = len(PIT_OPTIMIZER_V2_SYSTEM_PROMPTS[budget.role].encode("utf-8"))
++            static_bytes += len(_v2_canonical_bytes(pit_optimizer_response_format(budget.role)))
++            if static_bytes > budget.max_static_input_bytes:
++                raise ValueError("optimizer call static section exceeds its declared cap")
++        if len(self.call_budgets) > self.authorization_requirement.max_calls:
++            raise ValueError("optimizer calls exceed authorization")
++        if (
++            sum(item.max_input_tokens for item in self.call_budgets)
++            > self.authorization_requirement.max_tokens
++        ):
++            raise ValueError("optimizer tokens exceed authorization")
++        if (
++            sum(float(item.max_usd) for item in self.call_budgets)
++            > float(self.authorization_requirement.max_usd) + 1e-12
++        ):
++            raise ValueError("optimizer USD exceeds authorization")
++
++    @property
++    def sha256(self) -> str:
++        return _v2_digest(self)
++
++
++@dataclass(frozen=True, slots=True)
++class PitOptimizerGateConfig:
++    phase: str
++    baseline_run: Path
++    baseline_manifest_sha256: str
++    pit_bundle: Path
++    pit_bundle_sha256: str
++    effective_policy_sha256: str
++    optimizer_manifest: Path
++    optimizer_manifest_sha256: str
++    verified_parity_artifact: Path
++    verified_parity_sha256: str
++    readiness_artifact: Path | None
++    readiness_sha256: str | None
++    authorization_window_id: str | None
++    authorization_requirement_sha256: str
++    source_transmission_authorized: bool
++    max_usd: float
++    max_api_calls: int
++    max_tokens: int
++    max_iterations: int
++    apply: bool
++
++    def validate(self) -> None:
++        if self.phase not in {"prepare", "run"}:
++            raise ValueError("optimizer gate phase is invalid")
++        baseline = _resolved_directory(self.baseline_run, "optimizer gate baseline run")
++        baseline_manifest = _resolved_file(
++            baseline / "run_manifest.json",
++            "optimizer gate baseline manifest",
++        )
++        manifest_path = _resolved_file(
++            self.optimizer_manifest,
++            "optimizer manifest artifact",
++        )
++        bundle_path = _resolved_file(self.pit_bundle, "optimizer gate PIT bundle")
++        parity_path = _resolved_file(
++            self.verified_parity_artifact,
++            "optimizer gate parity artifact",
++        )
++        for name in (
++            "baseline_manifest_sha256",
++            "pit_bundle_sha256",
++            "effective_policy_sha256",
++            "optimizer_manifest_sha256",
++            "verified_parity_sha256",
++            "authorization_requirement_sha256",
++        ):
++            _require_digest(getattr(self, name), f"optimizer gate {name}")
++        if _sha256_file(baseline_manifest) != self.baseline_manifest_sha256:
++            raise ValueError("optimizer gate baseline manifest digest differs")
++        if _sha256_file(bundle_path) != self.pit_bundle_sha256:
++            raise ValueError("optimizer gate PIT bundle digest differs")
++        if _sha256_file(parity_path) != self.verified_parity_sha256:
++            raise ValueError("optimizer gate parity artifact digest differs")
++        raw_manifest = manifest_path.read_bytes()
++        if hashlib.sha256(raw_manifest).hexdigest() != self.optimizer_manifest_sha256:
++            raise ValueError("optimizer manifest digest differs")
++        try:
++            primitive = json.loads(raw_manifest)
++        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
++            raise ValueError("optimizer manifest is invalid JSON") from exc
++        if not isinstance(primitive, dict) or raw_manifest != _v2_canonical_bytes(primitive) + b"\n":
++            raise ValueError("optimizer manifest is not canonical JSON")
++        identity_fields = {
++            "baseline_manifest_sha256": self.baseline_manifest_sha256,
++            "pit_bundle_sha256": self.pit_bundle_sha256,
++            "effective_policy_sha256": self.effective_policy_sha256,
++        }
++        if any(primitive.get(name) != expected for name, expected in identity_fields.items()):
++            raise ValueError("optimizer gate identities differ from manifest")
++        authorization = primitive.get("authorization_requirement")
++        if not isinstance(authorization, dict):
++            raise ValueError("optimizer manifest authorization requirement is absent")
++        authorization_sha256 = hashlib.sha256(
++            _v2_canonical_bytes(authorization) + b"\n"
++        ).hexdigest()
++        if authorization_sha256 != self.authorization_requirement_sha256:
++            raise ValueError("optimizer gate authorization requirement digest differs")
++        _require_positive_int(self.max_api_calls, "optimizer gate call cap")
++        _require_positive_int(self.max_tokens, "optimizer gate token cap")
++        _require_positive_int(self.max_iterations, "optimizer gate iteration cap")
++        if (
++            isinstance(self.max_usd, bool)
++            or type(self.max_usd) not in {int, float}
++            or not math.isfinite(float(self.max_usd))
++            or float(self.max_usd) <= 0
++        ):
++            raise ValueError("optimizer gate USD cap is invalid")
++        if (
++            authorization.get("max_calls") != self.max_api_calls
++            or authorization.get("max_tokens") != self.max_tokens
++            or not math.isclose(
++                float(authorization.get("max_usd", -1)),
++                float(self.max_usd),
++                rel_tol=0.0,
++                abs_tol=1e-12,
++            )
++            or primitive.get("max_iterations") != self.max_iterations
++        ):
++            raise ValueError("optimizer gate ceilings differ from manifest")
++        if authorization.get("apply") is not self.apply:
++            raise ValueError("optimizer gate apply differs from authorization requirement")
++        if self.readiness_artifact is None or self.readiness_sha256 is None:
++            if self.readiness_artifact is not None or self.readiness_sha256 is not None:
++                raise ValueError("optimizer gate readiness identity is incomplete")
++            if self.phase != "prepare":
++                raise ValueError("run phase requires authenticated readiness")
++        else:
++            _require_digest(self.readiness_sha256, "optimizer gate readiness SHA-256")
++            readiness = _resolved_file(
++                self.readiness_artifact,
++                "optimizer gate readiness artifact",
++            )
++            if _sha256_file(readiness) != self.readiness_sha256:
++                raise ValueError("optimizer gate readiness artifact digest differs")
++        if self.phase == "prepare":
++            if self.authorization_window_id is not None:
++                raise ValueError("prepare phase cannot carry an authorization window")
++            if self.source_transmission_authorized is not False:
++                raise ValueError("prepare phase source transmission is not authorized")
++            if self.apply is not False:
++                raise ValueError("prepare phase apply must be false")
++        else:
++            _v2_identifier(self.authorization_window_id, "authorization window ID")
++            if self.source_transmission_authorized is not True:
++                raise ValueError("run phase source transmission must be authorized")
++            if type(self.apply) is not bool:
++                raise ValueError("optimizer gate apply must be boolean")
++
++
++def _resolved_directory(path: Path, label: str) -> Path:
++    candidate = Path(path)
++    if not candidate.is_absolute() or candidate.is_symlink() or not candidate.is_dir():
++        raise ValueError(f"{label} must be an existing absolute non-link directory")
++    return candidate.resolve()
++
++
++def _resolved_file(path: Path, label: str) -> Path:
++    candidate = Path(path)
++    if not candidate.is_absolute() or candidate.is_symlink() or not candidate.is_file():
++        raise ValueError(f"{label} must be an existing absolute regular non-link file")
++    return candidate.resolve()
++
++
++def _sha256_file(path: Path) -> str:
++    digest = hashlib.sha256()
++    with path.open("rb") as handle:
++        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def _canonical_mapping_bytes(value: Mapping[str, object]) -> bytes:
++    return _v2_canonical_bytes(value) + b"\n"
++
++
++def _require_canonical_mapping_artifact(
++    value: Mapping[str, object],
++    path: Path,
++    label: str,
++) -> tuple[Path, str]:
++    resolved = _resolved_file(path, label)
++    expected = _canonical_mapping_bytes(value)
++    if resolved.read_bytes() != expected:
++        raise ValueError(f"{label} differs from the supplied canonical object")
++    return resolved, hashlib.sha256(expected).hexdigest()
++
++
++def _require_parity_artifact(parity: object, path: Path) -> tuple[Path, str]:
++    from core.pit_policy_parity import ParityAttestation
++
++    if not isinstance(parity, ParityAttestation):
++        raise ValueError("verified parity must be a closed attestation")
++    resolved = _resolved_file(path, "verified parity artifact")
++    if parity.artifact_path.resolve() != resolved:
++        raise ValueError("verified parity artifact path differs from attestation")
++    primitive = {
++        field.name: _v2_primitive(getattr(parity, field.name))
++        for field in fields(parity)
++        if field.name not in {"artifact_path", "artifact_sha256"}
++    }
++    expected = _v2_canonical_bytes(primitive) + b"\n"
++    actual = resolved.read_bytes()
++    digest = hashlib.sha256(actual).hexdigest()
++    if actual != expected or digest != parity.artifact_sha256:
++        raise ValueError("verified parity artifact identity is invalid")
++    return resolved, digest
++
++
++def _source_bundle_envelope_bytes(
++    *,
++    policy_interface_version: int,
++    source_texts: Mapping[str, str],
++) -> tuple[int, int]:
++    records = [
++        {
++            "path": path,
++            "sha256": hashlib.sha256(source_texts[path].encode("utf-8")).hexdigest(),
++            "declared_symbols": list(_POLICY_DECLARED_SYMBOLS[path]),
++            "text": source_texts[path],
++        }
++        for path in _POLICY_EDITABLE_PATHS
++    ]
++    primitive = {
++        "policy_interface_version": policy_interface_version,
++        "cumulative_diff_sha256": hashlib.sha256(b"").hexdigest(),
++        "cumulative_diff": "",
++        "files": records,
++    }
++    initial_bytes = sum(len(source_texts[path].encode("utf-8")) for path in _POLICY_EDITABLE_PATHS)
++    envelope_bytes = len(_v2_canonical_bytes(primitive)) - initial_bytes
++    return initial_bytes, envelope_bytes
++
++
++def _require_first_call_plan(
++    call_budgets: tuple[PitOptimizerCallBudget, ...],
++    *,
++    max_iterations: int,
++) -> None:
++    expected_caps = {
++        "investigator": (8_000, 80_000, 88_000, 4_000, 8 * 1024, 0.05),
++        "author": (12_000, 76_000, 88_000, 8_000, 16 * 1024, 0.10),
++        "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024, 0.05),
++    }
++    if max_iterations != 2 or len(call_budgets) != 6:
++        raise ValueError("first subset canary requires two complete iterations")
++    for budget in call_budgets:
++        expected = expected_caps.get(budget.role)
++        actual = (
++            budget.max_static_input_bytes,
++            budget.max_dynamic_input_bytes,
++            budget.max_input_tokens,
++            budget.max_output_tokens,
++            budget.max_response_bytes,
++            float(budget.max_usd),
++        )
++        if budget.model != "deepseek/deepseek-r1" or actual != expected:
++            raise ValueError("first subset canary call caps are invalid")
++
++
++def build_subset_manifest(
++    *,
++    legacy_readiness: Mapping[str, object],
++    legacy_readiness_path: Path,
++    parity_attestation: object,
++    verified_parity_path: Path,
++    pit_bundle: Path,
++    baseline_run: Path,
++    source_root: Path,
++    permanent_runtime_root: Path,
++    controller_temp_parent: Path,
++    artifact_root: Path,
++    sandbox_image: str,
++    call_budgets: tuple[PitOptimizerCallBudget, ...],
++    candidate_bounds: PatchBounds,
++    max_iterations: int,
++) -> PitOptimizerRunManifest:
++    """Authenticate inert inputs and seal one provider-free subset manifest."""
++
++    if not isinstance(legacy_readiness, Mapping):
++        raise ValueError("legacy readiness must be a mapping")
++    _readiness_path, readiness_sha256 = _require_canonical_mapping_artifact(
++        legacy_readiness,
++        Path(legacy_readiness_path),
++        "legacy readiness artifact",
++    )
++    _parity_path, parity_sha256 = _require_parity_artifact(
++        parity_attestation,
++        Path(verified_parity_path),
++    )
++    source = _resolved_directory(Path(source_root), "source root")
++    _resolved_directory(Path(permanent_runtime_root), "permanent runtime root")
++    _resolved_directory(Path(controller_temp_parent), "controller temp parent")
++    _resolved_directory(Path(artifact_root), "optimizer artifact root")
++    bundle_path = _resolved_file(Path(pit_bundle), "PIT bundle")
++    baseline = _resolved_directory(Path(baseline_run), "baseline run")
++    baseline_manifest_path = _resolved_file(
++        baseline / "run_manifest.json",
++        "baseline run manifest",
++    )
++
++    if (
++        legacy_readiness.get("schema_version") != 1
++        or legacy_readiness.get("gate") != "pit_optimization"
++        or legacy_readiness.get("phase") != "ready"
++    ):
++        raise ValueError("legacy readiness is not authenticated ready input")
++    identities = legacy_readiness.get("identities")
++    sealed_inputs = legacy_readiness.get("sealed_inputs")
++    evaluation = legacy_readiness.get("evaluation_contract")
++    if not isinstance(identities, Mapping) or not isinstance(sealed_inputs, Mapping):
++        raise ValueError("legacy readiness identities are absent")
++    if not isinstance(evaluation, Mapping) or evaluation.get("verification_only") is not True:
++        raise ValueError("legacy readiness evaluation contract is invalid")
++
++    bundle_sha256 = _sha256_file(bundle_path)
++    baseline_sha256 = _sha256_file(baseline_manifest_path)
++    if identities.get("pit_bundle_sha256") != bundle_sha256:
++        raise ValueError("legacy readiness PIT bundle identity differs")
++    if identities.get("baseline_manifest_sha256") != baseline_sha256:
++        raise ValueError("legacy readiness baseline manifest identity differs")
++    if sealed_inputs.get("pit_bundle_sha256") != bundle_sha256:
++        raise ValueError("legacy readiness sealed PIT bundle identity differs")
++    baseline_map = sealed_inputs.get("baseline_artifact_sha256")
++    if not isinstance(baseline_map, Mapping) or baseline_map.get("run_manifest.json") != baseline_sha256:
++        raise ValueError("legacy readiness sealed baseline identity differs")
++    effective_policy = legacy_readiness.get("effective_policy")
++    if not isinstance(effective_policy, Mapping):
++        raise ValueError("legacy readiness effective policy is absent")
++    effective_policy_sha256 = hashlib.sha256(
++        _canonical_mapping_bytes(effective_policy)
++    ).hexdigest()
++    if identities.get("effective_policy_sha256") != effective_policy_sha256:
++        raise ValueError("legacy readiness effective policy identity differs")
++
++    from core.pit_data import PITDataBundle
++    from core.pit_policy_parity import build_fixed_fold_manifest
++
++    with PITDataBundle(bundle_path, expected_sha256=bundle_sha256) as bundle:
++        rows = bundle._connection.execute(
++            "SELECT trade_date FROM price WHERE ticker='SPY' "
++            "AND trade_date>='2021-06-25' AND trade_date<='2022-03-11' "
++            "ORDER BY trade_date"
++        ).fetchall()
++        benchmark_sessions = tuple(str(row[0]) for row in rows)
++    fold_manifest, _universe = build_fixed_fold_manifest(
++        readiness=legacy_readiness,
++        benchmark_sessions=benchmark_sessions,
++        data_identity_sha256=bundle_sha256,
++    )
++
++    parity = parity_attestation
++    if (
++        parity.pit_bundle_sha256 != bundle_sha256
++        or parity.baseline_manifest_sha256 != baseline_sha256
++        or parity.effective_policy_sha256 != effective_policy_sha256
++        or parity.discovery_fold_manifest_sha256 != fold_manifest.sha256
++        or parity.final_source_head != identities.get("source_head")
++        or parity.final_source_fingerprint_sha256
++        != identities.get("source_fingerprint_sha256")
++    ):
++        raise ValueError("verified parity differs from the authenticated identity graph")
++
++    source_texts: dict[str, str] = {}
++    source_sha256s: list[tuple[str, str]] = []
++    for relative in _POLICY_EDITABLE_PATHS:
++        source_file = _resolved_file(source / Path(relative), f"policy source {relative}")
++        try:
++            text = source_file.read_bytes().decode("utf-8")
++        except UnicodeDecodeError as exc:
++            raise ValueError("policy source must be UTF-8 text") from exc
++        source_texts[relative] = text
++        source_sha256s.append((relative, hashlib.sha256(text.encode("utf-8")).hexdigest()))
++
++    if not isinstance(candidate_bounds, PatchBounds):
++        raise ValueError("candidate bounds are invalid")
++    hard_bounds = PatchBounds(3, 12, 200, MAX_AUTHOR_DIFF_BYTES)
++    if not _bounds_fit(candidate_bounds, hard_bounds):
++        raise ValueError("candidate bounds exceed hard patch bounds")
++    initial_policy_bytes, envelope_bytes = _source_bundle_envelope_bytes(
++        policy_interface_version=parity.policy_interface_version,
++        source_texts=source_texts,
++    )
++    if (
++        initial_policy_bytes
++        + (2 * candidate_bounds.max_diff_bytes)
++        + envelope_bytes
++        > MAX_POLICY_SOURCE_BUNDLE_BYTES
++    ):
++        raise ValueError("prospective policy source bundle exceeds its byte cap")
++
++    if type(call_budgets) is not tuple or any(
++        not isinstance(item, PitOptimizerCallBudget) for item in call_budgets
++    ):
++        raise ValueError("optimizer call budgets are invalid")
++    _require_first_call_plan(call_budgets, max_iterations=max_iterations)
++    constraint_ids_value = legacy_readiness.get("invariant_ids")
++    if not isinstance(constraint_ids_value, list):
++        raise ValueError("legacy readiness invariant IDs are absent")
++    constraint_ids = _v2_string_list(
++        constraint_ids_value,
++        "legacy readiness invariant IDs",
++    )
++    constraints_sha256 = hashlib.sha256(
++        _v2_canonical_bytes(constraint_ids) + b"\n"
++    ).hexdigest()
++    scope = PolicySourceScope(
++        schema_version=2,
++        policy_interface_version=parity.policy_interface_version,
++        initial_policy_source_sha256s=tuple(source_sha256s),
++        editable_paths=_POLICY_EDITABLE_PATHS,
++        max_policy_source_bundle_bytes=MAX_POLICY_SOURCE_BUNDLE_BYTES,
++        max_iteration_feedback_bytes=MAX_ITERATION_FEEDBACK_BYTES,
++        max_iteration_history_bytes=MAX_ITERATION_HISTORY_BYTES,
++        hard_patch_bounds=hard_bounds,
++        candidate_bounds=candidate_bounds,
++        max_iterations=max_iterations,
++        allowed_descendant_rule=(
++            "authenticated_initial_sources_plus_validated_cumulative_diff"
++        ),
++    )
++    authorization = AuthorizationRequirement(
++        window_id=f"window_{uuid.uuid4().hex}",
++        max_calls=6,
++        max_tokens=448_000,
++        max_usd=0.40,
++        policy_source_scope_sha256=scope.sha256,
++        provider_retries=0,
++        apply=False,
++    )
++    return PitOptimizerRunManifest(
++        schema_version=2,
++        run_id=f"run_{uuid.uuid4().hex}",
++        run_kind="subset_canary",
++        model="deepseek/deepseek-r1",
++        source_head=str(identities["source_head"]),
++        source_fingerprint_sha256=str(identities["source_fingerprint_sha256"]),
++        legacy_readiness_sha256=readiness_sha256,
++        pit_bundle_sha256=bundle_sha256,
++        baseline_manifest_sha256=baseline_sha256,
++        effective_policy_sha256=effective_policy_sha256,
++        policy_interface_version=parity.policy_interface_version,
++        policy_source_sha256s=tuple(source_sha256s),
++        editable_paths=_POLICY_EDITABLE_PATHS,
++        policy_source_scope=scope,
++        immutable_constraints_sha256=constraints_sha256,
++        fold_manifest=fold_manifest,
++        parity_attestation_sha256=parity_sha256,
++        sandbox_image=sandbox_image,
++        validation_ledger_name="pit_optimizer_validation_ledger.jsonl",
++        immutable_constraint_ids=constraint_ids,
++        candidate_bounds=candidate_bounds,
++        call_budgets=call_budgets,
++        max_iterations=max_iterations,
++        non_improving_limit=3,
++        authorization_requirement=authorization,
++    )
++
++
++def write_optimizer_manifest(
++    manifest: PitOptimizerRunManifest,
++    output: Path,
++) -> tuple[Path, str]:
++    if not isinstance(manifest, PitOptimizerRunManifest):
++        raise ValueError("optimizer manifest writer requires a closed manifest")
++    path = Path(output)
++    if not path.is_absolute():
++        raise ValueError("optimizer manifest output must be absolute")
++    parent = _resolved_directory(path.parent, "optimizer manifest parent")
++    resolved = parent / path.name
++    payload = manifest.canonical_json_bytes() + b"\n"
++    with resolved.open("xb") as handle:
++        handle.write(payload)
++        handle.flush()
++        os.fsync(handle.fileno())
++    digest = hashlib.sha256(payload).hexdigest()
++    if digest != manifest.sha256:
++        raise ValueError("optimizer manifest writer produced a digest mismatch")
++    return resolved, digest
++
++
++def build_prepare_command(
++    manifest: PitOptimizerRunManifest,
++    *,
++    manifest_path: Path,
++    legacy_readiness_path: Path,
++    verified_parity_path: Path,
++    pit_bundle_path: Path,
++    baseline_run_path: Path,
++    repo_root: Path,
++    permanent_runtime_root: Path,
++    controller_temp_parent: Path,
++    artifact_root: Path,
++    git_executable: Path,
++    docker_executable: Path,
++    sandbox_image: str,
++) -> str:
++    if not isinstance(manifest, PitOptimizerRunManifest):
++        raise ValueError("prepare command requires a closed optimizer manifest")
++    optimizer_manifest = _resolved_file(manifest_path, "optimizer manifest artifact")
++    legacy_readiness = _resolved_file(legacy_readiness_path, "legacy readiness artifact")
++    verified_parity = _resolved_file(verified_parity_path, "verified parity artifact")
++    pit_bundle = _resolved_file(pit_bundle_path, "PIT bundle")
++    baseline_run = _resolved_directory(baseline_run_path, "baseline run")
++    baseline_manifest = _resolved_file(
++        baseline_run / "run_manifest.json",
++        "baseline run manifest",
++    )
++    repository = _resolved_directory(repo_root, "repository root")
++    runtime_root = _resolved_directory(permanent_runtime_root, "permanent runtime root")
++    temp_parent = _resolved_directory(controller_temp_parent, "controller temp parent")
++    artifacts = _resolved_directory(artifact_root, "optimizer artifact root")
++    git_path = _resolved_file(git_executable, "Git executable")
++    docker_path = _resolved_file(docker_executable, "Docker executable")
++    if _sha256_file(optimizer_manifest) != manifest.sha256:
++        raise ValueError("optimizer manifest artifact differs from manifest")
++    if _sha256_file(legacy_readiness) != manifest.legacy_readiness_sha256:
++        raise ValueError("legacy readiness artifact differs from manifest")
++    if _sha256_file(verified_parity) != manifest.parity_attestation_sha256:
++        raise ValueError("verified parity artifact differs from manifest")
++    if _sha256_file(pit_bundle) != manifest.pit_bundle_sha256:
++        raise ValueError("PIT bundle differs from manifest")
++    if _sha256_file(baseline_manifest) != manifest.baseline_manifest_sha256:
++        raise ValueError("baseline run differs from manifest")
++    for relative, expected_sha256 in manifest.policy_source_sha256s:
++        path = _resolved_file(repository / relative, f"policy source {relative}")
++        if _sha256_file(path) != expected_sha256:
++            raise ValueError("repository policy source differs from manifest")
++    if sandbox_image != manifest.sandbox_image:
++        raise ValueError("prepare sandbox image differs from manifest")
++    arguments = [
++        "python",
++        "-B",
++        "-m",
++        "core.pit_optimization",
++        "prepare-v2",
++        "--optimizer-manifest",
++        str(optimizer_manifest),
++        "--optimizer-manifest-sha256",
++        manifest.sha256,
++        "--legacy-readiness",
++        str(legacy_readiness),
++        "--legacy-readiness-sha256",
++        manifest.legacy_readiness_sha256,
++        "--verified-parity",
++        str(verified_parity),
++        "--verified-parity-sha256",
++        manifest.parity_attestation_sha256,
++        "--pit-bundle",
++        str(pit_bundle),
++        "--pit-bundle-sha256",
++        manifest.pit_bundle_sha256,
++        "--baseline-run",
++        str(baseline_run),
++        "--baseline-manifest-sha256",
++        manifest.baseline_manifest_sha256,
++        "--repo-root",
++        str(repository),
++        "--permanent-runtime-root",
++        str(runtime_root),
++        "--controller-temp-parent",
++        str(temp_parent),
++        "--artifact-root",
++        str(artifacts),
++        "--git-executable",
++        str(git_path),
++        "--docker-executable",
++        str(docker_path),
++        "--sandbox-image",
++        sandbox_image,
++        "--authorization-requirement-sha256",
++        manifest.authorization_requirement.sha256,
++    ]
++    return subprocess.list2cmdline(arguments)
++
++
++@dataclass(frozen=True, slots=True)
++class PolicySourceRecord(_V2Canonical):
++    path: str
++    sha256: str
++    declared_symbols: tuple[str, ...]
++    text: str
++
++    def __post_init__(self) -> None:
++        path = _v2_text(self.path, "policy source path")
++        if path not in _POLICY_EDITABLE_PATHS:
++            raise ValueError("policy source path is outside the editable scope")
++        _require_digest(self.sha256, "policy source SHA-256")
++        _v2_blob(
++            self.text,
++            "policy source text",
++            max_bytes=MAX_POLICY_SOURCE_BUNDLE_BYTES,
++        )
++        if hashlib.sha256(self.text.encode("utf-8")).hexdigest() != self.sha256:
++            raise ValueError("policy source SHA-256 differs from text")
++        _v2_string_tuple(self.declared_symbols, "policy declared symbols")
++        if self.declared_symbols != _POLICY_DECLARED_SYMBOLS[path]:
++            raise ValueError("policy declared symbols differ from the closed interface")
++
++
++@dataclass(frozen=True, slots=True)
++class PolicySourceBundle(_V2Canonical):
++    policy_interface_version: int
++    cumulative_diff_sha256: str
++    cumulative_diff: str
++    files: tuple[PolicySourceRecord, ...]
++
++    def __post_init__(self) -> None:
++        _require_positive_int(self.policy_interface_version, "policy interface version")
++        _require_digest(self.cumulative_diff_sha256, "cumulative diff SHA-256")
++        if not isinstance(self.cumulative_diff, str) or "\x00" in self.cumulative_diff:
++            raise ValueError("cumulative diff is invalid")
++        if len(self.cumulative_diff.encode("utf-8")) > MAX_AUTHOR_DIFF_BYTES:
++            raise ValueError("cumulative diff exceeds its byte cap")
++        if hashlib.sha256(self.cumulative_diff.encode("utf-8")).hexdigest() != self.cumulative_diff_sha256:
++            raise ValueError("cumulative diff SHA-256 differs from text")
++        if type(self.files) is not tuple or any(
++            not isinstance(item, PolicySourceRecord) for item in self.files
++        ):
++            raise ValueError("policy source files are invalid")
++        if tuple(item.path for item in self.files) != _POLICY_EDITABLE_PATHS:
++            raise ValueError("policy source bundle must contain the three editable files")
++        if len(self.canonical_json_bytes()) > MAX_POLICY_SOURCE_BUNDLE_BYTES:
++            raise ValueError("policy source bundle exceeds its byte cap")
++
++
+ @dataclass(frozen=True, slots=True)
+ class CandidateDefinition:
+     """One controller-owned one-line entry-contract alternative."""
+ 
+     candidate_id: str
+     constant_name: str
+     policy_field: str
+     old_value: float
+     new_value: float
+     old_line: str
+@@ -661,10 +1786,699 @@ def pit_optimization_response_format(role: str) -> dict[str, object]:
+     except KeyError as exc:
+         raise ValueError("unknown PIT optimization role") from exc
+     return {
+         "type": "json_schema",
+         "json_schema": {
+             "name": f"pit_optimization_{role}_v1",
+             "strict": True,
+             "schema": json.loads(json.dumps(schema, separators=(",", ":"))),
+         },
+     }
++
++
++@dataclass(frozen=True, slots=True)
++class InvestigatorArtifact(_V2Canonical):
++    hypothesis_id: str
++    family: str
++    evidence_ids: tuple[str, ...]
++    causal_rationale: str
++    target_paths: tuple[str, ...]
++    target_symbols: tuple[str, ...]
++    expected_diagnostic_changes: tuple[str, ...]
++    known_risks: tuple[str, ...]
++    author_instructions: tuple[str, ...]
++
++    def __post_init__(self) -> None:
++        _v2_identifier(self.hypothesis_id, "investigator hypothesis ID")
++        if self.family not in _INVESTIGATOR_FAMILIES:
++            raise ValueError("investigator family is invalid")
++        _v2_string_tuple(self.evidence_ids, "investigator evidence IDs")
++        _v2_text(self.causal_rationale, "investigator causal rationale")
++        _v2_string_tuple(self.target_paths, "investigator target paths")
++        _v2_string_tuple(self.target_symbols, "investigator target symbols")
++        _validate_scoped_paths_symbols(
++            self.target_paths,
++            self.target_symbols,
++            "investigator target",
++        )
++        _v2_string_tuple(
++            self.expected_diagnostic_changes,
++            "investigator expected diagnostic changes",
++        )
++        _v2_string_tuple(
++            self.known_risks,
++            "investigator known risks",
++            allow_empty=True,
++        )
++        _v2_string_tuple(self.author_instructions, "investigator author instructions")
++        if len(self.canonical_json_bytes()) > MAX_INVESTIGATOR_ARTIFACT_BYTES:
++            raise ValueError("investigator artifact exceeds its byte cap")
++
++    @classmethod
++    def from_json(
++        cls,
++        raw: str,
++        *,
++        max_total_bytes: int,
++    ) -> "InvestigatorArtifact":
++        value = _parse_v2_closed_object(
++            raw,
++            frozenset(
++                {
++                    "hypothesis_id",
++                    "family",
++                    "evidence_ids",
++                    "causal_rationale",
++                    "target_paths",
++                    "target_symbols",
++                    "expected_diagnostic_changes",
++                    "known_risks",
++                    "author_instructions",
++                }
++            ),
++            max_total_bytes=max_total_bytes,
++        )
++        family = _v2_text(value["family"], "investigator family")
++        if family not in _INVESTIGATOR_FAMILIES:
++            raise ValueError("investigator family is invalid")
++        return cls(
++            hypothesis_id=_v2_identifier(
++                value["hypothesis_id"], "investigator hypothesis ID"
++            ),
++            family=family,
++            evidence_ids=_v2_string_list(
++                value["evidence_ids"], "investigator evidence IDs"
++            ),
++            causal_rationale=_v2_text(
++                value["causal_rationale"], "investigator causal rationale"
++            ),
++            target_paths=_v2_string_list(
++                value["target_paths"], "investigator target paths"
++            ),
++            target_symbols=_v2_string_list(
++                value["target_symbols"], "investigator target symbols"
++            ),
++            expected_diagnostic_changes=_v2_string_list(
++                value["expected_diagnostic_changes"],
++                "investigator expected diagnostic changes",
++            ),
++            known_risks=_v2_string_list(
++                value["known_risks"], "investigator known risks", allow_empty=True
++            ),
++            author_instructions=_v2_string_list(
++                value["author_instructions"], "investigator author instructions"
++            ),
++        )
++
++
++@dataclass(frozen=True, slots=True)
++class AuthorArtifact(_V2Canonical):
++    hypothesis_id: str
++    behavioral_summary: str
++    changed_paths: tuple[str, ...]
++    changed_symbols: tuple[str, ...]
++    unified_diff: str
++    assumptions: tuple[str, ...]
++    validation_suggestions: tuple[str, ...]
++
++    def __post_init__(self) -> None:
++        _v2_identifier(self.hypothesis_id, "author hypothesis ID")
++        _v2_text(self.behavioral_summary, "author behavioral summary")
++        _v2_string_tuple(self.changed_paths, "author changed paths")
++        _v2_string_tuple(self.changed_symbols, "author changed symbols")
++        _validate_scoped_paths_symbols(
++            self.changed_paths,
++            self.changed_symbols,
++            "author changed",
++        )
++        _v2_blob(self.unified_diff, "author diff", max_bytes=MAX_AUTHOR_DIFF_BYTES)
++        _v2_string_tuple(self.assumptions, "author assumptions", allow_empty=True)
++        _v2_string_tuple(
++            self.validation_suggestions,
++            "author validation suggestions",
++            allow_empty=True,
++        )
++        primitive = self.to_primitive()
++        primitive["unified_diff"] = ""
++        if len(_v2_canonical_bytes(primitive)) > MAX_AUTHOR_NON_DIFF_ARTIFACT_BYTES:
++            raise ValueError("author non-diff artifact exceeds its byte cap")
++
++    @classmethod
++    def from_json(
++        cls,
++        raw: str,
++        *,
++        max_diff_bytes: int,
++        max_total_bytes: int,
++    ) -> "AuthorArtifact":
++        if (
++            type(max_diff_bytes) is not int
++            or max_diff_bytes <= 0
++            or max_diff_bytes > MAX_AUTHOR_DIFF_BYTES
++        ):
++            raise ValueError("author diff byte cap is invalid")
++        value = _parse_v2_closed_object(
++            raw,
++            frozenset(
++                {
++                    "hypothesis_id",
++                    "behavioral_summary",
++                    "changed_paths",
++                    "changed_symbols",
++                    "unified_diff",
++                    "assumptions",
++                    "validation_suggestions",
++                }
++            ),
++            max_total_bytes=max_total_bytes,
++        )
++        unified_diff = _v2_blob(
++            value["unified_diff"], "author diff", max_bytes=max_diff_bytes
++        )
++        non_diff = {**value, "unified_diff": ""}
++        if len(_v2_canonical_bytes(non_diff)) > MAX_AUTHOR_NON_DIFF_ARTIFACT_BYTES:
++            raise ValueError("author non-diff artifact exceeds its byte cap")
++        return cls(
++            hypothesis_id=_v2_identifier(value["hypothesis_id"], "author hypothesis ID"),
++            behavioral_summary=_v2_text(
++                value["behavioral_summary"], "author behavioral summary"
++            ),
++            changed_paths=_v2_string_list(value["changed_paths"], "author changed paths"),
++            changed_symbols=_v2_string_list(
++                value["changed_symbols"], "author changed symbols"
++            ),
++            unified_diff=unified_diff,
++            assumptions=_v2_string_list(
++                value["assumptions"], "author assumptions", allow_empty=True
++            ),
++            validation_suggestions=_v2_string_list(
++                value["validation_suggestions"],
++                "author validation suggestions",
++                allow_empty=True,
++            ),
++        )
++
++
++@dataclass(frozen=True, slots=True)
++class CriticArtifact(_V2Canonical):
++    hypothesis_id: str
++    prediction_vs_observation: str
++    causal_explanation: str
++    evidence_ids: tuple[str, ...]
++    disposition: str
++    next_direction: str
++
++    def __post_init__(self) -> None:
++        _v2_identifier(self.hypothesis_id, "critic hypothesis ID")
++        _v2_text(
++            self.prediction_vs_observation,
++            "critic prediction versus observation",
++        )
++        _v2_text(self.causal_explanation, "critic causal explanation")
++        _v2_string_tuple(self.evidence_ids, "critic evidence IDs")
++        if self.disposition not in _CRITIC_DISPOSITIONS:
++            raise ValueError("critic disposition is invalid")
++        _v2_text(self.next_direction, "critic next direction")
++        if len(self.canonical_json_bytes()) > MAX_CRITIC_ARTIFACT_BYTES:
++            raise ValueError("critic artifact exceeds its byte cap")
++
++    @classmethod
++    def from_json(
++        cls,
++        raw: str,
++        *,
++        max_total_bytes: int,
++    ) -> "CriticArtifact":
++        value = _parse_v2_closed_object(
++            raw,
++            frozenset(
++                {
++                    "hypothesis_id",
++                    "prediction_vs_observation",
++                    "causal_explanation",
++                    "evidence_ids",
++                    "disposition",
++                    "next_direction",
++                }
++            ),
++            max_total_bytes=max_total_bytes,
++        )
++        disposition = _v2_text(value["disposition"], "critic disposition")
++        if disposition not in _CRITIC_DISPOSITIONS:
++            raise ValueError("critic disposition is invalid")
++        return cls(
++            hypothesis_id=_v2_identifier(value["hypothesis_id"], "critic hypothesis ID"),
++            prediction_vs_observation=_v2_text(
++                value["prediction_vs_observation"],
++                "critic prediction versus observation",
++            ),
++            causal_explanation=_v2_text(
++                value["causal_explanation"], "critic causal explanation"
++            ),
++            evidence_ids=_v2_string_list(value["evidence_ids"], "critic evidence IDs"),
++            disposition=disposition,
++            next_direction=_v2_text(value["next_direction"], "critic next direction"),
++        )
++
++
++@dataclass(frozen=True, slots=True)
++class RuleSummaryRecord(_V2Canonical):
++    rule_id: str
++    text: str
++
++    def __post_init__(self) -> None:
++        _v2_identifier(self.rule_id, "rule summary ID")
++        _v2_text(self.text, "rule summary text")
++
++
++@dataclass(frozen=True, slots=True)
++class StrategyRuleSummary(_V2Canonical):
++    records: tuple[RuleSummaryRecord, ...]
++
++    def __post_init__(self) -> None:
++        if (
++            type(self.records) is not tuple
++            or not self.records
++            or len(self.records) > MAX_ROLE_LIST_ITEMS
++            or any(not isinstance(item, RuleSummaryRecord) for item in self.records)
++        ):
++            raise ValueError("strategy rule summary is invalid")
++        ids = tuple(item.rule_id for item in self.records)
++        if len(ids) != len(set(ids)):
++            raise ValueError("strategy rule summary IDs must be unique")
++        if len(self.canonical_json_bytes()) > MAX_DISCOVERY_EVIDENCE_BYTES:
++            raise ValueError("strategy rule summary exceeds its byte cap")
++
++
++@dataclass(frozen=True, slots=True)
++class DiscoveryEvidenceSummary(_V2Canonical):
++    folds: tuple[FoldAggregateSummary, ...]
++    score: DiscoveryScore | None
++    evidence_ids: tuple[str, ...]
++
++    def __post_init__(self) -> None:
++        if (
++            type(self.folds) is not tuple
++            or len(self.folds) != 2
++            or any(not isinstance(item, FoldAggregateSummary) for item in self.folds)
++            or any(not item.fold_id.startswith("discovery_") for item in self.folds)
++        ):
++            raise ValueError("discovery evidence must contain two discovery folds")
++        fold_ids = tuple(item.fold_id for item in self.folds)
++        if len(fold_ids) != len(set(fold_ids)):
++            raise ValueError("discovery evidence fold IDs must be unique")
++        _v2_string_tuple(self.evidence_ids, "discovery evidence IDs")
++        if len(self.evidence_ids) != len(self.folds):
++            raise ValueError("discovery evidence IDs must match folds")
++        if self.score is not None and not isinstance(self.score, DiscoveryScore):
++            raise ValueError("discovery score is invalid")
++        if len(self.canonical_json_bytes()) > MAX_DISCOVERY_EVIDENCE_BYTES:
++            raise ValueError("discovery evidence exceeds its byte cap")
++
++
++@dataclass(frozen=True, slots=True)
++class ProviderSeed(_V2Canonical):
++    rule_summary: StrategyRuleSummary
++    baseline_discovery: DiscoveryEvidenceSummary
++
++    def __post_init__(self) -> None:
++        if not isinstance(self.rule_summary, StrategyRuleSummary) or not isinstance(
++            self.baseline_discovery, DiscoveryEvidenceSummary
++        ):
++            raise ValueError("provider seed is invalid")
++
++
++@dataclass(frozen=True, slots=True)
++class IncumbentSummary(_V2Canonical):
++    candidate_identity_sha256: str | None
++    accepted_iteration: int | None
++    behavioral_summary: str
++    discovery: DiscoveryEvidenceSummary
++
++    def __post_init__(self) -> None:
++        if self.candidate_identity_sha256 is None:
++            if self.accepted_iteration is not None:
++                raise ValueError("baseline incumbent cannot have an accepted iteration")
++        else:
++            _require_digest(
++                self.candidate_identity_sha256,
++                "incumbent candidate identity SHA-256",
++            )
++            _require_positive_int(self.accepted_iteration, "incumbent accepted iteration")
++        _v2_text(self.behavioral_summary, "incumbent behavioral summary")
++        if not isinstance(self.discovery, DiscoveryEvidenceSummary):
++            raise ValueError("incumbent discovery evidence is invalid")
++
++
++@dataclass(frozen=True, slots=True)
++class AuthorManifestSummary(_V2Canonical):
++    hypothesis_id: str
++    behavioral_summary: str
++    changed_paths: tuple[str, ...]
++    changed_symbols: tuple[str, ...]
++
++    def __post_init__(self) -> None:
++        _v2_identifier(self.hypothesis_id, "author manifest hypothesis ID")
++        _v2_text(self.behavioral_summary, "author manifest behavioral summary")
++        _v2_string_tuple(self.changed_paths, "author manifest changed paths")
++        _v2_string_tuple(self.changed_symbols, "author manifest changed symbols")
++        _validate_scoped_paths_symbols(
++            self.changed_paths,
++            self.changed_symbols,
++            "author manifest changed",
++        )
++
++
++@dataclass(frozen=True, slots=True)
++class CandidateValidationSummary(_V2Canonical):
++    failure_code: str | None
++    syntax_ok: bool
++    imports_ok: bool
++    purity_ok: bool
++    deterministic_ok: bool
++    worker_ok: bool
++    replay_attempted: bool
++
++    def __post_init__(self) -> None:
++        if self.failure_code is not None:
++            _v2_identifier(self.failure_code, "candidate validation failure code")
++        for name in (
++            "syntax_ok",
++            "imports_ok",
++            "purity_ok",
++            "deterministic_ok",
++            "worker_ok",
++            "replay_attempted",
++        ):
++            _require_bool(getattr(self, name), f"candidate validation {name}")
++
++
++@dataclass(frozen=True, slots=True)
++class CandidateComparisonSummary(_V2Canonical):
++    folds: tuple[FoldAggregateSummary, ...]
++    score: DiscoveryScore | None
++    diagnostics: tuple[AggregateMetric, ...]
++
++    def __post_init__(self) -> None:
++        if (
++            type(self.folds) is not tuple
++            or len(self.folds) != 2
++            or any(not isinstance(item, FoldAggregateSummary) for item in self.folds)
++        ):
++            raise ValueError("candidate comparison folds are invalid")
++        if self.score is not None and not isinstance(self.score, DiscoveryScore):
++            raise ValueError("candidate comparison score is invalid")
++        if (
++            type(self.diagnostics) is not tuple
++            or len(self.diagnostics) > MAX_ROLE_LIST_ITEMS
++            or any(not isinstance(item, AggregateMetric) for item in self.diagnostics)
++        ):
++            raise ValueError("candidate comparison diagnostics are invalid")
++        ids = tuple(item.metric_id for item in self.diagnostics)
++        if len(ids) != len(set(ids)):
++            raise ValueError("candidate comparison diagnostic IDs must be unique")
++        if len(self.canonical_json_bytes()) > MAX_DISCOVERY_EVIDENCE_BYTES:
++            raise ValueError("candidate comparison exceeds its byte cap")
++
++
++@dataclass(frozen=True, slots=True)
++class IterationFeedbackSummary(_V2Canonical):
++    iteration: int
++    hypothesis_id: str
++    family: str
++    author_summary: str
++    validation_code: str
++    discovery_score: DiscoveryScore | None
++    critic_disposition: str
++    critic_next_direction: str
++    incumbent_changed: bool
++
++    def __post_init__(self) -> None:
++        _require_positive_int(self.iteration, "feedback iteration")
++        _v2_identifier(self.hypothesis_id, "feedback hypothesis ID")
++        if self.family not in _INVESTIGATOR_FAMILIES:
++            raise ValueError("feedback family is invalid")
++        _v2_text(self.author_summary, "feedback author summary")
++        _v2_identifier(self.validation_code, "feedback validation code")
++        if self.discovery_score is not None and not isinstance(
++            self.discovery_score, DiscoveryScore
++        ):
++            raise ValueError("feedback discovery score is invalid")
++        if self.critic_disposition not in _CRITIC_DISPOSITIONS:
++            raise ValueError("feedback critic disposition is invalid")
++        _v2_text(self.critic_next_direction, "feedback critic next direction")
++        _require_bool(self.incumbent_changed, "feedback incumbent_changed")
++        if len(self.canonical_json_bytes()) > MAX_ITERATION_FEEDBACK_BYTES:
++            raise ValueError("iteration feedback exceeds its byte cap")
++
++
++def _validate_role_common(
++    *,
++    schema_version: int,
++    iteration: int,
++    immutable_constraint_ids: tuple[str, ...],
++) -> None:
++    if schema_version != 2:
++        raise ValueError("optimizer role input schema is unsupported")
++    _require_positive_int(iteration, "optimizer role iteration")
++    _v2_string_tuple(immutable_constraint_ids, "immutable constraint IDs")
++
++
++@dataclass(frozen=True, slots=True)
++class InvestigatorInput(_V2Canonical):
++    schema_version: int
++    iteration: int
++    policy_interface_version: int
++    immutable_constraint_ids: tuple[str, ...]
++    candidate_bounds: PatchBounds
++    rule_summary: StrategyRuleSummary
++    source_bundle: PolicySourceBundle
++    baseline_discovery: DiscoveryEvidenceSummary
++    incumbent_summary: IncumbentSummary
++    prior_iterations: tuple[IterationFeedbackSummary, ...]
++
++    def __post_init__(self) -> None:
++        _validate_role_common(
++            schema_version=self.schema_version,
++            iteration=self.iteration,
++            immutable_constraint_ids=self.immutable_constraint_ids,
++        )
++        _require_positive_int(self.policy_interface_version, "policy interface version")
++        if self.source_bundle.policy_interface_version != self.policy_interface_version:
++            raise ValueError("investigator policy interface versions differ")
++        if not isinstance(self.candidate_bounds, PatchBounds):
++            raise ValueError("investigator candidate bounds are invalid")
++        if not isinstance(self.rule_summary, StrategyRuleSummary):
++            raise ValueError("investigator rule summary is invalid")
++        if not isinstance(self.source_bundle, PolicySourceBundle):
++            raise ValueError("investigator source bundle is invalid")
++        if not isinstance(self.baseline_discovery, DiscoveryEvidenceSummary):
++            raise ValueError("investigator baseline discovery is invalid")
++        if not isinstance(self.incumbent_summary, IncumbentSummary):
++            raise ValueError("investigator incumbent summary is invalid")
++        if (
++            type(self.prior_iterations) is not tuple
++            or len(self.prior_iterations) > 8
++            or any(
++                not isinstance(item, IterationFeedbackSummary)
++                for item in self.prior_iterations
++            )
++        ):
++            raise ValueError("investigator prior iterations may contain at most 8 summaries")
++        iterations = tuple(item.iteration for item in self.prior_iterations)
++        if iterations != tuple(sorted(set(iterations))) or any(
++            item >= self.iteration for item in iterations
++        ):
++            raise ValueError("investigator prior iteration order is invalid")
++        if len(_v2_canonical_bytes(self.prior_iterations)) > MAX_ITERATION_HISTORY_BYTES:
++            raise ValueError("investigator iteration history exceeds its byte cap")
++        if len(self.canonical_json_bytes()) > MAX_INVESTIGATOR_DYNAMIC_BYTES:
++            raise ValueError("investigator dynamic input exceeds its byte cap")
++
++
++@dataclass(frozen=True, slots=True)
++class AuthorInput(_V2Canonical):
++    schema_version: int
++    iteration: int
++    policy_interface_version: int
++    immutable_constraint_ids: tuple[str, ...]
++    candidate_bounds: PatchBounds
++    investigator: InvestigatorArtifact
++    source_bundle: PolicySourceBundle
++
++    def __post_init__(self) -> None:
++        _validate_role_common(
++            schema_version=self.schema_version,
++            iteration=self.iteration,
++            immutable_constraint_ids=self.immutable_constraint_ids,
++        )
++        _require_positive_int(self.policy_interface_version, "policy interface version")
++        if self.source_bundle.policy_interface_version != self.policy_interface_version:
++            raise ValueError("author policy interface versions differ")
++        if not isinstance(self.candidate_bounds, PatchBounds):
++            raise ValueError("author candidate bounds are invalid")
++        if not isinstance(self.investigator, InvestigatorArtifact):
++            raise ValueError("author investigator artifact is invalid")
++        if not isinstance(self.source_bundle, PolicySourceBundle):
++            raise ValueError("author source bundle is invalid")
++        if len(self.canonical_json_bytes()) > MAX_AUTHOR_DYNAMIC_BYTES:
++            raise ValueError("author dynamic input exceeds its byte cap")
++
++    def validate_artifact(self, artifact: AuthorArtifact) -> None:
++        if not isinstance(artifact, AuthorArtifact):
++            raise ValueError("author response has an invalid type")
++        if artifact.hypothesis_id != self.investigator.hypothesis_id:
++            raise ValueError("author hypothesis differs from investigator")
++
++
++@dataclass(frozen=True, slots=True)
++class CriticInput(_V2Canonical):
++    schema_version: int
++    iteration: int
++    immutable_constraint_ids: tuple[str, ...]
++    hypothesis_id: str
++    investigator_summary: InvestigatorArtifact
++    author_manifest: AuthorManifestSummary
++    validation: CandidateValidationSummary
++    candidate_vs_baseline: CandidateComparisonSummary | None
++    candidate_vs_incumbent: CandidateComparisonSummary | None
++
++    def __post_init__(self) -> None:
++        _validate_role_common(
++            schema_version=self.schema_version,
++            iteration=self.iteration,
++            immutable_constraint_ids=self.immutable_constraint_ids,
++        )
++        _v2_identifier(self.hypothesis_id, "critic input hypothesis ID")
++        if not isinstance(self.investigator_summary, InvestigatorArtifact):
++            raise ValueError("critic investigator summary is invalid")
++        if not isinstance(self.author_manifest, AuthorManifestSummary):
++            raise ValueError("critic author manifest is invalid")
++        if not isinstance(self.validation, CandidateValidationSummary):
++            raise ValueError("critic validation summary is invalid")
++        if not all(
++            item is None or isinstance(item, CandidateComparisonSummary)
++            for item in (self.candidate_vs_baseline, self.candidate_vs_incumbent)
++        ):
++            raise ValueError("critic candidate comparison is invalid")
++        if not (
++            self.hypothesis_id
++            == self.investigator_summary.hypothesis_id
++            == self.author_manifest.hypothesis_id
++        ):
++            raise ValueError("critic hypothesis IDs differ")
++        if len(self.canonical_json_bytes()) > MAX_CRITIC_DYNAMIC_BYTES:
++            raise ValueError("critic dynamic input exceeds its byte cap")
++
++    def validate_artifact(self, artifact: CriticArtifact) -> None:
++        if not isinstance(artifact, CriticArtifact):
++            raise ValueError("critic response has an invalid type")
++        if artifact.hypothesis_id != self.hypothesis_id:
++            raise ValueError("critic hypothesis differs from its input")
++
++
++def _v2_string_schema() -> dict[str, object]:
++    return {"type": "string", "maxLength": MAX_ROLE_TEXT_BYTES}
++
++
++def _v2_list_schema() -> dict[str, object]:
++    return {
++        "type": "array",
++        "maxItems": MAX_ROLE_LIST_ITEMS,
++        "uniqueItems": True,
++        "items": _v2_string_schema(),
++    }
++
++
++_V2_RESPONSE_SCHEMAS = MappingProxyType(
++    {
++        "investigator": {
++            "type": "object",
++            "additionalProperties": False,
++            "required": [
++                "hypothesis_id",
++                "family",
++                "evidence_ids",
++                "causal_rationale",
++                "target_paths",
++                "target_symbols",
++                "expected_diagnostic_changes",
++                "known_risks",
++                "author_instructions",
++            ],
++            "properties": {
++                "hypothesis_id": _v2_string_schema(),
++                "family": {"type": "string", "enum": list(_INVESTIGATOR_FAMILIES)},
++                "evidence_ids": _v2_list_schema(),
++                "causal_rationale": _v2_string_schema(),
++                "target_paths": _v2_list_schema(),
++                "target_symbols": _v2_list_schema(),
++                "expected_diagnostic_changes": _v2_list_schema(),
++                "known_risks": _v2_list_schema(),
++                "author_instructions": _v2_list_schema(),
++            },
++        },
++        "author": {
++            "type": "object",
++            "additionalProperties": False,
++            "required": [
++                "hypothesis_id",
++                "behavioral_summary",
++                "changed_paths",
++                "changed_symbols",
++                "unified_diff",
++                "assumptions",
++                "validation_suggestions",
++            ],
++            "properties": {
++                "hypothesis_id": _v2_string_schema(),
++                "behavioral_summary": _v2_string_schema(),
++                "changed_paths": _v2_list_schema(),
++                "changed_symbols": _v2_list_schema(),
++                "unified_diff": {
++                    "type": "string",
++                    "maxLength": MAX_AUTHOR_DIFF_BYTES,
++                },
++                "assumptions": _v2_list_schema(),
++                "validation_suggestions": _v2_list_schema(),
++            },
++        },
++        "critic": {
++            "type": "object",
++            "additionalProperties": False,
++            "required": [
++                "hypothesis_id",
++                "prediction_vs_observation",
++                "causal_explanation",
++                "evidence_ids",
++                "disposition",
++                "next_direction",
++            ],
++            "properties": {
++                "hypothesis_id": _v2_string_schema(),
++                "prediction_vs_observation": _v2_string_schema(),
++                "causal_explanation": _v2_string_schema(),
++                "evidence_ids": _v2_list_schema(),
++                "disposition": {
++                    "type": "string",
++                    "enum": list(_CRITIC_DISPOSITIONS),
++                },
++                "next_direction": _v2_string_schema(),
++            },
++        },
++    }
++)
++
++
++def pit_optimizer_response_format(role: str) -> dict[str, object]:
++    try:
++        schema = _V2_RESPONSE_SCHEMAS[role]
++    except KeyError as exc:
++        raise ValueError("unknown PIT optimizer v2 role") from exc
++    return {
++        "type": "json_schema",
++        "json_schema": {
++            "name": f"pit_optimizer_{role}_v2",
++            "strict": True,
++            "schema": json.loads(json.dumps(schema, separators=(",", ":"))),
++        },
++    }
+diff --git a/core/pit_optimizer_evaluation.py b/core/pit_optimizer_evaluation.py
+index fcb0421..0ec6e47 100644
+--- a/core/pit_optimizer_evaluation.py
++++ b/core/pit_optimizer_evaluation.py
+@@ -1,24 +1,35 @@
+ """Immutable fold and aggregate contracts for the PIT optimizer."""
+ 
+ from __future__ import annotations
+ 
++from contextlib import contextmanager
+ from dataclasses import asdict, dataclass
+ from datetime import date
++from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
+ import hashlib
+ import json
+ import math
++import os
++from pathlib import Path
+ import re
+ from itertools import pairwise
++from typing import Iterator
+ 
+ 
+ _SHA256_RE = re.compile(r"[0-9a-f]{64}")
++_CLOSED_ID_RE = re.compile(r"[a-z][a-z0-9_.-]{0,127}")
++_EXPOSURE_KINDS = {
++    "candidate_validation",
++    "provider_context",
++    "hidden_validation",
++}
+ 
+ 
+ def _canonical_json_bytes(value: object) -> bytes:
+     return (
+         json.dumps(
+             value,
+             sort_keys=True,
+             separators=(",", ":"),
+             allow_nan=False,
+         ).encode("utf-8")
+@@ -149,10 +160,558 @@ class FoldAggregateSummary:
+             _finite(self.excess_total_return_pp, "excess_total_return_pp")
+         if type(self.closed_trades) is not int or self.closed_trades < 0:
+             raise ValueError("closed_trades is invalid")
+         for name in ("entry_funnel", "exit_attribution"):
+             metrics = getattr(self, name)
+             if type(metrics) is not tuple or any(not isinstance(metric, AggregateMetric) for metric in metrics):
+                 raise ValueError(f"{name} is invalid")
+             ids = tuple(metric.metric_id for metric in metrics)
+             if len(set(ids)) != len(ids):
+                 raise ValueError(f"{name} metric IDs must be unique")
++
++
++_OBJECTIVE_QUANTUM = Decimal("0.01")
++
++
++def _objective_decimal(value: object, label: str) -> Decimal:
++    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
++        raise ValueError(f"{label} must be numeric")
++    try:
++        number = Decimal(str(value))
++    except InvalidOperation as exc:
++        raise ValueError(f"{label} must be numeric") from exc
++    if not number.is_finite():
++        raise ValueError(f"{label} must be finite")
++    return number.quantize(_OBJECTIVE_QUANTUM, rounding=ROUND_HALF_EVEN)
++
++
++@dataclass(frozen=True, slots=True)
++class DiscoveryScore:
++    median_excess_return_pp: Decimal
++    worst_excess_return_pp: Decimal
++    max_drawdown_magnitude_pp: Decimal
++
++    def __post_init__(self) -> None:
++        for name in (
++            "median_excess_return_pp",
++            "worst_excess_return_pp",
++            "max_drawdown_magnitude_pp",
++        ):
++            value = getattr(self, name)
++            if not isinstance(value, Decimal) or not value.is_finite():
++                raise ValueError(f"{name} must be a finite Decimal")
++            if value != value.quantize(_OBJECTIVE_QUANTUM, rounding=ROUND_HALF_EVEN):
++                raise ValueError(f"{name} must be quantized to 0.01")
++        if self.max_drawdown_magnitude_pp < 0:
++            raise ValueError("max_drawdown_magnitude_pp cannot be negative")
++
++    @property
++    def ordering_key(self) -> tuple[Decimal, Decimal, Decimal]:
++        return (
++            self.median_excess_return_pp,
++            self.worst_excess_return_pp,
++            -self.max_drawdown_magnitude_pp,
++        )
++
++
++def discovery_score_from_folds(
++    folds: tuple[FoldAggregateSummary, ...],
++) -> DiscoveryScore:
++    if (
++        type(folds) is not tuple
++        or len(folds) != 2
++        or any(not isinstance(item, FoldAggregateSummary) for item in folds)
++    ):
++        raise ValueError("discovery objective requires exactly two fold summaries")
++    if len({item.fold_id for item in folds}) != 2 or any(
++        not item.fold_id.startswith("discovery_") for item in folds
++    ):
++        raise ValueError("discovery objective fold identities are invalid")
++    if any(item.closed_trades < 1 for item in folds):
++        raise ValueError("each fold requires at least one closed discovery trade")
++    if any(item.excess_total_return_pp is None for item in folds):
++        raise ValueError("discovery objective requires fixed-baseline excess return")
++    excess = tuple(
++        _objective_decimal(item.excess_total_return_pp, "fold excess return")
++        for item in folds
++    )
++    ordered = tuple(sorted(excess))
++    median = ((ordered[0] + ordered[1]) / Decimal(2)).quantize(
++        _OBJECTIVE_QUANTUM,
++        rounding=ROUND_HALF_EVEN,
++    )
++    drawdowns = tuple(
++        _objective_decimal(
++            abs(min(Decimal(str(item.max_drawdown_pct)), Decimal(0))),
++            "fold drawdown magnitude",
++        )
++        for item in folds
++    )
++    return DiscoveryScore(
++        median_excess_return_pp=median,
++        worst_excess_return_pp=ordered[0],
++        max_drawdown_magnitude_pp=max(drawdowns),
++    )
++
++
++def strictly_improves_discovery(
++    candidate: DiscoveryScore,
++    incumbent: DiscoveryScore,
++) -> bool:
++    if not isinstance(candidate, DiscoveryScore) or not isinstance(
++        incumbent, DiscoveryScore
++    ):
++        raise ValueError("discovery comparison requires closed scores")
++    return candidate.ordering_key > incumbent.ordering_key
++
++
++@dataclass(frozen=True, slots=True)
++class HoldoutDecision:
++    excess_total_return_pp: Decimal
++    closed_trades: int
++    safety_complete: bool
++    integrity_complete: bool
++    accounting_complete: bool
++    long_replay_eligible: bool
++
++    def __post_init__(self) -> None:
++        if (
++            not isinstance(self.excess_total_return_pp, Decimal)
++            or not self.excess_total_return_pp.is_finite()
++            or self.excess_total_return_pp
++            != self.excess_total_return_pp.quantize(
++                _OBJECTIVE_QUANTUM,
++                rounding=ROUND_HALF_EVEN,
++            )
++        ):
++            raise ValueError("holdout excess return must be a quantized finite Decimal")
++        if type(self.closed_trades) is not int or self.closed_trades < 0:
++            raise ValueError("holdout closed trades are invalid")
++        for name in (
++            "safety_complete",
++            "integrity_complete",
++            "accounting_complete",
++            "long_replay_eligible",
++        ):
++            if type(getattr(self, name)) is not bool:
++                raise ValueError(f"holdout {name} must be boolean")
++        expected = (
++            self.excess_total_return_pp >= Decimal("0.10")
++            and self.closed_trades >= 3
++            and self.safety_complete
++            and self.integrity_complete
++            and self.accounting_complete
++        )
++        if self.long_replay_eligible is not expected:
++            raise ValueError("holdout eligibility differs from the closed gate")
++
++    @classmethod
++    def from_result(
++        cls,
++        *,
++        excess_total_return_pp: float | int | Decimal,
++        closed_trades: int,
++        safety_complete: bool,
++        integrity_complete: bool,
++        accounting_complete: bool,
++    ) -> "HoldoutDecision":
++        excess = _objective_decimal(
++            excess_total_return_pp,
++            "holdout excess return",
++        )
++        eligible = (
++            excess >= Decimal("0.10")
++            and type(closed_trades) is int
++            and closed_trades >= 3
++            and safety_complete is True
++            and integrity_complete is True
++            and accounting_complete is True
++        )
++        return cls(
++            excess_total_return_pp=excess,
++            closed_trades=closed_trades,
++            safety_complete=safety_complete,
++            integrity_complete=integrity_complete,
++            accounting_complete=accounting_complete,
++            long_replay_eligible=eligible,
++        )
++
++
++def _require_digest(value: object, label: str) -> str:
++    if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
++        raise ValueError(f"{label} is invalid")
++    return value
++
++
++def _require_closed_id(value: object, label: str) -> str:
++    if not isinstance(value, str) or _CLOSED_ID_RE.fullmatch(value) is None:
++        raise ValueError(f"{label} is invalid")
++    return value
++
++
++@dataclass(frozen=True, slots=True)
++class ValidationWindowIdentity:
++    pit_bundle_sha256: str
++    universe_sha256: str
++    benchmark: str
++    warmup_contract_sha256: str
++    sessions_sha256: str
++    session_count: int
++    first_session: str
++    last_session: str
++
++    def __post_init__(self) -> None:
++        for name in (
++            "pit_bundle_sha256",
++            "universe_sha256",
++            "warmup_contract_sha256",
++            "sessions_sha256",
++        ):
++            _require_digest(getattr(self, name), f"validation {name}")
++        if (
++            not isinstance(self.benchmark, str)
++            or not self.benchmark
++            or self.benchmark != self.benchmark.upper()
++        ):
++            raise ValueError("validation benchmark is invalid")
++        if type(self.session_count) is not int or self.session_count <= 0:
++            raise ValueError("validation session count is invalid")
++        first = _date(self.first_session, "validation first session")
++        last = _date(self.last_session, "validation last session")
++        if first > last:
++            raise ValueError("validation session bounds are invalid")
++
++
++@dataclass(frozen=True, slots=True)
++class ValidationExposureMetadata:
++    run_id: str
++    source_head: str
++    baseline_policy_sha256: str
++    candidate_identity_sha256: str | None
++    exposure_kind: str
++
++    def __post_init__(self) -> None:
++        _require_closed_id(self.run_id, "validation run ID")
++        if not isinstance(self.source_head, str) or re.fullmatch(
++            r"[0-9a-f]{40}", self.source_head
++        ) is None:
++            raise ValueError("validation source HEAD is invalid")
++        _require_digest(
++            self.baseline_policy_sha256,
++            "validation baseline policy SHA-256",
++        )
++        if self.candidate_identity_sha256 is not None:
++            _require_digest(
++                self.candidate_identity_sha256,
++                "validation candidate identity SHA-256",
++            )
++        if self.exposure_kind not in _EXPOSURE_KINDS:
++            raise ValueError("validation exposure kind is invalid")
++
++
++@dataclass(frozen=True, slots=True)
++class ValidationReservation:
++    consumption_key_sha256: str
++    reservation_record_sha256: str
++
++    def __post_init__(self) -> None:
++        _require_digest(
++            self.consumption_key_sha256,
++            "validation consumption key SHA-256",
++        )
++        _require_digest(
++            self.reservation_record_sha256,
++            "validation reservation record SHA-256",
++        )
++
++
++def _reject_duplicate_record_keys(
++    pairs: list[tuple[str, object]],
++) -> dict[str, object]:
++    value: dict[str, object] = {}
++    for key, item in pairs:
++        if key in value:
++            raise ValueError("validation ledger contains duplicate JSON keys")
++        value[key] = item
++    return value
++
++
++@contextmanager
++def _validation_file_lock(path: Path) -> Iterator[None]:
++    with path.open("a+b") as handle:
++        handle.seek(0, os.SEEK_END)
++        if handle.tell() == 0:
++            handle.write(b"\0")
++            handle.flush()
++            os.fsync(handle.fileno())
++        handle.seek(0)
++        if os.name == "nt":
++            import msvcrt
++
++            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
++            try:
++                yield
++            finally:
++                handle.seek(0)
++                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
++        else:
++            import fcntl
++
++            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
++            try:
++                yield
++            finally:
++                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
++
++
++class ValidationLedger:
++    """Permanent, hash-chained consumption ledger for validation windows."""
++
++    def __init__(self, path: Path) -> None:
++        candidate = Path(path)
++        if (
++            not candidate.is_absolute()
++            or candidate.name != "pit_optimizer_validation_ledger.jsonl"
++            or not candidate.parent.is_dir()
++            or candidate.parent.is_symlink()
++            or candidate.is_symlink()
++        ):
++            raise ValueError("validation ledger path is invalid")
++        self._path = candidate.resolve()
++        self._lock_path = self._path.with_suffix(self._path.suffix + ".lock")
++        with _validation_file_lock(self._lock_path):
++            self._read_records()
++
++    @staticmethod
++    def _consumption_key(identity: ValidationWindowIdentity) -> str:
++        return hashlib.sha256(_canonical_json_bytes(asdict(identity))).hexdigest()
++
++    @staticmethod
++    def _record_digest(record: dict[str, object]) -> str:
++        preimage = dict(record)
++        preimage.pop("record_sha256", None)
++        return hashlib.sha256(_canonical_json_bytes(preimage)).hexdigest()
++
++    def _read_records(self) -> list[dict[str, object]]:
++        if not self._path.exists():
++            return []
++        if self._path.is_symlink() or not self._path.is_file():
++            raise ValueError("validation ledger must be a regular non-link file")
++        raw = self._path.read_bytes()
++        if raw and not raw.endswith(b"\n"):
++            raise ValueError("validation ledger has a partial record")
++        records: list[dict[str, object]] = []
++        previous = "0" * 64
++        consumed: set[str] = set()
++        reservations: set[str] = set()
++        outcomes: set[str] = set()
++        for index, line in enumerate(raw.splitlines(keepends=True), start=1):
++            try:
++                value = json.loads(
++                    line,
++                    object_pairs_hook=_reject_duplicate_record_keys,
++                )
++            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
++                raise ValueError("validation ledger contains invalid JSON") from exc
++            if not isinstance(value, dict) or line != _canonical_json_bytes(value):
++                raise ValueError("validation ledger record is not canonical JSON")
++            if value.get("schema_version") != 2 or value.get("record_index") != index:
++                raise ValueError("validation ledger record index is invalid")
++            if value.get("previous_record_sha256") != previous:
++                raise ValueError("validation ledger hash chain is broken")
++            record_sha256 = value.get("record_sha256")
++            _require_digest(record_sha256, "validation ledger record SHA-256")
++            if record_sha256 != self._record_digest(value):
++                raise ValueError("validation ledger record digest differs")
++            record_type = value.get("record_type")
++            if record_type == "consumption":
++                expected_keys = {
++                    "schema_version",
++                    "record_type",
++                    "record_index",
++                    "previous_record_sha256",
++                    "consumption_key_sha256",
++                    "identity",
++                    "metadata",
++                    "record_sha256",
++                }
++                if set(value) != expected_keys:
++                    raise ValueError("validation consumption record keys are invalid")
++                key = value.get("consumption_key_sha256")
++                _require_digest(key, "validation consumption key SHA-256")
++                if key in consumed:
++                    raise ValueError("validation ledger repeats a consumed identity")
++                identity = value.get("identity")
++                metadata = value.get("metadata")
++                if not isinstance(identity, dict) or not isinstance(metadata, dict):
++                    raise ValueError("validation consumption record is malformed")
++                closed_identity = ValidationWindowIdentity(**identity)
++                ValidationExposureMetadata(**metadata)
++                if key != self._consumption_key(closed_identity):
++                    raise ValueError("validation consumption key differs from identity")
++                consumed.add(key)
++                reservations.add(str(record_sha256))
++            elif record_type == "outcome":
++                expected_keys = {
++                    "schema_version",
++                    "record_type",
++                    "record_index",
++                    "previous_record_sha256",
++                    "reservation_record_sha256",
++                    "attempted",
++                    "completed",
++                    "failure_code",
++                    "record_sha256",
++                }
++                if set(value) != expected_keys:
++                    raise ValueError("validation outcome record keys are invalid")
++                reservation = value.get("reservation_record_sha256")
++                if reservation not in reservations or reservation in outcomes:
++                    raise ValueError("validation outcome reservation is invalid")
++                self._validate_outcome_fields(
++                    attempted=value.get("attempted"),
++                    completed=value.get("completed"),
++                    failure_code=value.get("failure_code"),
++                )
++                outcomes.add(str(reservation))
++            else:
++                raise ValueError("validation ledger record type is invalid")
++            previous = str(record_sha256)
++            records.append(value)
++        return records
++
++    @staticmethod
++    def _validate_outcome_fields(
++        *,
++        attempted: object,
++        completed: object,
++        failure_code: object,
++    ) -> None:
++        if type(attempted) is not bool or type(completed) is not bool:
++            raise ValueError("validation outcome flags must be boolean")
++        if completed and not attempted:
++            raise ValueError("completed validation must have been attempted")
++        if completed:
++            if failure_code is not None:
++                raise ValueError("completed validation cannot have a failure code")
++        else:
++            _require_closed_id(failure_code, "validation outcome failure code")
++
++    def _append_record(
++        self,
++        records: list[dict[str, object]],
++        primitive: dict[str, object],
++    ) -> dict[str, object]:
++        record = {
++            "schema_version": 2,
++            "record_index": len(records) + 1,
++            "previous_record_sha256": (
++                "0" * 64 if not records else records[-1]["record_sha256"]
++            ),
++            **primitive,
++        }
++        record["record_sha256"] = self._record_digest(record)
++        payload = _canonical_json_bytes(record)
++        with self._path.open("ab") as handle:
++            handle.write(payload)
++            handle.flush()
++            os.fsync(handle.fileno())
++        return record
++
++    def _reserve(
++        self,
++        identity: ValidationWindowIdentity,
++        metadata: ValidationExposureMetadata,
++    ) -> ValidationReservation:
++        if not isinstance(identity, ValidationWindowIdentity) or not isinstance(
++            metadata, ValidationExposureMetadata
++        ):
++            raise ValueError("validation reservation requires closed contracts")
++        key = self._consumption_key(identity)
++        with _validation_file_lock(self._lock_path):
++            records = self._read_records()
++            if any(
++                record.get("record_type") == "consumption"
++                and record.get("consumption_key_sha256") == key
++                for record in records
++            ):
++                raise ValueError("validation window identity is permanently consumed")
++            record = self._append_record(
++                records,
++                {
++                    "record_type": "consumption",
++                    "consumption_key_sha256": key,
++                    "identity": asdict(identity),
++                    "metadata": asdict(metadata),
++                },
++            )
++        return ValidationReservation(key, str(record["record_sha256"]))
++
++    def mark_discovery(
++        self,
++        identity: ValidationWindowIdentity,
++        metadata: ValidationExposureMetadata,
++    ) -> ValidationReservation:
++        if not isinstance(metadata, ValidationExposureMetadata) or metadata.exposure_kind not in {
++            "candidate_validation",
++            "provider_context",
++        }:
++            raise ValueError("discovery exposure kind is invalid")
++        return self._reserve(identity, metadata)
++
++    def reserve_hidden(
++        self,
++        identity: ValidationWindowIdentity,
++        metadata: ValidationExposureMetadata,
++    ) -> ValidationReservation:
++        if not isinstance(metadata, ValidationExposureMetadata) or metadata.exposure_kind != "hidden_validation":
++            raise ValueError("hidden exposure kind is invalid")
++        return self._reserve(identity, metadata)
++
++    def record_outcome(
++        self,
++        reservation: ValidationReservation,
++        *,
++        attempted: bool,
++        completed: bool,
++        failure_code: str | None,
++    ) -> None:
++        if not isinstance(reservation, ValidationReservation):
++            raise ValueError("validation outcome requires a closed reservation")
++        self._validate_outcome_fields(
++            attempted=attempted,
++            completed=completed,
++            failure_code=failure_code,
++        )
++        with _validation_file_lock(self._lock_path):
++            records = self._read_records()
++            consumption = next(
++                (
++                    record
++                    for record in records
++                    if record.get("record_type") == "consumption"
++                    and record.get("record_sha256")
++                    == reservation.reservation_record_sha256
++                    and record.get("consumption_key_sha256")
++                    == reservation.consumption_key_sha256
++                ),
++                None,
++            )
++            if consumption is None:
++                raise ValueError("validation reservation is not present in this ledger")
++            if any(
++                record.get("record_type") == "outcome"
++                and record.get("reservation_record_sha256")
++                == reservation.reservation_record_sha256
++                for record in records
++            ):
++                raise ValueError("validation reservation outcome is already recorded")
++            self._append_record(
++                records,
++                {
++                    "record_type": "outcome",
++                    "reservation_record_sha256": reservation.reservation_record_sha256,
++                    "attempted": attempted,
++                    "completed": completed,
++                    "failure_code": failure_code,
++                },
++            )
+diff --git a/tests/test_pit_optimizer_v2.py b/tests/test_pit_optimizer_v2.py
+new file mode 100644
+index 0000000..d56c42a
+--- /dev/null
++++ b/tests/test_pit_optimizer_v2.py
+@@ -0,0 +1,1277 @@
++"""Schema-v2 contracts for the model-authored PIT optimizer."""
++
++from __future__ import annotations
++
++import json
++import hashlib
++from contextlib import closing
++from dataclasses import asdict, fields, replace
++from datetime import date, timedelta
++from decimal import Decimal, ROUND_HALF_EVEN
++from itertools import product
++from pathlib import Path
++import sqlite3
++import string
++
++import pytest
++
++import core.pit_optimization_contract as contract
++import core.pit_optimizer_evaluation as evaluation
++from core.pit_optimizer_evaluation import (
++    AggregateMetric,
++    FoldAggregateSummary,
++    FoldManifest,
++    FoldSpec,
++)
++from core.pit_policy_parity import ParityAttestation
++
++
++def _canonical_text(value: object) -> str:
++    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
++
++
++def _investigator_payload() -> dict[str, object]:
++    return {
++        "hypothesis_id": "hypothesis_1",
++        "family": "entry",
++        "evidence_ids": ["discovery_1.excess_return"],
++        "causal_rationale": "Raise selectivity where the entry funnel loses quality.",
++        "target_paths": ["core/strategy_policy/entry.py"],
++        "target_symbols": ["core.strategy_policy.entry.evaluate_entry"],
++        "expected_diagnostic_changes": ["fewer low-quality entries"],
++        "known_risks": ["lower trade count"],
++        "author_instructions": ["Change only evaluate_entry."],
++    }
++
++
++def test_role_schema_investigator_output_is_closed_and_bounded() -> None:
++    """Break caught: investigator output could widen or overflow the author envelope."""
++    payload = _investigator_payload()
++
++    artifact = contract.InvestigatorArtifact.from_json(
++        _canonical_text(payload),
++        max_total_bytes=contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
++    )
++
++    assert artifact.hypothesis_id == "hypothesis_1"
++    assert artifact.family == "entry"
++    schema = contract.pit_optimizer_response_format("investigator")
++    assert schema["json_schema"]["name"] == "pit_optimizer_investigator_v2"
++    body = schema["json_schema"]["schema"]
++    assert body["additionalProperties"] is False
++    assert set(body["required"]) == set(payload)
++    assert body["properties"]["family"]["enum"] == ["entry", "exit", "risk_sizing"]
++
++    with pytest.raises(ValueError, match="invalid keys"):
++        contract.InvestigatorArtifact.from_json(
++            _canonical_text({**payload, "hidden_fold": "hidden_1"}),
++            max_total_bytes=contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
++        )
++    duplicate = _canonical_text(payload)[:-1] + ',"hypothesis_id":"hypothesis_2"}'
++    with pytest.raises(ValueError, match="duplicate"):
++        contract.InvestigatorArtifact.from_json(
++            duplicate,
++            max_total_bytes=contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
++        )
++    with pytest.raises(ValueError, match="family"):
++        contract.InvestigatorArtifact.from_json(
++            _canonical_text({**payload, "family": "hidden_validation"}),
++            max_total_bytes=contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
++        )
++    with pytest.raises(ValueError, match="at most 16"):
++        contract.InvestigatorArtifact.from_json(
++            _canonical_text(
++                {
++                    **payload,
++                    "evidence_ids": [f"evidence_{index}" for index in range(17)],
++                }
++            ),
++            max_total_bytes=contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
++        )
++    with pytest.raises(ValueError, match="unique"):
++        contract.InvestigatorArtifact.from_json(
++            _canonical_text({**payload, "known_risks": ["same", "same"]}),
++            max_total_bytes=contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
++        )
++    with pytest.raises(ValueError, match="bounded"):
++        contract.InvestigatorArtifact.from_json(
++            _canonical_text(payload),
++            max_total_bytes=32,
++        )
++
++
++def _author_payload() -> dict[str, object]:
++    return {
++        "hypothesis_id": "hypothesis_1",
++        "behavioral_summary": "Require a stronger entry confirmation.",
++        "changed_paths": ["core/strategy_policy/entry.py"],
++        "changed_symbols": ["core.strategy_policy.entry.evaluate_entry"],
++        "unified_diff": "--- a/core/strategy_policy/entry.py\n+++ b/core/strategy_policy/entry.py\n",
++        "assumptions": ["The aggregate funnel is causal."],
++        "validation_suggestions": ["Run the focused entry checks."],
++    }
++
++
++def test_role_schema_author_output_has_independent_diff_and_metadata_caps() -> None:
++    """Break caught: an author response could hide oversized metadata beside a bounded diff."""
++    payload = _author_payload()
++
++    artifact = contract.AuthorArtifact.from_json(
++        _canonical_text(payload),
++        max_diff_bytes=8 * 1024,
++        max_total_bytes=16 * 1024,
++    )
++
++    assert artifact.changed_paths == ("core/strategy_policy/entry.py",)
++    assert artifact.changed_symbols == (
++        "core.strategy_policy.entry.evaluate_entry",
++    )
++    schema = contract.pit_optimizer_response_format("author")["json_schema"]["schema"]
++    assert schema["additionalProperties"] is False
++    assert set(schema["required"]) == set(payload)
++
++    with pytest.raises(ValueError, match="diff"):
++        contract.AuthorArtifact.from_json(
++            _canonical_text({**payload, "unified_diff": "x" * 33}),
++            max_diff_bytes=32,
++            max_total_bytes=16 * 1024,
++        )
++    with pytest.raises(ValueError, match="non-diff"):
++        contract.AuthorArtifact.from_json(
++            _canonical_text(
++                {
++                    **payload,
++                    "behavioral_summary": "s" * 4096,
++                    "assumptions": ["a" * 4096],
++                }
++            ),
++            max_diff_bytes=8 * 1024,
++            max_total_bytes=16 * 1024,
++        )
++    with pytest.raises(ValueError, match="invalid keys"):
++        contract.AuthorArtifact.from_json(
++            _canonical_text({**payload, "provider_audit_body": "forbidden"}),
++            max_diff_bytes=8 * 1024,
++            max_total_bytes=16 * 1024,
++        )
++
++
++def _critic_payload() -> dict[str, object]:
++    return {
++        "hypothesis_id": "hypothesis_1",
++        "prediction_vs_observation": "Trade quality rose, but participation fell too far.",
++        "causal_explanation": "The confirmation excluded both weak and valid entries.",
++        "evidence_ids": ["candidate.discovery_1.entry_funnel"],
++        "disposition": "refine",
++        "next_direction": "Retain confirmation only for extended entries.",
++    }
++
++
++def test_role_schema_critic_output_is_advisory_closed_and_bounded() -> None:
++    """Break caught: the critic could claim acceptance authority or expose hidden results."""
++    payload = _critic_payload()
++
++    artifact = contract.CriticArtifact.from_json(
++        _canonical_text(payload),
++        max_total_bytes=contract.MAX_CRITIC_ARTIFACT_BYTES,
++    )
++
++    assert artifact.disposition == "refine"
++    schema = contract.pit_optimizer_response_format("critic")["json_schema"]["schema"]
++    assert schema["additionalProperties"] is False
++    assert set(schema["required"]) == set(payload)
++    assert schema["properties"]["disposition"]["enum"] == [
++        "refine",
++        "abandon",
++        "change_family",
++    ]
++
++    with pytest.raises(ValueError, match="disposition"):
++        contract.CriticArtifact.from_json(
++            _canonical_text({**payload, "disposition": "accept"}),
++            max_total_bytes=contract.MAX_CRITIC_ARTIFACT_BYTES,
++        )
++    with pytest.raises(ValueError, match="invalid keys"):
++        contract.CriticArtifact.from_json(
++            _canonical_text({**payload, "hidden_metrics": {"return": 99}}),
++            max_total_bytes=contract.MAX_CRITIC_ARTIFACT_BYTES,
++        )
++    with pytest.raises(ValueError, match="bounded"):
++        contract.CriticArtifact.from_json(
++            _canonical_text(payload),
++            max_total_bytes=64,
++        )
++
++
++def _source_bundle() -> contract.PolicySourceBundle:
++    sources = (
++        (
++            "core/strategy_policy/entry.py",
++            "core.strategy_policy.entry.evaluate_entry",
++            "def evaluate_entry(snapshot):\n    return None\n",
++        ),
++        (
++            "core/strategy_policy/risk.py",
++            (
++                "core.strategy_policy.risk.recommend_capacity",
++                "core.strategy_policy.risk.recommend_allocation",
++                "core.strategy_policy.risk.select_eviction",
++            ),
++            "def recommend_capacity(snapshot):\n    return 1\n",
++        ),
++        (
++            "core/strategy_policy/exit.py",
++            "core.strategy_policy.exit.evaluate_exit",
++            "def evaluate_exit(snapshot):\n    return None\n",
++        ),
++    )
++    records = tuple(
++        contract.PolicySourceRecord(
++            path=path,
++            sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
++            declared_symbols=(symbol,) if isinstance(symbol, str) else symbol,
++            text=text,
++        )
++        for path, symbol, text in sources
++    )
++    return contract.PolicySourceBundle(
++        policy_interface_version=1,
++        cumulative_diff_sha256=hashlib.sha256(b"").hexdigest(),
++        cumulative_diff="",
++        files=records,
++    )
++
++
++def _fold_summary(fold_id: str, excess: float) -> FoldAggregateSummary:
++    return FoldAggregateSummary(
++        fold_id=fold_id,
++        total_return_pct=excess + 1.0,
++        excess_total_return_pp=excess,
++        max_drawdown_pct=-2.0,
++        sharpe_ratio=1.0,
++        closed_trades=2,
++        turnover_pct=10.0,
++        average_exposure_pct=20.0,
++        entry_funnel=(AggregateMetric("entries_executed", 2),),
++        exit_attribution=(AggregateMetric("end_of_test", 2),),
++    )
++
++
++def _discovery_summary() -> contract.DiscoveryEvidenceSummary:
++    return contract.DiscoveryEvidenceSummary(
++        folds=(
++            _fold_summary("discovery_1", 0.5),
++            _fold_summary("discovery_2", 0.25),
++        ),
++        score=None,
++        evidence_ids=("evidence.discovery_1", "evidence.discovery_2"),
++    )
++
++
++def _investigator_artifact() -> contract.InvestigatorArtifact:
++    return contract.InvestigatorArtifact.from_json(
++        _canonical_text(_investigator_payload()),
++        max_total_bytes=contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
++    )
++
++
++def test_role_schema_inputs_are_exact_bounded_provider_projections() -> None:
++    """Break caught: a role input could admit hidden identity or unbounded prior context."""
++    bounds = contract.PatchBounds(3, 12, 80, 8 * 1024)
++    discovery = _discovery_summary()
++    investigator = _investigator_artifact()
++    source_bundle = _source_bundle()
++    rule_summary = contract.StrategyRuleSummary(
++        records=(contract.RuleSummaryRecord("rule.entry", "Use causal entry inputs."),)
++    )
++    incumbent = contract.IncumbentSummary(
++        candidate_identity_sha256=None,
++        accepted_iteration=None,
++        behavioral_summary="Authenticated fixed baseline.",
++        discovery=discovery,
++    )
++    feedback = contract.IterationFeedbackSummary(
++        iteration=1,
++        hypothesis_id="hypothesis_0",
++        family="risk_sizing",
++        author_summary="Reduced concentration.",
++        validation_code="valid",
++        discovery_score=None,
++        critic_disposition="refine",
++        critic_next_direction="Use a smaller adjustment.",
++        incumbent_changed=False,
++    )
++    investigator_input = contract.InvestigatorInput(
++        schema_version=2,
++        iteration=2,
++        policy_interface_version=1,
++        immutable_constraint_ids=("causal_only", "no_external_io"),
++        candidate_bounds=bounds,
++        rule_summary=rule_summary,
++        source_bundle=source_bundle,
++        baseline_discovery=discovery,
++        incumbent_summary=incumbent,
++        prior_iterations=(feedback,),
++    )
++    author_input = contract.AuthorInput(
++        schema_version=2,
++        iteration=2,
++        policy_interface_version=1,
++        immutable_constraint_ids=("causal_only", "no_external_io"),
++        candidate_bounds=bounds,
++        investigator=investigator,
++        source_bundle=source_bundle,
++    )
++    author_artifact = contract.AuthorArtifact.from_json(
++        _canonical_text(_author_payload()),
++        max_diff_bytes=8 * 1024,
++        max_total_bytes=16 * 1024,
++    )
++    author_manifest = contract.AuthorManifestSummary(
++        hypothesis_id="hypothesis_1",
++        behavioral_summary=author_artifact.behavioral_summary,
++        changed_paths=author_artifact.changed_paths,
++        changed_symbols=author_artifact.changed_symbols,
++    )
++    comparison = contract.CandidateComparisonSummary(
++        folds=discovery.folds,
++        score=None,
++        diagnostics=(AggregateMetric("entry_quality_delta", 0.2),),
++    )
++    critic_input = contract.CriticInput(
++        schema_version=2,
++        iteration=2,
++        immutable_constraint_ids=("causal_only", "no_external_io"),
++        hypothesis_id="hypothesis_1",
++        investigator_summary=investigator,
++        author_manifest=author_manifest,
++        validation=contract.CandidateValidationSummary(
++            failure_code=None,
++            syntax_ok=True,
++            imports_ok=True,
++            purity_ok=True,
++            deterministic_ok=True,
++            worker_ok=True,
++            replay_attempted=True,
++        ),
++        candidate_vs_baseline=comparison,
++        candidate_vs_incumbent=comparison,
++    )
++
++    assert tuple(field.name for field in fields(contract.InvestigatorInput)) == (
++        "schema_version",
++        "iteration",
++        "policy_interface_version",
++        "immutable_constraint_ids",
++        "candidate_bounds",
++        "rule_summary",
++        "source_bundle",
++        "baseline_discovery",
++        "incumbent_summary",
++        "prior_iterations",
++    )
++    assert tuple(field.name for field in fields(contract.AuthorInput)) == (
++        "schema_version",
++        "iteration",
++        "policy_interface_version",
++        "immutable_constraint_ids",
++        "candidate_bounds",
++        "investigator",
++        "source_bundle",
++    )
++    assert tuple(field.name for field in fields(contract.CriticInput)) == (
++        "schema_version",
++        "iteration",
++        "immutable_constraint_ids",
++        "hypothesis_id",
++        "investigator_summary",
++        "author_manifest",
++        "validation",
++        "candidate_vs_baseline",
++        "candidate_vs_incumbent",
++    )
++    for role_input in (investigator_input, author_input, critic_input):
++        rendered = role_input.canonical_json_bytes().decode("utf-8")
++        for forbidden in (
++            "hidden_fold",
++            "2021-12-15",
++            "validation_ledger",
++            "provider_audit_body",
++            "credential",
++            "C:\\\\",
++        ):
++            assert forbidden not in rendered
++
++    author_input.validate_artifact(author_artifact)
++    with pytest.raises(ValueError, match="hypothesis"):
++        author_input.validate_artifact(replace(author_artifact, hypothesis_id="other"))
++    with pytest.raises(ValueError, match="hypothesis"):
++        replace(critic_input, hypothesis_id="other")
++    with pytest.raises(ValueError, match="source SHA-256"):
++        replace(source_bundle.files[0], sha256="0" * 64)
++    with pytest.raises(ValueError, match="declared symbols"):
++        replace(source_bundle.files[0], declared_symbols=("unrelated.symbol",))
++    with pytest.raises(ValueError, match="target paths"):
++        replace(investigator, target_paths=("C:\\private\\policy.py",))
++    with pytest.raises(ValueError, match="changed paths"):
++        replace(author_artifact, changed_paths=("core/backtest_engine.py",))
++    with pytest.raises(ValueError, match="at most 8"):
++        replace(investigator_input, prior_iterations=(feedback,) * 9)
++    with pytest.raises(ValueError, match="too large"):
++        replace(investigator, causal_rationale="x" * (4 * 1024 + 1))
++    with pytest.raises(ValueError, match="too large"):
++        replace(author_artifact, behavioral_summary="x" * (4 * 1024 + 1))
++    with pytest.raises(ValueError, match="too large"):
++        replace(
++            contract.CriticArtifact.from_json(
++                _canonical_text(_critic_payload()),
++                max_total_bytes=contract.MAX_CRITIC_ARTIFACT_BYTES,
++            ),
++            next_direction="x" * (4 * 1024 + 1),
++        )
++
++
++def _sessions(start: str, end: str) -> tuple[str, ...]:
++    first = date.fromisoformat(start)
++    return tuple(
++        [
++            (first + timedelta(days=offset)).isoformat()
++            for offset in range(59)
++        ]
++        + [end]
++    )
++
++
++def _fold_manifest() -> FoldManifest:
++    discovery_1 = FoldSpec(
++        fold_id="discovery_1",
++        purpose="discovery",
++        start_date="2021-06-25",
++        end_date="2021-09-20",
++        sessions=_sessions("2021-06-25", "2021-09-20"),
++    )
++    discovery_2 = FoldSpec(
++        fold_id="discovery_2",
++        purpose="discovery",
++        start_date="2021-09-21",
++        end_date="2021-12-14",
++        sessions=_sessions("2021-09-21", "2021-12-14"),
++    )
++    hidden = FoldSpec(
++        fold_id="hidden_1",
++        purpose="hidden",
++        start_date="2021-12-15",
++        end_date="2022-03-11",
++        sessions=_sessions("2021-12-15", "2022-03-11"),
++    )
++    return FoldManifest(
++        data_identity_sha256="a" * 64,
++        universe_sha256="b" * 64,
++        benchmark="SPY",
++        warmup_start_date="2021-01-01",
++        discovery_folds=(discovery_1, discovery_2),
++        hidden_fold=hidden,
++    )
++
++
++def _call_budgets() -> tuple[contract.PitOptimizerCallBudget, ...]:
++    role_caps = {
++        "investigator": (8_000, 80_000, 88_000, 4_000, 8 * 1024, 0.05),
++        "author": (12_000, 76_000, 88_000, 8_000, 16 * 1024, 0.10),
++        "critic": (8_000, 24_000, 32_000, 4_000, 8 * 1024, 0.05),
++    }
++    return tuple(
++        contract.PitOptimizerCallBudget(
++            call_index=(iteration - 1) * 3 + ordinal,
++            iteration=iteration,
++            role=role,
++            model="deepseek/deepseek-r1",
++            max_static_input_bytes=role_caps[role][0],
++            max_dynamic_input_bytes=role_caps[role][1],
++            max_input_tokens=role_caps[role][2],
++            max_output_tokens=role_caps[role][3],
++            max_response_bytes=role_caps[role][4],
++            max_usd=role_caps[role][5],
++        )
++        for iteration in (1, 2)
++        for ordinal, role in enumerate(contract.OPTIMIZER_V2_ROLES, start=1)
++    )
++
++
++def _v2_manifest() -> contract.PitOptimizerRunManifest:
++    candidate_bounds = contract.PatchBounds(3, 12, 80, 8 * 1024)
++    hard_bounds = contract.PatchBounds(3, 12, 200, 64 * 1024)
++    paths = (
++        "core/strategy_policy/entry.py",
++        "core/strategy_policy/risk.py",
++        "core/strategy_policy/exit.py",
++    )
++    source_sha256s = tuple((path, str(index) * 64) for index, path in enumerate(paths, 1))
++    scope = contract.PolicySourceScope(
++        schema_version=2,
++        policy_interface_version=1,
++        initial_policy_source_sha256s=source_sha256s,
++        editable_paths=paths,
++        max_policy_source_bundle_bytes=64 * 1024,
++        max_iteration_feedback_bytes=4 * 1024,
++        max_iteration_history_bytes=32 * 1024,
++        hard_patch_bounds=hard_bounds,
++        candidate_bounds=candidate_bounds,
++        max_iterations=2,
++        allowed_descendant_rule="authenticated_initial_sources_plus_validated_cumulative_diff",
++    )
++    budgets = _call_budgets()
++    constraint_ids = ("causal_only", "no_external_io")
++    constraints_sha256 = hashlib.sha256(
++        json.dumps(
++            list(constraint_ids),
++            sort_keys=True,
++            separators=(",", ":"),
++            allow_nan=False,
++        ).encode("utf-8")
++        + b"\n"
++    ).hexdigest()
++    authorization = contract.AuthorizationRequirement(
++        window_id="window_1",
++        max_calls=6,
++        max_tokens=448_000,
++        max_usd=0.40,
++        policy_source_scope_sha256=scope.sha256,
++        provider_retries=0,
++        apply=False,
++    )
++    return contract.PitOptimizerRunManifest(
++        schema_version=2,
++        run_id="run_1",
++        run_kind="subset_canary",
++        model="deepseek/deepseek-r1",
++        source_head="c" * 40,
++        source_fingerprint_sha256="d" * 64,
++        legacy_readiness_sha256="e" * 64,
++        pit_bundle_sha256="a" * 64,
++        baseline_manifest_sha256="f" * 64,
++        effective_policy_sha256="9" * 64,
++        policy_interface_version=1,
++        policy_source_sha256s=source_sha256s,
++        editable_paths=paths,
++        policy_source_scope=scope,
++        immutable_constraints_sha256=constraints_sha256,
++        fold_manifest=_fold_manifest(),
++        parity_attestation_sha256="7" * 64,
++        sandbox_image="example.invalid/pit-optimizer@sha256:" + "6" * 64,
++        validation_ledger_name="pit_optimizer_validation_ledger.jsonl",
++        immutable_constraint_ids=constraint_ids,
++        candidate_bounds=candidate_bounds,
++        call_budgets=budgets,
++        max_iterations=2,
++        non_improving_limit=3,
++        authorization_requirement=authorization,
++    )
++
++
++def _independent_digest(value: object) -> str:
++    payload = (
++        json.dumps(
++            asdict(value),
++            sort_keys=True,
++            separators=(",", ":"),
++            allow_nan=False,
++        ).encode("utf-8")
++        + b"\n"
++    )
++    return hashlib.sha256(payload).hexdigest()
++
++
++def test_manifest_identity_binds_scope_budget_order_and_authorization() -> None:
++    """Break caught: expanded source or reordered calls could reuse an old authorization."""
++    manifest = _v2_manifest()
++
++    assert manifest.policy_source_scope.sha256 == _independent_digest(
++        manifest.policy_source_scope
++    )
++    assert manifest.authorization_requirement.sha256 == _independent_digest(
++        manifest.authorization_requirement
++    )
++    assert manifest.sha256 == _independent_digest(manifest)
++    assert [
++        (item.call_index, item.iteration, item.role)
++        for item in manifest.call_budgets
++    ] == [
++        (1, 1, "investigator"),
++        (2, 1, "author"),
++        (3, 1, "critic"),
++        (4, 2, "investigator"),
++        (5, 2, "author"),
++        (6, 2, "critic"),
++    ]
++    assert sum(item.max_input_tokens for item in manifest.call_budgets) == 416_000
++    assert manifest.authorization_requirement.max_tokens == 448_000
++    assert sum(item.max_usd for item in manifest.call_budgets) == pytest.approx(0.40)
++    assert manifest.authorization_requirement.apply is False
++    assert manifest.authorization_requirement.provider_retries == 0
++
++    expanded = replace(
++        manifest.policy_source_scope,
++        max_iterations=manifest.policy_source_scope.max_iterations + 1,
++    )
++    assert expanded.sha256 != manifest.policy_source_scope.sha256
++    assert (
++        manifest.authorization_requirement.policy_source_scope_sha256
++        == manifest.policy_source_scope.sha256
++    )
++    with pytest.raises(ValueError, match="source scope authorization"):
++        replace(manifest, policy_source_scope=expanded, max_iterations=3)
++    with pytest.raises(ValueError, match="call order"):
++        replace(
++            manifest,
++            call_budgets=(
++                replace(manifest.call_budgets[0], call_index=2),
++                *manifest.call_budgets[1:],
++            ),
++        )
++    with pytest.raises(ValueError, match="hard patch bounds"):
++        replace(
++            manifest,
++            candidate_bounds=contract.PatchBounds(3, 12, 201, 8 * 1024),
++        )
++    with pytest.raises(ValueError, match="apply"):
++        replace(
++            manifest.authorization_requirement,
++            apply=True,
++        )
++
++
++_PIT_METADATA = {
++    "bundle_kind": "canslim_pit_v1",
++    "schema_version": "1",
++    "data_cutoff": "2022-03-11",
++    "evaluation_start": "2021-06-25",
++    "warmup_start": "2020-01-01",
++    "membership_source_sha256": "0" * 64,
++    "prices_source_sha256": "0" * 64,
++    "fundamentals_source_sha256": "0" * 64,
++    "membership_provenance_sha256": "0" * 64,
++    "prices_provenance_sha256": "0" * 64,
++    "fundamentals_provenance_sha256": "0" * 64,
++    "membership_source_kind": "offline_test_fixture",
++    "membership_revision_id": "fixture-v1",
++    "membership_raw_sha256": "0" * 64,
++    "membership_symbol_map_sha256": "0" * 64,
++    "membership_security_names_sha256": "0" * 64,
++    "prices_source_kind": "offline_test_fixture",
++    "prices_upstream_source_sha256": "0" * 64,
++    "spy_trading_days_sha256": "0" * 64,
++    "price_identity_map_sha256": "0" * 64,
++    "price_identity_request_contracts_sha256": "0" * 64,
++    "price_exclusion_count": "0",
++    "price_exclusions_sha256": "0" * 64,
++    "fundamentals_source_kind": "offline_test_fixture",
++    "fundamentals_submissions_archive_sha256": "0" * 64,
++    "fundamentals_companyfacts_archive_sha256": "0" * 64,
++    "fundamentals_identity_manifest_csv_sha256": "0" * 64,
++}
++
++
++def _member_symbols(count: int) -> tuple[str, ...]:
++    symbols: list[str] = []
++    for letters in product(string.ascii_uppercase, repeat=3):
++        ticker = "".join(letters)
++        if ticker != "SPY":
++            symbols.append(ticker)
++        if len(symbols) == count:
++            return tuple(symbols)
++    raise AssertionError("could not create synthetic tickers")
++
++
++def _write_pit_bundle(path: Path) -> tuple[str, tuple[str, ...]]:
++    members = _member_symbols(495)
++    fold_sessions = (
++        *_sessions("2021-06-25", "2021-09-20"),
++        *_sessions("2021-09-21", "2021-12-14"),
++        *_sessions("2021-12-15", "2022-03-11"),
++    )
++    with closing(sqlite3.connect(path)) as connection:
++        connection.execute(
++            "CREATE TABLE dataset_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
++        )
++        connection.execute(
++            "CREATE TABLE membership (effective_date TEXT NOT NULL, ticker TEXT NOT NULL, member INTEGER NOT NULL)"
++        )
++        connection.execute(
++            "CREATE TABLE price (trade_date TEXT NOT NULL, ticker TEXT NOT NULL, open REAL NOT NULL, high REAL NOT NULL, low REAL NOT NULL, close REAL NOT NULL, volume REAL NOT NULL)"
++        )
++        connection.execute(
++            "CREATE TABLE fundamentals (ticker TEXT NOT NULL, statement_type TEXT NOT NULL, period_end TEXT NOT NULL, public_date TEXT NOT NULL, basic_eps REAL, diluted_eps REAL, total_revenue REAL, net_income REAL, common_stock REAL, total_stockholders_equity REAL, shares_outstanding REAL, held_percent_institutions REAL, institution_count INTEGER, prev_institution_count INTEGER)"
++        )
++        connection.executemany(
++            "INSERT INTO dataset_metadata VALUES (?, ?)", _PIT_METADATA.items()
++        )
++        connection.executemany(
++            "INSERT INTO membership VALUES (?, ?, ?)",
++            (("2021-01-01", symbol, 1) for symbol in members),
++        )
++        connection.executemany(
++            "INSERT INTO price VALUES (?, ?, ?, ?, ?, ?, ?)",
++            (
++                [("2020-01-02", "SPY", 100.0, 101.0, 99.0, 100.0, 1_000.0)]
++                + [
++                    (session, "SPY", 100.0, 101.0, 99.0, 100.0, 1_000.0)
++                    for session in fold_sessions
++                ]
++            ),
++        )
++        connection.execute(
++            "INSERT INTO fundamentals VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
++            (
++                members[0],
++                "quarterly",
++                "2020-09-30",
++                "2020-11-01",
++                1.0,
++                1.0,
++                100.0,
++                10.0,
++                None,
++                None,
++                1_000_000.0,
++                None,
++                None,
++                None,
++            ),
++        )
++        connection.commit()
++    return hashlib.sha256(path.read_bytes()).hexdigest(), members[:25]
++
++
++def _canonical_file_bytes(value: object) -> bytes:
++    return (
++        json.dumps(
++            value,
++            sort_keys=True,
++            separators=(",", ":"),
++            allow_nan=False,
++        ).encode("utf-8")
++        + b"\n"
++    )
++
++
++def _builder_fixture(tmp_path: Path) -> tuple[dict[str, object], dict[str, object]]:
++    source_root = tmp_path / "source"
++    source_texts = {
++        "core/strategy_policy/entry.py": "raise RuntimeError('must not import')\ndef evaluate_entry(snapshot):\n    return None\n",
++        "core/strategy_policy/risk.py": "raise RuntimeError('must not import')\ndef recommend_capacity(snapshot):\n    return 1\n",
++        "core/strategy_policy/exit.py": "raise RuntimeError('must not import')\ndef evaluate_exit(snapshot):\n    return None\n",
++    }
++    for relative, text in source_texts.items():
++        path = source_root / relative
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_bytes(text.encode("utf-8"))
++
++    pit_bundle = tmp_path / "pit.sqlite3"
++    pit_sha256, universe = _write_pit_bundle(pit_bundle)
++    universe_sha256 = hashlib.sha256(_canonical_file_bytes(list(universe))).hexdigest()
++    fold_manifest = FoldManifest(
++        data_identity_sha256=pit_sha256,
++        universe_sha256=universe_sha256,
++        benchmark="SPY",
++        warmup_start_date="2021-01-01",
++        discovery_folds=(
++            FoldSpec(
++                "discovery_1",
++                "discovery",
++                "2021-06-25",
++                "2021-09-20",
++                _sessions("2021-06-25", "2021-09-20"),
++            ),
++            FoldSpec(
++                "discovery_2",
++                "discovery",
++                "2021-09-21",
++                "2021-12-14",
++                _sessions("2021-09-21", "2021-12-14"),
++            ),
++        ),
++        hidden_fold=FoldSpec(
++            "hidden_1",
++            "hidden",
++            "2021-12-15",
++            "2022-03-11",
++            _sessions("2021-12-15", "2022-03-11"),
++        ),
++    )
++
++    baseline_run = tmp_path / "baseline"
++    baseline_run.mkdir()
++    baseline_bytes = _canonical_file_bytes({"schema_version": 1, "run": "baseline"})
++    (baseline_run / "run_manifest.json").write_bytes(baseline_bytes)
++    baseline_sha256 = hashlib.sha256(baseline_bytes).hexdigest()
++    policy = {"schema_version": 1, "policy": "synthetic"}
++    effective_policy_sha256 = hashlib.sha256(_canonical_file_bytes(policy)).hexdigest()
++    source_head = "c" * 40
++    source_fingerprint = "d" * 64
++    constraint_ids = ["causal_only", "no_external_io"]
++    readiness = {
++        "schema_version": 1,
++        "gate": "pit_optimization",
++        "phase": "ready",
++        "identities": {
++            "source_head": source_head,
++            "source_fingerprint_sha256": source_fingerprint,
++            "pit_bundle_sha256": pit_sha256,
++            "baseline_manifest_sha256": baseline_sha256,
++            "effective_policy_sha256": effective_policy_sha256,
++        },
++        "sealed_inputs": {
++            "pit_bundle_sha256": pit_sha256,
++            "baseline_artifact_sha256": {"run_manifest.json": baseline_sha256},
++        },
++        "evaluation_contract": {
++            "verification_only": True,
++            "scope": {
++                "benchmark": "SPY",
++                "discovery_start": "2021-06-25",
++                "discovery_end": "2021-09-20",
++                "holdout_start": "2021-09-21",
++                "holdout_end": "2021-12-14",
++                "warmup_start": "2021-01-01",
++                "session_count": 60,
++                "symbol_count": 25,
++                "symbols": list(universe),
++            },
++        },
++        "effective_policy": policy,
++        "invariant_ids": constraint_ids,
++    }
++    readiness_path = tmp_path / "legacy-readiness.json"
++    readiness_bytes = _canonical_file_bytes(readiness)
++    readiness_path.write_bytes(readiness_bytes)
++
++    parity_path = tmp_path / "verified-parity.json"
++    provisional = ParityAttestation(
++        schema_version=1,
++        reference_artifact_sha256="4" * 64,
++        reference_source_head="1" * 40,
++        final_source_head=source_head,
++        final_source_fingerprint_sha256=source_fingerprint,
++        pit_bundle_sha256=pit_sha256,
++        baseline_manifest_sha256=baseline_sha256,
++        effective_policy_sha256=effective_policy_sha256,
++        discovery_fold_manifest_sha256=fold_manifest.sha256,
++        policy_interface_version=1,
++        reference_output_sha256s=(),
++        final_output_sha256s=(),
++        final_discovery_evidence=(),
++        transactions_equal=True,
++        entry_outcomes_equal=True,
++        equity_equal=True,
++        funnels_equal=True,
++        effective_policy_equal=True,
++        artifact_path=parity_path.resolve(),
++        artifact_sha256="0" * 64,
++    )
++    parity_primitive = asdict(provisional)
++    parity_primitive.pop("artifact_path")
++    parity_primitive.pop("artifact_sha256")
++    parity_bytes = _canonical_file_bytes(parity_primitive)
++    parity_path.write_bytes(parity_bytes)
++    parity = replace(
++        provisional,
++        artifact_sha256=hashlib.sha256(parity_bytes).hexdigest(),
++    )
++
++    permanent_runtime_root = tmp_path / "runtime"
++    controller_temp_parent = tmp_path / "controller-temp"
++    artifact_root = tmp_path / "artifacts"
++    for directory in (permanent_runtime_root, controller_temp_parent, artifact_root):
++        directory.mkdir()
++    inputs = {
++        "legacy_readiness": readiness,
++        "legacy_readiness_path": readiness_path,
++        "parity_attestation": parity,
++        "verified_parity_path": parity_path,
++        "pit_bundle": pit_bundle,
++        "baseline_run": baseline_run,
++        "source_root": source_root,
++        "permanent_runtime_root": permanent_runtime_root,
++        "controller_temp_parent": controller_temp_parent,
++        "artifact_root": artifact_root,
++        "sandbox_image": "example.invalid/pit-optimizer@sha256:" + "6" * 64,
++        "call_budgets": _call_budgets(),
++        "candidate_bounds": contract.PatchBounds(3, 12, 80, 8 * 1024),
++        "max_iterations": 2,
++    }
++    expected = {
++        "fold_manifest": fold_manifest,
++        "source_texts": source_texts,
++        "readiness_sha256": hashlib.sha256(readiness_bytes).hexdigest(),
++    }
++    return inputs, expected
++
++
++def test_manifest_builder_is_provider_free_canonical_and_source_budgeted(
++    tmp_path: Path,
++) -> None:
++    """Break caught: preparation could execute source or seal a context that cannot fit."""
++    inputs, expected = _builder_fixture(tmp_path)
++
++    manifest = contract.build_subset_manifest(**inputs)
++    second = contract.build_subset_manifest(**inputs)
++
++    assert manifest.fold_manifest == expected["fold_manifest"]
++    assert manifest.legacy_readiness_sha256 == expected["readiness_sha256"]
++    assert manifest.run_id != second.run_id
++    assert (
++        manifest.authorization_requirement.window_id
++        != second.authorization_requirement.window_id
++    )
++    assert manifest.authorization_requirement.max_calls == 6
++    assert manifest.authorization_requirement.max_tokens == 448_000
++    assert manifest.authorization_requirement.max_usd == pytest.approx(0.40)
++    assert manifest.authorization_requirement.apply is False
++    assert manifest.authorization_requirement.provider_retries == 0
++
++    source_records = []
++    declared = {
++        "core/strategy_policy/entry.py": ["core.strategy_policy.entry.evaluate_entry"],
++        "core/strategy_policy/risk.py": ["core.strategy_policy.risk.recommend_capacity"],
++        "core/strategy_policy/exit.py": ["core.strategy_policy.exit.evaluate_exit"],
++    }
++    for path, text in expected["source_texts"].items():
++        source_records.append(
++            {
++                "path": path,
++                "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
++                "declared_symbols": declared[path],
++                "text": text,
++            }
++        )
++    initial_bundle = {
++        "policy_interface_version": 1,
++        "cumulative_diff_sha256": hashlib.sha256(b"").hexdigest(),
++        "cumulative_diff": "",
++        "files": source_records,
++    }
++    initial_policy_bytes = sum(
++        len(text.encode("utf-8")) for text in expected["source_texts"].values()
++    )
++    envelope_bytes = len(_canonical_text(initial_bundle).encode("utf-8")) - initial_policy_bytes
++    assert initial_policy_bytes + (2 * 8 * 1024) + envelope_bytes <= 64 * 1024
++    worst_records = [dict(record) for record in source_records]
++    worst_records[0]["text"] = str(worst_records[0]["text"]) + ("s" * (8 * 1024))
++    worst_records[0]["sha256"] = hashlib.sha256(
++        str(worst_records[0]["text"]).encode("utf-8")
++    ).hexdigest()
++    worst_iteration_2_bundle = {
++        "policy_interface_version": 1,
++        "cumulative_diff_sha256": hashlib.sha256(
++            ("d" * (8 * 1024)).encode("utf-8")
++        ).hexdigest(),
++        "cumulative_diff": "d" * (8 * 1024),
++        "files": worst_records,
++    }
++    assert len(_canonical_text(worst_iteration_2_bundle).encode("utf-8")) == (
++        initial_policy_bytes + (2 * 8 * 1024) + envelope_bytes
++    )
++    assert len(_canonical_text(worst_iteration_2_bundle).encode("utf-8")) <= 64 * 1024
++    assert manifest.policy_source_sha256s == tuple(
++        (record["path"], record["sha256"]) for record in source_records
++    )
++    for budget in manifest.call_budgets:
++        static_bytes = len(
++            contract.PIT_OPTIMIZER_V2_SYSTEM_PROMPTS[budget.role].encode("utf-8")
++        ) + len(
++            _canonical_text(contract.pit_optimizer_response_format(budget.role)).encode(
++                "utf-8"
++            )
++        )
++        assert static_bytes <= budget.max_static_input_bytes
++        assert static_bytes + budget.max_dynamic_input_bytes <= budget.max_input_tokens
++
++    output = tmp_path / "optimizer-manifest.json"
++    written, digest = contract.write_optimizer_manifest(manifest, output)
++    assert written == output.resolve()
++    assert output.read_bytes() == _canonical_file_bytes(asdict(manifest))
++    assert digest == manifest.sha256 == hashlib.sha256(output.read_bytes()).hexdigest()
++    with pytest.raises(FileExistsError):
++        contract.write_optimizer_manifest(manifest, output)
++
++    with pytest.raises(ValueError, match="source bundle"):
++        contract.build_subset_manifest(
++            **{
++                **inputs,
++                "candidate_bounds": contract.PatchBounds(3, 12, 80, 32 * 1024),
++            }
++        )
++
++
++def test_gate_and_prepare_command_authenticate_without_granting_authority(
++    tmp_path: Path,
++) -> None:
++    """Break caught: a prepare command could imply spending or use an unauthenticated path."""
++    inputs, _expected = _builder_fixture(tmp_path)
++    manifest = contract.build_subset_manifest(**inputs)
++    manifest_path = tmp_path / "optimizer-manifest.json"
++    contract.write_optimizer_manifest(manifest, manifest_path)
++    gate = contract.PitOptimizerGateConfig(
++        phase="prepare",
++        baseline_run=inputs["baseline_run"],
++        baseline_manifest_sha256=manifest.baseline_manifest_sha256,
++        pit_bundle=inputs["pit_bundle"],
++        pit_bundle_sha256=manifest.pit_bundle_sha256,
++        effective_policy_sha256=manifest.effective_policy_sha256,
++        optimizer_manifest=manifest_path,
++        optimizer_manifest_sha256=manifest.sha256,
++        verified_parity_artifact=inputs["verified_parity_path"],
++        verified_parity_sha256=manifest.parity_attestation_sha256,
++        readiness_artifact=None,
++        readiness_sha256=None,
++        authorization_window_id=None,
++        authorization_requirement_sha256=manifest.authorization_requirement.sha256,
++        source_transmission_authorized=False,
++        max_usd=0.40,
++        max_api_calls=6,
++        max_tokens=448_000,
++        max_iterations=2,
++        apply=False,
++    )
++
++    gate.validate()
++    with pytest.raises(ValueError, match="source transmission"):
++        replace(gate, source_transmission_authorized=True).validate()
++    with pytest.raises(ValueError, match="apply"):
++        replace(gate, apply=True).validate()
++    with pytest.raises(ValueError, match="optimizer manifest"):
++        replace(gate, optimizer_manifest_sha256="0" * 64).validate()
++    run_gate = replace(
++        gate,
++        phase="run",
++        readiness_artifact=inputs["legacy_readiness_path"],
++        readiness_sha256=manifest.legacy_readiness_sha256,
++        authorization_window_id="window_live",
++        source_transmission_authorized=True,
++    )
++    run_gate.validate()
++    with pytest.raises(ValueError, match="apply"):
++        replace(run_gate, apply=True).validate()
++
++    git_executable = tmp_path / "git.exe"
++    docker_executable = tmp_path / "docker.exe"
++    git_executable.write_bytes(b"synthetic executable")
++    docker_executable.write_bytes(b"synthetic executable")
++    command = contract.build_prepare_command(
++        manifest,
++        manifest_path=manifest_path,
++        legacy_readiness_path=inputs["legacy_readiness_path"],
++        verified_parity_path=inputs["verified_parity_path"],
++        pit_bundle_path=inputs["pit_bundle"],
++        baseline_run_path=inputs["baseline_run"],
++        repo_root=inputs["source_root"],
++        permanent_runtime_root=inputs["permanent_runtime_root"],
++        controller_temp_parent=inputs["controller_temp_parent"],
++        artifact_root=inputs["artifact_root"],
++        git_executable=git_executable,
++        docker_executable=docker_executable,
++        sandbox_image=inputs["sandbox_image"],
++    )
++
++    assert "core.pit_optimization prepare-v2" in command
++    for value in (
++        manifest.sha256,
++        manifest.legacy_readiness_sha256,
++        manifest.parity_attestation_sha256,
++        manifest.pit_bundle_sha256,
++        manifest.baseline_manifest_sha256,
++        manifest.authorization_requirement.sha256,
++        str(inputs["permanent_runtime_root"].resolve()),
++        str(git_executable.resolve()),
++        str(docker_executable.resolve()),
++    ):
++        assert value in command
++    assert "authorization-window" not in command
++    assert "source-transmission-authorized" not in command
++    assert "credential" not in command.lower()
++
++
++def test_objective_is_quantized_lexicographic_strict_and_trade_eligible() -> None:
++    """Break caught: floating or non-strict ranking could promote an ineligible candidate."""
++    folds = (
++        replace(
++            _fold_summary("discovery_1", 1.235),
++            max_drawdown_pct=-4.005,
++            closed_trades=1,
++        ),
++        replace(
++            _fold_summary("discovery_2", 0.505),
++            max_drawdown_pct=-2.0,
++            closed_trades=3,
++        ),
++    )
++
++    score = evaluation.discovery_score_from_folds(folds)
++
++    expected_first = Decimal(str(1.235)).quantize(
++        Decimal("0.01"), rounding=ROUND_HALF_EVEN
++    )
++    expected_second = Decimal(str(0.505)).quantize(
++        Decimal("0.01"), rounding=ROUND_HALF_EVEN
++    )
++    assert score == evaluation.DiscoveryScore(
++        median_excess_return_pp=((expected_first + expected_second) / 2).quantize(
++            Decimal("0.01"), rounding=ROUND_HALF_EVEN
++        ),
++        worst_excess_return_pp=expected_second,
++        max_drawdown_magnitude_pp=Decimal(str(4.005)).quantize(
++            Decimal("0.01"), rounding=ROUND_HALF_EVEN
++        ),
++    )
++    assert score.ordering_key == (
++        Decimal("0.87"),
++        Decimal("0.50"),
++        Decimal("-4.00"),
++    )
++    assert evaluation.strictly_improves_discovery(score, score) is False
++    assert evaluation.strictly_improves_discovery(
++        replace(score, worst_excess_return_pp=Decimal("0.51")),
++        score,
++    ) is True
++    with pytest.raises(ValueError, match="closed discovery trade"):
++        evaluation.discovery_score_from_folds(
++            (replace(folds[0], closed_trades=0), folds[1])
++        )
++
++
++def test_holdout_gate_uses_return_trades_and_completeness_without_sharpe() -> None:
++    """Break caught: a Sharpe gate or permissive equality boundary could alter eligibility."""
++    decision = evaluation.HoldoutDecision.from_result(
++        excess_total_return_pp=0.105,
++        closed_trades=3,
++        safety_complete=True,
++        integrity_complete=True,
++        accounting_complete=True,
++    )
++
++    assert decision.excess_total_return_pp == Decimal("0.10")
++    assert decision.long_replay_eligible is True
++    assert "sharpe" not in {field.name for field in fields(evaluation.HoldoutDecision)}
++    assert evaluation.HoldoutDecision.from_result(
++        excess_total_return_pp=0.094,
++        closed_trades=3,
++        safety_complete=True,
++        integrity_complete=True,
++        accounting_complete=True,
++    ).long_replay_eligible is False
++    assert evaluation.HoldoutDecision.from_result(
++        excess_total_return_pp=0.10,
++        closed_trades=2,
++        safety_complete=True,
++        integrity_complete=True,
++        accounting_complete=True,
++    ).long_replay_eligible is False
++    with pytest.raises(ValueError, match="eligibility"):
++        evaluation.HoldoutDecision(
++            excess_total_return_pp=Decimal("0.10"),
++            closed_trades=3,
++            safety_complete=True,
++            integrity_complete=True,
++            accounting_complete=True,
++            long_replay_eligible=False,
++        )
++
++
++def _validation_identity(fold: FoldSpec, suffix: str) -> evaluation.ValidationWindowIdentity:
++    sessions_sha256 = hashlib.sha256(
++        _canonical_file_bytes(list(fold.sessions))
++    ).hexdigest()
++    return evaluation.ValidationWindowIdentity(
++        pit_bundle_sha256="a" * 64,
++        universe_sha256="b" * 64,
++        benchmark="SPY",
++        warmup_contract_sha256="c" * 64,
++        sessions_sha256=sessions_sha256,
++        session_count=60,
++        first_session=fold.start_date,
++        last_session=fold.end_date,
++    )
++
++
++def test_validation_ledger_permanently_consumes_identity_before_outcome(
++    tmp_path: Path,
++) -> None:
++    """Break caught: metadata changes or a failed evaluation could make a window hidden again."""
++    ledger_path = tmp_path / "pit_optimizer_validation_ledger.jsonl"
++    ledger = evaluation.ValidationLedger(ledger_path)
++    folds = _fold_manifest()
++    provider_metadata = evaluation.ValidationExposureMetadata(
++        run_id="run_1",
++        source_head="1" * 40,
++        baseline_policy_sha256="d" * 64,
++        candidate_identity_sha256=None,
++        exposure_kind="provider_context",
++    )
++    discovery_reservations = tuple(
++        ledger.mark_discovery(_validation_identity(fold, fold.fold_id), provider_metadata)
++        for fold in folds.discovery_folds
++    )
++
++    first_identity = _validation_identity(folds.discovery_folds[0], "discovery_1")
++    expected_key = hashlib.sha256(
++        _canonical_file_bytes(asdict(first_identity))
++    ).hexdigest()
++    assert discovery_reservations[0].consumption_key_sha256 == expected_key
++    with pytest.raises(ValueError, match="consumed"):
++        ledger.reserve_hidden(
++            first_identity,
++            evaluation.ValidationExposureMetadata(
++                run_id="run_later",
++                source_head="2" * 40,
++                baseline_policy_sha256="e" * 64,
++                candidate_identity_sha256="f" * 64,
++                exposure_kind="hidden_validation",
++            ),
++        )
++
++    hidden_identity = _validation_identity(folds.hidden_fold, "hidden_1")
++    hidden_metadata = evaluation.ValidationExposureMetadata(
++        run_id="run_1",
++        source_head="1" * 40,
++        baseline_policy_sha256="d" * 64,
++        candidate_identity_sha256="f" * 64,
++        exposure_kind="hidden_validation",
++    )
++    hidden_reservation = ledger.reserve_hidden(hidden_identity, hidden_metadata)
++    ledger.record_outcome(
++        hidden_reservation,
++        attempted=True,
++        completed=False,
++        failure_code="injected_failure",
++    )
++
++    reopened = evaluation.ValidationLedger(ledger_path)
++    with pytest.raises(ValueError, match="consumed"):
++        reopened.reserve_hidden(
++            hidden_identity,
++            replace(hidden_metadata, run_id="run_later", source_head="2" * 40),
++        )
++    records = [json.loads(line) for line in ledger_path.read_text("utf-8").splitlines()]
++    assert [record["record_type"] for record in records] == [
++        "consumption",
++        "consumption",
++        "consumption",
++        "outcome",
++    ]
++    assert records[1]["previous_record_sha256"] == records[0]["record_sha256"]
++    outcome = records[-1]
++    assert set(outcome) == {
++        "schema_version",
++        "record_type",
++        "record_index",
++        "previous_record_sha256",
++        "reservation_record_sha256",
++        "attempted",
++        "completed",
++        "failure_code",
++        "record_sha256",
++    }
++    assert not {"return", "sharpe", "trades", "holdings", "metrics"}.intersection(
++        outcome
++    )

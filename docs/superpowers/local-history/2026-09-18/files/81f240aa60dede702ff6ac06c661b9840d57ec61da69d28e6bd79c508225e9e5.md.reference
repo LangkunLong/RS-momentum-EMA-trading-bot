@@ -1,0 +1,33 @@
+# Increment C-b request/count evidence
+
+Disposition: **evidence prepared; readiness remains unapproved pending the full H3 summaries.** This review preserves the B4c principal acceptance and makes no source-readiness decision.
+
+## Actual request and parent evidence
+
+The authenticated runtime-04 manifest is `campaigns/development-controller-two-rounds-20260907-04/manifest.json` at SHA-256 `8fcae0423117f3a234e64391c277bd7efe5cbb775ff61ec879d8cbeb5659d37c`. Its baseline parent revision is `901b1ed2e50b401bcb209b7a5fd9c6239b2a6421d7f37e732211de6d24128c92`.
+
+Both archived investigator requests bind that parent. Round 1 request `9fe1509ca03a9aa7b3010f726a0f9fa300004276dbb02c09e828d12af664d949` is the 6,700-byte envelope `roles/requests/67bf0f...json`; round 2 request `c60f3494fe8c9ea4476d69d9c1d0f82db39cb9fcc834c8ba0c925aba0862389b` is the 22,071-byte envelope `roles/requests/a06615...json`. Each has 16 aggregate evaluator items. Authenticated typed comparison proves they are exactly four ordered headlines per each of four episodes: annualized return, drawdown, closed trades, exposure.
+
+The same authenticated baseline reports contain every member of the current closed 16-count allowlist in every episode: 64 available integer counts. Static current-source order is therefore, per episode, four headlines followed by its 16 available counts; after all four episodes comes the cumulative rejection count when nonzero, then archive families, critic/campaign directions, and experiment history. At zero, `_render_rejection_count` leaves the evidence builder untouched. The provider citation sequence keeps the entire aggregate block before archive/history.
+
+The archived requests predate the Increment-A/B4c additions, so their 16-item blocks do not dynamically execute the current 80-item zero-rejection projection. No future `FeedbackRoundInputV5`, wrapper, request, or provider packet was constructed. The 64-count availability and current order are authenticated-parent plus static-source evidence only.
+
+Runtime-04 record `records/9e2a2d...json` at content SHA-256 `af6c73e632a3dc47cb344ecf3d1a55f9f58ba3e755e29fe992e0c03d0da103ac` remains evaluated, round 1, four discovery episodes, critic-bound. It contains no reserved rejection. C-a's archive-derived counts remain `completed_lifecycle_rounds=1`, `evaluated_feedback_rounds=1`, `render_rejected_experiments=0`. Actual06 has no checkpoint records and remains `0/0/0`.
+
+## Bounds
+
+`prospective_role_usage_v5` was applied only to authenticated stored requests using actual06's authenticated capabilities: 6 calls, 448,000 total tokens, 8,192 maximum output tokens per role, and 4,096 input overhead. Runtime-04 round 1 has input upper bound 10,305 and total reservation 14,401 with its 4,096 output limit; round 2 is 27,370 and 31,466. Both fit the current per-output and cumulative token ceilings. Actual06's archived initial investigator request `3b4dc10...` is 6,985 bytes, has input bound 10,305 and total reservation 18,497; the immutable disclosure reports 429,503 capacity remaining after that reservation. No cost bound exists because the capability has no price upper bound.
+
+## Lifecycle and novelty
+
+`operations._run_campaign_v5` iterates `1..max_feedback_rounds`; this is a lifecycle-attempt cap. A cleaned committed record round is reused/completed and advances the loop whether its records are evaluated, rejected, or duplicate. `no_novel_hypothesis` can also consume an iteration without a checkpoint record. Other terminal states stop. The cap therefore does not prove two evaluated rounds.
+
+`summarize_repository_v5` counts distinct checkpoint-record rounds with successful cleanup, then intersects them with rounds containing at least one `status=evaluated` record carrying campaign evidence. Several evaluated candidates in one round still count once. Reserved-code invalid records count independently of cleanup. `CandidateArchiveReducerV5.apply` advances `next_round_index` and retains the novelty key for every record; invalid/duplicate records remain attempted history but are ineligible for archive promotion. Exhaustion requires authenticated no-novel outcomes covering every reconstructed parent and produces no record round.
+
+Unexecuted positive branches remain: current-source zero omission; committed closed rejection through checkpoint/cleanup; its positive next-investigator metric; rejection-only, duplicate-only, mixed evaluated/rejected, and multi-evaluated finalization; positive parent-identical exact duplicate; no-novel and full novelty-exhaustion closure. Runtime-04's round-2 deadline is none of these.
+
+## Static identities and preservation
+
+Relevant exact source slices: `_render_rejection_count` lines 592–613 SHA `9ebfebc9...d07b`; `_investigator_parts` 615–815 SHA `28fced81...f9b`; `_role_citation_sequence` 1368–1391 SHA `20b57229...7e2`; `prospective_role_usage_v5` 2106–2129 SHA `87fdd26a...78f`; `OptimizerSummaryV5.__post_init__` 85–143 SHA `406fab9c...b57`; `summarize_repository_v5` 172–327 SHA `a0483e39...0cd`; `_run_campaign_v5` 374–639 SHA `4337cb3d...bd5`; `CandidateArchiveReducerV5.apply` 772–805 SHA `03365410...676`; `classify_novelty_exhaustion_v5` 685–737 SHA `440638c7...757`.
+
+Complete `\\?\` root hashing matched C-a before and after: runtime-04 579/579 files, map SHA `24063a0c...61f`; actual06 83/83, map SHA `b9f3b55e...ae6`; zero missing, added, or changed. Reads used immutable graph/typed-artifact, role-request, and experiment authentication. No typed-state read was added; C-a's 178 state-index reads explicitly used `repair=False`. No summary call, test, synthetic evidence, external/campaign action, credential read, or source edit occurred.

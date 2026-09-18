@@ -1,0 +1,31 @@
+# Task 4 re-review — quantity-path reconciliation fix
+
+## Finding Verdict
+
+**Resolved.** `_validate_episode_quantity_path` replays each filtered `EpisodeId` fill
+in its DataFrame order and requires exact path/fill cardinality
+(`core/pit_optimizer_v5/diagnostics.py:397-405`). It rejects non-causal session order
+and duplicate transitions (`406-423`), maps BUYs to `entry`/`add_on` and SELLs to
+`scale_out`/terminal `exit` while accumulating signed position quantity (`425-438`),
+and checks each transition's action, session, reason, execution price, and post-fill
+quantity (`440-453`). It also reconciles add-on count, first/last fill action,
+entry/exit sessions, symbols, execution prices, exit reason, and zero terminal
+quantity (`455-480`). The pre-existing fill friction replay validates the action-derived
+cash deltas before this function runs (`210-295`).
+
+## New Breakage
+
+None found in the requested fix-only scope. Same-session fills remain supported in their
+recorded causal order (`408-410`), while a sell before its corresponding open quantity
+fails (`432-436`). Zero-activity still exits through the explicit no-fill branch and
+requires no episodes plus unchanged terminal cash (`313-320`).
+
+## Out-of-Scope
+
+No provider, Docker, replay, test, or git operations were run. Report formulas, role
+projection, source-map identity, and unrelated V5 behavior were not re-reviewed.
+
+## Verdict
+
+**PASS.** The prior fail-closed quantity-path reconciliation finding is fixed; no new
+breakage was identified in the bounded re-review.

@@ -1,0 +1,661 @@
+diff --git a/.superpowers/sdd/2026-09-04-pit-optimizer-v5-campaign/controller-roles-report.md b/.superpowers/sdd/2026-09-04-pit-optimizer-v5-campaign/controller-roles-report.md
+new file mode 100644
+index 0000000..4416bb4
+--- /dev/null
++++ b/.superpowers/sdd/2026-09-04-pit-optimizer-v5-campaign/controller-roles-report.md
+@@ -0,0 +1,45 @@
++# Controller-authored role response implementation report
++
++Implemented against base `79d730bb67589f42fd0542d736a6d6fc8be74976` as the bounded controller-role increment from `controller-roles-brief.md`.
++
++## Result
++
++- Added `ControllerRoleTerminalAuthorityV5` as a third, distinct terminal provenance variant. It binds the exact call key, request, attempt facts, immutable raw response reference, and parsed artifact identity when accepted. Its invocation package requires the exact zero-provider-usage shape.
++- Persisted and loaded controller terminal authority through the existing canonical role-terminal envelope without changing ledger or fixture encodings.
++- Added `FileBackedControllerRoleInvokerV5`, restricted at construction to a `development_sp500_v2` manifest with `provider=None` and an absolute response directory.
++- Selected controller input by `<call-key-sha256>.json`, verified both call and request identities, sealed the first submitted bytes create-only in `LocalArtifactRepositoryV5`, and made all recovery use those sealed bytes.
++- Preserved response-schema and evidence-binding failures as zero-usage terminal attempts with no parsed artifact. Once submitted and sealed, changed input bytes are not silently retried as another response.
++- Added the `awaiting_controller_response` feedback-round result with the exact role, call digest, request digest, and durable request reference. Missing input produces no role completion, round outcome, experiment record, checkpoint, or cleanup event, leaving existing work available for normal resume.
++- Enforced terminal provenance by scope on both new completions and loaded completions: controller authority only for provider-free development scope, fixture authority only for provider-free production, and ledger authority for paid production.
++- Documented the response directory, exact JSON envelope, zero-provider provenance, and resume behavior in `docs/pit-optimizer-v5-operations.md`.
++
++## Changed files
++
++- `core/pit_optimizer_v5/provider.py`
++- `core/pit_optimizer_v5/artifacts.py`
++- `core/pit_optimizer_v5/runtime.py`
++- `core/pit_optimizer_v5/controller_roles.py`
++- `core/pit_optimizer_v5/__init__.py`
++- `docs/pit-optimizer-v5-operations.md`
++- `.superpowers/sdd/2026-09-04-pit-optimizer-v5-campaign/controller-roles-report.md`
++
++The pre-existing controller-owned `progress.md` modification was preserved and not staged.
++
++## Response contract
++
++For pending call digest `C`, the operator writes `<response-directory>/C.json`. The object has exactly `schema_version: 5`, `artifact_type: "controller_role_response"`, the pending `call_key_sha256`, the pending `request_sha256`, and `response`. `response` is the existing role parser's `{artifact, binding}` object. Documentation uses placeholders only and does not present fabricated execution identities.
++
++The first observed file bytes are sealed at `adapter-blobs/controller-role-responses/C.bin`. The terminal authority and attempt bind that raw digest. Recovery reads the sealed artifact first and does not reread a changed operator file.
++
++## Validation
++
++- In-memory Python compilation of the five changed Python modules: passed.
++- Ruff over the five changed Python modules: passed.
++- `git diff --check`: passed with only pre-existing Windows line-ending notices.
++- Narrow source review of scope/provenance acceptance, create-only sealing, parser failure terminalization, persisted completion recovery, and the pending return boundary: completed.
++
++No tests or synthetic probes were read, created, modified, or run. No Docker, network, provider, or agent operation was performed.
++
++## Pending integration
++
++This increment does not construct the full development composition or campaign loop and does not implement semantic skip. The controller must still wire this invoker into that future development-only composition, collect the required real development parent episodes, and handle the pending result at the higher campaign boundary.
+diff --git a/core/pit_optimizer_v5/__init__.py b/core/pit_optimizer_v5/__init__.py
+index de1b28c..d2a4fec 100644
+--- a/core/pit_optimizer_v5/__init__.py
++++ b/core/pit_optimizer_v5/__init__.py
+@@ -69,6 +69,7 @@ from .evaluator import (
+     SimulationRunnerV5,
+     SimulatorFactoryV5,
+ )
++from .controller_roles import FileBackedControllerRoleInvokerV5
+ from .runtime import (
+     CandidateExecutionAuthorityV5,
+     CandidateExecutionKeyV5,
+@@ -78,6 +79,7 @@ from .runtime import (
+     FeedbackRoundInputV5,
+     FeedbackRoundResultV5,
+     LeaseAwareCandidateRuntimeV5,
++    PendingControllerRoleV5,
+     RuntimeFailureV5,
+     run_feedback_round_v5,
+ )
+@@ -237,6 +239,7 @@ __all__ = [
+     "FeedbackRoundDependenciesV5",
+     "FeedbackRoundInputV5",
+     "FeedbackRoundResultV5",
++    "FileBackedControllerRoleInvokerV5",
+     "GitCandidateMaterializerV5",
+     "GitWorkspaceDriverV5",
+     "HypothesisV5",
+@@ -323,6 +326,7 @@ __all__ = [
+     "summarize_repository_v5",
+     "selected_scenario",
+     "run_feedback_round_v5",
++    "PendingControllerRoleV5",
+     "validate_campaign_evidence_v5",
+     "validate_campaign_manifest_bindings_v5",
+     "validate_owned_panel_plans_v5",
+diff --git a/core/pit_optimizer_v5/artifacts.py b/core/pit_optimizer_v5/artifacts.py
+index edfc19e..a4bba23 100644
+--- a/core/pit_optimizer_v5/artifacts.py
++++ b/core/pit_optimizer_v5/artifacts.py
+@@ -91,6 +91,7 @@ from core.pit_optimizer_v5.probes import ProbeObservationV5, SemanticFingerprint
+ from core.pit_optimizer_v5.search import ArchiveEntryV5, SearchStateV5
+ from core.pit_optimizer_v5.provider import (
+     AuthorizedRoleSlotV5,
++    ControllerRoleTerminalAuthorityV5,
+     ExistingPersistedRoleRequestV5,
+     FixtureRoleTerminalAuthorityV5,
+     FreshPersistedRoleRequestV5,
+@@ -2470,6 +2471,9 @@ class LocalArtifactRepositoryV5:
+         elif type(authority) is FixtureRoleTerminalAuthorityV5:
+             kind = "fixture_authority"
+             identity = authority.sha256
++        elif type(authority) is ControllerRoleTerminalAuthorityV5:
++            kind = "controller_authority"
++            identity = authority.sha256
+         else:
+             raise ValueError("role terminal authority is outside the closed V5 union")
+         primitive = {
+@@ -2505,6 +2509,15 @@ class LocalArtifactRepositoryV5:
+             elif kind == "fixture_authority":
+                 authority = _decode_dataclass(FixtureRoleTerminalAuthorityV5, envelope["authority"])
+                 identity = authority.sha256
++            elif kind == "controller_authority":
++                authority = _decode_dataclass(ControllerRoleTerminalAuthorityV5, envelope["authority"])
++                identity = authority.sha256
++                self.load_binary_state(
++                    namespace="controller-role-responses",
++                    key=authority.call_key_sha256,
++                    reference=authority.raw_response_ref,
++                    maximum_bytes=_MAX_ARTIFACT_BYTES,
++                )
+             else:
+                 raise ArtifactSchemaFailureV5(reference)
+         except ArtifactRepositoryFailureV5:
+@@ -2523,6 +2536,32 @@ class LocalArtifactRepositoryV5:
+             raise ArtifactNonCanonicalV5(reference)
+         return authority
+ 
++    def append_controller_role_response(self, *, call: RoleCallKeyV5, content: bytes) -> ArtifactRefV5:
++        """Seal the first exact local response bytes for a call; identical retries authenticate."""
++
++        if type(call) is not RoleCallKeyV5 or type(content) is not bytes:
++            raise ValueError("controller role response requires an exact call and immutable bytes")
++        return self.append_binary_state(namespace="controller-role-responses", key=call.sha256, content=content)
++
++    def load_controller_role_response(self, *, call: RoleCallKeyV5) -> tuple[ArtifactRefV5, bytes] | None:
++        """Load only an already sealed response selected by its exact call identity."""
++
++        if type(call) is not RoleCallKeyV5:
++            raise ValueError("controller role response requires an exact call")
++        relative = f"adapter-blobs/controller-role-responses/{call.sha256}.bin"
++        try:
++            content = self._read_relative(relative)
++        except ArtifactMissingV5:
++            return None
++        reference = ArtifactRefV5(relative, hashlib.sha256(content).hexdigest())
++        authenticated = self.load_binary_state(
++            namespace="controller-role-responses",
++            key=call.sha256,
++            reference=reference,
++            maximum_bytes=_MAX_ARTIFACT_BYTES,
++        )
++        return reference, authenticated
++
+     def append_role_artifact(
+         self,
+         *,
+diff --git a/core/pit_optimizer_v5/controller_roles.py b/core/pit_optimizer_v5/controller_roles.py
+new file mode 100644
+index 0000000..120d5a3
+--- /dev/null
++++ b/core/pit_optimizer_v5/controller_roles.py
+@@ -0,0 +1,188 @@
++"""Recoverable, file-backed controller responses for development feedback roles."""
++
++from __future__ import annotations
++
++from decimal import Decimal
++import json
++import math
++from pathlib import Path
++
++from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5
++from core.pit_optimizer_v5.contracts import ArtifactRefV5, CampaignManifestV5, canonical_sha256_v5
++from core.pit_optimizer_v5.provider import (
++    ControllerRoleResponsePendingV5,
++    ControllerRoleTerminalAuthorityV5,
++    ExistingPersistedRoleRequestV5,
++    FreshPersistedRoleRequestV5,
++    PersistedRoleRequestV5,
++    RoleAttemptFactsV5,
++    RoleEvidenceBindingFailureV5,
++    RoleFailureCode,
++    RoleInvocationPackageV5,
++    RoleReconciliationResultV5,
++    RoleResponseSchemaFailureV5,
++    RoleUsageFactsV5,
++    parse_and_bind_role_artifact,
++)
++
++
++_MAX_CONTROLLER_RESPONSE_BYTES = 4 * 1024 * 1024
++
++
++def _zero_usage() -> RoleUsageFactsV5:
++    return RoleUsageFactsV5(
++        external_attempt_count=0,
++        request_started=False,
++        response_received=False,
++        input_tokens=0,
++        output_tokens=0,
++        total_tokens=0,
++        cost_usd=Decimal("0"),
++        requested_model=None,
++        returned_model=None,
++        provider_request_id=None,
++    )
++
++
++def _decode_unique_json(raw: bytes) -> dict[str, object]:
++    def pairs(items: list[tuple[str, object]]) -> dict[str, object]:
++        result: dict[str, object] = {}
++        for key, value in items:
++            if key in result:
++                raise ValueError("duplicate controller response key")
++            result[key] = value
++        return result
++
++    if len(raw) > _MAX_CONTROLLER_RESPONSE_BYTES:
++        raise ValueError("controller response exceeds its byte bound")
++    decoded = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs)
++    if type(decoded) is not dict:
++        raise ValueError("controller response envelope must be an object")
++    return decoded
++
++
++class FileBackedControllerRoleInvokerV5:
++    """Consume exact local JSON envelopes without any external-provider activity.
++
++    The response directory contains ``<call-key-sha256>.json`` files with exactly
++    ``schema_version``, ``artifact_type``, ``call_key_sha256``,
++    ``request_sha256``, and ``response``. ``response`` is the existing role
++    response object accepted by :func:`parse_and_bind_role_artifact`.
++    """
++
++    def __init__(
++        self,
++        *,
++        repository: LocalArtifactRepositoryV5,
++        manifest: CampaignManifestV5,
++        response_directory: Path,
++    ) -> None:
++        directory = Path(response_directory)
++        if (
++            type(repository) is not LocalArtifactRepositoryV5
++            or type(manifest) is not CampaignManifestV5
++            or manifest.pit_data_scope != "development_sp500_v2"
++            or manifest.provider is not None
++            or not directory.is_absolute()
++        ):
++            raise ValueError("controller role invoker requires provider-free development scope and an absolute directory")
++        self._repository = repository
++        self._response_directory = directory
++
++    def _incoming_path(self, persisted: PersistedRoleRequestV5) -> Path:
++        return self._response_directory / f"{persisted.call.sha256}.json"
++
++    def _sealed(self, persisted: PersistedRoleRequestV5) -> tuple[ArtifactRefV5, bytes]:
++        prior = self._repository.load_controller_role_response(call=persisted.call)
++        if prior is not None:
++            return prior
++        incoming = self._incoming_path(persisted)
++        try:
++            with incoming.open("rb") as stream:
++                raw = stream.read(_MAX_CONTROLLER_RESPONSE_BYTES + 1)
++        except FileNotFoundError:
++            raise ControllerRoleResponsePendingV5(persisted.call) from None
++        if len(raw) > _MAX_CONTROLLER_RESPONSE_BYTES:
++            raise ValueError("controller response exceeds its byte bound")
++        reference = self._repository.append_controller_role_response(call=persisted.call, content=raw)
++        return reference, raw
++
++    def _terminal(self, persisted: PersistedRoleRequestV5) -> RoleInvocationPackageV5:
++        reference, raw = self._sealed(persisted)
++        response_sha256 = reference.sha256
++        artifact = None
++        outcome = "response_schema_failure"
++        failure_code = RoleFailureCode.RESPONSE_SCHEMA
++        try:
++            envelope = _decode_unique_json(raw)
++            if set(envelope) != {
++                "schema_version",
++                "artifact_type",
++                "call_key_sha256",
++                "request_sha256",
++                "response",
++            }:
++                raise ValueError("controller response envelope keys are invalid")
++            if envelope["schema_version"] != 5 or envelope["artifact_type"] != "controller_role_response":
++                raise ValueError("controller response envelope schema is invalid")
++            if (
++                envelope["call_key_sha256"] != persisted.call.sha256
++                or envelope["request_sha256"] != persisted.request.sha256
++            ):
++                raise RoleEvidenceBindingFailureV5(role=persisted.call.role)
++            if type(envelope["response"]) is not dict:
++                raise ValueError("controller response payload is invalid")
++            response_text = json.dumps(envelope["response"], sort_keys=True, separators=(",", ":"), ensure_ascii=False)
++            artifact = parse_and_bind_role_artifact(request=persisted.request, response_text=response_text)
++            outcome = "accepted"
++            failure_code = None
++        except RoleEvidenceBindingFailureV5:
++            outcome = "evidence_binding_failure"
++            failure_code = RoleFailureCode.EVIDENCE_BINDING
++        except (RoleResponseSchemaFailureV5, TypeError, ValueError, UnicodeError, json.JSONDecodeError):
++            pass
++        attempt = RoleAttemptFactsV5(
++            role=persisted.call.role,
++            attempt_kind=persisted.call.attempt_kind,
++            attempt_index=persisted.call.attempt_index,
++            request_sha256=persisted.request.sha256,
++            slot_id=None,
++            outcome=outcome,
++            failure_code=failure_code,
++            usage=_zero_usage(),
++            response_sha256=response_sha256,
++            artifact_sha256=None if artifact is None else canonical_sha256_v5(artifact),
++        )
++        authority = ControllerRoleTerminalAuthorityV5(
++            call_key_sha256=persisted.call.sha256,
++            request_sha256=persisted.request.sha256,
++            attempt_facts_sha256=attempt.sha256,
++            raw_response_ref=reference,
++            artifact_sha256=None if artifact is None else canonical_sha256_v5(artifact),
++        )
++        return RoleInvocationPackageV5(persisted.call, persisted.request, attempt, authority, artifact)
++
++    def invoke_once(
++        self,
++        persisted_request: FreshPersistedRoleRequestV5,
++        *,
++        deadline_monotonic: float,
++    ) -> RoleInvocationPackageV5:
++        if (
++            type(persisted_request) is not FreshPersistedRoleRequestV5
++            or type(deadline_monotonic) is not float
++            or not math.isfinite(deadline_monotonic)
++        ):
++            raise ValueError("controller invocation requires a fresh request and finite deadline")
++        return self._terminal(persisted_request)
++
++    def reconcile_once(
++        self,
++        persisted_request: ExistingPersistedRoleRequestV5,
++    ) -> RoleReconciliationResultV5:
++        if type(persisted_request) is not ExistingPersistedRoleRequestV5:
++            raise ValueError("controller reconciliation requires an existing request")
++        return self._terminal(persisted_request)
++
++
++__all__ = ["FileBackedControllerRoleInvokerV5"]
+diff --git a/core/pit_optimizer_v5/provider.py b/core/pit_optimizer_v5/provider.py
+index a1e4916..9684027 100644
+--- a/core/pit_optimizer_v5/provider.py
++++ b/core/pit_optimizer_v5/provider.py
+@@ -2419,7 +2419,37 @@ class FixtureRoleTerminalAuthorityV5:
+         return canonical_sha256_v5(self)
+ 
+ 
+-RoleTerminalAuthorityV5 = LedgerRoleTerminalAuthorityV5 | FixtureRoleTerminalAuthorityV5
++@dataclass(frozen=True, slots=True)
++class ControllerRoleTerminalAuthorityV5:
++    """Provider-free authority for an immutable controller-authored response."""
++
++    call_key_sha256: str
++    request_sha256: str
++    attempt_facts_sha256: str
++    raw_response_ref: ArtifactRefV5
++    artifact_sha256: str | None
++
++    def __post_init__(self) -> None:
++        _digest(self.call_key_sha256, "controller role terminal call key")
++        _digest(self.request_sha256, "controller role terminal request")
++        _digest(self.attempt_facts_sha256, "controller role terminal facts")
++        if (
++            type(self.raw_response_ref) is not ArtifactRefV5
++            or self.raw_response_ref.relative_path
++            != f"adapter-blobs/controller-role-responses/{self.call_key_sha256}.bin"
++        ):
++            raise ValueError("controller role terminal raw response is invalid")
++        if self.artifact_sha256 is not None:
++            _digest(self.artifact_sha256, "controller role terminal artifact")
++
++    @property
++    def sha256(self) -> str:
++        return canonical_sha256_v5(self)
++
++
++RoleTerminalAuthorityV5 = (
++    LedgerRoleTerminalAuthorityV5 | FixtureRoleTerminalAuthorityV5 | ControllerRoleTerminalAuthorityV5
++)
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -2490,6 +2520,16 @@ class RoleInvocationPackageV5:
+                 or self.attempt.usage != _zero_usage_facts()
+             ):
+                 raise ValueError("fixture terminal authority differs from its invocation")
++        elif type(authority) is ControllerRoleTerminalAuthorityV5:
++            if (
++                authority.call_key_sha256 != self.call.sha256
++                or authority.request_sha256 != self.request.sha256
++                or authority.attempt_facts_sha256 != self.attempt.sha256
++                or authority.artifact_sha256 != artifact_sha256
++                or self.attempt.usage != _zero_usage_facts()
++                or authority.raw_response_ref.sha256 != self.attempt.response_sha256
++            ):
++                raise ValueError("controller terminal authority differs from its invocation")
+         else:
+             raise ValueError("role invocation terminal authority is invalid")
+ 
+@@ -2548,6 +2588,16 @@ class RoleReconciliationFailureV5:
+ RoleReconciliationResultV5 = RoleInvocationPackageV5 | RoleReconciliationFailureV5
+ 
+ 
++class ControllerRoleResponsePendingV5(Exception):
++    """The exact durable role request is waiting for local controller input."""
++
++    def __init__(self, call: RoleCallKeyV5) -> None:
++        if type(call) is not RoleCallKeyV5:
++            raise ValueError("pending controller response requires an exact call key")
++        self.call = call
++        super().__init__(f"controller response pending for {call.role}")
++
++
+ @runtime_checkable
+ class RecoverableRoleInvokerV5(Protocol):
+     """Crash-safe role boundary supplied by Task-9 production composition.
+@@ -3600,6 +3650,8 @@ __all__ = [
+     "ExperimentPredictionAggregateV5",
+     "ExperimentSemanticDifferenceAggregateV5",
+     "ExistingPersistedRoleRequestV5",
++    "ControllerRoleResponsePendingV5",
++    "ControllerRoleTerminalAuthorityV5",
+     "FailureStageV5",
+     "FixtureRoleTerminalAuthorityV5",
+     "FixtureRoleRunnerV5",
+diff --git a/core/pit_optimizer_v5/runtime.py b/core/pit_optimizer_v5/runtime.py
+index 0ce3f09..a38f6db 100644
+--- a/core/pit_optimizer_v5/runtime.py
++++ b/core/pit_optimizer_v5/runtime.py
+@@ -71,9 +71,12 @@ from core.pit_optimizer_v5.probes import (
+     classify_semantic_fingerprints_v5,
+ )
+ from core.pit_optimizer_v5.provider import (
++    ControllerRoleResponsePendingV5,
++    ControllerRoleTerminalAuthorityV5,
+     ExistingPersistedRoleRequestV5,
+     FreshPersistedRoleRequestV5,
+     FixtureRoleTerminalAuthorityV5,
++    LedgerRoleTerminalAuthorityV5,
+     LedgerBackedRoleInvokerV5,
+     PersistedRoleRequestV5,
+     RecoverableRoleInvokerV5,
+@@ -143,6 +146,7 @@ RuntimeStatusV5 = Literal[
+     "novelty_exhausted",
+     "critic_unavailable",
+     "failed",
++    "awaiting_controller_response",
+ ]
+ CandidateRuntimeStatusV5 = Literal[
+     "invalid",
+@@ -234,6 +238,28 @@ class RuntimeFailureV5:
+             _digest(self.experiment_id, "runtime failure experiment")
+ 
+ 
++@dataclass(frozen=True, slots=True)
++class PendingControllerRoleV5:
++    role: RoleNameV5
++    call_key_sha256: str
++    request_sha256: str
++    request_ref: ArtifactRefV5
++
++    def __post_init__(self) -> None:
++        if self.role not in {"investigator", "author", "critic"}:
++            raise ValueError("pending controller role is invalid")
++        _digest(self.call_key_sha256, "pending controller call key")
++        _digest(self.request_sha256, "pending controller request")
++        if type(self.request_ref) is not ArtifactRefV5:
++            raise ValueError("pending controller request reference is invalid")
++
++
++class _RuntimePendingControllerResponse(Exception):
++    def __init__(self, pending: PendingControllerRoleV5) -> None:
++        self.pending = pending
++        super().__init__(pending.role)
++
++
+ @dataclass(frozen=True, slots=True)
+ class OwnedLeaseV5:
+     payload: ResourceLeasePayloadV5
+@@ -409,6 +435,7 @@ class FeedbackRoundResultV5:
+     cleanup: CleanupResultPayloadV5 | None
+     failure: RuntimeFailureV5 | None
+     cleanup_failure: RuntimeFailureV5 | None = None
++    pending_controller_role: PendingControllerRoleV5 | None = None
+ 
+     def __post_init__(self) -> None:
+         if self.status not in {
+@@ -417,6 +444,7 @@ class FeedbackRoundResultV5:
+             "novelty_exhausted",
+             "critic_unavailable",
+             "failed",
++            "awaiting_controller_response",
+         }:
+             raise ValueError("feedback-round result status is invalid")
+         if type(self.campaign_id) is not str or not self.campaign_id:
+@@ -440,6 +468,16 @@ class FeedbackRoundResultV5:
+             or self.cleanup_failure.code not in {"cleanup_failed", "deadline_exceeded", "invalid_dependency_result"}
+         ):
+             raise ValueError("feedback-round cleanup failure is invalid")
++        if self.status == "awaiting_controller_response":
++            if (
++                type(self.pending_controller_role) is not PendingControllerRoleV5
++                or self.failure is not None
++                or self.terminal_outcome is not None
++                or self.checkpoint is not None
++            ):
++                raise ValueError("pending feedback round has invalid terminal state")
++        elif self.pending_controller_role is not None:
++            raise ValueError("non-pending feedback round cannot carry a pending controller role")
+         if self.status == "failed":
+             if self.failure is None:
+                 raise ValueError("failed feedback round requires its typed primary failure")
+@@ -1053,9 +1091,7 @@ class _Runtime:
+             package = self.dependencies.persistence.load_role_invocation(completed)
+             if package.call != call or package.request != request:
+                 raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result", role=role))
+-            if (type(package.terminal_authority) is FixtureRoleTerminalAuthorityV5) != (
+-                self.inputs.manifest.provider is None
+-            ):
++            if not self._valid_terminal_authority(package):
+                 raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result", role=role))
+             return package
+ 
+@@ -1069,19 +1105,34 @@ class _Runtime:
+             elif type(persisted) is ExistingPersistedRoleRequestV5:
+                 reconciled = self.dependencies.invoker.reconcile_once(persisted)
+                 if type(reconciled) is RoleReconciliationFailureV5:
++                    if (
++                        reconciled.failure_code == "pending"
++                        and self.inputs.manifest.pit_data_scope == "development_sp500_v2"
++                        and self.inputs.manifest.provider is None
++                    ):
++                        raise ControllerRoleResponsePendingV5(call)
+                     raise _RuntimeAbort(RuntimeFailureV5(role, "role_unrecoverable", role=role))  # type: ignore[arg-type]
+                 package = reconciled
+             else:
+                 raise _RuntimeAbort(RuntimeFailureV5(role, "invalid_dependency_result", role=role))  # type: ignore[arg-type]
+         except _RuntimeAbort:
+             raise
++        except ControllerRoleResponsePendingV5 as pending:
++            if pending.call != call:
++                raise _RuntimeAbort(RuntimeFailureV5(role, "invalid_dependency_result", role=role)) from None  # type: ignore[arg-type]
++            raise _RuntimePendingControllerResponse(
++                PendingControllerRoleV5(
++                    role=role,
++                    call_key_sha256=call.sha256,
++                    request_sha256=request.sha256,
++                    request_ref=persisted.reference,
++                )
++            ) from None
+         except BaseException:
+             raise _RuntimeAbort(RuntimeFailureV5(role, "role_unrecoverable", role=role)) from None  # type: ignore[arg-type]
+         if type(package) is not RoleInvocationPackageV5 or package.call != call or package.request != request:
+             raise _RuntimeAbort(RuntimeFailureV5(role, "invalid_dependency_result", role=role))  # type: ignore[arg-type]
+-        if (type(package.terminal_authority) is FixtureRoleTerminalAuthorityV5) != (
+-            self.inputs.manifest.provider is None
+-        ):
++        if not self._valid_terminal_authority(package):
+             raise _RuntimeAbort(RuntimeFailureV5(role, "invalid_dependency_result", role=role))  # type: ignore[arg-type]
+         persisted_invocation = self.dependencies.persistence.persist_role_invocation(
+             call=call,
+@@ -1092,6 +1143,14 @@ class _Runtime:
+         self._check_finished(deadline)
+         return package
+ 
++    def _valid_terminal_authority(self, package: RoleInvocationPackageV5) -> bool:
++        authority_type = type(package.terminal_authority)
++        if self.inputs.manifest.pit_data_scope == "development_sp500_v2":
++            return self.inputs.manifest.provider is None and authority_type is ControllerRoleTerminalAuthorityV5
++        if self.inputs.manifest.provider is None:
++            return authority_type is FixtureRoleTerminalAuthorityV5
++        return authority_type is LedgerRoleTerminalAuthorityV5
++
+     def _recover_projection(self) -> SearchProjectionV5:
+         reducer = self.dependencies.archive_reducers.recovery_reducer(self.inputs)
+         checkpoint, state = self.dependencies.persistence.recover_projection(reducer)
+@@ -2849,6 +2908,19 @@ def run_feedback_round_v5(
+     try:
+         runtime = _Runtime(inputs, dependencies, campaign_deadline_monotonic=campaign_deadline_monotonic)
+         return runtime.run()
++    except _RuntimePendingControllerResponse as pending:
++        return FeedbackRoundResultV5(
++            status="awaiting_controller_response",
++            campaign_id=inputs.campaign_id,
++            round_index=inputs.round_index,
++            parent=(None if runtime is None else runtime.parent),
++            terminal_outcome=None,
++            record_refs=(() if runtime is None else runtime.record_refs),
++            checkpoint=None,
++            cleanup=None,
++            failure=None,
++            pending_controller_role=pending.pending,
++        )
+     except _RuntimeAbort as abort:
+         if runtime is None:
+             return bare_failure(abort.failure)
+@@ -2890,6 +2962,7 @@ __all__ = [
+     "OwnedCleanupV5",
+     "OwnedLeaseV5",
+     "PaidRoleRecoveryRequiredV5",
++    "PendingControllerRoleV5",
+     "RoleRequestFactoryV5",
+     "RoundPersistenceV5",
+     "RuntimeCancellationV5",
+diff --git a/docs/pit-optimizer-v5-operations.md b/docs/pit-optimizer-v5-operations.md
+index f6f6886..6df1814 100644
+--- a/docs/pit-optimizer-v5-operations.md
++++ b/docs/pit-optimizer-v5-operations.md
+@@ -135,3 +135,39 @@ Completed rounds with complete cleanup are reused. `no_novel_hypothesis` advance
+ Campaign and round start times persist in epoch milliseconds. Resume subtracts elapsed wall time, including downtime, and passes the smaller remaining allowance to the runtime's monotonic deadline. It never resets those allowances or requires a full round's time to remain. This assumes an accurate host wall clock; a clock before a saved start is rejected. Cleanup retains its separate manifest timeout and can finish after the work deadline. Runtime calls remain responsible for honoring their supplied stage deadlines; this is not an external process watchdog.
+ 
+ Resume uses the original config and owner. A round with a saved start but no round journal is reported as uncertain and is not restarted automatically; inspect its paid-request/reservation state using the existing recovery boundary before taking further action. Existing journaled work uses the runtime's reconciliation path. Do not delete launch records or create a new campaign to evade unsettled work or reset budgets. Held-out confirmation, qualification, full replay, and live application remain separate explicit stages.
++
++### Controller-authored development role responses
++
++For a provider-free manifest with `pit_data_scope=development_sp500_v2`, construct
++`FileBackedControllerRoleInvokerV5` with an absolute response directory. For each
++durable role request, place one file named `<call-key-sha256>.json` in that
++directory. Its JSON object has exactly these fields:
++
++```json
++{
++  "schema_version": 5,
++  "artifact_type": "controller_role_response",
++  "call_key_sha256": "<exact call key from the pending result>",
++  "request_sha256": "<exact request digest from the pending result>",
++  "response": {"artifact": {}, "binding": {}}
++}
++```
++
++`response` is the existing investigator, author, or critic response envelope and
++must satisfy that request's schema and evidence binding. The placeholders above
++describe the contract; they are not execution identities or a valid role result.
++
++When the file is absent, `run_feedback_round_v5` returns
++`awaiting_controller_response` with the role, call key, request digest, and durable
++request reference. It writes no role completion, round outcome, experiment, or
++checkpoint. Resume with the same repository and inputs after writing the file.
++The first bytes found for that exact call are sealed create-only in the repository;
++all later recovery reads those sealed bytes. A malformed or mismatched submitted
++response therefore remains a truthful failed terminal attempt and cannot be
++silently replaced by editing the input file.
++
++This path records exact zero external-provider usage. It is controller-authored
++development input, distinct from deterministic synthetic fixtures, and it does
++not run an automatic external-model campaign. Production provider-free execution
++continues to require fixture authority, while paid production continues to require
++ledger authority.

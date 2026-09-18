@@ -1,0 +1,14 @@
+"""Additional bounded public notices, imported downloader preserves create-only bytes."""
+import runpy
+from pathlib import Path
+
+acquire = runpy.run_path(str(Path(__file__).with_name('nasdaq-acquisition-download.py')))['acquire']
+SOURCES = [
+    ('public-nasdaq-2023-amended.html','https://www.nasdaq.com/press-release/update%3A-annual-changes-to-the-nasdaq-100r-index-2023-12-12'),
+    ('public-nasdaq-tri-anss-20250728.html','https://www.nasdaq.com/press-release/thomson-reuters-corp-join-nasdaq-100-indexr-beginning-july-28-2025-2025-07-18'),
+    ('public-nasdaq-ilmn-gral-ECA2024-262.html','https://www.nasdaqtrader.com/TraderNews.aspx?id=ECA2024-262'),
+    ('public-hkex-ishares-nasdaq100-2024-interim.pdf','https://www1.hkexnews.hk/listedco/listconews/sehk/2024/0830/2024083001668.pdf'),
+    ('public-wikipedia-20210104-revision-lookup.json','https://en.wikipedia.org/w/api.php?action=query&format=json&prop=revisions&titles=Nasdaq-100&rvprop=ids%7Ctimestamp&rvstart=2021-01-04T00%3A00%3A00Z&rvlimit=1'),
+]
+for source in SOURCES:
+    acquire(*source)

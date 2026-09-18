@@ -1,0 +1,677 @@
+--- a/core/pit_optimizer_v5/historical_verification.py.pre-h3c
++++ b/core/pit_optimizer_v5/historical_verification.py
+@@ -2,12 +2,14 @@
+ 
+ from __future__ import annotations
+ 
++import hashlib
+ import ntpath
++import re
+ from dataclasses import dataclass, fields, replace
+ from pathlib import Path, PurePosixPath
+ from typing import Literal
+ 
+-from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5
++from core.pit_optimizer_v5.artifacts import ArtifactMissingV5, LocalArtifactRepositoryV5
+ from core.pit_optimizer_v5.candidate_ir import (
+     RenderedVariantV5,
+     StructuralTemplateV5,
+@@ -86,7 +88,12 @@
+     WorkspaceReadyRecordV5,
+ )
+ from core.pit_optimizer_v5.probes import PROBE_SUITE_ID_V5
+-from core.pit_optimizer_v5.provider import AuthorRoleInputV5
++from core.pit_optimizer_v5.provider import (
++    AuthorRoleInputV5,
++    RoleCallKeyV5,
++    RoleInvocationPackageV5,
++    RoleRequestV5,
++)
+ from core.pit_optimizer_v5.sandbox import (
+     derive_execution_lease_id_v5,
+     derive_sandbox_mount_authorities_v5,
+@@ -291,6 +298,426 @@
+             or not self.cleanup.cleanup_complete
+         ):
+             raise ValueError("completed historical round resource facts are invalid")
++
++
++def _existing_names_v5(
++    repository: LocalArtifactRepositoryV5,
++    parts: tuple[str, ...],
++) -> tuple[str, ...]:
++    try:
++        return repository._names(parts)
++    except ArtifactMissingV5:
++        return ()
++
++
++def _existing_round_state_v5(
++    repository: LocalArtifactRepositoryV5,
++    manifest: CampaignManifestV5,
++) -> tuple[int, ...]:
++    """Enumerate every selected launch/start/event slot without repair."""
++
++    if type(repository) is not LocalArtifactRepositoryV5 or type(manifest) is not CampaignManifestV5:
++        raise ValueError("historical round census authority is invalid")
++
++    def selected_records(namespace: str) -> dict[int, CampaignRoundLaunchV5]:
++        names = set(
++            _existing_names_v5(repository, ("adapter-state", namespace))
++        ) | set(
++            _existing_names_v5(
++                repository,
++                ("adapter-state-authority", namespace),
++            )
++        )
++        selected: dict[int, CampaignRoundLaunchV5] = {}
++        for name in sorted(names):
++            if re.fullmatch(r"[0-9a-f]{64}\.json", name) is None:
++                raise ValueError("historical round census filename is noncanonical")
++            key = name.removesuffix(".json")
++            record = repository.load_typed_state(
++                namespace=namespace,
++                key=key,
++                value_type=CampaignRoundLaunchV5,
++                repair=False,
++            )
++            if record is None:
++                raise ValueError("observed historical round state disappeared")
++            selected_key = canonical_sha256_v5(
++                {
++                    "campaign_manifest_sha256": manifest.sha256,
++                    "round_index": record.round_index,
++                }
++            )
++            if key != selected_key:
++                continue
++            if record.round_index > manifest.search.max_feedback_rounds:
++                raise ValueError("historical round state exceeds the manifest cap")
++            if record.round_index in selected:
++                raise ValueError("historical round state is duplicated")
++            selected[record.round_index] = record
++        return selected
++
++    launches = selected_records("campaign-round")
++    starts = selected_records("campaign-round-started")
++    event_names = _existing_names_v5(
++        repository,
++        ("events", manifest.campaign_id),
++    )
++    observed_event_rounds: set[int] = set()
++    for name in event_names:
++        if re.fullmatch(r"[0-9]{4,}", name) is None:
++            raise ValueError("historical event round directory is noncanonical")
++        round_index = int(name)
++        if round_index < 1 or name != f"{round_index:04d}":
++            raise ValueError("historical event round directory is noncanonical")
++        if round_index > manifest.search.max_feedback_rounds:
++            raise ValueError("historical event round exceeds the manifest cap")
++        observed_event_rounds.add(round_index)
++
++    started_rounds: list[int] = []
++    for round_index in range(1, manifest.search.max_feedback_rounds + 1):
++        key = canonical_sha256_v5(
++            {
++                "campaign_manifest_sha256": manifest.sha256,
++                "round_index": round_index,
++            }
++        )
++        launch = repository.load_typed_state(
++            namespace="campaign-round",
++            key=key,
++            value_type=CampaignRoundLaunchV5,
++            repair=False,
++        )
++        started = repository.load_typed_state(
++            namespace="campaign-round-started",
++            key=key,
++            value_type=CampaignRoundLaunchV5,
++            repair=False,
++        )
++        events = repository.load_round_events(
++            campaign_id=manifest.campaign_id,
++            round_index=round_index,
++        )
++        if any(
++            event.campaign_id != manifest.campaign_id
++            or event.round_index != round_index
++            for event in events
++        ):
++            raise ValueError("historical event journal is stored under a foreign round")
++        if launch != launches.get(round_index) or started != starts.get(round_index):
++            raise ValueError("historical round census differs from its canonical key")
++        if launch is None:
++            if started is not None or events or round_index in observed_event_rounds:
++                raise ValueError("historical future round has durable pending state")
++            continue
++        if started is None or not events:
++            raise ValueError("historical round launch is not durably settled")
++        started_rounds.append(round_index)
++    return tuple(started_rounds)
++
++
++def _existing_campaign_role_requests_v5(
++    repository: LocalArtifactRepositoryV5,
++    manifest: CampaignManifestV5,
++) -> tuple[tuple[ArtifactRefV5, RoleCallKeyV5, RoleRequestV5], ...]:
++    result: list[tuple[ArtifactRefV5, RoleCallKeyV5, RoleRequestV5]] = []
++    for name in _existing_names_v5(repository, ("roles", "requests")):
++        if re.fullmatch(r"[0-9a-f]{64}\.json", name) is None:
++            raise ValueError("historical role request filename is noncanonical")
++        relative = f"roles/requests/{name}"
++        raw = repository._read_relative(relative)
++        reference = ArtifactRefV5(relative, hashlib.sha256(raw).hexdigest())
++        call, request = repository._load_role_request_entry(reference)
++        if call.campaign_id != manifest.campaign_id:
++            continue
++        if call.round_index > manifest.search.max_feedback_rounds:
++            raise ValueError("historical role request exceeds the manifest cap")
++        result.append((reference, call, request))
++    return tuple(sorted(result, key=lambda item: item[1].sha256))
++
++
++def _existing_campaign_execution_payloads_v5(
++    repository: LocalArtifactRepositoryV5,
++    manifest: CampaignManifestV5,
++) -> tuple[CandidateExecutionAuthorityV5, ...]:
++    result: list[CandidateExecutionAuthorityV5] = []
++    for name in _existing_names_v5(
++        repository,
++        ("payloads", "candidate_execution"),
++    ):
++        if re.fullmatch(r"[0-9a-f]{64}\.json", name) is None:
++            raise ValueError("historical execution payload filename is noncanonical")
++        reference = ArtifactRefV5(
++            f"payloads/candidate_execution/{name}",
++            name.removesuffix(".json"),
++        )
++        payload = repository.load_round_payload(
++            reference,
++            expected_kind="candidate_execution",
++        )
++        if type(payload) is not CandidateExecutionAuthorityV5:
++            raise ValueError("historical execution payload type is invalid")
++        if payload.campaign_id != manifest.campaign_id:
++            continue
++        if payload.round_index > manifest.search.max_feedback_rounds:
++            raise ValueError("historical execution payload exceeds the manifest cap")
++        result.append(payload)
++    return tuple(
++        sorted(
++            result,
++            key=lambda item: (item.round_index, item.sha256),
++        )
++    )
++
++
++_HistoricalReservationRecordV5 = (
++    WorkspaceLeaseRecordV5 | MountReservationRecordV5 | ExecutionReservationRecordV5
++)
++
++
++def _existing_reservation_states_v5(
++    repository: LocalArtifactRepositoryV5,
++    *,
++    namespace: str,
++    value_type: type[_HistoricalReservationRecordV5],
++) -> tuple[tuple[str, _HistoricalReservationRecordV5], ...]:
++    allowed: dict[str, type[_HistoricalReservationRecordV5]] = {
++        "workspace-reservation": WorkspaceLeaseRecordV5,
++        "sandbox-mount-reservation": MountReservationRecordV5,
++        "container-reservation": ExecutionReservationRecordV5,
++    }
++    if allowed.get(namespace) is not value_type:
++        raise ValueError("historical reservation census namespace is unsupported")
++    names = set(
++        _existing_names_v5(repository, ("adapter-state", namespace))
++    ) | set(
++        _existing_names_v5(
++            repository,
++            ("adapter-state-authority", namespace),
++        )
++    )
++    result: list[tuple[str, _HistoricalReservationRecordV5]] = []
++    for name in sorted(names):
++        if re.fullmatch(r"[0-9a-f]{64}\.json", name) is None:
++            raise ValueError("historical reservation filename is noncanonical")
++        key = name.removesuffix(".json")
++        record = repository.load_typed_state(
++            namespace=namespace,
++            key=key,
++            value_type=value_type,
++            repair=False,
++        )
++        if record is None:
++            raise ValueError("observed historical reservation disappeared")
++        expected_key = (
++            record.lease.lease_token_sha256
++            if type(record) is WorkspaceLeaseRecordV5
++            else record.output_authority_sha256
++            if type(record) is MountReservationRecordV5
++            else record.command_sha256
++        )
++        if key != expected_key:
++            raise ValueError("historical reservation key differs from its value")
++        result.append((key, record))
++    return tuple(result)
++
++
++def _authenticate_completed_history_census_v5(
++    *,
++    repository: LocalArtifactRepositoryV5,
++    manifest: CampaignManifestV5,
++    rounds: tuple[CompletedHistoricalRoundResourcesV5, ...],
++) -> tuple[RoleInvocationPackageV5, ...]:
++    """Bind all selected requests, executions and reservations to journal facts."""
++
++    if (
++        type(rounds) is not tuple
++        or any(type(item) is not CompletedHistoricalRoundResourcesV5 for item in rounds)
++        or tuple(item.round_authority.owner.round_index for item in rounds)
++        != tuple(sorted(item.round_authority.owner.round_index for item in rounds))
++    ):
++        raise ValueError("historical completed-round census authority is invalid")
++    by_round = {
++        item.round_authority.owner.round_index: item
++        for item in rounds
++    }
++    if len(by_round) != len(rounds):
++        raise ValueError("historical completed-round census is duplicated")
++
++    packages: list[RoleInvocationPackageV5] = []
++    journal_requests: list[tuple[ArtifactRefV5, RoleCallKeyV5, RoleRequestV5]] = []
++    indexed_executions: list[CandidateExecutionAuthorityV5] = []
++    for round_index in range(1, manifest.search.max_feedback_rounds + 1):
++        indexed = repository.verify_candidate_execution_index(
++            campaign_id=manifest.campaign_id,
++            round_index=round_index,
++        )
++        if any(
++            type(item) is not CandidateExecutionAuthorityV5
++            or item.campaign_id != manifest.campaign_id
++            or item.round_index != round_index
++            for item in indexed
++        ):
++            raise ValueError("historical execution index is foreign")
++        completed = by_round.get(round_index)
++        expected = (
++            ()
++            if completed is None
++            else tuple(
++                item.authority
++                for item in completed.round_authority.execution_history
++            )
++        )
++        if indexed != expected:
++            raise ValueError("historical execution index differs from H1 authority")
++        indexed_executions.extend(indexed)
++        if completed is None:
++            continue
++        for event, payload in zip(
++            completed.events,
++            completed.payloads,
++            strict=True,
++        ):
++            if (
++                event.campaign_id != manifest.campaign_id
++                or event.round_index != round_index
++            ):
++                raise ValueError("historical event journal is foreign")
++            if type(payload) is not RoleCompletionPayloadV5:
++                continue
++            package = repository.load_role_invocation(payload)
++            if (
++                payload.campaign_id != manifest.campaign_id
++                or payload.round_index != round_index
++                or package.call.campaign_id != manifest.campaign_id
++                or package.call.round_index != round_index
++                or package.call.sha256 != payload.call_key_sha256
++                or package.request.sha256 != payload.request_sha256
++            ):
++                raise ValueError("historical role completion is foreign")
++            packages.append(package)
++            journal_requests.append(
++                (payload.request_ref, package.call, package.request)
++            )
++
++    observed_requests = _existing_campaign_role_requests_v5(repository, manifest)
++    ordered_journal_requests = tuple(
++        sorted(journal_requests, key=lambda item: item[1].sha256)
++    )
++    if (
++        len({item[1].sha256 for item in journal_requests})
++        != len(journal_requests)
++        or observed_requests != ordered_journal_requests
++    ):
++        raise ValueError("historical role requests differ from journal completions")
++
++    observed_executions = _existing_campaign_execution_payloads_v5(
++        repository,
++        manifest,
++    )
++    ordered_indexed_executions = tuple(
++        sorted(
++            indexed_executions,
++            key=lambda item: (item.round_index, item.sha256),
++        )
++    )
++    if observed_executions != ordered_indexed_executions:
++        raise ValueError("historical execution payloads differ from the journal index")
++
++    workspace_states = _existing_reservation_states_v5(
++        repository,
++        namespace="workspace-reservation",
++        value_type=WorkspaceLeaseRecordV5,
++    )
++    mount_states = _existing_reservation_states_v5(
++        repository,
++        namespace="sandbox-mount-reservation",
++        value_type=MountReservationRecordV5,
++    )
++    execution_states = _existing_reservation_states_v5(
++        repository,
++        namespace="container-reservation",
++        value_type=ExecutionReservationRecordV5,
++    )
++
++    selected_workspaces: dict[str, WorkspaceLeaseRecordV5] = {}
++    for key, record in workspace_states:
++        if type(record) is not WorkspaceLeaseRecordV5:
++            raise ValueError("historical workspace reservation type is invalid")
++        owner = record.lease.owner
++        if owner.campaign_id != manifest.campaign_id:
++            continue
++        completed = by_round.get(owner.round_index)
++        if completed is None or owner != completed.round_authority.owner:
++            raise ValueError("historical workspace reservation has foreign ownership")
++        selected_workspaces[key] = record
++
++    expected_workspace_keys: set[str] = set()
++    expected_mounts: dict[str, MountReservationRecordV5] = {}
++    expected_executions: dict[str, ExecutionReservationRecordV5] = {}
++    for completed in rounds:
++        round_authority = completed.round_authority
++        for workspace in round_authority.workspace_history:
++            key = workspace.lease_token_sha256
++            record = selected_workspaces.get(key)
++            if (
++                key in expected_workspace_keys
++                or record is None
++                or record.driver_identity_sha256
++                != round_authority.expected_workspace_identity_sha256
++                or record.lease.payload != workspace.payload
++                or record.lease.sha256 != workspace.lease_sha256
++                or record.lease.owner != round_authority.owner
++                or record.lease.owner.sha256 != workspace.owner_sha256
++                or record.lease.workspace_root_identity_sha256
++                != workspace.workspace_root_identity_sha256
++                or record.lease.workspace_root_path_sha256
++                != workspace.workspace_root_path_sha256
++                or record.lease.workspace_relative_path
++                != workspace.workspace_relative_path
++                or record.lease.lease_token_sha256 != workspace.lease_token_sha256
++                or record.lease.parent_revision_sha256
++                != workspace.parent_revision_sha256
++                or record.lease.child_revision_sha256
++                != workspace.child_revision_sha256
++            ):
++                raise ValueError("historical workspace reservation differs from journal authority")
++            expected_workspace_keys.add(key)
++        for execution in completed.execution_history:
++            mount_key = execution.mount_reservation.output_authority_sha256
++            execution_key = execution.reservation.command_sha256
++            if mount_key in expected_mounts or execution_key in expected_executions:
++                raise ValueError("historical execution reservation identity is reused")
++            expected_mounts[mount_key] = execution.mount_reservation
++            expected_executions[execution_key] = execution.reservation
++    if set(selected_workspaces) != expected_workspace_keys:
++        raise ValueError("historical workspace reservation is unjournaled or unsupported")
++
++    def selected_owned_records(
++        records: tuple[tuple[str, _HistoricalReservationRecordV5], ...],
++    ) -> dict[str, _HistoricalReservationRecordV5]:
++        selected: dict[str, _HistoricalReservationRecordV5] = {}
++        for key, record in records:
++            if type(record) not in {
++                MountReservationRecordV5,
++                ExecutionReservationRecordV5,
++            }:
++                raise ValueError("historical execution reservation type is invalid")
++            owner = record.owner
++            if owner.campaign_id != manifest.campaign_id:
++                continue
++            completed = by_round.get(owner.round_index)
++            if completed is None or owner != completed.round_authority.owner:
++                raise ValueError("historical execution reservation has foreign ownership")
++            selected[key] = record
++        return selected
++
++    selected_mounts = selected_owned_records(mount_states)
++    selected_executions = selected_owned_records(execution_states)
++    if selected_mounts != expected_mounts:
++        raise ValueError("historical mount reservations differ from journal authority")
++    if selected_executions != expected_executions:
++        raise ValueError("historical container reservations differ from journal authority")
++    return tuple(packages)
+ 
+ 
+ def _campaign_authorities(authenticated: AuthenticatedCampaignManifestV5) -> CampaignAuthoritiesV5:
+--- a/core/pit_optimizer_v5/development_preparation.py.pre-h3c
++++ b/core/pit_optimizer_v5/development_preparation.py
+@@ -413,6 +413,129 @@
+         response_ref, raw = sealed
+         if _classify_controller_response_v5(persisted=persisted, reference=response_ref, raw=raw) != package:
+             raise ValueError("controller package differs from exact sealed response")
++
++
++def authenticate_completed_development_history_v5(repository, manifest) -> None:
++    """Authenticate one completed development campaign without repair or adapters."""
++
++    from core.pit_optimizer_v5.contracts import CampaignManifestV5
++    from core.pit_optimizer_v5.historical_verification import (
++        _authenticate_completed_history_census_v5,
++        _campaign_authorities,
++        _existing_round_state_v5,
++        authenticate_completed_historical_round_resources_v5,
++        authenticate_historical_round_v5,
++    )
++    from core.pit_optimizer_v5.manifest import authenticate_campaign_manifest_v5
++    from core.pit_optimizer_v5.memory import RoundOutcomePayloadV5
++    from core.pit_optimizer_v5.operations import CampaignLaunchV5
++    from core.pit_optimizer_v5.production_runtime import LocalArchiveReducerFactoryV5
++
++    if type(repository) is not LocalArtifactRepositoryV5 or type(manifest) is not CampaignManifestV5:
++        raise ValueError("completed development history authority is invalid")
++    require_development_v5(manifest)
++    launch = repository.load_typed_state(
++        namespace="campaign-launch",
++        key=manifest.sha256,
++        value_type=CampaignLaunchV5,
++        repair=False,
++    )
++    if launch is None or launch.manifest_ref.sha256 != manifest.sha256:
++        raise ValueError("completed development history lacks its original campaign launch")
++    authenticated = authenticate_campaign_manifest_v5(
++        repository=repository,
++        manifest_ref=launch.manifest_ref,
++    )
++    if authenticated.manifest != manifest:
++        raise ValueError("completed development history differs from its original manifest")
++    authorities = _campaign_authorities(authenticated)
++    original_config = load_development_config_v5(
++        repository,
++        authorities,
++        launch.adapter_config_ref,
++    )
++
++    round_indices = _existing_round_state_v5(repository, manifest)
++    if not round_indices:
++        raise ValueError("completed development history has no settled round")
++    rounds = []
++    for round_index in round_indices:
++        round_authority = authenticate_historical_round_v5(
++            repository=repository,
++            manifest=manifest,
++            round_index=round_index,
++        )
++        completed = authenticate_completed_historical_round_resources_v5(
++            repository=repository,
++            manifest=manifest,
++            round_index=round_index,
++        )
++        if (
++            completed.round_authority != round_authority
++            or round_authority.authenticated_manifest != authenticated
++            or round_authority.campaign_launch != launch
++            or round_authority.original_config_ref != launch.adapter_config_ref
++            or round_authority.original_config != original_config
++        ):
++            raise ValueError("completed round differs from its original H1 authority")
++        rounds.append(completed)
++
++    checkpoint = repository.load_checkpoint()
++    records = (
++        ()
++        if checkpoint is None
++        else tuple(repository.load_experiment(reference) for reference in checkpoint.record_refs)
++    )
++    actual_rounds = set(round_indices)
++    if any(record.round_index not in actual_rounds for record in records):
++        raise ValueError("checkpoint record belongs to an unstarted historical round")
++    record_rounds = {record.round_index for record in records}
++    for completed in rounds:
++        round_index = completed.round_authority.owner.round_index
++        outcomes = tuple(
++            payload
++            for payload in completed.payloads
++            if type(payload) is RoundOutcomePayloadV5
++        )
++        if any(
++            outcome.campaign_id != manifest.campaign_id
++            or outcome.round_index != round_index
++            for outcome in outcomes
++        ):
++            raise ValueError("historical terminal outcome is foreign")
++        if len(outcomes) > 1:
++            raise ValueError("historical terminal outcome is duplicated")
++        if round_index not in record_rounds and not outcomes:
++            raise ValueError("historical round lacks a checkpoint record or terminal outcome")
++
++    packages = _authenticate_completed_history_census_v5(
++        repository=repository,
++        manifest=manifest,
++        rounds=tuple(rounds),
++    )
++    if manifest.provider is None:
++        authenticate_existing_controller_packages_v5(
++            repository,
++            manifest,
++            packages,
++        )
++    else:
++        from core.pit_optimizer_v5.production_provider import (
++            authenticate_paid_role_history_v5,
++        )
++
++        authenticate_paid_role_history_v5(
++            repository=repository,
++            manifest=manifest,
++            adapter_config=original_config,
++            packages=packages,
++        )
++    LocalArchiveReducerFactoryV5(repository).verify_projection(
++        manifest=manifest,
++        panel_plan=authenticated.panel_plan,
++        evaluator_contract=authenticated.evaluator_contract,
++        repair=False,
++    )
+ 
+ 
+ def authenticate_development_history_v5(repository, manifest):
+--- a/core/pit_optimizer_v5/summary.py.pre-h3c
++++ b/core/pit_optimizer_v5/summary.py
+@@ -175,11 +175,27 @@
+     manifest: CampaignManifestV5,
+     command: Literal["run", "run-fixture", "resume", "verify-run", "summarize", "import-v4-candidate"],
+     readiness_code: str = "ready",
++    verification_scope: Literal["current_runtime", "completed_history"] = "current_runtime",
+ ) -> OptimizerSummaryV5:
+     """Project only non-sensitive counts and aggregate performance metrics."""
+ 
+     if type(repository) is not LocalArtifactRepositoryV5 or type(manifest) is not CampaignManifestV5:
+         raise ValueError("optimizer summary authority is invalid")
++    if type(verification_scope) is not str or verification_scope not in {
++        "current_runtime",
++        "completed_history",
++    }:
++        raise ValueError("optimizer summary verification scope is invalid")
++    if verification_scope == "completed_history":
++        from core.pit_optimizer_v5.development_preparation import (
++            authenticate_completed_development_history_v5,
++            require_development_v5,
++        )
++
++        if command != "summarize":
++            raise ValueError("completed history requires the summarize command")
++        require_development_v5(manifest)
++        authenticate_completed_development_history_v5(repository, manifest)
+     rounds_seen = 0
+     terminal_rounds = 0
+     role_calls = 0
+@@ -217,6 +233,7 @@
+         manifest=manifest,
+         panel_plan=panel_plan,
+         evaluator_contract=evaluator_contract,
++        repair=verification_scope == "current_runtime",
+     )
+     record_rounds = {record.round_index for record in records}
+     completed_record_rounds = {
+@@ -261,7 +278,7 @@
+         # Scope and provider provenance are independent: the original config selects
+         # controller-package or paid-ledger authentication inside the shared verifier.
+         require_development_v5(manifest)
+-        if rounds_seen:
++        if verification_scope == "current_runtime" and rounds_seen:
+             authenticate_development_history_v5(repository, manifest)
+     elif manifest.provider is None and rounds_seen:
+         from core.pit_optimizer_v5.fixture_runtime import verify_fixture_run_v5
+--- a/core/pit_optimizer_v5/production_runtime.py.pre-h3c
++++ b/core/pit_optimizer_v5/production_runtime.py
+@@ -1353,7 +1353,11 @@
+     def _authorities(
+         self,
+         records: tuple[StoredExperimentRecordV5, ...],
++        *,
++        repair: bool = True,
+     ) -> tuple[ArchiveRecordAuthorityV5, ...]:
++        if type(repair) is not bool:
++            raise ValueError("archive authority repair mode is invalid")
+         result: list[ArchiveRecordAuthorityV5] = []
+         for stored in records:
+             record = stored.record
+@@ -1365,6 +1369,7 @@
+                 namespace="policy-source",
+                 key=record.policy_revision.sha256,
+                 value_type=SourceBundleV5,
++                repair=repair,
+             )
+             if source is None:
+                 raise ValueError("archive-eligible source authority is unavailable")
+@@ -1414,6 +1419,7 @@
+         manifest: CampaignManifestV5,
+         panel_plan: CampaignPanelPlanV5,
+         evaluator_contract: EvaluatorContractV5,
++        repair: bool = True,
+     ) -> SearchStateV5:
+         """Authenticate the committed checkpoint/archive without repairing either file."""
+ 
+@@ -1441,7 +1447,7 @@
+             panel_plan,
+             evaluator_contract,
+             manifest.target,
+-            self._authorities(records),
++            self._authorities(records, repair=repair),
+             manifest.search.archive_capacity,
+             pit_data_scope=manifest.pit_data_scope,
+             semantic_mode=manifest.semantic_mode,

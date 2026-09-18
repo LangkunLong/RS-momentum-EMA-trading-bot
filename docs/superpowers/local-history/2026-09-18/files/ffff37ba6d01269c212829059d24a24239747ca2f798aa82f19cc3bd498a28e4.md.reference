@@ -1,0 +1,94 @@
+# Task 4 Fix Round 3 Independent Review
+
+## Verdict
+
+**PASS — all remaining Task 4 findings are ADDRESSED.**
+
+The round-3 policy now describes the executed M bootstrap and S power-gap baseline exactly, and built-in
+strategy ownership is enforced both before capture and by the live digest. No new Critical, Important, or
+Minor finding was identified. Previously accepted lifecycle, custom-strategy, inventory, early-winner,
+publication, inert-request, and default behavior remains intact.
+
+## Remaining finding status
+
+### ADDRESSED — Important: exact M bootstrap inventory
+
+**Confidence: 10/10.**
+
+`stateful_bootstrap_rule` now distinguishes the constructor default from the data-derived starting state and
+records all previously missing behavior as active-fixed future optimizer policy: the `<2`-row no-op, EMA 200
+with `adjust=False`, strict close-above-EMA selection, exact history selection and replay length, comparison
+count, loop bounds, `i - replay_row_count + 1` index formula/range, distribution predicate, and post-seed
+threshold precedence (`core/engine_policy.py:720-754`).
+
+That mapping matches the implementation. A new tracker starts in correction; bootstrap returns unchanged
+below two rows, otherwise selects confirmed-uptrend only for strict `close > EMA`, replays
+`min(M_DISTRIBUTION_LOOKBACK + 1, len(hist))` rows with indices `2 - replay_row_count` through `0`, and applies
+correction before under-pressure only when the EMA state is not already correction
+(`core/canslim/m_market_direction.py:49-61`, `68-116`). The live transition policy remains separate and exact
+(`core/engine_policy.py:755-787`). The refreshed report now makes the constructor/bootstrap distinction
+truthfully (`task-4-report.md:50-65`).
+
+### ADDRESSED — Important: exact S power-gap baseline
+
+**Confidence: 10/10.**
+
+The policy records default lookback 10, minimum history `lookback_days + 50`, the literal half-open slice,
+and 49 baseline observations (`core/engine_policy.py:587-601`). This exactly matches the unchanged production
+calculation at `core/canslim/s_supply_demand.py:77-81`, `100-115`: the endpoints of
+`volumes.iloc[-(lookback_days + 50):-(lookback_days + 1)]` differ by 49. The report describes the same
+effective behavior (`task-4-report.md:75-81`). No S threshold, formula, or strategy code was changed.
+
+### ADDRESSED — Important: owned built-in object binding
+
+**Confidence: 10/10.**
+
+Fresh built-in capture now rejects unless `self.strategy is self._owned_builtin_strategy` before performing
+any synchronization (`core/backtest_engine.py:1439-1457`). Run-start capture still occurs before cache or data
+access (`core/backtest_engine.py:1529-1546`), so a same-type replacement made before `run()` fails at the
+required boundary.
+
+The canonical built-in scoring mapping also includes the relationship as a non-tunable invariant leaf
+(`core/engine_policy.py:439-474`). Verification does not synchronize; it rebuilds and compares the live
+object/digest against the stored object/digest (`core/backtest_engine.py:1489-1513`). A same-type replacement
+after capture therefore changes `owned_strategy_binding_intact` from true to false and fails before session
+behavior. Injected strategies remain compatible: synchronization returns immediately in injected mode
+(`core/backtest_engine.py:1442-1443`), and the custom scoring branch returns before any owned-binding or
+owned-field leaf is added (`core/engine_policy.py:404-438`).
+
+## Regression and evidence check
+
+- Custom type remains advisory; optional effective/checkpoint identity is JSON-normalized and live-bound,
+  while absent identity remains explicitly opaque and engine-envelope-only
+  (`core/engine_policy.py:135-165`, `324-438`). Technical-only/full canonicalization remains unchanged and
+  truthful (`core/backtest_engine.py:2236-2329`).
+- Inert compatibility validation remains structurally correct in both constructors
+  (`core/backtest_engine.py:633-655`, `1323-1351`). Constructor capture still precedes default
+  `DataFetcher` construction (`core/backtest_engine.py:1433-1437`).
+- Live verification remains at checkpoint fingerprint, every session, result config, checkpoint payload, and
+  restored-result boundaries (`core/backtest_engine.py:1183-1242`, `1734-1737`, `2058-2068`, `2124-2142`,
+  `2172-2179`). Result config still carries both policy and digest
+  (`core/backtest_engine.py:2110-2121`).
+- PIT publication still calls the live verifier, authenticates result policy/digest, and defines the policy
+  variables before successful summary/manifest use (`pit_baseline.py:1474-1489`, `1529-1546`). The strengthened
+  contract continues to reject an unauthenticated stale fake rather than synthesize policy.
+- Early-winner text still matches execution: only tiered scale-outs are suppressed; the flag clears before
+  day-40 processing; stop, stagnation, protective-stop, and EMA behavior remains active
+  (`core/engine_policy.py:932-954`; `core/backtest_engine.py:2693-2741`).
+- Canonical hashing remains sorted, compact JSON with `allow_nan=False`, and there is no circular import from
+  `core.engine_policy` to `core.backtest_engine` (`core/engine_policy.py:1-20`, `63-96`, `1010-1033`). No
+  sealed artifact is present in the scoped package.
+
+The accepted direct probe reports digest
+`744104da98b205d73b827d9ecd90e610dbc9d830eb11adc09b31cc034b3a006a`. Its section counts sum to 126
+leaves (`5 + 14 + 63 + 22 + 7 + 8 + 7`), its classification counts also sum to 126
+(`81 + 25 + 8 + 12`), and its candidate split reconciles (`105 + 21`). Relative to round 2, the single new
+built-in binding invariant explains the scoring total 62→63, causal-invariant total 11→12, and non-candidate
+total 20→21. The reported digest/count claims are therefore consistent with the inspected schema and the
+accepted probe output (`task-4-report.md:14-41`, `143-168`).
+
+## Review constraints observed
+
+The implementer's direct probes, compilation, and diff-check evidence were accepted without rerunning. No
+test, backtest, provider/network command, cache refresh, optimizer operation, download, or Git mutation was
+performed. Production sources were inspected read-only; only this review artifact was created.

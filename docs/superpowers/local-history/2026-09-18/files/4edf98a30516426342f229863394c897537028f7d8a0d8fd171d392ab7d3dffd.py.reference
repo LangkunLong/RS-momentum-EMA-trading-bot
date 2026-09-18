@@ -1,0 +1,122 @@
+"""Authenticate obtained material and expose dated SIC evidence, without V5 admission."""
+from bisect import bisect_right
+import csv
+from datetime import date, datetime, timezone
+import hashlib
+import io
+import json
+from pathlib import Path
+import sys
+
+ROOT = Path.cwd()
+sys.path.insert(0, str(ROOT))
+from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5
+from core.pit_optimizer_v5.contracts import ArtifactIndexV5, ArtifactRefV5
+from export_pit_prices import _expected_trading_days
+
+DATA = ROOT / '.artifacts/pit-optimizer-v5/data'
+
+def sha(path):
+    with path.open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+def write_json(path, value):
+    with path.open('x', encoding='utf-8', newline='\n') as stream:
+        json.dump(value, stream, indent=2, sort_keys=True)
+        stream.write('\n')
+
+def seal_sic():
+    source = DATA / 'acquisition/raw/sec-sic'
+    manifest_path = source / 'acquisition.json'
+    manifest = json.loads(manifest_path.read_text())
+    if not manifest['completed']:
+        raise ValueError('SEC SIC acquisition incomplete')
+    records = {}
+    repeated = 0
+    total_bytes = 0
+    quarter_count = 0
+    for record in manifest['requests']:
+        path = source / record['file']
+        if record['status'] != 'downloaded' or sha(path) != record['sha256'] or path.stat().st_size != record['bytes']:
+            raise ValueError('SEC obtained source failed hash/length authentication')
+        total_bytes += record['bytes']
+        if 'submissions' not in record:
+            continue
+        quarter_count += 1
+        meta = record['submissions']
+        raw = (source / meta['file']).read_bytes()
+        if hashlib.sha256(raw).hexdigest() != meta['sha256']:
+            raise ValueError('SEC extracted SUB hash mismatch')
+        rows = list(csv.DictReader(io.StringIO(raw.decode('utf-8-sig'), newline=''), delimiter='\t'))
+        if len(rows) != meta['rows']:
+            raise ValueError('SEC extracted SUB count mismatch')
+        for row in rows:
+            key = (row['adsh'], row['cik'])
+            selected = tuple(row[field] for field in ('adsh', 'cik', 'accepted', 'filed', 'sic', 'form'))
+            existing = records.get(key)
+            if existing:
+                if existing[0] != selected:
+                    raise ValueError('Conflicting SEC SIC accession metadata; no silent source selection')
+                repeated += 1
+                existing[1].add(record['file'])
+            else:
+                records[key] = (selected, {record['file']})
+    if quarter_count != 25:
+        raise ValueError('Unexpected SEC quarter coverage')
+    sessions = tuple(day.isoformat() for day in _expected_trading_days(date(2020, 1, 2), date(2025, 12, 31)))
+    result = []
+    missing_sic = 0
+    unavailable_in_window = 0
+    for selected, quarters in records.values():
+        accession, cik, accepted, filed, sic, form = selected
+        accepted_date = date.fromisoformat(accepted[:10]).isoformat()
+        if not cik.isdigit() or len(cik) > 10:
+            raise ValueError('Malformed SEC CIK')
+        if sic and (not sic.isdigit() or len(sic) > 4):
+            raise ValueError('Malformed SEC SIC')
+        sic = sic.zfill(4) if sic and int(sic) else ''
+        missing_sic += not bool(sic)
+        offset = bisect_right(sessions, accepted_date)
+        available = sessions[offset] if offset < len(sessions) else ''
+        unavailable_in_window += not bool(available)
+        result.append((cik.zfill(10), accepted, accession, available, sic, form, '|'.join(sorted(quarters))))
+    output = DATA / 'acquisition/sec-sic-filings.csv'
+    with output.open('x', encoding='utf-8', newline='') as stream:
+        writer = csv.writer(stream, lineterminator='\n')
+        writer.writerow(('cik', 'sec_accepted_timestamp', 'filing_accession', 'first_supplied_session_after_acceptance_date', 'sic', 'form', 'source_archives'))
+        writer.writerows(sorted(result))
+    provenance = {
+        'schema_version': 1,
+        'source_kind': 'SEC_SUB_filing_dated_SIC',
+        'source_acquisition_sha256': sha(manifest_path),
+        'output_sha256': sha(output),
+        'quarter_count': quarter_count,
+        'downloaded_source_bytes': total_bytes,
+        'unique_accession_cik_rows': len(result),
+        'distinct_ciks': len({row[0] for row in result}),
+        'identical_cross_quarter_duplicates': repeated,
+        'rows_without_sic_retained': missing_sic,
+        'rows_without_later_supplied_session_retained': unavailable_in_window,
+        'source_hashes_reverified_after_download': True,
+        'source_metadata_semantics': 'SIC as of filing date, SEC accepted timestamp preserved verbatim; first supplied SPY session strictly after acceptance calendar date; no current classifications backdated.',
+        'missing_data_semantics': 'Empty SIC is retained as unknown; empty usable session means after the supplied calendar cutoff. Neither is filled or silently dropped.',
+        'admission_status': 'dated_raw_classification_evidence_pending_complete_lineage_mapping_latest_filing_coverage_and_causal_group_ranking',
+        'normalizer_sha256': sha(Path(__file__)),
+    }
+    write_json(DATA / 'acquisition/sec-sic-filings-provenance.json', provenance)
+    print(json.dumps({key: provenance[key] for key in ('quarter_count', 'unique_accession_cik_rows', 'distinct_ciks', 'rows_without_sic_retained', 'downloaded_source_bytes')}), flush=True)
+
+def expose_profile():
+    repo = LocalArtifactRepositoryV5(ROOT / '.artifacts/pit-optimizer-v5')
+    original = ArtifactRefV5(relative_path='evaluator/sandbox-profile-663f1749ba91.json', sha256='7a9c1e73046f7a00abcb5fc029350ea7e42e5841b179074a5ef43a94f5613483')
+    repo.authenticate_exact(original)
+    value = json.loads((repo.root / original.relative_path).read_text()) if hasattr(repo, 'root') else json.loads((ROOT / '.artifacts/pit-optimizer-v5' / original.relative_path).read_text())
+    alias = repo.create_baseline_artifact('evaluator/sandbox-profile.json', value)
+    if alias.sha256 != original.sha256:
+        raise ValueError('Canonical profile copy differs')
+    repo.authenticate_exact(alias)
+    print(json.dumps({'canonical_sandbox_profile': alias.relative_path, 'sha256': alias.sha256}), flush=True)
+
+if __name__ == '__main__':
+    seal_sic()
+    expose_profile()

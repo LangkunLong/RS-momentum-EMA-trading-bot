@@ -1,0 +1,2902 @@
+# Review package: ec6cae1de94ebf9716f0b01d0eb96654d6cb17b6..9d05777383e54e54dda36c341ed2587f4543c0cb
+
+## Commits
+9d05777 feat: rank optimizer panels by portfolio CAGR
+
+## Files changed
+ core/pit_optimization.py         |   33 +
+ core/pit_optimizer_evaluation.py | 1480 +++++++++++++++++++++++++++++++++++++-
+ core/pit_policy_parity.py        |  472 +++++++++++-
+ tests/test_pit_optimizer_v2.py   |  387 ++++++----
+ tests/test_pit_policy_parity.py  |   67 +-
+ 5 files changed, 2276 insertions(+), 163 deletions(-)
+
+## Diff
+diff --git a/core/pit_optimization.py b/core/pit_optimization.py
+index 1f09337..5f29443 100644
+--- a/core/pit_optimization.py
++++ b/core/pit_optimization.py
+@@ -293,20 +293,53 @@ def _window_frame(
+     if result[date_field].duplicated().any() or not result[date_field].is_monotonic_increasing:
+         raise ValueError(f"{date_field} must be unique and monotonic")
+     start = pd.Timestamp(start_date)
+     end = pd.Timestamp(end_date)
+     result = result.loc[(result[date_field] >= start) & (result[date_field] <= end)].copy()
+     if result.empty:
+         raise ValueError("window contains no observations")
+     return result
+ 
+ 
++def production_equity_cagr_pct(
++    starting_equity: float | int,
++    ending_equity: float | int,
++    elapsed_calendar_days: int,
++) -> float:
++    """Return the production portfolio CAGR over exact elapsed calendar days."""
++
++    if (
++        isinstance(starting_equity, bool)
++        or type(starting_equity) not in {int, float}
++        or not math.isfinite(float(starting_equity))
++        or float(starting_equity) <= 0.0
++    ):
++        raise ValueError("starting equity must be finite and positive")
++    if (
++        isinstance(ending_equity, bool)
++        or type(ending_equity) not in {int, float}
++        or not math.isfinite(float(ending_equity))
++        or float(ending_equity) <= 0.0
++    ):
++        raise ValueError("ending equity must be finite and positive")
++    if type(elapsed_calendar_days) is not int or elapsed_calendar_days <= 0:
++        raise ValueError("elapsed calendar days must be a positive integer")
++    result = (
++        (float(ending_equity) / float(starting_equity))
++        ** (365.0 / elapsed_calendar_days)
++        - 1.0
++    ) * 100.0
++    if not math.isfinite(result):
++        raise ValueError("production annualized return is non-finite")
++    return result
++
++
+ def aggregate_equity_window(
+     frame: pd.DataFrame,
+     *,
+     start_date: str,
+     end_date: str,
+     closed_trades: int,
+ ) -> dict[str, float | int]:
+     """Return strategy and benchmark performance using production report semantics."""
+ 
+     if type(closed_trades) is not int or closed_trades < 0:
+diff --git a/core/pit_optimizer_evaluation.py b/core/pit_optimizer_evaluation.py
+index af08855..71054d8 100644
+--- a/core/pit_optimizer_evaluation.py
++++ b/core/pit_optimizer_evaluation.py
+@@ -1,25 +1,28 @@
+-"""Immutable fold and aggregate contracts for the PIT optimizer."""
++"""Immutable legacy-fold and continuous-panel contracts for the PIT optimizer."""
+ 
+ from __future__ import annotations
+ 
+ import argparse
+ from contextlib import contextmanager
+-from dataclasses import InitVar, asdict, dataclass
++from dataclasses import InitVar, asdict, dataclass, fields, is_dataclass
+ from datetime import date
+ from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
++from fractions import Fraction
+ import hashlib
+ import json
+ import math
+ import os
+ from pathlib import Path
+ import re
++import secrets
++import shutil
+ from itertools import pairwise
+ import sys
+ from typing import Iterator, Mapping, Sequence
+ 
+ 
+ _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+ _CLOSED_ID_RE = re.compile(r"[a-z][a-z0-9_.-]{0,127}")
+ _EXPOSURE_KINDS = {
+     "candidate_validation",
+     "provider_context",
+@@ -196,20 +199,1101 @@ def _objective_decimal(value: object, label: str) -> Decimal:
+         raise ValueError(f"{label} must be numeric")
+     try:
+         number = Decimal(str(value))
+     except InvalidOperation as exc:
+         raise ValueError(f"{label} must be numeric") from exc
+     if not number.is_finite():
+         raise ValueError(f"{label} must be finite")
+     return number.quantize(_OBJECTIVE_QUANTUM, rounding=ROUND_HALF_EVEN)
+ 
+ 
++_PANEL_PURPOSES = ("quick", "discovery", "qualification")
++_SOURCE_AFFILIATIONS = ("sp500", "nasdaq100", "russell2000")
++_AFFILIATION_BITSET_ORDER = (
++    ("sp500",),
++    ("nasdaq100",),
++    ("sp500", "nasdaq100"),
++    ("russell2000",),
++    ("sp500", "russell2000"),
++    ("nasdaq100", "russell2000"),
++    ("sp500", "nasdaq100", "russell2000"),
++)
++
++
++@dataclass(frozen=True, slots=True)
++class AnnualizedReturnTarget:
++    metric_id: str
++    formula_id: str
++    basis: str
++    target_pct: Decimal
++    milestones_pct: tuple[Decimal, ...]
++    precision_pct: Decimal
++
++    def __post_init__(self) -> None:
++        if self.metric_id != "portfolio_annualized_return_pct":
++            raise ValueError("annualized return target metric is invalid")
++        if self.formula_id != "production_equity_cagr_365_calendar_days_v1":
++            raise ValueError("annualized return target formula is invalid")
++        if self.basis != "absolute":
++            raise ValueError("annualized return target basis is invalid")
++        if self.target_pct != Decimal("10.00"):
++            raise ValueError("annualized return target is invalid")
++        if self.milestones_pct != (
++            Decimal("10.00"),
++            Decimal("20.00"),
++            Decimal("50.00"),
++        ):
++            raise ValueError("annualized return milestones are invalid")
++        if self.precision_pct != _OBJECTIVE_QUANTUM:
++            raise ValueError("annualized return comparison precision is invalid")
++
++    @classmethod
++    def production(cls) -> "AnnualizedReturnTarget":
++        return cls(
++            metric_id="portfolio_annualized_return_pct",
++            formula_id="production_equity_cagr_365_calendar_days_v1",
++            basis="absolute",
++            target_pct=Decimal("10.00"),
++            milestones_pct=(
++                Decimal("10.00"),
++                Decimal("20.00"),
++                Decimal("50.00"),
++            ),
++            precision_pct=_OBJECTIVE_QUANTUM,
++        )
++
++
++@dataclass(frozen=True, slots=True)
++class PanelSecurityLineage:
++    security_lineage_id: str
++    executable_tickers: tuple[str, ...]
++    source_affiliations: tuple[str, ...]
++
++    def __post_init__(self) -> None:
++        if (
++            not isinstance(self.security_lineage_id, str)
++            or re.fullmatch(r"[a-z][a-z0-9_-]{0,127}", self.security_lineage_id)
++            is None
++        ):
++            raise ValueError("panel security lineage ID is invalid")
++        if (
++            type(self.executable_tickers) is not tuple
++            or not self.executable_tickers
++            or len(set(self.executable_tickers)) != len(self.executable_tickers)
++            or any(
++                not isinstance(ticker, str)
++                or re.fullmatch(r"[A-Z][A-Z0-9.-]{0,15}", ticker) is None
++                for ticker in self.executable_tickers
++            )
++        ):
++            raise ValueError("panel executable ticker history is invalid")
++        if (
++            type(self.source_affiliations) is not tuple
++            or self.source_affiliations not in _AFFILIATION_BITSET_ORDER
++        ):
++            raise ValueError("panel source affiliations are invalid")
++
++
++@dataclass(frozen=True, slots=True)
++class PanelStratumAllocation:
++    source_affiliations: tuple[str, ...]
++    eligible_count: int
++    quick_count: int
++    discovery_count: int
++    qualification_count: int
++    unallocated_count: int
++
++    def __post_init__(self) -> None:
++        if self.source_affiliations not in _AFFILIATION_BITSET_ORDER:
++            raise ValueError("panel allocation affiliation stratum is invalid")
++        counts = (
++            self.eligible_count,
++            self.quick_count,
++            self.discovery_count,
++            self.qualification_count,
++            self.unallocated_count,
++        )
++        if any(type(value) is not int or value < 0 for value in counts):
++            raise ValueError("panel allocation counts are invalid")
++        if sum(counts[1:]) != self.eligible_count:
++            raise ValueError("panel allocation exceeds eligible stratum capacity")
++
++
++@dataclass(frozen=True, slots=True)
++class PanelAllocationRuleV1:
++    quick_count: int
++    discovery_count: int
++    qualification_count: int
++    algorithm_id: str = "sha256_lineage_stratified_v1"
++    remainder: str = "unallocated"
++    affiliation_bitset_order: tuple[tuple[str, ...], ...] = _AFFILIATION_BITSET_ORDER
++    panel_allocation_order: tuple[str, ...] = (
++        "qualification",
++        "discovery",
++        "quick",
++    )
++    apportionment_id: str = "largest_remainder_residual_capacity_v1"
++
++    def __post_init__(self) -> None:
++        counts = (self.quick_count, self.discovery_count, self.qualification_count)
++        if any(type(value) is not int or value < 0 for value in counts):
++            raise ValueError("panel requested counts are invalid")
++        if sum(counts) <= 0:
++            raise ValueError("panel allocation must request at least one lineage")
++        if self.algorithm_id != "sha256_lineage_stratified_v1":
++            raise ValueError("panel allocation algorithm is invalid")
++        if self.remainder != "unallocated":
++            raise ValueError("panel allocation remainder policy is invalid")
++        if self.affiliation_bitset_order != _AFFILIATION_BITSET_ORDER:
++            raise ValueError("panel affiliation-bitset order is invalid")
++        if self.panel_allocation_order != ("qualification", "discovery", "quick"):
++            raise ValueError("panel allocation order is invalid")
++        if self.apportionment_id != "largest_remainder_residual_capacity_v1":
++            raise ValueError("panel apportionment algorithm is invalid")
++
++
++def _validate_panel_lineages(
++    lineages: tuple[PanelSecurityLineage, ...],
++) -> None:
++    if type(lineages) is not tuple or any(
++        not isinstance(item, PanelSecurityLineage) for item in lineages
++    ):
++        raise ValueError("panel lineages are invalid")
++    lineage_ids = tuple(item.security_lineage_id for item in lineages)
++    if len(set(lineage_ids)) != len(lineage_ids):
++        raise ValueError("panel security lineage IDs must be unique")
++    ticker_owner: dict[str, str] = {}
++    for lineage in lineages:
++        for ticker in lineage.executable_tickers:
++            owner = ticker_owner.setdefault(ticker, lineage.security_lineage_id)
++            if owner != lineage.security_lineage_id:
++                raise ValueError("ticker alias crosses panel security lineages")
++
++
++def _panel_quota_counts(
++    residual: Mapping[tuple[str, ...], int],
++    demand: int,
++) -> dict[tuple[str, ...], int]:
++    total_residual = sum(residual.values())
++    if demand > total_residual:
++        raise ValueError("panel demand exceeds eligible capacity")
++    if demand == 0:
++        return {key: 0 for key in residual}
++    quotas = {
++        key: Fraction(demand * capacity, total_residual)
++        for key, capacity in residual.items()
++    }
++    assigned = {
++        key: min(quota.numerator // quota.denominator, residual[key])
++        for key, quota in quotas.items()
++    }
++    remaining = demand - sum(assigned.values())
++    tie_order = {key: index for index, key in enumerate(_AFFILIATION_BITSET_ORDER)}
++    candidates = sorted(
++        residual,
++        key=lambda key: (
++            -(quotas[key] - (quotas[key].numerator // quotas[key].denominator)),
++            tie_order[key],
++        ),
++    )
++    for key in candidates:
++        if remaining == 0:
++            break
++        if assigned[key] < residual[key]:
++            assigned[key] += 1
++            remaining -= 1
++    if remaining != 0 or any(assigned[key] > residual[key] for key in residual):
++        raise ValueError("panel apportionment exceeds residual capacity")
++    return assigned
++
++
++def sha256_lineage_stratified_v1(
++    *,
++    lineages: tuple[PanelSecurityLineage, ...],
++    partition_seed_sha256: str,
++    rule: PanelAllocationRuleV1,
++) -> tuple[
++    tuple[PanelSecurityLineage, ...],
++    tuple[PanelSecurityLineage, ...],
++    tuple[PanelSecurityLineage, ...],
++    tuple[PanelStratumAllocation, ...],
++]:
++    """Allocate closed lineage strata using residual-capacity largest remainder."""
++
++    _require_digest(partition_seed_sha256, "panel partition seed SHA-256")
++    if not isinstance(rule, PanelAllocationRuleV1):
++        raise ValueError("panel allocation rule is invalid")
++    _validate_panel_lineages(lineages)
++    if rule.quick_count + rule.discovery_count + rule.qualification_count > len(
++        lineages
++    ):
++        raise ValueError("panel demand exceeds eligible capacity")
++    strata: dict[tuple[str, ...], list[PanelSecurityLineage]] = {
++        key: [] for key in _AFFILIATION_BITSET_ORDER
++    }
++    for lineage in lineages:
++        strata[lineage.source_affiliations].append(lineage)
++    for values in strata.values():
++        values.sort(
++            key=lambda item: (
++                hashlib.sha256(
++                    (partition_seed_sha256 + item.security_lineage_id).encode("utf-8")
++                ).hexdigest(),
++                item.security_lineage_id,
++            )
++        )
++    residual = {key: len(strata[key]) for key in _AFFILIATION_BITSET_ORDER}
++    per_panel: dict[str, dict[tuple[str, ...], int]] = {}
++    for purpose in rule.panel_allocation_order:
++        counts = _panel_quota_counts(residual, getattr(rule, f"{purpose}_count"))
++        per_panel[purpose] = counts
++        for key, count in counts.items():
++            residual[key] -= count
++            if residual[key] < 0:
++                raise ValueError("panel allocation exceeds eligible stratum capacity")
++    cursors = {key: 0 for key in _AFFILIATION_BITSET_ORDER}
++    selected: dict[str, list[PanelSecurityLineage]] = {
++        purpose: [] for purpose in rule.panel_allocation_order
++    }
++    for purpose in rule.panel_allocation_order:
++        for key in _AFFILIATION_BITSET_ORDER:
++            start = cursors[key]
++            end = start + per_panel[purpose][key]
++            selected[purpose].extend(strata[key][start:end])
++            cursors[key] = end
++    allocations = tuple(
++        PanelStratumAllocation(
++            source_affiliations=key,
++            eligible_count=len(strata[key]),
++            quick_count=per_panel["quick"][key],
++            discovery_count=per_panel["discovery"][key],
++            qualification_count=per_panel["qualification"][key],
++            unallocated_count=residual[key],
++        )
++        for key in _AFFILIATION_BITSET_ORDER
++    )
++    result = tuple(
++        tuple(sorted(selected[purpose], key=lambda item: item.security_lineage_id))
++        for purpose in _PANEL_PURPOSES
++    )
++    assigned = (*result[0], *result[1], *result[2])
++    if len({item.security_lineage_id for item in assigned}) != len(assigned):
++        raise ValueError("security lineage alias crosses panels")
++    return result[0], result[1], result[2], allocations
++
++
++def _panel_json_value(value: object) -> object:
++    if isinstance(value, Decimal):
++        return format(value, ".2f")
++    if is_dataclass(value) and not isinstance(value, type):
++        return {
++            item.name: _panel_json_value(getattr(value, item.name))
++            for item in fields(value)
++        }
++    if isinstance(value, tuple):
++        return [_panel_json_value(item) for item in value]
++    if isinstance(value, list):
++        return [_panel_json_value(item) for item in value]
++    if isinstance(value, Mapping):
++        return {
++            str(key): _panel_json_value(item)
++            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
++        }
++    return value
++
++
++@dataclass(frozen=True, slots=True)
++class EvaluationPanelSpec:
++    purpose: str
++    start_date: str
++    end_date: str
++    sessions: tuple[str, ...]
++    sessions_sha256: str
++    lineages: tuple[PanelSecurityLineage, ...]
++
++    def __post_init__(self) -> None:
++        if self.purpose not in _PANEL_PURPOSES:
++            raise ValueError("evaluation panel purpose is invalid")
++        if type(self.sessions) is not tuple or len(self.sessions) < 2:
++            raise ValueError("evaluation panel requires continuous sessions")
++        parsed = tuple(_date(value, "evaluation panel session") for value in self.sessions)
++        if len(set(parsed)) != len(parsed) or any(
++            left >= right for left, right in pairwise(parsed)
++        ):
++            raise ValueError("evaluation panel sessions must be unique and chronological")
++        if self.start_date != self.sessions[0] or self.end_date != self.sessions[-1]:
++            raise ValueError("evaluation panel bounds differ from its sessions")
++        expected_sessions_sha256 = hashlib.sha256(
++            _canonical_json_bytes(list(self.sessions))
++        ).hexdigest()
++        if self.sessions_sha256 != expected_sessions_sha256:
++            raise ValueError("evaluation panel session digest differs")
++        _validate_panel_lineages(self.lineages)
++        if not self.lineages or self.lineages != tuple(
++            sorted(self.lineages, key=lambda item: item.security_lineage_id)
++        ):
++            raise ValueError("evaluation panel lineages must be sorted and nonempty")
++
++    @classmethod
++    def from_lineages(
++        cls,
++        *,
++        purpose: str,
++        sessions: tuple[str, ...],
++        lineages: tuple[PanelSecurityLineage, ...],
++    ) -> "EvaluationPanelSpec":
++        if not sessions:
++            raise ValueError("evaluation panel sessions are absent")
++        canonical_lineages = tuple(
++            sorted(lineages, key=lambda item: item.security_lineage_id)
++        )
++        return cls(
++            purpose=purpose,
++            start_date=sessions[0],
++            end_date=sessions[-1],
++            sessions=sessions,
++            sessions_sha256=hashlib.sha256(
++                _canonical_json_bytes(list(sessions))
++            ).hexdigest(),
++            lineages=canonical_lineages,
++        )
++
++    @property
++    def sha256(self) -> str:
++        return hashlib.sha256(
++            _canonical_json_bytes(_panel_json_value(self))
++        ).hexdigest()
++
++
++def _validate_panel_plan_common(
++    *,
++    schema_version: int,
++    pit_bundle_sha256: str,
++    prices_provenance_sha256: str,
++    partition_seed_sha256: str,
++    qualification_retirement_domain_id: str,
++    qualification_ledger_snapshot_sha256: str,
++    target: AnnualizedReturnTarget,
++    allocation_rule: PanelAllocationRuleV1,
++    stratum_allocations: tuple[PanelStratumAllocation, ...],
++) -> None:
++    if schema_version != 4:
++        raise ValueError("panel plan schema is unsupported")
++    for value, label in (
++        (pit_bundle_sha256, "panel PIT bundle SHA-256"),
++        (prices_provenance_sha256, "panel prices provenance SHA-256"),
++        (partition_seed_sha256, "panel partition seed SHA-256"),
++        (
++            qualification_retirement_domain_id,
++            "panel qualification retirement domain ID",
++        ),
++        (
++            qualification_ledger_snapshot_sha256,
++            "panel qualification ledger snapshot SHA-256",
++        ),
++    ):
++        _require_digest(value, label)
++    if not isinstance(target, AnnualizedReturnTarget):
++        raise ValueError("panel annualized return target is invalid")
++    if not isinstance(allocation_rule, PanelAllocationRuleV1):
++        raise ValueError("panel allocation rule is invalid")
++    if (
++        type(stratum_allocations) is not tuple
++        or tuple(item.source_affiliations for item in stratum_allocations)
++        != _AFFILIATION_BITSET_ORDER
++        or any(
++            not isinstance(item, PanelStratumAllocation)
++            for item in stratum_allocations
++        )
++    ):
++        raise ValueError("panel stratum allocation proof is invalid")
++    for purpose in _PANEL_PURPOSES:
++        if sum(getattr(item, f"{purpose}_count") for item in stratum_allocations) != getattr(
++            allocation_rule,
++            f"{purpose}_count",
++        ):
++            raise ValueError("panel stratum allocation totals differ from the rule")
++
++
++@dataclass(frozen=True, slots=True)
++class QualificationPanelPlan:
++    schema_version: int
++    plan_kind: str
++    pit_bundle_sha256: str
++    prices_provenance_sha256: str
++    partition_seed_sha256: str
++    qualification_retirement_domain_id: str
++    qualification_ledger_snapshot_sha256: str
++    target: AnnualizedReturnTarget
++    allocation_rule: PanelAllocationRuleV1
++    stratum_allocations: tuple[PanelStratumAllocation, ...]
++    qualification_panel: EvaluationPanelSpec
++
++    def __post_init__(self) -> None:
++        if self.plan_kind != "qualification_panel_plan":
++            raise ValueError("qualification panel plan kind is invalid")
++        _validate_panel_plan_common(
++            schema_version=self.schema_version,
++            pit_bundle_sha256=self.pit_bundle_sha256,
++            prices_provenance_sha256=self.prices_provenance_sha256,
++            partition_seed_sha256=self.partition_seed_sha256,
++            qualification_retirement_domain_id=self.qualification_retirement_domain_id,
++            qualification_ledger_snapshot_sha256=self.qualification_ledger_snapshot_sha256,
++            target=self.target,
++            allocation_rule=self.allocation_rule,
++            stratum_allocations=self.stratum_allocations,
++        )
++        if (
++            not isinstance(self.qualification_panel, EvaluationPanelSpec)
++            or self.qualification_panel.purpose != "qualification"
++            or len(self.qualification_panel.lineages)
++            != self.allocation_rule.qualification_count
++        ):
++            raise ValueError("qualification panel plan contents are invalid")
++
++    def to_primitive(self) -> dict[str, object]:
++        primitive = _panel_json_value(self)
++        if not isinstance(primitive, dict):
++            raise AssertionError("qualification panel primitive is not an object")
++        return primitive
++
++    @property
++    def sha256(self) -> str:
++        return hashlib.sha256(panel_plan_bytes(self)).hexdigest()
++
++
++@dataclass(frozen=True, slots=True)
++class DiscoveryPanelPlan:
++    schema_version: int
++    plan_kind: str
++    pit_bundle_sha256: str
++    prices_provenance_sha256: str
++    partition_seed_sha256: str
++    qualification_retirement_domain_id: str
++    qualification_ledger_snapshot_sha256: str
++    target: AnnualizedReturnTarget
++    allocation_rule: PanelAllocationRuleV1
++    stratum_allocations: tuple[PanelStratumAllocation, ...]
++    quick_panel: EvaluationPanelSpec
++    discovery_panel: EvaluationPanelSpec
++    qualification_plan_sha256: str
++
++    def __post_init__(self) -> None:
++        if self.plan_kind != "discovery_panel_plan":
++            raise ValueError("discovery panel plan kind is invalid")
++        _validate_panel_plan_common(
++            schema_version=self.schema_version,
++            pit_bundle_sha256=self.pit_bundle_sha256,
++            prices_provenance_sha256=self.prices_provenance_sha256,
++            partition_seed_sha256=self.partition_seed_sha256,
++            qualification_retirement_domain_id=self.qualification_retirement_domain_id,
++            qualification_ledger_snapshot_sha256=self.qualification_ledger_snapshot_sha256,
++            target=self.target,
++            allocation_rule=self.allocation_rule,
++            stratum_allocations=self.stratum_allocations,
++        )
++        _require_digest(
++            self.qualification_plan_sha256,
++            "discovery qualification plan commitment",
++        )
++        if (
++            not isinstance(self.quick_panel, EvaluationPanelSpec)
++            or self.quick_panel.purpose != "quick"
++            or len(self.quick_panel.lineages) != self.allocation_rule.quick_count
++            or not isinstance(self.discovery_panel, EvaluationPanelSpec)
++            or self.discovery_panel.purpose != "discovery"
++            or len(self.discovery_panel.lineages)
++            != self.allocation_rule.discovery_count
++        ):
++            raise ValueError("discovery panel plan contents are invalid")
++        combined = (*self.quick_panel.lineages, *self.discovery_panel.lineages)
++        _validate_panel_lineages(combined)
++
++    def to_primitive(self) -> dict[str, object]:
++        primitive = _panel_json_value(self)
++        if not isinstance(primitive, dict):
++            raise AssertionError("discovery panel primitive is not an object")
++        return primitive
++
++    @property
++    def sha256(self) -> str:
++        return hashlib.sha256(panel_plan_bytes(self)).hexdigest()
++
++
++def panel_plan_bytes(plan: DiscoveryPanelPlan | QualificationPanelPlan) -> bytes:
++    if not isinstance(plan, (DiscoveryPanelPlan, QualificationPanelPlan)):
++        raise ValueError("panel plan type is invalid")
++    return _canonical_json_bytes(plan.to_primitive())
++
++
++def compose_panel_plans(
++    *,
++    lineages: tuple[PanelSecurityLineage, ...],
++    sessions: tuple[str, ...],
++    pit_bundle_sha256: str,
++    prices_provenance_sha256: str,
++    partition_seed_sha256: str,
++    target: AnnualizedReturnTarget,
++    rule: PanelAllocationRuleV1,
++    ledger_snapshot: "QualificationRetirementSnapshot",
++) -> tuple[QualificationPanelPlan, DiscoveryPanelPlan]:
++    if not isinstance(ledger_snapshot, QualificationRetirementSnapshot):
++        raise ValueError("qualification retirement snapshot is invalid")
++    retired = frozenset(ledger_snapshot.retired_security_lineage_ids)
++    eligible = tuple(
++        item for item in lineages if item.security_lineage_id not in retired
++    )
++    quick, discovery, qualification, allocations = sha256_lineage_stratified_v1(
++        lineages=eligible,
++        partition_seed_sha256=partition_seed_sha256,
++        rule=rule,
++    )
++    common: dict[str, object] = {
++        "schema_version": 4,
++        "pit_bundle_sha256": pit_bundle_sha256,
++        "prices_provenance_sha256": prices_provenance_sha256,
++        "partition_seed_sha256": partition_seed_sha256,
++        "qualification_retirement_domain_id": ledger_snapshot.qualification_retirement_domain_id,
++        "qualification_ledger_snapshot_sha256": ledger_snapshot.snapshot_sha256,
++        "target": target,
++        "allocation_rule": rule,
++        "stratum_allocations": allocations,
++    }
++    qualification_plan = QualificationPanelPlan(
++        **common,  # type: ignore[arg-type]
++        plan_kind="qualification_panel_plan",
++        qualification_panel=EvaluationPanelSpec.from_lineages(
++            purpose="qualification",
++            sessions=sessions,
++            lineages=qualification,
++        ),
++    )
++    discovery_plan = DiscoveryPanelPlan(
++        **common,  # type: ignore[arg-type]
++        plan_kind="discovery_panel_plan",
++        quick_panel=EvaluationPanelSpec.from_lineages(
++            purpose="quick",
++            sessions=sessions,
++            lineages=quick,
++        ),
++        discovery_panel=EvaluationPanelSpec.from_lineages(
++            purpose="discovery",
++            sessions=sessions,
++            lineages=discovery,
++        ),
++        qualification_plan_sha256=qualification_plan.sha256,
++    )
++    return qualification_plan, discovery_plan
++
++
++def _panel_plan_pair_is_consistent(
++    qualification_plan: QualificationPanelPlan,
++    discovery_plan: DiscoveryPanelPlan,
++) -> None:
++    if discovery_plan.qualification_plan_sha256 != qualification_plan.sha256:
++        raise ValueError("discovery qualification commitment differs")
++    common_fields = (
++        "schema_version",
++        "pit_bundle_sha256",
++        "prices_provenance_sha256",
++        "partition_seed_sha256",
++        "qualification_retirement_domain_id",
++        "qualification_ledger_snapshot_sha256",
++        "target",
++        "allocation_rule",
++        "stratum_allocations",
++    )
++    if any(
++        getattr(qualification_plan, name) != getattr(discovery_plan, name)
++        for name in common_fields
++    ):
++        raise ValueError("panel plan common identities differ")
++    all_lineages = (
++        *discovery_plan.quick_panel.lineages,
++        *discovery_plan.discovery_panel.lineages,
++        *qualification_plan.qualification_panel.lineages,
++    )
++    _validate_panel_lineages(all_lineages)
++
++
++def _install_or_authenticate_panel_file(path: Path, payload: bytes) -> None:
++    if path.exists():
++        if path.is_symlink() or not path.is_file() or path.read_bytes() != payload:
++            raise ValueError("conflicting partial panel publication")
++        return
++    staging = path.parent / f".{path.name}.{secrets.token_hex(12)}.tmp"
++    try:
++        with staging.open("xb") as handle:
++            handle.write(payload)
++            handle.flush()
++            os.fsync(handle.fileno())
++        try:
++            os.link(staging, path)
++        except FileExistsError:
++            if path.is_symlink() or not path.is_file() or path.read_bytes() != payload:
++                raise ValueError("conflicting partial panel publication") from None
++    finally:
++        staging.unlink(missing_ok=True)
++
++
++def publish_panel_plans(
++    *,
++    output_root: Path,
++    qualification_plan: QualificationPanelPlan,
++    discovery_plan: DiscoveryPanelPlan,
++) -> dict[str, object]:
++    _panel_plan_pair_is_consistent(qualification_plan, discovery_plan)
++    root = Path(output_root).resolve(strict=False)
++    root.parent.mkdir(parents=True, exist_ok=True)
++    if root.parent.is_symlink() or root.is_symlink():
++        raise ValueError("panel publication root is invalid")
++    if root.exists() and not root.is_dir():
++        raise ValueError("panel publication root is not a directory")
++    if not root.exists():
++        root.mkdir()
++    marker = root / "publication.json"
++    if marker.exists():
++        raise FileExistsError("completed panel publication is immutable")
++    allowed = {"qualification-plan.json", "discovery-plan.json"}
++    unexpected = {path.name for path in root.iterdir()} - allowed
++    if unexpected:
++        raise ValueError("panel publication root contains unexpected partial files")
++    qualification_payload = panel_plan_bytes(qualification_plan)
++    discovery_payload = panel_plan_bytes(discovery_plan)
++    publication: dict[str, object] = {
++        "schema_version": 4,
++        "publication_kind": "panel_plans",
++        "qualification_plan_sha256": hashlib.sha256(
++            qualification_payload
++        ).hexdigest(),
++        "discovery_plan_sha256": hashlib.sha256(discovery_payload).hexdigest(),
++        "qualification_ledger_snapshot_sha256": discovery_plan.qualification_ledger_snapshot_sha256,
++        "quick_count": discovery_plan.allocation_rule.quick_count,
++        "discovery_count": discovery_plan.allocation_rule.discovery_count,
++        "qualification_count": discovery_plan.allocation_rule.qualification_count,
++    }
++    staging = root.parent / f".panel-staging-{secrets.token_hex(12)}"
++    staging.mkdir()
++    if os.name != "nt":
++        os.chmod(staging, 0o700)
++    try:
++        (staging / "qualification-plan.json").write_bytes(qualification_payload)
++        (staging / "discovery-plan.json").write_bytes(discovery_payload)
++        (staging / "publication.json").write_bytes(
++            _canonical_json_bytes(publication)
++        )
++        _install_or_authenticate_panel_file(
++            root / "qualification-plan.json",
++            (staging / "qualification-plan.json").read_bytes(),
++        )
++        _install_or_authenticate_panel_file(
++            root / "discovery-plan.json",
++            (staging / "discovery-plan.json").read_bytes(),
++        )
++        _install_or_authenticate_panel_file(
++            marker,
++            (staging / "publication.json").read_bytes(),
++        )
++    finally:
++        shutil.rmtree(staging)
++    return publication
++
++
++def _panel_lineage_from_primitive(value: object) -> PanelSecurityLineage:
++    if not isinstance(value, dict) or set(value) != {
++        "security_lineage_id",
++        "executable_tickers",
++        "source_affiliations",
++    }:
++        raise ValueError("panel lineage artifact is invalid")
++    return PanelSecurityLineage(
++        security_lineage_id=value["security_lineage_id"],  # type: ignore[arg-type]
++        executable_tickers=tuple(value["executable_tickers"]),  # type: ignore[arg-type]
++        source_affiliations=tuple(value["source_affiliations"]),  # type: ignore[arg-type]
++    )
++
++
++def _evaluation_panel_from_primitive(value: object) -> EvaluationPanelSpec:
++    if not isinstance(value, dict) or set(value) != {
++        "purpose",
++        "start_date",
++        "end_date",
++        "sessions",
++        "sessions_sha256",
++        "lineages",
++    }:
++        raise ValueError("evaluation panel artifact is invalid")
++    return EvaluationPanelSpec(
++        purpose=value["purpose"],  # type: ignore[arg-type]
++        start_date=value["start_date"],  # type: ignore[arg-type]
++        end_date=value["end_date"],  # type: ignore[arg-type]
++        sessions=tuple(value["sessions"]),  # type: ignore[arg-type]
++        sessions_sha256=value["sessions_sha256"],  # type: ignore[arg-type]
++        lineages=tuple(
++            _panel_lineage_from_primitive(item) for item in value["lineages"]  # type: ignore[union-attr]
++        ),
++    )
++
++
++def _target_from_primitive(value: object) -> AnnualizedReturnTarget:
++    if not isinstance(value, dict) or set(value) != {
++        "metric_id",
++        "formula_id",
++        "basis",
++        "target_pct",
++        "milestones_pct",
++        "precision_pct",
++    }:
++        raise ValueError("annualized return target artifact is invalid")
++    return AnnualizedReturnTarget(
++        metric_id=value["metric_id"],  # type: ignore[arg-type]
++        formula_id=value["formula_id"],  # type: ignore[arg-type]
++        basis=value["basis"],  # type: ignore[arg-type]
++        target_pct=Decimal(value["target_pct"]),  # type: ignore[arg-type]
++        milestones_pct=tuple(Decimal(item) for item in value["milestones_pct"]),  # type: ignore[union-attr]
++        precision_pct=Decimal(value["precision_pct"]),  # type: ignore[arg-type]
++    )
++
++
++def _allocation_rule_from_primitive(value: object) -> PanelAllocationRuleV1:
++    if not isinstance(value, dict):
++        raise ValueError("panel allocation rule artifact is invalid")
++    primitive = dict(value)
++    primitive["affiliation_bitset_order"] = tuple(
++        tuple(item) for item in primitive.get("affiliation_bitset_order", ())
++    )
++    primitive["panel_allocation_order"] = tuple(
++        primitive.get("panel_allocation_order", ())
++    )
++    return PanelAllocationRuleV1(**primitive)  # type: ignore[arg-type]
++
++
++def _allocation_from_primitive(value: object) -> PanelStratumAllocation:
++    if not isinstance(value, dict):
++        raise ValueError("panel stratum allocation artifact is invalid")
++    primitive = dict(value)
++    primitive["source_affiliations"] = tuple(
++        primitive.get("source_affiliations", ())
++    )
++    return PanelStratumAllocation(**primitive)  # type: ignore[arg-type]
++
++
++def _discovery_panel_plan_from_primitive(value: object) -> DiscoveryPanelPlan:
++    if not isinstance(value, dict) or value.get("schema_version") != 4:
++        raise ValueError("discovery panel plan is not schema-v4")
++    primitive = dict(value)
++    primitive["target"] = _target_from_primitive(primitive.get("target"))
++    primitive["allocation_rule"] = _allocation_rule_from_primitive(
++        primitive.get("allocation_rule")
++    )
++    primitive["stratum_allocations"] = tuple(
++        _allocation_from_primitive(item)
++        for item in primitive.get("stratum_allocations", ())
++    )
++    primitive["quick_panel"] = _evaluation_panel_from_primitive(
++        primitive.get("quick_panel")
++    )
++    primitive["discovery_panel"] = _evaluation_panel_from_primitive(
++        primitive.get("discovery_panel")
++    )
++    return DiscoveryPanelPlan(**primitive)  # type: ignore[arg-type]
++
++
++def _qualification_panel_plan_from_primitive(
++    value: object,
++) -> QualificationPanelPlan:
++    if not isinstance(value, dict) or value.get("schema_version") != 4:
++        raise ValueError("qualification panel plan is not schema-v4")
++    primitive = dict(value)
++    primitive["target"] = _target_from_primitive(primitive.get("target"))
++    primitive["allocation_rule"] = _allocation_rule_from_primitive(
++        primitive.get("allocation_rule")
++    )
++    primitive["stratum_allocations"] = tuple(
++        _allocation_from_primitive(item)
++        for item in primitive.get("stratum_allocations", ())
++    )
++    primitive["qualification_panel"] = _evaluation_panel_from_primitive(
++        primitive.get("qualification_panel")
++    )
++    return QualificationPanelPlan(**primitive)  # type: ignore[arg-type]
++
++
++def load_discovery_panel_plan(
++    path: Path,
++    *,
++    require_publication: bool = True,
++) -> DiscoveryPanelPlan:
++    resolved = Path(path).resolve()
++    if resolved.is_symlink() or not resolved.is_file():
++        raise ValueError("discovery panel plan must be a regular file")
++    raw = resolved.read_bytes()
++    try:
++        primitive = json.loads(raw, object_pairs_hook=_reject_duplicate_record_keys)
++    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
++        raise ValueError("discovery panel plan JSON is invalid") from exc
++    if not isinstance(primitive, dict) or raw != _canonical_json_bytes(primitive):
++        raise ValueError("discovery panel plan is not canonical JSON")
++    plan = _discovery_panel_plan_from_primitive(primitive)
++    if require_publication:
++        marker = resolved.parent / "publication.json"
++        if marker.is_symlink() or not marker.is_file():
++            raise ValueError("panel publication commit marker is absent")
++        marker_raw = marker.read_bytes()
++        try:
++            publication = json.loads(
++                marker_raw,
++                object_pairs_hook=_reject_duplicate_record_keys,
++            )
++        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
++            raise ValueError("panel publication marker JSON is invalid") from exc
++        if (
++            not isinstance(publication, dict)
++            or marker_raw != _canonical_json_bytes(publication)
++            or publication.get("schema_version") != 4
++            or publication.get("publication_kind") != "panel_plans"
++            or publication.get("discovery_plan_sha256")
++            != hashlib.sha256(raw).hexdigest()
++            or publication.get("qualification_plan_sha256")
++            != plan.qualification_plan_sha256
++        ):
++            raise ValueError("panel publication marker identity differs")
++    return plan
++
++
++def load_qualification_panel_plan(
++    path: Path,
++    *,
++    require_publication: bool = True,
++) -> QualificationPanelPlan:
++    resolved = Path(path).resolve()
++    if resolved.is_symlink() or not resolved.is_file():
++        raise ValueError("qualification panel plan must be a regular file")
++    raw = resolved.read_bytes()
++    try:
++        primitive = json.loads(raw, object_pairs_hook=_reject_duplicate_record_keys)
++    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
++        raise ValueError("qualification panel plan JSON is invalid") from exc
++    if not isinstance(primitive, dict) or raw != _canonical_json_bytes(primitive):
++        raise ValueError("qualification panel plan is not canonical JSON")
++    plan = _qualification_panel_plan_from_primitive(primitive)
++    if require_publication:
++        marker = resolved.parent / "publication.json"
++        if marker.is_symlink() or not marker.is_file():
++            raise ValueError("panel publication commit marker is absent")
++        marker_raw = marker.read_bytes()
++        try:
++            publication = json.loads(
++                marker_raw,
++                object_pairs_hook=_reject_duplicate_record_keys,
++            )
++        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
++            raise ValueError("panel publication marker JSON is invalid") from exc
++        if (
++            not isinstance(publication, dict)
++            or marker_raw != _canonical_json_bytes(publication)
++            or publication.get("schema_version") != 4
++            or publication.get("publication_kind") != "panel_plans"
++            or publication.get("qualification_plan_sha256")
++            != hashlib.sha256(raw).hexdigest()
++        ):
++            raise ValueError("panel publication marker identity differs")
++    return plan
++
++
++@dataclass(frozen=True, slots=True)
++class PanelAggregateSummary:
++    panel_id: str
++    starting_equity: float
++    ending_equity: float
++    elapsed_calendar_days: int
++    portfolio_annualized_return_pct: Decimal
++    total_return_pct: float
++    benchmark_return_pct: float
++    max_drawdown_pct: float
++    sharpe_ratio: float
++    closed_trades: int
++    turnover_pct: float
++    average_exposure_pct: float
++    entry_funnel: tuple[AggregateMetric, ...]
++    exit_attribution: tuple[AggregateMetric, ...]
++
++    def __post_init__(self) -> None:
++        if self.panel_id not in _PANEL_PURPOSES:
++            raise ValueError("panel aggregate identity is invalid")
++        for name in (
++            "starting_equity",
++            "ending_equity",
++            "total_return_pct",
++            "benchmark_return_pct",
++            "max_drawdown_pct",
++            "sharpe_ratio",
++            "turnover_pct",
++            "average_exposure_pct",
++        ):
++            _finite(getattr(self, name), f"panel {name}")
++        if self.starting_equity <= 0.0 or self.ending_equity <= 0.0:
++            raise ValueError("panel equity endpoints must be positive")
++        if type(self.elapsed_calendar_days) is not int or self.elapsed_calendar_days <= 0:
++            raise ValueError("panel elapsed calendar days are invalid")
++        if type(self.closed_trades) is not int or self.closed_trades < 0:
++            raise ValueError("panel closed trades are invalid")
++        for name in ("entry_funnel", "exit_attribution"):
++            metrics = getattr(self, name)
++            if type(metrics) is not tuple or any(
++                not isinstance(metric, AggregateMetric) for metric in metrics
++            ):
++                raise ValueError(f"panel {name} is invalid")
++            ids = tuple(metric.metric_id for metric in metrics)
++            if len(set(ids)) != len(ids):
++                raise ValueError(f"panel {name} metric IDs must be unique")
++        from core.pit_optimization import production_equity_cagr_pct
++
++        expected = _objective_decimal(
++            production_equity_cagr_pct(
++                self.starting_equity,
++                self.ending_equity,
++                self.elapsed_calendar_days,
++            ),
++            "panel production annualized return",
++        )
++        supplied = _objective_decimal(
++            self.portfolio_annualized_return_pct,
++            "panel annualized return",
++        )
++        if supplied != self.portfolio_annualized_return_pct or supplied != expected:
++            raise ValueError("panel annualized return differs from production CAGR")
++
++
++@dataclass(frozen=True, slots=True)
++class DiscoveryPanelComparison:
++    candidate_cagr_pct: Decimal
++    fixed_baseline_cagr_pct: Decimal
++    candidate_vs_fixed_baseline_delta_pp: Decimal
++    target_gap_pp: Decimal
++    strictly_improves_champion: bool
++
++    def __post_init__(self) -> None:
++        for name in (
++            "candidate_cagr_pct",
++            "fixed_baseline_cagr_pct",
++            "candidate_vs_fixed_baseline_delta_pp",
++            "target_gap_pp",
++        ):
++            value = getattr(self, name)
++            if (
++                not isinstance(value, Decimal)
++                or not value.is_finite()
++                or value != value.quantize(_OBJECTIVE_QUANTUM, rounding=ROUND_HALF_EVEN)
++            ):
++                raise ValueError(f"discovery panel {name} is invalid")
++        if self.candidate_vs_fixed_baseline_delta_pp != (
++            self.candidate_cagr_pct - self.fixed_baseline_cagr_pct
++        ).quantize(_OBJECTIVE_QUANTUM, rounding=ROUND_HALF_EVEN):
++            raise ValueError("discovery panel baseline delta differs")
++        if self.target_gap_pp != (
++            AnnualizedReturnTarget.production().target_pct - self.candidate_cagr_pct
++        ).quantize(_OBJECTIVE_QUANTUM, rounding=ROUND_HALF_EVEN):
++            raise ValueError("discovery panel target gap differs")
++        if type(self.strictly_improves_champion) is not bool:
++            raise ValueError("discovery panel champion comparison is invalid")
++
++    @classmethod
++    def from_result(
++        cls,
++        *,
++        candidate_cagr_pct: object,
++        fixed_baseline_cagr_pct: object,
++        current_champion_cagr_pct: object,
++        target: AnnualizedReturnTarget,
++    ) -> "DiscoveryPanelComparison":
++        if not isinstance(target, AnnualizedReturnTarget):
++            raise ValueError("discovery panel target is invalid")
++        candidate = _objective_decimal(candidate_cagr_pct, "candidate panel CAGR")
++        baseline = _objective_decimal(fixed_baseline_cagr_pct, "baseline panel CAGR")
++        champion = _objective_decimal(current_champion_cagr_pct, "champion panel CAGR")
++        return cls(
++            candidate_cagr_pct=candidate,
++            fixed_baseline_cagr_pct=baseline,
++            candidate_vs_fixed_baseline_delta_pp=(candidate - baseline).quantize(
++                _OBJECTIVE_QUANTUM,
++                rounding=ROUND_HALF_EVEN,
++            ),
++            target_gap_pp=(target.target_pct - candidate).quantize(
++                _OBJECTIVE_QUANTUM,
++                rounding=ROUND_HALF_EVEN,
++            ),
++            strictly_improves_champion=candidate > champion,
++        )
++
++
++@dataclass(frozen=True, slots=True)
++class QualificationDecision:
++    candidate_cagr_pct: Decimal
++    baseline_cagr_pct: Decimal
++    target_pct: Decimal
++    evaluation_complete: bool
++    integrity_complete: bool
++    qualified: bool
++
++    def __post_init__(self) -> None:
++        for name in ("candidate_cagr_pct", "baseline_cagr_pct", "target_pct"):
++            value = getattr(self, name)
++            if (
++                not isinstance(value, Decimal)
++                or not value.is_finite()
++                or value != value.quantize(_OBJECTIVE_QUANTUM, rounding=ROUND_HALF_EVEN)
++            ):
++                raise ValueError(f"qualification {name} is invalid")
++        if self.target_pct != AnnualizedReturnTarget.production().target_pct:
++            raise ValueError("qualification target differs from the active target")
++        if type(self.evaluation_complete) is not bool or type(self.integrity_complete) is not bool:
++            raise ValueError("qualification completion flags are invalid")
++        expected = (
++            self.evaluation_complete
++            and self.integrity_complete
++            and self.candidate_cagr_pct >= self.target_pct
++            and self.candidate_cagr_pct > self.baseline_cagr_pct
++        )
++        if self.qualified is not expected:
++            raise ValueError("qualification decision differs from the closed return gate")
++
++    @classmethod
++    def from_result(
++        cls,
++        *,
++        candidate_cagr_pct: object,
++        baseline_cagr_pct: object,
++        target: AnnualizedReturnTarget,
++        evaluation_complete: bool,
++        integrity_complete: bool,
++    ) -> "QualificationDecision":
++        if not isinstance(target, AnnualizedReturnTarget):
++            raise ValueError("qualification target is invalid")
++        candidate = _objective_decimal(candidate_cagr_pct, "qualification candidate CAGR")
++        baseline = _objective_decimal(baseline_cagr_pct, "qualification baseline CAGR")
++        qualified = (
++            evaluation_complete is True
++            and integrity_complete is True
++            and candidate >= target.target_pct
++            and candidate > baseline
++        )
++        return cls(
++            candidate_cagr_pct=candidate,
++            baseline_cagr_pct=baseline,
++            target_pct=target.target_pct,
++            evaluation_complete=evaluation_complete,
++            integrity_complete=integrity_complete,
++            qualified=qualified,
++        )
++
++
+ @dataclass(frozen=True, slots=True)
+ class DiscoveryScore:
+     median_excess_return_pp: Decimal
+     worst_excess_return_pp: Decimal
+     max_drawdown_magnitude_pp: Decimal
+ 
+     def __post_init__(self) -> None:
+         for name in (
+             "median_excess_return_pp",
+             "worst_excess_return_pp",
+@@ -842,20 +1926,206 @@ def _validation_file_lock(path: Path) -> Iterator[None]:
+         else:
+             import fcntl
+ 
+             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+             try:
+                 yield
+             finally:
+                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+ 
+ 
++@dataclass(frozen=True, slots=True)
++class QualificationRetirementSnapshot:
++    schema_version: int
++    qualification_retirement_domain_id: str
++    ledger_head_sha256: str
++    record_count: int
++    retired_security_lineage_ids: tuple[str, ...]
++
++    def __post_init__(self) -> None:
++        if self.schema_version != 4:
++            raise ValueError("qualification retirement snapshot schema is invalid")
++        _require_digest(
++            self.qualification_retirement_domain_id,
++            "qualification retirement domain ID",
++        )
++        _require_digest(self.ledger_head_sha256, "qualification ledger head")
++        if type(self.record_count) is not int or self.record_count < 1:
++            raise ValueError("qualification retirement snapshot record count is invalid")
++        if (
++            type(self.retired_security_lineage_ids) is not tuple
++            or self.retired_security_lineage_ids
++            != tuple(sorted(set(self.retired_security_lineage_ids)))
++            or any(
++                re.fullmatch(r"[a-z][a-z0-9_-]{0,127}", item) is None
++                for item in self.retired_security_lineage_ids
++            )
++        ):
++            raise ValueError("qualification retired lineage snapshot is invalid")
++
++    @property
++    def snapshot_sha256(self) -> str:
++        """Return the append-only ledger head used as the snapshot commitment."""
++
++        return self.ledger_head_sha256
++
++
++class QualificationRetirementLedger:
++    """Permanent schema-v4 hash chain for one-use qualification lineages."""
++
++    def __init__(
++        self,
++        path: Path,
++        qualification_retirement_domain_id: str,
++    ) -> None:
++        candidate = Path(path)
++        if not candidate.is_absolute():
++            raise ValueError("qualification retirement ledger path must be absolute")
++        _require_digest(
++            qualification_retirement_domain_id,
++            "qualification retirement domain ID",
++        )
++        candidate.parent.mkdir(parents=True, exist_ok=True)
++        if candidate.parent.is_symlink() or not candidate.parent.is_dir() or candidate.is_symlink():
++            raise ValueError("qualification retirement ledger path is invalid")
++        self._path = candidate.resolve(strict=False)
++        self._domain_id = qualification_retirement_domain_id
++        self._lock_path = self._path.with_suffix(self._path.suffix + ".lock")
++        with _validation_file_lock(self._lock_path):
++            if not self._path.exists():
++                self._initialize_unlocked()
++            self._read_records_unlocked()
++
++    @staticmethod
++    def _record_digest(record: Mapping[str, object]) -> str:
++        preimage = dict(record)
++        preimage.pop("record_sha256", None)
++        return hashlib.sha256(_canonical_json_bytes(preimage)).hexdigest()
++
++    def _initialize_unlocked(self) -> None:
++        record: dict[str, object] = {
++            "schema_version": 4,
++            "ledger_kind": "qualification_retirement",
++            "qualification_retirement_domain_id": self._domain_id,
++            "record_type": "genesis",
++            "sequence": 0,
++            "previous_record_sha256": None,
++        }
++        record["record_sha256"] = self._record_digest(record)
++        payload = _canonical_json_bytes(record)
++        staging = self._path.parent / (
++            f".{self._path.name}.{secrets.token_hex(12)}.tmp"
++        )
++        try:
++            with staging.open("xb") as handle:
++                handle.write(payload)
++                handle.flush()
++                os.fsync(handle.fileno())
++            try:
++                os.link(staging, self._path)
++            except FileExistsError:
++                return
++        finally:
++            staging.unlink(missing_ok=True)
++
++    def _read_records_unlocked(self) -> list[dict[str, object]]:
++        if self._path.is_symlink() or not self._path.is_file():
++            raise ValueError("qualification retirement ledger is not a regular file")
++        raw = self._path.read_bytes()
++        if not raw or not raw.endswith(b"\n"):
++            raise ValueError("qualification retirement ledger is not canonical JSONL")
++        records: list[dict[str, object]] = []
++        previous: str | None = None
++        for sequence, line in enumerate(raw.splitlines(keepends=True)):
++            try:
++                record = json.loads(
++                    line,
++                    object_pairs_hook=_reject_duplicate_record_keys,
++                )
++            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
++                raise ValueError("qualification retirement ledger JSON is invalid") from exc
++            if not isinstance(record, dict) or line != _canonical_json_bytes(record):
++                raise ValueError("qualification retirement ledger record is not canonical")
++            digest = record.get("record_sha256")
++            if (
++                record.get("schema_version") != 4
++                or record.get("ledger_kind") != "qualification_retirement"
++                or record.get("qualification_retirement_domain_id") != self._domain_id
++                or record.get("sequence") != sequence
++                or record.get("previous_record_sha256") != previous
++                or not isinstance(digest, str)
++                or digest != self._record_digest(record)
++            ):
++                raise ValueError("qualification retirement ledger hash chain is invalid")
++            record_type = record.get("record_type")
++            if sequence == 0:
++                if set(record) != {
++                    "schema_version",
++                    "ledger_kind",
++                    "qualification_retirement_domain_id",
++                    "record_type",
++                    "sequence",
++                    "previous_record_sha256",
++                    "record_sha256",
++                } or record_type != "genesis":
++                    raise ValueError("qualification retirement ledger genesis is invalid")
++            elif record_type not in {"reservation", "outcome", "retirement"}:
++                raise ValueError("qualification retirement ledger record type is invalid")
++            records.append(record)
++            previous = digest
++        return records
++
++    @staticmethod
++    def _retired_lineages(records: Sequence[Mapping[str, object]]) -> tuple[str, ...]:
++        retired: set[str] = set()
++        for record in records[1:]:
++            values = record.get("retired_security_lineage_ids")
++            if values is None and record.get("record_type") == "reservation":
++                values = record.get("security_lineage_ids")
++            if values is None and record.get("record_type") in {"reservation", "retirement"}:
++                lineage = record.get("security_lineage_id")
++                values = [] if lineage is None else [lineage]
++            if values is None:
++                continue
++            if (
++                not isinstance(values, list)
++                or values != sorted(set(values))
++                or any(
++                    not isinstance(item, str)
++                    or re.fullmatch(r"[a-z][a-z0-9_-]{0,127}", item) is None
++                    for item in values
++                )
++            ):
++                raise ValueError("qualification retirement lineage record is invalid")
++            retired.update(values)
++        return tuple(sorted(retired))
++
++    def _snapshot_unlocked(self) -> QualificationRetirementSnapshot:
++        records = self._read_records_unlocked()
++        return QualificationRetirementSnapshot(
++            schema_version=4,
++            qualification_retirement_domain_id=self._domain_id,
++            ledger_head_sha256=str(records[-1]["record_sha256"]),
++            record_count=len(records),
++            retired_security_lineage_ids=self._retired_lineages(records),
++        )
++
++    def snapshot(self) -> QualificationRetirementSnapshot:
++        with _validation_file_lock(self._lock_path):
++            return self._snapshot_unlocked()
++
++    @contextmanager
++    def locked_snapshot(self) -> Iterator[QualificationRetirementSnapshot]:
++        with _validation_file_lock(self._lock_path):
++            yield self._snapshot_unlocked()
++
++
+ class ValidationLedger:
+     """Permanent, hash-chained consumption ledger for validation windows."""
+ 
+     def __init__(self, path: Path) -> None:
+         candidate = Path(path)
+         if (
+             not candidate.is_absolute()
+             or candidate.name != "pit_optimizer_validation_ledger.jsonl"
+             or not candidate.parent.is_dir()
+             or candidate.parent.is_symlink()
+@@ -1226,20 +2496,172 @@ def _read_canonical_mapping(path: Path, label: str) -> Mapping[str, object]:
+     raw = candidate.read_bytes()
+     try:
+         value = json.loads(raw)
+     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+         raise ValueError(f"{label} is invalid JSON") from exc
+     if not isinstance(value, dict) or raw != _canonical_json_bytes(value):
+         raise ValueError(f"{label} is not canonical JSON")
+     return value
+ 
+ 
++def qualification_retirement_domain_id(
++    *,
++    prices_provenance_sha256: str,
++    lineages: tuple[PanelSecurityLineage, ...],
++) -> str:
++    """Bind the permanent retirement domain only to stable lineage provenance."""
++
++    _require_digest(
++        prices_provenance_sha256,
++        "qualification retirement prices provenance SHA-256",
++    )
++    _validate_panel_lineages(lineages)
++    primitive = {
++        "schema_version": 4,
++        "namespace_kind": "authenticated_price_identity_security_lineages_v1",
++        "prices_provenance_sha256": prices_provenance_sha256,
++        "lineages": [
++            _panel_json_value(item)
++            for item in sorted(lineages, key=lambda value: value.security_lineage_id)
++        ],
++    }
++    return hashlib.sha256(_canonical_json_bytes(primitive)).hexdigest()
++
++
++def _lineages_from_authenticated_bundle(
++    bundle: object,
++    transition_contract: object,
++) -> tuple[PanelSecurityLineage, ...]:
++    metadata = getattr(bundle, "metadata", None)
++    if not isinstance(metadata, Mapping) or metadata.get("schema_version") != "2":
++        raise ValueError("panel allocation requires a schema-v2 PIT bundle")
++    source_universe = metadata.get("source_universe")
++    if source_universe not in _SOURCE_AFFILIATIONS:
++        raise ValueError("panel bundle source affiliation is invalid")
++    raw_security_lineages = bundle.security_lineage_ids()
++    identities = getattr(transition_contract, "identities", None)
++    if not isinstance(raw_security_lineages, Mapping) or not isinstance(
++        identities,
++        Mapping,
++    ):
++        raise ValueError("panel bundle lineage identities are absent")
++    grouped: dict[str, list[str]] = {}
++    for ticker, lineage_id in raw_security_lineages.items():
++        if not isinstance(ticker, str) or not isinstance(lineage_id, str):
++            raise ValueError("panel bundle lineage binding is invalid")
++        grouped.setdefault(lineage_id, []).append(ticker)
++    result: list[PanelSecurityLineage] = []
++    for lineage_id, tickers in grouped.items():
++        ordered = tuple(
++            sorted(
++                tickers,
++                key=lambda ticker: (
++                    str(identities[ticker]["admitted_start"]),
++                    str(identities[ticker]["admitted_end"]),
++                    ticker,
++                ),
++            )
++        )
++        result.append(
++            PanelSecurityLineage(
++                security_lineage_id=lineage_id,
++                executable_tickers=ordered,
++                source_affiliations=(str(source_universe),),
++            )
++        )
++    lineages = tuple(sorted(result, key=lambda item: item.security_lineage_id))
++    _validate_panel_lineages(lineages)
++    return lineages
++
++
++def build_and_publish_panel_plans(
++    *,
++    pit_bundle: Path,
++    pit_bundle_sha256: str,
++    prices_provenance: Path,
++    start_date: str,
++    end_date: str,
++    partition_seed: str,
++    rule: PanelAllocationRuleV1,
++    target: AnnualizedReturnTarget,
++    qualification_ledger: Path,
++    output_root: Path,
++) -> dict[str, object]:
++    """Authenticate local inputs and publish one immutable schema-v4 panel pair."""
++
++    _require_digest(pit_bundle_sha256, "panel PIT bundle SHA-256")
++    if (
++        not isinstance(partition_seed, str)
++        or not partition_seed.strip()
++        or partition_seed != partition_seed.strip()
++        or len(partition_seed.encode("utf-8")) > 256
++    ):
++        raise ValueError("panel partition seed is invalid")
++    start = _date(start_date, "panel start date")
++    end = _date(end_date, "panel end date")
++    if start >= end:
++        raise ValueError("panel date range is invalid")
++    bundle_path = Path(pit_bundle).resolve()
++    provenance_path = Path(prices_provenance).resolve()
++    if bundle_path.is_symlink() or not bundle_path.is_file():
++        raise ValueError("panel PIT bundle must be a regular non-link file")
++    if provenance_path.is_symlink() or not provenance_path.is_file():
++        raise ValueError("panel prices provenance must be a regular non-link file")
++    from core.pit_data import PITDataBundle
++
++    with PITDataBundle(bundle_path, expected_sha256=pit_bundle_sha256) as bundle:
++        transition_contract = bundle.load_price_identity_transition_contract(
++            provenance_path
++        )
++        prices_provenance_sha256 = transition_contract.prices_provenance_sha256
++        lineages = _lineages_from_authenticated_bundle(bundle, transition_contract)
++        import pandas as pd
++
++        reference = bundle.fetch_price_data(
++            ("SPY",),
++            pd.Timestamp(start_date),
++            pd.Timestamp(end_date),
++        ).get("SPY")
++        if reference is None or reference.empty:
++            raise ValueError("panel reference sessions are absent")
++        sessions = tuple(index.date().isoformat() for index in reference.index)
++        if sessions[0] != start_date or sessions[-1] != end_date:
++            raise ValueError("panel bounds must be exact market sessions")
++    domain_id = qualification_retirement_domain_id(
++        prices_provenance_sha256=prices_provenance_sha256,
++        lineages=lineages,
++    )
++    ledger = QualificationRetirementLedger(
++        Path(qualification_ledger).resolve(strict=False),
++        domain_id,
++    )
++    partition_seed_sha256 = hashlib.sha256(
++        partition_seed.encode("utf-8")
++    ).hexdigest()
++    with ledger.locked_snapshot() as snapshot:
++        qualification_plan, discovery_plan = compose_panel_plans(
++            lineages=lineages,
++            sessions=sessions,
++            pit_bundle_sha256=pit_bundle_sha256,
++            prices_provenance_sha256=prices_provenance_sha256,
++            partition_seed_sha256=partition_seed_sha256,
++            target=target,
++            rule=rule,
++            ledger_snapshot=snapshot,
++        )
++        return publish_panel_plans(
++            output_root=Path(output_root),
++            qualification_plan=qualification_plan,
++            discovery_plan=discovery_plan,
++        )
++
++
+ def _manifest_cli_parser() -> argparse.ArgumentParser:
+     parser = argparse.ArgumentParser(
+         prog="python -m core.pit_optimizer_evaluation",
+         allow_abbrev=False,
+     )
+     commands = parser.add_subparsers(dest="command", required=True)
+     build = commands.add_parser("build-subset-manifest", allow_abbrev=False)
+     for flag in (
+         "readiness",
+         "verified-parity",
+@@ -1263,20 +2685,33 @@ def _manifest_cli_parser() -> argparse.ArgumentParser:
+             "dynamic-bytes",
+             "input-tokens",
+             "output-tokens",
+             "response-bytes",
+         ):
+             build.add_argument(f"--{role}-{suffix}", type=int, required=True)
+     build.add_argument("--max-files", type=int, required=True)
+     build.add_argument("--max-hunks", type=int, required=True)
+     build.add_argument("--max-changed-lines", type=int, required=True)
+     build.add_argument("--max-diff-bytes", type=int, required=True)
++    panels = commands.add_parser("build-panel-plans", allow_abbrev=False)
++    panels.add_argument("--pit-bundle", type=Path, required=True)
++    panels.add_argument("--pit-bundle-sha256", required=True)
++    panels.add_argument("--prices-provenance", type=Path, required=True)
++    panels.add_argument("--start-date", required=True)
++    panels.add_argument("--end-date", required=True)
++    panels.add_argument("--partition-seed", required=True)
++    panels.add_argument("--quick-count", type=int, required=True)
++    panels.add_argument("--discovery-count", type=int, required=True)
++    panels.add_argument("--qualification-count", type=int, required=True)
++    panels.add_argument("--target-pct", required=True)
++    panels.add_argument("--qualification-ledger", type=Path, required=True)
++    panels.add_argument("--output-root", type=Path, required=True)
+     return parser
+ 
+ 
+ def _call_budgets_from_namespace(namespace: argparse.Namespace) -> tuple[object, ...]:
+     from core.pit_optimization_contract import (
+         OPTIMIZER_V2_ROLES,
+         PIT_OPTIMIZER_R1_MODEL,
+         PitOptimizerCallBudget,
+     )
+ 
+@@ -1309,24 +2744,63 @@ def _call_budgets_from_namespace(namespace: argparse.Namespace) -> tuple[object,
+                     max_response_bytes=getattr(
+                         namespace,
+                         f"{prefix}_response_bytes",
+                     ),
+                 )
+             )
+     return tuple(budgets)
+ 
+ 
+ def main(argv: Sequence[str] | None = None) -> int:
+-    """Build one provider-free schema-v3 subset manifest and prepare command."""
++    """Build provider-free schema-v3 audit or schema-v4 panel artifacts."""
+     namespace = _manifest_cli_parser().parse_args(
+         list(sys.argv[1:] if argv is None else argv)
+     )
++    if namespace.command == "build-panel-plans":
++        target = AnnualizedReturnTarget(
++            metric_id="portfolio_annualized_return_pct",
++            formula_id="production_equity_cagr_365_calendar_days_v1",
++            basis="absolute",
++            target_pct=Decimal(namespace.target_pct),
++            milestones_pct=(
++                Decimal("10.00"),
++                Decimal("20.00"),
++                Decimal("50.00"),
++            ),
++            precision_pct=Decimal("0.01"),
++        )
++        publication = build_and_publish_panel_plans(
++            pit_bundle=namespace.pit_bundle,
++            pit_bundle_sha256=namespace.pit_bundle_sha256,
++            prices_provenance=namespace.prices_provenance,
++            start_date=namespace.start_date,
++            end_date=namespace.end_date,
++            partition_seed=namespace.partition_seed,
++            rule=PanelAllocationRuleV1(
++                quick_count=namespace.quick_count,
++                discovery_count=namespace.discovery_count,
++                qualification_count=namespace.qualification_count,
++            ),
++            target=target,
++            qualification_ledger=namespace.qualification_ledger,
++            output_root=namespace.output_root,
++        )
++        print(
++            "PIT_OPTIMIZER_PANEL_PLANS="
++            + json.dumps(
++                publication,
++                sort_keys=True,
++                separators=(",", ":"),
++                allow_nan=False,
++            )
++        )
++        return 0
+     if namespace.command != "build-subset-manifest":
+         raise ValueError("unknown PIT optimizer evaluation command")
+     from core.pit_optimization_contract import (
+         PatchBounds,
+         build_prepare_command,
+         build_subset_manifest,
+         write_optimizer_manifest,
+     )
+     from core.pit_optimizer_controller import _load_parity
+     from core.pit_policy_parity import load_parity_reference
+diff --git a/core/pit_policy_parity.py b/core/pit_policy_parity.py
+index fef131b..97bea25 100644
+--- a/core/pit_policy_parity.py
++++ b/core/pit_policy_parity.py
+@@ -1,31 +1,38 @@
+ """Canonical pre/post extraction evidence for the PIT strategy-policy boundary."""
+ 
+ from __future__ import annotations
+ 
+-from dataclasses import asdict, dataclass
++from dataclasses import asdict, dataclass, fields, is_dataclass
++from datetime import date
++from decimal import Decimal, ROUND_HALF_EVEN
+ from pathlib import Path
+ from collections import Counter
+ import argparse
+ import hashlib
+ import json
+ import math
+ import re
++import shutil
+ import subprocess
+ from types import MappingProxyType
+ from typing import Callable, Iterable, Mapping, Sequence
+ 
+ from core.pit_optimizer_evaluation import (
+     AggregateMetric,
++    DiscoveryPanelPlan,
++    EvaluationPanelSpec,
+     FoldAggregateSummary,
+     FoldManifest,
+     FoldSpec,
++    PanelAggregateSummary,
++    load_discovery_panel_plan,
+ )
+ 
+ 
+ _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+ _HEAD_RE = re.compile(r"[0-9a-f]{40}")
+ _REFERENCE_SCHEMA_VERSION = 1
+ _ATTESTATION_SCHEMA_VERSION = 1
+ _PARITY_SIGNAL_EVERY_N_DAYS = 1
+ _DISCOVERY_WINDOWS = (
+     ("discovery_1", "2021-06-25", "2021-09-20"),
+@@ -396,20 +403,22 @@ def _evidence_from_primitive(value: object) -> ParityFoldEvidence:
+ 
+ def load_parity_reference(path: Path) -> ParityReference:
+     resolved = Path(path).resolve()
+     raw = resolved.read_bytes()
+     try:
+         primitive = json.loads(raw)
+     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+         raise ValueError("parity reference JSON is invalid") from exc
+     if not isinstance(primitive, dict) or raw != _canonical_json_bytes(primitive):
+         raise ValueError("parity reference is not canonical JSON")
++    if primitive.get("schema_version") != _REFERENCE_SCHEMA_VERSION:
++        raise ValueError("legacy parity reader accepts schema-v1 artifacts only")
+     artifact_sha256 = hashlib.sha256(raw).hexdigest()
+     value = dict(primitive)
+     value["fold_manifest"] = _manifest_from_primitive(value.get("fold_manifest"))
+     value["universe"] = tuple(value.get("universe", ()))
+     value["discovery_evidence"] = tuple(_evidence_from_primitive(item) for item in value.get("discovery_evidence", ()))
+     value["discovery_output_sha256s"] = tuple(tuple(item) for item in value.get("discovery_output_sha256s", ()))
+     return ParityReference(
+         **value,
+         artifact_path=resolved,
+         artifact_sha256=artifact_sha256,
+@@ -1200,38 +1209,497 @@ def verify_parity_reference(
+         policy_interface_version=POLICY_INTERFACE_VERSION,
+         final_discovery_evidence=evidence,
+         pre_persist_check=lambda: _require_unchanged_source(
+             source_root=root,
+             expected_head=final_head,
+             expected_fingerprint_sha256=final_fingerprint,
+         ),
+     )
+ 
+ 
++def _v4_json_value(value: object) -> object:
++    if isinstance(value, Decimal):
++        return format(value, ".2f")
++    if is_dataclass(value) and not isinstance(value, type):
++        return {
++            item.name: _v4_json_value(getattr(value, item.name))
++            for item in fields(value)
++        }
++    if isinstance(value, tuple):
++        return [_v4_json_value(item) for item in value]
++    if isinstance(value, list):
++        return [_v4_json_value(item) for item in value]
++    if isinstance(value, Mapping):
++        return {str(key): _v4_json_value(item) for key, item in value.items()}
++    return value
++
++
++def _panel_session(value: object) -> str:
++    import pandas as pd
++
++    return pd.Timestamp(value).date().isoformat()
++
++
++def build_panel_evidence_v4(
++    *,
++    panel: EvaluationPanelSpec,
++    result: object,
++) -> dict[str, object]:
++    """Convert a continuous production run into canonical interface-v2 evidence."""
++
++    if not isinstance(panel, EvaluationPanelSpec) or panel.purpose == "qualification":
++        raise ValueError("parity accepts only quick or discovery panels")
++    equity_curve = getattr(result, "equity_curve", None)
++    benchmark_curve = getattr(result, "benchmark_curve", None)
++    if equity_curve is None or benchmark_curve is None:
++        raise ValueError("panel parity simulation curves are absent")
++    equity = tuple(
++        ParityEquityPoint(_panel_session(session), float(value))
++        for session, value in equity_curve.items()
++    )
++    benchmark = tuple(
++        ParityEquityPoint(_panel_session(session), float(value))
++        for session, value in benchmark_curve.items()
++    )
++    if tuple(point.session for point in equity) != panel.sessions:
++        raise ValueError("panel parity equity sessions differ from the plan")
++    if tuple(point.session for point in benchmark) != panel.sessions:
++        raise ValueError("panel parity benchmark sessions differ from the plan")
++    transaction_log = getattr(result, "transaction_log", None)
++    rows = (
++        []
++        if transaction_log is None or transaction_log.empty
++        else transaction_log.to_dict("records")
++    )
++    transactions: list[ParityTransaction] = []
++    for row in rows:
++        raw_from_symbol = row.get("FromTicker")
++        from_symbol = (
++            None
++            if raw_from_symbol is None
++            or (isinstance(raw_from_symbol, float) and math.isnan(raw_from_symbol))
++            else str(raw_from_symbol)
++        )
++        transactions.append(
++            ParityTransaction(
++                date=_panel_session(row["Date"]),
++                symbol=str(row["Ticker"]),
++                from_symbol=from_symbol,
++                action=str(row["Action"]),
++                price=float(row["Price"]),
++                quantity=float(row["Quantity"]),
++                value=float(row["Value"]),
++                reason=str(row["Reason"]),
++            )
++        )
++    entry_outcomes = tuple(
++        ParityEntryOutcome(**outcome.to_primitive())
++        for outcome in getattr(result, "entry_outcomes", ())
++    )
++    raw_funnel = getattr(result, "signal_funnel", None)
++    if not isinstance(raw_funnel, Mapping):
++        raise ValueError("panel parity signal funnel is absent")
++    funnel = tuple(
++        AggregateMetric(metric_id, raw_funnel[metric_id])
++        for metric_id in sorted(raw_funnel)
++    )
++    closed_trades = getattr(result, "closed_trades", None)
++    if not isinstance(closed_trades, list):
++        raise ValueError("panel parity closed trades are absent")
++    exit_counts = Counter(
++        str(getattr(trade, "exit_reason", None) or "unknown")
++        for trade in closed_trades
++    )
++    exit_attribution = tuple(
++        AggregateMetric(reason, count) for reason, count in sorted(exit_counts.items())
++    )
++    initial_capital = float(getattr(result, "initial_capital", math.nan))
++    if not math.isfinite(initial_capital) or initial_capital <= 0.0:
++        raise ValueError("panel parity initial capital is invalid")
++    turnover_pct = (
++        sum(abs(item.value) for item in transactions) / initial_capital * 100.0
++    )
++    by_session: dict[str, list[ParityTransaction]] = {}
++    for transaction in transactions:
++        by_session.setdefault(transaction.date, []).append(transaction)
++    cash = initial_capital
++    exposure_values: list[float] = []
++    for point in equity:
++        for transaction in by_session.get(point.session, ()):
++            if transaction.action == "BUY":
++                cash -= transaction.value
++            elif transaction.action == "SELL":
++                cash += transaction.value
++        exposure_values.append(
++            0.0
++            if point.equity == 0.0
++            else (point.equity - cash) / point.equity * 100.0
++        )
++    elapsed_days = (
++        date.fromisoformat(panel.end_date) - date.fromisoformat(panel.start_date)
++    ).days
++    from core.pit_optimization import production_equity_cagr_pct
++
++    portfolio_cagr = Decimal(
++        str(
++            production_equity_cagr_pct(
++                equity[0].equity,
++                equity[-1].equity,
++                elapsed_days,
++            )
++        )
++    ).quantize(Decimal("0.01"), rounding=ROUND_HALF_EVEN)
++    aggregate = PanelAggregateSummary(
++        panel_id=panel.purpose,
++        starting_equity=equity[0].equity,
++        ending_equity=equity[-1].equity,
++        elapsed_calendar_days=elapsed_days,
++        portfolio_annualized_return_pct=portfolio_cagr,
++        total_return_pct=float(result.total_return_pct),
++        benchmark_return_pct=float(result.benchmark_return_pct),
++        max_drawdown_pct=float(result.max_drawdown_pct),
++        sharpe_ratio=float(result.sharpe_ratio),
++        closed_trades=len(closed_trades),
++        turnover_pct=turnover_pct,
++        average_exposure_pct=(
++            sum(exposure_values) / len(exposure_values) if exposure_values else 0.0
++        ),
++        entry_funnel=funnel,
++        exit_attribution=exit_attribution,
++    )
++    config = getattr(result, "config", None)
++    effective_policy_sha256 = (
++        config.get("effective_engine_policy_sha256")
++        if isinstance(config, Mapping)
++        else None
++    )
++    _require_digest(effective_policy_sha256, "panel parity policy digest")
++    primitive: dict[str, object] = {
++        "panel_id": panel.purpose,
++        "panel_sha256": panel.sha256,
++        "policy_interface_version": 2,
++        "transactions": _v4_json_value(tuple(transactions)),
++        "entry_outcomes": _v4_json_value(entry_outcomes),
++        "equity": _v4_json_value(equity),
++        "benchmark": _v4_json_value(benchmark),
++        "funnel": _v4_json_value(funnel),
++        "aggregate": _v4_json_value(aggregate),
++        "effective_policy_sha256": effective_policy_sha256,
++    }
++    primitive["evidence_sha256"] = _digest(primitive)
++    return primitive
++
++
++def _validate_sandbox_image(value: str) -> str:
++    if (
++        not isinstance(value, str)
++        or re.fullmatch(r"[^\s@]+@sha256:[0-9a-f]{64}", value) is None
++    ):
++        raise ValueError("panel parity sandbox image is invalid")
++    return value
++
++
++def _v4_run_root(path: Path) -> Path:
++    root = Path(path).resolve(strict=False)
++    if root.exists():
++        raise FileExistsError("panel parity output root already exists")
++    root.parent.mkdir(parents=True, exist_ok=True)
++    if root.parent.is_symlink() or root.is_symlink():
++        raise ValueError("panel parity output root is invalid")
++    return root
++
++
++def _write_v4_run(
++    *,
++    output_root: Path,
++    artifact_name: str,
++    primitive: Mapping[str, object],
++) -> tuple[Path, str]:
++    root = _v4_run_root(output_root)
++    root.mkdir()
++    try:
++        payload = _canonical_json_bytes(primitive)
++        artifact = root / artifact_name
++        with artifact.open("xb") as handle:
++            handle.write(payload)
++            handle.flush()
++        digest = hashlib.sha256(payload).hexdigest()
++        marker = {
++            "schema_version": 4,
++            "publication_kind": "panel_parity_run",
++            "artifact_name": artifact_name,
++            "artifact_sha256": digest,
++        }
++        with (root / "publication.json").open("xb") as handle:
++            handle.write(_canonical_json_bytes(marker))
++            handle.flush()
++        return artifact, digest
++    except BaseException:
++        try:
++            shutil.rmtree(root)
++        except OSError as cleanup_exc:
++            raise RuntimeError("panel parity cleanup failed") from cleanup_exc
++        raise
++
++
++def _load_v4_reference(path: Path) -> tuple[dict[str, object], str]:
++    resolved = Path(path).resolve()
++    if resolved.is_symlink() or not resolved.is_file():
++        raise ValueError("panel parity reference must be a regular file")
++    raw = resolved.read_bytes()
++    try:
++        primitive = json.loads(raw)
++    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
++        raise ValueError("panel parity reference JSON is invalid") from exc
++    digest = hashlib.sha256(raw).hexdigest()
++    marker = resolved.parent / "publication.json"
++    if marker.is_symlink() or not marker.is_file():
++        raise ValueError("panel parity reference publication marker is absent")
++    marker_raw = marker.read_bytes()
++    try:
++        publication = json.loads(marker_raw)
++    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
++        raise ValueError("panel parity publication JSON is invalid") from exc
++    if (
++        not isinstance(primitive, dict)
++        or raw != _canonical_json_bytes(primitive)
++        or primitive.get("schema_version") != 4
++        or primitive.get("artifact_kind") != "panel_parity_reference"
++        or not isinstance(publication, dict)
++        or marker_raw != _canonical_json_bytes(publication)
++        or set(publication)
++        != {
++            "schema_version",
++            "publication_kind",
++            "artifact_name",
++            "artifact_sha256",
++        }
++        or publication.get("schema_version") != 4
++        or publication.get("publication_kind") != "panel_parity_run"
++        or publication.get("artifact_name") != resolved.name
++        or publication.get("artifact_sha256") != digest
++    ):
++        raise ValueError("panel parity reference identity is invalid")
++    return primitive, digest
++
++
++def _evaluate_discovery_panels_v4(
++    *,
++    plan: DiscoveryPanelPlan,
++    bundle: object,
++) -> tuple[dict[str, object], ...]:
++    from core.backtest_engine import PortfolioSimulator
++    from core.strategy_policy import POLICY_INTERFACE_VERSION
++
++    if POLICY_INTERFACE_VERSION != 2:
++        raise ValueError("panel parity requires policy interface 2")
++    simulator = PortfolioSimulator(
++        pit_bundle=bundle,
++        benchmark_symbol="SPY",
++        signal_every_n_days=_PARITY_SIGNAL_EVERY_N_DAYS,
++    )
++    warmup_start = bundle.metadata["warmup_start"]
++    evidence: list[dict[str, object]] = []
++    for panel in (plan.quick_panel, plan.discovery_panel):
++        tickers = tuple(
++            ticker
++            for lineage in panel.lineages
++            for ticker in lineage.executable_tickers
++        )
++        result = simulator.run(
++            list(tickers),
++            start_date=panel.start_date,
++            end_date=panel.end_date,
++            history_start_date=warmup_start,
++            benchmark_symbol="SPY",
++        )
++        evidence.append(build_panel_evidence_v4(panel=panel, result=result))
++    if len({item["effective_policy_sha256"] for item in evidence}) != 1:
++        raise ValueError("panel parity policy identity differs between panels")
++    return tuple(evidence)
++
++
++def _authenticated_panel_parity_evidence(
++    *,
++    discovery_panel_plan: Path,
++    pit_bundle: Path,
++    pit_bundle_sha256: str,
++    prices_provenance: Path,
++    sandbox_image: str,
++) -> tuple[DiscoveryPanelPlan, tuple[dict[str, object], ...]]:
++    _require_digest(pit_bundle_sha256, "panel parity PIT bundle digest")
++    _validate_sandbox_image(sandbox_image)
++    plan = load_discovery_panel_plan(Path(discovery_panel_plan))
++    if plan.pit_bundle_sha256 != pit_bundle_sha256:
++        raise ValueError("panel parity bundle differs from the discovery plan")
++    from core.pit_data import PITDataBundle
++
++    with PITDataBundle(pit_bundle, expected_sha256=pit_bundle_sha256) as bundle:
++        transition = bundle.load_price_identity_transition_contract(prices_provenance)
++        if transition.prices_provenance_sha256 != plan.prices_provenance_sha256:
++            raise ValueError("panel parity prices provenance differs from the plan")
++        evidence = _evaluate_discovery_panels_v4(plan=plan, bundle=bundle)
++    return plan, evidence
++
++
++def capture_panel_parity_reference_v4(
++    *,
++    discovery_panel_plan: Path,
++    pit_bundle: Path,
++    pit_bundle_sha256: str,
++    prices_provenance: Path,
++    sandbox_image: str,
++    output_root: Path,
++) -> tuple[Path, str, int]:
++    """Capture continuous quick/discovery baseline evidence without a provider."""
++
++    _v4_run_root(output_root)
++    plan, evidence = _authenticated_panel_parity_evidence(
++        discovery_panel_plan=discovery_panel_plan,
++        pit_bundle=pit_bundle,
++        pit_bundle_sha256=pit_bundle_sha256,
++        prices_provenance=prices_provenance,
++        sandbox_image=sandbox_image,
++    )
++    primitive = {
++        "schema_version": 4,
++        "artifact_kind": "panel_parity_reference",
++        "policy_interface_version": 2,
++        "discovery_panel_plan_sha256": plan.sha256,
++        "qualification_plan_sha256": plan.qualification_plan_sha256,
++        "pit_bundle_sha256": pit_bundle_sha256,
++        "prices_provenance_sha256": plan.prices_provenance_sha256,
++        "sandbox_image": sandbox_image,
++        "panel_evidence": list(evidence),
++    }
++    artifact, digest = _write_v4_run(
++        output_root=output_root,
++        artifact_name="parity-reference.json",
++        primitive=primitive,
++    )
++    return artifact, digest, len(evidence)
++
++
++def verify_panel_parity_reference_v4(
++    *,
++    reference: Path,
++    discovery_panel_plan: Path,
++    pit_bundle: Path,
++    pit_bundle_sha256: str,
++    prices_provenance: Path,
++    sandbox_image: str,
++    output_root: Path,
++) -> tuple[Path, str, int]:
++    """Repeat continuous quick/discovery evidence and attest byte equality."""
++
++    _v4_run_root(output_root)
++    reference_value, reference_sha256 = _load_v4_reference(reference)
++    plan, evidence = _authenticated_panel_parity_evidence(
++        discovery_panel_plan=discovery_panel_plan,
++        pit_bundle=pit_bundle,
++        pit_bundle_sha256=pit_bundle_sha256,
++        prices_provenance=prices_provenance,
++        sandbox_image=sandbox_image,
++    )
++    for key, expected in (
++        ("policy_interface_version", 2),
++        ("discovery_panel_plan_sha256", plan.sha256),
++        ("qualification_plan_sha256", plan.qualification_plan_sha256),
++        ("pit_bundle_sha256", pit_bundle_sha256),
++        ("prices_provenance_sha256", plan.prices_provenance_sha256),
++        ("sandbox_image", sandbox_image),
++    ):
++        if reference_value.get(key) != expected:
++            raise ValueError("panel parity reference identity differs")
++    reference_evidence = reference_value.get("panel_evidence")
++    if reference_evidence != list(evidence):
++        raise ValueError("panel parity quick/discovery evidence differs")
++    primitive = {
++        "schema_version": 4,
++        "artifact_kind": "panel_parity_attestation",
++        "policy_interface_version": 2,
++        "reference_artifact_sha256": reference_sha256,
++        "discovery_panel_plan_sha256": plan.sha256,
++        "qualification_plan_sha256": plan.qualification_plan_sha256,
++        "pit_bundle_sha256": pit_bundle_sha256,
++        "prices_provenance_sha256": plan.prices_provenance_sha256,
++        "sandbox_image": sandbox_image,
++        "panel_output_sha256s": [
++            [item["panel_id"], item["evidence_sha256"]] for item in evidence
++        ],
++        "parity_equal": True,
++    }
++    artifact, digest = _write_v4_run(
++        output_root=output_root,
++        artifact_name="parity-attestation.json",
++        primitive=primitive,
++    )
++    return artifact, digest, len(evidence)
++
++
+ def _parser() -> argparse.ArgumentParser:
+-    parser = argparse.ArgumentParser(description=__doc__)
++    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+     commands = parser.add_subparsers(dest="command", required=True)
+     capture = commands.add_parser("capture")
+     capture.add_argument("--readiness", required=True, type=Path)
+     capture.add_argument("--pit-bundle", required=True, type=Path)
+     capture.add_argument("--output", required=True, type=Path)
+     capture.add_argument("--first-discovery-session")
+     capture.add_argument("--fold-sessions", type=int, default=60)
+     verify = commands.add_parser("verify")
+     verify.add_argument("--reference", required=True, type=Path)
+     verify.add_argument("--pit-bundle", required=True, type=Path)
+     verify.add_argument("--output", required=True, type=Path)
++    capture_v4 = commands.add_parser("capture-v4", allow_abbrev=False)
++    verify_v4 = commands.add_parser("verify-v4", allow_abbrev=False)
++    for command in (capture_v4, verify_v4):
++        command.add_argument("--discovery-panel-plan", required=True, type=Path)
++        command.add_argument("--pit-bundle", required=True, type=Path)
++        command.add_argument("--pit-bundle-sha256", required=True)
++        command.add_argument("--prices-provenance", required=True, type=Path)
++        command.add_argument("--sandbox-image", required=True)
++        command.add_argument("--output-root", required=True, type=Path)
++    verify_v4.add_argument("--reference", required=True, type=Path)
+     return parser
+ 
+ 
+ def main(argv: Sequence[str] | None = None) -> int:
+     args = _parser().parse_args(argv)
++    if args.command == "capture-v4":
++        _artifact, digest, panel_count = capture_panel_parity_reference_v4(
++            discovery_panel_plan=args.discovery_panel_plan,
++            pit_bundle=args.pit_bundle,
++            pit_bundle_sha256=args.pit_bundle_sha256,
++            prices_provenance=args.prices_provenance,
++            sandbox_image=args.sandbox_image,
++            output_root=args.output_root,
++        )
++        print(
++            "PIT_POLICY_PANEL_PARITY_REFERENCE "
++            f"sha256={digest} panels={panel_count} policy_interface=2"
++        )
++        return 0
++    if args.command == "verify-v4":
++        _artifact, digest, panel_count = verify_panel_parity_reference_v4(
++            reference=args.reference,
++            discovery_panel_plan=args.discovery_panel_plan,
++            pit_bundle=args.pit_bundle,
++            pit_bundle_sha256=args.pit_bundle_sha256,
++            prices_provenance=args.prices_provenance,
++            sandbox_image=args.sandbox_image,
++            output_root=args.output_root,
++        )
++        print(
++            "PIT_POLICY_PANEL_PARITY_VERIFIED "
++            f"sha256={digest} panels={panel_count} policy_interface=2"
++        )
++        return 0
+     if args.command == "capture":
+         reference = capture_parity_reference(
+             readiness_path=args.readiness,
+             pit_bundle_path=args.pit_bundle,
+             output=args.output,
+             first_discovery_session=args.first_discovery_session,
+             fold_sessions=args.fold_sessions,
+         )
+         folds = ",".join(
+             f"{fold.fold_id}:{fold.start_date}..{fold.end_date}" for fold in reference.fold_manifest.discovery_folds
+diff --git a/tests/test_pit_optimizer_v2.py b/tests/test_pit_optimizer_v2.py
+index 2b7958f..08bd7b9 100644
+--- a/tests/test_pit_optimizer_v2.py
++++ b/tests/test_pit_optimizer_v2.py
+@@ -3,21 +3,21 @@
+ from __future__ import annotations
+ 
+ import base64
+ import json
+ import hashlib
+ import hmac
+ from concurrent.futures import ThreadPoolExecutor
+ from contextlib import closing
+ from dataclasses import asdict, fields, replace
+ from datetime import date, timedelta
+-from decimal import Decimal, ROUND_HALF_EVEN
++from decimal import Decimal
+ import difflib
+ from itertools import product
+ import os
+ from pathlib import Path
+ import shutil
+ import sqlite3
+ import string
+ import subprocess
+ import sys
+ import threading
+@@ -8731,173 +8731,274 @@ def test_pit_optimizer_v2_gateway_commits_authoritative_per_call_overage(
+             wall_deadline=10.0,
+             monotonic=lambda: 1.0,
+         )
+ 
+     records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
+     assert records[-2]["provider_facts"]["outcome"] == "budget_exceeded"
+     assert records[-2]["charged_usd"] == pytest.approx(plan.max_usd + 0.01)
+     assert records[-1]["record_type"] == "lease_close"
+ 
+ 
+-def test_objective_is_quantized_lexicographic_strict_and_trade_eligible() -> None:
+-    """Break caught: floating or non-strict ranking could promote an ineligible candidate."""
+-    folds = (
+-        replace(
+-            _fold_summary("discovery_1", 1.235),
+-            max_drawdown_pct=-4.005,
+-            closed_trades=1,
+-        ),
+-        replace(
+-            _fold_summary("discovery_2", 0.505),
+-            max_drawdown_pct=-2.0,
+-            closed_trades=3,
+-        ),
+-    )
+-
+-    original_baseline = (
+-        _fold_summary("discovery_1", 0.0),
+-        _fold_summary("discovery_2", 0.0),
+-    )
+-    baseline_sha256 = _aggregate_sha256(original_baseline)
+-    score = evaluation.discovery_score_from_folds(
+-        folds,
+-        original_baseline,
+-        original_baseline_sha256=baseline_sha256,
+-        expected_original_baseline_sha256=baseline_sha256,
+-    )
+-
+-    expected_first = Decimal(str(1.235)).quantize(
+-        Decimal("0.01"), rounding=ROUND_HALF_EVEN
+-    )
+-    expected_second = Decimal(str(0.505)).quantize(
+-        Decimal("0.01"), rounding=ROUND_HALF_EVEN
+-    )
+-    assert score == evaluation.DiscoveryScore(
+-        median_excess_return_pp=((expected_first + expected_second) / 2).quantize(
+-            Decimal("0.01"), rounding=ROUND_HALF_EVEN
+-        ),
+-        worst_excess_return_pp=expected_second,
+-        max_drawdown_magnitude_pp=Decimal(str(4.005)).quantize(
+-            Decimal("0.01"), rounding=ROUND_HALF_EVEN
+-        ),
+-    )
+-    assert score.ordering_key == (
+-        Decimal("0.87"),
+-        Decimal("0.50"),
+-        Decimal("-4.00"),
+-    )
+-    assert evaluation.strictly_improves_discovery(score, score) is False
+-    assert evaluation.strictly_improves_discovery(
+-        replace(score, worst_excess_return_pp=Decimal("0.51")),
+-        score,
+-    ) is True
+-    with pytest.raises(ValueError, match="closed discovery trade"):
+-        evaluation.discovery_score_from_folds(
+-            (replace(folds[0], closed_trades=0), folds[1]),
+-            original_baseline,
+-            original_baseline_sha256=baseline_sha256,
+-            expected_original_baseline_sha256=baseline_sha256,
+-        )
+-
+-
+-def test_discovery_objective_derives_excess_from_authenticated_fixed_baseline(
++def test_objective_is_absolute_panel_cagr_quantized_and_strict_on_ties() -> None:
++    """Break caught: a diagnostic, trade gate, or CAGR tie could change panel ranking."""
++    target = evaluation.AnnualizedReturnTarget.production()
++    assert target == evaluation.AnnualizedReturnTarget(
++        metric_id="portfolio_annualized_return_pct",
++        formula_id="production_equity_cagr_365_calendar_days_v1",
++        basis="absolute",
++        target_pct=Decimal("10.00"),
++        milestones_pct=(Decimal("10.00"), Decimal("20.00"), Decimal("50.00")),
++        precision_pct=Decimal("0.01"),
++    )
++    candidate = evaluation.PanelAggregateSummary(
++        panel_id="discovery",
++        starting_equity=100.0,
++        ending_equity=121.0,
++        elapsed_calendar_days=730,
++        portfolio_annualized_return_pct=Decimal("10.00"),
++        total_return_pct=21.0,
++        benchmark_return_pct=40.0,
++        max_drawdown_pct=-99.0,
++        sharpe_ratio=-5.0,
++        closed_trades=0,
++        turnover_pct=0.0,
++        average_exposure_pct=0.0,
++        entry_funnel=(),
++        exit_attribution=(),
++    )
++    comparison = evaluation.DiscoveryPanelComparison.from_result(
++        candidate_cagr_pct=candidate.portfolio_annualized_return_pct,
++        fixed_baseline_cagr_pct=Decimal("9.00"),
++        current_champion_cagr_pct=Decimal("10.00"),
++        target=target,
++    )
++
++    assert comparison.candidate_vs_fixed_baseline_delta_pp == Decimal("1.00")
++    assert comparison.target_gap_pp == Decimal("0.00")
++    assert comparison.strictly_improves_champion is False
++    assert evaluation.DiscoveryPanelComparison.from_result(
++        candidate_cagr_pct=Decimal("10.006"),
++        fixed_baseline_cagr_pct=Decimal("50.00"),
++        current_champion_cagr_pct=Decimal("10.00"),
++        target=target,
++    ).strictly_improves_champion is True
++    assert evaluation.DiscoveryPanelComparison.from_result(
++        candidate_cagr_pct=Decimal("8.00"),
++        fixed_baseline_cagr_pct=Decimal("7.00"),
++        current_champion_cagr_pct=Decimal("9.00"),
++        target=target,
++    ).target_gap_pp == Decimal("2.00")
++    with pytest.raises(ValueError, match="annualized return"):
++        replace(candidate, portfolio_annualized_return_pct=Decimal("10.01"))
++
++
++def test_panel_allocator_is_lineage_stratified_disjoint_and_capacity_closed(
+     tmp_path: Path,
+ ) -> None:
+-    """Break caught: fabricated excess or a substituted incumbent could drive ranking."""
+-    candidate = (
+-        replace(
+-            _fold_summary("discovery_1", 0.0),
+-            total_return_pct=2.235,
+-            excess_total_return_pp=99.0,
+-        ),
+-        replace(
+-            _fold_summary("discovery_2", 0.0),
+-            total_return_pct=1.505,
+-            excess_total_return_pp=-99.0,
+-        ),
+-    )
+-    original_baseline = (
+-        replace(_fold_summary("discovery_1", 0.0), total_return_pct=1.0),
+-        replace(_fold_summary("discovery_2", 0.0), total_return_pct=1.0),
+-    )
+-    baseline_sha256 = _aggregate_sha256(original_baseline)
+-
+-    score = evaluation.discovery_score_from_folds(
+-        candidate,
+-        original_baseline,
+-        original_baseline_sha256=baseline_sha256,
+-        expected_original_baseline_sha256=baseline_sha256,
++    """Break caught: allocation could depend on ticker aliases or overrun a stratum."""
++    lineages = tuple(
++        evaluation.PanelSecurityLineage(
++            security_lineage_id=f"chain-{index:02d}",
++            executable_tickers=(f"T{index:02d}",),
++            source_affiliations=(("sp500",) if index < 5 else ("nasdaq100",)),
++        )
++        for index in range(8)
++    )
++    rule = evaluation.PanelAllocationRuleV1(
++        quick_count=1,
++        discovery_count=3,
++        qualification_count=2,
++    )
++    first = evaluation.sha256_lineage_stratified_v1(
++        lineages=lineages,
++        partition_seed_sha256="a" * 64,
++        rule=rule,
++    )
++    second = evaluation.sha256_lineage_stratified_v1(
++        lineages=tuple(reversed(lineages)),
++        partition_seed_sha256="a" * 64,
++        rule=rule,
++    )
++
++    assert first == second
++    quick, discovery, qualification, allocations = first
++    assert (len(quick), len(discovery), len(qualification)) == (1, 3, 2)
++    assert len({item.security_lineage_id for item in (*quick, *discovery, *qualification)}) == 6
++    assert all(
++        item.quick_count
++        + item.discovery_count
++        + item.qualification_count
++        + item.unallocated_count
++        == item.eligible_count
++        for item in allocations
++    )
++    with pytest.raises(ValueError, match="eligible capacity"):
++        evaluation.sha256_lineage_stratified_v1(
++            lineages=lineages,
++            partition_seed_sha256="a" * 64,
++            rule=evaluation.PanelAllocationRuleV1(3, 3, 3),
++        )
++    with pytest.raises(ValueError, match="ticker alias"):
++        evaluation.sha256_lineage_stratified_v1(
++            lineages=(lineages[0], replace(lineages[1], executable_tickers=("T00",))),
++            partition_seed_sha256="a" * 64,
++            rule=evaluation.PanelAllocationRuleV1(0, 1, 1),
++        )
++
++    ledger = evaluation.QualificationRetirementLedger(
++        tmp_path / "qualification-ledger.json",
++        qualification_retirement_domain_id="b" * 64,
++    )
++    snapshot = ledger.snapshot()
++    assert snapshot.retired_security_lineage_ids == ()
++    reservation = {
++        "schema_version": 4,
++        "ledger_kind": "qualification_retirement",
++        "qualification_retirement_domain_id": "b" * 64,
++        "record_type": "reservation",
++        "sequence": 1,
++        "previous_record_sha256": snapshot.ledger_head_sha256,
++        "security_lineage_ids": ["chain-00"],
++    }
++    reservation["record_sha256"] = evaluation.QualificationRetirementLedger._record_digest(
++        reservation
++    )
++    with (tmp_path / "qualification-ledger.json").open("ab") as handle:
++        handle.write(_canonical_file_bytes(reservation))
++    retired_snapshot = evaluation.QualificationRetirementLedger(
++        tmp_path / "qualification-ledger.json",
++        qualification_retirement_domain_id="b" * 64,
++    ).snapshot()
++    assert retired_snapshot.retired_security_lineage_ids == ("chain-00",)
++    qualification_plan, discovery_plan = evaluation.compose_panel_plans(
++        lineages=lineages,
++        sessions=("2021-01-04", "2021-01-05", "2021-01-06"),
++        pit_bundle_sha256="c" * 64,
++        prices_provenance_sha256="d" * 64,
++        partition_seed_sha256="a" * 64,
++        target=evaluation.AnnualizedReturnTarget.production(),
++        rule=rule,
++        ledger_snapshot=retired_snapshot,
++    )
++    assert sum(item.eligible_count for item in discovery_plan.stratum_allocations) == 7
++    hidden_ids = {
++        item.security_lineage_id for item in qualification_plan.qualification_panel.lineages
++    }
++    discovery_text = json.dumps(discovery_plan.to_primitive(), sort_keys=True)
++    assert hidden_ids
++    assert all(lineage_id not in discovery_text for lineage_id in hidden_ids)
++    assert discovery_plan.qualification_plan_sha256 == qualification_plan.sha256
++
++    published = evaluation.publish_panel_plans(
++        output_root=tmp_path / "panels",
++        qualification_plan=qualification_plan,
++        discovery_plan=discovery_plan,
++    )
++    assert published["qualification_plan_sha256"] == qualification_plan.sha256
++    assert (tmp_path / "panels" / "publication.json").is_file()
++    with pytest.raises(FileExistsError, match="immutable"):
++        evaluation.publish_panel_plans(
++            output_root=tmp_path / "panels",
++            qualification_plan=qualification_plan,
++            discovery_plan=discovery_plan,
++        )
++
++    partial = tmp_path / "partial-panels"
++    partial.mkdir()
++    (partial / "qualification-plan.json").write_bytes(
++        evaluation.panel_plan_bytes(qualification_plan)
++    )
++    evaluation.publish_panel_plans(
++        output_root=partial,
++        qualification_plan=qualification_plan,
++        discovery_plan=discovery_plan,
++    )
++    assert evaluation.load_discovery_panel_plan(
++        partial / "discovery-plan.json"
++    ) == discovery_plan
++    assert evaluation.load_qualification_panel_plan(
++        partial / "qualification-plan.json"
++    ) == qualification_plan
++    parsed = evaluation._manifest_cli_parser().parse_args(
++        [
++            "build-panel-plans",
++            "--pit-bundle",
++            str(tmp_path / "pit.sqlite3"),
++            "--pit-bundle-sha256",
++            "c" * 64,
++            "--prices-provenance",
++            str(tmp_path / "prices.json"),
++            "--start-date",
++            "2021-01-04",
++            "--end-date",
++            "2025-12-31",
++            "--partition-seed",
++            "sealed-seed",
++            "--quick-count",
++            "12",
++            "--discovery-count",
++            "48",
++            "--qualification-count",
++            "24",
++            "--target-pct",
++            "10.00",
++            "--qualification-ledger",
++            str(tmp_path / "permanent-ledger.json"),
++            "--output-root",
++            str(tmp_path / "published-panels"),
++        ]
+     )
+-
+-    assert score.median_excess_return_pp == Decimal("0.87")
+-    assert score.worst_excess_return_pp == Decimal("0.50")
+-    with pytest.raises(ValueError, match="fixed baseline identity"):
+-        evaluation.discovery_score_from_folds(
+-            candidate,
+-            original_baseline,
+-            original_baseline_sha256=baseline_sha256,
+-            expected_original_baseline_sha256="f" * 64,
+-        )
+-    with pytest.raises(ValueError, match="supplied score differs"):
+-        proof = _discovery_exposure_proof(tmp_path)
+-        contract.candidate_comparison_from_fixed_baseline(
+-            candidate_folds=candidate,
+-            original_baseline_folds=original_baseline,
+-            original_baseline_sha256=baseline_sha256,
+-            expected_original_baseline_sha256=baseline_sha256,
+-            discovery_exposure=proof,
+-            expected_window_identities=proof.window_identities,
+-            expected_metadata=proof.metadata,
+-            diagnostics=(),
+-            supplied_score=replace(
+-                score,
+-                worst_excess_return_pp=score.worst_excess_return_pp
+-                + Decimal("0.01"),
+-            ),
+-        )
++    assert parsed.command == "build-panel-plans"
++    assert parsed.partition_seed == "sealed-seed"
+ 
+ 
+-def test_holdout_gate_uses_return_trades_and_completeness_without_sharpe() -> None:
+-    """Break caught: a Sharpe gate or permissive equality boundary could alter eligibility."""
+-    decision = evaluation.HoldoutDecision.from_result(
+-        excess_total_return_pp=0.105,
+-        closed_trades=3,
+-        safety_complete=True,
++def test_qualification_gate_uses_only_target_integrity_and_same_panel_baseline() -> None:
++    """Break caught: a diagnostic gate or baseline equality could alter qualification."""
++    decision = evaluation.QualificationDecision.from_result(
++        candidate_cagr_pct=Decimal("10.005"),
++        baseline_cagr_pct=Decimal("9.99"),
++        target=evaluation.AnnualizedReturnTarget.production(),
++        evaluation_complete=True,
+         integrity_complete=True,
+-        accounting_complete=True,
+     )
+ 
+-    assert decision.excess_total_return_pp == Decimal("0.10")
+-    assert decision.long_replay_eligible is True
+-    assert "sharpe" not in {field.name for field in fields(evaluation.HoldoutDecision)}
+-    assert evaluation.HoldoutDecision.from_result(
+-        excess_total_return_pp=0.094,
+-        closed_trades=3,
+-        safety_complete=True,
++    assert decision.candidate_cagr_pct == Decimal("10.00")
++    assert decision.qualified is True
++    assert {
++        "closed_trades",
++        "drawdown",
++        "sharpe",
++        "turnover",
++        "transaction_costs",
++    }.isdisjoint({field.name for field in fields(evaluation.QualificationDecision)})
++    assert evaluation.QualificationDecision.from_result(
++        candidate_cagr_pct=Decimal("9.99"),
++        baseline_cagr_pct=Decimal("1.00"),
++        target=evaluation.AnnualizedReturnTarget.production(),
++        evaluation_complete=True,
+         integrity_complete=True,
+-        accounting_complete=True,
+-    ).long_replay_eligible is False
+-    assert evaluation.HoldoutDecision.from_result(
+-        excess_total_return_pp=0.10,
+-        closed_trades=2,
+-        safety_complete=True,
++    ).qualified is False
++    assert evaluation.QualificationDecision.from_result(
++        candidate_cagr_pct=Decimal("10.00"),
++        baseline_cagr_pct=Decimal("10.00"),
++        target=evaluation.AnnualizedReturnTarget.production(),
++        evaluation_complete=True,
+         integrity_complete=True,
+-        accounting_complete=True,
+-    ).long_replay_eligible is False
+-    with pytest.raises(ValueError, match="eligibility"):
+-        evaluation.HoldoutDecision(
+-            excess_total_return_pp=Decimal("0.10"),
+-            closed_trades=3,
+-            safety_complete=True,
++    ).qualified is False
++    with pytest.raises(ValueError, match="qualification decision"):
++        evaluation.QualificationDecision(
++            candidate_cagr_pct=Decimal("10.00"),
++            baseline_cagr_pct=Decimal("9.00"),
++            target_pct=Decimal("10.00"),
++            evaluation_complete=True,
+             integrity_complete=True,
+-            accounting_complete=True,
+-            long_replay_eligible=False,
++            qualified=False,
+         )
+ 
+ 
+ def _validation_identity(fold: FoldSpec, suffix: str) -> evaluation.ValidationWindowIdentity:
+     sessions_sha256 = hashlib.sha256(
+         _canonical_file_bytes(list(fold.sessions))
+     ).hexdigest()
+     return evaluation.ValidationWindowIdentity(
+         pit_bundle_sha256="a" * 64,
+         universe_sha256="b" * 64,
+diff --git a/tests/test_pit_policy_parity.py b/tests/test_pit_policy_parity.py
+index 96b49c3..a23d0e3 100644
+--- a/tests/test_pit_policy_parity.py
++++ b/tests/test_pit_policy_parity.py
+@@ -14,23 +14,25 @@ import pytest
+ import core.pit_policy_parity as parity
+ from core.backtest_engine import (
+     EntryAttemptOutcome,
+     PortfolioSimulator,
+     SimulationResult,
+     Trade,
+ )
+ from core.strategy_policy.runtime import InProcessPolicyClient
+ from core.pit_optimizer_evaluation import (
+     AggregateMetric,
++    EvaluationPanelSpec,
+     FoldAggregateSummary,
+     FoldManifest,
+     FoldSpec,
++    PanelSecurityLineage,
+ )
+ from core.pit_policy_parity import (
+     ParityEntryOutcome,
+     ParityEquityPoint,
+     ParityFoldEvidence,
+     ParityTransaction,
+     build_fixed_fold_manifest,
+     build_fold_evidence,
+     capture_from_authenticated_inputs,
+     load_parity_reference,
+@@ -191,37 +193,37 @@ def _evidence(
+         "entry_outcomes": [asdict(outcome)],
+         "equity": [asdict(point) for point in equity_points],
+         "funnel": [asdict(metric) for metric in funnel],
+         "aggregate": asdict(fields["aggregate"]),
+         "effective_policy_sha256": "d" * 64,
+     }
+     digest = _json_digest(primitive)
+     return ParityFoldEvidence(**fields, evidence_sha256=digest)
+ 
+ 
+-def test_fold_manifest_rejects_reused_discovery_sessions() -> None:
++def test_legacy_fold_manifest_rejects_reused_discovery_sessions() -> None:
+     """Break caught: the same market sessions could influence both discovery folds."""
+     first = _fold("discovery_1", "discovery", "2021-01-04")
+     second = replace(first, fold_id="discovery_2")
+     hidden = _fold("hidden_1", "hidden", "2022-01-03")
+     with pytest.raises(ValueError, match="overlap"):
+         FoldManifest(
+             data_identity_sha256="a" * 64,
+             universe_sha256="b" * 64,
+             benchmark="SPY",
+             warmup_start_date="2020-01-02",
+             discovery_folds=(first, second),
+             hidden_fold=hidden,
+         )
+ 
+ 
+-def test_fold_manifest_requires_two_chronological_discovery_folds_before_hidden() -> None:
++def test_legacy_fold_manifest_requires_two_chronological_discovery_folds_before_hidden() -> None:
+     """Break caught: a short, reordered, or mislabeled fold could be evaluated."""
+     first = _fold("discovery_1", "discovery", "2021-01-04")
+     second = _fold("discovery_2", "discovery", "2021-04-01")
+     hidden = _fold("hidden_1", "hidden", "2022-01-03")
+     manifest = FoldManifest(
+         data_identity_sha256="4" * 64,
+         universe_sha256=_json_digest(["AAA", "BBB"]),
+         benchmark="SPY",
+         warmup_start_date="2020-01-02",
+         discovery_folds=(first, second),
+@@ -406,21 +408,21 @@ def test_fixed_fold_manifest_can_seal_a_later_independent_subset() -> None:
+         sessions[180],
+         sessions[240],
+     ]
+     assert [fold.sessions[-1] for fold in folds] == [
+         sessions[179],
+         sessions[239],
+         sessions[299],
+     ]
+ 
+ 
+-def test_fold_evidence_embeds_exact_result_rows_and_hand_checked_aggregates() -> None:
++def test_legacy_fold_and_panel_evidence_embed_production_aggregates() -> None:
+     """Break caught: capture emitted only hashes or computed aggregates from a different result."""
+     fold = _fold("discovery_1", "discovery", "2021-01-04")
+     equity = pd.Series([1_000.0] * 60, index=fold.sessions)
+     transactions = pd.DataFrame(
+         [
+             {
+                 "Date": fold.sessions[0],
+                 "Ticker": "AAA",
+                 "Action": "BUY",
+                 "Price": 100.0,
+@@ -467,23 +469,33 @@ def test_fold_evidence_embeds_exact_result_rows_and_hand_checked_aggregates() ->
+     assert evidence.entry_outcomes == (
+         ParityEntryOutcome("AAA", fold.sessions[0], fold.sessions[1], None, None, None, 100.0, "entries_executed"),
+     )
+     assert tuple(point.session for point in evidence.equity) == fold.sessions
+     assert evidence.aggregate.total_return_pct == 0.0
+     assert evidence.aggregate.excess_total_return_pp == 0.0
+     assert evidence.aggregate.closed_trades == 1
+     assert evidence.aggregate.turnover_pct == 20.0
+     assert evidence.aggregate.average_exposure_pct == pytest.approx(59 / 6)
+     assert dict((item.metric_id, item.value) for item in evidence.aggregate.exit_attribution) == {"end_of_test": 1}
++    panel = EvaluationPanelSpec.from_lineages(
++        purpose="discovery",
++        sessions=fold.sessions,
++        lineages=(
++            PanelSecurityLineage("chain_aaa", ("AAA",), ("sp500",)),
++        ),
++    )
++    panel_evidence = parity.build_panel_evidence_v4(panel=panel, result=result)
++    assert panel_evidence["policy_interface_version"] == 2
++    assert panel_evidence["aggregate"]["portfolio_annualized_return_pct"] == "0.00"
+ 
+ 
+-def test_capture_evaluates_only_discovery_and_seals_hidden_calendar(tmp_path: Path) -> None:
++def test_legacy_capture_evaluates_only_discovery_and_seals_hidden_calendar(tmp_path: Path) -> None:
+     """Break caught: reference capture evaluated hidden data or omitted its sealed boundary."""
+     closures = {"2021-07-05", "2021-09-06", "2021-11-25", "2021-12-24", "2022-01-17", "2022-02-21"}
+     sessions = tuple(
+         value.date().isoformat()
+         for value in pd.bdate_range("2021-06-25", "2022-03-11")
+         if value.date().isoformat() not in closures
+     )
+     readiness = {
+         "evaluation_contract": {
+             "verification_only": True,
+@@ -580,39 +592,64 @@ def test_capture_carries_a_later_subset_selection_into_the_reference(
+         pre_persist_check=lambda: None,
+     )
+ 
+     assert evaluated == [
+         ("discovery_1", sessions[120]),
+         ("discovery_2", sessions[180]),
+     ]
+     assert reference.fold_manifest.hidden_fold.sessions == sessions[240:300]
+ 
+ 
+-def test_parity_capture_cli_accepts_a_later_subset_start() -> None:
+-    """Break caught: the selectable fresh subset was available only to in-process callers."""
++def test_panel_parity_cli_requires_provider_free_v4_identity_inputs() -> None:
++    """Break caught: v4 parity could expose qualification or omit a sealed local identity."""
+     parser = parity._parser()
+ 
+-    args = parser.parse_args(
++    capture = parser.parse_args(
++        [
++            "capture-v4",
++            "--discovery-panel-plan",
++            "C:/artifacts/panels/discovery-plan.json",
++            "--pit-bundle",
++            "C:/artifacts/pit.sqlite3",
++            "--pit-bundle-sha256",
++            "a" * 64,
++            "--prices-provenance",
++            "C:/artifacts/prices.json",
++            "--sandbox-image",
++            "localhost/pit@sha256:" + "b" * 64,
++            "--output-root",
++            "C:/artifacts/parity/reference",
++        ]
++    )
++    verify = parser.parse_args(
+         [
+-            "capture",
+-            "--readiness",
+-            "C:/artifacts/readiness.json",
++            "verify-v4",
++            "--reference",
++            "C:/artifacts/parity/reference/parity-reference.json",
++            "--discovery-panel-plan",
++            "C:/artifacts/panels/discovery-plan.json",
+             "--pit-bundle",
+             "C:/artifacts/pit.sqlite3",
+-            "--output",
+-            "C:/artifacts/reference.json",
+-            "--first-discovery-session",
+-            "2022-03-14",
++            "--pit-bundle-sha256",
++            "a" * 64,
++            "--prices-provenance",
++            "C:/artifacts/prices.json",
++            "--sandbox-image",
++            "localhost/pit@sha256:" + "b" * 64,
++            "--output-root",
++            "C:/artifacts/parity/verification",
+         ]
+     )
+ 
+-    assert args.first_discovery_session == "2022-03-14"
++    assert capture.command == "capture-v4"
++    assert verify.command == "verify-v4"
++    assert not hasattr(capture, "qualification_panel_plan")
+ 
+ 
+ def test_capture_simulator_binds_authenticated_signal_cadence() -> None:
+     """Break caught: reference capture silently used the engine's five-day default cadence."""
+     readiness = {
+         "effective_policy": {
+             "entry_policy": {
+                 "signal_every_n_days": {
+                     "classification": "active_tunable_policy",
+                     "optimizer_candidate": True,

@@ -1,0 +1,34 @@
+# Learning/Search Task 5 Re-review
+
+## Spec Compliance
+
+APPROVED.
+
+The focused correction satisfies the requested critic-finalization, portable-reference, checkpoint-batch, and selected-lineage authority contracts without adding archive ranking or runtime/provider/evaluator behavior.
+
+## Strengths
+
+- The exact testability matrix is centralized in `is_testable_experiment_status_v5`: quick-rejected, zero-trade, timed-out, cancelled, evaluation-failed, and evaluated records require an embedded review plus critic reference, while invalid, exact-duplicate, and behavioral-equivalent records reject both (`memory.py:69-102`, `memory.py:249-263`). Feedback and summary projections repeat the same matrix rather than weakening it (`memory.py:871-957`).
+- Repository append validates the status/critic gate and authenticates the content-addressed critic before the record's create-only write. Load repeats the same check and requires exactly one review equal to the embedded review (`artifacts.py:930-993`). This closes the prior irreversible pre-critic finalization path.
+- Checkpoint record verification groups testable records by round, requires one shared critic reference, and requires the critic's unique review-ID set to equal exactly the promoted testable experiment-ID set (`artifacts.py:1013-1037`). Because this runs from both publication and recovery through `_verify_record_refs`, partial, split, or extra-review batches cannot become checkpoint authority.
+- `ArtifactRefV5` now validates every component with the portable closed grammar and rejects nested colons/ADS syntax, reserved device basenames, trailing dot/space, unsupported characters, and overlength names at contract construction (`contracts.py:304-330`).
+- Projection now requires a non-null selected parent to be identified by a supplied authorized record reference, checks that it is the evaluated non-no-op producer of the requested revision, and gives `None` the explicit external/baseline meaning (`memory.py:1087-1127`). Same-revision records are retained in deterministic order; only a revision with an evaluated producer advances ancestry, while conflicting policy identity, parent lineage, and cycles raise typed ambiguity failures (`memory.py:1007-1085`).
+- Archive reduction remains injected via `ArchiveReducerV5` (`memory.py:797-815`); the correction adds no ranking, admission, provider, evaluator, Docker, or execution coupling.
+
+## Issues
+
+### Critical
+
+None.
+
+### Important
+
+None.
+
+### Minor
+
+None.
+
+## Assessment
+
+The correction is narrowly scoped and resolves every prior finding. Critic completeness is now enforced both per record and across the checkpoint-authorized round batch; artifact references fail closed at the shared contract boundary; and lineage has an explicit authenticated anchor plus deterministic ambiguity handling. Task 5 is ready to proceed.

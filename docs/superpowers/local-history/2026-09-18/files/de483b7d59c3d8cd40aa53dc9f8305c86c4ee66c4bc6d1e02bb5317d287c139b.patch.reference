@@ -1,0 +1,367 @@
+diff --git a/.superpowers/sdd/2026-09-04-pit-optimizer-v5-campaign/development-scope-report.md b/.superpowers/sdd/2026-09-04-pit-optimizer-v5-campaign/development-scope-report.md
+new file mode 100644
+index 0000000..b27bd66
+--- /dev/null
++++ b/.superpowers/sdd/2026-09-04-pit-optimizer-v5-campaign/development-scope-report.md
+@@ -0,0 +1,45 @@
++# Development execution scope wiring report
++
++Implemented the first bounded source increment from `development-scope-brief.md` at base `cbd0d8dcec5a9830087b233cc4cbb87fd58dc07d`.
++
++## Result
++
++- Added validated `pit_data_scope` authority to `CampaignManifestV5` and `BaselineParentAuthorityV5`, with `production` as the compatibility default and `development_sp500_v2` as the only alternative.
++- Development manifests reject provider capabilities and therefore require `provider=None`.
++- Bound manifest scope to baseline-parent authority during manifest construction, authentication, CLI authority composition, feedback-round input construction, and confirmation dependency authentication.
++- Propagated manifest scope into the existing `PanelExecutionRequestV5`, preserving its output schema and its development prohibition on baseline capture and held-out evaluation.
++- Added `--pit-data-scope` to manifest construction and included the selected value in the manifest CLI projection.
++- Production services, production round factories/compositions, and the direct production composition helper explicitly reject development manifests or parents.
++- Fixture composition, invocation, and history verification explicitly require production scope, so development execution cannot enter through fixture provenance.
++
++## Changed files
++
++- `core/pit_optimizer_v5/contracts.py`
++- `core/pit_optimizer_v5/search.py`
++- `core/pit_optimizer_v5/sandbox.py`
++- `core/pit_optimizer_v5/manifest.py`
++- `core/pit_optimizer_v5/runtime.py`
++- `core/pit_optimizer_v5/cli.py`
++- `core/pit_optimizer_v5/baseline.py`
++- `core/pit_optimizer_v5/selection.py`
++- `core/pit_optimizer_v5/panels.py`
++- `core/pit_optimizer_v5/fixture_runtime.py`
++- `.superpowers/sdd/2026-09-04-pit-optimizer-v5-campaign/development-scope-report.md`
++
++The pre-existing controller-owned `progress.md` modification was not touched or staged.
++
++## Validation
++
++- `git diff --check`: passed (only existing line-ending notices).
++- In-memory Python compilation of all ten changed Python modules: `in-memory compile: 10 files OK`.
++- Ruff over all ten changed Python modules: `All checks passed!`.
++- `python -B -m core.pit_optimizer_v5.cli build-manifest --help`: passed and displayed `--pit-data-scope {production,development_sp500_v2}`.
++- Narrow source diff and constructor/call-site review completed. No tests or synthetic probes were read, created, modified, or run. No Docker, network, or provider operation was performed.
++
++## Identity migration
++
++`pit_data_scope` participates in canonical dataclass serialization, so newly decoded legacy manifests and baseline parents receive the production default but their newly computed canonical identities include that explicit field. Any pre-existing reference whose digest was computed before this field existed must retain its original bytes/reference rather than be silently re-emitted under the old digest. There is no prior real production campaign to migrate.
++
++## Remaining work
++
++This increment intentionally stops before development composition. The next increments still need controller-response provenance and development composition, explicit semantic-skip persistence/replay semantics, four real development parent discovery evaluations, and the two-round real feedback-loop run. Production baseline capture, qualification, and full replay remain unchanged and unavailable to development scope.
+diff --git a/core/pit_optimizer_v5/baseline.py b/core/pit_optimizer_v5/baseline.py
+index 6153b15..57aed89 100644
+--- a/core/pit_optimizer_v5/baseline.py
++++ b/core/pit_optimizer_v5/baseline.py
+@@ -357,7 +357,12 @@ def verify_baseline_v5(*, repository, authority_ref: ArtifactRefV5) -> dict[str,
+     )
+     if parent != expected:
+         raise ValueError("baseline parent projection differs from full authority")
+-    baseline_parent_candidate_v5(authority=parent, discovery_plan=inputs.plan, evaluator_contract=inputs.evaluator)
++    baseline_parent_candidate_v5(
++        authority=parent,
++        discovery_plan=inputs.plan,
++        evaluator_contract=inputs.evaluator,
++        pit_data_scope="production",
++    )
+     return {
+         "schema_version": 5,
+         "status": "verified",
+diff --git a/core/pit_optimizer_v5/cli.py b/core/pit_optimizer_v5/cli.py
+index 6def78b..55f0206 100644
+--- a/core/pit_optimizer_v5/cli.py
++++ b/core/pit_optimizer_v5/cli.py
+@@ -297,6 +297,7 @@ class CampaignAuthoritiesV5:
+         if (
+             self.manifest.baseline_authority_ref.sha256 != canonical_sha256_v5(self.baseline)
+             or self.manifest.sandbox_profile_ref.sha256 != self.sandbox_profile.sha256
++            or self.manifest.pit_data_scope != self.baseline.pit_data_scope
+         ):
+             raise ValueError("V5 campaign authority identity differs from the manifest")
+ 
+@@ -387,6 +388,8 @@ class ProductionRoundCompositionV5:
+         owner_token_sha256: str,
+         adapter_config: ProductionAdapterConfigV5,
+     ) -> None:
++        if authorities.manifest.pit_data_scope != "production" or authorities.baseline.pit_data_scope != "production":
++            raise V5CliFailure("production_authority_mismatch")
+         if type(self.inputs) is not FeedbackRoundInputV5 or type(self.dependencies) is not FeedbackRoundDependenciesV5:
+             raise V5CliFailure("production_dependency_invalid")
+         if (
+@@ -488,6 +491,8 @@ class ProductionRoundFactoryV5:
+         owner_token_sha256: str,
+         adapter_config: ProductionAdapterConfigV5,
+     ) -> ProductionRoundCompositionV5:
++        if authorities.manifest.pit_data_scope != "production" or authorities.baseline.pit_data_scope != "production":
++            raise V5CliFailure("production_authority_mismatch")
+         if (
+             adapter_config != self.adapter_config
+             or authorities.manifest.sha256 != self.adapter_config.campaign_manifest_sha256
+@@ -536,7 +541,9 @@ def _compose_production_round_from_paths_v5(
+     """Construct real local adapters without invoking a provider, Git, or Docker."""
+     provider_capabilities = authorities.manifest.provider
+     if (
+-        provider_capabilities is None
++        authorities.manifest.pit_data_scope != "production"
++        or authorities.baseline.pit_data_scope != "production"
++        or provider_capabilities is None
+         or provider_capabilities.automatic_retries != 0
+         or provider_capabilities.schema_repair_calls != 0
+     ):
+@@ -695,6 +702,8 @@ class ProductionV5CommandServices:
+                 manifest_ref,
+                 value_type=CampaignManifestV5,
+             )
++            if manifest.pit_data_scope != "production":
++                raise V5CliFailure("campaign_authority_invalid")
+             return CampaignAuthoritiesV5(
+                 manifest=manifest,
+                 panel_plan=repository.load_typed_artifact(
+@@ -1141,6 +1150,11 @@ def build_parser_v5() -> argparse.ArgumentParser:
+     build_manifest.add_argument("--max-discovery-survivors-per-template", type=int, default=6)
+     build_manifest.add_argument("--archive-capacity", type=int, default=8)
+     build_manifest.add_argument("--max-feedback-rounds", type=int, default=10)
++    build_manifest.add_argument(
++        "--pit-data-scope",
++        choices=("production", "development_sp500_v2"),
++        default="production",
++    )
+     build_manifest.add_argument("--deny-full-source-escape", action="store_true")
+     build_manifest.add_argument("--investigator-memory-max-bytes", type=int, default=96 * 1024)
+     build_manifest.add_argument("--max-parallel-evaluations", type=int, default=2)
+@@ -1480,6 +1494,7 @@ def _manifest_projection_v5(
+         "campaign_id": manifest.campaign_id,
+         "target_pct": manifest.target.to_text(),
+         "source_commit": manifest.source_commit,
++        "pit_data_scope": manifest.pit_data_scope,
+         "provider": (
+             None
+             if provider is None
+@@ -1535,6 +1550,7 @@ def dispatch_manifest_cli_v5(
+                 search=_manifest_search_capabilities_v5(namespace),
+                 provider=_manifest_provider_capabilities_v5(namespace),
+                 resources=_manifest_resource_capabilities_v5(namespace),
++                pit_data_scope=namespace.pit_data_scope,
+             )
+             projection = _manifest_projection_v5(authenticated, status="created")
+         else:
+diff --git a/core/pit_optimizer_v5/contracts.py b/core/pit_optimizer_v5/contracts.py
+index 809f503..6015be1 100644
+--- a/core/pit_optimizer_v5/contracts.py
++++ b/core/pit_optimizer_v5/contracts.py
+@@ -1058,6 +1058,7 @@ class CampaignManifestV5:
+     apply: Literal[False]
+     qualification_allowed: Literal[False]
+     full_replay_allowed: Literal[False]
++    pit_data_scope: Literal["production", "development_sp500_v2"] = "production"
+ 
+     def __post_init__(self) -> None:
+         if type(self.schema_version) is not int or self.schema_version != 5:
+@@ -1069,6 +1070,10 @@ class CampaignManifestV5:
+             raise ValueError("campaign search capabilities are invalid")
+         if self.provider is not None and type(self.provider) is not ProviderCapabilitiesV5:
+             raise ValueError("campaign provider capabilities are invalid")
++        if self.pit_data_scope not in {"production", "development_sp500_v2"}:
++            raise ValueError("campaign PIT data scope is invalid")
++        if self.pit_data_scope == "development_sp500_v2" and self.provider is not None:
++            raise ValueError("development campaign must be provider-free")
+         if type(self.resources) is not ResourceCapabilitiesV5:
+             raise ValueError("campaign resource capabilities are invalid")
+         if type(self.artifact_root) is not str or self.artifact_root != ARTIFACT_ROOT_V5:
+diff --git a/core/pit_optimizer_v5/fixture_runtime.py b/core/pit_optimizer_v5/fixture_runtime.py
+index 3302fc9..75f315c 100644
+--- a/core/pit_optimizer_v5/fixture_runtime.py
++++ b/core/pit_optimizer_v5/fixture_runtime.py
+@@ -164,7 +164,11 @@ class FixtureRoleInvokerV5:
+     """Adapt a deterministic RoleRunnerV5 to the persisted runtime role boundary."""
+ 
+     def __init__(self, manifest):
+-        if type(manifest) is not CampaignManifestV5 or manifest.provider is not None:
++        if (
++            type(manifest) is not CampaignManifestV5
++            or manifest.provider is not None
++            or manifest.pit_data_scope != "production"
++        ):
+             raise ValueError("fixture roles require exact provider-free authority")
+         self.runner: RoleRunnerV5 = FixtureRoleRunnerV5(responses={}, campaign_fixture=True)
+         self._manifest = manifest
+@@ -342,6 +346,7 @@ def compose_fixture_round_v5(*, repository, authorities, round_index):
+     manifest = authorities.manifest
+     if (
+         manifest.provider is not None
++        or manifest.pit_data_scope != "production"
+         or manifest.sha256 != authorities.manifest_ref.sha256
+         or manifest.search.hypotheses_per_investigator != 3
+         or manifest.search.max_variants_per_template < 3
+@@ -392,7 +397,7 @@ def compose_fixture_round_v5(*, repository, authorities, round_index):
+ 
+ def verify_fixture_run_v5(*, repository, manifest):
+     """Authenticate synthetic role/lease history without production adapter configuration."""
+-    if manifest.provider is not None:
++    if manifest.provider is not None or manifest.pit_data_scope != "production":
+         raise ValueError("fixture history requires provider-free authority")
+     for index in range(1, manifest.search.max_feedback_rounds + 1):
+         events = repository.load_round_events(campaign_id=manifest.campaign_id, round_index=index)
+diff --git a/core/pit_optimizer_v5/manifest.py b/core/pit_optimizer_v5/manifest.py
+index f738dfd..4412731 100644
+--- a/core/pit_optimizer_v5/manifest.py
++++ b/core/pit_optimizer_v5/manifest.py
+@@ -527,6 +527,7 @@ def _validate_precomposition_bindings_v5(
+     sandbox_profile_ref: ArtifactRefV5,
+     sandbox_profile: SandboxProfileV5,
+     resources: ResourceCapabilitiesV5,
++    pit_data_scope: Literal["production", "development_sp500_v2"],
+ ) -> None:
+     if type(target) is not AnnualizedReturnTargetV5 or type(source_snapshot) is not PolicySourceSnapshotV5:
+         raise ValueError("manifest target or source snapshot is invalid")
+@@ -550,6 +551,7 @@ def _validate_precomposition_bindings_v5(
+         authority=baseline_authority,
+         discovery_plan=panel_plan,
+         evaluator_contract=evaluator_contract,
++        pit_data_scope=pit_data_scope,
+     )
+     expected_source = baseline_authority.policy_revision.editable_source_sha256
+     bundle_source = tuple((item.path, item.sha256) for item in baseline_authority.source_bundle.files)
+@@ -574,6 +576,7 @@ def build_campaign_manifest_v5(
+     search: SearchCapabilitiesV5 | None = None,
+     provider: ProviderCapabilitiesV5 | None = None,
+     resources: ResourceCapabilitiesV5 | None = None,
++    pit_data_scope: Literal["production", "development_sp500_v2"] = "production",
+ ) -> AuthenticatedCampaignManifestV5:
+     """Create and reauthenticate one discovery-only campaign manifest."""
+ 
+@@ -587,6 +590,10 @@ def build_campaign_manifest_v5(
+         raise ValueError("manifest search capabilities are invalid")
+     if provider is not None and type(provider) is not ProviderCapabilitiesV5:
+         raise ValueError("manifest provider capabilities are invalid")
++    if pit_data_scope not in {"production", "development_sp500_v2"}:
++        raise ValueError("manifest PIT data scope is invalid")
++    if pit_data_scope == "development_sp500_v2" and provider is not None:
++        raise ValueError("development campaign must be provider-free")
+     if type(resolved_resources) is not ResourceCapabilitiesV5:
+         raise ValueError("manifest resource capabilities are invalid")
+ 
+@@ -598,6 +605,8 @@ def build_campaign_manifest_v5(
+         panel_plan_ref=panel_plan_ref,
+         sandbox_profile_ref=sandbox_profile_ref,
+     )
++    if baseline.pit_data_scope != pit_data_scope:
++        raise ValueError("manifest PIT data scope differs from baseline authority")
+     _validate_precomposition_bindings_v5(
+         target=target,
+         source_snapshot=source_snapshot,
+@@ -612,6 +621,7 @@ def build_campaign_manifest_v5(
+         sandbox_profile_ref=sandbox_profile_ref,
+         sandbox_profile=sandbox,
+         resources=resolved_resources,
++        pit_data_scope=pit_data_scope,
+     )
+ 
+     # Preserve the accepted Task 1 identity: the baseline descriptor is the
+@@ -649,6 +659,7 @@ def build_campaign_manifest_v5(
+         apply=False,
+         qualification_allowed=False,
+         full_replay_allowed=False,
++        pit_data_scope=pit_data_scope,
+     )
+     manifest_ref = repository.create_typed_artifact(manifest_path, manifest)
+     return authenticate_campaign_manifest_v5(repository=repository, manifest_ref=manifest_ref)
+@@ -728,6 +739,7 @@ def authenticate_campaign_manifest_v5(
+         sandbox_profile_ref=manifest.sandbox_profile_ref,
+         sandbox_profile=sandbox,
+         resources=manifest.resources,
++        pit_data_scope=manifest.pit_data_scope,
+     )
+     if (
+         manifest_ref.sha256 != manifest.sha256
+@@ -736,6 +748,7 @@ def authenticate_campaign_manifest_v5(
+         or policy_scope.baseline_policy_revision_ref != baseline.policy_revision_ref
+         or baseline_revision != baseline.policy_revision
+         or source_bundle != baseline.source_bundle
++        or manifest.pit_data_scope != baseline.pit_data_scope
+         or policy_scope.full_source_escape_allowed != manifest.search.allow_full_source_escape
+         or manifest.apply is not False
+         or manifest.qualification_allowed is not False
+diff --git a/core/pit_optimizer_v5/panels.py b/core/pit_optimizer_v5/panels.py
+index 144e814..e7b0069 100644
+--- a/core/pit_optimizer_v5/panels.py
++++ b/core/pit_optimizer_v5/panels.py
+@@ -1160,6 +1160,7 @@ def _authenticate_confirmation_attempt_dependencies_v5(
+         authority=baseline,
+         discovery_plan=discovery_plan,
+         evaluator_contract=evaluator,
++        pit_data_scope=manifest.pit_data_scope,
+     )
+     if experiment.campaign_evidence is not None and experiment.policy_revision is not None:
+         verified_campaign_cagr_pct(
+diff --git a/core/pit_optimizer_v5/runtime.py b/core/pit_optimizer_v5/runtime.py
+index 4300497..0ce3f09 100644
+--- a/core/pit_optimizer_v5/runtime.py
++++ b/core/pit_optimizer_v5/runtime.py
+@@ -389,6 +389,8 @@ class FeedbackRoundInputV5:
+             panel_plan=self.panel_plan,
+             evaluator_contract=self.evaluator_contract,
+         )
++        if self.manifest.pit_data_scope != self.baseline.pit_data_scope:
++            raise ValueError("feedback-round PIT data scope differs from baseline authority")
+ 
+     @property
+     def campaign_id(self) -> str:
+diff --git a/core/pit_optimizer_v5/sandbox.py b/core/pit_optimizer_v5/sandbox.py
+index b70d805..d47b659 100644
+--- a/core/pit_optimizer_v5/sandbox.py
++++ b/core/pit_optimizer_v5/sandbox.py
+@@ -844,6 +844,7 @@ def panel_execution_request_for_v5(
+             request.manifest.resources.worker_startup_timeout_seconds
+         ),
+         output_limit_bytes=request.manifest.resources.evaluation_output_limit_bytes,
++        pit_data_scope=request.manifest.pit_data_scope,
+     )
+ 
+ 
+diff --git a/core/pit_optimizer_v5/search.py b/core/pit_optimizer_v5/search.py
+index e201dad..4059cc8 100644
+--- a/core/pit_optimizer_v5/search.py
++++ b/core/pit_optimizer_v5/search.py
+@@ -814,6 +814,7 @@ class BaselineParentAuthorityV5:
+     campaign: CampaignEvidenceV5
+     source_bundle: SourceBundleV5
+     source_bundle_ref: ArtifactRefV5
++    pit_data_scope: Literal["production", "development_sp500_v2"] = "production"
+ 
+     def __post_init__(self) -> None:
+         if (
+@@ -825,6 +826,8 @@ class BaselineParentAuthorityV5:
+             or type(self.source_bundle_ref) is not ArtifactRefV5
+         ):
+             raise ValueError("baseline parent authority is invalid")
++        if self.pit_data_scope not in {"production", "development_sp500_v2"}:
++            raise ValueError("baseline parent PIT data scope is invalid")
+         if (
+             self.policy_revision_ref.sha256 != self.policy_revision.sha256
+             or self.source_bundle_ref.sha256 != self.source_bundle.sha256
+@@ -913,9 +916,12 @@ def baseline_parent_candidate_v5(
+     authority: BaselineParentAuthorityV5,
+     discovery_plan: CampaignPanelPlanV5,
+     evaluator_contract: EvaluatorContractV5,
++    pit_data_scope: Literal["production", "development_sp500_v2"],
+ ) -> ParentCandidateV5:
+     if type(authority) is not BaselineParentAuthorityV5:
+         raise ValueError("baseline authority is invalid")
++    if authority.pit_data_scope != pit_data_scope:
++        raise CampaignAuthorityMismatch()
+     if authority.source_bundle.sha256 != evaluator_contract.baseline_source_bundle_sha256:
+         raise CampaignAuthorityMismatch()
+     score = verified_campaign_cagr_pct(
+diff --git a/core/pit_optimizer_v5/selection.py b/core/pit_optimizer_v5/selection.py
+index 784c0a0..b2dbc2f 100644
+--- a/core/pit_optimizer_v5/selection.py
++++ b/core/pit_optimizer_v5/selection.py
+@@ -425,6 +425,7 @@ def parent_schedule_v5(
+         authority=baseline,
+         discovery_plan=discovery_plan,
+         evaluator_contract=evaluator_contract,
++        pit_data_scope=baseline.pit_data_scope,
+     )
+     if not state.archive.entries:
+         return (baseline_parent,)

@@ -1,0 +1,550 @@
+# Review package: 9115cdb..b2eb01c
+
+## Commits
+b2eb01c fix: bind v2 envelopes to canonical UTF-8
+
+## Files changed
+ core/pit_optimization_contract.py |  61 ++++++++++---
+ tests/test_pit_optimizer_v2.py    | 174 ++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 216 insertions(+), 19 deletions(-)
+
+## Diff
+diff --git a/core/pit_optimization_contract.py b/core/pit_optimization_contract.py
+index 465ad63..8db09b2 100644
+--- a/core/pit_optimization_contract.py
++++ b/core/pit_optimization_contract.py
+@@ -49,20 +49,22 @@ MAX_DISCOVERY_EVIDENCE_BYTES = 8 * 1024
+ MAX_INVESTIGATOR_ARTIFACT_BYTES = 8 * 1024
+ MAX_AUTHOR_NON_DIFF_ARTIFACT_BYTES = 8 * 1024
+ MAX_CRITIC_ARTIFACT_BYTES = 8 * 1024
+ MAX_ITERATION_FEEDBACK_BYTES = 4 * 1024
+ MAX_ITERATION_HISTORY_BYTES = 32 * 1024
+ MAX_INVESTIGATOR_DYNAMIC_BYTES = 80_000
+ MAX_AUTHOR_DYNAMIC_BYTES = 76_000
+ MAX_CRITIC_DYNAMIC_BYTES = 24_000
+ MAX_CANDIDATE_COMPARISON_BYTES = 3 * 1024
+ 
++_DISALLOWED_TEXT_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
++
+ _INVESTIGATOR_FAMILIES = ("entry", "exit", "risk_sizing")
+ _CRITIC_DISPOSITIONS = ("refine", "abandon", "change_family")
+ _CANDIDATE_COMPARISON_SEAL = object()
+ _POLICY_SOURCE_BUNDLE_SEAL = object()
+ CANDIDATE_VALIDATION_FAILURE_CODES = frozenset(
+     {
+         "author_diff_invalid",
+         "author_diff_noop",
+         "author_diff_not_applicable",
+         "author_diff_oversize",
+@@ -244,21 +246,27 @@ def _parse_v2_closed_object(
+     try:
+         value = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+     except json.JSONDecodeError as exc:
+         raise ValueError("provider payload is malformed JSON") from exc
+     if not isinstance(value, dict) or set(value) != keys:
+         raise ValueError("provider payload has invalid keys")
+     return value
+ 
+ 
+ def _v2_text(value: object, field: str, *, allow_empty: bool = False) -> str:
+-    if not isinstance(value, str) or value != value.strip() or "\x00" in value:
++    if (
++        not isinstance(value, str)
++        or value != value.strip()
++        or _DISALLOWED_TEXT_CONTROL_RE.search(value) is not None
++    ):
++        if isinstance(value, str) and _DISALLOWED_TEXT_CONTROL_RE.search(value):
++            raise ValueError(f"{field} contains a disallowed control character")
+         raise ValueError(f"{field} must be canonical text")
+     if not allow_empty and not value:
+         raise ValueError(f"{field} cannot be empty")
+     if len(value.encode("utf-8")) > MAX_ROLE_TEXT_BYTES:
+         raise ValueError(f"{field} is too large")
+     return value
+ 
+ 
+ def _v2_string_list(
+     value: object,
+@@ -293,33 +301,36 @@ def _v2_identifier(value: object, field: str) -> str:
+     text = _v2_text(value, field)
+     if _ID_RE.fullmatch(text) is None:
+         raise ValueError(f"{field} is invalid")
+     return text
+ 
+ 
+ def _v2_blob(value: object, field: str, *, max_bytes: int) -> str:
+     if (
+         not isinstance(value, str)
+         or not value
+-        or "\x00" in value
++        or _DISALLOWED_TEXT_CONTROL_RE.search(value) is not None
+         or len(value.encode("utf-8")) > max_bytes
+     ):
++        if isinstance(value, str) and _DISALLOWED_TEXT_CONTROL_RE.search(value):
++            raise ValueError(f"{field} contains a disallowed control character")
+         raise ValueError(f"{field} exceeds its byte cap")
+     return value
+ 
+ 
+ def _v2_canonical_bytes(value: object) -> bytes:
+     return json.dumps(
+         _v2_primitive(value),
+         sort_keys=True,
+         separators=(",", ":"),
+         allow_nan=False,
++        ensure_ascii=False,
+     ).encode("utf-8")
+ 
+ 
+ def _v2_digest(value: object) -> str:
+     return hashlib.sha256(_v2_canonical_bytes(value) + b"\n").hexdigest()
+ 
+ 
+ def _v2_primitive(value: object) -> object:
+     if isinstance(value, Decimal):
+         return format(value, "f")
+@@ -328,20 +339,40 @@ def _v2_primitive(value: object) -> object:
+             field.name: _v2_primitive(getattr(value, field.name))
+             for field in fields(value)
+         }
+     if isinstance(value, Mapping):
+         return {str(key): _v2_primitive(item) for key, item in value.items()}
+     if isinstance(value, (tuple, list)):
+         return [_v2_primitive(item) for item in value]
+     return value
+ 
+ 
++def _v2_max_canonical_text(max_raw_bytes: int) -> str:
++    """Return deterministic valid text with maximum canonical JSON expansion."""
++
++    _require_positive_int(max_raw_bytes, "canonical text raw-byte cap")
++    best = ""
++    best_size = -1
++    # UTF-8 is emitted raw. After closing unsafe controls, backslash/quote are
++    # the maximum two-byte JSON escapes; representative Unicode cannot exceed
++    # its raw UTF-8 size. The first maximum wins to make ties deterministic.
++    for unit in ("\\", '"', "é", "😀"):
++        unit_bytes = len(unit.encode("utf-8"))
++        candidate = unit * (max_raw_bytes // unit_bytes)
++        candidate += "x" * (max_raw_bytes - len(candidate.encode("utf-8")))
++        size = len(_v2_canonical_bytes(candidate))
++        if size > best_size:
++            best = candidate
++            best_size = size
++    return best
++
++
+ class _V2Canonical:
+     __slots__ = ()
+ 
+     def to_primitive(self) -> dict[str, object]:
+         primitive = _v2_primitive(self)
+         if not isinstance(primitive, dict):
+             raise ValueError("v2 contract is not an object")
+         return primitive
+ 
+     def canonical_json_bytes(self) -> bytes:
+@@ -2963,23 +2994,25 @@ def render_worst_iteration_two_role_inputs(
+ ) -> Mapping[str, bytes]:
+     """Render complete bounded iteration-2 role inputs before a manifest is sealed."""
+ 
+     if not isinstance(scope, PolicySourceScope):
+         raise ValueError("worst role input source scope is invalid")
+     _v2_string_tuple(immutable_constraint_ids, "worst role immutable constraints")
+     if tuple(source_texts) != scope.editable_paths:
+         raise ValueError("worst role source paths differ from scope")
+     if prospective_source_bundle is None:
+         grown_texts = dict(source_texts)
+-        worst_escaped_bytes = "\\" * scope.candidate_bounds.max_diff_bytes
+-        grown_texts[scope.editable_paths[0]] += worst_escaped_bytes
+-        cumulative_diff = worst_escaped_bytes
++        worst_raw_text = _v2_max_canonical_text(
++            scope.candidate_bounds.max_diff_bytes
++        )
++        grown_texts[scope.editable_paths[0]] += worst_raw_text
++        cumulative_diff = worst_raw_text
+         source_records = tuple(
+             PolicySourceRecord(
+                 path=path,
+                 sha256=hashlib.sha256(grown_texts[path].encode("utf-8")).hexdigest(),
+                 declared_symbols=_POLICY_DECLARED_SYMBOLS[path],
+                 text=grown_texts[path],
+             )
+             for path in scope.editable_paths
+         )
+         source_primitive = {
+@@ -3054,93 +3087,93 @@ def render_worst_iteration_two_role_inputs(
+             if size <= cap:
+                 best = candidate
+                 best_size = size
+                 low = count + 1
+             else:
+                 high = count - 1
+         if best is None or best_size < cap - 1:
+             raise ValueError("worst role section cannot reach its canonical cap")
+         return best
+ 
+-    def escaped(count: int) -> str:
+-        return "\\" * count
++    def maximized(count: int) -> str:
++        return _v2_max_canonical_text(count)
+     rule_summary = maximize_contract(
+         lambda count: StrategyRuleSummary(
+-            records=(RuleSummaryRecord("rule_1", "r" + escaped(count)),)
++            records=(RuleSummaryRecord("rule_1", "r" + maximized(count)),)
+         ),
+         MAX_DISCOVERY_EVIDENCE_BYTES,
+     )
+     discovery = maximize_contract(
+         lambda count: DiscoveryEvidenceSummary(
+             folds=folds,
+             score=None,
+-            evidence_ids=("e" + escaped(count), "evidence_2"),
++            evidence_ids=("e" + maximized(count), "evidence_2"),
+         ),
+         MAX_DISCOVERY_EVIDENCE_BYTES,
+     )
+     incumbent = IncumbentSummary(
+         candidate_identity_sha256="1" * 64,
+         accepted_iteration=1,
+-        behavioral_summary="\\" * MAX_ROLE_TEXT_BYTES,
++        behavioral_summary=_v2_max_canonical_text(MAX_ROLE_TEXT_BYTES),
+         discovery=discovery,
+     )
+     feedback = maximize_contract(
+         lambda count: IterationFeedbackSummary(
+             iteration=1,
+             hypothesis_id="hypothesis_1",
+             family="entry",
+-            author_summary="a" + escaped(count),
++            author_summary="a" + maximized(count),
+             validation_code="valid",
+             discovery_score=None,
+             critic_disposition="refine",
+             critic_next_direction="next",
+             incumbent_changed=True,
+         ),
+         scope.max_iteration_feedback_bytes,
+     )
+     investigator_artifact = maximize_contract(
+         lambda count: InvestigatorArtifact(
+             hypothesis_id="hypothesis_2",
+             family="entry",
+             evidence_ids=("evidence_1",),
+-            causal_rationale="c" + escaped(count),
++            causal_rationale="c" + maximized(count),
+             target_paths=(scope.editable_paths[0],),
+             target_symbols=(_POLICY_DECLARED_SYMBOLS[scope.editable_paths[0]][0],),
+             expected_diagnostic_changes=("diagnostic",),
+             known_risks=("risk",),
+             author_instructions=("instruction",),
+         ),
+         MAX_INVESTIGATOR_ARTIFACT_BYTES,
+     )
+     author_manifest = maximize_contract(
+         lambda count: AuthorManifestSummary(
+             hypothesis_id=investigator_artifact.hypothesis_id,
+-            behavioral_summary="b" + escaped(count),
++            behavioral_summary="b" + maximized(count),
+             changed_paths=(scope.editable_paths[0],),
+             changed_symbols=(_POLICY_DECLARED_SYMBOLS[scope.editable_paths[0]][0],),
+         ),
+         MAX_AUTHOR_NON_DIFF_ARTIFACT_BYTES,
+     )
+     synthetic_baseline_sha256 = hashlib.sha256(
+         _v2_canonical_bytes([_v2_primitive(item) for item in folds]) + b"\n"
+     ).hexdigest()
+     comparison_score = discovery_score_from_folds(
+         folds,
+         folds,
+         original_baseline_sha256=synthetic_baseline_sha256,
+         expected_original_baseline_sha256=synthetic_baseline_sha256,
+     )
+     comparison = maximize_contract(
+         lambda count: CandidateComparisonSummary(
+             folds=folds,
+             score=comparison_score,
+-            diagnostics=(AggregateMetric("d" + escaped(count), 1),),
++            diagnostics=(AggregateMetric("d" + maximized(count), 1),),
+             _controller_seal=_CANDIDATE_COMPARISON_SEAL,
+         ),
+         MAX_CANDIDATE_COMPARISON_BYTES,
+     )
+     validation = _successful_candidate_validation()
+     dynamic_values = {
+         "investigator": {
+             "schema_version": 2,
+             "iteration": 2,
+             "policy_interface_version": scope.policy_interface_version,
+diff --git a/tests/test_pit_optimizer_v2.py b/tests/test_pit_optimizer_v2.py
+index d026936..90302e0 100644
+--- a/tests/test_pit_optimizer_v2.py
++++ b/tests/test_pit_optimizer_v2.py
+@@ -27,20 +27,122 @@ from core.pit_optimizer_evaluation import (
+     FoldManifest,
+     FoldSpec,
+ )
+ from core.pit_policy_parity import ParityAttestation
+ 
+ 
+ def _canonical_text(value: object) -> str:
+     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+ 
+ 
++def test_v2_canonical_text_preserves_utf8_and_rejects_unsafe_controls() -> None:
++    """Break caught: ASCII escaping made valid Unicode larger than the sealed bound."""
++    raw_bytes = contract.MAX_ROLE_TEXT_BYTES
++    backslashes = "\\" * raw_bytes
++    quotes = '"' * raw_bytes
++    newlines = "\n" * raw_bytes
++    unicode_text = "é" * (raw_bytes // len("é".encode("utf-8")))
++    astral_text = "😀" * (raw_bytes // len("😀".encode("utf-8")))
++    unsafe_controls = "x\x01y"
++    for value in (backslashes, quotes, newlines, unicode_text, astral_text):
++        assert len(value.encode("utf-8")) == raw_bytes
++
++    def canonical_string_bytes(value: str) -> bytes:
++        return json.dumps(
++            value,
++            ensure_ascii=False,
++            separators=(",", ":"),
++        ).encode("utf-8")
++
++    backslash_json = canonical_string_bytes(backslashes)
++    quote_json = canonical_string_bytes(quotes)
++    newline_json = canonical_string_bytes(newlines)
++    unicode_json = canonical_string_bytes(unicode_text)
++    astral_json = canonical_string_bytes(astral_text)
++    control_json = json.dumps(
++        "\x01" * raw_bytes,
++        ensure_ascii=False,
++        separators=(",", ":"),
++    ).encode("utf-8")
++    assert len(backslash_json) == 2 + (2 * raw_bytes)
++    assert len(quote_json) == len(backslash_json)
++    assert len(newline_json) == len(backslash_json)
++    assert len(unicode_json) == 2 + raw_bytes
++    assert len(astral_json) == len(unicode_json)
++    assert len(control_json) == 2 + (6 * raw_bytes)
++
++    artifact = contract.InvestigatorArtifact.from_json(
++        json.dumps(
++            {**_investigator_payload(), "causal_rationale": unicode_text},
++            ensure_ascii=False,
++            sort_keys=True,
++            separators=(",", ":"),
++        ),
++        max_total_bytes=contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
++    )
++    assert unicode_text.encode("utf-8") in artifact.canonical_json_bytes()
++    assert b"\\u00e9" not in artifact.canonical_json_bytes()
++
++    with pytest.raises(ValueError, match="control"):
++        contract.InvestigatorArtifact.from_json(
++            json.dumps(
++                {**_investigator_payload(), "causal_rationale": unsafe_controls},
++                ensure_ascii=False,
++                sort_keys=True,
++                separators=(",", ":"),
++            ),
++            max_total_bytes=contract.MAX_INVESTIGATOR_ARTIFACT_BYTES,
++        )
++
++
++def test_v2_source_and_diff_blobs_reject_unsafe_controls() -> None:
++    """Break caught: control escapes could exceed every raw-byte source/diff bound."""
++    author_payload = {
++        **_author_payload(),
++        "unified_diff": "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-x\n+y\x01\n",
++    }
++    with pytest.raises(ValueError, match="control"):
++        contract.AuthorArtifact.from_json(
++            json.dumps(
++                author_payload,
++                ensure_ascii=False,
++                sort_keys=True,
++                separators=(",", ":"),
++            ),
++            max_total_bytes=contract.MAX_AUTHOR_NON_DIFF_ARTIFACT_BYTES
++            + contract.MAX_AUTHOR_DIFF_BYTES,
++            max_diff_bytes=contract.MAX_AUTHOR_DIFF_BYTES,
++        )
++
++    base = _source_bundle()
++    source_texts = {
++        record.path: (
++            record.text + "# unsafe \x01 control\n"
++            if record.path == "core/strategy_policy/entry.py"
++            else record.text
++        )
++        for record in base.files
++    }
++    scope = replace(
++        _source_scope(base),
++        initial_policy_source_sha256s=tuple(
++            (path, hashlib.sha256(text.encode("utf-8")).hexdigest())
++            for path, text in source_texts.items()
++        ),
++    )
++    with pytest.raises(ValueError, match="control"):
++        contract.initial_policy_source_bundle(
++            scope=scope,
++            source_texts=source_texts,
++        )
++
++
+ def _investigator_payload() -> dict[str, object]:
+     return {
+         "hypothesis_id": "hypothesis_1",
+         "family": "entry",
+         "evidence_ids": ["discovery_1.excess_return"],
+         "causal_rationale": "Raise selectivity where the entry funnel loses quality.",
+         "target_paths": ["core/strategy_policy/entry.py"],
+         "target_symbols": ["core.strategy_policy.entry.evaluate_entry"],
+         "expected_diagnostic_changes": ["fewer low-quality entries"],
+         "known_risks": ["lower trade count"],
+@@ -558,34 +660,47 @@ def test_controller_rejects_inconsistent_new_range_location() -> None:
+             scope=scope,
+             initial_bundle=initial,
+             current_bundle=initial,
+             artifact=_artifact_for_diff(inconsistent, (entry_path,)),
+             immutable_constraint_ids=("causal_only", "no_external_io"),
+             call_budgets=_call_budgets(),
+         )
+ 
+ 
+ @pytest.mark.parametrize(
+-    ("source_padding", "expected_failure_code"),
+-    ((10_000, None), (45_000, "next_context_oversize")),
++    ("padding_kind", "raw_padding_bytes", "expected_failure_code"),
++    (
++        ("ascii", 10_000, None),
++        ("ascii", 45_000, "next_context_oversize"),
++        ("backslash", 30_000, "next_context_oversize"),
++        ("unicode", 30_000, None),
++    ),
+ )
+ def test_candidate_materialization_checks_exact_next_role_envelope(
+-    source_padding: int,
++    padding_kind: str,
++    raw_padding_bytes: int,
+     expected_failure_code: str | None,
+ ) -> None:
+     """Break caught: a source-cap-valid incumbent could overflow the next role input."""
+     base = _source_bundle()
+     entry_path = "core/strategy_policy/entry.py"
++    padding_unit = {"ascii": "p", "backslash": "\\", "unicode": "é"}[
++        padding_kind
++    ]
++    padding = padding_unit * (
++        raw_padding_bytes // len(padding_unit.encode("utf-8"))
++    )
++    assert len(padding.encode("utf-8")) == raw_padding_bytes
+     padded_texts = {
+         record.path: (
+             "# "
+-            + ("p" * source_padding)
++            + padding
+             + "\n# spacer_1\n# spacer_2\n# spacer_3\n# spacer_4\n"
+             + record.text
+             if record.path == entry_path
+             else record.text
+         )
+         for record in base.files
+     }
+     padded_hashes = tuple(
+         (path, hashlib.sha256(text.encode("utf-8")).hexdigest())
+         for path, text in padded_texts.items()
+@@ -617,21 +732,29 @@ def test_candidate_materialization_checks_exact_next_role_envelope(
+     ]
+     candidate_bundle = {
+         "policy_interface_version": initial.policy_interface_version,
+         "cumulative_diff_sha256": hashlib.sha256(
+             independently_derived_cumulative.encode("utf-8")
+         ).hexdigest(),
+         "cumulative_diff": independently_derived_cumulative,
+         "files": candidate_records,
+     }
+     assert (
+-        len(_canonical_text(candidate_bundle).encode("utf-8"))
++        len(
++            json.dumps(
++                candidate_bundle,
++                ensure_ascii=False,
++                sort_keys=True,
++                separators=(",", ":"),
++                allow_nan=False,
++            ).encode("utf-8")
++        )
+         <= scope.max_policy_source_bundle_bytes
+     )
+ 
+     result = contract.materialize_policy_source_descendant(
+         scope=scope,
+         initial_bundle=initial,
+         current_bundle=initial,
+         artifact=_artifact_for_diff(patch, (entry_path,)),
+         immutable_constraint_ids=("causal_only", "no_external_io"),
+         call_budgets=_call_budgets(),
+@@ -1701,20 +1824,61 @@ def test_manifest_builder_is_provider_free_canonical_and_source_budgeted(
+     rendered = contract.render_worst_iteration_two_role_inputs(
+         scope=manifest.policy_source_scope,
+         source_texts=expected["source_texts"],
+         immutable_constraint_ids=manifest.immutable_constraint_ids,
+         call_budgets=manifest.call_budgets,
+     )
+     rendered_values = {
+         role: json.loads(payload.decode("utf-8"))
+         for role, payload in rendered.items()
+     }
++    investigator_value = rendered_values["investigator"]
++    source_value = investigator_value["source_bundle"]
++    worst_raw_diff_bytes = manifest.policy_source_scope.candidate_bounds.max_diff_bytes
++    expected_diff_maximizer = "\\" * worst_raw_diff_bytes
++    assert len(source_value["cumulative_diff"].encode("utf-8")) == worst_raw_diff_bytes
++    assert source_value["cumulative_diff"] == expected_diff_maximizer
++    entry_record = next(
++        record
++        for record in source_value["files"]
++        if record["path"] == "core/strategy_policy/entry.py"
++    )
++    initial_entry = expected["source_texts"]["core/strategy_policy/entry.py"]
++    assert entry_record["text"][len(initial_entry) :] == expected_diff_maximizer
++
++    incumbent_value = investigator_value["incumbent_summary"]
++    expected_text_maximizer = "\\" * contract.MAX_ROLE_TEXT_BYTES
++    assert incumbent_value["behavioral_summary"] == expected_text_maximizer
++    unicode_incumbent = {
++        **incumbent_value,
++        "behavioral_summary": "é"
++        * (contract.MAX_ROLE_TEXT_BYTES // len("é".encode("utf-8"))),
++    }
++    incumbent_bytes = len(
++        json.dumps(
++            incumbent_value,
++            ensure_ascii=False,
++            sort_keys=True,
++            separators=(",", ":"),
++            allow_nan=False,
++        ).encode("utf-8")
++    )
++    unicode_incumbent_bytes = len(
++        json.dumps(
++            unicode_incumbent,
++            ensure_ascii=False,
++            sort_keys=True,
++            separators=(",", ":"),
++            allow_nan=False,
++        ).encode("utf-8")
++    )
++    assert incumbent_bytes - unicode_incumbent_bytes == contract.MAX_ROLE_TEXT_BYTES
+     cap_derived_sections = (
+         (
+             rendered_values["investigator"]["rule_summary"],
+             contract.MAX_DISCOVERY_EVIDENCE_BYTES,
+         ),
+         (
+             rendered_values["investigator"]["baseline_discovery"],
+             contract.MAX_DISCOVERY_EVIDENCE_BYTES,
+         ),
+         (

@@ -1,0 +1,32 @@
+# B1 architect checkpoint review package
+
+## Scope
+
+B1 only is implemented. The sole production-file change is `core/pit_optimizer_v5/rendering.py`; the approved Increment A source SHA and `candidate_ir.py` SHA are unchanged.
+
+`RejectedVariantV5` is a frozen host-side carrier for one validated `VariantAssignmentV5` and the closed `policy_source_unbounded_or_stateful` code. It carries no source bundle and no policy revision.
+
+`render_variant_outcomes_v5` uses the former renderer's ordered assignment enumeration, marker processing, import check, bundle collision detection, and cap. It catches only the exact known `ValueError` at `_bundle_from_sources(rendered_sources)`. A matching rejection is appended as an outcome and therefore consumes a normal variant slot; no bundle is retained and no policy identity is derived. All other errors still propagate.
+
+Legacy `render_variants` retains its inputs and `tuple[RenderedVariantV5, ...]` output. It invokes the shared loop with known-rejection capture disabled, so the original AST exception still propagates to existing callers and no rejection object can reach them.
+
+## Actual06 verification
+
+`actual06-outcome-verification.json` was constructed only from the authenticated actual06 manifest graph, accepted author request/artifact, and fixed four-file baseline parent. With the actual maximum of one:
+
+- The new API returned one `RejectedVariantV5` with `policy_source_unbounded_or_stateful`.
+- The carrier has neither `source_bundle` nor `policy_revision`.
+- Legacy `render_variants` raised exactly `V5 policy AST contains an unbounded or stateful construct`.
+- Parent source bundle and policy-revision identities match the fixed actual06 values.
+
+No source was executed, normalized into a bundle, materialized, evaluated, or persisted to campaign06. The verification used no model/API call or credential value.
+
+## Verification and review inputs
+
+`rendering.py.preimage` preserves the exact LF preimage. `scoped-diff.patch` is the narrow source diff. `verification.json` records pre/final source hashes, unchanged A/candidate guards, evaluator identity before/after, scoped Ruff, in-memory compilation, and the actual06 verification hash.
+
+## Unverified behavior and decisions for B2
+
+The actual archived rejection path is verified. Valid render outcomes, multi-assignment collision behavior, and mixed valid/rejected caps were not exercised because tests and synthetic inputs are prohibited. Source review confirms those paths use the same shared loop as before; they remain subject to later authorized verification.
+
+B2-B4 remain unimplemented: no journal event, artifact schema, runtime finalization, record publication, provider guidance, or campaign lifecycle code was changed. Architect review should confirm the closed carrier shape, exact error-message boundary, rejection-slot semantics, and the proposed later authority binding before B2 begins.

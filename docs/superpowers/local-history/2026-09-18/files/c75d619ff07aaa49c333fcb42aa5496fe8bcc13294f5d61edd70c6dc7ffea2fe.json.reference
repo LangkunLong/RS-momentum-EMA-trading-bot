@@ -1,0 +1,86 @@
+[
+  {
+    "path": "core/pit_optimizer_v5/provider.py",
+    "preimage": {
+      "crcrlf": 0,
+      "crlf": 3841,
+      "lf_only": 12,
+      "bare_cr": 0
+    },
+    "before": {
+      "crcrlf": 0,
+      "crlf": 3866,
+      "lf_only": 0,
+      "bare_cr": 0
+    },
+    "after": {
+      "crcrlf": 0,
+      "crlf": 3845,
+      "lf_only": 21,
+      "bare_cr": 0
+    }
+  },
+  {
+    "path": "core/pit_optimizer_v5/production_provider.py",
+    "preimage": {
+      "crcrlf": 0,
+      "crlf": 989,
+      "lf_only": 0,
+      "bare_cr": 0
+    },
+    "before": {
+      "crcrlf": 0,
+      "crlf": 990,
+      "lf_only": 0,
+      "bare_cr": 0
+    },
+    "after": {
+      "crcrlf": 0,
+      "crlf": 990,
+      "lf_only": 0,
+      "bare_cr": 0
+    }
+  },
+  {
+    "path": "agent_loop.py",
+    "preimage": {
+      "crcrlf": 0,
+      "crlf": 24407,
+      "lf_only": 0,
+      "bare_cr": 0
+    },
+    "before": {
+      "crcrlf": 0,
+      "crlf": 24408,
+      "lf_only": 0,
+      "bare_cr": 0
+    },
+    "after": {
+      "crcrlf": 0,
+      "crlf": 24408,
+      "lf_only": 0,
+      "bare_cr": 0
+    }
+  },
+  {
+    "path": ".superpowers/sdd/2026-09-04-pit-optimizer-v5-campaign/prepare-provider-development.py",
+    "preimage": {
+      "crcrlf": 0,
+      "crlf": 209,
+      "lf_only": 0,
+      "bare_cr": 0
+    },
+    "before": {
+      "crcrlf": 0,
+      "crlf": 212,
+      "lf_only": 0,
+      "bare_cr": 0
+    },
+    "after": {
+      "crcrlf": 0,
+      "crlf": 212,
+      "lf_only": 0,
+      "bare_cr": 0
+    }
+  }
+]

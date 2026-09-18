@@ -1,0 +1,22 @@
+# B4c retained history and real-summary review
+
+## Static history / novelty trace
+
+`CandidateArchiveReducerV5.apply` derives and retains each record's hypothesis novelty key while advancing `next_round_index`, including records whose archive transition is `ineligible_status`. `transition_archive_from_record_v5` admits only `evaluated` and `zero_trade`; `LocalArchiveReducerFactoryV5._authorities` likewise skips invalid and duplicate records. Thus invalid/rejected proposals remain checkpoint history and novelty attempts but gain no materialized-source authority, archive/promotion/performance entry, or selected-parent lineage.
+
+`project_investigator_memory_v5` builds feedback or summaries from checkpoint-authorized stored records without filtering invalid status. In `_investigator_parts`, untestable records retain their established feedback/summary handling while existing `review is None` branches omit critic reissue; records with actual critic reviews retain the exact authenticated critic package path. The new one-item rejection diagnostic counts independently of whether a record's text feedback fits the bounded memory projection. No memory, reducer, selection, authority, or budget source changed.
+
+## Real archive facts (authenticated, read-only)
+
+| Repository | Checkpoint records | Successful cleanup for record rounds | Derived lifecycle | Derived evaluated feedback | Derived reserved-code invalids |
+| --- | ---: | --- | ---: | ---: | ---: |
+| `runtime-04` | one evaluated record in round 1 | round 1 cleanup complete | 1 | 1 | 0 |
+| `provider-runtime-06` / actual06 | no checkpoint records | cleanup round 1 complete, but no record round | 0 | 0 | 0 |
+
+The runtime-04 record remained authenticated/canonical as evaluated with four discovery episodes and its bound critic. Actual06's authenticated terminal journal remains `role_completion`, `round_intent`, `role_completion`, `round_outcome`, `cleanup_result`; it has `runtime_failed` at `rendering/stage_failed`, successful cleanup, no checkpoint records, and no `render_rejected` event. The direct archive facts are real historical evidence; they do not create a rejected record or execute a positive B4c path.
+
+## Full-summary comparison limit
+
+The required read-only calls to `summarize_repository_v5(..., command="summarize")` were attempted against both authenticated real repositories. Both reached the unchanged development-history verifier and failed before a summary was returned with `V5CliFailure("artifact_graph_invalid")`, whose cause was `ValueError("container execution reservation is foreign")` in `ProductionSandbox._load_reservation(..., repair=False)`. Source tracing shows the stored reservation's executor identity differs from this local verifier identity. No source, artifact, configuration, credential, or environment workaround was applied.
+
+Accordingly, no complete pre/post summary object is claimed. The before actual06 terminal summary remains the immutable `terminal-verification.json` historical result; direct authenticated archive inspection establishes the three new-count inputs above. The added fields and default values are statically reviewed, while full returned-summary compatibility is an explicit principal-review limitation.

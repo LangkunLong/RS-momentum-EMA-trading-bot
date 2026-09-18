@@ -1,0 +1,1051 @@
+# Review package: cd7a45927a7ea3ad7c0d8622a542412c0f9d656b..35614fbc5edcbb4e0daa489f0f21233f5ee0cbce
+
+## Commits
+35614fb fix: make PIT artifact writes race safe
+
+## Files changed
+ core/pit_optimizer_artifacts.py  | 526 +++++++++++++++++++++++++++++++++------
+ tests/test_pit_optimizer_loop.py | 222 ++++++++++++++++-
+ 2 files changed, 665 insertions(+), 83 deletions(-)
+
+## Diff
+diff --git a/core/pit_optimizer_artifacts.py b/core/pit_optimizer_artifacts.py
+index 2986710..14700c1 100644
+--- a/core/pit_optimizer_artifacts.py
++++ b/core/pit_optimizer_artifacts.py
+@@ -1,18 +1,19 @@
+ """Crash-safe, incremental local artifacts for the schema-v2 PIT optimizer."""
+ 
+ from __future__ import annotations
+ 
+ import hashlib
+ import json
+ import os
+ from pathlib import Path
++import secrets
+ import stat
+ import tempfile
+ from typing import Mapping
+ 
+ 
+ def canonical_json_bytes(value: Mapping[str, object]) -> bytes:
+     """Return the one canonical UTF-8 representation used by optimizer artifacts."""
+ 
+     return (
+         json.dumps(
+@@ -42,75 +43,451 @@ def _fsync_directory(path: Path) -> None:
+         os.close(descriptor)
+ 
+ 
+ def _is_link_or_reparse(path: Path) -> bool:
+     metadata = os.lstat(path)
+     attributes = getattr(metadata, "st_file_attributes", 0)
+     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+     return stat.S_ISLNK(metadata.st_mode) or bool(attributes & reparse_flag)
+ 
+ 
+-def write_create_only_bytes(path: Path, payload: bytes) -> tuple[Path, str]:
+-    """Create and fsync one artifact without permitting an overwrite."""
++def _metadata_identity(metadata: os.stat_result) -> tuple[int, int]:
++    return metadata.st_dev, metadata.st_ino
++
++
++def _windows_extended_path(path: Path) -> str:
++    value = str(path)
++    if value.startswith("\\\\"):
++        return "\\\\?\\UNC\\" + value[2:]
++    if value.startswith("\\\\?\\"):
++        return value
++    return "\\\\?\\" + value
++
++
++def _open_windows_directory_locked(path: Path) -> tuple[int, tuple[int, int]]:
++    """Open a non-reparse directory without delete sharing and bind its identity."""
++
++    import ctypes
++    from ctypes import wintypes
++
++    before = os.lstat(path)
++    if _is_link_or_reparse(path) or not stat.S_ISDIR(before.st_mode):
++        raise ValueError("optimizer artifact parent is a link or reparse point")
++    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
++    create_file = kernel32.CreateFileW
++    create_file.argtypes = (
++        wintypes.LPCWSTR,
++        wintypes.DWORD,
++        wintypes.DWORD,
++        wintypes.LPVOID,
++        wintypes.DWORD,
++        wintypes.DWORD,
++        wintypes.HANDLE,
++    )
++    create_file.restype = wintypes.HANDLE
++    handle = create_file(
++        _windows_extended_path(path),
++        0x0080,  # FILE_READ_ATTRIBUTES
++        0x0001 | 0x0002,  # FILE_SHARE_READ | FILE_SHARE_WRITE; no delete share
++        None,
++        3,  # OPEN_EXISTING
++        0x02000000 | 0x00200000,  # BACKUP_SEMANTICS | OPEN_REPARSE_POINT
++        None,
++    )
++    invalid = ctypes.c_void_p(-1).value
++    if handle in {None, invalid}:
++        raise ctypes.WinError(ctypes.get_last_error())
++    try:
++        after = os.lstat(path)
++        if (
++            _is_link_or_reparse(path)
++            or not stat.S_ISDIR(after.st_mode)
++            or _metadata_identity(before) != _metadata_identity(after)
++        ):
++            raise ValueError("optimizer artifact parent changed while opening")
++    except BaseException:
++        _close_windows_handle(int(handle))
++        raise
++    return int(handle), _metadata_identity(after)
++
++
++def _close_windows_handle(handle: int) -> None:
++    import ctypes
++    from ctypes import wintypes
++
++    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
++    close_handle = kernel32.CloseHandle
++    close_handle.argtypes = (wintypes.HANDLE,)
++    close_handle.restype = wintypes.BOOL
++    if not close_handle(wintypes.HANDLE(handle)):
++        raise ctypes.WinError(ctypes.get_last_error())
++
++
++def _posix_directory_flags() -> int:
++    no_follow = getattr(os, "O_NOFOLLOW", None)
++    directory = getattr(os, "O_DIRECTORY", None)
++    if no_follow is None or directory is None:
++        raise RuntimeError("secure component-relative artifact opens are unavailable")
++    return os.O_RDONLY | no_follow | directory | getattr(os, "O_CLOEXEC", 0)
++
++
++class _DirectoryAccess:
++    """Held directory capabilities for one verified absolute component chain."""
++
++    def __init__(
++        self,
++        *,
++        path: Path,
++        identity: tuple[int, int],
++        posix_descriptors: list[int] | None = None,
++        windows_handles: list[int] | None = None,
++    ) -> None:
++        self.path = path
++        self.identity = identity
++        self._posix_descriptors = posix_descriptors or []
++        self._windows_handles = windows_handles or []
++        self._closed = False
++
++    @property
++    def descriptor(self) -> int:
++        if os.name == "nt" or not self._posix_descriptors:
++            raise RuntimeError("component-relative directory descriptor is unavailable")
++        return self._posix_descriptors[-1]
++
++    def append_posix(self, path: Path, descriptor: int, identity: tuple[int, int]) -> None:
++        self.path = path
++        self.identity = identity
++        self._posix_descriptors.append(descriptor)
++
++    def append_windows(self, path: Path, handle: int, identity: tuple[int, int]) -> None:
++        self.path = path
++        self.identity = identity
++        self._windows_handles.append(handle)
++
++    def assert_current(self) -> None:
++        try:
++            current = _acquire_absolute_directory(self.path)
++        except (OSError, ValueError) as exc:
++            raise ValueError("optimizer artifact parent changed before mutation") from exc
++        with current:
++            if current.identity != self.identity:
++                raise ValueError("optimizer artifact parent changed before mutation")
++
++    def entry_exists(self, name: str) -> bool:
++        try:
++            if os.name == "nt":
++                metadata = os.lstat(self.path / name)
++            else:
++                metadata = os.stat(name, dir_fd=self.descriptor, follow_symlinks=False)
++        except FileNotFoundError:
++            return False
++        attributes = getattr(metadata, "st_file_attributes", 0)
++        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
++        if stat.S_ISLNK(metadata.st_mode) or bool(attributes & reparse_flag):
++            raise ValueError("optimizer artifact target is a link or reparse point")
++        if not stat.S_ISREG(metadata.st_mode):
++            raise ValueError("optimizer artifact target is not a regular file")
++        return True
++
++    def unlink(self, name: str) -> None:
++        if os.name == "nt":
++            (self.path / name).unlink(missing_ok=True)
++            return
++        try:
++            os.unlink(name, dir_fd=self.descriptor)
++        except FileNotFoundError:
++            pass
++
++    def replace(self, source: str, target: str) -> None:
++        if os.name == "nt":
++            os.replace(self.path / source, self.path / target)
++            return
++        os.replace(
++            source,
++            target,
++            src_dir_fd=self.descriptor,
++            dst_dir_fd=self.descriptor,
++        )
++
++    def close(self) -> None:
++        if self._closed:
++            return
++        self._closed = True
++        failures: list[OSError] = []
++        for descriptor in reversed(self._posix_descriptors):
++            try:
++                os.close(descriptor)
++            except OSError as exc:
++                failures.append(exc)
++        for handle in reversed(self._windows_handles):
++            try:
++                _close_windows_handle(handle)
++            except OSError as exc:
++                failures.append(exc)
++        if failures:
++            raise failures[0]
++
++    def __enter__(self) -> "_DirectoryAccess":
++        return self
++
++    def __exit__(self, *_exc: object) -> None:
++        self.close()
++
++
++def _open_posix_component(
++    parent_descriptor: int,
++    part: str,
++) -> tuple[int, tuple[int, int]]:
++    try:
++        descriptor = os.open(
++            part,
++            _posix_directory_flags(),
++            dir_fd=parent_descriptor,
++        )
++    except OSError as exc:
++        if exc.errno in {getattr(os, "ELOOP", 40), getattr(os, "ENOTDIR", 20)}:
++            raise ValueError("optimizer artifact parent is a link or invalid") from exc
++        raise
++    metadata = os.fstat(descriptor)
++    if not stat.S_ISDIR(metadata.st_mode):
++        os.close(descriptor)
++        raise ValueError("optimizer artifact parent is invalid")
++    return descriptor, _metadata_identity(metadata)
++
++
++def _acquire_absolute_directory(path: Path) -> _DirectoryAccess:
++    candidate = Path(path)
++    if not candidate.is_absolute():
++        raise ValueError("optimizer artifact parent is not absolute")
++    parts = candidate.parts
++    if not parts:
++        raise ValueError("optimizer artifact parent is invalid")
++    current = Path(parts[0])
++    if os.name == "nt":
++        handles: list[int] = []
++        try:
++            handle, identity = _open_windows_directory_locked(current)
++            handles.append(handle)
++            access = _DirectoryAccess(
++                path=current,
++                identity=identity,
++                windows_handles=handles,
++            )
++            for part in parts[1:]:
++                child = current / part
++                handle, identity = _open_windows_directory_locked(child)
++                access.append_windows(child, handle, identity)
++                current = child
++            return access
++        except BaseException:
++            for handle in reversed(handles):
++                try:
++                    _close_windows_handle(handle)
++                except OSError:
++                    pass
++            raise
++
++    descriptors: list[int] = []
++    try:
++        descriptor = os.open(current, _posix_directory_flags())
++        descriptors.append(descriptor)
++        metadata = os.fstat(descriptor)
++        access = _DirectoryAccess(
++            path=current,
++            identity=_metadata_identity(metadata),
++            posix_descriptors=descriptors,
++        )
++        for part in parts[1:]:
++            descriptor, identity = _open_posix_component(access.descriptor, part)
++            child = current / part
++            access.append_posix(child, descriptor, identity)
++            current = child
++        return access
++    except BaseException:
++        for descriptor in reversed(descriptors):
++            try:
++                os.close(descriptor)
++            except OSError:
++                pass
++        raise
++
++
++def _sync_directory_access(directory: _DirectoryAccess) -> None:
++    if os.name != "nt":
++        os.fsync(directory.descriptor)
++    # Preserve the existing injectable durability boundary.  The held
++    # descriptor/handle above is authoritative; this call is redundant on
++    # POSIX and intentionally a no-op on Windows unless a test injects failure.
++    _fsync_directory(directory.path)
++
++
++def _extend_directory(
++    access: _DirectoryAccess,
++    part: str,
++    *,
++    create: bool,
++) -> None:
++    child = access.path / part
++    if os.name == "nt":
++        try:
++            handle, identity = _open_windows_directory_locked(child)
++        except FileNotFoundError:
++            if not create:
++                raise ValueError("optimizer artifact parent is absent") from None
++            try:
++                child.mkdir()
++            except FileExistsError:
++                pass
++            handle, identity = _open_windows_directory_locked(child)
++            _sync_directory_access(access)
++        access.append_windows(child, handle, identity)
++        return
+ 
+-    target = Path(path)
+-    if not target.is_absolute() or target.parent.is_symlink() or not target.parent.is_dir():
+-        raise ValueError("optimizer artifact target is invalid")
+-    target = target.resolve(strict=False)
+-    created = False
+     try:
+-        with target.open("xb") as handle:
+-            created = True
++        descriptor, identity = _open_posix_component(access.descriptor, part)
++    except FileNotFoundError:
++        if not create:
++            raise ValueError("optimizer artifact parent is absent") from None
++        try:
++            os.mkdir(part, mode=0o700, dir_fd=access.descriptor)
++        except FileExistsError:
++            pass
++        descriptor, identity = _open_posix_component(access.descriptor, part)
++        _sync_directory_access(access)
++    access.append_posix(child, descriptor, identity)
++
++
++def _acquire_directory(
++    root: Path,
++    parts: tuple[str, ...],
++    *,
++    create: bool,
++    expected_root_identity: tuple[int, int] | None,
++) -> _DirectoryAccess:
++    access = _acquire_absolute_directory(root)
++    try:
++        if expected_root_identity is not None and access.identity != expected_root_identity:
++            raise ValueError("optimizer artifact root identity changed")
++        for part in parts:
++            _extend_directory(access, part, create=create)
++        return access
++    except BaseException:
++        access.close()
++        raise
++
++
++def _open_exclusive_file(directory: _DirectoryAccess, name: str) -> int:
++    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
++    flags |= getattr(os, "O_CLOEXEC", 0)
++    if os.name != "nt":
++        flags |= getattr(os, "O_NOFOLLOW", 0)
++        return os.open(name, flags, 0o600, dir_fd=directory.descriptor)
++    return os.open(directory.path / name, flags, 0o600)
++
++
++def _write_create_only_in_directory(
++    directory: _DirectoryAccess,
++    name: str,
++    payload: bytes,
++) -> tuple[Path, str]:
++    directory.assert_current()
++    descriptor = _open_exclusive_file(directory, name)
++    created = True
++    try:
++        with os.fdopen(descriptor, "wb") as handle:
+             _write_all(handle, payload)
+             handle.flush()
+             os.fsync(handle.fileno())
+-        _fsync_directory(target.parent)
++        directory.assert_current()
++        _sync_directory_access(directory)
++        directory.assert_current()
+     except BaseException:
+         if created:
+             try:
+-                target.unlink(missing_ok=True)
++                directory.unlink(name)
++                _sync_directory_access(directory)
+             except OSError:
+                 pass
+         raise
+-    return target, hashlib.sha256(payload).hexdigest()
++    return directory.path / name, hashlib.sha256(payload).hexdigest()
++
++
++def _open_temporary_file(
++    directory: _DirectoryAccess,
++    target_name: str,
++) -> tuple[int, str]:
++    if os.name == "nt":
++        descriptor, temporary_name = tempfile.mkstemp(
++            prefix=f".{target_name}.",
++            suffix=".tmp",
++            dir=directory.path,
++        )
++        return descriptor, Path(temporary_name).name
++    for _attempt in range(128):
++        name = f".{target_name}.{secrets.token_hex(12)}.tmp"
++        try:
++            return _open_exclusive_file(directory, name), name
++        except FileExistsError:
++            continue
++    raise FileExistsError("optimizer artifact temporary name space is exhausted")
++
++
++def _atomic_replace_in_directory(
++    directory: _DirectoryAccess,
++    name: str,
++    payload: bytes,
++) -> tuple[Path, str]:
++    directory.assert_current()
++    descriptor, temporary_name = _open_temporary_file(directory, name)
++    try:
++        with os.fdopen(descriptor, "wb") as handle:
++            _write_all(handle, payload)
++            handle.flush()
++            os.fsync(handle.fileno())
++        directory.assert_current()
++        directory.replace(temporary_name, name)
++        directory.assert_current()
++        _sync_directory_access(directory)
++        directory.assert_current()
++    finally:
++        try:
++            directory.unlink(temporary_name)
++        except OSError:
++            pass
++    return directory.path / name, hashlib.sha256(payload).hexdigest()
++
++
++def write_create_only_bytes(path: Path, payload: bytes) -> tuple[Path, str]:
++    """Create and fsync one artifact without permitting an overwrite."""
++
++    target = Path(path)
++    if not target.is_absolute():
++        raise ValueError("optimizer artifact target is invalid")
++    with _acquire_absolute_directory(target.parent) as directory:
++        return _write_create_only_in_directory(directory, target.name, payload)
+ 
+ 
+ def write_create_only_json(
+     path: Path,
+     value: Mapping[str, object],
+ ) -> tuple[Path, str]:
+     return write_create_only_bytes(Path(path), canonical_json_bytes(value))
+ 
+ 
+ def atomic_replace_bytes(path: Path, payload: bytes) -> tuple[Path, str]:
+     """Fsync a sibling temporary file before atomically replacing an artifact."""
+ 
+     target = Path(path)
+-    if not target.is_absolute() or target.parent.is_symlink() or not target.parent.is_dir():
++    if not target.is_absolute():
+         raise ValueError("optimizer artifact replacement target is invalid")
+-    target = target.resolve(strict=False)
+-    descriptor, temporary_name = tempfile.mkstemp(
+-        prefix=f".{target.name}.",
+-        suffix=".tmp",
+-        dir=target.parent,
+-    )
+-    temporary = Path(temporary_name)
+-    try:
+-        with os.fdopen(descriptor, "wb") as handle:
+-            _write_all(handle, payload)
+-            handle.flush()
+-            os.fsync(handle.fileno())
+-        os.replace(temporary, target)
+-        _fsync_directory(target.parent)
+-    finally:
+-        temporary.unlink(missing_ok=True)
+-    return target, hashlib.sha256(payload).hexdigest()
++    with _acquire_absolute_directory(target.parent) as directory:
++        return _atomic_replace_in_directory(directory, target.name, payload)
+ 
+ 
+ def atomic_replace_json(
+     path: Path,
+     value: Mapping[str, object],
+ ) -> tuple[Path, str]:
+     return atomic_replace_bytes(Path(path), canonical_json_bytes(value))
+ 
+ 
+ class IncrementalArtifactStore:
+@@ -120,70 +497,67 @@ class IncrementalArtifactStore:
+     _REPLACEABLE_DIFF = frozenset({"incumbent.diff"})
+     _ROOT_JSON = frozenset(
+         {"run.json", "baseline.json", "accounting.json", "holdout.json", "summary.json"}
+     )
+     _ITERATION_JSON = frozenset(
+         {"investigator.json", "author.json", "validation.json", "discovery.json", "critic.json", "decision.json"}
+     )
+ 
+     def __init__(self, root: Path) -> None:
+         candidate = Path(root)
+-        if not candidate.is_absolute() or candidate.is_symlink() or not candidate.is_dir():
++        if not candidate.is_absolute():
+             raise ValueError("optimizer artifact root is invalid")
+-        self._root = candidate.resolve()
++        candidate = Path(os.path.abspath(candidate))
++        try:
++            with _acquire_absolute_directory(candidate) as access:
++                self._root_identity = access.identity
++        except (OSError, ValueError) as exc:
++            raise ValueError("optimizer artifact root is invalid") from exc
++        self._root = candidate
+ 
+     @property
+     def root(self) -> Path:
+         return self._root
+ 
+-    def _secure_directory(self, parts: tuple[str, ...], *, create: bool) -> Path:
+-        current = self._root
+-        for part in parts:
+-            child = current / part
+-            try:
+-                if _is_link_or_reparse(child):
+-                    raise ValueError("optimizer artifact parent is a link or reparse point")
+-            except FileNotFoundError:
+-                if not create:
+-                    raise ValueError("optimizer artifact parent is absent") from None
+-                try:
+-                    child.mkdir()
+-                except FileExistsError:
+-                    pass
+-                if _is_link_or_reparse(child):
+-                    raise ValueError(
+-                        "optimizer artifact parent is a link or reparse point"
+-                    ) from None
+-                _fsync_directory(current)
+-            if not child.is_dir():
+-                raise ValueError("optimizer artifact parent is invalid")
+-            resolved = child.resolve(strict=True)
+-            if self._root not in (resolved, *resolved.parents):
+-                raise ValueError("optimizer artifact parent escaped its root")
+-            current = resolved
+-        return current
++    def _secure_directory(
++        self,
++        parts: tuple[str, ...],
++        *,
++        create: bool,
++    ) -> _DirectoryAccess:
++        return _acquire_directory(
++            self._root,
++            parts,
++            create=create,
++            expected_root_identity=self._root_identity,
++        )
+ 
+     def prepare_iteration(self, iteration: int) -> Path:
+         """Create and sync the numbered directory before any role authority is used."""
+ 
+         if type(iteration) is not int or not 1 <= iteration <= 999:
+             raise ValueError("optimizer iteration number is invalid")
+-        parent = self._secure_directory(("iterations",), create=True)
+-        directory = self._secure_directory(
++        with self._secure_directory(("iterations",), create=True) as parent:
++            _sync_directory_access(parent)
++        with self._secure_directory(
+             ("iterations", f"{iteration:03d}"),
+             create=True,
+-        )
+-        _fsync_directory(directory)
+-        _fsync_directory(parent)
+-        return directory
++        ) as directory:
++            _sync_directory_access(directory)
++            return directory.path
+ 
+-    def _target(self, name: str, *, json_artifact: bool) -> Path:
++    def _target(
++        self,
++        name: str,
++        *,
++        json_artifact: bool,
++    ) -> tuple[tuple[str, ...], str]:
+         if not isinstance(name, str) or "\\" in name:
+             raise ValueError("optimizer artifact name is invalid")
+         parts = Path(name).parts
+         valid = False
+         if json_artifact and name in self._ROOT_JSON:
+             valid = True
+         elif (
+             json_artifact
+             and len(parts) == 3
+             and parts[0] == "iterations"
+@@ -198,36 +572,38 @@ class IncrementalArtifactStore:
+                 len(parts) == 3
+                 and parts[0] == "iterations"
+                 and len(parts[1]) == 3
+                 and parts[1].isdigit()
+                 and parts[2] == "candidate.diff"
+             )
+         ):
+             valid = True
+         if not valid:
+             raise ValueError("optimizer artifact name is outside the closed layout")
+-        parent = self._secure_directory(tuple(parts[:-1]), create=False)
+-        return parent / parts[-1]
++        return tuple(parts[:-1]), parts[-1]
+ 
+     def write_json_artifact(
+         self,
+         name: str,
+         value: Mapping[str, object],
+     ) -> tuple[Path, str]:
+         if not isinstance(value, Mapping) or value.get("schema_version") != 2:
+             raise ValueError("optimizer JSON artifact schema is invalid")
+-        target = self._target(name, json_artifact=True)
+-        if name in self._REPLACEABLE_JSON and target.exists():
+-            return atomic_replace_json(target, value)
+-        return write_create_only_json(target, value)
++        parent_parts, target_name = self._target(name, json_artifact=True)
++        payload = canonical_json_bytes(value)
++        with self._secure_directory(parent_parts, create=False) as directory:
++            if name in self._REPLACEABLE_JSON and directory.entry_exists(target_name):
++                return _atomic_replace_in_directory(directory, target_name, payload)
++            return _write_create_only_in_directory(directory, target_name, payload)
+ 
+     def write_diff_artifact(self, name: str, value: str) -> tuple[Path, str]:
+         if not isinstance(value, str) or "\x00" in value:
+             raise ValueError("optimizer diff artifact is invalid")
+-        target = self._target(name, json_artifact=False)
++        parent_parts, target_name = self._target(name, json_artifact=False)
+         payload = value.encode("utf-8")
+-        if name in self._REPLACEABLE_DIFF and target.exists():
+-            return atomic_replace_bytes(target, payload)
+-        return write_create_only_bytes(target, payload)
++        with self._secure_directory(parent_parts, create=False) as directory:
++            if name in self._REPLACEABLE_DIFF and directory.entry_exists(target_name):
++                return _atomic_replace_in_directory(directory, target_name, payload)
++            return _write_create_only_in_directory(directory, target_name, payload)
+ 
+ 
+ PitOptimizerArtifactStore = IncrementalArtifactStore
+diff --git a/tests/test_pit_optimizer_loop.py b/tests/test_pit_optimizer_loop.py
+index c77cf6c..91e2880 100644
+--- a/tests/test_pit_optimizer_loop.py
++++ b/tests/test_pit_optimizer_loop.py
+@@ -730,20 +730,178 @@ def test_artifact_store_rejects_nested_link_before_any_outside_mutation(
+     except OSError:
+         pytest.skip("directory symlinks are unavailable on this platform")
+ 
+     store = IncrementalArtifactStore(root)
+     with pytest.raises(ValueError, match="link|reparse|parent"):
+         store.prepare_iteration(1)
+ 
+     assert list(outside.iterdir()) == []
+ 
+ 
++@pytest.mark.parametrize(
++    "mutation_kind",
++    ["create_only", "replace_json", "replace_diff"],
++)
++def test_artifact_store_blocks_post_check_path_replacement_race(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++    mutation_kind: str,
++) -> None:
++    """Break caught: a checked parent could be swapped before open/replace."""
++    import os
++
++    import core.pit_optimizer_artifacts as artifacts
++
++    root = (tmp_path / "run").resolve()
++    root.mkdir()
++    store = artifacts.IncrementalArtifactStore(root)
++    if mutation_kind == "create_only":
++        store.prepare_iteration(1)
++        name = "iterations/001/investigator.json"
++        target_name = "investigator.json"
++        component = root / "iterations"
++        detached = (tmp_path / "detached_iterations").resolve()
++        outside = (tmp_path / "outside_iterations").resolve()
++        outside.mkdir()
++        (outside / "001").mkdir()
++        original_bytes: bytes | None = None
++        replacement_bytes: bytes | None = None
++        updated_bytes = b'{"schema_version":2,"stage":"after"}\n'
++    elif mutation_kind == "replace_json":
++        name = "accounting.json"
++        target_name = name
++        component = root
++        detached = (tmp_path / "detached_run_json").resolve()
++        outside = (tmp_path / "outside_run_json").resolve()
++        outside.mkdir()
++        store.write_json_artifact(name, {"schema_version": 2, "stage": "before"})
++        original_bytes = (root / name).read_bytes()
++        replacement_bytes = b"synthetic replacement json marker\n"
++        (outside / name).write_bytes(replacement_bytes)
++        updated_bytes = b'{"schema_version":2,"stage":"after"}\n'
++    else:
++        name = "incumbent.diff"
++        target_name = name
++        component = root
++        detached = (tmp_path / "detached_run_diff").resolve()
++        outside = (tmp_path / "outside_run_diff").resolve()
++        outside.mkdir()
++        store.write_diff_artifact(name, "before\n")
++        original_bytes = (root / name).read_bytes()
++        replacement_bytes = b"synthetic replacement diff marker\n"
++        (outside / name).write_bytes(replacement_bytes)
++        updated_bytes = b"after\n"
++
++    race = {"injected": False, "blocked": False, "link": False}
++
++    def inject_replacement() -> None:
++        if race["injected"]:
++            return
++        race["injected"] = True
++        try:
++            component.rename(detached)
++        except OSError:
++            race["blocked"] = True
++            return
++        try:
++            component.symlink_to(outside, target_is_directory=True)
++            race["link"] = True
++        except OSError:
++            component.mkdir()
++            if mutation_kind == "create_only":
++                (component / "001").mkdir()
++            else:
++                assert replacement_bytes is not None
++                (component / target_name).write_bytes(replacement_bytes)
++
++    original_path_open = Path.open
++
++    def racing_path_open(path: Path, mode: str = "r", *args: object, **kwargs: object):
++        if path.name == target_name and "x" in mode:
++            inject_replacement()
++        return original_path_open(path, mode, *args, **kwargs)
++
++    original_mkstemp = artifacts.tempfile.mkstemp
++
++    def racing_mkstemp(*args: object, **kwargs: object):
++        prefix = kwargs.get("prefix", "")
++        if isinstance(prefix, str) and prefix.startswith(f".{target_name}."):
++            inject_replacement()
++        return original_mkstemp(*args, **kwargs)
++
++    original_os_open = artifacts.os.open
++
++    def racing_os_open(
++        path: object,
++        flags: int,
++        mode: int = 0o777,
++        *,
++        dir_fd: int | None = None,
++    ) -> int:
++        candidate_name = Path(os.fsdecode(path)).name if not isinstance(path, int) else ""
++        if candidate_name == target_name or (
++            candidate_name.startswith(f".{target_name}.")
++            and candidate_name.endswith(".tmp")
++        ):
++            inject_replacement()
++        if dir_fd is None:
++            return original_os_open(path, flags, mode)
++        return original_os_open(path, flags, mode, dir_fd=dir_fd)
++
++    monkeypatch.setattr(Path, "open", racing_path_open)
++    monkeypatch.setattr(artifacts.tempfile, "mkstemp", racing_mkstemp)
++    monkeypatch.setattr(artifacts.os, "open", racing_os_open)
++
++    try:
++        if mutation_kind in {"create_only", "replace_json"}:
++            store.write_json_artifact(
++                name,
++                {"schema_version": 2, "stage": "after"},
++            )
++        else:
++            store.write_diff_artifact(name, "after\n")
++    except (OSError, ValueError):
++        pass
++
++    assert race["injected"] is True
++    outside_target = (
++        outside / "001" / target_name
++        if mutation_kind == "create_only"
++        else outside / target_name
++    )
++    if race["blocked"]:
++        assert component.exists()
++        assert not detached.exists()
++        safe_target = (
++            component / "001" / target_name
++            if mutation_kind == "create_only"
++            else component / target_name
++        )
++        assert safe_target.read_bytes() == updated_bytes
++        if mutation_kind == "create_only":
++            assert not outside_target.exists()
++        else:
++            assert outside_target.read_bytes() == replacement_bytes
++        return
++
++    if mutation_kind == "create_only":
++        assert not outside_target.exists()
++        assert not (detached / "001" / target_name).exists()
++        if not race["link"]:
++            assert not (component / "001" / target_name).exists()
++    else:
++        assert outside_target.read_bytes() == replacement_bytes
++        assert (detached / target_name).read_bytes() == original_bytes
++        if not race["link"]:
++            assert (component / target_name).read_bytes() == replacement_bytes
++
++
+ def test_artifact_initialization_candidate_capability_is_keyed_only_by_workspace_id(
+     tmp_path: Path,
+ ) -> None:
+     """Break caught: a removed/forged root reference could recreate candidate authority."""
+     from types import SimpleNamespace
+     from unittest.mock import Mock
+ 
+     from core.pit_optimizer_controller import (
+         CandidateValidationOutcome,
+         CandidateWorkspace,
+@@ -1480,45 +1638,68 @@ def test_actual_two_iteration_loop_persists_exact_closed_artifacts_without_leaks
+         DeterminismAttestation,
+         DiscoveryComparison,
+         DiscoveryEvaluation,
+         FoldEvaluationResult,
+         PitOptimizerCleanup,
+         ValidationReservation,
+     )
+ 
+     inputs = _prepare_fixture(tmp_path)
+     readiness = _prepare(inputs)
++    raw_envelope_marker = "SYNTHETIC_RAW_ENVELOPE_MARKER_7R2"
++    approval_input_marker = "SYNTHETIC_APPROVAL_INPUT_MARKER_7R2"
++    candidate_input_marker = "SYNTHETIC_CANDIDATE_INPUT_MARKER_7R2"
++    raw_boundary_seen: list[str] = []
++    approval_boundary_seen: list[str] = []
++    candidate_boundary_seen: list[str] = []
+     git_path = shutil.which("git")
+     assert git_path is not None
+     git_capability = agent_loop.configure_git_executable(Path(git_path).resolve())
+     run_root = (tmp_path / "run").resolve()
+     run_root.mkdir()
+     store = IncrementalArtifactStore(run_root)
+     pricing, lease = _pricing_and_lease(readiness.manifest)
++    lease = replace(
++        lease,
++        one_shot_key_sha256=hashlib.sha256(
++            approval_input_marker.encode("utf-8")
++        ).hexdigest(),
++    )
++    synthetic_approval_input = {
++        "operator_approval_reference": approval_input_marker,
++    }
+     initial_bundle = controller.build_policy_source_bundle(
+         candidate_root=Path(inputs["source_root"]).resolve(),
+         cumulative_diff="",
+         policy_interface_version=readiness.manifest.policy_interface_version,
+     )
+     controller._require_complete_iteration_context(readiness, initial_bundle)
+     live: dict[str, Path] = {}
+     candidate_number = 0
+     evaluation_number = 0
+     role_inputs: list[object] = []
+     disposed: list[str] = []
+ 
+     def create_candidate(cumulative_diff: str | None) -> CandidateWorkspace:
+         nonlocal candidate_number
+         candidate_number += 1
+         workspace_id = f"workspace_actual_{candidate_number}"
+         root = (tmp_path / workspace_id).resolve()
+         shutil.copytree(Path(inputs["source_root"]), root)
++        exclude = root / ".git" / "info" / "exclude"
++        with exclude.open("a", encoding="utf-8") as handle:
++            handle.write("\n.synthetic_candidate_boundary\n")
++        candidate_boundary = root / ".synthetic_candidate_boundary"
++        candidate_boundary.write_text(candidate_input_marker, encoding="utf-8")
++        candidate_boundary_seen.append(
++            candidate_boundary.read_text(encoding="utf-8")
++        )
+         if cumulative_diff:
+             agent_loop._git(
+                 root,
+                 "apply",
+                 "--whitespace=error-all",
+                 "-",
+                 input_bytes=cumulative_diff.encode("utf-8"),
+                 git=git_capability,
+             )
+         live[workspace_id] = root
+@@ -1563,23 +1744,35 @@ def test_actual_two_iteration_loop_persists_exact_closed_artifacts_without_leaks
+             )
+         else:
+             payload = CriticArtifact(
+                 hypothesis_id=hypothesis,
+                 prediction_vs_observation="The closed discovery evidence was evaluated.",
+                 causal_explanation="Only fixed-baseline strict improvement can replace the incumbent.",
+                 evidence_ids=(readiness.baseline_discovery.evidence_ids[0],),
+                 disposition="refine",
+                 next_direction=f"bounded direction {plan.iteration}",
+             )
++        raw_envelope = {
++            "synthetic_transport_marker": raw_envelope_marker,
++            "message": {
++                "content": json.dumps(
++                    asdict(payload),
++                    separators=(",", ":"),
++                ),
++            },
++        }
++        assert callable(parser)
++        closed_payload = parser(raw_envelope["message"]["content"])
++        raw_boundary_seen.append(raw_envelope["synthetic_transport_marker"])
+         return PitOptimizerRoleCall(
+             plan,
+-            payload,
++            closed_payload,
+             _role_facts(plan, frozen_pricing_sha256=pricing.pricing_sha256),
+         )
+ 
+     def validate(
+         workspace: CandidateWorkspace,
+         author: AuthorArtifact,
+         cumulative_diff: str | None,
+     ) -> CandidateValidationOutcome:
+         assert live[workspace.workspace_id] == workspace.root
+         identity, authenticated_cumulative = validate_candidate_diff(
+@@ -1685,23 +1878,31 @@ def test_actual_two_iteration_loop_persists_exact_closed_artifacts_without_leaks
+         hidden = _hidden_result(
+             readiness.manifest.fold_manifest.hidden_fold.fold_id
+         )
+         return _hidden_attestation(
+             readiness,
+             identity.identity_sha256,
+             reserved,
+             hidden,
+         )
+ 
++    def open_lease(ready: object, frozen: object) -> object:
++        assert ready is readiness
++        assert frozen is pricing
++        approval_boundary_seen.append(
++            synthetic_approval_input["operator_approval_reference"]
++        )
++        return lease
++
+     services = PitOptimizerServices(
+         freeze_pricing=lambda model: pricing,
+-        open_run_lease=lambda ready, frozen: lease,
++        open_run_lease=open_lease,
+         close_run_lease=lambda active, terminal: None,
+         call_role=call_role,
+         recover_role_attempt=lambda plan, active: (_ for _ in ()).throw(
+             AssertionError("accepted calls must not recover")
+         ),
+         create_candidate=create_candidate,
+         validate_and_apply=validate,
+         evaluate_discovery=evaluate,
+         confirm_discovery=lambda workspace, identity, fold_id: DeterminismAttestation(
+             fold_id=fold_id,
+@@ -1721,20 +1922,23 @@ def test_actual_two_iteration_loop_persists_exact_closed_artifacts_without_leaks
+         ),
+         dispose_candidate=dispose,
+         verify_inputs=lambda ready: None,
+         cancellation_requested=lambda: False,
+         prepare_iteration_artifacts=store.prepare_iteration,
+         write_json_artifact=store.write_json_artifact,
+         write_diff_artifact=store.write_diff_artifact,
+     )
+     result = run_pit_optimizer_v2(readiness=readiness, services=services)
+ 
++    assert raw_boundary_seen == [raw_envelope_marker] * 6
++    assert approval_boundary_seen == [approval_input_marker]
++    assert candidate_boundary_seen == [candidate_input_marker] * 2
+     assert result.terminal_code == "iteration_limit"
+     assert result.status == "long_replay_eligible"
+     assert result.iterations_started == result.iterations_completed == 2
+     assert result.incumbent_updates == 1
+     assert result.valid_evaluations == 2
+     assert result.non_improving_streak == 1
+     assert len(role_inputs) == 6
+     assert [item.__class__.__name__ for item in role_inputs] == [
+         "InvestigatorInput",
+         "AuthorInput",
+@@ -1821,27 +2025,29 @@ def test_actual_two_iteration_loop_persists_exact_closed_artifacts_without_leaks
+         "rankable", "strictly_improves_incumbent", "folds",
+         "engine_policy_sha256", "candidate_identity_sha256",
+     }
+     assert set(json.loads((run_root / "iterations/001/decision.json").read_bytes())) == {
+         "schema_version", "rankable", "quantized_score",
+         "prior_incumbent_identity_sha256", "new_incumbent_identity_sha256", "decision",
+     }
+     durable = b"\n".join(
+         path.read_bytes() for path in run_root.rglob("*") if path.is_file()
+     )
+-    for sentinel in (
+-        b"RAW_PROVIDER_SECRET_SENTINEL",
+-        b"SYSTEM_PROMPT_SECRET_SENTINEL",
+-        b"OPERATOR_APPROVAL_SECRET_SENTINEL",
+-        b"AUTHORIZATION_HEADER_SECRET_SENTINEL",
++    persisted_and_public = durable + controller.canonical_json_bytes(
++        result.to_public_artifact()
++    )
++    for marker in (
++        raw_envelope_marker,
++        approval_input_marker,
++        candidate_input_marker,
+     ):
+-        assert sentinel not in durable
++        assert marker.encode("utf-8") not in persisted_and_public
+ 
+ 
+ def _decision_calls(state: object, *, iteration: int):
+     from unittest.mock import Mock
+ 
+     from core.pit_optimization_contract import AuthorArtifact, CriticArtifact, InvestigatorArtifact
+ 
+     investigator = Mock()
+     investigator.payload = InvestigatorArtifact(
+         hypothesis_id=f"hypothesis_{iteration}",

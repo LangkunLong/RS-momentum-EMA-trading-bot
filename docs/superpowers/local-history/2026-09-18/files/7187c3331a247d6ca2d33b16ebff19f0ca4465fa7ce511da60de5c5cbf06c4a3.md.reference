@@ -1,0 +1,21 @@
+# Task 4 Fix Re-review
+
+Reviewed only `review-a66a5e8..72ba31e.diff`, the appended Task 4 report, and the affected current contract lines. No tests were rerun.
+
+## Prior-Finding Verdicts
+
+1. **Exposure totals below gross: partially fixed; one important zero-gross boundary remains.** `core/strategy_policy/contracts_v3.py:282-286` now rejects totals that do not reconcile with gross, so ordinary underreported sector/industry totals no longer pass. However, `_same()` has an absolute tolerance of `1e-12` (`:62-63`). With `gross_exposure_fraction == 0.0`, a nonempty positive exposure tuple totaling, for example, `5e-13` passes `not _same(total, gross)` at `:285`; `_validate_exposures()` permits that positive element. This violates the requested zero-gross/empty-exposure boundary and the appended report's claim that empty classifications are the only zero-gross form. Add an explicit `if gross == 0.0 and exposures: fail` before using the reconciliation tolerance. Confidence: 10/10.
+
+2. **Explicit add-on cap beyond current plus cash: fixed.** `core/strategy_policy/contracts_v3.py:579-591` keeps `None` valid, rejects caps at or below current notional, and rejects an explicit cap above current notional plus remaining cash. The only allowed overage is the pre-existing `_same()` numerical tolerance at `:586`, which is appropriate for the floating-point sum boundary rather than a material unfunded request. Confidence: 10/10.
+
+3. **Exit MFE/current-return and MAE lower bounds: fixed.** `core/strategy_policy/contracts_v3.py:555-564` now rejects MFE below the exact current-return calculation, including when current return is negative, and bounds exit MAE to `[-1, 0]`. `:471-477` applies the same MAE lower bound to add-on snapshots while preserving its existing MFE/current-return check. Confidence: 10/10.
+
+4. **Nested Decimal/non-JSON ingress: fixed.** `core/strategy_policy/contracts_v3.py:220-238` accepts only exact strings for affiliations, exact `int` or `None` for `fundamental_age_days`, and exact `int`/`float`/`None` for other feature values; it invokes `_number()` for finite/non-boolean numeric validation. Therefore `Decimal`, booleans, infinities, and other float-coercible objects now fail at `from_primitive()` ingress. Confidence: 10/10.
+
+## V2 / New-Breakage Check
+
+The supplied fix diff changes only `contracts_v3.py`; V2 runtime, worker, envelopes, imports, method tuple, and bytes are untouched. No new V2 compatibility issue was introduced in this bounded diff review.
+
+## Assessment
+
+Do not close Task 4 yet: fix the zero-gross/nonempty exposure tolerance hole. The other three prior findings are resolved.

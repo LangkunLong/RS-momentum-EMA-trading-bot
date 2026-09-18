@@ -1,0 +1,162 @@
+"""Create-only source extraction and reconciliation diagnostics, never admission files."""
+import hashlib
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+from bs4 import BeautifulSoup
+
+ROOT = Path(__file__).resolve().parents[3]
+OUT = ROOT / '.artifacts/pit-optimizer-v5/data/acquisition/raw/nasdaq-public'
+
+def save(name, value):
+    with (OUT/name).open('x', encoding='utf-8') as stream:
+        json.dump(value, stream, indent=2, sort_keys=True)
+        stream.write('\n')
+
+def soup(name):
+    return BeautifulSoup((OUT/name).read_bytes(), 'html.parser')
+
+anchor_name = 'public-wikipedia-anchor-r997991401.html'
+anchor_table = soup(anchor_name).select('table')[3]
+anchor = [r.select('td')[1].get_text(' ', strip=True) for r in anchor_table.select('tr')[1:]]
+if len(set(anchor)) != len(anchor):
+    raise ValueError('duplicate anchor symbol')
+anchor_record = dict(source_file=anchor_name, source_revision=997991401,
+    source_revision_timestamp_utc='2021-01-03T06:22:02Z',
+    source_stated_asof='2020-12-21', proposed_seed_date='2021-01-04',
+    status='contemporaneous secondary-source anchor candidate; not admitted',
+    table_index_zero_based=3, ticker_column_zero_based=1,
+    ticker_count=len(anchor), tickers=sorted(anchor),
+    adaptation='Only the historical body membership table is extracted. Ignore current transcluded navigation templates, GICS fields, and all later current-list classifications. No price identity map is produced.')
+save('anchor-candidate-extraction.json', anchor_record)
+
+history = soup('public-wikipedia-history-r1371960136.html')
+events = []
+source_rows = []
+for row_index, row in enumerate(history.select('table')[0].select('tr')):
+    cells = row.find_all(['td','th'], recursive=False)
+    if len(cells) != 6:
+        continue
+    raw = [cell.get_text(' ', strip=True) for cell in cells]
+    try:
+        effective = datetime.strptime(raw[0], '%B %d, %Y').date().isoformat()
+    except ValueError:
+        continue
+    if effective < '2021-01-04':
+        continue
+    links = []
+    for link in row.select('a[href]'):
+        fragment = link['href'].split('#', 1)[-1]
+        if fragment.startswith('cite_note'):
+            note = history.find(id=fragment)
+            if note:
+                links.extend(a['href'] for a in note.select('a.external[href]'))
+    source_rows.append(dict(row_index_zero_based=row_index, source_effective_date=effective,
+        source_added_ticker=raw[1], source_added_security=raw[2],
+        source_removed_ticker=raw[3], source_removed_security=raw[4],
+        source_reason=raw[5], cited_urls=sorted(set(links))))
+    for ticker, member in [(raw[1],1),(raw[3],0)]:
+        if ticker:
+            events.append((effective,ticker,member))
+
+period_events = sorted(event for event in events if event[0] <= '2025-12-31')
+save('history-table-extraction-not-admitted.json', dict(
+    status='unvalidated source claims, including known wrong dates and ticker; not membership input',
+    source_file='public-wikipedia-history-r1371960136.html', source_revision=1371960136,
+    source_rows=source_rows, in_period_event_claim_count=len(period_events)))
+
+corrections = [
+    dict(id='fiserv-removal-ticker', source_claim=['2023-06-07','FI',0],
+         corrected_claim=['2023-06-07','FISV',0], status='resolved by contemporaneous primary notice',
+         source_file='public-nasdaq-gehc-fisv-20230607.html',
+         explanation='Nasdaq identifies the departing member as Nasdaq:FISV. Do not retroactively apply the successor NYSE ticker FI to the Nasdaq membership interval.'),
+    dict(id='ttwo-sgen-effective-date', source_claims=[['2023-12-14','TTWO',1],['2023-12-14','SGEN',0]],
+         corrected_claims=[['2023-12-18','TTWO',1],['2023-12-18','SGEN',0]],
+         status='resolved by contemporaneous primary amendment', source_file='public-nasdaq-2023-amended.html',
+         explanation='The corporate acquisition closing date Dec14 is not the index change date. Nasdaq amendment explicitly sets both changes before the Dec18 open.'),
+    dict(id='anss-effective-date', source_claim=['2025-07-17','ANSS',0],
+         corrected_claim=['2025-07-28','ANSS',0], status='resolved by contemporaneous primary notice',
+         source_file='public-nasdaq-tri-anss-20250728.html',
+         explanation='Official replacement release identifies TRI replacing ANSS before Jul28 open; the retrospective independently agrees. Preserve as index membership until removal even if shares cease trading earlier.'),
+    dict(id='fb-meta-dated-ticker', source_claim='omitted ticker rename',
+         corrected_claims=[['2022-06-09','FB',0],['2022-06-09','META',1]],
+         status='resolved by contemporaneous primary corporate-action notice',
+         source_file='public-nasdaq-fb-meta-ECA2022-125.html',
+         explanation='Same Class A CUSIP30303M102; ticker changes Jun9. This is ticker evidence only; reviewed downstream price identity linkage remains separate.'),
+]
+save('correction-evidence-ledger.json', corrections)
+
+def reconcile(seed, changes):
+    active = set(seed)
+    errors = []
+    for effective,ticker,member in sorted(changes):
+        if bool(member) == (ticker in active):
+            errors.append(dict(effective_date=effective,ticker=ticker,member=member,
+                error='not a state change'))
+        if member:
+            active.add(ticker)
+        else:
+            active.discard(ticker)
+    return active, errors
+
+original_active, original_errors = reconcile(anchor, period_events)
+corrected = []
+for date,ticker,member in period_events:
+    if date == '2023-06-07' and ticker == 'FI':
+        ticker = 'FISV'
+    if date == '2023-12-14' and ticker in {'TTWO','SGEN'}:
+        date = '2023-12-18'
+    if date == '2025-07-17' and ticker == 'ANSS':
+        date = '2025-07-28'
+    corrected.append((date,ticker,member))
+corrected += [('2022-06-09','FB',0),('2022-06-09','META',1)]
+corrected_active, corrected_errors = reconcile(anchor, corrected)
+current_table = soup('public-wikipedia-components-r1368915166.html').select('table')[0]
+current = {r.select('td')[0].get_text(' ',strip=True) for r in current_table.select('tr')[1:]}
+backcast = set(current)
+backcast_errors = []
+for date,ticker,member in sorted([e for e in events if e[0] > '2025-12-31'],reverse=True):
+    if bool(member) != (ticker in backcast):
+        backcast_errors.append([date,ticker,member])
+    if member:
+        backcast.discard(ticker)
+    else:
+        backcast.add(ticker)
+save('reconciliation-diagnostic-not-admitted.json', dict(
+    status='diagnostic only; endpoint agreement cannot establish intra-period completeness',
+    seed_ticker_count=len(anchor), original_event_claim_count=len(period_events),
+    original_state_errors=original_errors, corrected_event_claim_count=len(corrected),
+    corrected_state_errors=corrected_errors, corrected_end_ticker_count=len(corrected_active),
+    current_revision_ticker_count=len(current), after_period_reverse_state_errors=backcast_errors,
+    backcast_end_ticker_count=len(backcast), forward_only=sorted(corrected_active-backcast),
+    backcast_only=sorted(backcast-corrected_active),
+    warnings=[
+        'SOLS source date claims remain unresolved and are retained only for state-diagnostic purposes.',
+        'GRAL/GRALV transient inclusion is omitted from Wikipedia and no effective-date correction has been established.',
+        'Unenumerated transient omissions remain possible even when endpoints and all state transitions reconcile.',
+        'Current constituents are used only for a cross-check, never as the historical seed or classification source.',
+        'No source CSV/provenance pair, normalizer acceptance, prices, classifications, or identity map is emitted.',
+    ]))
+
+receipts = [json.loads(p.read_text()) for p in sorted(OUT.glob('*.receipt.json'))]
+verified = []
+for receipt in receipts:
+    if receipt.get('acquisition_ok'):
+        raw_path = OUT / receipt['source_file']
+        raw_bytes = raw_path.read_bytes()
+        if hashlib.sha256(raw_bytes).hexdigest() != receipt['sha256'] or len(raw_bytes) != receipt['byte_count']:
+            raise ValueError(f'receipt hash/length mismatch: {raw_path.name}')
+        verified.append(receipt['source_file'])
+save('acquisition-manifest.json', dict(
+    generated_at_utc=datetime.now(timezone.utc).isoformat().replace('+00:00','Z'),
+    status='raw evidence acquired; membership pair withheld',
+    successful_source_count=len(verified), successful_sources=verified, receipts=receipts,
+    receipt_integrity='All successful receipt hashes and byte lengths verified against local source bytes.',
+    url_caveat='Wikipedia oldid URLs pin article revisions, but rendered navigation templates can reflect later state and are excluded. The Jan2021 anchor receipt conservatively marks url_is_revision_pinned false because it used the generic single-download mode; the URL itself and API lookup identify immutable revision997991401. Official dated article/PDF URLs are not assumed server-immutable; preserve exact downloaded bytes and SHA256.',
+    membership_pair_created=False, normalizer_validation='Not invoked because no admissible source pair is emitted.',
+    no_tests_read_modified_added_or_run=True))
+print(json.dumps(dict(successful_source_count=len(verified),seed_count=len(anchor),
+    event_claim_count=len(period_events), corrected_event_count=len(corrected),
+    corrected_state_errors=corrected_errors, forward_end_count=len(corrected_active),
+    backcast_end_count=len(backcast), forward_only=sorted(corrected_active-backcast),
+    backcast_only=sorted(backcast-corrected_active)),indent=2))

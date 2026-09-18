@@ -1,0 +1,22 @@
+# Task 5 fix-round re-review
+
+Reviewed fix-only range `f7a7c103fc54e3e00bb5bd007f18b8a700fbc51c..95e7616decc856cb6dd9375b1ee519a6c242d5ef` and the final BASE..HEAD range. No implementation files were changed and no unit or broad tests were run.
+
+## Original findings
+
+1. **Important — zero-input rolling recall semantics and compatibility helper: ADDRESSED.**  
+   [`core/pit_baseline_report.py:634`](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-fundamental-corrections/core/pit_baseline_report.py:634)-[`646`](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-fundamental-corrections/core/pit_baseline_report.py:646) now treats an empty signal DataFrame as zero signals and returns shaped raw/all and PIT-exposed populations; it specifically returns both zero-denominator populations for no labels. Non-empty signal frames still require all three fields at [`648`](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-fundamental-corrections/core/pit_baseline_report.py:648)-[`651`](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-fundamental-corrections/core/pit_baseline_report.py:651). The retained compatibility wrapper delegates to this result at [`690`](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-fundamental-corrections/core/pit_baseline_report.py:690), preserving `0.0` for `rolling_label_recall_pct((), pd.DataFrame())`.
+
+2. **Minor — unrelated formatting-only rewrite outside reporting/schema scope: ADDRESSED.**  
+   The verified final `75ddddbb5d794f7c09b5644bb94c6e126e06f0e9..95e7616decc856cb6dd9375b1ee519a6c242d5ef` range is 185 additions and 18 deletions, affecting only the two authorized files. Its functional hunks are confined to recall schema/helpers, baseline summary construction, report prose, and manifest recall publication. The prior unrelated reconciliation/validation formatting churn is absent from the final range.
+
+3. **Minor/⚠ — reproducible focused-probe command and captured assertions/output: ADDRESSED.**  
+   The updated task report supplies a self-contained PowerShell/Python probe at [`task-5-report.md:41`](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/canonical-canslim-entry/.superpowers/sdd/2026-08-23-canonical-canslim-entry/task-5-report.md:41), including alias/reset isolation, five-year and rolling numerator/denominator assertions, zero-input compatibility assertions, non-empty-schema validation, and `allow_nan=False` JSON serialization. Its captured PASS output is recorded at [`task-5-report.md:89`](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/canonical-canslim-entry/.superpowers/sdd/2026-08-23-canonical-canslim-entry/task-5-report.md:89)-[`92`](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/canonical-canslim-entry/.superpowers/sdd/2026-08-23-canonical-canslim-entry/task-5-report.md:92).
+
+## New Critical/Important breakage
+
+**None found.** The fix-only change restores the compatibility edge case without changing CANSLIM thresholds, entry/exit behavior, sizing, cadence, or adding rolling execution attribution.
+
+## Verdict
+
+All three original findings are **ADDRESSED**. The fix-only patch is approved for Task 5 review purposes.

@@ -1,0 +1,11 @@
+{
+  "actual_request_file": ".artifacts\\pit-optimizer-v5\\development\\runtime-04\\roles\\requests\\39acd0018dc57ab8da77e06a44eb9ebf7097e896dda33cd0cb747a2759e622bf.json",
+  "actual_request_file_sha256": "99e19a239f1479f2eda9f164b48d1e835f64b6ff3fbd32fe7822a3e61d77c8f2",
+  "canonical_schema_sha256": "3b02c45e4cceddfb82379e1ce73d1b193040c9701d6d6d1af8c400906398f0a6",
+  "wire_schema_sha256": "39d7f749dde1e90c948acfc11f87e236f5eefdfac3afef786860f457e3f812ed",
+  "canonical_schema_bytes": 3264,
+  "wire_schema_bytes": 3005,
+  "author_default_property_preserved": true,
+  "four_disjoint_literal_branches_projected": true,
+  "canonical_unmutated": true
+}

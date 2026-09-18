@@ -1,0 +1,131 @@
+# Task 8C2 report — bounded Docker panel adapter
+
+## Outcome
+
+Created `core/pit_optimizer_v5/sandbox.py` and added its minimal package exports. The module is a
+production-shaped but fully injected boundary: it constructs an immutable argv tuple and delegates
+execution/cleanup to `ContainerExecutorV5`. It contains no subprocess or Docker invocation.
+
+## Implemented boundary
+
+- Frozen owner-bound request, root/content-authenticated mount handles, PID/time limits, command,
+  execution result, lease-bearing outcome, sanitized failure, and runtime lease-registrar contracts.
+- Source, data, and output mounts bind distinct roots to exact policy/evaluator, PIT/provenance/panel,
+  and owner/panel/policy authorities respectively. Source/data are read-only; output is bounded and
+  write-only in the authenticated profile.
+- Tuple-only argv uses the digest-pinned image, network none, read-only root, capability drop all,
+  no-new-privileges, PID/CPU/memory limits, read-only source/data mounts, bounded output mount, and
+  a noexec/nosuid/nodev temporary filesystem. Timeout and output limits remain typed executor facts.
+- The executor must return exactly ordered evaluator-process and container leases for the request's
+  campaign, round, and owner token. `RuntimeDockerPanelEvaluatorV5` registers those leases before
+  status, output, or evaluation evidence is consumed.
+- Output byte length is checked before JSON parsing. Decode rejects duplicate keys, noncanonical
+  JSON, missing/extra fields, wrong primitive types, noncanonical decimals, and invalid nested V5
+  dataclasses. The resulting panel must exactly match evaluator, sandbox, panel, policy, dates,
+  selected scenario, and requested scenario order.
+- Timeout, cancellation, nonzero exit, missing/oversized/noncanonical/schema-invalid output,
+  identity mismatch, foreign lease, driver failure, and cleanup failure reduce to closed stable
+  codes without command output, paths, container IDs, or driver messages.
+- Cleanup accepts only exact owned evaluator/container leases and authenticates the returned
+  `CleanupResultPayloadV5` counts.
+
+## Direct fake verification
+
+A temporary deterministic fake executor/registrar harness (removed afterward) produced
+`V5_SANDBOX_FAKE_SMOKE_OK`. It covered argv flags and mount modes, a valid strict decode, lease
+registration before output handling, output-bound-before-parse, identity and scenario mismatch,
+timeout, cancellation, nonzero exit, missing output, foreign leases, exact cleanup facts, and
+foreign cleanup rejection.
+
+Final source verification used `py_compile`, Ruff check/format, package export import, forbidden
+fallback/coupling scan, and `git diff --check`. No tests were created or modified, and no Docker,
+subprocess, provider, Git, replay, data, network, push, or merge operation ran.
+
+## Final-review correction
+
+- Removed caller-selected container limits. CPU, memory, output, and the closed PID limit now come
+  from the authenticated campaign resource manifest and matching sandbox profile. The command uses
+  the smaller of the manifest stage cap and the exact monotonic stage deadline remainder.
+- Bound evaluator-process/container leases and bounded output bytes to the owner, role, request,
+  command, and complete output-mount authority. Metadata is authenticated before the durable
+  registrar is called; leases are registered before status or output evidence is inspected.
+- Added a lease-aware B2 runtime seam. `DockerCandidateRuntimeV5` remains a complete
+  `CandidateRuntimeV5`, delegates source/materialization/validation/fingerprint operations, and
+  supplies both ordinary and B2-registered Docker quick/episode paths. B2 injects its own durable
+  lease registrar before consuming returned evaluation evidence.
+- Host mount roots use Windows case-normalized path identity, preventing case aliases from making
+  input and output roots appear distinct.
+- A replacement temporary fake (removed afterward) produced `V5_SANDBOX_REVIEW_SMOKE_OK`. It also
+  covered manifest/profile resource disagreement, deadline overreach and expiry, unbound leases and
+  output before registration/consumption, exact ordinary plus lease-aware runtime composition,
+  Windows case-alias rejection, and the prior argv/decode/failure/cleanup paths.
+
+## Final identity and durable-journal correction
+
+- The exact candidate execution key is now part of source/data/output mount authorities and the
+  canonical Docker request primitive. Equal policy, panel, and scenarios under different
+  experiment/stage/episode keys therefore produce distinct mount, request, command, output, and
+  lease bindings; cross-key reuse fails closed.
+- Candidate execution authority is now a closed `candidate_execution` round-event payload, grouping
+  the exact process/container leases with experiment, stage, episode ordinal, request, command, and
+  output authority in one authenticated journal event. `LocalArtifactRepositoryV5` provides strict
+  canonical codec, exact keyed lookup, duplicate rejection, append, and immediate authenticated
+  reload.
+- Runtime registration reloads both the exact typed lookup and full journal chain after append and
+  requires exact authority/reference equality before result consumption. Missing, mismatched, or
+  noncanonical reload aborts while both in-memory cleanup handles remain registered. Restart uses
+  the same keyed authority and the recover-only executor path, never a duplicate execution.
+- The temporary final fake (removed afterward) produced `V5_SANDBOX_FINAL_SMOKE_OK`, covering
+  cross-key digest separation/rejection, the real repository closed codec, reload mismatch with
+  complete cleanup authority, and exact restart lookup.
+
+## Re-review correction
+
+- Registration is now an uncaught boundary: the sandbox validates its own metadata, then forwards
+  one exact execution authority and both owned handles to the registrar. Runtime/journal aborts
+  propagate unchanged. The runtime retains both handles together before its one atomic persistence
+  call, so an in-process persistence failure still has complete cleanup authority.
+- Added `CandidateExecutionAuthorityV5` and an exact atomic persistence protocol. The durable record
+  binds campaign/round/owner, stage/candidate/episode, request, command, output mount, and both lease
+  payloads. Before evaluating, B2 checks this side journal. When prior authority exists without the
+  evidence event, it uses the executor's recovery-only method and never calls execute again.
+- Restored exact closed validation for nested `SandboxFailureV5` values in `DockerPanelOutcomeV5`.
+- The temporary re-review fake (removed afterward) produced `V5_SANDBOX_REREVIEW_SMOKE_OK`. It
+  covered registrar abort propagation with both cleanup handles retained, atomic persistence
+  failure, restart lookup and bound quick/episode output recovery with zero duplicate execute calls,
+  nested failure-subclass rejection, unbound lease/output, identity/noncanonical output, timeout,
+  cancellation, nonzero exit, missing output, and output-size rejection.
+
+## Two-phase launch correction
+
+- Replaced the monolithic execution seam with an explicit `reserve` / `start` / `collect` protocol.
+  Reservation deterministically binds the exact command, evaluator-process/container leases, and
+  opaque driver handle without launching. Runtime durably appends and authenticated-reloads that
+  authority before `start` can be called.
+- Recovery uses only `reconcile` followed by `collect`; it never calls `start`. Command identity is
+  stable across a restart's smaller deadline remainder while collection still receives the current
+  bounded remainder.
+- Candidate-execution persistence now discovers an exact unindexed authority payload left by a
+  crash between payload creation and event indexing. An identical retry indexes that payload;
+  mismatch or multiple candidates fail closed before launch.
+- The temporary two-phase fake (removed afterward) produced `V5_SANDBOX_TWOPHASE_SMOKE_OK`. It
+  covered a failpoint during start, restart after returned execution but before evaluation evidence,
+  zero duplicate starts on recovery, exact artifact-before-index reconciliation, and conflicting
+  orphan rejection.
+
+## Orphan-before-branch correction
+
+- Exact candidate-execution lookup now scans and authenticates unindexed authority payloads before
+  returning to runtime. A sole orphan is indexed, reloaded, and returned as an existing execution;
+  indexed-plus-orphan and multiple-orphan states fail closed.
+- Runtime refreshes its authenticated journal after lookup promotion, verifies the exact event and
+  payload reference, and recovers the original evaluator/container cleanup handles before choosing
+  the recover-only path. This also preserves the correct event head for later evidence publication.
+- Executor reservation is now an atomic create-or-load contract with closed `created` / `existing`
+  disposition and command/role-derived deterministic lease IDs. Only a newly created reservation
+  may call `start`; an existing pre-publication reservation proceeds through collection without a
+  second start.
+- The temporary ordering fake (removed afterward) produced `V5_SANDBOX_ORPHAN_ORDERING_SMOKE_OK`.
+  It covered authenticated orphan promotion and idempotent lookup, original cleanup ownership,
+  restarted reserve/start counts of zero, existing-reservation start suppression, and conflicting
+  orphan rejection before any start.

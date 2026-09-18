@@ -1,0 +1,79 @@
+# Task 5 Re-review — Fix Round 4 of 5
+
+**Range:** `38c4bde5ac1ec1da2a0414f6a431f48a987bf074..f34379006e395fbffde909038ccb3f30b7e53be1`  
+**Verdict:** **NEEDS FIXES**  
+**Open findings:** Critical 0, Important 1, Minor 0
+
+This was a read-only review except for this requested artifact. I read the full Fix Round 4 report and the complete 1,116-line scoped review package, inspected the integrated cleanup paths, ran 17 narrow fake-only tests, and used tiny synchronous in-memory reproducers. No provider, network, pricing, replay, real Docker, background process, subagent, or broad suite was used.
+
+## Finding Verdict
+
+### Previous Important — unsafe secondary evidence construction and attachment: **ADDRESSED**
+
+`agent_loop.py:4550-4594` now defines only private enum-backed phase/action/reason records and fixed note ceilings. `_record_policy_secondary_errors` at `agent_loop.py:4766-4787` constructs value-free ASCII notes, stops at 32 records, rejects notes beyond 128 ASCII bytes, calls `BaseException.add_note` unbound, and shields iteration, construction, encoding, and attachment from `BaseException`.
+
+The three integrated regressions are honest:
+
+- `tests/test_agent_loop.py:1219-1277` proves a cleanup exception with hostile `__str__` cannot replace the exact malformed-protocol `ValueError`, while wait/rm/absence and package cleanup still run.
+- `tests/test_agent_loop.py:1280-1343` proves an overridden `add_note` cannot replace the exact `KeyboardInterrupt` instance or message.
+- `tests/test_agent_loop.py:1346-1416` proves `TimeoutExpired.cmd`, container-ID, secret, and stderr sentinels do not appear in formatted exception output; only closed action/reason codes remain.
+
+The focused hostile/explicit-close slice passed **6 tests**. A direct 100-record probe attached exactly **32** notes; the longest was **77 ASCII bytes** against the 128-byte ceiling. For ordinary caught cleanup faults, explicit close still raises the generic unchained `SandboxError` at `agent_loop.py:4994-5000`.
+
+## New Breakage
+
+### Important 1 — returned capability fields can escape the cleanup shield, replace the primary, and stop owner cleanup
+
+**Requirement:** Cleanup must be unconditional on success, failure, timeout, cancellation, and controller exceptions. A secondary capability failure must never replace the active `BaseException`; every later owner cleanup must still be attempted, and explicit close must report its closed generic failure rather than leak an arbitrary capability exception.
+
+**Evidence:** `ProcessResult` is an ordinary frozen dataclass whose annotations are not runtime enforcement (`agent_loop.py:4120-4128`). In this round, `_cleanup_owned_policy_daemon.control` catches only the runner call at `agent_loop.py:4672-4687`; it then reads and operates on `result.timed_out` and `result.returncode` outside that shield at lines 4688-4713. Final absence reads `absence.timed_out`, `absence.returncode`, and `absence.stdout.strip()` outside a shield at lines 4743-4755. A `ProcessResult` with an invalid scalar whose comparison raises, or a subclass with a hostile field descriptor, therefore escapes instead of becoming closed `INVALID_RESULT`/`EXCEPTION` evidence.
+
+The integrated consequence is at `agent_loop.py:4936-5000`: `close` marks the session closed before calling `_cleanup_owned_policy_daemon` unguarded at line 4981. An escaping field read prevents later daemon wait/rm/ID-only absence verification, skips private-tree removal at lines 4982-4993, bypasses evidence attachment/generic explicit-close reporting at lines 4994-5000, and makes a second `close` a no-op.
+
+Two tiny synchronous reproducers confirmed the boundary. A fabricated session with an active `ValueError("policy JSON fields are invalid")` and a returned `ProcessResult` subclass whose `timed_out` getter raises produced:
+
+```text
+primary_mode True raised RuntimeError ('capability result escaped',) same False
+calls ['kill'] notes ()
+primary_mode False raised RuntimeError ('capability result escaped',) same False
+calls ['kill'] notes ()
+```
+
+The same escape requires no subclass: an exact `ProcessResult` with a non-integer `returncode` whose `__ne__` raises produced `RuntimeError('invalid scalar escaped')` after only `kill`. The pre-round code kept status reads inside the `try`; moving them outside is a Fix Round 4 regression.
+
+**Required fix:** Normalize the complete cleanup result inside a `BaseException` shield before using it. Require the exact closed runtime types needed by cleanup (`timed_out` exactly `bool`, `returncode` exactly `int` and not `bool`, and absence `stdout` exactly `str`) before truth testing, comparison, or `.strip()`. Convert an invalid or hostile return to controller-owned `INVALID_RESULT`/`EXCEPTION` evidence and continue kill, wait, rm, full-ID absence verification, and private-tree removal. Keep final absence field access inside the same shield. A defensive outer guard may be added, but it must not become a reason to skip the remaining owner actions.
+
+**Exact RED tests:**
+
+1. Start with valid fake create/inspect results, then return `ProcessResult(HostileScalar(), ...)` for cleanup kill where `HostileScalar.__ne__` raises; induce the exact malformed-protocol primary. Require the same primary object/type/message, safe bounded `daemon_kill` evidence, all `kill/wait/rm/container` calls, verified owner outcome, and package-tree removal.
+2. Repeat with a `ProcessResult` subclass whose `timed_out` or final-query `stdout` getter raises. Require no arbitrary exception text/value in notes and no skipped later action.
+3. Call explicit close with either hostile result. Require the closed generic `SandboxError` with no arbitrary cause/value, all later actions, and package-tree removal; a second close may be idempotent only after the first completed every cleanup attempt.
+
+## Prior Finding Closure Audit
+
+- The normal nonzero/typed-timeout daemon matrix and full-ID-only absence targeting remain closed; the focused ownership slice passed **11 tests**. Kill, wait, rm, and `container ls --filter id=<full-id>` still run in order for well-formed results.
+- Discovery, tentative ownership, inspect mismatch, and primary-error evidence remain closed for the tested exception/nonzero/timeout paths.
+- Candidate identity, canonical path ordering, Git rollback, AST grammar, authenticated protocol, and two-runtime execution production code are untouched by this scoped diff. No Task 1-4 contract file changed.
+- The new finding is confined to malformed/hostile `ProcessResult` returns introduced into the refactored cleanup status path; it does not reopen the value-free note formatter itself.
+
+## Test / Report Audit
+
+- Narrow verification: **17 passed, 1 pre-existing `cache_dir` warning**. Six tests covered the round's hostile evidence and explicit-close cases; eleven covered typed daemon status, exact-ID cleanup, discovery/inspect ownership, and tampered-identity cleanup.
+- Existing `_Task5FakeDockerControl` either returns well-formed exact `ProcessResult` objects or raises before returning. It does not exercise malformed scalar values or hostile descriptors, so it misses the escape above.
+- `task-5-report.md:617-620` and lines 665-668 correctly describe the closed evidence format, but the claims that all independent daemon actions remain preserved and explicit close always raises only the generic `SandboxError` are too broad until Important 1 is fixed.
+- `git diff --check 38c4bde..f343790` and tracked/untracked status were clean before this ignored review artifact was written.
+
+## Resource / Cleanup Audit
+
+- Caught exceptions, typed timeouts, nonzero statuses, and ordinary invalid result objects continue to produce controller-owned evidence without raw host/capability values.
+- The malformed-field escape is before the recorder and is therefore not protected by its nested shields. It can strand the authenticated daemon and private package tree while suppressing the original failure and the cleanup outcome.
+- Normal explicit close still signals an unverified cleanup without chaining arbitrary secondary data. Hostile returned fields currently bypass that contract and raise their arbitrary exception directly.
+
+## Out-of-Scope Observations
+
+- The 32-note cap has no direct committed regression test, but the implementation was verified with a 100-record synchronous probe and the natural controller cleanup surface produces fewer than 32 records. No fix is required for this round.
+- Real Docker lifecycle and replay/parity remain intentionally deferred and were not exercised.
+
+## Final Verdict
+
+**NEEDS FIXES — Critical 0, Important 1, Minor 0.** The original unsafe-note finding is closed, including hostile stringification, overridden attachment, sentinel redaction, and count/byte ceilings. Fix Round 4 is not ready because its cleanup refactor moved capability-result field use outside the failure shield, allowing a malformed result to replace the active primary and stop the remaining cleanup sequence.

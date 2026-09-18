@@ -1,0 +1,99 @@
+# Task 8 Independent Review
+
+## Spec Compliance
+
+**❌ Overall:** Task 8 is not ready for approval. The separate schema-v2 route, phase-first prepare behavior, authenticated preauthorization ordering, closed summary, and worker command confinement are substantially present, but one production identity mismatch makes an improving canary terminate before hidden validation. Four additional contract/test gaps require repair.
+
+**✅ Compliant portions**
+
+- `gate pit_optimizer` remains separate from legacy `gate pit_optimization`; the legacy branch explicitly rejects schema-v2 options (`agent_loop.py:19068-19129`).
+- Dispatch is phase-first: prepare returns through the provider-free adapter before `_build_pit_optimizer_v2_live_run` can be called (`agent_loop.py:18873-18894`; `core/pit_optimization.py:3260-3280`). The readiness loader reconstructs the authenticated manifest/parity graph and reuses final parity discovery evidence without replay or hidden evaluation (`core/pit_optimization.py:3283-3331`).
+- The canary preauthorization seam performs authentication, one pricing freeze, six plan preflights, and one lease before handing services to the controller (`agent_loop.py:18124-18164`). Production authentication uses the new public read-only authorization query (`agent_loop.py:18280-18309`; `core/pit_optimizer_authorization.py:2559-2602`).
+- The provider adapter is a one-shot R1 call with a sealed response format, `stream=False`, bounded output, no retry loop, and durable failure/accounting paths (`agent_loop.py:4001-4518`).
+- Candidate capabilities stay controller-private through `_CandidateCapabilityRegistry`; the worker command mounts only the generated policy package read-only and applies network/user/capability/resource restrictions (`core/pit_optimizer_controller.py:380-492`; `agent_loop.py:7404-7438`). The production builder binds the real evaluator, hidden reservation/outcome ledger, and cleanup services rather than substituting test implementations (`agent_loop.py:18503-18859`).
+- The prepare output uses `subprocess.list2cmdline`, the exact two prefixes, derived readiness path, explicit transmission acknowledgement, six calls, 448000 tokens, USD 0.40, two iterations, and no `--apply` (`agent_loop.py:20204-20335`).
+- Both prepare and canary summaries contain exactly the required 17 keys. The incumbent exposes only changed paths/symbols; credentials, provider content, trades, container IDs, and opaque identities are absent (`agent_loop.py:20164-20202`, `agent_loop.py:20462-20515`; `tests/test_agent_loop.py:480-545`).
+
+**⚠️ Verification limitations**
+
+- No post-fix live Docker smoke exists. Attempt 2, as recorded in the implementer report, reached real A-B-A worker execution and exact eventual removal, but pytest failed during benign KILL classification; the classifier and Windows `SYSTEMDRIVE` adjustment are fake-tested only. Given the two-attempt ceiling and the fact that attempt 2 independently observed worker execution and absence after force removal, this is an accurately disclosed residual limitation rather than an independent blocking defect. It is not evidence that the final code passed a live smoke.
+- Production behavior outside the supplied diff and the named focused cross-cutting contracts is **⚠️ cannot verify**. The implementer’s test counts and smoke observations were treated as untrusted recorded evidence and were not rerun.
+
+## Strengths
+
+- The readiness path is correctly derived as `<artifact_root>/<manifest.run_id>.readiness.json` and separately authenticated by its explicit digest (`agent_loop.py:18024-18028`, `agent_loop.py:20227-20251`). This follows the controller ruling without inventing a free-form readiness-path flag.
+- `AuthorizationLedger.authenticate_window(...)` validates the exact requirement digest, window ID, unique persisted record, and authorized policy-source scope without appending a journal record (`core/pit_optimizer_authorization.py:2559-2602`).
+- The production preauthorization order is explicit and injectable, which makes the intended authority/pricing/preflight/lease/controller boundary easy to audit (`agent_loop.py:18124-18164`; `tests/test_agent_loop.py:300-397`).
+- Manifest creation remains a narrow local adapter: it parses explicit paths/caps, calls `build_subset_manifest`, writes the canonical manifest, and renders a command; it contains no provider, pricing, replay, grant, Docker, or hidden-evaluation construction (`core/pit_optimizer_evaluation.py:1223-1402`).
+- The Docker argv itself is closed and strong: digest-pinned image, `--pull never`, network none, read-only root, unprivileged user, all capabilities dropped, no-new-privileges, exact PID/memory/CPU caps, bounded tmpfs, and one read-only generated-package mount (`agent_loop.py:7404-7438`).
+- The v2 summary test asserts the full key set and verifies that manifest, readiness, and winner digests are not emitted (`tests/test_agent_loop.py:480-545`).
+
+## Issues
+
+### Critical (1)
+
+#### C1. Production determinism attestation uses a different evidence identity than the controller
+
+**Evidence:** When an improving candidate becomes incumbent, the controller records each discovery evidence ID as SHA-256 of the aggregate-only projection `{"aggregate": asdict(item)}` (`core/pit_optimizer_controller.py:1733-1743`). At run completion it requires both attestation hashes to equal that ID (`core/pit_optimizer_controller.py:1916-1929`). The production evaluator instead caches the full `ParityFoldEvidence.evidence_sha256` (`agent_loop.py:18553`) and returns full-evidence hashes for both the expected and repeated values (`agent_loop.py:18624-18644`). That full digest covers the complete parity evidence primitive, not the aggregate-only projection (`core/pit_policy_parity.py:566-593`). Barring a SHA-256 collision, these values cannot match.
+
+The mocked two-iteration test masks the defect: it manually creates the controller’s aggregate-only digest (`tests/test_pit_optimizer_loop.py:1851-1856`) and returns that same value from its fake `confirm_discovery` (`tests/test_pit_optimizer_loop.py:1907-1912`).
+
+**Impact:** Every production run that finds an improving incumbent deterministically ends as `trusted_evaluator_nondeterminism` before hidden validation can open. A successful two-iteration canary with a winner therefore cannot complete, despite already consuming provider calls and local evaluation resources.
+
+**Repair:** Make the production adapter and controller share one explicit evidence-identity contract. The smallest compatible repair is to compute and compare the same aggregate projection for the original and repeated fold; a stronger repair is to carry an authenticated full-evidence digest through `FoldEvaluationResult` and persist that exact digest as the incumbent evidence ID. In either case, add a test that reaches `_finish_discovery` through the actual production composition and proves hidden validation opens for an improving candidate.
+
+### Important (4)
+
+#### I1. Main CLI path normalization erases the caller’s symlink before non-link validation
+
+**Evidence:** `_absolute_cli_path` checks only absoluteness and immediately calls `resolve(strict=False)` (`agent_loop.py:17929-17932`). `_build_pit_optimizer_v2_config` then checks `is_symlink()` on the resolved manifest target (`agent_loop.py:17950-17956`) and passes similarly resolved paths into `PitOptimizerGateConfig`. The contract’s `_resolved_file`/`_resolved_directory` checks therefore receive targets rather than the supplied links (`core/pit_optimization_contract.py:970-980`). The same pattern applies to the v2 sealed paths and execution roots. Exact-path de-duplication occurs only after that normalization (`core/pit_optimization_contract.py:846-858`). Windows reparse-point ancestry is not checked here either.
+
+**Impact:** The promised “explicit absolute regular non-link” CLI contract is bypassable through a symbolic link/junction. Validation and non-overlap are performed on a different path identity than the operator supplied, weakening provenance and making the accepted topology ambiguous.
+
+**Repair:** Preserve each original `Path`, use `lstat` plus the repository’s reparse-point/ancestor checks to reject links before resolution, and canonicalize only after the non-link check. Add negative v2 config tests for file symlinks, directory links/junctions, and two aliases resolving to an overlapping authenticated target.
+
+#### I2. A direct canary can carry wider authorization ceilings than the sealed first canary
+
+**Evidence:** `PitOptimizerRunManifest.__post_init__` enforces exact 448000 tokens, but only requires `len(call_budgets) <= authorization.max_calls` and total per-call USD `<= authorization.max_usd` (`core/pit_optimization_contract.py:706-729`). Exact two-iteration per-role caps are enforced by `_require_first_call_plan` (`core/pit_optimization_contract.py:1118-1141`) only while building a new subset manifest (`core/pit_optimization_contract.py:1293-1298`), not while deserializing a supplied canonical manifest (`core/pit_optimization_contract.py:992-1074`). `PitOptimizerGateConfig.validate` merely requires CLI ceilings to equal whatever the manifest says (`core/pit_optimization_contract.py:909-936`), while live preauthorization checks R1 and six plans but not exact USD/call authority or the per-role caps (`agent_loop.py:18143-18153`).
+
+**Impact:** A hand-authored canonical manifest plus matching authorization window can invoke canary directly with, for example, six calls but `max_calls=7` and/or `max_usd=0.50`, or altered per-role caps. The official prepare-line renderer rejects such values, but the canary route itself accepts them. This violates the exact six-call/USD 0.40 sealed authority requirement and makes the builder—not the closed manifest type—the sole owner of required role ceilings.
+
+**Repair:** Enforce `_require_first_call_plan`, `max_iterations == 2`, authorization `max_calls == 6`, `max_tokens == 448000`, and `max_usd == 0.40` in the closed manifest/canary validation path, not only in the builder/output renderer. Add canonical-deserialization and direct-canary mutation tests for every global and per-role ceiling.
+
+#### I3. Schema-v2 CLI flags are not exclusive to the v2 canary route
+
+**Evidence:** `all_pit_fields` omits the boolean `authorize_policy_source_transmission` (`agent_loop.py:18968-18976`), so `test` and `backtest` accept and ignore it. The `pit_diagnosis` branch rejects `optimization_fields` but does not reject `optimizer_v2_fields` or the transmission flag (`agent_loop.py:19024-19064`). Only the legacy `pit_optimization` branch has an explicit transmission rejection (`agent_loop.py:19068-19080`).
+
+**Impact:** `--authorize-policy-source-transmission` is silently accepted outside phase canary, and a diagnosis invocation can carry optimizer manifest/parity/window/requirement options that are silently discarded. This contradicts “accepted only for phase canary” and weakens the separate v1/v2 route contract, even though it does not itself transmit source.
+
+**Repair:** Centralize foreign-route option rejection. Include the transmission boolean in the forbidden v2 option set, reject `optimizer_v2_fields` on `pit_diagnosis`, and add negative tests for every non-v2 gate plus v2 prepare.
+
+#### I4. The required mocked integration does not exercise production service composition
+
+**Evidence:** The order test directly invokes `_preauthorize_pit_optimizer_v2_live_run` with `SimpleNamespace` plans and injected lambdas (`tests/test_agent_loop.py:300-397`). The two-iteration integration manually constructs `PitOptimizerServices`, including fake evaluation, hidden validation, and the aggregate-only determinism attestation (`tests/test_pit_optimizer_loop.py:1615-1940`). None of the changed tests invoke `_build_pit_optimizer_v2_live_run`, so they do not join the real public authorization query, gateway adapter, candidate registry, worker package, trusted evaluator, determinism confirmation, hidden binding, and cleanup boundaries. C1 is precisely the interface drift this leaves undetected.
+
+**Impact:** The recorded mocked integration proves the controller with a bespoke fake graph, not the Task 8 production composition required by the brief. Cross-service identity and ordering defects can pass all stated fake suites.
+
+**Repair:** Introduce narrowly injectable factories for external boundaries (pricing/provider transport, Docker worker, and evaluator data) and run two iterations through `_dispatch_pit_optimizer_v2` plus the actual `_build_pit_optimizer_v2_live_run`. Assert six calls, one real ledger lease, incumbent confirmation, hidden reservation/evaluation, cleanup, and closed output while leaving provider/network/Docker fully fake.
+
+### Minor (1)
+
+#### M1. The live Docker smoke predicates do not prove exact resource confinement
+
+**Evidence:** The production create argv requests 256 MiB memory, 1 CPU, 32 PIDs, and an exact 16 MiB `/tmp` tmpfs (`agent_loop.py:7425-7434`). The smoke fails only when inspected memory exceeds 1 GiB, CPU exceeds 1, or PIDs exceed 32 (`tests/test_pit_optimizer_v2.py:10294-10302`). Docker’s zero/unset values can mean “unlimited” and satisfy those predicates, and the smoke never checks `HostConfig.Tmpfs`.
+
+**Impact:** Attempt 2 is useful evidence for execution, determinism, network mode, mount allowlist, user/security flags, and cleanup, but its assertion cannot substantiate the report’s claim that all exact resource limits passed.
+
+**Repair:** Assert `Memory == 256 * 1024 * 1024`, `NanoCpus == 1_000_000_000`, `PidsLimit == 32`, and the normalized exact `/tmp` tmpfs options. Exercise those assertions in the next authorized live smoke.
+
+## Focused Unchanged-Code Inspection
+
+To verify named cross-cutting contracts without crawling untouched code, I inspected `core/pit_optimizer_controller.py` for readiness reuse, candidate capability ownership, incumbent replacement, determinism, hidden binding, and terminal cleanup; `core/pit_policy_parity.py` for evidence digest semantics; and `core/pit_optimizer_artifacts.py` for incremental artifact/cleanup boundaries. I also inspected the existing gateway and policy-worker implementation regions in `agent_loop.py` because the Task 8 composition directly binds them. No other untouched subsystem was used as review evidence.
+
+## Assessment
+
+**Needs fixes.** C1 is release-blocking because the production happy path with an improving winner cannot reach hidden validation. I1-I4 are important contract/coverage failures that should be repaired before approval. The missing third live smoke is not independently blocking under the bounded-attempt ruling, but the final classifier/environment changes remain live-unverified and the smoke’s resource assertions need tightening.
+
+## Review Resources and Effects
+
+The review read only the local requirements brief, implementer report, frozen `35614fb..cbbc9c9` diff package, changed files/tests, and the named focused unchanged contracts above. I used read-only Git/status/search/source inspection and ran **no** pytest, Docker, provider/OpenRouter/network call, live pricing, replay, parity run, candidate backtest, authorization/validation-ledger mutation, container, background process, upload, push, merge, deploy, or cloud action. The only filesystem write was this ignored review report. Tracked files, index, HEAD, and branch were not changed.

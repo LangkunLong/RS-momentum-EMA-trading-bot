@@ -1,0 +1,12 @@
+{
+  "reviewed_at_utc": "2026-09-07T15:59:06.400044+00:00",
+  "helper_sha256": "d843fc553621565add6bc017a5f07975e98e48b8164e96b45e7c631039f8679f",
+  "independent_review": "provider-preparation-helper-review.md",
+  "root_source_review": "actual request/reducer/parent/prospective accounting/config signatures inspected; no completion invocation in helper",
+  "status": "approved_for_local_call_free_preparation_after_fresh_baselines",
+  "preparation_input": ".artifacts/pit-optimizer-v5/development/provider-preparation-input-20260907-01.json",
+  "input_sha256": "8f6ff2ba4311b122b2c352ee4f5f235c43579c4a888e1050503f15885c0aadcf",
+  "external_calls_authorized": false,
+  "first_launch": "run-campaign; retain original resume command for later recovery",
+  "prerequisites": "newimage quick verified and cleaned; all four matching baseline verification and cleanup receipts required before execution"
+}

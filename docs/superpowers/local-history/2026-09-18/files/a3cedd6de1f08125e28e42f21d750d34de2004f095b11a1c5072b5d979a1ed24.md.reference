@@ -1,0 +1,72 @@
+# Task 4 Report: Incremental Immutable Diagnosis Fact Cache
+
+## Delivered files
+
+- `core/pit_diagnosis/fact_cache.py`: session-at-a-time PIT materializer, checkpoint/resume, immutable SQLite finalization, and read-only cache reader.
+- `core/pit_diagnosis/supplemental.py`: frozen institutional/group snapshots and explicit unavailable provider.
+- `tests/test_pit_diagnosis_fact_cache.py`: offline PIT, resume, and identity coverage.
+
+## Schema and provenance decisions
+
+- SQLite has `metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)` and normalized `session_facts`, keyed by `(bundle_sha256, rulebook_schema_version, symbol, session)`.
+- Rows contain only session-visible OHLCV, prior price/volume facts, visible fundamental state, RS, pre-event base structure, market facts, supplemental evidence IDs, availability bits, and canonical row hashes. They contain no leader labels, experiment outcomes, agent decisions, raw payloads, or secrets.
+- Checkpoint identity binds bundle digest/metadata source hashes, rulebook, partitions, supplemental identity, and schema. Checkpoints replace atomically; progress records are append-only and fsynced per completed session.
+- The unavailable provider uses the fixed all-zero identity. Non-default providers require nonzero content identity and future-dated evidence fails closed.
+- Finalization runs SQLite integrity and per-session membership-count checks, sets complete metadata, removes sidecars, atomically renames the partial file, and marks it read-only. Opening rehashes and uses SQLite `mode=ro` only.
+
+## TDD and verification evidence
+
+Initial RED command:
+
+```powershell
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_fact_cache.py
+```
+
+Result: expected collection failure: `ModuleNotFoundError: No module named 'core.pit_diagnosis.fact_cache'`.
+
+Final required commands:
+
+```powershell
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_fact_cache.py
+python -m ruff check core/pit_diagnosis/fact_cache.py core/pit_diagnosis/supplemental.py tests/test_pit_diagnosis_fact_cache.py
+git diff --check
+```
+
+Result: `2 passed`; Ruff: `All checks passed!`; diff check: exit zero. Pytest emitted pre-existing configuration and dependency deprecation warnings.
+
+## Commit
+
+`056ace2 feat: materialize resumable PIT diagnosis facts`
+
+## Concerns
+
+- The strict existing proper-base detector is invoked per member/session; time the full five-year, 500-member materialization before operational scheduling.
+- Tests use a bundle-shaped offline fixture because production PIT validation correctly requires the full 495-510 member universe.
+
+## Round 1 remediation (2026-08-24)
+
+- Removed the `core.momentum_analysis` dependency from the deterministic cache import path. `core/pit_diagnosis/rs.py` contains the pure, causal RS calculation and imports only pandas plus the pure trading-session utilities. The subprocess import-boundary regression verifies neither `core.data_client` nor `core.index_ticker_fetcher` is loaded.
+- Resume now requires the partial SQLite file, validates any checkpoint/progress identities, and reconciles contiguous committed sessions against exact PIT membership before processing more work. This covers the crash window after the fsynced progress append but before checkpoint replacement without duplicate primary keys.
+- Supplemental snapshots now reject date-only/empty evidence records. Available institutional snapshots require ownership, both holder counts, and source evidence; available industry snapshots require a group, rank, members, and evidence. Unavailable snapshots must be completely empty.
+- Finalization validates the exact symbol set and member flag for every session, rather than relying on aggregate row count. Non-finite numeric inputs now raise instead of being silently converted to missing facts.
+- `checkpoint_every_sessions` now controls the progress/checkpoint cadence while always flushing the final session.
+
+Round-1 RED command and result:
+
+```powershell
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_fact_cache.py
+```
+
+Result before remediation: 7 expected regressions failed (live-provider import, crash-window resume, empty supplemental snapshots, wrong-member finalization, and NaN/+Inf/-Inf inputs).
+
+Round-1 verification:
+
+```powershell
+python -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_diagnosis_fact_cache.py
+python -m ruff check core/pit_diagnosis/fact_cache.py core/pit_diagnosis/supplemental.py core/pit_diagnosis/rs.py tests/test_pit_diagnosis_fact_cache.py
+git diff --check
+```
+
+Result: `9 passed`; Ruff: `All checks passed!`; diff check exited zero. Pytest retained only the existing unknown `cache_dir` configuration warning.
+
+Round-1 commit: `3d914d4 fix: harden PIT fact cache recovery`.

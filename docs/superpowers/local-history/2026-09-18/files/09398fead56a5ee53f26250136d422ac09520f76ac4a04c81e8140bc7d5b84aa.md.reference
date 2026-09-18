@@ -1,0 +1,17 @@
+# Task 2 scoped re-review
+
+P2 CRLF preservation: ADDRESSED
+
+new breakage: none
+
+## Evidence
+
+- Current source SHA-256 is `a757a0ca89979be9453129321a04b96498fb06a9f37438034b46e407ad8b72eb`, matching the corrected implementation report.
+- Removing exactly the 1,139-byte helper insertion and the 329-byte aggregate-evidence insertion from the current source reproduces the 72,973-byte authenticated preimage byte-for-byte.
+- Therefore the existing 16-item `_INVESTIGATOR_ENTRY_COUNTS_V5` allowlist, the complete parent-episode loop, all existing `evidence.add` calls, and every other inherited source byte are byte-identical to the preimage.
+- The helper matches the brief exactly: it authenticates the checkpoint and each projected record, enforces prior-round, discovery-plan, PIT-scope, and semantic-mode authority, counts only the specified invalid failure code, and lets reload failures propagate.
+- The aggregate metric insertion matches the brief exactly, is omitted at zero, and occurs after the complete episode loop and before archive/history evidence.
+
+## Verdict
+
+PASS

@@ -1,0 +1,203 @@
+# PIT Optimizer V5 Learning/Search SDD Ledger
+
+## Preflight interface scan
+
+| Producer | Consumers | Boundary | Ruling |
+|---|---|---|---|
+| Task 1 | Tasks 2, 5–9 | Closed V5 manifest, role, evidence, and resource contracts | Must bind the complete authenticated artifact graph and four discovery episodes before identity/search/runtime code. |
+| Task 2 | Tasks 3–6, 8–9 | Panel-independent policy revision identity and panel-bound experiment identity | Source identity stays stable across panels; experiment identity binds round and discovery plan. |
+| Task 3 | Tasks 4–6, 8 | Deterministic template rendering and local variant expansion | One authored template may create up to manifest-capped variants without extra provider calls. |
+| Task 4 | Tasks 5–6, 8 | Six-method V3 semantic fingerprint | Behavioral equivalence is a typed untestable outcome before portfolio evaluation. |
+| Task 5 | Tasks 6, 8–9 | Immutable event journal, experiment records, checkpoint, bounded projection | Durable complete learning precedes any archive transition; role projection never truncates stored memory. |
+| Task 6 | Tasks 8–9 | Transparent compounded campaign CAGR, archive, scheduling | Four authenticated episodes and non-zero total activity are required; no weighted score. |
+| Task 7 | Tasks 8–9 | Provider-neutral authorized role runner and typed failures | Fixture and live providers share one binding parser; retries/repairs default to zero and require distinct slots. |
+| Task 8 | Task 9 | Injected runtime and owned local adapters | Persist evidence as it arrives; mutate archive only after critic/final records are durable; exact owned cleanup. |
+| Task 9 | Later campaign plan | Thin CLI/legacy dispatch | V5 stays out of V4 monoliths; no live run in this phase. |
+
+## Controller rulings
+
+1. User override: do not create, modify, or expand tests until the optimizer works end to end. Plan test-writing steps are replaced with existing focused checks, Ruff/compile, and deterministic direct smokes.
+2. No provider calls, Docker evaluation, qualification, replay, push, or merge in this implementation phase.
+3. Keep all V5 pure-domain modules free of CLI, provider, Git, Docker, subprocess, and filesystem implementations.
+4. Preserve annualized portfolio CAGR as the transparent primary objective; do not introduce a weighted composite score.
+5. Preserve V2–V4 readers and behavior. V5 is additive through narrow adapters, not appended control flow in legacy monoliths.
+6. Missing local market-data artifacts block only data-dependent campaign construction/evaluation, not source architecture.
+
+## Task status
+
+- Task 1: complete (`2f62f3c..7fbcda0`; review found discovery-plan overlap was rejected too late; fixed in `7fbcda0`; scoped re-review passed; no tests added).
+- Task 2: complete (`7fbcda0..468e6c9`; review found unbound template assignments and directly forgeable null policy identity; fixed in `468e6c9`; scoped re-review passed; V4 unchanged; no tests added).
+- Task 3: complete (`468e6c9..7272bdd`; plan signature corrected to bind authenticated parent revision; independent review passed; deterministic local families capped without additional role calls; no tests added).
+- Task 4: complete (`7272bdd..be0295f`; review found policy execution/protocol failure conflation and unsanitized lookup escape; fixed in `be0295f`; scoped re-review passed; no tests added).
+- Integration blocker: authenticated V3 `PolicyWorkerSession.call()` omits the bootstrap interface version when invoking its determinism guard; focused fix scheduled before Task 5/runtime work.
+- Integration blocker resolved (`be0295f..23abab9`; strict bootstrap interface version is captured before thread startup and forwarded to the determinism guard; independent review passed; no tests added).
+- Task 5: complete (`23abab9..b3a20bf`; immutable experiment journal, six-kind event chain, authenticated create-only artifact repository, checkpoint-authorized promotion/recovery, and deterministic bounded investigator projection; review found optional critic finalization, shared-reference ADS, and revision-lineage overwrite defects; all fixed in `b3a20bf`; scoped re-review passed; no tests added).
+- Task 6: complete (`b3a20bf..8e188d6`; exact four-episode CAGR, capacity-eight diverse archive, baseline fallback, quick survivors, parent rotation, novelty/exhaustion, and Task 5 reducer; review found quick-stage data-authority and cap bypasses; fixed in `8e188d6`; scoped re-review passed; no tests added).
+- Task 7: complete (`8e188d6..be2f1da`; provider-neutral one-shot role lifecycle, immutable schema
+  authority, typed parsing/binding/accounting, fixture path, and explicit production deferral;
+  review found an open nested-evidence confidentiality boundary, then ordered-citation and
+  parent-source binding gaps; fixed with closed typed role/evidence unions, exact globally unique
+  role-specific citation order, full parent policy-revision/source-byte authentication, and
+  defense-in-depth prose scanning; final scoped re-review passed; V4 unchanged; no tests or
+  provider calls).
+
+## Task 5 boundary rulings and deferred owners
+
+1. The checkpoint's authenticated ordered finalized-record reference set is the sole Task 5 promotion/commit authority. Create-only records or critic objects written before checkpoint publication may remain as orphans but are never promoted; archive reconstruction consumes only checkpoint-authorized references through the injected reducer.
+2. Task 6 owns the archive reducer and all archive policy: campaign-CAGR recomputation, zero-trade eligibility, top-K admission, novelty keys, target-gap authority, and scheduling. Task 5 provides a typed reducer/projection boundary and does not invent a second archive policy.
+3. Tasks 7 and 8 own authenticated issued investigator/critic evidence, role binding, stage-specific provider/runtime failure facts, and runtime wiring of journal/record/checkpoint persistence. Task 5 retains complete critic output and generic supplemental authenticated references without fabricating future envelopes.
+4. The evaluator baseline/candidate identity convention, V3 client surface/default, and evaluator source-map omissions remain focused evaluator/runtime work outside Task 5. No evaluator files were changed.
+5. The event union remains the brief's exact six kinds. Final create-only experiment records are the rebuildable experiment journal; expanding event kinds is unnecessary for the approved checkpoint authority model.
+6. The post-critic final-record contract supersedes the stale Task 8 fallback at `docs/superpowers/plans/2026-09-04-pit-optimizer-v5-learning-search.md:943-947`. If no separately authorized critic slot remains, Task 8 must retain authenticated pre-critic events/evidence, emit a typed critic-unavailable runtime outcome, create no final experiment record, and leave archive authority unchanged.
+7. Record-derived investigator ancestry requires the selected archive record reference, not an opaque revision digest alone. Task 6's selected archive entry must carry that reference; Task 8 must supply only checkpoint-authorized stored records to the pure projector. Null selected record authority is reserved for the external/baseline parent.
+
+## Task 8 boundary rulings
+
+1. Pre-experiment terminal states such as no-novel-hypothesis and novelty exhaustion require a
+   closed durable round-outcome event. They must not fabricate an experiment, placeholder
+   hypothesis, or cleanup failure.
+2. Critic unavailable preserves authenticated pre-critic evidence and writes a typed round outcome,
+   but creates no finalized experiment records and cannot mutate archive/checkpoint promotion
+   authority.
+3. Baseline and candidate evaluations must both bind a `PolicyRevisionIdentityV5.sha256`; a raw
+   baseline source-bundle digest is not interchangeable with a policy-revision identity.
+4. Runtime evaluation requires the V3 worker surface, including `evaluate_add_on`, and the closed
+   evaluator source identity must include all trusted V3 dependencies reached by that surface.
+5. Task 8 may minimally modify memory/artifact/evaluator contracts to close these deferred runtime
+   boundaries. Task 9 still owns real ledger-backed provider lifecycle and one-shot gateway
+   composition.
+
+## Task 8 implementation status
+
+- Task 8A: complete (`be2f1da..67adb37`; closed status-specific terminal round authority,
+  artifact/recovery support, identity-bearing V3 baseline and candidate evaluation, and complete
+  verified direct semantic evaluator source closure; review found generic outcome authority,
+  unbound baseline workers, and omitted executed CAN SLIM sources; fixed in `67adb37`; scoped
+  re-review passed; no tests, providers, Docker, replay, or data access).
+- Task 8B: next; pure injected feedback-round runtime plus typed create-only role request/attempt/
+  artifact persistence and role-completion recovery. This seam is required to prevent duplicate
+  provider calls after controller interruption.
+- Task 8B1: complete (`67adb37..b59c9d5`; typed create-only role request/attempt/terminal/artifact
+  persistence, authenticated role-completion events, explicit paid-response reconciliation, and
+  crash/tamper recovery; review found post-write role-order poisoning and advisory freshness;
+  fixed with pre-write full-chain folding and unrelated exact Fresh/Existing capabilities accepted
+  only by invoke/reconcile respectively; scoped re-review passed; no tests or external calls).
+- Task 8B2: complete (`b59c9d5..746cc22`; pure injected three-role feedback-round state machine,
+  durable stage recovery, exact critic/record binding, terminal/cleanup separation, and checkpoint
+  publication; review found unindexed local failures, incomplete record equality, cleanup masking,
+  checkpoint/deadline inconsistency, missing post-call deadlines, and constructor exception escape;
+  fixed in `b60561e`; final review found post-commit failure contradiction, fixed in `746cc22`;
+  scoped re-review passed; deterministic fake full round and restart branches green; no tests or
+  external calls).
+- Task 8C: next; bounded local workspace and network-disabled Docker adapters behind the accepted
+  runtime Protocols, verified only with injected fakes.
+- Task 8C1: complete (`746cc22..76c5446`; identity-bound four-file materialization and lease-scoped
+  cleanup through an injected workspace driver; review found bidirectional root nesting, rootless
+  leases, removal-before-retire crash handling, and string-path reparse TOCTOU; fixed with fully
+  disjoint roots, exact root-bound leases, crash-idempotent retirement, and opaque no-follow handles;
+  scoped re-review passed; no Git/process/external execution).
+- Task 8C2: complete (`76c5446..b2b08a2`; digest-pinned network-disabled Docker panel adapter,
+  manifest/deadline-bound CPU, memory, output, PID, and timeout authority, execution-key-bound
+  mounts/requests/commands/leases/output, exact quick/episode runtime composition, and closed
+  evaluator decoding/failures; review found caller-selected limits, weak lease/output binding,
+  missing runtime composition, Windows path aliasing, swallowed registrar failures, non-durable
+  execution recovery, incomplete nested failure validation, missing execution-key identity,
+  monolithic pre-registration launch windows, and orphan-before-branch ordering; fixed through
+  authenticated candidate-execution journal persistence, atomic deterministic create-or-load
+  reservation before launch, durable reload verification, and reconcile/collect-only restart;
+  final scoped re-review passed; direct fake crash windows and static checks green; no tests,
+  Docker, providers, replay, data, or external execution).
+- Task 9A: complete (`b2b08a2..dc3c64f`; closed V5 run/resume/verify/summarize/import command
+  surface, content-free summaries, sanitized public failures, four-line legacy dispatch, and exact
+  adapter-config authority threading; production composition remained intentionally incomplete
+  until the concrete adapters below; no tests or external execution).
+- Task 9B1: complete (`dc3c64f..43dc319`; concrete lazy zero-retry OpenRouter transport boundary,
+  durable authorization/accounting ledger, exact paid-response artifact recovery, per-role attempt
+  identity with separate global ledger order, live/expired invocation claims, atomic response-versus-
+  terminal settlement, exact stored-response reclassification, and canonical legacy-record handling;
+  multiple review rounds closed restart, concurrency, tamper, expiry, and accounting defects; final
+  independent review passed; no live provider/network calls or tests).
+- Task 9B2: complete (`43dc319..41c7d4e`; concrete Windows-only Git workspace, exact PIT-file mount,
+  and two-phase Docker executor adapters with durable created/ready/execution identities, handle-bound
+  confinement, bounded hashing, exact container-ID commands, closed Docker security/network/state
+  attestation, crash-safe ownership/cleanup, operational orphan repair, and exact production host
+  graph validation; repeated adversarial reviews closed TOCTOU, privilege, crash, race, and cleanup
+  gaps; final independent review passed; no live Git/Docker/provider/data/network or tests).
+- Task 9B3: next; concrete candidate-base/probe execution, typed runtime dependency factory, and
+  fresh-process authenticated CLI bootstrap composing the accepted 9B1/9B2 adapters.
+- Task 9B3 candidate source/materialization slice: complete through `6085105`, `522627c`,
+  `16aeeb2`, `8868e96`, and `643ff90`; authenticated four-file materialization, closed policy
+  write surface, bounded direct/callback call graph, authenticated collection selectors, and
+  syntax-only numeric/sequence allocation proof. Review rounds found indirect `max`/`min(key=)`
+  recursion, dynamic sequence/format allocation, bounded-traversal usability, and `round(float)`
+  misclassification; all were fixed and the final scoped re-review approved. Direct fakes and
+  pycompile/Ruff/diff checks passed; no tests or external execution.
+- Task 9B3 semantic-probe/panel slice: complete through `25b33dd`, `75c7fc2`, `350e5e8`, and
+  `3d2b4ba`; exact four-policy semantic mounts with no PIT data, exact panel source/two-data/output
+  mounts, durable two-phase recovery, image-resident probe and real panel entries, canonical
+  request/output binding, deny-all authenticated image context, `python -P`, and build-time
+  installed-source digest recomputation. Review rounds found the absent image modules, missing
+  panel entrypoint, unverified source-digest label, and the legacy newline-bearing panel codec
+  mismatch; all were fixed and the final scoped re-review approved. Direct protocol/attestation
+  fakes and pycompile/Ruff/diff checks passed; no tests or external execution.
+- Task 9B3 Ruling: the dedicated newline-bearing `EvaluationPanelSpec` codec must also be used on
+  the exact typed panel edges traversed by repository graph verification, not only by `panel_for` —
+  otherwise fresh-process CLI readiness rejects the same authenticated panel before evaluation —
+  cost if wrong: a narrowly typed special case remains in graph verification instead of globally
+  unifying legacy panel serialization with the newline-free V5 artifact codec.
+- Task 9B3 panel codec fix round 4/5: complete (`350e5e8..3d2b4ba`; dedicated authoritative
+  newline-bearing panel codec plus role-scoped manifest→plan→episode graph traversal; prior P1
+  addressed and scoped re-review approved; generic V5 codec unchanged; no tests/external work).
+- Task 9B3 final factory/bootstrap implementation: committed as `f995525`; fresh-process run/resume
+  constructs the exact concrete production dependency graph from authenticated local config with
+  no registry priming, readiness data/secret/external reads, or interim candidate-base failure;
+  read-only verification and summary paths were wired. Controlled direct fake, pycompile, Ruff,
+  import/export, coupling, dispatch, and diff checks passed. Independent task review is pending.
+- Task 9B3 factory/bootstrap review: not approved; four P1s enter fix round 1/5 — a successful but
+  deadline-late materialization can escape before its workspace lease is journaled; recovery rejects
+  an already-authenticated retired workspace if cleanup completed before the cleanup-result event;
+  verify-run does not bind role-completion packages to exact durable production-ledger terminals;
+  and verify-run does not authenticate underlying container reservation/cleanup and workspace
+  retirement records before reporting verified/cleanup complete. Original implementer owns the
+  consolidated recovery/verification fix wave.
+- Task 9B3 factory/bootstrap fix round 1/5: committed as `b378ca5`; closes materialization lease
+  registration ordering, retired/removed-before-retirement workspace recovery, exact production
+  role-ledger terminal binding, and read-only concrete workspace/container/output/cleanup record
+  verification. Resource-bearing verify/summarize now require the authenticated adapter config.
+  Deterministic fakes and focused static checks passed; scoped re-review pending.
+- Task 9B3 factory/bootstrap fix round 1/5 review: three P1s closed and one remains — operational
+  resume cannot repair the authenticated retirement value→authority-index publication crash window;
+  fix round 2/5 will permit only exact orphan-index repair during cleanup recovery while keeping
+  verify-run and every read-only verifier at `repair=False`.
+- Task 9B3 factory/bootstrap fix round 2/5: complete (`b378ca5..5a56874`; exact operational
+  orphan-retirement index repair after authenticated immutable reservation/value verification;
+  idempotent/concurrency-safe and read-only verification remains `repair=False`; scoped re-review
+  approved; no tests or external operations).
+- Task 9: complete (`b2b08a2..5a56874`; real fresh-process CLI composition, provider lifecycle,
+  local workspace/Docker adapters, candidate materialization and bounded model-authored source,
+  isolated semantic probes, real panel evaluator image/protocol, read-only verification, and
+  crash-safe recovery; all task-scoped Critical/Important findings closed by review; no tests or
+  external execution). Whole-branch review remains pending.
+- Final whole-branch review (`8dcce58..5a56874`): not approved. Complete findings are recorded in
+  `final-review-findings.md`; two Critical and seven Important integration/causality defects plus
+  four optimizer-quality minors enter the single allowed final fix wave.
+- Final-review Ruling: after-close-selected scale-outs execute at the next eligible open, never an
+  earlier intraday target — preserves causal evaluation — cost if wrong: conservative fills versus
+  a separately precommitted intraday-order model.
+- Final-review Ruling: raw campaign-data codec privilege is granted only by exact typed
+  manifest/plan edges — prevents arbitrary non-JSON graph bypass — cost if wrong: each future raw
+  artifact kind needs an explicit codec addition.
+- Final-review Ruling: a finite USD ceiling requires authenticated per-model price upper bounds and
+  a prospective worst-case reservation; no ceiling remains unrestricted — prevents post-spend cap
+  discovery — cost if wrong: finite-cap manifests require migration before they can run.
+- Final fix wave: complete (`5a56874..3548feb`; all Critical/Important findings 1–9 and optimizer-
+  quality findings 10–13 in `final-review-findings.md` addressed; design/plan text corrected;
+  deterministic 28-case direct evidence, compile/import, Ruff, coupling/isolation, and diff checks
+  passed; no tests or external execution).
+- Final scoped re-review: clean; all 13 findings ADDRESSED, no new Critical or Important breakage.
+  Fresh controller verification after review compiled/imported 29 sources/modules, passed Ruff lint,
+  passed format checks for the exact 12 changed V5 modules, passed provider-neutral coupling and
+  `git diff --check`, found no test-file changes, and confirmed a clean worktree.
+- V5 learning/search implementation plan: source implementation complete at `3548feb`; branch is
+  intentionally preserved for the user-requested local-only workflow. Real provider/data/Docker
+  subset execution remains a separate runtime-validation stage and was not claimed by this plan.

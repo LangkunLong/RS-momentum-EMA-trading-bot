@@ -1,0 +1,13 @@
+# Campaign06 rendering failure
+
+Actual launch session5015 exited1. Both investigator and author responses were received, paid usage accounted, and role parsing accepted. The first round then failed at rendering. Cleanup completed and idle-sleep protection was restored. No candidate reached evaluation; no critic or checkpoint completed.
+
+Usage:2 calls,8,596 tokens,$0.04234. Campaigns03-06 combined:7 calls,27,713 tokens,$0.138295. Five calls and868,287 tokens remain. The approved conditional replacement requires at least six calls; that condition is false. No campaign07 may launch under the current grant.
+
+The unchanged author response request09564719a54cfd10a0b6edbc5b61996e7a68015866f1e0b538859c542d158c0f has response-text SHA2c6d37ce6e8bc4eb65f021d70e289ac6c53612d7faba45c8ab1208489dad3d93. It uses base.__class__ and a generator expression. render_variants on the authenticated four-file parent reproduces ValueError: V5 policy AST contains an unbounded or stateful construct. See actual-render-failure.txt. No source execution, edited response, replay or test was used for diagnosis.
+
+The source-format, qualified-symbol and mode repairs passed this time. The remaining architectural gap is that expected candidate-source rejection occurs before a materialized candidate exists and becomes a fatal rendering stage error. Existing invalid-experiment records can represent rejected proposals, but CandidateEvidenceV5 requires materialization and an all-invalid round currently aborts before feedback publication. This needs a deliberate runtime change, preserving sandbox restrictions and invalid/evaluated distinctions.
+
+The investigator also lacks available entry-funnel counts. Actual parent reports show composite-score failures894-933 of960 rows per window and buy_signal_count0, but the investigator sees only four headline metrics per window. Gate counts overlap and do not alone prove causal necessity. Expose a bounded authenticated allowlist before another paid run.
+
+No source change, image rebuild or new campaign preparation followed this failure. The requested two completed evaluated rounds and post-completion Luna handoff remain outstanding. A separate preparatory recovery plan will describe the work needed to reach them.

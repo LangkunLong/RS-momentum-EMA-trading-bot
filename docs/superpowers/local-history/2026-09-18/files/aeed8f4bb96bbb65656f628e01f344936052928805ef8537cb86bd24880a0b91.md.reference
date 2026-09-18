@@ -1,0 +1,51 @@
+# SDD ledger — plan: docs/superpowers/plans/2026-09-04-pit-optimizer-v5-strategy-universe.md
+
+## Execution context
+
+- Workspace: `C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.worktrees\pit-optimizer-v5-architecture`
+- Branch: `codex/pit-optimizer-v5-architecture`
+- Plan base: `8769fb7`
+- Upstream phase: evaluator-truth Tasks 1–5 complete and independently accepted.
+
+## Preflight shared-task and interface scan
+
+| Producer | Consumer(s) | Shared interface / dependency | Consistency ruling |
+|---|---|---|---|
+| Task 1 | Tasks 2, 3, 7 | `PointInTimeUniverseV3`, lineage-native affiliation/ticker queries, schema-V3 PITDataBundle dispatch | Membership union and authenticated transition semantics must exist before normalization, features, or bundle proof. |
+| Task 2 | Task 7 | Canonical `membership_v3.csv`, provenance, schema-V3 builder/verifier | Local artifact construction consumes these exact create-only outputs. |
+| Task 3 | Tasks 4, 6 | `EntryFeaturesV3`, `HoldingFeaturesV3` | Policy contracts and baseline policies consume only trusted causal feature records. |
+| Task 3 | Task 7 | Complete active-union feature coverage assumptions | Bundle verification must provide all PIT inputs needed by feature builders. |
+| Task 4 | Tasks 5, 6 | Policy interface V3 snapshots/decisions, runtime negotiation, trusted adapter | Engine pyramiding and baseline bundle share one interface; legacy V2 framing stays byte-compatible. |
+| Task 5 | Tasks 6, 7 and later evaluator/campaign phases | `PendingAddOn`, next-open execution, checkpointed V5 add-on lifecycle | Baseline and authored position policies require the exact engine execution boundary. |
+| Task 6 | Task 7 and later search/campaign plans | Four deterministic V3 modules plus `EDITABLE_POLICY_PATHS_V5` | Bundle/evaluator authority and search scope bind this exact baseline/source surface. |
+| Task 7 | Later roadmap phases | Authenticated local schema-V3 three-universe bundle and verification report | No later panel/baseline capture starts without this local authority. |
+
+## Task self-consistency scan
+
+| Task | Inputs available when scheduled? | Outputs needed later? | Ruling |
+|---|---|---|---|
+| 1 | Yes: existing PIT data and authenticated price-transition contracts | Yes: Tasks 2, 3, 7 | Ready. |
+| 2 | Yes after Task 1 | Yes: Task 7 | Ready after Task 1 review. |
+| 3 | Yes after Task 1 | Yes: Tasks 4, 6 | Ready after Task 1 review; may follow Task 2 to preserve plan order. |
+| 4 | Yes after Task 3 | Yes: Tasks 5, 6 | Ready after Task 3 review. |
+| 5 | Yes after Task 4 and evaluator lifecycle work | Yes: Task 6/later evaluation | Ready after Task 4 review. |
+| 6 | Yes after Tasks 3–5 | Yes: Task 7/later search | Ready after Task 5 review. |
+| 7 | Only if all twelve named local market-data/provenance inputs exist | Yes: later panel/baseline capture | Preflight at execution; missing inputs block only Task 7 and must not be fetched or synthesized. |
+
+## Controller rulings
+
+1. Do not create or expand tests until the optimizer completes end to end. The user's explicit instruction overrides every test-edit/TDD step. Use existing focused tests, Ruff/compile, and deterministic direct smoke evidence. Cost if wrong: reduced early regression localization, offset by task-scoped independent reviews.
+2. Preserve bundle schemas V1–V2 and policy interfaces V1–V2 as read-only-compatible paths; V3 is explicit and opt-in.
+3. Source market data and built bundles remain below ignored `.artifacts/pit-optimizer-v5/data/`. Never commit, upload, fetch, or synthesize market data. SPY, QQQ, and IWM are observation-only references.
+4. The model-authored strategy stays O'Neil-centered and logically flexible through pure interfaces. Do not add an opaque weighted score, leverage, or engine-accounting bypass.
+5. Task 7 may stop independently on missing local inputs; source implementation continues. No provider calls, qualification, full replay, push, or merge in this plan.
+
+## Task status
+
+- Task 1: complete (`8769fb7..2f8f84c`; initial review found legacy ticker-validation drift, fixed through explicit V3-only validation/resolution in `c4da6a4` and `2f8f84c`; scoped re-review passed; no tests added).
+- Task 2: complete (`2f8f84c..f4e489c`; initial review found four nested-provenance/manifest/SQLite-URI fail-closed gaps; fixed in `f4e489c`; scoped re-review passed; no tests or market artifacts added).
+- Task 3: complete (`f4e489c..ad43db4`; initial review found global missing-value rejection and unbound holding identity; fixed in `ad43db4`; scoped re-review passed; no tests added).
+- Task 4: complete (`ad43db4..561bd37`; review found exposure, add-on-cap, excursion, and primitive-ingress gaps; fixed in `72ba31e` and `561bd37`; scoped re-review passed; V2 framing remained unchanged; no tests added).
+- Task 5: complete (`561bd37..ec29dcf`; initial review found remaining-lot cost-basis corruption after scale-out then add-on; fixed in `ec29dcf`; scoped re-review passed; entry/scale-out/add-on/exit P&L reconciled; V2 behavior remained unchanged; no tests added).
+- Task 6: complete (`ec29dcf..2f62f3c`; independent review passed; exact four-file V3 policy authoring scope sealed; V1/V2 preserved; no tests added).
+- Task 7: blocked on all twelve named local-only membership, price, fundamental, industry, and provenance inputs; preflight report saved; no data fetched, synthesized, copied, uploaded, or written; source phase is otherwise complete.

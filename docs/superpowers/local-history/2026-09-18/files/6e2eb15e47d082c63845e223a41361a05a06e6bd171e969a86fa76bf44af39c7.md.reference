@@ -1,0 +1,39 @@
+# Task 4 Re-review 2
+
+## Finding Verdicts
+
+### Finding 3 — ADDRESSED
+
+`core/pit_optimization_contract.py:1473` now uses `old_start` for a zero-old-count hunk and retains `old_start - 1` for consuming hunks. `core/pit_optimization_contract.py:1478-1480` independently authenticates the declared new-range start against the number of output lines already emitted. This gives the correct unified-diff positions at the start (`-0,0`), middle (`-1,0`), and end (`-N,0`), while preserving replacement and deletion semantics.
+
+Covering regressions are present at `tests/test_pit_optimizer_v2.py:473`, `tests/test_pit_optimizer_v2.py:523`, and `tests/test_pit_optimizer_v2.py:545`. They exercise the reported `@@ -1,0 +2,1 @@` case, boundary insertions, replacement, deletion, and inconsistent new-range coordinates.
+
+### Finding 5 — ADDRESSED
+
+`core/pit_optimizer_evaluation.py:475-477` makes both complete `ValidationWindowIdentity` values and the complete `ValidationExposureMetadata` part of the sealed proof. Proof creation reconstructs the closed identity and metadata objects at `core/pit_optimizer_evaluation.py:822-826`, includes `warmup_contract_sha256` in cross-fold lineage at `core/pit_optimizer_evaluation.py:830-841`, requires complete metadata equality at `core/pit_optimizer_evaluation.py:842-843`, and returns both values in the proof at `core/pit_optimizer_evaluation.py:848-849`.
+
+Comparison release now requires independently supplied expected identities and metadata and compares them exactly at `core/pit_optimization_contract.py:2716-2740`, in addition to the discovery fold-ID check. The tests retain the complete proof, mutate warmup identity, mutate every metadata field, and mutate the comparison-release expectations at `tests/test_pit_optimizer_v2.py:695`, `tests/test_pit_optimizer_v2.py:724`, `tests/test_pit_optimizer_v2.py:764`, and `tests/test_pit_optimizer_v2.py:793`.
+
+### Finding 6 — NOT ADDRESSED
+
+The exact-candidate path no longer double-counts hypothetical growth: `core/pit_optimization_contract.py:3003-3022` uses the supplied sealed prospective bundle directly, and `core/pit_optimization_contract.py:2641-2646` renders the next-role check from that exact bundle. The new binary search also brings the explicitly section-capped objects to within one canonical byte of their caps (`core/pit_optimization_contract.py:3039-3062`).
+
+However, the renderer still does not construct the maximum canonical content allowed by the contracts. Canonicalization uses `json.dumps` without `ensure_ascii=False` at `core/pit_optimization_contract.py:310-316`. The text/blob validators cap raw UTF-8 bytes and reject NUL, but permit non-ASCII text (`core/pit_optimization_contract.py:253-260` and `core/pit_optimization_contract.py:299-305`). Despite that, source growth is modeled only with backslashes at `core/pit_optimization_contract.py:2973-2975`, and the uncapped-composite incumbent summary uses only `"\\" * MAX_ROLE_TEXT_BYTES` at `core/pit_optimization_contract.py:3080-3084`; `IncumbentSummary` itself has no canonical section cap (`core/pit_optimization_contract.py:2470-2472`).
+
+A narrow byte-count check demonstrated the gap with equal allowed raw size: 8,192 raw backslash bytes canonicalized to 16,395 bytes, while 8,192 raw UTF-8 bytes of `é` canonicalized to 24,587 bytes. Thus the manifest worst-case source proof and the prospective candidate next-investigator proof can understate a valid envelope by thousands of bytes. The candidate path can still accept an incumbent whose actual next-role input exceeds the authenticated cap.
+
+The new boundary assertions at `tests/test_pit_optimizer_v2.py:1711-1739` cover six section-capped objects, but they do not cover the uncapped-composite incumbent summary or prove maximum escaping for source/cumulative-diff text. Fix by deriving a canonical maximum for every raw-byte-capped field (or by closing canonical text to an alphabet whose escape expansion is bounded), then use that bound for source growth, cumulative diff, incumbent summary, and the exact prospective next-role check.
+
+## New Breakage in Fix Diff
+
+No separate Critical or Important breakage found beyond the unresolved canonical-envelope defect in Finding 6.
+
+## Out-of-Scope Observations
+
+None.
+
+The appended Fix Round 2 report includes covering tests, exact commands, RED output, GREEN output, the focused 34-test result, Ruff output, and `git diff --check` output for all three repair slices. That evidence is complete as a process record, but its maximization tests share the backslash-only escaping assumption described above.
+
+## Verdict
+
+**NOT READY.** Findings 3 and 5 are addressed. Finding 6 remains Important because the authenticated maximum-input and exact next-role sizing proofs still undercount valid canonical JSON content.

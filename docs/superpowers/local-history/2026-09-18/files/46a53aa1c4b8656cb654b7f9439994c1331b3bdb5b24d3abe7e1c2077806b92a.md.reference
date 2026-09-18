@@ -1,0 +1,91 @@
+# SDD ledger — plan: docs/superpowers/plans/2026-08-26-task11-engine-fidelity-observability.md
+
+Started: 2026-08-26
+Branch: codex/pit-canslim-strategy-diagnosis
+BASE: 515cb1e50d051e2ee4253603608f2fd3920004bc
+Spec: docs/superpowers/specs/2026-08-26-task11-engine-fidelity-observability-design.md
+
+## Preflight rulings
+
+- Ruling: The bundled `sdd-workspace` Bash helper failed with `Bash/Service/CreateInstance/E_ACCESSDENIED`; use the exact ignored workspace `.superpowers/sdd/2026-08-26-task11-engine-fidelity-observability/` and create its artifacts with `apply_patch` — the plan remains isolated, but a typo in the manually resolved slug would strand reports outside the expected recovery directory.
+- Ruling: Do not add or run pytest/unit tests during Tasks 1–5 because the user explicitly deferred them until the build is finished; use direct parity probes, real offline CLI reconciliation, compilation, and diff checks — if these checks miss a regression, formal test coverage must catch it only after the user ends the build phase.
+- Ruling: Do not commit task changes because the current worktree already contains user-owned/uncommitted Task 11A/11B work and no commit/push/merge was authorized; task reviewers inspect the exact task files, implementer report, and path-scoped working-tree diff directly — the cost is that commit-range review packages cannot isolate edits automatically.
+- Ruling: Treat CANSLIM as the feature basis/reference family, not the optimization objective; classify exact Task 11 thresholds as active fixed optimizer candidates and causal/data/execution integrity as invariants — if this interpretation is wrong, the later optimizer surface would need reclassification but no strategy behavior changes in this plan.
+
+## Preflight interface and consistency scan
+
+| Producer / consumer | Shared file or interface | Finding |
+|---|---|---|
+| Task 1 / Task 1 | `earnings_trace.py`, C/A evaluator signatures, legacy tuple parity | Internally consistent: trace dataclasses carry every scalar legacy APIs return; legacy functions delegate to the same cores. |
+| Task 2 / Task 2 | `include_provenance=False` default and `PIT_PUBLIC_DATES_ATTR` | Internally consistent: provenance uses frame attrs only; default frame cells and provider cache remain unchanged. |
+| Task 3 / Task 3 | sealed Task 11 source chain, C cohort 8,439, conditional A cohort 1,926 | Internally consistent: exact hashes, dates, counts, tolerance, privacy boundary, and CLI route are specified. |
+| Task 4 / Task 4 | policy schema, digest, inert-setting validation, publication | Internally consistent: behavior is reported and unsupported changes reject; no inert knob is made effective. |
+| Task 5 / Task 5 | integrated verification and exposure report | Internally consistent: only direct offline checks run; no optimizer or backtest is launched. |
+| Task 1 / Task 2 | `PIT_PUBLIC_DATES_ATTR` | Task 1 defines the constant and trace reader; Task 2 imports and attaches the exact ISO mapping. |
+| Task 1 / Task 3 | `evaluate_c_with_trace`, `evaluate_a_with_trace`, trace enums | Task 3 consumes the exact Task 1 interfaces and aggregates closed enum values. |
+| Task 2 / Task 3 | `iter_fundamental_state_boundaries(..., include_provenance=True)` | Task 2 produces the opt-in frames Task 3 requires; normal provider behavior stays outside the diagnostic. |
+| Task 3 / existing dirty work | `pit_diagnosis.py` | Task 3 must preserve the existing uncommitted baseline-profile, verify-baseline, and artifact-diagnosis routes while adding one command. |
+| Task 4 / existing engine contract | `_result_config`, checkpoint fingerprint, Task 11 summary/manifest | Task 4 appends policy object/digest and validates inert requests without changing current strategy semantics. |
+| Tasks 1–4 / Task 5 | all public interfaces and output contracts | Task 5 consumes only completed task outputs and may request a narrow fix in an already listed file if direct integration evidence fails. |
+
+Preflight result: no unresolved cross-task contradiction. Begin Task 1.
+
+## Task 1 implementation loop
+
+- Task 1: implementer `task11_obs_t1_trace_core` reported DONE_WITH_CONCERNS; compilation, diff check, and inline scalar/trace parity passed.
+- Task 1 Ruling: the spec's malformed-provenance requirement overrides the plan's direct `evaluate_c`/`evaluate_a` call-through examples. Both public APIs must share one internal scoring core, but trace mode propagates malformed/missing-selected-period provenance errors while legacy scalar mode ignores optional provenance metadata and preserves the pre-change tuple — if wrong, this adds a small internal mode parameter that could be collapsed later, but it prevents the diagnostic from silently converting a corrupted provenance frame into `evaluator_exception`.
+- Task 1: pre-review correction complete; scalar parity, strict malformed-provenance behavior, compilation, and diff check passed. Review dispatched to `task11_obs_t1_review` using `task-1-review-package.md`.
+- Task 1 review: spec ❌ / quality needs fixes. Important 1: A legacy parity drift for duplicate selected rows and sortable non-date fiscal labels. Important 2: incomplete C/A observations return before selected-period provenance validation and discard available trace metadata. No Critical or Minor findings.
+- Task 1: fix round 1/5 started with original implementer; pre-fix task-file snapshots saved for scoped re-review.
+- Task 1: fix round 1/5 (2 addressed, 0 open — legacy A parity restored; incomplete-observation provenance validated and retained; uncommitted task diff).
+- Task 1: complete (BASE 515cb1e..working tree, scoped re-review clean; no commits per user constraint).
+
+## Task 2 implementation loop
+
+- Task 2: implementer `task11_obs_t2_pit_provenance` complete; local bundle default/provenance frame parity, compilation, and diff check passed. Review dispatched to `task11_obs_t2_review` using `task-2-review-package.md`.
+- Task 2: complete (BASE 515cb1e..working tree, task review clean with no findings; no commits per user constraint).
+
+## Task 3 implementation loop
+
+- Task 3: implementer `task11_obs_t3_ca_diagnostic` dispatched; pre-task `pit_diagnosis.py` snapshot saved so its new route can be reviewed separately from existing Task 11A/11B dirty work.
+- Task 3: implementation complete; one authorized offline run reconciled C 8,439 = 1,926/5,712/801 and conditional A 1,926 = 627/1,136/163 with zero mismatches; compilation/diff check passed. Review dispatched to `task11_obs_t3_review` using the scoped `task-3-review-package.md`.
+- Task 3 review: spec ❌ / quality needs fixes. Critical: the authenticated bundle pathname is re-opened lazily by SQLite after hashing, leaving a pathname swap/in-place mutation window. Important: manifest paths are resolved before lstat/reparse validation, allowing a declared link/junction to be dereferenced before checking. Minor (deferred): report calls eight top-level keys seven sections.
+- Task 3: fix round 1/5 started with original implementer; pre-fix task-file snapshots saved for scoped re-review.
+- Task 3 Ruling: repeat the real offline reconciliation exactly once after the source-opening fix because the corrected code changes which SQLite bytes are parsed; the extra cost is about five minutes of local read-only processing, but accepting the old run would leave the Critical authority fix unvalidated.
+- Task 3: fix round 1/5 (1 addressed, 1 open — lexical parent-component/reparse binding addressed; Critical remains because the authenticated temporary SQLite file is writable during lazy reads and metadata can theoretically be restored; no new breakage).
+- Task 3 Ruling: expand the fix boundary to add a bytes-backed `PITDataBundle` constructor in `core/pit_data.py`, deserialize canonical-hash-authenticated bytes into an in-memory SQLite connection, and remove the temporary-file consumption path — this adds one reusable public factory and a shared connection initializer, but it is the smallest maintainable way to eliminate the unresolved writable-path attack surface without duplicating PIT bundle validation in the diagnostic.
+- Task 3: fix round 2/5 started with original implementer; pre-fix snapshots include `core/pit_data.py` because the load-bearing source-boundary correction now touches that Task 2 file.
+- Task 3 Ruling: run one final full offline reconciliation after the in-memory deserialization change; this costs another roughly five minutes but is required because the data-consumption mechanism changes again, and no further full rerun is permitted unless a later fix alters parsed bytes or reconciliation semantics.
+- Task 3: fix round 2/5 (1 addressed, 0 open — authenticated immutable bytes are deserialized into query-only in-memory SQLite; shared validation retained; no new breakage).
+- Task 3: complete (BASE 515cb1e..working tree, scoped re-review clean; one deferred Minor: report says seven sections while listing eight top-level keys; no commits per user constraint).
+
+## Task 4 implementation loop
+
+- Task 4: implementer `task11_obs_t4_effective_policy` complete; default policy digest `e8dc1b79942101110efafe2b9e028d397bdff2b0a1a16fde2d4b7f409461360d`, pre-data inert-request rejection, compilation, and diff check passed. Review dispatched to `task11_obs_t4_review` using `task-4-review-package.md`.
+- Task 4 review: spec/quality fail. Critical: the one-time policy snapshot/digest can diverge from mutable simulator attributes and live settings while checkpoint/publication checks still pass. Important: active cadence, industry filtering, and M policy are missing; injected custom strategies are broken/misreported; early-winner behavior is overstated. No Minor findings.
+- Task 4: fix round 1/5 started with original implementer; the exact pre-fix state is preserved in `task-4-review-package.md` for scoped re-review.
+- Task 4: fix round 1/5 (2 addressed, 2 open, 1 new Important — stale-digest lifecycle and early-winner wording addressed; M/RS/N/S/I fixed-rule inventory and custom-policy attestation remain open; owned built-in nested strategy state is not yet bound).
+- Task 4 Ruling: explicitly scope custom-strategy attestation to the engine-owned envelope unless a strategy supplies a stable JSON-safe declared policy identity; type provenance alone must not imply configuration coverage — this preserves arbitrary injected strategies while making their optimization-readiness limitation machine-visible.
+- Task 4: fix round 2/5 started with original implementer; pre-fix state is preserved in `task-4-fix1-review-package.md` for scoped re-review.
+- Task 4: fix round 2 implementation complete; default digest `ed86dc5ecb7a50fc113a8c6d5bdf663ad8ea3dbf21ea710f9f142c1212cbd743`, 125 classified leaves, direct built-in/custom/drift/inert probes, compilation, and diff check passed. Scoped re-review dispatched using `task-4-fix2-review-package.md`.
+- Task 4: fix round 2/5 (1 prior finding addressed, 2 open — custom identity/scope is clean; M bootstrap and the actual 49-observation S baseline need exact description; owned built-in object-identity binding remains unattested). No new Critical or Minor findings.
+- Task 4: fix round 3/5 started with original implementer; pre-fix state is preserved in `task-4-fix2-review-package.md` for scoped re-review.
+- Task 4: fix round 3 implementation complete; default digest `744104da98b205d73b827d9ecd90e610dbc9d830eb11adc09b31cc034b3a006a`, 126 leaves, narrow exactness/binding probes, compilation, and diff check passed. Final scoped re-review dispatched using `task-4-fix3-review-package.md`.
+- Task 4: complete (BASE 515cb1e..working tree, final scoped re-review PASS with no Critical/Important/Minor findings; no commits per user constraint).
+
+## Task 5 implementation loop
+
+- Task 5 Ruling: do not rerun the five-minute Task 3 C/A provenance reconciliation because fix round 2 already performed the plan-authorized final full run, Tasks 4–5 do not alter parsed bundle bytes or reconciliation semantics, and the ledger explicitly forbids another full rerun absent such a change. Task 5 will authenticate and reuse that final exact evidence; the cost is that integrated acceptance relies on fresh structural compilation plus the already-reviewed Task 3 execution rather than duplicating it.
+- Task 5: implementer `task11_obs_t5_acceptance` complete; the exact sealed artifact command exposed and then passed after one narrow relative-path parser correction in `pit_diagnosis.py`; policy audit, full compilation, diff check, and status passed. Review dispatched to `task11_obs_t5_review` using `task-5-review-package.md`.
+- Task 5: complete (BASE 515cb1e..working tree, independent review PASS with no Critical/Important/Minor findings; no commits per user constraint).
+
+## Final whole-tree review and closure loop
+
+- Final senior review: FAIL with 0 Critical, 5 Important, 0 Minor. Findings covered PIT-unsafe industry-filter activation, unbound completed-checkpoint result policy, incomplete C fallback provenance, split-open/reparse artifact authentication, and over-attested/misclassified effective-policy fields.
+- Final fixes were split across three non-overlapping implementers. No strategy threshold, scoring value, entry/exit rule, portfolio behavior, dataset, cache, optimizer, or sealed artifact was changed.
+- Focused engine review: PASS with 0 Critical/Important/Minor. Focused sealed-I/O review: PASS with 0 Critical/Important/Minor. Focused final C-trace review: PASS with 0 Critical/Important/Minor.
+- Final-fix senior review: PASS with 0 Critical, 0 Important, 0 Minor; the same 13-file Task 11 scope and all five pinned post-fix hashes were stable at the final rehash.
+- Final offline artifact diagnosis: PASS. Focus-window funnel remains 375,703 evaluated / 8,439 technical / 1,926 C-pass / 627 A-pass / 238 RS-pass / 173 qualified-attempted / 131 executed / 42 next-open buy-zone rejected, with zero cash or capacity rejections and 67.60512426994353% average cash.
+- Final full offline C/A provenance reconciliation was required because the fix changed trace-reason semantics. It passed with zero mismatches across 8,439 C rows and 1,926 A rows. C unavailability is now truthfully classified as 511 negative-prior, 232 no-visible-observation, 41 nonfinite-current, and 17 zero-prior; C public-date visibility is 8,207 both-visible and 232 neither-visible. C/A gate totals and all legacy scalar values are unchanged.
+- Final default policy digest: `77baf710830c3f69caf463b8ae8b4fc0da808f855fbd1b16bd4bdc8ad9de052d`; 128 leaves = 86 active fixed, 25 active tunable, 8 advisory/unsupported, 9 causal invariant; 108 optimizer candidates. CANSLIM remains the design basis, while the multi-agent loop owns later return/drawdown optimization.
+- Final structural verification: the eleven production modules/CLIs compiled, `git diff --check` had no whitespace error, and `git status --short` remained the expected seven tracked modifications plus six intended untracked Task 11 files. No pytest/unit tests were added or run, per the user-approved phase boundary.

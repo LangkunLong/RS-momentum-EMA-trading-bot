@@ -1,0 +1,22 @@
+--- before/provider.py
++++ after/provider.py
+@@ -2035,7 +2035,18 @@
+                 result[key] = [project(child) for child in result[key]]
+         return result
+ 
+-    return project(schema, root=True)
++    result = project(schema, root=True)
++    authority = schema.get("x-pit-optimizer-v5-authority")
++    if isinstance(authority, Mapping) and authority.get("role") == "author":
++        # Match the existing local qualified-symbol contract at generation time.
++        # Never normalize a received artifact or change its canonical authority.
++        names = result["properties"]["artifact"]["properties"]["changed_symbols"]["items"]
++        names["pattern"] = r"^core\.strategy_policy\.v3\.[a-z_]+\.[A-Za-z_]\w*$"
++        names["description"] = (
++            "Fully qualified module.symbol from each source_operation: "
++            "remove .py, replace / with ., append .symbol."
++        )
++    return result
+ 
+ 
+ def prospective_role_usage_v5(

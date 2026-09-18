@@ -1,0 +1,12 @@
+{
+  "helper_sha256": "92ffd23077e0b4f3305b32ec927bd20b4db4e0cfe8331f6c2e196bcf451b05d2",
+  "static_checks": "Ruff and in-memory compile PASS",
+  "independent_review": "controller-credential-wrapper-review.md",
+  "review_status": "PASS",
+  "credential_value_read": false,
+  "helper_executed": false,
+  "external_calls_authorized": false,
+  "user_selected_file": "C:\\Projects\\trading_bot\\RS-momentum-EMA-trading-bot\\.env",
+  "user_selected_key": "OPENROUTER",
+  "canonical_child_environment_key": "OPENROUTER_API_KEY"
+}

@@ -1,0 +1,25 @@
+# H1 independent review
+
+Spec: **FAIL**. Code quality/security: **changes required** before H2.
+
+Reviewed only the new `core/pit_optimizer_v5/historical_verification.py`, its narrow supplied diff, H1 brief, design Decision/H1 checkpoint, supplied verification package, and directly relevant unchanged authority methods. No production edits, tests, synthetic probes, authentication reruns, external actions, or subagents were used.
+
+## Finding
+
+**[P2] Project workspace history into a data-only result instead of returning an operational workspace lease.** `historical_verification.py:78` declares `workspace_history` as `tuple[WorkspaceLeaseStateV5, ...]`; lines 327–332 retain the adapter's exact states and line 360 returns them. Each state contains an actual `WorkspaceLeaseV5` (`production_workspace.py:318–321`). That lease is the runtime lease type: `WorkspaceLeaseV5.as_owned_lease()` constructs `OwnedLeaseV5(self.payload, self.owner.round_index, self)` (`workspace.py:247–248`), and the materializer's operational `cleanup(owner=..., lease=...)` accepts it directly (`workspace.py:837–871`). Thus the frozen result exposes an operational lease and a method that issues the explicitly excluded owned-lease wrapper. Freezing the outer container does not establish the required data-only API boundary.
+
+This is a concrete conflict with the task brief's prohibition on returning operational leases/capability objects and the design's prohibition on issuing `OwnedLeaseV5`. It does not establish that calling H1 itself mutates anything or bypasses existing live-driver checks. Keep using `authenticate_lease_history` internally, then project the validated fields needed by H2 into a new frozen historical record containing scalar/tuple facts, payload/reference/digest, lifecycle, and source identity, without retaining `WorkspaceLeaseV5` or its conversion method. No protected workspace source change is needed.
+
+## Compliant portions
+
+The launch/config authority trace is sound within H1: exact repository/manifest checks, supported development scope, positive capped round, original launch reference and authenticated manifest equality, canonical round key, original owner token, positive started record and equality excluding only its start time, and round-one config reference equality are enforced. Config comparison covers every dataclass field except the four expressly allowed round-derived identity fields, including provider settings.
+
+The owner is deterministically derived with the existing controller lease function. The workspace and mount constructors inspect pinned local identities without initiating Git, Docker, provider composition, or credential/environment reads. Current workspace/mount digests must match the saved round config. Journal/index reads, workspace-history authentication, execution owner/request/command/lease bindings, config-pinned executor comparison, output-history authentication and workspace source linkage are present. Duplicate execution identities fail closed. The returned `ExecutionReservationRecordV5` is a frozen serialized evidence record, distinct from a live execution reservation/capability; no separate defect is asserted for that record type.
+
+All inspected reachable typed-state reads use `repair=False`, including workspace created/ready/retirement helpers. The workspace retirement repair branch is unreachable with `recover_retirement_index=False`. Other authority reads consume existing immutable artifacts. No operational executor is constructed. Empty execution/resource tuples are allowed when the original launch/config and nonempty round journal authenticate, so an early paid-round failure is not forced to invent executions. This branch was assessed statically only. Completion, phase/control semantics, terminal outcome and summary activation remain H2/H3 responsibilities and are not missing H1 features.
+
+## Evidence limits
+
+Supplied evidence reports scoped Ruff and in-memory compilation success and authenticates runtime-04 rounds 1 and 2 with five execution bindings each. The source package records SHA-256 `0f8383eac885cd03257b4316a80f720d25b8d216c7a0753ec5ad4c2d65c0ac82` and the 56-file evaluator map. These checks were not rerun.
+
+The implementer's 517-file runtime-04 before/after hash is narrower than the previously recorded full archive. The subsequently supplied `principal-preservation-check.json` independently covers all 579 runtime-04 and 83 provider-runtime-06 files and reports every file unchanged. Its coverage resolves the preservation gap; the implementer's 517-file claim should not be described as complete archive coverage. Negative, paid-empty-history and operational branches remain unexecuted. No live readiness or completed-history success is inferred.

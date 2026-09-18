@@ -1,0 +1,31 @@
+# H3b immutable paid role ledger history
+
+## Scope delivered
+
+Implemented H3b only in `core/pit_optimizer_v5/production_provider.py`; no summary path was activated.
+
+`RoleLedgerReadIdentityV5` is a frozen, slotted immutable value containing campaign-manifest, audit-store, ledger and gateway identities. `_role_ledger_read_identity_v5` derives the existing domain-separated formulas from the exact local repository identity, manifest/provider capabilities and the configured API-key environment variable name. It does not inspect the environment, read a key, use a nonce or clock, or construct a ledger/gateway.
+
+Extracted the six existing algorithms into `_conservative_unreported_usage_v5`, `_completion_usage_v5`, `_derive_reported_terminal_v5`, `_verify_terminal_facts_v5`, `_load_verified_role_ledger_v5` and `_authenticate_role_invocations_v5`. The operational read methods derive/check current immutable identities and delegate. The existing package collection type check remains before the operational ledger read. Duplicate reservation/slot checks, exact request distinctions, prospective limits, model/schema caps, claim deadline, slot/authorization formulas, continuous ledger/terminal order, prior/cumulative accounting, response classification, facts/artifact/receipt comparison and journal terminal order are preserved.
+
+`authenticate_paid_role_history_v5(*, repository, manifest, adapter_config, packages)` requires exact repository, manifest, `ProviderDevelopmentAdapterConfigV5`, tuple and package types. It recomputes campaign/audit/ledger/gateway identities, compares the original config's manifest/repository/provider identity fields, loads the verified ledger, and authenticates the complete package collection. Empty packages still require empty reservations and terminals. It creates no operational object and performs no recovery, migration or transition.
+
+## Static and preservation evidence
+
+The exact preimage is `pre-h3b-production_provider.py`: 48,861 bytes, SHA-256 `8fbb630fbc5f28b907cf7c8134d32219fc353a8436ec74d65e4a97f83e51f545`. Final source is 56,151 bytes, SHA-256 `6077f0a716fa5d64594f5760d86b00f3b2865b605ca25bf3ab57bed07793b94f`, with original CRLF and final newline preserved. `h3b-source.diff` is the exact preimage diff, SHA-256 `0b366f59d0267fbec386a1efff23759157ac11db76c306d6119c05001f1c077f`.
+
+`h3b-static-verification.json` proves exactly six existing read methods changed and all six extracted bodies are normalized AST-identical to their preimages (excluding only the old internal ledger-load assignment because records are explicit arguments). Every other existing definition is byte-identical, including both constructors and all reserve, publish, settle, recover, reconcile, clock and gateway methods. The new/delegated callgraph has no operational object, write, transition, typed-state, nonce, clock or environment access. Repository calls are exactly `load_role_ledger_records`, `load_role_provider_response`, `load_unique_role_request_by_sha256` and `load_unique_role_request_entry_by_sha256`.
+
+The transitive audit confirmed these paths authenticate immutable artifacts. Legacy ledger evidence is authenticated and then raises `RoleLedgerMigrationRequiredV5`; it never repairs or migrates. The ledger request loader retains its existing equal-value behavior, while invocation authentication retains the stricter exactly-one call/request entry lookup.
+
+The fixed 56-file evaluator closure remains unchanged at digest `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4`. Scoped Ruff and Python 3.13 in-memory compilation passed; diff whitespace/final-newline checks passed.
+
+Complete asserted extended-Windows-root before/after maps are saved for both archives. Runtime04 stayed 579 files / 69,994,319 bytes at tree digest `1988b37428bcbf647d468ec163b7ca235b99b26b2a7bcee80d7de733e19f8aa9`. Provider-runtime-06 stayed 83 files / 68,980,002 bytes at `2c411970b0a2d9cdfd2499afa01aed14fa723bb3ae5f4d44baee0d539b923f16`. No path changed.
+
+## Actual06 authentication
+
+After the transitive audit, the evidence collector loaded actual06's original typed manifest, immutable campaign launch with `repair=False`, and original typed provider config. It collected packages only from actual journal `RoleCompletionPayloadV5` entries through `load_role_invocation`. The historical entry accepted both round-1 packages (investigator and author), their exact ledger authorities and original config identities. Sealed usage remains 2 external attempts, 8,596 tokens and USD 0.0423400. The campaign remains the recorded round-1 `runtime_failed` outcome at rendering / `stage_failed`, with zero round-2 packages; H3b does not turn role acceptance into campaign success.
+
+Evidence is in `h3b-actual-auth-results.json`, `h3b-preservation-check.json`, the four complete archive maps, `h3b-static-verification.json`, `h3b-source-hashes.json`, `h3b-evaluator-source-map.json`, `h3b-ruff.txt`, `h3b-compile.txt` and `h3b-diff-check.txt`.
+
+No tests, synthetic records or negative cases, summaries, provider/API/Docker/external calls, credentials or environment values, campaigns, operational ledger/gateway construction, commits, installs or subagents were used. Negative/missing-state and live operational behavior have static evidence only. H3c owns campaign eligibility, full request census and summary integration.

@@ -1,0 +1,788 @@
+# Task 1 review package
+
+Base commit: 515cb1e50d051e2ee4253603608f2fd3920004bc
+Head commit: 515cb1e50d051e2ee4253603608f2fd3920004bc (uncommitted task diff; commits prohibited by user constraint)
+Task files: core/canslim/earnings_trace.py, core/canslim/c_current_earnings.py, core/canslim/a_annual_earnings.py
+
+## Tracked-file stat and diff
+
+```diff
+warning: in the working copy of 'core/canslim/a_annual_earnings.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'core/canslim/c_current_earnings.py', LF will be replaced by CRLF the next time Git touches it
+ core/canslim/a_annual_earnings.py  | 276 ++++++++++++++++++++++++++++++-------
+ core/canslim/c_current_earnings.py | 220 +++++++++++++++++++++++------
+ 2 files changed, 407 insertions(+), 89 deletions(-)
+warning: in the working copy of 'core/canslim/a_annual_earnings.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'core/canslim/c_current_earnings.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/core/canslim/a_annual_earnings.py b/core/canslim/a_annual_earnings.py
+index 1848309..e1f3b9f 100644
+--- a/core/canslim/a_annual_earnings.py
++++ b/core/canslim/a_annual_earnings.py
+@@ -11,20 +11,72 @@ Priority: Diluted EPS, then Basic EPS, then fallback to Net Income.
+ """
+ 
+ from __future__ import annotations
+ 
+ from typing import List, Optional
+ 
+ import pandas as pd
+ 
+ from config import settings
+ 
++from .earnings_trace import (
++    ATrace,
++    MetricFamily,
++    _PITProvenanceError,
++    TraceReason,
++    pit_public_date_for_period,
++    pit_public_dates_by_period,
++)
++
++
++def _metric_family(row_label: object) -> MetricFamily:
++    """Return the trace metric family for an already selected earnings row."""
++    label = str(row_label)
++    if pd.Series([label]).str.contains(r"Diluted EPS", case=False, regex=True).iloc[0]:
++        return MetricFamily.DILUTED_EPS
++    if pd.Series([label]).str.contains(r"Basic EPS", case=False, regex=True).iloc[0]:
++        return MetricFamily.BASIC_EPS
++    return MetricFamily.NET_INCOME
++
++
++def _trace_float(value: object) -> float | None:
++    """Coerce an observed trace value when representable as a float."""
++    try:
++        return float(value)
++    except (TypeError, ValueError):
++        return None
++
++
++def _period_end(label: object):
++    """Return the date corresponding to an annual frame column label."""
++    timestamp = pd.Timestamp(label)
++    if pd.isna(timestamp):
++        raise ValueError("annual period end is not a date")
++    return timestamp.date()
++
++
++def _a_unavailable_trace(annual_income: pd.DataFrame) -> tuple[MetricFamily, TraceReason]:
++    """Describe why the legacy annual row selector found no usable family."""
++    labels = annual_income.index.astype(str)
++    for pattern, metric_family in (
++        (r"Diluted EPS", MetricFamily.DILUTED_EPS),
++        (r"Basic EPS", MetricFamily.BASIC_EPS),
++        (r"Net Income", MetricFamily.NET_INCOME),
++    ):
++        matches = labels.str.contains(pattern, case=False, regex=True)
++        for row_label in annual_income.index[matches]:
++            earnings = annual_income.loc[row_label]
++            if isinstance(earnings, pd.DataFrame):
++                earnings = earnings.iloc[0]
++            if not earnings.sort_index().dropna().empty:
++                return metric_family, TraceReason.INSUFFICIENT_ANNUAL_HISTORY
++    return MetricFamily.UNAVAILABLE, TraceReason.NO_VISIBLE_OBSERVATION
+ 
+ def _safe_growth(current: float, previous: float) -> Optional[float]:
+     """Calculate YoY growth as a decimal.
+ 
+     Returns None when previous is negative to enforce the CANSLIM
+     requirement for established, positive earnings growth.
+     """
+     if current is None or previous in (None, 0):
+         return None
+ 
+@@ -144,98 +196,228 @@ def _calculate_roe(annual_income: pd.DataFrame, balance_sheet: pd.DataFrame) ->
+ 
+         if equity_val is None or equity_val <= 0:
+             return None
+ 
+         return net_income / equity_val
+ 
+     except Exception:
+         return None
+ 
+ 
+-def evaluate_a(
++def _evaluate_a_core(
+     annual_income: pd.DataFrame,
+     a_growth_target: Optional[float] = None,
+     balance_sheet: Optional[pd.DataFrame] = None,
+-) -> tuple[float, Optional[float], Optional[float]]:
+-    """Evaluate A (Annual Earnings Growth) score.
+-
+-    Per O'Neil's methodology:
+-    1. Annual EPS should be up 25%+ for each of the last 3-5 years
+-    2. Consistency across multiple years is critical
+-    3. ROE should be 17% or higher
+-
+-    Scoring breakdown:
+-    - 50% weight: Most recent year's EPS growth vs target
+-    - 30% weight: Consistency (how many of last 3 years show 25%+ growth)
+-    - 20% weight: ROE score (17%+ = full score)
+-
+-    Args:
+-        annual_income: Annual income statement DataFrame
+-        a_growth_target: Target growth rate (defaults to settings.A_GROWTH_TARGET)
+-        balance_sheet: Annual balance sheet DataFrame for ROE calculation
+-
+-    Returns:
+-        tuple: (score, annual_growth, roe) where score is 0-1,
+-               annual_growth is most recent year decimal,
+-               roe is return on equity decimal
+-    """
++    *,
++    strict_trace_provenance: bool,
++) -> ATrace:
++    """Evaluate A and retain the actual two annual observations used."""
+     import numpy as np
+ 
+     if a_growth_target is None:
+         a_growth_target = settings.A_GROWTH_TARGET
++    if strict_trace_provenance:
++        pit_public_dates_by_period(annual_income)
++
+     annual_growth = None
+     roe = None
++    metric_family = MetricFamily.UNAVAILABLE
++    terminal_reason = TraceReason.NO_VISIBLE_OBSERVATION
++    current_period_end = None
++    prior_period_end = None
++    current_public_date = None
++    prior_public_date = None
++    current_value = None
++    prior_value = None
+ 
+     if annual_income.empty:
+-        return 0.0, None, None
++        return ATrace(
++            0.0,
++            None,
++            None,
++            metric_family,
++            terminal_reason,
++            None,
++            None,
++            None,
++            None,
++            None,
++            None,
++        )
+ 
+     try:
+         row_label = _find_earnings_row(annual_income)
+         if row_label is None:
+-            return 0.0, None, None
+-
+-        # Sort columns by date oldest→newest so iloc[-1] is most recent
++            metric_family, terminal_reason = _a_unavailable_trace(annual_income)
++            return ATrace(
++                0.0,
++                None,
++                None,
++                metric_family,
++                terminal_reason,
++                None,
++                None,
++                None,
++                None,
++                None,
++                None,
++            )
++
++        metric_family = _metric_family(row_label)
+         earnings = annual_income.loc[row_label].sort_index().dropna()
+-
++        if isinstance(earnings, pd.DataFrame):
++            earnings = earnings.iloc[0]
+         if len(earnings) < 2:
+-            return 0.0, None, None
++            return ATrace(
++                0.0,
++                None,
++                None,
++                metric_family,
++                TraceReason.INSUFFICIENT_ANNUAL_HISTORY,
++                None,
++                None,
++                None,
++                None,
++                None,
++                None,
++            )
++
++        current_period_end = _period_end(earnings.index[-1])
++        prior_period_end = _period_end(earnings.index[-2])
++        current_value = _trace_float(earnings.iloc[-1])
++        prior_value = _trace_float(earnings.iloc[-2])
++        if strict_trace_provenance:
++            current_public_date = pit_public_date_for_period(annual_income, current_period_end)
++            prior_public_date = pit_public_date_for_period(annual_income, prior_period_end)
++
++        if current_value is None or not np.isfinite(current_value):
++            terminal_reason = TraceReason.NONFINITE_CURRENT_VALUE
++        elif prior_value is None or not np.isfinite(prior_value):
++            terminal_reason = TraceReason.NONFINITE_PRIOR_VALUE
++        elif np.isclose(prior_value, 0.0):
++            terminal_reason = TraceReason.ZERO_PRIOR_VALUE
++        elif prior_value < 0:
++            terminal_reason = TraceReason.NEGATIVE_PRIOR_VALUE
++        else:
++            terminal_reason = TraceReason.COMPLETE
+ 
+-        # Get year-over-year growth rates (most recent first)
+         yoy_growths = _get_annual_growths(earnings)
+-
+         if not yoy_growths or yoy_growths[0] is None:
+-            return 0.0, None, None
+-
+-        annual_growth = yoy_growths[0]  # Most recent year
+-
+-        # Component 1 (50%): Most recent year growth vs target
++            return ATrace(
++                0.0,
++                None,
++                None,
++                metric_family,
++                terminal_reason,
++                current_period_end,
++                prior_period_end,
++                current_public_date,
++                prior_public_date,
++                current_value,
++                prior_value,
++            )
++
++        annual_growth = yoy_growths[0]
+         growth_score = float(np.clip(annual_growth / a_growth_target, 0, 2) / 2)
+-
+-        # Component 2 (30%): Consistency — how many of last 3 years show 25%+ growth
+-        # O'Neil wants 3-5 years of consistent growth
+-        valid_growths = [g for g in yoy_growths[: settings.A_MIN_YEARS_GROWTH] if g is not None]
++        valid_growths = [
++            growth for growth in yoy_growths[: settings.A_MIN_YEARS_GROWTH] if growth is not None
++        ]
+         if valid_growths:
+-            years_above_target = sum(1 for g in valid_growths if g >= a_growth_target)
++            years_above_target = sum(
++                1 for growth in valid_growths if growth >= a_growth_target
++            )
+             consistency_score = years_above_target / len(valid_growths)
+         else:
+             consistency_score = 0.0
+ 
+-        # Component 3 (20%): ROE check — O'Neil requires 17%+ ROE
+         roe_score = 0.0
+         if balance_sheet is not None and not balance_sheet.empty:
+             roe = _calculate_roe(annual_income, balance_sheet)
+             if roe is not None:
+                 roe_target = settings.A_ROE_TARGET
+                 roe_score = float(np.clip(roe / roe_target, 0, 2) / 2)
+ 
+-        # Weighted combination
+         score = (
+             settings.A_GROWTH_WEIGHT * growth_score
+             + settings.A_CONSISTENCY_WEIGHT * consistency_score
+             + settings.A_ROE_WEIGHT * roe_score
+         )
+         score = float(np.clip(score, 0, 1))
++        return ATrace(
++            score,
++            annual_growth,
++            roe,
++            metric_family,
++            terminal_reason,
++            current_period_end,
++            prior_period_end,
++            current_public_date,
++            prior_public_date,
++            current_value,
++            prior_value,
++        )
++    except _PITProvenanceError:
++        raise
++    except Exception:
++        return ATrace(
++            0.0,
++            annual_growth,
++            roe,
++            metric_family,
++            TraceReason.EVALUATOR_EXCEPTION,
++            current_period_end,
++            prior_period_end,
++            current_public_date,
++            prior_public_date,
++            current_value,
++            prior_value,
++        )
+ 
+-        return score, annual_growth, roe
+ 
+-    except Exception:
+-        return 0.0, annual_growth, roe
++def evaluate_a_with_trace(
++    annual_income: pd.DataFrame,
++    a_growth_target: Optional[float] = None,
++    balance_sheet: Optional[pd.DataFrame] = None,
++) -> ATrace:
++    """Evaluate A with strict PIT provenance validation for trace metadata."""
++    return _evaluate_a_core(
++        annual_income,
++        a_growth_target,
++        balance_sheet,
++        strict_trace_provenance=True,
++    )
++
++
++def evaluate_a(
++    annual_income: pd.DataFrame,
++    a_growth_target: Optional[float] = None,
++    balance_sheet: Optional[pd.DataFrame] = None,
++) -> tuple[float, Optional[float], Optional[float]]:
++    """Evaluate A (Annual Earnings Growth) score.
++
++    Per O'Neil's methodology:
++    1. Annual EPS should be up 25%+ for each of the last 3-5 years
++    2. Consistency across multiple years is critical
++    3. ROE should be 17% or higher
++
++    Scoring breakdown:
++    - 50% weight: Most recent year's EPS growth vs target
++    - 30% weight: Consistency (how many of last 3 years show 25%+ growth)
++    - 20% weight: ROE score (17%+ = full score)
++
++    Args:
++        annual_income: Annual income statement DataFrame
++        a_growth_target: Target growth rate (defaults to settings.A_GROWTH_TARGET)
++        balance_sheet: Annual balance sheet DataFrame for ROE calculation
++
++    Returns:
++        tuple: (score, annual_growth, roe) where score is 0-1,
++               annual_growth is most recent year decimal,
++               roe is return on equity decimal
++    """
++    trace = _evaluate_a_core(
++        annual_income,
++        a_growth_target,
++        balance_sheet,
++        strict_trace_provenance=False,
++    )
++    return trace.score, trace.annual_growth, trace.roe
+diff --git a/core/canslim/c_current_earnings.py b/core/canslim/c_current_earnings.py
+index 6d0f7cd..49e9e59 100644
+--- a/core/canslim/c_current_earnings.py
++++ b/core/canslim/c_current_earnings.py
+@@ -10,20 +10,28 @@ Priority: EPS (Basic or Diluted) first, then fallback to Net Income.
+ """
+ 
+ from __future__ import annotations
+ 
+ from typing import List, Optional
+ 
+ import pandas as pd
+ 
+ from config import settings
+ 
++from .earnings_trace import (
++    CTrace,
++    MetricFamily,
++    _PITProvenanceError,
++    TraceReason,
++    pit_public_date_for_period,
++    pit_public_dates_by_period,
++)
+ from .fiscal_periods import match_fiscal_year_over_year_periods
+ 
+ 
+ def _safe_growth(current: float, previous: float) -> Optional[float]:
+     """Calculate growth as a decimal, handling edge cases."""
+     if current is None or previous in (None, 0):
+         return None
+ 
+     try:
+         current = float(current)
+@@ -116,87 +124,215 @@ def _check_acceleration(growths: List[Optional[float]]) -> float:
+     # growths[0] = most recent, growths[1] = previous quarter
+     # Acceleration means growths[0] > growths[1] > growths[2]...
+     for i in range(len(valid) - 1):
+         total_pairs += 1
+         if valid[i] > valid[i + 1]:
+             accelerating_pairs += 1
+ 
+     return accelerating_pairs / total_pairs if total_pairs > 0 else 0.5
+ 
+ 
+-def evaluate_c(
+-    quarterly_income: pd.DataFrame, c_growth_target: Optional[float] = None
+-) -> tuple[float, Optional[float]]:
+-    """Evaluate C (Current Quarterly Earnings Growth) score.
++def _metric_family(row_label: object) -> MetricFamily:
++    """Return the trace metric family for an already selected earnings row."""
++    label = str(row_label)
++    if pd.Series([label]).str.contains(r"Diluted EPS", case=False, regex=True).iloc[0]:
++        return MetricFamily.DILUTED_EPS
++    if pd.Series([label]).str.contains(r"Basic EPS", case=False, regex=True).iloc[0]:
++        return MetricFamily.BASIC_EPS
++    return MetricFamily.NET_INCOME
+ 
+-    Per O'Neil's methodology:
+-    1. Current quarter EPS must be up 25%+ vs same quarter last year (YoY)
+-    2. Prefer accelerating growth across recent quarters
+-    3. Multiple quarters of 25%+ growth is ideal
+ 
+-    Scoring breakdown:
+-    - 60% weight: Most recent quarter YoY growth vs target
+-    - 20% weight: Consistency (how many of last 3 quarters show 25%+ growth)
+-    - 20% weight: Acceleration (are growth rates increasing?)
+-
+-    Args:
+-        quarterly_income: Quarterly income statement DataFrame
+-        c_growth_target: Target growth rate (defaults to settings.C_GROWTH_TARGET)
++def _trace_float(value: object) -> float | None:
++    """Coerce an observed trace value when representable as a float."""
++    try:
++        return float(value)
++    except (TypeError, ValueError):
++        return None
+ 
+-    Returns:
+-        tuple: (score, current_growth) where score is 0-1 and current_growth is decimal
+ 
+-    """
++def _c_unavailable_reason(quarterly_income: pd.DataFrame) -> TraceReason:
++    """Explain why the legacy row selector could not select an earnings pair."""
++    labels = quarterly_income.index.astype(str)
++    for pattern in (r"Diluted EPS", r"Basic EPS", r"Net Income"):
++        matches = labels.str.contains(pattern, case=False, regex=True)
++        for row_label in quarterly_income.index[matches]:
++            earnings = quarterly_income.loc[row_label]
++            if isinstance(earnings, pd.DataFrame):
++                earnings = earnings.iloc[0]
++            comparisons = match_fiscal_year_over_year_periods(earnings)
++            if not comparisons:
++                continue
++            latest = comparisons[0]
++            if not pd.isna(latest.current_value) and not latest.matched:
++                return TraceReason.NO_COMPARABLE_PRIOR_PERIOD
++    return TraceReason.NO_VISIBLE_OBSERVATION
++
++
++def _evaluate_c_core(
++    quarterly_income: pd.DataFrame,
++    c_growth_target: Optional[float] = None,
++    *,
++    strict_trace_provenance: bool,
++) -> CTrace:
++    """Evaluate C and retain the selected fiscal pair and terminal condition."""
+     import numpy as np
+ 
+     if c_growth_target is None:
+         c_growth_target = settings.C_GROWTH_TARGET
++    if strict_trace_provenance:
++        pit_public_dates_by_period(quarterly_income)
++
+     current_growth = None
++    metric_family = MetricFamily.UNAVAILABLE
++    terminal_reason = TraceReason.NO_VISIBLE_OBSERVATION
++    current_period_end = None
++    prior_period_end = None
++    current_public_date = None
++    prior_public_date = None
++    current_value = None
++    prior_value = None
+ 
+     if quarterly_income.empty:
+-        return 0.0, None
++        return CTrace(
++            0.0, None, metric_family, terminal_reason, None, None, None, None, None, None
++        )
+ 
+     try:
+         row_label = _find_earnings_row(quarterly_income)
+         if row_label is None:
+-            return 0.0, None
+-
++            return CTrace(
++                0.0,
++                None,
++                metric_family,
++                _c_unavailable_reason(quarterly_income),
++                None,
++                None,
++                None,
++                None,
++                None,
++                None,
++            )
++
++        metric_family = _metric_family(row_label)
+         earnings = quarterly_income.loc[row_label]
+         if isinstance(earnings, pd.DataFrame):
+             earnings = earnings.iloc[0]
++        matches = match_fiscal_year_over_year_periods(earnings)
++        latest = matches[0]
++        current_period_end = latest.current_period
++        prior_period_end = latest.prior_period
++        current_value = _trace_float(latest.current_value)
++        prior_value = _trace_float(latest.prior_value)
++        if strict_trace_provenance:
++            current_public_date = pit_public_date_for_period(quarterly_income, current_period_end)
++            prior_public_date = pit_public_date_for_period(quarterly_income, prior_period_end)
++
++        if not latest.matched:
++            terminal_reason = TraceReason.NO_COMPARABLE_PRIOR_PERIOD
++        elif current_value is None or not np.isfinite(current_value):
++            terminal_reason = TraceReason.NONFINITE_CURRENT_VALUE
++        elif prior_value is None or not np.isfinite(prior_value):
++            terminal_reason = TraceReason.NONFINITE_PRIOR_VALUE
++        elif np.isclose(prior_value, 0.0):
++            terminal_reason = TraceReason.ZERO_PRIOR_VALUE
++        elif prior_value < 0:
++            terminal_reason = TraceReason.NEGATIVE_PRIOR_VALUE
++        else:
++            terminal_reason = TraceReason.COMPLETE
+ 
+-        # --- O'Neil's methodology: Year-over-Year comparison ---
+-        # Compare the latest period only with its unique date-matched prior year.
+         yoy_growths = _get_quarterly_yoy_growths(earnings)
+-
+         if not yoy_growths or yoy_growths[0] is None:
+-            return 0.0, None
+-
+-        current_growth = yoy_growths[0]  # Most recent quarter YoY
+-
+-        # Component 1 (60%): Current quarter growth vs target
+-        # 25%+ growth = full score, scales linearly
++            return CTrace(
++                0.0,
++                None,
++                metric_family,
++                terminal_reason,
++                current_period_end,
++                prior_period_end,
++                current_public_date,
++                prior_public_date,
++                current_value,
++                prior_value,
++            )
++
++        current_growth = yoy_growths[0]
+         growth_score = float(np.clip(current_growth / c_growth_target, 0, 2) / 2)
+-
+-        # Component 2 (20%): Consistency — how many recent quarters show 25%+ growth
+-        valid_growths = [g for g in yoy_growths[:3] if g is not None]
++        valid_growths = [growth for growth in yoy_growths[:3] if growth is not None]
+         if valid_growths:
+-            quarters_above_target = sum(1 for g in valid_growths if g >= c_growth_target)
++            quarters_above_target = sum(
++                1 for growth in valid_growths if growth >= c_growth_target
++            )
+             consistency_score = quarters_above_target / len(valid_growths)
+         else:
+             consistency_score = 0.0
+-
+-        # Component 3 (20%): Acceleration — are growth rates increasing?
+         acceleration_score = _check_acceleration(yoy_growths[:4])
+-
+-        # Weighted combination
+         score = (
+             settings.C_GROWTH_WEIGHT * growth_score
+             + settings.C_CONSISTENCY_WEIGHT * consistency_score
+             + settings.C_ACCELERATION_WEIGHT * acceleration_score
+         )
+         score = float(np.clip(score, 0, 1))
++        return CTrace(
++            score,
++            current_growth,
++            metric_family,
++            terminal_reason,
++            current_period_end,
++            prior_period_end,
++            current_public_date,
++            prior_public_date,
++            current_value,
++            prior_value,
++        )
++    except _PITProvenanceError:
++        raise
++    except Exception:
++        return CTrace(
++            0.0,
++            current_growth,
++            metric_family,
++            TraceReason.EVALUATOR_EXCEPTION,
++            current_period_end,
++            prior_period_end,
++            current_public_date,
++            prior_public_date,
++            current_value,
++            prior_value,
++        )
+ 
+-        return score, current_growth
+ 
+-    except Exception:
+-        return 0.0, current_growth
++def evaluate_c_with_trace(
++    quarterly_income: pd.DataFrame, c_growth_target: Optional[float] = None
++) -> CTrace:
++    """Evaluate C with strict PIT provenance validation for trace metadata."""
++    return _evaluate_c_core(
++        quarterly_income, c_growth_target, strict_trace_provenance=True
++    )
++
++
++def evaluate_c(
++    quarterly_income: pd.DataFrame, c_growth_target: Optional[float] = None
++) -> tuple[float, Optional[float]]:
++    """Evaluate C (Current Quarterly Earnings Growth) score.
++
++    Per O'Neil's methodology:
++    1. Current quarter EPS must be up 25%+ vs same quarter last year (YoY)
++    2. Prefer accelerating growth across recent quarters
++    3. Multiple quarters of 25%+ growth is ideal
++
++    Scoring breakdown:
++    - 60% weight: Most recent quarter YoY growth vs target
++    - 20% weight: Consistency (how many of last 3 quarters show 25%+ growth)
++    - 20% weight: Acceleration (are growth rates increasing?)
++
++    Args:
++        quarterly_income: Quarterly income statement DataFrame
++        c_growth_target: Target growth rate (defaults to settings.C_GROWTH_TARGET)
++
++    Returns:
++        tuple: (score, current_growth) where score is 0-1 and current_growth is decimal
++
++    """
++    trace = _evaluate_c_core(
++        quarterly_income, c_growth_target, strict_trace_provenance=False
++    )
++    return trace.score, trace.current_growth
+
+```
+
+## New-file diff
+
+```diff
+warning: in the working copy of 'core/canslim/earnings_trace.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/core/canslim/earnings_trace.py b/core/canslim/earnings_trace.py
+new file mode 100644
+index 0000000..35cdc24
+--- /dev/null
++++ b/core/canslim/earnings_trace.py
+@@ -0,0 +1,112 @@
++"""Closed trace vocabulary shared by CANSLIM earnings evaluators."""
++
++from __future__ import annotations
++
++from collections.abc import Mapping
++from dataclasses import dataclass
++from datetime import date
++from enum import StrEnum
++
++import pandas as pd
++
++
++PIT_PUBLIC_DATES_ATTR = "pit_public_date_by_period"
++
++
++class _PITProvenanceError(ValueError):
++    """A supplied PIT provenance mapping cannot support a selected trace."""
++
++
++class MetricFamily(StrEnum):
++    DILUTED_EPS = "diluted_eps"
++    BASIC_EPS = "basic_eps"
++    NET_INCOME = "net_income"
++    UNAVAILABLE = "unavailable"
++
++
++class TraceReason(StrEnum):
++    COMPLETE = "complete"
++    NO_VISIBLE_OBSERVATION = "no_visible_observation"
++    NO_COMPARABLE_PRIOR_PERIOD = "no_comparable_prior_period"
++    INSUFFICIENT_ANNUAL_HISTORY = "insufficient_annual_history"
++    NONFINITE_CURRENT_VALUE = "nonfinite_current_value"
++    NONFINITE_PRIOR_VALUE = "nonfinite_prior_value"
++    ZERO_PRIOR_VALUE = "zero_prior_value"
++    NEGATIVE_PRIOR_VALUE = "negative_prior_value"
++    EVALUATOR_EXCEPTION = "evaluator_exception"
++
++
++@dataclass(frozen=True, slots=True)
++class CTrace:
++    score: float
++    current_growth: float | None
++    metric_family: MetricFamily
++    terminal_reason: TraceReason
++    current_period_end: date | None
++    prior_period_end: date | None
++    current_public_date: date | None
++    prior_public_date: date | None
++    current_value: float | None
++    prior_value: float | None
++
++
++@dataclass(frozen=True, slots=True)
++class ATrace:
++    score: float
++    annual_growth: float | None
++    roe: float | None
++    metric_family: MetricFamily
++    terminal_reason: TraceReason
++    current_period_end: date | None
++    prior_period_end: date | None
++    current_public_date: date | None
++    prior_public_date: date | None
++    current_value: float | None
++    prior_value: float | None
++
++
++def pit_public_dates_by_period(frame: pd.DataFrame) -> dict[date, date] | None:
++    """Return validated PIT publication dates without changing ``frame``.
++
++    Missing provenance is represented by ``None`` so ordinary historical inputs
++    remain usable. If provenance is supplied, it must cover ISO period-end keys
++    with ISO public-date values; incomplete or malformed supplied provenance is
++    rejected for callers that need trace dates.
++    """
++    if PIT_PUBLIC_DATES_ATTR not in frame.attrs:
++        return None
++
++    raw_mapping = frame.attrs[PIT_PUBLIC_DATES_ATTR]
++    if not isinstance(raw_mapping, Mapping):
++        raise _PITProvenanceError(f"{PIT_PUBLIC_DATES_ATTR} must be an ISO-date mapping")
++
++    parsed: dict[date, date] = {}
++    for raw_period, raw_public_date in raw_mapping.items():
++        if not isinstance(raw_period, str) or not isinstance(raw_public_date, str):
++            raise _PITProvenanceError(f"{PIT_PUBLIC_DATES_ATTR} must be an ISO-date mapping")
++        try:
++            period = date.fromisoformat(raw_period)
++            public_date = date.fromisoformat(raw_public_date)
++        except ValueError as error:
++            raise _PITProvenanceError(
++                f"{PIT_PUBLIC_DATES_ATTR} must be an ISO-date mapping"
++            ) from error
++        parsed[period] = public_date
++    return parsed
++
++
++def pit_public_date_for_period(
++    frame: pd.DataFrame, period: date | None
++) -> date | None:
++    """Return a selected period's public date, rejecting unknown provenance."""
++    if period is None:
++        return None
++    public_dates = pit_public_dates_by_period(frame)
++    if public_dates is None:
++        return None
++    try:
++        return public_dates[period]
++    except KeyError as error:
++        raise _PITProvenanceError(
++            f"{PIT_PUBLIC_DATES_ATTR} has no public date for {period.isoformat()}"
++        ) from error
+
+```
+

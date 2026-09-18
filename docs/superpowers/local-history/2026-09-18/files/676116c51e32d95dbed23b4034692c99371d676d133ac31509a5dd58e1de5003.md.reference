@@ -1,0 +1,48 @@
+# Task 4 Re-review 3
+
+## Finding Verdict
+
+### Finding 6 — ADDRESSED
+
+The open canonical-envelope finding is addressed.
+
+`core/pit_optimization_contract.py:320-327` now makes the schema-v2 canonical serializer emit non-ASCII text as raw UTF-8 with `ensure_ascii=False`. `core/pit_optimization_contract.py:59`, `core/pit_optimization_contract.py:255-269`, and `core/pit_optimization_contract.py:307-318` close the only admitted character class that could expand beyond two canonical bytes per raw byte: unsafe C0 controls, DEL, and C1 controls. Tab, LF, and CR remain admitted where their field rules otherwise allow them. Under the actual serializer, backslash, quote, tab, LF, and CR require two JSON bytes per one raw byte; ordinary BMP and astral Unicode remain at their raw UTF-8 byte length. Therefore backslash/quote are tied canonical maximizers after the unsafe controls are closed.
+
+`core/pit_optimization_contract.py:349-365` derives the deterministic maximizer under that actual serializer and the requested raw-byte constraint. It tests backslash, quote, BMP Unicode, and astral Unicode at equal raw-byte budgets, with backslash winning the maximum tie deterministically. The renderer uses that maximizer for both source growth and cumulative diff at `core/pit_optimization_contract.py:3004-3029`, for the uncapped-composite incumbent behavioral field at `core/pit_optimization_contract.py:3113-3118`, and for each binary-searched section-capped composite at `core/pit_optimization_contract.py:3097-3169`. The capped composites are still filled to within one canonical byte of their respective caps, while the incumbent combines the maximum behavioral field with a maximum-sized discovery summary.
+
+The exact prospective-incumbent path is also closed. `materialize_policy_source_descendant` constructs the actual resulting source and controller-derived cumulative diff, measures the exact canonical bundle at `core/pit_optimization_contract.py:2641-2661`, seals it, and passes that exact bundle to the role renderer at `core/pit_optimization_contract.py:2670-2678`. The renderer verifies the sealed bundle matches the supplied resulting source at `core/pit_optimization_contract.py:3038-3054`, renders the complete investigator/author/critic dynamic inputs with maximum remaining sections at `core/pit_optimization_contract.py:3174-3211`, and checks both exact dynamic bytes and static-plus-dynamic bytes against the iteration-2 call records at `core/pit_optimization_contract.py:3212-3226`. It does not reapply hypothetical source growth to an already materialized candidate.
+
+The new tests independently establish the serializer model and the formerly missing maxima:
+
+- `tests/test_pit_optimizer_v2.py:37-94` compares equal-raw backslash, quote, LF, BMP Unicode, astral Unicode, and unsafe-control canonical sizes using standard-library compact JSON, and verifies raw UTF-8 v2 artifact bytes plus control rejection.
+- `tests/test_pit_optimizer_v2.py:97-135` verifies unsafe controls are rejected through the real author-diff parser and real initial-source factory.
+- `tests/test_pit_optimizer_v2.py:669-756` uses exact source-cap-valid candidates of equal raw size: the backslash candidate receives `next_context_oversize`, while the Unicode candidate fits under raw UTF-8 canonicalization.
+- `tests/test_pit_optimizer_v2.py:1824-1908` inspects the rendered maximum source suffix, cumulative diff, uncapped incumbent composite, six section-capped composites, and the complete role envelopes.
+
+Compatibility scope is correct. The fix diff changes only schema-v2 canonicalization/validation and schema-v2 tests; schema-v1 readers and their identity code are untouched. For admitted ASCII v2 values, `ensure_ascii=True` and `ensure_ascii=False` produce identical bytes, so existing printable-ASCII v2 identities remain byte-for-byte stable. The only ASCII admissibility change is intentional rejection of the unsafe controls that invalidated the raw-byte proof; printable ASCII and the required Python/source whitespace remain supported. Non-ASCII v2 identities intentionally move to their canonical raw UTF-8 representation.
+
+## New Breakage
+
+No new Critical or Important breakage found in `9115cdb..b2eb01c`.
+
+## Out-of-Scope Observations
+
+None.
+
+## Focused Verification
+
+Only the narrow, synchronous checks authorized for this review were run:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py::test_v2_canonical_text_preserves_utf8_and_rejects_unsafe_controls tests/test_pit_optimizer_v2.py::test_v2_source_and_diff_blobs_reject_unsafe_controls tests/test_pit_optimizer_v2.py::test_candidate_materialization_checks_exact_next_role_envelope
+6 passed, 1 warning in 0.16s
+
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py::test_manifest_builder_is_provider_free_canonical_and_source_budgeted
+1 passed, 1 warning in 1.24s
+```
+
+The warning is the existing `PytestConfigWarning: Unknown config option: cache_dir`.
+
+## Verdict
+
+**READY.** The raw-byte-constrained canonical maximum, source/diff/incumbent/composite proofs, and exact prospective next-role sizing now agree with the actual schema-v2 serializer. The prior Important finding is closed, and this fix introduces no new Critical or Important defect.

@@ -1,0 +1,93 @@
+"""Read-only comparison of original journal-bound resource components; no summary."""
+import json
+from pathlib import Path
+import runpy
+
+ROOT = Path.cwd().resolve()
+OUT = ROOT / '.artifacts/pit-optimizer-v5/development/increment-c-history-verifier'
+helpers = runpy.run_path(str(OUT / 'diagnose_existing_history.py'), run_name='diagnostic_helpers')
+from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5
+from core.pit_optimizer_v5.contracts import ArtifactRefV5, canonical_sha256_v5
+from core.pit_optimizer_v5.operations import CampaignLaunchV5, _authorities
+from core.pit_optimizer_v5.cli import _controller_lease_id_v5
+from core.pit_optimizer_v5.manifest import authenticate_campaign_manifest_v5
+from core.pit_optimizer_v5.development_preparation import load_development_config_v5
+from core.pit_optimizer_v5.memory import ResourceLeasePayloadV5
+from core.pit_optimizer_v5.production_workspace import LocalGitWorkspaceDriverV5
+from core.pit_optimizer_v5.workspace import WorkspaceRootsV5
+from core.pit_optimizer_v5.production_fs import acquire_absolute_directory_v5, directory_child_absent_v5
+from core.pit_optimizer_v5.production_sandbox import (
+    LocalSandboxMountFactoryV5, LocalContainerExecutorV5, ExecutionReservationRecordV5,
+    ExecutionControlRecordV5, ExecutionCleanupRecordV5, _directory_identity,
+)
+
+root = OUT.parent / 'runtime-04'
+before = helpers['archive_snapshot'](root)
+repo = LocalArtifactRepositoryV5(root)
+manifest_sha = '8fcae0423117f3a234e64391c277bd7efe5cbb775ff61ec879d8cbeb5659d37c'
+authenticated = authenticate_campaign_manifest_v5(repository=repo, manifest_ref=ArtifactRefV5('campaigns/development-controller-two-rounds-20260907-04/manifest.json', manifest_sha))
+authorities = _authorities(authenticated)
+manifest = authorities.manifest
+launch = repo.load_typed_state(namespace='campaign-launch', key=manifest.sha256, value_type=CampaignLaunchV5, repair=False)
+config = load_development_config_v5(repo, authorities, launch.adapter_config_ref)
+rounds = []
+for round_index in (1, 2):
+    executions = repo.verify_candidate_execution_index(campaign_id=manifest.campaign_id, round_index=round_index)
+    first = repo.load_typed_state(namespace='container-reservation', key=executions[0].command_sha256, value_type=ExecutionReservationRecordV5, repair=False)
+    owner = first.owner
+    assert owner.campaign_id == manifest.campaign_id and owner.round_index == round_index
+    assert owner.owner_token_sha256 == launch.owner_token_sha256
+    assert owner.controller_lease_id == _controller_lease_id_v5(manifest_sha256=manifest.sha256, round_index=round_index, owner_token_sha256=launch.owner_token_sha256)
+    driver = LocalGitWorkspaceDriverV5(roots=WorkspaceRootsV5(config.source_root, config.workspace_root), source_commit=manifest.source_commit, git_executable=Path(config.git_executable), repository=repo, owner=owner, export_mode=config.export_mode)
+    mounts = LocalSandboxMountFactoryV5(manifest=manifest, evaluator_contract=authorities.evaluator_contract, sandbox_profile=authorities.sandbox_profile, owner=owner, workspace_driver=driver, data_root=Path(config.data_root), output_root=Path(config.output_root), repository=repo)
+    executor = LocalContainerExecutorV5(manifest=manifest, sandbox_profile=authorities.sandbox_profile, owner=owner, mount_factory=mounts, docker_executable=Path(config.docker_executable), control_root=Path(config.control_root), repository=repo)
+    leases = []
+    for event in repo.load_round_events(campaign_id=manifest.campaign_id, round_index=round_index):
+        payload = repo.load_round_payload(event.payload_ref, expected_kind=event.event_kind)
+        if type(payload) is ResourceLeasePayloadV5:
+            leases.append(driver.authenticate_lease_history(payload))
+    current = {
+        'domain': 'pit-optimizer-v5-local-container-executor-v1', 'manifest_sha256': manifest.sha256,
+        'sandbox_profile_sha256': authorities.sandbox_profile.sha256, 'owner_sha256': owner.sha256,
+        'mount_factory_sha256': mounts.mount_identity_sha256, 'docker_executable_identity': executor._docker_identity,
+        'control_root_identity': _directory_identity(executor._control_root, executor._control_root_info),
+        'control_environment': executor._base_environment, 'runtime_contract': helpers['runtime_contract'](),
+        'repository_root_identity_sha256': repo.root_identity_sha256,
+    }
+    assert canonical_sha256_v5(current) == executor.executor_identity_sha256
+    items = []
+    with acquire_absolute_directory_v5(executor._control_root, expected_identity=(executor._control_root_info.st_dev, executor._control_root_info.st_ino)) as access:
+        correct_control_digest = executor._control_root_identity(access)
+        for authority in executions:
+            command = authority.command_sha256
+            reservation = repo.load_typed_state(namespace='container-reservation', key=command, value_type=ExecutionReservationRecordV5, repair=False)
+            ready = repo.load_typed_state(namespace='container-control-ready', key=command, value_type=ExecutionControlRecordV5, repair=False)
+            cleanup = repo.load_typed_state(namespace='container-cleanup', key=command, value_type=ExecutionCleanupRecordV5, repair=False)
+            absent = repo.load_typed_state(namespace='container-cleanup-container-absent', key=command, value_type=ExecutionCleanupRecordV5, repair=False)
+            output_source = mounts.authenticate_output_history(authority)
+            items.append({
+                'command_sha256': command, 'stage': authority.key.stage,
+                'stored_executor_sha256': reservation.executor_identity_sha256,
+                'current_executor_sha256': executor.executor_identity_sha256,
+                'command_binding_matches': reservation.command_sha256 == command == canonical_sha256_v5({'request_sha256': authority.request_sha256, 'argv': reservation.command_argv}),
+                'request_binding_matches': reservation.request_sha256 == authority.request_sha256,
+                'owner_binding_matches': reservation.owner == owner and authority.owner_token_sha256 == launch.owner_token_sha256,
+                'output_mount_authenticated': output_source in tuple(state.workspace_identity_sha256 for state in leases),
+                'saved_control_root_identity_sha256': ready.control_root_identity_sha256,
+                'current_control_record_identity_sha256': correct_control_digest,
+                'control_root_matches_same_encoding': ready.control_root_identity_sha256 == correct_control_digest,
+                'docker_identity_matches': ready.docker_executable_identity_sha256 == canonical_sha256_v5(executor._docker_identity),
+                'saved_executor_cross_records_match': reservation.executor_identity_sha256 == ready.executor_identity_sha256 == cleanup.executor_identity_sha256 == absent.executor_identity_sha256,
+                'cleanup_owner_matches': cleanup.owner_sha256 == absent.owner_sha256 == owner.sha256,
+                'control_transaction_absent': directory_child_absent_v5(access, reservation.control_relative_path),
+            })
+    rounds.append({'round_index': round_index, 'workspace_lifecycles': [state.lifecycle for state in leases], 'current_identity_recomputed_exactly': True,
+                   'current_component_digests': {key: canonical_sha256_v5(value) for key, value in current.items()}, 'executions': items})
+after = helpers['archive_snapshot'](root)
+report = {'supersedes': 'Only current-verifier-evidence.json control_root_matches and cross-encoding control-root comparison; its actual summary results remain valid.',
+          'correction': 'Executor constructor and control-ready records use different control-root hash encodings. Matching comparisons must use _control_root_identity for ready records.',
+          'rounds': rounds, 'archive_unchanged': before == after, 'full_historical_authentication_claimed': False}
+with (OUT / 'component-comparison-corrected.json').open('x', encoding='utf-8') as stream:
+    json.dump(report, stream, indent=2)
+    stream.write('\n')
+print(json.dumps({'archive_unchanged': report['archive_unchanged'], 'rounds': [{'round_index': r['round_index'], 'executions': len(r['executions']), 'control_roots_all_match': all(i['control_root_matches_same_encoding'] for i in r['executions']), 'all_other_record_checks_pass': all(all(v for k,v in i.items() if isinstance(v,bool)) for i in r['executions'])} for r in rounds]}))

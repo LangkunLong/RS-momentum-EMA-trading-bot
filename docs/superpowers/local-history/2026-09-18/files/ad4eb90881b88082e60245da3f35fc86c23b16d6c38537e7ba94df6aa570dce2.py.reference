@@ -1,0 +1,56 @@
+"""Acquire cutoff-calibrated SIP reference series using existing production helpers."""
+from dataclasses import asdict
+from datetime import date
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+ROOT = Path.cwd()
+sys.path.insert(0, str(ROOT))
+from core.alpaca_pit_backfill import ProviderIdentity, load_alpaca_credentials, fetch_alpaca_sip_snapshot, fetch_alpaca_sip_raw_calibration, _derive_cutoff_split_factors, _apply_cutoff_split_factors
+from export_pit_prices import _expected_trading_days
+
+def main():
+    output = ROOT / '.artifacts/pit-optimizer-v5/data/acquisition/raw/alpaca-references'
+    output.mkdir(parents=True, exist_ok=False)
+    symbols = ('IWM', 'QQQ', 'SPY')
+    start, end = date(2020, 1, 2), date(2025, 12, 31)
+    sessions = _expected_trading_days(start, end)
+    identities = {symbol: ProviderIdentity(symbol, symbol, end, start, end, True) for symbol in symbols}
+    key, secret = load_alpaca_credentials(ROOT.parent.parent / '.env')
+    common = dict(membership_symbol_count=0, start=start, end=end, expected_trading_days=sessions, api_key=key, secret_key=secret, identities=identities)
+    split = fetch_alpaca_sip_snapshot(symbols, output_path=output / 'sip-split.csv', **common)
+    print(json.dumps({'stage': 'split_snapshot', 'rows': split.row_count, 'sessions_per_reference': len(sessions)}), flush=True)
+    raw = fetch_alpaca_sip_raw_calibration(symbols, output_path=output / 'sip-raw.csv', **common)
+    print(json.dumps({'stage': 'raw_calibration', 'rows': raw.row_count}), flush=True)
+    factors = _derive_cutoff_split_factors(split.path, raw.path, symbols)
+    adjusted = output / 'references-cutoff.csv'
+    _apply_cutoff_split_factors(split.path, factors, adjusted)
+    def snapshot(value):
+        return {key: str(item) if isinstance(item, Path) else item for key, item in asdict(value).items()}
+    provenance = {
+        'schema_version': 1,
+        'source_kind': 'Alpaca_SIP_daily_split_snapshot_with_RAW_cutoff_factor_calibration',
+        'admission_status': 'reference_material_only_pending_complete_tradable_union_and_price_provenance_composition',
+        'reference_roles': {'SPY': 'sp500_non_tradable_reference', 'QQQ': 'nasdaq100_non_tradable_reference', 'IWM': 'russell2000_non_tradable_reference'},
+        'start_date': start.isoformat(), 'end_date': end.isoformat(),
+        'identity_asof': end.isoformat(), 'adjustment_cutoff': end.isoformat(),
+        'split_snapshot': snapshot(split), 'raw_calibration': snapshot(raw),
+        'cutoff_factors': factors, 'factor_tail_size': 20, 'minimum_matching_days': 5,
+        'sessions_per_reference': len(sessions), 'all_three_reference_calendars_exact': True,
+        'sha256_by_file': {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in (split.path, raw.path, adjusted)},
+        'source_sha256_by_path': {path: hashlib.sha256((ROOT / path).read_bytes()).hexdigest() for path in ('core/alpaca_pit_backfill.py', 'export_pit_prices.py')},
+        'credential_persisted': False,
+    }
+    with (output / 'acquisition.json').open('x', encoding='utf-8', newline='\n') as stream:
+        json.dump(provenance, stream, indent=2, sort_keys=True)
+        stream.write('\n')
+    print(json.dumps({'reference_acquisition': 'complete', 'cutoff_factors': factors, 'files': list(provenance['sha256_by_file'])}), flush=True)
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as error:
+        print(json.dumps({'acquisition_failed': True, 'error_type': type(error).__name__}), flush=True)
+        raise SystemExit(2) from None

@@ -1,0 +1,11 @@
+--- admission-p4/review-freeze-01/development_preparation.py
++++ core/pit_optimizer_v5/development_preparation.py
+@@ -99,7 +99,7 @@
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+-class ProviderDevelopmentAdapterConfigV5:
++class ProviderDevelopmentAdapterConfigV5:
+     schema_version: int
+     campaign_manifest_sha256: str
+     repository_root_identity_sha256: str

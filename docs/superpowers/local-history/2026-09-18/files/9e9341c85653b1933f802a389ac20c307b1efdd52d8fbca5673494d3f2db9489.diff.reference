@@ -1,0 +1,211 @@
+# Review package: 9450d157811e91cfac172aba7aa661108e00ebad..1e5fc0b1701d0ffc4ccc764822f15e85d0f80139
+
+## Commits
+1e5fc0b fix: enforce nested market context authority
+
+## Files changed
+ core/strategy_policy/contracts.py | 24 +++++++++++++++++---
+ core/strategy_policy/entry.py     |  3 ++-
+ tests/test_strategy_policy.py     | 47 +++++++++++++++++++++++++++++++++++----
+ 3 files changed, 66 insertions(+), 8 deletions(-)
+
+## Diff
+diff --git a/core/strategy_policy/contracts.py b/core/strategy_policy/contracts.py
+index 0091e09..9b0d904 100644
+--- a/core/strategy_policy/contracts.py
++++ b/core/strategy_policy/contracts.py
+@@ -192,28 +192,46 @@ class MarketContextV1(_CanonicalContract):
+         for name in (
+             "breadth_above_50_fraction",
+             "breadth_50_coverage_fraction",
+             "breadth_above_200_fraction",
+             "breadth_200_coverage_fraction",
+             "rs_at_least_80_fraction",
+             "rs_coverage_fraction",
+         ):
+             _unit_fraction(getattr(self, name), name)
+         _number(self.median_rs_score, "median_rs_score")
+-        for name in (
++        covered_counts: dict[str, int] = {}
++        for coverage_name in (
+             "breadth_50_coverage_fraction",
+             "breadth_200_coverage_fraction",
+             "rs_coverage_fraction",
+         ):
+-            covered = float(getattr(self, name)) * self.active_constituent_count
++            covered = float(getattr(self, coverage_name)) * self.active_constituent_count
+             if not math.isclose(covered, round(covered), abs_tol=1e-9):
+-                _fail(name)
++                _fail(coverage_name)
++            covered_counts[coverage_name] = round(covered)
++        for coverage_name, fraction_name in (
++            ("breadth_50_coverage_fraction", "breadth_above_50_fraction"),
++            ("breadth_200_coverage_fraction", "breadth_above_200_fraction"),
++            ("rs_coverage_fraction", "rs_at_least_80_fraction"),
++        ):
++            covered_count = covered_counts[coverage_name]
++            fraction = float(getattr(self, fraction_name))
++            numerator = fraction * covered_count
++            if (
++                (covered_count == 0 and fraction != 0.0)
++                or not math.isclose(numerator, round(numerator), abs_tol=1e-9)
++                or not 0 <= round(numerator) <= covered_count
++            ):
++                _fail(fraction_name)
++        if covered_counts["rs_coverage_fraction"] == 0 and self.median_rs_score != 0.0:
++            _fail("median_rs_score")
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class EntrySnapshot(_CanonicalContract):
+     market: MarketContextV1
+     technical_only: bool
+     require_proper_base: bool
+     c_score: float | None
+     a_score: float | None
+     n_score: float | None
+diff --git a/core/strategy_policy/entry.py b/core/strategy_policy/entry.py
+index 9b52ecf..3627afe 100644
+--- a/core/strategy_policy/entry.py
++++ b/core/strategy_policy/entry.py
+@@ -18,20 +18,21 @@ def evaluate_entry(snapshot: EntrySnapshot) -> EntryDecision:
+     blocking_codes = list(snapshot.technical_blocking_reasons)
+     if not snapshot.technical_only:
+         for code in (
+             _threshold_code(snapshot.current_growth, 0.25, "current_growth_unavailable", "current_growth_below_threshold"),
+             _threshold_code(snapshot.annual_growth, 0.25, "annual_growth_unavailable", "annual_growth_below_threshold"),
+             _threshold_code(snapshot.rs_score, 80.0, "rs_score_unavailable", "rs_score_below_threshold"),
+             _threshold_code(snapshot.entry_composite_score, 70.0, "composite_score_unavailable", "composite_score_below_threshold"),
+         ):
+             if code is not None:
+                 blocking_codes.append(code)
++    regime_allows_entries = snapshot.market.oneil_regime != "correction"
+     market_permitted = (
+         (not snapshot.require_bullish_market or snapshot.market_is_bullish or snapshot.cash_deployment_override)
+-        and (not snapshot.use_stateful_regime_gate or snapshot.regime_allows_entries)
++        and (not snapshot.use_stateful_regime_gate or regime_allows_entries)
+     )
+     return EntryDecision(
+         qualified=not blocking_codes,
+         market_permitted=market_permitted,
+         rank=(snapshot.canslim_score, snapshot.rs_score),
+         blocking_codes=tuple(blocking_codes),
+     )
+diff --git a/tests/test_strategy_policy.py b/tests/test_strategy_policy.py
+index 2956b98..7c75559 100644
+--- a/tests/test_strategy_policy.py
++++ b/tests/test_strategy_policy.py
+@@ -485,20 +485,24 @@ def test_contract_collections_must_be_tuples(factory, field: str, value: object)
+     """Break caught: caller mutation could alter a policy fact after validation."""
+     with pytest.raises(ValueError, match=field):
+         factory(**{field: value})
+ 
+ 
+ @pytest.mark.parametrize(
+     ("factory", "field", "value"),
+     [
+         (_market_context, "oneil_regime", "moonshot"),
+         (_market_context, "benchmarks", tuple(reversed(_market_context().benchmarks))),
++        (_market_context, "breadth_50_coverage_fraction", 0.905),
++        (_market_context, "breadth_above_50_fraction", 0.605),
++        (_market_context, "breadth_above_200_fraction", 0.551),
++        (_market_context, "rs_at_least_80_fraction", 0.405),
+         (_entry_snapshot, "canslim_score", math.nan),
+         (_entry_snapshot, "rs_score", math.inf),
+         (_capacity_snapshot, "cash_fraction", True),
+         (_allocation_snapshot, "entry_open", True),
+         (_exit_snapshot, "current_close", math.inf),
+     ],
+ )
+ def test_contracts_reject_invalid_enums_nonfinite_and_bool_numbers(factory, field: str, value: object) -> None:
+     """Break caught: malformed scalar facts could cross the trusted-policy boundary."""
+     with pytest.raises(ValueError, match=field):
+@@ -509,24 +513,39 @@ def test_closed_deserializer_rejects_unknown_keys_and_transport_types() -> None:
+     """Break caught: JSON transport could smuggle non-contract data into policy code."""
+     raw = json.loads(_entry_snapshot().to_canonical_json())
+     raw["symbol"] = "AAPL"
+     with pytest.raises(ValueError, match="unknown"):
+         EntrySnapshot.from_canonical_json(json.dumps(raw))
+     for hidden in (date(2026, 8, 27), Path("secret"), lambda: None, {"bad": "mutable"}):
+         with pytest.raises(ValueError):
+             _entry_snapshot(c_score=hidden)
+     zero = _market_context(
+         breadth_above_50_fraction=0.0,
++        breadth_50_coverage_fraction=0.0,
+         breadth_above_200_fraction=0.0,
++        breadth_200_coverage_fraction=0.0,
++        median_rs_score=0.0,
+         rs_at_least_80_fraction=0.0,
++        rs_coverage_fraction=0.0,
+     )
+     assert zero.breadth_above_50_fraction == 0.0
++    with pytest.raises(ValueError):
++        _market_context(
++            breadth_50_coverage_fraction=0.0,
++            breadth_above_50_fraction=0.01,
++        )
++    with pytest.raises(ValueError, match="median_rs_score"):
++        _market_context(
++            rs_coverage_fraction=0.0,
++            rs_at_least_80_fraction=0.0,
++            median_rs_score=1.0,
++        )
+ 
+ 
+ def test_contracts_reject_oversized_tuples_and_candidate_fill_prices() -> None:
+     """Break caught: unbounded or executable-price payloads could escape sandbox limits."""
+     with pytest.raises(ValueError, match="technical_blocking_reasons"):
+         _entry_snapshot(technical_blocking_reasons=tuple("x" for _ in range(33)))
+     with pytest.raises(TypeError):
+         ExitAction(
+             "close",
+             None,
+@@ -563,24 +582,44 @@ def test_entry_technical_only_bypasses_fundamentals_and_institutional_unavailabi
+             require_bullish_market=False,
+         )
+     )
+     assert decision.qualified is True
+     assert decision.market_permitted is True
+     assert decision.rank == (None, None)
+     assert decision.blocking_codes == ()
+ 
+ 
+ def test_entry_stateful_regime_gate_blocks_only_when_enabled() -> None:
+-    """Break caught: a disabled regime gate could still suppress valid entries."""
+-    enabled = evaluate_entry(_entry_snapshot(use_stateful_regime_gate=True, regime_allows_entries=False))
+-    disabled = evaluate_entry(_entry_snapshot(use_stateful_regime_gate=False, regime_allows_entries=False))
+-    assert enabled.market_permitted is False
++    """Break caught: the gate could ignore nested regime authority or run while disabled."""
++    correction = evaluate_entry(
++        _entry_snapshot(
++            market=_market_context(oneil_regime="correction"),
++            use_stateful_regime_gate=True,
++            regime_allows_entries=True,
++        )
++    )
++    pressure = evaluate_entry(
++        _entry_snapshot(
++            market=_market_context(oneil_regime="under_pressure"),
++            use_stateful_regime_gate=True,
++            regime_allows_entries=False,
++        )
++    )
++    disabled = evaluate_entry(
++        _entry_snapshot(
++            market=_market_context(oneil_regime="correction"),
++            use_stateful_regime_gate=False,
++            regime_allows_entries=False,
++        )
++    )
++    assert correction.market_permitted is False
++    assert pressure.market_permitted is True
+     assert disabled.market_permitted is True
+ 
+ 
+ def test_capacity_baseline_preserves_uncapped_and_finite_configuration() -> None:
+     """Break caught: baseline policy could turn the uncapped default into a hidden cap."""
+     assert recommend_capacity(_capacity_snapshot(configured_max_positions=None)) == CapacityDecision(None, True)
+     assert recommend_capacity(_capacity_snapshot(configured_max_positions=4)) == CapacityDecision(4, True)
+ 
+ 
+ def test_eviction_prefers_underwater_then_lowest_rs_and_requires_capacity() -> None:

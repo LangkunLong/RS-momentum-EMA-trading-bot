@@ -1,0 +1,48 @@
+# Independent review — Increment C-a
+
+Spec compliance: **PASS for the read-only diagnostic increment**. Section 10 permits a concrete diagnosis and narrow proposed correction when the original execution context cannot be reconstructed. This package establishes that condition and retains B4c acceptance and the campaign-readiness hold. It does not establish successful runtime-04 full historical verification.
+
+Diagnostic/design quality: **diagnosis accepted; design changes required before H2/H3 implementation approval**. The per-round authority boundary is defensible. Two details below must be made explicit before implementation; neither requires production changes in C-a.
+
+## Scope and independent checks
+
+Reviewed `package-review.diff`, the current diagnosis/design including their added per-round confirmation paragraphs, the completed `authority-trace-report.md`, `principal-round-config-anchors.json`, both diagnostic helper sources as text, and the relevant saved JSON evidence. This is the complete C-a package review, including the delegated authority trace, not a dirty-branch review.
+
+Source inspection covered the config loader and round launch derivation, the actual summary/resource verifier seam, typed-state read behavior, executor identity construction, the two control-root encodings, and the existing execution-history predicates. No tests, summary helpers, evaluator, campaign, Docker, credentials, environment-value reads, external calls, source edits, historical writes, or Git operations were performed. This review wrote only this report.
+
+An independent standard-library read/hash comparison established:
+
+- All 18 protected source files still match the package's initial hashes.
+- All 579 runtime-04 and 83 actual06 files in the saved before inventories still match their recorded hashes. This checks current preservation against those inventories; it does not independently recreate the earlier observation time.
+- All 27 actual06 returned-summary fields equal the B4c returned `summarize` summary, comparing the four Decimal-valued fields numerically. Status remains failed and lifecycle/evaluated-feedback/rejected counts remain 0/0/0.
+- Both round entry/started state-authority references lead to bytes with the named hashes; entries agree after removing only start time and starts are positive. Config hashes are `64b620c9add71ae02877d0126b81cf1ff6f5f452b4ffd1385c289124a83cca69` and `df2264692b1ce5a673122366c8f5b341c963cd58206151981f0d0ccf5d50a180`. Their executor digests equal all five reservation digests per round and the corresponding ready/cleanup/absent records.
+
+These independent raw-file checks corroborate the package's existing typed authentication; they are not mislabeled as an independent execution of the typed semantic verifier. The recorded 56-file evaluator map digest is `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4`; this reviewer did not rerun its helper.
+
+## Findings
+
+### [P2] Define supported historical semantics without an unavailable runtime-contract selector
+
+Location: `historical-verification-design.md:45`, with the authority limit at `authority-trace-report.md:74-77` (final report SHA-256 `20161707686abdba2320ce00e67474fdd6cd5690ca44d99d218db9da3b6d2c2f`).
+
+The design promises that an unsupported runtime-contract interpretation fails closed, but supplies no authenticated selector for determining that interpretation. `DevelopmentAdapterConfigV5` stores the whole executor digest and schema version, not a contract version or preimage (`development_preparation.py:56-84`); the runtime-contract literal exists only inside the executor composite (`production_sandbox.py:1519-1556`). The trace correctly establishes that the manifest commit does not authenticate the host module set that ran. Consequently the config digest can establish expected saved provenance, but cannot determine whether the original host used today's contract literal. As written, an implementer could either infer unsupported compatibility from schema version 5 or reject runtime-04 despite the proposed acceptance milestone.
+
+Required correction: define the reader as validating explicitly recognized serialized record schemas and the specified command/phase/output semantics under a reviewed historical interpretation, using the per-round config only to pin provenance. State explicitly that historical host-contract equality is not proven. Define rejection for records outside that supported interpretation, without inventing a historical contract selector. Alternatively, if host-contract equality is required, identify its missing authority as an unresolved blocker. The first option fits the package's stated narrow reporting scope.
+
+### [P2] Carry the no-repair boundary through reused role authentication
+
+Location: `historical-verification-design.md:31,43,53`.
+
+H2 requires every state read to use `repair=False`, while H3 preserves the existing controller/paid-role authentication without specifying its read-mode propagation. A concrete existing transitive path is `authenticate_controller_packages_v5` → `_authenticate_controller_request`: the campaign-launch and campaign-round-started reads omit `repair=False` (`development_preparation.py:343-354,377-390`). `load_typed_state` defaults to repair and can write an authority index for an otherwise authentic orphan (`artifacts.py:1914-1974`). Thus reusing that path unchanged could repair incomplete history instead of failing closed. Complete real archives and passing before/after hashes do not exercise the missing-index branch.
+
+Required correction: make the completed-history read-only guarantee apply to the entire summary call graph, including reused controller and paid-role authentication, and require scoped read-mode propagation or explicitly read-only entry points. Preserve operational defaults for existing callers. Include static inspection of all transitive state reads in the later verification checkpoint; do not add synthetic records or execute negative branches under the current restrictions. The concrete controller path above must be included in that scope.
+
+## Accepted evidence and boundaries
+
+The actual runtime-04 failure chain matches the source: `summary.py:265` reaches `development_preparation.py:409`, then a newly constructed executor in `cli.py:943-969`, then the foreign-executor check at `production_sandbox.py:1813-1829`. Its reservation command matches and executor digest differs. This is an actual failed full summary, separate from the successful actual06 returned summary.
+
+The original incorrect control comparison is correctly superseded. `_directory_identity` hashes canonical path/device/inode (`production_sandbox.py:195-203`); `_control_root_identity` hashes path plus identity tuple (`production_sandbox.py:2001-2007`). The first diagnostic compares unlike encodings. The corrected helper uses the latter for ready records and the former for exact constructor-payload recomputation. The saved corrected comparisons agree with all ten actual ready records. They do not authenticate deeper phases, outputs, panel inputs or cleanup counts, and the package appropriately declines that stronger claim.
+
+The saved config authority is independent of the reservations: `operations.py:494-521` derives/saves each round config before its round entry, and `operations.py:528-566` binds its started state. `load_development_config_v5` checks the exact typed config reference, manifest and repository identity (`development_preparation.py:283-291`); typed reads validate canonical bytes/schema and state-authority edges (`artifacts.py:1914-1974,2571-2599`). This supports the proposed expected historical executor digest within the repository's existing authority model. It does not prove original environment values, host-code preimages or present execution capability.
+
+Keeping the default current-runtime mode, selecting history explicitly only for summary, retaining live foreign-owner/capability guards, requiring per-round configs, and preserving round 2's failed outcome are appropriate. H2's planned reservation/panel/phase/terminal/output/control/cleanup checks closely track `production_sandbox.py:4004-4196`; their implementation and nonmutation remain future work. The acknowledged missing environment and host preimages do not justify a PATH-drift conclusion. No campaign-readiness or two-evaluated-round milestone is approved by this review.

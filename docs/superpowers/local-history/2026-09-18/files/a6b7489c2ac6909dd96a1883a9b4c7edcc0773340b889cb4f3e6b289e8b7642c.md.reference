@@ -1,0 +1,17 @@
+# Increment C-a: original saved authority trace
+
+Worktree: C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-v5-architecture
+
+Read this brief first. Trace only the real provider-free runtime-04 campaign development-controller-two-rounds-20260907-04. Its full summary failed at LocalContainerExecutorV5._load_reservation(repair=False): command digest matched, stored/current executor digests differed. Do not assume PATH drift or corruption.
+
+Deliverable: authority-trace-report.md in this same fresh package. Include exact local references, checked SHA-256 values, source function/line references, and a table of saved identity component evidence versus unavailable original context. Authenticate referenced artifacts with existing typed read APIs where safe; inspect source for side effects first. Hash-only evidence must not be mislabeled as semantic authentication.
+
+Follow authenticate_development_history_v5 in core/pit_optimizer_v5/development_preparation.py through saved CampaignLaunchV5, adapter config, owner/mount/executor authority. Find original saved launch/environment/host metadata and execution helpers. Inspect helpers as text only. Search only core/pit_optimizer_v5, relevant docs, and .artifacts/pit-optimizer-v5/development/runtime-04 plus directly referenced real artifacts; bounded nearby development metadata searches are allowed when provenance points there. Never read tests or unrelated sessions.
+
+Original manifest relative to runtime-04: campaigns/development-controller-two-rounds-20260907-04/manifest.json, SHA 8fcae0423117f3a234e64391c277bd7efe5cbb775ff61ec879d8cbeb5659d37c.
+Stored executor SHA: 2849cde885cc8bdde38230bc77ecd17163db42db1b071cc5a8a4212ce4601444.
+Prior principal executor SHA: a72e22fc6deeb4b23f65d82ef32abb148fea4ea6db5efecf26c4391e31605bb9.
+
+Constraints: no tests read/created/modified/run; no synthetic candidates, records, events, probes, mocked objects or fabricated authority. No credentials, .env, API/model/external calls, evaluations, campaign run/resume/poll/cleanup/reconciliation, Docker commands, source edits, environment changes, commits or Git manipulation. Preserve old artifacts byte-for-byte. Never dump environment values or owner tokens. Record digests and equality results only. No subagents. Do not run a full summary (principal owns the one current reproduction). Write only your named report in this new package. If you need an auxiliary diagnostic output, request a distinct filename from the principal first.
+
+Return compact status, report path, most important finding and unresolved evidence. Do not implement a correction.

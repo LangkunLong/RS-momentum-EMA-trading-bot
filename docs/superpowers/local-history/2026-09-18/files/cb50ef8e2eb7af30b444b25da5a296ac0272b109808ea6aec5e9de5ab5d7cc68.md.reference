@@ -1,0 +1,23 @@
+# Task 2 fix-round re-review
+
+## Finding Verdicts
+
+1. **RESOLVED — exact current-session opens for queued exits and evictions.** `core/backtest_engine.py:4239-4247` now retains a due `PendingPolicyExit` unless `exact_session_row` contains a finite, positive `Open`; the stale-close helper is no longer used at this fill boundary. `core/backtest_engine.py:3521-3533` separately revalidates the selected V5 eviction against its exact-session `Open` and returns `None` before any portfolio mutation when that open is missing or invalid. The legacy/non-fill valuation path remains unchanged.
+
+2. **RESOLVED — same-session friction-crossed stops execute in phase 5.** `core/backtest_engine.py:4277-4284` now closes every non-`None` stop resolution, including `gap_stop`. Phase 2 has already removed opening-gap stops on pre-open holdings before phase-4 entries, so the remaining `gap_stop` case is the newly opened position whose fill-derived stop is already above the reference open; removal from `_open_positions` prevents a second close.
+
+3. **RESOLVED — reported friction reconciles exactly to rounded cash movement.** `core/backtest_fills.py:170-192` allocates an integer-cent total across the raw commission, spread, and impact weights. `core/backtest_fills.py:213-244` derives that total directly from rounded `cash_delta` versus rounded reference notional, so the component sum shares the same accounting boundary. `core/backtest_engine.py:4588-4598` independently verifies the emitted total against cash friction and fails closed on disagreement. This covers the prior sub-cent case without changing cash accounting.
+
+4. **RESOLVED — V5 fill evidence is isolated from legacy result schema.** `core/backtest_engine.py:657-662` moves `fill_log` and `fill_cost_totals` into the `SimulationResultV5` subtype. Live results select the subtype and add those fields only under V5 at `core/backtest_engine.py:2541-2560`; completed resumes do the same at `core/backtest_engine.py:3063-3090`. Legacy simulator state now keeps an empty internal cost map at `core/backtest_engine.py:1829-1832` and `core/backtest_engine.py:2605-2608`, while the returned legacy dataclass retains its original field set.
+
+## New Breakage in Fix Diff
+
+None found. The exact-open checks occur before eviction mutation, the widened phase-5 stop condition cannot double-close positions removed in phase 2, the cent allocator preserves a non-negative exact total, and `SimulationResultV5` remains a `SimulationResult` subtype for existing consumers.
+
+## Out-of-Scope Observations
+
+None. Review was limited to `review-bd73459..d323846.diff`, the appended fix report, and line-accurate inspection of the modified regions supporting the four verdicts. No git, provider, Docker, replay, or test command was run.
+
+## Verdict
+
+**PASS — Task 2 fix round accepted.** All four prior Important findings are resolved, with no new blocking or non-blocking issue found in the fix diff.

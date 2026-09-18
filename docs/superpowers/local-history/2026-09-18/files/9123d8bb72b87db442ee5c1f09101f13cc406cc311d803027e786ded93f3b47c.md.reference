@@ -1,0 +1,40 @@
+# Task 1 report — pure fill and friction primitives
+
+## Status
+
+Implemented `core/backtest_fills.py` only. No tests were created or modified, per the controller ruling and user override.
+
+## Checks
+
+Commands run from the task worktree:
+
+```text
+python -B -c "...deterministic fill/stop smoke checks..."
+smoke: pass
+
+python -B -c "...invalid-input smoke checks..."
+invalid-input smoke: pass
+
+python -B -m ruff check core/backtest_fills.py
+All checks passed!
+
+python -B -m py_compile core/backtest_fills.py
+(no output; exit code 0)
+
+git diff --check
+(no output; exit code 0)
+```
+
+## Edge-case evidence
+
+- Zero-friction BUY and SELL fills produce exact reference execution prices and signed cash deltas.
+- A long stop with `open_price=91`, `low_price=89`, `stop_price=95` resolves to `StopReference(kind="gap_stop", price=91)`.
+- An exact intraday touch (`open_price=100`, `low_price=95`, `stop_price=95`) resolves at the stop price.
+- A 2 bps half-spread plus 3 bps impact produces BUY `100.05` and SELL `99.95` from a `100.0` reference; SELL proceeds for ten shares are `999.50`.
+- Commission is charged in cash accounting (10 bps on a 1,000 notional produces a 1.00 commission).
+- Boolean numerics, negative basis points, unknown sides, non-finite prices, and non-positive prices/quantities are rejected.
+- Execution prices retain full floating-point precision; currency/accounting fields are rounded only when constructing the final fill record.
+
+## Review
+
+The implementation is opt-in and standalone: it does not alter the legacy backtest engine or provider/replay paths. `FrictionScenario`, `StopReference`, and `ExecutionFill` are frozen slotted dataclasses; stop resolution follows the causal opening-gap-before-intraday rule.

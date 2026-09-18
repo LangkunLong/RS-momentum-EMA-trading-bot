@@ -1,0 +1,39 @@
+# P4 and combined admission review brief
+
+Review P4 against the campaign-admission design/plan, then perform the final broad P1-P4 admission review. This does not repeat the accepted H1-H3/B4c reviews of unrelated preexisting changes. User authorized subagent development. No commits exist for these increments, so exact retained preimages are the diff authority.
+
+## Inputs at source freeze
+
+- Binding design: docs/superpowers/specs/2026-09-08-pit-optimizer-v5-campaign-admission-design.md
+- P4 plan: docs/superpowers/plans/2026-09-08-pit-optimizer-v5-campaign-admission.md
+- P4 preparation notes and task-report.md, actual-task.diff, frozen source authority, static/protection evidence in this directory.
+- combined-admission.diff will cover new campaign_admission.py against original absence; runtime/provider against admission-p2 principal-preimages; operations/cli against admission-p3 principal-preimages; development_preparation/historical_verification against admission-p4 principal-preimages. Read the frozen task and combined diffs; focused unchanged dependencies only for named risks. No Git baseline substitution.
+- Prior P1/P2/P3 independent reviews and exact freeze evidence are available in sibling increment directories. Carry unresolved/deferred issues explicitly if any.
+
+## Binding global constraints
+
+- Work only in the existing `codex/pit-optimizer-v5-architecture` worktree. Do not reset, stash, clean, rebase, switch, commit or push.
+- No tests may be read, created, modified or run. No synthetic requests, outcomes, records, probes, mocks or fake future coverage.
+- No credentials, environment value dumps, provider/API/model calls, Docker/evaluation execution, image rebuild, campaign launch or new historical bindings during this subplan.
+- Preserve all 579 runtime-04 and 83 actual06 archive files and the 56-file evaluator closure `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4`.
+- Historical typed-state reads use `repair=False` transitively. No operational adapter, capability, nonce, clock or migration in completed-history verification.
+- Preserve existing dataclass fields/defaults, canonical digest domains, default legacy behavior, original owners/configs/deadlines and source newline bytes outside approved spans.
+- Static verification only until full source review: scoped Ruff, in-memory compile, source/AST/diff/hash inspection. No py_compile, imports for probes or test discovery.
+- C-c limits: target 2 evaluated rounds, 3 attempts, 8 calls, 600000 tokens, 75000 prospective total tokens per role, 8192 max output, zero retries/repair, one hypothesis/axis/variant/survivor, no source escape.
+- Preserve honest provider overage/failure accounting. No invented denied package or round outcome. Distinct operational stop reasons do not alter summary schemas/count formulas.
+- Each implementer saves exact preimages and narrow diffs under the proposal evidence directory; freezes source before independent review. Full actual summaries are deferred until P4 review, once each in a fresh package.
+
+
+## P4 task scope
+
+Optional admission integration occurs after the completed-history path authenticates its own original provenance, full round/resource/request/execution/reservation census, actual role history and immutable projection. Preserve its existing public None return and legacy absence behavior. Share immutable composition without public recursion or duplicate ledger/boundary logic. Explicit expected-policy entry requires enrollment and exact pin; it cannot substitute caller authority. Return new data-only compliance report with actual evaluated rounds/usage/final policy decision, logical-prefix eligibility, stored epoch scope and the explicit limitation that global publication timestamps are unavailable.
+
+Every actual enrolled request must satisfy the prospective envelope, and every started round must be eligible against its authenticated logical prior prefix and original stored deadlines. Reject unfinished publication, gaps, foreign/orphan selected state, post-target or insufficient-reserve admissions. Current-round roles use original admission. Actual provider overage or higher-precedence terminal failure remains historical fact; the final policy decision is not a claim of campaign success. No wall clock or operational construction in historical composition.
+
+## Combined P1-P4 risks
+
+Verify whole end-to-end path: immutable exact policy contracts and selected value/index census; conservative total-token and optional finite-USD arithmetic; three factory guards before request persistence; native ledger guard before reservation with exact call-slot binding; original owner/root/config/start/deadlines and logical prior prefix; enrollment/freshness and narrow interrupted binding publication; resume discovery/pinning; policy checks before next config/start and after reused/new settlements; global later-start/failure/cleanup precedence; historical optional/explicit pin compliance and transitive repair=False. Preserve old shapes/defaults/digest domains, legacy paths and summary formulas. Distinguish source proof from unexecuted positive-policy behavior.
+
+## Output and execution boundary
+
+Write independent-review.md with separate P4 spec and quality verdicts plus combined admission assessment, exact findings with file:line references and evidence limitations. No production edits or subagents. Do not execute real or synthetic readers, campaigns, tests or providers. Source approval is prerequisite to the separately static-reviewed actual historical collector; the collector does not run in this review. The principal will later pin this report SHA and exact source authority before the two real immutable summaries. Keep this approval report frozen afterward; actual results and readiness belong in separate reports.

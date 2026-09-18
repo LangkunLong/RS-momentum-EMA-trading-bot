@@ -1,0 +1,97 @@
+# Task 11 Final Senior Code Review
+
+## Verdict
+
+**FAIL — no Critical findings, five Important findings, and no Minor findings.**
+
+The implementation has strong foundations and does not appear to optimize the strategy or intentionally change the default entry/exit rules. It is not ready to close, however, because several production edge paths can make the effective-policy or provenance record materially untruthful, and the baseline/artifact authentication boundary is not consistently bound to the exact bytes later parsed.
+
+## Snapshot and review basis
+
+- The byte size and SHA-256 of all 13 scoped files matched `final-review-package.md` before review and again on the final snapshot rehash.
+- The working-tree scope matched the package. The absence of Task 11 commits is intentional and was not treated as a defect.
+- I read the specification, implementation plan, recovery ledger, all 13 scoped production/documentation files (complete untracked files and complete tracked diffs against `515cb1e50d051e2ee4253603608f2fd3920004bc`), and the available named task reports/reviews.
+- Per the user's explicit constraint, I did not run tests, backtests, provider/network commands, downloads, or optimizer operations. The accepted evidence was checked logically against the implementation but was not re-executed.
+- CANSLIM is correctly treated as the design basis. Supported thresholds, weights, and gates may be future optimizer candidates; causal PIT, execution, data, accounting, and truthful-observability rules are invariants. This review does not require exact CANSLIM fidelity as a hard optimization constraint.
+
+## Critical
+
+None.
+
+## Important
+
+### 1. The advertised industry-filter optimizer candidate can reintroduce non-PIT data into a PIT run
+
+**Evidence:** `core/engine_policy.py:293-307` advertises `industry_group_filter_enabled` and its mode as active tunable policy and marks the feature as an optimizer candidate. `core/backtest_engine.py:1419-1421` derives the safe default only at construction. The run path captures the policy at `core/backtest_engine.py:1533` without rejecting an incompatible enabled value, and `core/backtest_engine.py:1675-1679` then loads the live/current industry map whenever the mutable boolean is true.
+
+**Why this matters:** A caller—or the future optimizer the policy explicitly anticipates—can enable the gate on a PIT simulator. The engine will truthfully report the requested setting but then mix a current/provider industry map into the historical run. That crosses a causal data invariant even though the default path remains safe.
+
+**Fix:** Derive and validate the effective value at the same immutable-policy boundary as the other mode-dependent settings. Reject industry-filter enablement before any data access for PIT and technical-only runs unless a causal, as-of industry source is supplied. Advertise it as an optimizer candidate only in modes where its data source satisfies the invariant.
+
+**Confidence:** 9/10.
+
+### 2. Completed-checkpoint restore does not bind the embedded result policy to the live verified policy
+
+**Evidence:** `core/backtest_engine.py:2178` verifies the simulator's live policy, but `core/backtest_engine.py:2189-2198` accepts `checkpoint["result_config"]` after checking only the requested advisory floors. `core/backtest_engine.py:2219-2225` returns that mapping in `SimulationResult.config` without recomputing its embedded effective-policy digest or requiring its policy object and digest to equal the simulator's stored live-verified policy.
+
+**Why this matters:** The checkpoint fingerprint binds the current simulator policy, not the separately mutable `result_config` payload. A locally modified or stale completed checkpoint can therefore retain a valid fingerprint while returning a normal `SimulationResult` whose published policy configuration does not describe the engine that was verified. PIT baseline publication adds a later check, but ordinary checkpoint restoration has no equivalent protection.
+
+**Fix:** Require a mapping-shaped result configuration, recompute and validate its embedded policy digest, and require the embedded policy object/digest to equal the simulator's live stored policy object/digest before returning a completed checkpoint result.
+
+**Confidence:** 9/10.
+
+### 3. The C evaluator fallback discards a known prior period/public date and misclassifies unavailable prior values
+
+**Evidence:** In `core/canslim/c_current_earnings.py:152-178`, the fallback can encounter a valid current observation whose fiscal match reports `matched=True`, yet return only the current period/value with `NO_VISIBLE_OBSERVATION`. `core/canslim/c_current_earnings.py:212-234` then forces the trace's prior period, prior value, and prior public date to `None`. By contrast, `core/canslim/fiscal_periods.py:26` defines a match by a non-null prior period, and the selector retains the prior period/value at `core/canslim/fiscal_periods.py:146-147` even when that value is missing or non-finite.
+
+**Why this matters:** This is reachable when the newest current value is valid and a unique comparable prior-period column exists, but its SQLite value is `NULL`/NaN. The legacy scalar result remains `None`, so scalar parity is preserved, but the new provenance loses an actually selected prior period/public date and reports an availability reason inconsistent with the plan's `nonfinite_prior_value` semantics.
+
+**Fix:** Carry the matched prior period and raw prior value through the fallback, attach both public dates whenever the periods are known, and classify a matched missing/non-finite prior value as `NONFINITE_PRIOR_VALUE`. Reserve no-comparable/no-visible reasons for cases where no prior period was actually matched.
+
+**Confidence:** 9/10.
+
+### 4. Baseline and artifact authentication reopen live paths instead of binding validation to one byte snapshot
+
+**Evidence:** `core/pit_diagnosis/baseline.py:412-446` hashes the manifest and artifacts, then reparses them through fresh pathname opens in the helpers at `core/pit_diagnosis/baseline.py:567-581`. The semantic checks include permissive subset/range validation such as `core/pit_diagnosis/baseline.py:709-716`. Reproduction comparison again reopens paths at `core/pit_diagnosis/baseline.py:512-517` and `core/pit_diagnosis/baseline.py:748-766` without binding those reads to the recorded digests. The path helper at `core/pit_diagnosis/baseline.py:539-564` also resolves the path after checking only the final directory component, erasing lexical ancestor reparse information before the later lstat/open sequence.
+
+`core/pit_diagnosis/task11_artifact_diagnosis.py:259-272` improves content integrity by hashing the exact spooled bytes it parses, so noncanonical artifact contents cannot be accepted without a digest collision. However, its run path has already been resolved, and `core/pit_diagnosis/task11_artifact_diagnosis.py:866-903` performs final-component checks separately from the later open. An ancestor junction or leaf swap can therefore redirect the open to an unbounded, remote, or device source before the hash rejects it. The C/A command's manifest-declared bundle and sidecars use a stronger lexical, descriptor-bound primitive at `core/pit_diagnosis/task11_ca_provenance.py:769-896`, but the initial run manifest and signal inputs still inherit the baseline boundary.
+
+**Why this matters:** In the baseline verifier, a post-hash replacement can pass the subset semantic validation while the returned snapshot continues to claim the canonical hashes. Later replacement can also alter or pass comparison. In artifact diagnosis, the digest prevents a forged accepted aggregate, which keeps this below Critical, but the command can still read from a source that violates the required regular-file, bounded-byte, non-reparse boundary.
+
+**Fix:** Centralize the hardened lexical component validation and descriptor-bound snapshot primitive. Open once without resolving away caller-supplied lexical components, validate every component and the opened file identity/type, enforce the byte limit while reading, then hash and parse that same immutable byte snapshot. Carry bound snapshots or verified identities into reproduction comparison instead of reopening live paths.
+
+**Confidence:** 10/10.
+
+### 5. The effective-policy taxonomy over-attests fundamental causality and misclassifies supported strategy policy
+
+**Evidence:** `core/engine_policy.py:211-215` unconditionally emits `fundamental_visibility = public_on_or_before_evaluation_date` as a causal invariant sourced from the PIT bundle. That statement is not mode- or strategy-aware: opaque injected custom strategies can supply their own current/annual scalar calculations, normal provider mode is not sourced from the PIT bundle, and technical-only mode does not consume fundamentals. The later custom-strategy envelope correctly acknowledges opaque internals at `core/engine_policy.py:396-424`, so the unconditional causal claim contradicts the declared attestation scope.
+
+Separately, `core/engine_policy.py:476-486` labels C/A metric-family priority as a non-candidate causal invariant even though it is a supported strategy-selection policy, not a PIT/execution/data/accounting invariant. `core/engine_policy.py:275-279` reports the supported `proper_base_required` gate as active tunable policy but marks it `optimizer_candidate=False`, despite the binding distinction that supported CANSLIM-derived gates may be future optimizer candidates.
+
+**Why this matters:** The policy digest is internally stable, but it can authenticate statements the engine cannot prove for the active source/strategy and can incorrectly freeze strategy choices as causal invariants. That undermines the core purpose of the observability contract and conflicts with the clarified objective semantics: causal safeguards are fixed; supported strategy thresholds, weights, and gates are candidates for future return/drawdown optimization.
+
+**Fix:** Make fundamental visibility and source attestation mode-aware: distinguish built-in PIT, normal provider/as-of handling, technical-only non-use, and opaque custom strategy behavior. Treat custom fundamental internals as unattested unless the custom strategy implements a verifiable provenance contract. Reclassify C/A metric-family priority as supported strategy policy rather than a causal invariant, and mark the supported proper-base gate as an optimizer candidate. Regenerate the expected canonical policy digest/counts after those taxonomy changes.
+
+**Confidence:** 9/10.
+
+## Minor
+
+None.
+
+## Strengths
+
+- The shared C/A evaluator cores preserve legacy scalar return behavior while adding opt-in trace provenance. The accepted sealed reconciliation evidence is consistent with the code's common-core design and reports zero aggregate/scalar mismatches.
+- The bytes-backed PIT factory authenticates immutable bytes before query-only in-memory deserialization, shares the schema/integrity initializer with the ordinary path, and closes resources on error.
+- The sealed C/A diagnostic protects aggregate privacy and avoids emitting raw security identities. Its manifest-declared bundle/sidecar input primitive is a strong model for the remaining source-boundary work.
+- Effective policy is canonicalized, digested, and live-drift checked at multiple high-value lifecycle boundaries. Inert request rejection, actual scale-tier reporting, risk-sizing metadata, and fresh-result/PIT-publication bindings are substantial improvements.
+- The documentation correctly distinguishes CANSLIM as the design basis from the later return/drawdown optimizer objective, and it makes no claim that this phase optimized or improved performance.
+- No unintended default strategy entry/exit change was found in the reviewed diff. The normal provider and ordinary PIT paths retain their existing scalar strategy behavior, and the relative-path CLI correction is narrow.
+
+## Readiness assessment
+
+**Not ready for Task 11 closure.** Resolve the five Important findings and perform a focused re-review of the affected contracts. No Critical defect was found, and the issues are concentrated in mode/restore/provenance/source-boundary truthfulness rather than an intentional strategy optimization or default entry/exit rewrite.
+
+## Evidence limitations
+
+- `final-review-package.md` names `task-3-fix2-review.md`, but the snapshot contains only `task-3-fix2-review-package.md`. I reviewed the available package completely. This is an evidence-package completeness issue, not a production finding or snapshot mismatch.
+- Tests were intentionally deferred by the user. Their absence was not treated as a defect, and this report does not claim that tests passed.

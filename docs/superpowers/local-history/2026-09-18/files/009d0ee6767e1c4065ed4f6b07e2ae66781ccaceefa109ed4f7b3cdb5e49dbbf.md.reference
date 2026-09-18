@@ -1,0 +1,13 @@
+# Principal H3 integration sequence
+
+Principal accepts read-only-design.md as the integration direction, with explicit source review before activating completed_history. It identifies the previously hidden archive-projection policy-source repair path and covers provider-free and paid role verification without operational adapters. Preserve the current CLI and current_runtime default; historical reporting is initially direct API only.
+
+Ruling: Implement H3 in three bounded increments (controller response classifier, paid immutable ledger reader, then projection and historical-summary integration) with independent source review after each — each extraction has an independently auditable boundary and integration depends on both — cost if wrong is review overhead, without weakening authority requirements.
+
+- H3a: controller_roles.py pure classifier; development_preparation.py explicit existing-response controller authentication with repair=False at both authority reads. Preserve _sealed and live invoke/reconcile behavior. No activation.
+- H3b: production_provider.py shared immutable ledger verification/classification and dedicated historical entry; no operational ledger/gateway construction or nonce. Constructor and lifecycle operations remain byte-identical. No activation.
+- H3c: development_preparation.py, historical_verification.py, summary.py, and only the two archive-projection methods in production_runtime.py. Add explicit completed_history API scope, forward repair=False at actual projection authority reads, and orchestrate original-round/resource/role/record/checkpoint/archive verification. Preserve summary fields/formulas/current defaults. Review before real summary execution, then run one full summary per actual archive and compare old fields/new counts under complete before/after archive hashes.
+
+H3c must make the complete state-enumeration rule concrete before coding: authenticated indexed launches/starts/events and pending role/execution state cannot be ignored behind a prior cleanup. Use real stored metadata and immutable repository APIs; do not fabricate future rounds or completed wrappers. Empty execution rounds still verify original configs and actual role provenance. Future unstarted slots may be absent; durable pending authority cannot count as completed history.
+
+No tests or synthetic cases, external calls, campaigns, credentials, image rebuilds, commits, or historical artifact modifications. All evaluator-covered source remains protected. Every task keeps exact preimage/diff, static callgraph and typed-state repair audit, protected-method bytes, Ruff/in-memory compile, evaluator map and real complete archive preservation. Existing-only evidence limits remain explicit.

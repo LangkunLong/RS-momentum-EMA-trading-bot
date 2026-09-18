@@ -1,0 +1,152 @@
+# SDD ledger — plan: docs/superpowers/plans/2026-08-31-adaptive-oneil-optimizer-core-loop.md
+
+## Execution context
+
+- Worktree: `C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/adaptive-oneil-optimizer-core-loop`
+- Branch: `codex/adaptive-oneil-optimizer-core-loop`
+- Starting commit: `380594dcd936d91d9129190e5df54525cb8b3d0d`
+- Spec: `docs/superpowers/specs/2026-08-31-adaptive-oneil-optimizer-core-strategy-design.md`
+- User override: do not add test files or new test functions; update existing fixtures/assertions only.
+- Provider boundary: no OpenRouter call before Task 11; Task 11 is limited to its approved six-call/two-iteration/448,000-token/apply=false/zero-retry contract.
+
+## Preflight rulings
+
+1. Schema v3 stays readable for audit only. All new resumable/runtime behavior is schema v4; old scores and identities are never reinterpreted.
+2. `PIT_NON_TRADABLE_REFERENCE_SYMBOLS` uses canonical provenance order `(IWM, QQQ, SPY)`, while `MarketContextV1.benchmarks` deliberately uses policy presentation order `(SPY, QQQ, IWM)`. Conversion is explicit; neither order is inferred from the other.
+3. “Three calls per complete iteration” means three declared plan slots. A recoverable invalid investigator may settle author/critic slots as authenticated skips; skips consume zero calls and no usage.
+4. The only rank/return gate is quantized absolute portfolio CAGR. Drawdown, trades, Sharpe, turnover, baseline delta, and other values remain diagnostics and integrity evidence only.
+5. Task 4 owns qualification-ledger initialization, authentication, immutable snapshot, and retired-lineage exclusion. Task 9 extends the same contract with reservation/outcome mutation; it must not fork a second ledger model.
+6. Qualification-plan contents remain separate and unavailable to search roles/controller. Search sees only its commitment.
+7. Task 8 may import candidate source/checkpoint state but must remint identity and reevaluate under a changed plan; old evaluation scores never seed a new champion directly.
+8. Task 10 may use the plan's data-only Alpaca SIP reference backfill, but makes no OpenRouter calls. Task 11 is the only live role-call task.
+9. S&P-only qualification/canary results are architecture evidence. `full_replay_ready` remains false until a separate authenticated S&P/Nasdaq/Russell constituent bundle exists.
+10. No tracked candidate policy source is applied, no full replay starts, and no Git push/upload occurs in this execution plan.
+11. User speed override (2026-09-01): production-first implementation; no test-first design, no broad per-task suites, and no prolonged review cycles absent a concrete blocker. Use focused smoke checks and short scoped reviews. Provider accounting, credential/data secrecy, causal evaluation integrity, disposable execution, `apply=false`, and zero retries remain non-negotiable correctness boundaries.
+
+## Internal consistency scan
+
+| Task | Internal check | Ruling |
+|---|---|---|
+| 1 | Exact three-reference set, schema-v2 bundle, lineage IDs, and legacy read path | Consistent; preserve `symbols()` only as compatibility alias until Task 2. |
+| 2 | Tradable/reference/context separation across every strategic caller | Consistent; migrate callers before relying on the alias removal. |
+| 3 | One causal context across entry/risk/exit and pending-entry timing | Consistent; signal-session context is carried to next-open actions, completed-session context serves exits. |
+| 4 | Continuous panels, absolute CAGR, sealed qualification commitment, allocator | Consistent; no short-fold CAGR aggregation and no auxiliary performance gate. |
+| 5 | Schema-v4 manifest, parent identity, complete three-source response | Consistent; finite byte/token sizing is operational, not a change-size or USD constraint. |
+| 6 | Atomic three-file validation and rollback | Consistent; all validation precedes publication and v3 diff readers remain isolated. |
+| 7 | Accounted invalid output and zero-charge plan skips | Consistent; transport or uncertain accounting remains terminal and retries remain zero. |
+| 8 | Champion plus one refinable branch and durable cross-run state | Consistent; durable decision/checkpoint precedes live-state mutation and cleanup. |
+| 9 | One-use retrospective qualification | Consistent; reserve before evaluation, never feed results back, never start replay. |
+| 10 | Provider-free bundle/parity regeneration | Consistent; fresh no-clobber local artifact root and clean tracked checkout required. |
+| 11 | Authorized six-slot/two-iteration canary | Consistent; actual calls may be fewer only through authenticated skips; stop before qualification/replay. |
+
+## Cross-task shared-file/interface scan
+
+| Pair | Shared file/interface | Ordering/compatibility ruling |
+|---|---|---|
+| 1→2 | `PITDataBundle` symbol/reference APIs | Task 2 consumes the compatibility-preserving Task 1 API. |
+| 1→3 | Sealed reference prices and canonical reference set | Context builder requires all three histories but presents its own explicit benchmark order. |
+| 1→4 | Security lineage and source affiliation | Panel identity uses authenticated `chain_id`, never ticker text. |
+| 1→9 | Bundle lineage/provenance in retirement domain | Retirement domain excludes bundle/date/seed identities and uses stable lineage namespace. |
+| 1→10 | Export/build/verify bundle path | Regeneration occurs only after Task 1 contracts land. |
+| 1→11 | Authenticated bundle/reference readiness | Canary cannot open provider capability without exact reference completeness. |
+| 2→3 | `core/backtest_engine.py`, `tests/test_backtest_engine.py` | Task 2 separates symbols; Task 3 then threads causal context without restoring reference tradability. |
+| 2→4 | `core/pit_optimization.py` and evaluator universe composition | Continuous panels contain tradables only; full membership plus references remains context-only. |
+| 2→8 | `core/pit_optimization.py`, `agent_loop.py` | v4 controller composition must retain explicit tradable/reference/context sets. |
+| 2→9 | `pit_optimizer_holdout.py`, `core/pit_optimization.py`, `agent_loop.py` | Detached qualification uses the same reference exclusion. |
+| 2→10 | Baseline/parity universe setup | Provider-free parity must prove references never become holdings. |
+| 2→11 | Live evaluator composition | Readiness binds separated universe identities. |
+| 3→4 | Production result/context feeding parity/evaluation | CAGR comes from the production result; context completeness is integrity evidence, not score. |
+| 3→5 | Policy interface version 2 in run/source contracts | Manifest must bind interface v2 and nested market context. |
+| 3→6 | Typed-contract AST allowlist | Permit only the new context contracts; keep the purity boundary unchanged. |
+| 3→8 | Policy runtime consumed by controller evaluators | Parent/candidate evaluation uses identical interface-v2 context. |
+| 3→9 | Qualification evaluator | Same causal context and production formula as discovery. |
+| 3→10 | Interface-v2 parity | Baseline behavior must remain byte-equivalent on equivalent fixtures. |
+| 3→11 | Model-authored source/evaluator path | Canary author code may use market context only through the trusted typed input. |
+| 4→5 | `core/pit_optimizer_evaluation.py`, `tests/test_pit_optimizer_v2.py` | Role/manifest contracts reference closed v4 panel/target types. |
+| 4→6 | Panel-plan identity and shared candidate tests | Candidate identity binds discovery-plan digest, not legacy fold manifest. |
+| 4→7 | Shared optimizer-v2 assertions | Accounting changes must not reinterpret panel evidence. |
+| 4→8 | `core/pit_optimization.py` and controller evaluation interfaces | Champion comparison uses only quantized discovery CAGR. |
+| 4→9 | Evaluation types, optimizer composition, shared tests | Qualification decision reuses target/formula but never discovery feedback. |
+| 4→10 | Panel-plan and parity CLI | Task 10 exercises the exact Task 4 provider-free commands. |
+| 4→11 | Discovery plan, target, performance evidence | Canary never loads the separately stored qualification plan. |
+| 5→6 | `core/pit_optimization_contract.py` and shared tests | Author source map and selected-parent identity are the candidate validator inputs. |
+| 5→7 | Contract plus shared role/accounting tests | Invalid role output is content-free and distinct from an accepted role artifact. |
+| 5→8 | Parent/role contracts consumed by controller | Parent is selected and authenticated before every iteration. |
+| 5→9 | Target/checkpoint contracts used by qualification | Qualification loads frozen champion state, not role-visible history. |
+| 5→10 | v4 readiness contract | No provider capability opens during bundle/parity regeneration. |
+| 5→11 | Live prompts/response schemas | Exact three-file closed response and finite call budgets are bound before authorization. |
+| 6→7 | Shared contract/candidate tests | Schema-invalid provider output must never reach candidate materialization. |
+| 6→8 | Candidate identity/source bundle consumed by controller | Controller persists locally derived cumulative diff only after atomic validation. |
+| 6→9 | Frozen-candidate reconstruction | Qualification reauthenticates source/diff and reconstructs in a disposable checkout. |
+| 6→10 | Provider-free source validation checks | Verification must leave tracked policy source unchanged. |
+| 6→11 | Author-to-candidate path | Canary proves all three complete files traverse the atomic validator. |
+| 7→8 | Artifacts, `agent_loop.py`, shared loop tests | Attempts/skips are indexed by plan slot and survive durable checkpoint reporting. |
+| 7→9 | Artifacts, readiness, `agent_loop.py`, shared tests | Qualification requires closed/reconciled provider accounting but performs no calls. |
+| 7→10 | Focused verification set | Account/skip integrity is checked provider-free before canary. |
+| 7→11 | Live authorization ledger | Six slots are finite; invalid accepted responses count, skips do not. |
+| 8→9 | Artifacts, optimizer composition, checkpoint, shared tests | Only authenticated champion can qualify; active branch is refused. |
+| 8→10 | Checkpoint/readiness verification | Imported state is reconstructed and re-evaluated when identities change. |
+| 8→11 | Live controller and checkpoint | Iteration 2 receives iteration 1 feedback/selected parent after durable transition. |
+| 9→10 | Provider-free qualification/readiness checks | Task 10 validates code and sealed commitment without consuming qualification. |
+| 9→11 | Qualification commitment in readiness | Canary proves unopened state and ends with `qualification_started=false`. |
+| 10→11 | Local bundle/panels/parity artifact identities | Task 11 uses only the exact readiness-emitted command and fresh Task 10 artifacts. |
+
+## Task progress
+
+Baseline verification before Task 1: compile and Ruff passed; `tests/test_pit_data.py tests/test_export_pit_prices.py` reported 30 passed, 1 skipped. Pre-existing environment noise: unsupported pytest `cache_dir` option and third-party `websockets.legacy` deprecation.
+
+Task 5 exact focused-selection baseline at `3481c73`: 64 passed, 22 failed, 266 deselected. The 22 failures were present before Task 5 edits and match documented stale schema-v3/USD/interface fixtures plus unrelated selected-test mismatches; Task 5 verification must compare against this base and not claim those failures as regressions or chase them outside scope.
+
+| Task | Status | Base | Head | Implementer report | Review | Fix rounds |
+|---|---|---|---|---|---|---|
+| 1 | complete | `380594dcd936d91d9129190e5df54525cb8b3d0d` | `6455d4f` | `.superpowers/sdd/2026-08-31-adaptive-oneil-optimizer-core-loop/task-1-report.md` | initial review found equality gap; fix re-review approved | 1 |
+| 2 | complete | `6455d4f1b74cfaf33ea6cdad66d77d129fb29245` | `75502d4` | `.superpowers/sdd/2026-08-31-adaptive-oneil-optimizer-core-loop/task-2-report.md` | approved after two fix rounds; one Minor test-strength note deferred | 2 |
+| 3 | complete | `75502d435b1ba5b74894c2b055e926dfeaa03cef` | `ec6cae1` | `.superpowers/sdd/2026-08-31-adaptive-oneil-optimizer-core-loop/task-3-report.md` | approved after two fix rounds; checkpoint-docstring Minor deferred | 2 |
+| 4 | complete | `ec6cae1de94ebf9716f0b01d0eb96654d6cb17b6` | `3481c73` | `.superpowers/sdd/2026-08-31-adaptive-oneil-optimizer-core-loop/task-4-report.md` | approved after scoped re-review of same-panel binding and closed v4 loaders | 1 |
+| 5 | complete | `3481c73bee373114737f8be714af67900a0af1b2` | `c2f057d` | `.superpowers/sdd/2026-08-31-adaptive-oneil-optimizer-core-loop/task-5-report.md` | approved after one scoped fix round; no blockers | 1 |
+| 6 | complete | `c2f057d4166fcd0af40166a86fb927f06ebb77a5` | `f30032b` | `.superpowers/sdd/2026-08-31-adaptive-oneil-optimizer-core-loop/task-6-report.md` | approved after one scoped compatibility fix round | 1 |
+| 7 | complete | `f30032b7578e326be7b4cbf67f726d89cda987f6` | `0080d5d` | `.superpowers/sdd/2026-08-31-adaptive-oneil-optimizer-core-loop/task-7-report.md` | approved after one focused fix round | 1 |
+| 8 | complete | `0080d5d465483c2bb228e092da8616cfee473e60` | `220612f` | `.superpowers/sdd/2026-08-31-adaptive-oneil-optimizer-core-loop/task-8-report.md` | compile/Ruff/hooks plus focused settlement-mismatch smoke passed; no provider or Docker calls | 2 |
+| 9 | complete | `220612f` | `0c1aef4` | `.superpowers/sdd/2026-08-31-adaptive-oneil-optimizer-core-loop/task-9-report.md` | compile/Ruff plus focused provider-free reservation/evaluation/outcome smoke passed; no provider, Docker, or replay call | 0 |
+| 10 | complete | `0c1aef4` | `0c1aef4` | `.superpowers/sdd/2026-08-31-adaptive-oneil-optimizer-core-loop/task-10-report.md` | local bundle/panels authenticated; provider-free quick/discovery parity equal; cleanup complete | 0 |
+| 11 | execution | `0c1aef4` | `1bb9fb0` | `.superpowers/sdd/2026-08-31-adaptive-oneil-optimizer-core-loop/task-11-preflight-report.md` | production preflight fix reviewed clean; manifest/readiness/canary pending | 1 |
+
+## Out-of-scope observations for final review
+
+- Task 1 cross-task dependency: Task 4/10 must prove the S&P canary consumes sealed `source_universe=sp500`.
+- Task 1 cross-task dependency: the schema-v4 readiness path in Tasks 5/8 must reject schema-v1 bundles; schema-v1 remains readable only through legacy audit paths.
+- Task 2 verification baseline: `tests/test_pit_optimizer_loop.py` already passed obsolete `max_usd` to `AuthorizationRequirement` at fix base `4259d33`, causing 40 setup failures before the amended evaluator path. Tasks 5/7 must migrate those existing fixtures when updating the v4 authorization contract; do not attribute them to Task 2.
+- Task 3 cross-task dependency: existing `tests/test_pit_optimizer_v2.py` and `tests/test_agent_loop.py` still construct interface-v1 policy fixtures. Tasks 5/8 must migrate those existing fixtures during schema-v4 controller/contract integration.
+- Task 4 staged dependency: Task 8 must replace the live controller's `DiscoveryScore`/fold-ranking path with `PanelAggregateSummary` and `DiscoveryPanelComparison`; the Task 4 file list intentionally defines/evaluates contracts before controller migration.
+- Task 4 staged dependency: Task 9 must replace the detached `HoldoutDecision` path with `QualificationDecision` and exact same-panel evidence. Until Tasks 8/9 land, legacy writers remain temporarily reachable; final state must retire them behind read-only audit loading once v4 entry points replace them.
+
+## Review findings and rulings
+
+- Task 1 fix round 1 (Critical): `build_pit_bundle.py` allowed schema-v2 membership exclusions and `core/pit_data.py` checked only subset membership, so a tradable could be absent from actual price symbols. Ruling: real spec gap; reject non-empty v2 exclusions and enforce exact `price_symbols == tradables ∪ references` in builder and reader while preserving the explicit schema-v1 legacy path.
+- Task 2 fix round 1 (Critical): verification/v4 subset selection still derived from baseline entry-attempt activity. Ruling: real Task 2 Step 3 gap; derive/hash-rank the v4 panel from authenticated tradable membership independent of baseline behavior. `core/pit_optimization_contract.py` may be touched only as needed to remove the legacy-scope equality coupling because the explicit Task 2 interface requirement governs the file-list omission.
+- Task 2 fix round 1 (Important): evaluator/holdout composition computed but discarded distinct tradable, reference, and context universes. Ruling: real gap; carry, validate, and identity-bind all three without implementing `MarketContextV1` behavior.
+- Task 2 minor (deferred to final review): existing subset-reference assertion does not itself inject a reference-bearing v4 panel or prove baseline-independent selection. The no-new-test-functions constraint remains; final review may request an in-place assertion extension if production fixes are not otherwise covered.
+- Task 2 fix round 2 (Critical): round 1 made scope selection independent but removed the parity-selected-universe equality check, allowing replay and manifest universes to diverge. Ruling: restore fail-closed equality now that readiness scope itself is independently derived; old baseline-derived parity artifacts must fail and be regenerated rather than bypassed.
+- Task 3 fix round 1 (Important): `MarketContextV1` permits fractions inconsistent with their covered constituent counts. Ruling: enforce integral covered counts and associated numerators, including zero numerator/fraction for zero coverage, without changing the zero-allowing fraction validator or positive risk validators.
+- Task 3 fix round 1 (Important): baseline entry still uses independent `regime_allows_entries` without reading nested `market.oneil_regime`. Ruling: make the nested regime authoritative (or reject mismatch) using the existing allowed-regime mapping, preserving identical behavior for engine-produced snapshots.
+- Task 3 minor (deferred): update the schema-v3 wording in the checkpoint helper docstring to schema v4 during final polish if not naturally touched by a blocking fix.
+- Task 3 fix round 2 (Important): coverage/numerator integer checks use `math.isclose` with nonzero default relative tolerance, which admits fractional counts at large scale. Ruling: use zero relative tolerance plus the declared small absolute tolerance for exact discrete-count consistency.
+- Task 4 review adjudication (Critical findings on live controller/holdout): deferred by approved task ordering, not waived. `core/pit_optimizer_controller.py` is not a Task 4 file and is explicitly migrated in Task 8; detached qualification is explicitly Task 9. Pulling those integrations forward would collapse plan boundaries and conflict with later task briefs.
+- Task 4 fix round 1 (Important): `QualificationDecision.from_result` accepts unbound scalar candidate/baseline CAGR values and cannot prove same-panel comparison. Ruling: bind both inputs to one authenticated qualification-panel identity, preferably via `PanelAggregateSummary` carrying the panel-spec digest, and reject mismatches.
+- Task 4 fix round 1 (Important): v4 allocation/publication loaders accept omitted defaulted fields or extra marker keys. Ruling: enforce exact key sets for every affected v4 primitive, especially allocation rule/stratum and publication markers, before dataclass construction.
+- Task 4 review adjudication (legacy writers): stage retirement with Tasks 8/9 when replacement v4 live routes exist. Existing v3 artifacts remain non-resumable as v4 throughout; do not break the intermediate branch before its replacement controller/qualification paths are implemented.
+- Task 5 fix round 1 (Critical): v4 role feedback checked only panel purpose, allowing mismatched quick/discovery panel digests, inconsistent target-progress scalars, and selected-parent summaries inconsistent with baseline/champion/branch state. Ruling: bind quick/discovery panel identities from the authenticated `DiscoveryPanelPlan` into the v4 role context and cross-validate all summaries, progress values, and deterministic selected-parent-kind mapping.
+- Task 5 fix round 1 (Important): `PolicyAuthoringScopeV4` declared feedback/history byte caps but no v4 role path consumed them. Ruling: make budget validation scope-aware, reject infeasible declared component envelopes, and enforce actual canonical feedback/history component sizes in addition to the total dynamic cap.
+- Task 5 fix round 1 (Important): `RoleOutputInvalidSummary` lacked iteration/plan-slot identity and invalid-author critic inputs could carry contradictory candidate panels. Ruling: bind the content-free summary to the exact author plan slot/iteration, require it to match the critic iteration, reject candidate evidence on invalid author output, and require complete quick/discovery evidence for a valid candidate result.
+- Task 5 fix round 1 (Important): v4 requested provider `json_schema` despite the existing routed DeepSeek/OpenRouter compatibility boundary using `json_object`, while local parsers did not enforce the tighter published 256/96-character bounds. Ruling: request generic JSON objects, retain versioned schemas as local documentation, and make closed local parsing enforce the exact declared bounds.
+- Task 6 fix round 1 (Critical): `validate_candidate_diff` was changed to emit the schema-v4 parent/discovery-panel identity shape, breaking byte-for-byte schema-v3 candidate identity reconstruction used by archived holdout evidence. Ruling: preserve the exact legacy schema-v3 identity serialization/digest on the legacy diff path and issue the new parent/panel-bound identity only from `validate_candidate_sources`, using separate schema-aware identity canonicalization as needed.
+- Task 7 fix round 1 (Important): controller-input authorization binding discarded every predecessor attempt with `payload is None`, so a fully reconciled schema-invalid author could never authorize its planned critic. Ruling: bind the accepted investigator plus either an accepted author payload or the exact accounted invalid-author attempt; in the invalid branch require the critic's author payload/manifest to be absent and bind a content-free `RoleOutputInvalidSummary` to the attempt's iteration, call index, role, and validation code.
+- Task 8 fix round 1 (Critical): retained champion/branch materialization reissued a parent identity from returned sources without checking the retained cumulative-diff/source identities, and could leak a workspace when summary authentication failed before the iteration `try/finally`. Ruling: authenticate reconstructed diff and exact three-source bundle against retained state before role projection, and dispose every partially materialized workspace on all exception paths.
+- Task 8 fix round 1 (Critical): imported seed state was assigned to live state before seed artifacts and the initial checkpoint were durable, while result reporting hard-coded `checkpoint_present=true`. Ruling: construct seed state prospectively, persist seed artifacts and atomic checkpoint first, then mutate live state; report checkpoint presence only from a successful durable write.
+- Task 8 fix round 1 (Critical): schema-v4 CLI dispatch/config helpers were defined but not called by `_execute_cli_run`, no production v4 live-service builder existed, and the v4 controller had no authorization-lease finalization boundary. Ruling: add an actual schema-v4 execution branch that prepares readiness, composes candidate/evaluator/gateway/authorization/artifact services, dispatches the controller, closes and verifies the lease/audit/accounting outcome, and never falls through to the generic non-optimizer path.
+- Task 8 fix round 2 (Critical): v4 finalization marked itself started and validated `supplied == settled` before entering lease closure, so a durably reconciled attempt rejected before controller-state insertion could make finalization raise and leave the one-shot lease open. Ruling: validate in a guarded block and close exactly once in `finally`, using terminal code `failed` whenever finalizer consistency checks fail.
+- Task 11 preflight (load-bearing): schema-v4 preparation can publish readiness, but `main()` only renders and exits successfully for schema-v3 readiness; additionally, Windows checks out the three policy files as CRLF while the live v4 loader requires LF. Ruling: the user-directed production-first speed override permits the smallest tracked CLI/line-ending fixes before the canary, with compile/lint and scoped review but no new tests; the completed v4 parity evidence remains valid because it binds panel outputs and executable policy behavior, not Git metadata. Cost if wrong: the canary could fail before a provider call and require a fresh readiness attempt.
+- Task 11 preflight (plan/path conflict): the plan places runtime/controller/output roots under the ignored canary directory, while `LoopConfig` forbids all three from overlapping source and sealed inputs. Ruling: use three separate local temporary roots for live execution, then preserve the audited result under ignored local `.artifacts`; no upload or remote side effect. Cost if wrong: initialization fails closed before provider capability opens.
+- Task 11 review ruling (generic run length): the reviewer requested hard-coded two-iteration/six-call/448,000-token checks inside the generic schema-v4 command renderer. Ruling: do not hard-code the one canary's size into the reusable renderer because Task 5 and the approved architecture explicitly require finite run lengths beyond two; keep exact equality among manifest authorization, gate config, and rendered limits, and independently audit the Task 11 manifest as exactly 2/6/448,000 before execution. Cost if wrong: a differently minted manifest could emit a different valid command, but it cannot consume this canary's manifest-bound authorization grant.
+- Task 11 fix round 1/5 (2 addressed, 0 open — removed nonexistent v4 config validation call; bound both panel-plan ledger snapshots before command emission; commit `1bb9fb0`). Scoped re-review found no new Critical or Important breakage.
+- Task 11 pre-first-call context fix: iteration-1 failed locally because schema-v4 budget validation treated legacy feedback/history/source allocations as hard partitions even though the complete canonical payload fit the authenticated per-call cap; generic exception handling then mislabeled the rejection as sandbox failure, and the CLI later dereferenced a nonexistent v4 `exit_code`. Ruling: the exact transmitted canonical dynamic payload is authoritative; legacy allocations remain advisory. Fix: removed component-partition rejection, added typed static/dynamic context-overflow classification as `budget_exhausted`/`context_budget_exhausted`, preserved that terminal in the v4 runner, and derived the CLI exit from v4 status without changing the public schema.

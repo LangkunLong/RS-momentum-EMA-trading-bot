@@ -1,0 +1,37 @@
+[
+  {
+    "addition": "MRNA",
+    "effective_date": "2021-07-21",
+    "matched": true,
+    "official_announcement_url": "https://press.spglobal.com/2021-07-15-Moderna-Set-to-Join-S-P-500",
+    "removal": "ALXN"
+  },
+  {
+    "addition": "NDSN",
+    "effective_date": "2022-02-15",
+    "matched": true,
+    "official_announcement_url": "https://www.spglobal.com/spdji/en/documents/indexnews/announcements/20220210-1449702/1449702_xlnx5.pdf",
+    "removal": "XLNX"
+  },
+  {
+    "addition": "BG",
+    "effective_date": "2023-03-15",
+    "matched": true,
+    "official_announcement_url": "https://press.spglobal.com/2023-03-13-Bunge-Set-to-Join-S-P-500",
+    "removal": "SBNY"
+  },
+  {
+    "addition": "KKR",
+    "effective_date": "2024-06-24",
+    "matched": true,
+    "official_announcement_url": "https://www.spglobal.com/spdji/en/documents/indexnews/announcements/20240607-1472747/1472747_finaljuneshuffle546.pdf",
+    "removal": "RHI"
+  },
+  {
+    "addition": "IBKR",
+    "effective_date": "2025-08-28",
+    "matched": true,
+    "official_announcement_url": "https://press.spglobal.com/2025-08-25-Interactive-Brokers-Group-Set-to-Join-S-P-500%2C-Talen-Energy-to-Join-S-P-MidCap-400-and-Kinetik-Holdings-to-Join-S-P-SmallCap-600",
+    "removal": "WBA"
+  }
+]

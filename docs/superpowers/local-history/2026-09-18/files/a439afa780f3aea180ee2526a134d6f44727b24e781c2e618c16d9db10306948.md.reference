@@ -1,0 +1,43 @@
+# Corrected optimizer campaign and bounded continuation
+
+Prepared 2026-09-07T17:52:40.375262+00:00. **No new model call is authorized by this document; campaign 03 has not started.**
+
+## Current status
+
+Approved campaign 02 stopped at its first investigator request with SDK BadRequestError, HTTP 400. Cleanup completed; no candidate, evaluator, critic, completed round or checkpoint was produced. The diagnostic did not retain the provider message, so the specific rejected field is unproven. Campaign 01 is also terminal. Neither journal will be restarted or modified.
+
+The compatibility repair adds a shared provider-facing schema projection. It removes uniqueItems and local schema metadata, converts the current disjoint oneOf alternatives to anyOf, and converts string const discriminants to typed enum. The canonical schema, request identities, local uniqueness/binding checks and response parser remain unchanged. Gateway and review preparation share the same projector. Accounting covers the larger of canonical and projected schema bytes, so old bounds do not decrease.
+
+Scoped Ruff, in-memory compilation, root source review and independent review passed. Actual archived investigator requests retain the 10,305 input allowance; an actual archived author schema preserves its default property and all four typed literal branches. The evaluator runtime is unchanged. This is a compatibility fix awaiting real provider acceptance, not a claim that the original 400 is conclusively resolved.
+
+## Proposed approval
+
+Authorize the prepared campaign 03 and **at most one replacement** after an identified and reviewed local controller/provider repair. This bounded continuation avoids requiring a new grant for each repaired failed campaign. Stop after the first successful two-round campaign or when the allowance is exhausted.
+
+- At most **12 additional role calls  and 896,000 total tokens** across these two possible campaigns. Each campaign remains capped at 2 rounds, 6 calls, 448,000 tokens, and 8,192 output tokens per call, one hypothesis and one candidate per round.
+- Model **openai/gpt-5.4** at **https://openrouter.ai/api/v1/chat/completions**. Standard compatible upstream routing; no upstream pin or explicit upstream failover disable.
+- Zero automatic retries and zero schema repair calls. No blind repeat following an uncertain accepted outcome; reconcile existing evidence first. A replacement requires a reviewed local repair and a newly prepared, verified manifest/config/body package before launch.
+- Cost is audited with **no hard USD ceiling**. At the previously verified headline input/output rates, two fully capped campaigns are approximately $3.47; this is advisory arithmetic, not a routed price guarantee. [OpenRouter model pricing](https://openrouter.ai/openai/gpt-5.4).
+- Role 300 seconds; round 2 hours; campaign 4 hours; quick 600 seconds; discovery window 1,200 seconds. One local Docker evaluator at a time, 1 CPU, 1,024 MiB, 32 PIDs, and 64 MiB output. At most 8 hours across two fresh campaigns; do not extend starts/deadlines during recovery.
+- Use the existing OPENROUTER key from the main checkout .env through the reviewed credential wrapper. Never place the key in model messages or logs.
+
+The prior two campaigns each recorded one conservative attempt and 18,497 reserved tokens. They are outside this proposed additional allowance. Across all four possible campaigns, the maximum is 14 attempts and 932,994 accounted/reserved tokens. Prior recorded zero cost is not proof of zero provider billing.
+
+## Outgoing data and fixed local scope
+
+The first exact logical body is [initial-outbound-body.json](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-v5-architecture/.artifacts/pit-optimizer-v5/development/provider-runtime-03/initial-outbound-body.json), 6,093 bytes. It contains 16 aggregate baseline metrics and binding/evidence identifiers, with no strategy source. Conservative input allowance 10,305 plus 8,192 output. [initial-response-schema.json](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-v5-architecture/.artifacts/pit-optimizer-v5/development/provider-runtime-03/initial-response-schema.json) remains the full local authority; [initial-wire-response-schema.json](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-v5-architecture/.artifacts/pit-optimizer-v5/development/provider-runtime-03/initial-wire-response-schema.json) is the provider-facing projection actually sent.
+
+Later roles may send aggregate performance/history/predictions/failures/archive/critic evidence and selected editable policy source/contracts, potentially all four entry.py,risk.py,position.py,exit.py under core/strategy_policy/v3/. No raw dataset, full repository, environment or credential-file content is model input. Later bodies depend on actual preceding results and must fit the same per-campaign and aggregate allowance.
+
+Both possible campaigns use the same provisional S&P 500 development data, disabled_development semantics, policy_only workspace exports, discovery panels and authenticated image pit-optimizer-v5-evaluator@sha256:4e85b19aa8c135362ae8796e4d33a410ec5af650d296c358ae6a7737d5b05b6a. Parent quick and all four discovery baselines are already verified and cleaned; no rebuild or rebaseline is needed. No trading, deployment, source push, data purchase, held-out qualification or full replay is included. Keep AC power and lid open; the sleep guard cannot override explicit lid sleep.
+
+## Exact prepared campaign 03
+
+- Manifest: campaigns/development-provider-two-rounds-20260907-03/manifest.json, SHA 6cd117b97cc62908db0db67946543b2b37b51ad80298e7bc599e72fa6bf0ab96.
+- Adapter config SHA 19e3b572de0bb8c082cc5ee36f0f042b98021c2898b18bcaed137a854efa4fd0.
+- Initial request SHA 3b4dc10f306d3fcc48cd4bfc3848a573f67905725520c35c913bb1af24f74866 (unchanged).
+- Initial logical body SHA 7616b962ba4a922f3f2cc5af07803b2757a828ea404263f86bdb44c3a51fc748.
+- Exact launch argv and source/helper hashes: launch-review.json.
+- Full rules: continuation-allowance-proposal.json. This proposal does not authorize calls by itself.
+
+After actual two-round completion, the principal architect will produce the detailed step-by-step GPT-5.6 Luna implementation handoff requested by the user. The user creates the next session manually. A successful development loop alone is not proof of a profitable or production-qualified strategy.

@@ -1,0 +1,139 @@
+# Review package: 2fc90ad95ac29d3a57c084ff80705c95d07419a2..70a5eb271d7117449027029f93b77cb557aa080e
+
+## Commits
+70a5eb2 fix: reject non-finite computed C/A growth
+
+## Files changed
+ .../2026-08-23-canonical-canslim-entry/progress.md | 13 +++++++++++
+ .../task-4-report.md                               | 27 ++++++++++++++++++++++
+ core/canslim/a_annual_earnings.py                  |  3 ++-
+ core/canslim/c_current_earnings.py                 |  3 ++-
+ 4 files changed, 44 insertions(+), 2 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-23-canonical-canslim-entry/progress.md b/.superpowers/sdd/2026-08-23-canonical-canslim-entry/progress.md
+index b2fb2d7..bc46cb7 100644
+--- a/.superpowers/sdd/2026-08-23-canonical-canslim-entry/progress.md
++++ b/.superpowers/sdd/2026-08-23-canonical-canslim-entry/progress.md
+@@ -195,10 +195,23 @@ Execution order: `1, 2, 3, 4, 5, 6, 7`.
+   `0000034088`. Read-only archive probing proved the present-day
+   `0002115436` current-ticker candidate exists but cannot win; narrow
+   extraction produced 209 XOM normalized rows. The CAH `2021-05-13` bundle
+   probe produced finite-or-missing C/A results.
+ - Compile/import, touched-file Ruff, `git diff --check`, and source-hash
+   before/after checks passed. No unit/broad tests, network activity, or
+   normalized regeneration ran.
+ - **Task 4 remains incomplete:** Step 4 immutable SEC-output/PIT-bundle
+   regeneration is pending completion of the active multi-hour replay and
+   release of shared-machine resources.
++
++### Task 4 — Fix Round 1 (non-completion)
++
++- Review found finite extreme C/A operands could overflow the calculated
++  growth. Both helpers now return computed growth only when finite, preserving
++  every prior input/negative/zero/EPS/fallback rule.
++- Focused direct helper probe passed for finite-input overflow, `NaN`,
++  `+inf`, `-inf`, and the ordinary `1.25/1.0` control in both helpers.
++  Touched-file compile/import, Ruff, and `git diff --check` passed; the
++  immutable CAH `2021-05-13` probe again produced finite-or-missing values
++  with an unchanged bundle hash.
++- **Task 4 remains incomplete:** Step 4 regeneration is pending active replay
++  completion and shared-machine resources.
+diff --git a/.superpowers/sdd/2026-08-23-canonical-canslim-entry/task-4-report.md b/.superpowers/sdd/2026-08-23-canonical-canslim-entry/task-4-report.md
+index 6bffeb8..5949c86 100644
+--- a/.superpowers/sdd/2026-08-23-canonical-canslim-entry/task-4-report.md
++++ b/.superpowers/sdd/2026-08-23-canonical-canslim-entry/task-4-report.md
+@@ -35,10 +35,37 @@ Status: production fixes and narrow probes complete; Task 4 is **not complete**.
+ 
+ - `py_compile` and direct import/finite-growth/XOM-mapping probe passed.
+ - Ruff passed for the three touched production files.
+ - `git diff --check` passed.
+ - No unit, broad, network, or normalized-regeneration run was started.
+ 
+ ## Concern — Step 4 pending active replay completion
+ 
+ Do not begin immutable SEC-output/PIT-bundle regeneration until the active
+ multi-hour replay has completed and shared-machine capacity is available.
++
++## Fix Round 1 — finite computed growth
++
++Independent review identified that finite extreme operands could overflow the
++growth numerator to infinity. Both C/A `_safe_growth` helpers now assign the
++computed quotient and return it only when `np.isfinite(growth)`; all existing
++input, negative-prior, near-zero-prior, EPS-first, and Net-Income fallback
++semantics are unchanged.
++
++Commands and output:
++
++- `python -m py_compile core/canslim/c_current_earnings.py
++  core/canslim/a_annual_earnings.py` — passed.
++- Direct helper probe covering
++  `(-sys.float_info.max, sys.float_info.max)`, `NaN`, `+inf`, `-inf`, and
++  `(1.25, 1.0)` for both C/A helpers —
++  `safe_growth_extreme_nan_inf_and_control_probe=passed`.
++- `python -m ruff check core/canslim/c_current_earnings.py
++  core/canslim/a_annual_earnings.py` — `All checks passed!`.
++- `git diff --check` — passed.
++- Immutable SQLite CAH probe at `2021-05-13` —
++  `cah_2021_05_13=(0.0, None, 0.09999999999999999,
++  -3.771428571428572, -2.064804469273743);
++  bundle_read_only_hash_unchanged=passed`.
++
++Task 4 remains incomplete: Step 4 regeneration is still pending active replay
++completion and shared-machine capacity.
+diff --git a/core/canslim/a_annual_earnings.py b/core/canslim/a_annual_earnings.py
+index a70bc1c..663bb33 100644
+--- a/core/canslim/a_annual_earnings.py
++++ b/core/canslim/a_annual_earnings.py
+@@ -41,21 +41,22 @@ def _safe_growth(current: float, previous: float) -> Optional[float]:
+ 
+     if np.isclose(previous, 0.0):
+         return None
+ 
+     # Reject negative prior-period earnings — transitioning from a loss
+     # to a profit produces misleading growth percentages for CANSLIM.
+     if previous < 0:
+         return None
+ 
+     try:
+-        return (current - previous) / abs(previous)
++        growth = (current - previous) / abs(previous)
++        return growth if np.isfinite(growth) else None
+     except ZeroDivisionError:
+         return None
+ 
+ 
+ def _find_earnings_row(df: pd.DataFrame) -> Optional[str]:
+     """Find the best earnings row label using fuzzy matching.
+ 
+     Priority:
+         1. Basic EPS or Diluted EPS
+         2. Net Income (fallback)
+diff --git a/core/canslim/c_current_earnings.py b/core/canslim/c_current_earnings.py
+index ca7a807..f111f6d 100644
+--- a/core/canslim/c_current_earnings.py
++++ b/core/canslim/c_current_earnings.py
+@@ -31,21 +31,22 @@ def _safe_growth(current: float, previous: float) -> Optional[float]:
+ 
+     import numpy as np
+ 
+     if not np.isfinite(current) or not np.isfinite(previous):
+         return None
+ 
+     if previous < 0 or np.isclose(previous, 0.0):
+         return None
+ 
+     try:
+-        return (current - previous) / abs(previous)
++        growth = (current - previous) / abs(previous)
++        return growth if np.isfinite(growth) else None
+     except ZeroDivisionError:
+         return None
+ 
+ 
+ def _find_earnings_row(df: pd.DataFrame) -> Optional[str]:
+     """Find the best earnings row label using fuzzy matching.
+ 
+     Priority:
+         1. Basic EPS or Diluted EPS
+         2. Net Income (fallback)

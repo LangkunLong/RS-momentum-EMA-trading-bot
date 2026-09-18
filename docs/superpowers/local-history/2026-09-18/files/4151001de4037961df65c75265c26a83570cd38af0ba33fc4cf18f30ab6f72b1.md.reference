@@ -1,0 +1,36 @@
+# Learning/Search Task 7 Review
+
+## Spec Compliance
+
+CHANGES REQUIRED.
+
+The implementation establishes a strong provider-neutral, one-shot role and authorization lifecycle with immutable schema authority, strict response parsing/binding, truthful usage facts, explicit retry/repair kinds, and fixture parity. One security requirement remains unmet: the aggregate-only outbound filter is an open-ended nested-value blacklist and does not reliably prevent raw rows, tickers, paths, or secrets from reaching a provider.
+
+The report correctly defers real ledger-backed lifecycle and one-shot gateway composition to Task 9; it does not falsely claim production wiring is complete.
+
+## Strengths
+
+- `RoleSchemaAuthorityV5` stores immutable canonical schema bytes, reconstructs and compares the exact role-specific schema, and binds manifest-derived hypothesis/axis/variant/full-source capabilities plus policy-scope/path authority (`provider.py:403-580`). `RoleRequestV5` freezes nested message content and binds the schema digest, issued evidence digests, role binding, and output limit (`provider.py:766-896`).
+- Provider response JSON rejects duplicate, missing, extra, and wrong primitive types while accepting insignificant whitespace/key ordering; accepted response identity is derived from canonicalized JSON (`provider.py:147-187`, `provider.py:956-1200`, `provider.py:1589-1594`). Float literals use exact finite round-tripping hexadecimal tags in both schema and parser (`provider.py:288-315`, `provider.py:987-1007`).
+- Investigator cardinality/ranks/citations, author parent/hypothesis/source authority and structural limits, and critic ordered complete-batch/citation bindings are explicit. Structural failures and evidence/identity disagreements use distinct response-schema and evidence-binding failure classes (`provider.py:1116-1199`).
+- `CompletionProvider` and the gateway adapter expose one truthful call; the adapter passes exact schema bytes and forces zero hidden retries and repairs (`provider.py:1203-1290`). Completion and usage facts carry exact returned model, one external attempt, token counts, response state, provider request identity, and finite nonnegative Decimal USD (`provider.py:1214-1241`, `provider.py:1337-1382`).
+- The authorization runner reserves and verifies typed slots, settles terminal facts, recovers uncertain settlements, verifies chained cumulative receipts, rejects substituted models/attempt counts/token or USD overages, and uses separately limited primary/retry/repair kinds (`provider.py:1293-1586`, `provider.py:1597-2111`). Failure identities are closed and do not include provider exception type/text (`provider.py:899-953`).
+- `FixtureRoleRunnerV5` uses the shared parser/binder while emitting the exact zero-external-call/token/cost shape (`provider.py:1538-1550`, `provider.py:2114-2230`). The focused commit does not alter legacy authorization and introduces no `agent_loop`, provider-specific, filesystem, Docker, subprocess, evaluator-execution, or runtime coupling.
+
+## Issues
+
+### Critical
+
+None.
+
+### Important
+
+1. **The aggregate-only filter can be bypassed by ordinary raw-data and secret aliases or embedded values.** Role-specific envelopes close only their top-level section names; investigator sections, critic batch rows, and issued evidence payloads remain arbitrary nested mappings/tuples checked by `_validate_aggregate_only` (`provider.py:671-763`, `provider.py:814-831`). That validator rejects keys only when a forbidden word appears as a separated token or the entire collapsed key equals one of a short compound list, so lowercase concatenations such as `mytickerdata`, `rawvalueseries`, or `secretvalue` pass (`provider.py:50-113`, `provider.py:583-612`). It also uses `_TICKER_VALUE_RE.fullmatch`, allowing ticker material embedded in prose such as `leaders: AAPL, MSFT`, and its narrow value regex does not reject common embedded credential forms such as `password=hunter2` or `token=...`. More fundamentally, a raw row represented with neutral aliases such as `{ "day": "2026-01-02", "value": 123.4 }` passes unchanged. This violates the explicit no-raw-rows/tickers/paths/secrets provider boundary. Replace the open nested blacklist with closed aggregate evidence schemas (or an equivalently fail-closed typed aggregate union), and supplement value scanning so prohibited identifiers and credentials cannot be hidden in free text.
+
+### Minor
+
+None.
+
+## Assessment
+
+The schema, parser, artifact binding, accounting, slot lifecycle, and provider-neutral composition boundary are thoughtfully designed and otherwise satisfy Task 7. The outbound confidentiality boundary must become structurally allow-listed before this is safe to compose with the real Task 9 gateway. No live provider call was made during this review.

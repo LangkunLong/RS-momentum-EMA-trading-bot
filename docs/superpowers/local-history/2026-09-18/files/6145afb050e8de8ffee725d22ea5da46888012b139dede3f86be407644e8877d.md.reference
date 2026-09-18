@@ -1,0 +1,33 @@
+# C-c preparation driver independent static review — final freeze 03
+
+Specification verdict: **PASS**. Quality verdict: **APPROVE**.
+
+I explicitly approve the exact driver SHA-256 `3ca3a90c81380b99532d5fd79dda18de14a2d49700ac20dbfb06425ef0c8d2da` for principal actual preparation only, using the reviewed `C:/WINDOWS/py.EXE -3.13 -B` invocation and all fixed source, readiness, tool, input, path, and review gates. This does not authorize a paid launch. The resulting actual prepared package still needs independent artifact/launch review and a separate fresh user paid grant.
+
+## Exact final evidence
+
+- `prepare_c_c_campaign.py`: 53,367 bytes, SHA-256 `3ca3a90c81380b99532d5fd79dda18de14a2d49700ac20dbfb06425ef0c8d2da`.
+- `implementation-report.md`: 7,269 bytes, SHA-256 `cda2b9c0c03c256fe2691f4ec2b007704a83064b55d78ec6fdf0581401b8aee6`.
+- `fix-02.diff`: 15,260 bytes, SHA-256 `bc53e020d8153a9fd1274d9465cf32a0d68312e4ba29a8d96c96fa958c2b1201`.
+- Each final file independently matched its exact retained `review-freeze-03-exact` copy, size, and hash.
+- Principal correction note `../native-launch-interpreter-correction.md`: SHA-256 `10b7a1468bcc0e4f31bf9c73432be9f29eab5510df6c34a8c849e53466a76fe5`.
+- Actual launcher metadata `../preparation-tool-files-launcher-resolution.json`: SHA-256 `11caf55b22bcdf85fefe9f8b599ffa63c97013f636ad2b4f15bf8e24164312dc`.
+- The prior final review is retained at `review-freeze-02-exact/independent-review.md`, independently hash-checked as `9221cafaeec60ccccd7fab5084ba2bec3f05944b9c105f3c13624cd93357b756`. It approved driver `48053dcc003ccdd576d7c8c3290463b85a3a534304ad7527bbfbfc2431d4adc9` after resolving I1/M1, relying on the original full bounded review retained under `review-freeze-01`.
+
+## Scoped interpreter correction
+
+The retained `actual-start-01-failed-before-python.json` records Windows rejecting direct installed-binary process creation with Access is denied. It does not show a Python or driver failure. The retained launcher metadata reports both fresh roots absent and no project source imported. No prepared identity exists to rebind.
+
+The correction replaces only the unusable direct installed-binary selection requirement with the principal's observed launcher/interpreter relationship. Before project imports or destination writes, the driver now authenticates the exact correction and metadata documents, launcher file hash/size, separately readable installed Python file hash/size, native alias metadata using `os.lstat`, and the observed `sys.executable`, `sys._base_executable`, `sys.base_prefix`, and Python version. Constants match the retained actual metadata. The alias is explicitly represented as a zero-byte APPEXECLINK entry, with no content hash and no same-file claim equating it to the readable installed binary or launcher. The changed preflight fails on differing evidence or native interpreter identity.
+
+The launcher remains `C:/WINDOWS/py.EXE`, SHA-256 `7a2dad0ccad20e9ddf1217aa1ca3af9ae12207b4990d17d6a5192c28bba3ea36`, size 783,192. The installed binary remains SHA-256 `ad169f4cb4bfb78c7a5c030a4529c19d6643276778e33994c93e145b6191c3ec`, size 171,744. Native alias metadata remains size 0, attributes 1056, reparse tag 2147483675. These distinct identities and actual native sys values are recorded separately in the report. The driver does not assign to those sys values or alter the environment.
+
+The complete scoped diff was reviewed. AST comparison confirms the only changed existing functions are `authenticate_review_gates`, `preflight_paths_and_inputs`, and `main`; the only added function is the alias metadata reader. Remaining changes are interpreter constants and report text. Git/Docker pins, native renderer behavior, prior I1/M1 corrections, preparation calls, root/input protections, policy and caps, and operational exclusion remain unchanged. Native rendering still uses the actual unchanged `sys.executable` alias and its canonical policy-pinned arguments. The report accurately distinguishes preparation launcher, native rendered executable, and installed binary. No new findings arose from this correction.
+
+## Authority and limits
+
+This final verdict relies on the retained original bounded review, the retained I1/M1 resolution review, and this interpreter-only delta review. It does not repeat broader source/readiness review. The protected final source review remains `4e4991b0dfcdcfe980b2bd2655ba5bf88af6300c956c179d2e258014dd1fef4b`, its 22-file authority remains `d896bce97945b9438bed6f4837fd16213530338563e3bbd728eafaa8a9fbbe09`, and independent readiness remains `50cd6d863fb3f6235af3a47fcf90fe4d21a5425c8852055b470abe9c95634f3a`.
+
+The earlier native-launch documentation's physical-executable requirement is superseded only by the exact principal correction note. The pinned launcher is a reviewed preparation entry point; this static review does not establish future process-start success or attest a running process's parent executable. Matching native interpreter metadata and separately pinned files do not assert an alias-content measurement.
+
+No driver/project source import or execution, tests, synthetic probes, native reader/summary invocation, Git/Docker command, provider/API/evaluation/campaign activity, credential/environment-value access, or archive mutation was performed. Only retained evidence, source/diff, AST, and hashes were inspected. This approval is not evidence of successful preparation, positive enrolled admission, or paid execution. Preserve this report for the execution-gate hash and review actual preparation results separately.

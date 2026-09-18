@@ -1,0 +1,9 @@
+# H2a independent task review
+
+Worktree: C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-v5-architecture. Review h2a-task-brief.md, extraction-design.md pure-helper/live-order sections, h2a-task-report.md, exact preimage diff and supplied evidence. Only production_sandbox.py H2a extraction is in scope, not older branch work or future H2b/H3 implementations.
+
+Assess spec and quality: exact preservation of existing live behavior, error precedence/short circuit/load order, helper purity and precise optional-record signatures, absence semantics, phase prefix/identity/network/lifecycle, terminal-output, cleanup, control-readiness and completed-control predicates. Verify protected schemas/methods/foreign-executor guards/operational paths byte-identical and only intended history-method blocks delegated. Pay particular attention to optional created/identity/reservation access and active control branches remaining unchanged. Shared helpers must work from immutable explicit facts, no mutable context or callbacks. Do not require full historical caller/command interpreter or summary activation in H2a.
+
+Review supplied Ruff/compile/AST/hash evidence, no repetitive verification unless a concrete concern justifies a scoped read. No tests may be read/run/created; no synthetic records/cases/wrappers, authentication/summary/campaign/Docker/provider/external calls, credentials/environment, source edits, commits or subagents. Existing read-only git diff metadata is allowed if needed. Do not derive or review whole dirty branch.
+
+Write h2a-independent-review.md under1200words: spec PASS/FAIL, prioritized concrete findings with lines, quality approved/changes required, evidence limits. Return compact verdict. Principal owns fix loops.

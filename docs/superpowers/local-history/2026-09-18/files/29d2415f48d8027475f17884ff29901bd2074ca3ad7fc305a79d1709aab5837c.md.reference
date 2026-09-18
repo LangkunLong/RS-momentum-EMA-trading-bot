@@ -1,0 +1,165 @@
+# Task 4 Report: Replace Fold Ranking with Continuous-Panel CAGR
+
+## Status
+
+Implemented the schema-v4 continuous-panel objective, allocation, retirement-ledger,
+publication, parity, discovery-comparison, and qualification contracts. Legacy fold
+contracts remain separate and readable for old audit artifacts. No provider, replay,
+qualification consumption, Docker, Alpaca, or external service was invoked.
+
+## Implementation
+
+- Added the exact absolute annualized-return target contract and production CAGR
+  calculation:
+  `((ending_equity / starting_equity) ** (365 / elapsed_calendar_days) - 1) * 100`.
+  Objective comparisons quantize to 0.01 percentage points with half-even rounding.
+- Added stable `chain_id`-based security lineage and continuous quick, discovery, and
+  qualification panel contracts. Discovery serialization contains only quick and
+  discovery members plus the qualification-plan SHA-256 commitment.
+- Implemented `sha256_lineage_stratified_v1` with the sealed seven-stratum affiliation
+  ordering, SHA-256 lineage ordering, qualification-to-discovery-to-quick allocation,
+  exact largest-remainder residual-capacity apportionment, deterministic remainder
+  tie-breaking, capacity checks, alias-crossing rejection, and explicit unallocated
+  counts.
+- Added provider-free `build-panel-plans`, authenticated PIT-bundle/provenance lineage
+  construction, exact market-session binding, and content-free CLI output.
+- Added the permanent canonical schema-v4 qualification-retirement ledger genesis,
+  hash-chain authentication, locked immutable snapshots, retired-lineage exclusion,
+  and snapshot commitments in both plans. The ledger remains the extension point for
+  Task 9 reservation/outcome records; no second ledger design was introduced.
+- Added resumable, manifest-last publication. Existing partial plan files must match
+  exact requested bytes; conflicts fail closed. Plan, marker, and ledger-genesis
+  installation is atomic and create-only; a completed publication is immutable.
+- Added `PanelAggregateSummary`, which recomputes production CAGR from positive equity
+  endpoints and elapsed calendar days while retaining risk/activity values strictly as
+  diagnostics. A valid zero-trade equity curve is accepted.
+- Added `DiscoveryPanelComparison`, ranking only quantized candidate CAGR and retaining
+  the current champion on ties. Baseline delta and target gap remain diagnostic.
+- Added `QualificationDecision`, whose complete gate is evaluation integrity, target
+  CAGR, and strict improvement over the baseline evaluated on that qualification panel.
+- Added provider-free `capture-v4` and `verify-v4`. They load only the discovery plan,
+  continuously evaluate quick/discovery with policy interface 2, authenticate bundle,
+  provenance, sandbox image, plan and qualification commitment identities, require
+  same effective policy identity across both panels, use create-only run roots, and
+  publish canonical digest-bound artifacts without provider calls.
+- Tightened legacy parity loading to reject non-legacy schema artifacts instead of
+  reinterpreting schema-v4 data.
+
+## Files changed
+
+- `core/pit_optimization.py`
+- `core/pit_optimizer_evaluation.py`
+- `core/pit_policy_parity.py`
+- `tests/test_pit_optimizer_v2.py`
+- `tests/test_pit_policy_parity.py`
+
+No test file or test function was added. Existing objective, allocator, qualification,
+parity, and legacy assertions were rewritten or extended in place as required.
+
+## Exact verification evidence
+
+Run from the isolated `adaptive-oneil-optimizer-core-loop` worktree:
+
+1. `python -B -m compileall -q core/pit_optimizer_evaluation.py core/pit_policy_parity.py core/pit_optimization.py`
+   - PASS, exit code 0, no output.
+2. `python -B -m ruff check core/pit_optimizer_evaluation.py core/pit_policy_parity.py core/pit_optimization.py --no-cache`
+   - PASS: `All checks passed!`
+3. `python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_policy_parity.py tests/test_pit_optimizer_v2.py -k "annualized or panel or objective or qualification or legacy"`
+   - PASS: `9 passed, 299 deselected, 2 warnings in 1.23s`.
+   - Warnings are the repository's unknown `cache_dir` pytest option and upstream
+     `websockets.legacy` deprecation warning.
+4. `git diff --check`
+   - PASS, with only the repository's LF-to-CRLF checkout notices.
+
+TDD checkpoints observed the new objective/allocator/plan/qualification and v4 parser
+assertions fail before their production contracts existed, then pass after implementation.
+The target-gap sign assertion also failed before the diagnostic was corrected to
+`target - candidate`.
+
+## Self-review
+
+- **Allocator determinism and capacity:** confirmed input-order independence, exact
+  SHA-256 lineage ordering inside each sealed stratum, exact fixed panel order,
+  residual decrement after each allocation, deterministic fractional/tie ordering,
+  per-stratum closure, total-demand rejection, disjoint members, and alias rejection.
+- **Hidden-plan isolation:** confirmed the discovery object contains no qualification
+  member field, its serialized bytes exclude qualification lineage IDs, loaders and v4
+  parity take only the discovery-plan path, and the only cross-plan value is the
+  qualification digest commitment.
+- **Publication crash recovery:** confirmed both possible existing partial plan files
+  authenticate byte-for-byte, conflicting partials fail, file installs are atomic and
+  create-only, the commit marker installs last, and completed roots reject reuse.
+- **Ledger hash chain:** confirmed canonical JSONL, atomic genesis creation, fixed domain,
+  sequence/previous-record/digest authentication, immutable locked snapshot head,
+  and permanent exclusion of every recorded retired/reserved lineage.
+- **CAGR arithmetic:** confirmed positive finite endpoints, positive elapsed calendar
+  days, exact 365-day exponent formula, endpoint recomputation, 0.01 pp quantization,
+  and rejection of supplied aggregate mismatches.
+- **Tie handling:** confirmed only quantized candidate CAGR selects a champion and exact
+  ties retain the existing champion. Diagnostic baseline, risk, cost, activity, and
+  trade values cannot alter ranking.
+- **Qualification gate:** confirmed only completion, integrity, absolute target, and
+  strict same-panel baseline improvement gate qualification; zero trades and all
+  risk/activity/cost diagnostics are absent from the decision contract.
+- **Legacy isolation:** confirmed schema-v4 contracts are separate from `FoldSpec`,
+  `FoldManifest`, `DiscoveryScore`, and `HoldoutDecision`, and the old parity loader
+  rejects schema-v4 rather than reinterpreting it.
+
+Two concrete issues found during self-review were fixed before final verification:
+atomic create-only plan/ledger installation prevents crash-partial files from appearing
+installed, and v4 parity reference loading now authenticates canonical publication-marker
+bytes plus the exact schema and publication kind.
+
+## Concerns and regression disposition
+
+The required focused suite is clean. A bounded unfiltered run of the same two large test
+modules produced `99 failed, 206 passed, 3 skipped` after 6m09s. The first complete failures
+are pre-existing fixture/contract drift outside Task 4: an unrelated `InvestigatorArtifact`
+limit expectation, a legacy v2 parity fixture omitting an already-present
+`parity_reference=None` field, old call-budget fixtures missing `max_usd`, and interface-v1
+capacity fixtures missing newer fields. Per scope, these unrelated gateway/provider fixture
+cascades were classified and not chased. No Task 4 contract concern remains from the bounded
+self-review or required verification.
+
+## Review fix round 1
+
+Addressed the two Task-4-owned Important review findings without touching controller,
+holdout, provider, Task 5, Task 8, or Task 9 integration:
+
+- `PanelAggregateSummary` now carries and validates the exact evaluation-panel SHA-256.
+  Production v4 parity evidence sets it from `EvaluationPanelSpec.sha256`.
+  `QualificationDecision.from_result` now accepts candidate and baseline
+  `PanelAggregateSummary` evidence plus the authenticated qualification-panel spec,
+  requires both evidence records to carry that spec's exact digest, records the digest
+  in the decision, and rejects a mismatch. The gate remains exclusively
+  evaluation/integrity completion, candidate
+  CAGR at or above target, and strict candidate improvement over the same-panel
+  baseline.
+- All schema-v4 plan deserialization now requires closed exact key sets before dataclass
+  construction. This includes allocation rules, stratum allocations, discovery plans,
+  qualification plans, and plan-publication markers. Missing fields that dataclass
+  defaults previously restored and all extra keys now fail closed. Publication loading
+  also authenticates snapshot/count fields against the loaded plan while retaining
+  canonical JSON and duplicate-key validation.
+
+TDD evidence:
+
+- Before the production fix, the three updated existing cases failed as intended:
+  v4 panel evidence lacked `panel_sha256`, an allocation rule missing `algorithm_id`
+  loaded successfully through the dataclass default, and `PanelAggregateSummary`
+  rejected the new panel-digest argument because the binding did not yet exist.
+- After the production fix, the bounded regression command
+  `python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_policy_parity.py tests/test_pit_optimizer_v2.py -k "panel_allocator or qualification_gate or legacy_fold_and_panel"`
+  passed: `3 passed, 305 deselected, 2 warnings in 1.17s`.
+
+Fresh required verification after the review fixes:
+
+1. `python -B -m compileall -q core/pit_optimizer_evaluation.py core/pit_policy_parity.py core/pit_optimization.py`
+   - PASS, exit code 0, no output.
+2. `python -B -m ruff check core/pit_optimizer_evaluation.py core/pit_policy_parity.py core/pit_optimization.py --no-cache`
+   - PASS: `All checks passed!`
+3. `python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_policy_parity.py tests/test_pit_optimizer_v2.py -k "annualized or panel or objective or qualification or legacy"`
+   - PASS: `9 passed, 299 deselected, 2 warnings in 1.30s`.
+
+The warnings remain the repository's unknown `cache_dir` pytest option and the upstream
+`websockets.legacy` deprecation warning. No new concern was found in the bounded review.

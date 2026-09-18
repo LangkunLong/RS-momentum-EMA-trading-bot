@@ -1,0 +1,61 @@
+### Task 8: Persist Champion, Exploratory Branch, and Cross-Run Checkpoint
+
+**Files:**
+
+- Modify: `core/pit_optimizer_artifacts.py`
+- Modify: `core/pit_optimizer_controller.py`
+- Modify: `core/pit_optimization.py`
+- Modify: `agent_loop.py`
+- Modify: `tests/test_pit_optimizer_loop.py`
+- Modify: `tests/test_agent_loop.py`
+
+**Interfaces:**
+
+- Produces: `SearchCandidateState`, `CampaignCheckpoint`, `prepare_pit_optimizer_v4`, `run_pit_optimizer_v4`, `--campaign-checkpoint`, and `--campaign-checkpoint-sha256`.
+
+- [ ] **Step 1: Replace single-incumbent state with explicit search states.**
+
+  `SearchCandidateState` binds candidate identity, cumulative-diff artifact, source-bundle artifact, discovery evidence, hypothesis, behavioral summary, originating run/iteration, and all referenced digests. `_RunState` owns baseline quick/discovery evidence, optional champion, optional active branch, selected parent, call attempts, skips, and feedback tail.
+
+- [ ] **Step 2: Select one parent deterministically before each iteration.**
+
+  Use active branch after the previous effective `refine`; otherwise champion; otherwise baseline. Reconstruct that parent's cumulative diff into a fresh disposable checkout and authenticate its three-file source bundle before building any role input.
+
+- [ ] **Step 3: Recompute baseline on the exact panels.**
+
+  Replace parity-derived baseline performance with `evaluate_baseline(panel)`. Recompute and persist quick/discovery baseline evidence for the exact bundle, continuous dates, symbols, engine policy, and panel identities before the first role call. Parity remains an engine-equivalence attestation only.
+
+- [ ] **Step 4: Evaluate quick then discovery without a return gate.**
+
+  Persist quick evidence for feedback. If the candidate executes validly, always run the discovery panel even for zero trades or low return. Candidate syntax/typed-decision/runtime failures become validation feedback and leave the existing champion intact.
+
+- [ ] **Step 5: Apply the exact champion/branch transition table.**
+
+  A strictly higher discovery CAGR becomes champion and clears the branch regardless of critic output. A valid nonwinner becomes the active branch only after effective `refine`. `abandon` clears it. A nonwinning `promote` is discarded. A CAGR tie retains the existing champion. Invalid critic output uses `abandon` but cannot undo a metric-owned champion promotion. Invalid author reaches critic with validation failure. Invalid investigator records unchanged state, settles its two skips, and advances.
+
+  When candidate validation or execution fails, still call the planned critic with the closed validation summary unless the evaluator itself is unavailable. Effective `refine` retains the already selected active branch when that parent was a branch; it cannot turn an invalid child into a branch. Effective `abandon`, nonwinning `promote`, or invalid critic clears the branch.
+
+- [ ] **Step 6: Commit durable artifacts before mutating live state.**
+
+  Persist candidate source/diff/evaluation, critic or content-free critic failure, and a complete prospective `decision.json`; atomically replace root `checkpoint.json`; then mutate `_RunState`; then dispose candidate/controller/worker resources. Persist create-only seed copies for imported champion/branch sources and diffs.
+
+- [ ] **Step 7: Authenticate cross-run resume.**
+
+  A later bounded run accepts an explicit checkpoint path plus digest, reauthenticates clean current source, reconstructs each retained diff, remints current candidate identities, and reevaluates old candidates under a changed bundle/panel plan. Old fold scores never seed a v4 champion directly.
+
+- [ ] **Step 8: Compose schema-v4 production services and summaries.**
+
+  Add v4 parser/config/readiness/live-run/summary paths in `agent_loop.py`. Index attempts by plan index, not accepted-call list position. Public summary reports target, baseline/champion/branch CAGR, iterations, calls/tokens/cost, terminal reason, checkpoint presence, `apply=false`, and cleanup; omit raw hashes/content/secrets.
+
+- [ ] **Step 9: Rewrite existing two-iteration/durability cases and verify.**
+
+  Update current production-composition, incumbent, multi-iteration, decision-durability, and cleanup cases in place. Do not add test functions.
+
+  ```powershell
+  python -B -m compileall -q core/pit_optimizer_artifacts.py core/pit_optimizer_controller.py core/pit_optimization.py agent_loop.py
+  python -B -m ruff check core/pit_optimizer_artifacts.py core/pit_optimizer_controller.py core/pit_optimization.py agent_loop.py --no-cache
+  python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py tests/test_agent_loop.py -k "iteration or champion or branch or checkpoint or decision or cleanup or summary"
+  git add core/pit_optimizer_artifacts.py core/pit_optimizer_controller.py core/pit_optimization.py agent_loop.py tests/test_pit_optimizer_loop.py tests/test_agent_loop.py
+  git commit -m "feat: persist adaptive optimizer search state"
+  ```
+

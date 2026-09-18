@@ -1,0 +1,136 @@
+# Review package: b62411b2c84cfe690406aa1af48f51bcae1b9c66..205df8d
+
+## Commits
+205df8d Repair PIT readiness descendant authentication
+
+## Files changed
+ core/pit_optimization_contract.py | 32 ++++++++++++++++++++------------
+ 1 file changed, 20 insertions(+), 12 deletions(-)
+
+## Diff
+diff --git a/core/pit_optimization_contract.py b/core/pit_optimization_contract.py
+index 42126b3..049e79a 100644
+--- a/core/pit_optimization_contract.py
++++ b/core/pit_optimization_contract.py
+@@ -1159,21 +1159,25 @@ def build_subset_manifest(
+     _readiness_path, readiness_sha256 = _require_canonical_mapping_artifact(
+         legacy_readiness,
+         Path(legacy_readiness_path),
+         "legacy readiness artifact",
+     )
+     _parity_path, parity_sha256 = _require_parity_artifact(
+         parity_attestation,
+         Path(verified_parity_path),
+     )
+     source = _resolved_directory(Path(source_root), "source root")
+-    from core.pit_policy_parity import _authenticated_readiness, _source_identity
++    from core.pit_policy_parity import (
++        _authenticated_readiness,
++        _require_later_descendant_source,
++        _source_identity,
++    )
+ 
+     actual_source_head, actual_source_fingerprint = _source_identity(source)
+     authenticated_readiness, authenticated_readiness_sha256 = _authenticated_readiness(
+         _readiness_path,
+         source_root=source,
+     )
+     if (
+         authenticated_readiness != dict(legacy_readiness)
+         or authenticated_readiness_sha256 != readiness_sha256
+     ):
+@@ -1192,26 +1196,31 @@ def build_subset_manifest(
+         legacy_readiness.get("schema_version") != 1
+         or legacy_readiness.get("gate") != "pit_optimization"
+         or legacy_readiness.get("phase") != "ready"
+     ):
+         raise ValueError("legacy readiness is not authenticated ready input")
+     identities = legacy_readiness.get("identities")
+     sealed_inputs = legacy_readiness.get("sealed_inputs")
+     evaluation = legacy_readiness.get("evaluation_contract")
+     if not isinstance(identities, Mapping) or not isinstance(sealed_inputs, Mapping):
+         raise ValueError("legacy readiness identities are absent")
+-    if (
+-        identities.get("source_head") != actual_source_head
+-        or identities.get("source_fingerprint_sha256")
+-        != actual_source_fingerprint
+-    ):
+-        raise ValueError("legacy readiness source identity differs from source root")
++    parity = parity_attestation
++    _require_later_descendant_source(
++        source_root=source,
++        reference_head=identities.get("source_head"),
++        final_head=parity.reference_source_head,
++    )
++    _require_later_descendant_source(
++        source_root=source,
++        reference_head=parity.reference_source_head,
++        final_head=parity.final_source_head,
++    )
+     if not isinstance(evaluation, Mapping) or evaluation.get("verification_only") is not True:
+         raise ValueError("legacy readiness evaluation contract is invalid")
+ 
+     bundle_sha256 = _sha256_file(bundle_path)
+     baseline_sha256 = _sha256_file(baseline_manifest_path)
+     if identities.get("pit_bundle_sha256") != bundle_sha256:
+         raise ValueError("legacy readiness PIT bundle identity differs")
+     if identities.get("baseline_manifest_sha256") != baseline_sha256:
+         raise ValueError("legacy readiness baseline manifest identity differs")
+     if sealed_inputs.get("pit_bundle_sha256") != bundle_sha256:
+@@ -1235,29 +1244,28 @@ def build_subset_manifest(
+             "AND trade_date>='2021-06-25' AND trade_date<='2022-03-11' "
+             "ORDER BY trade_date"
+         ).fetchall()
+         benchmark_sessions = tuple(str(row[0]) for row in rows)
+     fold_manifest, _universe = build_fixed_fold_manifest(
+         readiness=legacy_readiness,
+         benchmark_sessions=benchmark_sessions,
+         data_identity_sha256=bundle_sha256,
+     )
+ 
+-    parity = parity_attestation
+     if (
+         parity.pit_bundle_sha256 != bundle_sha256
+         or parity.baseline_manifest_sha256 != baseline_sha256
+         or parity.effective_policy_sha256 != effective_policy_sha256
+         or parity.discovery_fold_manifest_sha256 != fold_manifest.sha256
+-        or parity.final_source_head != identities.get("source_head")
++        or parity.final_source_head != actual_source_head
+         or parity.final_source_fingerprint_sha256
+-        != identities.get("source_fingerprint_sha256")
++        != actual_source_fingerprint
+     ):
+         raise ValueError("verified parity differs from the authenticated identity graph")
+ 
+     source_texts: dict[str, str] = {}
+     source_sha256s: list[tuple[str, str]] = []
+     for relative in _POLICY_EDITABLE_PATHS:
+         source_file = _resolved_file(source / Path(relative), f"policy source {relative}")
+         try:
+             text = source_file.read_bytes().decode("utf-8")
+         except UnicodeDecodeError as exc:
+@@ -1324,22 +1332,22 @@ def build_subset_manifest(
+         max_tokens=448_000,
+         policy_source_scope_sha256=scope.sha256,
+         provider_retries=0,
+         apply=False,
+     )
+     return PitOptimizerRunManifest(
+         schema_version=3,
+         run_id=f"run_{uuid.uuid4().hex}",
+         run_kind="subset_canary",
+         model=PIT_OPTIMIZER_R1_MODEL,
+-        source_head=str(identities["source_head"]),
+-        source_fingerprint_sha256=str(identities["source_fingerprint_sha256"]),
++        source_head=actual_source_head,
++        source_fingerprint_sha256=actual_source_fingerprint,
+         legacy_readiness_sha256=readiness_sha256,
+         pit_bundle_sha256=bundle_sha256,
+         baseline_manifest_sha256=baseline_sha256,
+         effective_policy_sha256=effective_policy_sha256,
+         policy_interface_version=parity.policy_interface_version,
+         policy_source_sha256s=tuple(source_sha256s),
+         editable_paths=_POLICY_EDITABLE_PATHS,
+         policy_source_scope=scope,
+         immutable_constraints_sha256=constraints_sha256,
+         fold_manifest=fold_manifest,

@@ -1,0 +1,91 @@
+### Task 1: Pin and Normalize Five-Year S&P Membership
+
+**Files:**
+- Create: `core/public_membership.py`
+- Create: `fetch_sp500_membership.py`
+- Create: `exports/pit/.gitkeep`
+- Modify: `.gitignore`
+
+**Interfaces:**
+- Consumes: a pinned public page revision containing the current S&P 500 constituent table and dated changes table.
+- Produces: `fetch_membership(revision_url: str, start_date: date, end_date: date) -> MembershipExport` and strict `effective_date,ticker,member` CSV rows accepted by `build_pit_bundle.py`.
+- Produces: `membership_provenance.json` with `source_url`, `revision_id`, `retrieved_at_utc`, `raw_sha256`, `first_effective_date`, `last_effective_date`, `event_count`, `symbol_count`, and explicit exclusions.
+
+- [ ] **Step 1: Define immutable result types and canonical symbol mapping**
+
+Add these public types to `core/public_membership.py`:
+
+```python
+@dataclass(frozen=True)
+class MembershipChange:
+    effective_date: date
+    added_ticker: str | None
+    removed_ticker: str | None
+    added_company: str | None
+    removed_company: str | None
+
+@dataclass(frozen=True)
+class MembershipExport:
+    seed_date: date
+    events: tuple[MembershipEvent, ...]
+    company_names: Mapping[str, str]
+    source_sha256: str
+    source_url: str
+    revision_id: str
+    exclusions: tuple[Mapping[str, str], ...]
+```
+
+Canonicalize source tickers with an explicit alias table for punctuation differences such as `BRK.B -> BRK-B` and `BF.B -> BF-B`. Reject unknown punctuation transformations rather than guessing.
+
+- [ ] **Step 2: Fetch exactly one pinned revision**
+
+Implement `fetch_revision(url: str, *, timeout_seconds: float = 30.0) -> bytes` using `urllib.request` with a descriptive user agent, HTTPS-only URL validation, a 10 MiB response cap, and no redirects to a different host. The CLI requires a revision URL containing an immutable revision identifier and refuses an unpinned current page URL.
+
+- [ ] **Step 3: Reconstruct the 2021 seed and dated transitions**
+
+Parse the constituent and changes tables with `pandas.read_html`. Starting with the revision's current constituents, reverse all changes later than `2021-01-01` to derive the seed state, then replay changes forward. Emit the complete seed as `member=1` events dated `2021-01-01`, followed by additions/removals through `2025-12-31`.
+
+At every transition, assert that an addition is not already active and a removal is active. Record mergers, share-class changes, or unresolvable aliases in `exclusions` and stop unless the CLI receives an explicit reviewed mapping CSV with header:
+
+```text
+source_ticker,canonical_ticker,effective_start,effective_end,reason
+```
+
+- [ ] **Step 4: Write immutable membership artifacts**
+
+`fetch_sp500_membership.py` accepts:
+
+```text
+--revision-url URL
+--start-date 2021-01-01
+--end-date 2025-12-31
+--symbol-map-csv PATH
+--output-dir PATH
+```
+
+It writes `membership.csv`, `security_names.csv`, `membership_provenance.json`, and `membership_raw.html` through temporary files followed by atomic renames. Refuse an existing output directory.
+
+- [ ] **Step 5: Perform the first functional membership run**
+
+Run the CLI against the selected pinned revision. Then run:
+
+```powershell
+python convert_membership_snapshots.py --help
+python -c "from core.leader_evaluation import PointInTimeUniverse; from pathlib import Path; u=PointInTimeUniverse.from_csv(Path('exports/pit/membership.csv')); print(len(u.events), len(u.members_at('2021-01-01')), len(u.members_at('2025-12-31')))"
+```
+
+Expected: both membership counts are between 495 and 510; no duplicate transition error occurs.
+
+- [ ] **Step 6: Record official spot checks**
+
+Add `membership_spot_checks.json` with one checked change from each of 2021, 2022, 2023, 2024, and 2025. Each item contains the effective date, addition, removal, official S&P announcement URL, and `matched=true`. Do not continue if any selected event disagrees.
+
+- [ ] **Step 7: Commit membership acquisition**
+
+```powershell
+git add core/public_membership.py fetch_sp500_membership.py exports/pit/.gitkeep .gitignore
+git commit -m "feat: acquire five-year point-in-time membership"
+```
+
+Do not commit downloaded raw data or generated CSV/JSON artifacts.
+

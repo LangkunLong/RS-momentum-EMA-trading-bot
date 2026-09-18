@@ -1,0 +1,23 @@
+# Baseline preparation fix review
+
+Verdict: **approved**.
+
+Reviewed `a55947da8343da97960e3cc311401d447efebc42..42716a84a0df10f729c8afdfa82e2c534bf64404` against the two P1 findings in `baseline-preparation-review.md` and the constraints in `baseline-preparation-fix-brief.md`.
+
+## Original finding verdicts
+
+### Actual populated capture command — resolved
+
+Preparation now requires explicit canonical source and scratch roots plus actual Git and Docker executable paths, hashes the executable bytes, and verifies optional independently supplied digests (`core/pit_optimizer_v5/baseline_preparation.py:38-69`). The emitted argv uses the resolved artifact root, the created capture-input reference, the real host paths, and the computed executable digests; the PowerShell rendering single-quotes every literal and escapes embedded apostrophes (`core/pit_optimizer_v5/baseline_preparation.py:72-100`). Both explicit-reference and composed-source CLI modes supply these authorities, and preparation returns the command without executing it (`core/pit_optimizer_v5/cli.py:1799-1869`).
+
+### Ordinary source descriptor composition — resolved
+
+`--compose-source` captures a clean checkout at the explicit commit with authenticated Git, keeps its pins live through publication, reads exactly the four canonical editable policy files, and accepts CRLF only through the same normalization already authenticated by the clean-source snapshot (`core/pit_optimizer_v5/baseline_preparation.py:185-194,229-234,288-289`; `core/pit_optimizer_v5/readiness.py:320-385`). It derives the existing source bundle, policy revision, policy scope, and evaluator contract from authenticated sandbox/runtime, execution, evaluator-source, transition, resource, panel/data/provenance, immutable-configuration, and source identities (`core/pit_optimizer_v5/baseline_preparation.py:235-287`).
+
+The complete pending descriptor graph is authenticated in memory before the first create-only write, then authenticated again from the repository after publication (`core/pit_optimizer_v5/baseline_preparation.py:103-136`). Existing explicit ten-reference callers remain supported via the non-composed branch (`core/pit_optimizer_v5/cli.py:1857-1875`). The existing graph traversal remains limited to mechanics, quick, and four discovery panels selected by the supplied panel plan; it does not scan confirmation or qualification panel bodies (`core/pit_optimizer_v5/baseline.py:150-212,260-264`).
+
+## New findings
+
+No new Critical or Important findings.
+
+No tests were read, created, modified, or run. No source capture command, Docker/provider/network action, or held-out panel action was performed.

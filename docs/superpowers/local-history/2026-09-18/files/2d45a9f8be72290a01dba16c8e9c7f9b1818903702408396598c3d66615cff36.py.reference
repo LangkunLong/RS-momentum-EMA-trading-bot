@@ -1,0 +1,280 @@
+from __future__ import annotations
+
+import argparse
+import importlib
+import json
+import sys
+from datetime import date
+from pathlib import Path
+
+
+ANCESTOR_MODULES = (
+    "core.pit_optimization",
+    "core.backtest_engine",
+    "core.pit_data",
+    "core.engine_policy",
+)
+CURRENT_HELPERS = (
+    "core.pit_optimizer_evaluation",
+    "core.pit_policy_parity",
+)
+
+
+def _resolved_file(module: object, label: str) -> Path:
+    raw = getattr(module, "__file__", None)
+    if not isinstance(raw, str) or not raw:
+        raise RuntimeError(f"{label} has no concrete module origin")
+    return Path(raw).resolve(strict=True)
+
+
+def _require_under(path: Path, root: Path, label: str) -> None:
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise RuntimeError(f"{label} resolved outside its authenticated root") from exc
+
+
+def _controlled_sys_path(ancestor_root: Path, current_root: Path) -> None:
+    retained: list[str] = []
+    for entry in sys.path:
+        try:
+            resolved = Path(entry or ".").resolve()
+        except (OSError, RuntimeError):
+            retained.append(entry)
+            continue
+        if resolved not in {ancestor_root, current_root}:
+            retained.append(entry)
+    sys.path[:] = [str(ancestor_root), str(current_root), *retained]
+
+
+def _date_text(value: object, label: str) -> str:
+    if isinstance(value, str):
+        text = value[:10]
+    else:
+        converter = getattr(value, "date", None)
+        converted = converter() if callable(converter) else value
+        formatter = getattr(converted, "isoformat", None)
+        text = formatter() if callable(formatter) else ""
+    try:
+        date.fromisoformat(text)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{label} is not a canonical date") from exc
+    return text
+
+
+class _WarmupBundleAdapter:
+    _OVERRIDE_NAMES = frozenset({"fetch_price_data", "fetch_closes"})
+
+    def __init__(
+        self,
+        original: object,
+        *,
+        history_start_date: object,
+        fold_start_date: object,
+        fold_end_date: object,
+        timestamp_factory: object,
+    ) -> None:
+        self._original = original
+        self._history_start_text = _date_text(history_start_date, "history start")
+        self._fold_start_text = _date_text(fold_start_date, "fold start")
+        self._fold_end_text = _date_text(fold_end_date, "fold end")
+        self._timestamp_factory = timestamp_factory
+        self._override_calls: list[str] = []
+
+    def _record(self, name: str, requested_start: object, requested_end: object) -> None:
+        if name not in self._OVERRIDE_NAMES:
+            raise RuntimeError("unexpected adapter override method")
+        if name in self._override_calls:
+            raise RuntimeError(f"adapter override {name} was called more than once")
+        if _date_text(requested_start, f"{name} requested start") != self._fold_start_text:
+            raise RuntimeError(f"{name} requested start differs from the preserved fold start")
+        if _date_text(requested_end, f"{name} requested end") != self._fold_end_text:
+            raise RuntimeError(f"{name} requested end differs from the preserved fold end")
+        self._override_calls.append(name)
+
+    def fetch_price_data(self, tickers: object, start_date: object, end_date: object) -> object:
+        self._record("fetch_price_data", start_date, end_date)
+        return self._original.fetch_price_data(
+            tickers,
+            self._timestamp_factory(self._history_start_text),
+            end_date,
+        )
+
+    def fetch_closes(self, tickers: object, start_date: object, end_date: object) -> object:
+        self._record("fetch_closes", start_date, end_date)
+        return self._original.fetch_closes(
+            tickers,
+            self._timestamp_factory(self._history_start_text),
+            end_date,
+        )
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._original, name)
+
+    def require_complete(self) -> None:
+        if self._override_calls != ["fetch_price_data", "fetch_closes"]:
+            raise RuntimeError("adapter did not use exactly the two authorized overrides")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ancestor-root", required=True, type=Path)
+    parser.add_argument("--current-root", required=True, type=Path)
+    parser.add_argument("--readiness", required=True, type=Path)
+    parser.add_argument("--pit-bundle", required=True, type=Path)
+    parser.add_argument("--output", required=True, type=Path)
+    args = parser.parse_args()
+
+    ancestor_root = args.ancestor_root.resolve(strict=True)
+    current_root = args.current_root.resolve(strict=True)
+    readiness_path = args.readiness.resolve(strict=True)
+    pit_bundle_path = args.pit_bundle.resolve(strict=True)
+    output = args.output.resolve(strict=False)
+    if output.exists():
+        raise FileExistsError(output)
+    if output.parent.resolve(strict=True) != output.parent:
+        raise RuntimeError("output parent is not canonical")
+    if output.name != "reference-tree-authenticated.json":
+        raise RuntimeError("tree-authenticated recovery output filename is invalid")
+    if not output.with_name("reference.json").is_file():
+        raise RuntimeError("prior failed reference evidence is absent")
+
+    _controlled_sys_path(ancestor_root, current_root)
+
+    origin_results: dict[str, bool] = {}
+    ancestor_modules: dict[str, object] = {}
+    for name in ANCESTOR_MODULES:
+        module = importlib.import_module(name)
+        _require_under(_resolved_file(module, name), ancestor_root, name)
+        ancestor_modules[name] = module
+        origin_results[name] = True
+
+    helper_modules: dict[str, object] = {}
+    for name in CURRENT_HELPERS:
+        module = importlib.import_module(name)
+        _require_under(_resolved_file(module, name), current_root, name)
+        helper_modules[name] = module
+        origin_results[name] = True
+
+    readiness = json.loads(readiness_path.read_text(encoding="utf-8"))
+    identities = readiness.get("identities")
+    if not isinstance(identities, dict):
+        raise RuntimeError("sealed readiness identities are absent")
+    sealed_head = identities.get("source_head")
+    if not isinstance(sealed_head, str):
+        raise RuntimeError("sealed source commit identity is absent")
+
+    parity = helper_modules["core.pit_policy_parity"]
+    original_tree_identity_before = parity._source_identity(ancestor_root)
+    if original_tree_identity_before[0] != sealed_head:
+        raise RuntimeError("current helper clean identity head differs from sealed readiness")
+
+    scope = readiness.get("evaluation_contract", {}).get("scope", {})
+    warmup_start = scope.get("warmup_start")
+    if not isinstance(warmup_start, str):
+        raise RuntimeError("sealed readiness warmup is absent")
+    expected_pairs = tuple(
+        (start, end, warmup_start)
+        for _fold_id, start, end in parity._DISCOVERY_WINDOWS
+    )
+    if len(expected_pairs) != 2:
+        raise RuntimeError("current helper does not define exactly two discovery pairs")
+    hidden_pair = tuple(parity._HIDDEN_WINDOW[1:])
+    observed_pairs: list[tuple[str, str, str]] = []
+
+    engine = ancestor_modules["core.backtest_engine"]
+    simulator_type = engine.PortfolioSimulator
+    original_run = simulator_type.run
+
+    def compatible_run(
+        self: object,
+        *run_args: object,
+        history_start_date: object = None,
+        **run_kwargs: object,
+    ) -> object:
+        fold_start = run_kwargs.get("start_date")
+        fold_end = run_kwargs.get("end_date")
+        if fold_start is None or fold_end is None or history_start_date is None:
+            raise RuntimeError("adapter call is missing fold or warmup dates")
+        pair = (
+            _date_text(fold_start, "wrapper fold start"),
+            _date_text(fold_end, "wrapper fold end"),
+            _date_text(history_start_date, "wrapper history start"),
+        )
+        if date.fromisoformat(pair[2]) >= date.fromisoformat(pair[0]):
+            raise RuntimeError("adapter warmup is missing or not earlier than the fold")
+        if pair[:2] == hidden_pair:
+            raise RuntimeError("hidden fold reached the discovery-only adapter")
+        if pair not in expected_pairs or pair in observed_pairs:
+            raise RuntimeError("unexpected or duplicate discovery fold/warmup pair")
+        observed_pairs.append(pair)
+
+        original_bundle = self.pit_bundle
+        adapter = _WarmupBundleAdapter(
+            original_bundle,
+            history_start_date=history_start_date,
+            fold_start_date=fold_start,
+            fold_end_date=fold_end,
+            timestamp_factory=engine.pd.Timestamp,
+        )
+        self.pit_bundle = adapter
+        try:
+            result = original_run(self, *run_args, **run_kwargs)
+        finally:
+            self.pit_bundle = original_bundle
+        adapter.require_complete()
+        return result
+
+    simulator_type.run = compatible_run
+    try:
+        reference = parity.capture_parity_reference(
+            readiness_path=readiness_path,
+            pit_bundle_path=pit_bundle_path,
+            output=output,
+            source_root=ancestor_root,
+        )
+    finally:
+        simulator_type.run = original_run
+    original_tree_identity_after = parity._source_identity(ancestor_root)
+    if original_tree_identity_after != original_tree_identity_before:
+        raise RuntimeError("current helper clean HEAD/tree identity changed after capture")
+    if tuple(observed_pairs) != expected_pairs:
+        raise RuntimeError("capture did not use exactly the two expected discovery fold/warmup pairs")
+    loaded = parity.load_parity_reference(output)
+
+    discovery_ids = tuple(fold.fold_id for fold in loaded.fold_manifest.discovery_folds)
+    evidence_ids = tuple(item.fold_id for item in loaded.discovery_evidence)
+    hidden_id = loaded.fold_manifest.hidden_fold.fold_id
+    if len(discovery_ids) != 2 or len(evidence_ids) != 2:
+        raise RuntimeError("canonical reference does not contain exactly two discovery folds")
+    if evidence_ids != discovery_ids or hidden_id in evidence_ids:
+        raise RuntimeError("hidden fold was evaluated or discovery evidence order changed")
+    if loaded.reference_source_head != identities.get("source_head"):
+        raise RuntimeError("reference source head differs from sealed readiness")
+    if loaded.reference_source_fingerprint_sha256 != original_tree_identity_before[1]:
+        raise RuntimeError("reference source fingerprint differs from authenticated tree identity")
+    if reference.artifact_sha256 != loaded.artifact_sha256:
+        raise RuntimeError("canonical reference reload identity differs")
+
+    print(
+        json.dumps(
+            {
+                "ancestor_origins_authenticated": all(origin_results[name] for name in ANCESTOR_MODULES),
+                "current_helper_origins_authenticated": all(origin_results[name] for name in CURRENT_HELPERS),
+                "original_tree_identity_stable": True,
+                "source_head_authenticated": True,
+                "tree_fingerprint_authenticated": True,
+                "discovery_fold_count": len(discovery_ids),
+                "discovery_warmup_pair_count": len(observed_pairs),
+                "adapter_override_methods": 2,
+                "hidden_unevaluated": True,
+                "canonical_reference": True,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

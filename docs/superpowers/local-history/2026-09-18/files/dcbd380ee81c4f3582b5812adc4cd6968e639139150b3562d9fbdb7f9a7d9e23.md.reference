@@ -1,0 +1,15 @@
+# H2b fix 1 independent re-review
+
+**P2 host-path finding: ADDRESSED. Scoped spec/quality verdict: PASS.** No new actionable issue found in the fix. This closes the sole finding in `h2b-independent-review.md`; its other conclusions and evidence limits remain applicable.
+
+Reviewed only `h2b-fix1.diff`, affected helper/call-site context, the appended fix report and supplied fix evidence. Independently read final source SHA-256 `8c48c486dad583dfdb5508b21edc8bc75d3d979f042916ef96b82e0f15a17468`, matching the sealed source.
+
+The new pure `_require_docker_host_path_v5` (`historical_verification.py:343`) rejects non-string/blank/surrounding-whitespace paths, nonabsolute/noncanonical spelling and comma, NUL, LF or CR. It returns the original string unchanged. This supplies the previously missing restrictions from live `SandboxMountHandleV5` (`sandbox.py:143–151`) and `_docker_host_path_v5` (`production_sandbox.py:95–103`).
+
+`_mount_primitive_v5` now applies the guard before mount metadata is emitted. The existing completed-execution path constructs source/output and, for panels, data mount primitives before comparing request/command/runtime digests, so all applicable configured mount hosts are covered. The derived panel-input host is separately checked before runtime-argv interpolation and before expected-mount construction. Fixed child filenames add no prohibited delimiters. The fix does not normalize or escape invalid spelling, reopen retired sources, create capabilities, add state reads or perform operations.
+
+The four-hunk change is confined to the validator and its required uses. Valid inputs retain their previous strings, primitive values, argv ordering and digest encodings. No new breakage is apparent from the scoped static comparison.
+
+Supplied fix evidence reports passing Ruff, in-memory compile and static verification; all ten actual runtime-04 executions authenticated. Preservation evidence reports unchanged complete runtime-04 and provider-runtime-06 archives (579 and 83 files), and the evaluator map remains 56 files at digest `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4`. These are implementer results inspected here, not reviewer reruns. Invalid-path rejection is established by static inspection; no synthetic case was executed.
+
+No full re-review, tests, authentication reruns, summaries, synthetic artifacts, external operations, source edits or subagents were used. Only this re-review document was written. Acceptance remains limited to H2b resource authentication; H3 owns full historical completion integration.

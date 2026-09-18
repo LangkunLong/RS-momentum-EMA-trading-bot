@@ -1,0 +1,25 @@
+BASE: 33a5fde
+WORKTREE: uncommitted implementation
+
+REQUIREMENTS: Add only a deterministic, additive print_pnl_report section
+that counts each SimulationResult.entry_outcomes[*].outcome, sorts outcome
+names, and handles an empty list. No entry behavior, schemas, tests,
+downloads, optimizer, SEC/13F, or shared-branch changes.
+
+DIFF:
+@@
++    entry_outcome_counts: dict[str, int] = {}
++    for entry_outcome in result.entry_outcomes:
++        entry_outcome_counts[entry_outcome.outcome] = (
++            entry_outcome_counts.get(entry_outcome.outcome, 0) + 1
++        )
++    print("\n--- Entry Attempt Outcomes ---")
++    if entry_outcome_counts:
++        for outcome, count in sorted(entry_outcome_counts.items()):
++            print(f"{outcome}: {count}")
++    else:
++        print("No entry attempts recorded.")
+
+IMPLEMENTER REPORT:
+py_compile passed; direct populated and empty report invocations passed;
+no tests/data downloads; no concerns.

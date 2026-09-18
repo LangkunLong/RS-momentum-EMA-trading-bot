@@ -1,0 +1,30 @@
+# V5 runtime prerequisite preflight
+
+Source commit inspected: 5cb81b78435c519bcfd14bd5ba5303d8e465c43a.
+
+Read-only exact-path existence checks only; no data bytes or Docker inventory were read.
+
+Data root: C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.worktrees\pit-optimizer-v5-architecture\.artifacts\pit-optimizer-v5\data
+
+Missing required inputs: 12 of 12
+
+- source/sp500_membership.csv
+- source/sp500_provenance.json
+- source/nasdaq100_membership.csv
+- source/nasdaq100_provenance.json
+- source/russell2000_membership.csv
+- source/russell2000_provenance.json
+- prices.csv
+- prices_provenance.json
+- fundamentals.csv
+- fundamentals_provenance.json
+- industry.csv
+- industry_provenance.json
+
+Authenticated evaluator sandbox profile present: False
+
+The user separately confirmed prior searches of 34 local checkout roots found no complete V5 input set; older exports have not been authenticated together for V5. Docker engine is user-reported unreachable. No new broad search, data adaptation, fetch, synthesis, or Docker check was performed.
+
+Next dependency: explicitly scoped trusted-source acquisition/import or adaptation and provenance sealing, followed by schema-V3 bundle build/verification and immutable evaluator image/profile preparation. The current source task does not authorize those external/runtime actions.
+
+Discovery, confirmation, qualification, and full replay remain unexecuted. No optimizer return result is established.

@@ -1,0 +1,40 @@
+# Task 3 review — deterministic V5 local variant rendering
+
+## Spec Compliance
+
+APPROVED.
+
+- Authenticated lineage is fail-closed: `render_variants()` requires the exact `PolicyRevisionIdentityV5`, `_validate_render_inputs()` compares every parent path/digest to the supplied four-file bundle, and the template must name that revision (`core/pit_optimizer_v5/rendering.py:580-589`, `core/pit_optimizer_v5/rendering.py:596-614`).
+- Normal rendering changes only complete authorized top-level functions or module constants. Target lookup is exact, decorators and shared physical lines are rejected, and replacements are applied only to the located statement spans (`core/pit_optimizer_v5/rendering.py:89-126`, `core/pit_optimizer_v5/rendering.py:234-257`, `core/pit_optimizer_v5/rendering.py:400-468`).
+- Marker handling is syntactic and scoped: only exact `PIT_AXIS("name")` calls are accepted, their UTF-8 byte columns are converted to Python character offsets, each declared axis must occur exactly once, and executable marker tokens may not survive rendering (`core/pit_optimizer_v5/rendering.py:47-85`, `core/pit_optimizer_v5/rendering.py:164-210`, `core/pit_optimizer_v5/rendering.py:556-566`).
+- Full-source escape preserves the atomic ordered four-file bundle, reconstructs it from the parent by replacing only declared authorized symbols, rejects all other byte changes, and preserves the parent import AST (`core/pit_optimizer_v5/rendering.py:471-540`).
+- Assignment selection is deterministic and strict: default is first, one-axis-at-a-time variants follow declared axis/value order, remaining Cartesian assignments sort by canonical assignment identity, and strict type-aware keys deduplicate scheduling tiers (`core/pit_optimizer_v5/rendering.py:328-385`).
+- The emission cap applies to unique rendered assignments, while distinct assignments that produce identical complete source bundles fail with the typed `VariantRenderingCollisionV5` instead of being silently collapsed (`core/pit_optimizer_v5/rendering.py:629-695`).
+- Every rendered four-file bundle is rebuilt as `SourceFileV5` records, invoking the complete source validator, and each child revision is derived from exact rendered bytes while preserving the authenticated parent's runtime and immutable-constraint identities (`core/pit_optimizer_v5/rendering.py:393-399`, `core/pit_optimizer_v5/rendering.py:669-692`).
+- A parent-identical default is not filtered out: collision tracking begins only after the default is rendered and the first bundle is always emitted, preserving downstream exact-duplicate classification (`core/pit_optimizer_v5/rendering.py:629-695`).
+- Scope is clean: the review package contains only the new `core/pit_optimizer_v5/rendering.py`; no tests, imports outside that module, or unrelated files changed.
+
+## Strengths
+
+- Span replacement avoids `ast.unparse`, so unrelated formatting and source bytes remain stable.
+- UTF-8-aware AST offset conversion correctly handles non-ASCII text without confusing byte and character columns.
+- Strict primitive handling preserves `bool` versus `int`, rejects unsupported and non-finite values, and parenthesizes literals to preserve precedence.
+- Both normal-operation and full-source modes converge on the same import check, source validation, bundle construction, collision detection, and identity derivation path.
+
+## Issues
+
+### Critical
+
+None.
+
+### Important
+
+None.
+
+### Minor
+
+None.
+
+## Assessment
+
+APPROVED. The implementation satisfies the Task 3 rendering contract and the named integration risks. The supplied report's verification evidence is consistent with the reviewed code; checks were not rerun during this read-only review.

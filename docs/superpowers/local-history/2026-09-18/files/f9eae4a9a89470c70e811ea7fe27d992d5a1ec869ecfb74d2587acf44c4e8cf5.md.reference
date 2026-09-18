@@ -1,0 +1,51 @@
+```diff
+diff --git a/core/pit_optimizer_v5/production_runtime.py b/core/pit_optimizer_v5/production_runtime.py
+--- a/core/pit_optimizer_v5/production_runtime.py
++++ b/core/pit_optimizer_v5/production_runtime.py
+@@ -589,6 +589,29 @@ class LocalRoleRequestFactoryV5:
+     def manifest(self) -> CampaignManifestV5:
+         return self._manifest
+ 
++    def _render_rejection_count(self, inputs: FeedbackRoundInputV5, projection: SearchProjectionV5) -> int:
++        if self._repository.load_checkpoint() != projection.checkpoint:
++            raise ValueError("investigator rejection checkpoint differs")
++        count = 0
++        for stored in projection.stored_records:
++            record = self._repository.load_experiment(stored.reference)
++            if (
++                record != stored.record
++                or record.round_index >= inputs.round_index
++                or record.experiment_identity.discovery_plan_sha256
++                != inputs.panel_plan.discovery_plan_sha256
++                or (record.pit_data_scope, record.semantic_mode)
++                != (inputs.manifest.pit_data_scope, inputs.manifest.semantic_mode)
++            ):
++                raise ValueError("investigator rejection record authority differs")
++            if (
++                record.status == "invalid"
++                and record.validation.failure_code
++                == "policy_source_unbounded_or_stateful"
++            ):
++                count += 1
++        return count
++
+     def _investigator_parts(
+         self,
+         inputs: FeedbackRoundInputV5,
+@@ -619,6 +642,15 @@ class LocalRoleRequestFactoryV5:
+                 if metric_id in counts:
+                     evaluator_ids.append(evidence.add(f"{prefix}.entry.{metric_id}", counts[metric_id]))
+ 
++        rejection_count = self._render_rejection_count(inputs, projection)
++        if rejection_count:
++            evaluator_ids.append(
++                evidence.add(
++                    "failure.rendering.policy_source_unbounded_or_stateful_count",
++                    rejection_count,
++                )
++            )
++
+         families: list[ArchiveFamilyAggregateV5] = []
+         for mechanism in PRIMARY_MECHANISMS_V5:
+             entries = tuple(item for item in projection.state.archive.entries if item.primary_mechanism == mechanism)
+```

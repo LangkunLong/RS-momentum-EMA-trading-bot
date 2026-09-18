@@ -1,0 +1,361 @@
+# Task 2 Report — PIT Optimizer Audit-Only USD Authorization
+
+## Status
+
+Complete. The schema-v3 authorization ledger now treats calls and tokens as the
+only capacity authority. Pricing projections and authoritative provider cost are
+durable audit evidence and never participate in capacity comparison.
+
+No tests were added, modified, or run, following the binding production-first
+ruling. No provider, Docker daemon, hidden data, upload, push, or subagent was
+used.
+
+## Commit
+
+- Commit: `e65ab35e883568485c2318fa8d7ad1f8a572beb5`
+- Subject: `Make PIT optimizer USD accounting audit-only`
+- Committed production file: `core/pit_optimizer_authorization.py`
+- Commit diff: 504 insertions, 188 deletions
+
+## Exact API and record changes
+
+### Advisory pricing
+
+- Replaced `FrozenModelPricing` with `OptimizerPricingSnapshot`.
+- The active fields are exactly `model`, `lookup_status`,
+  `prompt_per_million`, `completion_per_million`, and
+  `pricing_payload_sha256`.
+- `lookup_status` accepts only `available` or `unavailable`.
+- Available snapshots require finite, non-negative `Decimal` rates.
+- Unavailable snapshots require both rates to be `None`.
+- The pricing digest covers model, status, and canonical decimal-rate strings.
+- `available(...)`, `unavailable(...)`, and
+  `projected_call_usd(prompt_bytes, output_tokens)` are implemented.
+- Pricing records serialize rates as canonical decimal text or JSON null.
+
+### Active authorization dataclasses
+
+- `OperatorAuthorizationGrant` now contains exactly `grant_id`,
+  `additional_calls`, `additional_tokens`, and
+  `policy_source_scope_sha256`.
+- `OperatorAuthorizationWindow` now contains exactly `window_id`, `grant_ids`,
+  `authorization_requirement_sha256`, `max_calls`, `max_tokens`, and
+  `policy_source_scope_sha256`.
+- `AuthorizationRunLease` now contains exactly `lease_id`,
+  `one_shot_key_sha256`, `window_id`, `run_manifest_sha256`,
+  `pricing_snapshot_sha256`, `pricing_status`, `projected_plan_usd`,
+  `max_calls`, and `max_tokens`.
+- `AuthorizationCallReservation` now contains exactly `reservation_id`,
+  `lease_id`, `call_index`, `iteration`, `role`, `reserved_tokens`, and
+  `projected_call_usd`.
+- `PitOptimizerProviderFacts` now contains exactly `call_index`, `iteration`,
+  `role`, `requested_model`, `returned_model`, `pricing_snapshot_sha256`,
+  `outcome`, `request_started`, `response_received`, `finish_reason`,
+  `response_schema_valid`, `accounting_complete`, `prompt_tokens`,
+  `completion_tokens`, `total_tokens`, `cost_usd`,
+  `retained_reservation_tokens`, and `audit_sha256`.
+- Advisory plan/call projections are stored as canonical non-negative decimal
+  text or null. Their magnitude is never compared with capacity.
+
+### Schema-v3 ledger
+
+- Active records use `schema_version=3` and exact closed key sets.
+- `open_run_lease` validates manifest, requirement, scope, one-shot identity,
+  pricing identity/status, and only call/token capacity.
+- `open_run_lease` atomically appends adjacent `pricing_snapshot` and
+  `lease_open` records.
+- `reserve_call` enforces ordered sealed-plan identity and only call/token
+  capacity. It accepts the keyword-only advisory `projected_call_usd`.
+- Grants, windows, leases, and reservations contain no `max_usd`,
+  `additional_usd`, `reserved_usd`, retained USD, nullable ceiling, infinity,
+  or sentinel.
+- Ledger replay revalidates manifest/scope identity, exact grant/window/lease
+  capacity, pricing-to-lease binding, one-shot keys, reservation order, provider
+  pricing identity, record indices, canonical JSON, record digests, and the hash
+  chain.
+- Pricing snapshots must be immediately and uniquely bound to a lease.
+- The `record-grant` CLI no longer accepts `--additional-usd`.
+
+### Reconciliation and terminal accounting
+
+- Request not started records `charged_calls=0`, `charged_tokens=0`,
+  `actual_cost_usd=0.0`, and `cost_accounting_status=not_started`.
+- Complete accounting records one charged call, authoritative actual tokens,
+  authoritative actual cost, and `cost_accounting_status=authoritative`.
+- Started but incomplete accounting records one charged call, the full retained
+  token reservation, null actual cost, and
+  `cost_accounting_status=unavailable`; the lease closes terminally.
+- Reconciliation overage now consists only of a token reservation overflow or
+  cumulative calls/tokens beyond the lease.
+- A resource overage is appended durably before raising and must have a
+  `budget_exhausted` lease close.
+- High finite authoritative cost is preserved in the reconciliation and gateway
+  terminal commitment without producing capacity exhaustion.
+- Gateway terminal commitments and charged-total recovery use the same
+  calls/tokens plus explicit actual-cost audit state. Retained USD and USD
+  charge-basis fields were removed.
+
+### Immutable schema-v2 history
+
+- Added `read_legacy_authorization_history(path)`.
+- It verifies regular non-link input, complete newline-delimited records,
+  duplicate-free canonical JSON, schema version, record indices, record hashes,
+  and the previous-record hash chain.
+- It returns a tuple of recursively immutable mappings/tuples.
+- It never translates, rewrites, resumes, or appends schema-v2 records.
+- Opening an active `AuthorizationLedger` on canonical schema-v2 history raises
+  a clear `schema-v2 ... not resumable` error.
+
+## Verification evidence
+
+### Required compile
+
+Command:
+
+```text
+python -B -m py_compile core/pit_optimizer_authorization.py
+```
+
+Result: exit 0, no output.
+
+### Provider-free construction and ledger smoke
+
+The local smoke constructed a valid schema-v3 six-call manifest without reading
+repository data artifacts, recorded grant/window authority, appended an
+available pricing snapshot and lease, reserved a call with a projected cost of
+`500000`, reconciled authoritative actual cost of `999999.0`, closed and
+reopened the ledger, then verified a minimal canonical schema-v2 history was
+readable but not resumable.
+
+Output:
+
+```text
+provider-free smoke: 7 v3 records; high cost audit-only; legacy history immutable/non-resumable
+```
+
+All temporary workspace smoke directories were resolved to exact worktree paths
+and removed. Final `git status --short` was empty after the commit.
+
+### Exact shape and CLI smoke
+
+An import-only introspection check compared every active dataclass field tuple
+with the approved exact shape, verified the `reserve_call` projection parameter,
+and verified that CLI help contains no `--additional-usd`.
+
+Output:
+
+```text
+shape/CLI smoke: exact v3 fields and no --additional-usd
+```
+
+### Pricing-state smoke
+
+Output:
+
+```text
+pricing smoke: available/unavailable projections validated
+```
+
+### Diff and forbidden-field review
+
+Commands:
+
+```text
+git diff --check
+rg -n 'max_usd|additional_usd|reserved_usd|retained_reservation_usd|frozen_pricing|charged_usd|charge_basis' core/pit_optimizer_authorization.py
+```
+
+Results: `git diff --check` exited 0; the forbidden-field search found no
+matches. Before commit, `git status --short` showed only
+`core/pit_optimizer_authorization.py` modified.
+
+### Commit hooks
+
+The commit ran and passed:
+
+- Ruff legacy alias
+- trailing-whitespace fix/check
+- end-of-file fix/check
+- merge-conflict check
+- YAML check skipped because no YAML file changed
+
+## Self-review
+
+- Confirmed active common record keys are closed and every nested active
+  dataclass rejects extra/missing keys through exact construction.
+- Confirmed the pricing digest and authorization record digest both use the
+  canonical newline-terminated JSON representation already used by the ledger.
+- Confirmed pricing snapshot and lease publication share one atomic append.
+- Confirmed one-shot identity is independent of pricing so a pricing retry
+  cannot replay the same manifest/window authority.
+- Confirmed projections are validated only for canonical, finite,
+  non-negative audit representation and are never compared by magnitude.
+- Confirmed high actual cost is persisted but omitted from every remaining
+  capacity calculation.
+- Confirmed incomplete accounting retains the full token reservation and is
+  terminal, while before-send failure releases call/token charge.
+- Confirmed token overage is durable and terminal before the public method
+  raises.
+- Confirmed active schema-v3 opening cannot reinterpret schema-v2 authority.
+- Confirmed no provider payload, provider response, credential, raw approval
+  text, or secret is written to authorization records.
+
+## Concerns and follow-up boundary
+
+- No defect is known within the Task 2 production file.
+- This is an intentionally incremental migration. `agent_loop.py` and the
+  optimizer controller still import/use the prior pricing and authorization
+  API until the subsequent tasks migrate their resource ledger, gateway, and
+  controller call sites. Full application import/integration is therefore not
+  claimed at this commit.
+- Focused/unit tests were intentionally deferred by explicit user direction;
+  verification here is compile, closed-shape introspection, provider-free ledger
+  construction/reopen, migration-boundary smoke, diff review, and commit hooks.
+
+---
+
+## Fix round 1 — Terminal precedence and replay semantics
+
+### Status and commit
+
+Both round-1 findings are fixed in the same production file. No tests were
+added, modified, or run. No provider, Docker daemon, hidden data, push, upload,
+or subagent was used.
+
+- Commit: `4b22b45c49a75a51c104303e0044209cc24c13a0`
+- Subject: `Harden PIT optimizer terminal replay`
+- Committed file: `core/pit_optimizer_authorization.py`
+- Commit diff: 118 insertions, 11 deletions
+
+### Critical finding correction
+
+Any complete, started call whose authoritative `total_tokens` exceed the exact
+authorization reservation now forces `budget_exhausted` before terminal receipt
+cross-checking and publication. This precedence is unconditional: it overrides
+an outcome-derived `failed` code and an explicitly requested `failed` or
+`cancelled` code.
+
+The same precedence is applied by `verify_reconciliation`, so recovery with the
+caller's original non-budget terminal request verifies the durably committed
+`budget_exhausted` close rather than disagreeing with it.
+
+### Replay-validation correction
+
+Schema-v3 `_read_records` now reconstructs and validates the terminal state
+machine while replaying the hash chain:
+
+- each reconciliation is accumulated in lease call order with its exact
+  reservation and provider facts;
+- any non-accepted reconciliation requires its terminal lease close as the
+  immediately following record;
+- a terminal audit receipt, when present, fixes the exact permitted close code;
+- without a receipt, the replay admits the same explicit
+  failed/cancelled/budget terminal choices allowed by the mutation API;
+- every resource overage requires an immediate `budget_exhausted` close and an
+  overage receipt cannot claim another terminal code;
+- `completed` requires the exact full six-call plan, with every call satisfying
+  the complete accepted-provider contract;
+- `early_stop` requires a non-empty, proper accepted prefix of that exact plan;
+- empty, non-accepted, excess, partial-completed, and full-early-stop histories
+  are rejected on reopen.
+
+The complete accepted-provider predicate is shared by replay and
+`close_run_lease`, eliminating drift between mutation-time and reopen-time
+validation.
+
+### Exact verification commands and output
+
+Required compile:
+
+```powershell
+python -B -m py_compile core\pit_optimizer_authorization.py
+```
+
+Output: none; exit 0.
+
+Focused provider-free smoke invocation:
+
+```powershell
+@'
+# Inline Python constructs a closed schema-v3 six-call manifest and isolated
+# local authorization ledgers. It performs these exact cases:
+# 1. schema_invalid + explicit cancelled + actual token overflow;
+# 2. accepted one-call prefix + early_stop;
+# 3. accepted exact six-call plan + completed;
+# 4. canonical/rehashed rejection with its lease_close removed;
+# 5. canonical/rehashed partial prefix relabeled completed;
+# 6. canonical/rehashed full plan relabeled early_stop.
+# It reopens legitimate ledgers, calls verify_reconciliation on the overage
+# using the original cancelled request, and asserts AuthorizationError for all
+# impossible histories.
+'@ | python -B -
+```
+
+The executed inline body used only contract dataclass construction, local
+workspace-temporary JSONL ledgers, canonical record rehashing, and
+`AuthorizationLedger`; it did not import a test module or read a data artifact.
+
+Exact output:
+
+```text
+overage precedence smoke: schema_invalid + explicit cancelled -> budget_exhausted; reopen and recovery verify clean
+legitimate replay smoke: accepted partial early_stop reopens
+legitimate replay smoke: accepted exact full plan completed reopens
+impossible replay smoke: missing rejection close, partial completed, and full early_stop rejected
+```
+
+The smoke directory was resolved to this exact path before recursive cleanup:
+
+```text
+C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.worktrees\pit-optimizer-implementation\.task2-fix-smoke
+```
+
+`Test-Path` returned `False` after removal, and the subsequent status contained
+only the intended production-file modification.
+
+Final diff and authority-field verification:
+
+```powershell
+git diff --check
+rg -n 'max_usd|additional_usd|reserved_usd|retained_reservation_usd|frozen_pricing|charged_usd|charge_basis' core\pit_optimizer_authorization.py
+git status --short
+git diff --stat
+```
+
+Output before commit:
+
+```text
+forbidden authority fields: none
+ M core/pit_optimizer_authorization.py
+ core/pit_optimizer_authorization.py | 129 +++++++++++++++++++++++++++++++++---
+ 1 file changed, 118 insertions(+), 11 deletions(-)
+```
+
+`git diff --check` exited 0. The commit hooks again passed Ruff, trailing
+whitespace, end-of-file, and merge-conflict checks; YAML was skipped because no
+YAML file changed.
+
+### Fix-round self-review
+
+- Confirmed token overflow precedence is decided before receipt verification
+  and before durable reconciliation/close publication.
+- Confirmed retry/recovery verification applies the same precedence.
+- Confirmed the reconciliation and required terminal close remain one adjacent,
+  atomic append in the mutation path and are required to be adjacent on replay.
+- Confirmed canonical JSON and correct record hashes cannot bypass terminal
+  semantics.
+- Confirmed `completed` and `early_stop` use the same full accepted-facts
+  predicate as `close_run_lease`.
+- Confirmed high USD remains audit-only; no USD authority field or comparison
+  was reintroduced.
+- Confirmed no active dataclass or record shape changed in this fix round.
+- Confirmed only `core/pit_optimizer_authorization.py` was committed.
+
+### Fix-round concerns
+
+- No remaining defect is known in the two reviewed authorization paths.
+- The previously reported incremental-integration boundary remains: downstream
+  optimizer gateway/controller call sites are migrated by subsequent tasks.
+- Tests remain intentionally deferred by explicit user direction; the evidence
+  for this round is compile, focused provider-free durable-ledger reproduction,
+  canonical-history rejection, diff review, and commit hooks.

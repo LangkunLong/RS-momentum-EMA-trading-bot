@@ -1,0 +1,7 @@
+{
+  "actual_archived_response": ".artifacts\\pit-optimizer-v5\\development\\runtime\\controller-investigator-round1-response.json",
+  "structure_passed": true,
+  "previously_rejected_prose_fields_passed": 2,
+  "synthetic_inputs": false,
+  "provider_calls": 0
+}

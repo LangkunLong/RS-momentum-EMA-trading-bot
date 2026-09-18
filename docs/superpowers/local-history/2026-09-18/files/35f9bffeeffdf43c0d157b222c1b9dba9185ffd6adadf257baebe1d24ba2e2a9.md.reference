@@ -1,0 +1,37 @@
+# Task 2 Review — Strategy-Universe V3
+
+## Spec Compliance
+
+The normalizer has the requested seven arguments, exact input/output CSV headers, canonical output ordering, authenticated lineage resolution, and constrained same-date rename coalescing.  The V3 builder creates the specified `membership_v3` primary key, retains the V2 default path, emits canonical three-universe metadata, and checks the reference-symbol identity surface.  The verifier independently rebuilds per-universe state, union and affiliation chronology, checks exact source/table rows, and only emits a create-only report after the V3 checks complete.
+
+The implementation does not fully meet the fail-closed provenance/report contract because the normalized membership's nested source bindings are not authenticated in the builder, and manifest handling has both strict-JSON and identity-race gaps.
+
+## Strengths
+
+- `normalize_pit_universe_membership.py:263-294` enforces exact source columns, sorted per-universe ticker state transitions, and rejects invalid membership state before lineage conversion.
+- `normalize_pit_universe_membership.py:371-400` only omits an event pair when it is one removal plus one addition in the same universe/date/lineage and matches an explicit authenticated predecessor-to-successor transition; it otherwise fails closed.
+- `build_pit_bundle.py:977-992` creates the requested V3 table and composite primary key, while `build_pit_bundle.py:1082-1091` keeps schema 2 as the default and rejects V3-only inputs on that legacy route.
+- `build_pit_bundle.py:808-866` separates reference symbols and requires authenticated price and fundamental coverage against the V3 identity surface.
+- `verify_pit_bundle.py:248-283` reconstructs each universe's state and explicit affiliations at every membership boundary without applying the legacy S&P cardinality constraint.
+
+## Issues Critical
+
+None.
+
+## Issues Important
+
+- `build_pit_bundle.py:657-663` — V3 accepts a membership provenance `inputs` list based only on the filtered `universe_id` sequence.  It does not require every entry to be an object, rejects neither non-object extras nor missing `membership_sha256`/`provenance_sha256`, and never validates each source's declared kind, retrieval time, or event count.  A canonical handcrafted membership provenance can therefore omit or falsify the source-byte bindings that the V3 bundle is supposed to seal.  Require exactly three objects with the normalizer's exact binding keys and validate their types/canonical digests/counts before deriving `membership_inputs_sha`.
+
+- `verify_pit_bundle.py:378-393` — The manifest is parsed and compared before it is hashed into the create-only report, but is not included in the `before`/after input-identity check.  A manifest replacement after line 385 can produce a report that says `verified` while binding the replacement bytes at line 393 rather than the manifest that was checked.  Hash the regular manifest before parsing, verify it is unchanged immediately before report publication, and use that authenticated digest in the report.
+
+- `verify_pit_bundle.py:380-382` — Manifest JSON uses permissive `json.loads`, which accepts duplicate object keys and non-finite constants.  This leaves a V3 checked input outside the duplicate/non-finite JSON rejection rule.  Parse it with the same duplicate-key/non-finite loader used for V3 provenance (and require a canonical manifest representation if that is part of the manifest contract).
+
+- `verify_pit_bundle.py:104-106` — `_database_rows` interpolates `bundle_path.as_posix()` into a SQLite URI rather than encoding it with `Path.as_uri()`.  A valid filename containing `?` or `#` changes the URI's query/fragment parsing and can make the exact-table comparison inspect a different path from the bundle already authenticated by `PITDataBundle`.  Build the URI with `bundle_path.as_uri()` and append the query parameters safely.
+
+## Issues Minor
+
+None.
+
+## Assessment
+
+Changes requested before accepting Task 2.  The state/coalescing and V3 coverage design are sound in the reviewed paths, but the four Important findings violate the required complete provenance, fail-closed JSON/source-path, and report-byte-binding guarantees.  Per review bounds, no tests or commands were rerun.

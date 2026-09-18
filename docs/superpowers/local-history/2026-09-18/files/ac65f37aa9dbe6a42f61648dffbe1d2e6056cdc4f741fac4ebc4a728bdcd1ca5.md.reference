@@ -1,0 +1,7 @@
+# H3a independent review
+
+Worktree: C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-v5-architecture. Read h3a-task-brief.md, h3a-task-report.md, exact source preimage diff and verification evidence. Review only H3a changes to controller_roles.py and development_preparation.py; inspect directly reached unchanged readers as needed, not whole dirty branch.
+
+Assess spec and quality: exact pure controller response classification after _sealed extraction, preserved live behavior/error ordering/terminal usage, no _sealed/constructor/invoke/reconcile modifications; existing-only package entry validates request/call/ref and sealed response exactly, rejects absence, never instantiates invoker or calls reconcile/incoming path, and forwards repair=False to both request-authority reads. Preserve existing package authenticator and current defaults. All return authority is actual immutable sealed evidence; no synthetic wrapper or writable fallback. Empty collections do not waive H3c lifecycle checks. Review actual runtime04 five-package evidence if supplied without repeating it.
+
+No source edits, tests read/run/create, synthetic cases, new authentications/summaries/campaigns/provider/Docker/external calls, credential/environment reads, commits or subagents. Static/diff and supplied real evidence review only. Report concrete prioritized findings with source lines and evidence limits, spec PASS/FAIL and quality approved/changes required in h3a-independent-review.md under1000words; return concise verdict.

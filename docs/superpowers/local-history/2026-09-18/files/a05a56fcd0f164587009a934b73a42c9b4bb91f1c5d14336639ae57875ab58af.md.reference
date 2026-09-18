@@ -1,0 +1,30 @@
+# B4c architect handoff — rejection feedback and progress accounting
+
+## Requested checkpoint
+
+B4c is ready for principal review. It changes only [production_runtime.py](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-v5-architecture/core/pit_optimizer_v5/production_runtime.py:592) and [summary.py](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-v5-architecture/core/pit_optimizer_v5/summary.py:56). Increment C and campaign work have not started.
+
+The scoped diffs are [Task 2](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-v5-architecture/.artifacts/pit-optimizer-v5/development/luna-recovery-b4c/task-2-review-diff.md) and [Task 3](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-v5-architecture/.artifacts/pit-optimizer-v5/development/luna-recovery-b4c/task-3-review-diff.md). The combined review view is [b4c-review-diff.md](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-v5-architecture/.artifacts/pit-optimizer-v5/development/luna-recovery-b4c/b4c-review-diff.md).
+
+## Delivered behavior
+
+`LocalRoleRequestFactoryV5` now reloads each checkpoint-authorized projection record and emits exactly one aggregate evaluator evidence item, `failure.rendering.policy_source_unbounded_or_stateful_count`, only for a nonzero count of prior-round committed invalid records carrying the closed reserved failure code. Checkpoint equality, record reload equality, discovery-plan, PIT-scope, and semantic-mode checks are mandatory; load failures propagate. The item appears after all existing episode evidence and before archive/history evidence. The approved A allowlist and episode block are byte-identical to their preimage.
+
+`OptimizerSummaryV5` now exposes defaulted `completed_lifecycle_rounds`, `evaluated_feedback_rounds`, and `render_rejected_experiments`. They preserve positional construction, use strict existing integer validation plus the specified consistency guard, and derive only after record authentication and `verify_projection`. Existing status/readiness/performance, tokens/costs, cleanup semantics, durable schemas, runtime/finalizer, and history/novelty behavior are unchanged.
+
+## Real evidence and limitation
+
+Read-only authenticated archive inspection derived runtime-04's new counts as `1, 1, 0` from its one canonical evaluated record and successful cleanup. Actual06 has no checkpoint records, so it derives `0, 0, 0`; its five-event terminal `rendering/stage_failed` journal and cleanup remain unchanged.
+
+The requested full `summarize_repository_v5(command="summarize")` before/after projections did **not** return for either archive. Both reached the existing development-history verifier and failed at foreign container-reservation identity (`artifact_graph_invalid`) before emitting a summary. This was reproduced read-only and source-traced; no credential, environment, artifact, or source workaround was used. [history-and-summary-review.md](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-v5-architecture/.artifacts/pit-optimizer-v5/development/luna-recovery-b4c/history-and-summary-review.md) separates these real archive facts from static count reasoning.
+
+## Verification
+
+- Final source SHAs: `production_runtime.py` `a757a0ca89979be9453129321a04b96498fb06a9f37438034b46e407ad8b72eb`; `summary.py` `e4ccb8a2077ca28d2ece2e541839265b3f08218e1b66e93b635772e600270865`.
+- Scoped Ruff, in-memory compilation, exact-preimage whitespace checks, and AST scope comparison passed. All protected source hashes remain pinned in [architect-verification.json](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-v5-architecture/.artifacts/pit-optimizer-v5/development/luna-recovery-b4c/architect-verification.json).
+- The 56-file evaluator identity is unchanged: `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4`; neither edited host file is covered.
+- Task-specific and whole-increment static reviews passed. Task 2 initially changed protected CRLF bytes; the exact-preimage mechanical splice restored them and its scoped re-review passed.
+
+No test, synthetic probe/record/event/wrapper, model/API call, credential access, candidate evaluation, campaign operation, evaluator rebuild, commit, push, or deployment occurred. Positive rejection, rejection-only/mixed lifecycle, and C1 duplicate branches remain static-only because no authenticated real record exists.
+
+**Checkpoint:** principal architect review required before Increment C or any campaign proposal.

@@ -1,0 +1,72 @@
+diff --git a/campaign-preparation-driver/review-freeze-01/prepare_c_c_campaign.py b/campaign-preparation-driver/prepare_c_c_campaign.py
+index 209daa4..160333b 100644
+--- a/campaign-preparation-driver/review-freeze-01/prepare_c_c_campaign.py
++++ b/campaign-preparation-driver/prepare_c_c_campaign.py
+@@ -523,6 +523,7 @@ def main() -> int:
+     preflight = preflight_paths_and_inputs(args)
+ 
+     sys.path.insert(0, str(SOURCE_ROOT))
++    from core.backtest_fills import ExecutionProfileV5
+     from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5
+     from core.pit_optimizer_v5.campaign_admission import (
+         CampaignAdmissionPolicyV5,
+@@ -533,15 +534,13 @@ def main() -> int:
+         ArtifactRefV5,
+         CampaignPanelPlanV5,
+         EvaluatorContractV5,
+-        ExecutionProfileV5,
+-        PolicyRevisionIdentityV5,
+         ProviderCapabilitiesV5,
+         ResourceCapabilitiesV5,
+         SearchCapabilitiesV5,
+-        SourceBundleV5,
+         canonical_json_bytes_v5,
+         canonical_primitive_v5,
+     )
++    from core.pit_optimizer_v5.candidate_ir import PolicyRevisionIdentityV5, SourceBundleV5
+     from core.pit_optimizer_v5.development_preparation import (
+         DevelopmentRoundFactoryV5,
+         capture_development_policy_v5,
+@@ -1014,7 +1013,10 @@ def main() -> int:
+             "docker_runs": 0,
+             "role_requests_persisted": 0,
+             "role_reservations": 0,
+-            "credentials_or_environment_values_read": False,
++            "credential_resolution_performed": False,
++            "environment_values_published": False,
++            "native_internal_git_environment_handling": True,
++            "native_internal_executor_environment_identity_handling": True,
+             "execution_authorized": False,
+         },
+     }
+diff --git a/campaign-preparation-driver/review-freeze-01/implementation-report.md b/campaign-preparation-driver/implementation-report.md
+index efd9d34..752f245 100644
+--- a/campaign-preparation-driver/review-freeze-01/implementation-report.md
++++ b/campaign-preparation-driver/implementation-report.md
+@@ -2,7 +2,7 @@
+ 
+ Status: **STATIC IMPLEMENTATION COMPLETE; DRIVER NOT EXECUTED.**
+ 
+-The bounded driver is `prepare_c_c_campaign.py`, 48,796 bytes, SHA-256 `05a12300be6b9b1253c55cdfaff0b55005cb18a0fe520e31f95fe609093e9831`. It is frozen for independent static review. No campaign/root/resource/config/manifest/policy/preview was created by this work.
++The bounded driver is `prepare_c_c_campaign.py`, 49,039 bytes, SHA-256 `48053dcc003ccdd576d7c8c3290463b85a3a534304ad7527bbfbfc2431d4adc9`. It is frozen for bounded independent re-review. No campaign/root/resource/config/manifest/policy/preview was created by this work.
+ 
+ ## Fixed authority and execution gate
+ 
+@@ -10,7 +10,7 @@ The driver pins the final P1-P4 independent source review `4e4991b0dfcdcfe980b2b
+ 
+ Execution additionally requires explicit command-line pins for the fixed source review, source authority, both readiness reviews, this exact driver SHA, and a new `campaign-preparation-driver/independent-review.md` SHA. The independent review must contain this exact driver SHA and an explicit approval verdict. Python bytecode suppression is mandatory. All gates, all 22 current source-byte checks, exact tool-file checks, source inventory reads, quick-evidence reads, and selected-path absence checks precede project imports and every destination write.
+ 
+-The selected physical Python, Git, and Docker files are pinned to the paths and hashes in `preparation-tool-files.json`. The process must already be running under that physical Python executable; the WindowsApps launcher alias is not hashed or accepted as the launch executable. Docker is hashed as a file and supplied to native composition but never executed by the driver. No environment values are published. Credential authority remains only the native `OPENROUTER_API_KEY` handle, with lazy resolution.
++The selected physical Python, Git, and Docker files are pinned to the paths and hashes in `preparation-tool-files.json`. The process must already be running under that physical Python executable; the WindowsApps launcher alias is not hashed or accepted as the launch executable. Docker is hashed as a file and supplied to native composition but never executed by the driver. Credential authority remains only the native `OPENROUTER_API_KEY` handle, with no credential resolution during preparation. Native source capture supplies its sanitized Git environment and native executor composition includes its internal control-environment handling in the executor identity. No environment values are published.
+ 
+ ## Exact preparation
+ 
+@@ -35,7 +35,7 @@ The source contains no round/campaign runner, provider call, evaluator call, Doc
+ ## Static verification
+ 
+ - Scoped Ruff: PASS.
+-- AST parse and in-memory compile: PASS.
++- AST parse and in-memory compile: PASS. Static binding inspection confirms `ExecutionProfileV5` comes from `core.backtest_fills` and `PolicyRevisionIdentityV5` / `SourceBundleV5` come from `core.pit_optimizer_v5.candidate_ir`.
+ - Static call inspection found the required native preparation calls and none of `run_feedback_round_v5`, `_run_campaign_v5`, `create_campaign_admission_v5`, `reserve_role_slot`, or role-request append calls.
+ - Project imports occur only after `authenticate_review_gates` and `preflight_paths_and_inputs`.
+ - Current reviewed source map: 22/22 match, zero mismatches.

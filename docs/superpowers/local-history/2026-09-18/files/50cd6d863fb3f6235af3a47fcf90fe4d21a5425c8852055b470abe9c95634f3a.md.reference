@@ -1,0 +1,51 @@
+# Independent post-admission actual-results and readiness review
+
+**Verdict: PASS for actual fresh C-c preparation after the preparation driver receives separate static approval.** No actionable finding remains in this bounded evidence/readiness review. This is neither preparation-driver approval, paid-launch authorization, positive-policy execution evidence, nor completion of the two-evaluated-round milestone.
+
+## Authority and execution boundary
+
+Read `admission-readiness.md`, the produced overall and per-archive results, complete saved before/after archive maps, collector review and focused collector evidence-binding/comparison sections, final reviewed source authority, and the prior fixed C-b readiness review. Independently verified these SHA-256 pins:
+
+| Evidence | SHA-256 |
+| --- | --- |
+| Reviewed `admission-readiness.md` | `14f385172f29dccf258d4be4802137724774e57b267ebbac4201a4945c01aed2` |
+| Frozen final P4/combined source review | `4e4991b0dfcdcfe980b2bd2655ba5bf88af6300c956c179d2e258014dd1fef4b` |
+| Final reviewed 22-source authority | `d896bce97945b9438bed6f4837fd16213530338563e3bbd728eafaa8a9fbbe09` |
+| Already-approved collector source | `bbe19f73eac84a5a30735f5047288797c537f8d4731c34918a39975727379d8d` |
+| Collector static review | `942bfe517ad3a3b2dc74730f811cbd2f16ccab3f3c81d431360cfa323b71eaed` |
+| Actual overall result | `8af00498b5fe1ba9a5f4c7bdaaa950f4bfe4e639871bb3dd46caa30abfa8d043` |
+| Actual review/source/evaluator authority | `d5280ab34f2ec8874337fdb8941576880a4dc2c7f2c388076f7e50852f6d97ab` |
+| Prior fixed C-b readiness review | `f604815930cb1a8bceeafcbe2bedbe6a7d243ac560d01256843d046cddf55742` |
+
+The collector's actual authority names the exact frozen final review and reviewed-source-authority digest. Its 22-file map equals both that approved map and the final freeze-02 source map. The prerequisite source review was therefore for the exact source used in the supplied collection evidence. The collector bytes still match its separate static approval.
+
+The principal records one invocation with `py -3.13 -B`, terminal session 41675, exit 0. The approved collector creates a fresh exclusive output package and makes one direct `completed_history` summary call per fixed original archive, without retry or operational fallback. Both supplied results returned successfully and the overall result is PASS. This review accepts that produced execution evidence; it did not rerun or independently observe either original call.
+
+## Actual summary compatibility
+
+The per-archive results exactly equal the corresponding entries in the overall result. Every reported old-field/count comparison is true and exact expected field membership is true.
+
+- **Runtime-04:** all 23 original non-command fields and the three count checks pass. The original `resume` versus new `summarize` distinction is explicitly recorded, not compared away. Independently compared all 27 returned fields against the previously accepted H3c returned summary, using numeric Decimal equality: all match. Counts remain lifecycle/evaluated feedback/render-rejected **1/1/0**. It remains `failed / runtime_failed`, with `discovery_evaluation:deadline_exceeded`, completed cleanup, zero provider-accounted calls/tokens/spend, one evaluated experiment and two rounds seen. This is historical controller evidence, not two new model-driven evaluated rounds.
+- **Provider-runtime-06:** independently compared all 27 returned fields against the exact accepted baseline summary, numerically for Decimal fields and directly otherwise: all match. Both command labels are `summarize`; count checks remain **0/0/0**. It remains `failed / runtime_failed`, with `rendering:stage_failed`, completed cleanup, **2 calls, 8596 tokens, USD 0.04234**, no experiment/checkpoint/evaluated candidate and no new critic evidence. Its rendering failure is not recast as a committed render-rejection record.
+
+Both original `source_unchanged=null` summary values remain intact. The separate collector preservation result supplies the host-source observation; these old summary fields do not assert it. Neither archive reports qualification or replay.
+
+## Preservation and fixed graph
+
+Independently compared the complete saved maps, including their key sets and hashes: runtime-04 **579** entries and provider-runtime-06 **83** entries are identical before/after and equal the accepted original maps in `current-verifier-evidence.json` (independently hashed `b1b648418bfaa66f830f056570964851880a0c7181ef6adbf0a901d9179c0a3b`). Thus the supplied maps preserve all **662** archived files and show no additions, including enrollment additions. Both final all-archive preservation checks also report true.
+
+Independently verified the readiness document's six per-archive result/map digests: runtime maps `3643fbb34d2e57d1986ebbcc17d69bc088f77069c379627b85dee4da9c4ebce0`, runtime result `c84342532296820ea2d40f99676c9f16d9967809c78428be22d4998e2ee71dce`; actual06 maps `6db8d3925f446e99b4b2134f6ca7b7649834df5f84753a5c4c0931eff4b14a68`, actual06 result `405ec5395506ac4c9685630d832f09a907f7dee2ca95fd8602cd36c68eb17623`.
+
+The actual evaluator map has exactly **56** entries and equals the accepted H3b evaluator map. Independently recomputing the canonical digest from this saved map gives `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4`, matching every supplied pin. The approved collector's post-call 22-host-file and 56-evaluator-file comparisons report unchanged. These are saved maps and produced after-check results, not a new live filesystem census or atomic/concurrent-writer guarantee.
+
+The prior independently approved C-b review remains authority for the fixed image/profile/development bundle/parent graph, four discovery baselines and separate quick evidence. This review does not reauthenticate that graph or recreate those outputs. The unchanged evaluator closure supports retaining that graph through the host-only admission change. Zero-trade/zero-return baselines and available entry counts, including zeros, are accurately scoped; they do not establish future packet size, positive performance or new dynamic request coverage.
+
+## Remaining preparation and execution gates
+
+The readiness document correctly confines the next step to one distinct fresh C-c package after driver static approval: actual manifest/config/policy and native, nonpersisting initial request preview, with no enrollment or launch. The reviewed policy target/caps remain 2 evaluated rounds, 3 attempts, 8 calls, 600000 total tokens, 75000 prospective total tokens per role, 8192 output, zero retries/repairs and one hypothesis/axis/variant/survivor. Their reserve arithmetic does not guarantee valid candidates or successful outcomes, and no hard USD ceiling or future price quote is established.
+
+Policy-positive execution, later response-dependent packets and new evaluations remain unexecuted. Historical admission claims are limited to logical-prefix eligibility and original stored epochs, with no global cross-file publication timestamps. No production three-universe, held-out qualification, replay or trading-performance claim follows.
+
+After driver approval and actual preparation, the exact fresh artifacts/packet/source/tool/environment/launch identities require independent review before the separate paid-run grant. The old remainder cannot authorize a replacement run. The two actual model-driven evaluated rounds and later actual-results Luna handoff remain outstanding.
+
+No source or archive rescan, test, source import, probe, synthetic evidence, reader/summary rerun, provider/API, credential/environment-value access, Docker/evaluation/campaign, Git mutation, production edit or archive mutation occurred during this review. Only this readiness review was written. The final source approval report was hash-checked and left frozen.

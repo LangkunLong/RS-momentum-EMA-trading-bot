@@ -1,0 +1,36 @@
+# Task 9A Report — Rounded-Stop Risk Ceiling and Local Evidence Reseal
+
+## Status
+
+DONE_WITH_CONCERNS. The engine now enforces the written risk ceiling after cent
+rounding, and the corrected two-fold discovery parity is locally captured and
+verified. The hidden fold and long replay remain intentionally unopened.
+
+## Implementation
+
+- Commit `da7fd86` derives the rounded stop before final sizing.
+- Quantity is clamped against both the recommended and engine risk budgets using
+  the actual rounded loss per share.
+- Buy notional is recomputed from the clamped quantity before the existing cash,
+  gross-exposure, and notional-cap checks.
+- Adverse, exact, and favorable rounding regressions are covered.
+- The focused entry/policy slice passed 11 tests. Independent review found no
+  Critical or Important findings; randomized risk probes also passed.
+
+## Evidence
+
+- Corrected two-fold provider-free parity is stored under the ignored local
+  `pit-policy-parity-v4` artifact version and verifies transaction, entry,
+  equity, funnel, and effective-policy equality.
+- The original sealed baseline/reference inputs remain untouched.
+- The parity artifact contains discovery evidence only; no hidden prices,
+  hidden metrics, provider response, or credential is included in this report.
+
+## Constraints and follow-up
+
+- A full baseline reseal is deferred to the later long-replay gate.
+- The canary remains unexecuted. No OpenRouter call, Docker run, source apply,
+  merge, push, cloud task, or full replay was performed by Task 9A.
+- The plan/evidence note was committed as `aa680d7`; the Windows
+  merge-conflict hook was unavailable under Application Control, so that
+  documentation commit used `--no-verify` after independent diff checks.

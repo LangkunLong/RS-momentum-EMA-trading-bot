@@ -1,0 +1,424 @@
+from __future__ import annotations
+
+import ast
+import difflib
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+ROOT = Path.cwd()
+sys.path.insert(0, str(ROOT))
+
+from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5
+from core.pit_optimizer_v5.contracts import (
+    ArtifactRefV5,
+    CampaignManifestV5,
+    canonical_sha256_v5,
+)
+from core.pit_optimizer_v5.historical_verification import (
+    authenticate_completed_historical_round_resources_v5,
+)
+
+
+PACKAGE = ROOT / ".artifacts/pit-optimizer-v5/development/increment-c-history-h2"
+SOURCE = ROOT / "core/pit_optimizer_v5/historical_verification.py"
+PREIMAGE = PACKAGE / "pre-h2b-historical_verification.py"
+RUNTIME = ROOT / ".artifacts/pit-optimizer-v5/development/runtime-04"
+PROVIDER = ROOT / ".artifacts/pit-optimizer-v5/development/provider-runtime-06"
+MANIFEST_REF = ArtifactRefV5(
+    "campaigns/development-controller-two-rounds-20260907-04/manifest.json",
+    "8fcae0423117f3a234e64391c277bd7efe5cbb775ff61ec879d8cbeb5659d37c",
+)
+PUBLIC = "authenticate_completed_historical_round_resources_v5"
+FORBIDDEN_CALLS = {
+    "ContainerCommandV5",
+    "DockerPanelRequestV5",
+    "OwnedLeaseV5",
+    "SandboxMountHandleV5",
+    "WorkspaceLeaseV5",
+    "adapter_state_transition",
+    "append_round_event",
+    "append_typed_state",
+    "cleanup",
+    "execute",
+    "launch",
+    "mounts_for",
+    "recover_typed_state_index",
+}
+
+
+def digest(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def newline_style(raw: bytes) -> str:
+    if b"\r\n" in raw and b"\n" not in raw.replace(b"\r\n", b""):
+        return "crlf"
+    if b"\r" not in raw:
+        return "lf"
+    return "mixed"
+
+
+def write_json(name: str, value: object) -> None:
+    (PACKAGE / name).write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def extended_root(path: Path) -> str:
+    absolute = str(path.resolve())
+    if os.name != "nt" or absolute.startswith("\\\\?\\"):
+        raise RuntimeError("H2b archive evidence requires a non-extended Windows root")
+    value = f"\\\\?\\{absolute}"
+    if not value.startswith("\\\\?\\"):
+        raise RuntimeError("extended Windows root assertion failed")
+    return value
+
+
+def archive_map(path: Path) -> dict[str, object]:
+    root = extended_root(path)
+    files: dict[str, dict[str, object]] = {}
+    for directory, directories, names in os.walk(root):
+        directories.sort()
+        for name in sorted(names):
+            absolute = os.path.join(directory, name)
+            relative = os.path.relpath(absolute, root).replace(os.sep, "/")
+            with open(absolute, "rb") as handle:
+                raw = handle.read()
+            files[relative] = {"sha256": digest(raw), "bytes": len(raw)}
+    files = dict(sorted(files.items()))
+    tree = digest(
+        json.dumps(files, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    )
+    return {
+        "archive_root": path.relative_to(ROOT).as_posix(),
+        "extended_root": root,
+        "extended_root_asserted": root.startswith("\\\\?\\"),
+        "file_count": len(files),
+        "byte_count": sum(int(item["bytes"]) for item in files.values()),
+        "tree_sha256": tree,
+        "canonicalization": (
+            "sorted ordinal relative path keys; compact UTF-8 JSON object of "
+            "sha256 and byte count"
+        ),
+        "files": files,
+    }
+
+
+def snapshots(suffix: str) -> None:
+    runtime = archive_map(RUNTIME)
+    provider = archive_map(PROVIDER)
+    if runtime["file_count"] != 579 or provider["file_count"] != 83:
+        raise RuntimeError("archive file count differs from the sealed scope")
+    write_json(f"h2b-runtime-04-{suffix}.json", runtime)
+    write_json(f"h2b-provider-runtime-06-{suffix}.json", provider)
+    print(runtime["file_count"], runtime["tree_sha256"])
+    print(provider["file_count"], provider["tree_sha256"])
+
+
+def call_name(node: ast.Call) -> str | None:
+    if isinstance(node.func, ast.Name):
+        return node.func.id
+    if isinstance(node.func, ast.Attribute):
+        return node.func.attr
+    return None
+
+
+def function_nodes(tree: ast.Module) -> dict[str, ast.FunctionDef]:
+    return {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+    }
+
+
+def reachable_graph(
+    nodes: dict[str, ast.FunctionDef],
+) -> tuple[dict[str, list[str]], list[str]]:
+    pending = [PUBLIC]
+    reached: set[str] = set()
+    graph: dict[str, list[str]] = {}
+    while pending:
+        name = pending.pop()
+        if name in reached:
+            continue
+        reached.add(name)
+        called = sorted(
+            {
+                candidate
+                for child in ast.walk(nodes[name])
+                if isinstance(child, ast.Call)
+                and (candidate := call_name(child)) in nodes
+            }
+        )
+        graph[name] = called
+        pending.extend(called)
+    return dict(sorted(graph.items())), sorted(reached)
+
+
+def static_evidence() -> None:
+    pre_raw = PREIMAGE.read_bytes()
+    raw = SOURCE.read_bytes()
+    tree = ast.parse(raw)
+    nodes = function_nodes(tree)
+    graph, reached = reachable_graph(nodes)
+    state_reads: list[dict[str, object]] = []
+    external_calls: set[str] = set()
+    forbidden: list[dict[str, object]] = []
+    for function in reached:
+        for child in ast.walk(nodes[function]):
+            if not isinstance(child, ast.Call):
+                continue
+            name = call_name(child)
+            if name is not None and name not in nodes:
+                external_calls.add(name)
+            if name in FORBIDDEN_CALLS:
+                forbidden.append({"function": function, "line": child.lineno, "call": name})
+            if name == "load_typed_state":
+                repairs = [
+                    keyword.value
+                    for keyword in child.keywords
+                    if keyword.arg == "repair"
+                ]
+                state_reads.append(
+                    {
+                        "function": function,
+                        "line": child.lineno,
+                        "repair_is_literal_false": (
+                            len(repairs) == 1
+                            and isinstance(repairs[0], ast.Constant)
+                            and repairs[0].value is False
+                        ),
+                    }
+                )
+    public_calls = {
+        call_name(child)
+        for child in ast.walk(nodes[PUBLIC])
+        if isinstance(child, ast.Call)
+    }
+    added_lines = raw.decode("utf-8").splitlines(keepends=True)
+    pre_lines = pre_raw.decode("utf-8").splitlines(keepends=True)
+    diff = "".join(
+        difflib.unified_diff(
+            pre_lines,
+            added_lines,
+            fromfile="a/core/pit_optimizer_v5/historical_verification.py.pre-h2b",
+            tofile="b/core/pit_optimizer_v5/historical_verification.py",
+        )
+    )
+    (PACKAGE / "h2b-source.diff").write_text(diff, encoding="utf-8", newline="")
+
+    accepted_map = json.loads(
+        (ROOT / ".artifacts/pit-optimizer-v5/development/increment-c-history-h1/evaluator-source-map.json").read_text(
+            encoding="utf-8"
+        )
+    )["source_sha256_by_path"]
+    evaluator_map = {
+        path: digest((ROOT / path).read_bytes()) for path in accepted_map
+    }
+    evaluator = {
+        "count": len(evaluator_map),
+        "sha256": canonical_sha256_v5(evaluator_map),
+        "source_sha256_by_path": evaluator_map,
+    }
+    write_json("h2b-evaluator-source-map.json", evaluator)
+
+    checks = {
+        "public_calls_h1_internally": "authenticate_historical_round_v5" in public_calls,
+        "public_does_not_accept_round_authority": (
+            [argument.arg for argument in nodes[PUBLIC].args.kwonlyargs]
+            == ["repository", "manifest", "round_index"]
+        ),
+        "all_reachable_typed_state_reads_disable_repair": bool(state_reads)
+        and all(item["repair_is_literal_false"] for item in state_reads),
+        "no_forbidden_operational_or_capability_calls": not forbidden,
+        "source_byte_style_matches_preimage": newline_style(raw)
+        == newline_style(pre_raw),
+        "evaluator_closure_is_56_files": len(evaluator_map) == 56,
+        "evaluator_digest_is_fixed": evaluator["sha256"]
+        == "005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4",
+        "evaluator_files_are_unchanged": evaluator_map == accepted_map,
+    }
+    evidence = {
+        "checks": checks,
+        "pass": all(checks.values()),
+        "preimage": {"sha256": digest(pre_raw), "bytes": len(pre_raw)},
+        "source": {"sha256": digest(raw), "bytes": len(raw)},
+        "newline_style": {
+            "preimage": newline_style(pre_raw),
+            "source": newline_style(raw),
+        },
+        "reachable_local_callgraph": graph,
+        "reachable_local_functions": reached,
+        "reachable_external_calls": sorted(item for item in external_calls if item),
+        "typed_state_reads": state_reads,
+        "forbidden_calls": forbidden,
+        "immutable_external_read_audit": {
+            "repository": [
+                "load_binary_state",
+                "load_evaluation_panel_spec",
+                "load_role_invocation",
+                "load_round_events",
+                "load_round_payload",
+                "load_typed_artifact",
+                "load_typed_state(repair=False)",
+                "verify_candidate_execution_index",
+            ],
+            "authenticated_graph": [
+                "authenticate_campaign_manifest_v5",
+                "load_development_config_v5",
+            ],
+            "accepted_h1_read_only_history": [
+                "LocalGitWorkspaceDriverV5.authenticate_lease_history",
+                "LocalSandboxMountFactoryV5.authenticate_output_history",
+            ],
+            "pinned_filesystem_reads": [
+                "acquire_absolute_directory_v5",
+                "directory_child_absent_v5",
+                "hash_regular_in_directory_v5",
+            ],
+        },
+    }
+    write_json("h2b-static-verification.json", evidence)
+    write_json(
+        "h2b-source-hashes.json",
+        {"preimage": evidence["preimage"], "source": evidence["source"]},
+    )
+    print(json.dumps(evidence, indent=2, sort_keys=True))
+    if not evidence["pass"]:
+        raise SystemExit(1)
+
+
+def authenticate_actual() -> None:
+    repository = LocalArtifactRepositoryV5(RUNTIME.resolve())
+    manifest = repository.load_typed_artifact(
+        MANIFEST_REF,
+        value_type=CampaignManifestV5,
+    )
+    rows: list[dict[str, object]] = []
+    total = 0
+    for round_index in (1, 2):
+        result = authenticate_completed_historical_round_resources_v5(
+            repository=repository,
+            manifest=manifest,
+            round_index=round_index,
+        )
+        executions = []
+        for item in result.execution_history:
+            executions.append(
+                {
+                    "key": {
+                        "experiment_id": item.authority.key.experiment_id,
+                        "stage": item.authority.key.stage,
+                        "episode_ordinal": item.authority.key.episode_ordinal,
+                    },
+                    "request_sha256": item.authority.request_sha256,
+                    "command_sha256": item.authority.command_sha256,
+                    "terminal_status": item.terminal.status,
+                    "output_sha256": (
+                        None if item.terminal.output_ref is None else item.terminal.output_ref.sha256
+                    ),
+                    "observed_byte_count": item.terminal.observed_byte_count,
+                    "cleanup_authenticated": True,
+                    "workspace_payload_ref": item.workspace_payload_ref.to_primitive(),
+                }
+            )
+        total += len(executions)
+        authority = result.round_authority
+        rows.append(
+            {
+                "round_index": round_index,
+                "evaluator_contract_sha256": authority.authenticated_manifest.evaluator_contract.sha256,
+                "sandbox_profile_sha256": authority.authenticated_manifest.sandbox_profile.sha256,
+                "image_reference": authority.authenticated_manifest.sandbox_profile.image_reference,
+                "expected_executor_identity_sha256": authority.expected_executor_identity_sha256,
+                "workspace_count": len(authority.workspace_history),
+                "successful_execution_keys": [
+                    {
+                        "experiment_id": key.experiment_id,
+                        "stage": key.stage,
+                        "episode_ordinal": key.episode_ordinal,
+                    }
+                    for key in result.successful_execution_keys
+                ],
+                "execution_count": len(executions),
+                "executions": executions,
+                "cleanup": {
+                    "owned_workspaces": result.cleanup.owned_workspaces,
+                    "owned_policy_workers": result.cleanup.owned_policy_workers,
+                    "owned_evaluators": result.cleanup.owned_evaluators,
+                    "owned_containers": result.cleanup.owned_containers,
+                    "cleanup_complete": result.cleanup.cleanup_complete,
+                },
+            }
+        )
+    evidence = {
+        "archive_root": RUNTIME.relative_to(ROOT).as_posix(),
+        "manifest_sha256": manifest.sha256,
+        "rounds": rows,
+        "total_execution_count": total,
+        "pass": total == 10 and all(row["execution_count"] == 5 for row in rows),
+    }
+    write_json("h2b-actual-auth-results.json", evidence)
+    print(json.dumps(evidence, indent=2, sort_keys=True))
+    if not evidence["pass"]:
+        raise SystemExit(1)
+
+
+def preservation() -> None:
+    before_runtime = json.loads((PACKAGE / "h2b-runtime-04-before.json").read_text())
+    after_runtime = json.loads((PACKAGE / "h2b-runtime-04-after.json").read_text())
+    before_provider = json.loads((PACKAGE / "h2b-provider-runtime-06-before.json").read_text())
+    after_provider = json.loads((PACKAGE / "h2b-provider-runtime-06-after.json").read_text())
+
+    def result(before: dict[str, object], after: dict[str, object]) -> dict[str, object]:
+        before_files = before["files"]
+        after_files = after["files"]
+        assert isinstance(before_files, dict) and isinstance(after_files, dict)
+        changed = sorted(
+            path
+            for path in set(before_files) | set(after_files)
+            if before_files.get(path) != after_files.get(path)
+        )
+        return {
+            "before_file_count": before["file_count"],
+            "after_file_count": after["file_count"],
+            "before_byte_count": before["byte_count"],
+            "after_byte_count": after["byte_count"],
+            "before_tree_sha256": before["tree_sha256"],
+            "after_tree_sha256": after["tree_sha256"],
+            "extended_roots_asserted": before["extended_root_asserted"]
+            and after["extended_root_asserted"],
+            "unchanged": not changed,
+            "changed_paths": changed,
+        }
+
+    runtime = result(before_runtime, after_runtime)
+    provider = result(before_provider, after_provider)
+    value = {
+        "runtime_04": runtime,
+        "provider_runtime_06": provider,
+        "pass": runtime["unchanged"] and provider["unchanged"],
+    }
+    write_json("h2b-preservation-check.json", value)
+    print(json.dumps(value, indent=2, sort_keys=True))
+    if not value["pass"]:
+        raise SystemExit(1)
+
+
+if len(sys.argv) != 2:
+    raise SystemExit("usage: h2b_evidence.py before|static|auth|after|preservation")
+mode = sys.argv[1]
+if mode in {"before", "after"}:
+    snapshots(mode)
+elif mode == "static":
+    static_evidence()
+elif mode == "auth":
+    authenticate_actual()
+elif mode == "preservation":
+    preservation()
+else:
+    raise SystemExit("unknown evidence mode")

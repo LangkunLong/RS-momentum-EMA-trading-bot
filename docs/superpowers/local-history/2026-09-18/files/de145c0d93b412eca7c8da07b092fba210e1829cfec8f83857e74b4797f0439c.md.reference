@@ -1,0 +1,72 @@
+# Increment C-b readiness review
+
+Principal assessment: readiness is supported for C-c's concrete fresh campaign proposal, subject to independent consolidated review of this package. H1, H2a, H2b, H3a, H3b and H3c have passed independent source review. Both actual completed-history summaries returned with all field/count comparisons passing and complete archive preservation. No paid execution is approved by this document.
+
+## Accepted immutable inputs
+
+The supplied fixed-authority-report.md and fixed-authority-evidence.json authenticate actual06's 16-edge original graph and the existing four discovery request/output pairs. Their complete archive preservation checks passed. These fixed inputs are distinct from runtime04's older authenticated evaluator and policy graph; no historical reference has been rebound.
+
+| Authority | Accepted identity |
+| --- | --- |
+| Evaluator source, 56 files | 005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4 |
+| Evaluator image | pit-optimizer-v5-evaluator@sha256:4e85b19aa8c135362ae8796e4d33a410ec5af650d296c358ae6a7737d5b05b6a |
+| Sandbox profile | 0923e93f56e06fc982c9db00815329d1cdc936c0a0b9a140d287b7611ad5b1c9 |
+| Evaluator contract | 73a4a914ca3a6088e6275eb1ab83f32fdfb26a24474c69a886313b30a75ccde4 |
+| Execution profile | 93ced32086727384e67f36c5bdfa8ebfd3211a7fe47e25e7356b170a3bacb3af |
+| Development bundle | cf729b47d762ae86287bb8a87c28a1664e7475c74ef1aca736fbc240111349de |
+| Parent source bundle | 109a61992ac79317446861c4cb2053f2704239eb1f8eacfe2b2d27ca2cf7456e |
+| Parent policy revision | 5d2a95ba2572e71dab448934544cef22130415fcc1691c9a98deb820d40a1fa9 |
+| Baseline parent | 1f23034024f3b5caa55604cb21b561cb941e92d54bc09969935bea856a54dd6e |
+| Panel plan | 34fd3430ce952fa7115ec8802a4998cd6e940df5052c2dcfd92a1fb1a87843d5 |
+| Parent provenance | 65cdc2349e3f63540bf60e1c09e3ab15d97164ebcdd674fe9af094c06053d3e5 |
+
+All four accepted discovery baselines report zero base trades and returns. The existing quick output SHA is ee52964453c9831f371ca7539a6d30d5c47707d5c0e6cf3d16436e15c28c5716, with request-bound verification SHA 30cd7f6c5048b535f864ae657d9292064d1e3739e07caff954bccd2d1d987843. It shares the fixed graph and also reports zero base trades/return. Its request episode label development-first-loop-2021q1 differs from the manifest's development-quick label with identical panel digest bfa5c7767c74f0757442cc47a2cda8aaee9f43193a2ebe041b1bffbb0328cc05. It remains separate from the parent-provenance edges. Exact paths, all original references and data lineage are in the fixed-authority evidence.
+
+## Request and progress evidence
+
+request-evidence-report.md and request-evidence.json record runtime04's actual first and second investigator envelopes: 6,700 and 22,071 bytes, with prospective input bounds 10,305 and 27,370. Each has 16 evaluator headline items. These archived requests predate the current metric insertion and cannot demonstrate its dynamic execution.
+
+Current source orders four headline metrics plus available integer counts from a closed 16-metric allowlist per episode, including zero values, then a rejection count if nonzero, then archive/history evidence. The four real parent episodes supply 64 available count values; this supports the possible 80-item zero-rejection projection together with static source inspection. Omission of a zero rejection count and the new request composition have no manufactured runtime coverage.
+
+The archived request bounds fit actual06's stored capabilities individually. That analytical comparison is neither a future packet nor a fresh budget authorization. Its stored six-call/448,000-token capabilities and prior spend are historical facts. C-c must choose one coherent finite future call/token budget and exact initial packets before a new grant.
+
+The lifecycle cap limits attempts. Rejected or failed attempts do not establish an evaluated feedback round. The required future success is two distinct actual evaluated rounds with critic, checkpoint and successful cleanup evidence.
+
+## Completed source and actual-summary verification
+
+H3c independent review SHA is 9a7c698b42702c2a7a8b63f6a7e9ed51229552564a37a25b215a793cbd01b26e. It approved the frozen implementation and exact reachable immutable boundary, with no actionable integration finding. A report-only overstatement was corrected: recorded export mode/driver and workspace/resource lifecycle evidence is authenticated; separate confirmation or finalized-discovery readers are not invoked.
+
+Immediately before summary execution, principal-pre-summary-source-check.json compared all 21 relevant host source files against the accepted C-a baseline plus independently approved H1/H2/H3 changes. All hashes matched. The collector then recomputed all 56 evaluator file hashes and their canonical digest; the fixed closure remained unchanged. Full current source and evaluator maps are in ../increment-c-history-h3/h3c-actual-summaries-01/review-and-source-authority.json. Final host integration hashes are:
+
+| Source | SHA-256 |
+| --- | --- |
+| historical_verification.py | 978c0bd83ddbafecc9ef388420c23634429f32a5f6473eef441c09db4c6c521b |
+| development_preparation.py | e7f7e2c0d6c4b66eefd31b031cc18cf53f3924a013b39a318d613ccff75b72f8 |
+| summary.py | bbf96eeece0e5c3aab963e975977f16f703ec5780802869c565558d9f9f588c5 |
+| production_runtime.py | 1a232da79f5ddf0c01e48f39dd94008f6ad3b34ed08af385c3787e4f4555e070 |
+| production_provider.py | 6077f0a716fa5d64594f5760d86b00f3b2865b605ca25bf3ab57bed07793b94f |
+| controller_roles.py | 62f7414dd31a7970d08bcbf7fcc7faaeb19e5ee806cba5363311aef338b15b1f |
+| production_sandbox.py | 8dd79cef1e524a87cc324745ac7ee49fbbe5e1a91f271ce0d641451dc99337d7 |
+
+The independently inspected collector ran once per original manifest with explicit completed_history, command summarize, and Python -B. It exited 0. Exact returned objects and comparisons are in ../increment-c-history-h3/h3c-actual-summaries-01/result.json:
+
+| Archive | Returned outcome | Lifecycle / evaluated / render-rejected counts | Comparison |
+| --- | --- | --- | --- |
+| runtime04 | failed; discovery_evaluation:deadline_exceeded in round2; one checkpoint/evaluated experiment | 1 / 1 / 0 | All 23 prior non-command fields match; original resume versus new summarize preserved explicitly; all three new counts match |
+| actual06 | failed; rendering:stage_failed; two paid calls, 8596 tokens, USD 0.04234; no experiment | 0 / 0 / 0 | All 27 prior fields match, including the same summarize command |
+
+Decimal-valued fields were compared numerically; all other compared fields matched exactly. Both reported cleanup_complete=true, no qualification or replay, and no render-rejected committed experiment. Runtime04's role_calls=0 reflects its recorded controller provenance and does not erase its five role packages. Neither archive proves the required future two evaluated feedback rounds.
+
+Before and after maps exactly match the accepted C-a baseline: runtime04 has 579 unchanged files and actual06 has 83. A final second preservation comparison also passed; all 21 checked host sources remained unchanged during collection. The current-runtime CLI/default path was not rerun or bypassed. Historical API success does not claim that the old context-sensitive runtime04 executor identity can be reconstructed.
+
+## Next permitted step
+
+After independent consolidated review, prepare C-c with a distinct fresh campaign/root, exact manifest/config/outbound initial packet composition, finite lifecycle and paid call/token reserves, explicit two-evaluated-round success rule, fixed environment/deadline/cleanup authority, and one saved launch. No parent reevaluation or evaluator rebuild is justified by these host-only changes. Obtain a fresh separate execution grant only after that complete proposal is reviewable. The old remaining grant cannot fund the minimum six role calls and must not be reused as authority for a replacement run.
+
+## Material limits carried forward
+
+No tests or synthetic cases were read, created or run for this transition. Negative and absent-state branches have static evidence only. The following positive paths remain unexecuted under current changes: dynamic omission of a zero rejection count, committed closed rejection with checkpoint/cleanup, positive feedback metric, rejection-only/duplicate-only/mixed or multiple-evaluated finalization, parent-identical duplication and full novelty closure. A future real campaign may exercise some; it must not be represented as guaranteed coverage.
+
+The historical reader recognizes authenticated recorded semantics and original per-round configuration; it does not reconstruct unsaved historical environment or host-contract preimages. Live launch identity checks remain separate. Immutable census observes evidence and is not a concurrent-writer lock.
+
+Development evidence uses the provisional SP500 bundle. It does not establish final three-universe production validity, held-out qualification, replay readiness or promotion. Zero-trade baselines motivate investigation without establishing a cause. New paid execution remains a separate final user grant after C-c's concrete reviewed preparation.

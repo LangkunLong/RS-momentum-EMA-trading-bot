@@ -1,0 +1,496 @@
+# Review package: e10e4a5..e435217
+
+## Commits
+e435217 fix: enforce policy safety boundaries
+
+## Files changed
+ core/backtest_engine.py               |  43 ++++++--------
+ tests/test_backtest_engine.py         | 108 ++++++++++++++++++++++++++++++++--
+ tests/test_backtest_open_causality.py |  18 +++---
+ 3 files changed, 131 insertions(+), 38 deletions(-)
+
+## Diff
+diff --git a/core/backtest_engine.py b/core/backtest_engine.py
+index 1a13f87..fea4daa 100644
+--- a/core/backtest_engine.py
++++ b/core/backtest_engine.py
+@@ -1722,24 +1722,24 @@ class PortfolioSimulator:
+         end_date: Optional[str] = None,
+         history_start_date: Optional[str] = None,
+         benchmark_symbol: Optional[str] = None,
+         checkpoint_path: Optional[str | Path] = None,
+         progress_log_path: Optional[str | Path] = None,
+         resume: bool = False,
+         checkpoint_every_days: int = 20,
+         checkpoint_code_identity: Optional[str] = None,
+     ) -> SimulationResult:
+         client = self._policy_client_factory()
+-        if client.interface_version != POLICY_INTERFACE_VERSION:
+-            raise ValueError("policy interface version mismatch")
+-        self._policy_client = client
+         try:
++            self._policy_client = client
++            if client.interface_version != POLICY_INTERFACE_VERSION:
++                raise ValueError("policy interface version mismatch")
+             return self._run_with_policy_client_active(
+                 tickers,
+                 lookback_weeks,
+                 start_date=start_date,
+                 end_date=end_date,
+                 history_start_date=history_start_date,
+                 benchmark_symbol=benchmark_symbol,
+                 checkpoint_path=checkpoint_path,
+                 progress_log_path=progress_log_path,
+                 resume=resume,
+@@ -2683,22 +2683,28 @@ class PortfolioSimulator:
+             cash_fraction=cash_fraction,
+             configured_eviction_enabled=self.enable_eviction,
+         )
+         decision = self._adapter_policy_client().recommend_capacity(snapshot)
+         if type(decision) is not CapacityDecision:
+             raise ValueError("capacity policy decision is invalid")
+         return validate_capacity_decision(snapshot, decision)
+ 
+     def _capacity_state(self, pending: PendingEntry) -> tuple[bool, bool]:
+         limit = pending.capacity.max_positions
+-        full = limit is not None and len(self._open_positions) >= limit
+-        return full, bool(full and pending.capacity.eviction_enabled)
++        open_position_count = len(self._open_positions)
++        full = limit is not None and open_position_count >= limit
++        eviction_enabled = bool(
++            limit is not None
++            and open_position_count == limit
++            and pending.capacity.eviction_enabled
++        )
++        return full, eviction_enabled
+ 
+     def _evaluate_signals(
+         self,
+         *,
+         tickers: List[str],
+         ticker_ohlcv: Dict[str, pd.DataFrame],
+         all_closes: pd.DataFrame,
+         eval_date: pd.Timestamp,
+         market_state: dict,
+     ) -> List[PendingEntry]:
+@@ -2852,21 +2858,25 @@ class PortfolioSimulator:
+             cash_fraction=min(cash_fraction, 1.0),
+         )
+         if capacity.max_positions is None:
+             candidate_limit = len(signals)
+         else:
+             open_slots = max(
+                 capacity.max_positions - len(self._open_positions),
+                 0,
+             )
+             candidate_limit = open_slots
+-            if candidate_limit == 0 and capacity.eviction_enabled:
++            if (
++                candidate_limit == 0
++                and len(self._open_positions) == capacity.max_positions
++                and capacity.eviction_enabled
++            ):
+                 candidate_limit = 1
+         self._execution_diagnostics["capacity_truncated_signals"] += max(
+             len(signals) - candidate_limit,
+             0,
+         )
+         return [
+             PendingEntry(signal=dict(signal), capacity=capacity)
+             for signal in signals[:candidate_limit]
+         ]
+ 
+@@ -3173,21 +3183,20 @@ class PortfolioSimulator:
+         self._close_trade(evict_sym, evict_price, "evicted", str(eval_date.date()))
+         self._execution_diagnostics["evictions_executed"] += 1
+         return True
+ 
+     def _enter_position(
+         self,
+         pending: PendingEntry | dict[str, object],
+         ticker_ohlcv: Dict[str, pd.DataFrame],
+         entry_date: pd.Timestamp,
+     ) -> None:
+-        direct_legacy_entry = not isinstance(pending, PendingEntry)
+         if not isinstance(pending, PendingEntry):
+             pending = PendingEntry(
+                 signal=dict(pending),
+                 capacity=CapacityDecision(
+                     self.max_positions,
+                     self.enable_eviction,
+                 ),
+             )
+         if (
+             pending.capacity.max_positions is not None
+@@ -3310,38 +3319,22 @@ class PortfolioSimulator:
+             ),
+             projected_gross_exposure_after_eviction=max(
+                 projection.projected_gross_long_notional,
+                 math.ulp(1.0),
+             ),
+             entry_open=projection.entry_open,
+             pending_entries_remaining=max(self._pending_entries_remaining, 1),
+             capacity_is_uncapped=pending.capacity.max_positions is None,
+             configured_position_risk_pct=self.position_risk_pct,
+             configured_stop_loss_pct=self.stop_loss_pct,
+-            maximum_position_risk_fraction=(
+-                max(self.position_risk_pct, 0.01)
+-                if direct_legacy_entry
+-                or (
+-                    self._strategy_was_injected
+-                    and type(self._policy_client) is InProcessPolicyClient
+-                )
+-                else 0.01
+-            ),
+-            maximum_stop_fraction=(
+-                max(self.stop_loss_pct, 0.08)
+-                if direct_legacy_entry
+-                or (
+-                    self._strategy_was_injected
+-                    and type(self._policy_client) is InProcessPolicyClient
+-                )
+-                else 0.08
+-            ),
++            maximum_position_risk_fraction=0.01,
++            maximum_stop_fraction=0.08,
+             canslim_score=_finite_signal_number(signal.get("canslim_score")),
+             rs_score=_finite_signal_number(signal.get("rs_score")),
+         )
+         recommendation = self._adapter_policy_client().recommend_allocation(
+             allocation_snapshot
+         )
+         if type(recommendation) is not AllocationDecision:
+             raise ValueError("allocation policy decision is invalid")
+         recommendation = validate_allocation_decision(
+             allocation_snapshot,
+diff --git a/tests/test_backtest_engine.py b/tests/test_backtest_engine.py
+index c427e44..255e58b 100644
+--- a/tests/test_backtest_engine.py
++++ b/tests/test_backtest_engine.py
+@@ -41,20 +41,30 @@ class _ExplodingFetcher:
+ 
+ 
+ class _CountingClient(InProcessPolicyClient):
+     def __init__(self, closed: list[int]) -> None:
+         self._closed_events = closed
+ 
+     def close(self) -> None:
+         self._closed_events.append(1)
+ 
+ 
++class _MismatchedVersionClient(_CountingClient):
++    interface_version = 2
++
++
++class _RaisingVersionClient(_CountingClient):
++    @property
++    def interface_version(self) -> int:
++        raise RuntimeError("injected interface version failure")
++
++
+ def test_policy_client_factory_creates_and_closes_once_per_run() -> None:
+     made: list[_CountingClient] = []
+     closed: list[int] = []
+ 
+     def factory() -> _CountingClient:
+         client = _CountingClient(closed)
+         made.append(client)
+         return client
+ 
+     simulator = PortfolioSimulator(
+@@ -66,20 +76,50 @@ def test_policy_client_factory_creates_and_closes_once_per_run() -> None:
+             simulator.run(
+                 ["AAPL"],
+                 start_date="2021-06-25",
+                 end_date="2021-09-20",
+             )
+     assert len({id(client) for client in made}) == 2
+     assert closed == [1, 1]
+     assert simulator._policy_client is None
+ 
+ 
++@pytest.mark.parametrize(
++    ("client_type", "error_type", "message"),
++    [
++        (_MismatchedVersionClient, ValueError, "policy interface version mismatch"),
++        (_RaisingVersionClient, RuntimeError, "injected interface version failure"),
++    ],
++)
++def test_policy_client_interface_validation_failure_closes_and_clears(
++    client_type: type[_CountingClient],
++    error_type: type[Exception],
++    message: str,
++) -> None:
++    """Break caught: interface validation could bypass factory-client cleanup."""
++    closed: list[int] = []
++    simulator = PortfolioSimulator(
++        data_fetcher=_ExplodingFetcher(),
++        policy_client_factory=lambda: client_type(closed),
++    )
++
++    with pytest.raises(error_type, match=message):
++        simulator.run(
++            ["AAPL"],
++            start_date="2021-06-25",
++            end_date="2021-09-20",
++        )
++
++    assert closed == [1]
++    assert simulator._policy_client is None
++
++
+ def _make_ohlcv(
+     n: int = 10,
+     *,
+     start_price: float = 100.0,
+     close_value: float | None = None,
+     high_value: float | None = None,
+     low_value: float | None = None,
+ ) -> pd.DataFrame:
+     dates = pd.date_range(end=datetime(2026, 4, 17).date(), periods=n, freq="B")
+     close = close_value if close_value is not None else start_price
+@@ -912,32 +952,64 @@ def test_policy_capacity_pending_entry_round_trip_and_carried_capacity() -> None
+         capacity=CapacityDecision(max_positions=1, eviction_enabled=False),
+     )
+     assert PendingEntry.from_primitive(pending.to_primitive()) == pending
+     simulator = PortfolioSimulator(max_positions=None, enable_eviction=True)
+     simulator._open_positions = {"OLD": object()}
+     assert simulator._capacity_state(pending) == (True, False)
+ 
+ 
+ def test_policy_capacity_lowered_below_holdings_blocks_without_liquidation() -> None:
+     """Break caught: lowering a policy cap could force unrequested liquidation."""
++    class Client(InProcessPolicyClient):
++        def recommend_capacity(self, _snapshot):
++            return CapacityDecision(1, True)
++
+     simulator = PortfolioSimulator(max_positions=None, enable_eviction=True)
+     positions = {
+-        "OLD1": Trade("OLD1", "2026-01-01", 100.0, 1.0, 92.0),
+-        "OLD2": Trade("OLD2", "2026-01-01", 100.0, 1.0, 92.0),
++        "OLD1": Trade("OLD1", "2026-01-01", 100.0, 1.0, 92.0, rs_score=60.0),
++        "OLD2": Trade("OLD2", "2026-01-01", 100.0, 1.0, 92.0, rs_score=70.0),
+     }
+     simulator._open_positions = dict(positions)
++    simulator._policy_client = Client()
++    simulator._regime_tracker = SimpleNamespace(allows_entries=True)
++    simulator._ticker_industry = {}
++    frame = _make_canonical_entry_ohlcv(120.0)
++    simulator.strategy = SimpleNamespace(
++        evaluate_symbol=lambda **_kwargs: _canonical_full_signal(
++            "NEW", rs_score=99.0, canslim_score=90.0
++        )
++    )
++
++    assert simulator._evaluate_signals(
++        tickers=["NEW"],
++        ticker_ohlcv={"OLD1": frame, "OLD2": frame, "NEW": frame},
++        all_closes=pd.DataFrame(index=frame.index),
++        eval_date=frame.index[-1],
++        market_state={"market_is_bullish": True},
++    ) == []
++
+     pending = PendingEntry(
+-        signal={"symbol": "NEW", "rs_score": 99.0},
+-        capacity=CapacityDecision(1, False),
++        signal={"symbol": "NEW", "rs_score": 99.0, "canslim_score": 90.0},
++        capacity=CapacityDecision(1, True),
+     )
++
+     assert simulator._capacity_state(pending) == (True, False)
++    simulator._enter_position(
++        pending,
++        {"OLD1": frame, "OLD2": frame, "NEW": frame},
++        frame.index[-1],
++    )
++
+     assert simulator._open_positions == positions
++    assert simulator._trades == []
++    assert simulator._transactions == []
++    assert simulator._entry_outcomes[-1].outcome == "entry_rejected_capacity"
+ 
+ 
+ def test_policy_capacity_evaluate_signals_carries_one_batch_decision() -> None:
+     """Break caught: ranking/truncation could discard the signal-session capacity."""
+ 
+     class Client(InProcessPolicyClient):
+         def __init__(self) -> None:
+             self.capacity_calls = 0
+ 
+         def recommend_capacity(self, _snapshot):
+@@ -1092,20 +1164,48 @@ def test_policy_allocation_rejects_unsafe_projected_transition(
+     projection: ProjectedEntryTransition,
+     recommendation: AllocationDecision,
+     message: str,
+ ) -> None:
+     """Break caught: unsafe risk/cash/leverage could reach the mutating apply phase."""
+     simulator = PortfolioSimulator()
+     with pytest.raises(ValueError, match=message):
+         simulator._validate_entry_transition(projection, recommendation)
+ 
+ 
++@pytest.mark.parametrize(
++    ("position_risk_pct", "stop_loss_pct", "message"),
++    [
++        (0.02, 0.08, "risk_fraction"),
++        (0.01, 0.10, "stop_distance_fraction"),
++    ],
++)
++def test_policy_allocation_fixed_engine_ceilings_apply_to_direct_entry(
++    position_risk_pct: float,
++    stop_loss_pct: float,
++    message: str,
++) -> None:
++    """Break caught: compatibility entry paths could relax fixed safety ceilings."""
++    simulator = PortfolioSimulator(
++        initial_capital=1_000.0,
++        position_risk_pct=position_risk_pct,
++        stop_loss_pct=stop_loss_pct,
++    )
++    frame = _make_ohlcv(n=2, close_value=100.0)
++
++    with pytest.raises(ValueError, match=message):
++        simulator._enter_position(
++            {"symbol": "NEW", "rs_score": 90.0, "canslim_score": 80.0},
++            {"NEW": frame},
++            frame.index[-1],
++        )
++
++
+ def test_projected_entry_transition_failed_allocation_is_byte_stable() -> None:
+     """Break caught: eviction could occur before allocation validation completes."""
+ 
+     class Client(InProcessPolicyClient):
+         def recommend_allocation(self, _snapshot):
+             return AllocationDecision(0.011, 0.08, None)
+ 
+     simulator = PortfolioSimulator(max_positions=1, enable_eviction=True)
+     simulator._policy_client = Client()
+     old = Trade("OLD", "2026-01-01", 100.0, 10.0, 92.0, rs_score=60.0)
+diff --git a/tests/test_backtest_open_causality.py b/tests/test_backtest_open_causality.py
+index 051e07f..dafc710 100644
+--- a/tests/test_backtest_open_causality.py
++++ b/tests/test_backtest_open_causality.py
+@@ -189,22 +189,22 @@ def test_fold_history_is_visible_without_emitting_prefold_state_and_runs_reset(
+         close_windows=[],
+     )
+     strategy = _DatedSignals(
+         {
+             ("LEAD", evaluation_dates[0]): _signal("LEAD", evaluation_dates[0]),
+             ("LEAD", evaluation_dates[-1]): _signal("LEAD", evaluation_dates[-1]),
+         }
+     )
+     simulator = PortfolioSimulator(
+         initial_capital=1_000.0,
+-        position_risk_pct=0.01,
+-        stop_loss_pct=0.10,
++        position_risk_pct=0.008,
++        stop_loss_pct=0.08,
+         ma_consecutive=999,
+         signal_every_n_days=1,
+         technical_only=True,
+         stagnation_days=999,
+         data_fetcher=fetcher,
+         strategy=strategy,
+     )
+     monkeypatch.setattr("core.backtest_engine.get_sp500_tickers", lambda: [])
+ 
+     results = [
+@@ -268,22 +268,22 @@ def test_pending_open_buy_cannot_spend_same_day_exit_proceeds(monkeypatch: pytes
+     prices = {"OLD": old, "NEW": new, "SPY": spy}
+     closes = pd.DataFrame({"OLD": old["Close"], "NEW": new["Close"]})
+     strategy = _DatedSignals(
+         {
+             ("OLD", dates[0]): _signal("OLD", dates[0]),
+             ("NEW", dates[1]): _signal("NEW", dates[1]),
+         }
+     )
+     simulator = PortfolioSimulator(
+         initial_capital=1_000.0,
+-        position_risk_pct=0.08,
+-        stop_loss_pct=0.08,
++        position_risk_pct=0.01,
++        stop_loss_pct=0.0101,
+         signal_every_n_days=1,
+         technical_only=True,
+         stagnation_days=999,
+         data_fetcher=_StaticFetcher(prices, closes),
+         strategy=strategy,
+     )
+     monkeypatch.setattr("core.backtest_engine.get_sp500_tickers", lambda: [])
+ 
+     result = simulator.run(
+         ["OLD", "NEW"],
+@@ -316,21 +316,21 @@ def test_new_open_position_still_observes_same_day_stop(monkeypatch: pytest.Monk
+         dates[0],
+     )
+     spy = _with_warmup_and_canonical_entry(
+         _ohlcv(dates, opens=[100.0] * len(dates), closes=[100.0] * len(dates)),
+         None,
+     )
+     prices = {"NEW": new, "SPY": spy}
+     strategy = _DatedSignals({("NEW", dates[0]): _signal("NEW", dates[0])})
+     simulator = PortfolioSimulator(
+         initial_capital=1_000.0,
+-        position_risk_pct=0.08,
++        position_risk_pct=0.01,
+         stop_loss_pct=0.08,
+         signal_every_n_days=1,
+         technical_only=True,
+         stagnation_days=999,
+         data_fetcher=_StaticFetcher(prices, pd.DataFrame({"NEW": new["Close"]}, index=dates)),
+         strategy=strategy,
+     )
+     monkeypatch.setattr("core.backtest_engine.get_sp500_tickers", lambda: [])
+ 
+     result = simulator.run(
+@@ -351,22 +351,22 @@ def test_entry_sizing_marks_holdings_at_open_then_strictly_prior_close() -> None
+     """Break caught: entry sizing used same-day closes that were unknown at the open."""
+     dates = pd.DatetimeIndex(
+         [
+             pd.Timestamp("2026-04-15"),
+             pd.Timestamp("2026-04-16"),
+             pd.Timestamp("2026-04-17"),
+         ]
+     )
+     simulator = PortfolioSimulator(
+         initial_capital=1_000.0,
+-        position_risk_pct=0.01,
+-        stop_loss_pct=0.10,
++        position_risk_pct=0.008,
++        stop_loss_pct=0.08,
+         technical_only=True,
+     )
+     simulator._equity = 1_000.0
+     simulator._open_positions = {
+         "OPEN_MARK": Trade("OPEN_MARK", "2026-04-01", 100.0, 10.0, 90.0),
+         "PRIOR_MARK": Trade("PRIOR_MARK", "2026-04-01", 100.0, 10.0, 90.0),
+     }
+     prices = {
+         "OPEN_MARK": _ohlcv(dates, opens=[90.0, 95.0, 100.0], closes=[90.0, 95.0, 500.0]),
+         "PRIOR_MARK": _ohlcv(
+@@ -384,22 +384,22 @@ def test_entry_sizing_marks_holdings_at_open_then_strictly_prior_close() -> None
+     assert buy["Value"] == pytest.approx(280.0)
+     assert buy["Quantity"] == pytest.approx(28.0)
+ 
+ 
+ def test_capped_eviction_selects_and_sells_using_causal_open_price() -> None:
+     """Break caught: capped replacement used same-day closes to choose and price eviction."""
+     dates = pd.DatetimeIndex([pd.Timestamp("2026-04-16"), pd.Timestamp("2026-04-17")])
+     simulator = PortfolioSimulator(
+         initial_capital=1_000.0,
+         max_positions=2,
+-        position_risk_pct=0.01,
+-        stop_loss_pct=0.10,
++        position_risk_pct=0.008,
++        stop_loss_pct=0.08,
+         technical_only=True,
+         enable_eviction=True,
+     )
+     simulator._equity = 0.0
+     open_winner = Trade("OPEN_WINNER", "2026-04-01", 100.0, 10.0, 90.0)
+     open_winner.rs_score = 60.0
+     open_loser = Trade("OPEN_LOSER", "2026-04-01", 100.0, 10.0, 90.0)
+     open_loser.rs_score = 70.0
+     simulator._open_positions = {
+         "OPEN_WINNER": open_winner,

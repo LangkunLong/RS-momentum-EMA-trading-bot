@@ -1,0 +1,80 @@
+# Task 8B1 Report: Durable V5 Role-Completion Boundary
+
+## Scope
+
+Task 8B1 implements only the provider-call durability seam required before runtime orchestration:
+
+- `core/pit_optimizer_v5/provider.py`
+- `core/pit_optimizer_v5/memory.py`
+- `core/pit_optimizer_v5/artifacts.py`
+
+No `runtime.py`, package composition, concrete provider lifecycle, Docker/Git/subprocess adapter,
+replay, market-data access, test file, or V2-V4 behavior was added or changed.
+
+## Closed durable role contracts
+
+- `RoleCallKeyV5` gives each campaign/round/role/attempt an exact controller-owned identity and binds
+  it to the complete canonical request digest. Identical semantic requests in different rounds do
+  not alias one paid-call authority. `FreshPersistedRoleRequestV5` and
+  `ExistingPersistedRoleRequestV5` are distinct exact frozen results; both authenticate the complete
+  call/request artifact reference, with no advisory creation boolean.
+- Parsed investigator, author, and critic artifacts now have a lossless closed persistence codec.
+  Author axis literals retain exact bool/int/finite-float/string types, and every loaded accepted
+  artifact is rebound against its complete authenticated `RoleRequestV5`.
+- `RoleInvocationPackageV5` binds the call key, reconstructible request, exact attempt facts,
+  accepted artifact or failure absence, and either an exact ledger terminal receipt or explicit
+  zero-usage fixture authority. Ledger receipts bind their call key, request, slot, and attempt;
+  fixture authorities bind the same local facts and cannot claim an external attempt.
+- `RecoverableRoleInvokerV5` is the narrow Task 8B2/Task 9 boundary: `invoke_once` accepts only the
+  fresh persisted-request type, while `reconcile_once` accepts only the existing persisted-request
+  type, performs no new provider call, and returns either the same authenticated terminal package or
+  a sanitized typed unrecoverable fact. Task 8B2 therefore cannot pass a repository's existing result
+  to the invocation interface.
+
+## Create-only repository and event recovery
+
+- The repository persists the complete reconstructible request before invocation and reports
+  whether that exact call record was newly created. Attempts, terminal authorities, and accepted
+  artifacts use role-tagged create-only paths and strict canonical typed load/verification.
+- `persist_role_invocation` requires the exact pre-existing request record, writes the terminal
+  components create-only, and produces a fully duplicated-and-bound `RoleCompletionPayloadV5`.
+  Loading a role completion recursively authenticates and decodes every referenced component and
+  reconstructs the package before accepting the payload.
+- `role_completion` is a closed campaign-level journal event. It binds campaign, round, fixed role
+  order, outcome, call/request/binding/attempt/terminal/artifact/package identities, and all typed
+  references. Accepted events require one exact artifact; failed events reject artifact fields.
+- Round recovery accepts only the canonical investigator/author/critic completion prefix. Before an
+  event file is created, `append_round_event` loads every prior payload and folds the candidate
+  extended chain; critic-first, duplicate, skipped, or otherwise order-invalid completions therefore
+  cannot poison the journal. Orphaned create-only request or terminal components are not treated as
+  a completed role. Task 8B2 must reconcile a pre-existing request and must never infer permission to
+  call again from a missing local event.
+
+## Direct deterministic verification
+
+The focused direct fakes covered all three roles and both terminal-authority variants, including an
+author template with a floating-point axis literal. They proved request/package/artifact round trips,
+different-round call-key separation, accepted and failed terminal packages, and exact role binding.
+
+The adversarial crash and integrity smoke covered request-only, component-only, payload-only, and
+event-complete crash windows; orphan recovery; live and fixture terminal reconstruction; call,
+binding, and package digest tampering; missing and modified referenced artifacts; and skipped or
+out-of-order role completions. All cases failed closed where required, and only the durable event
+counted as completion.
+
+The focused review smoke additionally proved exact Fresh/Existing repository discrimination, full
+reference-digest validation, protocol-level capability separation, and pre-write rejection of both
+critic-first and duplicate-investigator events. It verified that no rejected event path was created
+and that each affected journal remained loadable at its prior valid state.
+
+Final verification passed module compilation, Ruff check/format, module export integrity,
+forbidden-coupling inspection, and `git diff --check`. Existing tests were neither added, changed,
+nor run, per the explicit override.
+
+## Task 8B2 boundary
+
+Task 8B2 remains responsible for the pure orchestration state machine, including selecting parents,
+constructing role requests, invoking only a proven-new call, reconciliation without repeat spend,
+candidate rendering/evaluation, critic-unavailable and novelty outcomes, final records, archive and
+checkpoint publication, deadlines/cancellation, and owned-resource cleanup. Concrete provider,
+Git, Docker, and subprocess composition remains deferred.

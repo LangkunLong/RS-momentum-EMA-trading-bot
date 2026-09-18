@@ -1,0 +1,281 @@
+# Task 1 Report: Pin and Normalize Five-Year S&P Membership
+
+## Result
+
+Implemented the immutable public-membership acquisition boundary in
+`core/public_membership.py` and `fetch_sp500_membership.py`.
+
+- The fetcher accepts HTTPS-only URLs with a numeric `oldid` immutable revision
+  identifier, uses a descriptive `urllib.request` user agent, caps responses at
+  10 MiB, and refuses redirects that change hosts.
+- The normalizer uses `pandas.read_html` to read the current-constituents and
+  dated-changes tables, builds a 2021-01-01 seed by reversing subsequent
+  changes, and then replays transitions through 2025-12-31.
+- Source punctuation aliases include `BRK.B -> BRK-B` and `BF.B -> BF-B`;
+  unreviewed punctuation is refused.  Date-bounded reviewed mappings are read
+  from the specified five-column CSV format.
+- The CLI writes CSV, raw HTML, provenance, and official spot-check JSON via
+  temporary files plus atomic replacement.  Generated artifacts are ignored.
+
+## Pinned source and functional run
+
+Selected public immutable revision:
+
+`https://en.wikipedia.org/w/index.php?title=List_of_S%26P_500_companies&oldid=1347775889`
+
+The functional run used the required explicit reviewed mapping for Ceridian's
+historical `CDAY` source symbol to canonical `DAY` (effective 2021-01-01
+through 2025-12-31).  Without that reviewed mapping, the reverse transition
+check stops instead of guessing.
+
+Output provenance:
+
+- Revision ID: `1347775889`
+- Raw SHA-256: `8940a97243ad30664b2d0e606e832fec13e6bf38c250b1c999cff8a94093e14d`
+- Events: 679
+- Symbols: 591
+- First/last effective dates: 2021-01-01 / 2025-12-22
+- Exclusions: none after applying the reviewed mapping
+
+## Official spot checks
+
+`membership_spot_checks.json` records matching official S&P announcements for:
+
+- 2021-07-21: MRNA added, ALXN removed
+- 2022-02-15: NDSN added, XLNX removed
+- 2023-03-15: BG added, SBNY removed
+- 2024-06-24: KKR added, RHI removed
+- 2025-08-28: IBKR added, WBA removed
+
+## Validation
+
+- `python fetch_sp500_membership.py ...` completed successfully.
+- `python convert_membership_snapshots.py --help` completed successfully.
+- `PointInTimeUniverse.from_csv(exports/pit/membership.csv)` reported
+  `679 505 503` for event count, 2021-01-01 members, and 2025-12-31 members.
+- Verified all five spot checks report `matched=true`.
+- `python -m py_compile core/public_membership.py fetch_sp500_membership.py`
+  and `git diff --check` completed successfully.
+
+## Requirement ruling applied
+
+The brief's output-directory condition conflicted with the required tracked
+`exports/pit/.gitkeep` and its prescribed validation path.  Per the parent
+agent's ruling, the CLI allows an existing output directory only when it is
+empty or contains exactly `.gitkeep`; it still refuses existing generated or
+temporary target files.
+
+## Notes
+
+The local Python environment lacked an HTML-table parser for `pandas.read_html`.
+Installed `lxml` into that local environment solely to perform the requested
+functional validation; no dependency-manifest file was changed.
+
+## Fix Round 1
+
+Addressed the Task 1 review findings:
+
+- Redirect handling now requires every redirect target and the final response
+  URL to remain HTTPS, on the original host, and retain the original numeric
+  `oldid` revision identifier.
+- The CLI now rejects every date window except exactly 2021-01-01 through
+  2025-12-31 before it touches the output directory or network.
+- Provenance now records SHA-256 values for `membership.csv`,
+  `security_names.csv`, and `membership_spot_checks.json` after those files
+  are atomically written.  The existing raw-source SHA-256 remains unchanged.
+- `MembershipExport` copies `company_names` and every exclusion mapping into
+  read-only mapping proxies, including for direct public construction.
+- A pre-existing output directory is now accepted only when it contains
+  exactly `.gitkeep`; an absent directory remains valid and is created only
+  after successful acquisition and normalization.
+
+Focused validation commands and output:
+
+```text
+python - (focused invariants)
+focused invariant checks passed
+
+python fetch_sp500_membership.py ... --start-date 2021-01-02
+fetch_sp500_membership.py: error: membership window must be exactly
+2021-01-01 through 2025-12-31
+
+python fetch_sp500_membership.py ... --symbol-map-csv ... --output-dir exports/pit
+event_count=679, symbol_count=591, first_effective_date=2021-01-01,
+last_effective_date=2025-12-22
+
+python - (verify emitted hashes and spot checks)
+artifact hashes and spot checks verified
+
+python -c "... PointInTimeUniverse.from_csv(...) ..."
+679 505 503
+
+python -m py_compile core/public_membership.py fetch_sp500_membership.py
+git diff --check
+```
+
+The focused invariant script verifies final HTTP-downgrade and changed-`oldid`
+redirect rejection, nonexact-date rejection, direct mutation rejection for
+both immutable export mapping fields, and the exact `.gitkeep` pre-existing
+directory policy.  The emitted manifest hashes were recomputed from the three
+written files and matched exactly.
+
+## Fix Round 2: point-in-time ticker identity
+
+The pinned 2026 constituent snapshot labeled Marsh McLennan `MRSH`, although
+the issuer's October 16, 2025 release says the NYSE ticker would change from
+`MMC` to `MRSH` only in January 2026. The parser had applied reviewed mappings
+to dated membership changes but not to the current-constituent snapshot, so the
+future ticker leaked into the 2021 seed.
+
+Reviewed mappings now project the snapshot and out-of-window change rows onto
+the evaluation cutoff. Contiguous date ranges with different canonical tickers
+also emit explicit same-company membership swaps. The tracked mapping source is
+`config/pit_membership_symbol_map.csv`; its full rows, reasons, official URLs,
+and SHA-256 are recorded in `membership_provenance.json`.
+
+Corrected intervals:
+
+- Before: `MRSH` was active 2021-01-01 through 2025-12-31. After: `MMC` is
+  active for the full evaluation interval and `MRSH` is absent.
+- Before: `DAY` was active beginning 2021-09-20. After: `CDAY` is active from
+  2021-09-20 through 2024-01-31; `CDAY` exits and `DAY` enters on 2024-02-01.
+
+Primary evidence:
+
+- Marsh McLennan 3Q25 issuer release:
+  `https://www.marshmclennan.com/web-assets/files-for-download/investors/2025/pdf-2025-marsh-mclennan-investors-3q-news-release.pdf`
+- Dayforce Form 8-K:
+  `https://www.sec.gov/Archives/edgar/data/1725057/000095017024009619/day-20240131.htm`
+
+Functional regeneration results:
+
+- raw source SHA-256 unchanged:
+  `8940a97243ad30664b2d0e606e832fec13e6bf38c250b1c999cff8a94093e14d`
+- reviewed map SHA-256:
+  `a9781f0a2989dc0ec50e3ae3e512738f098ee4325018a062f4d0691ba2d78948`
+- membership SHA-256:
+  `23a3c5e09f266da1db29ce9c458dd994a07b763666b59309a87f79f88de06f56`
+- security names SHA-256:
+  `a943a681fb47fc239ad77cabfa87af9ebc87b8f75b0769fdf8d619f9af6d7ef3`
+- 681 unique events, 592 union symbols, 505 members on 2021-01-01, and
+  503 members on 2025-12-31; the CDAY/DAY swap preserves 503 active members.
+
+Narrow regression checks passed (`3 passed`) and both Python modules compiled;
+`git diff --check` passed. The generated artifact hashes were recomputed and
+matched provenance.
+
+### Follow-up identity audit
+
+The tracked reviewed mapping previously contained only the broad CDAY-to-DAY
+row; no other reviewed source rows existed. A read-only CIK comparison against
+immutable Wikipedia revision `978246445` exposed additional snapshot identities
+that need the same dated treatment before the bundle can be called fully ticker-
+PIT: BLL/BALL, ABC/COR, ANTM/ELV, COG/CTRA, RE/EG, FB/META, FLT/CPAY,
+PEAK/DOC, NLOK/GEN, PKI/RVTY, and WLTW/WTW. The pinned page also leaves Fiserv
+as stale `FISV`, and the 2021 seed currently leaks `PSKY` across the historical
+VIAC/PARA/PSKY chain. DISCA/DISCK/WBD is already represented by explicit index
+change rows. The share-class cross-products GOOG/GOOGL and NWS/NWSA are not
+ticker changes. These discovered rows were not silently guessed into this
+narrow repair; each needs an official-source effective date and review.
+
+## Fix Round 3: complete reviewed identity map
+
+Completed the official-source identity audit and regenerated the functional
+five-year export. The tracked map now contains 30 rows across 15 source chains:
+the 27 newly reviewed rows plus the existing two DAY rows and one MRSH row.
+Every source chain is required to cover 2021-01-01 through 2025-12-31 exactly;
+both overlaps and calendar gaps fail before normalization.
+
+Corrected identity intervals:
+
+- `BALL`: BLL 2021-01-01 through 2022-05-09; BALL 2022-05-10 through 2025-12-31.
+- `COR`: ABC 2021-01-01 through 2023-08-29; COR 2023-08-30 through 2025-12-31.
+- `ELV`: ANTM 2021-01-01 through 2022-06-27; ELV 2022-06-28 through 2025-12-31.
+- `CTRA`: COG 2021-01-01 through 2021-10-03; CTRA 2021-10-04 through 2025-12-31.
+- `EG`: RE 2021-01-01 through 2023-07-09; EG 2023-07-10 through 2025-12-31.
+- `META`: FB 2021-01-01 through 2022-06-08; META 2022-06-09 through 2025-12-31.
+- `CPAY`: FLT 2021-01-01 through 2024-03-24; CPAY 2024-03-25 through 2025-12-31.
+- `DOC`: PEAK 2021-01-01 through 2024-03-03; DOC 2024-03-04 through 2025-12-31.
+- `GEN`: NLOK 2021-01-01 through 2022-11-07; GEN 2022-11-08 through 2025-12-31.
+- `RVTY`: PKI 2021-01-01 through 2023-05-15; RVTY 2023-05-16 through 2025-12-31.
+- `WTW`: WLTW 2021-01-01 through 2022-01-09; WTW 2022-01-10 through 2025-12-31.
+- `FISV`: FISV 2021-01-01 through 2023-06-06; FI 2023-06-07 through 2025-12-31.
+- `PSKY`: VIAC 2021-01-01 through 2022-02-16; PARA 2022-02-17 through 2025-08-06; PSKY 2025-08-07 through 2025-12-31.
+- `DAY`: CDAY 2021-01-01 through 2024-01-31; DAY 2024-02-01 through 2025-12-31.
+- `MRSH`: MMC for the complete 2021-01-01 through 2025-12-31 evaluation window.
+
+The PSKY rows and their emitted provenance explicitly classify PARA-to-PSKY as
+a successor-issuer transaction. They are an index-membership identity chain
+only and do not assert entity, raw-price, or position continuity. The CTRA and
+DOC reasons likewise preserve the reviewed accounting/predecessor boundaries.
+Every row retains its full primary issuer or SEC evidence URL.
+
+The public `fetch_membership` API and CLI now default to the tracked reviewed
+map while retaining a regular-file/non-symlink explicit path override. The map
+loader reads the file once, parses those exact bytes, and carries their digest
+to provenance, eliminating the prior parse/hash TOCTOU. Snapshot company names
+are propagated to every reviewed historical ticker identity, so every emitted
+membership symbol has a security-name row.
+
+Functional regeneration from immutable revision `1347775889` produced:
+
+- 709 unique and deterministically sorted events over 606 union symbols.
+- 505 active members on 2021-01-01 and 503 on 2025-12-31.
+- 876 security-name rows with zero emitted membership symbols missing a name.
+- All 15 in-window identity boundaries represented by same-day removal/addition pairs.
+- All five official S&P spot checks matched and exclusions remained empty.
+
+Artifact SHA-256 values:
+
+- reviewed map: `d49870136079dd8a8cc4fa043fd6187bcc5ed36b51ca75caf874bdd4499f5312`
+- immutable raw HTML: `8940a97243ad30664b2d0e606e832fec13e6bf38c250b1c999cff8a94093e14d`
+- membership CSV: `60df8d5ded9f1c66212585b1d3df49f13a6761e1a2b5913ee50491b9a8ecdba0`
+- security names CSV: `12cf4c46a9cbcc349cf1cd79d65354a2d960c68282c8bb68203d2a5e35b2a1df`
+- spot checks JSON: `d2c2d8d70bd3053a497bf4d4f5654f68e06a02d74a85c40a1dfea7b4cabf8b55`
+- provenance JSON: `51d5d8f933a2b778c9677bd495d5174c86d735242ba219b2901a3fd81e4e30ff`
+
+Narrow validation passed (`7 passed`), both Python modules compiled, and
+`git diff --check` passed. A functional validator replayed all events without
+state errors, checked every mapped boundary and map interval, verified complete
+security names, and recomputed all five linked digests successfully.
+
+## Fix Round 4: Fiserv ticker reversion
+
+Corrected the Fiserv identity chain after the functional price acquisition
+proved that `FI` ended on 2025-11-10. The reviewed map now records the complete
+same-issuer round trip:
+
+- `FISV`: 2021-01-01 through 2023-06-06.
+- `FI`: 2023-06-07 through 2025-11-10.
+- `FISV`: 2025-11-11 through 2025-12-31.
+
+The new 2025 boundary is supported by Fiserv's issuer announcement that its
+Nasdaq listing would begin under `FISV` on 2025-11-11. The existing SEC and
+issuer evidence for the 2023 `FISV`-to-`FI` boundary remains attached to all
+three provenance rows. A focused regression proves that the mapping mechanism
+emits both remove/add pairs deterministically even when a canonical ticker
+returns, and that both `FI` and `FISV` retain the complete company name
+`Fiserv`.
+
+Functional regeneration from immutable revision `1347775889` produced:
+
+- 711 unique events over 606 union symbols.
+- 505 active members on 2021-01-01 and 503 on 2025-12-31.
+- 876 security-name rows with no emitted ticker missing a company name.
+- All 16 in-window reviewed identity boundaries represented by same-day
+  removal/addition pairs.
+- `FISV` active at both evaluation endpoints and `FI` active only during its
+  reviewed middle interval.
+
+Artifact SHA-256 values:
+
+- reviewed map: `6284214a6a4cefd766b3c52e84be57ac7e087cbf76d642d22abad131d61d8fa4`
+- immutable raw HTML: `8940a97243ad30664b2d0e606e832fec13e6bf38c250b1c999cff8a94093e14d`
+- membership CSV: `a12413a9134623b51350ad4671d4a678eeed8edf2241a9985d0d7d51957f5389`
+- security names CSV: `12cf4c46a9cbcc349cf1cd79d65354a2d960c68282c8bb68203d2a5e35b2a1df`
+- spot checks JSON: `d2c2d8d70bd3053a497bf4d4f5654f68e06a02d74a85c40a1dfea7b4cabf8b55`
+- provenance JSON: `16fdda33dc102c3e8bfbcd2f683812666a892a0fb28bdc5347ba90c1e9206518`
+
+Narrow validation passed (`8 passed`), the membership modules compiled, the
+functional validator checked counts, both Fiserv boundaries, endpoint/middle
+membership, complete names, and linked digests, and `git diff --check` passed.

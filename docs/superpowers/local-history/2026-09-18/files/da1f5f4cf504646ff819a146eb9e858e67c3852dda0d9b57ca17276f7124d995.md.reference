@@ -1,0 +1,37 @@
+# P4 historical compliance implementation report
+
+## Frozen source
+
+- `review-freeze-01/campaign_admission.py`: SHA-256 `3ea07b2b6db87cec0d1347aebb8035960a24de3fd2c7b9ec69f63b3db5d75670`, 80470 bytes.
+- `review-freeze-01/development_preparation.py`: SHA-256 `ab3665f3d85d8263a9067ece3ec6f46591f1b40f459d609f1ba03193c9b15966`, 46356 bytes.
+- `actual-task.diff`: SHA-256 `5731ada3341dc49ed3ccac9903a7780458f23bb40b2abb3840d4dba9a01783d2`, 28246 bytes. It was compared exactly with fresh no-index diffs from the P4 principal preimages.
+- `historical_verification.py` remained unchanged at SHA-256 `978c0bd83ddbafecc9ef388420c23634429f32a5f6473eef441c09db4c6c521b`.
+- Protected `operations.py` remained `02249f02dfad345ef3b6cca59a378f5bc0a211517427991f4c661158e9883942` and protected `cli.py` remained `cf127dba9914911e51b7c9a7bf907ed3208aaffa8fb81184e30b1a0e7debae74`.
+
+## Implemented behavior
+
+`development_preparation.py` now extracts the existing completed-history body into `_authenticate_completed_development_history_facts_v5`. The original body is AST-identical through projection verification and returns a private frozen data-only aggregate afterward. `authenticate_completed_development_history_v5` keeps its original signature and implicit `None` result, then performs optional policy discovery/compliance. A legacy archive without enrollment therefore exposes no new summary field or return value.
+
+`campaign_admission.py` now exposes `authenticate_campaign_policy_compliance_v5` and frozen `CampaignPolicyComplianceV5`. The explicit entry authenticates the original complete history once, then requires the caller-pinned policy to match exact persisted enrollment. It binds the admission to the already authenticated manifest, launch, provider config, owner, repository root, round configurations, and stored starts.
+
+The report returns the exact policy/manifest pins, configured rounds, stored round-start epochs, distinct evaluated round indices, actual cumulative attempts/tokens/USD, final reserve/target decision, final actual round outcome when present, and fixed claims that logical-prefix eligibility is verified while global publication timestamps are unavailable. The report is not persisted.
+
+`_compose_campaign_prefix_facts_v5` is the single shared substantive composer for settled boundary counters, request envelopes, evaluated-round/critic proof, terminal receipt totals, and prior-round continuability. The existing P3 `_load_campaign_boundary_facts_v5` delegates to it. Historical compliance calls it over each authenticated prior prefix and once over the final prefix.
+
+For a new round, every earlier round must contain committed records or one terminal outcome, every actual persisted request must fit the policy envelope, and the prior prefix must remain continuable. Runtime/provider/critic/novelty-exhaustion stops reject a later round even when budget remains. `no_novel_hypothesis` remains continuable when its actual role package was accepted. The final prefix allows its last noncontinuable settlement to be reported and retains its actual cumulative receipt, outcome, and overage-derived reserve decision.
+
+The policy census requires configured and started rounds to be one contiguous prefix, requires every start to match its pre-start configuration, and checks each persisted start against the original campaign start and deadline. Historical compliance makes no claim about event, cleanup, checkpoint, or critic publication order across files because those global timestamps are not stored.
+
+## Static verification
+
+- Scoped `python -m ruff check` passed for both modified production files.
+- In-memory `compile(...)` passed for `campaign_admission.py`, `development_preparation.py`, and the unchanged `historical_verification.py`.
+- AST comparison proved the original completed-history authentication body is preserved before the new data-only return.
+- AST comparison found no changed existing serialized class in either modified file. The three original admission authority classes and both development config classes retained their exact ASTs.
+- Existing functions changed only at the approved shared role-package extraction, P3 boundary delegation, and completed-history wrapper/extraction spans.
+- The explicit compliance entry does not invoke the public completed-history entry, so there is no public recursion.
+- Direct source inspection found no clock, state write, repair, recovery, nonce, credential/environment read, provider call, or campaign execution in the new historical functions. Existing live admission retains its original current-time guard outside the historical call path.
+- Every `load_typed_state` in `campaign_admission.py` and `historical_verification.py` passes `repair=False`. The private completed-history body retains its original `campaign-launch` read with `repair=False`; unrelated operational/controller functions were not changed.
+- The approved paid-history reader authenticates immutable ledger records and exact journal packages before the data-only aggregate is returned. P4 derives prefix usage only from those authenticated package receipts.
+
+No test was read, created, modified, or run. No source-import probe, synthetic artifact/request/result, actual archive reader, credential or environment value, provider/API/model call, Docker/evaluation run, campaign activity, historical write, Git mutation, or commit was performed. Actual archive/evaluator preservation and one summary per archive remain deferred to the principal's reviewed collector after broad source approval.

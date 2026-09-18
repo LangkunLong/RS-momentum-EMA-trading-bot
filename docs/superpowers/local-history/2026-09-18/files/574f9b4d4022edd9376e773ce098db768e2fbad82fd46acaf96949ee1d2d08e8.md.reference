@@ -1,0 +1,804 @@
+# Task 7 Implementation Report
+
+Date: 2026-08-28  
+Branch: `codex/pit-optimizer-implementation`  
+Base: `b5034600d99c40eff13fa2f461808748d07b8e9c`  
+Commit: `f6124bc3d50ac067a92fbc1bcb88f9b0ffa08e71`
+
+## Implementation summary
+
+Implemented the provider-free schema-v2 PIT optimizer preparation path, incumbent feedback loop, incremental local artifact store, hidden-validation boundary, and common terminal finalizer.
+
+The implementation:
+
+- authenticates canonical manifest and final-parity inputs, including every nested `ParityFoldEvidence` digest and the complete source/bundle/fold/policy identity graph;
+- derives the immutable discovery baseline and provider seed only from final-parity-attested discovery aggregates, after permanently marking both discovery windows;
+- freezes one injected pricing record and opens one injected non-spend run lease before creating run artifacts;
+- keeps `CandidateWorkspace` inert and retains live candidate authority only in a private registry keyed by `workspace_id`, revoking the entry before disposal;
+- performs the exact investigator, author, local validation/discovery, critic, and controller-decision order;
+- compares candidate scores only to the original authenticated discovery baselines while retaining candidate-versus-incumbent values as diagnostics;
+- makes zero-discovery-trade outcomes safe critic feedback rather than integrity failures;
+- persists incremental canonical artifacts with create-only or atomic-replace semantics and fsync checks;
+- reserves hidden validation once, closes the provider capability before evaluation, validates the quantized eligibility gate, and writes `holdout.json` only afterward;
+- finalizes through lease close, attempt-all candidate/worker cleanup, input verification, accounting replacement, and `summary.json` last;
+- emits an inert `PitOptimizerResult` whose public artifact uses relative artifact paths and contains no prompts, strategy source, raw provider envelopes, credentials, headers, keys, or approval contents;
+- exposes lazy public schema-v2 prepare/run adapters from `core.pit_optimization` without constructing provider services during import or prepare.
+
+## Files changed
+
+- `core/pit_optimizer_artifacts.py` — new canonical create-only and atomic-replace artifact primitives plus the closed incremental store.
+- `core/pit_optimizer_controller.py` — new readiness projection, capability registry, incumbent controller, hidden boundary, accounting, cleanup, and result construction.
+- `core/pit_optimizer_evaluation.py` — added `FoldEvaluationResult`, `DiscoveryComparison`, `DiscoveryEvaluation`, `DeterminismAttestation`, `HiddenEvaluation`, and `PitOptimizerCleanup`.
+- `core/pit_optimization.py` — added public lazy adapters for `prepare_pit_optimizer_v2` and `run_pit_optimizer_v2`.
+- `tests/test_pit_optimizer_loop.py` — new provider-free unit/controller coverage for every prescribed Task 7 slice.
+- `tests/test_pit_optimizer_v2.py` — added the pure final-parity baseline projection anchor fixture/test.
+
+Commit summary: 6 files changed, 4,427 insertions, 2 deletions.
+
+## Stepwise RED and GREEN evidence
+
+### Prepare slice
+
+Command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py tests/test_pit_optimizer_v2.py -k "prepare_v2 or prepare_parity or prepare_discovery_exposure"
+```
+
+RED: `4 failed, 233 deselected`. This was expected because the schema-v2 controller/readiness module and `_baseline_from_parity` did not yet exist.
+
+GREEN: `4 passed, 233 deselected, 1 warning in 2.18s` after implementing canonical input reconstruction, nested digest authentication, source identity checks, discovery exposure ordering, fixed-baseline projection, hidden-free provider seed construction, and create-only readiness persistence.
+
+### Artifact, pricing, capability, and run-lease slice
+
+Command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py -k "artifact_initialization or run_lease or artifact_failure"
+```
+
+RED: `5 failed, 1 passed, 4 deselected`. This was expected because the incremental artifact store, private capability registry, and run-artifact initializer were absent.
+
+During GREEN iteration, one assertion incorrectly searched for the generic substring `prompt`, which also matches the required accounting key `prompt_tokens`; the test was corrected to search for the prohibited `system_prompt` key. No production behavior was weakened.
+
+GREEN: `6 passed, 4 deselected, 1 warning in 1.19s` after implementing create-only/replace/fsync primitives, exact layout enforcement, pricing-before-lease ordering, root artifact creation, failure cleanup, and workspace-ID-only capability resolution.
+
+### Single-iteration slice
+
+Command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py -k "single_iteration or invalid_author or malformed_author or focused_candidate_checks"
+```
+
+RED: `4 failed` because the role helpers, validation/evaluation branches, and `_run_iteration` were not implemented.
+
+GREEN: `4 passed, 10 deselected` after implementing durable investigator/author/critic artifacts, candidate diff/validation/discovery artifacts, controller-derived focused checks, mandatory critic feedback for safe candidate rejection, and terminal malformed-provider handling.
+
+### Incumbent slice
+
+Command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py -k "two_iteration or incumbent_transition or next_context_oversize"
+```
+
+RED: `2 failed, 1 passed` because `_persist_iteration_decision` was intentionally incomplete.
+
+GREEN: `3 passed, 14 deselected` after implementing bounded iteration feedback, critic-before-decision durability, atomic incumbent replacement, strict Decimal lexicographic comparison, fixed-baseline scoring, incumbent diagnostics, and prior-incumbent retention on `next_context_oversize`.
+
+### Stop and terminal-boundary slice
+
+Command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py -k "stop_condition or terminal_boundary or discovery_repeat"
+```
+
+RED: `12 failed` because complete-plan preflight, closed terminal mapping, common run routing, and final discovery repeat were absent.
+
+GREEN: `12 passed, 17 deselected` after implementing cancellation/stagnation/iteration precedence, complete three-call call/token/USD checks, context-budget classification, closed integrity/accounting terminal codes, common finalizer routing, and byte-identical fresh discovery confirmation.
+
+### Hidden boundary and finalization slice
+
+Command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py -k "hidden_boundary or hidden_qualification or provider_closed"
+```
+
+RED: `6 failed, 3 passed, 29 deselected`. Five failures were the intentionally missing `_run_hidden_once`; one identified the missing retained lease snapshot needed for exact post-close accounting.
+
+GREEN: `9 passed, 29 deselected, 1 warning in 3.57s` after implementing one-shot reservation, provider closure before hidden evaluation, hard post-boundary call rejection, fold/identity/quantized-decision checks, post-event `holdout.json`, attempt-all finalization, final accounting, cleanup, and summary-last persistence.
+
+### Self-review regression: zero discovery trades
+
+Command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py -k "no_discovery_trades"
+```
+
+RED: `1 failed, 38 deselected`; the valid local candidate's zero-trade discovery aggregates reached the strict ranking helper and were incorrectly classified as `EvidenceTampering`.
+
+GREEN: `1 passed, 38 deselected, 1 warning in 0.66s` after making a trusted, explicitly unrankable zero-trade result persist `discovery.json` with `failure_code=no_discovery_trades` and continue as sanitized critic feedback without incrementing the valid non-improvement streak.
+
+Combined affected slice after the correction:
+
+```text
+5 passed, 34 deselected, 1 warning in 0.63s
+```
+
+## Final complete controller test
+
+Command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py tests/test_pit_optimizer_v2.py
+```
+
+Final output:
+
+```text
+........................................................................ [ 26%]
+........................................................................ [ 53%]
+........................................................................ [ 79%]
+.......................................................                  [100%]
+271 passed, 1 warning in 96.61s (0:01:36)
+```
+
+The warning is the pre-existing `PytestConfigWarning: Unknown config option: cache_dir` from the installed pytest version.
+
+Environment diagnostic: the first sandboxed complete run produced 44 failures in unchanged Task 6 gateway tests because Python 3.13's Windows `mkdir(mode=0o700)` ACL excluded the filesystem sandbox token from the newly created audit directory. A single failing fake-only test passed unchanged under the normal host token (`1 passed in 1.37s`), confirming the root cause. The identical complete command was then run under that host token and passed. No Task 6 code or security behavior was changed.
+
+## Static verification
+
+Focused Ruff command:
+
+```text
+python -B -m ruff check core/pit_optimizer_artifacts.py core/pit_optimizer_controller.py core/pit_optimizer_evaluation.py core/pit_optimization.py tests/test_pit_optimizer_loop.py tests/test_pit_optimizer_v2.py
+```
+
+Initial result: four mechanical Bugbear findings (`B009`/`B010`) for constant `getattr`/`setattr`; corrected with direct imports/assignments. Final result:
+
+```text
+All checks passed!
+```
+
+Focused compilation command:
+
+```text
+python -B -m py_compile core/pit_optimizer_artifacts.py core/pit_optimizer_controller.py core/pit_optimizer_evaluation.py core/pit_optimization.py
+```
+
+Result: exit 0, no output.
+
+Public adapter import smoke:
+
+```text
+python -B -c "from core.pit_optimization import prepare_pit_optimizer_v2, run_pit_optimizer_v2; print(prepare_pit_optimizer_v2.__name__, run_pit_optimizer_v2.__name__)"
+```
+
+Output: `prepare_pit_optimizer_v2 run_pit_optimizer_v2`.
+
+Diff validation command:
+
+```text
+git diff --check
+```
+
+Result: exit 0; only Git's informational LF-to-CRLF working-copy notices appeared. The staged `git diff --cached --check` also exited 0 with no findings.
+
+## Commit-hook result
+
+Commit command:
+
+```text
+git commit -m "feat: add feedback-driven PIT incumbent loop"
+```
+
+Hook output:
+
+```text
+ruff (legacy alias)......................................................Passed
+trim trailing whitespace.................................................Passed
+fix end of files.........................................................Passed
+check yaml...........................................(no files to check)Skipped
+check for merge conflicts................................................Passed
+```
+
+Commit created: `f6124bc3d50ac067a92fbc1bcb88f9b0ffa08e71` (`feat: add feedback-driven PIT incumbent loop`).
+
+## Self-review
+
+### State ordering
+
+- A complete iteration is investigator, author, local candidate validation/discovery, critic, then deterministic controller decision.
+- Every accepted role call updates accounting before its role artifact is consumed.
+- Role artifacts are persisted before downstream consumption; `critic.json` durability is checked before any incumbent decision.
+- Safe candidate failures, including syntax/import/purity/worker/replay/zero-trade/unrankable outcomes, retain the incumbent and reach critic feedback; protocol, audit, accounting, identity, evidence, nondeterminism, and sandbox failures remain terminal.
+- Invalid candidates do not increment `non_improving_streak`; only rankable valid non-improvements do.
+
+### Fixed-baseline objective
+
+- `baseline_discovery` is projected byte-for-byte from authenticated final parity fold aggregates and evidence IDs.
+- Candidate discovery scores are recomputed against those original baseline folds and their recomputed digest.
+- Candidate-versus-incumbent scores are retained only in `candidate_vs_incumbent_diagnostics` and never control objective ranking.
+- Incumbent replacement uses the closed quantized Decimal ordering key and occurs only after critic durability.
+
+### Critic before decision
+
+- `_run_iteration` has the exact investigator → author → validation → discovery → critic → decision sequence.
+- Safe validation and evaluation failures still call the critic.
+- Malformed or unauthenticated provider output stops before a synthetic critic can be created.
+
+### Hidden boundary
+
+- Hidden identity/date/metrics/results are absent from `ProviderSeed` and every provider-projectable role input.
+- `_run_hidden_once` permits exactly one reservation, stores the sealed reservation, and sets `provider_enabled=False` before invoking the hidden evaluator.
+- `_call_role` checks the provider guard as its first statement, making all later role calls impossible.
+- Hidden fold identity, candidate identity, aggregate excess, and the exact quantized eligibility decision are checked before `holdout.json` is written.
+
+### Atomic artifacts
+
+- Readiness and immutable run/iteration/holdout/summary artifacts are create-only canonical UTF-8 JSON with a trailing newline.
+- Partial writes and fsync failures fail closed and clean an uncommitted create.
+- Accounting and `incumbent.diff` use sibling-temp fsync plus atomic replacement.
+- Artifact names are confined to the exact closed Task 7 layout and recorded with SHA-256 identities; public summary paths are relative to the run root.
+
+### Capability disposal
+
+- `CandidateWorkspace` contains no live authority.
+- `_CandidateCapabilityRegistry` resolves only the existing opaque `workspace_id`; roots never recreate capability.
+- The registry entry is removed before invoking disposal, so a failed cleanup cannot restore or reuse authority.
+- The common finalizer attempts every unique active iteration/incumbent workspace even if an earlier disposal fails.
+
+### Terminal cleanup
+
+- The common terminal order is provider disabled, lease close with the terminal code, attempt-all candidate/worker disposal, source/input verification, inert incumbent persistence when needed, accounting replacement, result construction, and summary write last.
+- A retained lease snapshot preserves exact authorized totals after close.
+- Close, cleanup, verification, incumbent-artifact, accounting, and summary failures fail the result closed while later cleanup/evidence attempts continue where possible.
+- Source modification, incomplete cleanup, or incomplete accounting prevents a successful result.
+
+### Secrecy
+
+- No prompt body, raw provider response/envelope, credential, header, API key, operator approval content, or model-authored source body is included in `PitOptimizerResult.to_public_artifact`.
+- Role artifacts persist only validated closed payloads and payload digests; accounting persists closed lifecycle facts, not provider envelopes.
+- The tracked Task 7 tests contain only synthetic local fixtures and use pytest temporary roots.
+
+## Resource/effect statement
+
+Exact Task 7 resource/effect result: no subagents or reviewers were used; no OpenRouter/provider call, network access, live pricing lookup, real SDK construction, Docker invocation, replay/parity/candidate backtest, permanent ledger mutation, background process, upload, push, merge, deploy, cloud work, or operator-worktree mutation occurred. All Task 7 clients, role calls, pricing values, evaluations, candidates, authorization objects, artifacts, and cleanup actions were injected fakes/mocks using pytest temporary paths. No hidden IDs/dates/metrics/results entered provider-projectable inputs. No prompts, real model-authored strategy source, raw provider responses, credentials, headers, keys, or operator approval contents were written to this report, user output, or durable test artifacts.
+
+The only durable effects were the six requested tracked source/test files and local Git commit `f6124bc3d50ac067a92fbc1bcb88f9b0ffa08e71`; this ignored report was written at the requested path. Pytest created disposable local temporary files, and the repository commit hook read/validated the staged files. No Task 8 work was started.
+
+## Concerns
+
+No implementation concerns. The only environmental note is the pre-existing pytest `cache_dir` warning and the Windows Python 3.13 private-directory ACL interaction under the filesystem sandbox described above; the final complete suite passed unchanged under the normal host token.
+
+# Task 7 Fix Round 1/5 — 2026-08-28
+
+## Outcome
+
+All three Critical and all four Important findings in `task-7-review.md` were repaired. The separately ledgered Minor capability-ownership finding was not changed. The provider-free controller and Task 6 recovery adapter remain schema-v1 compatible, and every new orchestration test uses injected fakes and pytest temporary paths.
+
+Fix commit: `cd7a45927a7ea3ad7c0d8622a542412c0f9d656b` (`fix: close PIT controller durability boundaries`).
+
+## Implementation summary and files changed
+
+- `agent_loop.py`
+  - Made `OpenRouterGateway.recover_pit_optimizer_finalization(...)` return its already cross-verified `PitOptimizerProviderFacts`, including idempotent repeated recovery.
+- `core/pit_optimizer_artifacts.py`
+  - Added component-by-component `lstat` symlink/reparse checks and resolved-root containment before use.
+  - Added explicit create-and-sync `prepare_iteration(iteration)` and stopped lazy parent creation during artifact writes.
+- `core/pit_optimizer_controller.py`
+  - Added a closed provider-attempt record independent of accepted payloads, failed-attempt recovery, exact accounting persistence before terminal normalization, and attempt-based budget/final-result accounting.
+  - Added complete investigator/author/critic worst-case context preflight before iteration start and before a prospective incumbent transition.
+  - Classified real cumulative/source `next_context_oversize` as a safe invalid candidate that still reaches the critic.
+  - Staged prospective incumbent state, made `decision.json` durable before state/capability transition, and made `holdout.json` durable before hidden state publication.
+  - Added authenticated hidden attestation validation, independent reset binding, and mandatory content-free validation-outcome proof handling.
+- `core/pit_optimizer_evaluation.py`
+  - Added `HiddenResetReceipt`, self-digested `HiddenEvaluationAttestation`, and `ValidationOutcomeProof`.
+  - Made `ValidationLedger.record_outcome(...)` return the content-free proof of its durable appended record.
+- `tests/test_pit_optimizer_loop.py`
+  - Added the focused failed/uncertain accounting, artifact ordering/containment, durability, real context, hidden binding/outcome, safe-failure, and full actual-loop coverage requested by the review.
+- `tests/test_pit_optimizer_v2.py`
+  - Proved gateway recovery returns stable closed facts and validation-ledger completion returns its exact proof.
+
+## Finding-by-finding RED → GREEN evidence
+
+### 1. Critical — failed and uncertain attempts disappeared from accounting
+
+Command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py -k failed_provider_attempt
+```
+
+RED:
+
+```text
+2 failed, 39 deselected
+```
+
+The new started-schema-invalid and uncertain-provider cases failed because `PitOptimizerServices` exposed no finalized-attempt recovery and the controller had no failed-attempt record to persist.
+
+GREEN:
+
+```text
+2 passed, 39 deselected, 1 warning in 1.15s
+```
+
+Both cases now recover plan/pricing-bound terminal facts, replace `accounting.json` before terminal normalization, and retain exact spent or uncertain reserved token/USD exposure in both the durable accounting artifact and `OptimizerBudgetSummary`.
+
+Task 6 adapter checks:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k reopens_audit_and_idempotently_finishes_active_call
+```
+
+The sandbox-token run hit the known Windows Python 3.13 private audit-directory ACL `PermissionError`; the identical fake/temp-only command under the normal host token passed:
+
+```text
+1 passed, 231 deselected, 1 warning in 1.55s
+```
+
+The returned facts are identical across repeated idempotent recovery.
+
+### 2. Critical — incumbent/hidden state preceded authoritative durability
+
+Incumbent command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py -k "incumbent_transition or decision_durability_failure"
+```
+
+RED:
+
+```text
+3 failed, 42 deselected
+```
+
+The old ordering disposed/replaced the incumbent and incremented transition counters before an injected `decision.json` write or directory-sync failure.
+
+GREEN:
+
+```text
+3 passed, 42 deselected, 1 warning in 1.64s
+```
+
+The transition is now staged; `decision.json` is created and synced first, `incumbent.diff` is made durable next when needed, and only then are live state and capability ownership committed. Both injected failures preserve prior identity, workspace, counters, and capability.
+
+Hidden write and directory-sync failures were included in the hidden slice below. Both now leave `state.hidden_evaluation` unset, record a content-free failure outcome, and preserve the incumbent capability.
+
+### 3. Critical — complete-plan context preflight and safe next-context handling
+
+Command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py -k "real_next_context or complete_three_role_context"
+```
+
+RED after the first controller implementation:
+
+```text
+1 failed, 1 passed, 45 deselected
+```
+
+The real oversized cumulative/source bundle reached the safe path, but the persisted validation evidence incorrectly lost the already-proved author-manifest match.
+
+GREEN:
+
+```text
+2 passed, 45 deselected, 1 warning in 1.22s
+```
+
+The controller now uses the real `build_policy_source_bundle` and `render_worst_iteration_two_role_inputs` helpers. It proves the complete investigator/author/critic plan before `iterations_started`; a real shrunken critic context stops normally with `budget_exhausted/context_budget_exhausted` before any provider call or iteration directory, while candidate-attributable `next_context_oversize` persists a safe invalid validation and reaches a real critic input. The same complete-plan proof runs for a prospective incumbent before any decision artifact or state change.
+
+### 4. Important — durable numbered directory before investigator authority
+
+Command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py -k "iteration_directory_is_durable or nested_link"
+```
+
+RED:
+
+```text
+1 failed, 1 skipped, 41 deselected
+```
+
+The services/store interface had no explicit numbered-directory preparation operation, so an investigator failure could consume authority without `iterations/NNN` evidence.
+
+GREEN:
+
+```text
+1 passed, 1 skipped, 41 deselected, 1 warning in 0.14s
+```
+
+`iterations/NNN` is now created and directory-synced after complete context preflight but before `iterations_started` and the investigator call. An injected investigator failure leaves that empty durable directory in place.
+
+### 5. Important — nested symlink/reparse escape
+
+Round 1 added only a pre-existing nested intermediate-link test and pathname checks. That test skipped on this Windows token, and it did not inject a post-check replacement race. The first re-review correctly found that ordinary following `Path.open`/`mkstemp`/`os.replace` mutations remained exposed after those checks. This historical Round 1 claim is superseded by the executable Fix Round 2 race evidence below.
+
+### 6. Important — hidden attestation binding and durable content-free outcome
+
+Command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py -k "hidden_boundary_reserves_once or hidden_qualification or hidden_attestation_rejects or hidden_evaluation_failure or holdout_durability"
+```
+
+RED:
+
+```text
+10 failed, 42 deselected
+```
+
+The prior callback returned only an unbound `HiddenEvaluation`; no reservation/source/baseline/candidate/reset attestation or controller-verified ledger-completion proof existed.
+
+GREEN:
+
+```text
+10 passed, 42 deselected, 1 warning in 5.18s
+```
+
+The closed attestation self-digest binds the reservation record, source HEAD/fingerprint, baseline policy identity, candidate identity, hidden fold, two subject-specific reset receipts, and evaluation. Wrong candidate identity and reset-receipt reuse fail closed. Evaluation, attestation, holdout write, and holdout directory-sync failures all produce an attempted content-free failure outcome; success produces a completed outcome proof before hidden state is published.
+
+Validation-ledger proof command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k validation_ledger_permanently_consumes_identity_before_outcome
+```
+
+GREEN:
+
+```text
+1 passed, 231 deselected, 1 warning in 0.28s
+```
+
+### 7. Important — missing focused fake/temp coverage
+
+Actual-loop command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py -k actual_two_iteration_loop
+```
+
+The new test was deliberately run through its RED stages. The final meaningful RED exposed a trusted-repeat mismatch because the fake repeat receipt did not use the exact persisted fold-evidence digest:
+
+```text
+1 failed, 52 deselected, 1 warning
+```
+
+After binding it to that durable evidence identity, GREEN was:
+
+```text
+1 passed, 52 deselected, 1 warning in 1.70s
+```
+
+This test does not monkeypatch controller stages. It uses real source-bundle/context helpers, real candidate diff authentication, a real incremental artifact store in a pytest temporary root, injected role/evaluation/authorization fakes, two full iterations, fixed-baseline scoring, first-candidate improvement, second-candidate non-improvement, hidden closeout, and exact disposal. In Round 1 it asserted expected paths, exact top-level JSON key sets, public shape, and role/history ordering. Its four purported leak sentinels were not injected at any input boundary, so their absence was non-probative; the first re-review correctly rejected that coverage claim. The executable boundary injections and persisted/public omission proof are recorded in Fix Round 2 below.
+
+## Final complete Task 7 controller/adapter suite
+
+Command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py tests/test_pit_optimizer_v2.py
+```
+
+Final output:
+
+```text
+..........s............................................................. [ 24%]
+........................................................................ [ 48%]
+........................................................................ [ 73%]
+........................................................................ [ 97%]
+.......                                                                  [100%]
+294 passed, 1 skipped, 1 warning in 106.58s (0:01:46)
+```
+
+The one skip is the supported-platform nested-symlink case described above. The warning is the pre-existing `PytestConfigWarning: Unknown config option: cache_dir`. The suite used the normal host token solely because the Windows audit-log `0o700` ACL excludes the filesystem sandbox token; all test effects remained fake/temp-only.
+
+## Static verification
+
+Focused Ruff:
+
+```text
+python -B -m ruff check agent_loop.py core/pit_optimizer_artifacts.py core/pit_optimizer_controller.py core/pit_optimizer_evaluation.py tests/test_pit_optimizer_loop.py tests/test_pit_optimizer_v2.py --output-format concise
+```
+
+Initial output found one `B904` exception-chain finding in the new reparse guard. After adding an explicit `from None`, the final output was:
+
+```text
+All checks passed!
+```
+
+Focused compilation:
+
+```text
+python -B -m py_compile agent_loop.py core/pit_optimizer_artifacts.py core/pit_optimizer_controller.py core/pit_optimizer_evaluation.py tests/test_pit_optimizer_loop.py tests/test_pit_optimizer_v2.py
+```
+
+Result: exit 0, no output.
+
+Diff validation:
+
+```text
+git diff --check
+git diff --cached --check
+```
+
+Both exited 0 with no findings; the unstaged check printed only Git's informational LF-to-CRLF notices.
+
+## Commit-hook result
+
+Commit command:
+
+```text
+git commit -m "fix: close PIT controller durability boundaries"
+```
+
+Hook output:
+
+```text
+ruff (legacy alias)......................................................Passed
+trim trailing whitespace.................................................Passed
+fix end of files.........................................................Passed
+check yaml...........................................(no files to check)Skipped
+check for merge conflicts................................................Passed
+```
+
+Commit created: `cd7a45927a7ea3ad7c0d8622a542412c0f9d656b`.
+
+## Fix-round self-review
+
+### State ordering and fixed-baseline objective
+
+- Complete iterations remain investigator → author → local validation/discovery → critic → decision.
+- `iterations/NNN` is durable before investigator authority; the complete three-role context plan is proved before the iteration is counted.
+- Every accepted or failed finalized provider attempt enters exact accounting before its terminal outcome is normalized.
+- Every candidate score remains relative to the original authenticated parity baseline; incumbent comparisons remain diagnostics only.
+- A prospective improvement is context-proved and staged, then `decision.json` and `incumbent.diff` are made durable before live incumbent state or capability ownership changes.
+
+### Critic-before-decision and safe failures
+
+- All nonterminal closed validation failures, including the real cumulative/source oversize path and zero-discovery-trades path, retain the incumbent and receive critic review.
+- Protocol, audit, identity, accounting, evidence, and evaluator-integrity failures remain terminal and cannot be rewritten as candidate feedback.
+- The critic artifact remains durable before any `decision.json` or incumbent transition.
+
+### Hidden boundary
+
+- Provider capability closes before hidden evaluation and every later role call is rejected.
+- Reservation, source, baseline, candidate, fold, independent reset, aggregate, and decision identities are authenticated before the holdout artifact.
+- `holdout.json` is durable before hidden state can affect the result; write/sync failure leaves hidden state unset.
+- A content-free validation-ledger outcome proof is required on success and on every caught hidden failure; no hidden content is placed in the ledger proof.
+
+### Atomic artifacts and containment
+
+- Immutable JSON artifacts remain canonical create-only files with file and parent-directory durability; accounting/incumbent snapshots retain atomic replacement.
+- Round 1 component walking rejected pre-existing symlink/reparse metadata, but did not close a post-check/pre-mutation replacement race. This self-review statement was incomplete and is superseded by the handle-relative Fix Round 2 implementation and deterministic race test below.
+- Numbered directories are explicitly created/synced and partial directories/artifacts are retained after terminal investigator/provider failures.
+- Injected write and directory-sync failures prove no incumbent or hidden state advance.
+
+### Capability disposal and terminal cleanup
+
+- `CandidateWorkspace` remains inert; no authority is reconstructed from a root path.
+- Prior incumbent disposal occurs only after the authoritative transition artifacts and live-state commit. A non-winning candidate is disposed only after its retain decision is durable.
+- The common terminal path still disables provider use, closes the lease, attempts every candidate/worker cleanup, verifies inputs/source, replaces exact accounting, and attempts `summary.json` last.
+- The separately reviewed Minor pre-registration ownership-transfer case was intentionally left unchanged because none of the blocking repairs required that path.
+
+### Secrecy
+
+- Provider-projectable inputs contain no hidden IDs, dates, metrics, outcomes, or reservation facts.
+- Public result and exact artifact key-set tests exclude runtime capability paths, prompts, raw provider envelopes, credentials, headers, keys, and operator approval contents.
+- Failed attempt artifacts contain only closed lifecycle facts and an optional accepted-payload digest; failed/uncertain records have `payload_sha256=null`.
+- All committed fixtures are synthetic and all runtime artifacts/ledgers in tests use pytest temporary roots.
+
+## Exact resource/effect statement
+
+No subagents or reviewers were used. No OpenRouter/provider call, network access, live pricing lookup, real SDK construction, Docker invocation, replay/parity/candidate backtest, permanent-ledger mutation, background process, upload, push, merge, deploy, cloud work, or operator-worktree mutation occurred. All clients, role calls, pricing values, evaluations, candidates, authorizations, artifacts, validation ledgers, and cleanup actions were injected fakes/mocks operating only in pytest temporary paths. No hidden IDs/dates/metrics/results entered provider-projectable inputs. No prompt, real model-authored strategy source, raw provider response, credential, header, key, or operator approval content was written to this report, output, or durable test artifacts.
+
+The durable effects are the six scoped tracked files in commit `cd7a45927a7ea3ad7c0d8622a542412c0f9d656b` and this ignored report append. The Git index/HEAD changed only through that local commit. No Task 8 work was started.
+
+## Concerns
+
+No implementation concern remains. Environmental notes only: the supported-platform nested-link test skipped because this Windows token cannot create symlinks, the installed pytest emits the pre-existing unknown-`cache_dir` warning, and Windows Python 3.13 secure audit-directory ACLs require the normal host token for the Task 6 fake/temp tests. The final tracked worktree is clean.
+
+# Task 7 Fix Round 2/5 — 2026-08-28
+
+## Outcome and corrected prior claims
+
+Both open Important findings in `task-7-rereview-1.md` are fixed in commit `35614fbc5edcbb4e0daa489f0f21233f5ee0cbce` (`fix: make PIT artifact writes race safe`). The historical Fix Round 1 paragraphs above were corrected in place: Round 1 had only pre-existing-link pathname coverage, and its leak-marker literals were never injected. This round supplies the actual post-check replacement race and boundary-injected omission proof. The separately deferred Minor was not touched, and none of the five already addressed findings was reopened.
+
+Files changed:
+
+- `core/pit_optimizer_artifacts.py`
+  - Replaced check-then-path mutation with held directory capabilities for all direct create-only helpers and all incremental-store create/replace paths.
+  - POSIX walks absolute and store-relative components with `O_DIRECTORY | O_NOFOLLOW` descriptors and performs final create, temporary create, unlink, and atomic replace relative to the held parent descriptor.
+  - Windows opens each directory component with native `CreateFileW` using `FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS`, validates non-reparse `lstat` identity across handle acquisition, and deliberately omits `FILE_SHARE_DELETE` so the complete held chain cannot be renamed or replaced during a pathname mutation.
+  - Preserved exclusive creation, file fsync, parent-directory durability, temporary cleanup, create-failure cleanup, store-root identity binding, and the exact closed artifact layout.
+- `tests/test_pit_optimizer_loop.py`
+  - Added a deterministic post-check/pre-mutation replacement race for create-only JSON, replaceable JSON, and replaceable diff.
+  - Injected three distinct synthetic markers into the fake raw-provider envelope, approval input, and ignored candidate input; proved each boundary was exercised and that every persisted artifact plus the public result omitted all three markers.
+
+## Finding 5 — race-safe create and replace mutations
+
+Focused command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py -k post_check_path_replacement_race
+```
+
+RED against the pathname writer:
+
+```text
+FFF                                                                      [100%]
+3 failed, 63 deselected, 1 warning in 0.26s
+```
+
+The deterministic hook ran after the existing parent checks and immediately before `Path.open("xb")` or `tempfile.mkstemp`. On this Windows host, all three unguarded directory renames succeeded; the create-only artifact and both replacement payloads were written into the injected replacement directory. This was the expected security failure, not a fixture error.
+
+GREEN after held-capability mutation:
+
+```text
+...                                                                      [100%]
+3 passed, 63 deselected, 1 warning in 0.18s
+```
+
+On Windows the same three replacement attempts now fail while the native component handles are held without delete sharing; the intended in-root artifacts complete with the exact expected bytes, no detached directory appears, and each outside/replacement target remains absent or byte-for-byte unchanged. On POSIX the same test hooks the final relative `os.open`; the implementation uses held no-follow directory descriptors and revalidates identity around mutation, so a successful pathname replacement cannot redirect create/unlink/replace into the installed link or directory.
+
+The older pre-existing directory-symlink test remains an honest capability test: it skips on this Windows token because directory symlink creation is unavailable. The new ordinary path-replacement race does not require that privilege and executed on all three mutation paths here; it is not skipped.
+
+## Finding 7 — probative containment and leakage coverage
+
+Leak-boundary command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py -k actual_two_iteration_loop
+```
+
+RED after adding the boundary-exercise assertions but before wiring the synthetic inputs:
+
+```text
+F                                                                        [100%]
+1 failed, 65 deselected, 1 warning in 1.78s
+```
+
+The exact failure was `raw_boundary_seen == []`, proving the former marker literals did not cross any raw-provider boundary.
+
+GREEN after real test-boundary injection:
+
+```text
+.                                                                        [100%]
+1 passed, 65 deselected, 1 warning in 1.75s
+```
+
+The actual two-iteration loop now proves six raw-envelope marker observations, one approval-input observation, and two candidate-input observations. The fake provider parses its closed role artifact from a raw-envelope object that also carries the synthetic transport marker. The authorization fake receives a synthetic approval reference and returns only a one-shot digest derived from it. Each temporary candidate contains a separately ignored synthetic marker file that candidate validation and source projection must not serialize. The test concatenates every persisted run artifact with canonical `result.to_public_artifact()` bytes and asserts all three injected markers are absent.
+
+Combined prescribed focused slice:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py -k "post_check_path_replacement_race or actual_two_iteration_loop"
+```
+
+Output:
+
+```text
+....                                                                     [100%]
+4 passed, 62 deselected, 1 warning in 1.72s
+```
+
+An additional focused durability/regression slice covering the store, failed creates, numbered-directory ordering, decision durability, and holdout durability produced:
+
+```text
+9 passed, 1 skipped, 56 deselected, 1 warning in 2.28s
+```
+
+## Final complete Task 7 controller/adapter suite
+
+Command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py tests/test_pit_optimizer_v2.py
+```
+
+Final output:
+
+```text
+..........s............................................................. [ 24%]
+........................................................................ [ 48%]
+........................................................................ [ 72%]
+........................................................................ [ 96%]
+..........                                                               [100%]
+297 passed, 1 skipped, 1 warning in 102.91s (0:01:42)
+```
+
+The one skip is only the older pre-existing-symlink capability case. The deterministic post-check path-replacement tests all executed and passed. The warning is the pre-existing `PytestConfigWarning: Unknown config option: cache_dir`. The complete fake/temp-only suite ran under the normal host token solely because the existing Windows secure audit-directory ACL excludes the filesystem sandbox token.
+
+## Static verification
+
+Focused Ruff:
+
+```text
+python -B -m ruff check core/pit_optimizer_artifacts.py tests/test_pit_optimizer_loop.py --output-format concise
+```
+
+Output:
+
+```text
+All checks passed!
+```
+
+Focused compilation:
+
+```text
+python -B -m py_compile core/pit_optimizer_artifacts.py tests/test_pit_optimizer_loop.py
+```
+
+Result: exit 0, no output.
+
+Diff validation:
+
+```text
+git diff --check
+git diff --cached --check
+```
+
+Both exited 0 with no findings; the unstaged command printed only Git's informational LF-to-CRLF notices.
+
+## Commit-hook result
+
+Command:
+
+```text
+git commit -m "fix: make PIT artifact writes race safe"
+```
+
+Hook output:
+
+```text
+ruff (legacy alias)......................................................Passed
+trim trailing whitespace.................................................Passed
+fix end of files.........................................................Passed
+check yaml...........................................(no files to check)Skipped
+check for merge conflicts................................................Passed
+```
+
+Commit created: `35614fbc5edcbb4e0daa489f0f21233f5ee0cbce`.
+
+## Fix Round 2 self-review
+
+### No-follow containment and mutation
+
+- Every absolute parent is walked component-by-component rather than accepted through `resolve`; every store operation additionally compares the held run-root identity with the identity captured at store construction.
+- POSIX directory descriptors remain open through final exclusive create, temporary creation, `unlink`, and `os.replace(..., src_dir_fd=..., dst_dir_fd=...)`. Final creates use `O_EXCL | O_NOFOLLOW`; no later mutation re-resolves an attacker-controlled intermediate pathname.
+- Windows directory handles remain open for the entire mutation with reparse-point opening enabled for inspection and delete sharing withheld. A pre/post-`lstat` identity comparison binds each handle acquisition and rejects reparse metadata. The deterministic race proves replacement is blocked at the exact former gap.
+- Create-only failure removes the uncommitted file relative to the held capability. Atomic replacement fsyncs its exclusive sibling temporary before component-relative/locked-parent replace, syncs the held parent, and removes any leftover temporary through the same capability.
+- Direct readiness `write_create_only_json` uses the same secured absolute-parent capability path; incremental artifacts use the stricter stored-root identity and exact name layout.
+
+### Coverage and secrecy
+
+- The race is injected, not inferred: the test wraps both the legacy final mutation calls and the secured final `os.open` boundary, records that injection occurred, and asserts exact inside/outside bytes for create-only JSON, replaceable JSON, and replaceable diff.
+- The symlink capability skip is reported only for the distinct pre-existing-link primitive; the ordinary replacement race executes without elevated link privileges.
+- The three synthetic markers are distinct, intentionally non-secret, and observed at their respective fake boundaries before the omission assertion.
+- Persisted coverage includes every file below the run artifact root; public coverage includes canonical bytes of `PitOptimizerResult.to_public_artifact()`. Neither side contains a marker.
+- No hidden fold identity/result was added to provider-projectable inputs, and no raw envelope, approval reference, or candidate marker content became a durable artifact.
+
+### Preserved Task 7 invariants
+
+- Artifact layout, canonical schema-v2 bytes, create-only immutability, atomic accounting/incumbent replacement, and file/directory durability remain unchanged at the public interface.
+- The controller state ordering, fixed-baseline objective, critic-before-decision path, hidden boundary, capability lifecycle, terminal cleanup, accounting, and context logic were not modified in this round.
+- The deferred pre-registration capability-ownership Minor was not touched.
+
+## Exact resource/effect statement
+
+No subagents or reviewers were used. No OpenRouter/provider call, network access, live pricing lookup, real SDK construction, Docker invocation, replay/parity/candidate backtest, permanent-ledger mutation, background process, upload, push, merge, deploy, cloud work, or operator-worktree mutation occurred. Every client, raw envelope, approval input, role call, pricing value, evaluation, candidate, authorization object, artifact, and cleanup action was synthetic/injected and operated only in pytest temporary paths. The three leak markers were intentionally synthetic labels and contained no prompt, strategy source, real provider content, credential, header, key, approval content, or hidden data.
+
+The durable effects are the two scoped tracked files in local commit `35614fbc5edcbb4e0daa489f0f21233f5ee0cbce` and the requested ignored report corrections/append. The Git index/HEAD changed only through that commit. No Task 8 work was started.
+
+## Concerns
+
+No implementation concern remains. Environmental notes only: this Windows token cannot create the separate pre-existing directory-symlink primitive, the installed pytest emits the pre-existing unknown-`cache_dir` warning, and the existing Task 6 secure-audit ACL tests require the normal host token. The deterministic ordinary path-replacement race executed on this host for all three mutation modes, and the tracked worktree is clean.

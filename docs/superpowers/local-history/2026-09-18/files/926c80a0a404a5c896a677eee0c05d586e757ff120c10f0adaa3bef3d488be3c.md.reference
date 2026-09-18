@@ -1,0 +1,66 @@
+# Saved command bindings for H2b
+
+This corrects and supersedes only “variant hash/key” in `extraction-design.md`: a registered execution key contains the contextual **experiment ID**, not `RenderedVariantV5.sha256`. The earlier design artifact remains unchanged. Source references below are within `core/pit_optimizer_v5`.
+
+## Journal-to-policy authority
+
+Use H1's authenticated round events/payloads and `repository.verify_candidate_execution_index(campaign_id=..., round_index=...)`. Otherwise obtain them with `load_round_events` and `load_round_payload(event.payload_ref, expected_kind=event.event_kind)`; retain event order and the existing fold checks.
+
+For each execution, require its event's experiment ID equals `authority.key.experiment_id`. Find exactly one preceding `rendered_variant` event with that **event ID**, and its `RenderedVariantPayloadV5.variant`. Find the preceding unique round intent and accepted author completion; authenticate `repository.load_role_invocation(author_completion)`, whose `artifact` is the exact `StructuralTemplateV5`. Bind accepted package/campaign/round, template parent/hypothesis, author request's complete hypothesis and discovery binding to intent, as in `artifacts.py:_validate_render_rejection_context`.
+
+Compute `candidate_ir.py:derive_experiment_identity_v5` from variant policy revision and assignment, intent parent revision/hypothesis/discovery digest, authenticated template and round index. Require its digest equal rendered-event ID and execution-key ID. The variant's own digest identifies its full rendered payload; it is not interchangeable with this context digest. The unregistered convenience calls in `sandbox.py` use variant hashes; registered runtime execution uses the supplied contextual key (`runtime.py:_initial_candidate`, semantic/quick registration, and discovery registration).
+
+Require exactly one prior `CandidateStageResultPayloadV5` for that ID/stage `validation`, outcome `validation_valid`, with valid typed validation. If policy equals intent parent, actual changed symbols must be empty; otherwise they equal template changed symbols. Parent-identical candidates take `exact_duplicate` and return before probe/quick/discovery in `runtime.py:_initial_candidate`. C1 permits that record with empty actual changes; it does not authorize an evaluator execution. Reject execution authority for this branch.
+
+Invalid materialized candidates derive a separate `PreValidationInvalidExperimentIdentityV5` from assignment/context after failed validation; render rejections also use that route. Their finalized IDs need not equal rendered-event IDs. Neither branch can supply execution authority. Do not associate records through blanket ID equality, assume a changed revision, or infer validation from a final record.
+
+## Actual resource lookups
+
+All typed-state reads use `repair=False` and existing authority-index authentication:
+
+| Namespace/key | Record |
+| --- | --- |
+| `container-reservation` / command SHA | `ExecutionReservationRecordV5` |
+| `container-panel-input` / request SHA | optional `PanelExecutionRequestV5` |
+| `sandbox-mount-reservation`, `sandbox-mount-created`, `sandbox-mount-ready` / output authority SHA | corresponding `Mount*RecordV5` |
+| `workspace-reservation`, `workspace-created`, `workspace-ready`, `workspace-retirement` / journal workspace lease ID stripped of `workspace.` | `WorkspaceLeaseRecordV5`, `WorkspaceCreatedRecordV5`, `WorkspaceReadyRecordV5`, `WorkspaceLeaseRetirementV5` |
+
+Retain `LocalGitWorkspaceDriverV5.authenticate_lease_history` and `LocalSandboxMountFactoryV5.authenticate_output_history`. Select exactly one authenticated journal workspace whose ready identity equals mount reservation's `source_root_identity_sha256`; require lease owner, parent revision and child revision equal H1 owner, intent parent and variant policy respectively. Match complete journal lease payloads, not just IDs. Workspace tokens are saved random lease tokens, never derivable from experiment IDs.
+
+Source path is pinned workspace root plus lease relative path; output path is pinned output root plus mount reservation relative path; data path is pinned config root. Verify mount creation/readiness equality and deterministic output name. Removed workspace source need not be reopened.
+
+## Exact immutable request mapping
+
+Let `H=canonical_sha256_v5`, `P=canonical_primitive_v5`, `K(path)=ntpath.normcase(ntpath.normpath(path))`. Mirror `sandbox.py:DockerPanelRequestV5.to_primitive` exactly:
+
+```
+{
+  owner_sha256: owner.sha256,
+  manifest_sha256: manifest.sha256,
+  execution_key: P(authority.key),
+  policy_revision: variant.policy_revision.to_primitive(),
+  evaluator_contract_sha256: contract.sha256,
+  sandbox_profile_sha256: profile.sha256,
+  panel: P(episode),
+  panel_spec: P(panel_spec),             # None for probe
+  scenario_ids: scenarios,
+  mounts: (source, output)              # probe
+          or (source, data, output)     # panel
+}
+```
+
+Each mount is the exact `SandboxMountHandleV5.authority_primitive` mapping:
+`kind, mode, root_identity_sha256, content_authority_sha256, host_path_key, container_path, maximum_bytes`.
+Kinds/targets are source/`/pit/candidate`, data/`/pit/data`, output/`/pit/output`; modes are `read_only`, `read_only`, `bounded_write_only`; maximum bytes are None, None, manifest output limit; host path key is `K(path)`.
+
+**Distinguish two source identity encodings.** Mount root identity is `H({canonical_path_key:K(path),device,inode})` for all three mounts (`production_sandbox.py:_mount_handle/_directory_identity`). Source device/inode come from workspace created/ready; data identity comes from authenticated current data root; output from mount created/ready. Workspace ready/source-binding identity additionally includes `lease_sha256` (`production_workspace.py:_authenticate_lease_history`). Never substitute that binding hash for the source mount's root hash.
+
+Obtain content authorities via existing pure `derive_sandbox_mount_authorities_v5(owner,policy_revision,evaluator_contract,sandbox_profile,panel,scenario_ids,execution_key)`. Its common mapping contains evaluator/profile/panel/policy digests, scenarios and canonical key; probes add trusted-probe-runtime authority. Source hashes common+kind; data hashes common+kind+bundle/provenance digests; output hashes common+kind+owner. Require output result equal journal/mount reservation. Require reconstructed request hash equal journal/reservation request SHA.
+
+## Stage and command interpretation
+
+Load `CampaignPanelPlanV5` through `manifest.panel_plan_ref`; require its discovery digest equal intent. Probe uses mechanics episode, no panel spec/input/data, empty scenarios, required semantics. Quick uses quick episode/no ordinal and selection scenario only. Discovery uses exact ordinal 1–4 and its matching plan episode, all friction scenarios in contract order. Load panel specs with `load_evaluation_panel_spec(episode.panel_ref)`; compare complete typed panel input to `panel_execution_request_for_v5` semantics, including resource fields/data scope and absent baseline-capture reference. Unsupported stages fail closed.
+
+Use exact ordered `sandbox.py:build_docker_argv_v5` grammar for both branches; no shell parsing, token reordering or path-case normalization of saved argv. Request primitives normalize paths; argv preserves canonical host spelling. Require `H({request_sha256:request_sha,argv:saved_argv})==command_sha`. Probe flags bind policy/runtime/constraints/suite/contract/profile/timeouts; panel flags bind canonical input hash, episode/panel/date/scenarios.
+
+Also verify `production_sandbox.py:_runtime_argv/_reservation_record` serialized transformation and runtime digest: panel input path is repository root plus `adapter-state/container-panel-input/{request_sha}.json`; its reference digest equals typed input hash. Exact runtime mount tuples use normalized host paths, targets and writable booleans, sorted; probe has four policy files plus output, panel additionally two data files and panel input. Use only immutable values; instantiate no request, command, mount, lease or executor capabilities.

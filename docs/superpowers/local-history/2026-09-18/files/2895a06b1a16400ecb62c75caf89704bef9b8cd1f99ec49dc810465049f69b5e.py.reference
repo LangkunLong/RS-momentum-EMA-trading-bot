@@ -1,0 +1,112 @@
+"""Authenticate and compare two completed real development panel executions."""
+
+import argparse
+from datetime import datetime, timezone
+import hashlib
+import json
+from pathlib import Path
+
+from core.pit_optimizer_v5.candidate_ir import SourceBundleV5, SourceFileV5
+from core.pit_optimizer_v5.container_protocol import (
+    decode_panel_execution_output_v5,
+    decode_panel_execution_request_v5,
+    panel_execution_output_bytes_v5,
+)
+from core.pit_optimizer_v5.policy_scope import EDITABLE_POLICY_PATHS_V5
+
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def authenticate(run):
+    request = decode_panel_execution_request_v5((run / "request/panel-request.json").read_bytes())
+    raw = (run / "output/panel-evaluation.json").read_bytes()
+    output = decode_panel_execution_output_v5(raw)
+    if request.pit_data_scope != "development_sp500_v2" or request.panel.purpose != "quick":
+        raise ValueError("Comparison is restricted to explicit development quick panels")
+    if output.request_sha256 != request.request_sha256 or output.input_sha256 != request.sha256:
+        raise ValueError("Output request identity mismatch")
+    if panel_execution_output_bytes_v5(request=request, evaluation=output.evaluation) != raw:
+        raise ValueError("Output canonical bytes differ from the bound request")
+    state = json.loads((run / "container-state.json").read_text())
+    if state["Running"] or state["ExitCode"] != 0 or state["OOMKilled"]:
+        raise ValueError("Evaluation did not complete normally")
+    for path, expected in request.policy_revision.editable_source_sha256:
+        if digest((run / "policy" / Path(path).name).read_bytes()) != expected:
+            raise ValueError("Mounted policy source differs from the request")
+    source = SourceBundleV5(tuple(
+        SourceFileV5(path, (run / "policy" / Path(path).name).read_text(encoding="utf-8"))
+        for path in EDITABLE_POLICY_PATHS_V5
+    ))
+    report = output.evaluation.scenarios[0].report
+    entries = next((item.count for item in report.entry_funnel if item.metric_id == "episode.quick.entries_executed"), 0)
+    record = {
+        "run": str(run.resolve()),
+        "request_sha256": request.request_sha256,
+        "input_sha256": request.sha256,
+        "output_sha256": digest(raw),
+        "policy_sha256": request.policy_revision.sha256,
+        "source_bundle_sha256": source.sha256,
+        "panel_sha256": request.panel.sha256,
+        "evaluator_contract_sha256": request.evaluator_contract.sha256,
+        "container_id": (run / "container-id.txt").read_text().strip(),
+        "container_state": state,
+        "portfolio_annualized_return_pct": str(report.portfolio_annualized_return_pct),
+        "portfolio_total_return_pct": str(report.portfolio_total_return_pct),
+        "average_exposure_pct": str(report.average_exposure_pct),
+        "max_drawdown_pct": str(report.max_drawdown_pct),
+        "closed_trades": report.closed_trades,
+        "entries_executed": entries,
+        "total_friction_usd": str(report.total_friction_usd),
+        "entry_funnel": {item.metric_id: item.count for item in report.entry_funnel},
+    }
+    return request, report, record
+
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--parent-run", type=Path, required=True)
+parser.add_argument("--candidate-run", type=Path, required=True)
+parser.add_argument("--hypothesis", type=Path, required=True)
+parser.add_argument("--output", type=Path, required=True)
+args = parser.parse_args()
+parent_request, parent_report, parent = authenticate(args.parent_run)
+candidate_request, candidate_report, candidate = authenticate(args.candidate_run)
+if parent_request.panel != candidate_request.panel or parent_request.evaluator_contract != candidate_request.evaluator_contract:
+    raise ValueError("Parent and candidate must use the same panel and evaluator contract")
+if parent_request.scenario_ids != candidate_request.scenario_ids:
+    raise ValueError("Parent and candidate friction scenario differs")
+raw_hypothesis = args.hypothesis.read_bytes()
+hypothesis = json.loads(raw_hypothesis)
+if (
+    hypothesis["parent_policy_sha256"] != parent["policy_sha256"]
+    or hypothesis["parent_output_sha256"] != parent["output_sha256"]
+    or hypothesis["panel_sha256"] != parent["panel_sha256"]
+    or hypothesis["source_bundle_sha256"] != candidate["source_bundle_sha256"]
+):
+    raise ValueError("Hypothesis does not bind this actual parent and candidate")
+improved = candidate_report.portfolio_annualized_return_pct > parent_report.portfolio_annualized_return_pct
+active = candidate["entries_executed"] > 0
+promoted = active and improved
+record = {
+    "record_kind": "real_development_feedback_comparison",
+    "created_at_utc": datetime.now(timezone.utc).isoformat(),
+    "scope": "development_sp500_v2",
+    "hypothesis_sha256": digest(raw_hypothesis),
+    "parent": parent,
+    "candidate": candidate,
+    "candidate_active_on_quick_panel": active,
+    "net_annualized_return_improved": improved,
+    "decision": "promote_for_further_development" if promoted else "retain_parent",
+    "reason": "active_and_higher_net_return" if promoted else "no_entries_on_this_quick_panel" if not active else "no_strict_net_return_improvement",
+    "selected_policy_sha256": candidate["policy_sha256"] if promoted else parent["policy_sha256"],
+    "production_baseline_authority": False,
+    "full_feedback_runtime_complete": False,
+    "full_campaign_complete": False,
+    "paid_provider_calls": 0,
+    "limitation": "One controller-authored development feedback comparison; no campaign retirement or held-out eligibility. A zero-trade quick panel does not terminate broader discovery.",
+}
+args.output.parent.mkdir(parents=True, exist_ok=True)
+with args.output.open("x", encoding="utf-8") as stream:
+    stream.write(json.dumps(record, indent=2) + "\n")
+print(json.dumps({"output": str(args.output.resolve()), "output_sha256": digest(args.output.read_bytes()), "decision": record["decision"], "reason": record["reason"], "parent_total_return_pct": parent["portfolio_total_return_pct"], "candidate_total_return_pct": candidate["portfolio_total_return_pct"], "candidate_entries": candidate["entries_executed"]}))

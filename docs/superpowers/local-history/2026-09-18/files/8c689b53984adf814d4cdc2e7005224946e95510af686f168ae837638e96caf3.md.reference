@@ -1,0 +1,11 @@
+# P2 implementation report
+
+P2 adds the native live admission guard at both points required to prevent unadmitted paid work: after each complete request is built but before runtime persistence, and inside the existing ledger transition before reservation construction and append.
+
+The shared reader preserves the legacy path by rediscovering enrollment and returning immediately when absent. For enrolled campaigns it authenticates the policy envelope, original manifest/launch/config/root/owner, selected round configuration/start, stored deadlines, prior settled resource history, checkpoint/archive projection, committed evaluated records and their accepted critic, request/journal identities, and the exact verified ledger prefix. It permits only the exact current request/call recovery tail, rejects later/conflicting/orphan selected state, rejects new work in a settled current round, and applies the P1 boundary decision to the immutable prefix before the current round.
+
+`production_runtime.py` contains one factory helper and exactly three guarded request returns. `production_provider.py` retains the old content lookup, budget predicate, slot construction, and `lease_started` order for unenrolled ledgers. Enrolled ledgers additionally require the unique persisted call/request and repeat the shared guard before reservation creation; no second transition was added.
+
+Independent review of freeze 01 found five gaps. Fix round 1 now binds the incoming ledger attempt identity, requires accepted current predecessors before any next call or tail, applies native prior-stop precedence, propagates failed foreign-config authentication, and performs a fresh real-time deadline check after immutable authentication and the boundary decision. The exact reviewed freeze and original diff remain in `review-freeze-01/`; the narrow correction is `fix-round-1.diff`.
+
+The corrected source is frozen at the hashes in `source-freeze.md`. The updated three-file unified diff is `actual-task.diff`. Ruff, in-memory compile, focused source/AST protection checks, and the earlier 662-archive-file plus 56-evaluator-file byte preservation check passed. Dynamic tests and operational readers were prohibited and were not run. Independent fix review remains the next gate before any later increment changes these files.

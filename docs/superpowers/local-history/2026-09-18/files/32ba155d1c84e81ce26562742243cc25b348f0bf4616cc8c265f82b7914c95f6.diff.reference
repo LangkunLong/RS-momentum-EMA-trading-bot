@@ -1,0 +1,2743 @@
+# Review package: 0080d5d465483c2bb228e092da8616cfee473e60..b9c4371
+
+## Commits
+b9c4371 feat: persist adaptive optimizer search state
+
+## Files changed
+ agent_loop.py                    |  249 ++++++-
+ core/pit_optimization.py         |  146 ++++
+ core/pit_optimizer_artifacts.py  |  253 ++++++-
+ core/pit_optimizer_controller.py | 1530 +++++++++++++++++++++++++++++++++++++-
+ tests/test_agent_loop.py         |    7 +-
+ 5 files changed, 2164 insertions(+), 21 deletions(-)
+
+## Diff
+diff --git a/agent_loop.py b/agent_loop.py
+index 3cee45f..3a93c41 100644
+--- a/agent_loop.py
++++ b/agent_loop.py
+@@ -12521,25 +12521,29 @@ class LoopConfig:
+                 "historical_data_bundle must not overlap the permanent runtime"
+             )
+         if not isinstance(self.mode, ExecutionMode):
+             raise ConfigurationError("mode must be ExecutionMode")
+         try:
+             from pit_diagnosis_agent import PitDiagnosisGateConfig
+             pit_gate_type: tuple[type[object], ...] = (PitDiagnosisGateConfig,)
+         except ImportError:
+             pit_gate_type = ()
+         try:
+-            from core.pit_optimization import PitOptimizationGateConfig
++            from core.pit_optimization import (
++                PitOptimizationGateConfig,
++                PitOptimizerGateConfigV4,
++            )
+             from core.pit_optimization_contract import PitOptimizerGateConfig
+             optimization_gate_type: tuple[type[object], ...] = (
+                 PitOptimizationGateConfig,
+                 PitOptimizerGateConfig,
++                PitOptimizerGateConfigV4,
+             )
+         except ImportError:
+             optimization_gate_type = ()
+         if not isinstance(
+             self.gate,
+             (
+                 TestGateConfig,
+                 BacktestGateConfig,
+                 *pit_gate_type,
+                 *optimization_gate_type,
+@@ -12570,21 +12574,24 @@ class LoopConfig:
+             if any(_configuration_paths_overlap(artifacts, path) for path in protected):
+                 raise ConfigurationError(
+                     "artifact_root must not overlap source, controller runtime, "
+                     "permanent runtime, or sealed PIT optimization inputs"
+                 )
+             for name in ("baseline_run", "pit_bundle"):
+                 if _configuration_paths_overlap(getattr(self.gate, name), runtime):
+                     raise ConfigurationError(
+                         "PIT optimization input must not overlap the permanent runtime"
+                     )
+-            if isinstance(self.gate, PitOptimizerGateConfig):
++            if isinstance(
++                self.gate,
++                (PitOptimizerGateConfig, PitOptimizerGateConfigV4),
++            ):
+                 expected_context = (
+                     source,
+                     runtime,
+                     controller,
+                     artifacts,
+                     git,
+                 )
+                 actual_context = (
+                     self.gate.source_root,
+                     self.gate.permanent_runtime_root,
+@@ -12593,21 +12600,21 @@ class LoopConfig:
+                     self.gate.git_executable,
+                 )
+                 if actual_context != expected_context:
+                     raise ConfigurationError(
+                         "PIT optimizer execution context differs from LoopConfig"
+                     )
+         if not isinstance(self.models, ModelConfig):
+             raise ConfigurationError("models must be a validated config")
+         if optimization_gate_type and isinstance(
+             self.gate,
+-            PitOptimizerGateConfig,
++            (PitOptimizerGateConfig, PitOptimizerGateConfigV4),
+         ):
+             if not isinstance(self.limits, PitOptimizerLoopLimits):
+                 raise ConfigurationError(
+                     "PIT optimizer requires optimizer-specific limits"
+                 )
+         elif not isinstance(self.limits, LoopLimits):
+             raise ConfigurationError("legacy route requires USD-enforcing limits")
+         object.__setattr__(self, "source_root", source)
+         object.__setattr__(self, "permanent_runtime_root", runtime)
+         object.__setattr__(self, "git_executable", git)
+@@ -19206,20 +19213,24 @@ def build_parser() -> argparse.ArgumentParser:
+         "--optimization-prior-discovery-feedback",
+         type=Path,
+         help="Canonical aggregate-only feedback from earlier subset candidates.",
+     )
+     parser.add_argument("--optimization-prior-discovery-feedback-sha256")
+     parser.add_argument("--baseline-manifest-sha256")
+     parser.add_argument("--effective-policy-sha256")
+     parser.add_argument("--readiness-sha256")
+     parser.add_argument("--optimizer-manifest", type=Path)
+     parser.add_argument("--optimizer-manifest-sha256")
++    parser.add_argument("--discovery-panel-plan", type=Path)
++    parser.add_argument("--discovery-panel-plan-sha256")
++    parser.add_argument("--campaign-checkpoint", type=Path)
++    parser.add_argument("--campaign-checkpoint-sha256")
+     parser.add_argument("--verified-parity", type=Path)
+     parser.add_argument("--verified-parity-sha256")
+     parser.add_argument("--optimizer-authorization-window-id")
+     parser.add_argument("--optimizer-authorization-requirement-sha256")
+     parser.add_argument(
+         "--authorize-policy-source-transmission",
+         action="store_true",
+         help="Acknowledge the exact manifest-bound policy source transmission.",
+     )
+     parser.add_argument("--minimum-total-return", type=float)
+@@ -19466,28 +19477,143 @@ def _build_pit_optimizer_v3_config(
+                 "Docker executable",
+             ),
+             sandbox_image=getattr(namespace, "sandbox_image", None),
+         )
+         config.validate()
+     except ValueError as exc:
+         raise ConfigurationError(str(exc)) from exc
+     return config
+ 
+ 
++def _build_pit_optimizer_v4_config(namespace: argparse.Namespace) -> object:
++    """Build a closed schema-v4 gate from authenticated manifest/panel inputs."""
++
++    from core.pit_optimization import PitOptimizerGateConfigV4
++    from core.pit_optimization_contract import load_pit_optimizer_manifest_v4
++    from core.pit_optimizer_evaluation import load_discovery_panel_plan
++
++    phase = getattr(namespace, "optimization_phase", None)
++    manifest_path = _absolute_cli_path(
++        getattr(namespace, "optimizer_manifest", None),
++        "optimizer manifest",
++    )
++    manifest_sha256 = getattr(namespace, "optimizer_manifest_sha256", None)
++    panel_path = _absolute_cli_path(
++        getattr(namespace, "discovery_panel_plan", None),
++        "discovery panel plan",
++    )
++    panel_sha256 = getattr(namespace, "discovery_panel_plan_sha256", None)
++    if (
++        _SHA256_RE.fullmatch(manifest_sha256 or "") is None
++        or _SHA256_RE.fullmatch(panel_sha256 or "") is None
++    ):
++        raise ConfigurationError("optimizer v4 manifest/panel digest is invalid")
++    try:
++        panel = load_discovery_panel_plan(panel_path)
++        if hashlib.sha256(panel_path.read_bytes()).hexdigest() != panel_sha256:
++            raise ValueError("optimizer v4 discovery panel digest differs")
++        manifest = load_pit_optimizer_manifest_v4(
++            manifest_path,
++            expected_sha256=manifest_sha256,
++            discovery_panel_plan=panel,
++        )
++    except ValueError as exc:
++        raise ConfigurationError(str(exc)) from exc
++    checkpoint = getattr(namespace, "campaign_checkpoint", None)
++    checkpoint_sha256 = getattr(namespace, "campaign_checkpoint_sha256", None)
++    if (checkpoint is None) != (checkpoint_sha256 is None):
++        raise ConfigurationError(
++            "campaign checkpoint path and SHA-256 must be supplied together"
++        )
++    if manifest.seed_checkpoint_sha256 != checkpoint_sha256:
++        raise ConfigurationError("optimizer v4 manifest checkpoint differs")
++    artifact_root = _absolute_cli_path(
++        getattr(namespace, "artifact_root", None),
++        "artifact root",
++    )
++    readiness_artifact = artifact_root / f"{manifest.campaign_id}.readiness.json"
++    try:
++        return PitOptimizerGateConfigV4(
++            phase=phase,
++            baseline_run=_absolute_cli_path(
++                getattr(namespace, "baseline_run", None),
++                "baseline run",
++            ),
++            pit_bundle=_absolute_cli_path(
++                getattr(namespace, "pit_bundle", None),
++                "PIT bundle",
++            ),
++            pit_bundle_sha256=getattr(namespace, "pit_bundle_sha256", None),
++            optimizer_manifest=manifest_path,
++            optimizer_manifest_sha256=manifest_sha256,
++            discovery_panel_plan=panel_path,
++            discovery_panel_plan_sha256=panel_sha256,
++            readiness_artifact=readiness_artifact,
++            readiness_sha256=getattr(namespace, "readiness_sha256", None),
++            campaign_checkpoint=(
++                None
++                if checkpoint is None
++                else _absolute_cli_path(checkpoint, "campaign checkpoint")
++            ),
++            campaign_checkpoint_sha256=checkpoint_sha256,
++            source_transmission_authorized=getattr(
++                namespace,
++                "authorize_policy_source_transmission",
++                False,
++            ),
++            max_api_calls=getattr(namespace, "max_api_calls", None),
++            max_tokens=getattr(namespace, "max_tokens", None),
++            max_iterations=getattr(namespace, "max_iterations", None),
++            apply=getattr(namespace, "apply", None),
++            source_root=_absolute_cli_path(
++                getattr(namespace, "repo_root", None),
++                "repository root",
++            ),
++            permanent_runtime_root=_absolute_cli_path(
++                getattr(namespace, "permanent_runtime_root", None),
++                "permanent runtime root",
++            ),
++            controller_temp_parent=_absolute_cli_path(
++                getattr(namespace, "controller_temp_parent", None),
++                "controller temporary parent",
++            ),
++            artifact_root=artifact_root,
++            git_executable=_absolute_cli_path(
++                getattr(namespace, "git_executable", None),
++                "Git executable",
++            ),
++            docker_executable=_absolute_cli_path(
++                getattr(namespace, "docker_executable", None),
++                "Docker executable",
++            ),
++            sandbox_image=getattr(namespace, "sandbox_image", None),
++        )
++    except ValueError as exc:
++        raise ConfigurationError(str(exc)) from exc
++
++
+ @dataclass(frozen=True, slots=True)
+ class PitOptimizerLiveRun:
+     """Authenticated schema-v3 readiness paired with injected live capabilities."""
+ 
+     readiness: PitOptimizerReadiness
+     optimizer_services: PitOptimizerServices
+ 
+ 
++@dataclass(frozen=True, slots=True)
++class PitOptimizerLiveRunV4:
++    """Authenticated schema-v4 readiness paired with live capabilities."""
++
++    readiness: object
++    optimizer_services: object
++
++
+ @dataclass(frozen=True, slots=True)
+ class _PitOptimizerEvaluatorData:
+     """Authenticated universe plus the two local evaluator capabilities."""
+ 
+     universe: tuple[str, ...]
+     tradable_tickers: tuple[str, ...]
+     market_reference_tickers: tuple[str, ...]
+     market_context_universe: tuple[str, ...]
+     evaluate_candidate: Callable[[Path, object, object, str], object]
+     evaluate_baseline: Callable[[object], object]
+@@ -20633,20 +20759,70 @@ def _dispatch_pit_optimizer_v3(
+     if not isinstance(live, PitOptimizerLiveRun):
+         raise ConfigurationError("PIT optimizer live services are invalid")
+     from core.pit_optimization import run_pit_optimizer_v3
+ 
+     return run_pit_optimizer_v3(
+         readiness=live.readiness,
+         services=live.optimizer_services,
+     )
+ 
+ 
++def _dispatch_pit_optimizer_v4(
++    config: object,
++    limits: PitOptimizerLoopLimits,
++    *,
++    prepare: Callable[[object], object],
++    build_live_services: Callable[
++        [object, PitOptimizerLoopLimits], PitOptimizerLiveRunV4
++    ],
++) -> object:
++    """Keep provider construction strictly behind authenticated v4 readiness."""
++
++    from core.pit_optimization import (
++        PitOptimizerGateConfigV4,
++        run_pit_optimizer_v4,
++    )
++    from core.pit_optimizer_controller import (
++        PitOptimizerReadinessV4,
++        PitOptimizerServicesV4,
++    )
++
++    if not isinstance(config, PitOptimizerGateConfigV4):
++        raise ConfigurationError("PIT optimizer v4 gate is invalid")
++    if (
++        not isinstance(limits, PitOptimizerLoopLimits)
++        or (
++            limits.max_api_calls,
++            limits.max_tokens,
++            limits.max_iterations,
++        )
++        != (config.max_api_calls, config.max_tokens, config.max_iterations)
++    ):
++        raise ConfigurationError("PIT optimizer v4 execution limits differ")
++    if config.phase == "prepare":
++        readiness = prepare(config)
++        if not isinstance(readiness, PitOptimizerReadinessV4):
++            raise ConfigurationError("PIT optimizer v4 readiness is invalid")
++        return readiness
++    live = build_live_services(config, limits)
++    if (
++        not isinstance(live, PitOptimizerLiveRunV4)
++        or not isinstance(live.readiness, PitOptimizerReadinessV4)
++        or not isinstance(live.optimizer_services, PitOptimizerServicesV4)
++    ):
++        raise ConfigurationError("PIT optimizer v4 live services are invalid")
++    return run_pit_optimizer_v4(
++        readiness=live.readiness,
++        services=live.optimizer_services,
++    )
++
++
+ def _build_cli_config(
+     namespace: argparse.Namespace,
+ ) -> tuple[LoopConfig, Path, str]:
+     max_usd = getattr(namespace, "max_usd", None)
+     if namespace.gate == "pit_optimizer":
+         if max_usd is not None:
+             raise ConfigurationError(
+                 "pit_optimizer does not accept --max-usd"
+             )
+     elif max_usd is None:
+@@ -20705,47 +20881,51 @@ def _build_cli_config(
+         namespace.experiment_catalog_sha256,
+     )
+     optimization_fields = (
+         namespace.optimization_phase,
+         namespace.baseline_manifest_sha256,
+         namespace.effective_policy_sha256,
+         namespace.readiness_sha256,
+         namespace.optimization_prior_discovery_feedback,
+         namespace.optimization_prior_discovery_feedback_sha256,
+     )
+-    optimizer_v3_fields = (
++    optimizer_fields = (
+         namespace.optimizer_manifest,
+         namespace.optimizer_manifest_sha256,
++        namespace.discovery_panel_plan,
++        namespace.discovery_panel_plan_sha256,
++        namespace.campaign_checkpoint,
++        namespace.campaign_checkpoint_sha256,
+         namespace.verified_parity,
+         namespace.verified_parity_sha256,
+         namespace.optimizer_authorization_window_id,
+         namespace.optimizer_authorization_requirement_sha256,
+     )
+     if (
+         namespace.gate != "pit_optimizer"
+         and (
+-            any(value is not None for value in optimizer_v3_fields)
++            any(value is not None for value in optimizer_fields)
+             or namespace.authorize_policy_source_transmission
+         )
+     ) or (
+         namespace.gate == "pit_optimizer"
+         and namespace.optimization_phase != "canary"
+         and namespace.authorize_policy_source_transmission
+     ):
+         raise ConfigurationError(
+-            "schema-v3 optimizer options are accepted only by optimizer canary"
++            "schema-v2 optimizer options are accepted only by optimizer canary"
+         )
+     all_pit_fields = (
+         *pit_shared_fields,
+         *diagnosis_fields,
+         *optimization_fields,
+-        *optimizer_v3_fields,
++        *optimizer_fields,
+     )
+     if namespace.gate == "test":
+         if any(value is not None for value in backtest_fields):
+             raise ConfigurationError(
+                 "backtest-only options cannot be supplied to the test gate"
+             )
+         if any(value is not None for value in all_pit_fields):
+             raise ConfigurationError("PIT options cannot be supplied to the test gate")
+         if namespace.optimization_verification_subset:
+             raise ConfigurationError(
+@@ -20902,21 +21082,54 @@ def _build_cli_config(
+             or namespace.optimization_prior_discovery_feedback_sha256 is not None
+         ):
+             raise ConfigurationError(
+                 "legacy PIT optimization options cannot be supplied to the optimizer gate"
+             )
+         if namespace.proposal_samples is not None or namespace.canary_max_usd is not None:
+             raise ConfigurationError(
+                 "proposal samples are not supported by the PIT optimizer gate"
+             )
+         namespace.max_api_calls = max_api_calls
+-        gate = _build_pit_optimizer_v3_config(namespace)
++        manifest_path = _absolute_cli_path(
++            namespace.optimizer_manifest,
++            "optimizer manifest",
++        )
++        try:
++            manifest_schema = json.loads(manifest_path.read_bytes()).get(
++                "schema_version"
++            )
++        except (AttributeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
++            raise ConfigurationError("optimizer manifest is invalid JSON") from exc
++        if manifest_schema == 4:
++            if namespace.verified_parity is not None or (
++                namespace.verified_parity_sha256 is not None
++            ) or namespace.optimizer_authorization_window_id is not None or (
++                namespace.optimizer_authorization_requirement_sha256 is not None
++            ):
++                raise ConfigurationError(
++                    "legacy optimizer authority cannot be supplied to schema v4"
++                )
++            gate = _build_pit_optimizer_v4_config(namespace)
++        else:
++            if any(
++                value is not None
++                for value in (
++                    namespace.discovery_panel_plan,
++                    namespace.discovery_panel_plan_sha256,
++                    namespace.campaign_checkpoint,
++                    namespace.campaign_checkpoint_sha256,
++                )
++            ):
++                raise ConfigurationError(
++                    "schema-v4 checkpoint/panel options require a v4 manifest"
++                )
++            gate = _build_pit_optimizer_v3_config(namespace)
+     limits: LoopLimits | PitOptimizerLoopLimits
+     if namespace.gate == "pit_optimizer":
+         # DeepSeek R1 is a mandatory-reasoning model.  A short generic HTTP
+         # idle timeout can outlive a partial proxy response yet still abort
+         # before a complete, accountably usable completion arrives.  Keep the
+         # provider one-shot/no-retry rule, but give the bounded optimizer
+         # profile a realistic request and controller window.
+         api_timeout_seconds = max(
+             namespace.api_timeout_seconds,
+             PIT_OPTIMIZER_MIN_API_TIMEOUT_SECONDS,
+@@ -22000,20 +22213,37 @@ def _pit_optimizer_v3_summary(
+         "incumbent": incumbent,
+         "hidden_validation_opened": result.hidden_validation_opened,
+         "long_replay_eligible": result.long_replay_eligible,
+         "budget": asdict(result.budget),
+         "artifact_root": str(result.artifact_root),
+         "source_modified": result.source_modified,
+         "cleanup_complete": result.cleanup_complete,
+     }
+ 
+ 
++def _pit_optimizer_v4_summary(result: object) -> dict[str, object]:
++    """Project schema-v4 search status without hashes, source, or credentials."""
++
++    from core.pit_optimizer_controller import PitOptimizerResultV4
++
++    if not isinstance(result, PitOptimizerResultV4):
++        raise ConfigurationError(
++            "CLI execution did not return a PitOptimizerResultV4"
++        )
++    summary = dict(result.to_public_artifact())
++    if any("sha256" in key.lower() for key in summary):
++        raise ConfigurationError("optimizer v4 public summary exposed an opaque digest")
++    if summary.get("apply") is not False:
++        raise ConfigurationError("optimizer v4 public summary is not apply=false")
++    return summary
++
++
+ def _pit_optimizer_v3_execution_limit_args(
+     limits: PitOptimizerLoopLimits,
+ ) -> tuple[str, ...]:
+     if not isinstance(limits, PitOptimizerLoopLimits):
+         raise ConfigurationError("PIT optimizer execution limits are invalid")
+     return (
+         "--max-api-calls",
+         str(limits.max_api_calls),
+         "--max-tokens",
+         str(limits.max_tokens),
+@@ -22291,32 +22521,35 @@ def main(argv: Sequence[str] | None = None) -> int:
+             docker_executable=docker_executable,
+             sandbox_image=sandbox_image,
+             run_id=run_id,
+             batch_limits=batch_limits,
+         )
+         from core.pit_optimization import PitOptimizationLoopResult
+         from core.pit_optimization_contract import PitOptimizerGateConfig
+         from core.pit_optimizer_controller import (
+             PitOptimizerReadiness,
+             PitOptimizerResult,
++            PitOptimizerResultV4,
+         )
+         from pit_diagnosis_agent import PitDiagnosisLoopResult
+ 
+         summary = (
+             _proposal_batch_summary(result)
+             if isinstance(result, ProposalBatchResult)
+             else _pit_diagnosis_summary(result)
+             if isinstance(result, PitDiagnosisLoopResult)
+             else _pit_optimization_summary(result)
+             if isinstance(result, PitOptimizationLoopResult)
+             else _pit_optimizer_v3_summary(result)
+             if isinstance(result, PitOptimizerResult)
++            else _pit_optimizer_v4_summary(result)
++            if isinstance(result, PitOptimizerResultV4)
+             else {
+                 "schema_version": 3,
+                 "phase": "prepare",
+                 "status": "ready",
+                 "terminal_code": "prepared",
+                 "exit_code": 0,
+                 "run_id": result.manifest.run_id,
+                 "iterations_started": 0,
+                 "iterations_completed": 0,
+                 "valid_evaluations": 0,
+diff --git a/core/pit_optimization.py b/core/pit_optimization.py
+index 5f29443..a4d40f1 100644
+--- a/core/pit_optimization.py
++++ b/core/pit_optimization.py
+@@ -16,22 +16,32 @@ from dataclasses import asdict, dataclass
+ from pathlib import Path
+ from statistics import mean, median
+ from types import MappingProxyType
+ from typing import TYPE_CHECKING, Callable, Iterable, Mapping, Sequence
+ 
+ import pandas as pd
+ 
+ if TYPE_CHECKING:
+     from core.pit_optimizer_controller import (
+         PitOptimizerReadiness,
++        PitOptimizerReadinessV4,
+         PitOptimizerResult,
++        PitOptimizerResultV4,
+         PitOptimizerServices,
++        PitOptimizerServicesV4,
++    )
++    from core.pit_optimization_contract import AuthorSourceFile, PitOptimizerRunManifestV4
++    from core.pit_optimizer_artifacts import SearchCandidateState
++    from core.pit_optimizer_evaluation import (
++        DiscoveryPanelPlan,
++        EvaluationPanelSpec,
++        PanelAggregateSummary,
+     )
+ 
+ from core.pit_optimization_contract import (
+     BASELINE_MANIFEST_SHA256,
+     BASELINE_SOURCE_COMMIT,
+     ENTRY_CONTRACT_PATH,
+     FULL_END_DATE,
+     FULL_START_DATE,
+     HOLDOUT_END_DATE,
+     HOLDOUT_START_DATE,
+@@ -262,20 +272,112 @@ class PitOptimizationGateConfig:
+                 )
+         if self.phase == "prepare" and self.readiness_sha256 is not None:
+             raise ValueError("prepare cannot trust a prior readiness identity")
+         if self.phase == "canary" and (
+             not isinstance(self.readiness_sha256, str)
+             or _SHA256_RE.fullmatch(self.readiness_sha256) is None
+         ):
+             raise ValueError("canary requires the exact readiness SHA-256")
+ 
+ 
++@dataclass(frozen=True, slots=True)
++class PitOptimizerGateConfigV4:
++    """Closed CLI configuration for schema-v4 prepare or bounded search."""
++
++    phase: str
++    baseline_run: Path
++    pit_bundle: Path
++    pit_bundle_sha256: str
++    optimizer_manifest: Path
++    optimizer_manifest_sha256: str
++    discovery_panel_plan: Path
++    discovery_panel_plan_sha256: str
++    readiness_artifact: Path
++    readiness_sha256: str | None
++    campaign_checkpoint: Path | None
++    campaign_checkpoint_sha256: str | None
++    source_transmission_authorized: bool
++    max_api_calls: int
++    max_tokens: int
++    max_iterations: int
++    apply: bool
++    source_root: Path
++    permanent_runtime_root: Path
++    controller_temp_parent: Path
++    artifact_root: Path
++    git_executable: Path
++    docker_executable: Path
++    sandbox_image: str
++
++    def __post_init__(self) -> None:
++        if self.phase not in {"prepare", "canary"}:
++            raise ValueError("optimizer v4 phase must be prepare or canary")
++        for name in (
++            "baseline_run",
++            "pit_bundle",
++            "optimizer_manifest",
++            "discovery_panel_plan",
++            "readiness_artifact",
++            "source_root",
++            "permanent_runtime_root",
++            "controller_temp_parent",
++            "artifact_root",
++            "git_executable",
++            "docker_executable",
++        ):
++            path = _absolute_path(getattr(self, name), f"optimizer v4 {name}")
++            object.__setattr__(self, name, path)
++        for name in (
++            "pit_bundle_sha256",
++            "optimizer_manifest_sha256",
++            "discovery_panel_plan_sha256",
++        ):
++            if _SHA256_RE.fullmatch(getattr(self, name) or "") is None:
++                raise ValueError(f"optimizer v4 {name} is invalid")
++        checkpoint_pair = (
++            self.campaign_checkpoint is not None,
++            self.campaign_checkpoint_sha256 is not None,
++        )
++        if checkpoint_pair[0] != checkpoint_pair[1]:
++            raise ValueError("optimizer v4 checkpoint path and digest must be paired")
++        if self.campaign_checkpoint is not None:
++            object.__setattr__(
++                self,
++                "campaign_checkpoint",
++                _absolute_path(
++                    self.campaign_checkpoint,
++                    "optimizer v4 campaign checkpoint",
++                ),
++            )
++            if _SHA256_RE.fullmatch(self.campaign_checkpoint_sha256 or "") is None:
++                raise ValueError("optimizer v4 campaign checkpoint digest is invalid")
++        if self.phase == "prepare":
++            if self.readiness_sha256 is not None or self.source_transmission_authorized:
++                raise ValueError("optimizer v4 prepare cannot carry live authority")
++        elif (
++            _SHA256_RE.fullmatch(self.readiness_sha256 or "") is None
++            or self.source_transmission_authorized is not True
++        ):
++            raise ValueError("optimizer v4 canary requires readiness and source authority")
++        if (
++            type(self.max_iterations) is not int
++            or self.max_iterations <= 0
++            or self.max_api_calls != 3 * self.max_iterations
++            or type(self.max_tokens) is not int
++            or self.max_tokens <= 0
++            or self.apply is not False
++        ):
++            raise ValueError("optimizer v4 execution bounds are invalid")
++        if re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", self.sandbox_image or "") is None:
++            raise ValueError("optimizer v4 sandbox image is not digest pinned")
++
++
+ def _numeric_series(frame: pd.DataFrame, field: str, *, positive: bool = False) -> pd.Series:
+     if field not in frame:
+         raise ValueError(f"frame lacks {field}")
+     result = pd.to_numeric(frame[field], errors="raise").astype(float)
+     if result.empty or not result.map(math.isfinite).all():
+         raise ValueError(f"{field} contains non-finite values")
+     if positive and (result <= 0.0).any():
+         raise ValueError(f"{field} must be positive")
+     return result
+ 
+@@ -3331,12 +3433,56 @@ def run_pit_optimizer_v3(
+     readiness: PitOptimizerReadiness,
+     services: PitOptimizerServices,
+ ) -> PitOptimizerResult:
+     """Public adapter for the injected schema-v3 incumbent loop."""
+ 
+     from core.pit_optimizer_controller import run_pit_optimizer_v3 as run
+ 
+     return run(readiness=readiness, services=services)
+ 
+ 
++def prepare_pit_optimizer_v4(
++    *,
++    manifest: PitOptimizerRunManifestV4,
++    discovery_panel_plan: DiscoveryPanelPlan,
++    baseline_sources: tuple[AuthorSourceFile, ...],
++    artifact_path: Path,
++    evaluate_baseline: Callable[[EvaluationPanelSpec], PanelAggregateSummary],
++    verify_inputs: Callable[[PitOptimizerRunManifestV4, DiscoveryPanelPlan], None],
++    campaign_checkpoint_path: Path | None = None,
++    campaign_checkpoint_sha256: str | None = None,
++    restore_seed: Callable[
++        [str, Mapping[str, object], Path, DiscoveryPanelPlan], SearchCandidateState
++    ]
++    | None = None,
++) -> PitOptimizerReadinessV4:
++    """Public schema-v4 preparation adapter; it has no provider capability."""
++
++    from core.pit_optimizer_controller import prepare_pit_optimizer_v4 as prepare
++
++    return prepare(
++        manifest=manifest,
++        discovery_panel_plan=discovery_panel_plan,
++        baseline_sources=baseline_sources,
++        artifact_path=artifact_path,
++        evaluate_baseline=evaluate_baseline,
++        verify_inputs=verify_inputs,
++        campaign_checkpoint_path=campaign_checkpoint_path,
++        campaign_checkpoint_sha256=campaign_checkpoint_sha256,
++        restore_seed=restore_seed,
++    )
++
++
++def run_pit_optimizer_v4(
++    *,
++    readiness: PitOptimizerReadinessV4,
++    services: PitOptimizerServicesV4,
++) -> PitOptimizerResultV4:
++    """Public adapter for the bounded schema-v4 champion/branch loop."""
++
++    from core.pit_optimizer_controller import run_pit_optimizer_v4 as run
++
++    return run(readiness=readiness, services=services)
++
++
+ if __name__ == "__main__":
+     raise SystemExit(_worker_main(tuple(sys.argv[1:])))
+diff --git a/core/pit_optimizer_artifacts.py b/core/pit_optimizer_artifacts.py
+index dfc77d0..6258dec 100644
+--- a/core/pit_optimizer_artifacts.py
++++ b/core/pit_optimizer_artifacts.py
+@@ -1,24 +1,235 @@
+-"""Crash-safe, incremental local artifacts for the schema-v3 PIT optimizer."""
++"""Crash-safe, incremental local artifacts for the PIT optimizer."""
+ 
+ from __future__ import annotations
+ 
+-from dataclasses import asdict
++from dataclasses import asdict, dataclass
++from decimal import Decimal
+ import hashlib
+ import json
+ import os
+ from pathlib import Path
+ import secrets
+ import stat
+ import tempfile
+ from typing import Mapping
+ 
++from core.pit_optimizer_candidate import CandidateIdentityV4
++from core.pit_optimizer_evaluation import PanelAggregateSummary
++
++
++def _closed_sha256(value: object, field: str) -> str:
++    if (
++        not isinstance(value, str)
++        or len(value) != 64
++        or any(character not in "0123456789abcdef" for character in value)
++    ):
++        raise ValueError(f"{field} is invalid")
++    return value
++
++
++def _closed_relative_artifact(value: object, field: str) -> str:
++    if (
++        not isinstance(value, str)
++        or not value
++        or "\\" in value
++        or Path(value).is_absolute()
++        or ".." in Path(value).parts
++    ):
++        raise ValueError(f"{field} is invalid")
++    return value
++
++
++def _artifact_primitive(value: object) -> object:
++    if isinstance(value, Decimal):
++        return format(value, "f")
++    if isinstance(value, Mapping):
++        return {str(key): _artifact_primitive(item) for key, item in value.items()}
++    if isinstance(value, (tuple, list)):
++        return [_artifact_primitive(item) for item in value]
++    return value
++
++
++@dataclass(frozen=True, slots=True)
++class SearchCandidateState:
++    """Digest-bound durable state for one champion or exploratory branch."""
++
++    candidate_identity: CandidateIdentityV4
++    cumulative_diff_artifact: str
++    cumulative_diff_sha256: str
++    source_bundle_artifact: str
++    source_bundle_sha256: str
++    discovery_evidence_artifact: str
++    discovery_evidence_sha256: str
++    discovery_evidence: PanelAggregateSummary
++    hypothesis: str
++    behavioral_summary: str
++    originating_run_id: str
++    originating_iteration: int
++    quick_evidence_artifact: str | None = None
++    quick_evidence_sha256: str | None = None
++    quick_evidence: PanelAggregateSummary | None = None
++
++    def __post_init__(self) -> None:
++        if not isinstance(self.candidate_identity, CandidateIdentityV4):
++            raise ValueError("search candidate identity is invalid")
++        for name in (
++            "cumulative_diff_artifact",
++            "source_bundle_artifact",
++            "discovery_evidence_artifact",
++        ):
++            _closed_relative_artifact(getattr(self, name), f"search candidate {name}")
++        for name in (
++            "cumulative_diff_sha256",
++            "source_bundle_sha256",
++            "discovery_evidence_sha256",
++        ):
++            _closed_sha256(getattr(self, name), f"search candidate {name}")
++        if (
++            self.cumulative_diff_sha256
++            != self.candidate_identity.cumulative_diff_sha256
++        ):
++            raise ValueError("search candidate diff identity differs")
++        if (
++            not isinstance(self.discovery_evidence, PanelAggregateSummary)
++            or self.discovery_evidence.panel_id != "discovery"
++        ):
++            raise ValueError("search candidate discovery evidence is invalid")
++        if (self.quick_evidence is None) != (self.quick_evidence_artifact is None) or (
++            self.quick_evidence is None
++        ) != (self.quick_evidence_sha256 is None):
++            raise ValueError("search candidate quick evidence is incomplete")
++        if self.quick_evidence is not None:
++            if self.quick_evidence.panel_id != "quick":
++                raise ValueError("search candidate quick evidence is invalid")
++            _closed_relative_artifact(
++                self.quick_evidence_artifact,
++                "search candidate quick evidence artifact",
++            )
++            _closed_sha256(
++                self.quick_evidence_sha256,
++                "search candidate quick evidence SHA-256",
++            )
++        if (
++            not isinstance(self.hypothesis, str)
++            or not self.hypothesis.strip()
++            or not isinstance(self.behavioral_summary, str)
++            or not self.behavioral_summary.strip()
++            or not isinstance(self.originating_run_id, str)
++            or not self.originating_run_id.strip()
++            or type(self.originating_iteration) is not int
++            or self.originating_iteration <= 0
++        ):
++            raise ValueError("search candidate provenance is invalid")
++
++    def to_primitive(self) -> dict[str, object]:
++        return {
++            "candidate_identity": self.candidate_identity.to_primitive(),
++            "cumulative_diff_artifact": self.cumulative_diff_artifact,
++            "cumulative_diff_sha256": self.cumulative_diff_sha256,
++            "source_bundle_artifact": self.source_bundle_artifact,
++            "source_bundle_sha256": self.source_bundle_sha256,
++            "discovery_evidence_artifact": self.discovery_evidence_artifact,
++            "discovery_evidence_sha256": self.discovery_evidence_sha256,
++            "discovery_evidence": _artifact_primitive(asdict(self.discovery_evidence)),
++            "hypothesis": self.hypothesis,
++            "behavioral_summary": self.behavioral_summary,
++            "originating_run_id": self.originating_run_id,
++            "originating_iteration": self.originating_iteration,
++            "quick_evidence_artifact": self.quick_evidence_artifact,
++            "quick_evidence_sha256": self.quick_evidence_sha256,
++            "quick_evidence": (
++                None
++                if self.quick_evidence is None
++                else _artifact_primitive(asdict(self.quick_evidence))
++            ),
++        }
++
++
++@dataclass(frozen=True, slots=True)
++class CampaignCheckpoint:
++    """Authenticated, atomically replaced state carried between bounded runs."""
++
++    schema_version: int
++    artifact_type: str
++    campaign_id: str
++    campaign_sequence: int
++    source_head: str
++    source_fingerprint_sha256: str
++    discovery_panel_plan_sha256: str
++    completed_iterations: int
++    champion: SearchCandidateState | None
++    active_branch: SearchCandidateState | None
++    feedback_tail: tuple[Mapping[str, object], ...]
++
++    def __post_init__(self) -> None:
++        if self.schema_version != 4 or self.artifact_type != "campaign_checkpoint":
++            raise ValueError("campaign checkpoint schema is invalid")
++        if (
++            not isinstance(self.campaign_id, str)
++            or not self.campaign_id.strip()
++            or type(self.campaign_sequence) is not int
++            or self.campaign_sequence <= 0
++            or not isinstance(self.source_head, str)
++            or len(self.source_head) != 40
++            or any(character not in "0123456789abcdef" for character in self.source_head)
++            or type(self.completed_iterations) is not int
++            or self.completed_iterations < 0
++        ):
++            raise ValueError("campaign checkpoint provenance is invalid")
++        _closed_sha256(
++            self.source_fingerprint_sha256,
++            "campaign checkpoint source fingerprint",
++        )
++        _closed_sha256(
++            self.discovery_panel_plan_sha256,
++            "campaign checkpoint discovery plan",
++        )
++        if self.champion is not None and not isinstance(
++            self.champion, SearchCandidateState
++        ):
++            raise ValueError("campaign checkpoint champion is invalid")
++        if self.active_branch is not None and not isinstance(
++            self.active_branch, SearchCandidateState
++        ):
++            raise ValueError("campaign checkpoint active branch is invalid")
++        if self.active_branch is not None and self.champion is not None and (
++            self.active_branch.candidate_identity.identity_sha256
++            == self.champion.candidate_identity.identity_sha256
++        ):
++            raise ValueError("campaign checkpoint branch duplicates champion")
++        if type(self.feedback_tail) is not tuple or any(
++            not isinstance(item, Mapping) for item in self.feedback_tail
++        ):
++            raise ValueError("campaign checkpoint feedback tail is invalid")
++
++    def to_primitive(self) -> dict[str, object]:
++        return {
++            "schema_version": self.schema_version,
++            "artifact_type": self.artifact_type,
++            "campaign_id": self.campaign_id,
++            "campaign_sequence": self.campaign_sequence,
++            "source_head": self.source_head,
++            "source_fingerprint_sha256": self.source_fingerprint_sha256,
++            "discovery_panel_plan_sha256": self.discovery_panel_plan_sha256,
++            "completed_iterations": self.completed_iterations,
++            "champion": None if self.champion is None else self.champion.to_primitive(),
++            "active_branch": (
++                None if self.active_branch is None else self.active_branch.to_primitive()
++            ),
++            "feedback_tail": [dict(item) for item in self.feedback_tail],
++        }
++
++    @property
++    def sha256(self) -> str:
++        return hashlib.sha256(canonical_json_bytes(self.to_primitive())).hexdigest()
++
+ 
+ def canonical_json_bytes(value: Mapping[str, object]) -> bytes:
+     """Return the one canonical UTF-8 representation used by optimizer artifacts."""
+ 
+     return (
+         json.dumps(
+             value,
+             sort_keys=True,
+             separators=(",", ":"),
+             ensure_ascii=False,
+@@ -485,29 +696,52 @@ def atomic_replace_bytes(path: Path, payload: bytes) -> tuple[Path, str]:
+ 
+ 
+ def atomic_replace_json(
+     path: Path,
+     value: Mapping[str, object],
+ ) -> tuple[Path, str]:
+     return atomic_replace_bytes(Path(path), canonical_json_bytes(value))
+ 
+ 
+ class IncrementalArtifactStore:
+-    """Bounded create-only evidence with two explicit replaceable snapshots."""
++    """Bounded create-only evidence with explicit replaceable snapshots."""
+ 
+-    _REPLACEABLE_JSON = frozenset({"accounting.json"})
+-    _REPLACEABLE_DIFF = frozenset({"incumbent.diff"})
++    _REPLACEABLE_JSON = frozenset({"accounting.json", "checkpoint.json"})
++    _REPLACEABLE_DIFF = frozenset({"incumbent.diff", "champion.diff", "branch.diff"})
++    _SEED_DIFF = frozenset({"seed-champion.diff", "seed-branch.diff"})
+     _ROOT_JSON = frozenset(
+-        {"run.json", "baseline.json", "accounting.json", "holdout.json", "summary.json"}
++        {
++            "run.json",
++            "baseline.json",
++            "accounting.json",
++            "checkpoint.json",
++            "seed-champion-source.json",
++            "seed-champion-quick.json",
++            "seed-champion-discovery.json",
++            "seed-branch-source.json",
++            "seed-branch-quick.json",
++            "seed-branch-discovery.json",
++            "holdout.json",
++            "summary.json",
++        }
+     )
+     _ITERATION_JSON = frozenset(
+-        {"investigator.json", "author.json", "validation.json", "discovery.json", "critic.json", "decision.json"}
++        {
++            "investigator.json",
++            "author.json",
++            "candidate-source.json",
++            "validation.json",
++            "quick.json",
++            "discovery.json",
++            "critic.json",
++            "decision.json",
++        }
+     )
+     _ROLE_OUTPUT_INVALID_JSON = frozenset(
+         {
+             "investigator_output_invalid.json",
+             "author_output_invalid.json",
+             "critic_output_invalid.json",
+         }
+     )
+     _PLAN_SKIP_JSON = "authorization_skips.json"
+ 
+@@ -572,21 +806,21 @@ class IncrementalArtifactStore:
+             and parts[0] == "iterations"
+             and len(parts[1]) == 3
+             and parts[1].isdigit()
+             and parts[2]
+             in self._ITERATION_JSON
+             | self._ROLE_OUTPUT_INVALID_JSON
+             | {self._PLAN_SKIP_JSON}
+         ):
+             valid = True
+         elif not json_artifact and (
+-            name in self._REPLACEABLE_DIFF
++            name in self._REPLACEABLE_DIFF | self._SEED_DIFF
+             or (
+                 len(parts) == 3
+                 and parts[0] == "iterations"
+                 and len(parts[1]) == 3
+                 and parts[1].isdigit()
+                 and parts[2] == "candidate.diff"
+             )
+         ):
+             valid = True
+         if not valid:
+@@ -597,21 +831,22 @@ class IncrementalArtifactStore:
+         self,
+         name: str,
+         value: Mapping[str, object],
+     ) -> tuple[Path, str]:
+         if not isinstance(value, Mapping):
+             raise ValueError("optimizer JSON artifact schema is invalid")
+         parent_parts, target_name = self._target(name, json_artifact=True)
+         is_recovery_artifact = target_name in (
+             self._ROLE_OUTPUT_INVALID_JSON | {self._PLAN_SKIP_JSON}
+         )
+-        if value.get("schema_version") != (4 if is_recovery_artifact else 3):
++        expected_versions = {4} if is_recovery_artifact else {3, 4}
++        if value.get("schema_version") not in expected_versions:
+             raise ValueError("optimizer JSON artifact schema is invalid")
+         payload = canonical_json_bytes(value)
+         with self._secure_directory(parent_parts, create=False) as directory:
+             if name in self._REPLACEABLE_JSON and directory.entry_exists(target_name):
+                 return _atomic_replace_in_directory(directory, target_name, payload)
+             return _write_create_only_in_directory(directory, target_name, payload)
+ 
+     def write_role_output_invalid(self, attempt: object) -> tuple[Path, str]:
+         """Persist closed plan/provider facts, never rejected provider content."""
+ 
+diff --git a/core/pit_optimizer_controller.py b/core/pit_optimizer_controller.py
+index 29b49bf..e6f533b 100644
+--- a/core/pit_optimizer_controller.py
++++ b/core/pit_optimizer_controller.py
+@@ -27,29 +27,35 @@ from core.pit_optimization_contract import (
+     PitOptimizerGateConfig,
+     PitOptimizerRunManifest,
+     ProviderSeed,
+     RuleSummaryRecord,
+     StrategyRuleSummary,
+     _CANDIDATE_COMPARISON_SEAL,
+     _VALIDATION_FAILURE_FLAGS,
+     _pit_optimizer_manifest_from_primitive,
+     render_worst_iteration_two_role_inputs,
+ )
+-from core.pit_optimizer_artifacts import canonical_json_bytes, write_create_only_json
++from core.pit_optimizer_artifacts import (
++    CampaignCheckpoint,
++    SearchCandidateState,
++    canonical_json_bytes,
++    write_create_only_json,
++)
+ from core.pit_optimizer_authorization import (
+     AuthorizationRunLease,
+     OptimizerPricingSnapshot,
+     PitOptimizerProviderFacts,
+     PitOptimizerRoleCall,
+ )
+ from core.pit_optimizer_candidate import (
+     CandidateIdentity,
++    CandidateIdentityV4,
+     build_policy_source_bundle,
+     require_source_context_fit,
+     validate_candidate_identity,
+ )
+ from core.pit_optimizer_evaluation import (
+     AggregateMetric,
+     DeterminismAttestation,
+     DiscoveryEvaluation,
+     DiscoveryScore,
+     FoldAggregateSummary,
+@@ -66,20 +72,48 @@ from core.pit_optimizer_evaluation import (
+     strictly_improves_discovery,
+ )
+ from core.pit_policy_parity import (
+     ParityAttestation,
+     ParityEntryOutcome,
+     ParityEquityPoint,
+     ParityFoldEvidence,
+     ParityTransaction,
+ )
+ 
++from core.pit_optimization_contract import (
++    AuthorArtifactV4,
++    AuthorInputV4,
++    AuthorManifestSummaryV4,
++    AuthorSourceFile,
++    CandidateValidationStatusV4,
++    CriticArtifactV4,
++    CriticInputV4,
++    InvestigatorArtifactV4,
++    InvestigatorInputV4,
++    PitOptimizerRunManifestV4,
++    PriorHypothesisSummaryV4,
++    RoleOutputInvalidSummary,
++    SelectedParentIdentity,
++    SelectedParentSummary,
++    TargetProgressV4,
++)
++from core.pit_optimizer_authorization import (
++    AuthorizationPlanSkip,
++    PitOptimizerRoleAttempt,
++)
++from core.pit_optimizer_evaluation import (
++    AnnualizedReturnTarget,
++    DiscoveryPanelPlan,
++    EvaluationPanelSpec,
++    PanelAggregateSummary,
++)
++
+ 
+ @dataclass(frozen=True, slots=True)
+ class PitOptimizerReadiness:
+     schema_version: int
+     manifest: PitOptimizerRunManifest
+     manifest_sha256: str
+     readiness_sha256: str
+     artifact_path: Path
+     parity: ParityAttestation
+     baseline_discovery: DiscoveryEvidenceSummary
+@@ -356,20 +390,28 @@ class _RunState:
+     incumbent_identity: CandidateIdentity | None
+     incumbent_cumulative_diff: str
+     incumbent_discovery: DiscoveryEvidenceSummary
+     prior_iterations: tuple[IterationFeedbackSummary, ...]
+     valid_evaluations: int
+     incumbent_updates: int
+     non_improving_streak: int
+     provider_enabled: bool
+     pricing_snapshot: OptimizerPricingSnapshot | None
+     authorization_lease: AuthorizationRunLease | None
++    baseline_quick: PanelAggregateSummary | None = None
++    baseline_discovery_v4: PanelAggregateSummary | None = None
++    champion: SearchCandidateState | None = None
++    active_branch: SearchCandidateState | None = None
++    selected_parent: SelectedParentIdentity | None = None
++    call_attempts: list[PitOptimizerRoleAttempt] = field(default_factory=list)
++    skips: list[AuthorizationPlanSkip] = field(default_factory=list)
++    feedback_tail: list[PriorHypothesisSummaryV4] = field(default_factory=list)
+     artifact_paths: list[tuple[Path, str]] = field(default_factory=list)
+     artifact_root: Path | None = None
+     call_records: list[PitOptimizerRoleCall] = field(default_factory=list)
+     provider_attempts: list[_ProviderAttemptRecord] = field(default_factory=list)
+     iteration_workspace: CandidateWorkspace | None = None
+     iteration_source_bundle: object | None = None
+     prospective_source_bundle: object | None = None
+     last_investigator: PitOptimizerRoleCall | None = None
+     last_author: PitOptimizerRoleCall | None = None
+     iterations_started: int = 0
+@@ -2723,10 +2765,1496 @@ def run_pit_optimizer_v3(
+             state.iterations_started += 1
+             outcome = _run_iteration(readiness, state, services)
+             if outcome.terminal_code is not None:
+                 terminal_code = outcome.terminal_code
+                 break
+         _finish_discovery(readiness, state, services)
+     except BaseException as exc:
+         terminal_code, terminal_detail = _terminal_from_exception(exc)
+         state.terminal_detail = terminal_detail
+     return _finalize_result(readiness, state, services, terminal_code)
++
++
++# Schema v4 deliberately lives beside the read-only v3 audit path.  It does not
++# reuse v3 fold ranking or hidden-validation state.
++
++
++@dataclass(frozen=True, slots=True)
++class PitOptimizerReadinessV4:
++    schema_version: int
++    manifest: PitOptimizerRunManifestV4
++    discovery_panel_plan: DiscoveryPanelPlan
++    readiness_sha256: str
++    artifact_path: Path
++    baseline_sources: tuple[AuthorSourceFile, ...]
++    baseline_quick: PanelAggregateSummary
++    baseline_discovery: PanelAggregateSummary
++    seed_champion: SearchCandidateState | None = None
++    seed_active_branch: SearchCandidateState | None = None
++
++    def __post_init__(self) -> None:
++        if self.schema_version != 4:
++            raise ValueError("optimizer v4 readiness schema is unsupported")
++        if not isinstance(self.manifest, PitOptimizerRunManifestV4):
++            raise ValueError("optimizer v4 readiness manifest is invalid")
++        if not isinstance(self.discovery_panel_plan, DiscoveryPanelPlan):
++            raise ValueError("optimizer v4 readiness panel plan is invalid")
++        self.manifest.validate_discovery_plan(self.discovery_panel_plan)
++        if (
++            not isinstance(self.artifact_path, Path)
++            or not self.artifact_path.is_absolute()
++            or len(self.readiness_sha256) != 64
++        ):
++            raise ValueError("optimizer v4 readiness artifact is invalid")
++        baseline_identity = SelectedParentIdentity.issue(
++            parent_kind="baseline",
++            parent_id="baseline_policy",
++            source_head=self.manifest.source_head,
++            policy_sources=self.baseline_sources,
++        )
++        baseline_identity.validate_sources(self.baseline_sources)
++        expected_hashes = tuple(
++            (item.path, item.source_sha256) for item in self.baseline_sources
++        )
++        if (
++            expected_hashes
++            != self.manifest.policy_authoring_scope.initial_policy_source_sha256s
++            or self.baseline_quick.panel_id != "quick"
++            or self.baseline_quick.panel_sha256 != self.manifest.quick_panel_sha256
++            or self.baseline_discovery.panel_id != "discovery"
++            or self.baseline_discovery.panel_sha256
++            != self.manifest.discovery_panel_sha256
++        ):
++            raise ValueError("optimizer v4 readiness baseline differs")
++        for candidate in (self.seed_champion, self.seed_active_branch):
++            if candidate is not None and (
++                not isinstance(candidate, SearchCandidateState)
++                or candidate.candidate_identity.source_commit
++                != self.manifest.source_head
++                or candidate.candidate_identity.discovery_panel_plan_sha256
++                != self.manifest.discovery_panel_plan_sha256
++                or candidate.discovery_evidence.panel_sha256
++                != self.manifest.discovery_panel_sha256
++                or candidate.quick_evidence is None
++                or candidate.quick_evidence.panel_sha256
++                != self.manifest.quick_panel_sha256
++            ):
++                raise ValueError("optimizer v4 resumed candidate was not reminted")
++
++
++@dataclass(frozen=True, slots=True)
++class CandidateParentV4:
++    workspace: CandidateWorkspace
++    cumulative_diff: str
++    policy_sources: tuple[AuthorSourceFile, ...]
++
++    def __post_init__(self) -> None:
++        if not isinstance(self.workspace, CandidateWorkspace):
++            raise ValueError("optimizer v4 parent workspace is invalid")
++        if not isinstance(self.cumulative_diff, str) or "\x00" in self.cumulative_diff:
++            raise ValueError("optimizer v4 parent diff is invalid")
++        if type(self.policy_sources) is not tuple or len(self.policy_sources) != 3:
++            raise ValueError("optimizer v4 parent sources are invalid")
++
++
++@dataclass(frozen=True, slots=True)
++class CandidateValidationOutcomeV4:
++    valid: bool
++    failure_code: str | None
++    cumulative_diff: str
++    identity: CandidateIdentityV4 | None
++
++    def __post_init__(self) -> None:
++        if type(self.valid) is not bool or not isinstance(self.cumulative_diff, str):
++            raise ValueError("optimizer v4 candidate validation is invalid")
++        if self.valid != (self.identity is not None):
++            raise ValueError("optimizer v4 candidate validation identity differs")
++        if self.valid:
++            if self.failure_code is not None or not isinstance(
++                self.identity, CandidateIdentityV4
++            ):
++                raise ValueError("optimizer v4 valid candidate is inconsistent")
++        elif not isinstance(self.failure_code, str) or not self.failure_code:
++            raise ValueError("optimizer v4 invalid candidate lacks a failure code")
++
++
++@dataclass(frozen=True, slots=True)
++class PitOptimizerServicesV4:
++    call_role: Callable[
++        [
++            PitOptimizerCallBudget,
++            InvestigatorInputV4 | AuthorInputV4 | CriticInputV4,
++            Callable[[str], object],
++        ],
++        PitOptimizerRoleAttempt,
++    ]
++    materialize_parent: Callable[
++        [str, SearchCandidateState | None], CandidateParentV4
++    ]
++    validate_and_apply: Callable[
++        [CandidateWorkspace, AuthorArtifactV4, SelectedParentIdentity],
++        CandidateValidationOutcomeV4,
++    ]
++    evaluate_candidate: Callable[
++        [CandidateWorkspace, CandidateIdentityV4, EvaluationPanelSpec],
++        PanelAggregateSummary,
++    ]
++    dispose_candidate: Callable[[CandidateWorkspace], PitOptimizerCleanup]
++    settle_invalid_investigator: Callable[
++        [PitOptimizerCallBudget, tuple[PitOptimizerCallBudget, ...]],
++        tuple[AuthorizationPlanSkip, ...],
++    ]
++    verify_inputs: Callable[[PitOptimizerReadinessV4], None]
++    cancellation_requested: Callable[[], bool]
++    prepare_iteration_artifacts: Callable[[int], Path]
++    write_json_artifact: Callable[[str, Mapping[str, object]], tuple[Path, str]]
++    write_diff_artifact: Callable[[str, str], tuple[Path, str]]
++
++
++@dataclass(frozen=True, slots=True)
++class PitOptimizerResultV4:
++    schema_version: int
++    status: str
++    terminal_code: str
++    campaign_id: str
++    target_cagr_pct: str
++    baseline_cagr_pct: str
++    champion_cagr_pct: str
++    branch_cagr_pct: str | None
++    iterations_started: int
++    iterations_completed: int
++    calls: int
++    tokens: int
++    cost_usd: str
++    checkpoint_present: bool
++    apply: bool
++    cleanup_complete: bool
++    source_modified: bool
++    checkpoint: CampaignCheckpoint
++    artifact_paths: tuple[tuple[Path, str], ...]
++
++    def to_public_artifact(self) -> Mapping[str, object]:
++        return {
++            "schema_version": self.schema_version,
++            "status": self.status,
++            "terminal_reason": self.terminal_code,
++            "campaign_id": self.campaign_id,
++            "target_cagr_pct": self.target_cagr_pct,
++            "baseline_cagr_pct": self.baseline_cagr_pct,
++            "champion_cagr_pct": self.champion_cagr_pct,
++            "branch_cagr_pct": self.branch_cagr_pct,
++            "iterations": {
++                "started": self.iterations_started,
++                "completed": self.iterations_completed,
++            },
++            "accounting": {
++                "calls": self.calls,
++                "tokens": self.tokens,
++                "cost_usd": self.cost_usd,
++            },
++            "checkpoint_present": self.checkpoint_present,
++            "apply": self.apply,
++            "cleanup": {
++                "complete": self.cleanup_complete,
++                "source_modified": self.source_modified,
++            },
++        }
++
++
++def _panel_v4_artifact(value: PanelAggregateSummary) -> dict[str, object]:
++    primitive = asdict(value)
++    primitive["portfolio_annualized_return_pct"] = format(
++        value.portfolio_annualized_return_pct,
++        "f",
++    )
++    return primitive
++
++
++def _target_v4_artifact(value: AnnualizedReturnTarget) -> dict[str, object]:
++    primitive = asdict(value)
++    primitive["target_pct"] = format(primitive["target_pct"], "f")
++    primitive["milestones_pct"] = [
++        format(item, "f") for item in primitive["milestones_pct"]
++    ]
++    primitive["precision_pct"] = format(primitive["precision_pct"], "f")
++    return primitive
++
++
++def _read_checkpoint_primitive(path: Path, expected_sha256: str) -> Mapping[str, object]:
++    candidate = Path(path)
++    if not candidate.is_absolute() or candidate.is_symlink() or not candidate.is_file():
++        raise ValueError("campaign checkpoint must be an absolute regular file")
++    if len(expected_sha256) != 64:
++        raise ValueError("campaign checkpoint SHA-256 is invalid")
++    raw = candidate.read_bytes()
++    if hashlib.sha256(raw).hexdigest() != expected_sha256:
++        raise ValueError("campaign checkpoint digest differs")
++    try:
++        primitive = json.loads(raw)
++    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
++        raise ValueError("campaign checkpoint is invalid JSON") from exc
++    if (
++        not isinstance(primitive, dict)
++        or raw != canonical_json_bytes(primitive)
++        or primitive.get("schema_version") != 4
++        or primitive.get("artifact_type") != "campaign_checkpoint"
++    ):
++        raise ValueError("campaign checkpoint is not canonical schema v4")
++    return primitive
++
++
++def prepare_pit_optimizer_v4(
++    *,
++    manifest: PitOptimizerRunManifestV4,
++    discovery_panel_plan: DiscoveryPanelPlan,
++    baseline_sources: tuple[AuthorSourceFile, ...],
++    artifact_path: Path,
++    evaluate_baseline: Callable[[EvaluationPanelSpec], PanelAggregateSummary],
++    verify_inputs: Callable[[PitOptimizerRunManifestV4, DiscoveryPanelPlan], None],
++    campaign_checkpoint_path: Path | None = None,
++    campaign_checkpoint_sha256: str | None = None,
++    restore_seed: Callable[
++        [str, Mapping[str, object], Path, DiscoveryPanelPlan], SearchCandidateState
++    ]
++    | None = None,
++) -> PitOptimizerReadinessV4:
++    """Evaluate the unchanged policy on the exact quick/discovery panels."""
++
++    if not isinstance(manifest, PitOptimizerRunManifestV4):
++        raise ValueError("optimizer v4 manifest is invalid")
++    manifest.validate_discovery_plan(discovery_panel_plan)
++    verify_inputs(manifest, discovery_panel_plan)
++    baseline_identity = SelectedParentIdentity.issue(
++        parent_kind="baseline",
++        parent_id="baseline_policy",
++        source_head=manifest.source_head,
++        policy_sources=baseline_sources,
++    )
++    baseline_identity.validate_sources(baseline_sources)
++    quick = evaluate_baseline(discovery_panel_plan.quick_panel)
++    discovery = evaluate_baseline(discovery_panel_plan.discovery_panel)
++    if (
++        quick.panel_id != "quick"
++        or quick.panel_sha256 != manifest.quick_panel_sha256
++        or discovery.panel_id != "discovery"
++        or discovery.panel_sha256 != manifest.discovery_panel_sha256
++    ):
++        raise ValueError("optimizer v4 baseline evidence differs from exact panels")
++
++    checkpoint_supplied = campaign_checkpoint_path is not None
++    if checkpoint_supplied != (campaign_checkpoint_sha256 is not None):
++        raise ValueError("campaign checkpoint path and digest must be supplied together")
++    if manifest.seed_checkpoint_sha256 != campaign_checkpoint_sha256:
++        raise ValueError("optimizer v4 manifest seed checkpoint differs")
++    champion = None
++    branch = None
++    if campaign_checkpoint_path is not None:
++        primitive = _read_checkpoint_primitive(
++            campaign_checkpoint_path,
++            campaign_checkpoint_sha256 or "",
++        )
++        if restore_seed is None:
++            raise ValueError("campaign checkpoint restore capability is absent")
++        for kind, key in (("champion", "champion"), ("branch", "active_branch")):
++            candidate = primitive.get(key)
++            if candidate is None:
++                continue
++            if not isinstance(candidate, Mapping):
++                raise ValueError("campaign checkpoint candidate state is invalid")
++            restored = restore_seed(
++                kind,
++                candidate,
++                campaign_checkpoint_path.parent,
++                discovery_panel_plan,
++            )
++            if (
++                restored.candidate_identity.source_commit != manifest.source_head
++                or restored.candidate_identity.discovery_panel_plan_sha256
++                != manifest.discovery_panel_plan_sha256
++                or restored.discovery_evidence.panel_sha256
++                != manifest.discovery_panel_sha256
++                or restored.quick_evidence is None
++                or restored.quick_evidence.panel_sha256 != manifest.quick_panel_sha256
++            ):
++                raise ValueError("restored checkpoint candidate was not reminted and reevaluated")
++            if kind == "champion":
++                champion = restored
++            else:
++                branch = restored
++
++    primitive = {
++        "schema_version": 4,
++        "artifact_type": "optimizer_readiness",
++        "manifest_sha256": manifest.sha256,
++        "discovery_panel_plan_sha256": discovery_panel_plan.sha256,
++        "baseline_source_sha256s": [
++            [item.path, item.source_sha256] for item in baseline_sources
++        ],
++        "baseline_quick": _panel_v4_artifact(quick),
++        "baseline_discovery": _panel_v4_artifact(discovery),
++        "seed_checkpoint_sha256": campaign_checkpoint_sha256,
++        "seed_champion_identity": (
++            None if champion is None else champion.candidate_identity.identity_sha256
++        ),
++        "seed_branch_identity": (
++            None if branch is None else branch.candidate_identity.identity_sha256
++        ),
++    }
++    output, digest = write_create_only_json(Path(artifact_path), primitive)
++    return PitOptimizerReadinessV4(
++        schema_version=4,
++        manifest=manifest,
++        discovery_panel_plan=discovery_panel_plan,
++        readiness_sha256=digest,
++        artifact_path=output,
++        baseline_sources=baseline_sources,
++        baseline_quick=quick,
++        baseline_discovery=discovery,
++        seed_champion=champion,
++        seed_active_branch=branch,
++    )
++
++
++@dataclass(slots=True)
++class _V4RunState:
++    champion: SearchCandidateState | None
++    active_branch: SearchCandidateState | None
++    feedback_tail: list[PriorHypothesisSummaryV4]
++    selected_parent: SelectedParentIdentity | None = None
++    call_attempts: list[PitOptimizerRoleAttempt] = field(default_factory=list)
++    skips: list[AuthorizationPlanSkip] = field(default_factory=list)
++    artifact_paths: list[tuple[Path, str]] = field(default_factory=list)
++    iterations_started: int = 0
++    iterations_completed: int = 0
++    cleanup_observations: list[PitOptimizerCleanup] = field(default_factory=list)
++
++
++def _v4_plan(
++    readiness: PitOptimizerReadinessV4,
++    *,
++    iteration: int,
++    role: str,
++) -> PitOptimizerCallBudget:
++    role_offset = {"investigator": 1, "author": 2, "critic": 3}[role]
++    call_index = (iteration - 1) * 3 + role_offset
++    plans = readiness.manifest.call_budgets
++    if call_index > len(plans):
++        raise AuthorizationExhausted("optimizer v4 call plan is exhausted")
++    plan = plans[call_index - 1]
++    if (plan.call_index, plan.iteration, plan.role) != (
++        call_index,
++        iteration,
++        role,
++    ):
++        raise AuthorizationExhausted("optimizer v4 plan slot differs")
++    return plan
++
++
++def _record_v4_artifact(
++    state: _V4RunState,
++    artifact: tuple[Path, str],
++) -> tuple[Path, str]:
++    path, digest = artifact
++    if not isinstance(path, Path) or not path.is_absolute() or len(digest) != 64:
++        raise AuditFailure("optimizer v4 artifact writer returned invalid evidence")
++    state.artifact_paths.append((path, digest))
++    return path, digest
++
++
++def _v4_attempt_artifact(attempt: PitOptimizerRoleAttempt) -> dict[str, object]:
++    payload = attempt.payload
++    return {
++        "schema_version": 4,
++        "artifact_type": (
++            "role_output_invalid" if payload is None else "role_output"
++        ),
++        "plan": attempt.plan.to_primitive(),
++        "provider_facts": asdict(attempt.facts),
++        "payload": None if payload is None else payload.to_primitive(),
++    }
++
++
++def _write_v4_attempt(
++    *,
++    state: _V4RunState,
++    services: PitOptimizerServicesV4,
++    attempt: PitOptimizerRoleAttempt,
++) -> None:
++    state.call_attempts.append(attempt)
++    suffix = (
++        f"{attempt.plan.role}_output_invalid.json"
++        if attempt.payload is None
++        else f"{attempt.plan.role}.json"
++    )
++    _record_v4_artifact(
++        state,
++        services.write_json_artifact(
++            f"iterations/{attempt.plan.iteration:03d}/{suffix}",
++            _v4_attempt_artifact(attempt),
++        ),
++    )
++    _record_v4_artifact(
++        state,
++        services.write_json_artifact(
++            "accounting.json",
++            _v4_accounting_artifact(state),
++        ),
++    )
++
++
++def _v4_accounting_artifact(state: _V4RunState) -> dict[str, object]:
++    facts = tuple(attempt.facts for attempt in state.call_attempts)
++    return {
++        "schema_version": 4,
++        "artifact_type": "optimizer_accounting",
++        "attempts": [
++            {
++                "call_index": attempt.plan.call_index,
++                "iteration": attempt.plan.iteration,
++                "role": attempt.plan.role,
++                "outcome": attempt.facts.outcome,
++                "request_started": attempt.facts.request_started,
++                "accounting_complete": attempt.facts.accounting_complete,
++                "prompt_tokens": attempt.facts.prompt_tokens,
++                "completion_tokens": attempt.facts.completion_tokens,
++                "total_tokens": attempt.facts.total_tokens,
++                "cost_usd": attempt.facts.cost_usd,
++            }
++            for attempt in state.call_attempts
++        ],
++        "skips": [skip.to_record() for skip in state.skips],
++        "totals": {
++            "calls": sum(1 for item in facts if item.request_started),
++            "prompt_tokens": sum(item.prompt_tokens or 0 for item in facts),
++            "completion_tokens": sum(item.completion_tokens or 0 for item in facts),
++            "total_tokens": sum(item.total_tokens or 0 for item in facts),
++            "cost_usd": format(
++                sum(
++                    (
++                        Decimal(str(item.cost_usd or 0))
++                        for item in facts
++                        if item.accounting_complete
++                    ),
++                    Decimal("0"),
++                ),
++                "f",
++            ),
++        },
++        "accounting_complete": all(item.accounting_complete for item in facts),
++    }
++
++
++def _call_v4_role(
++    *,
++    state: _V4RunState,
++    services: PitOptimizerServicesV4,
++    plan: PitOptimizerCallBudget,
++    role_input: InvestigatorInputV4 | AuthorInputV4 | CriticInputV4,
++    parser: Callable[[str], object],
++) -> PitOptimizerRoleAttempt:
++    attempt = services.call_role(plan, role_input, parser)
++    if not isinstance(attempt, PitOptimizerRoleAttempt) or attempt.plan != plan:
++        raise ProviderProtocolFailure("optimizer v4 provider attempt differs from plan")
++    if attempt.payload is not None:
++        validator = getattr(role_input, "validate_artifact", None)
++        if callable(validator):
++            validator(attempt.payload)
++        elif not isinstance(attempt.payload, InvestigatorArtifactV4):
++            raise ProviderProtocolFailure("optimizer v4 investigator payload differs")
++    _write_v4_attempt(state=state, services=services, attempt=attempt)
++    return attempt
++
++
++def _baseline_parent_summary(
++    readiness: PitOptimizerReadinessV4,
++) -> SelectedParentSummary:
++    identity = SelectedParentIdentity.issue(
++        parent_kind="baseline",
++        parent_id="baseline_policy",
++        source_head=readiness.manifest.source_head,
++        policy_sources=readiness.baseline_sources,
++    )
++    return SelectedParentSummary(
++        identity=identity,
++        hypothesis_id="baseline_policy",
++        behavioral_summary="Authenticated unchanged baseline policy.",
++        quick_panel=readiness.baseline_quick,
++        discovery_panel=readiness.baseline_discovery,
++    )
++
++
++def _candidate_parent_summary(
++    *,
++    readiness: PitOptimizerReadinessV4,
++    kind: str,
++    candidate: SearchCandidateState,
++    sources: tuple[AuthorSourceFile, ...],
++) -> SelectedParentSummary:
++    if candidate.quick_evidence is None:
++        raise IdentityDrift("retained candidate lacks exact quick evidence")
++    identity = SelectedParentIdentity.issue(
++        parent_kind=kind,
++        parent_id=candidate.candidate_identity.identity_sha256,
++        source_head=readiness.manifest.source_head,
++        policy_sources=sources,
++    )
++    return SelectedParentSummary(
++        identity=identity,
++        hypothesis_id=candidate.hypothesis,
++        behavioral_summary=candidate.behavioral_summary,
++        quick_panel=candidate.quick_evidence,
++        discovery_panel=candidate.discovery_evidence,
++    )
++
++
++def _selected_parent_kind(state: _V4RunState) -> str:
++    if state.active_branch is not None:
++        return "branch"
++    if state.champion is not None:
++        return "champion"
++    return "baseline"
++
++
++def _dispose_v4(
++    services: PitOptimizerServicesV4,
++    state: _V4RunState,
++    workspace: CandidateWorkspace | None,
++) -> None:
++    if workspace is None:
++        return
++    cleanup = services.dispose_candidate(workspace)
++    if not isinstance(cleanup, PitOptimizerCleanup):
++        raise SandboxIntegrityFailure("optimizer v4 cleanup evidence is invalid")
++    state.cleanup_observations.append(cleanup)
++
++
++def _materialize_v4_context(
++    *,
++    readiness: PitOptimizerReadinessV4,
++    state: _V4RunState,
++    services: PitOptimizerServicesV4,
++) -> tuple[
++    str,
++    SearchCandidateState | None,
++    CandidateParentV4,
++    SelectedParentSummary,
++    SelectedParentSummary,
++    SelectedParentSummary | None,
++    SelectedParentSummary | None,
++]:
++    kind = _selected_parent_kind(state)
++    selected_candidate = (
++        state.active_branch
++        if kind == "branch"
++        else state.champion if kind == "champion" else None
++    )
++    selected = services.materialize_parent(kind, selected_candidate)
++    if not isinstance(selected, CandidateParentV4):
++        raise SandboxIntegrityFailure("optimizer v4 parent materialization is invalid")
++    baseline = _baseline_parent_summary(readiness)
++    if kind == "baseline":
++        if selected.policy_sources != readiness.baseline_sources:
++            raise IdentityDrift("optimizer v4 baseline sources differ")
++        selected_summary = baseline
++    else:
++        assert selected_candidate is not None
++        selected_summary = _candidate_parent_summary(
++            readiness=readiness,
++            kind=kind,
++            candidate=selected_candidate,
++            sources=selected.policy_sources,
++        )
++    champion_summary: SelectedParentSummary | None = None
++    if state.champion is not None:
++        if kind == "champion":
++            champion_summary = selected_summary
++        else:
++            champion_parent = services.materialize_parent("champion", state.champion)
++            try:
++                champion_summary = _candidate_parent_summary(
++                    readiness=readiness,
++                    kind="champion",
++                    candidate=state.champion,
++                    sources=champion_parent.policy_sources,
++                )
++            finally:
++                _dispose_v4(services, state, champion_parent.workspace)
++    branch_summary = selected_summary if kind == "branch" else None
++    state.selected_parent = selected_summary.identity
++    return (
++        kind,
++        selected_candidate,
++        selected,
++        selected_summary,
++        baseline,
++        champion_summary,
++        branch_summary,
++    )
++
++
++def _checkpoint_v4(
++    *,
++    readiness: PitOptimizerReadinessV4,
++    completed_iterations: int,
++    champion: SearchCandidateState | None,
++    active_branch: SearchCandidateState | None,
++    feedback_tail: Sequence[PriorHypothesisSummaryV4],
++) -> CampaignCheckpoint:
++    return CampaignCheckpoint(
++        schema_version=4,
++        artifact_type="campaign_checkpoint",
++        campaign_id=readiness.manifest.campaign_id,
++        campaign_sequence=readiness.manifest.campaign_sequence,
++        source_head=readiness.manifest.source_head,
++        source_fingerprint_sha256=readiness.manifest.source_fingerprint_sha256,
++        discovery_panel_plan_sha256=readiness.manifest.discovery_panel_plan_sha256,
++        completed_iterations=completed_iterations,
++        champion=champion,
++        active_branch=active_branch,
++        feedback_tail=tuple(item.to_primitive() for item in feedback_tail),
++    )
++
++
++def _persist_v4_transition(
++    *,
++    readiness: PitOptimizerReadinessV4,
++    state: _V4RunState,
++    services: PitOptimizerServicesV4,
++    iteration: int,
++    decision: Mapping[str, object],
++    champion: SearchCandidateState | None,
++    active_branch: SearchCandidateState | None,
++    feedback_tail: Sequence[PriorHypothesisSummaryV4],
++) -> CampaignCheckpoint:
++    checkpoint = _checkpoint_v4(
++        readiness=readiness,
++        completed_iterations=iteration,
++        champion=champion,
++        active_branch=active_branch,
++        feedback_tail=feedback_tail,
++    )
++    # This ordering is the crash boundary: the complete prospective decision,
++    # then the atomically replaced checkpoint, and only then live state.
++    _record_v4_artifact(
++        state,
++        services.write_json_artifact(
++            f"iterations/{iteration:03d}/decision.json",
++            {"schema_version": 4, **dict(decision)},
++        ),
++    )
++    _record_v4_artifact(
++        state,
++        services.write_json_artifact("checkpoint.json", checkpoint.to_primitive()),
++    )
++    return checkpoint
++
++
++def _invalid_investigator_feedback(iteration: int) -> PriorHypothesisSummaryV4:
++    return PriorHypothesisSummaryV4(
++        iteration=iteration,
++        hypothesis_id=f"invalid_investigator_{iteration}",
++        focus_areas=("entry",),
++        behavioral_summary="Investigator output was rejected by the closed schema.",
++        validation=CandidateValidationStatusV4(
++            status="not_evaluated",
++            failure_code=None,
++        ),
++        discovery_cagr_pct=None,
++        critic_disposition="abandon",
++    )
++
++
++def _candidate_failure_code(value: str | None) -> str:
++    allowed = {
++        "author_output_invalid",
++        "source_invalid",
++        "syntax_failed",
++        "imports_failed",
++        "purity_failed",
++        "determinism_failed",
++        "worker_failed",
++        "typed_decision_invalid",
++        "runtime_invalid",
++        "evaluation_failed",
++    }
++    return value if value in allowed else "source_invalid"
++
++
++def _v4_role_common(
++    readiness: PitOptimizerReadinessV4,
++    *,
++    iteration: int,
++    parent_identity: SelectedParentIdentity,
++) -> dict[str, object]:
++    manifest = readiness.manifest
++    return {
++        "schema_version": 4,
++        "iteration": iteration,
++        "run_manifest_sha256": manifest.sha256,
++        "policy_authoring_scope_sha256": manifest.policy_authoring_scope.sha256,
++        "policy_interface_version": manifest.policy_interface_version,
++        "immutable_constraint_ids": manifest.immutable_constraint_ids,
++        "annualized_return_target": manifest.annualized_return_target,
++        "discovery_panel_plan_sha256": manifest.discovery_panel_plan_sha256,
++        "quick_panel_sha256": manifest.quick_panel_sha256,
++        "discovery_panel_sha256": manifest.discovery_panel_sha256,
++        "selected_parent_identity": parent_identity,
++    }
++
++
++def _write_validation_v4(
++    *,
++    state: _V4RunState,
++    services: PitOptimizerServicesV4,
++    iteration: int,
++    status: CandidateValidationStatusV4,
++    identity: CandidateIdentityV4 | None,
++) -> None:
++    _record_v4_artifact(
++        state,
++        services.write_json_artifact(
++            f"iterations/{iteration:03d}/validation.json",
++            {
++                "schema_version": 4,
++                "artifact_type": "candidate_validation",
++                "status": status.to_primitive(),
++                "candidate_identity": (
++                    None if identity is None else identity.to_primitive()
++                ),
++            },
++        ),
++    )
++
++
++def _run_v4_iteration(
++    *,
++    readiness: PitOptimizerReadinessV4,
++    state: _V4RunState,
++    services: PitOptimizerServicesV4,
++    iteration: int,
++) -> CampaignCheckpoint:
++    manifest = readiness.manifest
++    selected_workspace: CandidateWorkspace | None = None
++    (
++        selected_kind,
++        selected_candidate,
++        parent,
++        selected_summary,
++        baseline_summary,
++        champion_summary,
++        branch_summary,
++    ) = _materialize_v4_context(
++        readiness=readiness,
++        state=state,
++        services=services,
++    )
++    selected_workspace = parent.workspace
++    try:
++        common = _v4_role_common(
++            readiness,
++            iteration=iteration,
++            parent_identity=selected_summary.identity,
++        )
++        champion_panel = (
++            readiness.baseline_discovery
++            if champion_summary is None
++            else champion_summary.discovery_panel
++        )
++        investigator_input = InvestigatorInputV4(
++            **common,  # type: ignore[arg-type]
++            selected_parent_source_bundle_sha256=(
++                selected_summary.identity.source_bundle_sha256
++            ),
++            selected_parent_sources=parent.policy_sources,
++            selected_parent_summary=selected_summary,
++            baseline_summary=baseline_summary,
++            champion_summary=champion_summary,
++            branch_summary=branch_summary,
++            target_progress=TargetProgressV4.from_summaries(
++                target=manifest.annualized_return_target,
++                baseline=readiness.baseline_discovery,
++                selected_parent=selected_summary.discovery_panel,
++                champion=champion_panel,
++            ),
++            prior_hypotheses=tuple(state.feedback_tail),
++            validation_status=CandidateValidationStatusV4(
++                status="not_evaluated",
++                failure_code=None,
++            ),
++        )
++        investigator_plan = _v4_plan(
++            readiness,
++            iteration=iteration,
++            role="investigator",
++        )
++        investigator_input.validate_budget(
++            investigator_plan,
++            scope=manifest.policy_authoring_scope,
++            manifest=manifest,
++        )
++        investigator_attempt = _call_v4_role(
++            state=state,
++            services=services,
++            plan=investigator_plan,
++            role_input=investigator_input,
++            parser=lambda raw: InvestigatorArtifactV4.from_json(
++                raw,
++                max_total_bytes=investigator_plan.max_response_bytes,
++            ),
++        )
++        if investigator_attempt.payload is None:
++            remaining = (
++                _v4_plan(readiness, iteration=iteration, role="author"),
++                _v4_plan(readiness, iteration=iteration, role="critic"),
++            )
++            skips = services.settle_invalid_investigator(
++                investigator_plan,
++                remaining,
++            )
++            if (
++                type(skips) is not tuple
++                or tuple(skip.call_index for skip in skips)
++                != tuple(plan.call_index for plan in remaining)
++            ):
++                raise AuditFailure("optimizer v4 invalid-investigator skips differ")
++            state.skips.extend(skips)
++            _record_v4_artifact(
++                state,
++                services.write_json_artifact(
++                    f"iterations/{iteration:03d}/authorization_skips.json",
++                    {
++                        "schema_version": 4,
++                        "artifact_type": "authorization_plan_skips",
++                        "iteration": iteration,
++                        "skips": [skip.to_record() for skip in skips],
++                    },
++                ),
++            )
++            feedback = _invalid_investigator_feedback(iteration)
++            prospective_feedback = (*state.feedback_tail, feedback)
++            checkpoint = _persist_v4_transition(
++                readiness=readiness,
++                state=state,
++                services=services,
++                iteration=iteration,
++                decision={
++                    "artifact_type": "search_transition",
++                    "selected_parent_kind": selected_kind,
++                    "candidate_valid": False,
++                    "candidate_promoted": False,
++                    "critic_disposition": "abandon",
++                    "effective_disposition": "unchanged",
++                    "prospective_champion": (
++                        None
++                        if state.champion is None
++                        else state.champion.to_primitive()
++                    ),
++                    "prospective_active_branch": (
++                        None
++                        if state.active_branch is None
++                        else state.active_branch.to_primitive()
++                    ),
++                },
++                champion=state.champion,
++                active_branch=state.active_branch,
++                feedback_tail=prospective_feedback,
++            )
++            state.feedback_tail = list(prospective_feedback)
++            state.iterations_completed = iteration
++            return checkpoint
++
++        investigator = investigator_attempt.payload
++        if not isinstance(investigator, InvestigatorArtifactV4):
++            raise ProviderProtocolFailure("optimizer v4 investigator type differs")
++        author_plan = _v4_plan(readiness, iteration=iteration, role="author")
++        author_input = AuthorInputV4(
++            **common,  # type: ignore[arg-type]
++            selected_parent_source_bundle_sha256=(
++                selected_summary.identity.source_bundle_sha256
++            ),
++            selected_parent_sources=parent.policy_sources,
++            investigator=investigator,
++        )
++        author_input.validate_budget(
++            author_plan,
++            scope=manifest.policy_authoring_scope,
++            manifest=manifest,
++        )
++        author_attempt = _call_v4_role(
++            state=state,
++            services=services,
++            plan=author_plan,
++            role_input=author_input,
++            parser=lambda raw: AuthorArtifactV4.from_json(
++                raw,
++                selected_parent=selected_summary.identity,
++                max_total_bytes=author_plan.max_response_bytes,
++            ),
++        )
++
++        candidate_state: SearchCandidateState | None = None
++        candidate_identity: CandidateIdentityV4 | None = None
++        quick: PanelAggregateSummary | None = None
++        discovery: PanelAggregateSummary | None = None
++        source_artifact: tuple[Path, str] | None = None
++        diff_artifact: tuple[Path, str] | None = None
++        quick_artifact: tuple[Path, str] | None = None
++        discovery_artifact: tuple[Path, str] | None = None
++        if author_attempt.payload is None:
++            validation_status = CandidateValidationStatusV4(
++                status="invalid",
++                failure_code="author_output_invalid",
++            )
++            author_manifest = None
++            validation_code = author_attempt.facts.response_validation_code
++            if validation_code is None:
++                raise AuditFailure("invalid author attempt lacks validation code")
++            author_invalid = RoleOutputInvalidSummary(
++                iteration=iteration,
++                call_index=author_plan.call_index,
++                role="author",
++                validation_code=validation_code,
++            )
++            behavioral_summary = "Author output was rejected by the closed schema."
++        else:
++            author = author_attempt.payload
++            if not isinstance(author, AuthorArtifactV4):
++                raise ProviderProtocolFailure("optimizer v4 author type differs")
++            author_manifest = AuthorManifestSummaryV4.from_artifact(
++                author,
++                selected_parent=selected_summary.identity,
++            )
++            author_invalid = None
++            behavioral_summary = author.behavioral_summary
++            outcome = services.validate_and_apply(
++                parent.workspace,
++                author,
++                selected_summary.identity,
++            )
++            if not isinstance(outcome, CandidateValidationOutcomeV4):
++                raise SandboxIntegrityFailure("optimizer v4 validation evidence is invalid")
++            if not outcome.valid:
++                validation_status = CandidateValidationStatusV4(
++                    status="invalid",
++                    failure_code=_candidate_failure_code(outcome.failure_code),
++                )
++            else:
++                candidate_identity = outcome.identity
++                assert candidate_identity is not None
++                if (
++                    candidate_identity.parent_identity_sha256
++                    != selected_summary.identity.parent_identity_sha256
++                    or candidate_identity.discovery_panel_plan_sha256
++                    != manifest.discovery_panel_plan_sha256
++                ):
++                    raise IdentityDrift("optimizer v4 candidate identity differs")
++                diff_artifact = _record_v4_artifact(
++                    state,
++                    services.write_diff_artifact(
++                        f"iterations/{iteration:03d}/candidate.diff",
++                        outcome.cumulative_diff,
++                    ),
++                )
++                source_artifact = _record_v4_artifact(
++                    state,
++                    services.write_json_artifact(
++                        f"iterations/{iteration:03d}/candidate-source.json",
++                        {
++                            "schema_version": 4,
++                            "artifact_type": "candidate_source_bundle",
++                            "candidate_identity_sha256": candidate_identity.identity_sha256,
++                            "policy_sources": {
++                                item.path: item.source for item in author.policy_sources
++                            },
++                        },
++                    ),
++                )
++                try:
++                    quick = services.evaluate_candidate(
++                        parent.workspace,
++                        candidate_identity,
++                        readiness.discovery_panel_plan.quick_panel,
++                    )
++                    if (
++                        quick.panel_id != "quick"
++                        or quick.panel_sha256 != manifest.quick_panel_sha256
++                    ):
++                        raise CandidateEvaluationFailure("replay_failed")
++                    quick_artifact = _record_v4_artifact(
++                        state,
++                        services.write_json_artifact(
++                            f"iterations/{iteration:03d}/quick.json",
++                            {
++                                "schema_version": 4,
++                                "artifact_type": "candidate_panel_evidence",
++                                "candidate_identity_sha256": candidate_identity.identity_sha256,
++                                "evidence": _panel_v4_artifact(quick),
++                            },
++                        ),
++                    )
++                    # Quick return/trades never gate discovery.
++                    discovery = services.evaluate_candidate(
++                        parent.workspace,
++                        candidate_identity,
++                        readiness.discovery_panel_plan.discovery_panel,
++                    )
++                    if (
++                        discovery.panel_id != "discovery"
++                        or discovery.panel_sha256 != manifest.discovery_panel_sha256
++                    ):
++                        raise CandidateEvaluationFailure("replay_failed")
++                    discovery_artifact = _record_v4_artifact(
++                        state,
++                        services.write_json_artifact(
++                            f"iterations/{iteration:03d}/discovery.json",
++                            {
++                                "schema_version": 4,
++                                "artifact_type": "candidate_panel_evidence",
++                                "candidate_identity_sha256": candidate_identity.identity_sha256,
++                                "evidence": _panel_v4_artifact(discovery),
++                            },
++                        ),
++                    )
++                    validation_status = CandidateValidationStatusV4(
++                        status="valid",
++                        failure_code=None,
++                    )
++                except CandidateEvaluationFailure as exc:
++                    validation_status = CandidateValidationStatusV4(
++                        status="invalid",
++                        failure_code=(
++                            "worker_failed"
++                            if exc.failure_code == "worker_failed"
++                            else "evaluation_failed"
++                        ),
++                    )
++                    quick = None
++                    discovery = None
++
++        _write_validation_v4(
++            state=state,
++            services=services,
++            iteration=iteration,
++            status=validation_status,
++            identity=(
++                candidate_identity if validation_status.status == "valid" else None
++            ),
++        )
++        critic_plan = _v4_plan(readiness, iteration=iteration, role="critic")
++        critic_input = CriticInputV4(
++            **common,  # type: ignore[arg-type]
++            selected_parent_summary=selected_summary,
++            hypothesis_id=investigator.hypothesis_id,
++            investigator_summary=investigator,
++            author_manifest=author_manifest,
++            author_output_invalid=author_invalid,
++            validation_status=validation_status,
++            candidate_quick=quick,
++            candidate_discovery=discovery,
++            baseline_quick=readiness.baseline_quick,
++            baseline_discovery=readiness.baseline_discovery,
++            champion_discovery=champion_panel,
++            target_progress=TargetProgressV4.from_summaries(
++                target=manifest.annualized_return_target,
++                baseline=readiness.baseline_discovery,
++                selected_parent=selected_summary.discovery_panel,
++                champion=champion_panel,
++            ),
++        )
++        critic_input.validate_budget(
++            critic_plan,
++            scope=manifest.policy_authoring_scope,
++            manifest=manifest,
++        )
++        critic_attempt = _call_v4_role(
++            state=state,
++            services=services,
++            plan=critic_plan,
++            role_input=critic_input,
++            parser=lambda raw: CriticArtifactV4.from_json(
++                raw,
++                max_total_bytes=critic_plan.max_response_bytes,
++            ),
++        )
++        critic = critic_attempt.payload
++        critic_valid = isinstance(critic, CriticArtifactV4)
++        disposition = critic.disposition if critic_valid else "abandon"
++
++        if validation_status.status == "valid":
++            assert (
++                candidate_identity is not None
++                and quick is not None
++                and discovery is not None
++                and source_artifact is not None
++                and diff_artifact is not None
++                and quick_artifact is not None
++                and discovery_artifact is not None
++            )
++            candidate_state = SearchCandidateState(
++                candidate_identity=candidate_identity,
++                cumulative_diff_artifact=(
++                    f"iterations/{iteration:03d}/candidate.diff"
++                ),
++                cumulative_diff_sha256=diff_artifact[1],
++                source_bundle_artifact=(
++                    f"iterations/{iteration:03d}/candidate-source.json"
++                ),
++                source_bundle_sha256=source_artifact[1],
++                discovery_evidence_artifact=(
++                    f"iterations/{iteration:03d}/discovery.json"
++                ),
++                discovery_evidence_sha256=discovery_artifact[1],
++                discovery_evidence=discovery,
++                hypothesis=investigator.hypothesis_id,
++                behavioral_summary=behavioral_summary,
++                originating_run_id=manifest.campaign_id,
++                originating_iteration=iteration,
++                quick_evidence_artifact=f"iterations/{iteration:03d}/quick.json",
++                quick_evidence_sha256=quick_artifact[1],
++                quick_evidence=quick,
++            )
++
++        current_winner_cagr = (
++            readiness.baseline_discovery.portfolio_annualized_return_pct
++            if state.champion is None
++            else state.champion.discovery_evidence.portfolio_annualized_return_pct
++        )
++        promoted = bool(
++            candidate_state is not None
++            and candidate_state.discovery_evidence.portfolio_annualized_return_pct
++            > current_winner_cagr
++        )
++        if promoted:
++            prospective_champion = candidate_state
++            prospective_branch = None
++            effective_disposition = "promote"
++        elif candidate_state is not None and disposition == "refine":
++            prospective_champion = state.champion
++            prospective_branch = candidate_state
++            effective_disposition = "refine"
++        elif candidate_state is None and disposition == "refine" and selected_kind == "branch":
++            prospective_champion = state.champion
++            prospective_branch = selected_candidate
++            effective_disposition = "refine_existing_branch"
++        else:
++            prospective_champion = state.champion
++            prospective_branch = None
++            effective_disposition = "abandon"
++
++        feedback = PriorHypothesisSummaryV4(
++            iteration=iteration,
++            hypothesis_id=investigator.hypothesis_id,
++            focus_areas=investigator.focus_areas,
++            behavioral_summary=behavioral_summary,
++            validation=validation_status,
++            discovery_cagr_pct=(
++                None
++                if candidate_state is None
++                else candidate_state.discovery_evidence.portfolio_annualized_return_pct
++            ),
++            critic_disposition=disposition,
++        )
++        prospective_feedback = (*state.feedback_tail, feedback)
++        checkpoint = _persist_v4_transition(
++            readiness=readiness,
++            state=state,
++            services=services,
++            iteration=iteration,
++            decision={
++                "artifact_type": "search_transition",
++                "selected_parent_kind": selected_kind,
++                "candidate_valid": candidate_state is not None,
++                "candidate_promoted": promoted,
++                "critic_output_valid": critic_valid,
++                "critic_disposition": disposition,
++                "effective_disposition": effective_disposition,
++                "prospective_champion": (
++                    None
++                    if prospective_champion is None
++                    else prospective_champion.to_primitive()
++                ),
++                "prospective_active_branch": (
++                    None
++                    if prospective_branch is None
++                    else prospective_branch.to_primitive()
++                ),
++            },
++            champion=prospective_champion,
++            active_branch=prospective_branch,
++            feedback_tail=prospective_feedback,
++        )
++        state.champion = prospective_champion
++        state.active_branch = prospective_branch
++        state.feedback_tail = list(prospective_feedback)
++        state.iterations_completed = iteration
++        return checkpoint
++    finally:
++        _dispose_v4(services, state, selected_workspace)
++
++
++def _copy_seed_v4(
++    *,
++    kind: str,
++    candidate: SearchCandidateState,
++    state: _V4RunState,
++    services: PitOptimizerServicesV4,
++) -> SearchCandidateState:
++    parent = services.materialize_parent(kind, candidate)
++    label = "champion" if kind == "champion" else "branch"
++    try:
++        diff = _record_v4_artifact(
++            state,
++            services.write_diff_artifact(
++                f"seed-{label}.diff",
++                parent.cumulative_diff,
++            ),
++        )
++        source = _record_v4_artifact(
++            state,
++            services.write_json_artifact(
++                f"seed-{label}-source.json",
++                {
++                    "schema_version": 4,
++                    "artifact_type": "seed_candidate_source_bundle",
++                    "candidate_identity_sha256": (
++                        candidate.candidate_identity.identity_sha256
++                    ),
++                    "policy_sources": {
++                        item.path: item.source for item in parent.policy_sources
++                    },
++                },
++            ),
++        )
++        quick = _record_v4_artifact(
++            state,
++            services.write_json_artifact(
++                f"seed-{label}-quick.json",
++                {
++                    "schema_version": 4,
++                    "artifact_type": "seed_candidate_panel_evidence",
++                    "evidence": _panel_v4_artifact(candidate.quick_evidence),
++                },
++            ),
++        )
++        discovery = _record_v4_artifact(
++            state,
++            services.write_json_artifact(
++                f"seed-{label}-discovery.json",
++                {
++                    "schema_version": 4,
++                    "artifact_type": "seed_candidate_panel_evidence",
++                    "evidence": _panel_v4_artifact(candidate.discovery_evidence),
++                },
++            ),
++        )
++        return replace(
++            candidate,
++            cumulative_diff_artifact=f"seed-{label}.diff",
++            cumulative_diff_sha256=diff[1],
++            source_bundle_artifact=f"seed-{label}-source.json",
++            source_bundle_sha256=source[1],
++            discovery_evidence_artifact=f"seed-{label}-discovery.json",
++            discovery_evidence_sha256=discovery[1],
++            quick_evidence_artifact=f"seed-{label}-quick.json",
++            quick_evidence_sha256=quick[1],
++        )
++    finally:
++        _dispose_v4(services, state, parent.workspace)
++
++
++def run_pit_optimizer_v4(
++    *,
++    readiness: PitOptimizerReadinessV4,
++    services: PitOptimizerServicesV4,
++) -> PitOptimizerResultV4:
++    """Run the bounded schema-v4 search without qualification or replay."""
++
++    if not isinstance(readiness, PitOptimizerReadinessV4) or not isinstance(
++        services,
++        PitOptimizerServicesV4,
++    ):
++        raise ValueError("optimizer v4 run composition is invalid")
++    services.verify_inputs(readiness)
++    state = _V4RunState(
++        champion=None,
++        active_branch=None,
++        feedback_tail=[],
++    )
++    terminal_code = "iteration_limit"
++    checkpoint: CampaignCheckpoint | None = None
++    active_workspace: CandidateWorkspace | None = None
++    try:
++        if readiness.seed_champion is not None:
++            state.champion = _copy_seed_v4(
++                kind="champion",
++                candidate=readiness.seed_champion,
++                state=state,
++                services=services,
++            )
++        if readiness.seed_active_branch is not None:
++            state.active_branch = _copy_seed_v4(
++                kind="branch",
++                candidate=readiness.seed_active_branch,
++                state=state,
++                services=services,
++            )
++        for name, primitive in (
++            (
++                "run.json",
++                {
++                    "schema_version": 4,
++                    "artifact_type": "optimizer_run",
++                    "campaign_id": readiness.manifest.campaign_id,
++                    "campaign_sequence": readiness.manifest.campaign_sequence,
++                    "manifest_sha256": readiness.manifest.sha256,
++                    "readiness_sha256": readiness.readiness_sha256,
++                    "target": _target_v4_artifact(
++                        readiness.manifest.annualized_return_target
++                    ),
++                    "apply": False,
++                    "provider_retries": 0,
++                    "qualification_started": False,
++                    "full_replay_started": False,
++                },
++            ),
++            (
++                "baseline.json",
++                {
++                    "schema_version": 4,
++                    "artifact_type": "exact_panel_baseline",
++                    "quick": _panel_v4_artifact(readiness.baseline_quick),
++                    "discovery": _panel_v4_artifact(readiness.baseline_discovery),
++                    "parity_use": "engine_equivalence_only",
++                },
++            ),
++            ("accounting.json", _v4_accounting_artifact(state)),
++        ):
++            _record_v4_artifact(
++                state,
++                services.write_json_artifact(name, primitive),
++            )
++        checkpoint = _checkpoint_v4(
++            readiness=readiness,
++            completed_iterations=0,
++            champion=state.champion,
++            active_branch=state.active_branch,
++            feedback_tail=state.feedback_tail,
++        )
++        _record_v4_artifact(
++            state,
++            services.write_json_artifact("checkpoint.json", checkpoint.to_primitive()),
++        )
++        for iteration in range(1, readiness.manifest.max_iterations + 1):
++            if services.cancellation_requested():
++                terminal_code = "cancelled"
++                break
++            directory = services.prepare_iteration_artifacts(iteration)
++            if (
++                not isinstance(directory, Path)
++                or not directory.is_absolute()
++                or not directory.is_dir()
++            ):
++                raise AuditFailure("optimizer v4 iteration directory is not durable")
++            state.iterations_started = iteration
++            checkpoint = _run_v4_iteration(
++                readiness=readiness,
++                state=state,
++                services=services,
++                iteration=iteration,
++            )
++    except BaseException as exc:
++        terminal_code, _detail = _terminal_from_exception(exc)
++        if terminal_code in {
++            "iteration_limit",
++            "budget_exhausted",
++            "stagnation_limit",
++            "cancelled",
++        }:
++            terminal_code = "audit_failure"
++    finally:
++        _dispose_v4(services, state, active_workspace)
++
++    if checkpoint is None:
++        checkpoint = _checkpoint_v4(
++            readiness=readiness,
++            completed_iterations=state.iterations_completed,
++            champion=state.champion,
++            active_branch=state.active_branch,
++            feedback_tail=state.feedback_tail,
++        )
++    try:
++        services.verify_inputs(readiness)
++    except BaseException:
++        terminal_code = "identity_drift"
++    facts = tuple(attempt.facts for attempt in state.call_attempts)
++    cleanup_complete = all(
++        item.candidate_removed and item.worker_stopped and not item.source_modified
++        for item in state.cleanup_observations
++    )
++    source_modified = any(item.source_modified for item in state.cleanup_observations)
++    accounting_complete = all(item.accounting_complete for item in facts)
++    if not accounting_complete:
++        terminal_code = "provider_accounting_failure"
++    successful_terminal = terminal_code in {"iteration_limit", "cancelled"}
++    if successful_terminal and not cleanup_complete:
++        terminal_code = "sandbox_integrity_failure"
++        successful_terminal = False
++    champion_cagr = (
++        readiness.baseline_discovery.portfolio_annualized_return_pct
++        if state.champion is None
++        else state.champion.discovery_evidence.portfolio_annualized_return_pct
++    )
++    branch_cagr = (
++        None
++        if state.active_branch is None
++        else state.active_branch.discovery_evidence.portfolio_annualized_return_pct
++    )
++    result = PitOptimizerResultV4(
++        schema_version=4,
++        status="completed" if successful_terminal else "aborted",
++        terminal_code=terminal_code,
++        campaign_id=readiness.manifest.campaign_id,
++        target_cagr_pct=format(
++            readiness.manifest.annualized_return_target.target_pct,
++            "f",
++        ),
++        baseline_cagr_pct=format(
++            readiness.baseline_discovery.portfolio_annualized_return_pct,
++            "f",
++        ),
++        champion_cagr_pct=format(champion_cagr, "f"),
++        branch_cagr_pct=None if branch_cagr is None else format(branch_cagr, "f"),
++        iterations_started=state.iterations_started,
++        iterations_completed=state.iterations_completed,
++        calls=sum(1 for item in facts if item.request_started),
++        tokens=sum(item.total_tokens or 0 for item in facts),
++        cost_usd=format(
++            sum(
++                (
++                    Decimal(str(item.cost_usd or 0))
++                    for item in facts
++                    if item.accounting_complete
++                ),
++                Decimal("0"),
++            ),
++            "f",
++        ),
++        checkpoint_present=True,
++        apply=False,
++        cleanup_complete=cleanup_complete,
++        source_modified=source_modified,
++        checkpoint=checkpoint,
++        artifact_paths=tuple(state.artifact_paths),
++    )
++    try:
++        _record_v4_artifact(
++            state,
++            services.write_json_artifact("summary.json", result.to_public_artifact()),
++        )
++    except BaseException:
++        return replace(
++            result,
++            status="aborted",
++            terminal_code="audit_failure",
++            cleanup_complete=False,
++        )
++    return replace(result, artifact_paths=tuple(state.artifact_paths))
+diff --git a/tests/test_agent_loop.py b/tests/test_agent_loop.py
+index ed0da72..9568d47 100644
+--- a/tests/test_agent_loop.py
++++ b/tests/test_agent_loop.py
+@@ -248,40 +248,41 @@ def test_pit_optimizer_v2_config_parser_has_a_separate_closed_route(
+     assert namespace.verified_parity == absolute / "parity.json"
+     assert namespace.optimizer_authorization_requirement_sha256 == "4" * 64
+     assert namespace.authorize_policy_source_transmission is False
+     assert "pit_optimization" in agent_loop.build_parser()._option_string_actions[
+         "--gate"
+     ].choices
+ 
+ 
+ def _minimal_gate_cli_argv(tmp_path: Path, gate: str) -> list[str]:
+     root = tmp_path.resolve()
+-    return [
++    argv = [
+         "--repo-root",
+         str(root / "source"),
+         "--permanent-runtime-root",
+         str(root / "runtime"),
+         "--git-executable",
+         str(root / "git.exe"),
+         "--controller-temp-parent",
+         str(root / "controller"),
+         "--artifact-root",
+         str(root / "artifacts"),
+         "--docker-executable",
+         str(root / "docker.exe"),
+         "--sandbox-image",
+         "example.invalid/worker@sha256:" + "1" * 64,
+         "--gate",
+         gate,
+-        "--max-usd",
+-        "0.40",
+     ]
++    if gate != "pit_optimizer":
++        argv.extend(("--max-usd", "0.40"))
++    return argv
+ 
+ 
+ @pytest.mark.parametrize(
+     ("gate", "extra"),
+     [
+         (gate, extra)
+         for gate in ("test", "backtest", "pit_diagnosis", "pit_optimization")
+         for extra in (
+             ("--optimizer-manifest", "C:/foreign/optimizer-manifest.json"),
+             ("--authorize-policy-source-transmission",),

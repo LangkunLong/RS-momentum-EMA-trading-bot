@@ -1,0 +1,113 @@
+"""Read-only archived authority and pure B1 outcome inspection; no runtime path."""
+
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+ROOT = Path.cwd().resolve()
+sys.path.insert(0, str(ROOT))
+
+from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5
+from core.pit_optimizer_v5.candidate_ir import derive_pre_validation_invalid_experiment_identity_v5
+from core.pit_optimizer_v5.contracts import (
+    ArtifactRefV5,
+    evaluator_source_map_v5,
+    evaluator_source_sha256,
+)
+from core.pit_optimizer_v5.manifest import authenticate_campaign_manifest_v5
+from core.pit_optimizer_v5.memory import RoleCompletionPayloadV5, RoundIntentPayloadV5
+from core.pit_optimizer_v5.rendering import RejectedVariantV5, render_variant_outcomes_v5
+
+
+repository = LocalArtifactRepositoryV5(ROOT / '.artifacts/pit-optimizer-v5/development/provider-runtime-06')
+manifest_ref = ArtifactRefV5(
+    'campaigns/development-provider-two-rounds-20260907-06/manifest.json',
+    'd90ed717c0d6b34d4cfa6bf7e2dd1f753e68c43b1127b200a66d2a9f930dfdf6',
+)
+authenticated = authenticate_campaign_manifest_v5(repository=repository, manifest_ref=manifest_ref)
+events = repository.load_round_events(campaign_id=authenticated.manifest.campaign_id, round_index=1)
+payloads = tuple(repository.load_round_payload(event.payload_ref, expected_kind=event.event_kind) for event in events)
+intents = tuple(item for item in payloads if type(item) is RoundIntentPayloadV5)
+authors = tuple(item for item in payloads if type(item) is RoleCompletionPayloadV5 and item.role == 'author')
+assert len(intents) == len(authors) == 1
+intent, author = intents[0], authors[0]
+assert author.outcome == 'accepted'
+assert author.request_sha256 == '09564719a54cfd10a0b6edbc5b61996e7a68015866f1e0b538859c542d158c0f'
+assert author.artifact_ref == ArtifactRefV5(
+    'roles/artifacts/author/98445c0e22a90e95482d40a77706b77780d2dd1e8e097092a81f9363c020e9f7.json',
+    'ad979279cdf09db2bd4ee6250d7b40103db2f5b89749e898dcd6ac234d5f06f2',
+)
+package = repository.load_role_invocation(author)
+template = package.artifact
+assert package.accepted
+assert package.request.role_input.hypothesis.sha256 == intent.hypothesis.sha256
+assert template.sha256 == author.artifact_sha256
+parent = authenticated.baseline_authority.source_bundle
+revision = authenticated.baseline_authority.policy_revision
+assert parent.sha256 == '109a61992ac79317446861c4cb2053f2704239eb1f8eacfe2b2d27ca2cf7456e'
+assert revision.sha256 == '5d2a95ba2572e71dab448934544cef22130415fcc1691c9a98deb820d40a1fa9'
+outcomes = render_variant_outcomes_v5(
+    parent=parent,
+    parent_revision=revision,
+    template=template,
+    maximum=authenticated.manifest.search.max_variants_per_template,
+)
+assert len(outcomes) == 1 and type(outcomes[0]) is RejectedVariantV5
+outcome = outcomes[0]
+assert outcome.failure_code == 'policy_source_unbounded_or_stateful'
+identity = derive_pre_validation_invalid_experiment_identity_v5(
+    parent_revision_sha256=revision.sha256,
+    hypothesis=intent.hypothesis,
+    template=template,
+    assignment=outcome.assignment,
+    round_index=1,
+    discovery_plan_sha256=intent.discovery_plan_sha256,
+)
+legacy = LocalArtifactRepositoryV5(ROOT / '.artifacts/pit-optimizer-v5/development/runtime-04')
+record_ref = ArtifactRefV5(
+    'records/9e2a2dfdf35ce55653a3b9ec0d39ce87740a69a940ad5f3e473fd38ea629390d.json',
+    'af6c73e632a3dc47cb344ecf3d1a55f9f58ba3e755e29fe992e0c03d0da103ac',
+)
+before = legacy.authenticate(record_ref).content
+record = legacy.load_experiment(record_ref)
+after = legacy.authenticate(record_ref).content
+assert before == after == record.canonical_json_bytes()
+source_map = evaluator_source_map_v5(ROOT)
+evaluator_identity = evaluator_source_sha256(source_map)
+assert len(source_map) == 56
+assert evaluator_identity == '005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4'
+principal = json.loads((ROOT / '.artifacts/pit-optimizer-v5/development/luna-recovery-b3b/principal-architect-verification.json').read_text())
+hashes = {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in principal['source_hashes']}
+assert all(hashes[name] == sha for name, sha in principal['source_hashes'].items() if name != 'core/pit_optimizer_v5/runtime.py')
+print(json.dumps({
+    'status': 'read_only_actual_archived_input_and_pure_B1_inspection_passed',
+    'actual06': {
+        'artifact_graph_verified': authenticated.graph.verified,
+        'manifest_ref': manifest_ref.to_primitive(),
+        'event_kinds': [event.event_kind for event in events],
+        'event_sha256s': [event.sha256 for event in events],
+        'render_rejected_events': sum(event.event_kind == 'render_rejected' for event in events),
+        'author_artifact_ref': author.artifact_ref.to_primitive(),
+        'template_sha256': template.sha256,
+        'hypothesis_sha256': intent.hypothesis.sha256,
+        'parent_source_bundle_sha256': parent.sha256,
+        'parent_policy_revision_sha256': revision.sha256,
+        'outcome_type': type(outcome).__name__,
+        'outcome_failure_code': outcome.failure_code,
+        'outcome_assignment_sha256': outcome.assignment.sha256,
+        'derived_invalid_identity': identity.to_primitive(),
+        'derived_invalid_experiment_id': identity.sha256,
+    },
+    'runtime04': {
+        'record_ref': record_ref.to_primitive(),
+        'canonical_bytes_unchanged': before == after == record.canonical_json_bytes(),
+        'status': record.status,
+        'discovery_episodes': len(record.discovery_episodes),
+    },
+    'source_hashes': hashes,
+    'evaluator_identity': evaluator_identity,
+    'covered_files': len(source_map),
+    'new_runtime_or_rejection_journal_paths_executed': False,
+    'tests_synthetic_probes_events_records_model_calls_credentials_evaluations_campaigns': 0,
+}, sort_keys=True))

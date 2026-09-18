@@ -1,0 +1,57 @@
+# Luna follow-up: B2 authority corrections only
+
+Worktree: C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.worktrees\pit-optimizer-v5-architecture
+
+You are implementing a bounded correction for principal architect review. A and B1 are approved. B2 is implemented but requires the two corrections in the linked architect review. Do not advance to B3/B4.
+
+## 1. Establish the exact starting state
+
+Read:
+- docs/superpowers/plans/2026-09-07-pit-optimizer-v5-luna-recovery.md, including its latest B2 decision.
+- .artifacts/pit-optimizer-v5/development/luna-recovery-b2/architect-review.md.
+- .artifacts/pit-optimizer-v5/development/luna-recovery-b2/architect-verification.json.
+
+Confirm the four current B2 source hashes equal that verification. If they differ, inspect and explain the change before editing; do not overwrite another session's work. Create a fresh `luna-recovery-b2-correction` review package and preserve the exact artifacts.py preimage. Do not overwrite the original B2 package. Expected artifacts.py starting SHA: ce6c00a8851e424d4c413550e434f4fdfa47a803129e2f755949fe7bc043d38d.
+
+## 2. Bind the complete hypothesis
+
+In LocalArtifactRepositoryV5._validate_render_rejection_context, after authenticating the accepted author invocation and before deriving the invalid identity:
+- Access the typed AuthorRoleInputV5 from the authenticated request; use an explicit type check/narrowing if necessary.
+- Require its hypothesis.sha256 to equal intent.hypothesis.sha256.
+- Fail closed with the existing artifact schema failure convention when they differ.
+- Retain every existing identity, parent, discovery-plan, campaign/round, accepted artifact and typed bounded assignment check. A matching hypothesis ID is insufficient.
+
+No provider schema or candidate_ir change is needed.
+
+## 3. Enforce critic exclusion for rejected identities
+
+Extend the same repository context validation, which is invoked by both append_round_event and load_round_events:
+- Gather the render-rejected identity hashes for the round only after existing rejection authentication succeeds.
+- If there are no rejected identities, preserve existing behavior without unnecessary additional role-package loads.
+- Inspect each critic role completion in a rejection-containing round, including failed completions.
+- Authenticate its stored invocation through load_role_invocation, following existing exception handling conventions. Verify its call belongs to the same event campaign/round and is a critic request/completion.
+- Reject the critic completion if any request.expected_binding.experiment_ids member is a rejected identity. The request binding is the authority to inspect even when no accepted critic artifact exists.
+- Allow critics whose bound IDs concern only other candidates. Do not ban all critics merely because this round has a rejection.
+- Keep ordering enforcement in the existing fold: candidate work cannot follow critic completion. Avoid recursion through load_round_events.
+
+Do not add new payload fields or change old canonical encodings. Do not implement runtime critic construction, invalid record publication, renderer switching, or finalization.
+
+## 4. Review the two paths statically
+
+Trace both append_round_event and load_round_events to the shared validator. Explain why a same-ID/different-content author hypothesis fails, why both accepted and failed critic requests containing a rejected ID fail, and why a critic for other candidates is allowed. These are static reasoning checks; do not create synthetic inputs or fabricate journal events to demonstrate them.
+
+Confirm the existing rendered-assignment conflict and absent-to-terminal stage checks are preserved. Keep approved A, B1 rendering behavior, runtime.py, memory.py and candidate_ir.py unchanged unless a minimal necessary deviation is documented; expected correction scope is artifacts.py alone.
+
+## 5. Verify with allowed evidence
+
+Run scoped Ruff, in-memory compilation, and scoped diff checking for changed production files. Recompute the evaluator source identity and unchanged guards. It must remain 005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4.
+
+Read-only actual06 inspection may authenticate the existing manifest, author invocation and intent, compare their complete hypothesis hashes, and derive the same bounded assignment/invalid identity. Preserve all actual06 bytes. Do not execute the old verification helper's create-only main against existing package files; use a fresh output location or a read-only equivalent.
+
+Actual06 has no rejection or critic event. Report that the new exclusion/append/replay behavior is static-reviewed and unexecuted; successful historical loading does not prove those new branches ran.
+
+## 6. Return a fresh checkpoint package
+
+Save exact preimage, correction-only diff, final hashes, scoped check results, actual-artifact inspection results, evaluator identity, and a concise review explaining both corrected invariants. State all deviations and verification limits. Stop for architect review before B3/B4.
+
+No tests may be read, created, changed or run. No synthetic probes, fake provider responses, model/API calls, credential reads, candidate evaluations, campaign restarts, commits, pushes or deployment. Do not launch a campaign or infer a new budget grant. The original two evaluated feedback rounds remain unfinished.

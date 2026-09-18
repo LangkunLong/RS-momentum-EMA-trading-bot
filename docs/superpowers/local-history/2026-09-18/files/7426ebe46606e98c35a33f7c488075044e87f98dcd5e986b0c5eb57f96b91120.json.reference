@@ -1,0 +1,14 @@
+[
+  "C:\\Users\\llong\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\python.exe",
+  "-m",
+  "ruff",
+  "check",
+  "\\\\?\\C:\\Projects\\trading_bot\\RS-momentum-EMA-trading-bot\\.worktrees\\pit-optimizer-v5-architecture\\.superpowers\\sdd\\2026-09-04-pit-optimizer-v5-campaign\\provider-staging\\proposed\\core\\pit_optimizer_v5\\contracts.py",
+  "\\\\?\\C:\\Projects\\trading_bot\\RS-momentum-EMA-trading-bot\\.worktrees\\pit-optimizer-v5-architecture\\.superpowers\\sdd\\2026-09-04-pit-optimizer-v5-campaign\\provider-staging\\proposed\\core\\pit_optimizer_v5\\manifest.py",
+  "\\\\?\\C:\\Projects\\trading_bot\\RS-momentum-EMA-trading-bot\\.worktrees\\pit-optimizer-v5-architecture\\.superpowers\\sdd\\2026-09-04-pit-optimizer-v5-campaign\\provider-staging\\proposed\\core\\pit_optimizer_v5\\development_preparation.py",
+  "\\\\?\\C:\\Projects\\trading_bot\\RS-momentum-EMA-trading-bot\\.worktrees\\pit-optimizer-v5-architecture\\.superpowers\\sdd\\2026-09-04-pit-optimizer-v5-campaign\\provider-staging\\proposed\\core\\pit_optimizer_v5\\cli.py",
+  "\\\\?\\C:\\Projects\\trading_bot\\RS-momentum-EMA-trading-bot\\.worktrees\\pit-optimizer-v5-architecture\\.superpowers\\sdd\\2026-09-04-pit-optimizer-v5-campaign\\provider-staging\\proposed\\core\\pit_optimizer_v5\\operations.py",
+  "\\\\?\\C:\\Projects\\trading_bot\\RS-momentum-EMA-trading-bot\\.worktrees\\pit-optimizer-v5-architecture\\.superpowers\\sdd\\2026-09-04-pit-optimizer-v5-campaign\\provider-staging\\proposed\\core\\pit_optimizer_v5\\runtime.py",
+  "\\\\?\\C:\\Projects\\trading_bot\\RS-momentum-EMA-trading-bot\\.worktrees\\pit-optimizer-v5-architecture\\.superpowers\\sdd\\2026-09-04-pit-optimizer-v5-campaign\\provider-staging\\proposed\\core\\pit_optimizer_v5\\summary.py",
+  "\\\\?\\C:\\Projects\\trading_bot\\RS-momentum-EMA-trading-bot\\.worktrees\\pit-optimizer-v5-architecture\\.superpowers\\sdd\\2026-09-04-pit-optimizer-v5-campaign\\provider-staging\\proposed\\core\\pit_optimizer_v5\\provider.py"
+]

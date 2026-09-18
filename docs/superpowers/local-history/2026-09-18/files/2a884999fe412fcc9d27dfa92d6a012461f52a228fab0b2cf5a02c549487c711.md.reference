@@ -1,0 +1,25 @@
+# Price-loop diagnosis plan
+
+## Goal
+
+Finish one end-to-end daily PIT price/volume replay and identify the smallest
+engine change needed to avoid missing otherwise-valid CANSLIM entries.
+
+## Global constraints
+
+- Use only the existing local PIT bundle and normalized artifacts.
+- Do not download or reprocess SEC/13F data.
+- Do not touch the optimizer, live/paper execution, or shared branches.
+- CANSLIM fidelity is a hard constraint; do not weaken entry thresholds.
+- Do not add tests until the build is finished, per user direction.
+- Any code change must preserve causal as-of behavior and be verified with one
+  bounded replay.
+
+## Tasks
+
+1. Audit daily cadence, same-day volume gating, and PIT price coverage using
+   bounded read-only runs.
+2. Implement the smallest evidence-backed engine change, if one is required,
+   using a fresh implementer and a scoped review.
+3. Run a bounded daily replay and reconcile signals, executions, cash, and
+   artifacts.

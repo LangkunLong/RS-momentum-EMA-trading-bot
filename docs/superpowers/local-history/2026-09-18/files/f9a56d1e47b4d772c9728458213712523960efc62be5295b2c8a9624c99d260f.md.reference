@@ -1,0 +1,14 @@
+# Bounded correction of C-a proposed design
+
+Correct documentation only. The independent reviewer identified these two concrete design issues:
+
+1. H2 promises fail-closed runtime-contract compatibility, but saved configs have no independent contract selector/preimage. The acceptance rule must distinguish serialized record-schema/command/output validation from proving the exact historical host contract.
+2. H3 retains existing role authentication, whose _authenticate_controller_request currently uses repair-default typed reads. A completed_history read-only guarantee must cover the entire transitive controller and paid-role authentication path explicitly.
+
+Principal architecture direction: accept completed-history provenance using authenticated per-round configs plus exact recognized serialized schema/command/output/phase semantics. Explicitly do not claim reconstruction or equality of the unsaved host runtime-contract literal/environment. Unknown serialized formats or ambiguous evidence still fail closed. The current runtime path and foreign-executor guards remain intact; no synthetic proof or assumed historical selector.
+
+For read-only enforcement, identify the concrete transitive calls that would need a narrowly propagated repair=False policy or an explicitly reviewed write-prevention boundary. Do not leave a generic promise unsupported by named source seams. Default live behavior remains unchanged; completed_history must not create missing indexes even through role authentication, and preflight alone is insufficient to guarantee this against a missing-index race. Keep proposal small and reviewable; no repository-wide implementation now.
+
+Read the design and principal diagnosis in this package, plus independent-review.md if available. The original pre-fix versions are *.review-preimage.md. Edit only historical-verification-design.md and, only for a required clarification, principal-diagnosis.md. Do not edit prior authority trace/evidence/preimages/reviewer output. Write design-correction-report.md with exact changed sections, named source reads and remaining concerns. The independent reviewer will re-review the diff.
+
+No production source edits; no tests read/created/run; no synthetic evidence, credentials/environment values, external calls, campaigns/evaluations/Docker, history mutations, commits or subagents. Do not rerun diagnostic scripts. Return a compact status and report path. Stop once both documentation issues are concrete and corrected; do not expand the investigation.

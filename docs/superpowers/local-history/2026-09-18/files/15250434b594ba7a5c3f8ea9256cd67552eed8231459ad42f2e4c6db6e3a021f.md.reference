@@ -1,0 +1,40 @@
+# Task 2 implementation report
+
+## Source change
+
+- Changed only `core/pit_optimizer_v5/production_runtime.py` from the authenticated preimage.
+- Added `LocalRoleRequestFactoryV5._render_rejection_count` adjacent to `_investigator_parts`.
+- Added the cumulative `failure.rendering.policy_source_unbounded_or_stateful_count` evidence item after all parent-episode evidence and before archive/history evidence, omitting it when the authenticated count is zero.
+- The preimage-to-result diff contains only the required helper and the required `_investigator_parts` insertion. The existing 16-item Increment-A allowlist, complete per-episode body, and existing `evidence.add` calls remain unchanged.
+
+## Static authority rationale
+
+The helper reloads and compares the repository checkpoint before counting. It then reloads every projected experiment by its stored reference and requires equality with the projected record, a strictly prior round, the active discovery-plan identity, and the active PIT data scope and semantic mode. Any authority mismatch raises the specified `ValueError`; repository reload failures propagate. Only authenticated invalid records whose validation failure code is `policy_source_unbounded_or_stateful` contribute to the cumulative count.
+
+## Exact function scope
+
+- New function: `LocalRoleRequestFactoryV5._render_rejection_count(self, inputs: FeedbackRoundInputV5, projection: SearchProjectionV5) -> int`.
+- Existing function touched: `LocalRoleRequestFactoryV5._investigator_parts`, solely to call the helper and append the nonzero aggregate evidence item at the specified ordering seam.
+- No author flow, request budgets, provider schema, event/record/schema/identity behavior, evaluator source, repository authentication, or other source files were changed by this task.
+
+## Hashes
+
+- Starting authenticated SHA-256: `78da0dc5efcf5cf94541a465e0a3c212221c843dade07f680ddc5e1508fdc476`.
+- Final `core/pit_optimizer_v5/production_runtime.py` SHA-256: `a757a0ca89979be9453129321a04b96498fb06a9f37438034b46e407ad8b72eb`.
+
+## Permitted static checks
+
+- `python -m ruff check core/pit_optimizer_v5/production_runtime.py`: passed (`All checks passed!`).
+- In-memory Python `compile(...)` of `core/pit_optimizer_v5/production_runtime.py`: passed (`compile: OK`).
+- Static text comparison: isolated exactly the two required source insertions.
+- Full raw-byte comparison: the result is byte-identical to the authenticated preimage plus exactly the reviewed 1,139-byte helper insertion and 329-byte aggregate-evidence insertion.
+- Protected-slice comparison: the existing 16-metric allowlist and complete parent-episode block are byte-identical to the preimage.
+- No tests, synthetic inputs, probes, candidates, records, events, requests, wrappers, model/API calls, evaluator activity, or campaign activity were created or executed.
+
+## Round 1 exact-byte fix result
+
+The controller authorized one byte-preserving PowerShell source splice after confirming that `apply_patch` cannot preserve literal CRLF bytes. The source was rebuilt mechanically from the exact authenticated preimage bytes and the two reviewed insertion byte blocks. The full result matches that construction byte-for-byte; all inherited bytes, including the allowlist and parent-episode loop, are restored exactly. Final SHA-256 is `a757a0ca89979be9453129321a04b96498fb06a9f37438034b46e407ad8b72eb`.
+
+## Concerns
+
+None.

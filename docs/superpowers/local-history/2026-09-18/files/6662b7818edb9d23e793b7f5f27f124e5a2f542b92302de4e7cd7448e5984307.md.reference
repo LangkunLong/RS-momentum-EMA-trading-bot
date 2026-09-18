@@ -1,0 +1,19 @@
+# Scoped development summary history review
+
+**PASS.** No concrete findings in the newest unstaged diff. Spec and quality both pass for this bounded summary-routing fix.
+
+Reviewed only the unstaged changes in `core/pit_optimizer_v5/summary.py` and `core/pit_optimizer_v5/development_preparation.py`, with necessary source context for the existing verification calls. The earlier staged integration was not reopened.
+
+- `summary.py:228` now selects explicit development scope before the provider-free fixture branch. It requires the provider-free, semantic-disabled development contract. When journal history exists, the new helper authenticates that history rather than invoking fixture verification.
+- `development_preparation.py:301-316` retrieves the campaign's saved launch by manifest identity, rejects an absent/mismatched launch, fully authenticates the launch's manifest reference and compares the resulting manifest with the summary input. It loads the original saved adapter-config reference through the existing typed development loader, which binds config content to the manifest and repository identity. It then invokes the existing local history verifier for controller terminal packages, real resource/execution histories, cleanup evidence and archive projection. The helper does not run the campaign or invoke an evaluator/provider.
+- The existing verifier checks cleanup counts before accepting the no-resource case. Consequently, the controller-reported terminal round with complete cleanup and zero resources has a valid static path through this fix. Runtime failure remains reflected by the existing failure/status projection rather than being relabeled as successful work.
+- Development summaries report `evaluation_mode=development_sp500_v2`; the closed summary type accepts that value. They leave `source_unchanged` unknown rather than applying the fixture-only source assertion. Provider-free production scope retains its previous fixture verification and `synthetic_fixture` mode, while provider-enabled production retains `production` mode.
+
+Source SHA-256 values independently match the review request:
+
+| Source | SHA-256 |
+| --- | --- |
+| `summary.py` | `99f62b286ec4ed0304f8f958106153ead977f8b1bbba7ab8bd1154655aa3dd6f` |
+| `development_preparation.py` | `3d7bd9789b88a2812af9fb51aa1ede6b4aa08e3380a03a6114d87b100d8e9252` |
+
+This verdict applies to those unstaged bytes, not a commit. No tests were read, written or run; no probes, application imports/execution, Docker, network, agents, commits, staging or hook changes occurred. Only this report was written. The actual run state and the separate author-request safe-text false positive were supplied by the controller, not re-executed or independently diagnosed here. This diff fixes summary routing; it does not claim to fix that author-request failure or complete the campaign.

@@ -1,0 +1,86 @@
+"""Run and compare one real local development candidate in one operator command.
+
+This uses the existing development launcher and canonical result comparator.
+It does not claim production campaign or automatic role-runtime completion.
+"""
+
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+from core.pit_optimizer_v5.artifacts import _decode_dataclass
+from core.pit_optimizer_v5.candidate_ir import SourceBundleV5, SourceFileV5
+from core.pit_optimizer_v5.container_protocol import (
+    decode_panel_execution_output_v5,
+    decode_panel_execution_request_v5,
+    panel_execution_output_bytes_v5,
+)
+from core.pit_optimizer_v5.contracts import SandboxProfileV5
+from core.pit_optimizer_v5.policy_scope import EDITABLE_POLICY_PATHS_V5
+
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--parent-run", type=Path, required=True)
+parser.add_argument("--candidate-root", type=Path, required=True)
+parser.add_argument("--sandbox-profile", type=Path, required=True)
+parser.add_argument("--label", required=True)
+parser.add_argument("--comparison-output", type=Path)
+parser.add_argument("--reuse-completed", action="store_true", help="Reuse only a completed recorded run; never restart existing work")
+args = parser.parse_args()
+if re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,90}", args.label) is None:
+    raise ValueError("label must be a simple lower-case run name")
+root = Path.cwd()
+workspace = root / ".superpowers/sdd/2026-09-04-pit-optimizer-v5-campaign"
+development = root / ".artifacts/pit-optimizer-v5/development"
+run_root = development / "runs" / args.label
+output = args.comparison_output or development / "feedback" / (args.label + ".json")
+if output.exists():
+    raise FileExistsError("Comparison already exists; inspect its recorded decision")
+parent = decode_panel_execution_request_v5((args.parent_run / "request/panel-request.json").read_bytes())
+parent_raw = (args.parent_run / "output/panel-evaluation.json").read_bytes()
+parent_output = decode_panel_execution_output_v5(parent_raw)
+if panel_execution_output_bytes_v5(request=parent, evaluation=parent_output.evaluation) != parent_raw:
+    raise ValueError("Parent result does not match its canonical request")
+if parent.pit_data_scope != "development_sp500_v2" or parent.panel.purpose != "quick":
+    raise ValueError("Only explicit development quick panels are supported")
+sandbox = _decode_dataclass(SandboxProfileV5, json.loads(args.sandbox_profile.read_text()))
+if sandbox != parent.sandbox_profile:
+    raise ValueError("Candidate must use the parent's exact sandbox profile")
+source = SourceBundleV5(tuple(
+    SourceFileV5(path, (args.candidate_root / Path(path).name).read_text(encoding="utf-8"))
+    for path in EDITABLE_POLICY_PATHS_V5
+))
+hypothesis_path = args.candidate_root / "hypothesis.json"
+hypothesis = json.loads(hypothesis_path.read_text())
+if (
+    hypothesis["source_bundle_sha256"] != source.sha256
+    or hypothesis["parent_policy_sha256"] != parent.policy_revision.sha256
+    or hypothesis["parent_output_sha256"] != hashlib.sha256(parent_raw).hexdigest()
+    or hypothesis["panel_sha256"] != parent.panel.sha256
+):
+    raise ValueError("Hypothesis differs from the real parent or candidate source")
+
+
+def invoke(script, arguments):
+    command = [sys.executable, "-B", "-c", "import runpy; runpy.run_path(" + repr(str(workspace / script)) + ", run_name='__main__')", *arguments]
+    subprocess.run(command, check=True, cwd=root)
+
+
+if run_root.exists():
+    if not args.reuse_completed:
+        raise FileExistsError("Run exists; inspect its owned container or explicitly reuse a completed result")
+    state_path = run_root / "container-state.json"
+    if not state_path.is_file() or not (run_root / "output/panel-evaluation.json").is_file():
+        raise ValueError("Existing run is not completed; inspect its exact recorded container, do not restart")
+    state = json.loads(state_path.read_text())
+    if state["Running"] or state["ExitCode"] != 0 or state["OOMKilled"]:
+        raise ValueError("Existing run did not complete normally")
+else:
+    if args.reuse_completed:
+        raise FileNotFoundError("Requested completed run does not exist")
+    invoke("launch-development-panel.py", ["--label", args.label, "--policy-root", str(args.candidate_root.resolve()), "--sandbox-profile", str(args.sandbox_profile.resolve())])
+invoke("compare-development-runs.py", ["--parent-run", str(args.parent_run.resolve()), "--candidate-run", str(run_root), "--hypothesis", str(hypothesis_path.resolve()), "--output", str(output.resolve())])

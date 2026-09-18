@@ -1,0 +1,30 @@
+# Final whole-branch review package: eb93437c185152bb98974303a8c485d08b3ba779..a1449a0
+
+## Scope
+
+The branch contains the PIT CANSLIM diagnosis work plus the focused price-loop
+fixes recorded in `progress.md`. The full range is 59 files, 19,673 additions,
+and 78 deletions; the principal load-bearing changes for this plan are:
+
+- `core/canslim/c_current_earnings.py` and `a_annual_earnings.py`: documented
+  C/A row fallback selection using existing as-of normalized data.
+- `core/canslim/entry_contract.py`: optional strict proper-base construction
+  using `detect_proper_base`/`BasePolicy.canonical_v1`, fail-closed when absent.
+- `backtest.py` and `core/backtest_engine.py`: causal pre-event OHLC propagation
+  and identical strict signal/execution-boundary revalidation.
+- `core/backtest_engine.py`: additive entry-attempt outcome report.
+
+## Verification and decisions
+
+- No tests were added or run, per user direction; `py_compile` and bounded
+  read-only probes/replays were used.
+- Same-day 1.30x volume, 5% buy zone, C/A/RS/composite thresholds, sizing,
+  cadence, cash policy, optimizer, and live paths were not relaxed or changed.
+- Strict proper-base verification: NVDA, daily, 2023-01-01 through 2025-12-31,
+  corrected PIT bundle; 666 evaluated rows, 3 buy signals/attempts, 2
+  executions, 1 next-open buy-zone rejection, zero cash/capacity/risk
+  rejections, no `proper_base_unavailable` crash.
+- Task reviews: Task 4 Spec PASS/quality APPROVED; Task 5 final Spec PASS/
+  quality APPROVED.
+- Read `.superpowers/sdd/2026-08-25-price-loop-diagnosis/progress.md` for all
+  recorded rulings and deferred concerns before judging completion.

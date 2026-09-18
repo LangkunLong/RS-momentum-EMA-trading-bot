@@ -1,0 +1,42 @@
+# Task 2 review — V5 execution profile and pending policy exits
+
+## Spec Compliance
+
+Partially compliant. The implementation correctly makes V5 opt-in as an exact profile/scenario pair, derives profile identity from all profile fields, separates schema-5 checkpoints from legacy schema 4, orders the normal V5 session phases correctly, queues close-derived exits, applies friction through centralized BUY/SELL paths, and persists pending exits/fill totals. It is not ready to accept because valid edge cases can still fabricate open fills, skip a same-session stop, and report friction totals that do not reconcile. The successful legacy path also exposes V5-only result fields, contrary to the legacy-schema requirement.
+
+The explicit waiver of test additions/edits was honored and is not a finding.
+
+## Strengths
+
+- `core/backtest_fills.py:16-64` closes the V5 profile to the exact supported literals and derives SHA-256 from canonical serialization of every field; callers cannot inject an identity label.
+- `core/backtest_engine.py:1695-1705` rejects partial profile/scenario configuration and wrong concrete types, while `core/backtest_engine.py:1756-1765` selects V5/schema 5 only for the complete pair.
+- `core/backtest_engine.py:2279-2412` gives V5 a distinct lifecycle with transition/remap, pre-open gap stops, queued policy exits, entries, intraday stops, after-close exit evaluation, and then new-signal evaluation; the legacy branch remains separate at `core/backtest_engine.py:2387-2397`.
+- `core/backtest_engine.py:2070-2102`, `core/backtest_engine.py:2227-2249`, and `core/backtest_engine.py:2946-2965` bind V5 checkpoint identity and restore/persist pending exits and fill-cost totals. The completed-result journal also carries terminal equity/fills at `core/backtest_engine.py:2487-2515`.
+- Actual V5 BUY/SELL state changes are centralized through `apply_friction`: entries at `core/backtest_engine.py:3710-3757`, scale-outs at `core/backtest_engine.py:4443-4493`, and full closes at `core/backtest_engine.py:4495-4537`.
+- The targeted touch-validation check found that scale-outs are not filled merely because a policy returned them: `core/strategy_policy/contracts.py:600-617` rejects tiers whose threshold was not crossed.
+
+## Issues
+
+### Critical
+
+None.
+
+### Important
+
+1. **V5 open-phase sells can be filled at a stale prior close instead of an actual open** (confidence: 10/10). `core/backtest_engine.py:4204-4215` prices a due `PendingPolicyExit` with `_causal_open_price`; that helper falls back to the most recent prior close when the current session has no valid `Open` (`core/backtest_engine.py:810-825`). The same fallback feeds V5 eviction pricing at `core/backtest_engine.py:3479-3489`, which is later executed at `core/backtest_engine.py:3699-3705`. A suspended/missing-bar symbol is therefore sold and dated on a session where it never opened, rather than keeping the queued exit (or declining the eviction) until an exact eligible open. Fix: require `exact_session_row(...)["Open"]` for every V5 open fill; retain the fallback helper only for non-fill valuation/legacy behavior.
+
+2. **A valid same-session entry can cross its stop immediately but never be closed** (confidence: 9/10). V5 executes entries before the post-entry stop phase (`core/backtest_engine.py:2318-2326`) and derives the stop from the friction-adjusted entry price (`core/backtest_engine.py:3590-3609`). `FrictionScenario` accepts any non-negative integer bps (`core/backtest_fills.py:78-109`), so spread plus impact can validly exceed the stop distance, making the derived stop greater than the reference open. `resolve_long_stop` then returns `gap_stop` (`core/backtest_fills.py:156-166`), but `_apply_v5_intraday_stops` closes only `intraday_stop` (`core/backtest_engine.py:4238-4245`). Because the opening-gap phase ran before this position existed, the new position survives despite an already-crossed stop. Fix: track positions opened in phase 4 or, after held-position gap stops have been removed, execute any remaining resolved stop in phase 5, using the open reference for this immediate same-session case.
+
+3. **Fill-cost totals do not always reconcile to the cash delta** (confidence: 10/10). `apply_friction` calculates unrounded cash and costs but rounds `cash_delta`, commission, spread, and impact independently at `core/backtest_fills.py:188-207`; `_record_v5_fill` then defines total friction by adding the already-rounded components at `core/backtest_engine.py:4549-4577`. A focused pure check with reference price 1.00, quantity 1, and 40/40/40 bps produced `cash_delta=-1.01` (one cent of actual cash friction) while all three reported components and `TotalFrictionUSD` were `0.00`. The persisted totals therefore fail the required reconciliation even though cash itself moved by the rounded `cash_delta`. Fix: carry unrounded component values through aggregation and round only at the reporting boundary, or derive total friction from `cash_delta` versus reference notional and assign the cent-rounding remainder so components sum exactly.
+
+4. **Legacy successful results now expose V5-only schema and non-empty cost totals** (confidence: 9/10). `SimulationResult` unconditionally adds `fill_log` and `fill_cost_totals` at `core/backtest_engine.py:481-495`; every successful run populates them at `core/backtest_engine.py:2533-2547`; and legacy reset initializes four zero-valued cost keys at `core/backtest_engine.py:2588-2615`. Thus both-absent V2-V4 runs no longer preserve the prior result shape, and successful legacy runs return a V5 cost schema even though fatal/default results return `{}`. Fix: keep the legacy result contract unchanged and expose V5 evidence through a V5-specific result/envelope, or otherwise gate serialization/fields so legacy consumers observe exactly the old schema.
+
+### Minor
+
+None.
+
+## Assessment
+
+**Changes requested.** The core structure is strong, and checkpoint/live-completed resume wiring is internally consistent, but the three evaluator-truth defects above can produce false execution prices, missed stops, or irreconcilable costs under valid inputs. The legacy result-schema leak also violates the explicit opt-in boundary.
+
+Outside-diff inspection was limited to named risk/call-site checks: `_causal_open_price` at `core/backtest_engine.py:810-825` for exact-open causality, `validate_exit_decision` at `core/strategy_policy/contracts.py:600-617` for touched scale-outs, and narrow searches of BUY/SELL/friction plus checkpoint restore call sites. No provider, Docker, replay, git, or suite command was run; the only focused execution was the provider-free pure rounding reproduction described in Important issue 3.

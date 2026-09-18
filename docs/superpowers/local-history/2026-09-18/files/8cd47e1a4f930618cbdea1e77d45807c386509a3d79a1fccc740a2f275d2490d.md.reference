@@ -1,0 +1,30 @@
+# Task 2 implementation report — entry-attempt outcome counts
+
+## Status
+
+Implemented on base `33a5fde`.
+
+## Change
+
+Updated `core/backtest_engine.py::print_pnl_report` with an additive `Entry
+Attempt Outcomes` section after the existing execution diagnostics. The
+section counts `SimulationResult.entry_outcomes[*].outcome`, prints outcome
+names in sorted order with deterministic counts, and prints a harmless
+`No entry attempts recorded.` message when the outcome list is empty.
+
+No entry qualification, sizing, cadence, checkpoint, serialization,
+optimizer, SEC, or 13F behavior was changed.
+
+## Verification
+
+- `python -m py_compile core/backtest_engine.py` — passed.
+- Bounded direct report invocation with three immutable outcomes — printed
+  `alpha: 2` before `zeta: 1`, confirming aggregation and sorting.
+- Bounded direct report invocation with the default empty outcome list —
+  printed the section and `No entry attempts recorded.` without error.
+
+No tests were added, and no data was downloaded.
+
+## Concerns
+
+None identified within the requested scope.

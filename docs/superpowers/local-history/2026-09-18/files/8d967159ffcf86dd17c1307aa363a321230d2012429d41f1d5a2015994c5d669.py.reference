@@ -1,0 +1,117 @@
+"""Acquire public SEC filing-dated SIC raw sources; no final industry admission."""
+import csv
+from datetime import datetime, timezone
+import hashlib
+from html.parser import HTMLParser
+import io
+import json
+from pathlib import Path
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import zipfile
+
+ROOT = Path.cwd()
+sys.path.insert(0, str(ROOT))
+from fetch_sec_pit_fundamentals import _require_user_agent
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+class Links(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.links = []
+    def handle_starttag(self, tag, attrs):
+        if tag == 'a':
+            self.links.extend(value for key, value in attrs if key == 'href' and value)
+
+def now():
+    return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+
+def main():
+    destination = ROOT / '.artifacts/pit-optimizer-v5/data/acquisition/raw/sec-sic'
+    destination.mkdir(parents=True, exist_ok=False)
+    opener = urllib.request.build_opener(NoRedirect())
+    user_agent = _require_user_agent('RS-momentum-EMA-trading-bot PIT-V5 local research langkunlong@gmail.com')
+    records = []
+    manifest_path = destination / 'acquisition.json'
+    def fetch(url, name, maximum):
+        if urllib.parse.urlsplit(url).scheme != 'https' or urllib.parse.urlsplit(url).hostname != 'www.sec.gov':
+            raise ValueError('Only linked official SEC HTTPS sources allowed')
+        record = {'url': url, 'file': name, 'retrieved_at_utc': now()}
+        records.append(record)
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            request = urllib.request.Request(url, headers={'User-Agent': user_agent, 'Accept-Encoding': 'identity'})
+            with opener.open(request, timeout=40) as response:
+                record['http_status'] = response.status
+                record['content_type'] = response.headers.get('Content-Type')
+                with (destination / name).open('xb') as stream:
+                    while chunk := response.read(1024 * 1024):
+                        size += len(chunk)
+                        if size > maximum:
+                            raise ValueError('Source exceeds bounded byte limit')
+                        stream.write(chunk)
+                        digest.update(chunk)
+            record.update(status='downloaded', bytes=size, sha256=digest.hexdigest())
+            print(json.dumps({'file': name, 'status': 'downloaded', 'bytes': size}), flush=True)
+            time.sleep(0.35)
+            return destination / name
+        except urllib.error.HTTPError as error:
+            record.update(status='http_error', http_status=error.code)
+            print(json.dumps({'file': name, 'status': 'http_error', 'http_status': error.code}), flush=True)
+            raise RuntimeError('SEC acquisition stopped on HTTP status ' + str(error.code)) from None
+        except Exception as error:
+            record.update(status='failed', error_type=type(error).__name__)
+            raise
+    complete = False
+    try:
+        page_url = 'https://www.sec.gov/data-research/sec-markets-data/financial-statement-data-sets'
+        page = fetch(page_url, 'source-index.html', 5 * 1024 * 1024)
+        links = Links()
+        links.feed(page.read_text(encoding='utf-8'))
+        by_name = {}
+        for link in links.links:
+            url = urllib.parse.urljoin(page_url, link)
+            name = Path(urllib.parse.urlsplit(url).path).name
+            by_name.setdefault(name, set()).add(url)
+        docs = by_name.get('financial-statement-data-sets.pdf')
+        if not docs or len(docs) != 1:
+            raise ValueError('SEC documentation link ambiguous/missing')
+        fetch(next(iter(docs)), 'financial-statement-data-sets.pdf', 5 * 1024 * 1024)
+        periods = ['2019q4'] + [str(year) + 'q' + str(quarter) for year in range(2020, 2026) for quarter in range(1, 5)]
+        for period in periods:
+            name = period + '.zip'
+            urls = by_name.get(name)
+            if not urls or len(urls) != 1:
+                raise ValueError('Quarter archive link ambiguous/missing: ' + period)
+            path = fetch(next(iter(urls)), name, 256 * 1024 * 1024)
+            with zipfile.ZipFile(path) as archive:
+                if archive.namelist().count('sub.txt') != 1 or archive.getinfo('sub.txt').file_size > 64 * 1024 * 1024:
+                    raise ValueError('Quarter submissions member missing/ambiguous/oversize')
+                raw = archive.read('sub.txt')
+            with (destination / (period + '-sub.txt')).open('xb') as stream:
+                stream.write(raw)
+            rows = list(csv.DictReader(io.StringIO(raw.decode('utf-8-sig'), newline=''), delimiter='\t'))
+            required = {'adsh', 'cik', 'sic', 'accepted', 'filed', 'form'}
+            if not rows or not required.issubset(rows[0]) or any(None in row for row in rows):
+                raise ValueError('Quarter submissions schema malformed')
+            records[-1]['submissions'] = {'file': period + '-sub.txt', 'sha256': hashlib.sha256(raw).hexdigest(), 'rows': len(rows), 'rows_with_sic': sum(bool(row['sic']) for row in rows), 'accepted_min': min(row['accepted'] for row in rows), 'accepted_max': max(row['accepted'] for row in rows)}
+            print(json.dumps({'quarter': period, **records[-1]['submissions']}), flush=True)
+        complete = True
+    except Exception as error:
+        print(json.dumps({'acquisition_complete': False, 'error_type': type(error).__name__}), flush=True)
+    finally:
+        manifest = {'schema_version': 1, 'source_kind': 'SEC_financial_statement_data_sets_filing_dated_SIC', 'completed': complete, 'requests': records, 'contact_header_supplied_by_operator': True, 'contact_header_persisted_in_manifest': False, 'admission_status': 'raw_only_pending_lineage_mapping_session_availability_group_ranking_and_full_union_coverage', 'classification_rule': 'SEC SUB.sic is assignment as of filing date; only use after documented accepted date, never backdate current profile or bulk submissions SIC', 'publication_metadata_rule': 'use filing accepted timestamp rather than quarter posting time for underlying historical filing contents; archive retrieval timestamp preserved separately'}
+        with manifest_path.open('x', encoding='utf-8', newline='\n') as stream:
+            json.dump(manifest, stream, indent=2, sort_keys=True)
+            stream.write('\n')
+    return 0 if complete else 2
+
+if __name__ == '__main__':
+    raise SystemExit(main())

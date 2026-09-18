@@ -1,0 +1,160 @@
+# Task 7 Report: Provider-Neutral Authorized Role Lifecycle
+
+## Outcome
+
+Task 7 is implemented in the approved V5 source boundary:
+
+- `core/pit_optimizer_v5/provider.py` is the new provider-neutral domain and orchestration module.
+- `core/pit_optimizer_authorization.py` has no content change from `HEAD`. The proposed structural
+  legacy authorization change was reverted after audit because it would weaken the existing V3/V4
+  concrete-owner and registry checks. V5 authorization remains a separate typed lifecycle.
+
+No test, evaluator, runtime, CLI, gateway, Docker, replay, data, or filesystem-repository file was
+added or modified. No live provider call was made.
+
+## Closed role authority and binding
+
+- `RoleSchemaAuthorityV5` owns exact immutable canonical schema bytes plus the role-specific
+  manifest-derived cardinality, tunable-axis/variant limits, full-source permission, and author
+  policy-scope/path authority. Its digest is derived from that complete authority; requests cannot
+  substitute a mutable schema mapping or infer limits from prompt text.
+- `RoleRequestV5` binds one role, canonical aggregate-only input, issued evidence, complete expected
+  parent/hypothesis/experiment/discovery-plan identity, the schema authority, and output limit.
+- The manifest constructor derives this authority from validated `CampaignManifestV5` and
+  `PolicyScopeV5` values. Investigator, author, and critic inputs each have a closed role-specific
+  envelope. Author input is restricted to the exact editable files authorized by policy scope; all
+  four source files require manifest-enabled full-source escape.
+- Outbound evidence is not an arbitrary nested JSON value. It must be the existing bounded
+  `RoleEvidenceV5` numeric/null aggregate projection, while role context must be one exact frozen
+  `InvestigatorRoleInputV5`, `AuthorRoleInputV5`, or `CriticRoleInputV5` value. `RoleRequestV5`
+  derives its immutable messages, evidence digests, and issued-evidence records from those values;
+  callers cannot inject a separately authored message envelope.
+- `parse_and_bind_role_artifact` duplicate-rejects JSON keys, validates closed role schemas and exact
+  primitive types without coercion, then canonicalizes accepted provider JSON for authenticated
+  persistence. Whitespace and key order are not incorrectly treated as semantic failures.
+- Investigator ranks/cardinality/evidence citations, author parent/hypothesis/policy scope and
+  structural-template caps, and critic complete ordered experiment/evidence batches are checked
+  against request authority. Artifact structure/cardinality/cap failures classify as
+  `response_schema`; unknown evidence or echoed identity disagreement classifies as
+  `evidence_binding`.
+- Tagged floats are represented as finite canonical round-tripping hexadecimal strings consistently
+  in both schema and parser. Decimal, tuple, enum, and null representations use existing exact V5
+  canonical primitives.
+
+## One-shot provider and durable lifecycle
+
+- `CompletionProvider.complete_once` accepts a neutral `ProviderCompletionRequestV5` and returns a
+  closed `CompletionResultV5`. Results include the exact returned model, authoritative nonnegative
+  Decimal USD cost, exact input/output tokens, provider request identity, response-received state,
+  and `external_attempt_count == 1`.
+- `OneShotJsonCompletionV5` and `GatewayCompletionProviderV5` form a truthful structural adapter
+  boundary. The adapter sends the authenticated schema bytes and explicitly requests zero automatic
+  retries and zero schema-repair calls. It does not claim compatibility with a nonexistent method on
+  the current V4 gateway.
+- `RoleAuthorizationLifecycleV5` defines durable reserve, slot verification, terminal settlement,
+  unreported-attempt reconciliation, recovery, and receipt verification. Slot and receipt values
+  authenticate the request, authorization, prior and cumulative attempts/tokens/USD, terminal
+  sequence, attempt facts, and settlement identity.
+- `AuthorizedRoleRunnerV5` reserves one distinct manifest-authorized primary/retry/repair slot,
+  verifies it, invokes the provider exactly once, parses through the shared binder, and verifies the
+  terminal receipt. Retries and repairs default to zero and can only use separately authorized
+  attempt kinds.
+- Model substitution, hidden/multiple external attempts, per-call or cumulative token/USD overage,
+  malformed or duplicate slot responses, and mismatched receipts fail typed. Any slot returned after
+  successful reserve is terminally settled or recovered; transport uncertainty uses the lifecycle's
+  reconciliation boundary and cannot silently abandon accounting authority.
+- Stable failures contain only closed role/code fields. Provider exception messages and types do not
+  enter stable identities. Neutral usage facts are recorded for success, schema/binding failure,
+  transport failure, and recovered outcomes.
+- `FixtureRoleRunnerV5` consumes deterministic local responses through the same parser/binder and
+  emits exact provider-free zero-call/zero-token/zero-cost facts.
+
+## Direct verification
+
+Deterministic local fakes exercised the requested boundary without external calls:
+
+1. `task7 hardened provider smoke: ok` covered valid investigator/author/critic artifacts;
+   duplicate/extra/coerced JSON; unknown evidence and echoed-binding disagreement; malformed ranks
+   and incomplete critic batches; whitespace/key-order canonicalization; sensitive-key/path/ticker
+   rejection; transport/schema/accounting outcomes; returned-model substitution; hidden attempts;
+   token/USD limits; explicit repair authorization; fixture zero usage; and gateway one-shot options.
+2. `task7 full-source smoke: ok` covered exact four-file full-source escape, incomplete source
+   rejection, and immutable schema-byte enforcement.
+3. `task7 lifecycle smoke: ok` covered malformed and duplicate reserved-slot terminal settlement,
+   duplicate reconciliation, and recovery after a post-commit settlement transport exception.
+4. The legacy authorization file's working bytes and Git object are identical to `HEAD`; its source
+   diff is empty. The proposed spoofable structural-owner change is absent.
+5. Fresh checks passed:
+   - `python -B -m py_compile core/pit_optimizer_v5/provider.py core/pit_optimizer_authorization.py`
+   - `python -B -m ruff check core/pit_optimizer_v5/provider.py core/pit_optimizer_authorization.py`
+   - export-integrity import check for every declared `provider.__all__` member
+   - forbidden-coupling search for `agent_loop`, OpenRouter, Docker, subprocess, filesystem, and Git
+     imports/usages
+   - `git diff --check`
+
+The available focused legacy test selection was also attempted. All selected cases stopped in the
+shared pre-target V2 fixture at `core/pit_optimization_contract.py:3698` with
+`ValueError: worst role section cannot reach its canonical cap`, before any provider or
+authorization assertion ran. This pre-existing stale-fixture failure was not changed outside Task 7
+scope. The planned `tests/test_pit_optimizer_v5_runtime.py` does not exist at this revision, and the
+user override forbids adding a substitute.
+
+## Deferred production composition
+
+Task 7 intentionally defines, but does not fabricate, a durable ledger implementation. Task 9 must
+compose `AuthorizedRoleRunnerV5` with a real ledger-backed `RoleAuthorizationLifecycleV5` and a
+truthful production implementation of `OneShotJsonCompletionV5`. That implementation must preserve
+reserve/settle/recover authentication and authoritative returned-model/token/USD/attempt facts. The
+current V4 gateway and its concrete authorization registry remain unchanged until that focused
+composition exists.
+
+## Security review correction
+
+The scoped review found that the original aggregate-only gate still accepted arbitrary nested
+mappings and depended on a blacklist. The provider boundary now fails closed structurally:
+
+- investigator archive-family and prior-critic context use frozen tagged aggregate records and only
+  reference the exact issued metric evidence;
+- author input is a typed hypothesis, typed V3 policy-contract authority, and an exact tuple of
+  validated `SourceFileV5` values;
+- critic input is an ordered complete batch of tagged evaluation-scenario, prediction, semantic
+  comparison, and typed-failure aggregate records;
+- all supplied `RoleEvidenceV5` items must use the closed provider metric namespace, every issued ID
+  must be referenced by the role-specific input, and no unreferenced payload can be added; and
+- explicit prose fields retain a defense-in-depth scanner for symbol-like tokens embedded in text,
+  common credential formats, concatenated sensitive names, and Windows/POSIX paths. Exact
+  policy-scope-authorized source text is the sole content-scanning exemption.
+
+`task7 closed aggregate security smoke: ok` covered valid investigator/author/critic construction,
+deterministic request identity, shared fixture parsing, initial empty archive/critic context,
+authorized source transmission, and representative existing aggregate metric IDs. It also rejected
+the former arbitrary mapping/payload surface, `{day, value}` rows, `mytickerdata`/`secretvalue`,
+unreferenced evidence, non-namespaced metrics, embedded ticker lists, password/token material,
+Windows/POSIX paths, and a mismatched critic experiment batch. No provider call or test-file change
+was made.
+
+## Ordered citation and parent-source correction
+
+The final scoped re-review identified two remaining request-authority gaps, now closed in
+`provider.py`:
+
+- Role citations no longer pass through sets. The controller defines one role-specific ordered
+  citation tuple: investigator evaluator evidence followed by archive-family and critic-direction
+  rows; author hypothesis citations; and critic evaluation-scenario evidence followed by semantic
+  and typed-failure evidence. That flattened tuple must be globally duplicate-free and equal the
+  issued `RoleEvidenceV5` tuple exactly, including order. Reuse across aggregate records or role
+  sections and reordered/extra/missing evidence now fail request construction.
+- `AuthorPolicyContractsV5` now carries the complete exact `PolicyRevisionIdentityV5` instead of
+  independently supplied interface/runtime/constraint digests. Every authorized `SourceFileV5`
+  path and exact UTF-8 SHA-256 must match the corresponding digest in the parent's canonical
+  four-file source map, and the request binding's `parent_revision_sha256` must equal the digest
+  derived from that full parent identity. A caller can no longer pair an opaque parent digest with
+  unrelated but syntactically valid source bytes.
+
+`task7 ordered citation and parent source binding smoke: ok` covered exact-order positive controls
+for all three roles, reordered investigator/author/critic evidence, cross-record investigator reuse,
+cross-section critic reuse, an authenticated source subset, exact four-file full-source escape, a
+valid one-byte source mutation rejected against the original identity, an unrelated binding digest,
+shared fixture parsing, embedded ticker and credential rejection, and the valid source-content
+scanner exemption. Fresh compile, Ruff, export, coupling, source-diff, and legacy-authorization
+checks passed without a provider call or test-file change.

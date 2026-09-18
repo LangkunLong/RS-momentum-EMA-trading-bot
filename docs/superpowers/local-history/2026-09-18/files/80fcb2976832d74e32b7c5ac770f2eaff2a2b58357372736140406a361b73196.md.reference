@@ -1,0 +1,33 @@
+# C-c preparation driver independent static review — freeze 01
+
+Specification verdict: **FAIL**. Quality verdict: **CHANGES REQUIRED**.
+
+Execution is not permitted for this freeze. Resolve I1 and M1 and retain the corrected bytes for a bounded re-review. This review concerns actual preparation only; a complete actual package will still require independent artifact/launch review and a separate fresh user paid grant.
+
+## Exact reviewed evidence
+
+- Driver: `prepare_c_c_campaign.py`, 48,796 bytes, SHA-256 `05a12300be6b9b1253c55cdfaff0b55005cb18a0fe520e31f95fe609093e9831`.
+- Implementation report: `implementation-report.md`, 5,980 bytes, SHA-256 `8dc9ea1f17c58be5e9bbae2575a2fb186055995e9d61fdbad39ad96a7ecf052b`.
+- Both live files matched their retained `review-freeze-01` copies. The driver and report hashes were independently checked.
+- Final source review `4e4991b0dfcdcfe980b2bd2655ba5bf88af6300c956c179d2e258014dd1fef4b`; 22-file source authority `d896bce97945b9438bed6f4837fd16213530338563e3bbd728eafaa8a9fbbe09`; principal readiness `14f385172f29dccf258d4be4802137724774e57b267ebbac4201a4945c01aed2`; independent readiness `50cd6d863fb3f6235af3a47fcf90fe4d21a5425c8852055b470abe9c95634f3a`.
+- Preparation tool evidence `c329ade7d4f50a705bd6992da477870f4d1e0c3e4862feffe0f855d7c3fb243d`; native launch notes `1ea2eabd612c94d3992f0485a9cc5ec387e4fd465e44fb1c48a97abbc06ef49c`.
+
+## Findings
+
+**I1 — Important: three native types are imported from a module that does not provide them.** At `prepare_c_c_campaign.py:532-543`, the `contracts` import requests `ExecutionProfileV5` (line 536), `PolicyRevisionIdentityV5` (line 537), and `SourceBundleV5` (line 541). Static inspection of `contracts.py` finds neither definitions nor reexports for these names. Their actual definitions are `core/backtest_fills.py:17`, `core/pit_optimizer_v5/candidate_ir.py:904`, and `core/pit_optimizer_v5/candidate_ir.py:1013`, respectively. The existing native manifest module uses those defining modules at `manifest.py:20-22`. Consequently, an invocation that reaches this import fails before creating the fresh roots; the intended native preparation cannot run. Move these three imports to their defining modules. AST parsing, compilation, and linting do not establish imported-name availability. A bounded static check of every other project import in this driver found each requested top-level binding present; necessary downstream native signatures and supplied keywords were also checked without executing imports.
+
+**M1 — Minor: the final execution record incorrectly claims that no environment values were read.** `prepare_c_c_campaign.py:1017` emits `credentials_or_environment_values_read: false`. The legitimate native path reads ambient environment internally: `LocalContainerExecutorV5.__init__` at `production_sandbox.py:1696-1702` captures six present control variables and includes the environment in native identity construction; `capture_development_policy_v5` at `development_preparation.py:349-393` supplies `_sanitized_git_environment_v5()` to fixed read-only Git commands, and `manifest.py:253-268` constructs that environment from ambient entries. This contradicts the combined field even though no environment values are published in the preparation packet. Replace the combined assertion with accurate separate claims: credential resolution remains absent, environment values are not published, and native internal environment handling occurs. Preserve the native behavior and digest-only evidence; do not add environment or credential dumps. The native gateway construction remains lazy, and the reviewed path does not invoke credential resolution.
+
+## Other bounded conclusions
+
+The gate and preflight ordering authenticates fixed reviews, selected caller hashes, all 22 source files, tool bytes, inputs, and destination absence before project imports and destination writes. Fixed fresh roots are constrained within the authorized repository, disjoint from mounted source and from one another. Writes are create-only; the driver contains no deletion, historical enrollment, migration, runtime launch, provider/evaluation call, or Docker execution.
+
+The fixed import inventory comprises 14 existing dependency files and nine exact parent-provenance files, with native typed/panel authentication and exact raw-byte preservation. The preparation path captures the real immutable policy snapshot, builds the native manifest directly, prepares a fresh native owner/config, and creates only the immutable prepared admission policy. It does not copy old mutable launch, role, ledger, reservation, checkpoint, or result state.
+
+The actual initial empty projection is derived only after fresh repository creation, using native composition, reducer, baseline authority, parent selection, and investigator-request construction. Preview bytes are written outside operational role/state namespaces; pure envelope and prospective accounting checks inspect the real request. Repository hashes bracket preview construction and command rendering. Native adapter constructors were traced only as necessary to distinguish identity construction from operational invocation; no provider, evaluator, or Docker operation is reachable through the inspected preparation calls.
+
+The fixed caps, target, evaluator/data/panel/parent authority, model identifier, disabled semantics, and absent dollar ceiling are represented in native manifest/policy inputs and the output packet. The rendered native `run-campaign` command pins the prepared policy and physical interpreter; command rendering does not launch it. Source hashes and the original graph are rechecked before evidence output. Later response-dependent request bytes, enrolled admission, and paid execution remain unexecuted and unknown.
+
+## Review limits
+
+This was source-only inspection of the frozen driver, retained evidence, AST/import bindings, hashes, and necessary native call paths. The implementer's reported lint/compile results were read as static evidence; they do not demonstrate execution. No tests were read, created, modified, or run. No driver or project module was imported or executed; no synthetic probe, native reader invocation, summary, Git command, Docker/provider/evaluation/campaign operation, credential/environment-value access, or archive mutation was performed. The prior source review remains frozen and was not broadly repeated.

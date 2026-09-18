@@ -1,0 +1,882 @@
+# Review package: 250cbc0..adcda5f
+
+## Commits
+adcda5f Propagate PIT optimizer execution limits
+
+## Files changed
+ agent_loop.py | 253 +++++++++++++++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 225 insertions(+), 28 deletions(-)
+
+## Diff
+diff --git a/agent_loop.py b/agent_loop.py
+index a56b6d6..bf1fbe5 100644
+--- a/agent_loop.py
++++ b/agent_loop.py
+@@ -7244,43 +7244,70 @@ class PolicyWorkerSession:
+ 
+     def __init__(
+         self,
+         *,
+         process: Any,
+         package_root: Path,
+         daemon: _OwnedPolicyDaemon,
+         bootstrap: object,
+         method_timeout_seconds: float,
+         fold_timeout_seconds: float,
++        output_limit_bytes: int | None = None,
++        wall_deadline: float | None = None,
++        monotonic: Callable[[], float] | None = None,
+     ) -> None:
+         from core.strategy_policy.worker import (
+             DecisionDeterminismGuard,
+             initial_chain_sha256,
+         )
+ 
+         if process.stdin is None or process.stdout is None or process.stderr is None:
+             raise SandboxError("policy worker stdio is incomplete")
++        if (
++            not math.isfinite(fold_timeout_seconds)
++            or fold_timeout_seconds <= 0
++            or (monotonic is not None and not callable(monotonic))
++        ):
++            raise SandboxError("policy worker session timeout is invalid")
++        if output_limit_bytes is not None and (
++            type(output_limit_bytes) is not int
++            or not 1 <= output_limit_bytes <= 4 * 1024 * 1024
++        ):
++            raise SandboxError("policy worker session output limit is invalid")
++        if wall_deadline is not None and (
++            type(wall_deadline) not in {int, float}
++            or not math.isfinite(float(wall_deadline))
++        ):
++            raise SandboxError("policy worker session wall deadline is invalid")
+         self._process = process
+         self.package_root = package_root
+         self._daemon = daemon
+         self._bootstrap = bootstrap
+         self._method_timeout_seconds = method_timeout_seconds
+-        self._fold_timeout_seconds = fold_timeout_seconds
+-        self._started_at = time.monotonic()
++        self._fold_timeout_seconds = float(fold_timeout_seconds)
++        self._output_limit_bytes = output_limit_bytes
++        self._wall_deadline = (
++            None if wall_deadline is None else float(wall_deadline)
++        )
++        self._monotonic = time.monotonic if monotonic is None else monotonic
++        self._started_at = float(self._monotonic())
+         self._sequence = 1
+         self._previous_hmac = initial_chain_sha256(bootstrap)
+         self._guard = DecisionDeterminismGuard()
+         self._closed = False
+         self._lock = threading.Lock()
+         self._stdout_values: queue.Queue[bytes | BaseException | None] = queue.Queue()
+         self._stderr = bytearray()
+         self._stderr_sha256 = hashlib.sha256()
++        self._stdout_bytes = 0
++        self._stderr_bytes = 0
++        self._output_limit_exceeded = threading.Event()
+         self._stdout_thread = threading.Thread(
+             target=self._read_stdout,
+             name="pit-policy-stdout",
+             daemon=True,
+         )
+         self._stderr_thread = threading.Thread(
+             target=self._read_stderr,
+             name="pit-policy-stderr",
+             daemon=True,
+         )
+@@ -7291,69 +7318,106 @@ class PolicyWorkerSession:
+     def stderr_bytes(self) -> bytes:
+         return bytes(self._stderr)
+ 
+     def _read_stdout(self) -> None:
+         try:
+             while True:
+                 raw = self._process.stdout.readline(16 * 1024 + 2)
+                 if not raw:
+                     self._stdout_values.put(None)
+                     return
++                self._stdout_bytes += len(raw)
++                if (
++                    self._output_limit_bytes is not None
++                    and self._stdout_bytes > self._output_limit_bytes
++                ):
++                    self._output_limit_exceeded.set()
++                    self._stdout_values.put(
++                        SandboxError("policy worker stdout output limit exceeded")
++                    )
++                    return
+                 self._stdout_values.put(raw)
+         except BaseException as exc:
+             self._stdout_values.put(exc)
+ 
+     def _read_stderr(self) -> None:
+         try:
+             while True:
+                 raw = self._process.stderr.read(4096)
+                 if not raw:
+                     return
+                 self._stderr_sha256.update(raw)
+-                remaining = 64 * 1024 - len(self._stderr)
++                self._stderr_bytes += len(raw)
++                if (
++                    self._output_limit_bytes is not None
++                    and self._stderr_bytes > self._output_limit_bytes
++                ):
++                    self._output_limit_exceeded.set()
++                    self._stdout_values.put(
++                        SandboxError("policy worker stderr output limit exceeded")
++                    )
++                    return
++                capture_limit = min(
++                    64 * 1024,
++                    self._output_limit_bytes or 64 * 1024,
++                )
++                remaining = capture_limit - len(self._stderr)
+                 if remaining > 0:
+                     self._stderr.extend(raw[:remaining])
+         except (OSError, ValueError, queue.Empty):
+             return
+ 
+     def call(self, method: str, snapshot: object) -> object:
+         from core.strategy_policy.worker import (
+             decode_policy_response,
+             encode_policy_request,
+         )
+ 
+         with self._lock:
+             if self._closed:
+                 raise RuntimeError("policy worker session is closed")
++            if self._output_limit_exceeded.is_set():
++                output_error = SandboxError("policy worker output limit exceeded")
++                self.close(primary_error=output_error)
++                raise output_error
++            observed_at = float(self._monotonic())
+             remaining_fold = self._fold_timeout_seconds - (
+-                time.monotonic() - self._started_at
++                observed_at - self._started_at
++            )
++            remaining_wall = (
++                remaining_fold
++                if self._wall_deadline is None
++                else self._wall_deadline - observed_at
+             )
+-            if remaining_fold <= 0:
+-                timeout_error = TimeoutError("policy worker fold timeout")
++            remaining = min(remaining_fold, remaining_wall)
++            if remaining <= 0:
++                timeout_error = TimeoutError("policy worker execution deadline")
+                 self.close(primary_error=timeout_error)
+                 raise timeout_error
+             request_line, request = encode_policy_request(
+                 bootstrap=self._bootstrap,
+                 sequence=self._sequence,
+                 previous_hmac_sha256=self._previous_hmac,
+                 method=method,
+                 snapshot=snapshot,
+             )
+             try:
+                 self._process.stdin.write(request_line.encode("utf-8") + b"\n")
+                 self._process.stdin.flush()
+                 try:
+                     result = self._stdout_values.get(
+-                        timeout=min(self._method_timeout_seconds, remaining_fold)
++                        timeout=min(self._method_timeout_seconds, remaining)
+                     )
+                 except queue.Empty as exc:
+                     raise TimeoutError("policy worker method timeout") from exc
++                if self._output_limit_exceeded.is_set():
++                    raise SandboxError("policy worker output limit exceeded")
+                 if result is None:
+                     raise RuntimeError("policy worker closed before a response")
+                 if isinstance(result, BaseException):
+                     raise RuntimeError("policy worker output failed") from result
+                 if len(result) > 16 * 1024 + 1:
+                     raise ValueError("policy worker response line limit exceeded")
+                 try:
+                     response_line = result.decode("utf-8", errors="strict")
+                 except UnicodeDecodeError as exc:
+                     raise ValueError("policy worker response is not UTF-8") from exc
+@@ -7458,29 +7522,51 @@ class PolicyWorkerRunner:
+     def __init__(
+         self,
+         *,
+         image: str,
+         engine: DockerCapability | None = None,
+         injected_engine_path: Path | None = None,
+         process_factory: Callable[..., Any] = subprocess.Popen,
+         control_runner: ProcessRunner = _bounded_process,
+         temp_parent: Path | None = None,
+         method_timeout_seconds: float = 1.0,
++        fold_timeout_seconds: float = 900.0,
++        output_limit_bytes: int | None = None,
++        wall_deadline: float | None = None,
++        monotonic: Callable[[], float] | None = None,
+     ) -> None:
+         if re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", image or "") is None:
+             raise SandboxError("policy worker image must be digest pinned")
+         if (
+             not math.isfinite(method_timeout_seconds)
+             or method_timeout_seconds <= 0
+             or method_timeout_seconds > 1.0
+         ):
+             raise SandboxError("policy worker method timeout is invalid")
++        if (
++            not math.isfinite(fold_timeout_seconds)
++            or fold_timeout_seconds <= 0
++            or fold_timeout_seconds > MAX_CHILD_TIMEOUT_SECONDS
++        ):
++            raise SandboxError("policy worker fold timeout is invalid")
++        if output_limit_bytes is not None and (
++            type(output_limit_bytes) is not int
++            or not 1 <= output_limit_bytes <= 4 * 1024 * 1024
++        ):
++            raise SandboxError("policy worker output limit is invalid")
++        if wall_deadline is not None and (
++            type(wall_deadline) not in {int, float}
++            or not math.isfinite(float(wall_deadline))
++        ):
++            raise SandboxError("policy worker wall deadline is invalid")
++        if monotonic is not None and not callable(monotonic):
++            raise SandboxError("policy worker monotonic clock is invalid")
+         self.image = image
+         self._process_factory = process_factory
+         self._control_runner = control_runner
+         self._engine_capability = engine
+         if process_factory is subprocess.Popen:
+             if (
+                 engine is None
+                 or injected_engine_path is not None
+                 or control_runner is not _bounded_process
+             ):
+@@ -7496,32 +7582,49 @@ class PolicyWorkerRunner:
+                 or not injected_engine_path.is_absolute()
+                 or injected_engine_path.name.casefold() not in {"docker", "docker.exe"}
+             ):
+                 raise SandboxError("injected policy worker requires a Docker-shaped endpoint")
+             self.engine_path = injected_engine_path
+         parent = temp_parent or Path(tempfile.gettempdir())
+         if not isinstance(parent, Path) or not parent.is_absolute() or not parent.is_dir():
+             raise SandboxError("policy worker temporary parent is invalid")
+         self.temp_parent = parent.resolve()
+         self.method_timeout_seconds = float(method_timeout_seconds)
+-        self.fold_timeout_seconds = 900.0
++        self.fold_timeout_seconds = float(fold_timeout_seconds)
++        self.output_limit_bytes = (
++            64 * 1024 if output_limit_bytes is None else output_limit_bytes
++        )
++        self._session_output_limit_bytes = output_limit_bytes
++        self.wall_deadline = (
++            None if wall_deadline is None else float(wall_deadline)
++        )
++        self._monotonic = time.monotonic if monotonic is None else monotonic
++
++    def _bounded_control_timeout(self) -> float:
++        timeout = min(10.0, self.fold_timeout_seconds)
++        if self.wall_deadline is not None:
++            remaining = self.wall_deadline - float(self._monotonic())
++            if remaining <= 0:
++                raise TimeoutError("policy worker wall deadline")
++            timeout = min(timeout, remaining)
++        return timeout
+ 
+     def _control(
+         self,
+         environment: Mapping[str, str],
+         *args: str,
+     ) -> ProcessResult:
+         result = self._control_runner(
+             (str(self.engine_path), *args),
+             env=environment,
+-            timeout=10.0,
+-            output_limit=64 * 1024,
++            timeout=self._bounded_control_timeout(),
++            output_limit=min(64 * 1024, self.output_limit_bytes),
+         )
+         if (
+             not isinstance(result, ProcessResult)
+             or result.timed_out
+             or result.returncode != 0
+         ):
+             raise SandboxError("policy daemon control command failed")
+         return result
+ 
+     def _inspect_owned_daemon(
+@@ -7705,20 +7808,21 @@ class PolicyWorkerRunner:
+         self,
+         *,
+         candidate_root: Path,
+         interface_version: int,
+         fold_run_id: str,
+     ) -> PolicyWorkerSession:
+         from core.strategy_policy.worker import WorkerBootstrap
+ 
+         if re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", fold_run_id or "") is None:
+             raise SandboxError("policy worker fold run ID is invalid")
++        self._bounded_control_timeout()
+         package_root = self._make_package(candidate_root, interface_version)
+         temporary_root = package_root.parent
+         process: Any | None = None
+         session: PolicyWorkerSession | None = None
+         daemon: _OwnedPolicyDaemon | None = None
+         try:
+             if "," in str(package_root):
+                 raise SandboxError("policy worker package path is not mount-safe")
+             if self._process_factory is subprocess.Popen:
+                 assert self._engine_capability is not None
+@@ -7813,22 +7917,22 @@ class PolicyWorkerRunner:
+                                 ),
+                             ),
+                         )
+                 return tentative
+ 
+             create_error: BaseException | None = None
+             try:
+                 created = self._control_runner(
+                     create_argv,
+                     env=environment,
+-                    timeout=10.0,
+-                    output_limit=64 * 1024,
++                    timeout=self._bounded_control_timeout(),
++                    output_limit=min(64 * 1024, self.output_limit_bytes),
+                 )
+             except BaseException as exc:
+                 create_error = exc
+                 created = None
+             if create_error is None and (
+                 not isinstance(created, ProcessResult)
+                 or created.timed_out
+                 or created.returncode != 0
+             ):
+                 create_error = SandboxError("policy daemon creation failed")
+@@ -7876,20 +7980,23 @@ class PolicyWorkerRunner:
+                 env=environment,
+             )
+             bootstrap = WorkerBootstrap.create(interface_version=interface_version)
+             session = PolicyWorkerSession(
+                 process=process,
+                 package_root=package_root,
+                 daemon=daemon,
+                 bootstrap=bootstrap,
+                 method_timeout_seconds=self.method_timeout_seconds,
+                 fold_timeout_seconds=self.fold_timeout_seconds,
++                output_limit_bytes=self._session_output_limit_bytes,
++                wall_deadline=self.wall_deadline,
++                monotonic=self._monotonic,
+             )
+             try:
+                 process.stdin.write(bootstrap.to_json().encode("utf-8") + b"\n")
+                 process.stdin.flush()
+             except BaseException as exc:
+                 session.close(primary_error=exc)
+                 raise
+             return session
+         except BaseException as primary_error:
+             cleanup_errors: list[_PolicySecondaryFailure] = []
+@@ -18645,24 +18752,23 @@ def _preauthorize_pit_optimizer_v3_live_run(
+     services = build_services(readiness, pricing, lease)
+     return PitOptimizerLiveRun(
+         readiness=readiness,
+         optimizer_services=services,
+     )
+ 
+ 
+ def _build_pit_optimizer_v3_live_run(
+     config: PitOptimizerGateConfig,
+     *,
++    limits: PitOptimizerLoopLimits,
+     source_state: SourceState,
+     git_capability: GitCapability,
+-    api_timeout_seconds: float,
+-    wall_timeout_seconds: float,
+     gateway_factory: Callable[..., OpenRouterGateway] | None = None,
+     worker_runner_factory: Callable[..., object] | None = None,
+     evaluator_data_factory: Callable[..., _PitOptimizerEvaluatorData] | None = None,
+ ) -> PitOptimizerLiveRun:
+     """Compose the production schema-v3 services behind opaque capabilities."""
+     from core.backtest_engine import PortfolioSimulator
+     from core.pit_data import PITDataBundle
+     from core.pit_optimization import (
+         _build_verification_scope,
+         load_pit_optimizer_v3_readiness,
+@@ -18707,20 +18813,34 @@ def _build_pit_optimizer_v3_live_run(
+         raise ConfigurationError("PIT optimizer source capability is invalid")
+     if any(
+         factory is not None and not callable(factory)
+         for factory in (
+             gateway_factory,
+             worker_runner_factory,
+             evaluator_data_factory,
+         )
+     ):
+         raise ConfigurationError("PIT optimizer external boundary factory is invalid")
++    if (
++        not isinstance(limits, PitOptimizerLoopLimits)
++        or (
++            limits.max_api_calls,
++            limits.max_tokens,
++            limits.max_iterations,
++        )
++        != (
++            config.max_api_calls,
++            config.max_tokens,
++            config.max_iterations,
++        )
++    ):
++        raise ConfigurationError("PIT optimizer execution limits differ")
+     readiness = load_pit_optimizer_v3_readiness(config)
+     manifest = readiness.manifest
+     runtime_root = config.permanent_runtime_root
+     artifact_root = config.artifact_root
+     docker_executable = config.docker_executable
+     sandbox_image = config.sandbox_image
+     if (
+         runtime_root is None
+         or artifact_root is None
+         or docker_executable is None
+@@ -18730,31 +18850,37 @@ def _build_pit_optimizer_v3_live_run(
+     ):
+         raise ConfigurationError("PIT optimizer execution context is absent")
+ 
+     def production_worker_runner_factory(
+         *,
+         image: str,
+         docker_executable: Path,
+         source_root: Path,
+         controller_temp_parent: Path,
+         permanent_runtime_root: Path,
++        child_timeout_seconds: float,
++        output_limit_bytes: int,
++        wall_deadline: float,
+     ) -> object:
+         docker = configure_docker_executable(
+             docker_executable,
+             source_root=source_root,
+             controller_root=controller_temp_parent,
+             permanent_runtime_root=permanent_runtime_root,
+         )
+         return PolicyWorkerRunner(
+             image=image,
+             engine=docker,
+             temp_parent=controller_temp_parent,
++            fold_timeout_seconds=child_timeout_seconds,
++            output_limit_bytes=output_limit_bytes,
++            wall_deadline=wall_deadline,
+         )
+ 
+     def production_evaluator_data_factory(
+         *,
+         pit_bundle: Path,
+         pit_bundle_sha256: str,
+         baseline_run: Path,
+     ) -> _PitOptimizerEvaluatorData:
+         with PITDataBundle(
+             pit_bundle,
+@@ -18856,29 +18982,36 @@ def _build_pit_optimizer_v3_live_run(
+     )
+     audit = AuditTrail(
+         artifact_root,
+         manifest.run_id,
+         known_secrets=known_secrets,
+     )
+     build_gateway = gateway_factory or OpenRouterGateway
+     gateway = build_gateway(
+         run_id=manifest.run_id,
+         pit_optimizer_ledger=budget,
+-        timeout_seconds=api_timeout_seconds,
++        timeout_seconds=limits.api_timeout_seconds,
+         max_attempts=1,
+         controller_root=config.source_root,
+         authorization_ledger=authorization,
+         audit_trail=audit,
+     )
+     if not isinstance(gateway, OpenRouterGateway):
+         raise ConfigurationError("PIT optimizer gateway capability is invalid")
+-    deadline = time.monotonic() + wall_timeout_seconds
++    deadline = time.monotonic() + limits.wall_timeout_seconds
++
++    def require_evaluator_wall_time() -> float:
++        remaining = _remaining_wall_seconds(deadline, time.monotonic)
++        if remaining <= 0:
++            raise BudgetExceededError("PIT optimizer evaluator wall deadline reached")
++        return remaining
++
+     validation_ledger = ValidationLedger(
+         runtime_root / manifest.validation_ledger_name
+     )
+     store = IncrementalArtifactStore(audit.run_root)
+     worker_box: dict[str, object] = {}
+     evaluator_box: dict[str, _PitOptimizerEvaluatorData] = {}
+     incumbent_folds = list(readiness.baseline_discovery.folds)
+     evidence_sha256s: dict[tuple[str, str], str] = {}
+     worker_sequence = 0
+     source_closed = False
+@@ -18909,49 +19042,56 @@ def _build_pit_optimizer_v3_live_run(
+             raise ConfigurationError("PIT optimizer authority graph differs")
+         authorization.authenticate_window(
+             window_id=config.authorization_window_id,
+             authorization_requirement_sha256=(
+                 config.authorization_requirement_sha256
+             ),
+         )
+         build_evaluator = (
+             evaluator_data_factory or production_evaluator_data_factory
+         )
++        require_evaluator_wall_time()
+         evaluator = build_evaluator(
+             pit_bundle=config.pit_bundle,
+             pit_bundle_sha256=config.pit_bundle_sha256,
+             baseline_run=config.baseline_run,
+         )
++        require_evaluator_wall_time()
+         if not isinstance(evaluator, _PitOptimizerEvaluatorData):
+             raise ConfigurationError("PIT optimizer evaluator capability is invalid")
+         universe_sha256 = hashlib.sha256(
+             _canonical_json_bytes(list(evaluator.universe)) + b"\n"
+         ).hexdigest()
+         if universe_sha256 != manifest.fold_manifest.universe_sha256:
+             raise ConfigurationError("PIT optimizer universe identity differs")
+         for relative, expected_sha256 in manifest.policy_source_sha256s:
+             path = config.source_root / relative
+             if (
+                 path.is_symlink()
+                 or not path.is_file()
+                 or hashlib.sha256(path.read_bytes()).hexdigest()
+                 != expected_sha256
+             ):
+                 raise ConfigurationError("PIT optimizer policy source differs")
+         build_worker = worker_runner_factory or production_worker_runner_factory
++        require_evaluator_wall_time()
+         worker_box["runner"] = build_worker(
+             image=sandbox_image,
+             docker_executable=docker_executable,
+             source_root=config.source_root,
+             controller_temp_parent=config.controller_temp_parent,
+             permanent_runtime_root=runtime_root,
++            child_timeout_seconds=limits.child_timeout_seconds,
++            output_limit_bytes=limits.output_limit_bytes,
++            wall_deadline=deadline,
+         )
++        require_evaluator_wall_time()
+         evaluator_box["data"] = evaluator
+         worker_sequence = 0
+ 
+     def freeze_pricing(model: str) -> OptimizerPricingSnapshot:
+         return gateway.freeze_pit_optimizer_pricing(
+             model=model,
+             wall_deadline=deadline,
+             monotonic=time.monotonic,
+         )
+ 
+@@ -19119,28 +19259,30 @@ def _build_pit_optimizer_v3_live_run(
+             validate_capability=validate_capability,
+             dispose_capability=dispose_capability,
+         )
+ 
+         def evaluate_fold(
+             candidate_root: Path,
+             fold: object,
+             identity_sha256: str,
+         ) -> object:
+             nonlocal worker_sequence
++            require_evaluator_wall_time()
+             worker_sequence += 1
+             fold_id = str(fold.fold_id)
+             evidence = evaluator.evaluate_candidate(
+                 candidate_root,
+                 fold,
+                 runner,
+                 f"{fold_id}-{worker_sequence:02d}",
+             )
++            require_evaluator_wall_time()
+             if (
+                 not isinstance(evidence, ParityFoldEvidence)
+                 or evidence.fold_id != fold_id
+                 or evidence.effective_policy_sha256
+                 != manifest.effective_policy_sha256
+             ):
+                 raise CandidateMutationError(
+                     "candidate evaluator evidence identity differs"
+                 )
+             evidence_sha256s[(identity_sha256, fold_id)] = evidence.evidence_sha256
+@@ -19244,21 +19386,23 @@ def _build_pit_optimizer_v3_live_run(
+                 ValidationExposureMetadata(
+                     run_id=manifest.run_id,
+                     source_head=manifest.source_head,
+                     baseline_policy_sha256=manifest.effective_policy_sha256,
+                     candidate_identity_sha256=identity.identity_sha256,
+                     exposure_kind="hidden_validation",
+                 ),
+             )
+ 
+         def baseline_hidden_evidence(fold: object) -> object:
++            require_evaluator_wall_time()
+             evidence = evaluator.evaluate_baseline(fold)
++            require_evaluator_wall_time()
+             if (
+                 not isinstance(evidence, ParityFoldEvidence)
+                 or evidence.fold_id != str(fold.fold_id)
+                 or evidence.effective_policy_sha256
+                 != manifest.effective_policy_sha256
+             ):
+                 raise CandidateMutationError(
+                     "baseline hidden evidence identity differs"
+                 )
+             return evidence
+@@ -19483,31 +19627,49 @@ def _build_pit_optimizer_v3_live_run(
+                     opened_lease[0],
+                     terminal_code="failed",
+                 )
+             except BaseException:
+                 pass
+         raise
+ 
+ 
+ def _dispatch_pit_optimizer_v3(
+     config: PitOptimizerGateConfig,
++    limits: PitOptimizerLoopLimits,
+     *,
+     prepare: Callable[[PitOptimizerGateConfig], PitOptimizerReadiness],
+-    build_live_services: Callable[[PitOptimizerGateConfig], PitOptimizerLiveRun],
++    build_live_services: Callable[
++        [PitOptimizerGateConfig, PitOptimizerLoopLimits],
++        PitOptimizerLiveRun,
++    ],
+ ) -> PitOptimizerReadiness | PitOptimizerResult:
+     """Dispatch preparation before any live service can be constructed."""
+     config.validate()
++    if (
++        not isinstance(limits, PitOptimizerLoopLimits)
++        or (
++            limits.max_api_calls,
++            limits.max_tokens,
++            limits.max_iterations,
++        )
++        != (
++            config.max_api_calls,
++            config.max_tokens,
++            config.max_iterations,
++        )
++    ):
++        raise ConfigurationError("PIT optimizer execution limits differ")
+     if config.phase == "prepare":
+         return prepare(config)
+     if config.phase != "canary":
+         raise ConfigurationError("unknown PIT optimizer phase")
+-    live = build_live_services(config)
++    live = build_live_services(config, limits)
+     if not isinstance(live, PitOptimizerLiveRun):
+         raise ConfigurationError("PIT optimizer live services are invalid")
+     from core.pit_optimization import run_pit_optimizer_v3
+ 
+     return run_pit_optimizer_v3(
+         readiness=live.readiness,
+         services=live.optimizer_services,
+     )
+ 
+ 
+@@ -20086,20 +20248,24 @@ def _execute_cli_run(
+             prepare_pit_optimization,
+             run_pit_optimization_canary,
+             verify_sealed_baseline_artifacts,
+         )
+         from core.pit_optimization_contract import PitOptimizerGateConfig
+         from core.pit_optimizer_controller import (
+             PitOptimizerReadiness,
+             PitOptimizerResult,
+         )
+         if isinstance(config.gate, PitOptimizerGateConfig):
++            if not isinstance(config.limits, PitOptimizerLoopLimits):
++                raise ConfigurationError(
++                    "PIT optimizer execution limits are invalid"
++                )
+             if state.fingerprint is None:
+                 raise ConfigurationError("preflight source fingerprint is absent")
+ 
+             def v3_source_identity(root: Path) -> tuple[str, str]:
+                 return _pit_optimizer_source_identity(root, git_capability)
+ 
+             def prepare_v3(
+                 gate: PitOptimizerGateConfig,
+             ) -> PitOptimizerReadiness:
+                 nonlocal stage
+@@ -20119,33 +20285,34 @@ def _execute_cli_run(
+                     source_root=config.source_root,
+                     artifact_root=config.artifact_root,
+                     permanent_runtime_root=config.permanent_runtime_root,
+                     source_head=manifest_source_head,
+                     source_fingerprint_sha256=manifest_source_fingerprint,
+                     source_identity=v3_source_identity,
+                 )
+ 
+             def build_v3(
+                 gate: PitOptimizerGateConfig,
++                limits: PitOptimizerLoopLimits,
+             ) -> PitOptimizerLiveRun:
+                 nonlocal stage
+                 stage = "pit_optimizer_canary"
+                 return _build_pit_optimizer_v3_live_run(
+                     gate,
++                    limits=limits,
+                     source_state=state,
+                     git_capability=git_capability,
+-                    api_timeout_seconds=config.limits.api_timeout_seconds,
+-                    wall_timeout_seconds=config.limits.wall_timeout_seconds,
+                 )
+ 
+             v3_result = _dispatch_pit_optimizer_v3(
+                 config.gate,
++                config.limits,
+                 prepare=prepare_v3,
+                 build_live_services=build_v3,
+             )
+             if isinstance(v3_result, PitOptimizerReadiness):
+                 if recheck_source_unchanged(state).source_modified:
+                     raise CandidateMutationError(
+                         "source changed during PIT optimizer readiness publication"
+                     )
+             elif not isinstance(v3_result, PitOptimizerResult):
+                 raise ConfigurationError("PIT optimizer returned an invalid result")
+@@ -20853,32 +21020,57 @@ def _pit_optimizer_v3_summary(
+         "incumbent": incumbent,
+         "hidden_validation_opened": result.hidden_validation_opened,
+         "long_replay_eligible": result.long_replay_eligible,
+         "budget": asdict(result.budget),
+         "artifact_root": str(result.artifact_root),
+         "source_modified": result.source_modified,
+         "cleanup_complete": result.cleanup_complete,
+     }
+ 
+ 
++def _pit_optimizer_v3_execution_limit_args(
++    limits: PitOptimizerLoopLimits,
++) -> tuple[str, ...]:
++    if not isinstance(limits, PitOptimizerLoopLimits):
++        raise ConfigurationError("PIT optimizer execution limits are invalid")
++    return (
++        "--max-api-calls",
++        str(limits.max_api_calls),
++        "--max-tokens",
++        str(limits.max_tokens),
++        "--max-iterations",
++        str(limits.max_iterations),
++        "--api-timeout-seconds",
++        str(limits.api_timeout_seconds),
++        "--child-timeout-seconds",
++        str(limits.child_timeout_seconds),
++        "--wall-timeout-seconds",
++        str(limits.wall_timeout_seconds),
++        "--output-limit-bytes",
++        str(limits.output_limit_bytes),
++    )
++
++
+ def _pit_optimizer_v3_prepare_lines(
+     config: PitOptimizerGateConfig,
+     readiness: PitOptimizerReadiness,
++    limits: PitOptimizerLoopLimits,
+ ) -> tuple[str, str]:
+     """Render the authenticated readiness record and inert canary command."""
+     from core.pit_optimization_contract import PitOptimizerGateConfig
+     from core.pit_optimizer_controller import PitOptimizerReadiness
+ 
+     if (
+         not isinstance(config, PitOptimizerGateConfig)
+         or config.phase != "prepare"
+         or not isinstance(readiness, PitOptimizerReadiness)
++        or not isinstance(limits, PitOptimizerLoopLimits)
+         or readiness.manifest_sha256 != config.optimizer_manifest_sha256
+     ):
+         raise ConfigurationError(
+             "prepare output requires authenticated schema-v3 readiness"
+         )
+     config.validate()
+     context = (
+         config.source_root,
+         config.permanent_runtime_root,
+         config.git_executable,
+@@ -20906,20 +21098,23 @@ def _pit_optimizer_v3_prepare_lines(
+         != hashlib.sha256(supplied_readiness.read_bytes()).hexdigest()
+     ):
+         raise ConfigurationError(
+             "prepare output requires authenticated schema-v3 readiness"
+         )
+     authorization = manifest.authorization_requirement
+     if (
+         config.max_api_calls != 6
+         or config.max_tokens != 448_000
+         or config.max_iterations != 2
++        or limits.max_api_calls != config.max_api_calls
++        or limits.max_tokens != config.max_tokens
++        or limits.max_iterations != config.max_iterations
+         or config.apply is not False
+     ):
+         raise ConfigurationError("PIT optimizer prepare ceilings are invalid")
+     argv = (
+         sys.executable,
+         "-B",
+         str((config.source_root / "agent_loop.py").resolve()),  # type: ignore[operator]
+         "--repo-root",
+         str(config.source_root),
+         "--permanent-runtime-root",
+@@ -20956,26 +21151,21 @@ def _pit_optimizer_v3_prepare_lines(
+         str(config.verified_parity_artifact),
+         "--verified-parity-sha256",
+         config.verified_parity_sha256,
+         "--readiness-sha256",
+         readiness.readiness_sha256,
+         "--optimizer-authorization-window-id",
+         authorization.window_id,
+         "--optimizer-authorization-requirement-sha256",
+         authorization.sha256,
+         "--authorize-policy-source-transmission",
+-        "--max-api-calls",
+-        "6",
+-        "--max-tokens",
+-        "448000",
+-        "--max-iterations",
+-        "2",
++        *_pit_optimizer_v3_execution_limit_args(limits),
+     )
+     command = subprocess.list2cmdline(argv)
+     ready = {
+         "schema_version": 3,
+         "phase": "ready",
+         "run_id": manifest.run_id,
+         "readiness_artifact": str(readiness.artifact_path),
+         "canary_command": command,
+     }
+     return (
+@@ -21172,23 +21362,30 @@ def main(argv: Sequence[str] | None = None) -> int:
+     except ControllerInitializationError as exc:
+         print(f"agent loop initialization failed: {exc.stage}", file=sys.stderr)
+         return 22
+     except Exception:
+         print("agent loop initialization failed", file=sys.stderr)
+         return 22
+     if isinstance(result, PitOptimizationLoopResult):
+         for line in result.operator_lines:
+             print(line)
+     if isinstance(result, PitOptimizerReadiness):
+-        if not isinstance(config.gate, PitOptimizerGateConfig):
++        if (
++            not isinstance(config.gate, PitOptimizerGateConfig)
++            or not isinstance(config.limits, PitOptimizerLoopLimits)
++        ):
+             raise ConfigurationError("PIT optimizer readiness gate is invalid")
+-        for line in _pit_optimizer_v3_prepare_lines(config.gate, result):
++        for line in _pit_optimizer_v3_prepare_lines(
++            config.gate,
++            result,
++            config.limits,
++        ):
+             print(line)
+     print(
+         "AGENT_LOOP_SUMMARY="
+         + json.dumps(
+             summary,
+             sort_keys=True,
+             separators=(",", ":"),
+             ensure_ascii=False,
+             allow_nan=False,
+         )

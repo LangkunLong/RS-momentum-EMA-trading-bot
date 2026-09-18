@@ -1,0 +1,13 @@
+# P1 preimage report
+
+Captured before P1 source creation on 2026-09-08.
+
+- `core/pit_optimizer_v5/campaign_admission.py`: absent
+- Evidence directory `admission-p1`: absent
+- `core/pit_optimizer_v5/contracts.py`: 89,607 bytes; SHA-256 `5ec3278af501f4abf285716bbd4d211fe5cd34c873e1644b63e3d43daa3de398`
+- `core/pit_optimizer_v5/artifacts.py`: 188,124 bytes; SHA-256 `2bab516e4945976d9bf6bb356934289cd14d9b87c25088521a043c8ac5cfa2c2`
+- `core/pit_optimizer_v5/manifest.py`: 39,987 bytes; SHA-256 `813970f8f9ea467c2af8e674c4f9d90b25d06796f798c02d8e9134ad32daeded`
+- `core/pit_optimizer_v5/provider.py`: 164,025 bytes; SHA-256 `d9b17d62a6c8b485ba6ae6abb22a9e87f9d908b3c96409ba6e21f86eb691e937`
+- `core/pit_optimizer_v5/development_preparation.py`: 42,987 bytes; SHA-256 `e7f7e2c0d6c4b66eefd31b031cc18cf53f3924a013b39a318d613ccff75b72f8`
+
+The existing source files above were read as contract dependencies and were not authorized for modification in P1.

@@ -1,0 +1,578 @@
+diff --git a/core/pit_optimizer_v5/baseline_preparation.py b/core/pit_optimizer_v5/baseline_preparation.py
+index a2c1028..d55445a 100644
+--- a/core/pit_optimizer_v5/baseline_preparation.py
++++ b/core/pit_optimizer_v5/baseline_preparation.py
+@@ -4,86 +4,80 @@ from __future__ import annotations
+ 
+ from dataclasses import dataclass
+ import hashlib
++from pathlib import Path, PurePosixPath
++import sys
+ 
+ from core.pit_optimizer_v5.artifacts import _extract_artifact_refs, _strict_json_object
+-from core.pit_optimizer_v5.baseline import BaselineCaptureInputsV5, authenticate_baseline_inputs_v5
+-from core.pit_optimizer_v5.contracts import ArtifactRefV5, AuthenticatedArtifactV5, canonical_json_bytes_v5
++from core.pit_optimizer_v5.baseline import (
++    BaselineCaptureInputsV5,
++    BaselineHostAuthorityV5,
++    authenticate_baseline_inputs_v5,
++)
++from core.pit_optimizer_v5.candidate_ir import SourceBundleV5, SourceFileV5, derive_policy_revision_identity_v5
++from core.pit_optimizer_v5.contracts import (
++    ArtifactRefV5,
++    AuthenticatedArtifactV5,
++    CampaignPanelPlanV5,
++    EvaluatorContractV5,
++    SandboxProfileV5,
++    canonical_json_bytes_v5,
++    initial_friction_grid_v5,
++)
++from core.pit_optimizer_v5.manifest import PolicyScopeDescriptorV5
++from core.pit_optimizer_v5.policy_scope import EDITABLE_POLICY_PATHS_V5
++from core.pit_optimizer_v5.readiness import ReadinessGitAuthorityV5, capture_readiness_source_v5
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class PreparedBaselineInputsV5:
+-    """Content-free result of baseline input preparation."""
+-
+     inputs_ref: ArtifactRefV5
+     capture_argv: tuple[str, ...]
++    powershell_command: str
+ 
+ 
+-def prepare_baseline_inputs_v5(
+-    *,
+-    repository,
+-    output_path: str,
+-    evaluator_contract_ref: ArtifactRefV5,
+-    execution_profile_ref: ArtifactRefV5,
+-    sandbox_profile_ref: ArtifactRefV5,
+-    panel_plan_ref: ArtifactRefV5,
+-    baseline_policy_revision_ref: ArtifactRefV5,
+-    source_bundle_ref: ArtifactRefV5,
+-    policy_scope_ref: ArtifactRefV5,
+-    evaluator_source_ref: ArtifactRefV5,
+-    identity_transition_ref: ArtifactRefV5,
+-    resources_ref: ArtifactRefV5,
+-) -> PreparedBaselineInputsV5:
+-    """Authenticate and create-only publish one complete baseline input graph.
+-
+-    The pending root is authenticated in memory before publication. Every child
+-    is consequently read only at its explicitly supplied path and digest.
+-    """
++def _file_sha256(path: str, expected: str | None) -> str:
++    candidate = Path(path)
++    if not candidate.is_absolute() or not candidate.is_file() or candidate.is_symlink():
++        raise ValueError("host executable must be an absolute non-link file")
++    resolved = candidate.resolve(strict=True)
++    if str(candidate).casefold() != str(resolved).casefold():
++        raise ValueError("host executable path must be canonical")
++    digest = hashlib.sha256()
++    with resolved.open("rb") as stream:
++        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
++            digest.update(chunk)
++    actual = digest.hexdigest()
++    if expected is not None and expected != actual:
++        raise ValueError("host executable digest differs")
++    return actual
+ 
+-    inputs = BaselineCaptureInputsV5(
+-        schema_version=5,
+-        evaluator_contract_ref=evaluator_contract_ref,
+-        execution_profile_ref=execution_profile_ref,
+-        sandbox_profile_ref=sandbox_profile_ref,
+-        panel_plan_ref=panel_plan_ref,
+-        baseline_policy_revision_ref=baseline_policy_revision_ref,
+-        source_bundle_ref=source_bundle_ref,
+-        policy_scope_ref=policy_scope_ref,
+-        evaluator_source_ref=evaluator_source_ref,
+-        identity_transition_ref=identity_transition_ref,
+-        resources_ref=resources_ref,
+-    )
+-    raw = canonical_json_bytes_v5(inputs)
+-    pending_ref = ArtifactRefV5(output_path, hashlib.sha256(raw).hexdigest())
+ 
+-    class PendingInputsRepository:
+-        def authenticate_exact(self, reference):
+-            if reference == pending_ref:
+-                return AuthenticatedArtifactV5(
+-                    reference,
+-                    raw,
+-                    _extract_artifact_refs(_strict_json_object(raw, reference)),
+-                )
+-            return repository.authenticate_exact(reference)
++def _host(*, source_root, scratch_root, git_executable, git_sha256, docker_executable, docker_sha256):
++    for value in (source_root, scratch_root):
++        directory = Path(value)
++        if not directory.is_absolute() or not directory.is_dir() or directory.is_symlink():
++            raise ValueError("baseline host root must be an absolute existing non-link directory")
++        if str(directory).casefold() != str(directory.resolve(strict=True)).casefold():
++            raise ValueError("baseline host root must be canonical")
++    return BaselineHostAuthorityV5(
++        source_root,
++        scratch_root,
++        git_executable,
++        _file_sha256(git_executable, git_sha256),
++        docker_executable,
++        _file_sha256(docker_executable, docker_sha256),
++    )
+ 
+-        def __getattr__(self, name):
+-            return getattr(repository, name)
+ 
+-    authenticated = authenticate_baseline_inputs_v5(repository=PendingInputsRepository(), inputs_ref=pending_ref)
+-    if authenticated.inputs != inputs:
+-        raise ValueError("prepared baseline inputs changed during authentication")
+-    created = repository.create_baseline_artifact(output_path, inputs)
+-    if created != pending_ref:
+-        raise ValueError("prepared baseline input identity differs")
+-    if authenticate_baseline_inputs_v5(repository=repository, inputs_ref=created).inputs != inputs:
+-        raise ValueError("published baseline inputs failed authentication")
+-    capture_argv = (
+-        "python",
++def _command(repository, host, created):
++    argv = (
++        sys.executable,
+         "-B",
+         "-m",
+         "core.pit_optimizer_v5.cli",
+         "capture-baseline",
+         "--artifact-root",
+-        "<ABSOLUTE_ARTIFACT_ROOT>",
++        str(repository.root.resolve(strict=True)),
+         "--capture-inputs-path",
+         created.relative_path,
+         "--capture-inputs-sha256",
+@@ -91,19 +85,209 @@ def prepare_baseline_inputs_v5(
+         "--output-path",
+         "evaluator/baseline-authority.json",
+         "--source-root",
+-        "<ABSOLUTE_CLEAN_SOURCE_ROOT>",
++        host.source_root,
+         "--scratch-root",
+-        "<ABSOLUTE_SCRATCH_ROOT>",
++        host.scratch_root,
+         "--trusted-git-executable",
+-        "<ABSOLUTE_GIT_EXECUTABLE>",
++        host.git_executable,
+         "--trusted-git-sha256",
+-        "<GIT_SHA256>",
++        host.git_sha256,
+         "--docker-executable",
+-        "<ABSOLUTE_DOCKER_EXECUTABLE>",
++        host.docker_executable,
+         "--docker-sha256",
+-        "<DOCKER_SHA256>",
++        host.docker_sha256,
++    )
++    return argv, "& " + " ".join("'" + value.replace("'", "''") + "'" for value in argv)
++
++
++def _prepare(*, repository, output_path, inputs, pending, host):
++    raw = canonical_json_bytes_v5(inputs)
++    root_ref = ArtifactRefV5(output_path, hashlib.sha256(raw).hexdigest())
++    pending[root_ref] = raw
++
++    class PendingRepository:
++        def authenticate_exact(self, reference):
++            content = pending.get(reference)
++            if content is not None:
++                return AuthenticatedArtifactV5(
++                    reference, content, _extract_artifact_refs(_strict_json_object(content, reference))
++                )
++            return repository.authenticate_exact(reference)
++
++        def __getattr__(self, name):
++            return getattr(repository, name)
++
++    if authenticate_baseline_inputs_v5(repository=PendingRepository(), inputs_ref=root_ref).inputs != inputs:
++        raise ValueError("prepared baseline inputs changed during authentication")
++    for reference, content in pending.items():
++        if reference != root_ref:
++            created = repository.create_baseline_artifact(
++                reference.relative_path, _strict_json_object(content, reference)
++            )
++            if created != reference:
++                raise ValueError("prepared baseline dependency identity differs")
++    created = repository.create_baseline_artifact(output_path, inputs)
++    if (
++        created != root_ref
++        or authenticate_baseline_inputs_v5(repository=repository, inputs_ref=created).inputs != inputs
++    ):
++        raise ValueError("published baseline inputs failed authentication")
++    argv, powershell = _command(repository, host, created)
++    return PreparedBaselineInputsV5(created, argv, powershell)
++
++
++def prepare_baseline_inputs_v5(
++    *,
++    repository,
++    output_path,
++    evaluator_contract_ref,
++    execution_profile_ref,
++    sandbox_profile_ref,
++    panel_plan_ref,
++    baseline_policy_revision_ref,
++    source_bundle_ref,
++    policy_scope_ref,
++    evaluator_source_ref,
++    identity_transition_ref,
++    resources_ref,
++    source_root,
++    scratch_root,
++    git_executable,
++    docker_executable,
++    git_sha256=None,
++    docker_sha256=None,
++):
++    """Publish an explicitly referenced graph and a concrete capture command."""
++    host = _host(
++        source_root=source_root,
++        scratch_root=scratch_root,
++        git_executable=git_executable,
++        git_sha256=git_sha256,
++        docker_executable=docker_executable,
++        docker_sha256=docker_sha256,
++    )
++    inputs = BaselineCaptureInputsV5(
++        5,
++        evaluator_contract_ref,
++        execution_profile_ref,
++        sandbox_profile_ref,
++        panel_plan_ref,
++        baseline_policy_revision_ref,
++        source_bundle_ref,
++        policy_scope_ref,
++        evaluator_source_ref,
++        identity_transition_ref,
++        resources_ref,
++    )
++    return _prepare(repository=repository, output_path=output_path, inputs=inputs, pending={}, host=host)
++
++
++def _source_bundle(root, snapshot):
++    files, expected = [], dict(snapshot.editable_source_sha256)
++    for relative in EDITABLE_POLICY_PATHS_V5:
++        raw = root.joinpath(*PurePosixPath(relative).parts).read_bytes()
++        if hashlib.sha256(raw).hexdigest() != expected[relative]:
++            raw = raw.replace(b"\r\n", b"\n")
++            if hashlib.sha256(raw).hexdigest() != expected[relative]:
++                raise ValueError("policy source bytes differ from clean source snapshot")
++        files.append(SourceFileV5(relative, raw.decode("utf-8", "strict")))
++    return SourceBundleV5(tuple(files))
++
++
++def prepare_composed_baseline_inputs_v5(
++    *,
++    repository,
++    output_path,
++    execution_profile_ref,
++    sandbox_profile_ref,
++    panel_plan_ref,
++    evaluator_source_ref,
++    identity_transition_ref,
++    resources_ref,
++    immutable_constraints_ref,
++    source_bundle_output_path,
++    policy_revision_output_path,
++    policy_scope_output_path,
++    evaluator_contract_output_path,
++    source_commit,
++    source_root,
++    scratch_root,
++    git_executable,
++    docker_executable,
++    git_sha256=None,
++    docker_sha256=None,
++):
++    """Derive source and evaluator descriptors from pinned real inputs."""
++    host = _host(
++        source_root=source_root,
++        scratch_root=scratch_root,
++        git_executable=git_executable,
++        git_sha256=git_sha256,
++        docker_executable=docker_executable,
++        docker_sha256=docker_sha256,
+     )
+-    return PreparedBaselineInputsV5(created, capture_argv)
++    authority = ReadinessGitAuthorityV5(host.git_executable, host.git_sha256)
++    with capture_readiness_source_v5(
++        source_root=Path(source_root), expected_source_commit=source_commit, git_authority=authority
++    ) as inspection:
++        bundle = _source_bundle(Path(source_root), inspection.snapshot)
++        inspection.revalidate()
++        sandbox = repository.load_typed_artifact(sandbox_profile_ref, value_type=SandboxProfileV5)
++        panel = repository.load_typed_artifact(panel_plan_ref, value_type=CampaignPanelPlanV5)
++        repository.authenticate_exact(execution_profile_ref)
++        repository.authenticate_exact(evaluator_source_ref)
++        repository.authenticate_raw_artifact(identity_transition_ref)
++        repository.authenticate_exact(resources_ref)
++        constraints = repository.authenticate_exact(immutable_constraints_ref)
++        if constraints.child_references:
++            raise ValueError("immutable constraints configuration must be a leaf artifact")
++        revision = derive_policy_revision_identity_v5(
++            source_bundle=bundle,
++            trusted_policy_runtime_sha256=sandbox.runtime_source_sha256,
++            immutable_constraints_sha256=immutable_constraints_ref.sha256,
++        )
++        source_ref = ArtifactRefV5(source_bundle_output_path, bundle.sha256)
++        revision_ref = ArtifactRefV5(policy_revision_output_path, revision.sha256)
++        scope = PolicyScopeDescriptorV5(
++            5, source_commit, inspection.snapshot.editable_source_sha256, revision_ref, False
++        )
++        scope_ref = ArtifactRefV5(policy_scope_output_path, hashlib.sha256(canonical_json_bytes_v5(scope)).hexdigest())
++        evaluator = EvaluatorContractV5(
++            5,
++            execution_profile_ref.sha256,
++            sandbox_profile_ref.sha256,
++            evaluator_source_ref.sha256,
++            panel.pit_bundle_ref.sha256,
++            panel.prices_provenance_ref.sha256,
++            identity_transition_ref.sha256,
++            source_ref.sha256,
++            revision_ref.sha256,
++            initial_friction_grid_v5(),
++            "base",
++        )
++        evaluator_ref = ArtifactRefV5(evaluator_contract_output_path, evaluator.sha256)
++        pending = {
++            source_ref: canonical_json_bytes_v5(bundle),
++            revision_ref: canonical_json_bytes_v5(revision),
++            scope_ref: canonical_json_bytes_v5(scope),
++            evaluator_ref: canonical_json_bytes_v5(evaluator),
++        }
++        inputs = BaselineCaptureInputsV5(
++            5,
++            evaluator_ref,
++            execution_profile_ref,
++            sandbox_profile_ref,
++            panel_plan_ref,
++            revision_ref,
++            source_ref,
++            scope_ref,
++            evaluator_source_ref,
++            identity_transition_ref,
++            resources_ref,
++        )
++        result = _prepare(repository=repository, output_path=output_path, inputs=inputs, pending=pending, host=host)
++        inspection.revalidate()
++        return result
+ 
+ 
+-__all__ = ["PreparedBaselineInputsV5", "prepare_baseline_inputs_v5"]
++__all__ = ["PreparedBaselineInputsV5", "prepare_baseline_inputs_v5", "prepare_composed_baseline_inputs_v5"]
+diff --git a/core/pit_optimizer_v5/cli.py b/core/pit_optimizer_v5/cli.py
+index aba3e35..6def78b 100644
+--- a/core/pit_optimizer_v5/cli.py
++++ b/core/pit_optimizer_v5/cli.py
+@@ -1254,8 +1254,28 @@ def build_parser_v5() -> argparse.ArgumentParser:
+                 "identity-transition",
+                 "resources",
+             ):
+-                command.add_argument(f"--{prefix}-path", required=True)
+-                command.add_argument(f"--{prefix}-sha256", required=True)
++                required = prefix not in {
++                    "evaluator-contract",
++                    "baseline-policy-revision",
++                    "source-bundle",
++                    "policy-scope",
++                }
++                command.add_argument(f"--{prefix}-path", required=required)
++                command.add_argument(f"--{prefix}-sha256", required=required)
++            command.add_argument("--compose-source", action="store_true")
++            command.add_argument("--source-commit")
++            command.add_argument("--immutable-constraints-path")
++            command.add_argument("--immutable-constraints-sha256")
++            command.add_argument("--source-bundle-output-path")
++            command.add_argument("--policy-revision-output-path")
++            command.add_argument("--policy-scope-output-path")
++            command.add_argument("--evaluator-contract-output-path")
++            command.add_argument("--source-root", required=True)
++            command.add_argument("--scratch-root", required=True)
++            command.add_argument("--git-executable", required=True)
++            command.add_argument("--git-sha256")
++            command.add_argument("--docker-executable", required=True)
++            command.add_argument("--docker-sha256")
+         if name == "build-sandbox-profile":
+             command.add_argument("--image-name", required=True)
+             command.add_argument(
+@@ -1774,31 +1794,94 @@ def dispatch_baseline_cli_v5(
+                         worker_factory=selected_factory,
+                     )
+             elif args.command == "prepare-baseline-inputs":
+-                from core.pit_optimizer_v5.baseline_preparation import prepare_baseline_inputs_v5
++                from core.pit_optimizer_v5.baseline_preparation import (
++                    prepare_baseline_inputs_v5,
++                    prepare_composed_baseline_inputs_v5,
++                )
+ 
+-                prepared = prepare_baseline_inputs_v5(
+-                    repository=repository,
+-                    output_path=args.output_path,
+-                    evaluator_contract_ref=ArtifactRefV5(args.evaluator_contract_path, args.evaluator_contract_sha256),
+-                    execution_profile_ref=ArtifactRefV5(args.execution_profile_path, args.execution_profile_sha256),
+-                    sandbox_profile_ref=ArtifactRefV5(args.sandbox_profile_path, args.sandbox_profile_sha256),
+-                    panel_plan_ref=ArtifactRefV5(args.panel_plan_path, args.panel_plan_sha256),
+-                    baseline_policy_revision_ref=ArtifactRefV5(
+-                        args.baseline_policy_revision_path, args.baseline_policy_revision_sha256
+-                    ),
+-                    source_bundle_ref=ArtifactRefV5(args.source_bundle_path, args.source_bundle_sha256),
+-                    policy_scope_ref=ArtifactRefV5(args.policy_scope_path, args.policy_scope_sha256),
+-                    evaluator_source_ref=ArtifactRefV5(args.evaluator_source_path, args.evaluator_source_sha256),
+-                    identity_transition_ref=ArtifactRefV5(
++                common = {
++                    "repository": repository,
++                    "output_path": args.output_path,
++                    "execution_profile_ref": ArtifactRefV5(args.execution_profile_path, args.execution_profile_sha256),
++                    "sandbox_profile_ref": ArtifactRefV5(args.sandbox_profile_path, args.sandbox_profile_sha256),
++                    "panel_plan_ref": ArtifactRefV5(args.panel_plan_path, args.panel_plan_sha256),
++                    "evaluator_source_ref": ArtifactRefV5(args.evaluator_source_path, args.evaluator_source_sha256),
++                    "identity_transition_ref": ArtifactRefV5(
+                         args.identity_transition_path, args.identity_transition_sha256
+                     ),
+-                    resources_ref=ArtifactRefV5(args.resources_path, args.resources_sha256),
+-                )
++                    "resources_ref": ArtifactRefV5(args.resources_path, args.resources_sha256),
++                    "source_root": args.source_root,
++                    "scratch_root": args.scratch_root,
++                    "git_executable": args.git_executable,
++                    "git_sha256": args.git_sha256,
++                    "docker_executable": args.docker_executable,
++                    "docker_sha256": args.docker_sha256,
++                }
++                if args.compose_source:
++                    required_values = (
++                        args.source_commit,
++                        args.immutable_constraints_path,
++                        args.immutable_constraints_sha256,
++                        args.source_bundle_output_path,
++                        args.policy_revision_output_path,
++                        args.policy_scope_output_path,
++                        args.evaluator_contract_output_path,
++                    )
++                    explicit_values = (
++                        args.evaluator_contract_path,
++                        args.evaluator_contract_sha256,
++                        args.baseline_policy_revision_path,
++                        args.baseline_policy_revision_sha256,
++                        args.source_bundle_path,
++                        args.source_bundle_sha256,
++                        args.policy_scope_path,
++                        args.policy_scope_sha256,
++                    )
++                    if any(value is None for value in required_values) or any(
++                        value is not None for value in explicit_values
++                    ):
++                        raise ValueError("composed baseline inputs are incomplete or mixed with explicit source refs")
++                    prepared = prepare_composed_baseline_inputs_v5(
++                        **common,
++                        source_commit=args.source_commit,
++                        immutable_constraints_ref=ArtifactRefV5(
++                            args.immutable_constraints_path, args.immutable_constraints_sha256
++                        ),
++                        source_bundle_output_path=args.source_bundle_output_path,
++                        policy_revision_output_path=args.policy_revision_output_path,
++                        policy_scope_output_path=args.policy_scope_output_path,
++                        evaluator_contract_output_path=args.evaluator_contract_output_path,
++                    )
++                else:
++                    values = (
++                        args.evaluator_contract_path,
++                        args.evaluator_contract_sha256,
++                        args.baseline_policy_revision_path,
++                        args.baseline_policy_revision_sha256,
++                        args.source_bundle_path,
++                        args.source_bundle_sha256,
++                        args.policy_scope_path,
++                        args.policy_scope_sha256,
++                    )
++                    if any(value is None for value in values):
++                        raise ValueError("explicit baseline inputs are incomplete")
++                    prepared = prepare_baseline_inputs_v5(
++                        **common,
++                        evaluator_contract_ref=ArtifactRefV5(
++                            args.evaluator_contract_path, args.evaluator_contract_sha256
++                        ),
++                        baseline_policy_revision_ref=ArtifactRefV5(
++                            args.baseline_policy_revision_path, args.baseline_policy_revision_sha256
++                        ),
++                        source_bundle_ref=ArtifactRefV5(args.source_bundle_path, args.source_bundle_sha256),
++                        policy_scope_ref=ArtifactRefV5(args.policy_scope_path, args.policy_scope_sha256),
++                    )
+                 payload = {
+                     "schema_version": 5,
+                     "status": "created",
+                     "artifact_ref": prepared.inputs_ref,
+                     "capture_argv": prepared.capture_argv,
++                    "powershell_command": prepared.powershell_command,
+                     "provider_calls": 0,
+                     "evaluation_performed": False,
+                 }
+diff --git a/docs/pit-optimizer-v5-operations.md b/docs/pit-optimizer-v5-operations.md
+index ad9ba01..402fe2e 100644
+--- a/docs/pit-optimizer-v5-operations.md
++++ b/docs/pit-optimizer-v5-operations.md
+@@ -14,22 +14,31 @@ If no real manifest exists yet, first complete the upstream data and panel work.
+ 
+ ## Prepare and capture the baseline
+ 
+-Supply each existing artifact as a path relative to the canonical artifact root plus its SHA-256 digest. The command does not accept unverified identity placeholders. The final V3 PIT bundle, prices provenance, and discovery panels must already be reachable from the supplied discovery panel plan. The source bundle, policy revision, policy scope, evaluator contract, evaluator source map, identity-transition contract, and resource authority also need to have been built and persisted upstream; no safe production builder currently derives those artifacts from the panel plan alone.
++The recommended `--compose-source` mode derives the source bundle, baseline policy revision, policy scope, and evaluator contract. It pins a clean checkout at the declared commit and binds the derived identities to the authenticated sandbox runtime, immutable-constraints configuration, execution profile, evaluator source map, transition contract, resources, and discovery panel plan. The final V3 PIT bundle, prices provenance, and six development panels must already be reachable from that plan.
+ 
+ ```powershell
+ Set-Location 'C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.worktrees\pit-optimizer-v5-architecture'
+ $python = (Get-Command python.exe).Source
+ $artifactRoot = Read-Host 'Absolute artifact repository directory'
++$sourceRoot = 'C:\pit-v5\source'
++$scratchRoot = 'C:\pit-v5\baseline-scratch'
++$git = (Get-Command git.exe).Source
++$docker = (Get-Command docker.exe).Source
+ $baselineArgs = @(
+     '--artifact-root', $artifactRoot,
+     '--output-path', 'evaluator/baseline-capture-inputs.json',
+-    '--evaluator-contract-path', '<path>', '--evaluator-contract-sha256', '<sha256>',
++    '--compose-source',
++    '--source-commit', '<clean-source-commit-sha1>',
++    '--source-root', $sourceRoot, '--scratch-root', $scratchRoot,
++    '--git-executable', $git, '--docker-executable', $docker,
++    '--immutable-constraints-path', '<path>', '--immutable-constraints-sha256', '<sha256>',
++    '--source-bundle-output-path', 'evaluator/baseline-source-bundle.json',
++    '--policy-revision-output-path', 'evaluator/baseline-policy-revision.json',
++    '--policy-scope-output-path', 'evaluator/baseline-policy-scope.json',
++    '--evaluator-contract-output-path', 'evaluator/baseline-evaluator-contract.json',
+     '--execution-profile-path', '<path>', '--execution-profile-sha256', '<sha256>',
+     '--sandbox-profile-path', '<path>', '--sandbox-profile-sha256', '<sha256>',
+     '--panel-plan-path', '<path>', '--panel-plan-sha256', '<sha256>',
+-    '--baseline-policy-revision-path', '<path>', '--baseline-policy-revision-sha256', '<sha256>',
+-    '--source-bundle-path', '<path>', '--source-bundle-sha256', '<sha256>',
+-    '--policy-scope-path', '<path>', '--policy-scope-sha256', '<sha256>',
+     '--evaluator-source-path', '<path>', '--evaluator-source-sha256', '<sha256>',
+     '--identity-transition-path', '<path>', '--identity-transition-sha256', '<sha256>',
+     '--resources-path', '<path>', '--resources-sha256', '<sha256>'
+@@ -38,22 +47,11 @@ $preparedLine = & $python -B -m core.pit_optimizer_v5.cli prepare-baseline-input
+ if ($LASTEXITCODE -ne 0) { $preparedLine; throw 'Baseline input preparation failed' }
+ $prepared = ($preparedLine -replace '^PIT_OPTIMIZER_V5_BASELINE=', '') | ConvertFrom-Json
+ 
+-# Fill the explicit host paths and executable hashes shown as placeholders in
+-# $prepared.capture_argv, then run that argv. Equivalently:
+-& $python -B -m core.pit_optimizer_v5.cli capture-baseline `
+-    --artifact-root $artifactRoot `
+-    --capture-inputs-path $prepared.artifact_ref.relative_path `
+-    --capture-inputs-sha256 $prepared.artifact_ref.sha256 `
+-    --output-path 'evaluator/baseline-authority.json' `
+-    --source-root '<absolute-clean-source-root>' `
+-    --scratch-root '<absolute-disjoint-scratch-root>' `
+-    --trusted-git-executable '<absolute-git-executable>' `
+-    --trusted-git-sha256 '<git-sha256>' `
+-    --docker-executable '<absolute-docker-executable>' `
+-    --docker-sha256 '<docker-sha256>'
++$prepared.powershell_command
++Invoke-Expression $prepared.powershell_command
+ ```
+ 
+-Baseline capture requires a clean checkout at the exact source commit named by the policy scope, a disjoint empty scratch root, the locally available digest-pinned evaluator image, and authenticated Git and Docker executable hashes. It runs two fresh network-disabled full-grid evaluations and publishes authority only after byte-identical results and cleanup. Verify the resulting reference with `verify-baseline`, then pass that authority to `build-manifest`.
++Preparation hashes the actual Git and Docker executable bytes; optional `--git-sha256` and `--docker-sha256` arguments verify independently supplied digests. The emitted command is fully populated but is not executed by preparation. Baseline capture requires the locally available digest-pinned evaluator image and runs two fresh network-disabled full-grid evaluations. Existing prebuilt source, revision, scope, and evaluator artifacts remain supported by omitting `--compose-source` and supplying their four path/digest pairs.
+ 
+ ## Prepare the local adapter configuration
+ 

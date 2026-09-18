@@ -1,0 +1,45 @@
+# Task 3 implementation report — additive operator progress counts
+
+## Status
+
+DONE. The implementation is limited to `core/pit_optimizer_v5/summary.py`; this report is the only other file written.
+
+## Source change
+
+- Appended three defaulted fields to `OptimizerSummaryV5`, after the prior last field, preserving all existing positional parameters:
+  - `completed_lifecycle_rounds: int = 0`
+  - `evaluated_feedback_rounds: int = 0`
+  - `render_rejected_experiments: int = 0`
+- Added the three fields to the existing strict nonnegative-integer validation tuple.
+- Added only the specified cross-count consistency guard and exact error: `optimizer summary progress counts are inconsistent`.
+- In `summarize_repository_v5`, after record loading/authentication and successful `verify_projection`, derived record rounds, successfully cleaned record rounds, evaluated record rounds, and the reserved-code invalid-record count.
+- Passed the three additive values as keyword arguments at the end of the existing `OptimizerSummaryV5` return constructor.
+
+## Definitions preserved
+
+- `completed_lifecycle_rounds` counts distinct checkpoint-record rounds having a successful cleanup payload. It includes rejection-only, duplicate-only, and mixed record rounds, while terminal no-record rounds remain represented only by the existing terminal count.
+- `evaluated_feedback_rounds` counts the intersection of successfully cleaned checkpoint-record rounds and rounds containing at least one authenticated `status == "evaluated"` record with campaign evidence.
+- `render_rejected_experiments` counts committed invalid checkpoint records whose validation failure code is exactly `policy_source_unbounded_or_stateful`, including records whose cleanup is still pending.
+
+## Exact scope
+
+- Class field scope: `OptimizerSummaryV5` additive defaulted fields and its existing `__post_init__` count validation.
+- Function scope: `summarize_repository_v5` derivation after `LocalArchiveReducerFactoryV5(...).verify_projection(...)` and additive keyword projection in the existing return constructor.
+- Unchanged by this task: schema version, prior positional arguments and fields, status/readiness/terminal logic, performance selection, failure taxonomy, role/token/cost totals, cleanup semantics, durable records/events/requests, serialization implementation, historical artifacts, and all other production files.
+
+## Hashes
+
+- Starting `core/pit_optimizer_v5/summary.py` SHA-256: `4eaef3424a6043a5ce0aeef60bf0a8abe444d4a24588d93d26804d44a3127258` (matched the captured preimage).
+- Final `core/pit_optimizer_v5/summary.py` SHA-256: `e4ccb8a2077ca28d2ece2e541839265b3f08218e1b66e93b635772e600270865`.
+
+## Permitted static checks
+
+- `py -3.13 -B -m ruff check core/pit_optimizer_v5/summary.py` — passed (`All checks passed!`).
+- `py -3.13 -B -c "...compile(source, 'core/pit_optimizer_v5/summary.py', 'exec')..."` — passed (`in-memory compile: passed`).
+- Preimage-to-source scoped diff — only the Task 3 field, validation, derivation, and return-keyword additions are present.
+
+No tests, synthetic inputs, probes, events, records, wrappers, models, APIs, credentials, candidates, evaluators, campaign operations, commits, pushes, or deployments were executed.
+
+## Concerns
+
+None within the authorized scope. Behavioral test execution was explicitly prohibited, so verification is limited to the permitted scoped static checks and exact preimage diff.

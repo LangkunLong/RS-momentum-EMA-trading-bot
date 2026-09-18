@@ -1,0 +1,29 @@
+### Task 5: Report Raw and PIT-Exposed Leader Recall
+
+**Files:**
+- Modify: `core/pit_baseline_report.py`
+- Modify: `pit_baseline.py`
+
+- [ ] **Step 1: Add explicit five-year denominators**
+
+Report raw leader count/signaled/executed/percentages for all five-year labels,
+and PIT-exposed equivalents restricted exactly to `member_at_start=True`.
+Percentages must divide by their named denominator.
+
+- [ ] **Step 2: Add explicit rolling denominators**
+
+Report raw rolling recall and PIT-exposed rolling recall restricted to
+`member_at_evaluation=True`, retaining same-issuer alias treatment and successor
+reset separation.
+
+- [ ] **Step 3: Update report prose and compatibility aliases**
+
+Render denominators alongside numerators. If old `top100_*` fields remain, mark
+them deprecated raw aliases and never label a count as a percentage.
+
+- [ ] **Step 4: Functional report probe, review, and commit**
+
+Exercise a small mixed-exposure label set and verify zero-denominator handling.
+Review definitions against leader-label models, then commit only reporting files
+and ledger.
+

@@ -1,0 +1,6 @@
+Scoped Ruff: All checks passed!
+In-memory compile: PASS (4files)
+Semantic content unchanged by newline repair: PASS
+Equal source lines preserve exact preimage bytes; replacement/insertions use corresponding local preimage endings.
+Patch uses LF only, no CRCRLF.
+Actual04 archived preflight receipt remains valid; no semantic changes.

@@ -1,0 +1,7 @@
+Compile in memory: PASS (3 files)
+Ruff exit 0
+All checks passed!
+
+Actual archived provider-runtime-01: canonical schema 2087, wire 1720 bytes; old/new bound 10305.
+Actual archived provider-runtime-02: canonical schema 2087, wire 1720 bytes; old/new bound 10305.
+No synthetic inputs, tests, network/provider/Docker or campaign launches.

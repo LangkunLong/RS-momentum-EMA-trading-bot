@@ -1,0 +1,1229 @@
+# Review package: 032a430..1d7fb1c
+
+## Commits
+1d7fb1c fix: harden PIT parity trust boundaries
+
+## Files changed
+ core/pit_policy_parity.py       | 249 ++++++++++++++++++++-
+ tests/test_pit_policy_parity.py | 463 +++++++++++++++++++++++++++++++++++++---
+ 2 files changed, 681 insertions(+), 31 deletions(-)
+
+## Diff
+diff --git a/core/pit_policy_parity.py b/core/pit_policy_parity.py
+index 5ace66c..3db48b8 100644
+--- a/core/pit_policy_parity.py
++++ b/core/pit_policy_parity.py
+@@ -4,20 +4,21 @@ from __future__ import annotations
+ 
+ from dataclasses import asdict, dataclass
+ from pathlib import Path
+ from collections import Counter
+ import argparse
+ import hashlib
+ import json
+ import math
+ import re
+ import subprocess
++from types import MappingProxyType
+ from typing import Callable, Iterable, Mapping, Sequence
+ 
+ from core.pit_optimizer_evaluation import (
+     AggregateMetric,
+     FoldAggregateSummary,
+     FoldManifest,
+     FoldSpec,
+ )
+ 
+ 
+@@ -175,40 +176,60 @@ class ParityReference:
+             "reference_source_fingerprint_sha256",
+             "readiness_sha256",
+             "pit_bundle_sha256",
+             "baseline_manifest_sha256",
+             "effective_policy_sha256",
+             "artifact_sha256",
+         ):
+             _require_digest(getattr(self, name), name)
+         if not isinstance(self.fold_manifest, FoldManifest):
+             raise ValueError("parity reference fold manifest is invalid")
++        if self.fold_manifest.data_identity_sha256 != self.pit_bundle_sha256:
++            raise ValueError("parity reference data identity differs from PIT bundle")
+         if (
+             type(self.universe) is not tuple
+             or not self.universe
+             or any(not isinstance(symbol, str) or not symbol for symbol in self.universe)
+         ):
+             raise ValueError("parity reference universe is invalid")
+         if len(set(self.universe)) != len(self.universe):
+             raise ValueError("parity reference universe contains duplicates")
++        if self.fold_manifest.universe_sha256 != _digest(list(self.universe)):
++            raise ValueError("parity reference universe identity mismatch")
+         if type(self.discovery_evidence) is not tuple or len(self.discovery_evidence) != 2:
+             raise ValueError("parity reference requires two discovery evidence records")
+         expected_ids = tuple(fold.fold_id for fold in self.fold_manifest.discovery_folds)
+         if tuple(evidence.fold_id for evidence in self.discovery_evidence) != expected_ids:
+             raise ValueError("parity reference evidence fold order is invalid")
+         expected_outputs = tuple((evidence.fold_id, evidence.evidence_sha256) for evidence in self.discovery_evidence)
+         if self.discovery_output_sha256s != expected_outputs:
+             raise ValueError("parity reference output digests are invalid")
+         if any(
+             evidence.effective_policy_sha256 != self.effective_policy_sha256 for evidence in self.discovery_evidence
+         ):
+             raise ValueError("parity reference effective policy differs by fold")
++        for fold, evidence in zip(
++            self.fold_manifest.discovery_folds,
++            self.discovery_evidence,
++            strict=True,
++        ):
++            if tuple(point.session for point in evidence.equity) != fold.sessions:
++                raise ValueError("parity evidence equity sessions differ from fold")
++            if evidence.funnel != evidence.aggregate.entry_funnel:
++                raise ValueError("parity evidence entry funnel differs from aggregate")
++            sessions = frozenset(fold.sessions)
++            if any(transaction.date not in sessions for transaction in evidence.transactions):
++                raise ValueError("parity transaction date is outside its fold")
++            if any(outcome.signal_date not in sessions for outcome in evidence.entry_outcomes):
++                raise ValueError("parity entry outcome signal date is outside its fold")
++            if any(outcome.entry_date not in sessions for outcome in evidence.entry_outcomes):
++                raise ValueError("parity entry outcome entry date is outside its fold")
+         if not isinstance(self.artifact_path, Path) or not self.artifact_path.is_absolute():
+             raise ValueError("parity reference artifact path is invalid")
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class ParityAttestation:
+     schema_version: int
+     reference_artifact_sha256: str
+     reference_source_head: str
+     final_source_head: str
+@@ -396,21 +417,24 @@ def load_parity_reference(path: Path) -> ParityReference:
+ 
+ 
+ def verify_parity_evidence(
+     *,
+     reference: ParityReference,
+     output: Path,
+     final_source_head: str,
+     final_source_fingerprint_sha256: str,
+     policy_interface_version: int,
+     final_discovery_evidence: tuple[ParityFoldEvidence, ...],
++    pre_persist_check: Callable[[], None],
+ ) -> ParityAttestation:
++    if final_source_head == reference.reference_source_head:
++        raise ValueError("parity verification requires a later source HEAD")
+     if tuple(item.fold_id for item in final_discovery_evidence) != tuple(
+         item.fold_id for item in reference.discovery_evidence
+     ):
+         raise ValueError("final parity folds differ from reference")
+     transactions_equal = all(
+         left.transactions == right.transactions
+         for left, right in zip(reference.discovery_evidence, final_discovery_evidence, strict=True)
+     )
+     entry_outcomes_equal = all(
+         left.entry_outcomes == right.entry_outcomes
+@@ -433,20 +457,21 @@ def verify_parity_evidence(
+             ("transactions", transactions_equal),
+             ("entry outcomes", entry_outcomes_equal),
+             ("equity", equity_equal),
+             ("funnels", funnels_equal),
+             ("effective policy", effective_policy_equal),
+         )
+         if not equal
+     ]
+     if failures:
+         raise ValueError("parity differs in " + ", ".join(failures))
++    pre_persist_check()
+     final_output_sha256s = tuple((item.fold_id, item.evidence_sha256) for item in final_discovery_evidence)
+     path = Path(output).resolve()
+     provisional = ParityAttestation(
+         schema_version=_ATTESTATION_SCHEMA_VERSION,
+         reference_artifact_sha256=reference.artifact_sha256,
+         reference_source_head=reference.reference_source_head,
+         final_source_head=final_source_head,
+         final_source_fingerprint_sha256=final_source_fingerprint_sha256,
+         pit_bundle_sha256=reference.pit_bundle_sha256,
+         baseline_manifest_sha256=reference.baseline_manifest_sha256,
+@@ -659,20 +684,21 @@ def build_fold_evidence(*, fold: FoldSpec, result: object) -> ParityFoldEvidence
+ def capture_from_authenticated_inputs(
+     *,
+     readiness: Mapping[str, object],
+     readiness_sha256: str,
+     pit_bundle_sha256: str,
+     reference_source_head: str,
+     reference_source_fingerprint_sha256: str,
+     benchmark_sessions: Iterable[str],
+     output: Path,
+     evaluate_discovery_fold: Callable[[FoldSpec, tuple[str, ...], str], ParityFoldEvidence],
++    pre_persist_check: Callable[[], None],
+ ) -> ParityReference:
+     """Compose a reference after callers authenticate source, readiness, and bundle."""
+ 
+     if Path(output).exists():
+         raise FileExistsError(Path(output))
+     _require_digest(readiness_sha256, "readiness digest")
+     identities = readiness.get("identities")
+     if not isinstance(identities, Mapping):
+         raise ValueError("readiness identities are absent")
+     if identities.get("pit_bundle_sha256") != pit_bundle_sha256:
+@@ -684,20 +710,21 @@ def capture_from_authenticated_inputs(
+     manifest, universe = build_fixed_fold_manifest(
+         readiness=readiness,
+         benchmark_sessions=benchmark_sessions,
+         data_identity_sha256=pit_bundle_sha256,
+     )
+     evidence = tuple(
+         evaluate_discovery_fold(fold, universe, manifest.warmup_start_date) for fold in manifest.discovery_folds
+     )
+     if any(item.effective_policy_sha256 != effective_policy_sha256 for item in evidence):
+         raise ValueError("captured fold effective policy differs from readiness")
++    pre_persist_check()
+     return persist_parity_reference(
+         output=Path(output),
+         reference_source_head=reference_source_head,
+         reference_source_fingerprint_sha256=reference_source_fingerprint_sha256,
+         readiness_sha256=readiness_sha256,
+         pit_bundle_sha256=pit_bundle_sha256,
+         baseline_manifest_sha256=baseline_manifest_sha256,
+         effective_policy_sha256=effective_policy_sha256,
+         fold_manifest=manifest,
+         universe=universe,
+@@ -734,53 +761,247 @@ def _source_identity(source_root: Path) -> tuple[str, str]:
+     def git(*args: str) -> bytes:
+         completed = subprocess.run(
+             ["git", *args],
+             cwd=root,
+             check=True,
+             stdout=subprocess.PIPE,
+             stderr=subprocess.PIPE,
+         )
+         return completed.stdout
+ 
+-    if git("status", "--porcelain", "--untracked-files=no").strip():
++    if git("status", "--porcelain", "--untracked-files=all").strip():
+         raise ValueError("parity capture requires a clean committed source")
+     head = git("rev-parse", "HEAD").decode("ascii").strip()
+     _require_head(head, "source head")
+     tree = git("ls-tree", "-r", "--full-tree", "HEAD")
+     return head, hashlib.sha256(tree).hexdigest()
+ 
+ 
++def _require_later_descendant_source(
++    *,
++    source_root: Path,
++    reference_head: str,
++    final_head: str,
++) -> None:
++    _require_head(reference_head, "reference source head")
++    _require_head(final_head, "final source head")
++    if final_head == reference_head:
++        raise ValueError("parity verification requires a later source HEAD")
++    completed = subprocess.run(
++        ["git", "merge-base", "--is-ancestor", reference_head, final_head],
++        cwd=Path(source_root).resolve(),
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++    )
++    if completed.returncode == 1:
++        raise ValueError("final source HEAD is not a descendant of the reference")
++    if completed.returncode != 0:
++        raise ValueError("source ancestry could not be verified")
++
++
++def _require_unchanged_source(
++    *,
++    source_root: Path,
++    expected_head: str,
++    expected_fingerprint_sha256: str,
++) -> None:
++    if _source_identity(source_root) != (
++        expected_head,
++        expected_fingerprint_sha256,
++    ):
++        raise ValueError("source changed during parity evaluation")
++
++
+ def _benchmark_calendar(bundle: object, benchmark: str) -> tuple[str, ...]:
+     connection = getattr(bundle, "_connection", None)
+     if connection is None:
+         raise ValueError("PIT bundle benchmark calendar is unavailable")
+     rows = connection.execute(
+         "SELECT trade_date FROM price WHERE ticker=? AND trade_date>=? AND trade_date<=? ORDER BY trade_date",
+         (benchmark, _DISCOVERY_WINDOWS[0][1], _HIDDEN_WINDOW[2]),
+     ).fetchall()
+     sessions = tuple(str(row[0]) for row in rows)
+     if not sessions:
+         raise ValueError("PIT bundle benchmark calendar is empty")
+     return sessions
+ 
+ 
+-def _authenticated_readiness(path: Path) -> tuple[dict[str, object], str]:
+-    _, readiness, readiness_sha256 = _canonical_object(path, "readiness artifact")
++def _authenticated_readiness(
++    path: Path,
++    *,
++    source_root: Path,
++) -> tuple[dict[str, object], str]:
++    artifact_path, readiness, readiness_sha256 = _canonical_object(
++        path, "readiness artifact"
++    )
++    expected_top_level = {
++        "baseline",
++        "budget_contract",
++        "candidate_catalog",
++        "date_contract",
++        "effective_policy",
++        "evaluation_contract",
++        "evidence_ids",
++        "gate",
++        "identities",
++        "invariant_ids",
++        "phase",
++        "prior_discovery_feedback",
++        "schema_version",
++        "sealed_inputs",
++    }
++    if (
++        set(readiness) != expected_top_level
++        or readiness.get("schema_version") != 1
++        or readiness.get("gate") != "pit_optimization"
++        or readiness.get("phase") != "ready"
++    ):
++        raise ValueError("readiness is not the closed readiness contract")
+     identities = readiness.get("identities")
++    sealed_inputs = readiness.get("sealed_inputs")
+     effective_policy = readiness.get("effective_policy")
+-    if not isinstance(identities, Mapping) or not isinstance(effective_policy, Mapping):
++    expected_identity_keys = {
++        "baseline_manifest_sha256",
++        "baseline_source_commit",
++        "effective_policy_sha256",
++        "entry_contract_source_sha256",
++        "pit_bundle_sha256",
++        "prior_discovery_feedback_sha256",
++        "source_fingerprint_sha256",
++        "source_head",
++    }
++    if (
++        not isinstance(identities, dict)
++        or set(identities) != expected_identity_keys
++        or not isinstance(sealed_inputs, dict)
++        or set(sealed_inputs)
++        != {
++            "baseline_artifact_sha256",
++            "pit_bundle_sha256",
++            "prior_discovery_feedback_sha256",
++        }
++        or not isinstance(effective_policy, Mapping)
++    ):
+         raise ValueError("readiness identity graph is incomplete")
++    from core.pit_optimization import (
++        BASELINE_MANIFEST_SHA256,
++        BASELINE_SOURCE_COMMIT,
++        FULL_END_DATE,
++        FULL_START_DATE,
++        HOLDOUT_END_DATE,
++        HOLDOUT_START_DATE,
++        PIT_BUNDLE_SHA256,
++        PitOptimizationReadiness,
++        _INVARIANT_IDS,
++        _VERIFICATION_EVIDENCE_IDS,
++        _provider_payload,
++        _readiness_identity,
++        _verify_policy_catalog,
++        candidate_catalog,
++    )
++
++    for name in (
++        "source_fingerprint_sha256",
++        "entry_contract_source_sha256",
++        "pit_bundle_sha256",
++        "baseline_manifest_sha256",
++        "effective_policy_sha256",
++    ):
++        _require_digest(identities.get(name), f"readiness {name}")
++    _require_head(identities.get("source_head"), "readiness source head")
++    prior_sha256 = identities.get("prior_discovery_feedback_sha256")
++    if prior_sha256 is not None:
++        _require_digest(prior_sha256, "readiness prior feedback digest")
++    if (
++        identities.get("pit_bundle_sha256") != PIT_BUNDLE_SHA256
++        or identities.get("baseline_manifest_sha256") != BASELINE_MANIFEST_SHA256
++        or identities.get("baseline_source_commit") != BASELINE_SOURCE_COMMIT
++    ):
++        raise ValueError("readiness fixed authority identity changed")
++    baseline_artifacts = sealed_inputs.get("baseline_artifact_sha256")
++    if (
++        sealed_inputs.get("pit_bundle_sha256") != identities["pit_bundle_sha256"]
++        or sealed_inputs.get("prior_discovery_feedback_sha256") != prior_sha256
++        or not isinstance(baseline_artifacts, dict)
++        or not baseline_artifacts
++        or any(
++            not isinstance(name, str)
++            or not name
++            or not isinstance(digest, str)
++            or _SHA256_RE.fullmatch(digest) is None
++            for name, digest in baseline_artifacts.items()
++        )
++        or baseline_artifacts.get("run_manifest.json")
++        != identities["baseline_manifest_sha256"]
++    ):
++        raise ValueError("readiness sealed input identity changed")
++    if readiness.get("date_contract") != {
++        "full_start": FULL_START_DATE,
++        "full_end": FULL_END_DATE,
++        "holdout_start": HOLDOUT_START_DATE,
++        "holdout_end": HOLDOUT_END_DATE,
++    }:
++        raise ValueError("readiness date contract changed")
++    if readiness.get("evidence_ids") != list(_VERIFICATION_EVIDENCE_IDS) or readiness.get(
++        "invariant_ids"
++    ) != list(_INVARIANT_IDS):
++        raise ValueError("readiness evidence contract changed")
++    prior_feedback = readiness.get("prior_discovery_feedback")
++    if not isinstance(prior_feedback, list) or any(
++        not isinstance(item, Mapping)
++        or not isinstance(item.get("candidate_id"), str)
++        for item in prior_feedback
++    ):
++        raise ValueError("readiness prior discovery feedback is malformed")
++    tested_candidate_ids = {
++        str(item["candidate_id"])
++        for item in prior_feedback
++    }
++    expected_catalog = [
++        {
++            "candidate_id": item.candidate_id,
++            "constant_name": item.constant_name,
++            "policy_field": item.policy_field,
++            "old_value": item.old_value,
++            "new_value": item.new_value,
++            "path": item.path,
++            "old_line": item.old_line,
++            "new_line": item.new_line,
++        }
++        for item in candidate_catalog().values()
++        if item.candidate_id not in tested_candidate_ids
++    ]
++    if readiness.get("candidate_catalog") != expected_catalog:
++        raise ValueError("readiness candidate catalog changed")
++
+     from core.engine_policy import effective_engine_policy_sha256
+ 
+     expected_policy_sha256 = identities.get("effective_policy_sha256")
+     if effective_engine_policy_sha256(effective_policy) != expected_policy_sha256:
+         raise ValueError("readiness effective policy digest mismatch")
++    _verify_policy_catalog(effective_policy)
++    provider_payload = _provider_payload(readiness)
++    authenticated = PitOptimizationReadiness(
++        readiness_sha256=readiness_sha256,
++        artifact_path=artifact_path,
++        artifact_sha256=readiness_sha256,
++        effective_policy_sha256=expected_policy_sha256,
++        provider_payload=MappingProxyType(provider_payload),
++        primitive=MappingProxyType(readiness),
++    )
++    _readiness_identity(
++        authenticated,
++        expected_readiness_sha256=readiness_sha256,
++        expected_effective_policy_sha256=expected_policy_sha256,
++        source_root=Path(source_root).resolve(),
++        candidate_root=None,
++    )
+     return readiness, readiness_sha256
+ 
+ 
+ def simulator_kwargs_from_readiness(
+     readiness: Mapping[str, object],
+ ) -> dict[str, object]:
+     """Bind simulator constructor inputs that differ from engine defaults."""
+ 
+     policy = readiness.get("effective_policy")
+     entry_policy = policy.get("entry_policy") if isinstance(policy, Mapping) else None
+@@ -799,21 +1020,24 @@ def capture_parity_reference(
+     *,
+     readiness_path: Path,
+     pit_bundle_path: Path,
+     output: Path,
+     source_root: Path | None = None,
+ ) -> ParityReference:
+     """Authenticate local inputs and capture the inline-policy discovery reference."""
+ 
+     root = Path(source_root or Path(__file__).resolve().parents[1]).resolve()
+     source_head, source_fingerprint = _source_identity(root)
+-    readiness, readiness_sha256 = _authenticated_readiness(Path(readiness_path))
++    readiness, readiness_sha256 = _authenticated_readiness(
++        Path(readiness_path),
++        source_root=root,
++    )
+     identities = readiness["identities"]
+     if not isinstance(identities, Mapping):
+         raise ValueError("readiness identities are absent")
+     expected_bundle_sha256 = identities.get("pit_bundle_sha256")
+     _require_digest(expected_bundle_sha256, "readiness PIT bundle digest")
+     bundle_path = Path(pit_bundle_path)
+     if bundle_path.is_symlink() or not bundle_path.is_file():
+         raise ValueError("PIT bundle must be a regular non-link file")
+     if _sha256_file(bundle_path.resolve()) != expected_bundle_sha256:
+         raise ValueError("PIT bundle digest differs from readiness")
+@@ -846,35 +1070,45 @@ def capture_parity_reference(
+ 
+         return capture_from_authenticated_inputs(
+             readiness=readiness,
+             readiness_sha256=readiness_sha256,
+             pit_bundle_sha256=expected_bundle_sha256,
+             reference_source_head=source_head,
+             reference_source_fingerprint_sha256=source_fingerprint,
+             benchmark_sessions=calendar,
+             output=Path(output),
+             evaluate_discovery_fold=evaluate,
++            pre_persist_check=lambda: _require_unchanged_source(
++                source_root=root,
++                expected_head=source_head,
++                expected_fingerprint_sha256=source_fingerprint,
++            ),
+         )
+ 
+ 
+ def verify_parity_reference(
+     *,
+     reference_path: Path,
+     pit_bundle_path: Path,
+     output: Path,
+     source_root: Path | None = None,
+ ) -> ParityAttestation:
+     """Re-evaluate discovery at a later clean HEAD and persist equality attestation."""
+ 
+     root = Path(source_root or Path(__file__).resolve().parents[1]).resolve()
+     final_head, final_fingerprint = _source_identity(root)
+     reference = load_parity_reference(Path(reference_path))
++    _require_later_descendant_source(
++        source_root=root,
++        reference_head=reference.reference_source_head,
++        final_head=final_head,
++    )
+     bundle_path = Path(pit_bundle_path)
+     if bundle_path.is_symlink() or not bundle_path.is_file():
+         raise ValueError("PIT bundle must be a regular non-link file")
+     if _sha256_file(bundle_path.resolve()) != reference.pit_bundle_sha256:
+         raise ValueError("PIT bundle digest differs from parity reference")
+ 
+     from core.backtest_engine import PortfolioSimulator
+     from core.pit_data import PITDataBundle
+     from core.strategy_policy import POLICY_INTERFACE_VERSION
+ 
+@@ -897,20 +1131,25 @@ def verify_parity_reference(
+             )
+             for fold in reference.fold_manifest.discovery_folds
+         )
+     return verify_parity_evidence(
+         reference=reference,
+         output=Path(output),
+         final_source_head=final_head,
+         final_source_fingerprint_sha256=final_fingerprint,
+         policy_interface_version=POLICY_INTERFACE_VERSION,
+         final_discovery_evidence=evidence,
++        pre_persist_check=lambda: _require_unchanged_source(
++            source_root=root,
++            expected_head=final_head,
++            expected_fingerprint_sha256=final_fingerprint,
++        ),
+     )
+ 
+ 
+ def _parser() -> argparse.ArgumentParser:
+     parser = argparse.ArgumentParser(description=__doc__)
+     commands = parser.add_subparsers(dest="command", required=True)
+     capture = commands.add_parser("capture")
+     capture.add_argument("--readiness", required=True, type=Path)
+     capture.add_argument("--pit-bundle", required=True, type=Path)
+     capture.add_argument("--output", required=True, type=Path)
+diff --git a/tests/test_pit_policy_parity.py b/tests/test_pit_policy_parity.py
+index 11f3c76..423b7f7 100644
+--- a/tests/test_pit_policy_parity.py
++++ b/tests/test_pit_policy_parity.py
+@@ -1,22 +1,24 @@
+ """Behavioral contracts for fold manifests and persisted policy parity."""
+ 
+ from __future__ import annotations
+ 
+ from dataclasses import asdict, replace
+ import hashlib
+ import json
+ from pathlib import Path
++import subprocess
+ 
+ import pandas as pd
+ import pytest
+ 
++import core.pit_policy_parity as parity
+ from core.backtest_engine import EntryAttemptOutcome, SimulationResult, Trade
+ from core.pit_optimizer_evaluation import (
+     AggregateMetric,
+     FoldAggregateSummary,
+     FoldManifest,
+     FoldSpec,
+ )
+ from core.pit_policy_parity import (
+     ParityEntryOutcome,
+     ParityEquityPoint,
+@@ -55,79 +57,107 @@ def _fold(fold_id: str, purpose: str, start: str) -> FoldSpec:
+     sessions = tuple(value.date().isoformat() for value in pd.bdate_range(start=start, periods=60))
+     return FoldSpec(
+         fold_id=fold_id,
+         purpose=purpose,
+         start_date=sessions[0],
+         end_date=sessions[-1],
+         sessions=sessions,
+     )
+ 
+ 
+-def _aggregate(fold_id: str) -> FoldAggregateSummary:
+-    funnel = (AggregateMetric("entries_executed", 1),)
++def _aggregate(
++    fold_id: str,
++    *,
++    funnel: tuple[AggregateMetric, ...] | None = None,
++) -> FoldAggregateSummary:
++    funnel = funnel or (AggregateMetric("entries_executed", 1),)
+     exits = (AggregateMetric("end_of_test", 1),)
+     return FoldAggregateSummary(
+         fold_id=fold_id,
+         total_return_pct=1.0,
+         excess_total_return_pp=0.5,
+         max_drawdown_pct=-0.25,
+         sharpe_ratio=1.5,
+         closed_trades=1,
+         turnover_pct=20.0,
+         average_exposure_pct=10.0,
+         entry_funnel=funnel,
+         exit_attribution=exits,
+     )
+ 
+ 
+-def _evidence(fold_id: str, *, equity: float = 1_010.0) -> ParityFoldEvidence:
++def _json_digest(value: object) -> str:
++    return hashlib.sha256(
++        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
++            "utf-8"
++        )
++        + b"\n"
++    ).hexdigest()
++
++
++def _evidence(
++    fold: FoldSpec,
++    *,
++    equity: float = 1_010.0,
++    equity_sessions: tuple[str, ...] | None = None,
++    transaction_date: str | None = None,
++    signal_date: str | None = None,
++    entry_date: str | None = None,
++    aggregate_funnel: tuple[AggregateMetric, ...] | None = None,
++) -> ParityFoldEvidence:
++    transaction_date = transaction_date or fold.sessions[1]
++    signal_date = signal_date or fold.sessions[0]
++    entry_date = entry_date or fold.sessions[1]
+     transaction = ParityTransaction(
+-        date="2021-01-05",
++        date=transaction_date,
+         symbol="AAA",
+         from_symbol=None,
+         action="BUY",
+         price=100.0,
+         quantity=1.0,
+         value=100.0,
+         reason="fixture",
+     )
+     outcome = ParityEntryOutcome(
+         symbol="AAA",
+-        signal_date="2021-01-04",
+-        entry_date="2021-01-05",
++        signal_date=signal_date,
++        entry_date=entry_date,
+         pivot=None,
+         buy_zone_lower=None,
+         buy_zone_upper=None,
+         entry_open=100.0,
+         outcome="entries_executed",
+     )
++    funnel = (AggregateMetric("entries_executed", 1),)
++    equity_points = tuple(
++        ParityEquityPoint(session, equity)
++        for session in (equity_sessions or fold.sessions)
++    )
+     fields = {
+-        "fold_id": fold_id,
++        "fold_id": fold.fold_id,
+         "transactions": (transaction,),
+         "entry_outcomes": (outcome,),
+-        "equity": (ParityEquityPoint("2021-01-05", equity),),
+-        "funnel": (AggregateMetric("entries_executed", 1),),
+-        "aggregate": _aggregate(fold_id),
++        "equity": equity_points,
++        "funnel": funnel,
++        "aggregate": _aggregate(fold.fold_id, funnel=aggregate_funnel),
+         "effective_policy_sha256": "d" * 64,
+     }
+     primitive = {
+-        "fold_id": fold_id,
++        "fold_id": fold.fold_id,
+         "transactions": [asdict(transaction)],
+         "entry_outcomes": [asdict(outcome)],
+-        "equity": [asdict(fields["equity"][0])],
+-        "funnel": [asdict(fields["funnel"][0])],
++        "equity": [asdict(point) for point in equity_points],
++        "funnel": [asdict(metric) for metric in funnel],
+         "aggregate": asdict(fields["aggregate"]),
+         "effective_policy_sha256": "d" * 64,
+     }
+-    digest = hashlib.sha256(
+-        json.dumps(primitive, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8") + b"\n"
+-    ).hexdigest()
++    digest = _json_digest(primitive)
+     return ParityFoldEvidence(**fields, evidence_sha256=digest)
+ 
+ 
+ def test_fold_manifest_rejects_reused_discovery_sessions() -> None:
+     """Break caught: the same market sessions could influence both discovery folds."""
+     first = _fold("discovery_1", "discovery", "2021-01-04")
+     second = replace(first, fold_id="discovery_2")
+     hidden = _fold("hidden_1", "hidden", "2022-01-03")
+     with pytest.raises(ValueError, match="overlap"):
+         FoldManifest(
+@@ -139,48 +169,48 @@ def test_fold_manifest_rejects_reused_discovery_sessions() -> None:
+             hidden_fold=hidden,
+         )
+ 
+ 
+ def test_fold_manifest_requires_two_chronological_discovery_folds_before_hidden() -> None:
+     """Break caught: a short, reordered, or mislabeled fold could be evaluated."""
+     first = _fold("discovery_1", "discovery", "2021-01-04")
+     second = _fold("discovery_2", "discovery", "2021-04-01")
+     hidden = _fold("hidden_1", "hidden", "2022-01-03")
+     manifest = FoldManifest(
+-        data_identity_sha256="a" * 64,
+-        universe_sha256="b" * 64,
++        data_identity_sha256="4" * 64,
++        universe_sha256=_json_digest(["AAA", "BBB"]),
+         benchmark="SPY",
+         warmup_start_date="2020-01-02",
+         discovery_folds=(first, second),
+         hidden_fold=hidden,
+     )
+ 
+     assert len(first.sessions) == len(second.sessions) == len(hidden.sessions) == 60
+     assert manifest.sha256 == hashlib.sha256(canonical_json_bytes_without_self_digest(manifest, "sha256")).hexdigest()
+     with pytest.raises(ValueError, match="chronological"):
+         replace(manifest, discovery_folds=(second, first))
+ 
+ 
+ def test_reference_persists_canonical_nested_evidence_and_is_create_only(tmp_path: Path) -> None:
+     """Break caught: parity hashes replaced retrievable evidence or an artifact was overwritten."""
+     first = _fold("discovery_1", "discovery", "2021-01-04")
+     second = _fold("discovery_2", "discovery", "2021-04-01")
+     manifest = FoldManifest(
+-        data_identity_sha256="a" * 64,
+-        universe_sha256="b" * 64,
++        data_identity_sha256="4" * 64,
++        universe_sha256=_json_digest(["AAA", "BBB"]),
+         benchmark="SPY",
+         warmup_start_date="2020-01-02",
+         discovery_folds=(first, second),
+         hidden_fold=_fold("hidden_1", "hidden", "2022-01-03"),
+     )
+     output = tmp_path / "reference.json"
+-    evidence = (_evidence("discovery_1"), _evidence("discovery_2"))
++    evidence = (_evidence(first), _evidence(second))
+ 
+     reference = persist_parity_reference(
+         output=output,
+         reference_source_head="1" * 40,
+         reference_source_fingerprint_sha256="2" * 64,
+         readiness_sha256="3" * 64,
+         pit_bundle_sha256="4" * 64,
+         baseline_manifest_sha256="5" * 64,
+         effective_policy_sha256="d" * 64,
+         fold_manifest=manifest,
+@@ -206,29 +236,29 @@ def test_reference_persists_canonical_nested_evidence_and_is_create_only(tmp_pat
+             universe=("AAA", "BBB"),
+             discovery_evidence=evidence,
+         )
+ 
+ 
+ def test_attestation_is_not_written_when_any_retrievable_evidence_differs(tmp_path: Path) -> None:
+     """Break caught: matching summary hashes could conceal a changed equity path."""
+     first = _fold("discovery_1", "discovery", "2021-01-04")
+     second = _fold("discovery_2", "discovery", "2021-04-01")
+     manifest = FoldManifest(
+-        data_identity_sha256="a" * 64,
+-        universe_sha256="b" * 64,
++        data_identity_sha256="4" * 64,
++        universe_sha256=_json_digest(["AAA", "BBB"]),
+         benchmark="SPY",
+         warmup_start_date="2020-01-02",
+         discovery_folds=(first, second),
+         hidden_fold=_fold("hidden_1", "hidden", "2022-01-03"),
+     )
+     reference_path = tmp_path / "reference.json"
+-    reference_evidence = (_evidence("discovery_1"), _evidence("discovery_2"))
++    reference_evidence = (_evidence(first), _evidence(second))
+     persist_parity_reference(
+         output=reference_path,
+         reference_source_head="1" * 40,
+         reference_source_fingerprint_sha256="2" * 64,
+         readiness_sha256="3" * 64,
+         pit_bundle_sha256="4" * 64,
+         baseline_manifest_sha256="5" * 64,
+         effective_policy_sha256="d" * 64,
+         fold_manifest=manifest,
+         universe=("AAA", "BBB"),
+@@ -237,23 +267,24 @@ def test_attestation_is_not_written_when_any_retrievable_evidence_differs(tmp_pa
+     output = tmp_path / "attestation.json"
+ 
+     with pytest.raises(ValueError, match="equity"):
+         verify_parity_evidence(
+             reference=load_parity_reference(reference_path),
+             output=output,
+             final_source_head="6" * 40,
+             final_source_fingerprint_sha256="7" * 64,
+             policy_interface_version=1,
+             final_discovery_evidence=(
+-                _evidence("discovery_1", equity=999.0),
++                _evidence(first, equity=999.0),
+                 reference_evidence[1],
+             ),
++            pre_persist_check=lambda: None,
+         )
+     assert not output.exists()
+ 
+ 
+ def test_fixed_fold_manifest_uses_only_the_supplied_benchmark_calendar() -> None:
+     """Break caught: fold construction queried hidden values instead of sealing session IDs."""
+     closures = {"2021-07-05", "2021-09-06", "2021-11-25", "2021-12-24", "2022-01-17", "2022-02-21"}
+     sessions = tuple(
+         value.date().isoformat()
+         for value in pd.bdate_range("2021-06-25", "2022-03-11")
+@@ -383,31 +414,32 @@ def test_capture_evaluates_only_discovery_and_seals_hidden_calendar(tmp_path: Pa
+         "identities": {
+             "pit_bundle_sha256": "4" * 64,
+             "baseline_manifest_sha256": "5" * 64,
+             "effective_policy_sha256": "d" * 64,
+         },
+     }
+     evaluated: list[str] = []
+ 
+     def evaluate(fold: FoldSpec, _universe: tuple[str, ...], _warmup: str) -> ParityFoldEvidence:
+         evaluated.append(fold.fold_id)
+-        return _evidence(fold.fold_id)
++        return _evidence(fold)
+ 
+     reference = capture_from_authenticated_inputs(
+         readiness=readiness,
+         readiness_sha256="3" * 64,
+         pit_bundle_sha256="4" * 64,
+         reference_source_head="1" * 40,
+         reference_source_fingerprint_sha256="2" * 64,
+         benchmark_sessions=sessions,
+         output=tmp_path / "reference.json",
+         evaluate_discovery_fold=evaluate,
++        pre_persist_check=lambda: None,
+     )
+ 
+     assert evaluated == ["discovery_1", "discovery_2"]
+     assert reference.fold_manifest.hidden_fold.fold_id == "hidden_1"
+     assert len(reference.discovery_evidence) == 2
+ 
+ 
+ def test_capture_simulator_binds_authenticated_signal_cadence() -> None:
+     """Break caught: reference capture silently used the engine's five-day default cadence."""
+     readiness = {
+@@ -417,10 +449,389 @@ def test_capture_simulator_binds_authenticated_signal_cadence() -> None:
+                     "classification": "active_tunable_policy",
+                     "optimizer_candidate": True,
+                     "source": "core.backtest_engine.PortfolioSimulator.signal_every_n_days",
+                     "value": 1,
+                 }
+             }
+         }
+     }
+ 
+     assert simulator_kwargs_from_readiness(readiness) == {"signal_every_n_days": 1}
++
++
++def test_attestation_rejects_the_reference_source_head(tmp_path: Path) -> None:
++    """Break caught: capture HEAD could immediately attest itself as post-extraction."""
++    first = _fold("discovery_1", "discovery", "2021-01-04")
++    second = _fold("discovery_2", "discovery", "2021-04-01")
++    reference_path = tmp_path / "reference.json"
++    reference = persist_parity_reference(
++        output=reference_path,
++        reference_source_head="1" * 40,
++        reference_source_fingerprint_sha256="2" * 64,
++        readiness_sha256="3" * 64,
++        pit_bundle_sha256="4" * 64,
++        baseline_manifest_sha256="5" * 64,
++        effective_policy_sha256="d" * 64,
++        fold_manifest=FoldManifest(
++            data_identity_sha256="4" * 64,
++            universe_sha256=_json_digest(["AAA", "BBB"]),
++            benchmark="SPY",
++            warmup_start_date="2020-01-02",
++            discovery_folds=(first, second),
++            hidden_fold=_fold("hidden_1", "hidden", "2022-01-03"),
++        ),
++        universe=("AAA", "BBB"),
++        discovery_evidence=(_evidence(first), _evidence(second)),
++    )
++
++    with pytest.raises(ValueError, match="later source HEAD"):
++        verify_parity_evidence(
++            reference=reference,
++            output=tmp_path / "attestation.json",
++            final_source_head=reference.reference_source_head,
++            final_source_fingerprint_sha256="7" * 64,
++            policy_interface_version=1,
++            final_discovery_evidence=reference.discovery_evidence,
++            pre_persist_check=lambda: None,
++        )
++    assert not (tmp_path / "attestation.json").exists()
++
++
++def test_verification_rejects_a_non_descendant_source_head(tmp_path: Path) -> None:
++    """Break caught: an unrelated commit could be called the final extracted source."""
++    repository = tmp_path / "repository"
++    repository.mkdir()
++
++    def git(*args: str) -> str:
++        return subprocess.run(
++            ["git", *args],
++            cwd=repository,
++            check=True,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
++            text=True,
++        ).stdout.strip()
++
++    git("init")
++    git("config", "user.name", "Parity Test")
++    git("config", "user.email", "parity@example.invalid")
++    (repository / "tracked.txt").write_text("reference\n", encoding="utf-8")
++    git("add", "tracked.txt")
++    git("commit", "-m", "reference")
++    reference_head = git("rev-parse", "HEAD")
++    git("switch", "--orphan", "unrelated")
++    (repository / "other.txt").write_text("unrelated\n", encoding="utf-8")
++    git("add", "other.txt")
++    git("commit", "-m", "unrelated")
++    final_head = git("rev-parse", "HEAD")
++
++    with pytest.raises(ValueError, match="descendant"):
++        parity._require_later_descendant_source(
++            source_root=repository,
++            reference_head=reference_head,
++            final_head=final_head,
++        )
++
++
++def test_readiness_authentication_rejects_a_canonical_incomplete_contract(
++    tmp_path: Path,
++) -> None:
++    """Break caught: canonical bytes alone could masquerade as closed readiness."""
++    policy = {"schema_version": 1}
++    policy_sha256 = hashlib.sha256(
++        json.dumps(policy, sort_keys=True, separators=(",", ":")).encode("utf-8")
++        + b"\n"
++    ).hexdigest()
++    readiness = {
++        "effective_policy": policy,
++        "identities": {"effective_policy_sha256": policy_sha256},
++    }
++    path = tmp_path / "readiness.json"
++    path.write_bytes(
++        json.dumps(readiness, sort_keys=True, separators=(",", ":")).encode("utf-8")
++        + b"\n"
++    )
++
++    with pytest.raises(ValueError, match="closed readiness contract"):
++        parity._authenticated_readiness(
++            path,
++            source_root=Path(__file__).resolve().parents[1],
++        )
++
++
++def test_readiness_authentication_rejects_tampered_candidate_catalog(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Break caught: known candidate IDs could carry unauthenticated edit records."""
++    import core.pit_optimization as optimization
++    from core.engine_policy import effective_engine_policy_sha256
++
++    policy = {"schema_version": 1}
++    policy_sha256 = effective_engine_policy_sha256(policy)
++    readiness = {
++        "schema_version": 1,
++        "gate": "pit_optimization",
++        "phase": "ready",
++        "identities": {
++            "source_head": "1" * 40,
++            "source_fingerprint_sha256": "2" * 64,
++            "entry_contract_source_sha256": "3" * 64,
++            "pit_bundle_sha256": optimization.PIT_BUNDLE_SHA256,
++            "baseline_manifest_sha256": optimization.BASELINE_MANIFEST_SHA256,
++            "baseline_source_commit": optimization.BASELINE_SOURCE_COMMIT,
++            "effective_policy_sha256": policy_sha256,
++            "prior_discovery_feedback_sha256": None,
++        },
++        "sealed_inputs": {
++            "pit_bundle_sha256": optimization.PIT_BUNDLE_SHA256,
++            "baseline_artifact_sha256": {
++                "run_manifest.json": optimization.BASELINE_MANIFEST_SHA256
++            },
++            "prior_discovery_feedback_sha256": None,
++        },
++        "date_contract": {
++            "full_start": optimization.FULL_START_DATE,
++            "full_end": optimization.FULL_END_DATE,
++            "holdout_start": optimization.HOLDOUT_START_DATE,
++            "holdout_end": optimization.HOLDOUT_END_DATE,
++        },
++        "budget_contract": {},
++        "evaluation_contract": {},
++        "candidate_catalog": [
++            {"candidate_id": "min_rs_score_075", "new_line": "TAMPERED = True"}
++        ],
++        "effective_policy": policy,
++        "baseline": {},
++        "prior_discovery_feedback": [],
++        "evidence_ids": list(optimization._VERIFICATION_EVIDENCE_IDS),
++        "invariant_ids": list(optimization._INVARIANT_IDS),
++    }
++    path = tmp_path / "readiness.json"
++    path.write_bytes(
++        json.dumps(readiness, sort_keys=True, separators=(",", ":")).encode("utf-8")
++        + b"\n"
++    )
++    monkeypatch.setattr(optimization, "_verify_policy_catalog", lambda _policy: None)
++    monkeypatch.setattr(optimization, "_provider_payload", lambda _readiness: {})
++    monkeypatch.setattr(optimization, "_readiness_identity", lambda *_args, **_kwargs: None)
++
++    with pytest.raises(ValueError, match="candidate catalog changed"):
++        parity._authenticated_readiness(path, source_root=tmp_path)
++
++
++def test_source_identity_rejects_nonignored_untracked_files(tmp_path: Path) -> None:
++    """Break caught: untracked executable input was compatible with a clean source claim."""
++    repository = tmp_path / "repository"
++    repository.mkdir()
++
++    def git(*args: str) -> None:
++        subprocess.run(
++            ["git", *args],
++            cwd=repository,
++            check=True,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
++        )
++
++    git("init")
++    git("config", "user.name", "Parity Test")
++    git("config", "user.email", "parity@example.invalid")
++    (repository / "tracked.txt").write_text("tracked\n", encoding="utf-8")
++    git("add", "tracked.txt")
++    git("commit", "-m", "tracked")
++    (repository / "runtime_policy.py").write_text("ACTIVE = True\n", encoding="utf-8")
++
++    with pytest.raises(ValueError, match="clean committed source"):
++        parity._source_identity(repository)
++
++
++def test_capture_rechecks_source_after_evaluation_before_write(tmp_path: Path) -> None:
++    """Break caught: capture could publish after source changed during evaluation."""
++    closures = {
++        "2021-07-05",
++        "2021-09-06",
++        "2021-11-25",
++        "2021-12-24",
++        "2022-01-17",
++        "2022-02-21",
++    }
++    sessions = tuple(
++        value.date().isoformat()
++        for value in pd.bdate_range("2021-06-25", "2022-03-11")
++        if value.date().isoformat() not in closures
++    )
++    readiness = {
++        "evaluation_contract": {
++            "verification_only": True,
++            "scope": {
++                "benchmark": "SPY",
++                "discovery_start": "2021-06-25",
++                "discovery_end": "2021-09-20",
++                "holdout_start": "2021-09-21",
++                "holdout_end": "2021-12-14",
++                "warmup_start": "2021-01-01",
++                "session_count": 60,
++                "symbol_count": 2,
++                "symbols": ["AAA", "BBB"],
++            },
++        },
++        "identities": {
++            "pit_bundle_sha256": "4" * 64,
++            "baseline_manifest_sha256": "5" * 64,
++            "effective_policy_sha256": "d" * 64,
++        },
++    }
++
++    def reject_drift() -> None:
++        raise ValueError("source changed during parity evaluation")
++
++    output = tmp_path / "reference.json"
++    with pytest.raises(ValueError, match="source changed"):
++        capture_from_authenticated_inputs(
++            readiness=readiness,
++            readiness_sha256="3" * 64,
++            pit_bundle_sha256="4" * 64,
++            reference_source_head="1" * 40,
++            reference_source_fingerprint_sha256="2" * 64,
++            benchmark_sessions=sessions,
++            output=output,
++            evaluate_discovery_fold=lambda fold, _universe, _warmup: _evidence(
++                fold
++            ),
++            pre_persist_check=reject_drift,
++        )
++    assert not output.exists()
++
++
++def test_attestation_rechecks_source_after_evaluation_before_write(tmp_path: Path) -> None:
++    """Break caught: verification could publish after source changed during evaluation."""
++    first = _fold("discovery_1", "discovery", "2021-01-04")
++    second = _fold("discovery_2", "discovery", "2021-04-01")
++    reference = persist_parity_reference(
++        output=tmp_path / "reference.json",
++        reference_source_head="1" * 40,
++        reference_source_fingerprint_sha256="2" * 64,
++        readiness_sha256="3" * 64,
++        pit_bundle_sha256="4" * 64,
++        baseline_manifest_sha256="5" * 64,
++        effective_policy_sha256="d" * 64,
++        fold_manifest=FoldManifest(
++            data_identity_sha256="4" * 64,
++            universe_sha256=_json_digest(["AAA", "BBB"]),
++            benchmark="SPY",
++            warmup_start_date="2020-01-02",
++            discovery_folds=(first, second),
++            hidden_fold=_fold("hidden_1", "hidden", "2022-01-03"),
++        ),
++        universe=("AAA", "BBB"),
++        discovery_evidence=(_evidence(first), _evidence(second)),
++    )
++
++    def reject_drift() -> None:
++        raise ValueError("source changed during parity evaluation")
++
++    output = tmp_path / "attestation.json"
++    with pytest.raises(ValueError, match="source changed"):
++        verify_parity_evidence(
++            reference=reference,
++            output=output,
++            final_source_head="6" * 40,
++            final_source_fingerprint_sha256="7" * 64,
++            policy_interface_version=1,
++            final_discovery_evidence=reference.discovery_evidence,
++            pre_persist_check=reject_drift,
++        )
++    assert not output.exists()
++
++
++@pytest.mark.parametrize(
++    ("data_identity_sha256", "universe_sha256", "message"),
++    [
++        ("a" * 64, _json_digest(["AAA", "BBB"]), "data identity"),
++        ("4" * 64, "b" * 64, "universe identity"),
++    ],
++)
++def test_reference_rejects_manifest_identity_crosslink_mismatch(
++    tmp_path: Path,
++    data_identity_sha256: str,
++    universe_sha256: str,
++    message: str,
++) -> None:
++    """Break caught: embedded evidence could be attributed to different sealed inputs."""
++    first = _fold("discovery_1", "discovery", "2021-01-04")
++    second = _fold("discovery_2", "discovery", "2021-04-01")
++
++    with pytest.raises(ValueError, match=message):
++        persist_parity_reference(
++            output=tmp_path / "reference.json",
++            reference_source_head="1" * 40,
++            reference_source_fingerprint_sha256="2" * 64,
++            readiness_sha256="3" * 64,
++            pit_bundle_sha256="4" * 64,
++            baseline_manifest_sha256="5" * 64,
++            effective_policy_sha256="d" * 64,
++            fold_manifest=FoldManifest(
++                data_identity_sha256=data_identity_sha256,
++                universe_sha256=universe_sha256,
++                benchmark="SPY",
++                warmup_start_date="2020-01-02",
++                discovery_folds=(first, second),
++                hidden_fold=_fold("hidden_1", "hidden", "2022-01-03"),
++            ),
++            universe=("AAA", "BBB"),
++            discovery_evidence=(_evidence(first), _evidence(second)),
++        )
++    assert not (tmp_path / "reference.json").exists()
++
++
++@pytest.mark.parametrize(
++    ("mutation", "message"),
++    [
++        ("equity", "equity sessions"),
++        ("funnel", "entry funnel"),
++        ("transaction", "transaction date"),
++        ("signal", "signal date"),
++        ("entry", "entry date"),
++    ],
++)
++def test_reference_rejects_fold_evidence_crosslink_mismatch(
++    tmp_path: Path,
++    mutation: str,
++    message: str,
++) -> None:
++    """Break caught: self-consistent evidence could be attached to the wrong fold."""
++    first = _fold("discovery_1", "discovery", "2021-01-04")
++    second = _fold("discovery_2", "discovery", "2021-04-01")
++    kwargs: dict[str, object] = {}
++    if mutation == "equity":
++        kwargs["equity_sessions"] = first.sessions[:-1]
++    elif mutation == "funnel":
++        kwargs["aggregate_funnel"] = (AggregateMetric("other", 1),)
++    elif mutation == "transaction":
++        kwargs["transaction_date"] = "2020-12-31"
++    elif mutation == "signal":
++        kwargs["signal_date"] = "2020-12-31"
++    else:
++        kwargs["entry_date"] = "2020-12-31"
++
++    with pytest.raises(ValueError, match=message):
++        persist_parity_reference(
++            output=tmp_path / "reference.json",
++            reference_source_head="1" * 40,
++            reference_source_fingerprint_sha256="2" * 64,
++            readiness_sha256="3" * 64,
++            pit_bundle_sha256="4" * 64,
++            baseline_manifest_sha256="5" * 64,
++            effective_policy_sha256="d" * 64,
++            fold_manifest=FoldManifest(
++                data_identity_sha256="4" * 64,
++                universe_sha256=_json_digest(["AAA", "BBB"]),
++                benchmark="SPY",
++                warmup_start_date="2020-01-02",
++                discovery_folds=(first, second),
++                hidden_fold=_fold("hidden_1", "hidden", "2022-01-03"),
++            ),
++            universe=("AAA", "BBB"),
++            discovery_evidence=(_evidence(first, **kwargs), _evidence(second)),
++        )
++    assert not (tmp_path / "reference.json").exists()

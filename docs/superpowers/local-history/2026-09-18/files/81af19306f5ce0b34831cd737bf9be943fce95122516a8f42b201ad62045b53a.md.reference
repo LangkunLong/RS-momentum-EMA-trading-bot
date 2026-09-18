@@ -1,0 +1,20 @@
+# Independent development-semantics fix review
+
+Commit reviewed: `a068e0aed40ecbe5e0078924071f374e7809b8c2` against parent `0985d9bae74162ec1da8a7268bd54e47f21b0b85`.
+
+## Prior finding disposition
+
+- **P1 ADDRESSED.** `core/pit_optimizer_v5/artifacts.py:1329` now constructs the finalized-campaign `CandidateArchiveReducerV5` with `pit_data_scope=manifest.pit_data_scope` and `semantic_mode=manifest.semantic_mode`. Disabled-development records therefore replay under their authenticated mode instead of the reducer's production/required defaults.
+- **P2 ADDRESSED.** `core/pit_optimizer_v5/selection.py:140` now enforces that a quick-screen semantic fingerprint is absent exactly in disabled-development mode and present in required mode. Missing production semantic evidence is rejected at construction rather than silently becoming ineligible.
+
+## Spec-compliance verdict: PASS
+
+The scoped fix restores finalized archive authentication for disabled-development campaigns and preserves strict required-mode semantic evidence. Both changes implement the requested invariants directly at the affected authority boundaries.
+
+## Code-quality verdict: PASS
+
+The changes are narrow, consistent with the equivalent invariants already used by parent and quick-evidence contracts, and introduce no new breakage in the fix diff.
+
+## Review boundaries
+
+The review examined only the exact fix diff and necessary adjacent source context. No tests, synthetic probes, application imports, Docker, network/provider calls, or source edits were performed.

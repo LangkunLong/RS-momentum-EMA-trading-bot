@@ -1,0 +1,282 @@
+# Task 6 re-review — Fix Round 5
+
+Date: 2026-08-28  
+Review base: `ae5d837`  
+Review head: `f66abeaecb24f856504677d776194b1ce2a215e7`  
+Disposition: **NEEDS FIXES**  
+Open findings: **0 Critical, 2 Important, 1 Minor**
+
+## Scope and threat model
+
+This was a fresh read-only review of the complete Fix Round 5 section of
+`task-6-report.md`, all 2,689 lines of `review-ae5d837..f66abea.diff`, every
+open Round 4 item, the Task 6 brief, the approved design, and the relevant
+current authorization, gateway, budget, audit, recovery, and focused-test code.
+Static evidence was sufficient, so I did not run tests. I ran only read-only
+repository/status/whitespace checks and wrote this ignored review report. No
+provider, network, live pricing, real SDK, replay/parity, Docker, background
+process, permanent ledger, or user authorization was used.
+
+The requested threat calibration is applied. Untrusted model-authored policy
+code runs in the isolated worker and cannot import controller internals. No
+Critical finding relies on reflection, a private underscore method, or mutation
+of private capability state. The former supported-public forgery is closed.
+Important 1 concerns recovery from tampered durable evidence, an explicit
+design stop condition, and is Important rather than Critical because no
+supported public writer now creates the forged package. Important 2 is a
+normal in-scope Task 6 `BaseException` phase failure reachable through an
+injected dependency.
+
+Round 5 substantially improves the security boundary: generic namespaces and
+optimizer events are reserved; reservation/start events have trusted
+AuthorizationLedger commitments; authorization verification now precedes
+BudgetLedger restore; provider, budget, and event evidence is read and hashed
+through one protected open; and role-derived LoopState is replayed exactly.
+Two lifecycle/accounting gaps still prevent readiness.
+
+## Finding Verdicts
+
+| Round 4 item | Round 5 verdict | Evidence |
+|---|---|---|
+| Critical 1 — generic namespace/event forgery and gateway-origin authority | **PUBLIC FORGERY ADDRESSED; DURABLE ORIGIN PARTIAL, OPEN AS IMPORTANT 1.** Generic names beginning `provider-call`, `provider-budget`, or `optimizer-receipt` are rejected (`agent_loop.py:12091-12099`), and public `append_event` rejects every optimizer state or lifecycle code (`12229-12245`). The private typed path derives the state from the live lifecycle (`12247-12267`). AuthorizationLedger commits reserved/start stages (`core/pit_optimizer_authorization.py:1455-1572`), and the supported-public attack test is meaningful (`tests/test_pit_optimizer_v2.py:5777-5964`). The commitment never binds the terminal provider, budget, or event digests, however. See Important 1. |
+| Important 1 — verify authorization before BudgetLedger restore, with genuine retry | **ADDRESSED.** Recovery obtains the stored active reservation, derives untrusted audit facts without mutation, calls `verify_terminal_audit_receipt`, and only restores the returned verified image (`agent_loop.py:3957-3978`). The test snapshots every fresh-budget field, rejects the wrong authorization identity without mutation, restores genuine bytes, retries on the same ledger, and unlocks exactly plan 2 (`tests/test_pit_optimizer_v2.py:6488-6645`). |
+| Important 2 — one protected identity for provider/budget/receipt evidence | **ADDRESSED for the durable evidence files.** `_read_protected_audit_artifact` performs direct-parent/path, `lstat`, regular-file, symlink/reparse, single-link, size, one-open/one-read, descriptor/path identity, and same-byte hash checks (`agent_loop.py:11895-11969`). Provider and budget fresh/existing/recovery branches use `_read_protected_json` (`12401-12438`, `12602`, `12700`, `12792`), and event replay uses the same primitive (`13373`). Hardlink, reparse, and deterministic second-open tests are targeted (`tests/test_pit_optimizer_v2.py:6648-6857`). `TerminalAuditReceipt` is a projection of the protected provider/event evidence, not a separate receipt file; after reconciliation it is stored in the trusted hash-chained AuthorizationLedger. |
+| Important 3 — exact role-derived LoopState replay | **ADDRESSED.** Replay maps the sealed record role to exactly one state and rejects every relevant lifecycle event with another state (`agent_loop.py:12897-12903`). The fully rehashed investigator-to-author relabel test fails before restore (`tests/test_pit_optimizer_v2.py:6859-6941`). |
+| Minor 1 — evidence/report accuracy | **PARTIAL; OPEN.** The corrected implementation and most command/count/resource claims match the inspected tests. The claim that the focused REDs cover all optimizer lifecycle states is broader than the parameterization. See Minor 1. |
+
+## Actionable findings
+
+### Important 1 — recovery can authenticate a rewritten terminal package because the trusted commitment stops at request start
+
+**Confidence: 9/10.**
+
+The new trusted `gateway_lifecycle` primitive contains the plan, authorization
+reservation, budget reservation, manifest, audit run, lease, reserved-event
+digest, and optional started-event digest
+(`core/pit_optimizer_authorization.py:1487-1505`). The normal-path test confirms
+that the AuthorizationLedger tail is reservation, reserved commitment, started
+commitment, reconciliation; there is no terminal commitment
+(`tests/test_pit_optimizer_v2.py:5572-5587`).
+
+Terminal publication happens after BudgetLedger reconciliation: the gateway
+writes the provider/budget/terminal receipt package and only then calls
+`AuthorizationLedger.reconcile_call` (`agent_loop.py:3857-3909`). A crash at
+that existing recovery boundary therefore leaves authentic reserved/start
+commitments but no trusted provider/event/budget digest. On restart,
+`_require_gateway_lifecycle_commitment` compares the facts only to the
+reserved/start lifecycle digest and compares only the original budget
+*reservation* primitive (`core/pit_optimizer_authorization.py:1387-1452`). It
+does not bind `provider_record_sha256`, `budget_recovery_sha256`,
+`terminal_event_sha256`, usage, terminal outcome/code, or payload digest.
+
+Consequently, after a genuine request reaches terminal audit but crashes before
+authorization reconciliation, a rewritten provider usage/cost, matching budget
+recovery image, and matching terminal event can extend the genuine hash chain
+from the authentic start event. Semantic replay accepts the self-consistent
+package (`agent_loop.py:13004-13088`), the start commitment still matches, and
+recovery restores the rewritten budget and publishes a reconciliation
+(`3931-3984`). The next plan is then unlocked. The audit-local hashes prove
+consistency, but the trusted ledger does not prove that the gateway produced
+those terminal facts. This violates the approved design's requirement to stop
+on evidence tampering and to close call/token/cost/audit records exactly
+(`docs/superpowers/specs/2026-08-27-model-authored-pit-optimizer-design.md:453-465`,
+`560-564`).
+
+**Required fix:** add a private gateway-owned terminal commitment to the
+AuthorizationLedger before terminal evidence can authorize restart. Bind the
+exact authorization reservation, provider record digest, budget recovery
+digest, terminal event digest, run/manifest/call/iteration/role, usage and
+charge basis (or their canonical digest), outcome, payload digest, and terminal
+code. Recovery and reconciliation must require this commitment. A crash before
+the terminal commitment must remain fail-closed; it must not be auto-resealed
+from audit-local hashes. Prefer making the trusted terminal commitment and
+authorization reconciliation one idempotent transaction where possible.
+
+**Exact fake/temp RED:** start from
+`_task6_crash_after_terminal_audit` in a pytest `tmp_path`, with the injected
+fake client and fake pricing. Preserve the genuine reserved and started events
+byte-for-byte and preserve their existing AuthorizationLedger commitments.
+Change the provider record from the genuine 100/50/150, `$0.001` usage to a
+different closed authoritative 120/60/180, `$0.002` usage. Change the budget
+recovery snapshot/reconciliation to match while keeping the genuine budget
+reservation primitive. Change only the terminal event's provider digest,
+budget digest, snapshot, and terminal hash; keep its genuine authorization ID,
+reservation/start digests, lifecycle digest, role, and ordering. Reopen a fresh
+AuditTrail, AuthorizationLedger, and zero BudgetLedger and call public
+`recover_pit_optimizer_finalization`.
+
+Require rejection before BudgetLedger restore or authorization reconciliation,
+and require `reserve_call(..., plan2)` to remain fenced. Current code accepts
+the rewritten image, charges `$0.002`, reconciles call 1, and makes plan 2
+available. This is the missing companion to the Round 5 wrong-authorization
+test: that test rewrites the reserved/start authorization identity too
+(`tests/test_pit_optimizer_v2.py:6556-6587`), so the new start commitment—not
+terminal origin—causes its expected rejection.
+
+**Why Task 6, not Task 7:** Task 6 defines the durable receipt, trusted ledger,
+semantic recovery, accounting restore, reconciliation, and next-plan unlock.
+Task 7 cannot add gateway provenance after Task 6 has accepted audit-local
+terminal hashes as authorization evidence.
+
+### Important 2 — a start-commitment exception releases budget capacity but strands the active authorization reservation
+
+**Confidence: 10/10.**
+
+`_ensure_pit_optimizer_started_event` first persists the start event and stores
+its digest on the lifecycle, then binds the AuthorizationLedger commitment
+(`agent_loop.py:3665-3675`). The caller sets `possibly_sent = True` only after
+that whole method returns (`4252-4253`). If the binding dependency raises a
+`BaseException` after the event is durable, outer cleanup still constructs
+`failed_before_send` facts because `possibly_sent` is false (`4500-4515`).
+
+Finalization reconciles BudgetLedger before validating the lifecycle
+(`3857-3887`). It therefore releases the budget reservation with zero usage,
+then `_seal_pit_optimizer_lifecycle` rejects those before-send facts because a
+start event exists (`3692-3697`). The original exception is preserved, but the
+AuthorizationLedger retains its active call reservation while BudgetLedger has
+released the corresponding reservation (`4534-4556`). A next call fails on the
+active authorization reservation; restart recovery also has no terminal audit
+record to consume. This is a concrete cross-ledger divergence and terminal
+lease wedge at a newly introduced Round 5 persistence boundary.
+
+The existing phase test covers authorization reservation, reservation-event
+append, SDK construction, start-event append, SDK invocation, and response
+processing (`tests/test_pit_optimizer_v2.py:4873-4991`). It does not inject at
+either lifecycle-commitment append.
+
+**Required fix:** treat the durable start-event existence as the conservative
+request-start boundary during every cleanup, even if commitment binding raises
+before the wrapper assigns `possibly_sent`. Validate/commit all terminal
+preconditions before releasing or charging BudgetLedger, or otherwise ensure a
+failure preserves matching active budget and authorization fences. For a
+one-shot commitment exception after a durable start event, retry the exact
+idempotent commitment during cleanup and close the call as uncertain with the
+full reservation retained; do not relabel it before-send and do not transmit a
+replacement request.
+
+**Exact fake/temp RED:** extend the existing synchronous phase test with
+`phase="start_commitment"`. Monkeypatch the injected AuthorizationLedger's
+`_bind_gateway_lifecycle_commitment` wrapper so that, on the first call where
+`lifecycle.started_event_sha256 is not None`, it calls the genuine method and
+then raises `KeyboardInterrupt("start_commitment")`. Invoke the ordinary fake
+gateway once. Require zero SDK calls, one uncertain/started terminal record,
+full retained budget exposure, one matching authorization reconciliation, and
+lease closure as `cancelled`. Reopen the ledgers/audit and assert idempotent
+terminal verification and that no same-plan retry can send. Current code
+returns the interruption with no terminal record or authorization
+reconciliation, releases the BudgetLedger reservation, and leaves the active
+authorization fence so both same-plan retry and plan 2 fail without a recovery
+artifact.
+
+**Why Task 6, not Task 7:** the event/commitment/`possibly_sent` boundary and
+both cleanup transactions are entirely inside Task 6's one-shot gateway. Task
+7 cannot observe this internal partial publication safely, and retrying at the
+controller would violate Task 6's no-retry/no-disguised-retry contract.
+
+### Minor 1 — the report overstates lifecycle-state test coverage
+
+**Confidence: 10/10.**
+
+`task-6-report.md:628-632` says the focused REDs cover all lifecycle
+codes/states. The public append parameterization covers all five reserved event
+codes but only one optimizer role state (`CALL_INVESTIGATOR`); the other rows
+use ordinary `PREPARE` (`tests/test_pit_optimizer_v2.py:5807-5839`). The replay
+test covers one investigator chain relabeled to author, not every exact
+role/state permutation (`6859-6941`). The implementation itself uses the full
+three-state set and a role-derived exact mapping, so this is an evidence/report
+correction, not a code blocker. Say that the tests cover every lifecycle code,
+one representative public optimizer state, and one cross-role semantic relabel,
+with the remaining state closure established by the shared set/mapping logic.
+
+## New Breakage
+
+- Important 2 is a new Round 5 failure boundary introduced by the separate
+  started-event and AuthorizationLedger commitment publications.
+- Important 1 is an incomplete closure of durable gateway-origin authority. It
+  is not the former supported-public capability forgery; that Critical path is
+  closed under the calibrated threat model.
+- No other new Critical or Important regression was found in grant/window
+  durability, source/manifest authentication, pricing freeze lifecycle,
+  canonical wire bytes, normal authoritative/overage/uncertain accounting,
+  accepted post-publication semantics, role synchronization, or legacy
+  schema-v1 provider compatibility.
+
+## Requirement Coverage
+
+| Task 6 requirement | Result |
+|---|---|
+| Hash-chain/exclusive-lock durability; atomic grant + window | **Meets; unchanged.** Authorization history remains exclusively locked, hash-chained, complete-image replaced, and replay checked. Audit file framing/hash replay remains intact. |
+| Old 20/19 isolation; named grant; most-restrictive ceilings | **Meets; unchanged.** No path infers authorization or combines stale capacity. |
+| Authenticated manifest/requirements/source scope; non-secret approval | **Meets.** Canonical manifest, reverse-diff/source identity, and plan provenance remain authenticated; approval values are not persisted. |
+| One-shot run key; concurrency/reopen; no-spend lease open | **Partial.** Lease open and synchronized role consumption remain sound. The start-commit exception cannot reach an exact terminal reopen (Important 2). |
+| Frozen Decimal R1 pricing identity and no post-freeze drift | **Meets.** Fresh gateway cache ownership, live reauthentication, and late callback mutation checks remain intact. |
+| Next-call-only reservation; exact indexes/iterations/roles | **Partial on recovery.** Normal issuance is exact, but an uncommitted rewritten terminal can unlock plan 2 (Important 1). |
+| Authoritative/overage/before-send/uncertain reconciliation | **Partial.** Ordinary paths remain closed. Start-commit failure is misclassified before-send, and rewritten terminal accounting can be restored (Important 1/2). |
+| Complete conservative bytes/tokens/USD before SDK/ledger/start effects | **Meets.** Captured canonical bytes and authenticated frozen pricing still drive preflight before the first reservation or SDK effect. |
+| BudgetLedger/AuthorizationLedger consistency under every exception/cancellation | **Does not yet meet.** Important 2 produces a released budget reservation plus active authorization reservation. |
+| All-R1 profile; one request; `max_retries=0`; no healing/recovery | **Meets in the ordinary wrapper.** No alternate model, retry, healing, or generation recovery was introduced. |
+| Iteration-aware closed provider/audit facts; legacy compatibility | **Partial.** Exact role state, closed records, and schema-v1 compatibility are intact; terminal origin is not committed across the recovery gap (Important 1). |
+| Terminal lease closure; no disguised retry | **Partial.** Normal and recovered genuine terminals close exactly; the start-commit phase wedges without a terminal record (Important 2). |
+| Content/credential/source/provider-response secrecy | **Meets.** Reviewed durable artifacts contain closed accounting/lifecycle/model/pricing/digest facts only. |
+| Record-grant CLI cannot infer authority, combine capacity, or touch credentials | **Meets; unchanged.** The CLI remains an administrative recorder and has no provider path. |
+
+## Test/Report Audit
+
+- The Round 5 tests use pytest temporary roots, fake clients/responses, injected
+  pricing, and synchronous local mutation only. No test uses a real provider,
+  network, live pricing, permanent ledger, replay engine, Docker, or background
+  worker.
+- The public namespace/event test and supported-public attack are honest and
+  close the prior Critical supported API path. No private capability forgery is
+  counted against them.
+- The verify-before-restore test is a genuine fresh-ledger/no-mutation/retry
+  test. Its changed authorization ID also changes the committed reserved/start
+  identity, so it does not exercise terminal-only provenance (Important 1).
+- The hardlink parameterization covers both provider and budget files; the
+  simulated reparse and deterministic old-second-open tests match the protected
+  reader. There is no standalone optimizer receipt file: the receipt is derived
+  from the protected provider/event package and later embedded in the trusted
+  AuthorizationLedger reconciliation.
+- The exact-state relabel test is honest for investigator-to-author replay.
+- The reported `233 passed`, dedicated `20 passed`, Ruff, and compilation
+  outputs were inspected as recorded evidence but were not independently rerun
+  in this constrained review. The 20-test count matches the inspected
+  parameterizations.
+
+## Resource/Secrecy Audit
+
+- This review performed code/diff/status reads and `git diff --check`, then
+  wrote only this ignored SDD report. It ran no tests or temporary reproducers.
+- It started no provider/network/live-pricing/SDK/replay/container/background
+  action and created no authorization grant, lease, ledger, audit package, or
+  other permanent state.
+- No prompt, strategy source, raw provider response, request header, credential,
+  API key, or operator approval content is added to the reviewed artifacts or
+  this report.
+
+## Out-of-Scope Observations
+
+- The AuthorizationLedger is the trusted, locked, hash-chained origin anchor.
+  Its `_read_records` path is not the Round 5 protected audit-artifact reader;
+  direct arbitrary corruption of that trusted ledger was excluded by the
+  calibrated threat model. Applying equivalent hardlink/reparse/descriptor
+  identity checks there would be defense in depth, not the present blocker.
+- Live provider/SDK compatibility remains intentionally untested at this safety
+  boundary.
+- Pre-Round-5 optimizer histories lacking the new gateway commitments correctly
+  fail closed and may need explicit trusted migration/disposition.
+- Private-name import/reflection by isolated policy code remains excluded. No
+  severity depends on such access.
+- Task 7 owns orchestration order. It cannot repair terminal provenance or
+  cross-ledger exception atomicity after Task 6 has accepted or stranded the
+  transition.
+
+## Final Disposition
+
+**NEEDS FIXES.** Round 5 closes the supported-public namespace/event forgery,
+authorization-before-restore ordering, protected single-read evidence, and
+exact role-state replay. Task 6 still needs (1) a durable gateway-owned terminal
+commitment that authenticates the exact provider/budget/event package used by
+restart and (2) cancellation-safe accounting across the started-event to
+authorization-commitment boundary. Add the two focused fake/temp REDs above
+and correct the lifecycle-state test claim before readiness.

@@ -1,0 +1,1209 @@
+# Review package: c2f057d4166fcd0af40166a86fb927f06ebb77a5..b0367d48a848b1cbaea64683c9220efe7ef55ff5
+
+## Commits
+b0367d4 feat: validate atomic three-file strategy candidates
+
+## Files changed
+ core/pit_optimization_contract.py |   8 ++
+ core/pit_optimizer_candidate.py   | 264 ++++++++++++++++++++++++++++++++++++-
+ tests/test_pit_optimizer_loop.py  |  28 +++-
+ tests/test_pit_optimizer_v2.py    | 270 ++++++++++++++++++++++++--------------
+ 4 files changed, 457 insertions(+), 113 deletions(-)
+
+## Diff
+diff --git a/core/pit_optimization_contract.py b/core/pit_optimization_contract.py
+index f1f6581..e3e3d1a 100644
+--- a/core/pit_optimization_contract.py
++++ b/core/pit_optimization_contract.py
+@@ -5127,20 +5127,28 @@ class AuthorArtifactV4(_V2Canonical):
+                 value["validation_suggestions"],
+                 "author v4 validation suggestions",
+                 allow_empty=True,
+             ),
+         )
+ 
+     @property
+     def source_bundle_sha256(self) -> str:
+         return policy_source_bundle_v4_sha256(self.policy_sources)
+ 
++    @property
++    def replacement_sources(self) -> Mapping[str, str]:
++        """Expose the complete canonical source map for atomic materialization."""
++
++        return MappingProxyType(
++            {item.path: item.source for item in self.policy_sources}
++        )
++
+     def changed_paths(self, parent: SelectedParentIdentity) -> tuple[str, ...]:
+         if self.parent_identity_sha256 != parent.parent_identity_sha256:
+             raise ValueError("author v4 artifact parent identity differs")
+         return tuple(
+             item.path
+             for item, (_path, parent_sha256) in zip(
+                 self.policy_sources,
+                 parent.policy_source_sha256s,
+                 strict=True,
+             )
+diff --git a/core/pit_optimizer_candidate.py b/core/pit_optimizer_candidate.py
+index 3eba98d..a9b9522 100644
+--- a/core/pit_optimizer_candidate.py
++++ b/core/pit_optimizer_candidate.py
+@@ -59,32 +59,37 @@ _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+ _AUTHOR_HUNK_HEADER_RE = re.compile(
+     r"^@@ -(0|[1-9][0-9]*)(?:,([0-9]+))? "
+     r"\+(0|[1-9][0-9]*)(?:,([0-9]+))? @@((?: .*)?)\n$"
+ )
+ _FULL_SOURCE_TRANSPORT_PREFIX = "PIT_FULL_SOURCE_V1\n"
+ _CANDIDATE_IDENTITY_CONSTRUCTION_SEAL = object()
+ _CONTRACT_IMPORTS = frozenset(
+     {
+         "AllocationDecision",
+         "AllocationSnapshot",
++        "BenchmarkContextV1",
+         "CapacityDecision",
+         "CapacitySnapshot",
+         "EntryDecision",
+         "EntrySnapshot",
+         "EvictionDecision",
+         "EvictionPosition",
+         "EvictionSnapshot",
+         "ExitAction",
+         "ExitDecision",
+         "ExitSnapshot",
++        "MarketContextV1",
+     }
+ )
++_NON_CALLABLE_CONTRACT_IMPORTS = frozenset(
++    {"BenchmarkContextV1", "MarketContextV1"}
++)
+ _PURE_BUILTINS = frozenset(
+     {
+         "abs",
+         "all",
+         "any",
+         "bool",
+         "enumerate",
+         "float",
+         "int",
+         "isinstance",
+@@ -168,21 +173,22 @@ _ALLOWED_AST_NODES = (
+ 
+ @dataclass(frozen=True, slots=True, weakref_slot=True)
+ class CandidateIdentity:
+     source_commit: str
+     policy_interface_version: int
+     cumulative_diff_sha256: str
+     editable_file_sha256s: tuple[tuple[str, str], ...]
+     changed_paths: tuple[str, ...]
+     changed_symbols: tuple[str, ...]
+     immutable_constraints_sha256: str
+-    discovery_manifest_sha256: str
++    discovery_panel_plan_sha256: str
++    parent_identity_sha256: str
+     identity_sha256: str
+     _controller_seal: InitVar[object] = None
+ 
+     def __post_init__(self, _controller_seal: object) -> None:
+         if _controller_seal is not _CANDIDATE_IDENTITY_CONSTRUCTION_SEAL:
+             raise ValueError("candidate identity must be controller derived")
+         _validate_candidate_identity_fields(self)
+ 
+     def to_primitive(self) -> dict[str, object]:
+         return {
+@@ -191,20 +197,26 @@ class CandidateIdentity:
+         }
+ 
+     def to_canonical_json(self) -> str:
+         return json.dumps(
+             self.to_primitive(),
+             sort_keys=True,
+             separators=(",", ":"),
+             allow_nan=False,
+         ) + "\n"
+ 
++    @property
++    def discovery_manifest_sha256(self) -> str:
++        """Compatibility alias for schema-v3 audit consumers."""
++
++        return self.discovery_panel_plan_sha256
++
+ 
+ _AUTHENTICATED_CANDIDATE_IDENTITIES: WeakValueDictionary[
+     int, CandidateIdentity
+ ] = WeakValueDictionary()
+ 
+ 
+ def _immutable_literal(value: object) -> bool:
+     if value is None or type(value) in {bool, int, float, str}:
+         return True
+     return type(value) is tuple and all(_immutable_literal(item) for item in value)
+@@ -416,21 +428,23 @@ def validate_policy_ast(*, path: str, source: str) -> None:
+                 if isinstance(owner, ast.FunctionDef)
+                 else set()
+             )
+             if isinstance(node.func, ast.Name):
+                 name = node.func.id
+                 if name in _REFLECTION_CALLS:
+                     raise ValueError("policy reflection calls are forbidden")
+                 if name in _DANGEROUS_CALLS:
+                     raise ValueError("policy call is outside the allowlist")
+                 if name not in (
+-                    _PURE_BUILTINS | imported_contracts | local_functions
++                    _PURE_BUILTINS
++                    | (imported_contracts - _NON_CALLABLE_CONTRACT_IMPORTS)
++                    | local_functions
+                 ):
+                     raise ValueError("policy call is outside the allowlist")
+             elif isinstance(node.func, ast.Attribute):
+                 root = _root_name(node.func)
+                 if root == "math":
+                     if not imported_math or node.func.attr.startswith("_"):
+                         raise ValueError("policy math call is outside the allowlist")
+                 elif (
+                     node.func.attr == "append"
+                     and isinstance(node.func.value, ast.Name)
+@@ -583,62 +597,62 @@ def _identity_digest(fields: Mapping[str, object]) -> str:
+ 
+ def _candidate_identity_values(candidate: CandidateIdentity) -> dict[str, object]:
+     return {
+         "source_commit": candidate.source_commit,
+         "policy_interface_version": candidate.policy_interface_version,
+         "cumulative_diff_sha256": candidate.cumulative_diff_sha256,
+         "editable_file_sha256s": candidate.editable_file_sha256s,
+         "changed_paths": candidate.changed_paths,
+         "changed_symbols": candidate.changed_symbols,
+         "immutable_constraints_sha256": candidate.immutable_constraints_sha256,
+-        "discovery_manifest_sha256": candidate.discovery_manifest_sha256,
++        "discovery_panel_plan_sha256": candidate.discovery_panel_plan_sha256,
++        "parent_identity_sha256": candidate.parent_identity_sha256,
+     }
+ 
+ 
+ def _validate_candidate_identity_fields(candidate: CandidateIdentity) -> None:
+     if re.fullmatch(r"[0-9a-f]{40}", candidate.source_commit or "") is None:
+         raise ValueError("candidate identity source commit is invalid")
+     if (
+         type(candidate.policy_interface_version) is not int
+         or candidate.policy_interface_version <= 0
+     ):
+         raise ValueError("candidate identity interface version is invalid")
+     for value in (
+         candidate.cumulative_diff_sha256,
+         candidate.immutable_constraints_sha256,
+-        candidate.discovery_manifest_sha256,
++        candidate.discovery_panel_plan_sha256,
++        candidate.parent_identity_sha256,
+         candidate.identity_sha256,
+     ):
+         if _SHA256_RE.fullmatch(value or "") is None:
+             raise ValueError("candidate identity digest is invalid")
+     if (
+         type(candidate.editable_file_sha256s) is not tuple
+         or tuple(path for path, _digest in candidate.editable_file_sha256s)
+         != EDITABLE_POLICY_PATHS
+         or any(
+             _SHA256_RE.fullmatch(digest or "") is None
+             for _path, digest in candidate.editable_file_sha256s
+         )
+     ):
+         raise ValueError("candidate identity editable hashes are invalid")
+     canonical_paths = tuple(
+         path for path in EDITABLE_POLICY_PATHS if path in candidate.changed_paths
+     )
+     if (
+         type(candidate.changed_paths) is not tuple
+-        or not candidate.changed_paths
+         or candidate.changed_paths != canonical_paths
+     ):
+         raise ValueError("candidate identity changed paths are invalid")
+     if (
+         type(candidate.changed_symbols) is not tuple
+-        or not candidate.changed_symbols
+         or len(candidate.changed_symbols) != len(set(candidate.changed_symbols))
+         or any(not isinstance(symbol, str) for symbol in candidate.changed_symbols)
+     ):
+         raise ValueError("candidate identity changed symbols are invalid")
+     allowed = {
+         symbol
+         for path in candidate.changed_paths
+         for symbol in _DECLARED_SYMBOLS[path]
+     }
+     constant_prefixes = tuple(
+@@ -1013,38 +1027,273 @@ def validate_candidate_diff(
+         values: dict[str, object] = {
+             "source_commit": source_commit,
+             "policy_interface_version": policy_interface_version,
+             "cumulative_diff_sha256": hashlib.sha256(
+                 cumulative_diff.encode("utf-8")
+             ).hexdigest(),
+             "editable_file_sha256s": editable_hashes,
+             "changed_paths": changed_paths,
+             "changed_symbols": changed_symbols,
+             "immutable_constraints_sha256": immutable_constraints_sha256,
+-            "discovery_manifest_sha256": discovery_manifest_sha256,
++            "discovery_panel_plan_sha256": discovery_manifest_sha256,
++            "parent_identity_sha256": _identity_digest(
++                {
++                    "source_commit": source_commit,
++                    "editable_file_sha256s": tuple(
++                        (
++                            path,
++                            hashlib.sha256(
++                                before_sources[path].encode("utf-8")
++                            ).hexdigest(),
++                        )
++                        for path in EDITABLE_POLICY_PATHS
++                    ),
++                }
++            ),
+         }
+         identity = CandidateIdentity(
+             **values,
+             identity_sha256=_identity_digest(values),
+             _controller_seal=_CANDIDATE_IDENTITY_CONSTRUCTION_SEAL,
+         )
+         _AUTHENTICATED_CANDIDATE_IDENTITIES[id(identity)] = identity
+         return identity, cumulative_diff
+     except BaseException as exc:
+         if applied:
+             for path, content in before_bytes.items():
+                 (candidate_root / path).write_bytes(content)
+         if isinstance(exc, (PatchPolicyError, UnicodeDecodeError)):
+             raise ValueError(str(exc)) from exc
+         raise
+ 
+ 
++def validate_candidate_sources(
++    *,
++    authenticated_base_root: Path,
++    candidate_root: Path,
++    replacement_sources: Mapping[str, str],
++    git: object,
++    source_commit: str,
++    policy_interface_version: int,
++    immutable_constraints_sha256: str,
++    discovery_panel_plan_sha256: str,
++    parent_identity_sha256: str,
++) -> tuple[CandidateIdentity, str]:
++    """Atomically validate and publish one complete three-source candidate."""
++    from agent_loop import PreflightError, _git, derive_authenticated_cumulative_diff
++
++    if re.fullmatch(r"[0-9a-f]{40}", source_commit or "") is None:
++        raise ValueError("candidate source commit is invalid")
++    if type(policy_interface_version) is not int or policy_interface_version <= 0:
++        raise ValueError("candidate policy interface version is invalid")
++    for value, label in (
++        (immutable_constraints_sha256, "immutable constraint"),
++        (discovery_panel_plan_sha256, "discovery panel plan"),
++        (parent_identity_sha256, "parent identity"),
++    ):
++        if _SHA256_RE.fullmatch(value or "") is None:
++            raise ValueError(f"candidate {label} digest is invalid")
++    if not all(
++        isinstance(root, Path) and root.is_absolute() and root.is_dir()
++        for root in (authenticated_base_root, candidate_root)
++    ):
++        raise ValueError("candidate roots must be absolute directories")
++    try:
++        authenticated_base_root = _existing_path_without_links(
++            authenticated_base_root
++        )
++        candidate_root = _existing_path_without_links(candidate_root)
++    except OSError as exc:
++        raise ValueError(
++            "candidate roots contain a link or reparse point"
++        ) from exc
++    if authenticated_base_root == candidate_root:
++        raise ValueError("candidate root must be disposable and distinct from its base")
++    if not isinstance(replacement_sources, Mapping):
++        raise ValueError("candidate replacement sources must be a mapping")
++    try:
++        supplied_sources = dict(replacement_sources)
++    except (TypeError, ValueError) as exc:
++        raise ValueError("candidate replacement sources are invalid") from exc
++    if tuple(path for path in EDITABLE_POLICY_PATHS if path in supplied_sources) != (
++        EDITABLE_POLICY_PATHS
++    ) or set(supplied_sources) != set(EDITABLE_POLICY_PATHS):
++        raise ValueError(
++            "candidate replacement sources must contain exactly the three editable paths"
++        )
++
++    # Parse, compile, and enforce the closed policy language for every supplied
++    # source before the first candidate byte is changed.
++    canonical_sources: dict[str, str] = {}
++    for path in EDITABLE_POLICY_PATHS:
++        source_file = optimization_contract.AuthorSourceFile.from_source(
++            path=path,
++            source=supplied_sources[path],
++        )
++        validate_policy_ast(path=path, source=source_file.source)
++        canonical_sources[path] = source_file.source
++
++    base_sources = _read_policy_sources(authenticated_base_root)
++    before_sources = _read_policy_sources(candidate_root)
++    before_bytes = {
++        path: (candidate_root / path).read_bytes() for path in EDITABLE_POLICY_PATHS
++    }
++    comparable_before_sources = {
++        path: source.replace("\r\n", "\n")
++        for path, source in before_sources.items()
++    }
++    if any("\r" in source for source in comparable_before_sources.values()):
++        raise ValueError("candidate parent sources contain invalid line endings")
++    if canonical_sources == comparable_before_sources:
++        raise ValueError("candidate source bundle is a no-op")
++    for path in EDITABLE_POLICY_PATHS:
++        validate_policy_ast(path=path, source=base_sources[path])
++
++    try:
++        actual_head = _git(
++            authenticated_base_root,
++            "rev-parse",
++            "HEAD",
++            git=git,
++        ).stdout.decode("ascii", errors="strict").strip()
++        if actual_head != source_commit:
++            raise ValueError("candidate source commit differs from authenticated base")
++        if _git(
++            authenticated_base_root,
++            "status",
++            "--porcelain=v1",
++            "--untracked-files=all",
++            git=git,
++        ).stdout:
++            raise ValueError("authenticated candidate base is not clean")
++    except (PreflightError, UnicodeDecodeError) as exc:
++        raise ValueError("candidate source provenance cannot be authenticated") from exc
++
++    write_started = False
++    try:
++        for path in EDITABLE_POLICY_PATHS:
++            write_started = True
++            (candidate_root / path).write_bytes(canonical_sources[path].encode("utf-8"))
++
++        after_sources = _read_policy_sources(candidate_root)
++        if after_sources != canonical_sources:
++            raise ValueError("candidate replacement sources were not published exactly")
++        for path in EDITABLE_POLICY_PATHS:
++            validate_policy_ast(path=path, source=after_sources[path])
++
++        status = _git(
++            candidate_root,
++            "status",
++            "--porcelain=v1",
++            "-z",
++            "--untracked-files=all",
++            git=git,
++        ).stdout.decode("utf-8", errors="strict")
++        records = tuple(item for item in status.split("\x00") if item)
++        if any(
++            len(item) < 4
++            or item[:2] != " M"
++            or item[3:] not in EDITABLE_POLICY_PATHS
++            for item in records
++        ):
++            raise ValueError("candidate checkout contains out-of-scope changes")
++        changed_names = _git(
++            candidate_root,
++            "diff",
++            "--name-only",
++            "-z",
++            "HEAD",
++            git=git,
++        ).stdout.decode("utf-8", errors="strict")
++        changed_name_set = {
++            item for item in changed_names.split("\x00") if item
++        }
++        if not changed_name_set <= set(EDITABLE_POLICY_PATHS):
++            raise ValueError("candidate checkout contains out-of-scope changes")
++        if _git(
++            candidate_root,
++            "diff",
++            "--summary",
++            "HEAD",
++            git=git,
++        ).stdout:
++            raise ValueError("candidate checkout contains structural or file-mode changes")
++        for path in EDITABLE_POLICY_PATHS:
++            index_entry = _git(
++                candidate_root,
++                "ls-files",
++                "-s",
++                "--",
++                path,
++                git=git,
++            ).stdout.decode("utf-8", errors="strict").strip().split()
++            if (
++                len(index_entry) != 4
++                or index_entry[0] != "100644"
++                or index_entry[2] != "0"
++                or index_entry[3] != path
++            ):
++                raise ValueError("candidate policy source must be a tracked 100644 file")
++
++        _git(candidate_root, "diff", "--check", git=git)
++        cumulative_diff = derive_authenticated_cumulative_diff(
++            git=git,
++            authenticated_base_root=authenticated_base_root,
++            candidate_root=candidate_root,
++            editable_paths=EDITABLE_POLICY_PATHS,
++        )
++        changed_paths = tuple(
++            path for path in EDITABLE_POLICY_PATHS if path in changed_name_set
++        )
++        changed_symbols = derive_changed_symbols(
++            before_sources=base_sources,
++            after_sources=after_sources,
++        )
++        editable_hashes = tuple(
++            (path, hashlib.sha256(after_sources[path].encode("utf-8")).hexdigest())
++            for path in EDITABLE_POLICY_PATHS
++        )
++        values: dict[str, object] = {
++            "source_commit": source_commit,
++            "policy_interface_version": policy_interface_version,
++            "cumulative_diff_sha256": hashlib.sha256(
++                cumulative_diff.encode("utf-8")
++            ).hexdigest(),
++            "editable_file_sha256s": editable_hashes,
++            "changed_paths": changed_paths,
++            "changed_symbols": changed_symbols,
++            "immutable_constraints_sha256": immutable_constraints_sha256,
++            "discovery_panel_plan_sha256": discovery_panel_plan_sha256,
++            "parent_identity_sha256": parent_identity_sha256,
++        }
++        identity = CandidateIdentity(
++            **values,
++            identity_sha256=_identity_digest(values),
++            _controller_seal=_CANDIDATE_IDENTITY_CONSTRUCTION_SEAL,
++        )
++        _AUTHENTICATED_CANDIDATE_IDENTITIES[id(identity)] = identity
++        return identity, cumulative_diff
++    except BaseException as exc:
++        rollback_errors: list[OSError] = []
++        if write_started:
++            for path, content in before_bytes.items():
++                try:
++                    (candidate_root / path).write_bytes(content)
++                except OSError as rollback_error:
++                    rollback_errors.append(rollback_error)
++        if rollback_errors:
++            raise ValueError("candidate source rollback failed") from exc
++        if isinstance(exc, (PreflightError, UnicodeDecodeError)):
++            raise ValueError(str(exc)) from exc
++        raise
++
++
+ def validate_author_manifest(
+     author: AuthorArtifact,
+     candidate: CandidateIdentity,
+ ) -> None:
+     """Require advisory author scope to equal controller-derived scope exactly."""
+     if not isinstance(author, AuthorArtifact) or not isinstance(
+         candidate, CandidateIdentity
+     ):
+         raise ValueError("author_manifest_mismatch")
+     validate_candidate_identity(candidate)
+@@ -1148,13 +1397,14 @@ def require_source_context_fit(
+ __all__ = [
+     "CandidateIdentity",
+     "EDITABLE_POLICY_PATHS",
+     "LEGACY_PATCH_BOUNDS",
+     "PIT_OPTIMIZER_PATCH_BOUNDS",
+     "build_policy_source_bundle",
+     "derive_changed_symbols",
+     "require_source_context_fit",
+     "validate_author_manifest",
+     "validate_candidate_diff",
++    "validate_candidate_sources",
+     "validate_candidate_identity",
+     "validate_policy_ast",
+ ]
+diff --git a/tests/test_pit_optimizer_loop.py b/tests/test_pit_optimizer_loop.py
+index c33cae2..8391596 100644
+--- a/tests/test_pit_optimizer_loop.py
++++ b/tests/test_pit_optimizer_loop.py
+@@ -1841,21 +1841,21 @@ def test_actual_two_iteration_loop_persists_exact_closed_artifacts_without_leaks
+ 
+     import agent_loop
+     from core import pit_optimizer_controller as controller
+     from core.pit_optimization_contract import (
+         AuthorArtifact,
+         CriticArtifact,
+         InvestigatorArtifact,
+     )
+     from core.pit_optimizer_artifacts import IncrementalArtifactStore
+     from core.pit_optimizer_authorization import PitOptimizerRoleCall
+-    from core.pit_optimizer_candidate import validate_candidate_diff
++    from core.pit_optimizer_candidate import validate_candidate_sources
+     from core.pit_optimizer_controller import (
+         CandidateValidationOutcome,
+         CandidateWorkspace,
+         PitOptimizerServices,
+         run_pit_optimizer_v2,
+     )
+     from core.pit_optimizer_evaluation import (
+         DeterminismAttestation,
+         DiscoveryComparison,
+         DiscoveryEvaluation,
+@@ -1989,32 +1989,50 @@ def test_actual_two_iteration_loop_persists_exact_closed_artifacts_without_leaks
+             closed_payload,
+             _role_facts(plan, frozen_pricing_sha256=pricing.pricing_sha256),
+         )
+ 
+     def validate(
+         workspace: CandidateWorkspace,
+         author: AuthorArtifact,
+         cumulative_diff: str | None,
+     ) -> CandidateValidationOutcome:
+         assert live[workspace.workspace_id] == workspace.root
+-        identity, authenticated_cumulative = validate_candidate_diff(
++        replacement_sources = {
++            path: (workspace.root / path).read_text("utf-8")
++            for path in (
++                "core/strategy_policy/entry.py",
++                "core/strategy_policy/risk.py",
++                "core/strategy_policy/exit.py",
++            )
++        }
++        before_literal, after_literal = (
++            ("None", "True")
++            if author.behavioral_summary.endswith("1")
++            else ("True", "False")
++        )
++        replacement_sources["core/strategy_policy/entry.py"] = replacement_sources[
++            "core/strategy_policy/entry.py"
++        ].replace(f"return {before_literal}", f"return {after_literal}")
++        identity, authenticated_cumulative = validate_candidate_sources(
+             authenticated_base_root=Path(inputs["source_root"]).resolve(),
+             candidate_root=workspace.root,
+-            incremental_diff=author.unified_diff,
++            replacement_sources=replacement_sources,
+             git=git_capability,
+-            bounds=readiness.manifest.candidate_bounds,
+             source_commit=readiness.manifest.source_head,
+             policy_interface_version=readiness.manifest.policy_interface_version,
+             immutable_constraints_sha256=(
+                 readiness.manifest.immutable_constraints_sha256
+             ),
+-            discovery_manifest_sha256=readiness.manifest.fold_manifest.sha256,
++            discovery_panel_plan_sha256=readiness.manifest.fold_manifest.sha256,
++            parent_identity_sha256=hashlib.sha256(
++                (cumulative_diff or "baseline").encode("utf-8")
++            ).hexdigest(),
+         )
+         return CandidateValidationOutcome(
+             True,
+             None,
+             author.unified_diff,
+             authenticated_cumulative,
+             identity,
+             identity.changed_paths,
+             identity.changed_symbols,
+         )
+diff --git a/tests/test_pit_optimizer_v2.py b/tests/test_pit_optimizer_v2.py
+index c32653e..517462c 100644
+--- a/tests/test_pit_optimizer_v2.py
++++ b/tests/test_pit_optimizer_v2.py
+@@ -1558,20 +1558,21 @@ def test_role_schema_inputs_are_exact_bounded_provider_projections(
+         "behavioral_summary": "Coordinate entry quality while retaining risk and exit.",
+         "policy_sources": replacement_sources,
+         "assumptions": [],
+         "validation_suggestions": [],
+     }
+     author_v4 = contract.AuthorArtifactV4.from_json(
+         _canonical_text(author_v4_payload),
+         selected_parent=v4_parent,
+         max_total_bytes=len(_canonical_text(author_v4_payload).encode("utf-8")),
+     )
++    assert dict(author_v4.replacement_sources) == replacement_sources
+     author_input_v4.validate_artifact(author_v4)
+     author_manifest_v4 = contract.AuthorManifestSummaryV4.from_artifact(
+         author_v4,
+         selected_parent=v4_parent,
+     )
+     critic_input_v4 = contract.CriticInputV4(
+         **common_v4,
+         selected_parent_summary=parent_summary,
+         hypothesis_id=investigator_v4.hypothesis_id,
+         investigator_summary=investigator_v4,
+@@ -9876,89 +9877,79 @@ def _task5_create_directory_link(target: Path, link: Path) -> None:
+     if completed.returncode != 0:
+         pytest.skip(
+             "directory-link creation unavailable: "
+             f"{completed.stderr or completed.stdout}"
+         )
+ 
+ 
+ def test_candidate_identity_is_git_derived_and_author_manifest_must_match(
+     tmp_path: Path,
+ ) -> None:
+-    """Break caught: author-declared scope could replace controller-derived identity."""
++    """Break caught: a partial author map could replace the atomic controller identity."""
+     from core.pit_optimizer_candidate import (
+-        PIT_OPTIMIZER_PATCH_BOUNDS,
+-        validate_author_manifest,
+-        validate_candidate_diff,
++        validate_candidate_sources,
+     )
+ 
+     authenticated, candidate_root, git = _task5_policy_roots(tmp_path)
+-    incremental = _task5_incremental_diff(
+-        candidate_root,
+-        "core/strategy_policy/entry.py",
++    replacement_sources = {
++        path: (candidate_root / path).read_text("utf-8") for path in _POLICY_PATHS
++    }
++    replacement_sources["core/strategy_policy/entry.py"] = replacement_sources[
++        "core/strategy_policy/entry.py"
++    ].replace(
+         "return EntryDecision(True, True, (None, None), ())",
+-        "return EntryDecision(snapshot.market_is_bullish, True, (None, None), ())",
++        "return EntryDecision(snapshot.market.oneil_regime == 'confirmed_uptrend', True, (None, None), ())",
++    ).replace(
++        "from .contracts import EntryDecision, EntrySnapshot",
++        "from .contracts import EntryDecision, EntrySnapshot, MarketContextV1",
+     )
+     source_commit = _task5_git(authenticated, "rev-parse", "HEAD", text=True).strip()
+ 
+-    identity, cumulative_diff = validate_candidate_diff(
++    identity, cumulative_diff = validate_candidate_sources(
+         authenticated_base_root=authenticated,
+         candidate_root=candidate_root,
+-        incremental_diff=incremental,
++        replacement_sources=replacement_sources,
+         git=git,
+-        bounds=PIT_OPTIMIZER_PATCH_BOUNDS,
+         source_commit=source_commit,
+-        policy_interface_version=1,
++        policy_interface_version=2,
+         immutable_constraints_sha256="a" * 64,
+-        discovery_manifest_sha256="b" * 64,
++        discovery_panel_plan_sha256="b" * 64,
++        parent_identity_sha256="c" * 64,
+     )
+ 
+     assert cumulative_diff == _task5_git(
+         candidate_root,
+         "diff",
+         "--no-ext-diff",
+         "--no-color",
+         "HEAD",
+         "--",
+         *_POLICY_PATHS,
+     )
+     assert identity.source_commit == source_commit
++    assert identity.parent_identity_sha256 == "c" * 64
++    assert identity.discovery_panel_plan_sha256 == "b" * 64
+     assert identity.cumulative_diff_sha256 == hashlib.sha256(
+         cumulative_diff.encode("utf-8")
+     ).hexdigest()
+     assert identity.changed_paths == ("core/strategy_policy/entry.py",)
+     assert identity.changed_symbols == (
+         "core.strategy_policy.entry.evaluate_entry",
+     )
+     assert tuple(path for path, _digest in identity.editable_file_sha256s) == tuple(
+         _POLICY_PATHS
+     )
+ 
+-    matching = contract.AuthorArtifact.from_json(
+-        _canonical_text(
+-            {
+-                **_author_payload(),
+-                "changed_paths": list(identity.changed_paths),
+-                "changed_symbols": list(identity.changed_symbols),
+-                "unified_diff": incremental,
+-            }
+-        ),
+-        max_diff_bytes=64 * 1024,
+-        max_total_bytes=72 * 1024,
+-    )
+-    validate_author_manifest(matching, identity)
+-    mismatch = replace(
+-        matching,
+-        changed_paths=("core/strategy_policy/risk.py",),
+-        changed_symbols=("core.strategy_policy.risk.recommend_capacity",),
+-    )
+-    with pytest.raises(ValueError, match="author_manifest_mismatch"):
+-        validate_author_manifest(mismatch, identity)
++    assert dict(identity.editable_file_sha256s) == {
++        path: hashlib.sha256(source.encode("utf-8")).hexdigest()
++        for path, source in replacement_sources.items()
++    }
+ 
+ 
+ def _task5_authenticated_identity(
+     tmp_path: Path,
+ ) -> tuple[object, contract.AuthorArtifact]:
+     from core.pit_optimizer_candidate import validate_candidate_diff
+ 
+     authenticated, candidate_root, git = _task5_policy_roots(tmp_path)
+     incremental = _task5_incremental_diff(
+         candidate_root,
+@@ -10000,41 +9991,43 @@ def test_candidate_identity_rejects_direct_unsealed_construction() -> None:
+         CandidateIdentity(
+             source_commit="a" * 40,
+             policy_interface_version=1,
+             cumulative_diff_sha256="b" * 64,
+             editable_file_sha256s=tuple(
+                 (path, "c" * 64) for path in _POLICY_PATHS
+             ),
+             changed_paths=("core/strategy_policy/entry.py",),
+             changed_symbols=("core.strategy_policy.entry.evaluate_entry",),
+             immutable_constraints_sha256="d" * 64,
+-            discovery_manifest_sha256="e" * 64,
++            discovery_panel_plan_sha256="e" * 64,
++            parent_identity_sha256="f" * 64,
+             identity_sha256="f" * 64,
+         )
+ 
+ 
+ def test_candidate_identity_has_exact_public_nine_field_json_shape(
+     tmp_path: Path,
+ ) -> None:
+     """Break caught: the construction seal leaked into persisted identity data."""
+     from core.pit_optimizer_candidate import CandidateIdentity
+ 
+     identity, _author = _task5_authenticated_identity(tmp_path)
+     expected_fields = (
+         "source_commit",
+         "policy_interface_version",
+         "cumulative_diff_sha256",
+         "editable_file_sha256s",
+         "changed_paths",
+         "changed_symbols",
+         "immutable_constraints_sha256",
+-        "discovery_manifest_sha256",
++        "discovery_panel_plan_sha256",
++        "parent_identity_sha256",
+         "identity_sha256",
+     )
+     assert tuple(item.name for item in fields(CandidateIdentity)) == expected_fields
+     primitive = identity.to_primitive()
+     assert tuple(primitive) == expected_fields
+     assert primitive == asdict(identity)
+     assert not any(key.startswith("_") for key in primitive)
+     rendered = identity.to_canonical_json()
+     assert rendered.endswith("\n")
+     assert json.loads(rendered) == json.loads(json.dumps(primitive))
+@@ -10047,21 +10040,22 @@ def test_candidate_identity_has_exact_public_nine_field_json_shape(
+         ("source_commit", "f" * 40),
+         ("policy_interface_version", True),
+         ("cumulative_diff_sha256", "f" * 64),
+         (
+             "editable_file_sha256s",
+             tuple((path, "f" * 64) for path in _POLICY_PATHS),
+         ),
+         ("changed_paths", ("core/strategy_policy/risk.py",)),
+         ("changed_symbols", ("core.strategy_policy.risk.recommend_capacity",)),
+         ("immutable_constraints_sha256", "f" * 64),
+-        ("discovery_manifest_sha256", "f" * 64),
++        ("discovery_panel_plan_sha256", "f" * 64),
++        ("parent_identity_sha256", "f" * 64),
+         ("identity_sha256", "f" * 64),
+     ),
+ )
+ def test_candidate_identity_tampering_fails_before_manifest_comparison(
+     tmp_path: Path,
+     field: str,
+     value: object,
+ ) -> None:
+     """Break caught: a mutated identity was trusted when advisory scope still matched."""
+     from core.pit_optimizer_candidate import validate_author_manifest
+@@ -10084,21 +10078,22 @@ def test_candidate_identity_rejects_attacker_recomputed_digest(
+ 
+     identity, author = _task5_authenticated_identity(tmp_path)
+     forged_fields = {
+         "source_commit": "f" * 40,
+         "policy_interface_version": identity.policy_interface_version,
+         "cumulative_diff_sha256": identity.cumulative_diff_sha256,
+         "editable_file_sha256s": identity.editable_file_sha256s,
+         "changed_paths": identity.changed_paths,
+         "changed_symbols": identity.changed_symbols,
+         "immutable_constraints_sha256": identity.immutable_constraints_sha256,
+-        "discovery_manifest_sha256": identity.discovery_manifest_sha256,
++        "discovery_panel_plan_sha256": identity.discovery_panel_plan_sha256,
++        "parent_identity_sha256": identity.parent_identity_sha256,
+     }
+     recomputed = hashlib.sha256(
+         json.dumps(
+             forged_fields,
+             sort_keys=True,
+             separators=(",", ":"),
+             allow_nan=False,
+         ).encode("utf-8")
+         + b"\n"
+     ).hexdigest()
+@@ -10261,139 +10256,192 @@ def test_candidate_identity_rejects_git_derived_cumulative_scope_growth(
+             policy_interface_version=1,
+             immutable_constraints_sha256="a" * 64,
+             discovery_manifest_sha256="b" * 64,
+         )
+     assert "return EntryDecision(True, True, (None, None), ())" in (
+         candidate_root / "core/strategy_policy/entry.py"
+     ).read_text("utf-8")
+ 
+ 
+ @pytest.mark.parametrize(
+-    ("old", "new", "message"),
++    ("case", "message"),
+     (
+-        (
+-            "return EntryDecision(True, True, (None, None), ())",
+-            "return EntryDecision(True, True, (None, None), ())",
+-            "no-op",
+-        ),
+-        (
+-            "return EntryDecision(False, False, (None, None), ())",
+-            "return EntryDecision(True, False, (None, None), ())",
+-            "apply",
+-        ),
++        ("no_op", "no-op"),
++        ("crlf", "LF-only"),
++        ("missing_final_lf", "end with LF"),
+     ),
+ )
+ def test_candidate_identity_rejects_noop_or_non_applicable_incremental_diff(
+     tmp_path: Path,
+-    old: str,
+-    new: str,
++    case: str,
+     message: str,
+ ) -> None:
+-    """Break caught: an unapplied author artifact could receive an executable identity."""
+-    from core.pit_optimizer_candidate import validate_candidate_diff
++    """Break caught: a no-op or non-canonical source map received an identity."""
++    from core.pit_optimizer_candidate import validate_candidate_sources
+ 
+     authenticated, candidate_root, git = _task5_policy_roots(tmp_path)
++    before = {
++        path: (candidate_root / path).read_bytes() for path in _POLICY_PATHS
++    }
++    replacements = {
++        path: content.decode("utf-8") for path, content in before.items()
++    }
++    if case != "no_op":
++        entry = replacements["core/strategy_policy/entry.py"].replace(
++            "EntryDecision(True", "EntryDecision(False"
++        )
++        replacements["core/strategy_policy/entry.py"] = (
++            entry.replace("\n", "\r\n")
++            if case == "crlf"
++            else entry.removesuffix("\n")
++        )
+     with pytest.raises(ValueError, match=message):
+-        validate_candidate_diff(
++        validate_candidate_sources(
+             authenticated_base_root=authenticated,
+             candidate_root=candidate_root,
+-            incremental_diff=_task5_raw_author_diff(old, new),
++            replacement_sources=replacements,
+             git=git,
+-            bounds=contract.PatchBounds(3, 12, 200, 64 * 1024),
+             source_commit=_task5_git(
+                 authenticated, "rev-parse", "HEAD", text=True
+             ).strip(),
+-            policy_interface_version=1,
++            policy_interface_version=2,
+             immutable_constraints_sha256="a" * 64,
+-            discovery_manifest_sha256="b" * 64,
++            discovery_panel_plan_sha256="b" * 64,
++            parent_identity_sha256="c" * 64,
+         )
++    assert {
++        path: (candidate_root / path).read_bytes() for path in _POLICY_PATHS
++    } == before
+ 
+ 
+ @pytest.mark.parametrize(
+     "path",
+     (
+         "core/strategy_policy/contracts.py",
+         "core/strategy_policy/runtime.py",
+         "core/strategy_policy/worker.py",
+         "core/strategy_policy/generated.py",
+     ),
+ )
+ def test_candidate_identity_rejects_protected_or_generated_paths(
+     tmp_path: Path,
+     path: str,
+ ) -> None:
+-    """Break caught: a policy diff could target protected infrastructure or generated code."""
+-    from core.pit_optimizer_candidate import validate_candidate_diff
++    """Break caught: a complete-source map could include protected or omit required code."""
++    from core.pit_optimizer_candidate import validate_candidate_sources
+ 
+     authenticated, candidate_root, git = _task5_policy_roots(tmp_path)
+-    with pytest.raises(ValueError, match="editable|permanently denied|outside"):
+-        validate_candidate_diff(
+-            authenticated_base_root=authenticated,
+-            candidate_root=candidate_root,
+-            incremental_diff=_task5_raw_author_diff("old", "new", path=path),
+-            git=git,
+-            bounds=contract.PatchBounds(3, 12, 200, 64 * 1024),
+-            source_commit=_task5_git(
+-                authenticated, "rev-parse", "HEAD", text=True
+-            ).strip(),
+-            policy_interface_version=1,
+-            immutable_constraints_sha256="a" * 64,
+-            discovery_manifest_sha256="b" * 64,
++    before = {
++        relative: (candidate_root / relative).read_bytes()
++        for relative in _POLICY_PATHS
++    }
++    replacements = {
++        relative: content.decode("utf-8") for relative, content in before.items()
++    }
++    replacements["core/strategy_policy/entry.py"] = replacements[
++        "core/strategy_policy/entry.py"
++    ].replace("EntryDecision(True", "EntryDecision(False")
++    replacements[path] = "def protected():\n    return None\n"
++    common = {
++        "authenticated_base_root": authenticated,
++        "candidate_root": candidate_root,
++        "git": git,
++        "source_commit": _task5_git(
++            authenticated, "rev-parse", "HEAD", text=True
++        ).strip(),
++        "policy_interface_version": 2,
++        "immutable_constraints_sha256": "a" * 64,
++        "discovery_panel_plan_sha256": "b" * 64,
++        "parent_identity_sha256": "c" * 64,
++    }
++    with pytest.raises(ValueError, match="exactly the three editable paths"):
++        validate_candidate_sources(
++            **common,
++            replacement_sources=replacements,
++        )
++    replacements.pop(path)
++    replacements.pop("core/strategy_policy/exit.py")
++    with pytest.raises(ValueError, match="exactly the three editable paths"):
++        validate_candidate_sources(
++            **common,
++            replacement_sources=replacements,
++        )
++    foreign = candidate_root / path
++    foreign.write_text("def protected():\n    return None\n", encoding="utf-8")
++    replacements[path] = replacements.get(path, "")
++    replacements["core/strategy_policy/exit.py"] = before[
++        "core/strategy_policy/exit.py"
++    ].decode("utf-8")
++    replacements.pop(path)
++    with pytest.raises(ValueError, match="out-of-scope"):
++        validate_candidate_sources(
++            **common,
++            replacement_sources=replacements,
+         )
++    assert {
++        relative: (candidate_root / relative).read_bytes()
++        for relative in _POLICY_PATHS
++    } == before
+ 
+ 
+ @pytest.mark.parametrize("mode", ("120000", "160000"))
+ def test_candidate_identity_rejects_non_regular_index_mode(
+     tmp_path: Path,
+     mode: str,
+ ) -> None:
+     """Break caught: a symlink/gitlink could evade regular-source provenance."""
+-    from core.pit_optimizer_candidate import validate_candidate_diff
++    from core.pit_optimizer_candidate import validate_candidate_sources
+ 
+     authenticated, candidate_root, git = _task5_policy_roots(tmp_path)
+-    incremental = _task5_incremental_diff(
+-        candidate_root,
+-        "core/strategy_policy/entry.py",
+-        "return EntryDecision(True, True, (None, None), ())",
+-        "return EntryDecision(False, True, (None, None), ())",
+-    )
++    before = {
++        path: (candidate_root / path).read_bytes() for path in _POLICY_PATHS
++    }
++    replacements = {
++        path: content.decode("utf-8") for path, content in before.items()
++    }
++    replacements["core/strategy_policy/entry.py"] = replacements[
++        "core/strategy_policy/entry.py"
++    ].replace("EntryDecision(True", "EntryDecision(False")
+     commit = _task5_git(authenticated, "rev-parse", "HEAD", text=True).strip()
+     object_id = (
+         commit
+         if mode == "160000"
+         else _task5_git(
+             authenticated,
+             "rev-parse",
+             "HEAD:core/strategy_policy/entry.py",
+             text=True,
+         ).strip()
+     )
+     _task5_git(
+         candidate_root,
+         "update-index",
+         "--add",
+         "--cacheinfo",
+         f"{mode},{object_id},core/strategy_policy/entry.py",
+     )
+ 
+-    with pytest.raises(ValueError, match="100644|regular"):
+-        validate_candidate_diff(
++    with pytest.raises(ValueError, match="100644|mode|out-of-scope"):
++        validate_candidate_sources(
+             authenticated_base_root=authenticated,
+             candidate_root=candidate_root,
+-            incremental_diff=incremental,
++            replacement_sources=replacements,
+             git=git,
+-            bounds=contract.PatchBounds(3, 12, 200, 64 * 1024),
+             source_commit=commit,
+-            policy_interface_version=1,
++            policy_interface_version=2,
+             immutable_constraints_sha256="a" * 64,
+-            discovery_manifest_sha256="b" * 64,
++            discovery_panel_plan_sha256="b" * 64,
++            parent_identity_sha256="c" * 64,
+         )
++    assert {
++        path: (candidate_root / path).read_bytes() for path in _POLICY_PATHS
++    } == before
+ 
+ 
+ @pytest.mark.parametrize(
+     "metadata",
+     (
+         "GIT binary patch\n",
+         (
+             "similarity index 100%\n"
+             "rename from core/strategy_policy/entry.py\n"
+             "rename to core/strategy_policy/risk.py\n"
+@@ -10485,53 +10533,62 @@ def test_candidate_identity_rejects_cumulative_hunk_line_and_byte_growth(
+         )
+     assert entry.read_bytes() == before_entry
+ 
+ 
+ @pytest.mark.parametrize("failure", (RuntimeError("fault"), KeyboardInterrupt()))
+ def test_candidate_identity_rolls_back_after_fault_or_cancellation(
+     tmp_path: Path,
+     monkeypatch: pytest.MonkeyPatch,
+     failure: BaseException,
+ ) -> None:
+-    """Break caught: post-apply faults or cancellation left candidate policy bytes changed."""
++    """Break caught: post-publish faults left any member of the source bundle changed."""
+     import agent_loop
+-    from core.pit_optimizer_candidate import validate_candidate_diff
++    from core.pit_optimizer_candidate import validate_candidate_sources
+ 
+     authenticated, candidate_root, git = _task5_policy_roots(tmp_path)
+-    entry = candidate_root / "core/strategy_policy/entry.py"
+-    before_entry = entry.read_bytes()
+-    incremental = _task5_incremental_diff(
+-        candidate_root,
+-        "core/strategy_policy/entry.py",
+-        "return EntryDecision(True, True, (None, None), ())",
+-        "return EntryDecision(False, True, (None, None), ())",
+-    )
++    before = {
++        path: (candidate_root / path).read_bytes() for path in _POLICY_PATHS
++    }
++    replacements = {
++        path: content.decode("utf-8") for path, content in before.items()
++    }
++    replacements["core/strategy_policy/entry.py"] = replacements[
++        "core/strategy_policy/entry.py"
++    ].replace("EntryDecision(True", "EntryDecision(False")
++    replacements["core/strategy_policy/risk.py"] = replacements[
++        "core/strategy_policy/risk.py"
++    ].replace("AllocationDecision(0.01", "AllocationDecision(0.02")
++    replacements["core/strategy_policy/exit.py"] = replacements[
++        "core/strategy_policy/exit.py"
++    ].replace("ExitDecision((), None", "ExitDecision((), 0.03")
+ 
+     def fail_after_apply(**_kwargs: object) -> str:
+         raise failure
+ 
+     monkeypatch.setattr(agent_loop, "derive_authenticated_cumulative_diff", fail_after_apply)
+     with pytest.raises(type(failure), match="fault" if isinstance(failure, RuntimeError) else None):
+-        validate_candidate_diff(
++        validate_candidate_sources(
+             authenticated_base_root=authenticated,
+             candidate_root=candidate_root,
+-            incremental_diff=incremental,
++            replacement_sources=replacements,
+             git=git,
+-            bounds=contract.PatchBounds(3, 12, 200, 64 * 1024),
+             source_commit=_task5_git(
+                 authenticated, "rev-parse", "HEAD", text=True
+             ).strip(),
+-            policy_interface_version=1,
++            policy_interface_version=2,
+             immutable_constraints_sha256="a" * 64,
+-            discovery_manifest_sha256="b" * 64,
++            discovery_panel_plan_sha256="b" * 64,
++            parent_identity_sha256="c" * 64,
+         )
+-    assert entry.read_bytes() == before_entry
++    assert {
++        path: (candidate_root / path).read_bytes() for path in _POLICY_PATHS
++    } == before
+ 
+ 
+ @pytest.mark.parametrize(
+     "failure",
+     (RuntimeError("mutating apply fault"), KeyboardInterrupt()),
+ )
+ def test_candidate_identity_rolls_back_when_real_mutating_apply_raises(
+     tmp_path: Path,
+     monkeypatch: pytest.MonkeyPatch,
+     failure: BaseException,
+@@ -10635,20 +10692,27 @@ def _task5_entry_source(body: str, *, prelude: str = "") -> str:
+         (_task5_entry_source("cache = [math]\ncache[0].pi += 1.0\nreturn EntryDecision(True, True, (None, None), ())", prelude="\nimport math\n"), "mutation root"),
+         (_task5_entry_source("cache = [[]]\ncache[0].append(True)\nreturn EntryDecision(True, True, (None, None), ())"), "attribute call"),
+         (_task5_entry_source("cache = []\ncache.member.append(True)\nreturn EntryDecision(True, True, (None, None), ())"), "attribute call"),
+         (_task5_entry_source("value = getattr(snapshot, 'market_is_bullish')\nreturn EntryDecision(value, True, (None, None), ())"), "reflection"),
+         (_task5_entry_source("return EntryDecision(True, True, (None, None), ())", prelude="\nimport time\n"), "import"),
+         (_task5_entry_source("return EntryDecision(True, True, (None, None), ())", prelude="\nimport random\n"), "import"),
+         (_task5_entry_source("return EntryDecision(True, True, (None, None), ())", prelude="\nimport os\n"), "import"),
+         (_task5_entry_source("handle = open('x')\nreturn EntryDecision(True, True, (None, None), ())"), "call"),
+         (_task5_entry_source("module = __import__('os')\nreturn EntryDecision(True, True, (None, None), ())"), "call"),
+         (_task5_entry_source("value = eval('1')\nreturn EntryDecision(True, True, (None, None), ())"), "call"),
++        (
++            _task5_entry_source(
++                "context = MarketContextV1()\nreturn EntryDecision(bool(context), True, (None, None), ())",
++                prelude="\nfrom .contracts import MarketContextV1\n",
++            ),
++            "call",
++        ),
+         ("from .contracts import EntryDecision\n\nasync def evaluate_entry(snapshot):\n    return EntryDecision(True, True, (None, None), ())\n", "async"),
+         (_task5_entry_source("yield snapshot\nreturn EntryDecision(True, True, (None, None), ())"), "generator"),
+         (_task5_entry_source("return EntryDecision(True, True, (None, None), ())", prelude="\ndef public_helper():\n    return True\n"), "public"),
+         (_task5_entry_source("return EntryDecision(True, True, (None, None), ())", prelude="\nfrom .contracts import _CanonicalContract\n"), "contract import"),
+         ("FLOOR = 0.25\nfrom __future__ import annotations\nfrom .contracts import EntryDecision\n\ndef evaluate_entry(snapshot):\n    return EntryDecision(True, True, (None, None), ())\n", "syntax"),
+         (_task5_entry_source("selected = False\nfor value in {'first', 'second'}:\n    selected = bool(value)\n    break\nreturn EntryDecision(selected, True, (None, None), ())"), "unordered"),
+     ),
+ )
+ def test_ast_purity_rejects_non_closed_policy_behavior(
+     source: str,
+@@ -10666,20 +10730,24 @@ def test_ast_purity_accepts_current_policy_and_immutable_literal_constants() ->
+     from core.pit_optimizer_candidate import validate_policy_ast
+ 
+     root = Path(__file__).parents[1]
+     for path in _POLICY_PATHS:
+         source = (root / path).read_text("utf-8")
+         if path == "core/strategy_policy/entry.py":
+             source = source.replace(
+                 "from __future__ import annotations\n",
+                 "from __future__ import annotations\nFLOORS = (0.25, 70.0, None, 'entry')\n",
+                 1,
++            ).replace(
++                "from .contracts import EntryDecision, EntrySnapshot",
++                "from .contracts import BenchmarkContextV1, EntryDecision, EntrySnapshot, MarketContextV1",
++                1,
+             )
+         validate_policy_ast(path=path, source=source)
+ 
+ 
+ def _task5_feedback(iteration: int) -> contract.IterationFeedbackSummary:
+     return contract.IterationFeedbackSummary(
+         iteration=iteration,
+         hypothesis_id=f"hypothesis_{iteration}",
+         family="entry",
+         author_summary="bounded author summary",

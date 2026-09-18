@@ -1,0 +1,47 @@
+"""Copy authenticated old price/fundamental material, preserving its limited scope."""
+from datetime import datetime, timezone
+import hashlib
+import json
+from pathlib import Path
+
+ROOT = Path.cwd()
+OLD = ROOT.parent / 'five-year-public-pit'
+DEST = ROOT / '.artifacts/pit-optimizer-v5/data/acquisition/raw/local-cache'
+
+def main():
+    DEST.mkdir(parents=True, exist_ok=False)
+    records = []
+    def copy(source, name, expected=None):
+        before = source.stat()
+        raw = source.read_bytes()
+        after = source.stat()
+        sha = hashlib.sha256(raw).hexdigest()
+        if source.is_symlink() or (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns) or expected is not None and sha != expected:
+            raise ValueError('Source cache authentication failed: ' + source.name)
+        target = DEST / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open('xb') as stream:
+            stream.write(raw)
+        if hashlib.sha256(target.read_bytes()).hexdigest() != sha:
+            raise ValueError('Copied cache authentication failed')
+        records.append({'file': name, 'sha256': sha, 'bytes': len(raw), 'source_local_path': str(source), 'bound_by_original_provenance': expected is not None})
+        return raw
+    price_root = OLD / 'exports/pit'
+    prices = json.loads(copy(price_root / 'prices_provenance.json', 'prices/prices_provenance.json'))
+    for name, field in (('prices.csv', 'prices_sha256'), ('spy_trading_days.csv', 'spy_trading_days_sha256'), ('membership.csv', 'membership_sha256')):
+        copy(price_root / name, 'prices/' + name, prices[field])
+    copy(OLD / 'config/pit_price_identity_map.csv', 'prices/pit_price_identity_map.csv', prices['price_identity_map_sha256'])
+    sec_root = OLD / '.artifacts/sec-pit'
+    sec = json.loads(copy(sec_root / 'fundamentals_provenance.json', 'fundamentals/fundamentals_provenance.json'))
+    for name, field in (('fundamentals.csv', 'fundamentals_sha256'), ('security_master.csv', 'security_master_sha256'), ('security_master_exclusions.csv', 'security_master_exclusions_sha256')):
+        copy(sec_root / name, 'fundamentals/' + name, sec[field])
+    copy(price_root / 'security_names.csv', 'fundamentals/security_names.csv', sec['security_names_csv_sha256'])
+    copy(OLD / 'config/pit_price_identity_map.csv', 'fundamentals/pit_price_identity_map.csv', sec['identity_manifest_csv_sha256'])
+    manifest = {'schema_version': 1, 'imported_at_utc': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'), 'files': records, 'admission_status': 'authenticated_previous_SP500_material_only_not_complete_V5_inputs', 'limitations': ['Price provenance does not bind the complete V5 three-universe lineage union or all three explicit reference identities.', 'The historical security master has documented exclusions and cannot satisfy V5 zero-exclusion fundamental coverage.', 'Original provenance binds its original membership seed and must not be relabeled as the new V5 membership hash.', 'Raw SEC archives have been copied separately for regeneration after complete identity mapping.']}
+    with (DEST / 'import-provenance.json').open('x', encoding='utf-8', newline='\n') as stream:
+        json.dump(manifest, stream, indent=2, sort_keys=True)
+        stream.write('\n')
+    print(json.dumps({'copied_files': len(records), 'bytes': sum(row['bytes'] for row in records), 'status': manifest['admission_status']}), flush=True)
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,104 @@
+# Task 8B2 report — pure V5 feedback-round runtime
+
+## Outcome
+
+Created `core/pit_optimizer_v5/runtime.py` and added only its minimal package exports. The module is a
+pure dependency-injected state machine; it contains no filesystem, Git, Docker, subprocess, provider
+gateway, CLI, replay, or market-data implementation.
+
+## Implemented boundary
+
+- Frozen input/result/failure, deadline, candidate-evidence, materialization, lease, and projection
+  values plus narrow runtime Protocols.
+- Exact Task 8B1 role recovery: the request is reconstructed and persisted before use;
+  `FreshPersistedRoleRequestV5` is the only value accepted by `invoke_once`, while an existing request
+  can only load a complete matching role event/package or go through `reconcile_once`. The terminal
+  package and `role_completion` event are durable before its artifact is consumed.
+- Authenticated projection and parent selection precede investigator, controller-owned novelty,
+  author, deterministic rendering, validation/probes, quick selection, rotated discovery episodes,
+  one complete critic batch, final records, archive reduction/checkpoint, and owned cleanup.
+- Persisted rendered, quick, episode, role, lease, cleanup, and terminal outcome events are reused on
+  restart. Completed quick/episode/role work is not repeated.
+- Exact/source and suite-local behavioral duplicates remain untestable; only manifest-capped,
+  behaviorally distinct quick survivors receive all four discovery episodes and all evaluator
+  scenarios. Campaign CAGR is recomputed through the Task 6 authority.
+- Failed terminal critic attempts create `critic_unavailable` with the full typed pre-critic evidence
+  identity batch, no experiment records, and no checkpoint/archive mutation. No-novel and novelty
+  exhaustion likewise create only their Task 8A durable terminal authorities.
+- Final records are accepted only from the injected factory after one accepted critic artifact. All
+  records are create-only before the archive reducer runs, and the checkpoint is published before
+  cleanup. A checkpointed restart schedules cleanup only.
+- Stage deadlines use the exact manifest values and monotonic time, cancellation is checked at stage
+  boundaries, dependency exceptions are reduced to stable codes, and cleanup receives only recovered
+  or newly issued opaque handles whose campaign/round ownership is exact.
+
+Concrete workspace/worker/evaluator/provider/CLI composition remains deliberately deferred to Task
+8C/9.
+
+## Direct verification
+
+A temporary deterministic in-memory fake harness (removed after use) produced:
+
+- `V5_RUNTIME_HAPPY_SMOKE_OK`: exact investigator → author → critic sequence, two final records
+  (`evaluated`, `quick_rejected`), one archive entry, checkpoint, then cleanup.
+- `V5_RUNTIME_RESTART_SMOKE_OK`: crashes immediately after investigator, author, critic, quick, and
+  discovery episode event boundaries resumed without repeating completed role/evaluator calls.
+- `V5_RUNTIME_NOVELTY_TERMINAL_SMOKE_OK`: no-novel and novelty-exhausted made no author/critic calls,
+  records, or checkpoint.
+- `V5_RUNTIME_CRITIC_UNAVAILABLE_SMOKE_OK`: failed critic preserved typed authority and made no
+  records/checkpoint.
+- `V5_RUNTIME_CANCELLATION_SMOKE_OK`: pre-stage cancellation made zero role calls.
+
+Final source verification used `py_compile`, Ruff check/format, package export import, forbidden
+coupling scan, and `git diff --check`. No provider, Docker, replay, market data, or external process
+was invoked.
+
+## Final review correction
+
+- Added a closed, indexed `CandidateStageResultPayloadV5` journal authority for validation,
+  semantic-probe, quick-evaluation, and discovery-evaluation results. Typed stage failures are
+  create-only artifacts authenticated on append/load. Recovery now reuses each durable local result
+  and refuses to invoke a missing earlier stage once a later result or failure exists.
+- Reconstructed every expected final `ExperimentRecordV5` inside the controller from the complete
+  `CandidateEvidenceV5` value and the matching critic review/reference. The injected record factory
+  output must equal that exact tuple; a structurally valid substituted review was rejected before
+  persistence.
+- Added a typed durable `runtime_failed` round outcome. Primary terminal authority is appended before
+  cleanup; incomplete cleanup is the sole permitted post-terminal retry path, and its failure is
+  reported separately without replacing the primary failure.
+- Checkpoint publication now validates the requested generation/reference set and records the returned
+  checkpoint before the post-call deadline check. Validation and cleanup also have controller-side
+  post-call deadline checks, and runtime construction is inside the sanitizing entry boundary.
+
+The final bounded direct fakes additionally produced:
+
+- `RESTART_AFTER_CRITIC_ZERO_DUPLICATE_OK`: after durable critic completion and a restart before
+  checkpoint, validation/probe/quick/four-episode/role counters remained unchanged and the canonical
+  critic request identity was identical.
+- `RECORD_SUBSTITUTION_REJECTED_OK`: a valid-looking record with substituted critic content failed as
+  `finalization/invalid_dependency_result`.
+- `CLEANUP_FAILURE_RETRY_PRESERVES_PRIMARY_OK`: terminal failure preceded cleanup, incomplete cleanup
+  retried to completion, and primary failure authority remained unchanged.
+- `CHECKPOINT_GENERATION_AND_POST_COMMIT_DEADLINE_OK`: a wrong generation failed closed; a valid
+  committed checkpoint remained recorded when its post-call deadline fired.
+- `CONSTRUCTOR_EXCEPTION_SANITIZED_OK`: an exception from the initial clock returned stable
+  `recovery/stage_failed` without exposing its message.
+
+## Post-commit authority correction
+
+An exact valid `publish_projection` result is now the irreversible round-commit authority. The
+runtime canonicalizes and records the current-round record refs and checkpoint without a post-commit
+round-deadline abort. Any later exception is routed through completed cleanup handling and cannot
+append `runtime_failed` or return the checkpoint as absent.
+
+Recovery authenticates/reduces the projection first. An exact advanced state must bind the current
+round's finalized records, the complete ordered checkpoint ref set, and a generation equal to the
+number of finalized record-bearing rounds. That checkpoint is adopted before journal terminal
+interpretation. This deliberately lets an authenticated advanced checkpoint outrank the stale
+post-checkpoint `runtime_failed` shape produced by the immediately preceding implementation, while
+still scheduling only owned cleanup and no role or candidate work.
+
+The focused direct fake produced `POST_COMMIT_CHECKPOINT_PRECEDENCE_OK`: publication completed as the
+round clock expired; both the first result and restart reported the same checkpoint and current-round
+refs, no runtime-failure event was appended, an injected contradictory legacy terminal was ignored,
+cleanup was not duplicated, and all role/validator/prober/quick/discovery counters stayed zero.

@@ -1,0 +1,28 @@
+# P3 review preparation risk map
+
+Preparation only; no spec or quality verdict. The moving P3 implementation, task report, and actual-task diff were not inspected. Actual review requires the frozen diff/report and exact postimage hash authority.
+
+## Authorities read
+
+- `review-brief.md`, the complete campaign-admission design, and implementation plan (P3 and global constraints govern this task).
+- Retained `principal-preimages/operations.py`: campaign lifecycle function; retained `campaign_admission.py`: selected-state helpers and focused live-prefix/guard excerpts. Retained CLI source was hashed, not read.
+- Unchanged `core/pit_optimizer_v5/artifacts.py`: typed-state publication/load/recovery and transition locking, solely for enrollment/crash risk.
+- All three preimage hashes match their principal authority JSONs: operations `8164379a88d045c795ce3487683c5d5d911e56583d0555a01551e934cdea2bcc`; CLI `59044289f6f8cd3050e5f3604c30813f7f627fd221651af6ea76c74b4a6feb22`; admission `c42b07adc2d14fd00300acf2c76fb15669cade0ad4b149d7d92cbe9666c88d5e`.
+
+## Checks to apply to the frozen change
+
+1. **Enrollment and crash writes.** The preimage holds the campaign-launch transition around composition and the campaign loop (`operations.py:390`). Repository append publishes immutable value before index (`artifacts.py:1883`); default typed-state load may repair a missing index (`:1925`). Every enrollment/recovery write must follow independent exact expected policy/config/owner/root authentication and selected no-start/no-spend freshness. `recover_typed_state_index` (`:1976`) authenticates the exact existing value, creates only its missing index, and reloads with `repair=False`; its caller must establish authorization first. A catch-all missing-artifact handler must not mistake absent policy/config/value bytes or contradictory authority for that narrow crash window. Binding-before-launch continuation requires an explicit matching policy; launched legacy state cannot be enrolled.
+
+2. **Selected-state completeness.** Retained admission `_state_names_v5` (`:485`) enumerates value/index unions; launch and round selectors use `repair=False`. Round selection includes config-derived campaign identity and propagates failed config authentication. Freshness and boundary composition must preserve these properties, including orphan, misplaced, duplicate and later state; absence of one canonical entry alone is insufficient evidence of freshness.
+
+3. **Boundary positions.** The preimage's settled-round shortcut (`operations.py:464`) continues before later round-state processing; absent config leads to creation (`:475` onward); existing unstarted configs reach start publication (`:564`). Verify stopping after reused and new settlements, including the final capped round, before creating another config, and before first start of an existing config. An already-started round must retain its original prior-round admission rather than pay a new three-call reserve from current-round remaining capacity.
+
+4. **Failure before target.** Trace reconciliation, full selected observed-start census, original authority/deadlines, ledger accounting, committed records/critics, cleanup and novelty exhaustion before success. Reaching a target in an early prefix cannot hide a later pending, failed or cleanup-incomplete start. Existing runtime/provider failures and real overage accounting must retain their meaning. Distinct target/reserve reasons must map to completed/stopped without manufactured outcomes or altered old summary formulas.
+
+5. **Shared helper extraction.** P2 live prefix is request-specific (`campaign_admission.py:807`) and actual live guard rechecks real time after heavy authentication (`:1099`). Boundary/freshness support must be data-only composition using immutable selectors/resources/packages/ledger facts, with no fake request or clock. Preserve P2 exact incoming/persisted attempt slot, accepted current predecessor packages for continuation, prior runtime/critic/novelty failure blocks even with empty later journal, failed config authentication, and the final real-clock checks. Historical transitive reads must remain `repair=False` without operational construction, migration or clocks.
+
+6. **CLI and resume pinning.** Verify paired path/SHA options only for run/resume campaign, exact validated ArtifactRef forwarding, mismatch failure, and policy discovery even when resume omits its argument. Every enrolled generated resume command must pin the discovered reference. Preserve legacy rendering keys/flags and optional behavior, original serialized fields/defaults/digest domains, and bytes outside approved spans.
+
+## Review gate
+
+Read the frozen actual-task diff once against these retained preimages, verify reported hashes directly, and inspect only complete functions needed for clipped hunks or a named dependency risk. Report separate spec and task-quality verdicts with exact source line evidence; defer P4 historical integration and broad review. No tests, source imports, synthetic probes, historical reader execution, operational activity, git mutations or archive edits were performed during preparation. The only write was this preparation report. Static review cannot establish policy-positive execution behavior.

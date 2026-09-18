@@ -1,0 +1,416 @@
+# Task 8 Report — Schema-v2 PIT Optimizer CLI and Live Composition
+
+## Status
+
+Implemented Task 8 on `codex/pit-optimizer-implementation` from the requested base. The schema-v2 `gate pit_optimizer` route is separate from the unchanged schema-v1 `gate pit_optimization` route. Pure/mock gates are green. Two authorized foreground Docker smoke attempts were used; the second proved worker execution, deterministic synthetic output, confinement, and eventual exact cleanup, but exposed a benign cleanup-classification defect that was subsequently fixed with fake RED/GREEN coverage. The two-attempt ceiling prohibited a third live smoke.
+
+Commit: `cbbc9c9` (`feat: expose model-authored PIT optimizer`)
+
+## Implementation and files
+
+- `agent_loop.py`
+  - Added the separate schema-v2 parser route and `_build_pit_optimizer_v2_config`.
+  - Added phase-first `_dispatch_pit_optimizer_v2`; prepare returns before gateway, pricing, authorization lease, Docker worker, or hidden evaluation construction.
+  - Added `PitOptimizerLiveRun`, the ordered canary preauthorization seam, and production service composition around the existing one-shot all-R1 gateway.
+  - Added exact closed readiness loading, authority/source/scope/universe authentication, one pricing freeze, six conservative call preflights, one lease, candidate capability registry wiring, policy-package-only worker wiring, discovery/determinism/hidden evaluation services, artifact services, and cleanup/final verification.
+  - Added exact two-line prepare output and generated-only canary command using `subprocess.list2cmdline`.
+  - Added the exact 17-key schema-v2 public summary, with incumbent represented only by changed paths and symbols.
+  - Corrected the policy-worker Docker entrypoint composition, bounded cleanup classification, and Windows `SYSTEMDRIVE` controller-environment handling found by the bounded smoke.
+- `core/pit_optimization.py`
+  - Added canonical schema-v2 readiness reconstruction and identity-graph validation for canary.
+- `core/pit_optimization_contract.py`
+  - Closed prepare/canary phase validation, source-transmission authorization, readiness/window requirements, apply=false, sealed ceilings, execution-context regularity, and authenticated input separation.
+  - Changed the generated prepare command to invoke the real `agent_loop.py --gate pit_optimizer` route.
+- `core/pit_optimizer_evaluation.py`
+  - Added the provider-free `build-subset-manifest` CLI adapter with explicit local inputs, exact role caps, candidate bounds, canonical manifest publication, and generated prepare command.
+- `core/pit_optimizer_authorization.py`
+  - Added the narrow public, read-only, fail-closed `AuthorizationLedger.authenticate_window` query. This was the only unavoidable file-scope expansion: it avoids coupling the trusted builder to the private journal `_read_records` implementation and does not mutate authority.
+- `tests/test_agent_loop.py`
+  - Added route/config, phase-first dispatch, canary ordering, prepare-line, summary, policy-worker argv/environment, and cleanup classification coverage.
+- `tests/test_pit_optimizer_v2.py`
+  - Added config/manifest CLI/public authorization coverage and the exact-selector-only bounded Docker smoke.
+- `tests/test_pit_optimization_contract.py`
+  - Updated only stale schema-v1 fixture/coexistence expectations to the already-current v1 contract.
+- `tests/test_pit_optimizer_loop.py`
+  - No change was necessary; its existing mocked two-iteration controller integration was consumed unchanged.
+
+Tracked diff reviewed: 8 files, 2,816 insertions and 85 deletions. No unrelated tracked file was changed.
+
+## RED/GREEN evidence
+
+### Baseline
+
+Command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py
+```
+
+Result: `65 passed, 1 skipped`.
+
+### Steps 1–3: schema-v2 phase/config route
+
+Command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py tests/test_pit_optimizer_v2.py -k "pit_optimizer_v2_config"
+```
+
+- RED: `4 failed, 754 deselected`; the schema-v2 parser/config route was absent.
+- GREEN: `4 passed, 754 deselected`.
+
+The tests prove the legacy route remains selectable, prepare rejects source-transmission authority and live-window/readiness inputs, canary requires exact authority/readiness identities, ceilings are manifest-owned, at least two iterations are required, and apply remains false.
+
+### Steps 4–5: provider-free subset-manifest CLI
+
+Command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "build_subset_manifest_cli"
+```
+
+- RED: `1 failed`; the adapter route was absent.
+- GREEN: `1 passed, 235 deselected`.
+
+The node used synthetic local inputs and spies. It proved six calls, 448000 tokens, USD 0.40, exact role/candidate bounds, canonical policy scope and identity graph, and no pricing, replay, grant, hidden evaluation, or provider-service action.
+
+### Steps 6–8: phase-first dispatch
+
+Command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py::test_prepare_dispatch_never_builds_live_services
+```
+
+- RED: `1 failed`; dispatch was absent.
+- GREEN: `1 passed`.
+
+### Steps 9–10: canary order and exact prepare lines
+
+Command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py -k "prepare_dispatch or canary_dispatch"
+```
+
+- RED: `1 failed, 1 passed, 523 deselected`; the canary preauthorization composition was absent.
+- GREEN: `2 passed, 523 deselected`.
+
+Observed fake event order was exact authority authentication, one pricing freeze, preflights 1–6, one lease, service construction, then controller execution.
+
+Prepare-line focus:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py tests/test_pit_optimizer_v2.py -k "pit_optimizer_v2_prepare"
+```
+
+Result: `3 passed`. A later self-review regression first failed when byte-authenticated readiness was moved away from the sealed derived path, then passed after exact `<artifact_root>/<run_id>.readiness.json` enforcement.
+
+Public authorization query focus:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "authorization_window_query"
+```
+
+- RED: missing public method.
+- GREEN: `1 passed, 236 deselected`.
+
+### Steps 11–12: closed summary
+
+Command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py -k "pit_optimizer_v2_summary"
+```
+
+- RED: `1 failed`; the summary adapter was absent.
+- GREEN: `1 passed`.
+
+The resulting dictionary has exactly the prescribed 17 keys and excludes credentials, provider contents, trades, container identities, and opaque artifact identities.
+
+### Step 13: mocked integration and legacy coexistence
+
+Command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py tests/test_agent_loop.py tests/test_pit_optimizer_v2.py tests/test_pit_optimization_contract.py -k "pit_optimizer or pit_optimization"
+```
+
+Integration history:
+
+- First diagnostic run: 53 failures identified stale schema-v1 fixture expectations plus managed-sandbox Windows ACL denial for temporary audit files.
+- After fixture correction and running the same fully mocked/temp-path suite outside that ACL virtualization: `357 passed, 1 skipped, 1 failed`; the remaining assertion expected a legacy-readiness digest as a free v2 CLI token even though it is authenticated during manifest construction and bound into the manifest.
+- After removing that stale coexistence assertion: `358 passed, 1 skipped, 524 deselected`.
+- After guarding the Docker smoke behind its exact selector: `358 passed, 2 skipped, 524 deselected`.
+- Final post-self-review run: `358 passed, 2 skipped, 524 deselected, 2 warnings in 109.52s`.
+
+The two warnings are the existing unknown `cache_dir` pytest option and an upstream `websockets.legacy` deprecation warning. The suite contains the unchanged mocked two-iteration controller integration, exact role lineage, closed artifacts, live-gateway fake accounting, and schema-v1 coexistence.
+
+One focused fake gateway test initially encountered only the managed-sandbox Windows ACL issue. The exact same provider-free test outside that virtualization passed: `1 passed`.
+
+## Step 14: bounded Docker smoke and cleanup
+
+Exact smoke command used for both authorized attempts:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "policy_worker_docker_smoke"
+```
+
+No image pull was allowed or attempted. The locally available digest-pinned image was used with a foreground worker, network disabled, read-only root, one CPU, 256 MiB memory, PID/capability/security limits, one read-only generated policy-package mount, and deterministic synthetic snapshots only.
+
+Attempt 1: `1 failed, 237 deselected in 7.80s`. Read-only image metadata inspection showed that the pinned image already owned the Python entrypoint, while the runner supplied another leading Python token. No provider or replay action occurred. Exact task-name container inspection was empty afterward and the task temporary root was absent. A fake argv regression failed before the change and passed after adding an explicit entrypoint override and corrected command tail.
+
+Attempt 2: `1 failed, 237 deselected in 2.99s`. Worker startup, A-B-A determinism, output, network-none, resource/security limits, user, and exact mount allowlist assertions all passed. The failure occurred only during `client.close()`: stdin EOF had already stopped the worker, Docker KILL returned nonzero, force removal succeeded, and the exact-ID absence query was empty. Post-attempt task-name container and matching process checks were empty, and the generated package was absent.
+
+The cleanup classifier was then narrowed so a nonzero KILL is ignored only when force removal succeeds and an exact-ID absence query conclusively proves absence. Focused fake cleanup matrix: `6 passed, 521 deselected`. Full policy worker/daemon fake group: `44 passed, 483 deselected`.
+
+The smoke also revealed that omitting Windows `SYSTEMDRIVE` from the controller-only Docker environment could make Windows resolve a native cache path under the checkout. The focused fake test was RED with a missing key and GREEN with `1 passed`; `SYSTEMDRIVE` is now passed only to the Docker CLI controller environment and remains absent from the container environment. The exact task-created literal cache directory was permanently removed; it contained only smoke-created Windows cache files, no source or user artifact, and is now absent.
+
+No third Docker invocation was made. Final task-created container list, matching background-process list, generated worker package, and literal cache path are all empty/absent.
+
+## Static, diff, and hook evidence
+
+Final Ruff command over all modified Python files:
+
+```text
+python -B -m ruff check agent_loop.py core/pit_optimization.py core/pit_optimization_contract.py core/pit_optimizer_authorization.py core/pit_optimizer_evaluation.py tests/test_agent_loop.py tests/test_pit_optimization_contract.py tests/test_pit_optimizer_v2.py
+```
+
+Result: `All checks passed!`
+
+Final bytecode compilation used the same eight files with `python -B -m py_compile`; result: exit 0, no output.
+
+`git diff --check`: exit 0. Git emitted only the repository's Windows LF-to-CRLF working-copy notices.
+
+Hook discovery: no custom `core.hooksPath`; the repository has an installed generated pre-commit hook. Commit-time hook result: Ruff passed, trailing-whitespace passed, end-of-file normalization passed, YAML skipped because no YAML was staged, and merge-conflict detection passed.
+
+## Self-review
+
+- Confirmed `pit_optimization` remains schema v1 and rejects schema-v2-only options.
+- Confirmed prepare branches before live-service construction and does not build a gateway/client, freeze pricing, open a lease, record authority, invoke Docker, evaluate hidden data, or replay evidence.
+- Confirmed the generated canary command is printed only; it was never executed.
+- Confirmed the live builder authenticates the exact source/manifest/readiness/parity/window/requirement/scope/universe graph before pricing, checks the complete six-call plan before the lease, and delegates each provider call to the Task 6 one-shot gateway without retry/healing/bypass.
+- Confirmed the builder uses the public read-only authorization query and does not access private ledger journal structure.
+- Confirmed candidate roots remain private capabilities; the worker receives only the generated policy package.
+- Confirmed fixed-baseline ranking remains controller-verified, hidden validation is opened only after discovery/determinism, authorization/pricing/accounting identities are retained, and candidate/source cleanup is reverified at finalization.
+- Confirmed public summary and operator output do not include prompts, provider contents, credentials, raw trades, hidden identities/data, container IDs, or opaque artifact digests.
+- Reviewed all eight-file changes and found no debug bypass, provider fallback, background worker, or unrelated mutation.
+
+## Exact resource and secrecy statement
+
+No OpenRouter/provider call, network access, live pricing lookup, replay/parity/candidate backtest, permanent external-ledger mutation, background process, upload, push, merge, deploy, cloud work, or operator-worktree mutation occurred. All service-order, role, authorization, pricing, candidate, evaluator, and gateway tests used injected fakes/mocks and pytest temporary paths. Prepare remained provider-free. Docker activity was limited to the two explicitly authorized foreground synthetic smoke attempts with no pull, network disabled, one CPU, 256 MiB, and preserved confinement limits; exact task-resource absence was verified afterward. No task-created container or background process remains. No prompts, real model-authored source, raw provider contents, credentials, keys, headers, sealed raw hashes, operator approval contents, hidden identities/data, or container IDs are included in this report.
+
+## Concern
+
+The only residual verification limitation is deliberate: the corrected benign-KILL cleanup classification and Windows environment fix could not be exercised in a third live Docker smoke because the authorized two-attempt ceiling was exhausted. Both are covered by focused fakes, and attempt 2 independently proved live worker execution, determinism, confinement, force removal, exact task-container absence, package removal, and no background process.
+
+## Fix Round 1 (2026-08-28)
+
+Fix Round 1 started from clean commit `cbbc9c9`. It addresses review blockers C1 and I1-I4 only. The separately ledgered Docker resource-assertion minor was deliberately not changed, and neither prior Docker limitation was reopened.
+
+### C1: one authenticated discovery-evidence identity
+
+The end-to-end identity is now the full authenticated `ParityFoldEvidence.evidence_sha256`. `FoldEvaluationResult` requires that digest, the production evaluator carries it through discovery, the controller promotes those exact fold digests into `DiscoveryEvidenceSummary.evidence_ids`, and `_finish_discovery` compares the repeated full-evidence digest with the promoted full-evidence digest. The old aggregate-projection digest is no longer manufactured during incumbent promotion.
+
+Initial RED command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py::test_incumbent_transition_replaces_diff_only_after_critic_and_fixed_score
+```
+
+Result: `1 failed`; the new test supplied `evidence_sha256`, but `FoldEvaluationResult` rejected the argument with `TypeError`. This established that the closed evaluation type did not yet carry the authenticated identity.
+
+Final cross-boundary GREEN command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py::test_actual_two_iteration_loop_persists_exact_closed_artifacts_without_leaks tests/test_pit_optimizer_loop.py::test_incumbent_transition_replaces_diff_only_after_critic_and_fixed_score tests/test_pit_optimizer_loop.py::test_discovery_repeat_requires_byte_identical_incumbent_evidence tests/test_pit_optimizer_loop.py::test_dispatch_with_production_composition_completes_mocked_two_iteration_canary
+```
+
+Result: `4 passed, 2 warnings in 9.73s`. The production-composition node proves an improving candidate is promoted under the full-evidence identity, repeated deterministically, and allowed to open hidden validation.
+
+### I1: caller path topology is preserved until links are rejected
+
+`_absolute_cli_path` now walks the caller-supplied lexical absolute path with `lstat`, rejecting a file link or linked/reparse-point ancestor before resolution. Only then does it canonicalize. `PitOptimizerGateConfig` additionally checks canonical equality and `os.path.samefile` so hard-link or other filesystem aliases cannot expose one authenticated target through two accepted names. An inability to inspect or compare path identity fails closed.
+
+RED focus:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py -k "v2_config_rejects_caller_supplied_file_link or v2_config_rejects_linked_directory_ancestor or v2_config_rejects_hard_link_alias"
+```
+
+The hard-link case failed because validation progressed to parity-content rejection instead of rejecting overlapping authenticated identity. The two symbolic-link primitives were unavailable on this Windows test host and skipped honestly.
+
+The final combined C1/I1-I3 focus reported `58 passed, 2 skipped, 1 warning in 16.40s`; the only skips were those unavailable file/directory symbolic-link primitives. The hard-link alias case passed and reached the intended `paths overlap` rejection.
+
+### I2: exact first-canary authority is a deserialization invariant
+
+`PitOptimizerRunManifest.__post_init__` now enforces `max_iterations == 2`, exactly six R1 calls in the existing canonical iteration/role order, exact aggregate authority of 448000 tokens and USD 0.40, and the exact investigator/author/critic static bytes, dynamic bytes, input tokens, output tokens, response bytes, and per-call USD caps. Because primitive reconstruction invokes the closed dataclass, this applies equally to a canonical supplied manifest and direct canary validation.
+
+RED command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_v2.py::test_closed_manifest_rejects_every_first_canary_plan_mutation
+```
+
+Result: `17 failed, 6 passed`. The accepted mutations exposed the missing deserialization invariant.
+
+GREEN focus over canonical-manifest and direct-canary mutation matrices: `47 passed`. The matrix covers all four global ceilings, call order, and all six fields for each of the three roles.
+
+### I3: v2 CLI options are route- and phase-exclusive
+
+`_build_cli_config` now performs one early rejection for every schema-v2-only field and the transmission-authorization boolean. V2 fields and the boolean are rejected on `test`, `backtest`, `pit_diagnosis`, and legacy `pit_optimization`; the boolean is additionally rejected on v2 `prepare`. It is accepted only on v2 `canary`.
+
+RED command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py -k "schema_v2_options_are_rejected_outside_optimizer_canary or optimizer_prepare_rejects_source_transmission_authority"
+```
+
+Result: `9 failed`; all newly enumerated foreign-route/prepare cases were silently accepted before central rejection.
+
+GREEN focus: `10 passed`. This includes the eight foreign-route field/boolean combinations, the v2-prepare boolean rejection, and the existing accepted v2-canary contract.
+
+Final combined C1/I1-I3 focus command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py tests/test_pit_optimizer_v2.py tests/test_pit_optimizer_loop.py -k "first_canary_plan_mutation or v2_config_rejects_caller_supplied_file_link or v2_config_rejects_linked_directory_ancestor or v2_config_rejects_hard_link_alias or schema_v2_options_are_rejected_outside_optimizer_canary or optimizer_prepare_rejects_source_transmission_authority or actual_two_iteration_loop_persists_exact_closed_artifacts_without_leaks or incumbent_transition_replaces_diff_only_after_critic_and_fixed_score or discovery_repeat_requires_byte_identical_incumbent_evidence"
+```
+
+Result: `58 passed, 2 skipped, 1 warning in 16.40s`.
+
+### I4: actual production composition under fake external boundaries
+
+The live builder now has three narrow optional factories at true external boundaries only: the gateway transport/pricing boundary, policy worker boundary, and evaluator-data boundary. The builder still requires a real `OpenRouterGateway`; the integration supplies its fake client and frozen pricing loader. All controller, authorization, budget, audit, candidate registry, source authentication, validation ledger, hidden decision, artifact, and cleanup components are production implementations.
+
+The production adapter now also:
+
+- authenticates the same clean Git HEAD/tree identity used by the manifest and parity contract;
+- binds every controller role input to the real authorization ledger with exact durable predecessor lineage before its one-shot gateway call;
+- derives an incumbent cumulative diff from a controller-exported tree-equivalent candidate without accepting caller-supplied diff text as proof;
+- selects the hidden window from the closed discovery-plus-hidden sequence;
+- projects candidate-versus-baseline hidden excess return into the candidate aggregate before issuing the hidden attestation; and
+- closes the source capability after reloading and re-authenticating the sealed inputs.
+
+RED command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py::test_dispatch_with_production_composition_completes_mocked_two_iteration_canary
+```
+
+Initial result: `1 failed, 1 warning in 2.11s`; `_build_pit_optimizer_v2_live_run` did not accept the narrow `gateway_factory` boundary. Subsequent production-only RED states exposed and led to closure of the source identity domain, missing runtime service import, controller-role provenance binding, synthetic candidate commit/tree identity, hidden fold indexing, and hidden excess-return projection. None was bypassed with a controller-stage fake.
+
+Final isolated GREEN result: `1 passed, 2 warnings in 6.27s`.
+
+The integration enters through `_dispatch_pit_optimizer_v2`, invokes actual `_build_pit_optimizer_v2_live_run`, consumes exactly six fake-transport calls, opens one real authorization lease, records six real reservations and reconciliations, creates two production candidate capabilities, confirms the promoted incumbent against full evidence, durably reserves/evaluates/closes hidden validation, removes both candidate roots, closes the source capability, and produces the 17-key closed summary. Provider, network, Docker, and real evaluator data remain absent.
+
+### Exact mocked integration and legacy coexistence suite
+
+Prescribed command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py tests/test_agent_loop.py tests/test_pit_optimizer_v2.py tests/test_pit_optimization_contract.py -k "pit_optimizer or pit_optimization"
+```
+
+First run: `2 failed, 406 passed, 4 skipped, 531 deselected, 2 warnings in 134.07s`. Both failures were stale tests that attempted to mutate the newly sealed canonical first-canary plan: the complete-context preflight test narrowed one critic budget, and the gateway exact-cost test narrowed one investigator USD cap. The product integration and legacy coexistence paths passed.
+
+The tests were corrected without weakening their behaviors: the context test injects an overflow from the pure complete-context renderer while retaining the canonical plan, and the gateway test uses the canonical USD 0.05 cap with a synthetic completion rate that produces an exact over-cap conservative cost.
+
+Correction focus:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py::test_complete_three_role_context_preflight_stops_before_iteration_start tests/test_pit_optimizer_v2.py::test_pit_optimizer_v2_exact_over_cap_preflight_has_zero_effects
+```
+
+Result: `2 passed, 1 warning in 2.10s`.
+
+Final prescribed suite: `408 passed, 4 skipped, 531 deselected, 2 warnings in 132.62s (0:02:12)`. The warnings remain the repository's unknown `cache_dir` pytest option and upstream `websockets.legacy` deprecation. No test-created `task8-controller-*` directory remained after the suite.
+
+### Static checks, hooks, and self-review
+
+Final static command set:
+
+```text
+python -B -m ruff check agent_loop.py core/pit_optimization_contract.py core/pit_optimizer_controller.py core/pit_optimizer_evaluation.py core/pit_policy_parity.py tests/test_agent_loop.py tests/test_pit_optimizer_loop.py tests/test_pit_optimizer_v2.py
+python -B -m py_compile agent_loop.py core/pit_optimization_contract.py core/pit_optimizer_controller.py core/pit_optimizer_evaluation.py core/pit_policy_parity.py tests/test_agent_loop.py tests/test_pit_optimizer_loop.py tests/test_pit_optimizer_v2.py
+git diff --check
+```
+
+Results: Ruff `All checks passed!`; `py_compile` exit 0 with no output; `git diff --check` exit 0 with only expected Windows LF-to-CRLF notices. Commit-time hook results are recorded below after the commit is created.
+
+Self-review covered all eight tracked files. The v1 `pit_optimization` route remains unchanged in meaning and coexistence tests pass. Prepare remains phase-first and provider-free. The gateway remains Task 6's real one-shot gateway with real authorization/pricing/audit/recovery components, not a duplicate transport path. Candidate roots remain opaque controller capabilities, fixed-baseline ranking is unchanged, hidden validation remains post-discovery/post-determinism only, and the public summary remains closed. No debug bypass, retry, live fallback, source-copy leakage, private-ledger journal access, or unrelated production change was found.
+
+### Fix-round resource, secrecy, and residual concerns
+
+This fix round made no Docker invocation and no provider/OpenRouter/network call, live pricing lookup, real provider SDK construction, replay/parity run, candidate backtest, permanent external-ledger mutation, background process, upload, push, merge, deploy, cloud work, or operator-worktree mutation. All authorization, audit, budget, candidate, validation, evaluator, pricing, and transport effects were injected fakes or pytest temporary paths. One empty task-owned temporary controller directory left by an interrupted test process was removed after its exact path and emptiness were verified; the final matching count is zero.
+
+No prompts, real model-authored source, raw provider contents, credentials, keys, headers, raw authenticated hashes, operator approval contents, hidden identities/data, or container IDs are included here.
+
+Residual disclosed limitations are unchanged: the cleanup-classification and Windows controller-environment fixes were not re-smoked after the prior two-attempt ceiling, and M1's Docker smoke predicates still do not assert the exact 256 MiB/1 CPU/32 PID/`/tmp` confinement values. No Docker was run in this round, as required. File and directory symbolic-link tests skipped honestly because that primitive was unavailable on this host; the hard-link alias test passed. Production behavior outside the supplied diff and named focused contracts was not exhaustively verified.
+
+Fix Round 1 commit: `284b04f fix: close PIT optimizer production composition`. Commit hooks passed Ruff, trailing-whitespace, end-of-file normalization, and merge-conflict detection; YAML correctly skipped because no YAML file was staged. The eight tracked files were committed and the tracked worktree was verified clean afterward.
+
+## Fix Round 2 (2026-08-28)
+
+Fix Round 2 started from clean commit `284b04f` and addresses only the rereview's one new Important finding: schema-v2 prepare and canary source authentication must use the explicitly configured Git capability rather than ambient `PATH` Git. No Docker-resource assertion or other previously clean Task 8 behavior was reopened.
+
+### Approved Git capability is now the only optimizer authentication path
+
+`core.pit_policy_parity.authenticated_source_identity` now requires a bounded Git-command capability with no ambient default. Its clean-repository, HEAD, and tree-fingerprint logic is shared with the legacy internal parity helper, so the authenticated identity semantics remain unchanged while optimizer production callers cannot silently select `git` from `PATH`.
+
+`agent_loop._pit_optimizer_source_identity` adapts the approved `GitCapability` to that narrow command seam through the existing hardened `_git` runner. Every invocation therefore revalidates the exact approved executable identity and uses the existing fixed arguments, credential/config-free environment, no-shell invocation, and bounded timeout. The canary live-service preauthorization path calls this adapter directly. The prepare route creates the same capability-bound closure, uses it for its outer manifest/source check, and injects it through the public adapter into `core.pit_optimizer_controller.prepare_pit_optimizer_v2`, eliminating the controller's second ambient-Git authentication.
+
+The focused tests use the host's real approved Git executable, which is installed at a canonical path containing spaces. Inherited `PATH`/Git state is poisoned with a trace sentinel and invalid ambient repository override: a bare/PATH invocation both records the attempt and fails, while the configured hardened executable succeeds because the forbidden inherited Git variables are removed. A missing configured executable and a wrong regular file named `git.exe` both fail closed before live-service construction, Docker configuration, provider construction, pricing, authorization lease mutation, replay, or other runtime/artifact mutation.
+
+Tracked implementation files:
+
+- `agent_loop.py`: added the approved-capability adapter and used it for schema-v2 prepare and canary authentication.
+- `core/pit_policy_parity.py`: factored the unchanged source identity algorithm over a required bounded command seam.
+- `core/pit_optimization.py`: threaded the required source-identity capability through the public prepare adapter.
+- `core/pit_optimizer_controller.py`: removed its private ambient Git dependency and requires the injected source authenticator.
+- `tests/test_pit_optimizer_loop.py`: added the two production-path regressions and fail-closed missing/wrong executable cases; the existing full production-composition canary now also proves ambient Git is not invoked.
+
+### Strict RED to GREEN evidence
+
+Focused RED command:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py::test_production_prepare_uses_exact_configured_git_not_ambient_path tests/test_pit_optimizer_loop.py::test_optimizer_canary_wrong_configured_git_fails_before_live_boundaries tests/test_pit_optimizer_loop.py::test_dispatch_with_production_composition_completes_mocked_two_iteration_canary
+```
+
+RED result: `2 failed, 2 passed, 2 warnings in 6.04s`. The two production-path failures were the prepare controller's second authentication and canary preauthorization calling bare `git` under the poisoned ambient state. Both failed at the expected ambient `subprocess.run(["git", ...])` seam. The parametrized missing/wrong configured-executable cases already passed and proved zero downstream effects.
+
+After capability threading, the identical focused command was GREEN: `4 passed, 2 warnings in 9.59s`. The prepare path wrote provider-free readiness, the actual production-composition canary completed its closed mocked two-iteration run, neither created the ambient trace sentinel, and both invalid configured-executable variants remained fail-closed.
+
+### Mocked integration and legacy coexistence
+
+The prescribed combined suite was run once after the focused fix:
+
+```text
+python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_optimizer_loop.py tests/test_agent_loop.py tests/test_pit_optimizer_v2.py tests/test_pit_optimization_contract.py -k "pit_optimizer or pit_optimization"
+```
+
+Result: `411 passed, 4 skipped, 531 deselected, 2 warnings in 138.19s (0:02:18)`. The warnings remain the repository's unknown `cache_dir` pytest option and the upstream `websockets.legacy` deprecation. The suite covers the real schema-v2 production composition through fake external boundaries and legacy schema-v1 coexistence. No test-created matching controller temporary directory remained after verified cleanup; one empty task-owned directory left by the run was checked for exact parent and emptiness, removed, and the final matching count was zero.
+
+### Static checks and self-review
+
+Commands:
+
+```text
+python -B -m ruff check agent_loop.py core/pit_optimization.py core/pit_optimizer_controller.py core/pit_policy_parity.py tests/test_pit_optimizer_loop.py
+python -B -m py_compile agent_loop.py core/pit_optimization.py core/pit_optimizer_controller.py core/pit_policy_parity.py tests/test_pit_optimizer_loop.py
+git diff --check
+```
+
+Results: Ruff `All checks passed!`; `py_compile` exit 0 with no output; `git diff --check` exit 0 with only the repository's expected Windows LF-to-CRLF working-copy notices.
+
+Self-review confirmed the optimizer's public authenticated-source function has no ambient fallback, both actual production phases receive the same configured capability, the underlying source identity calculation is unchanged, and wrong/missing executable failures occur before any live boundary. Schema-v1 behavior, readiness/manifest identity, authorization/pricing ordering, six-call plan, fixed-baseline ranking, hidden boundary, candidate cleanup, and closed summary semantics are unchanged. No retry, provider fallback, Docker fallback, test-only production bypass, or unrelated change was introduced.
+
+### Resource, secrecy, and residual risks
+
+This fix round made no Docker invocation and no provider/OpenRouter/network call, live pricing lookup, real provider SDK construction, replay/parity run, candidate backtest, permanent external-ledger mutation, background process, upload, push, merge, deploy, cloud work, or operator-worktree mutation. All runtime effects were injected fakes or pytest temporary paths. No task-created controller temporary directory or background process remains.
+
+No prompts, real model-authored source, raw provider contents, credentials, keys, headers, raw authenticated artifact hashes, operator approval contents, hidden identities/data, or container IDs are included here.
+
+Residual limitations are unchanged and out of this round's scope: the cleanup-classification and Windows controller-environment corrections were not live re-smoked after the prior two-attempt ceiling, and the separately ledgered Docker smoke assertion Minor remains open. The internal legacy parity `_source_identity` retains its preexisting ambient implementation for non-optimizer callers; both production optimizer phases use the new required capability seam and are covered by the focused regressions.
+
+Fix Round 2 commit: `5eb00d5 fix: bind PIT source identity to approved Git`. Commit hooks passed Ruff, trailing-whitespace, end-of-file normalization, and merge-conflict detection; YAML correctly skipped because no YAML file was staged. The five tracked files were committed.

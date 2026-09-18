@@ -1,0 +1,376 @@
+# Task 4 Report — Schema-v3 Controller, Artifacts, Adapters, and CLI
+
+## Status
+
+Completed and committed.
+
+Commit: `250cbc00d7394083d62fb4cc53a26612b2983df1` (`Expose audit-only PIT optimizer v3 flow`)
+
+No tests were added, modified, or run. No provider, Docker, hidden-data,
+network, push, upload, or subagent action was used.
+
+## Behavior changed
+
+- Advanced active optimizer readiness, run artifacts, accounting artifacts,
+  public results, and CLI serialization to outer `schema_version=3`.
+- Advanced the active Python entrypoints to the required v3 names without v2
+  aliases:
+  - `prepare_pit_optimizer_v3`
+  - `load_pit_optimizer_v3_readiness`
+  - `run_pit_optimizer_v3`
+  - `_build_pit_optimizer_v3_config`
+  - `_preauthorize_pit_optimizer_v3_live_run`
+  - `_build_pit_optimizer_v3_live_run`
+  - `_dispatch_pit_optimizer_v3`
+  - `_pit_optimizer_v3_summary`
+  - `_pit_optimizer_v3_prepare_lines`
+- Preserved nested Investigator, Author, and Critic role-input protocol objects
+  at schema version 2, as required by their unchanged closed protocol.
+- Replaced the controller budget/result shape with calls, prompt/completion/total
+  tokens, canonical-text authoritative USD, lease-bound projected-plan USD and
+  pricing status, retained reservation tokens, incomplete call count, and an
+  explicit accounting-complete flag.
+- Cumulative authoritative USD now sums only complete provider facts through
+  `Decimal` and is rendered as canonical non-exponent decimal text. Multiple
+  individually finite high costs therefore do not overflow the public summary.
+- Projected plan USD and pricing status come only from the active or snapshotted
+  authorization lease. A pre-lease exceptional summary reports
+  `pricing_status="not_initialized"` and no projection.
+- Reworked `accounting.json` to expose exactly calls/tokens under
+  `authorized_totals` and `reserved_totals`, advisory pricing under
+  `pricing_advisory`, authoritative actual usage including USD under
+  `actual_totals`, incomplete call/token exposure, and explicit completeness.
+  Provider payload identities, audit/pricing digests, audit-chain heads,
+  reserved USD, and retained USD are not serialized there.
+- Removed required/charged USD arithmetic and cost-budget exhaustion from the
+  optimizer pre-iteration stop. Cancellation, stagnation, iteration, lease,
+  call, token, provider-accounting, identity, sandbox, audit, and cleanup gates
+  remain in place.
+- Discovery completion still performs the deterministic incumbent repeat, but
+  `run_pit_optimizer_v3` no longer invokes hidden evaluation. The audit-only
+  canary therefore returns with `hidden_validation_opened=False` and
+  `long_replay_eligible=None` while the hidden fold remains sealed.
+- Updated the incremental artifact store to admit schema-v3 outer artifacts
+  while retaining the existing closed root/iteration layout and create-only or
+  explicitly replaceable path rules.
+- Added `PitOptimizerLoopLimits` with only calls, tokens, iterations, timeouts,
+  and output bytes. The optimizer route constructs this USD-free limits type;
+  all legacy routes still construct the USD-enforcing `LoopLimits`.
+- Made the global parser's `--max-usd` option syntactically optional, rejected
+  it for `pit_optimizer`, and required it before any further configuration work
+  for `test`, `backtest`, `pit_diagnosis`, and legacy `pit_optimization`.
+- Removed optimizer USD from its emitted canary command, prepare/result
+  summaries, live resource-ledger construction, and stop conditions. The fixed
+  optimizer plan remains six calls, 448000 tokens, two iterations, one attempt
+  per provider call, and `apply=false`.
+
+## Files changed
+
+- `core/pit_optimizer_controller.py`
+  - Migrated outer controller/artifact/result schemas and active function names.
+  - Added canonical cumulative-USD reporting, lease-bound pricing advisory,
+    explicit accounting completeness, and accounting-artifact redaction.
+  - Removed optimizer USD stopping and automatic hidden evaluation.
+- `core/pit_optimizer_artifacts.py`
+  - Admits schema-v3 optimizer JSON artifacts with the unchanged closed layout.
+- `core/pit_optimization.py`
+  - Updated only the bottom public adapters to the v3 names and readiness schema.
+  - The earlier legacy `PitOptimizationGateConfig` and legacy optimizer remain
+    unchanged.
+- `agent_loop.py`
+  - Added optimizer-specific USD-free loop limits.
+  - Migrated active controller/live-run/summary/prepare names and Task 1-3
+    interfaces.
+  - Enforced the optimizer-versus-legacy `--max-usd` CLI split.
+- `core/pit_optimization_contract.py`
+  - Applied the explicitly authorized one-line dependency correction so the
+    outer `PitOptimizerGateConfig` readiness validator requires schema 3.
+  - No nested role-input protocol schema was changed.
+
+## Verification
+
+Required production compilation, run immediately before commit:
+
+```text
+python -B -m py_compile agent_loop.py core/pit_optimization.py core/pit_optimizer_artifacts.py core/pit_optimizer_controller.py core/pit_optimization_contract.py core/pit_optimizer_authorization.py core/pit_optimizer_evaluation.py
+exit 0; no output
+```
+
+Lint:
+
+```text
+python -B -m ruff check agent_loop.py core/pit_optimization.py core/pit_optimizer_artifacts.py core/pit_optimizer_controller.py core/pit_optimization_contract.py
+All checks passed!
+```
+
+Import-only smoke:
+
+```text
+import smoke: schema-v3 controller/CLI modules imported
+```
+
+Provider-free controller/accounting construction smokes:
+
+```text
+controller accounting smoke: ok
+incomplete accounting smoke: ok
+high cumulative canonical USD smoke: ok
+accounting construction smoke: canonical and fail-closed
+```
+
+These assertions covered exact accounting-artifact sections, removal of raw
+hash/payload and reserved/retained USD fields, complete-facts-only actual USD,
+lease-derived advisory pricing, terminal incomplete accounting, and a sum of
+two `sys.float_info.max` costs rendered without exponent notation or float
+overflow.
+
+Provider-free artifact-store smoke, run under an authorized worktree directory:
+
+```text
+schema-v3 artifact store smoke: ok
+artifact smoke cleanup: ok
+```
+
+Provider-free CLI/result/static isolation smokes:
+
+```text
+schema-v3 CLI summary smoke: ok
+CLI/no-USD/hidden-seal smoke: ok
+all legacy routes require --max-usd: ok
+CLI construction smoke: legacy USD enforced; optimizer USD absent; hidden sealed
+```
+
+These assertions covered the exact `PitOptimizerLoopLimits` fields, optional
+parser syntax, optimizer USD rejection, missing-USD rejection for every legacy
+route, absence of `--max-usd` from the emitted optimizer command, absence of
+active v2 controller entrypoints, and absence of `_run_hidden_once` from the
+active v3 run function.
+
+Diff and commit checks:
+
+```text
+git diff --cached --check
+exit 0; no output
+
+git show --check --oneline --stat HEAD
+250cbc0 Expose audit-only PIT optimizer v3 flow
+```
+
+Commit hooks passed Ruff, trailing-whitespace, end-of-file, YAML, and
+merge-conflict checks.
+
+### Harness-only probe corrections
+
+- An initial accounting harness used the invalid unqualified model string
+  `gpt-5`; the unchanged closed model validator rejected the fixture before the
+  accounting code ran. The corrected `openai/gpt-5` fixture passed without a
+  production edit.
+- An initial artifact-store probe used the Windows system temporary directory,
+  where the sandbox denied the hardened directory-handle operation. The exact
+  temporary directory was removed, and the same provider-free probe passed in
+  the authorized worktree. No production edit resulted.
+- An optional `ruff format --check` was not used as an acceptance gate: the
+  repository configuration explicitly enables Ruff lint only and the formatter
+  proposed broad pre-existing reflow across all five large files. Required Ruff
+  lint and the repository's commit hooks passed.
+
+## Self-review
+
+- Confirmed `OptimizerBudgetSummary` has the exact ten required fields and that
+  canonical authoritative/projected strings, pricing/projection consistency,
+  token totals, retained-token exposure, and accounting completeness validate
+  fail closed.
+- Confirmed accounting projection/status derives only from the active or
+  snapshotted lease, while actual authoritative USD derives only from complete
+  provider facts.
+- Confirmed accounting artifacts have exact calls/tokens authorized and
+  reserved sections and contain no payload digest, provider audit digest,
+  pricing snapshot digest, audit-chain head, reserved USD, or retained USD.
+- Confirmed the optimizer pre-iteration stop retains calls/tokens and all
+  non-cost hard stops but contains no required/charged USD calculation or
+  `cost_budget_exhausted` outcome.
+- Confirmed the active v3 controller performs discovery determinism checking
+  and contains no hidden-run invocation. Hidden-evaluation code remains
+  available for a separately authorized future phase but is unreachable from
+  this audit-only canary entrypoint.
+- Confirmed all nine required active names are present and the prior v2 active
+  names/aliases are absent.
+- Confirmed outer optimizer readiness/artifact/result writes use schema 3; the
+  only controller schema-2 constructions are the three required nested role
+  inputs.
+- Confirmed `core/pit_optimization.py` changed only at the bottom adapters and
+  `core/pit_optimization_contract.py` changed only at the approved one-line
+  outer-readiness seam.
+- Confirmed all non-optimizer CLI routes fail immediately when `--max-usd` is
+  absent and retain `LoopLimits`; the optimizer rejects the option and uses the
+  exact USD-free limits type.
+- Confirmed the production diff contains only the five authorized files and no
+  tests.
+
+## Concerns / follow-up
+
+- Production provider, Docker, disposable-worker, and hidden/full-replay paths
+  were deliberately not exercised under the Task 4 constraints. Verification
+  is compilation, lint, import/static checks, and provider-free construction and
+  serialization only.
+- Optimizer-focused test migration and fixture updates remain assigned to the
+  next task; this task intentionally did not modify or run tests.
+- The separately deferred minor recovery-key admission/validation concern from
+  Task 3 is unchanged and remains outside this task's controller/CLI scope.
+
+## Fix round 1 — Optimizer execution-ceiling propagation
+
+### Status
+
+Completed and committed.
+
+Commit: `adcda5f27ce31e1a545a2e7694cfa67bb0cf3f8c`
+(`Propagate PIT optimizer execution limits`)
+
+No tests were added, modified, or run. No provider, Docker, hidden-data,
+network, push, upload, or subagent action was used.
+
+### Review finding and correction
+
+The schema-v3 CLI admitted `child_timeout_seconds` and `output_limit_bytes`,
+but the canary dispatch passed only API and wall values into the live builder.
+The disposable policy worker consequently retained its legacy 900-second fold
+timeout, and regenerated canary commands omitted all four timeout/output
+settings.
+
+The correction keeps the legacy worker defaults intact while making the full
+optimizer-specific `PitOptimizerLoopLimits` object effective in the active v3
+path:
+
+- `_dispatch_pit_optimizer_v3` now receives and validates the exact optimizer
+  limits before passing them to the live-service builder.
+- `_build_pit_optimizer_v3_live_run` consumes that limits object directly.
+  API timeout configures the gateway; child timeout configures the disposable
+  worker fold; output bytes cap Docker control capture and the interactive
+  policy-worker session; and one absolute wall deadline is shared by provider
+  calls, worker control/session work, and evaluator boundary checks.
+- `PolicyWorkerRunner` accepts optimizer child/output/wall bounds. Its defaults
+  remain the prior 900-second fold, 64-KiB Docker-control capture, and no
+  absolute wall deadline for unchanged legacy callers.
+- `PolicyWorkerSession` counts worker stdout and stderr, fails closed after the
+  configured ceiling, and bounds each response wait by both the remaining fold
+  time and the absolute run wall deadline.
+- Trusted evaluator construction and candidate/baseline fold execution check
+  the same wall deadline immediately before and after work. Candidate policy
+  execution additionally receives that absolute deadline in its disposable
+  worker session.
+- `_pit_optimizer_v3_prepare_lines` now serializes max calls, max tokens,
+  iterations, API timeout, child timeout, wall timeout, and output bytes from
+  the validated optimizer limits. It still emits no USD option.
+- The audit-only active controller still contains no hidden-evaluation
+  invocation.
+
+### Files changed
+
+- `agent_loop.py` only: 225 insertions, 28 deletions.
+- No test file and no other production file changed in this fix round.
+
+### Verification
+
+Required production compilation, run from the final diff before commit:
+
+```text
+python -B -m py_compile agent_loop.py core/pit_optimization.py core/pit_optimizer_artifacts.py core/pit_optimizer_controller.py core/pit_optimization_contract.py core/pit_optimizer_authorization.py core/pit_optimizer_evaluation.py
+exit 0; no output
+```
+
+Lint and diff/scope checks:
+
+```text
+python -B -m ruff check agent_loop.py core/pit_optimization.py core/pit_optimizer_artifacts.py core/pit_optimizer_controller.py core/pit_optimization_contract.py
+All checks passed!
+
+git diff --check
+exit 0; only the repository's LF-to-CRLF working-copy warning
+
+git diff --cached --check
+exit 0; no output
+
+git diff --cached --name-only
+agent_loop.py
+```
+
+Provider-free low-distinct-limit and prior Task 4 regression smoke:
+
+```text
+distinct-limit propagation smoke: parser/config -> dispatch -> live worker construction -> command rendering: ok
+deadline/output smoke: child/output bounds and absolute evaluator wall seams: ok
+CLI/accounting/hidden-seal regression smoke: ok
+```
+
+The probe used API `0.125`, child `0.25`, wall `0.5`, and output `1234`.
+It parsed the actual CLI, constructed `PitOptimizerLoopLimits`, passed the same
+object through canary dispatch, constructed an injected provider-free
+`PolicyWorkerRunner`, observed child/output bounds on Docker-shaped control
+calls, advanced an injected monotonic clock to verify absolute-wall reduction
+and expiry, and checked exact command flag/value rendering. Static seam checks
+confirmed the production live builder performs the same mapping and guards
+evaluator work. It also rechecked legacy-route USD enforcement, optimizer USD
+rejection, canonical/fail-closed accounting, schema-v3 summary output, absence
+of active v2 aliases, and the sealed hidden path.
+
+Focused interactive-worker output check:
+
+```text
+policy-worker session output ceiling smoke: ok
+```
+
+Provider-free artifact-store regression and exact cleanup:
+
+```text
+schema-v3 artifact store smoke: ok
+artifact smoke cleanup: ok
+```
+
+Commit verification:
+
+```text
+ruff (legacy alias)......................................................Passed
+trim trailing whitespace.................................................Passed
+fix end of files.........................................................Passed
+check yaml...........................................(no files to check)Skipped
+check for merge conflicts................................................Passed
+
+adcda5f Propagate PIT optimizer execution limits
+```
+
+### Harness-only correction
+
+The first consolidated smoke compared the high cumulative USD text against a
+harness expression that stripped significant trailing zeroes from an integer.
+Production returned the required canonical non-exponent value. The expected
+value was corrected to strip zeroes only after a decimal point, matching the
+canonical-text rule, and the complete smoke then passed. No production edit
+resulted.
+
+### Self-review
+
+- Confirmed every field in `PitOptimizerLoopLimits` is effective: calls,
+  tokens, and iterations remain equal to the sealed gate ceilings; API, child,
+  wall, and output values now reach their active execution boundaries.
+- Confirmed the active optimizer worker no longer uses the legacy 900-second
+  fold value because the validated child timeout is supplied explicitly.
+- Confirmed lower output limits cap both Docker-shaped control capture and the
+  long-lived policy-worker stream, with fail-closed cleanup on overflow.
+- Confirmed the absolute wall deadline bounds control calls and policy response
+  waits and is checked around evaluator construction and every candidate or
+  baseline fold evaluation.
+- Confirmed emitted prepare/canary commands preserve all four operator
+  timeout/output settings and contain no `--max-usd`.
+- Confirmed legacy callers that omit the new optional worker arguments retain
+  their prior timeout/output behavior.
+- Confirmed the active v3 controller still does not call hidden validation and
+  the fix diff contains only the authorized `agent_loop.py` production file.
+
+### Concerns / follow-up
+
+- Production provider, Docker, and hidden/full-replay paths remained
+  deliberately unexecuted under the task constraints. Verification used
+  compilation, lint, static call-seam inspection, and provider-free injected
+  construction/runtime smokes.
+- No new production concern was found during fix-round self-review.

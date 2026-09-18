@@ -1,0 +1,51 @@
+### Task 1: Seal the Three Non-Tradable Market References
+
+**Files:**
+
+- Modify: `core/pit_provenance.py`
+- Modify: `core/pit_data.py`
+- Modify: `export_pit_prices.py`
+- Modify: `core/alpaca_pit_backfill.py`
+- Modify: `build_pit_bundle.py`
+- Modify: `verify_pit_bundle.py`
+- Modify: `tests/test_pit_data.py`
+- Modify: `tests/test_export_pit_prices.py`
+
+**Interfaces:**
+
+- Produces: `PIT_NON_TRADABLE_REFERENCE_SYMBOLS = ("IWM", "QQQ", "SPY")`; `PITDataBundle.tradable_symbols()`; `reference_symbols()`; `price_symbols()`; authenticated `security_lineage_id` access derived from the price-identity `chain_id`; bundle kind `canslim_pit_v2`; schema version `2`.
+- Preserves: `PITDataBundle.symbols()` only as a compatibility alias for `price_symbols()` until every strategic caller is migrated in Task 2.
+
+- [ ] **Step 1: Replace every SPY-only provenance invariant with the exact sealed reference set.**
+
+  Add the shared constant and canonical JSON/digest helpers in `core/pit_provenance.py`. In the exporter and backfill path, require price-identity request contracts for membership symbols plus all three references, require an identical expected trading-session calendar for SPY/QQQ/IWM, and compute membership counts by set difference rather than `len(symbols) - 1`.
+
+- [ ] **Step 2: Add bundle-schema-v2 metadata and APIs.**
+
+  Seal `non_tradable_reference_symbols_json`, `non_tradable_reference_symbols_sha256`, and the current source-universe label `sp500`. During `PITDataBundle._initialize_connection`, materialize separate immutable tradable, reference, and price-symbol sets. Reject references in membership or fundamentals, reject prices outside `tradables ∪ references`, and require provenance identities to equal that union exactly. Expose each tradable ticker's authenticated price-identity `chain_id` canonically as `security_lineage_id` so the panel builder groups renames as one lineage; the S&P-only canary assigns affiliation `sp500` from sealed bundle metadata.
+
+- [ ] **Step 3: Make manifest and verification output prove reference completeness.**
+
+  `PITDataBundle.manifest()` must report the exact reference list and first date, last date, and session count for each reference. `verify_pit_bundle.py` must compare these fields to the rebuilt source/provenance graph before accepting the manifest-last marker.
+
+- [ ] **Step 4: Update existing bundle/export fixtures in place.**
+
+  Extend the current SPY fixtures in `tests/test_pit_data.py` and `tests/test_export_pit_prices.py` with QQQ/IWM rows and assertions. Rewrite existing SPY-only count assertions; do not create new test functions.
+
+- [ ] **Step 5: Run the focused static and existing checks.**
+
+  ```powershell
+  python -B -m compileall -q core/pit_provenance.py core/pit_data.py core/alpaca_pit_backfill.py export_pit_prices.py build_pit_bundle.py verify_pit_bundle.py
+  python -B -m ruff check core/pit_provenance.py core/pit_data.py core/alpaca_pit_backfill.py export_pit_prices.py build_pit_bundle.py verify_pit_bundle.py --no-cache
+  python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_pit_data.py tests/test_export_pit_prices.py
+  ```
+
+  Expected: compilation/lint pass; the two existing test modules pass; a v1 bundle remains readable only through the explicit legacy path and cannot satisfy v4 readiness.
+
+- [ ] **Step 6: Commit the reference boundary.**
+
+  ```powershell
+  git add core/pit_provenance.py core/pit_data.py core/alpaca_pit_backfill.py export_pit_prices.py build_pit_bundle.py verify_pit_bundle.py tests/test_pit_data.py tests/test_export_pit_prices.py
+  git commit -m "feat: seal PIT market reference symbols"
+  ```
+

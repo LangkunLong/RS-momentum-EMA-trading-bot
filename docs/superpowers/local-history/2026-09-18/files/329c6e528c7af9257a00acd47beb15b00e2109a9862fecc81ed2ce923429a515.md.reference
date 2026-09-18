@@ -1,0 +1,350 @@
+# Task 3 Report: Route the Simulator Through the Extracted Baseline Policy
+
+Date: 2026-08-27
+
+## Status
+
+Implemented the trusted in-process baseline-policy runtime and routed entry/ranking, capacity, eviction/allocation, and exits through immutable strategy-policy snapshots and closed decisions. The engine retains fact acquisition, dates/symbols, prices/fills, quantities, cash, accounting, transactions, hard-stop authority, and all transition validation.
+
+No real fold, parity capture/verification, provider call, network fetch, Docker operation, upload, push, merge, or cloud task was run. The ignored `.artifacts/pit-policy-parity-v2/reference.json` was not read, written, captured, verified, rewritten, or staged.
+
+## Files
+
+- Created `core/strategy_policy/runtime.py`
+- Modified `core/backtest_engine.py`
+- Modified `tests/test_strategy_policy.py`
+- Modified `tests/test_pit_policy_parity.py`
+- Modified `tests/test_backtest_engine.py`
+- Modified `tests/test_backtest_custom_strategy_contract.py`
+- Modified `tests/test_task11_effective_policy_contract.py`
+- Verified without modification: `core/engine_policy.py`
+- Verified without modification: `tests/test_backtest_open_causality.py`
+
+## Implemented boundaries
+
+- `InProcessPolicyClient` exactly delegates the five policy calls to the Task 1 pure entry/risk/exit modules and exposes interface version 1.
+- `PortfolioSimulator(policy_client_factory=...)` creates one fresh client per `run()`, closes it in `finally`, and clears `_policy_client` on success or failure.
+- The owned `CanslimStrategy` and the execution-boundary re-canonicalizer build the same complete identity-free `EntrySnapshot`; all entry qualification and ranking now come from the policy decision.
+- Policy decisions are exact closed dataclass values. Mapping/object decisions with date, symbol, fill price, unknown fields, or nonfinite ranks are rejected before signal mutation.
+- Capacity is recommended once per eligible batch. `PendingEntry` carries the validated decision through truncation, checkpoint serialization/restoration, and next-session execution.
+- The uncapped default remains uncapped, and its existing equal-cash treatment for large pending batches is preserved.
+- Eviction uses stable insertion-order opaque slots. The engine resolves slots to symbols and causal execution prices, projects cash/gross exposure without mutation, validates allocation and the cent-rounded stop, seals the pre-apply portfolio state, and only then applies sell plus buy.
+- Strict extracted-policy ceilings are 1% risk and 8% stop distance. Existing direct private-entry fixtures and the pre-existing custom-strategy/InProcess baseline compatibility seam retain their configured legacy limits; injected policy-client subclasses remain under the strict ceilings.
+- Exit handling increments days/peak in trusted code, executes the hard stop before policy invocation, builds trusted stop candidates, validates the complete action plan, fills scale-outs from engine-derived tier prices, fills closes only at trusted current close, and applies only trusted stop candidates.
+- `POLICY_INTERFACE_VERSION` is recorded separately in result and checkpoint candidate identity. Schema-v1 effective-engine-policy content and existing source labels were not changed.
+
+## TDD evidence
+
+### Factory lifecycle and runtime
+
+RED 1:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_backtest_engine.py -k "policy_client_factory"`
+
+- Collection failed with `ModuleNotFoundError: No module named 'core.strategy_policy.runtime'`.
+
+RED 2 after adding only the runtime delegate:
+
+- Failed with `TypeError: PortfolioSimulator.__init__() got an unexpected keyword argument 'policy_client_factory'`.
+
+GREEN:
+
+- `1 passed, 27 deselected`; two runs made distinct clients, closed each once, and cleared the run-local reference after the injected fetch failure.
+- The parity lifecycle test additionally exercises two consecutive synthetic fold-shaped `run()` calls without running a real fold.
+
+### Entry and ranking
+
+RED:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_strategy_policy.py -k "entry_policy"`
+
+- `7 failed, 27 deselected`; failures showed inline qualification/rank values were retained and malformed client decisions were not rejected.
+
+GREEN:
+
+- `7 passed, 27 deselected` after routing re-canonicalization through `EntrySnapshot`/`EntryDecision` and exact closed-decision validation.
+
+Built-in strategy seam RED:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_backtest_engine.py -k "entry_policy_canslim_strategy"`
+
+- Failed because the capturing client received zero snapshots.
+
+Built-in strategy seam GREEN:
+
+- `1 passed, 28 deselected`; the policy received the institutional-unavailable reweighted score `82.2222222222`, no identity fields, and its returned qualification/rank controlled the row.
+
+Focused entry/factory/rank GREEN:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_strategy_policy.py tests/test_backtest_custom_strategy_contract.py tests/test_pit_policy_parity.py -k "policy_client_factory or entry_policy or policy_rank"`
+
+- `8 passed, 62 deselected` at that checkpoint; the subsequently added stable nullable-rank matrix also passes in the final set.
+
+### Carried capacity
+
+RED 1:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_backtest_engine.py -k "policy_capacity"`
+
+- Collection failed because `PendingEntry` did not exist.
+
+RED 2 after adding only the carrier:
+
+- `7 failed, 29 deselected`; `_resolve_capacity` and `_capacity_state` were missing.
+
+GREEN 1:
+
+- `7 passed, 29 deselected` for validated uncapped/finite decisions, the 25-position ceiling, carrier primitive round-trip, and lowered-cap no-liquidation behavior.
+
+RED 3 for integration:
+
+- `3 failed, 7 passed`; capacity was not called by `_evaluate_signals`, checkpoint serialization could not encode the carrier, and `_enter_position` could not consume it.
+
+GREEN 2:
+
+- `10 passed, 29 deselected`; one capacity call per eligible batch, carried/truncated values, checkpoint serialization, and next-session enforcement all passed.
+
+### Projected eviction and allocation
+
+RED 1:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_backtest_engine.py -k "policy_eviction or policy_allocation or projected_entry_transition"`
+
+- Collection failed because `ProjectedEntryTransition` did not exist.
+
+RED 2 after adding only transition dataclasses:
+
+- `7 failed, 39 deselected`; failures named the missing snapshot/project/validate helpers and showed the old path did not reject an unsafe recommendation.
+
+GREEN:
+
+- `7 passed, 39 deselected` after stable slots, non-mutating projection, strict transition validation, sealed state comparison, and atomic apply.
+
+Uncapped parity RED:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_backtest_engine.py -k "policy_allocation_uncapped_batch"`
+
+- Failed with buy value `125.0` versus the hand-checked equal-batch value `100.0`.
+
+Uncapped parity GREEN:
+
+- `1 passed, 49 deselected` after adding the engine-owned pending-batch notional ceiling.
+
+### Exit adapter
+
+RED:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_backtest_engine.py -k "policy_exit"`
+
+- `2 failed, 1 passed, 46 deselected`; the hard-stop anchor already passed, while a policy close was ignored and an uncrossed policy scale-out was not validated.
+
+GREEN:
+
+- `3 passed, 46 deselected`; hard stop precedes any policy call, policy close uses trusted current close, and the invalid scale-out leaves quantity/cash/transactions unchanged.
+
+The complete engine file also keeps the existing early-winner activation/release, multiple-tier, stagnation, EMA close, trailing-stop, and hard-stop behaviors green.
+
+### Separate interface attestation
+
+RED:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_task11_effective_policy_contract.py -k "policy_interface_identity"`
+
+- Failed with `KeyError: 'policy_interface_version'`.
+
+GREEN:
+
+- `1 passed, 17 deselected` after adding the separate result/candidate identity.
+
+Full attestation:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_task11_effective_policy_contract.py`
+
+- `18 passed`.
+
+## Policy digest evidence
+
+- Effective engine policy schema remains version 1.
+- Exact effective-policy SHA-256 from a technical-only baseline simulator: `b317b29d721abfafdf6efd391dd265fbfd097884ee712df8bfa768bba6805a22`.
+- Separate result identity: `policy_interface_version = 1`.
+- The effective-policy contract suite passed all 18 tests and asserts that `policy_interface_version` is absent from the schema-v1 policy object.
+
+## Final focused verification
+
+Exact brief command:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_strategy_policy.py tests/test_pit_policy_parity.py tests/test_backtest_engine.py tests/test_backtest_custom_strategy_contract.py tests/test_backtest_open_causality.py tests/test_task11_effective_policy_contract.py`
+
+Final fresh result after the commit-hook cleanup: `149 passed, 2 warnings in 12.21s`.
+
+The warnings are pre-existing environment/test-configuration warnings:
+
+- pytest does not recognize configured `cache_dir`.
+- `websockets.legacy` emits an upstream deprecation warning.
+
+`git diff --check` reports no whitespace errors; it only reports the repository's Windows LF-to-CRLF conversion notices.
+
+The first commit attempt was stopped by the Ruff pre-commit hook for one unused local (`rs_score`) in `_canonicalize_signal_row`. The dead assignment was removed, and the exact final focused suite above was rerun successfully before restaging.
+
+## Resource and process cleanup
+
+- Commands were run one at a time in the foreground.
+- No background Python process was started by this task.
+- No provider/network/Docker/real-fold command was run.
+- No temporary task artifact or tracked cache was created.
+- Python bytecode and pytest/ruff cache paths remain ignored and unstaged.
+- An unrelated pre-existing Python process was visible to the host process list; it was not started, inspected beyond its basic process record, or modified by this task.
+
+## Self-review
+
+- Reviewed the complete production and test diff.
+- Confirmed all policy calls receive only closed scalar snapshots; no client call receives simulator, bundle, history frame, date, symbol, `Trade`, or fill price.
+- Confirmed exact-type decision validation at every client boundary.
+- Confirmed the hard stop is evaluated before `evaluate_exit`.
+- Confirmed capacity decisions are carried through checkpoint restore and revalidated against the 25-position engine ceiling.
+- Confirmed all entry transition validation precedes eviction/buy mutation and state drift between projection/apply fails closed.
+- Confirmed old effective-policy source labels remain untouched and `core/engine_policy.py` is unchanged.
+- Confirmed the sealed parity artifact remains ignored and untouched; final real-fold parity remains reserved for Task 9.
+- Confirmed no unrelated tracked file changes.
+
+## Concerns
+
+- No unresolved architectural ambiguity remains.
+- Final real-fold parity was intentionally not run and remains the Task 9 gate.
+- The two non-failing environment warnings above remain outside Task 3 scope.
+
+---
+
+## Fix Round 1
+
+Date: 2026-08-27
+
+### Status and files
+
+Resolved all three open review findings:
+
+- `core/backtest_engine.py`: moved policy-interface validation into the client cleanup scope; distinguished exactly-full from over-capacity portfolios; admitted an eviction candidate only at exact capacity; and made the allocation safety maxima unconditional literals `0.01` and `0.08`.
+- `tests/test_backtest_engine.py`: added lifecycle validation-failure coverage, strengthened the lowered-capacity regression through both signal evaluation and actual entry execution, and added direct-entry regressions for both fixed ceilings.
+- `tests/test_backtest_open_causality.py`: normalized only five obsolete unsafe risk/stop fixture inputs. All causality setup and assertions remain unchanged. The no-cash fixture uses `0.01/0.0101`, retaining near-full deployment while keeping the existing entry-day low above its stop; ratio-equivalent `0.008/0.08` values preserve the sizing assertions in the other affected fixtures.
+
+This round supersedes the original report's compatibility statement: there is no longer any direct-entry or injected-strategy exception to the fixed 1% risk and 8% stop-distance ceilings.
+
+### Strict RED/GREEN evidence
+
+#### Fixed engine safety ceilings
+
+Covering test: `test_policy_allocation_fixed_engine_ceilings_apply_to_direct_entry` (parameterized for excess risk and excess stop distance).
+
+Command:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_backtest_engine.py -k "fixed_engine_ceilings_apply_to_direct_entry"`
+
+RED before the production fix:
+
+- Both cases failed with `Failed: DID NOT RAISE <class 'ValueError'>`.
+- Exact summary: `2 failed, 50 deselected, 2 warnings in 0.80s`.
+
+GREEN after replacing both compatibility expressions with fixed literals:
+
+- Exact summary: `2 passed, 50 deselected, 2 warnings in 0.65s`.
+
+#### Lowered capacity with eviction enabled
+
+Covering test: `test_policy_capacity_lowered_below_holdings_blocks_without_liquidation`.
+
+The regression now obtains `CapacityDecision(1, True)` with two live holdings, verifies `_evaluate_signals()` returns no candidate, calls `_enter_position()` with the carried decision, and verifies positions, trades, and transactions are unchanged with an `entry_rejected_capacity` outcome.
+
+Command:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_backtest_engine.py -k "policy_capacity_lowered_below_holdings_blocks_without_liquidation"`
+
+RED before the production fix:
+
+- `_evaluate_signals()` returned one replacement `PendingEntry` instead of `[]`.
+- Exact summary: `1 failed, 51 deselected, 2 warnings in 0.77s`.
+
+GREEN after exact-capacity eviction gating in both signal truncation and carried-capacity state:
+
+- Exact summary: `1 passed, 51 deselected, 2 warnings in 0.64s`.
+
+#### Interface validation cleanup
+
+Covering test: `test_policy_client_interface_validation_failure_closes_and_clears`, parameterized for a mismatched interface version and an `interface_version` property that raises.
+
+Command:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_backtest_engine.py -k "policy_client_interface_validation_failure_closes_and_clears"`
+
+RED before the production fix:
+
+- Both cases raised the intended validation exception but recorded `closed == []` instead of `[1]`.
+- Exact summary: `2 failed, 52 deselected, 2 warnings in 0.76s`.
+
+GREEN after activation and validation moved inside the cleanup scope:
+
+- Exact summary: `2 passed, 52 deselected, 2 warnings in 0.64s`.
+
+### Narrow GREEN slices
+
+- Lifecycle: `python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_backtest_engine.py -k "policy_client_factory or policy_client_interface"` -> `3 passed, 51 deselected, 2 warnings in 8.87s`.
+- Capacity: `python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_backtest_engine.py -k "policy_capacity"` -> `10 passed, 44 deselected, 2 warnings in 0.66s`.
+- Projected eviction/allocation: `python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_backtest_engine.py -k "policy_eviction or policy_allocation or projected_entry_transition"` -> `10 passed, 44 deselected, 2 warnings in 0.66s`.
+
+### Obsolete causality fixture normalization
+
+The first complete focused run correctly exposed five obsolete unsafe inputs in `tests/test_backtest_open_causality.py`; these were test-fixture recommendations above the newly enforced immutable ceilings, not production regressions.
+
+Pre-normalization full-gate RED:
+
+- Exact summary: `5 failed, 148 passed, 2 warnings in 12.12s`.
+- Three failures were `stop_distance_fraction is invalid`; two were `risk_fraction is invalid`.
+
+After changing only the five unsafe fixture risk/stop values, the targeted causality command passed:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_backtest_open_causality.py -k "fold_history_is_visible or pending_open_buy or new_open_position or entry_sizing_marks or capped_eviction"`
+
+- Exact summary: `5 passed, 4 deselected, 2 warnings in 0.91s`.
+
+### Final focused verification
+
+Exact Task 3 gate:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_strategy_policy.py tests/test_pit_policy_parity.py tests/test_backtest_engine.py tests/test_backtest_custom_strategy_contract.py tests/test_backtest_open_causality.py tests/test_task11_effective_policy_contract.py`
+
+- Fresh result: `153 passed, 2 warnings in 11.36s`.
+- Post-commit verification of commit `e435217` with the same exact command: `153 passed, 2 warnings in 11.35s`.
+
+Separate attestation command:
+
+`python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_task11_effective_policy_contract.py`
+
+- Fresh result: `18 passed, 2 warnings in 0.66s`.
+- Effective engine policy remains schema version 1.
+- Exact baseline digest remains `b317b29d721abfafdf6efd391dd265fbfd097884ee712df8bfa768bba6805a22`.
+- `policy_interface_version` remains separately recorded as `1` and absent from schema-v1 effective-policy bytes.
+- `core/engine_policy.py` was not modified.
+
+Both warning classes are unchanged environmental warnings: pytest's unknown `cache_dir` option and the upstream `websockets.legacy` deprecation.
+
+### Resource and process cleanup
+
+- Every command ran singly in the foreground; no background Python process was started.
+- No real fold, capture, parity replay/verification, provider call, network fetch, Docker operation, upload, push, merge, or cloud task was run.
+- `.artifacts/pit-policy-parity-v2/reference.json` was not read, written, rewritten, captured, verified, or staged.
+- No temporary task artifact or tracked cache was created.
+
+### Self-review
+
+- Reviewed the complete production and test diff.
+- Confirmed the engine snapshot always supplies literal maxima `0.01` and `0.08`; no compatibility branch remains and those exact values remain the validation limits.
+- Confirmed finite over-capacity portfolios produce zero new signal candidates and carried pending entries cannot select or apply an eviction; exact-capacity portfolios retain the single-candidate eviction path.
+- Confirmed both a mismatched interface value and a raising interface property call `close()` exactly once and clear `_policy_client` while preserving the original exception.
+- Confirmed the causality diff changes fixture risk/stop values only; test logic, market data, and assertions are untouched.
+- Confirmed policy clients still receive only closed immutable snapshots and retain no date, symbol, fill, quantity, cash, transaction, accounting, hard-stop, or safety-validation authority.
+- `git diff --check` reported no whitespace errors, only the repository's Windows LF-to-CRLF notices.
+
+### Concerns
+
+- No unresolved architectural ambiguity remains.
+- Final real-fold parity remains intentionally reserved for Task 9.
+- The two non-failing environment warnings remain outside Task 3 scope.

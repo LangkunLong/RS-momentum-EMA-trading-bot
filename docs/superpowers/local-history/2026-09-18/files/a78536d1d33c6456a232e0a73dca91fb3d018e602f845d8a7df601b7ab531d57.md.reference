@@ -1,0 +1,142 @@
+# Task 3 report — V5 evaluator and evidence contracts
+
+## Outcome
+
+Implemented and committed the V5 evaluator/evidence boundary as commit `a9219a1`
+(`feat: add optimizer v5 evaluator contract`). The commit contains exactly:
+
+- `core/pit_optimizer_v5/__init__.py`
+- `core/pit_optimizer_v5/contracts.py`
+- `core/pit_optimizer_v5/evaluator.py`
+
+No tests were created or modified, per the controller ruling and user override.
+
+## Contract behavior
+
+- Added every frozen, slotted record declared by Task 3 with exact field order and types:
+  `SandboxProfileV5`, `EvaluatorContractV5`, `MetricCountV5`, `SliceMetricsV5`,
+  `EvaluationSliceV5`, `RollingReturnV5`, `DistributionSummaryV5`,
+  `EvaluationReportV5`, `ScenarioPanelEvaluationV5`, and `PanelEvaluationV5`.
+- Enforced schema V5, lowercase SHA-256 identities, finite `Decimal` metrics, non-Boolean
+  counts, canonical ISO dates, valid nested V5 records, unique metric/slice/scenario keys,
+  and monotonic distribution summaries.
+- `SandboxProfileV5.sha256` derives from every declared field. Images use a separate
+  canonical `sha256:<64 lowercase hex>` digest and cannot smuggle an embedded digest in
+  `image_name`. Network, root, source mount, data mount, and output modes are fixed to the
+  declared V5 isolation values.
+- `sandbox_profile_from_manifest_v5` consumes the campaign resource fields explicitly;
+  `validate_sandbox_profile_resources_v5` rejects any CPU, memory, or output mismatch.
+- `EvaluatorContractV5.sha256` binds execution profile, sandbox, evaluator runtime source,
+  PIT bundle, prices provenance, transition contract, baseline source, friction grid,
+  selection scenario, SPY, and daily signals.
+- The explicit initial manifest grid is `gross=(0,0,0)`, `base=(2,3,0)`, and
+  `stress=(5,10,1)` in canonical order, with `base` selected. Duplicate IDs and a missing
+  or non-base selection are rejected.
+- `selected_scenario()` resolves by ID and requires exactly one match; it never assumes a
+  tuple position.
+- `evaluator_source_sha256()` accepts only the closed semantic runtime path set and hashes
+  the canonical path-to-byte-digest map. Any listed digest changes the identity; missing or
+  unrelated paths fail closed. `evaluator_source_map_v5()` reads the required files and
+  currently fails closed because Task 4's `core/pit_optimizer_v5/diagnostics.py` does not yet
+  exist. It never authenticates an incomplete source identity.
+
+## Evaluator service and adapter choices
+
+- `PitPanelEvaluatorV5` receives an already authenticated/open PIT bundle, the absolute
+  prices-provenance file, execution and sandbox profiles, campaign resources, a simulator
+  factory, baseline worker factory, and a report builder.
+- Construction validates resource, sandbox, execution, bundle, prices-provenance, and
+  transition-contract identities and calls the bundle transition loader exactly once.
+  Provenance mismatch therefore fails before any simulator can be constructed.
+- Each requested panel/scenario creates a new simulator. A one-shot wrapper invokes the
+  supplied `StrategyPolicyClientFactory` exactly once per simulator and rejects reuse of the
+  same worker object within an evaluation.
+- The authenticated transition contract and V5 execution profile are passed explicitly to
+  every simulator, together with the scenario, SPY benchmark, and `signal_every_n_days=1`.
+- Scenario requests must be a non-empty, duplicate-free subset of the contract grid in
+  canonical grid order and must contain `base`. Thus quick `("base",)` and full
+  `("gross", "base", "stress")` requests are valid.
+- The evaluator rejects legacy `SimulationResult`/schema-V4 aggregate output and validates
+  the V5 result's bundle, execution-profile, friction-scenario, panel dates, signal cadence,
+  and benchmark identities before building evidence.
+- Rich report derivation belongs to Task 4. Rather than emit placeholder metrics,
+  `EvaluationReportBuilderV5` is a required narrow adapter from `(panel, scenario,
+  SimulationResultV5)` to a real `EvaluationReportV5`. This is functional today with the
+  current engine and allows Task 4 diagnostics to plug in without circular imports.
+- `candidate_root` is required to be an absolute, existing, non-link directory. Candidate
+  process construction remains owned by the supplied worker factory, matching the existing
+  zero-argument `StrategyPolicyClientFactory` contract.
+
+## Verification evidence
+
+Commands were run from the isolated worktree.
+
+1. `python -B -m ruff check core/pit_optimizer_v5/__init__.py core/pit_optimizer_v5/contracts.py core/pit_optimizer_v5/evaluator.py`
+   - Output: `All checks passed!`
+2. `python -B -m py_compile core/pit_optimizer_v5/__init__.py core/pit_optimizer_v5/contracts.py core/pit_optimizer_v5/evaluator.py`
+   - Exit code 0, no output.
+3. In-memory deterministic Python smoke (no file created):
+   - Output: `SMOKE_OK valid_invalid=1 digest_resource=1 scenarios=1 source_map=1 provenance_preflight=1 fresh_instances=1 schema_v4_rejected=1`
+   - Covered valid/invalid V5 records, digest-pinned image, sandbox digest sensitivity,
+     resource mismatch, duplicate/missing selected scenarios, selected lookup, exact grid,
+     evaluator-source identity sensitivity, missing/unrelated source paths, canonical subsets,
+     provenance fail-before-simulation, fresh simulator/worker counts, and V4 rejection.
+4. Direct source-tree resolver smoke:
+   - Output: `SOURCE_MAP_FAIL_CLOSED_OK`
+   - Confirmed the resolver names missing Task 4 `diagnostics.py` and issues no incomplete
+     source identity.
+5. Dataclass declaration introspection:
+   - Output: `DECLARED_FIELDS_OK records=10 frozen_slots=10`
+6. Final staged audit:
+   - `git diff --cached --check` passed.
+   - Output: `FINAL_VERIFY_OK ruff=clean py_compile=clean diff_check=clean staged_scope=3`.
+7. Commit hooks:
+   - Ruff passed; trailing whitespace, end-of-file, YAML, and merge-conflict hooks passed.
+
+No Docker, provider, replay, qualification, push, merge, or test command was run.
+
+## Self-review and concerns
+
+- Reviewed staged scope and confirmed only the three authorized source files were committed.
+- No `pass`, `NotImplementedError`, TODO, FIXME, or fake-success path exists in the V5 package.
+- Deliberate Task 4 dependency: constructing a real production evaluator requires a real
+  `EvaluationReportBuilderV5`; this is fail-closed and is not a blocker for Task 3.
+- Deliberate source identity behavior: repository source-map resolution cannot succeed until
+  Task 4 creates `diagnostics.py`. Callers may still exercise identity derivation with an
+  explicit complete canonical digest map, but cannot silently hash the currently incomplete
+  tree.
+
+## Targeted review fix
+
+Commit `a06ccf2` (`fix: bind optimizer v5 candidate workers`) resolves the Important finding in
+`task-3-review.md`.
+
+- Added `CandidateWorkerFactoryV5`, a trusted root-aware construction boundary. The evaluator
+  passes the canonical candidate root and requested policy identity into this factory for every
+  scenario.
+- Added frozen `CandidateWorkerBindingV5`, which binds the canonical root, lowercase policy
+  digest, and concrete policy client. Its SHA-256 is derived from the canonical-root digest and
+  policy identity; callers cannot supply the binding identity.
+- The evaluator rejects a returned binding whose root or policy identity differs from the
+  request, closes the mismatched client, and does so before constructing a simulator.
+- A valid binding supplies the exact client to the simulator's one-shot worker factory. The
+  binding's root digest, policy digest, and derived binding digest are then attached to and
+  validated in `SimulationResultV5.config` before report construction or `PanelEvaluationV5`
+  acceptance. A conflicting simulator-emitted binding is rejected.
+- Fresh worker and simulator requirements remain per scenario; reused worker objects remain
+  rejected.
+
+Focused direct smoke output:
+
+`CANDIDATE_BINDING_SMOKE_OK valid=1 root_mismatch_pre_sim=1 policy_mismatch_pre_sim=1 result_provenance=1`
+
+Final fix verification:
+
+- Ruff: `All checks passed!`
+- `py_compile`: exit code 0.
+- `git diff --check`: exit code 0.
+- Source scope: only `core/pit_optimizer_v5/__init__.py` and
+  `core/pit_optimizer_v5/evaluator.py` changed.
+- Staged scope: exactly those two authorized Task 3 files.
+- Commit hooks: Ruff, whitespace, end-of-file, YAML, and merge-conflict checks passed.
+- No tests, provider calls, Docker, replay, qualification, push, or merge were run.

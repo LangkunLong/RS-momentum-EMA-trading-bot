@@ -1,0 +1,45 @@
+# Two-round optimizer campaign — ready for approval
+
+Prepared 2026-09-07T17:07:43.455885+00:00. **No external model call is authorized or has run.**
+
+This campaign will exercise investigator → policy author → local evaluation → critic twice. Round two receives round one's actual feedback and archive. It uses the provisional S&P 500 development cohort. Successful completion demonstrates the loop; it does not establish a profitable or qualified strategy.
+
+## What approval covers
+
+- Model: `openai/gpt-5.4` through `https://openrouter.ai/api/v1/chat/completions`.
+- OpenRouter selects a compatible upstream. No upstream provider is pinned and upstream failover is not explicitly disabled.
+- At most **2 rounds, 6 role calls, 448,000 total tokens, and 8,192 output tokens per call**, including reasoning within the output accounting. One hypothesis and at most one candidate per round.
+- **No automatic retries or schema repairs.** Uncertain accepted outcomes stop for reconciliation; no blind repeat call.
+- **Cost is audited; there is no enforcing USD ceiling.** At the currently published $2.50/M input and $15/M output headline rates, using the total-token ceiling with all six maximum outputs gives about **$1.73**. This is arithmetic guidance, not a guaranteed price or spending cap; routed tiers, fees and actual usage can differ. [OpenRouter pricing](https://openrouter.ai/openai/gpt-5.4).
+- Each role has up to 300 seconds; each round up to 2 hours; the campaign up to 4 hours. Local evaluation: quick 600 seconds, each discovery window 1,200 seconds, one evaluator at a time.
+- Use the existing `OPENROUTER` entry in the main checkout `.env`, mapped only into the launch process's `OPENROUTER_API_KEY`. The key is used for API authentication, never inserted into model messages, logs or review artifacts.
+
+## What leaves this computer
+
+The first request contains sixteen aggregate baseline metrics and their evidence/binding identifiers. It contains no strategy source. Its exact logical request body is [initial-outbound-body.json](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-v5-architecture/.artifacts/pit-optimizer-v5/development/provider-runtime-01/initial-outbound-body.json) (6,460 bytes); the conservative first-input token allowance is **10,305**, plus up to **8,192** output tokens.
+
+Subsequent requests can send aggregate performance, predictions, typed failures, archive summaries and prior critiques. Author requests can include the editable policy sources and interface contracts for `entry.py`, `risk.py`, `position.py` and `exit.py` under `core/strategy_policy/v3/`, including all four files when the requested change crosses policies. Later request contents depend on the actual preceding results and are checked against the same cumulative caps.
+
+Raw market/fundamental datasets, the full repository, environment values and credential-file contents are not model input. HTTP authentication uses the API key; transport metadata includes the campaign ID and request-hash prefix. JSON whitespace and HTTP headers are produced by the SDK; the saved body records the exact reviewed logical values.
+
+## Local evidence and boundaries
+
+The new image is `pit-optimizer-v5-evaluator@sha256:4e85b19aa8c135362ae8796e4d33a410ec5af650d296c358ae6a7737d5b05b6a`. All four real parent discovery windows and the quick baseline passed source/data/output authentication and cleanup under this image. All parent reports produced zero trades/return.
+
+Read-only CLI summary of this actual prepared campaign returned `ready`, zero rounds, zero calls, zero tokens and zero cost. It has a new repository and workspace; no prior campaign journal is reused. The prior failed controller campaign remains preserved.
+
+Evaluations run locally in the bounded Docker sandbox. No strategy deployment, trading order, purchase of data, source push, held-out qualification or full replay is included. No tests were added or run.
+
+Keep the laptop plugged in with its lid open during execution. The process-scoped idle-sleep guard restores the prior request afterward; explicit lid sleep still takes effect and can expire campaign deadlines.
+
+## Exact authority and execution
+
+- Campaign: `development-provider-two-rounds-20260907-01`.
+- Manifest SHA-256: `7de4930c43afd963b1d7288f4084d5308f5e0aa85260b79051550381ebfb4fd5`.
+- Adapter-config SHA-256: `171edd9de8423ef27f0a8525900ef2d5c3136a4a99ff78f589c52cf52bd0b729`.
+- Initial request SHA-256: `3b4dc10f306d3fcc48cd4bfc3848a573f67905725520c35c913bb1af24f74866`.
+- Initial logical body SHA-256: `c339c4737846a930024cb61b12e5d6e0c1391460aad9b25ed57d4d0650cd4273`.
+- Complete configuration/caps: [campaign-launch-input.json](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-v5-architecture/.artifacts/pit-optimizer-v5/development/provider-runtime-01/campaign-launch-input.json) and [review-disclosure.json](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-v5-architecture/.artifacts/pit-optimizer-v5/development/provider-runtime-01/review-disclosure.json).
+- Exact first-launch argv and operator-helper hashes: [launch-review.json](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-v5-architecture/.artifacts/pit-optimizer-v5/development/provider-runtime-01/launch-review.json). It uses `run-campaign` through the reviewed saved-command helper's `--start` switch. Subsequent recovery retains the original manifest/config/owner and starts/deadlines.
+
+After a successful two-round campaign, the principal architect will write the detailed GPT-5.6 Luna implementation handoff requested by the user, including exact tasks, files, commands, acceptance criteria and architect review checkpoints. The user will manually create the new session.

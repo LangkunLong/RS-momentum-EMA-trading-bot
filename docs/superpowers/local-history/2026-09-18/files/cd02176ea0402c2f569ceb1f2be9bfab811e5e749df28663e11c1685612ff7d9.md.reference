@@ -1,0 +1,36 @@
+# Principal architect B4b decision: correct C1 before B4c
+
+B4b remains held pending the C1 correction. The principal decision is to implement the narrow host record invariant correction, preserving the intended ability to complete exact-duplicate-containing batches. C1 is not accepted as a permanent exception to the optimizer's lifecycle guarantee.
+
+Reviewed B4b source:
+- runtime.py: `d834eae8e3e120355b4479c77f87ebe46519a0b82a52cc072abe1dab60943aec`
+- artifacts.py: `2bab516e4945976d9bf6bb356934289cd14d9b87c25088521a043c8ac5cfa2c2`
+
+No additional blocker was identified in the reviewed diff and affected source paths. The common finalization, conditional critic handling, complete durable journal closure, bounded typed assignment mapping, validation-origin identity bridge, and role/request/record authority are consistent with the intended B4b design. Recovery/checkpoint adoption and cleanup were preserved. This is source-review evidence; no new lifecycle or finalized-campaign helper was executed.
+
+## C1 finding and decision
+
+C1 is confirmed by static source flow. A declared statement replacement can be identical to the parent, producing the same policy revision. The validator then truthfully records no changed symbols, and runtime.py requires that empty tuple before marking exact_duplicate. StructuralTemplateV5 still requires a nonempty declared symbol tuple. ExperimentRecordV5._validate_post_validation_identity currently requires the actual validation tuple to equal that declaration, so record construction fails even for a legitimate no-op. A mixed batch can also fail at record construction after spending on its required critic.
+
+Correct only memory.py's record changed-symbol invariant:
+- For status exact_duplicate with the candidate policy revision identity equal to the parent revision identity, require actual validation.changed_symbols == ().
+- For all other post-validation records, retain the current exact equality with template.changed_symbols.
+- Preserve complete post-validation identity validation/derivation and _validate_status_evidence, including exact_duplicate's parent-policy equality and absence of candidate fingerprint/evaluation/scoring evidence. The status label alone must never create an exemption for a changed policy.
+
+The nonempty template declaration, actual durable ValidationResultV5, validation-stage payload and record validation must remain unchanged. No policy revision, experiment ID, template hash, payload, serialized record field, schema version or evaluator source needs to change. No-op is a legitimate exact_duplicate outcome with no critic or performance result; it is not a rendering rejection.
+
+This is an explicit, narrow scope expansion for a follow-up Luna session: memory.py's changed-symbol guard was protected during B4b but may now be corrected at this one method. It does not authorize changes to candidate_ir.py, contracts.py, runtime validation, factories, finalizer evidence comparison or quick-screen rules. QuickScreenCandidateV5's equality guard remains appropriate because runtime excludes exact duplicates from quick screening.
+
+## Verification and compatibility limits
+
+See `principal-architect-verification.json`. Exact source/preimage/diff hashes, scoped Ruff, in-memory compilation and exact-preimage diff checks passed. The 56-file evaluator identity is unchanged at `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4`; memory.py is not covered by that source map.
+
+The real runtime-04 evaluated record and its 19-event journal/three accepted role packages authenticated read-only with unchanged canonical record bytes, four discovery episodes and critic binding. Actual06 remains its original five-event terminal rendering/stage_failed journal with complete cleanup.
+
+A read-only inventory under this worktree's `.artifacts/pit-optimizer-v5/**/records/*.json`, excluding tests/preimages, found four experiment records: one evaluated and three evaluation_failed, with no exact_duplicate. This is a bounded local inventory, not a claim about every checkout or external repository. It supplies no positive execution evidence for C1. There is no known stored exact-duplicate record in that inventory requiring a migration, and no migration is authorized.
+
+No new lifecycle branch, finalized wrapper, event, record, checkpoint, candidate evaluation, test, synthetic probe, external request, campaign, credential read, production edit, commit, push or deployment occurred during the principal review.
+
+## Next step
+
+Use `next-luna-prompt-c1.md`: C1 correction only in memory.py, then return for principal review. Preserve B4b's current source and all previous packages. B4c and any campaign remain pending. The original two real evaluated feedback rounds are still unfinished.

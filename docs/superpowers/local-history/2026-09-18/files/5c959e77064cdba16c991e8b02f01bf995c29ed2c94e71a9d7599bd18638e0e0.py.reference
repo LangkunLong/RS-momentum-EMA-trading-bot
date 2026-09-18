@@ -1,0 +1,133 @@
+"""One-shot local operator preparation for a real, provisional V5 panel run."""
+from pathlib import Path
+from dataclasses import asdict
+from types import SimpleNamespace
+import argparse
+import hashlib
+import json
+import re
+import subprocess
+import uuid
+
+from core.backtest_fills import ExecutionProfileV5
+from core.pit_data import PITDataBundle
+from core.pit_optimizer_evaluation import EvaluationPanelSpec, PanelSecurityLineage
+from core.pit_optimizer_v5.artifacts import _decode_dataclass
+from core.pit_optimizer_v5.baseline import baseline_container_argv_v5
+from core.pit_optimizer_v5.candidate_ir import SourceBundleV5, SourceFileV5, derive_policy_revision_identity_v5
+from core.pit_optimizer_v5.container_protocol import PanelExecutionRequestV5
+from core.pit_optimizer_v5.contracts import ArtifactRefV5, EpisodePlanV5, EvaluatorContractV5, SandboxProfileV5, canonical_json_bytes_v5, canonical_sha256_v5, initial_friction_grid_v5
+from core.pit_optimizer_v5.policy_scope import EDITABLE_POLICY_PATHS_V5
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--label', required=True)
+parser.add_argument('--policy-root', type=Path)
+parser.add_argument('--sandbox-profile', required=True, type=Path)
+parser.add_argument('--profile', action='store_true', help='Record the real evaluator CPU profile; allow 900 seconds for profiling overhead')
+parser.add_argument('--panel-spec', type=Path, help='Use an already selected development discovery panel')
+parser.add_argument('--panel-sha256', help='Exact digest of the selected panel bytes')
+parser.add_argument('--episode-ordinal', type=int, choices=(1, 2, 3, 4))
+parser.add_argument('--maximum-wall-seconds', type=int, help='Explicit local run bound from 60 to 3600 seconds')
+args = parser.parse_args()
+if re.fullmatch(r'[a-z0-9][a-z0-9._-]{0,90}', args.label) is None:
+    raise ValueError('label must be a simple lower-case run name')
+if (args.panel_spec is None) != (args.panel_sha256 is None) or (args.panel_spec is None) != (args.episode_ordinal is None):
+    raise ValueError('Discovery execution requires panel spec, exact digest and episode ordinal together')
+if args.maximum_wall_seconds is not None and not 60 <= args.maximum_wall_seconds <= 3600:
+    raise ValueError('Explicit local wall bound must be between 60 and 3600 seconds')
+root = Path.cwd()
+artifacts = root / '.artifacts/pit-optimizer-v5'
+development = artifacts / 'development'
+run_root = development / 'runs' / args.label
+if run_root.exists():
+    raise ValueError('Run already exists; inspect its recorded container, do not restart it')
+bundle_path = development / 'data/sp500-v2/pit_bundle.sqlite3'
+provenance = development / 'data/sp500-v2/prices_provenance.json'
+bundle_sha = 'cf729b47d762ae86287bb8a87c28a1664e7475c74ef1aca736fbc240111349de'
+sandbox = _decode_dataclass(SandboxProfileV5, json.loads(args.sandbox_profile.read_text()))
+execution = ExecutionProfileV5(5, 'next_open', 'open_then_stop', 'last_session_close', 'half_spread_plus_market_impact_plus_commission_bps')
+constraints = {'execution_profile': asdict(execution), 'editable_policy_paths': EDITABLE_POLICY_PATHS_V5, 'policy_interface_version': 3, 'pit_data_scope': 'development_sp500_v2'}
+baseline_source = SourceBundleV5(tuple(SourceFileV5(path, (root / path).read_text(encoding='utf-8')) for path in EDITABLE_POLICY_PATHS_V5))
+baseline_revision = derive_policy_revision_identity_v5(source_bundle=baseline_source, trusted_policy_runtime_sha256=sandbox.runtime_source_sha256, immutable_constraints_sha256=canonical_sha256_v5(constraints))
+source = SourceBundleV5(tuple(SourceFileV5(path, ((args.policy_root / Path(path).name) if args.policy_root else (root / path)).read_text(encoding='utf-8')) for path in EDITABLE_POLICY_PATHS_V5))
+revision = derive_policy_revision_identity_v5(source_bundle=source, trusted_policy_runtime_sha256=sandbox.runtime_source_sha256, immutable_constraints_sha256=canonical_sha256_v5(constraints))
+with PITDataBundle(bundle_path, expected_sha256=bundle_sha) as bundle:
+    transitions = bundle.load_price_identity_transition_contract(provenance)
+    active = bundle.members_at('2021-01-04')
+    active_lineages = {transitions.identities[t]['chain_id'] for t in active}
+    # Fixed selection precedes evaluation; use real historical members, including all ticker aliases.
+    selected = sorted(active_lineages, key=lambda value: hashlib.sha256(('v5-development-first-loop:' + value).encode()).hexdigest())[:32]
+    lineages = tuple(PanelSecurityLineage(lineage, tuple(sorted(t for t in bundle.tradable_symbols() if transitions.identities[t]['chain_id'] == lineage)), ('sp500',)) for lineage in selected)
+    sessions = tuple(row[0] for row in bundle._connection.execute("SELECT trade_date FROM price WHERE ticker='SPY' AND trade_date BETWEEN '2021-01-04' AND '2021-03-31' ORDER BY trade_date"))
+    panel = EvaluationPanelSpec.from_lineages(purpose='quick', sessions=sessions, lineages=lineages)
+    if args.panel_spec is not None:
+        selected_bytes = args.panel_spec.read_bytes()
+        if hashlib.sha256(selected_bytes).hexdigest() != args.panel_sha256:
+            raise ValueError('Selected panel bytes differ from the recorded digest')
+        selected_panel = _decode_dataclass(EvaluationPanelSpec, json.loads(selected_bytes))
+        if selected_panel.sha256 != args.panel_sha256 or selected_panel.purpose != 'discovery':
+            raise ValueError('Selected panel must be an authenticated discovery descriptor')
+        if selected_panel.lineages != panel.lineages:
+            raise ValueError('Selected panel differs from the already observed development cohort')
+        expected_sessions = tuple(row[0] for row in bundle._connection.execute(
+            "SELECT trade_date FROM price WHERE ticker='SPY' AND trade_date BETWEEN ? AND ? ORDER BY trade_date",
+            (selected_panel.start_date, selected_panel.end_date),
+        ))
+        if selected_panel.sessions != expected_sessions or len(expected_sessions) < 30:
+            raise ValueError('Selected discovery must contain at least30 continuous real trading sessions')
+        panel = selected_panel
+        sessions = panel.sessions
+    identity_sha = transitions.request_contracts_sha256
+
+panel_bytes = json.dumps(asdict(panel), sort_keys=True, separators=(',', ':')).encode() + b'\n'
+if hashlib.sha256(panel_bytes).hexdigest() != panel.sha256:
+    raise ValueError('Panel serialization mismatch')
+panel_ref = ArtifactRefV5('development/runs/' + args.label + '/panel.json', panel.sha256)
+episode_id = 'development-first-loop-2021q1' if args.episode_ordinal is None else 'development-discovery-' + str(args.episode_ordinal)
+episode = EpisodePlanV5(episode_id, args.episode_ordinal, panel.purpose, panel.start_date, panel.end_date, tuple(x.security_lineage_id for x in panel.lineages), panel_ref)
+scenario_ids = ('gross', 'base', 'stress') if panel.purpose == 'discovery' else ('base',)
+contract = EvaluatorContractV5(5, execution.sha256, sandbox.sha256, sandbox.runtime_source_sha256, bundle_sha, hashlib.sha256(provenance.read_bytes()).hexdigest(), identity_sha, baseline_source.sha256, baseline_revision.sha256, initial_friction_grid_v5(), 'base')
+request_identity = canonical_sha256_v5({'label': args.label, 'scope': 'provisional_sp500_integration', 'evaluator': contract.sha256, 'panel': panel.sha256, 'policy': revision.sha256})
+request = PanelExecutionRequestV5(5, request_identity, contract, sandbox, execution, revision, episode, panel, scenario_ids, 1, 30, sandbox.output_limit_bytes, pit_data_scope='development_sp500_v2')
+run_root.mkdir(parents=True)
+policy_root, input_root, output_root = [run_root / name for name in ('policy', 'request', 'output')]
+for directory in (policy_root, input_root, output_root):
+    directory.mkdir()
+for item in source.files:
+    (policy_root / Path(item.path).name).write_bytes(item.source.encode('utf-8'))
+(run_root / 'panel.json').write_bytes(panel_bytes)
+(run_root / 'constraints.json').write_bytes(canonical_json_bytes_v5(constraints))
+(input_root / 'panel-request.json').write_bytes(canonical_json_bytes_v5(request))
+module_args = ('core.pit_optimizer_v5.container_entry', '--request-sha256', request.request_sha256, '--input-sha256', request.sha256, '--evaluator-sha256', contract.sha256, '--sandbox-sha256', sandbox.sha256, '--policy-sha256', revision.sha256, '--panel-sha256', panel.sha256, '--start-date', panel.start_date, '--end-date', panel.end_date, '--output-limit-bytes', str(sandbox.output_limit_bytes))
+module_args += tuple(value for scenario_id in scenario_ids for value in ('--scenario', scenario_id))
+if args.profile:
+    module_args = ('cProfile', '-o', '/pit/output/runtime-profile.pstats', '-m', *module_args)
+maximum_wall_seconds = args.maximum_wall_seconds if args.maximum_wall_seconds is not None else (900 if args.profile else 600)
+container_name = 'pit-v5-baseline-' + uuid.uuid4().hex
+argv = baseline_container_argv_v5(inputs=SimpleNamespace(sandbox=sandbox), policy_root=str(policy_root), input_root=str(input_root), output_root=str(output_root), bundle_path=str(bundle_path), provenance_path=str(provenance), module_args=module_args, container_name=container_name)
+docker = str(Path.home() / 'AppData/Local/Programs/DockerDesktop/resources/bin/docker.exe')
+record = {'record_kind': 'provisional_real_market_integration', 'production_baseline_authority': False, 'full_campaign_complete': False, 'pit_data_scope': 'development_sp500_v2', 'label': args.label, 'container_name': container_name, 'image': sandbox.image_reference, 'bundle_sha256': bundle_sha, 'bundle_schema': 2, 'panel_sha256': panel.sha256, 'policy_revision_sha256': revision.sha256, 'lineages': len(lineages), 'sessions': len(sessions), 'start_date': panel.start_date, 'end_date': panel.end_date, 'maximum_wall_seconds': 600, 'limitations': ['S&P-only legacy dataset, incomplete SEC identity mapping and no industry input', 'Fixed development cohort; not discovery/confirmation/qualification authority', 'No model-provider calls; real evaluator integration only'], 'docker_create_argv': [docker, *argv]}
+record['maximum_wall_seconds'] = maximum_wall_seconds
+record['cpu_profile_enabled'] = args.profile
+record['episode_id'] = episode_id
+record['episode_ordinal'] = args.episode_ordinal
+record['panel_purpose'] = panel.purpose
+record['scenario_ids'] = scenario_ids
+record['selected_panel_path'] = None if args.panel_spec is None else str(args.panel_spec.resolve())
+record['selected_panel_sha256'] = args.panel_sha256
+(run_root / 'launch.json').write_text(json.dumps(record, indent=2) + '\n', encoding='utf-8')
+created = subprocess.run([docker, *argv], check=True, capture_output=True, text=True, timeout=60)
+container_id = created.stdout.strip()
+(run_root / 'container-id.txt').write_text(container_id + '\n', encoding='utf-8')
+print(json.dumps({'container_id': container_id, 'container_name': container_name, 'run_root': str(run_root), 'lineages': len(lineages), 'sessions': len(sessions), 'state': 'starting'}), flush=True)
+with (run_root / 'console.log').open('x', encoding='utf-8') as log:
+    try:
+        completed = subprocess.run([docker, 'start', '--attach', container_id], stdout=log, stderr=subprocess.STDOUT, timeout=maximum_wall_seconds)
+    except subprocess.TimeoutExpired:
+        subprocess.run([docker, 'stop', '--time', '2', container_id], check=True, capture_output=True, text=True, timeout=30)
+        raise ValueError(f'Development evaluator reached its {maximum_wall_seconds}-second limit; container stopped') from None
+observed = json.loads(subprocess.run([docker, 'inspect', container_id], check=True, capture_output=True, text=True, timeout=30).stdout)[0]
+(run_root / 'container-state.json').write_text(json.dumps(observed['State'], indent=2) + '\n', encoding='utf-8')
+print(json.dumps({'container_id': container_id, 'state': observed['State'], 'output_file_present': (output_root / 'panel-evaluation.json').is_file()}), flush=True)
+if completed.returncode or observed['State']['ExitCode']:
+    raise ValueError('Development evaluation failed; inspect recorded console.log and container-state.json')

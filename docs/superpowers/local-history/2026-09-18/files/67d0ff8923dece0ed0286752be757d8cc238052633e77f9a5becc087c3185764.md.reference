@@ -1,0 +1,47 @@
+# Spec compliance
+
+**Approved for P2 after fix round 1. Five Important findings resolved; zero remaining findings in the reviewed scope.** P3/P4 are intentionally absent. This is static source approval, not authorization for campaign/provider/evaluator activity or a claim of dynamic policy-positive coverage.
+
+The original findings report is retained as `independent-review-freeze-01.md`. The reviewed first-freeze source bytes and original full diff remain under `review-freeze-01/`. Read the narrow `fix-round-1.diff` once against those exact bytes, focusing on the five corrections and introduced risks; did not reread the full task diff or moving production source.
+
+## Frozen authority
+
+Independently computed hashes match the principal's fix freeze:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `campaign_admission.py` | `c42b07adc2d14fd00300acf2c76fb15669cade0ad4b149d7d92cbe9666c88d5e` |
+| `production_runtime.py` | `9d1fad0710037a64b46d1745d107203d114483baac215563e49e1c28e8892f83` |
+| `production_provider.py` | `e8aa63d92f48574bfb082f20a15f253f06c4e304d9afee95f0b02ed7954b80f4` |
+| `fix-round-1.diff` | `053f3fcc07c49503d9d080574987a8786f79a808ebfcc6f15f957509157bc7a7` |
+| Updated `actual-task.diff` | `a0318c2c8f7659b4c77dfe8b95c76d0d9d15f9fedf12959c7c79de2df3bb7994` |
+
+The actual retained first-freeze admission/provider preimages also rehash to `07fdea2f5aa8d86b58a1f7537306253dc63fcb8ed6ed2290ddf745ad643e5d14` and `5a5ca08f1fd8f95ee63c7c98028dfa90ed1d26e1f8e6fa75f928b3329d03bace`. Runtime's unchanged hash establishes byte equality to the first reviewed freeze. The three original principal preimages were independently hashed during preparation.
+
+## Resolved findings
+
+1. **Incoming slot attempt binding — resolved, `production_provider.py:864-865`.** The enrolled branch now compares the incoming slot's attempt kind/index to its exact persisted primary call. A different attempt identity cannot bypass duplicate-slot refusal and turn completed-request replay into another reservation.
+2. **Failed current predecessor continuation — resolved, `campaign_admission.py:917-918,954`.** New current-role admission requires every earlier current package to be accepted. The same rule applies to a supported later tail, including when an earlier role is being replayed. Exact completed-role replay remains separate.
+3. **Prior failure/exhaustion precedence — resolved, `campaign_admission.py:882-889`.** A prior terminal permits continuation only for the native `no_novel_hypothesis` outcome without committed records. Other outcomes fail, including when conflicting committed records coexist. A completed prior round requires committed settlement without a terminal. This closes the empty-current-journal lower-level reservation hole.
+4. **Failed config authentication classified as foreign — resolved, `campaign_admission.py:553-557`.** Config loading no longer catches repository authentication failure. Missing, corrupt or incompatible config state propagates failure; authenticated provider config linkage determines foreign selection. No repair was introduced.
+5. **Stale deadline check — resolved, `campaign_admission.py:1146-1155`.** Deadline validation follows full immutable fact authentication and the boundary decision. It validates the supplied epoch, then performs a fresh real wall-clock check as the last live check before return. Shared authority/prefix readers remain timeless, and legacy absence returns before either deadline check.
+
+## Strengths and scoped quality checks
+
+- `production_runtime.py:593` and its three request methods preserve complete request construction and insert one native return guard before unchanged runtime persistence. `runtime.py:1196-1216` retains exact primary call construction and authenticated completed-package replay.
+- `production_provider.py:852-895` keeps enrollment discovery and admission inside the existing transition before reservation construction/append. Legacy content lookup, duplicate/incomplete checks, budget/accounting predicates and time acquisition remain in their original order.
+- `campaign_admission.py:485,560` covers value/index unions and selected canonical round state. Typed-state reads explicitly use `repair=False`; projection verification likewise disables repair. The corrected foreign-config branch now fails closed.
+- The prefix implementation reviewed in freeze 01 authenticates the complete request census and verified ledger before completed-prefix slicing. Prior-round receipts drive continuation reserves; evaluated counts require committed records, accepted critic binding and successful H1/H2 cleanup. The five changes preserve that structure.
+- Focused unchanged dependency checks remain documented in `independent-review-preparation.md`: request lookup compatibility, full ledger authentication, H1/H2 settlement, projection/critic binding, journal ordering and native campaign stop behavior. Local imports avoid the existing provider/runtime/operations cycles. No operational adapter, capability, nonce or clock was added to shared immutable facts.
+
+## Verification evidence and limits
+
+Read the now-complete original and updated `task-report.md`, `static-checks.md`, `source-freeze.md`, `protection-map.md`, `preservation-report.md` and `fix-round-1-report.md`. This closes the original review's missing-report gap. Updated reports explicitly tie the corrected hashes and five fixes to repeated scoped Ruff (`All checks passed!`), in-memory compile (`PASS`) and focused fix-round-1 AST/protection checks (`PASS`). Original protection evidence covers unchanged P1 definitions, protected runtime/provider methods, three guarded returns and explicit immutable reads. No failed output or warning is reported.
+
+Preservation evidence is the implementer's earlier direct-byte comparison: all 579 runtime-04 files (69,994,319 bytes), all 83 provider-runtime-06 files (68,980,002 bytes), and all 56 evaluator paths. The evaluator map is pinned to `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4`. The reviewer read these reports rather than rerunning the checks; the updated task report accurately identifies preservation as the earlier check. Source/diff hashes listed above were independently computed.
+
+No tests were read, created or run; no source imports, synthetic cases, probes, actual artifact readers/summaries, credentials/environment reads, provider/API, Docker, evaluator or campaign activity occurred. Reviewer edits are evidence documents only. Static inspection does not prove runtime behavior, atomic cross-file snapshots, cross-round publication timing or actual positive-policy execution. Those limits remain material and do not expand P2 scope.
+
+## Quality assessment
+
+**Approved for P2.** The five corrections address the identified pre-spend and failure-precedence gaps without broadening production scope or changing old serialized contracts. No additional finding arose from the focused fix review. Later increments and final integrated review remain required.

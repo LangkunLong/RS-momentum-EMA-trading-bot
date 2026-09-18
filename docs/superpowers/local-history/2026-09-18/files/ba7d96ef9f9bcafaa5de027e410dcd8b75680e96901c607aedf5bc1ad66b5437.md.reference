@@ -1,0 +1,16 @@
+# Task 5 P1 Re-review — `d5b3902..ec29dcf`
+
+## Verdict: APPROVED
+
+The P1 remaining-lot basis defect is corrected with no unrelated scope.
+
+- Engine add-on execution now combines only the live basis (`trade.entry_price * current_qty`) with the new actual fill, then divides by the new live quantity at [`core/backtest_engine.py:5329`](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-v5-architecture/core/backtest_engine.py:5329). A prior scale-out has already reduced `current_qty`, so sold shares cannot affect a later add-on basis.
+- The independent diagnostics replay retains the per-share basis across SELL rows while reducing live quantity, and combines that remaining basis with each later BUY at [`core/pit_optimizer_v5/diagnostics.py:432`](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-v5-architecture/core/pit_optimizer_v5/diagnostics.py:432)-[`443`](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-v5-architecture/core/pit_optimizer_v5/diagnostics.py:443). Its endpoint assertion compares the episode basis to this replay at [`core/pit_optimizer_v5/diagnostics.py:483`](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-v5-architecture/core/pit_optimizer_v5/diagnostics.py:483)-[`484`](C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-v5-architecture/core/pit_optimizer_v5/diagnostics.py:484), rather than repeating the engine's former all-buy error.
+- Realized P&L remains recognized at each scale-out against the then-live basis; the corrected remaining basis is used for subsequent close P&L and open-risk sizing. V5 diagnostics continue to reconcile episode return and terminal cash to canonical fill cash.
+- One BUY still yields its own execution price as the replayed basis, so V2/single-fill behavior is unchanged. The follow-up diff is limited to the engine and V5 diagnostics.
+
+## Verification
+
+`python -B -m pytest tests/test_backtest_open_causality.py tests/test_backtest_engine.py -q` — **64 passed** (two pre-existing environment warnings).
+
+`python -B -m ruff check core/backtest_engine.py core/pit_optimizer_v5/diagnostics.py` — **passed**.

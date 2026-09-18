@@ -1,0 +1,81 @@
+# Task 6 Report — Baseline V3 Policy Bundle
+
+## Outcome
+
+Implemented strategy-universe Task 6 on branch `codex/pit-optimizer-v5-architecture` from accepted
+base `ec29dcf`.
+
+Source-only commit: `2f62f3c` — `feat: seed optimizer v5 policy bundle`
+
+Created exactly the six requested source files:
+
+- `core/strategy_policy/v3/__init__.py`
+- `core/strategy_policy/v3/entry.py`
+- `core/strategy_policy/v3/risk.py`
+- `core/strategy_policy/v3/position.py`
+- `core/strategy_policy/v3/exit.py`
+- `core/pit_optimizer_v5/policy_scope.py`
+
+No tests, V1/V2 policy modules, engine code, provider/Docker paths, replay/qualification paths,
+market data, or bundle artifacts were changed. No source scope expansion was performed.
+
+## Baseline behavior
+
+The V3 entry, capacity, allocation, eviction, and exit functions accept their exact V3 snapshot
+types and delegate deterministically to the existing V2 baseline using `snapshot.base`. The new V3
+fields remain observable to later authored candidates without changing baseline behavior.
+
+The V3 position policy returns the exact inert add-on decision:
+
+```text
+add=False
+risk_fraction=0.0
+notional_fraction_cap=None
+reason_code=baseline_no_add_on
+```
+
+`core.strategy_policy.v3` identifies itself as interface version 3 and exports the exact six policy
+functions consumed by the existing V3 runtime loader.
+
+## Exact V5 authoring scope
+
+`policy_scope.py` establishes one ordered, immutable four-path authority:
+
+1. `core/strategy_policy/v3/entry.py` → `evaluate_entry`
+2. `core/strategy_policy/v3/risk.py` → `recommend_capacity`, `recommend_allocation`,
+   `select_eviction`
+3. `core/strategy_policy/v3/position.py` → `evaluate_add_on`
+4. `core/strategy_policy/v3/exit.py` → `evaluate_exit`
+
+The scope is bound to policy interface version 3. Normal mode accepts only complete replacements of
+the required named functions or named public uppercase module constants. It rejects unrelated paths,
+unlisted functions, invalid constant names, duplicate symbol operations, empty/mixed authoring modes,
+and malformed operations. Full-source escape is atomic and accepts only the complete ordered
+four-file bundle.
+
+## Verification evidence
+
+1. `python -B -m pytest tests/test_strategy_policy.py -q`: **41 passed**. Warnings were limited to
+   the existing websockets deprecation and sandbox-denied pytest-cache write.
+2. `python -B -m compileall -q core/strategy_policy/v3 core/pit_optimizer_v5/policy_scope.py`:
+   passed.
+3. `python -B -m ruff check core/strategy_policy/v3 core/pit_optimizer_v5/policy_scope.py`:
+   **All checks passed**.
+4. Deterministic direct V3 smoke: passed (`task6 V3 delegation/runtime/scope smoke: ok`). It built
+   validated V3 entry, capacity, allocation, eviction, add-on, and exit snapshots; compared all five
+   parity delegates byte-for-behavior with the V2 functions; verified the exact inert add-on record;
+   loaded and called all six functions through `InProcessPolicyClientV3`; and confirmed interface 3.
+5. Scope smoke: accepted named-function and named-constant operations, accepted only the complete
+   four-file full-source escape, and rejected a V2 path, an unlisted helper function, a partial
+   full-source bundle, and mixed normal/full-source modes.
+6. `git diff --cached --check`: passed before commit. Pre-commit Ruff, whitespace, EOF, YAML, and
+   merge-conflict hooks all passed.
+
+## Final audit
+
+- V1/V2 source and tests were untouched, and the focused V2 strategy-policy suite remains green.
+- The commit contains only the six requested source files.
+- This report is intentionally outside the source-only commit.
+- No provider call, Docker action, market-data operation, replay, push, merge, or qualification was
+  performed.
+- No blocker remains.

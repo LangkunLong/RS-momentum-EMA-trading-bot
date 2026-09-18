@@ -1,0 +1,150 @@
+# Task 6A Review: Trusted Terminal Lifecycle Closure
+
+Date: 2026-08-28  
+Review base: `f66abeaecb24f856504677d776194b1ce2a215e7`  
+Review head: `b5034600d99c40eff13fa2f461808748d07b8e9c`  
+Disposition: **APPROVED**  
+Open findings: **0 Critical, 0 Important, 0 Minor**
+
+### Spec Compliance — ✅
+
+- **Trusted terminal package:** `AuthorizationLedger._gateway_terminal_commitment`
+  binds the exact authorization reservation primitive and digest, the reserved or
+  started lifecycle commitment digest, provider-facts digest, provider-record
+  digest, budget-recovery digest, terminal-event digest, audit run, manifest,
+  call index, iteration, role, usage, charged calls/tokens/USD, charge basis,
+  terminal outcome/code, and payload digest
+  (`core/pit_optimizer_authorization.py:1466`,
+  `core/pit_optimizer_authorization.py:1500`). The normal-path test asserts the
+  complete committed mapping against the actual fake/temp artifacts
+  (`tests/test_pit_optimizer_v2.py:5718`,
+  `tests/test_pit_optimizer_v2.py:5725`).
+- **Exclusive trusted verification:** attachment, public receipt verification,
+  and reconciliation verification require the stored `gateway_terminal` package
+  to equal a package rebuilt from protected audit evidence and the durable
+  lifecycle commitment (`core/pit_optimizer_authorization.py:667`,
+  `core/pit_optimizer_authorization.py:718`,
+  `core/pit_optimizer_authorization.py:1541`,
+  `core/pit_optimizer_authorization.py:3208`). A missing commitment is rejected;
+  public restart recovery no longer synthesizes a reconciliation
+  (`agent_loop.py:3961`, `agent_loop.py:3967`, `agent_loop.py:3974`,
+  `agent_loop.py:3979`).
+- **Atomic and idempotent transition:** the gateway-only operation routes the
+  live lifecycle through `reconcile_call`, which constructs the terminal
+  commitment inside the reconciliation record and appends reconciliation plus
+  any lease close in one `_append_records` call
+  (`core/pit_optimizer_authorization.py:1627`,
+  `core/pit_optimizer_authorization.py:3030`,
+  `core/pit_optimizer_authorization.py:3181`,
+  `core/pit_optimizer_authorization.py:3195`). The focused unchanged atomicity
+  check confirmed `_append_records` writes one complete ledger image to a new
+  file, fsyncs it, and publishes it with one `os.replace`
+  (`core/pit_optimizer_authorization.py:2216`,
+  `core/pit_optimizer_authorization.py:2233`,
+  `core/pit_optimizer_authorization.py:2246`). Exact replay either verifies the
+  same package or rejects a differing commitment
+  (`core/pit_optimizer_authorization.py:3049`,
+  `core/pit_optimizer_authorization.py:3056`).
+- **Crash-before-commitment fail-closed:** public recovery authenticates the
+  terminal commitment and existing reconciliation before BudgetLedger restore;
+  it has no reconciliation writer (`agent_loop.py:3967`,
+  `core/pit_optimizer_authorization.py:1563`). The rewrite regression preserves
+  the genuine reserved/started event bytes, rewrites the provider, budget, and
+  terminal package coherently, then proves no BudgetLedger mutation, no
+  AuthorizationLedger mutation/reconciliation, and no plan-2 unlock
+  (`tests/test_pit_optimizer_v2.py:6843`,
+  `tests/test_pit_optimizer_v2.py:6886`,
+  `tests/test_pit_optimizer_v2.py:6933`,
+  `tests/test_pit_optimizer_v2.py:6938`,
+  `tests/test_pit_optimizer_v2.py:6946`). Genuine committed evidence is restored
+  twice without another authorization transition
+  (`tests/test_pit_optimizer_v2.py:6674`,
+  `tests/test_pit_optimizer_v2.py:6796`).
+- **Conservative started boundary:** cleanup promotes a non-null durable started
+  digest before retrying the exact lifecycle bind, so it builds
+  uncertain/started facts rather than a before-send release
+  (`agent_loop.py:4488`, `agent_loop.py:4490`, `agent_loop.py:4502`). The phase
+  regression calls the genuine started commitment and then raises the required
+  one-shot `KeyboardInterrupt` (`tests/test_pit_optimizer_v2.py:4962`). It
+  verifies one retained-reservation reconciliation, a `cancelled` close, one
+  uncertain/started terminal event, exact full reservation retention, zero SDK
+  sends, two idempotent fresh-reopen recoveries, and fencing of both the same
+  plan and plan 2 (`tests/test_pit_optimizer_v2.py:5004`,
+  `tests/test_pit_optimizer_v2.py:5013`,
+  `tests/test_pit_optimizer_v2.py:5035`,
+  `tests/test_pit_optimizer_v2.py:5078`,
+  `tests/test_pit_optimizer_v2.py:5093`).
+- **Compatibility and prior Task 6 behavior:** ledger replay retains the old
+  reconciliation key shapes while recognizing the new terminal field
+  (`core/pit_optimizer_authorization.py:1975`), but audit attachment rejects an
+  optimizer receipt without its exact terminal commitment
+  (`core/pit_optimizer_authorization.py:700`). The unchanged provider reader
+  continues to distinguish schema v1 from v2 rather than reinterpret v1
+  records (`agent_loop.py:1181`, `agent_loop.py:1191`). The reviewed gateway
+  still has a single SDK send site and this patch adds no provider retry or
+  response-healing path (`agent_loop.py:4257`).
+- **Evidence wording:** the corrected report now says the focused REDs cover
+  every lifecycle code, one representative public optimizer state, and one
+  cross-role semantic relabel, with the remainder established by shared
+  set/mapping logic (`task-6-report.md:628`). That matches the inspected tests.
+
+⚠️ **Cannot independently verify:** per the task's review method, I did not
+rerun the implementer's focused pytest/Ruff/compile/diff-check commands or run
+git status. Their exact pass counts, commit identity, and clean tracked-worktree
+claim remain recorded evidence rather than fresh runtime evidence. The supplied
+review package and static source/test inspection expose no contradiction.
+
+### Strengths — evidence with file:line
+
+- The commitment is not merely another audit-local hash: it is part of the
+  trusted hash-chained reconciliation record, and both the live publication
+  path and public verification reconstruct its full closed fact set
+  (`core/pit_optimizer_authorization.py:1500`,
+  `core/pit_optimizer_authorization.py:1572`,
+  `core/pit_optimizer_authorization.py:3040`).
+- Recovery ordering is unambiguous: recover untrusted facts, authenticate the
+  committed package, restore BudgetLedger, then re-verify the already durable
+  reconciliation (`agent_loop.py:3961`, `agent_loop.py:3967`,
+  `agent_loop.py:3974`, `agent_loop.py:3979`).
+- Idempotency covers the full terminal package and terminal lease closure, not
+  just provider facts (`core/pit_optimizer_authorization.py:3056`,
+  `core/pit_optimizer_authorization.py:3075`,
+  `core/pit_optimizer_authorization.py:3100`).
+- The start-commitment regression exercises the exact post-publication failure
+  boundary and observes the externally relevant invariants, including zero
+  sends and fresh-process replay (`tests/test_pit_optimizer_v2.py:4966`,
+  `tests/test_pit_optimizer_v2.py:5026`,
+  `tests/test_pit_optimizer_v2.py:5060`).
+- New durable fields are closed identities, digests, lifecycle, usage, charge,
+  and terminal facts; they do not add prompt, candidate source, raw response,
+  credential, header, key, or approval content
+  (`core/pit_optimizer_authorization.py:1500`).
+
+### Issues — Critical / Important / Minor
+
+- **Critical:** none.
+- **Important:** none.
+- **Minor:** none.
+
+### Assessment — Task quality Approved
+
+Task 6A closes both load-bearing predecessor findings without weakening the
+calibrated isolation boundary, schema-v1 reader behavior, one-shot send path, or
+fail-closed treatment of pre-commit schema-v2 terminal histories. The terminal
+origin anchor is complete and atomic, the recovery mutation order is safe, and
+the prescribed regressions exercise the relevant failure and tamper boundaries.
+
+**Exact review resources/effects:** I read, in the required order,
+`task-6a-brief.md`, `task-6a-report.md`, the supplied
+`review-f66abea..b503460.diff` package (continued in bounded chunks only after
+the display cap truncated the initial read), and `task-6-rereview-5.md`. I then
+performed focused read-only checks of the changed terminal commitment and
+tests plus one unchanged check each for atomic replacement, ledger replay/audit
+attachment, the gateway finalization/recovery/cleanup call sites, and schema-v1
+reader compatibility; I also checked the corrected report wording. I ran no git
+commands and no tests, provider/OpenRouter/network/live-pricing/real-SDK/Docker/
+replay/permanent-ledger/background action. I did not modify tracked files, the
+index, HEAD, or the branch, and did not push, upload, merge, deploy, or create
+cloud work. The only write was this ignored review report. No prompt, strategy
+source, provider contents, credentials, keys, headers, or operator approval
+content was exposed.

@@ -1,0 +1,142 @@
+"""Collect two real archive summaries after explicit principal review approval."""
+
+from __future__ import annotations
+
+import argparse
+from decimal import Decimal
+from hashlib import sha256
+import json
+from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parents[4]
+PACKAGE = Path(__file__).resolve().parent
+DEVELOPMENT = PACKAGE.parent
+BASELINE_SHA = "b1b648418bfaa66f830f056570964851880a0c7181ef6adbf0a901d9179c0a3b"
+DECIMAL_FIELDS = {"cost_usd", "best_campaign_cagr_pct", "target_gap_pct", "target_pct"}
+COUNT_FIELDS = {"completed_lifecycle_rounds", "evaluated_feedback_rounds", "render_rejected_experiments"}
+ARCHIVES = (
+    ("runtime-04", "development-controller-two-rounds-20260907-04", "8fcae0423117f3a234e64391c277bd7efe5cbb775ff61ec879d8cbeb5659d37c"),
+    ("provider-runtime-06", "development-provider-two-rounds-20260907-06", "d90ed717c0d6b34d4cfa6bf7e2dd1f753e68c43b1127b200a66d2a9f930dfdf6"),
+)
+
+
+def digest(raw: bytes) -> str:
+    return sha256(raw).hexdigest()
+
+
+def snapshot(root: Path) -> dict[str, str]:
+    absolute = root.resolve(strict=True)
+    extended = Path(chr(92) * 2 + "?" + chr(92) + str(absolute))
+    if not extended.is_dir() or not str(extended).startswith(chr(92) * 2 + "?" + chr(92)):
+        raise RuntimeError("extended archive root is unavailable")
+    return {
+        path.relative_to(extended).as_posix(): digest(path.read_bytes())
+        for path in sorted(extended.rglob("*")) if path.is_file()
+    }
+
+
+def write_json(directory: Path, name: str, value: object) -> None:
+    with (directory / name).open("x", encoding="utf-8", newline="\n") as stream:
+        json.dump(value, stream, indent=2, sort_keys=True)
+        stream.write("\n")
+
+
+def equivalent(key: str, actual: object, old: object) -> bool:
+    if key in DECIMAL_FIELDS and actual is not None and old is not None:
+        return Decimal(str(actual)) == Decimal(str(old))
+    return actual == old
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--approved-review-sha256", required=True)
+    args = parser.parse_args()
+    review = PACKAGE / "h3c-independent-review.md"
+    if digest(review.read_bytes()) != args.approved_review_sha256:
+        raise RuntimeError("principal-approved review digest mismatch")
+    baseline_path = DEVELOPMENT / "increment-c-history-verifier/current-verifier-evidence.json"
+    baseline_raw = baseline_path.read_bytes()
+    if digest(baseline_raw) != BASELINE_SHA:
+        raise RuntimeError("accepted baseline evidence changed")
+    baseline = json.loads(baseline_raw)
+    before = {name: snapshot(DEVELOPMENT / name) for name, _, _ in ARCHIVES}
+    for name, _, _ in ARCHIVES:
+        if before[name] != baseline["archives"][name]["before_file_hashes"]:
+            raise RuntimeError(f"archive differs from accepted baseline: {name}")
+    old_runtime_raw = (DEVELOPMENT / "runtime-04/resume-05-result.json").read_bytes()
+    if digest(old_runtime_raw) != "8dc264db67938ca9f5e46e59f0b000f1185003ba942aeb304a87cef468e72581":
+        raise RuntimeError("original runtime04 summary wrapper changed")
+    old_summaries = {
+        "runtime-04": json.loads(old_runtime_raw)["summary"],
+        "provider-runtime-06": baseline["archives"]["provider-runtime-06"]["full_summary"]["summary"],
+    }
+    sys.path.insert(0, str(ROOT))
+    from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5
+    from core.pit_optimizer_v5.contracts import ArtifactRefV5, CampaignManifestV5, canonical_sha256_v5
+    from core.pit_optimizer_v5.summary import summarize_repository_v5
+
+    accepted_evaluator = json.loads((PACKAGE / "h3b-evaluator-source-map.json").read_text(encoding="utf-8"))
+    evaluator_map = {name: digest((ROOT / name).read_bytes()) for name in accepted_evaluator["source_sha256_by_path"]}
+    evaluator_sha = canonical_sha256_v5(evaluator_map)
+    if len(evaluator_map) != 56 or evaluator_map != accepted_evaluator["source_sha256_by_path"] or evaluator_sha != accepted_evaluator["sha256"]:
+        raise RuntimeError("accepted evaluator closure changed")
+    source_paths = tuple(ROOT / "core/pit_optimizer_v5" / name for name in (
+        "historical_verification.py", "controller_roles.py", "production_provider.py",
+        "production_runtime.py", "summary.py", "development_preparation.py",
+        "production_sandbox.py", "production_workspace.py", "production_fs.py",
+        "artifacts.py", "memory.py", "runtime.py", "contracts.py", "candidate_ir.py",
+        "rendering.py", "provider.py", "selection.py", "search.py", "cli.py",
+        "operations.py", "manifest.py",
+    ))
+    source_before = {path.relative_to(ROOT).as_posix(): digest(path.read_bytes()) for path in source_paths}
+    output = PACKAGE / "h3c-actual-summaries-01"
+    output.mkdir(exist_ok=False)
+    write_json(output, "review-and-source-authority.json", {
+        "review_sha256": args.approved_review_sha256,
+        "source_sha256_by_path": source_before,
+        "evaluator_sha256": evaluator_sha,
+        "evaluator_source_sha256_by_path": evaluator_map,
+    })
+    for name, _, _ in ARCHIVES:
+        write_json(output, f"{name}-before.json", before[name])
+    results: dict[str, object] = {}
+    for name, campaign, manifest_sha in ARCHIVES:
+        result: dict[str, object] = {"returned": False}
+        try:
+            repository = LocalArtifactRepositoryV5((DEVELOPMENT / name).resolve(strict=True))
+            manifest = repository.load_typed_artifact(ArtifactRefV5(f"campaigns/{campaign}/manifest.json", manifest_sha), value_type=CampaignManifestV5)
+            actual = summarize_repository_v5(repository=repository, manifest=manifest, command="summarize", verification_scope="completed_history").to_primitive()
+            old = old_summaries[name]
+            keys = set(old) - ({"command"} if name == "runtime-04" else set())
+            comparisons = {key: key in actual and equivalent(key, actual[key], old[key]) for key in sorted(keys)}
+            expected_counts = (1, 1, 0) if name == "runtime-04" else (0, 0, 0)
+            count_comparisons = {key: actual[key] == expected for key, expected in zip(("completed_lifecycle_rounds", "evaluated_feedback_rounds", "render_rejected_experiments"), expected_counts, strict=True)}
+            command_expected = old["command"] == ("resume" if name == "runtime-04" else "summarize") and actual["command"] == "summarize"
+            field_set_expected = set(actual) == set(old) | COUNT_FIELDS
+            result = {"returned": True, "summary": actual, "old_fields_compared": len(keys), "old_field_comparisons": comparisons, "new_count_comparisons": count_comparisons, "command_labels": {"original": old["command"], "returned": actual["command"], "expected": command_expected}, "field_set_expected": field_set_expected, "comparison_pass": all(comparisons.values()) and all(count_comparisons.values()) and command_expected and field_set_expected}
+        except Exception as exc:
+            chain = []
+            current: BaseException | None = exc
+            while current is not None and len(chain) < 12:
+                chain.append({"type": type(current).__name__, "message": str(current)})
+                current = current.__cause__ or current.__context__
+            result["failure_chain"] = chain
+        after = snapshot(DEVELOPMENT / name)
+        write_json(output, f"{name}-after.json", after)
+        result["archive_unchanged"] = before[name] == after
+        result["archive_file_count"] = len(after)
+        results[name] = result
+        write_json(output, f"{name}-result.json", result)
+        if before[name] != after:
+            raise RuntimeError(f"archive changed during summary collection: {name}")
+    source_after = {path.relative_to(ROOT).as_posix(): digest(path.read_bytes()) for path in source_paths}
+    complete = {name: before[name] == snapshot(DEVELOPMENT / name) for name, _, _ in ARCHIVES}
+    overall = {"archives": results, "complete_archive_preservation": complete, "source_unchanged": source_before == source_after, "pass": all(complete.values()) and source_before == source_after and all(item.get("comparison_pass", False) for item in results.values())}
+    write_json(output, "result.json", overall)
+    print(json.dumps({"pass": overall["pass"], "archives": {name: {key: value.get(key) for key in ("returned", "comparison_pass", "archive_unchanged", "failure_chain")} for name, value in results.items()}}, sort_keys=True))
+    return 0 if overall["pass"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

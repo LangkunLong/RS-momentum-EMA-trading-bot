@@ -1,0 +1,39 @@
+# Corrected campaign 05 â€” one additional attempt within the existing budget
+
+Prepared 2026-09-07T18:20:54.748715+00:00. **Campaign05 has not started and is not authorized to make model calls.**
+
+## What happened
+
+The approved two-attempt continuation ended before candidate evaluation. Campaign 03 received an accepted investigator response, then the author supplied a bare changed_symbols name. The local parser requires a fully qualified module.symbol name. Campaign 04 accepted an investigator response selecting full_source_escape, which that manifest disables, so author request construction stopped. Both terminal campaigns completed cleanup and remain preserved.
+
+Actual combined usage for 03+04: **3 calls, 10,679 tokens, $0.055885**. Both campaign slots are used. Nine call slots and 885,321 tokens remain within the existing 12-call/896,000-token allowance.
+
+## Completed local repairs
+
+The shared provider-facing author schema now describes and constrains the required fully qualified symbol form. Separately, the authenticated manifest permission is passed through the existing gateway to the shared investigator wire-schema projector. Explicit False permits only symbol_edits; enabled and legacy configurations retain their existing options. The author-only RoleSchemaAuthority flag is not misused as a campaign permission.
+
+Canonical local schemas/request hashes, parsing, original response artifacts, paid accounting and final authorization guards are unchanged. Saved outgoing preparation uses the same manifest flag and projector as the live gateway. Scoped Ruff, compilation, root and independent source review passed; actual archived requests verified projected shapes and unchanged conservative accounting. No tests or synthetic probes were run. Provider acceptance and full round completion remain to be verified by a real run.
+
+The image, data and completed quick/four parent baselines are unchanged and reusable. No rebuild or rebaseline is required.
+
+## Requested extension
+
+Allow **one additional campaign 05** within the existing 12-call/896,000-token allowance. This campaign remains capped at **2 rounds, 6 calls, 448,000 tokens, 8,192 output tokens per call**. Including completed 03+04, the resulting maximum is **9 calls and 458,679 tokens**, inside the existing totals. No additional replacement is included.
+
+All other approved terms remain: model openai/gpt-5.4 through https://openrouter.ai/api/v1/chat/completions, standard compatible upstream routing, no hard dollar ceiling, zero automatic retries/schema repairs, role 300 seconds, round 2 hours, campaign 4 hours, quick 600 seconds and discovery window 1,200 seconds. One Docker evaluator, 1 CPU, 1,024 MiB memory, 32 PIDs, 64 MiB output. Original deadlines remain fixed on permitted recovery. Uncertain paid outcomes must be reconciled before any duplicate request.
+
+Same outgoing scope: aggregate metrics/history/evidence and selected editable policy source/contracts, potentially all four policy modules for cross-policy work. The API key from the selected main checkout .env is solely HTTP authentication. No raw dataset, full repository, environment or credential-file contents are model input. No purchases, trading, deployment, source push, held-out qualification or replay.
+
+## Exact preparation
+
+Campaign: development-provider-two-rounds-20260907-05.
+
+Manifest SHA: e15826585a8742f42c020ec102242fe20616a349822c2efd2f6e475ef8300e24.
+Adapter config SHA: 08230584899f02b616e6b1d6bcaed8ef5694d7d638a4851ecad1e1db0dfd0d9d.
+Initial logical body SHA: 6fc53026d4228d6a41fd2ecce63b8a6f8edf729400904cf5a31f84785a0bfd82.
+
+The initial investigator body is initial-outbound-body.json. Its authoring_mode enum is now only symbol_edits; the canonical local schema is preserved in initial-response-schema.json and the exact provider projection in initial-wire-response-schema.json. Conservative first input allowance remains 10,305 tokens plus 8,192 output tokens. Later packets depend on actual prior results and remain bounded by the same grant.
+
+Exact argv and source/helper hashes: launch-review.json. Full proposed amendment: continuation-extension-proposal.json. No approval is implied by preparing these files. Keep AC power/lid open during any authorized execution; idle-sleep protection cannot override explicit lid sleep.
+
+After actual two-round completion and cleanup, the principal architect will write the detailed step-by-step GPT-5.6 Luna implementation handoff. The user creates the next session manually. This preparation is not proof of a completed optimizer loop or profitable strategy.

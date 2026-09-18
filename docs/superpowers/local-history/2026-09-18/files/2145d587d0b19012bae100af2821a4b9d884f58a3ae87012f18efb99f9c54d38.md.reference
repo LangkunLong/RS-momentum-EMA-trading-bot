@@ -1,0 +1,26 @@
+# H3a independent review
+
+Spec: **PASS**. Quality: **approved**. No prioritized source findings or required code changes.
+
+Reviewed the two H3a sources against their exact saved preimages, the task/design/sequence briefs, directly reached immutable readers, and finalized supplied evidence after principal's report-ready confirmation. This verdict covers H3a only.
+
+## Source findings
+
+- `controller_roles.py:64`: independent AST comparison confirms the classifier body is exactly the former `_terminal` body after `_sealed`. Envelope keys, duplicate-key and 4 MiB bounds, schema/binding error classification, zero usage, artifact hashes and terminal facts are preserved. The classifier uses only supplied values and pure parsing/contract helpers.
+- `controller_roles.py:170`: `_terminal` still calls `_sealed` first, then delegates its returned reference and bytes. Independent byte comparisons confirm constructor, `_incoming_path`, `_sealed`, `invoke_once` and `reconcile_once` are unchanged.
+- `development_preparation.py:348`: the only existing helper change is keyword `repair: bool = True`, forwarded at both actual campaign authority reads (`:354`, `:358`). Existing validations and default behavior remain intact. The operational package authenticator at `:377` is byte-identical.
+- `development_preparation.py:400`: the new entry enforces provider-free development scope and exact controller terminal type; reconstructs/authenticates the same persisted request reference; calls request authentication with literal `repair=False`; loads the sealed response once; rejects absence or mismatching request/call; and compares the entire classification result with the supplied package. It constructs no invoker, consults no cwd/incoming directory, and calls no reconcile/sealing/publication path.
+- The reached request, typed-artifact, binary and raw readers authenticate stored bytes. `artifacts.py:1956` raises before the orphan-index writer when repair is false. `load_controller_role_response` at `:2815` reaches immutable binary authentication only. The relocation search is read-only and raises rather than substituting another artifact.
+- An empty package iterable validates manifest scope only. This is appropriate for H3a and is **not** completed-history or lifecycle acceptance; H3c must supply that eligibility check.
+
+## Evidence assessment
+
+Current source hashes independently match the report: controller `62f7414dd31a7970d08bcbf7fcc7faaeb19e5ee806cba5363311aef338b15b1f`; preparation `7e9427839eff441831dc83a9737f2a638efc0fa279a2e8e241f9dd3296ab29bd`. The supplied narrow diff digest also matches `h3a-diff-check.txt`.
+
+The supplied real-evidence collector loads runtime04's original typed manifest and actual journal `RoleCompletionPayloadV5` packages through `load_role_invocation`, without fabricated authority. Its recorded successful authentication covers five packages: investigator/author/critic in round 1 and investigator/author in round 2. I did not repeat authentication.
+
+Independently checked complete supplied before/after maps for exact equality, file/byte counts, asserted extended roots and recomputed tree digests using the collector's serialization order. Runtime04 remains 579 files / 69,994,319 bytes, digest `1988b37428bcbf647d468ec163b7ca235b99b26b2a7bcee80d7de733e19f8aa9`; actual06 preservation control remains 83 files / 68,980,002 bytes, digest `2c411970b0a2d9cdfd2499afa01aed14fa723bb3ae5f4d44baee0d539b923f16`. The evaluator evidence contains 56 paths at unchanged declared digest `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4`. Supplied scoped Ruff, in-memory compile and whitespace checks passed.
+
+## Limits
+
+No tests, synthetic or negative cases, missing-state exercises, operational invocations, authenticator/summary reruns, campaigns, providers, Docker, credentials or environment reads were performed by this reviewer. Runtime evidence is reviewed supplied evidence, not an independent rerun or new archive snapshot. Failure branches and preserved live behavior have static evidence only. No H3c lifecycle, paid-history or historical-summary acceptance is implied.

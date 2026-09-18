@@ -1,0 +1,21 @@
+# Task 1 Rereview — V3 Ticker-Validation Isolation
+
+## Finding Verdict
+
+**Not fully resolved.** `core/pit_data.py:271-287` restores the exact legacy character set and adds a V3-only validator. The bundle schema router is correctly used for V3 price symbols, fundamentals, bundle queries, provenance identity rows, and explicit transition rows (`core/pit_data.py:593-600`, `core/pit_data.py:798-813`, `core/pit_data.py:850-872`, `core/pit_data.py:1082-1118`). V1/V2 membership loading remains explicitly on `_canonical_ticker` (`core/pit_data.py:524-544`).
+
+However, `PriceIdentityTransitionContract.resolve_open_holding()` no longer preserves its legacy validation behavior. At `core/pit_data.py:185-194`, it switches to `_canonical_ticker_v3` merely because an identity key contains a digit. A directly constructed legacy contract containing `DUAL2` previously rejected that argument through the legacy validator; it now accepts it. The contract has no schema-version/provenance discriminator, so identity contents are not a valid way to determine which validation domain applies. This violates the requirement that every V1/V2 call site retain the legacy validator and that V3 syntax be isolated to authenticated schema-V3 paths.
+
+Use an explicit, authenticated schema-V3 contract marker/validator selected by the V3 loader, or preserve legacy validation in this shared API and expose a V3-specific resolver. Do not infer schema from ticker characters.
+
+## New Breakage
+
+None beyond the remaining mixed validator route above. The checked V3 bundle routes accept only the added digit syntax; both validators retain the prior uppercase/trim normalization and reject unsupported punctuation.
+
+## Out-of-Scope
+
+No tests, providers, Docker/replay surfaces, Git state, or source files were modified or executed. This rereview assessed only `476a688..c4da6a4` and the appended task report.
+
+## Verdict
+
+**Changes requested.** The main bundle routing fix is sound, but replace the identity-content heuristic in `core/pit_data.py:185-194` before considering the V1/V2 compatibility finding closed.

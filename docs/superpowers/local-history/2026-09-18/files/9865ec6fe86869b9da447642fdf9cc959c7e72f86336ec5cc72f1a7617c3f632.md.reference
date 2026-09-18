@@ -1,0 +1,23 @@
+# Task 2 Fix Re-review — V3 Provenance and Verification Seal
+
+## Per-Finding Verdicts
+
+1. **Resolved — exact nested membership source provenance.** `build_pit_bundle.py:861-933` requires exactly three ordered objects with the exact normalizer binding schema; validates each digest, kind, UTC retrieval time, and positive source event count; and reconciles per-universe removed events to the emitted coalescing count.  `build_pit_bundle.py:657-663` now uses this validated value before deriving the membership-input identity.
+
+2. **Resolved — manifest identity timing/report digest.** `verify_pit_bundle.py:352-354` captures the manifest identity before V3 work; `verify_pit_bundle.py:150-163` includes it in the complete checked-input set; and `verify_pit_bundle.py:308-310` preserves that before digest set.  `verify_pit_bundle.py:415-421` rechecks both the bundle and every checked input immediately before the report is published, while the report binds those authenticated pre/post-equal digests rather than a fresh unchecked manifest hash.
+
+3. **Resolved — duplicate/non-finite manifest JSON.** `verify_pit_bundle.py:31-35` routes V3 manifests through the strict duplicate-key/non-finite JSON loader and requires the exact canonical newline-terminated byte representation.  `build_pit_bundle.py:1351-1356` emits those same canonical V3 bytes; the schema-2 pretty JSON output path remains unchanged.
+
+4. **Resolved — SQLite URI path encoding.** `verify_pit_bundle.py:111-113` now derives the URI with `Path.as_uri()` before adding the SQLite query parameters, so `?` and `#` in a valid pathname stay percent-encoded path data rather than changing the target database URI.
+
+## New Breakage
+
+None found in the narrowed review.  The new normalizer-provenance validation matches its emitted six-field source bindings and coalesced-event accounting.  Builder and verifier use the identical `pit_canonical_json_bytes` newline convention for schema V3 manifests.  V1/V2 behavior remains on its separate legacy parser/output route.
+
+## Out-of-Scope
+
+No provider, Docker, replay, git, or test commands were run.  This rereview covered only the four prior findings and directly affected V3 manifest/provenance/report/URI paths.
+
+## Verdict
+
+Approved for the reviewed fixes.  All four prior findings are resolved, and no directly introduced breakage was identified.

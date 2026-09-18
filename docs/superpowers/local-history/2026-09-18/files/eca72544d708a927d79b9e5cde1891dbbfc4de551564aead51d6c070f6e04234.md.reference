@@ -1,0 +1,127 @@
+# PIT Optimizer V5 Roadmap Task 1 Report
+
+Date: 2026-09-04
+
+## Scope
+
+Verified the six prepared V5 architecture and planning documents against `task-1-brief.md`.
+No document corrections were required. No tests were added or modified, and no provider calls,
+Docker/replay runs, or external writes were made.
+
+## Files reviewed
+
+- `docs/superpowers/specs/2026-09-04-pit-optimizer-v5-hybrid-architecture-design.md`
+- `docs/superpowers/plans/2026-09-04-pit-optimizer-v5-roadmap.md`
+- `docs/superpowers/plans/2026-09-04-pit-optimizer-v5-evaluator-truth.md`
+- `docs/superpowers/plans/2026-09-04-pit-optimizer-v5-learning-search.md`
+- `docs/superpowers/plans/2026-09-04-pit-optimizer-v5-strategy-universe.md`
+- `docs/superpowers/plans/2026-09-04-pit-optimizer-v5-campaign.md`
+
+## Required checks
+
+### Specification references
+
+Command:
+
+```powershell
+rg -n -g "2026-09-04-pit-optimizer-v5-*.md" '\*\*Spec:\*\* `docs/superpowers/specs/2026-09-04-pit-optimizer-v5-hybrid-architecture-design.md`' docs/superpowers/plans
+```
+
+Result: 5 matches, exactly one in the roadmap and each of the four detailed plans.
+
+### Research/replay authorization boundaries
+
+Command:
+
+```powershell
+rg -n -g "2026-09-04-pit-optimizer-v5-*.md" "OpenRouter|qualification|full replay|apply=false" docs/superpowers/plans
+```
+
+Result: matches confirm that provider calls, qualification, and full replay are explicitly
+deferred or separately authorized, while discovery is constrained to `apply=false`. References to
+these terms in technology descriptions, deferred-task sections, and the verification command are
+intentional and do not authorize execution in Task 1.
+
+## Commit
+
+```text
+58e1f2b docs: plan PIT optimizer v5 architecture
+```
+
+The commit contains exactly the six requested design/plan files. Commit hooks passed: trailing
+whitespace, end-of-file, merge-conflict checks; Ruff and YAML checks were skipped because no
+applicable files were present.
+
+## Self-review
+
+- All six required paths exist and were committed.
+- All five plans point to the required V5 specification.
+- The roadmap and detailed plans preserve local-only artifacts, provider authorization gates,
+  `apply=false` discovery, and no qualification/full-replay during architecture implementation.
+- Working tree was clean after the commit (the report is created separately and is not part of the
+  six-file commit).
+
+## Concerns
+
+None. The second required search intentionally returns many contextual/deferred references; this
+is consistent with the brief's expected interpretation and does not indicate implicit live
+research authorization.
+
+## Review Fix
+
+The review identified one important gap: qualification did not carry or verify the authenticated
+friction/scenario-grid identity shared by baseline and candidate. The campaign plan was updated
+only in the directly affected qualification boundary:
+
+- `QualificationAttemptCommitmentV5` now carries `scenario_grid_ref`.
+- Qualification attempt construction requires the immutable authenticated scenario-grid reference
+  and fails closed unless it matches the attempt, baseline evidence, and candidate evidence.
+- Qualification assertions and outcome verification explicitly require the same shared
+  friction/scenario-grid identity, matching the confirmation comparison boundary.
+
+Focused check:
+
+```powershell
+$text=Get-Content -Raw 'docs/superpowers/plans/2026-09-04-pit-optimizer-v5-campaign.md'
+foreach ($needle in @('scenario_grid_ref','friction/scenario-grid identity','equal for the attempt, baseline, and candidate','same-panel V5 baseline evaluated under the exact shared authenticated')) { if ($text -notmatch [regex]::Escape($needle)) { throw "missing: $needle" } }
+```
+
+Result: `focused qualification consistency checks: PASS`.
+
+Fix commit:
+
+```text
+0707f4c docs: bind qualification scenario identity
+```
+
+Commit hooks passed the applicable whitespace, EOF, merge-conflict, Ruff/YAML gating checks
+(Ruff and YAML skipped because no applicable files were present). No tests, provider calls,
+Docker/replay, or external writes were performed.
+
+## Review Fix Round 2
+
+The second review found that the prior fix had placed `scenario_grid_ref` only on
+`ConfirmationAttemptCommitmentV5`, while qualification prose claimed the field existed there too.
+The minimal correction adds exactly one `scenario_grid_ref: ArtifactRefV5` field to
+`QualificationAttemptCommitmentV5`; the confirmation field remains intentional. Qualification
+construction/checklist/equality verification now consistently refers to that authenticated shared
+baseline/candidate friction scenario-grid identity.
+
+Focused read-only check:
+
+```powershell
+$text=Get-Content -Raw 'docs/superpowers/plans/2026-09-04-pit-optimizer-v5-campaign.md'
+$confirmation=[regex]::Match($text,'(?s)class ConfirmationAttemptCommitmentV5:.*?(?=\n@dataclass)').Value
+$qualification=[regex]::Match($text,'(?s)class QualificationAttemptCommitmentV5:.*?(?=\n@dataclass)').Value
+```
+
+Result: `round-2 focused qualification checks: PASS` — both commitment classes contain exactly one
+`scenario_grid_ref: ArtifactRefV5`, and qualification equality-verification prose is present.
+
+Round-2 fix commit:
+
+```text
+582dfca docs: bind qualification scenario grid
+```
+
+No tests, provider calls, Docker/replay, or external writes were performed.

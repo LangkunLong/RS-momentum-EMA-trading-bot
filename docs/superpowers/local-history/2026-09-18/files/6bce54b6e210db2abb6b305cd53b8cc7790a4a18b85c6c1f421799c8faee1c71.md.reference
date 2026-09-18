@@ -1,0 +1,152 @@
+# Task 4 Independent Review
+
+## Verdict
+
+**FAIL — 1 Critical, 3 Important, 0 Minor findings.**
+
+The implementation gets the schema, canonical serializer, inert-default checks, constructor/checkpoint
+ordering, and future publication wiring mostly right. It does not yet provide a truthful immutable digest
+of the behavior that can actually execute.
+
+## Findings
+
+### Critical — The policy digest can silently diverge from runtime behavior
+
+**Confidence: 10/10.**
+
+`PortfolioSimulator` builds and hashes the policy once at construction
+(`core/backtest_engine.py:1424-1427`), then later execution continues to read mutable policy inputs:
+
+- signal cadence reads `self.signal_every_n_days` at `core/backtest_engine.py:1677`;
+- position sizing reads `self.position_risk_pct` and `self.stop_loss_pct` at
+  `core/backtest_engine.py:2501-2510`;
+- stagnation and EMA exits read simulator attributes at `core/backtest_engine.py:2619-2634`;
+- CANSLIM scoring reads live `settings.CANSLIM_WEIGHT_*` globals in
+  `backtest.py:340-359`; and
+- scale-out execution reads live `settings.SCALE_OUT_TIERS` at
+  `core/backtest_engine.py:2604-2614`, while the policy merely snapshots that global at
+  `core/engine_policy.py:415-419`.
+
+None of those public simulator attributes or module settings is frozen, and the existing suite even
+uses post-construction mutation of `max_positions`/`enable_eviction`
+(`tests/test_backtest_engine.py:534-535`, `561-562`, `586-587`, `613`, `727`). `_result_config`
+publishes the stored object and stored digest without rebuilding from live state
+(`core/backtest_engine.py:2023-2024`). The PIT check likewise recomputes the hash of the stored snapshot,
+not of current effective inputs (`pit_baseline.py:1474-1482`).
+
+Consequently, a caller or later optimizer can change actual sizing, exits, cadence, capacity, gates, or
+global weights/tiers after construction and still receive the original policy SHA. The checkpoint
+fingerprint then binds the stale SHA (`core/backtest_engine.py:1239`), so the core attestation and resume
+guarantee can be false while all digest checks pass.
+
+Required fix: make execution consume an immutable captured policy state, or rebuild and compare a complete
+live policy before fingerprinting, execution, result creation, and publication. Hashing the already stored
+dict again is not sufficient.
+
+### Important — Active cadence, industry filtering, and M policy are outside the classified/digested surface
+
+**Confidence: 9/10.**
+
+The schema omits material active behavior despite the requirement that behavior-bearing fields be
+truthful, classified, sourced, and digest-bound:
+
+- `signal_every_n_days` changes which sessions can produce signals
+  (`core/backtest_engine.py:1677-1690`). It is present only as an unclassified raw result-config value
+  (`core/backtest_engine.py:1997`) and a legacy checkpoint-fingerprint field
+  (`core/backtest_engine.py:1225`); it is absent from `_SimulatorPolicy` and every policy helper
+  (`core/engine_policy.py:36-57`, `474-490`).
+- Normal provider-mode runs load an industry map (`core/backtest_engine.py:1588-1589`) and reject symbols
+  outside the ranked groups (`core/backtest_engine.py:2280-2287`). The active top-N and minimum-group-size
+  policies come from `config/settings.py:59-60` and are applied at
+  `core/industry_group.py:16-49`. Only top-N is copied to raw result config
+  (`core/backtest_engine.py:2022`); minimum size, whether the filter is active, its source/classification,
+  and both values in the effective-policy digest are missing.
+- `_market_policy_fields` records only the two constructor booleans
+  (`core/engine_policy.py:292-309`), but the M score and bullish result used by the engine come from
+  `evaluate_m` (`core/backtest_engine.py:698-705`), whose weights, bullish threshold, and rising lookback
+  are live settings (`core/canslim/m_market_direction.py:354-368`). Those active M policies are neither in
+  the effective policy nor truthfully exposed elsewhere in result config.
+
+The cadence raw field is truthful as far as its value goes, and its separate legacy fingerprint does
+protect resume from cadence changes. That still does not satisfy the required leaf wrapper or make cadence
+part of the canonical policy digest. Industry minimum-size/filter-mode and M evaluator settings have no
+equivalent protection. Runs with materially different entry selection can therefore share the same
+effective-policy SHA.
+
+Required fix: inventory all active engine behavior, at minimum cadence, industry-filter activation/top-N/
+minimum-size, and M evaluation settings, and add classified/source-bearing leaves whose values are the ones
+execution actually consumes.
+
+### Important — The new `min_c_a_growth` check breaks supported injected strategies and can misstate their scoring policy
+
+**Confidence: 10/10.**
+
+For any injected strategy, the constructor converts a missing `min_c_a_growth` attribute to `None`
+(`core/backtest_engine.py:1330-1334`). The compatibility validator accepts only a finite numeric default
+(`core/engine_policy.py:108-125`), so a custom strategy that never requested this inert
+`CanslimStrategy` field now fails before construction completes. This is not rejection of a non-default
+inert request; it is rejection because an unrelated custom strategy has no such request surface.
+
+That path is supported intentionally: `PortfolioSimulator` tracks injected strategies and binds their
+canonical engine-owned fields (`core/backtest_engine.py:1376-1407`), and the custom-strategy contract uses
+an object with only `evaluate_market`/`evaluate_symbol`
+(`tests/test_backtest_custom_strategy_contract.py:69-81`, instantiated at `120-125`). The change therefore
+adds a behavior regression beyond the task's allowed fail-closed rejection of explicit non-default inert
+arguments. Policy construction also unconditionally dereferences the same attribute
+(`core/engine_policy.py:465-469`).
+
+Even an injected strategy that happens to define the attribute is described as if it used the built-in
+metric selection and CANSLIM scoring: `_scoring_policy_fields` discards `simulator` and always emits the
+built-in settings (`core/engine_policy.py:232-289`), while the injected execution path obtains the row from
+`self.strategy.evaluate_symbol` (`core/backtest_engine.py:2307-2315`) and only re-applies the engine-owned
+entry contract afterward (`core/backtest_engine.py:2139-2229`).
+
+Required fix: apply the `min_c_a_growth` inert check only to the built-in `CanslimStrategy` policy surface
+(or otherwise preserve absent-field compatibility), and represent injected-strategy mode/identity so the
+policy does not claim built-in scoring behavior that did not produce the signal.
+
+### Important — The early-winner leaf does not describe the exits that actually remain active
+
+**Confidence: 10/10.**
+
+The policy says a `+20%` winner within 15 days gets a `hold_through_trading_day: 40`
+(`core/engine_policy.py:405-413`). Actual execution clears `eight_week_hold` at the start of day 40
+(`core/backtest_engine.py:2586-2598`), before that day's exit processing. More importantly, the flag does
+not create a general hold: the hard stop is always checked (`2600-2602`), and stagnation, protective-stop,
+and EMA exits remain active (`2619-2634`). Only tiered scale-outs are guarded by
+`not trade.eight_week_hold` (`2604-2618`).
+
+Thus the leaf overstates both the day-40 boundary and the scope of the hold. Because Task 4 must expose
+current behavior without changing strategy semantics, the policy should say precisely that the trigger
+suspends scale-out tiers while the flag is active, that the flag is cleared when `days_held >= 40`, and
+that the other listed exits remain active.
+
+## Verified task requirements
+
+- `PolicyClassification` has the four exact values, `_field` requires the enum, and canonical JSON rejects
+  NaN/non-JSON-safe values (`core/engine_policy.py:23-29`, `60-93`).
+- The requested entry thresholds, component weights, C/A settings, non-M composite, institutional
+  reweighting, market/regime booleans, capacity values, risk inputs, configured exit thresholds, and scale
+  tiers are present and correctly classified at snapshot time (`core/engine_policy.py:170-420`).
+- The risk target is algebraically `portfolio_equity * position_risk_pct / stop_loss_pct`
+  (`core/backtest_engine.py:2501-2510`); `position_size_pct` is reported unsupported, not effective
+  (`core/engine_policy.py:447-452`).
+- Inert validation rejects booleans, `None`, NaN/infinity, and non-default finite values with the required
+  absolute tolerance and source-bearing error (`core/engine_policy.py:96-125`). It is invoked before
+  `DataFetcher` construction (`core/backtest_engine.py:1322-1346`, `1375`).
+- Canonical digesting uses sorted compact UTF-8 JSON with `allow_nan=False`
+  (`core/engine_policy.py:60-66`, `494-497`). The digest exists by the end of construction
+  (`core/backtest_engine.py:1424-1427`) before the run creates a checkpoint fingerprint
+  (`core/backtest_engine.py:1483-1496`).
+- Result config contains the policy and digest (`core/backtest_engine.py:2023-2024`). On the only successful
+  manifest-publication path, `effective_policy` and `effective_policy_digest` are defined and verified
+  before summary writes (`pit_baseline.py:1474-1503`) and remain in scope for top-level manifest creation
+  (`pit_baseline.py:1524-1557`). `canslim_config` also retains both through `active_config`.
+- `core/engine_policy.py` does not import `core.backtest_engine`; the inspected import path does not create a
+  circular import. The exact Task 4 package changes only the three authorized production files and does not
+  rewrite a sealed Task 11 artifact.
+
+## Review constraints observed
+
+No tests, backtest, provider/network command, cache refresh, optimizer operation, or Git mutation was run.
+Production sources were inspected read-only; only this review artifact was written.

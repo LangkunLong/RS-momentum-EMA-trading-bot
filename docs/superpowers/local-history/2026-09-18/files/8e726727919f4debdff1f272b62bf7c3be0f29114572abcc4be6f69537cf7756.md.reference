@@ -1,0 +1,98 @@
+# B4b implementation checkpoint
+
+B4b is implemented locally for principal architect review. Only `core/pit_optimizer_v5/runtime.py` and `core/pit_optimizer_v5/artifacts.py` changed in production scope. B4c and the two-real-evaluated-round milestone remain pending.
+
+Architect decision needed: a pre-existing exact-duplicate incompatibility prevents that particular no-testable form from publishing a canonical record. `StructuralTemplateV5` requires a nonempty `changed_symbols` tuple (`candidate_ir.py:1153`); `_initial_candidate` requires `validation.changed_symbols == ()` for a rendered policy identical to the parent (`runtime.py:2094`); `ExperimentRecordV5._validate_post_validation_identity` instead requires those validation symbols to equal the template's nonempty tuple (`memory.py:469`). The production validator derives the actual source changes, so identical parent bytes yield the empty tuple. These requirements cannot all hold. The parent architect confirmed the limitation and ruled to retain fail-closed behavior rather than mutate validation evidence or edit the protected memory/schema. B4b completes the canonical untestable forms that satisfy existing invariants; exact-duplicate publication needs a separately authorized invariant correction. No affected candidate or record was fabricated to demonstrate this static finding.
+
+The existing linked worktree remains at `C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.worktrees/pit-optimizer-v5-architecture`, branch `codex/pit-optimizer-v5-architecture`. Its pre-existing staged/unstaged changes were preserved. Saved actual06 terminal evidence and the development status established no live campaign; no process/session was polled.
+
+> Correction: the preceding sentence saying that the parent architect confirmed the exact-duplicate limitation is inaccurate. The implementation controller made the fail-closed ruling from the prompt's protected-schema boundary; principal architect confirmation remains required at this checkpoint.
+
+## Changed symbols and behavior
+
+| File | Exact symbol | Change |
+| --- | --- | --- |
+| runtime.py | `_Runtime.run` | Requires the existing candidate batch to be nonempty and rejects any remaining `quick_ready`; keeps B4a's exact materialized/testable critic filtering. The critic-required branch preserves request creation, role completion, unavailable terminal authority, review order and critic persistence. The no-testable branch requires supported untestable carriers, no existing critic completion, and leaves critic/ref absent. Both reach one unchanged finalization/publication/cleanup sequence. |
+| artifacts.py | `LocalArtifactRepositoryV5._verify_finalized_discovery_rounds` | Loads the complete durable round with `load_round_events`, including B2 context validation; compares canonical event references/order to the supplied closure; requires nonempty exact record references, complete final cleanup and no primary terminal outcome. Binds manifest/intent, full accepted author template/hypothesis, accepted role positions, complete bounded assignment set/order and exact critic authority. |
+| artifacts.py | `LocalArtifactRepositoryV5._verify_finalized_role_requests` (new) | Authenticates persisted round request entries and requires their exact set to equal accepted completion request refs. An omitted/unindexed failed or pending critic invocation cannot be treated as absent. Only the existing runtime `_complete_role` persists these primary request entries; internal provider repair mechanisms remain unchanged. |
+| artifacts.py | `LocalArtifactRepositoryV5._verify_finalized_candidate_origin` (new) | Checks each assignment's exact rejection or rendered origin. Materialized invalid records bind to the rendered post-validation ID and real invalid/failed validation stage, then rederive their separate pre-validation-invalid record identity. Non-invalid records retain rendered identity/policy, stage refs and exact validation/semantic/quick/episode content bindings. |
+
+The only additional imports are the existing `derive_experiment_identity_v5` and `InvestigatorArtifactV5` types/helpers. AST comparison found no other changed existing function, removed function or new symbol.
+
+The verifier uses canonical assignment bytes rather than ordinary Python literal equality. Candidate-origin order must equal `bounded_variant_assignments_v5` at the accepted author's authenticated maximum, which must match `manifest.search.max_variants_per_template`. Canonically sorted record filenames are mapped back through those exact assignments before critic order is checked.
+
+Accepted investigator/author completions remain in positions 1/2. The complete chosen hypothesis must occur in the accepted investigator artifact and match the author input and intent. Any testable record requires position 3 and exactly its ordered testable IDs in both critic request and reviews; every testable record binds the accepted full critic and its exact review. Untestable records retain absent critic fields. Successful cleanup closes the complete event chain; only cleanup retry payloads may follow its first cleanup payload.
+
+B4a rendering/rejection helpers and screening/discovery routing, B3 factories/expected record construction/publication safeguards, B2/B3b repository checks, schemas, candidate IR, evaluator, provider/budget and data logic were preserved. Historical `no_testable_experiments` failure decoding remains in place.
+
+## Static lifecycle and authority review
+
+Every row below describes reviewed source behavior; new runtime and finalized branches were not executed.
+
+| Scenario | Lifecycle behavior | Authority/boundary |
+| --- | --- | --- |
+| Rejected-only nonempty batch | run leaves critic/ref absent; _expected_records and canonical factory publish real invalid records, checkpoint, then cleanup. | No materialization/evaluation/critic/source authority; finalized rejection remains exact B2/B3b authority. |
+| Mixed rejected and materialized/testable | Existing materialized/testable filter retains candidate order; accepted critic covers exactly testable IDs; common finalization retains every record. | Any required critic failure stays terminal; rejected IDs have no critic or downstream evidence. |
+| Materialized validation-invalid/failed | Rendered origin is authenticated under post-validation ID; validation result/ref matches actual stage; record uses rederived pre-validation-invalid ID. | Exact typed assignment and accepted template bridge identities; no invented render_rejected event. |
+| Duplicate/equivalent untestable batch | Behavioral-equivalent and sibling-equivalent records require corresponding semantic outcome; no critic if all untestable. Parent-identical exact duplicates reach the no-critic branch but fail canonical record construction because of the pre-existing changed-symbol conflict above. | Validation/semantic payloads stay exact. The finalized verifier also fails closed: it cannot accept a modified validation result to hide the conflict. Architect decision required for exact duplicates. |
+| Empty or quick_ready batch | run fails before critic/finalization. | No empty checkpoint and no testable status reclassified as untestable. |
+| Critic absent, failed, wrong position/order or IDs | Testable finalization requires accepted investigator/author/critic slots and exact request/review IDs in origin order. | Missing/failed completion, omitted durable event, or extra/unindexed round request is rejected. |
+| Missing/extra/conflicting origin or record | Bounded intended assignment tuple equals origin tuple; record assignments are unique and exactly cover it. | Typed canonical assignment bytes prevent bool/int/float equivalence; B2 fold/context rejects cross-form collisions and downstream rejection work. |
+| Wrong round/mode/parent/hypothesis/template/assignment | Manifest/intent/role bindings, full hypothesis and accepted template bytes, identity derivation, and bounded assignment authority must agree. | Supplied closure is compared to all durable events including canonical refs/order; terminal outcome cannot be hidden. |
+| Checkpoint committed before cleanup | _recover_projection adopts checkpoint-owned current-round records; run immediately returns _completed_result, which retries owned cleanup. | No paid role, rendering, record republish, or new-work deadline reset is needed. |
+| Valid prefix before checkpoint | Committed prior projection and scheduling prefix recover; accepted roles are loaded; B4a reuses exact rejection events; publication authenticates identical record writes. | Create-only _create_only_with_status refuses different existing bytes; records remain uncommitted until checkpoint. |
+| Cleanup retry | Complete existing cleanup is returned; incomplete cleanup recovers exact owned leases and uses existing cleanup-only timeout. | Completion wrapper still requires final complete cleanup and only cleanup payloads after cleanup starts. |
+| Cancellation/deadline | Existing _deadline gates new work; finalization/checkpoint keep their gates; operations passes remaining time based on persisted campaign/round starts. | Terminal/committed recovery reaches cleanup without new-work gates; no saved time or campaign limits refreshed. |
+| Historical terminal actual06 | Original runtime_failed rendering:stage_failed outcome takes terminal return/cleanup path before new author/rendering work. | No migration, restart, rejection event, candidate record or checkpoint was created. |
+| Lifecycle versus evaluated success/promotion | Reducer advances next_round_index and records novelty key for all records; source/archive admission remains evaluated/zero_trade only. | All-rejected lifecycle history supplies no champion; existing evaluated champion/confirmation/readiness requirements remain unchanged. |
+
+## Recovery call graph and invariant audit
+
+1. The operations campaign loop loads saved campaign/round start authority and computes the remaining campaign/round time. It passes the bounded deadline into `run_feedback_round_v5`; `_Runtime.__init__` takes the minimum. B4b neither constructs another runtime nor refreshes saved deadlines or limits.
+2. `_Runtime.run -> _recover_projection -> LocalArchiveReducerFactoryV5.recovery_reducer -> repository.recover_projection` loads only checkpoint-owned records and their required archive source authorities. Repository recovery may repair `archive.json` only to the exact already-committed checkpoint digest. `_adopt_completed_projection` verifies generation/reference agreement and adopts current-round records.
+3. With current-round records committed, `run -> _completed_result -> _cleanup` happens before parent selection and paid roles. Existing complete cleanup is reused; otherwise exact owned leases are recovered and only cleanup is retried. The existing cleanup-specific timeout permits cleanup after the new-work deadline.
+4. With no current-round records committed, `recover_scheduling -> _scheduling_history` restores the historical scheduling prefix. A primary terminal outcome takes the unchanged terminal return path. A nonterminal prefix retains all new-work cancellation/deadline gates, accepted invocation reuse in `_complete_role`, and exact author/rejection event reuse through B4a.
+5. Successful candidates take `finalization deadline -> _expected_records -> dependency record factory -> _require_exact_records -> _check_finished -> _publish -> _completed_result -> _cleanup` once. `_publish` calls create-only `append_experiment`, the publication reducer, and `publish_projection`. Existing identical record bytes are authenticated by `_create_only_with_status`; differing bytes cannot replace them. A prefix that wrote some records before its checkpoint can reuse those exact files.
+6. `CandidateArchiveReducerV5.apply` sets `next_round_index=max(current, record.round_index+1)` and retains each record's hypothesis novelty key. `LocalArchiveReducerFactoryV5._authorities`, runtime publication and archive transition still admit source authority only for evaluated/zero-trade records. The finalized champion consumer still requires a nonempty archive and an evaluated champion. No parent or fake candidate is inserted.
+
+No recovery production change was necessary: these existing mechanisms satisfy the concrete B4b checkpoint ownership, idempotence, terminal preservation and deadline invariants. The separate exact-duplicate constructor conflict above remains an architect decision. Reviewed source paths include `runtime.py` recovery, role, finalization and cleanup methods; `artifacts.py` create-only/publish/recover/load/fold interfaces; `production_runtime.py` reducer factory and scheduling history; `memory.py` fold/stage/record validators; `search.py` reducer/archive transition; and `operations.py` saved-deadline handoff. None of those runtime recovery/publishing methods was invoked during verification.
+
+## Executed read-only compatibility
+
+The permitted runtime-04 round-1 manifest, all 19 durable events/payloads and three accepted invocation packages were authenticated. Its record `records/9e2a2dfdf35ce55653a3b9ec0d39ce87740a69a940ad5f3e473fd38ea629390d.json` remains byte-canonical at SHA `af6c73e632a3dc47cb344ecf3d1a55f9f58ba3e755e29fe992e0c03d0da103ac`: status evaluated, round 1, four discovery episodes and accepted bound critic. All nine record evidence references were authenticated. The rendered policy/typed assignment, bounded assignment membership, actual validation stage, quick/episode payload contents and payload-reference set matched the record. The two real stage outcomes are `validation_valid` and `semantic_skipped_development`.
+
+Actual06's typed manifest, all five durable events/payloads, accepted investigator and accepted author packages were authenticated read-only. It remains `runtime_failed`, stage `rendering`, code `stage_failed`, with complete cleanup, no rejection event and no checkpoint. The accepted author template SHA remains `98445c0e22a90e95482d40a77706b77780d2dd1e8e097092a81f9363c020e9f7`; request SHA remains `09564719a54cfd10a0b6edbc5b61996e7a68015866f1e0b538859c542d158c0f`. Full hypothesis and author variant-limit bindings matched. No pure rendering call was needed in B4b; its previously approved B1 outcome is historical context, not a newly executed verification claim.
+
+No finalized campaign wrapper was constructed or passed to the verifier. No suitable real finalized campaign was exercised. These archived comparisons used existing immutable objects, not synthetic records/events, fixtures or new finalized helpers. Full manifest graph traversal was not repeated. Exact inspected manifest/event/role hashes and all comparison results are in `verification.json`.
+
+## Verification and hashes
+
+Scoped Ruff passed for both edited files. Python 3.13 `compile(bytes, path, 'exec')` passed in memory for both; no code object was executed. Final `git apply --reverse --check implementation.diff` passed with repository newline handling. Both exact-preimage `git diff --no-index --check` checks reported no whitespace errors (exit 1 denotes differences), with only existing LF/CRLF conversion advisories.
+
+The initial raw-line-ending diff check with forced `core.autocrlf=false` failed after patch-file newline normalization. The review diff was regenerated using repository Git newline handling and its final reverse check passed. Exact raw preimages are preserved separately and retain the principal-approved SHA values; the diff uses only repo-relative labels. No production rewrite was used to resolve that packaging issue.
+
+Evaluator source identity recomputed across all 56 covered files is unchanged: `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4`. Neither edited file belongs to that closure. Existing image remains `pit-optimizer-v5-evaluator@sha256:4e85b19aa8c135362ae8796e4d33a410ec5af650d296c358ae6a7737d5b05b6a`; no rebuild or resealing occurred.
+
+| Source/package | SHA-256 |
+| --- | --- |
+| runtime.py exact preimage | `097b5c1e67e2f4c2852a8033e1a3f30d14254f0e2d18b4a899589d555e61d1f3` |
+| artifacts.py exact preimage | `33a124043338d834fe3b60508b533c777df5c4fefbbdfb52ac812ab5eda0ca4f` |
+| core/pit_optimizer_v5/artifacts.py final | `2bab516e4945976d9bf6bb356934289cd14d9b87c25088521a043c8ac5cfa2c2` |
+| core/pit_optimizer_v5/candidate_ir.py final | `a437d9536fb57d48c7e9c9c6fab2f8a29ac9bea0666be61caeb2baf583b13f1b` |
+| core/pit_optimizer_v5/contracts.py final | `5ec3278af501f4abf285716bbd4d211fe5cd34c873e1644b63e3d43daa3de398` |
+| core/pit_optimizer_v5/memory.py final | `99e084eeff284d39a651e899e9562780e2581eb936ce7ff1f3f0542ed7b523aa` |
+| core/pit_optimizer_v5/operations.py final | `8164379a88d045c795ce3487683c5d5d911e56583d0555a01551e934cdea2bcc` |
+| core/pit_optimizer_v5/production_runtime.py final | `78da0dc5efcf5cf94541a465e0a3c212221c843dade07f680ddc5e1508fdc476` |
+| core/pit_optimizer_v5/provider.py final | `d9b17d62a6c8b485ba6ae6abb22a9e87f9d908b3c96409ba6e21f86eb691e937` |
+| core/pit_optimizer_v5/rendering.py final | `bd726b9a32ddaf675a9883aade2099747a8682ab6be5f36d465de77542e93464` |
+| core/pit_optimizer_v5/runtime.py final | `d834eae8e3e120355b4479c77f87ebe46519a0b82a52cc072abe1dab60943aec` |
+| core/pit_optimizer_v5/search.py final | `2f756453123ce834d03cf5fcd2eb57c82781fe228d77e7d4218b600c1b124e3c` |
+| implementation.diff | `3e4a3d09fa4e6e51111146e84bf8897cb3bae039650b9653aafbb42ee0249c4f` |
+
+All six protected source hashes named by B4a (candidate_ir, contracts, memory, production_runtime, provider, rendering) still match principal verification exactly. Search and operations hashes are additional final audit references; those files were read only.
+
+## Limits and next boundary
+
+New no-testable completion, record publication, cleanup/resume and finalized rejection/materialized-invalid branches remain statically reviewed only until a separately authorized real campaign. Exact-duplicate-with-nonempty-template-changes remains a known fail-closed incompatibility requiring an architect decision before that form can publish. Lifecycle completion does not count as an evaluated experiment or establish a promotable champion. Two real evaluated feedback rounds with critic/checkpoint/cleanup evidence remain required.
+
+B4c summary counts/labels, bounded rejection metrics in investigator requests and detailed feedback/history exposition were not changed. No tests were read, created, changed or run. No synthetic probes/events/records/fixtures/responses, model/API calls, credential reads, candidate evaluation, campaign launch/resume/poll, runtime evidence writes, evaluator rebuild, commits, pushes or deployment occurred. This checkpoint grants no additional call or campaign budget.

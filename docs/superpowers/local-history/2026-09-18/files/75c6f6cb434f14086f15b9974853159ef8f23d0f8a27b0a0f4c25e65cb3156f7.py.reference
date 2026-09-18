@@ -1,0 +1,71 @@
+"""Import actual acquired references into a labeled legacy S&P development export."""
+from pathlib import Path
+import csv
+import hashlib
+import heapq
+import json
+from core.pit_provenance import PIT_NON_TRADABLE_REFERENCE_SYMBOLS, pit_canonical_json, pit_canonical_json_sha256
+
+root = Path.cwd() / '.artifacts/pit-optimizer-v5'
+cache = root / 'data/acquisition/raw/local-cache/prices'
+refs = root / 'data/acquisition/raw/alpaca-references'
+output = root / 'development/data/sp500-v2'
+output.mkdir(parents=True, exist_ok=False)
+digest = lambda p: hashlib.file_digest(p.open('rb'), 'sha256').hexdigest()
+original = json.loads((cache / 'prices_provenance.json').read_text())
+acquired = json.loads((refs / 'acquisition.json').read_text())
+if digest(cache / 'prices.csv') != original['prices_sha256']:
+    raise ValueError('Legacy source hash mismatch')
+if digest(refs / 'references-cutoff.csv') != acquired['sha256_by_file']['references-cutoff.csv']:
+    raise ValueError('Reference source hash mismatch')
+with (refs / 'references-cutoff.csv').open(newline='') as f:
+    reference_rows = list(csv.DictReader(f))
+added = [row for row in reference_rows if row['ticker'] in {'IWM', 'QQQ'}]
+coverage_dates = {symbol: [] for symbol in PIT_NON_TRADABLE_REFERENCE_SYMBOLS}
+count = 0
+with (cache / 'prices.csv').open(newline='') as src, (output / 'prices.csv').open('x', newline='', encoding='utf-8') as dst:
+    reader = csv.DictReader(src)
+    writer = csv.DictWriter(dst, fieldnames=reader.fieldnames, lineterminator='\n')
+    writer.writeheader()
+    previous = None
+    for row in heapq.merge(reader, added, key=lambda r: (r['trade_date'], r['ticker'])):
+        key = row['trade_date'], row['ticker']
+        if previous is not None and key <= previous:
+            raise ValueError('Nonunique or unordered merged price rows')
+        previous = key
+        if row['ticker'] in coverage_dates:
+            coverage_dates[row['ticker']].append(row['trade_date'])
+        writer.writerow(row)
+        count += 1
+if len({tuple(days) for days in coverage_dates.values()}) != 1:
+    raise ValueError('Reference calendars differ')
+contracts = original['price_identity_request_contracts']
+for ticker in ('IWM', 'QQQ'):
+    contracts[ticker] = {'provider_symbol': ticker, 'identity_asof': acquired['identity_asof'], 'admitted_start': acquired['start_date'], 'admitted_end': acquired['end_date'], 'chain_id': 'reference_' + ticker.lower(), 'continuity_kind': 'non_tradable_reference', 'warmup_predecessor': None, 'factor_anchor': True}
+with (cache / 'pit_price_identity_map.csv').open(newline='') as src, (output / 'pit_price_identity_map.csv').open('x', newline='', encoding='utf-8') as dst:
+    reader = csv.DictReader(src)
+    writer = csv.DictWriter(dst, fieldnames=reader.fieldnames, lineterminator='\n')
+    writer.writeheader()
+    writer.writerows(reader)
+    for ticker in ('IWM', 'QQQ'):
+        identity = dict(contracts[ticker])
+        identity['factor_anchor'] = 1
+        identity['warmup_predecessor'] = ''
+        writer.writerow({'canonical_ticker': ticker, **identity, 'evidence_url': 'https://data.alpaca.markets/v2/stocks/bars'})
+original.update(prices_sha256=digest(output / 'prices.csv'), price_row_count=count,
+    price_identity_map_sha256=digest(output / 'pit_price_identity_map.csv'),
+    price_identity_request_contracts_sha256=pit_canonical_json_sha256(contracts),
+    non_tradable_reference_symbols_json=pit_canonical_json(list(PIT_NON_TRADABLE_REFERENCE_SYMBOLS)),
+    non_tradable_reference_symbols_sha256=pit_canonical_json_sha256(list(PIT_NON_TRADABLE_REFERENCE_SYMBOLS)),
+    reference_symbol_coverage={ticker: {'first_date': days[0], 'last_date': days[-1], 'session_count': len(days)} for ticker, days in coverage_dates.items()})
+original['development_adaptation'] = {
+    'original_prices_provenance_sha256': digest(cache / 'prices_provenance.json'),
+    'reference_acquisition_sha256': digest(refs / 'acquisition.json'),
+    'reference_prices_sha256': digest(refs / 'references-cutoff.csv'),
+    'operation': 'Preserve every original price row/identity; append acquired IWM/QQQ reference rows and their explicit non-tradable identities.',
+    'scope': 'provisional_sp500_development_only',
+    'limitations': ['Legacy S&P membership and identity mappings', 'Documented SEC fundamental mapping exclusions retained', 'Industry data unavailable', 'Not the final V5 three-universe bundle']}
+with (output / 'prices_provenance.json').open('x', encoding='utf-8', newline='\n') as f:
+    json.dump(original, f, sort_keys=True, indent=2)
+    f.write('\n')
+print(json.dumps({'output': str(output), 'price_rows': count, 'added_reference_rows': len(added), 'price_sha256': original['prices_sha256']}))

@@ -1,0 +1,14 @@
+# P1 narrow diff and hash report
+
+Frozen production diff:
+
+- Added `core/pit_optimizer_v5/campaign_admission.py` from a recorded absent preimage.
+- No existing production file was modified by P1.
+- Original review-freeze source SHA-256: `85c126d3380d31ee1e36af19090dc61d5a248b0d8667baeb251ad8e39e755ab5`; 16,229 bytes; 401 LF and zero CRLF sequences.
+- Final fix-round-1 source SHA-256: `7e15ed500121b4c85df7a838feab51750e1f476a3e5427b9d1a0b1f0f58a89d9`; 17,227 bytes; 437 LF and zero CRLF sequences.
+
+The narrow fix-round-1 diff adds the existing exact Decimal cost-sum helper, computes finite-USD per-envelope input/output components and call-count products inside explicit 50-digit `ROUND_CEILING` contexts, requires the request's fixed provider output cap, and replaces cap-minus-spend subtraction with a cap-versus-exact-sum comparison. No other source scope changed.
+
+Limitation: the exact 16,229-byte intermediate review-freeze preimage was not copied into the evidence directory before fix round 1. Its SHA-256, size, newline census, complete source as read by the independent reviewer, and the targeted correction description are preserved, but this package does not contain an independently diffable copy of those intermediate bytes. No unified fix diff is claimed. The original task preimage remains exact: `campaign_admission.py` was absent.
+
+The final new file is itself the complete exact postimage because the original preimage was absent. It contains only the three proposed immutable admission types, the four proposed public functions, and private validation/census/arithmetic helpers.

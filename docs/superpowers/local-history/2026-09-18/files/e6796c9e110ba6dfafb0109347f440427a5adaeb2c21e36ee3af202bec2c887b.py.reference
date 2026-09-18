@@ -1,0 +1,209 @@
+"""Create-only local provider campaign review package; never invoke a role or run a round.
+
+Execute only after independent review, refreshed actual baselines, and local preparation
+approval, in the SAME elevated environment intended for the eventual campaign run.
+Input JSON contract and limitations are documented in provider-preparation-helper-report.md.
+"""
+from __future__ import annotations
+
+import argparse
+from dataclasses import replace
+import hashlib
+import json
+import os
+from pathlib import Path
+import sys
+
+
+def io_path(path):
+    value = str(Path(path).absolute())
+    if os.name == "nt" and not value.startswith("\\\\?\\"):
+        value = "\\\\?\\UNC\\" + value[2:] if value.startswith("\\\\") else "\\\\?\\" + value
+    return Path(value)
+
+
+def load(path):
+    return json.loads(io_path(path).read_text(encoding="utf-8-sig"))
+
+
+def digest(path):
+    with io_path(path).open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input-file", required=True)
+    args = parser.parse_args()
+    cfg = load(args.input_file)
+    source = Path(cfg["source_root"]).resolve(strict=True)
+    if not source.is_absolute() or Path.cwd().resolve() != source:
+        raise ValueError("Run from the final applied source checkout")
+    sys.path.insert(0, str(source))
+    from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5, _decode_dataclass
+    from core.pit_optimizer_v5.contracts import (
+        ArtifactRefV5, ProviderCapabilitiesV5, SandboxProfileV5, canonical_json_bytes_v5,
+    )
+    from core.pit_optimizer_v5.development_preparation import (
+        capture_development_policy_v5, prepare_development_campaign_v5,
+    )
+    from core.pit_optimizer_v5.manifest import build_campaign_manifest_v5
+    from core.pit_optimizer_v5.operations import prepare_development_adapter_config_v5
+    from core.pit_optimizer_v5.production_runtime import LocalArchiveReducerFactoryV5, LocalRoleRequestFactoryV5
+    from core.pit_optimizer_v5.provider import prospective_role_usage_v5, wire_role_messages_v5, wire_role_schema_v5
+    from core.pit_optimizer_v5.runtime import FeedbackRoundInputV5, SearchProjectionV5
+    from core.pit_optimizer_v5.selection import select_parent_v5
+
+    if digest(cfg["proposal_path"]) != cfg["proposal_sha256"]:
+        raise ValueError("Proposal bytes differ from reviewed recommendation")
+    proposal = load(cfg["proposal_path"])
+    if proposal["external_calls_authorized"] is not False:
+        raise ValueError("Expected the non-authorizing reviewed proposal")
+    provider = _decode_dataclass(ProviderCapabilitiesV5, proposal["recommended_provider_capabilities"])
+    bounds = proposal["recommended_bounds"]
+    if (provider.maximum_usd is not None or provider.price_upper_bound is not None
+            or provider.automatic_retries or provider.schema_repair_calls
+            or bounds["rounds"] != 2 or bounds["hypotheses_per_round"] != 1
+            or bounds["variants_per_template"] != 1):
+        raise ValueError("Proposal differs from reviewed two-round audit-only scope")
+    profile = _decode_dataclass(SandboxProfileV5, load(cfg["sandbox_profile_path"]))
+    plan = load(cfg["baseline_plan_path"])
+    if profile.sha256 != plan["profile_sha256"] or profile.image_reference != plan["image_reference"]:
+        raise ValueError("New profile differs from actual baseline plan")
+    if profile.runtime_source_sha256 != cfg["expected_runtime_source_sha256"]:
+        raise ValueError("Profile does not bind the explicitly selected new runtime")
+    windows = plan["window_selection"]["windows"]
+    if [w["ordinal"] for w in windows] != [1, 2, 3, 4] or len(cfg["parent_run_directories"]) != 4:
+        raise ValueError("Require all four ordered refreshed real windows")
+    parents = []
+    contract_sha = None
+    for window, directory in zip(windows, cfg["parent_run_directories"], strict=True):
+        run = Path(directory).resolve(strict=True)
+        receipt = load(run / "verification-record.json")
+        cleanup = load(run / "cleanup-record.json")
+        if (receipt["sandbox_sha256"] != profile.sha256
+                or receipt["image_reference"] != profile.image_reference
+                or receipt["panel_sha256"] != window["panel_sha256"]
+                or receipt["episode_ordinal"] != window["ordinal"]
+                or receipt["scenario_ids"] != ["gross", "base", "stress"]
+                or not receipt["canonical_output_and_source_verified"]
+                or not cleanup["removed"] or cleanup["container_id"] != receipt["container_id"]
+                or digest(run / "output/panel-evaluation.json") != receipt["output_sha256"]):
+            raise ValueError("Refreshed actual parent verification/cleanup differs")
+        if contract_sha is not None and contract_sha != receipt["evaluator_contract_sha256"]:
+            raise ValueError("Refreshed parent evaluator contracts differ")
+        contract_sha = receipt["evaluator_contract_sha256"]
+        parents.append({"request_path": str(run / "request/panel-request.json"),
+                        "output_path": str(run / "output/panel-evaluation.json")})
+    root = Path(cfg["artifact_root"]).absolute()
+    if io_path(root).exists():
+        raise ValueError("New artifact root already exists; never resume preparation or reuse a journal")
+    quick_ref = ArtifactRefV5(**cfg["quick_panel_ref"])
+    assets = cfg["assets"]
+    if {a["target"] for a in assets} != {"data/pit_bundle.sqlite3", "data/prices_provenance.json", quick_ref.relative_path} or len(assets) != 3:
+        raise ValueError("Only data bundle/provenance and explicit quick panel may be copied")
+    for asset in assets:
+        ArtifactRefV5(asset["target"], asset["sha256"])
+        if digest(asset["source"]) != asset["sha256"]:
+            raise ValueError("Input asset digest differs")
+    if next(a["sha256"] for a in assets if a["target"] == quick_ref.relative_path) != quick_ref.sha256:
+        raise ValueError("Quick source differs from its explicit reference")
+    paths = cfg["operator_paths"]
+    expected_paths = {"source_root", "workspace_root", "data_root", "output_root", "control_root", "git_executable", "docker_executable"}
+    if set(paths) != expected_paths or Path(paths["source_root"]).resolve() != source:
+        raise ValueError("Exact provider-development local paths required; no response directory")
+    for field in ("workspace_root", "output_root", "control_root"):
+        if io_path(paths[field]).exists():
+            raise ValueError("Use fresh workspace/output/control roots")
+    io_path(root).mkdir(parents=True, exist_ok=False)
+
+    def save(name, value):
+        path = io_path(root / name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("xb") as handle:
+            handle.write(canonical_json_bytes_v5(value))
+
+    for asset in assets:
+        target = io_path(root / asset["target"])
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("xb") as handle:
+            handle.write(io_path(asset["source"]).read_bytes())
+        if digest(target) != asset["sha256"]:
+            raise ValueError("Copied asset differs from its preflight digest")
+    repository = LocalArtifactRepositoryV5(root)
+    campaign = cfg["campaign_id"]
+    inputs = dict(
+        source_root=str(source), source_commit=cfg["source_commit"], git_executable=paths["git_executable"],
+        campaign_id=campaign + "-baseline-seed", target_pct=cfg["target_pct"], quick_panel_ref=quick_ref,
+        parent_results=parents, output_prefix="preparation-seed", evaluator_contract_sha256=contract_sha,
+        sandbox_profile_sha256=profile.sha256, provider=None,
+        caps={"quick_timeout_seconds": bounds["quick_evaluation_timeout_seconds"],
+              "discovery_episode_timeout_seconds": bounds["discovery_evaluation_timeout_seconds"],
+              "round_wall_timeout_seconds": bounds["round_timeout_seconds"],
+              "campaign_wall_timeout_seconds": bounds["campaign_timeout_seconds"]},
+    )
+    save("seed-validation.json", prepare_development_campaign_v5(repository=repository, validate_only=True, **inputs))
+    seed = prepare_development_campaign_v5(repository=repository, **inputs)
+    snapshot, _ = capture_development_policy_v5(source_root=source, git_executable=Path(paths["git_executable"]), expected_source_commit=cfg["source_commit"])
+    manifest = seed.manifest
+    prefix = "campaigns/" + campaign
+    final = build_campaign_manifest_v5(
+        repository=repository, campaign_id=campaign, target=manifest.target, source_snapshot=snapshot,
+        execution_profile_ref=manifest.execution_profile_ref, evaluator_contract_ref=manifest.evaluator_contract_ref,
+        baseline_authority_ref=manifest.baseline_authority_ref, panel_plan_ref=manifest.panel_plan_ref,
+        sandbox_profile_ref=manifest.sandbox_profile_ref, policy_scope_path=prefix + "/policy-scope.json",
+        manifest_path=prefix + "/manifest.json", search=manifest.search, provider=provider,
+        resources=replace(manifest.resources, role_call_timeout_seconds=bounds["role_call_timeout_seconds"]),
+        pit_data_scope="development_sp500_v2", semantic_mode="disabled_development",
+    )
+    for field in ("workspace_root", "output_root", "control_root"):
+        io_path(paths[field]).mkdir(parents=True, exist_ok=False)
+    prepared = prepare_development_adapter_config_v5(
+        repository=repository, authenticated=final, output_path=prefix + "/adapter-config.json", **paths,
+    )
+    save("campaign-launch-input.json", prepared)
+    inputs = FeedbackRoundInputV5(final.manifest, final.panel_plan, final.evaluator_contract, final.baseline_authority, 1, prepared["owner_token_sha256"])
+    reducer = LocalArchiveReducerFactoryV5(repository).recovery_reducer(inputs)
+    # A fresh campaign has no history; do not launch, reserve a role, or create a round start.
+    if repository.load_checkpoint() is not None:
+        raise ValueError("New preparation unexpectedly has a checkpoint")
+    projection = SearchProjectionV5(None, reducer.initial(), ())
+    parent = select_parent_v5(state=projection.state, baseline=inputs.baseline, discovery_plan=inputs.panel_plan,
+                              evaluator_contract=inputs.evaluator_contract, stored_records=())
+    request = LocalRoleRequestFactoryV5(repository=repository, manifest=final.manifest).investigator_request(inputs, projection, parent)
+    input_bound, cost_bound = prospective_role_usage_v5(request, provider)
+    if input_bound + request.max_output_tokens > provider.maximum_total_tokens:
+        raise ValueError("Initial outbound request exceeds the proposed token ceiling")
+    save("initial-role-request.json", request.to_primitive())
+    save("initial-response-schema.json", json.loads(request.schema_authority.canonical_schema_json))
+    wire_schema = wire_role_schema_v5(json.loads(request.schema_authority.canonical_schema_json))
+    save("initial-wire-response-schema.json", wire_schema)
+    wire = {"model": provider.model, "messages": wire_role_messages_v5(request.messages),
+            "response_format": {"type": "json_schema", "json_schema": {"name": "pit_optimizer_v5_role", "strict": True,
+                                "schema": wire_schema}},
+            "stream": False, "max_tokens": request.max_output_tokens,
+            "provider": {"require_parameters": True}, "reasoning": {"exclude": True}}
+    save("initial-outbound-body.json", wire)
+    save("review-disclosure.json", {
+        "external_calls_authorized": False, "provider_calls": 0, "manifest_ref": final.manifest_ref,
+        "request_sha256": request.sha256,
+        "initial_body_sha256": digest(root / "initial-outbound-body.json"),
+        "response_schema_sha256": request.schema_authority.sha256,
+        "wire_response_schema_sha256": digest(root / "initial-wire-response-schema.json"),
+        "input_token_upper_bound": input_bound,
+        "output_token_upper_bound": request.max_output_tokens, "cost_upper_bound_usd": cost_bound,
+        "remaining_token_capacity_after_initial_reservation": provider.maximum_total_tokens - input_bound - request.max_output_tokens,
+        "capabilities": provider, "resources": final.manifest.resources,
+        "destination": "https://openrouter.ai/api/v1/chat/completions",
+        "routing": "compatible upstream selected by OpenRouter; upstream and upstream fallbacks not explicitly pinned",
+        "later_packets": "Actual author/critic/later investigator packets depend on real preceding outputs. Existing typed factories and ledger reserve each actual serialized request within cumulative caps. No future exact packet is invented here.",
+        "outgoing_scope": "Aggregate evaluation/archive/history/predictions/typed failures; selected editable policy source and contracts to author, possibly all four policy files for cross-policy work. No full repository, raw dataset, credentials or environment.",
+        "transport_metadata": "SDK supplies JSON encoding and authorization. X-Session-Id binds campaign ID and request hash prefix. Runtime HTTP timeout is bounded by remaining original role deadline; no SDK retries. Body file is canonical review encoding of request values, not a claim about SDK whitespace bytes.",
+        "seed_manifest": "Provider-free baseline-import seed only; no config, owner, launch, ledger invocation or packet is bound to it.",
+        "environment_requirement": "Run eventual campaign in the same elevated environment as this preparation; environment differences change authenticated host identities. Do not refresh starts or reuse a previous campaign journal.",
+    })
+    print(json.dumps({"status": "prepared_for_review", "artifact_root": str(root), "provider_calls": 0}))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,205 @@
+# Task 2 report — V5 campaign and resource manifests
+
+## Preflight and scope
+
+- Worktree: `C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.worktrees\pit-optimizer-v5-architecture`
+- Branch: `codex/pit-optimizer-v5-architecture`
+- Exact starting HEAD: `6ab4a908f72f3a2d1bddc0a1c7afa8a09ea7db12`
+- The starting source tree was clean. The controller later updated the campaign ledger with the two
+  binding Task 2 rulings; that ledger change was not implemented, staged, or committed by Task 2.
+- No file beneath `tests/` was created, modified, read, or run. No provider, network, Docker,
+  evaluation, Git materialization, stage opening, replay, push, or merge occurred.
+- Focused source commit: `3aa0c7d` (`feat: add optimizer v5 campaign manifests`).
+
+## Implementation
+
+### Manifest composition and verification
+
+- Added `core/pit_optimizer_v5/manifest.py` without redefining the accepted
+  `CampaignManifestV5`, `SearchCapabilitiesV5`, `ProviderCapabilitiesV5`, or
+  `ResourceCapabilitiesV5` contracts.
+- Added `PolicySourceSnapshotV5` and `PolicyScopeDescriptorV5`. The policy-scope descriptor binds:
+  the exact clean source commit; the exact ordered four editable policy paths and byte digests; the
+  accepted baseline policy revision child reference; and the manifest's full-source-escape bit.
+- Preserved the Task 1 baseline identity ruling. `CampaignManifestV5.baseline_policy_revision_ref`
+  remains exactly equal to `BaselineParentAuthorityV5.policy_revision_ref`, and the create-only
+  baseline descriptor is the existing `PolicyRevisionIdentityV5` value at that exact path. No
+  wrapper or parallel baseline contract was introduced.
+- Added explicit clean-source capture from an absolute source root and absolute Git executable.
+  The implementation requires the declared commit to equal `HEAD`, requires a completely clean
+  worktree, and hashes bytes read from that exact commit for the fixed editable paths. No PATH,
+  current-directory, environment, or hard-coded repository path supplies source authority.
+- `build_campaign_manifest_v5` authenticates each supplied root before typed loading, authenticates
+  the typed raw PIT bundle and price-provenance edges through the panel plan, verifies all raw panel
+  owners, validates all precomposition bindings, performs create-only descriptor/manifest writes,
+  and then reauthenticates the complete resulting graph before returning.
+- `authenticate_campaign_manifest_v5` calls the complete graph verifier before typed authority
+  construction. It then binds exact target, panel, raw data, evaluator, execution, sandbox,
+  baseline campaign, baseline source bundle, baseline policy, policy scope, source commit, and
+  resource identities. It also requires `apply=false`, `qualification_allowed=false`, and
+  `full_replay_allowed=false`.
+- Baseline evidence is revalidated against the exact discovery plan/evaluator via the existing
+  baseline parent authority path. Evaluator execution/sandbox/data/source identities and baseline
+  policy/source identities must match the corresponding exact authenticated values.
+- Sandbox resources must exactly equal manifest resources. Existing fixed sandbox invariants keep
+  networking absent, root/source/data mounts read-only, output bounded write-only, and the image and
+  runtime digest-pinned. No legacy two-hour timeout floor was added.
+- Provider-free composition stores `provider=None`. Provider-authorized composition requires model,
+  call, total-token, and per-role output-token caps together. `maximum_usd=None` remains an unlimited
+  USD ceiling only and does not remove call or token caps.
+
+### CLI and exports
+
+- Added closed `build-manifest`, `verify-manifest`, and `render-command` parsers and dispatch. Every
+  artifact dependency uses an explicit canonical relative path plus SHA-256 under one explicit
+  absolute artifact root. Source root, Git executable, and source commit are explicit build inputs.
+- Capability values are explicit manifest inputs with the accepted contract defaults: two parallel
+  evaluations; one CPU; 1 GiB; 64 MiB output; 60-second mechanics; 180-second quick and role-call;
+  600-second discovery episode; 30-minute round; five-hour campaign; and 60-second cleanup.
+- `verify-manifest` and `render-command` authenticate the complete dependency graph before producing
+  output. Their output is a canonical, content-free projection.
+- Per the controller's binding interface ruling, `render-command` does not emit or imply a runnable
+  production `run` command. It renders the authenticated target/search/provider/resource/source
+  authorization with `adapter_composition="pending"` and `executable=false`. A later fixture or
+  production composition task must bind an explicit adapter authority; Task 2 does not invent
+  adapter arguments or widen the accepted manifest.
+- Exported the new Task 2 value types and functions from `core.pit_optimizer_v5/__init__.py`.
+- The existing generic canonical dataclass artifact codec already decodes the new descriptor and
+  discovers its exact `ArtifactRefV5` child. No duplicate codec or artifact-reference grammar was
+  added, and no artifact codec source change was necessary.
+
+## Direct checks and observed output
+
+1. Bounded synthetic in-memory authority round trip, executed from the temporary non-test script
+   `task-2-synthetic.py` and removed after verification:
+
+   `synthetic-task2: targets=10.00,20.00,50.00 provider-free=yes usd-none-preserves-call-token-caps=yes graph-before-parse=yes missing-relocated-mismatch=rejected resources=exact render=manifest-bound-adapter-pending`
+
+   The fake used exact typed raw PIT/provenance authorities, raw panel owners, baseline/evaluator/
+   execution/sandbox/source authorities, and create-only descriptor behavior. It proved all three
+   exact targets round-trip without consulting a production target; provider-free manifests carry
+   no provider authority; `maximum_usd=None` preserves call/token caps; a sandbox/resource mismatch
+   fails before output creation; and missing, relocated, or digest-mismatched dependencies fail at
+   graph verification without invoking typed loads.
+
+2. Static/import verification:
+
+   - `python -B -m compileall -q core/pit_optimizer_v5` — exit 0, no output.
+   - `python -B -c "import core.pit_optimizer_v5; import core.pit_optimizer_v5.manifest; import core.pit_optimizer_v5.cli"` — exit 0, no output.
+   - `python -B -m ruff check core/pit_optimizer_v5/manifest.py core/pit_optimizer_v5/cli.py core/pit_optimizer_v5/__init__.py` — `All checks passed!`
+   - `python -B -m ruff format --check core/pit_optimizer_v5/manifest.py core/pit_optimizer_v5/cli.py core/pit_optimizer_v5/__init__.py` — `3 files already formatted`.
+   - `git diff --check` — exit 0; Git emitted only existing LF-to-CRLF checkout notices, including
+     the controller-owned ledger change.
+
+3. CLI ownership:
+
+   - `python -B -m core.pit_optimizer_v5.cli build-manifest --help`
+   - `python -B -m core.pit_optimizer_v5.cli verify-manifest --help`
+   - `python -B -m core.pit_optimizer_v5.cli render-command --help`
+
+   All three parsers loaded and exited zero. Build exposes explicit canonical artifact references,
+   source authority, search/provider/resource values, and create-only output paths. Verify/render
+   expose only the artifact root and exact manifest path/digest locator.
+
+4. Coupling scan:
+
+   `rg -n "AnnualizedReturnTarget\.production|os\.environ|getenv|7200|OPENROUTER_API_KEY|subprocess\.run" core/pit_optimizer_v5/manifest.py`
+
+   The only match is the intentionally explicit `subprocess.run` boundary used with the required
+   absolute Git executable/source root to authenticate the clean source commit. There is no
+   production-target lookup, environment dependency, provider secret, or legacy 7,200-second floor.
+
+## Source-only authenticated-bundle blocker
+
+This worktree still does not contain the authenticated schema-V3 three-universe PIT bundle and its
+matching authenticated price-identity provenance. Consequently Task 2 did not build or emit a real
+campaign manifest, inspect or reuse parent/main-worktree artifacts, run a real evaluation, or
+exercise provider/Docker/production adapter composition. The source implementation and bounded
+synthetic authority checks are complete; actual local manifest emission must wait for that exact
+bundle and separate later-task authority.
+
+## Concerns
+
+- The real filesystem repository graph and clean-Git snapshot boundary have not been exercised
+  against the unavailable campaign bundle. Their source paths are fail-closed, but real artifact
+  lifecycle evidence remains pending.
+- Actual bundle/panel capacity and complete causal history remain unobserved, as recorded by Task 1.
+- The accepted manifest has no production adapter-config reference. The controller ruled that Task
+  2 rendering must therefore stay an authorization/readiness projection with adapter composition
+  explicitly pending. It must not be treated as executable until a later task authenticates a
+  concrete fixture or production adapter authority.
+
+## Fix round 1 — pre-parse graph authentication and Git environment isolation
+
+Focused source commit: `9b99c12324f41237ac0b4e42fe756f6ab8999372`
+
+### Review findings addressed
+
+1. Build now performs an explicit complete dependency-authentication phase before its first typed
+   load. It authenticates the execution, evaluator, baseline, panel-plan, and sandbox root bytes;
+   reads only their already-authenticated canonical primitives to route references; authenticates
+   the PIT bundle, prices provenance, and every mechanics/quick/discovery panel as typed raw edges;
+   and authenticates the baseline source bundle and any existing baseline policy descriptor. The
+   evaluator/execution/sandbox leaves must not contain undeclared child references, and the panel
+   and baseline child sets must exactly equal the authenticated primitive's named references.
+
+   The only permitted absent edge is the exact `policy_revision_ref` named by the authenticated
+   baseline authority, because `build-manifest` owns that create-only descriptor write. An absent
+   baseline source, panel/data edge, or any relocated/digest-mismatched child fails before a typed
+   authority or panel is constructed and before any output write. After typed construction, the
+   baseline's decoded policy reference must equal the preauthenticated create-only edge; an
+   existing descriptor is decoded and must equal the inline baseline policy before composition.
+   The policy-scope artifact remains a build output and is created only after this input graph and
+   all cross-artifact bindings succeed.
+
+2. Clean-source capture no longer passes inherited Git settings. It removes every ambient variable
+   whose name begins with `GIT_`, then installs a closed environment that disables system/global
+   config and attributes, replace-object rewriting, and optional locks. This covers repository and
+   worktree selectors including `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR`, `GIT_CONFIG`,
+   `GIT_CONFIG_PARAMETERS`, ceiling/discovery overrides, index/object/alternate-object paths, and
+   executable-path overrides.
+
+   Every Git subprocess uses the explicit absolute executable, `-C` with the explicit source root,
+   an explicit `cwd`, `shell=False`, and the sanitized environment. Before HEAD, status, or source
+   blob reads, the implementation requires the supplied source root to be its canonical resolved
+   path, requires Git's absolute `--show-toplevel` result to resolve exactly to that root, and
+   requires `--is-inside-work-tree` to return true. A redirected worktree therefore fails before
+   source bytes are accepted.
+
+### Direct synthetic evidence
+
+A bounded disposable non-test script used authenticated in-memory root primitives and raw edges,
+then replaced the baseline source child with independent missing and digest-mismatch failures. Its
+typed loader and all write/panel-parse methods were assertion bombs. Both failures propagated with
+the typed-load counter still zero.
+
+The same script mocked the Git process boundary, populated a hostile environment with repository,
+worktree, common-dir, config, index, object, alternate-object, ceiling, discovery, and executable
+overrides, and asserted that none reached the subprocess. It completed a source snapshot using only
+mocked exact-root responses, then independently returned a different existing top-level and proved
+the capture failed before HEAD/status/show.
+
+Observed output:
+
+`synthetic-task2-fix1: transitive-missing-mismatch=pre-parse-rejected typed-loads=0 git-env=sanitized resolved-worktree=exact hostile-redirection=rejected`
+
+No real Git command, materialization, provider, network, Docker, data evaluation, replay, or test
+file was used by this check. The disposable script was removed after the final run.
+
+### Fix verification
+
+- `python -B -m compileall -q core/pit_optimizer_v5` — exit 0, no output.
+- `python -B -c "import core.pit_optimizer_v5; import core.pit_optimizer_v5.manifest; import core.pit_optimizer_v5.cli"` — exit 0, no output.
+- `python -B -m ruff check core/pit_optimizer_v5/manifest.py core/pit_optimizer_v5/cli.py core/pit_optimizer_v5/__init__.py` — `All checks passed!`.
+- `python -B -m ruff format --check core/pit_optimizer_v5/manifest.py core/pit_optimizer_v5/cli.py core/pit_optimizer_v5/__init__.py` — `3 files already formatted`.
+- `python -B -m core.pit_optimizer_v5.cli build-manifest --help`, `verify-manifest --help`, and
+  `render-command --help` — all exited zero.
+- `git diff --check` — exit 0 with only the worktree's LF-to-CRLF checkout notice.
+
+### Remaining blocker and concerns
+
+The authenticated schema-V3 three-universe PIT bundle and matching price-identity provenance remain
+unavailable in this worktree, so no real manifest was emitted and the real filesystem graph was not
+opened. The existing adapter-composition concern is unchanged: Task 2 rendering remains explicitly
+pending/non-executable until a later task supplies authenticated adapter authority. No source beyond
+this focused Task 2 fix was changed.

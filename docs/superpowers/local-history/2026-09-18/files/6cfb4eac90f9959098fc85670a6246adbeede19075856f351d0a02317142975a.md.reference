@@ -1,0 +1,62 @@
+# Task 3 implementation report
+
+Status: source implementation and bounded provider-free verification complete. Task 4 was not started.
+
+Source-only commit: `9f68679d8ea407667dbcc536bfcbeb5dcd17278a` — `feat: prove optimizer v5 provider-free loop` (seven source files). Commit hooks were disabled only for this invocation to honor the explicit no-tests instruction; authorized direct/static checks had already passed. The remaining tracked worktree change is the controller-owned progress ledger.
+
+Base: `812c59e2303b206f8e1bdd55d3aa8f6c510ee6d8`, branch `codex/pit-optimizer-v5-architecture`.
+
+## Scope and authority
+
+Read the Task 3 brief and campaign rulings before implementation. Honored the user override: no tests were read, created, modified, or run. No real `.artifacts` directory was created or inspected; no main/parent artifacts, market rows, Docker, Git materialization, network, provider, replay, push, or merge were used. All evaluation and workspace ownership were synthetic. Only the assigned worktree was changed. The controller-owned progress ledger is excluded from the source commit.
+
+The checked-in V3 entry module contains no editable entry constant. The controller accepted and recorded a ruling to use an explicitly declared synthetic V3-contract baseline containing `FIXTURE_ENTRY_THRESHOLD = 0`. Fixture composition rejects a missing/noninteger/nonzero baseline constant. It never adds a constant to production source. The direct authority check built the synthetic source bundle in memory from the V3 source bytes plus that declared fixture constant and verified the original four policy files remained byte-identical.
+
+## Implementation
+
+- Added `fixture_runtime.py`: fixed deterministic investigator, author, and critic content; recoverable fixture invoker; synthetic candidate/evaluator and lease cleanup; authenticated fixture composition; two-round campaign orchestration; read-only synthetic-history verification.
+- Reused the existing `FixtureRoleRunnerV5` and strict role parsers/evidence-ID binding. Added a closed built-in campaign-fixture mode, exclusive of static response slots. No arbitrary callback, raw CompletionProvider, provider credential, or external adapter is accepted. Each runner exposes at most one primary slot per role; extra slots fail closed.
+- Adapted the role runner to the existing `RecoverableRoleInvokerV5` boundary. Durable requests, terminal fixture authorities, role completion events, critic artifacts, experiment records, archive projection, and checkpoint publication use the normal runtime and repository paths. Reconciliation is deterministic and provider-free.
+- The normal request factory now supports provider-free manifests with a bounded local output-schema budget. Paid output ceilings remain manifest-owned. The original investigator memory projection reconstructs the previous critic explanation and next direction from persisted evidence.
+- Fixture candidate operations render the author's declared axis through `render_variants`, derive changed symbols from the actual parent/rendered bundles, bind mechanics/quick/all discovery episodes to exact serialized panel specs, produce fixed-suite typed semantic observations, and evaluate synthetic scenario reports. All source bundles remain immutable; synthetic leases are owned and cleaned through the normal cleanup protocol.
+- Added `run-fixture --artifact-root ABSOLUTE_ROOT --manifest-path RELATIVE_PATH --manifest-sha256 DIGEST`. The actual CLI authenticates the full campaign manifest graph before composing a fixture. It accepts no adapter configuration or hidden arguments and rejects a provider-enabled or insufficient-capacity manifest. Read-only `summarize` and `verify-run` recognize authenticated provider-free history without requiring production adapter configuration.
+- Summaries contain execution-profile identity, target, round/checkpoint counts, unique behavioral fingerprints, archive-family count, best synthetic campaign CAGR/target gap, closed typed runtime failures, external calls/tokens/cost, synthetic source-bundle integrity, cleanup, and qualification/replay state. Candidate source and raw role content are never emitted. `evaluation_mode` explicitly identifies synthetic fixture evidence. Production source cleanliness stays unknown when no source authority can establish it.
+- Tightened fixture terminal validation to require the entire zero-usage fact record, and the runtime rejects fixture/paid terminal-authority mode mismatches both on new completion and recovery.
+
+## Direct bounded verification
+
+Used an uncommitted direct Python orchestration script under the task's `.superpowers/sdd` directory. It uses no test framework. Scratch repositories were isolated local synthetic directories, never real campaign artifacts.
+
+The first round passed all checks:
+
+- Three investigator hypotheses with exact ranks and issued evidence IDs.
+- Author declared the three literal integer values 1, 2, and 3 for one entry axis.
+- Normal rendering produced three distinct variants with exactly those assignments.
+- Three mechanics/changed-symbol validations and three distinct fixed-suite semantic fingerprints.
+- All three variants completed the base-cost quick screen.
+- All three selected survivors completed discovery ordinals 1–4, each under gross/base/stress: 36 discovery scenario operations, plus three quick operations.
+- Three fake workspace leases were cleaned, leaving no active fake resources.
+
+Reopened the same local repository and reconstructed all runtime dependencies for round two. The normal checkpoint/reducer restored prior records and the second investigator request contained the exact first critic explanation and exact next campaign direction. The second round also completed three mechanics validations, three quick evaluations, and 36 discovery scenario operations, with complete cleanup. Both checkpoint generations were published by the normal runtime.
+
+Final content-free evidence: two rounds, two checkpoint generations, six evaluated experiments, five unique behavioral fingerprints across the campaign, one archive family, 0 external calls, 0 total tokens, USD 0, source unchanged, cleanup complete, qualification not started, replay not started. The two rounds each contain three distinct sibling variants; one semantic setting repeats across rounds, so the global unique-fingerprint count is correctly five rather than six. The displayed 9.019343% best CAGR and 0.980657 target gap are synthetic outputs, not market performance evidence.
+
+The real command dispatcher also completed the two-round run and then `summarize` and `verify-run` with direct synthetic authority loaders at the authentication boundary. All three emitted only the expected content-free summary. This verifies command composition while respecting the unavailable V5 bundle. It does not claim that a real full graph was available or that a production fixture manifest was emitted. Normal CLI graph authentication remains in source and fails closed before composition; no replacement authority loader is part of production code.
+
+Negative direct checks rejected a provider-enabled fixture manifest, insufficient variant capacity, a foreign role binding, an extra dynamic fixture role slot, and hidden CLI adapter arguments. Original V3 source bytes were checked after the loop. Scratch persistence and fake resources are separate: real local scratch directories are removed after verification; fake cleanup is proved by the runtime lease accounting.
+
+## Static verification
+
+- Ruff check: all V5 source modules passed.
+- Ruff format check: all seven changed V5 source files passed.
+- Compiled and imported all 30 V5 Python modules with `python -B` and in-memory `compile`; no test discovery and no bytecode output.
+- Root CLI help and `run-fixture --help` passed; only artifact root and authenticated manifest reference arguments are exposed for the fixture command.
+- `git diff --check` passed. Only expected Windows line-ending notices were emitted.
+
+## Limits and operational notes
+
+The authenticated three-universe V5 bundle remains unavailable. No real manifest/panel artifact emission, market evaluation, later-stage eligibility, qualification opening, or replay was attempted. Fixture evidence is explicitly synthetic; it proves controller mechanics and feedback persistence, not policy performance.
+
+Windows Python temporary-directory ACL behavior rejected two initially created empty directories, and deeply nested scratch paths exceeded the platform's practical path limit. Subsequent direct checks used short, shell-created worktree-local scratch paths. These were verification-environment limitations; no production filesystem/authentication guard was weakened. The detailed direct script is uncommitted campaign working material, and the focused commit contains source changes only.
+
+Cleanup confirmation: all synthetic scratch repositories were removed after exact worktree-boundary checks. The two empty ACL-restricted directory attempts were removed through narrowly scoped, automatically approved elevation. Final read-only enumeration reported zero synthetic scratch directories remaining. No user data or real campaign artifacts were removed.

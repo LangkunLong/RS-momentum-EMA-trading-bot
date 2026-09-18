@@ -1,0 +1,15 @@
+# P2 fix round 1
+
+Independent review of the exact first freeze identified five important admission gaps. The retained authority is `review-freeze-01/authority.json`, and `review-freeze-01/actual-task.diff` is the reviewed original diff.
+
+The bounded correction makes these changes:
+
+1. The enrolled ledger branch requires the incoming slot attempt kind/index to equal the exact persisted primary call before invoking the shared guard or constructing a new reservation.
+2. A new current role requires every earlier current package to be accepted. The same condition applies to a later unjournaled recovery tail, while exact replay of the completed failed role can remain read-only.
+3. A prior round may continue through the committed-record completed path or the sole `no_novel_hypothesis` outcome path. Failure, critic-unavailable, and novelty-exhausted outcomes stop admission, and an outcome has failure precedence when conflicting records exist.
+4. A missing, corrupt, or incompatible referenced round config propagates authentication failure. It is never treated as proof that a record is foreign, and no repair is attempted.
+5. Immutable authority/prefix facts remain clock-free. After those facts and the boundary decision, the live wrapper validates its supplied timestamp and reads fresh real wall time for the final deadline check immediately before returning. The ledger's original `lease_started` capture and invocation claim remain unchanged.
+
+The narrow diff is `fix-round-1.diff`, SHA-256 `053f3fcc07c49503d9d080574987a8786f79a808ebfcc6f15f957509157bc7a7`, 4,917 bytes. Its source changes are 25 additions/14 deletions in `campaign_admission.py`, two additions in `production_provider.py`, and zero bytes in `production_runtime.py`.
+
+Scoped Ruff, in-memory compile, and focused AST/protected-definition checks passed. No test or operational reader was run. Updated frozen hashes and the full principal-preimage diff authority are recorded in `source-freeze.md`.

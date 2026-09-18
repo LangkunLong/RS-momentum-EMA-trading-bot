@@ -1,0 +1,13 @@
+# H1 fix 1 independent re-review
+
+Original P2: **ADDRESSED**. H1 spec: **PASS** within the previously reviewed scope. Quality: **approved**. No new findings in the fix diff.
+
+Reviewed `fix.diff`, the matching changed source, the appended task report and `fix-verification.json`. This review is restricted to the original operational-workspace-lease exposure and new breakage introduced by its fix.
+
+`_HistoricalWorkspaceResourceV5` (`historical_verification.py:62–104`) is now a frozen, slotted data record containing only the validated resource payload/reference, string identities/path and lifecycle. It has no runtime lease, live adapter, opaque handle or owned-lease conversion method. `HistoricalRoundAuthorityV5.workspace_history` and its exact-type validation now require this projection rather than `WorkspaceLeaseStateV5` (lines 124 and 153).
+
+The projection helper (lines 180–200) consumes the authenticated lease locally and copies only data fields. The runtime lease and state do not escape through the returned result. The existing mandatory `authenticate_lease_history` call remains in place. Pairing the original events and payloads with strict zip preserves the payload reference associated with each authenticated workspace, while retaining the original workspace filter and ordering (lines 395–402). The source-identity comparison uses the renamed projected field with the same authenticated digest (line 403). Empty workspace/execution histories remain possible under the unchanged H1 conditions.
+
+No added state reads, repair paths, mutation methods, provider composition or operational entry points appear in the fix. The supplied fix evidence reports Ruff, in-memory compilation and both real runtime-04 authentications passed, retaining one workspace and five execution bindings per round with source linkage. Its recorded final source SHA-256 is `1833ae0f443d5cb4d55cc1c05110e4f0d957f52afd540d480689a7b7967d0ba0`.
+
+I did not rerun checks or authentication, read/run/create tests, create synthetic data, modify production source, use external actions or delegate. Prior evidence limitations remain; this approval does not establish H2/H3 completion or operational readiness.

@@ -1,0 +1,341 @@
+### Task 6: Extend Provider Budgeting and Audit for All-R1 Iterations
+
+**Files:**
+
+- Create: core/pit_optimizer_authorization.py
+- Modify: agent_loop.py
+- Modify: core/pit_optimization_contract.py
+- Modify: tests/test_agent_loop.py
+- Modify: tests/test_pit_optimizer_v2.py
+
+**Interfaces:**
+
+- Produces: request_pit_optimizer_once; one frozen R1 pricing identity per run; explicit grant/window recording CLI/API; non-spend exclusive run lease; exact one-call reservation/reconciliation; optimizer-v2 role/model profile; iteration-aware ProviderCallRecord and audit events.
+- Consumes: one sealed PitOptimizerCallBudget, one explicit OperatorAuthorizationWindow bound to the manifest requirement, canonical role input, strict parser, BudgetLedger, AuditTrail, and wall deadline.
+
+**Gateway interface:**
+
+    OpenRouterGateway.request_pit_optimizer_once(
+        role,
+        dynamic_input,
+        parser,
+        *,
+        call_budget,
+        authorization_lease,
+        frozen_pricing,
+        wall_deadline,
+        monotonic,
+    ) -> PitOptimizerRoleCall
+
+All three optimizer-v2 roles map to deepseek/deepseek-r1 without changing the general loop's orchestrator/reasoner/coder models.
+
+**Authorization interfaces:**
+
+    @dataclass(frozen=True, slots=True)
+    class FrozenModelPricing:
+        model: str
+        prompt_per_million: Decimal
+        completion_per_million: Decimal
+        pricing_payload_sha256: str
+
+        @property
+        def pricing_sha256(self) -> str
+
+    @dataclass(frozen=True, slots=True)
+    class OperatorAuthorizationGrant:
+        grant_id: str
+        additional_calls: int
+        additional_tokens: int
+        additional_usd: float
+        policy_source_scope_sha256: str
+
+    @dataclass(frozen=True, slots=True)
+    class OperatorAuthorizationWindow:
+        window_id: str
+        grant_ids: tuple[str, ...]
+        authorization_requirement_sha256: str
+        max_calls: int
+        max_tokens: int
+        max_usd: float
+        policy_source_scope_sha256: str
+
+    @dataclass(frozen=True, slots=True)
+    class AuthorizationRunLease:
+        lease_id: str
+        one_shot_key_sha256: str
+        window_id: str
+        run_manifest_sha256: str
+        frozen_pricing_sha256: str
+        max_calls: int
+        max_tokens: int
+        max_usd: float
+
+    @dataclass(frozen=True, slots=True)
+    class AuthorizationCallReservation:
+        reservation_id: str
+        lease_id: str
+        call_index: int
+        iteration: int
+        role: str
+        reserved_tokens: int
+        reserved_usd: float
+
+    @dataclass(frozen=True, slots=True)
+    class PitOptimizerProviderFacts:
+        call_index: int
+        iteration: int
+        role: str
+        requested_model: str
+        returned_model: str | None
+        frozen_pricing_sha256: str
+        outcome: str
+        request_started: bool
+        response_received: bool
+        finish_reason: str | None
+        response_schema_valid: bool
+        accounting_complete: bool
+        prompt_tokens: int | None
+        completion_tokens: int | None
+        total_tokens: int | None
+        cost_usd: float | None
+        retained_reservation_tokens: int
+        retained_reservation_usd: float
+        audit_sha256: str
+
+    @dataclass(frozen=True, slots=True)
+    class PitOptimizerRoleCall:
+        plan: PitOptimizerCallBudget
+        payload: InvestigatorArtifact | AuthorArtifact | CriticArtifact
+        facts: PitOptimizerProviderFacts
+
+    AuthorizationLedger.append_grant(
+        grant: OperatorAuthorizationGrant,
+        *,
+        operator_approval_reference: str,
+    ) -> None
+    AuthorizationLedger.bind_window(
+        *,
+        window: OperatorAuthorizationWindow,
+        requirement: AuthorizationRequirement,
+        operator_approval_reference: str,
+    ) -> None
+    AuthorizationLedger.open_run_lease(
+        *,
+        window_id: str,
+        authorization_requirement_sha256: str,
+        run_manifest_sha256: str,
+        frozen_pricing_sha256: str,
+    ) -> AuthorizationRunLease
+    AuthorizationLedger.reserve_call(
+        lease: AuthorizationRunLease,
+        plan: PitOptimizerCallBudget,
+    ) -> AuthorizationCallReservation
+    AuthorizationLedger.reconcile_call(
+        reservation: AuthorizationCallReservation,
+        provider_facts: PitOptimizerProviderFacts,
+    ) -> None
+    AuthorizationLedger.close_run_lease(
+        lease: AuthorizationRunLease,
+        *,
+        terminal_code: str,
+    ) -> None
+
+    record_authorized_grant(
+        *,
+        ledger_path: Path,
+        manifest_path: Path,
+        manifest_sha256: str,
+        grant: OperatorAuthorizationGrant,
+        operator_approval_reference: str,
+    ) -> OperatorAuthorizationWindow
+
+    OpenRouterGateway.freeze_pit_optimizer_pricing(
+        *,
+        model: str,
+        wall_deadline: float,
+        monotonic: Callable[[], float],
+    ) -> FrozenModelPricing
+
+    def freeze_pricing_record(
+        model: str,
+        value: Mapping[str, Any] | Pricing,
+    ) -> FrozenModelPricing
+
+    def preflight_pit_optimizer_call(
+        *,
+        static_bytes: bytes,
+        dynamic_bytes: bytes,
+        call_budget: PitOptimizerCallBudget,
+        lease: AuthorizationRunLease,
+        pricing: FrozenModelPricing,
+    ) -> Decimal
+
+    def conservative_call_cost_usd(
+        *,
+        rendered_prompt_bytes: int,
+        max_output_tokens: int,
+        pricing: FrozenModelPricing,
+    ) -> Decimal
+
+    def require_authorized_policy_source_scope(
+        manifest: PitOptimizerRunManifest,
+        requirement: AuthorizationRequirement,
+        window: OperatorAuthorizationWindow,
+    ) -> str
+
+The side-effecting `python -B -m core.pit_optimizer_authorization record-grant` CLI maps one-to-one to this function, but Task 9 does not print or run that command. It can be rendered only after a later fresh authorization supplies the exact grant ID, call/token/USD ceilings, and non-secret approval reference. It reads the manifest's source scope and AuthorizationRequirement, appends exactly one named grant, and binds exactly the declared window under the ledger lock. It refuses values outside the approved ceilings or scope and never reads an OpenRouter credential.
+
+- [ ] **Step 1: Write failing grant/window tests.** Seed the append-only ledger with the reconciled old 20-call grant showing 19 used. Assert its one remaining call is not silently combined with a new run. record-grant must require an authenticated manifest/requirement, exact scope, a non-secret approval reference, and fresh explicit call/token/USD values. A six-call window cannot start a seventh call, and the most restrictive remaining ceiling across named grants, window, CLI, and manifest wins.
+
+  The Task 4 contract test creates one canonical `v2_manifest` fixture by calling `build_subset_manifest` with its synthetic files; add this exact scope assertion:
+
+  ```python
+  def test_authorized_source_scope_must_match_manifest(v2_manifest):
+      requirement = v2_manifest.authorization_requirement
+      window = OperatorAuthorizationWindow(
+          window_id=requirement.window_id,
+          grant_ids=("grant-v2",),
+          authorization_requirement_sha256=requirement.sha256,
+          max_calls=requirement.max_calls,
+          max_tokens=requirement.max_tokens,
+          max_usd=requirement.max_usd,
+          policy_source_scope_sha256=requirement.policy_source_scope_sha256,
+      )
+      assert require_authorized_policy_source_scope(
+          v2_manifest, requirement, window
+      ) == v2_manifest.policy_source_scope.sha256
+      with pytest.raises(AuthorizationError, match="policy source scope"):
+          require_authorized_policy_source_scope(
+              v2_manifest,
+              requirement,
+              replace(window, policy_source_scope_sha256="f" * 64),
+          )
+  ```
+- [ ] **Step 2: Implement append_grant, bind_window, and the record-grant CLI.** Store the hash-chained ledger at permanent_runtime_root/pit_optimizer_authorization_ledger.jsonl under the existing cross-platform exclusive-file-lock pattern. Prepare never invokes these methods. A chat message is not inferred by code; only a separately operator-authorized invocation may append/bind.
+
+  Call this helper from both bind_window and open_run_lease before a ledger append:
+
+  ```python
+  def require_authorized_policy_source_scope(manifest, requirement, window):
+      expected = manifest.policy_source_scope.sha256
+      if requirement.sha256 != manifest.authorization_requirement.sha256:
+          raise AuthorizationError("authorization requirement mismatch")
+      if window.authorization_requirement_sha256 != requirement.sha256:
+          raise AuthorizationError("authorization window requirement mismatch")
+      if (
+          requirement.policy_source_scope_sha256 != expected
+          or window.policy_source_scope_sha256 != expected
+      ):
+          raise AuthorizationError("policy source scope mismatch")
+      return expected
+  ```
+- [ ] **Step 3: Write failing run-lease lifecycle and frozen-pricing tests.** freeze_pit_optimizer_pricing loads deepseek/deepseek-r1 pricing once during live canary setup, validates finite nonnegative Decimal rates, stores only the model/rates/payload digest, and makes no role call or source transmission. open_run_lease proves the complete plan fits but debits no calls/tokens/USD; it binds frozen_pricing_sha256 and atomically appends a one-shot key over window_id+run_manifest_sha256 before returning. Concurrent use fails, and a closed/failed/cancelled lease with that key can never reopen, so a provider failure cannot be retried under the same run. Cancellation or early stop closes the lease and releases unused future allowance. Authoritative spent calls remain spent; uncertain per-call reservations remain retained. Reusing any remaining grant capacity requires a newly authenticated manifest, new AuthorizationRequirement/window ID, newly frozen pricing, and separately bound run; prior spent call indexes cannot be replayed.
+- [ ] **Step 4: Implement frozen pricing, the one-shot non-spend run lease, and exact call reservation types above.** Reuse the existing bounded pricing loader, freeze one canonical record before opening the lease, and refuse any later model/rate identity change. reserve_call permits only the next never-before-started planned call, rejects a second active call reservation or any reused (manifest, call_index), and reserves exactly max_input_tokens+max_output_tokens plus that call's max_usd. Never reserve future calls or the complete run spend.
+
+  ```python
+  def freeze_pricing_record(model: str, value: Mapping[str, Any] | Pricing):
+      parsed = Pricing.from_value(value)
+      payload = {
+          "model": model,
+          "prompt_per_million": str(parsed.prompt_per_million),
+          "completion_per_million": str(parsed.completion_per_million),
+      }
+      payload_bytes = json.dumps(
+          payload,
+          sort_keys=True,
+          separators=(",", ":"),
+      ).encode("utf-8")
+      return FrozenModelPricing(
+          model=model,
+          prompt_per_million=Decimal(payload["prompt_per_million"]),
+          completion_per_million=Decimal(payload["completion_per_million"]),
+          pricing_payload_sha256=hashlib.sha256(payload_bytes).hexdigest(),
+      )
+  ```
+- [ ] **Step 5: Write failing pre-send and fake-client accounting tests.** Render the exact system messages/response schema and dynamic role JSON separately; require each byte count within max_static_input_bytes/max_dynamic_input_bytes, their combined canonical UTF-8 bytes <= max_input_tokens, and the validated response byte limit. Compute `((prompt_bytes * prompt_per_million) + (max_output_tokens * completion_per_million)) / 1_000_000` with Decimal from the lease-bound FrozenModelPricing and require it <= call_budget.max_usd before authorization reservation, SDK client construction, or transmission. Assert a one-cent excess starts no paid call. Send max_tokens=max_output_tokens. Cover authoritative accepted and schema-invalid responses, actual usage over a per-call cap, failure before send, pricing identity drift, and uncertain post-send accounting.
+
+  ```python
+  def test_call_preflight_uses_lease_bound_frozen_pricing():
+      pricing = freeze_pricing_record(
+          "deepseek/deepseek-r1",
+          {"prompt": 2, "completion": 8},
+      )
+      lease = AuthorizationRunLease(
+          lease_id="lease-v2",
+          one_shot_key_sha256="a" * 64,
+          window_id="window-v2",
+          run_manifest_sha256="b" * 64,
+          frozen_pricing_sha256=pricing.pricing_sha256,
+          max_calls=6,
+          max_tokens=448_000,
+          max_usd=0.40,
+      )
+      budget = PitOptimizerCallBudget(
+          call_index=1,
+          iteration=1,
+          role="investigator",
+          model="deepseek/deepseek-r1",
+          max_static_input_bytes=400,
+          max_dynamic_input_bytes=600,
+          max_input_tokens=1_000,
+          max_output_tokens=1_000,
+          max_response_bytes=8_192,
+          max_usd=0.009999,
+      )
+      with pytest.raises(BudgetExceededError, match="per-call USD"):
+          preflight_pit_optimizer_call(
+              static_bytes=b"s" * 400,
+              dynamic_bytes=b"d" * 600,
+              call_budget=budget,
+              lease=lease,
+              pricing=pricing,
+          )
+  ```
+
+  The conservative cost is exactly USD 0.010000, so the fake SDK client, both ledgers, and request-start audit list must remain untouched.
+- [ ] **Step 6: Extend BudgetLedger and AuthorizationLedger preflight/reconciliation.** Before send, use the same frozen rates in BudgetLedger, reserve the conservative computed amount there, reserve the sealed max_usd in AuthorizationLedger, and persist both records. On authoritative facts, commit actual usage/cost and release unused reservation before validating caps; an overage stays committed and terminates. If a request may have reached the provider without authoritative accounting, retain the full one-call reservations permanently and terminate. Failure before reservation/send commits nothing.
+
+  ```python
+  def preflight_pit_optimizer_call(
+      *,
+      static_bytes,
+      dynamic_bytes,
+      call_budget,
+      lease,
+      pricing,
+  ):
+      if call_budget.model != pricing.model:
+          raise AuthorizationError("frozen pricing model mismatch")
+      if lease.frozen_pricing_sha256 != pricing.pricing_sha256:
+          raise AuthorizationError("frozen pricing identity drift")
+      if len(static_bytes) > call_budget.max_static_input_bytes:
+          raise BudgetExceededError("static input byte cap exceeded")
+      if len(dynamic_bytes) > call_budget.max_dynamic_input_bytes:
+          raise BudgetExceededError("dynamic input byte cap exceeded")
+      prompt_bytes = len(static_bytes) + len(dynamic_bytes)
+      if prompt_bytes > call_budget.max_input_tokens:
+          raise BudgetExceededError("conservative input-token cap exceeded")
+      cost = conservative_call_cost_usd(
+          rendered_prompt_bytes=prompt_bytes,
+          max_output_tokens=call_budget.max_output_tokens,
+          pricing=pricing,
+      )
+      if cost > Decimal(str(call_budget.max_usd)):
+          raise BudgetExceededError("per-call USD cap exceeded")
+      return cost
+  ```
+
+  request_pit_optimizer_once calls this helper before BudgetLedger.reserve, AuthorizationLedger.reserve_call, SDK construction, or transmission.
+- [ ] **Step 7: Add the isolated optimizer-v2 role profile.** Use R1 for investigator/author/critic, max_attempts=1, SDK max_retries=0, allow_generation_recovery=False, and no response-healing plugin.
+- [ ] **Step 8: Extend closed accounting roles/states and the durable wrapper.** Add CALL_INVESTIGATOR, CALL_AUTHOR, CALL_CRITIC; accept legacy/v2 role sets by schema version; pass the real iteration into ProviderCallRecord. Persist reservation/start before transmission and terminal provider facts/audit before the next call. Provider contents stay out of user-facing accounting. Malformed response or uncertain accounting is terminal and cannot become a disguised retry.
+- [ ] **Step 9: Run the focused provider/audit tests.**
+
+      python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_agent_loop.py tests/test_pit_optimizer_v2.py -k "pit_optimizer_v2 or call_budget or provider_call or budget_reservation"
+
+- [ ] **Step 10: Commit provider integration.**
+
+      git add core/pit_optimizer_authorization.py agent_loop.py core/pit_optimization_contract.py tests/test_agent_loop.py tests/test_pit_optimizer_v2.py
+      git commit -m "feat: account all-R1 optimizer iterations"
+
+---
+

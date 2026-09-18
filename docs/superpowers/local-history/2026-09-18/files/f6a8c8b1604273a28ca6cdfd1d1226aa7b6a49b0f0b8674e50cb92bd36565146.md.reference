@@ -1,0 +1,15 @@
+# Principal architect checkpoint B4a: APPROVED
+
+B4a is approved at runtime.py SHA `097b5c1e67e2f4c2852a8033e1a3f30d14254f0e2d18b4a899589d555e61d1f3`. No actionable findings were identified in the exact diff and relevant journal, materialization, screening, discovery and critic paths.
+
+The runtime uses the approved outcome renderer with the same parent/revision/template/cap and deadline checks. Exact rendered variants retain the existing materialized path. Rejections use the accepted current-round author invocation, complete template and hypothesis bindings, existing invalid identity derivation, and the dedicated B2 payload. Related rejection identity/assignment authority is compared canonically; an exact existing event is reused and a fresh event is persisted before the carrier is returned. The event reference comes from a unique actual journal entry, not a payload hash or predicted sequence.
+
+Rejected carriers bypass materialization, validation, semantic and evaluator work, survive screening/discovery unchanged in their original order, and cannot enter critic input. Existing B2 append/replay checks and B3a/B3b record/publication safeguards remain unchanged. The no_testable_experiments abort and historical terminal path remain as deliberately deferred in B4a.
+
+Principal verification is saved separately in `principal-architect-verification.json`. Source/preimage/diff hashes, exact changed/added function scope, protected source hashes, scoped Ruff, in-memory compilation and preimage diff checks passed. The 56-file evaluator identity remains `005064e57e80840f3b2a97d7db694b176832b8f982996e63efc8a35064505ed4`.
+
+The actual06 manifest/intent/accepted author were authenticated read-only. The pure B1 renderer again produced the closed rejection and invalid identity `18ea7a802fed21683eef0d31354f6d656e07af576199c27819bdacde25faeb7f`; the strict legacy renderer raised the exact prior AST ValueError. Actual06 still has no rejection event. The runtime-04 evaluated record retained its canonical bytes, four discovery episodes and critic binding. New runtime helper/journal paths were not executed, so this is static approval plus archived-input compatibility, not live lifecycle proof.
+
+Next scope is B4b: no-testable record/checkpoint/cleanup completion and exact finalized-round/recovery authority. Use `next-luna-prompt-b4b.md`, then return for principal review before B4c. The finalizer must account for the existing distinction between post-validation rendered-event IDs and pre-validation invalid-record IDs; a simple union of rendered/rejected event ID sets is insufficient for materialized-validation-invalid records. Preserve mandatory critic authority for every testable candidate.
+
+No production edits, tests, synthetic probes, credentials, model/API calls, candidate evaluations, campaigns, commits, pushes or deployment occurred during this review. The original two real evaluated feedback rounds remain unfinished.

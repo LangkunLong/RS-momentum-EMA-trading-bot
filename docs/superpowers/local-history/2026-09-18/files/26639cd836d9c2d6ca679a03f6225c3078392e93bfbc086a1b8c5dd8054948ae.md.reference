@@ -1,0 +1,47 @@
+### Task 3: Export the Hash-Pinned Price Cache into Plain PIT Bars
+
+**Files:**
+- Create: `export_pit_prices.py`
+- Create: `tools/export_price_cache_worker.py`
+
+**Interfaces:**
+- Consumes: the existing `dataset_cache` SQLite file, its required SHA-256, `membership.csv`, and the requested 2020-2025 date range.
+- Produces: exact `trade_date,ticker,open,high,low,close,volume` CSV, `spy_trading_days.csv`, and `prices_provenance.json`.
+
+- [ ] **Step 1: Validate the cache before deserialization**
+
+The host CLI requires `--cache-sha256`, verifies the regular non-link file and exact digest, checks that SQLite contains only the expected `dataset_cache` table/columns, and enumerates only `price`/`closes` cache keys. It copies the cache read-only into a fresh temporary worker directory.
+
+- [ ] **Step 2: Run the converter in a disposable offline worker**
+
+Launch `tools/export_price_cache_worker.py` with network disabled and read-only source/cache mounts. The worker is the only process allowed to unpickle cache payloads. It accepts a canonical JSON request naming the membership-union tickers plus SPY and the inclusive date range.
+
+The worker validates each price frame has a monotonic date index and finite positive OHLC, nonnegative volume, and no duplicate ticker/date rows. It emits only CSV and a content-free completion envelope.
+
+- [ ] **Step 3: Enforce price coverage**
+
+Compute:
+
+```text
+member_trading_day_pairs
+covered_member_trading_day_pairs
+coverage_pct
+symbols_with_no_prices
+symbols_with_partial_prices
+spy_first_date
+spy_last_date
+```
+
+Require complete SPY coverage from 2020-01-01 through 2025-12-31 and at least 98% member/trading-day close coverage. Fail before bundle construction if either condition is false.
+
+- [ ] **Step 4: Perform the first functional cache export**
+
+Run the exporter with the known cache digest. Confirm `prices.csv` is ordinary UTF-8 CSV, the source cache remains byte-identical, and `prices_provenance.json` labels the source kind exactly `existing_hash_pinned_cache`.
+
+- [ ] **Step 5: Commit the confined exporter**
+
+```powershell
+git add export_pit_prices.py tools/export_price_cache_worker.py
+git commit -m "feat: export validated PIT price bars"
+```
+

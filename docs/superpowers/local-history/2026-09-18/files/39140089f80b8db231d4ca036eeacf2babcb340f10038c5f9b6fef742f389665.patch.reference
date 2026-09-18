@@ -1,0 +1,109 @@
+diff --git a/.superpowers/sdd/2026-09-04-pit-optimizer-v5-campaign/development-scope-fix-report.md b/.superpowers/sdd/2026-09-04-pit-optimizer-v5-campaign/development-scope-fix-report.md
+new file mode 100644
+index 0000000..0698344
+--- /dev/null
++++ b/.superpowers/sdd/2026-09-04-pit-optimizer-v5-campaign/development-scope-fix-report.md
+@@ -0,0 +1,10 @@
++# Development scope review fix
++
++Resolved the migration-documentation finding without changing generic exact-key decoding or artifact identities.
++
++- Corrected `development-scope-report.md`: dataclass defaults apply to source construction, not persisted wire decoding.
++- Documented in `docs/pit-optimizer-v5-operations.md` that pre-scope bytes remain readable and content-authenticatable under their original references, while typed use requires an explicitly rebuilt manifest/parent graph with new content-addressed references.
++- Added a narrow manifest authentication diagnostic for missing `pit_data_scope` on the manifest or baseline parent. It tells the operator to retain the old artifact and rebuild the graph; it does not inject a field, reinterpret bytes, reuse an old digest, or weaken unknown-key rejection.
++- Applied the same parent diagnostic to manifest building when an old parent reference is supplied.
++
++Validation: source diff inspection, `git diff --check`, in-memory compilation of `core/pit_optimizer_v5/manifest.py`, and Ruff on that module. No tests or synthetic probes were read, created, modified, or run. No Docker, network, or provider operation was performed.
+diff --git a/.superpowers/sdd/2026-09-04-pit-optimizer-v5-campaign/development-scope-report.md b/.superpowers/sdd/2026-09-04-pit-optimizer-v5-campaign/development-scope-report.md
+index b27bd66..32065f5 100644
+--- a/.superpowers/sdd/2026-09-04-pit-optimizer-v5-campaign/development-scope-report.md
++++ b/.superpowers/sdd/2026-09-04-pit-optimizer-v5-campaign/development-scope-report.md
+@@ -38,7 +38,7 @@ The pre-existing controller-owned `progress.md` modification was not touched or
+ 
+ ## Identity migration
+ 
+-`pit_data_scope` participates in canonical dataclass serialization, so newly decoded legacy manifests and baseline parents receive the production default but their newly computed canonical identities include that explicit field. Any pre-existing reference whose digest was computed before this field existed must retain its original bytes/reference rather than be silently re-emitted under the old digest. There is no prior real production campaign to migrate.
++`pit_data_scope` participates in canonical dataclass serialization. The dataclass constructor defaults preserve source-call compatibility only; they do not migrate persisted JSON because typed artifact decoding requires exact keys. Pre-scope manifest and parent bytes remain readable and content-authenticatable at their original references, while typed loading now gives an actionable diagnostic requiring an explicitly rebuilt graph with new content-addressed references. Old artifacts must be retained unchanged and must never be silently re-emitted or relabeled under their old digests. There is no prior real production campaign to migrate.
+ 
+ ## Remaining work
+ 
+diff --git a/core/pit_optimizer_v5/manifest.py b/core/pit_optimizer_v5/manifest.py
+index 4412731..bbd6277 100644
+--- a/core/pit_optimizer_v5/manifest.py
++++ b/core/pit_optimizer_v5/manifest.py
+@@ -348,6 +348,21 @@ def _authenticated_object_v5(artifact: AuthenticatedArtifactV5, label: str) -> d
+     return value
+ 
+ 
++def _require_explicit_pit_data_scope_v5(
++    artifact: AuthenticatedArtifactV5,
++    *,
++    label: str,
++) -> None:
++    """Diagnose pre-scope authorities without rewriting authenticated bytes."""
++
++    value = _authenticated_object_v5(artifact, label)
++    if "pit_data_scope" not in value:
++        raise ManifestAuthenticationFailureV5(
++            f"{label} predates explicit pit_data_scope; retain the old artifact and rebuild "
++            "the manifest graph with new content-addressed references before typed loading"
++        )
++
++
+ def _primitive_artifact_ref_v5(value: object, label: str) -> ArtifactRefV5:
+     if type(value) is not dict or set(value) != {"relative_path", "sha256"}:
+         raise ValueError(f"{label} reference is invalid")
+@@ -482,6 +497,12 @@ def _authenticate_build_dependencies_v5(
+         panel_plan_ref=panel_plan_ref,
+         sandbox_profile_ref=sandbox_profile_ref,
+     )
++    baseline_item = next(
++        item for item in graph.authenticated if item.reference == baseline_authority_ref
++    )
++    if type(baseline_item) is not AuthenticatedArtifactV5:
++        raise ValueError("baseline authority is not authenticated canonical JSON")
++    _require_explicit_pit_data_scope_v5(baseline_item, label="baseline parent authority")
+     # Every existing edge is authenticated before the first typed load.  The
+     # exact baseline policy edge may be absent only because this command owns
+     # its create-only descriptor write.
+@@ -682,6 +703,13 @@ def authenticate_campaign_manifest_v5(
+         raise ManifestAuthenticationFailureV5(f"campaign artifact graph is {reason}")
+ 
+     # Typed construction is intentionally after complete graph authentication.
++    manifest_item = next(
++        (item for item in graph.authenticated if item.reference == manifest_ref),
++        None,
++    )
++    if type(manifest_item) is not AuthenticatedArtifactV5:
++        raise ManifestAuthenticationFailureV5("campaign manifest is not authenticated canonical JSON")
++    _require_explicit_pit_data_scope_v5(manifest_item, label="campaign manifest")
+     manifest = repository.load_typed_artifact(manifest_ref, value_type=CampaignManifestV5)
+     execution = repository.load_typed_artifact(
+         manifest.execution_profile_ref,
+@@ -691,6 +719,13 @@ def authenticate_campaign_manifest_v5(
+         manifest.evaluator_contract_ref,
+         value_type=EvaluatorContractV5,
+     )
++    baseline_item = next(
++        (item for item in graph.authenticated if item.reference == manifest.baseline_authority_ref),
++        None,
++    )
++    if type(baseline_item) is not AuthenticatedArtifactV5:
++        raise ManifestAuthenticationFailureV5("baseline parent authority is not authenticated canonical JSON")
++    _require_explicit_pit_data_scope_v5(baseline_item, label="baseline parent authority")
+     baseline = repository.load_typed_artifact(
+         manifest.baseline_authority_ref,
+         value_type=BaselineParentAuthorityV5,
+diff --git a/docs/pit-optimizer-v5-operations.md b/docs/pit-optimizer-v5-operations.md
+index 402fe2e..f6f6886 100644
+--- a/docs/pit-optimizer-v5-operations.md
++++ b/docs/pit-optimizer-v5-operations.md
+@@ -6,6 +6,8 @@ The production entry point is `python -B -m core.pit_optimizer_v5.cli` on the Wi
+ 
+ Start with a real, authenticated discovery manifest and every artifact it references. The manifest fixes the source commit, baseline, discovery panels, evaluator, sandbox image, provider limits, and resource limits. Setup does not invent these artifacts or modify the manifest. A separately persisted adapter configuration supplies the local host paths and adapter identities.
+ 
++Current manifests and baseline-parent authorities must contain an explicit `pit_data_scope`. The Python constructor default preserves source-call compatibility; it is not a migration for persisted JSON because typed artifact decoding requires exact keys. Pre-scope bytes remain readable and content-authenticatable under their original references, but typed manifest or parent loading reports that the graph must be rebuilt. Retain those artifacts unchanged, create a replacement manifest and parent with explicit scope, and use the newly computed content-addressed references throughout the rebuilt graph. Never edit old bytes in place or reuse their digests for re-emitted content.
++
+ The source, workspace, data, output, and control directories must already exist and be mutually disjoint. For example, use sibling directories under `C:\pit-v5`, with a clean source checkout at `C:\pit-v5\source`. The data directory must contain exactly `pit_bundle.sqlite3` and `prices_provenance.json`, matching the manifest's evaluator digests. Keep the artifact repository outside the data directory. Git and Docker must be installed; their paths can be discovered from `PATH` or supplied explicitly.
+ 
+ Preparation checks the clean source commit and policy bytes, hashes the two data files without querying market or held-out domains, and constructs the actual production adapters to capture their identities. It does not start Docker or check daemon/image readiness. Before execution, make the manifest-pinned image available locally and configure `OPENROUTER_API_KEY` in the launch environment. The runtime uses the pinned image with pulling disabled.

@@ -1,0 +1,3956 @@
+# Review package: 35614fbc5edcbb4e0daa489f0f21233f5ee0cbce..cbbc9c9
+
+## Commits
+cbbc9c9 feat: expose model-authored PIT optimizer
+
+## Files changed
+ agent_loop.py                           | 1366 ++++++++++++++++++++++++++++++-
+ core/pit_optimization.py                |   50 ++
+ core/pit_optimization_contract.py       |  203 +++--
+ core/pit_optimizer_authorization.py     |   45 +
+ core/pit_optimizer_evaluation.py        |  212 ++++-
+ tests/test_agent_loop.py                |  371 ++++++++-
+ tests/test_pit_optimization_contract.py |   48 +-
+ tests/test_pit_optimizer_v2.py          |  606 +++++++++++++-
+ 8 files changed, 2816 insertions(+), 85 deletions(-)
+
+## Diff
+diff --git a/agent_loop.py b/agent_loop.py
+index fe32846..f7bf8a5 100644
+--- a/agent_loop.py
++++ b/agent_loop.py
+@@ -43,30 +43,38 @@ from typing import (
+     Callable,
+     ClassVar,
+     Generic,
+     Mapping,
+     Protocol,
+     Sequence,
+     TypeVar,
+ )
+ 
+ if TYPE_CHECKING:
+-    from core.pit_optimization_contract import PitOptimizerCallBudget
++    from core.pit_optimization_contract import (
++        PitOptimizerCallBudget,
++        PitOptimizerGateConfig,
++    )
+     from core.pit_optimizer_authorization import (
+         AuthorizationCallReservation,
+         AuthorizationLedger,
+         AuthorizationRunLease,
+         FrozenModelPricing,
+         PitOptimizerProviderFacts,
+         PitOptimizerRoleCall,
+         TerminalAuditReceipt,
+     )
++    from core.pit_optimizer_controller import (
++        PitOptimizerReadiness,
++        PitOptimizerResult,
++        PitOptimizerServices,
++    )
+ 
+ MAX_ITERATIONS = 10
+ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+ ORCHESTRATOR_MODEL = "qwen/qwen3-next-80b-a3b-instruct"
+ REASONER_MODEL = "deepseek/deepseek-r1"
+ CODER_MODEL = "qwen/qwen3-coder-next"
+ 
+ # Controller-owned conservative reservation rates for the three-call PIT gate.
+ # Provider-returned inline cost remains the authoritative charge; these sealed
+ # per-million ceilings prevent a pre-call /models lookup from becoming a fourth
+@@ -207,20 +215,23 @@ _CONTROLLER_INITIALIZATION_STAGES = frozenset(
+         "source_preflight_unknown",
+         "candidate_export",
+         "docker_capability",
+         "sandbox_init",
+         "gateway_init",
+         "data_bundle",
+         "audit_init",
+         "pit_optimization_prepare",
+         "pit_optimization_readiness",
+         "pit_optimization_canary",
++        "pit_optimizer_prepare",
++        "pit_optimizer_readiness",
++        "pit_optimizer_canary",
+         "controller_run",
+         "cleanup",
+     }
+ ) | _PIT_OPTIMIZATION_PROVIDER_STAGES
+ 
+ 
+ class ControllerInitializationError(RuntimeError):
+     """Carry only one controller-owned pre-audit failure stage to the CLI."""
+ 
+     def __init__(self, stage: str) -> None:
+@@ -6810,21 +6821,21 @@ def _cleanup_owned_policy_daemon(
+         "kill",
+         "--signal",
+         "KILL",
+         daemon.container_id,
+     )
+     control(
+         _PolicySecondaryAction.DAEMON_WAIT,
+         "wait",
+         daemon.container_id,
+     )
+-    control(
++    removed = control(
+         _PolicySecondaryAction.DAEMON_RM,
+         "rm",
+         "--force",
+         daemon.container_id,
+     )
+     absence = control(
+         _PolicySecondaryAction.DAEMON_ABSENCE_QUERY,
+         "container",
+         "ls",
+         "--all",
+@@ -6847,20 +6858,36 @@ def _cleanup_owned_policy_daemon(
+             )
+         )
+     elif absence.stdout_present:
+         errors.append(
+             _PolicySecondaryFailure(
+                 _PolicySecondaryPhase.CLEANUP,
+                 _PolicySecondaryAction.DAEMON_ABSENCE_VERIFY,
+                 _PolicySecondaryReason.PRESENT,
+             )
+         )
++    elif (
++        removed is not None
++        and not removed.timed_out
++        and not removed.nonzero
++    ):
++        # Closing stdin can let the worker exit before the defensive KILL.
++        # A successful force-removal followed by exact-ID absence is stronger
++        # terminal evidence than that benign "not running" return code.
++        errors = [
++            error
++            for error in errors
++            if not (
++                error.action is _PolicySecondaryAction.DAEMON_KILL
++                and error.reason is _PolicySecondaryReason.NONZERO
++            )
++        ]
+     return errors
+ 
+ 
+ def _record_policy_secondary_errors(
+     primary: BaseException,
+     errors: Sequence[_PolicySecondaryFailure],
+ ) -> None:
+     try:
+         for index, error in enumerate(errors):
+             if index >= _MAX_POLICY_SECONDARY_NOTES:
+@@ -7321,24 +7348,24 @@ class PolicyWorkerRunner:
+                 _remove_private_tree(temporary_root)
+             raise
+ 
+     def _engine_environment(self, temporary_root: Path) -> dict[str, str]:
+         control = temporary_root / "engine-control"
+         home = control / "home"
+         config = control / "config"
+         temp = control / "tmp"
+         for directory in (home, config, temp):
+             directory.mkdir(parents=True, exist_ok=False)
+-        environment = _canonical_environment(
+-            os.environ,
+-            {"PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT"},
+-        )
++        allowed = {"PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT"}
++        if os.name == "nt":
++            allowed.add("SYSTEMDRIVE")
++        environment = _canonical_environment(os.environ, allowed)
+         environment.update(
+             {
+                 "HOME": str(home),
+                 "USERPROFILE": str(home),
+                 "DOCKER_CONFIG": str(config),
+                 "TEMP": str(temp),
+                 "TMP": str(temp),
+             }
+         )
+         return environment
+@@ -7382,40 +7409,41 @@ class PolicyWorkerRunner:
+                 container_name,
+                 "--label",
+                 f"pit-policy.owner={owner_token}",
+                 "--pull",
+                 "never",
+                 "--network",
+                 "none",
+                 "--read-only",
+                 "--user",
+                 "65532:65532",
++                "--entrypoint",
++                "python",
+                 "--cap-drop",
+                 "ALL",
+                 "--security-opt",
+                 "no-new-privileges",
+                 "--pids-limit",
+                 "32",
+                 "--memory",
+                 "256m",
+                 "--cpus",
+                 "1.0",
+                 "--tmpfs",
+                 "/tmp:rw,noexec,nosuid,size=16m",
+                 "--env",
+                 "PYTHONHASHSEED=0",
+                 "--mount",
+                 f"type=bind,src={package_root},dst=/workspace/policy,readonly",
+                 "--workdir",
+                 "/workspace/policy",
+                 self.image,
+-                "python",
+                 "-B",
+                 "-m",
+                 "core.strategy_policy.worker",
+             )
+ 
+             def recover_failed_create(
+                 primary_error: BaseException,
+             ) -> _OwnedPolicyDaemon | None:
+                 try:
+                     tentative = self._discover_tentative_owned_daemon(
+@@ -11213,22 +11241,24 @@ class LoopConfig:
+             )
+         if not isinstance(self.mode, ExecutionMode):
+             raise ConfigurationError("mode must be ExecutionMode")
+         try:
+             from pit_diagnosis_agent import PitDiagnosisGateConfig
+             pit_gate_type: tuple[type[object], ...] = (PitDiagnosisGateConfig,)
+         except ImportError:
+             pit_gate_type = ()
+         try:
+             from core.pit_optimization import PitOptimizationGateConfig
++            from core.pit_optimization_contract import PitOptimizerGateConfig
+             optimization_gate_type: tuple[type[object], ...] = (
+                 PitOptimizationGateConfig,
++                PitOptimizerGateConfig,
+             )
+         except ImportError:
+             optimization_gate_type = ()
+         if not isinstance(
+             self.gate,
+             (
+                 TestGateConfig,
+                 BacktestGateConfig,
+                 *pit_gate_type,
+                 *optimization_gate_type,
+@@ -11259,20 +11289,39 @@ class LoopConfig:
+             if any(_configuration_paths_overlap(artifacts, path) for path in protected):
+                 raise ConfigurationError(
+                     "artifact_root must not overlap source, controller runtime, "
+                     "permanent runtime, or sealed PIT optimization inputs"
+                 )
+             for name in ("baseline_run", "pit_bundle"):
+                 if _configuration_paths_overlap(getattr(self.gate, name), runtime):
+                     raise ConfigurationError(
+                         "PIT optimization input must not overlap the permanent runtime"
+                     )
++            if isinstance(self.gate, PitOptimizerGateConfig):
++                expected_context = (
++                    source,
++                    runtime,
++                    controller,
++                    artifacts,
++                    git,
++                )
++                actual_context = (
++                    self.gate.source_root,
++                    self.gate.permanent_runtime_root,
++                    self.gate.controller_temp_parent,
++                    self.gate.artifact_root,
++                    self.gate.git_executable,
++                )
++                if actual_context != expected_context:
++                    raise ConfigurationError(
++                        "PIT optimizer execution context differs from LoopConfig"
++                    )
+         if not isinstance(self.models, ModelConfig) or not isinstance(self.limits, LoopLimits):
+             raise ConfigurationError("models and limits must be validated configs")
+         object.__setattr__(self, "source_root", source)
+         object.__setattr__(self, "permanent_runtime_root", runtime)
+         object.__setattr__(self, "git_executable", git)
+         object.__setattr__(self, "controller_temp_parent", controller)
+         object.__setattr__(self, "artifact_root", artifacts)
+ 
+ 
+ @dataclass(frozen=True)
+@@ -17772,21 +17821,27 @@ def build_parser() -> argparse.ArgumentParser:
+     )
+     parser.add_argument("--repo-root", type=Path, required=True)
+     parser.add_argument("--permanent-runtime-root", type=Path, required=True)
+     parser.add_argument("--git-executable", type=Path, required=True)
+     parser.add_argument("--controller-temp-parent", type=Path, required=True)
+     parser.add_argument("--artifact-root", type=Path, required=True)
+     parser.add_argument("--docker-executable", type=Path, required=True)
+     parser.add_argument("--sandbox-image", required=True)
+     parser.add_argument(
+         "--gate",
+-        choices=("test", "backtest", "pit_diagnosis", "pit_optimization"),
++        choices=(
++            "test",
++            "backtest",
++            "pit_diagnosis",
++            "pit_optimization",
++            "pit_optimizer",
++        ),
+         required=True,
+     )
+     parser.add_argument(
+         "--test-path",
+         action="append",
+         default=[],
+         metavar="tests/.../test_*.py",
+     )
+     parser.add_argument("--tickers", nargs="+")
+     parser.add_argument("--benchmark")
+@@ -17816,20 +17871,31 @@ def build_parser() -> argparse.ArgumentParser:
+     )
+     parser.add_argument(
+         "--optimization-prior-discovery-feedback",
+         type=Path,
+         help="Canonical aggregate-only feedback from earlier subset candidates.",
+     )
+     parser.add_argument("--optimization-prior-discovery-feedback-sha256")
+     parser.add_argument("--baseline-manifest-sha256")
+     parser.add_argument("--effective-policy-sha256")
+     parser.add_argument("--readiness-sha256")
++    parser.add_argument("--optimizer-manifest", type=Path)
++    parser.add_argument("--optimizer-manifest-sha256")
++    parser.add_argument("--verified-parity", type=Path)
++    parser.add_argument("--verified-parity-sha256")
++    parser.add_argument("--optimizer-authorization-window-id")
++    parser.add_argument("--optimizer-authorization-requirement-sha256")
++    parser.add_argument(
++        "--authorize-policy-source-transmission",
++        action="store_true",
++        help="Acknowledge the exact manifest-bound policy source transmission.",
++    )
+     parser.add_argument("--minimum-total-return", type=float)
+     parser.add_argument("--minimum-annualized-return", type=float)
+     parser.add_argument("--minimum-sharpe-ratio", type=float)
+     parser.add_argument("--maximum-drawdown-magnitude", type=float)
+     parser.add_argument("--minimum-closed-trades", type=int)
+     parser.add_argument("--max-usd", type=float, required=True)
+     parser.add_argument("--max-iterations", type=int, default=MAX_ITERATIONS)
+     parser.add_argument(
+         "--max-api-calls",
+         type=int,
+@@ -17859,27 +17925,990 @@ def build_parser() -> argparse.ArgumentParser:
+     )
+     return parser
+ 
+ 
+ def _absolute_cli_path(value: object, field: str) -> Path:
+     if not isinstance(value, Path) or not value.is_absolute():
+         raise ConfigurationError(f"{field} must be an explicit absolute path")
+     return value.resolve(strict=False)
+ 
+ 
++def _build_pit_optimizer_v2_config(
++    namespace: argparse.Namespace,
++) -> PitOptimizerGateConfig:
++    """Build and validate one closed schema-v2 optimizer gate configuration."""
++    from core.pit_optimization_contract import (
++        PitOptimizerGateConfig,
++        _pit_optimizer_manifest_from_primitive,
++        _v2_canonical_bytes,
++    )
++
++    phase = getattr(namespace, "optimization_phase", None)
++    if phase not in {"prepare", "canary"}:
++        raise ConfigurationError(
++            "the PIT optimizer gate requires phase prepare or canary"
++        )
++    manifest_path = _absolute_cli_path(
++        getattr(namespace, "optimizer_manifest", None),
++        "optimizer manifest",
++    )
++    if manifest_path.is_symlink() or not manifest_path.is_file():
++        raise ConfigurationError(
++            "optimizer manifest must be an existing absolute regular non-link file"
++        )
++    expected_manifest_sha256 = getattr(
++        namespace,
++        "optimizer_manifest_sha256",
++        None,
++    )
++    if (
++        not isinstance(expected_manifest_sha256, str)
++        or _SHA256_RE.fullmatch(expected_manifest_sha256) is None
++    ):
++        raise ConfigurationError("optimizer manifest SHA-256 is invalid")
++    raw_manifest = manifest_path.read_bytes()
++    if hashlib.sha256(raw_manifest).hexdigest() != expected_manifest_sha256:
++        raise ConfigurationError("optimizer manifest digest differs")
++    try:
++        primitive = json.loads(raw_manifest)
++    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
++        raise ConfigurationError("optimizer manifest is invalid JSON") from exc
++    if (
++        not isinstance(primitive, dict)
++        or raw_manifest != _v2_canonical_bytes(primitive) + b"\n"
++    ):
++        raise ConfigurationError("optimizer manifest is not canonical JSON")
++    try:
++        manifest = _pit_optimizer_manifest_from_primitive(primitive)
++    except ValueError as exc:
++        raise ConfigurationError(str(exc)) from exc
++    if manifest.sha256 != expected_manifest_sha256:
++        raise ConfigurationError("optimizer manifest closed identity differs")
++
++    supplied_requirement = getattr(
++        namespace,
++        "optimizer_authorization_requirement_sha256",
++        None,
++    )
++    if phase == "prepare":
++        if supplied_requirement not in {
++            None,
++            manifest.authorization_requirement.sha256,
++        }:
++            raise ConfigurationError(
++                "prepare authorization requirement differs from manifest"
++            )
++        if getattr(namespace, "optimizer_authorization_window_id", None) is not None:
++            raise ConfigurationError(
++                "prepare phase cannot carry an authorization window"
++            )
++        if getattr(namespace, "readiness_sha256", None) is not None:
++            raise ConfigurationError("prepare phase cannot carry readiness")
++        readiness_artifact = None
++        readiness_sha256 = None
++        authorization_window_id = None
++    else:
++        readiness_sha256 = getattr(namespace, "readiness_sha256", None)
++        authorization_window_id = getattr(
++            namespace,
++            "optimizer_authorization_window_id",
++            None,
++        )
++        if (
++            readiness_sha256 is None
++            or authorization_window_id is None
++            or supplied_requirement is None
++        ):
++            raise ConfigurationError(
++                "canary phase requires readiness, authorization window, and requirement identities"
++            )
++        artifact_root = _absolute_cli_path(
++            getattr(namespace, "artifact_root", None),
++            "artifact root",
++        )
++        readiness_artifact = artifact_root / f"{manifest.run_id}.readiness.json"
++
++    max_api_calls = getattr(namespace, "max_api_calls", None)
++    if max_api_calls is None:
++        max_api_calls = 6
++    try:
++        config = PitOptimizerGateConfig(
++            phase=phase,
++            baseline_run=_absolute_cli_path(
++                getattr(namespace, "baseline_run", None),
++                "baseline run",
++            ),
++            baseline_manifest_sha256=getattr(
++                namespace,
++                "baseline_manifest_sha256",
++                None,
++            ),
++            pit_bundle=_absolute_cli_path(
++                getattr(namespace, "pit_bundle", None),
++                "PIT bundle",
++            ),
++            pit_bundle_sha256=getattr(namespace, "pit_bundle_sha256", None),
++            effective_policy_sha256=getattr(
++                namespace,
++                "effective_policy_sha256",
++                None,
++            ),
++            optimizer_manifest=manifest_path,
++            optimizer_manifest_sha256=expected_manifest_sha256,
++            verified_parity_artifact=_absolute_cli_path(
++                getattr(namespace, "verified_parity", None),
++                "verified parity",
++            ),
++            verified_parity_sha256=getattr(
++                namespace,
++                "verified_parity_sha256",
++                None,
++            ),
++            readiness_artifact=readiness_artifact,
++            readiness_sha256=readiness_sha256,
++            authorization_window_id=authorization_window_id,
++            authorization_requirement_sha256=(
++                manifest.authorization_requirement.sha256
++                if supplied_requirement is None
++                else supplied_requirement
++            ),
++            source_transmission_authorized=getattr(
++                namespace,
++                "authorize_policy_source_transmission",
++                False,
++            ),
++            max_usd=getattr(namespace, "max_usd", None),
++            max_api_calls=max_api_calls,
++            max_tokens=getattr(namespace, "max_tokens", None),
++            max_iterations=getattr(namespace, "max_iterations", None),
++            apply=getattr(namespace, "apply", None),
++            source_root=_absolute_cli_path(
++                getattr(namespace, "repo_root", None),
++                "repository root",
++            ),
++            permanent_runtime_root=_absolute_cli_path(
++                getattr(namespace, "permanent_runtime_root", None),
++                "permanent runtime root",
++            ),
++            controller_temp_parent=_absolute_cli_path(
++                getattr(namespace, "controller_temp_parent", None),
++                "controller temporary parent",
++            ),
++            artifact_root=_absolute_cli_path(
++                getattr(namespace, "artifact_root", None),
++                "artifact root",
++            ),
++            git_executable=_absolute_cli_path(
++                getattr(namespace, "git_executable", None),
++                "Git executable",
++            ),
++            docker_executable=_absolute_cli_path(
++                getattr(namespace, "docker_executable", None),
++                "Docker executable",
++            ),
++            sandbox_image=getattr(namespace, "sandbox_image", None),
++        )
++        config.validate()
++    except ValueError as exc:
++        raise ConfigurationError(str(exc)) from exc
++    return config
++
++
++@dataclass(frozen=True, slots=True)
++class PitOptimizerLiveRun:
++    """Authenticated schema-v2 readiness paired with injected live capabilities."""
++
++    readiness: PitOptimizerReadiness
++    optimizer_services: PitOptimizerServices
++
++
++def _preauthorize_pit_optimizer_v2_live_run(
++    config: PitOptimizerGateConfig,
++    *,
++    readiness: PitOptimizerReadiness,
++    authenticate: Callable[[PitOptimizerGateConfig, PitOptimizerReadiness], None],
++    freeze_pricing: Callable[[str], FrozenModelPricing],
++    preflight_call: Callable[[PitOptimizerCallBudget, FrozenModelPricing], None],
++    open_run_lease: Callable[
++        [PitOptimizerGateConfig, PitOptimizerReadiness, FrozenModelPricing],
++        AuthorizationRunLease,
++    ],
++    build_services: Callable[
++        [PitOptimizerReadiness, FrozenModelPricing, AuthorizationRunLease],
++        PitOptimizerServices,
++    ],
++) -> PitOptimizerLiveRun:
++    """Authenticate and conservatively fit the complete plan before lease mutation."""
++    from core.pit_optimization_contract import PIT_OPTIMIZER_R1_MODEL
++
++    config.validate()
++    if config.phase != "canary":
++        raise ConfigurationError("live PIT optimizer services require canary phase")
++    authenticate(config, readiness)
++    manifest = readiness.manifest
++    plans = tuple(manifest.call_budgets)
++    if (
++        manifest.model != PIT_OPTIMIZER_R1_MODEL
++        or len(plans) != 6
++        or any(plan.model != PIT_OPTIMIZER_R1_MODEL for plan in plans)
++    ):
++        raise ConfigurationError("PIT optimizer live call plan is invalid")
++    pricing = freeze_pricing(manifest.model)
++    for plan in plans:
++        preflight_call(plan, pricing)
++    lease = open_run_lease(config, readiness, pricing)
++    services = build_services(readiness, pricing, lease)
++    return PitOptimizerLiveRun(
++        readiness=readiness,
++        optimizer_services=services,
++    )
++
++
++def _build_pit_optimizer_v2_live_run(
++    config: PitOptimizerGateConfig,
++    *,
++    source_state: SourceState,
++    git_capability: GitCapability,
++    api_timeout_seconds: float,
++    wall_timeout_seconds: float,
++) -> PitOptimizerLiveRun:
++    """Compose the production schema-v2 services behind opaque capabilities."""
++    from core.backtest_engine import PortfolioSimulator
++    from core.pit_data import PITDataBundle
++    from core.pit_optimization import (
++        _build_verification_scope,
++        load_pit_optimizer_v2_readiness,
++    )
++    from core.pit_optimization_contract import (
++        AuthorArtifact,
++        PIT_OPTIMIZER_V2_SYSTEM_PROMPTS,
++        pit_optimizer_response_format,
++    )
++    from core.pit_optimizer_artifacts import IncrementalArtifactStore
++    from core.pit_optimizer_authorization import (
++        AuthorizationLedger,
++    )
++    from core.pit_optimizer_candidate import validate_candidate_diff
++    from core.pit_optimizer_controller import (
++        CandidateValidationOutcome,
++        _CandidateCapabilityRegistry,
++        _folds_digest,
++        _window_identity,
++    )
++    from core.pit_optimizer_evaluation import (
++        DeterminismAttestation,
++        DiscoveryComparison,
++        DiscoveryEvaluation,
++        FoldEvaluationResult,
++        HiddenEvaluation,
++        HiddenEvaluationAttestation,
++        HiddenResetReceipt,
++        HoldoutDecision,
++        PitOptimizerCleanup,
++        ValidationExposureMetadata,
++        ValidationLedger,
++        discovery_score_from_folds,
++        strictly_improves_discovery,
++    )
++    from core.pit_policy_parity import build_fold_evidence
++    from core.strategy_policy.contracts import CapacitySnapshot
++    from core.strategy_policy.worker import PolicyDeterminismProbe
++
++    if not isinstance(source_state, SourceState) or source_state.fingerprint is None:
++        raise ConfigurationError("PIT optimizer source capability is invalid")
++    readiness = load_pit_optimizer_v2_readiness(config)
++    manifest = readiness.manifest
++    runtime_root = config.permanent_runtime_root
++    artifact_root = config.artifact_root
++    docker_executable = config.docker_executable
++    sandbox_image = config.sandbox_image
++    if (
++        runtime_root is None
++        or artifact_root is None
++        or docker_executable is None
++        or sandbox_image is None
++        or config.source_root is None
++        or config.controller_temp_parent is None
++    ):
++        raise ConfigurationError("PIT optimizer execution context is absent")
++
++    authorization = AuthorizationLedger(
++        runtime_root / "pit_optimizer_authorization_ledger.jsonl",
++        manifest,
++    )
++    budget = BudgetLedger(
++        max_usd=config.max_usd,
++        max_calls=config.max_api_calls,
++        max_tokens=config.max_tokens,
++    )
++    dotenv_values = _controller_dotenv_values(config.source_root)
++    known_secrets = tuple(
++        value
++        for value in {
++            os.getenv("OPENROUTER_API_KEY"),
++            os.getenv("OPENROUTER"),
++            dotenv_values.get("OPENROUTER_API_KEY"),
++            dotenv_values.get("OPENROUTER"),
++        }
++        if isinstance(value, str) and value
++    )
++    audit = AuditTrail(
++        artifact_root,
++        manifest.run_id,
++        known_secrets=known_secrets,
++    )
++    gateway = OpenRouterGateway(
++        run_id=manifest.run_id,
++        ledger=budget,
++        timeout_seconds=api_timeout_seconds,
++        max_attempts=1,
++        controller_root=config.source_root,
++        authorization_ledger=authorization,
++        audit_trail=audit,
++    )
++    deadline = time.monotonic() + wall_timeout_seconds
++    validation_ledger = ValidationLedger(
++        runtime_root / manifest.validation_ledger_name
++    )
++    store = IncrementalArtifactStore(audit.run_root)
++    worker_box: dict[str, PolicyWorkerRunner] = {}
++    universe_box: dict[str, tuple[str, ...]] = {}
++    incumbent_folds = list(readiness.baseline_discovery.folds)
++    evidence_sha256s: dict[tuple[str, str], str] = {}
++    worker_sequence = 0
++    source_closed = False
++    opened_lease: list[AuthorizationRunLease] = []
++
++    def authenticate(
++        supplied_config: PitOptimizerGateConfig,
++        supplied_readiness: PitOptimizerReadiness,
++    ) -> None:
++        nonlocal worker_sequence
++        if supplied_config is not config or supplied_readiness is not readiness:
++            raise ConfigurationError("PIT optimizer authenticated inputs changed")
++        if (
++            source_state.head != manifest.source_head
++            or source_state.fingerprint is None
++            or source_state.fingerprint.sha256
++            != manifest.source_fingerprint_sha256
++            or config.authorization_window_id
++            != manifest.authorization_requirement.window_id
++            or config.authorization_requirement_sha256
++            != manifest.authorization_requirement.sha256
++        ):
++            raise ConfigurationError("PIT optimizer authority graph differs")
++        authorization.authenticate_window(
++            window_id=config.authorization_window_id,
++            authorization_requirement_sha256=(
++                config.authorization_requirement_sha256
++            ),
++        )
++        with PITDataBundle(
++            config.pit_bundle,
++            expected_sha256=config.pit_bundle_sha256,
++        ) as bundle:
++            scope = _build_verification_scope(bundle, config.baseline_run)
++        universe = tuple(scope["symbols"])
++        universe_sha256 = hashlib.sha256(
++            _canonical_json_bytes(list(universe)) + b"\n"
++        ).hexdigest()
++        if universe_sha256 != manifest.fold_manifest.universe_sha256:
++            raise ConfigurationError("PIT optimizer universe identity differs")
++        for relative, expected_sha256 in manifest.policy_source_sha256s:
++            path = config.source_root / relative
++            if (
++                path.is_symlink()
++                or not path.is_file()
++                or hashlib.sha256(path.read_bytes()).hexdigest()
++                != expected_sha256
++            ):
++                raise ConfigurationError("PIT optimizer policy source differs")
++        docker = configure_docker_executable(
++            docker_executable,
++            source_root=config.source_root,
++            controller_root=config.controller_temp_parent,
++            permanent_runtime_root=runtime_root,
++        )
++        worker_box["runner"] = PolicyWorkerRunner(
++            image=sandbox_image,
++            engine=docker,
++            temp_parent=config.controller_temp_parent,
++        )
++        universe_box["symbols"] = universe
++        worker_sequence = 0
++
++    def freeze_pricing(model: str) -> FrozenModelPricing:
++        return gateway.freeze_pit_optimizer_pricing(
++            model=model,
++            wall_deadline=deadline,
++            monotonic=time.monotonic,
++        )
++
++    def preflight_call(
++        plan: PitOptimizerCallBudget,
++        pricing: FrozenModelPricing,
++    ) -> None:
++        static_bytes = PIT_OPTIMIZER_V2_SYSTEM_PROMPTS[plan.role].encode("utf-8")
++        static_bytes += json.dumps(
++            pit_optimizer_response_format(plan.role),
++            sort_keys=True,
++            separators=(",", ":"),
++            ensure_ascii=False,
++        ).encode("utf-8")
++        rendered_bytes = len(static_bytes) + plan.max_dynamic_input_bytes
++        conservative_cost = conservative_call_cost_usd(
++            rendered_prompt_bytes=rendered_bytes,
++            max_output_tokens=plan.max_output_tokens,
++            pricing=pricing,
++        )
++        if (
++            len(static_bytes) > plan.max_static_input_bytes
++            or rendered_bytes > plan.max_input_tokens
++            or conservative_cost > Decimal(str(plan.max_usd))
++        ):
++            raise BudgetExceededError(
++                "PIT optimizer complete call plan exceeds a sealed cap"
++            )
++
++    def open_run_lease(
++        supplied_config: PitOptimizerGateConfig,
++        supplied_readiness: PitOptimizerReadiness,
++        pricing: FrozenModelPricing,
++    ) -> AuthorizationRunLease:
++        if supplied_config is not config or supplied_readiness is not readiness:
++            raise ConfigurationError("PIT optimizer lease inputs changed")
++        lease = authorization.open_run_lease(
++            window_id=manifest.authorization_requirement.window_id,
++            authorization_requirement_sha256=(
++                manifest.authorization_requirement.sha256
++            ),
++            run_manifest_sha256=manifest.sha256,
++            frozen_pricing_sha256=pricing.pricing_sha256,
++        )
++        opened_lease.append(lease)
++        return lease
++
++    def build_services(
++        supplied_readiness: PitOptimizerReadiness,
++        pricing: FrozenModelPricing,
++        lease: AuthorizationRunLease,
++    ) -> PitOptimizerServices:
++        nonlocal worker_sequence
++        if (
++            supplied_readiness is not readiness
++            or opened_lease != [lease]
++            or "runner" not in worker_box
++            or "symbols" not in universe_box
++        ):
++            raise ConfigurationError("PIT optimizer live services are unbound")
++        runner = worker_box["runner"]
++        universe = universe_box["symbols"]
++
++        def create_capability(cumulative_diff: str | None) -> Candidate:
++            candidate = export_candidate(source_state)
++            try:
++                if cumulative_diff:
++                    encoded = cumulative_diff.encode("utf-8")
++                    _git(
++                        candidate.root,
++                        "apply",
++                        "--check",
++                        "--whitespace=error-all",
++                        "-",
++                        input_bytes=encoded,
++                        git=git_capability,
++                    )
++                    _git(
++                        candidate.root,
++                        "apply",
++                        "--whitespace=error-all",
++                        "-",
++                        input_bytes=encoded,
++                        git=git_capability,
++                    )
++                    observed = derive_authenticated_cumulative_diff(
++                        git=git_capability,
++                        authenticated_base_root=config.source_root,
++                        candidate_root=candidate.root,
++                        editable_paths=manifest.editable_paths,
++                    )
++                    if not hmac.compare_digest(observed, cumulative_diff):
++                        raise CandidateMutationError(
++                            "incumbent cumulative diff changed during export"
++                        )
++                if _git(
++                    candidate.root,
++                    "ls-files",
++                    "--others",
++                    "--exclude-standard",
++                    "-z",
++                    git=git_capability,
++                ).stdout:
++                    raise CandidateMutationError(
++                        "fresh optimizer candidate contains untracked paths"
++                    )
++                return candidate
++            except BaseException:
++                dispose_candidate(candidate)
++                raise
++
++        def validate_capability(
++            candidate: Candidate,
++            author: AuthorArtifact,
++            cumulative_diff: str | None,
++        ) -> CandidateValidationOutcome:
++            try:
++                identity, authenticated_cumulative = validate_candidate_diff(
++                    authenticated_base_root=config.source_root,
++                    candidate_root=candidate.root,
++                    incremental_diff=author.unified_diff,
++                    git=git_capability,
++                    bounds=manifest.candidate_bounds,
++                    source_commit=manifest.source_head,
++                    policy_interface_version=manifest.policy_interface_version,
++                    immutable_constraints_sha256=(
++                        manifest.immutable_constraints_sha256
++                    ),
++                    discovery_manifest_sha256=manifest.fold_manifest.sha256,
++                )
++            except ValueError:
++                return CandidateValidationOutcome(
++                    valid=False,
++                    failure_code="author_diff_invalid",
++                    incremental_diff=author.unified_diff,
++                    cumulative_diff=cumulative_diff or "",
++                    identity=None,
++                    changed_paths=author.changed_paths,
++                    changed_symbols=author.changed_symbols,
++                )
++            return CandidateValidationOutcome(
++                valid=True,
++                failure_code=None,
++                incremental_diff=author.unified_diff,
++                cumulative_diff=authenticated_cumulative,
++                identity=identity,
++                changed_paths=identity.changed_paths,
++                changed_symbols=identity.changed_symbols,
++            )
++
++        def dispose_capability(candidate: Candidate) -> PitOptimizerCleanup:
++            root = candidate.root
++            dispose_candidate(candidate)
++            modified = recheck_source_unchanged(source_state).source_modified
++            return PitOptimizerCleanup(
++                candidate_removed=not root.exists(),
++                worker_stopped=True,
++                source_modified=modified,
++            )
++
++        registry = _CandidateCapabilityRegistry(
++            create_capability=create_capability,
++            validate_capability=validate_capability,
++            dispose_capability=dispose_capability,
++        )
++
++        probes = (
++            PolicyDeterminismProbe(
++                "recommend_capacity",
++                CapacitySnapshot(None, 25, 0, 3, 1.0, False),
++                CapacitySnapshot(5, 25, 2, 1, 0.5, True),
++            ),
++        )
++
++        def evaluate_fold(
++            candidate_root: Path,
++            fold: object,
++            identity_sha256: str,
++        ) -> object:
++            nonlocal worker_sequence
++            worker_sequence += 1
++            fold_id = str(fold.fold_id)
++            factory = runner.client_factory(
++                candidate_root=candidate_root,
++                interface_version=manifest.policy_interface_version,
++                fold_run_id=f"{fold_id}-{worker_sequence:02d}",
++                determinism_probes=probes,
++            )
++            with PITDataBundle(
++                config.pit_bundle,
++                expected_sha256=config.pit_bundle_sha256,
++            ) as bundle:
++                simulator = PortfolioSimulator(
++                    pit_bundle=bundle,
++                    benchmark_symbol=manifest.fold_manifest.benchmark,
++                    signal_every_n_days=1,
++                    policy_client_factory=factory,
++                )
++                result = simulator.run(
++                    list(universe),
++                    start_date=fold.start_date,
++                    end_date=fold.end_date,
++                    history_start_date=manifest.fold_manifest.warmup_start_date,
++                    benchmark_symbol=manifest.fold_manifest.benchmark,
++                )
++            evidence = build_fold_evidence(fold=fold, result=result)
++            if evidence.effective_policy_sha256 != manifest.effective_policy_sha256:
++                raise CandidateMutationError(
++                    "candidate evaluator engine policy identity differs"
++                )
++            evidence_sha256s[(identity_sha256, fold_id)] = evidence.evidence_sha256
++            return evidence
++
++        def evaluate_discovery(
++            workspace: object,
++            identity: object,
++        ) -> DiscoveryEvaluation:
++            evidence = tuple(
++                evaluate_fold(
++                    workspace.root,
++                    fold,
++                    identity.identity_sha256,
++                )
++                for fold in manifest.fold_manifest.discovery_folds
++            )
++            aggregates = tuple(item.aggregate for item in evidence)
++            baseline = readiness.baseline_discovery.folds
++            baseline_sha256 = _folds_digest(baseline)
++            incumbent = tuple(incumbent_folds)
++            incumbent_sha256 = _folds_digest(incumbent)
++            rankable = all(item.closed_trades >= 1 for item in aggregates)
++            if rankable:
++                fixed_score = discovery_score_from_folds(
++                    aggregates,
++                    baseline,
++                    original_baseline_sha256=baseline_sha256,
++                    expected_original_baseline_sha256=baseline_sha256,
++                )
++                incumbent_score = discovery_score_from_folds(
++                    aggregates,
++                    incumbent,
++                    original_baseline_sha256=incumbent_sha256,
++                    expected_original_baseline_sha256=incumbent_sha256,
++                )
++                current_score = discovery_score_from_folds(
++                    incumbent,
++                    baseline,
++                    original_baseline_sha256=baseline_sha256,
++                    expected_original_baseline_sha256=baseline_sha256,
++                )
++                improves = strictly_improves_discovery(fixed_score, current_score)
++            else:
++                fixed_score = discovery_score_from_folds(
++                    baseline,
++                    baseline,
++                    original_baseline_sha256=baseline_sha256,
++                    expected_original_baseline_sha256=baseline_sha256,
++                )
++                incumbent_score = fixed_score
++                improves = False
++            if improves:
++                incumbent_folds[:] = aggregates
++            folds = tuple(
++                FoldEvaluationResult(
++                    fold_id=item.fold_id,
++                    engine_policy_sha256=manifest.effective_policy_sha256,
++                    candidate_identity_sha256=identity.identity_sha256,
++                    aggregate_metrics=item.aggregate,
++                )
++                for item in evidence
++            )
++            return DiscoveryEvaluation(
++                folds=folds,
++                comparison=DiscoveryComparison(
++                    candidate_vs_fixed_baseline=fixed_score,
++                    candidate_vs_incumbent_diagnostics=incumbent_score,
++                    rankable=rankable,
++                    strictly_improves_incumbent=rankable and improves,
++                ),
++            )
++
++        def confirm_discovery(
++            workspace: object,
++            identity: object,
++            fold_id: str,
++        ) -> DeterminismAttestation:
++            fold = next(
++                item
++                for item in manifest.fold_manifest.discovery_folds
++                if item.fold_id == fold_id
++            )
++            expected = evidence_sha256s[(identity.identity_sha256, fold_id)]
++            repeated = evaluate_fold(
++                workspace.root,
++                fold,
++                identity.identity_sha256,
++            ).evidence_sha256
++            return DeterminismAttestation(
++                fold_id=fold_id,
++                expected_evidence_sha256=expected,
++                repeated_evidence_sha256=repeated,
++                matched=hmac.compare_digest(expected, repeated),
++            )
++
++        def reserve_hidden(identity: object) -> object:
++            return validation_ledger.reserve_hidden(
++                _window_identity(manifest, 2),
++                ValidationExposureMetadata(
++                    run_id=manifest.run_id,
++                    source_head=manifest.source_head,
++                    baseline_policy_sha256=manifest.effective_policy_sha256,
++                    candidate_identity_sha256=identity.identity_sha256,
++                    exposure_kind="hidden_validation",
++                ),
++            )
++
++        def baseline_hidden_evidence(fold: object) -> object:
++            with PITDataBundle(
++                config.pit_bundle,
++                expected_sha256=config.pit_bundle_sha256,
++            ) as bundle:
++                simulator = PortfolioSimulator(
++                    pit_bundle=bundle,
++                    benchmark_symbol=manifest.fold_manifest.benchmark,
++                    signal_every_n_days=1,
++                )
++                result = simulator.run(
++                    list(universe),
++                    start_date=fold.start_date,
++                    end_date=fold.end_date,
++                    history_start_date=manifest.fold_manifest.warmup_start_date,
++                    benchmark_symbol=manifest.fold_manifest.benchmark,
++                )
++            evidence = build_fold_evidence(fold=fold, result=result)
++            if evidence.effective_policy_sha256 != manifest.effective_policy_sha256:
++                raise CandidateMutationError(
++                    "baseline hidden engine policy identity differs"
++                )
++            return evidence
++
++        def evaluate_hidden(
++            workspace: object,
++            identity: object,
++            reservation: object,
++        ) -> HiddenEvaluationAttestation:
++            fold = manifest.fold_manifest.hidden_fold
++            baseline = baseline_hidden_evidence(fold)
++            candidate = evaluate_fold(
++                workspace.root,
++                fold,
++                identity.identity_sha256,
++            )
++            accounting = _budget_snapshot(budget)
++            decision = HoldoutDecision.from_result(
++                excess_total_return_pp=(
++                    candidate.aggregate.total_return_pct
++                    - baseline.aggregate.total_return_pct
++                ),
++                closed_trades=candidate.aggregate.closed_trades,
++                safety_complete=True,
++                integrity_complete=True,
++                accounting_complete=(
++                    accounting.api_calls == len(manifest.call_budgets)
++                    and accounting.incomplete_accounting_calls == 0
++                ),
++            )
++
++            def reset_receipt(subject: str, identity_sha256: str) -> HiddenResetReceipt:
++                digest = hashlib.sha256(
++                    _canonical_json_bytes(
++                        {
++                            "fold_id": fold.fold_id,
++                            "subject": subject,
++                            "subject_identity_sha256": identity_sha256,
++                            "reset": "fresh_simulator_and_policy_session",
++                        }
++                    )
++                ).hexdigest()
++                return HiddenResetReceipt(
++                    fold_id=fold.fold_id,
++                    subject=subject,
++                    subject_identity_sha256=identity_sha256,
++                    reset_receipt_sha256=digest,
++                )
++
++            evaluation = HiddenEvaluation(
++                baseline_aggregate=baseline.aggregate,
++                candidate_aggregate=candidate.aggregate,
++                decision=decision,
++            )
++            return HiddenEvaluationAttestation.issue(
++                reservation_record_sha256=(
++                    reservation.reservation_record_sha256
++                ),
++                source_head=manifest.source_head,
++                source_fingerprint_sha256=manifest.source_fingerprint_sha256,
++                baseline_policy_sha256=manifest.effective_policy_sha256,
++                candidate_identity_sha256=identity.identity_sha256,
++                fold_id=fold.fold_id,
++                baseline_reset=reset_receipt(
++                    "baseline",
++                    manifest.effective_policy_sha256,
++                ),
++                candidate_reset=reset_receipt(
++                    "candidate",
++                    identity.identity_sha256,
++                ),
++                evaluation=evaluation,
++            )
++
++        def close_run_lease(
++            active: AuthorizationRunLease,
++            terminal_code: str,
++        ) -> None:
++            mapped = {
++                "iteration_limit": "completed",
++                "stagnation_limit": "early_stop",
++                "cancelled": "cancelled",
++                "budget_exhausted": "budget_exhausted",
++            }.get(terminal_code, "failed")
++            authorization.close_run_lease(active, terminal_code=mapped)
++
++        pricing_claimed = False
++        lease_claimed = False
++
++        def cached_pricing(model: str) -> FrozenModelPricing:
++            nonlocal pricing_claimed
++            if pricing_claimed or model != manifest.model:
++                raise ConfigurationError("PIT optimizer pricing capability was reused")
++            pricing_claimed = True
++            return pricing
++
++        def cached_lease(
++            supplied: PitOptimizerReadiness,
++            frozen: FrozenModelPricing,
++        ) -> AuthorizationRunLease:
++            nonlocal lease_claimed
++            if lease_claimed or supplied is not readiness or frozen is not pricing:
++                raise ConfigurationError("PIT optimizer lease capability was reused")
++            lease_claimed = True
++            return lease
++
++        def verify_inputs(supplied: PitOptimizerReadiness) -> None:
++            nonlocal source_closed
++            try:
++                if supplied is not readiness:
++                    raise CandidateMutationError(
++                        "PIT optimizer readiness capability changed"
++                    )
++                config.validate()
++                reloaded = load_pit_optimizer_v2_readiness(config)
++                if (
++                    reloaded.manifest_sha256 != readiness.manifest_sha256
++                    or reloaded.readiness_sha256 != readiness.readiness_sha256
++                    or recheck_source_unchanged(source_state).source_modified
++                ):
++                    raise CandidateMutationError(
++                        "PIT optimizer authenticated inputs changed"
++                    )
++            finally:
++                if not source_closed:
++                    source_state.close()
++                    source_closed = True
++
++        return PitOptimizerServices(
++            freeze_pricing=cached_pricing,
++            open_run_lease=cached_lease,
++            close_run_lease=close_run_lease,
++            call_role=lambda plan, role_input, parser, active, frozen: (
++                gateway.request_pit_optimizer_once(
++                    plan.role,
++                    role_input,
++                    parser,
++                    call_budget=plan,
++                    authorization_lease=active,
++                    frozen_pricing=frozen,
++                    wall_deadline=deadline,
++                    monotonic=time.monotonic,
++                )
++            ),
++            recover_role_attempt=lambda plan, active: (
++                gateway.recover_pit_optimizer_finalization(
++                    call_budget=plan,
++                    authorization_lease=active,
++                )
++            ),
++            create_candidate=registry.create_candidate,
++            validate_and_apply=registry.validate_and_apply,
++            evaluate_discovery=evaluate_discovery,
++            confirm_discovery=confirm_discovery,
++            reserve_hidden_validation=reserve_hidden,
++            evaluate_hidden=evaluate_hidden,
++            record_hidden_outcome=lambda reservation, attempted, completed, failure: (
++                validation_ledger.record_outcome(
++                    reservation,
++                    attempted=attempted,
++                    completed=completed,
++                    failure_code=failure,
++                )
++            ),
++            dispose_candidate=registry.dispose_candidate,
++            verify_inputs=verify_inputs,
++            cancellation_requested=lambda: False,
++            prepare_iteration_artifacts=store.prepare_iteration,
++            write_json_artifact=store.write_json_artifact,
++            write_diff_artifact=store.write_diff_artifact,
++        )
++
++    try:
++        return _preauthorize_pit_optimizer_v2_live_run(
++            config,
++            readiness=readiness,
++            authenticate=authenticate,
++            freeze_pricing=freeze_pricing,
++            preflight_call=preflight_call,
++            open_run_lease=open_run_lease,
++            build_services=build_services,
++        )
++    except BaseException:
++        if opened_lease:
++            try:
++                authorization.close_run_lease(
++                    opened_lease[0],
++                    terminal_code="failed",
++                )
++            except BaseException:
++                pass
++        raise
++
++
++def _dispatch_pit_optimizer_v2(
++    config: PitOptimizerGateConfig,
++    *,
++    prepare: Callable[[PitOptimizerGateConfig], PitOptimizerReadiness],
++    build_live_services: Callable[[PitOptimizerGateConfig], PitOptimizerLiveRun],
++) -> PitOptimizerReadiness | PitOptimizerResult:
++    """Dispatch preparation before any live service can be constructed."""
++    config.validate()
++    if config.phase == "prepare":
++        return prepare(config)
++    if config.phase != "canary":
++        raise ConfigurationError("unknown PIT optimizer phase")
++    live = build_live_services(config)
++    if not isinstance(live, PitOptimizerLiveRun):
++        raise ConfigurationError("PIT optimizer live services are invalid")
++    from core.pit_optimization import run_pit_optimizer_v2
++
++    return run_pit_optimizer_v2(
++        readiness=live.readiness,
++        services=live.optimizer_services,
++    )
++
++
+ def _build_cli_config(
+     namespace: argparse.Namespace,
+ ) -> tuple[LoopConfig, Path, str]:
+     max_api_calls = namespace.max_api_calls
+     if max_api_calls is None:
+         max_api_calls = (
+-            3
++            6
++            if namespace.gate == "pit_optimizer"
++            else 3
+             if namespace.gate in {"pit_diagnosis", "pit_optimization"}
+             else DEFAULT_MAX_CALLS
+         )
+     docker_executable = _absolute_cli_path(
+         namespace.docker_executable, "docker executable"
+     )
+     sandbox_image = namespace.sandbox_image
+     if (
+         not isinstance(sandbox_image, str)
+         or re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", sandbox_image) is None
+@@ -17921,21 +18950,34 @@ def _build_cli_config(
+         namespace.experiment_catalog_sha256,
+     )
+     optimization_fields = (
+         namespace.optimization_phase,
+         namespace.baseline_manifest_sha256,
+         namespace.effective_policy_sha256,
+         namespace.readiness_sha256,
+         namespace.optimization_prior_discovery_feedback,
+         namespace.optimization_prior_discovery_feedback_sha256,
+     )
+-    all_pit_fields = (*pit_shared_fields, *diagnosis_fields, *optimization_fields)
++    optimizer_v2_fields = (
++        namespace.optimizer_manifest,
++        namespace.optimizer_manifest_sha256,
++        namespace.verified_parity,
++        namespace.verified_parity_sha256,
++        namespace.optimizer_authorization_window_id,
++        namespace.optimizer_authorization_requirement_sha256,
++    )
++    all_pit_fields = (
++        *pit_shared_fields,
++        *diagnosis_fields,
++        *optimization_fields,
++        *optimizer_v2_fields,
++    )
+     if namespace.gate == "test":
+         if any(value is not None for value in backtest_fields):
+             raise ConfigurationError(
+                 "backtest-only options cannot be supplied to the test gate"
+             )
+         if any(value is not None for value in all_pit_fields):
+             raise ConfigurationError("PIT options cannot be supplied to the test gate")
+         if namespace.optimization_verification_subset:
+             raise ConfigurationError(
+                 "PIT optimization options cannot be supplied to the test gate"
+@@ -18016,25 +19058,33 @@ def _build_cli_config(
+             experiment_catalog_sha256=namespace.experiment_catalog_sha256,
+             partition=namespace.pit_partition,
+             max_usd=namespace.max_usd,
+             max_api_calls=max_api_calls,
+             max_tokens=namespace.max_tokens,
+             wall_timeout_seconds=namespace.wall_timeout_seconds,
+             child_timeout_seconds=namespace.child_timeout_seconds,
+             output_limit_bytes=namespace.output_limit_bytes,
+             apply=namespace.apply,
+         )
+-    else:
++    elif namespace.gate == "pit_optimization":
+         if namespace.test_path or any(value is not None for value in backtest_fields):
+             raise ConfigurationError(
+                 "test/backtest options cannot be supplied to the PIT optimization gate"
+             )
++        if any(value is not None for value in optimizer_v2_fields):
++            raise ConfigurationError(
++                "schema-v2 optimizer options cannot be supplied to the legacy PIT optimization gate"
++            )
++        if namespace.authorize_policy_source_transmission:
++            raise ConfigurationError(
++                "schema-v2 source authorization cannot be supplied to the legacy PIT optimization gate"
++            )
+         if any(value is not None for value in diagnosis_fields):
+             raise ConfigurationError(
+                 "PIT diagnosis options cannot be supplied to the optimization gate"
+             )
+         if namespace.proposal_samples is not None or namespace.canary_max_usd is not None:
+             raise ConfigurationError(
+                 "proposal samples are not supported by the PIT optimization gate"
+             )
+         required_optimization = (
+             *pit_shared_fields,
+@@ -18069,20 +19119,43 @@ def _build_cli_config(
+                     )
+                     if namespace.optimization_prior_discovery_feedback is not None
+                     else None
+                 ),
+                 prior_discovery_feedback_sha256=(
+                     namespace.optimization_prior_discovery_feedback_sha256
+                 ),
+             )
+         except ValueError as exc:
+             raise ConfigurationError(str(exc)) from exc
++    else:
++        if namespace.test_path or any(value is not None for value in backtest_fields):
++            raise ConfigurationError(
++                "test/backtest options cannot be supplied to the PIT optimizer gate"
++            )
++        if any(value is not None for value in diagnosis_fields):
++            raise ConfigurationError(
++                "PIT diagnosis options cannot be supplied to the optimizer gate"
++            )
++        if (
++            namespace.optimization_verification_subset
++            or namespace.optimization_prior_discovery_feedback is not None
++            or namespace.optimization_prior_discovery_feedback_sha256 is not None
++        ):
++            raise ConfigurationError(
++                "legacy PIT optimization options cannot be supplied to the optimizer gate"
++            )
++        if namespace.proposal_samples is not None or namespace.canary_max_usd is not None:
++            raise ConfigurationError(
++                "proposal samples are not supported by the PIT optimizer gate"
++            )
++        namespace.max_api_calls = max_api_calls
++        gate = _build_pit_optimizer_v2_config(namespace)
+     config = LoopConfig(
+         source_root=_absolute_cli_path(namespace.repo_root, "repository root"),
+         permanent_runtime_root=_absolute_cli_path(
+             namespace.permanent_runtime_root, "permanent runtime root"
+         ),
+         git_executable=_absolute_cli_path(
+             namespace.git_executable, "Git executable"
+         ),
+         controller_temp_parent=_absolute_cli_path(
+             namespace.controller_temp_parent, "controller temporary parent"
+@@ -18356,24 +19429,78 @@ def _execute_cli_run(
+         except PreflightError as exc:
+             raise ControllerInitializationError(
+                 _closed_source_preflight_stage(exc)
+             ) from exc
+         from core.pit_optimization import (
+             PitOptimizationCanaryServices,
+             PitOptimizationCleanup,
+             PitOptimizationGateConfig,
+             PitOptimizationLoopResult,
+             PitOptimizationRoleCall,
++            prepare_pit_optimizer_v2,
+             prepare_pit_optimization,
+             run_pit_optimization_canary,
+             verify_sealed_baseline_artifacts,
+         )
++        from core.pit_optimization_contract import PitOptimizerGateConfig
++        from core.pit_optimizer_controller import (
++            PitOptimizerReadiness,
++            PitOptimizerResult,
++        )
++
++        if isinstance(config.gate, PitOptimizerGateConfig):
++            if state.fingerprint is None:
++                raise ConfigurationError("preflight source fingerprint is absent")
++
++            def prepare_v2(
++                gate: PitOptimizerGateConfig,
++            ) -> PitOptimizerReadiness:
++                nonlocal stage
++                stage = "pit_optimizer_prepare"
++                return prepare_pit_optimizer_v2(
++                    gate,
++                    source_root=config.source_root,
++                    artifact_root=config.artifact_root,
++                    permanent_runtime_root=config.permanent_runtime_root,
++                    source_head=state.head,
++                    source_fingerprint_sha256=state.fingerprint.sha256,
++                )
++
++            def build_v2(
++                gate: PitOptimizerGateConfig,
++            ) -> PitOptimizerLiveRun:
++                nonlocal stage
++                stage = "pit_optimizer_canary"
++                return _build_pit_optimizer_v2_live_run(
++                    gate,
++                    source_state=state,
++                    git_capability=git_capability,
++                    api_timeout_seconds=config.limits.api_timeout_seconds,
++                    wall_timeout_seconds=config.limits.wall_timeout_seconds,
++                )
++
++            v2_result = _dispatch_pit_optimizer_v2(
++                config.gate,
++                prepare=prepare_v2,
++                build_live_services=build_v2,
++            )
++            if isinstance(v2_result, PitOptimizerReadiness):
++                if recheck_source_unchanged(state).source_modified:
++                    raise CandidateMutationError(
++                        "source changed during PIT optimizer readiness publication"
++                    )
++            elif not isinstance(v2_result, PitOptimizerResult):
++                raise ConfigurationError("PIT optimizer returned an invalid result")
++            state.close()
++            state = None
++            loop_returned = True
++            return v2_result
+ 
+         if (
+             isinstance(config.gate, PitOptimizationGateConfig)
+             and config.gate.phase == "prepare"
+         ):
+             if state.fingerprint is None:
+                 raise ConfigurationError("preflight source fingerprint is absent")
+             stage = "pit_optimization_prepare"
+             readiness = prepare_pit_optimization(
+                 config.gate,
+@@ -19027,20 +20154,194 @@ def _pit_optimization_summary(result: Any) -> dict[str, object]:
+             for path, digest in result.artifact_paths
+         ],
+         "provider_calls": result.provider_calls,
+         "spent_usd": result.spent_usd,
+         "source_modified": result.source_modified,
+         "cleanup_complete": result.cleanup_complete,
+         "verification_only": result.verification_only,
+     }
+ 
+ 
++def _pit_optimizer_v2_summary(
++    result: PitOptimizerResult,
++) -> dict[str, object]:
++    """Project one schema-v2 result without provider content or opaque digests."""
++    from core.pit_optimizer_controller import PitOptimizerResult
++
++    if not isinstance(result, PitOptimizerResult):
++        raise ConfigurationError(
++            "CLI execution did not return a PitOptimizerResult"
++        )
++    winner = result.discovery_winner
++    incumbent = (
++        None
++        if winner is None
++        else {
++            "changed_paths": list(winner.changed_paths),
++            "changed_symbols": list(winner.changed_symbols),
++        }
++    )
++    return {
++        "schema_version": 2,
++        "phase": result.phase,
++        "status": result.status,
++        "terminal_code": result.terminal_code,
++        "exit_code": result.exit_code,
++        "run_id": result.run_id,
++        "iterations_started": result.iterations_started,
++        "iterations_completed": result.iterations_completed,
++        "valid_evaluations": result.valid_evaluations,
++        "incumbent_updates": result.incumbent_updates,
++        "incumbent": incumbent,
++        "hidden_validation_opened": result.hidden_validation_opened,
++        "long_replay_eligible": result.long_replay_eligible,
++        "budget": asdict(result.budget),
++        "artifact_root": str(result.artifact_root),
++        "source_modified": result.source_modified,
++        "cleanup_complete": result.cleanup_complete,
++    }
++
++
++def _pit_optimizer_v2_prepare_lines(
++    config: PitOptimizerGateConfig,
++    readiness: PitOptimizerReadiness,
++) -> tuple[str, str]:
++    """Render the authenticated readiness record and inert canary command."""
++    from core.pit_optimization_contract import PitOptimizerGateConfig
++    from core.pit_optimizer_controller import PitOptimizerReadiness
++
++    if (
++        not isinstance(config, PitOptimizerGateConfig)
++        or config.phase != "prepare"
++        or not isinstance(readiness, PitOptimizerReadiness)
++        or readiness.manifest_sha256 != config.optimizer_manifest_sha256
++    ):
++        raise ConfigurationError(
++            "prepare output requires authenticated schema-v2 readiness"
++        )
++    config.validate()
++    context = (
++        config.source_root,
++        config.permanent_runtime_root,
++        config.git_executable,
++        config.controller_temp_parent,
++        config.artifact_root,
++        config.docker_executable,
++        config.sandbox_image,
++    )
++    if any(value is None for value in context):
++        raise ConfigurationError("PIT optimizer prepare execution context is absent")
++    manifest = readiness.manifest
++    expected_readiness = (
++        config.artifact_root / f"{manifest.run_id}.readiness.json"  # type: ignore[operator]
++    ).resolve(strict=False)
++    supplied_readiness = Path(readiness.artifact_path)
++    if (
++        not supplied_readiness.is_absolute()
++        or supplied_readiness.is_symlink()
++        or not supplied_readiness.is_file()
++        or supplied_readiness.resolve(strict=False) != expected_readiness
++    ):
++        raise ConfigurationError("PIT optimizer derived readiness path differs")
++    if (
++        readiness.readiness_sha256
++        != hashlib.sha256(supplied_readiness.read_bytes()).hexdigest()
++    ):
++        raise ConfigurationError(
++            "prepare output requires authenticated schema-v2 readiness"
++        )
++    authorization = manifest.authorization_requirement
++    if (
++        config.max_api_calls != 6
++        or config.max_tokens != 448_000
++        or not math.isclose(config.max_usd, 0.40, rel_tol=0.0, abs_tol=1e-12)
++        or config.max_iterations != 2
++        or config.apply is not False
++    ):
++        raise ConfigurationError("PIT optimizer prepare ceilings are invalid")
++    argv = (
++        sys.executable,
++        "-B",
++        str((config.source_root / "agent_loop.py").resolve()),  # type: ignore[operator]
++        "--repo-root",
++        str(config.source_root),
++        "--permanent-runtime-root",
++        str(config.permanent_runtime_root),
++        "--git-executable",
++        str(config.git_executable),
++        "--controller-temp-parent",
++        str(config.controller_temp_parent),
++        "--artifact-root",
++        str(config.artifact_root),
++        "--docker-executable",
++        str(config.docker_executable),
++        "--sandbox-image",
++        str(config.sandbox_image),
++        "--gate",
++        "pit_optimizer",
++        "--optimization-phase",
++        "canary",
++        "--baseline-run",
++        str(config.baseline_run),
++        "--baseline-manifest-sha256",
++        config.baseline_manifest_sha256,
++        "--pit-bundle",
++        str(config.pit_bundle),
++        "--pit-bundle-sha256",
++        config.pit_bundle_sha256,
++        "--effective-policy-sha256",
++        config.effective_policy_sha256,
++        "--optimizer-manifest",
++        str(config.optimizer_manifest),
++        "--optimizer-manifest-sha256",
++        config.optimizer_manifest_sha256,
++        "--verified-parity",
++        str(config.verified_parity_artifact),
++        "--verified-parity-sha256",
++        config.verified_parity_sha256,
++        "--readiness-sha256",
++        readiness.readiness_sha256,
++        "--optimizer-authorization-window-id",
++        authorization.window_id,
++        "--optimizer-authorization-requirement-sha256",
++        authorization.sha256,
++        "--authorize-policy-source-transmission",
++        "--max-usd",
++        "0.40",
++        "--max-api-calls",
++        "6",
++        "--max-tokens",
++        "448000",
++        "--max-iterations",
++        "2",
++    )
++    command = subprocess.list2cmdline(argv)
++    ready = {
++        "schema_version": 2,
++        "phase": "ready",
++        "run_id": manifest.run_id,
++        "readiness_artifact": str(readiness.artifact_path),
++        "canary_command": command,
++    }
++    return (
++        "PIT_OPTIMIZER_READY="
++        + json.dumps(
++            ready,
++            sort_keys=True,
++            separators=(",", ":"),
++            ensure_ascii=False,
++            allow_nan=False,
++        ),
++        "PIT_OPTIMIZER_CANARY_COMMAND=" + command,
++    )
++
++
+ def _pit_optimization_prepare_lines(
+     config: LoopConfig,
+     *,
+     docker_executable: Path,
+     sandbox_image: str,
+     readiness: Any,
+ ) -> tuple[str, str]:
+     """Return the canonical readiness record and its exact inert canary command."""
+ 
+     from core.pit_optimization import PitOptimizationGateConfig, PitOptimizationReadiness
+@@ -19156,45 +20457,86 @@ def main(argv: Sequence[str] | None = None) -> int:
+     run_id = _new_run_id()
+     try:
+         result = _execute_cli_run(
+             config,
+             docker_executable=docker_executable,
+             sandbox_image=sandbox_image,
+             run_id=run_id,
+             batch_limits=batch_limits,
+         )
+         from core.pit_optimization import PitOptimizationLoopResult
++        from core.pit_optimization_contract import PitOptimizerGateConfig
++        from core.pit_optimizer_controller import (
++            PitOptimizerReadiness,
++            PitOptimizerResult,
++        )
+         from pit_diagnosis_agent import PitDiagnosisLoopResult
+ 
+         summary = (
+             _proposal_batch_summary(result)
+             if isinstance(result, ProposalBatchResult)
+             else _pit_diagnosis_summary(result)
+             if isinstance(result, PitDiagnosisLoopResult)
+             else _pit_optimization_summary(result)
+             if isinstance(result, PitOptimizationLoopResult)
++            else _pit_optimizer_v2_summary(result)
++            if isinstance(result, PitOptimizerResult)
++            else {
++                "schema_version": 2,
++                "phase": "prepare",
++                "status": "ready",
++                "terminal_code": "prepared",
++                "exit_code": 0,
++                "run_id": result.manifest.run_id,
++                "iterations_started": 0,
++                "iterations_completed": 0,
++                "valid_evaluations": 0,
++                "incumbent_updates": 0,
++                "incumbent": None,
++                "hidden_validation_opened": False,
++                "long_replay_eligible": None,
++                "budget": {
++                    "api_calls": 0,
++                    "prompt_tokens": 0,
++                    "completion_tokens": 0,
++                    "total_tokens": 0,
++                    "authoritative_usd": 0.0,
++                    "retained_reservation_tokens": 0,
++                    "retained_reservation_usd": 0.0,
++                    "incomplete_accounting_calls": 0,
++                },
++                "artifact_root": str(result.artifact_path.parent),
++                "source_modified": False,
++                "cleanup_complete": True,
++            }
++            if isinstance(result, PitOptimizerReadiness)
+             else _loop_result_summary(result)
+         )
+     except ControllerInitializationError as exc:
+         print(f"agent loop initialization failed: {exc.stage}", file=sys.stderr)
+         return 22
+     except Exception:
+         print("agent loop initialization failed", file=sys.stderr)
+         return 22
+     if isinstance(result, PitOptimizationLoopResult):
+         for line in result.operator_lines:
+             print(line)
++    if isinstance(result, PitOptimizerReadiness):
++        if not isinstance(config.gate, PitOptimizerGateConfig):
++            raise ConfigurationError("PIT optimizer readiness gate is invalid")
++        for line in _pit_optimizer_v2_prepare_lines(config.gate, result):
++            print(line)
+     print(
+         "AGENT_LOOP_SUMMARY="
+         + json.dumps(
+             summary,
+             sort_keys=True,
+             separators=(",", ":"),
+             ensure_ascii=False,
+             allow_nan=False,
+         )
+     )
+-    return result.exit_code
++    return 0 if isinstance(result, PitOptimizerReadiness) else result.exit_code
+ 
+ 
+ if __name__ == "__main__":
+     raise SystemExit(main())
+diff --git a/core/pit_optimization.py b/core/pit_optimization.py
+index 9c0e907..8e6c231 100644
+--- a/core/pit_optimization.py
++++ b/core/pit_optimization.py
+@@ -3273,20 +3273,70 @@ def prepare_pit_optimizer_v2(
+     return prepare(
+         config,
+         source_root=source_root,
+         artifact_root=artifact_root,
+         permanent_runtime_root=permanent_runtime_root,
+         source_head=source_head,
+         source_fingerprint_sha256=source_fingerprint_sha256,
+     )
+ 
+ 
++def load_pit_optimizer_v2_readiness(
++    config: PitOptimizerGateConfig,
++) -> PitOptimizerReadiness:
++    """Load and reconstruct one previously prepared canonical readiness artifact."""
++
++    from core.pit_optimizer_artifacts import canonical_json_bytes
++    from core.pit_optimizer_controller import (
++        PitOptimizerReadiness,
++        _baseline_from_parity,
++        _load_manifest,
++        _load_parity,
++        _provider_seed_from_baseline,
++        _readiness_primitive,
++        _validate_parity_graph,
++    )
++
++    if not isinstance(config, PitOptimizerGateConfig) or config.phase != "canary":
++        raise ValueError("optimizer readiness load requires a canary gate")
++    config.validate()
++    if config.readiness_artifact is None or config.readiness_sha256 is None:
++        raise ValueError("optimizer canary readiness identity is absent")
++    manifest = _load_manifest(config.optimizer_manifest)
++    parity = _load_parity(config.verified_parity_artifact)
++    _validate_parity_graph(parity, manifest)
++    baseline = _baseline_from_parity(parity)
++    provider_seed = _provider_seed_from_baseline(baseline)
++    expected = _readiness_primitive(
++        manifest=manifest,
++        parity=parity,
++        baseline=baseline,
++        provider_seed=provider_seed,
++    )
++    raw = config.readiness_artifact.read_bytes()
++    if (
++        raw != canonical_json_bytes(expected)
++        or hashlib.sha256(raw).hexdigest() != config.readiness_sha256
++    ):
++        raise ValueError("optimizer readiness artifact differs from closed inputs")
++    return PitOptimizerReadiness(
++        schema_version=2,
++        manifest=manifest,
++        manifest_sha256=manifest.sha256,
++        readiness_sha256=config.readiness_sha256,
++        artifact_path=config.readiness_artifact.resolve(),
++        parity=parity,
++        baseline_discovery=baseline,
++        provider_seed=provider_seed,
++    )
++
++
+ def run_pit_optimizer_v2(
+     *,
+     readiness: PitOptimizerReadiness,
+     services: PitOptimizerServices,
+ ) -> PitOptimizerResult:
+     """Public adapter for the injected schema-v2 incumbent loop."""
+ 
+     from core.pit_optimizer_controller import run_pit_optimizer_v2 as run
+ 
+     return run(readiness=readiness, services=services)
+diff --git a/core/pit_optimization_contract.py b/core/pit_optimization_contract.py
+index 8d4a953..d1bb326 100644
+--- a/core/pit_optimization_contract.py
++++ b/core/pit_optimization_contract.py
+@@ -748,38 +748,121 @@ class PitOptimizerGateConfig:
+     readiness_artifact: Path | None
+     readiness_sha256: str | None
+     authorization_window_id: str | None
+     authorization_requirement_sha256: str
+     source_transmission_authorized: bool
+     max_usd: float
+     max_api_calls: int
+     max_tokens: int
+     max_iterations: int
+     apply: bool
++    source_root: Path | None = None
++    permanent_runtime_root: Path | None = None
++    controller_temp_parent: Path | None = None
++    artifact_root: Path | None = None
++    git_executable: Path | None = None
++    docker_executable: Path | None = None
++    sandbox_image: str | None = None
+ 
+     def validate(self) -> None:
+-        if self.phase not in {"prepare", "run"}:
++        if self.phase not in {"prepare", "canary"}:
+             raise ValueError("optimizer gate phase is invalid")
++        if self.phase == "prepare":
++            if self.source_transmission_authorized is not False:
++                raise ValueError(
++                    "prepare phase cannot authorize policy source transmission"
++                )
++            if self.authorization_window_id is not None:
++                raise ValueError("prepare phase cannot carry an authorization window")
++            if self.readiness_artifact is not None or self.readiness_sha256 is not None:
++                raise ValueError("prepare phase cannot carry a readiness identity")
++        else:
++            if self.source_transmission_authorized is not True:
++                raise ValueError(
++                    "canary phase policy source transmission must be authorized"
++                )
++            _v2_identifier(self.authorization_window_id, "authorization window ID")
++            if self.readiness_artifact is None or self.readiness_sha256 is None:
++                raise ValueError("canary phase requires authenticated readiness")
++        if self.apply is not False:
++            raise ValueError("optimizer gate apply must be false")
++        execution_context = (
++            self.source_root,
++            self.permanent_runtime_root,
++            self.controller_temp_parent,
++            self.artifact_root,
++            self.git_executable,
++            self.docker_executable,
++            self.sandbox_image,
++        )
++        if any(value is not None for value in execution_context):
++            if any(value is None for value in execution_context):
++                raise ValueError("optimizer gate execution context is incomplete")
++            assert self.source_root is not None
++            assert self.permanent_runtime_root is not None
++            assert self.controller_temp_parent is not None
++            assert self.artifact_root is not None
++            assert self.git_executable is not None
++            assert self.docker_executable is not None
++            assert self.sandbox_image is not None
++            _resolved_directory(self.source_root, "optimizer gate source root")
++            _resolved_directory(
++                self.permanent_runtime_root,
++                "optimizer gate permanent runtime root",
++            )
++            _resolved_directory(
++                self.controller_temp_parent,
++                "optimizer gate controller temp parent",
++            )
++            _resolved_directory(self.artifact_root, "optimizer gate artifact root")
++            _resolved_file(self.git_executable, "optimizer gate Git executable")
++            _resolved_file(self.docker_executable, "optimizer gate Docker executable")
++            if (
++                re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", self.sandbox_image)
++                is None
++            ):
++                raise ValueError("optimizer gate sandbox image is invalid")
+         baseline = _resolved_directory(self.baseline_run, "optimizer gate baseline run")
+         baseline_manifest = _resolved_file(
+             baseline / "run_manifest.json",
+             "optimizer gate baseline manifest",
+         )
+         manifest_path = _resolved_file(
+             self.optimizer_manifest,
+             "optimizer manifest artifact",
+         )
+         bundle_path = _resolved_file(self.pit_bundle, "optimizer gate PIT bundle")
+         parity_path = _resolved_file(
+             self.verified_parity_artifact,
+             "optimizer gate parity artifact",
+         )
++        readiness_path = (
++            None
++            if self.readiness_artifact is None
++            else _resolved_file(
++                self.readiness_artifact,
++                "optimizer gate readiness artifact",
++            )
++        )
++        authenticated_files = tuple(
++            path
++            for path in (
++                baseline_manifest,
++                manifest_path,
++                bundle_path,
++                parity_path,
++                readiness_path,
++            )
++            if path is not None
++        )
++        if len(set(authenticated_files)) != len(authenticated_files):
++            raise ValueError("optimizer gate authenticated input paths overlap")
+         for name in (
+             "baseline_manifest_sha256",
+             "pit_bundle_sha256",
+             "effective_policy_sha256",
+             "optimizer_manifest_sha256",
+             "verified_parity_sha256",
+             "authorization_requirement_sha256",
+         ):
+             _require_digest(getattr(self, name), f"optimizer gate {name}")
+         if _sha256_file(baseline_manifest) != self.baseline_manifest_sha256:
+@@ -802,20 +885,25 @@ class PitOptimizerGateConfig:
+             raise ValueError("optimizer manifest closed identity differs")
+         identity_fields = {
+             "baseline_manifest_sha256": self.baseline_manifest_sha256,
+             "pit_bundle_sha256": self.pit_bundle_sha256,
+             "effective_policy_sha256": self.effective_policy_sha256,
+         }
+         if any(primitive.get(name) != expected for name, expected in identity_fields.items()):
+             raise ValueError("optimizer gate identities differ from manifest")
+         if closed_manifest.parity_attestation_sha256 != self.verified_parity_sha256:
+             raise ValueError("optimizer gate parity identity differs from manifest")
++        if (
++            self.sandbox_image is not None
++            and self.sandbox_image != closed_manifest.sandbox_image
++        ):
++            raise ValueError("optimizer gate sandbox image differs from manifest")
+         authorization = primitive.get("authorization_requirement")
+         if not isinstance(authorization, dict):
+             raise ValueError("optimizer manifest authorization requirement is absent")
+         authorization_sha256 = hashlib.sha256(
+             _v2_canonical_bytes(authorization) + b"\n"
+         ).hexdigest()
+         if authorization_sha256 != self.authorization_requirement_sha256:
+             raise ValueError("optimizer gate authorization requirement digest differs")
+         _require_positive_int(self.max_api_calls, "optimizer gate call cap")
+         _require_positive_int(self.max_tokens, "optimizer gate token cap")
+@@ -834,53 +922,56 @@ class PitOptimizerGateConfig:
+                 float(authorization.get("max_usd", -1)),
+                 float(self.max_usd),
+                 rel_tol=0.0,
+                 abs_tol=1e-12,
+             )
+             or primitive.get("max_iterations") != self.max_iterations
+         ):
+             raise ValueError("optimizer gate ceilings differ from manifest")
+         if authorization.get("apply") is not self.apply:
+             raise ValueError("optimizer gate apply differs from authorization requirement")
+-        if self.readiness_artifact is None or self.readiness_sha256 is None:
+-            if self.readiness_artifact is not None or self.readiness_sha256 is not None:
+-                raise ValueError("optimizer gate readiness identity is incomplete")
+-            if self.phase != "prepare":
+-                raise ValueError("run phase requires authenticated readiness")
+-        else:
++        if readiness_path is not None:
++            assert self.readiness_sha256 is not None
+             _require_digest(self.readiness_sha256, "optimizer gate readiness SHA-256")
+-            readiness = _resolved_file(
+-                self.readiness_artifact,
+-                "optimizer gate readiness artifact",
+-            )
+-            if _sha256_file(readiness) != self.readiness_sha256:
++            raw_readiness = readiness_path.read_bytes()
++            if hashlib.sha256(raw_readiness).hexdigest() != self.readiness_sha256:
+                 raise ValueError("optimizer gate readiness artifact digest differs")
+-            if closed_manifest.legacy_readiness_sha256 != self.readiness_sha256:
+-                raise ValueError("optimizer gate readiness identity differs from manifest")
+-        if self.phase == "prepare":
+-            if self.authorization_window_id is not None:
+-                raise ValueError("prepare phase cannot carry an authorization window")
+-            if self.source_transmission_authorized is not False:
+-                raise ValueError("prepare phase source transmission is not authorized")
+-            if self.apply is not False:
+-                raise ValueError("prepare phase apply must be false")
+-        else:
+-            _v2_identifier(self.authorization_window_id, "authorization window ID")
++            try:
++                readiness = json.loads(raw_readiness)
++            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
++                raise ValueError("optimizer gate readiness artifact is invalid JSON") from exc
+             if (
+-                self.authorization_window_id
+-                != closed_manifest.authorization_requirement.window_id
++                not isinstance(readiness, dict)
++                or set(readiness)
++                != {
++                    "schema_version",
++                    "manifest",
++                    "manifest_sha256",
++                    "parity",
++                    "baseline_discovery",
++                    "provider_seed",
++                }
++                or raw_readiness != _v2_canonical_bytes(readiness) + b"\n"
+             ):
+-                raise ValueError("optimizer gate authorization window differs from manifest")
+-            if self.source_transmission_authorized is not True:
+-                raise ValueError("run phase source transmission must be authorized")
+-            if type(self.apply) is not bool:
+-                raise ValueError("optimizer gate apply must be boolean")
++                raise ValueError("optimizer gate readiness artifact is not canonical")
++            if (
++                readiness.get("schema_version") != 2
++                or readiness.get("manifest_sha256") != closed_manifest.sha256
++                or readiness.get("manifest") != primitive
++            ):
++                raise ValueError("optimizer gate readiness identity differs from manifest")
++        if (
++            self.phase == "canary"
++            and self.authorization_window_id
++            != closed_manifest.authorization_requirement.window_id
++        ):
++            raise ValueError("optimizer gate authorization window differs from manifest")
+ 
+ 
+ def _resolved_directory(path: Path, label: str) -> Path:
+     candidate = Path(path)
+     if not candidate.is_absolute() or candidate.is_symlink() or not candidate.is_dir():
+         raise ValueError(f"{label} must be an existing absolute non-link directory")
+     return candidate.resolve()
+ 
+ 
+ def _resolved_file(path: Path, label: str) -> Path:
+@@ -1340,59 +1431,67 @@ def build_prepare_command(
+         raise ValueError("baseline run differs from manifest")
+     for relative, expected_sha256 in manifest.policy_source_sha256s:
+         path = _resolved_file(repository / relative, f"policy source {relative}")
+         if _sha256_file(path) != expected_sha256:
+             raise ValueError("repository policy source differs from manifest")
+     if sandbox_image != manifest.sandbox_image:
+         raise ValueError("prepare sandbox image differs from manifest")
+     arguments = [
+         "python",
+         "-B",
+-        "-m",
+-        "core.pit_optimization",
+-        "prepare-v2",
++        str((repository / "agent_loop.py").resolve()),
++        "--repo-root",
++        str(repository),
++        "--permanent-runtime-root",
++        str(runtime_root),
++        "--git-executable",
++        str(git_path),
++        "--controller-temp-parent",
++        str(temp_parent),
++        "--artifact-root",
++        str(artifacts),
++        "--docker-executable",
++        str(docker_path),
++        "--sandbox-image",
++        sandbox_image,
++        "--gate",
++        "pit_optimizer",
++        "--optimization-phase",
++        "prepare",
+         "--optimizer-manifest",
+         str(optimizer_manifest),
+         "--optimizer-manifest-sha256",
+         manifest.sha256,
+-        "--legacy-readiness",
+-        str(legacy_readiness),
+-        "--legacy-readiness-sha256",
+-        manifest.legacy_readiness_sha256,
+         "--verified-parity",
+         str(verified_parity),
+         "--verified-parity-sha256",
+         manifest.parity_attestation_sha256,
+         "--pit-bundle",
+         str(pit_bundle),
+         "--pit-bundle-sha256",
+         manifest.pit_bundle_sha256,
+         "--baseline-run",
+         str(baseline_run),
+         "--baseline-manifest-sha256",
+         manifest.baseline_manifest_sha256,
+-        "--repo-root",
+-        str(repository),
+-        "--permanent-runtime-root",
+-        str(runtime_root),
+-        "--controller-temp-parent",
+-        str(temp_parent),
+-        "--artifact-root",
+-        str(artifacts),
+-        "--git-executable",
+-        str(git_path),
+-        "--docker-executable",
+-        str(docker_path),
+-        "--sandbox-image",
+-        sandbox_image,
+-        "--authorization-requirement-sha256",
++        "--effective-policy-sha256",
++        manifest.effective_policy_sha256,
++        "--optimizer-authorization-requirement-sha256",
+         manifest.authorization_requirement.sha256,
++        "--max-usd",
++        "0.40",
++        "--max-api-calls",
++        "6",
++        "--max-tokens",
++        "448000",
++        "--max-iterations",
++        "2",
+     ]
+     return subprocess.list2cmdline(arguments)
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class PolicySourceRecord(_V2Canonical):
+     path: str
+     sha256: str
+     declared_symbols: tuple[str, ...]
+     text: str
+diff --git a/core/pit_optimizer_authorization.py b/core/pit_optimizer_authorization.py
+index 6110788..d214d05 100644
+--- a/core/pit_optimizer_authorization.py
++++ b/core/pit_optimizer_authorization.py
+@@ -2549,20 +2549,65 @@ class AuthorizationLedger:
+                         "operator_approval_reference_sha256": approval_sha256,
+                     },
+                     {
+                         "record_type": "window",
+                         "window": asdict(window),
+                         "operator_approval_reference_sha256": approval_sha256,
+                     },
+                 ],
+             )
+ 
++    def authenticate_window(
++        self,
++        *,
++        window_id: str,
++        authorization_requirement_sha256: str,
++    ) -> OperatorAuthorizationWindow:
++        """Return the exact authenticated window without mutating authority."""
++
++        try:
++            _require_id(window_id, "authorization window ID")
++            _require_digest(
++                authorization_requirement_sha256,
++                "authorization requirement SHA-256",
++            )
++        except ValueError as exc:
++            raise AuthorizationError(str(exc)) from exc
++        requirement = self._manifest.authorization_requirement
++        if authorization_requirement_sha256 != requirement.sha256:
++            raise AuthorizationError("authorization requirement mismatch")
++        if window_id != requirement.window_id:
++            raise AuthorizationError("authorization window ID mismatch")
++        with _authorization_file_lock(self._lock_path):
++            records = self._read_records()
++            matches = [
++                record
++                for record in records
++                if record.get("record_type") == "window"
++                and isinstance(record.get("window"), dict)
++                and record["window"].get("window_id") == window_id
++            ]
++        if len(matches) != 1:
++            raise AuthorizationError("authorization window is absent")
++        primitive = dict(matches[0]["window"])
++        primitive["grant_ids"] = tuple(primitive.get("grant_ids", ()))
++        try:
++            window = OperatorAuthorizationWindow(**primitive)
++        except (TypeError, ValueError) as exc:
++            raise AuthorizationError("authorization window record is invalid") from exc
++        require_authorized_policy_source_scope(
++            self._manifest,
++            requirement,
++            window,
++        )
++        return window
++
+     def open_run_lease(
+         self,
+         *,
+         window_id: str,
+         authorization_requirement_sha256: str,
+         run_manifest_sha256: str,
+         frozen_pricing_sha256: str,
+     ) -> AuthorizationRunLease:
+         """Atomically acquire the manifest/window once without debiting allowance."""
+ 
+diff --git a/core/pit_optimizer_evaluation.py b/core/pit_optimizer_evaluation.py
+index f227829..65a8414 100644
+--- a/core/pit_optimizer_evaluation.py
++++ b/core/pit_optimizer_evaluation.py
+@@ -1,26 +1,28 @@
+ """Immutable fold and aggregate contracts for the PIT optimizer."""
+ 
+ from __future__ import annotations
+ 
++import argparse
+ from contextlib import contextmanager
+ from dataclasses import InitVar, asdict, dataclass
+ from datetime import date
+ from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
+ import hashlib
+ import json
+ import math
+ import os
+ from pathlib import Path
+ import re
+ from itertools import pairwise
+-from typing import Iterator
++import sys
++from typing import Iterator, Mapping, Sequence
+ 
+ 
+ _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+ _CLOSED_ID_RE = re.compile(r"[a-z][a-z0-9_.-]{0,127}")
+ _EXPOSURE_KINDS = {
+     "candidate_validation",
+     "provider_context",
+     "hidden_validation",
+ }
+ VALIDATION_OUTCOME_FAILURE_CODES = frozenset(
+@@ -1186,10 +1188,218 @@ class ValidationLedger:
+             )
+             record_sha256 = str(record["record_sha256"])
+             return ValidationOutcomeProof(
+                 reservation_record_sha256=reservation.reservation_record_sha256,
+                 attempted=attempted,
+                 completed=completed,
+                 failure_code=failure_code,
+                 outcome_record_sha256=record_sha256,
+                 ledger_head_sha256=record_sha256,
+             )
++
++
++def _absolute_cli_path(path: Path, label: str) -> Path:
++    candidate = Path(path)
++    if not candidate.is_absolute():
++        raise ValueError(f"{label} must be an explicit absolute path")
++    if candidate.is_symlink():
++        raise ValueError(f"{label} must not be a symbolic link")
++    return candidate.resolve(strict=False)
++
++
++def _read_canonical_mapping(path: Path, label: str) -> Mapping[str, object]:
++    candidate = _absolute_cli_path(path, label)
++    if candidate.is_symlink() or not candidate.is_file():
++        raise ValueError(f"{label} must be an existing regular non-link file")
++    raw = candidate.read_bytes()
++    try:
++        value = json.loads(raw)
++    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
++        raise ValueError(f"{label} is invalid JSON") from exc
++    if not isinstance(value, dict) or raw != _canonical_json_bytes(value):
++        raise ValueError(f"{label} is not canonical JSON")
++    return value
++
++
++def _manifest_cli_parser() -> argparse.ArgumentParser:
++    parser = argparse.ArgumentParser(
++        prog="python -m core.pit_optimizer_evaluation",
++        allow_abbrev=False,
++    )
++    commands = parser.add_subparsers(dest="command", required=True)
++    build = commands.add_parser("build-subset-manifest", allow_abbrev=False)
++    for flag in (
++        "readiness",
++        "verified-parity",
++        "pit-bundle",
++        "baseline-run",
++        "source-root",
++        "permanent-runtime-root",
++        "controller-temp-parent",
++        "artifact-root",
++        "git-executable",
++        "docker-executable",
++        "output",
++    ):
++        build.add_argument(f"--{flag}", type=Path, required=True)
++    build.add_argument("--sandbox-image", required=True)
++    build.add_argument("--iterations", type=int, required=True)
++    for role in ("investigator", "author", "critic"):
++        for suffix in (
++            "static-bytes",
++            "dynamic-bytes",
++            "input-tokens",
++            "output-tokens",
++            "response-bytes",
++        ):
++            build.add_argument(f"--{role}-{suffix}", type=int, required=True)
++        build.add_argument(f"--{role}-max-usd", type=float, required=True)
++    build.add_argument("--max-files", type=int, required=True)
++    build.add_argument("--max-hunks", type=int, required=True)
++    build.add_argument("--max-changed-lines", type=int, required=True)
++    build.add_argument("--max-diff-bytes", type=int, required=True)
++    return parser
++
++
++def _call_budgets_from_namespace(namespace: argparse.Namespace) -> tuple[object, ...]:
++    from core.pit_optimization_contract import (
++        OPTIMIZER_V2_ROLES,
++        PIT_OPTIMIZER_R1_MODEL,
++        PitOptimizerCallBudget,
++    )
++
++    budgets = []
++    for iteration in range(1, namespace.iterations + 1):
++        for ordinal, role in enumerate(OPTIMIZER_V2_ROLES, start=1):
++            prefix = role.replace("-", "_")
++            budgets.append(
++                PitOptimizerCallBudget(
++                    call_index=(iteration - 1) * 3 + ordinal,
++                    iteration=iteration,
++                    role=role,
++                    model=PIT_OPTIMIZER_R1_MODEL,
++                    max_static_input_bytes=getattr(
++                        namespace,
++                        f"{prefix}_static_bytes",
++                    ),
++                    max_dynamic_input_bytes=getattr(
++                        namespace,
++                        f"{prefix}_dynamic_bytes",
++                    ),
++                    max_input_tokens=getattr(
++                        namespace,
++                        f"{prefix}_input_tokens",
++                    ),
++                    max_output_tokens=getattr(
++                        namespace,
++                        f"{prefix}_output_tokens",
++                    ),
++                    max_response_bytes=getattr(
++                        namespace,
++                        f"{prefix}_response_bytes",
++                    ),
++                    max_usd=getattr(namespace, f"{prefix}_max_usd"),
++                )
++            )
++    return tuple(budgets)
++
++
++def main(argv: Sequence[str] | None = None) -> int:
++    """Build one provider-free schema-v2 subset manifest and prepare command."""
++    namespace = _manifest_cli_parser().parse_args(
++        list(sys.argv[1:] if argv is None else argv)
++    )
++    if namespace.command != "build-subset-manifest":
++        raise ValueError("unknown PIT optimizer evaluation command")
++    from core.pit_optimization_contract import (
++        PatchBounds,
++        build_prepare_command,
++        build_subset_manifest,
++        write_optimizer_manifest,
++    )
++    from core.pit_optimizer_controller import _load_parity
++
++    readiness_path = _absolute_cli_path(namespace.readiness, "readiness artifact")
++    parity_path = _absolute_cli_path(
++        namespace.verified_parity,
++        "verified parity artifact",
++    )
++    readiness = _read_canonical_mapping(readiness_path, "readiness artifact")
++    parity = _load_parity(parity_path)
++    manifest = build_subset_manifest(
++        legacy_readiness=readiness,
++        legacy_readiness_path=readiness_path,
++        parity_attestation=parity,
++        verified_parity_path=parity_path,
++        pit_bundle=_absolute_cli_path(namespace.pit_bundle, "PIT bundle"),
++        baseline_run=_absolute_cli_path(namespace.baseline_run, "baseline run"),
++        source_root=_absolute_cli_path(namespace.source_root, "source root"),
++        permanent_runtime_root=_absolute_cli_path(
++            namespace.permanent_runtime_root,
++            "permanent runtime root",
++        ),
++        controller_temp_parent=_absolute_cli_path(
++            namespace.controller_temp_parent,
++            "controller temporary parent",
++        ),
++        artifact_root=_absolute_cli_path(namespace.artifact_root, "artifact root"),
++        sandbox_image=namespace.sandbox_image,
++        call_budgets=_call_budgets_from_namespace(namespace),
++        candidate_bounds=PatchBounds(
++            namespace.max_files,
++            namespace.max_hunks,
++            namespace.max_changed_lines,
++            namespace.max_diff_bytes,
++        ),
++        max_iterations=namespace.iterations,
++    )
++    output = _absolute_cli_path(namespace.output, "optimizer manifest output")
++    written, digest = write_optimizer_manifest(manifest, output)
++    command = build_prepare_command(
++        manifest,
++        manifest_path=written,
++        legacy_readiness_path=readiness_path,
++        verified_parity_path=parity_path,
++        pit_bundle_path=_absolute_cli_path(namespace.pit_bundle, "PIT bundle"),
++        baseline_run_path=_absolute_cli_path(namespace.baseline_run, "baseline run"),
++        repo_root=_absolute_cli_path(namespace.source_root, "source root"),
++        permanent_runtime_root=_absolute_cli_path(
++            namespace.permanent_runtime_root,
++            "permanent runtime root",
++        ),
++        controller_temp_parent=_absolute_cli_path(
++            namespace.controller_temp_parent,
++            "controller temporary parent",
++        ),
++        artifact_root=_absolute_cli_path(namespace.artifact_root, "artifact root"),
++        git_executable=_absolute_cli_path(namespace.git_executable, "Git executable"),
++        docker_executable=_absolute_cli_path(
++            namespace.docker_executable,
++            "Docker executable",
++        ),
++        sandbox_image=namespace.sandbox_image,
++    )
++    print(
++        "PIT_OPTIMIZER_MANIFEST="
++        + json.dumps(
++            {
++                "artifact": str(written),
++                "sha256": digest,
++                "manifest": manifest.to_primitive(),
++                "authorization": {
++                    "max_calls": manifest.authorization_requirement.max_calls,
++                    "max_tokens": manifest.authorization_requirement.max_tokens,
++                    "max_usd": manifest.authorization_requirement.max_usd,
++                },
++            },
++            sort_keys=True,
++            separators=(",", ":"),
++            ensure_ascii=False,
++            allow_nan=False,
++        )
++    )
++    print("PIT_OPTIMIZER_PREPARE_COMMAND=" + command)
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/test_agent_loop.py b/tests/test_agent_loop.py
+index 89aa393..51df541 100644
+--- a/tests/test_agent_loop.py
++++ b/tests/test_agent_loop.py
+@@ -181,20 +181,380 @@ def test_task3_state_and_terminal_status_values_are_closed() -> None:
+     )
+     assert tuple(status.value for status in TerminalStatus) == (
+         "gate_observed_pass",
+         "proposal_exported",
+         "agent_aborted",
+         "limits_exhausted",
+         "controller_error",
+     )
+ 
+ 
++def test_pit_optimizer_v2_config_parser_has_a_separate_closed_route(
++    tmp_path: Path,
++) -> None:
++    """Break caught: schema v2 could overwrite the legacy optimization route."""
++    import agent_loop
++
++    absolute = tmp_path.resolve()
++    namespace = agent_loop.build_parser().parse_args(
++        [
++            "--repo-root",
++            str(absolute),
++            "--permanent-runtime-root",
++            str(absolute),
++            "--git-executable",
++            str(absolute / "git.exe"),
++            "--controller-temp-parent",
++            str(absolute),
++            "--artifact-root",
++            str(absolute),
++            "--docker-executable",
++            str(absolute / "docker.exe"),
++            "--sandbox-image",
++            "example.invalid/worker@sha256:" + "1" * 64,
++            "--gate",
++            "pit_optimizer",
++            "--optimization-phase",
++            "prepare",
++            "--optimizer-manifest",
++            str(absolute / "manifest.json"),
++            "--optimizer-manifest-sha256",
++            "2" * 64,
++            "--verified-parity",
++            str(absolute / "parity.json"),
++            "--verified-parity-sha256",
++            "3" * 64,
++            "--optimizer-authorization-requirement-sha256",
++            "4" * 64,
++            "--max-usd",
++            "0.40",
++        ]
++    )
++
++    assert namespace.gate == "pit_optimizer"
++    assert namespace.optimizer_manifest == absolute / "manifest.json"
++    assert namespace.verified_parity == absolute / "parity.json"
++    assert namespace.optimizer_authorization_requirement_sha256 == "4" * 64
++    assert namespace.authorize_policy_source_transmission is False
++    assert "pit_optimization" in agent_loop.build_parser()._option_string_actions[
++        "--gate"
++    ].choices
++
++
++@pytest.fixture
++def v2_gate(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> Any:
++    """Provide a structurally real gate while isolating dispatch from file validation."""
++    from core.pit_optimization_contract import PitOptimizerGateConfig
++
++    monkeypatch.setattr(PitOptimizerGateConfig, "validate", lambda _self: None)
++    return PitOptimizerGateConfig(
++        phase="canary",
++        baseline_run=tmp_path / "baseline",
++        baseline_manifest_sha256="1" * 64,
++        pit_bundle=tmp_path / "pit.sqlite3",
++        pit_bundle_sha256="2" * 64,
++        effective_policy_sha256="3" * 64,
++        optimizer_manifest=tmp_path / "manifest.json",
++        optimizer_manifest_sha256="4" * 64,
++        verified_parity_artifact=tmp_path / "parity.json",
++        verified_parity_sha256="5" * 64,
++        readiness_artifact=tmp_path / "readiness.json",
++        readiness_sha256="6" * 64,
++        authorization_window_id="window_test",
++        authorization_requirement_sha256="7" * 64,
++        source_transmission_authorized=True,
++        max_usd=0.40,
++        max_api_calls=6,
++        max_tokens=448_000,
++        max_iterations=2,
++        apply=False,
++        source_root=tmp_path / "source",
++        permanent_runtime_root=tmp_path / "runtime",
++        controller_temp_parent=tmp_path / "controller",
++        artifact_root=tmp_path / "artifacts",
++        git_executable=tmp_path / "git.exe",
++        docker_executable=tmp_path / "docker.exe",
++        sandbox_image="example.invalid/worker@sha256:" + "8" * 64,
++    )
++
++
++def test_prepare_dispatch_never_builds_live_services(v2_gate: Any) -> None:
++    """Break caught: provider capabilities could be constructed before phase dispatch."""
++    import agent_loop
++
++    readiness = object()
++    events: list[str] = []
++    result = agent_loop._dispatch_pit_optimizer_v2(
++        replace(v2_gate, phase="prepare"),
++        prepare=lambda _config: events.append("prepare") or readiness,
++        build_live_services=lambda _config: pytest.fail(
++            "prepare constructed live services"
++        ),
++    )
++    assert result is readiness
++    assert events == ["prepare"]
++
++
++def test_canary_dispatch_authenticates_and_preflights_before_controller(
++    v2_gate: Any,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Break caught: a lease or controller could run before the whole plan fits."""
++    import agent_loop
++    import core.pit_optimization as optimization
++    from core.pit_optimization_contract import PIT_OPTIMIZER_R1_MODEL
++
++    events: list[str] = []
++    plans = tuple(
++        SimpleNamespace(call_index=index, model=PIT_OPTIMIZER_R1_MODEL)
++        for index in range(1, 7)
++    )
++    readiness = SimpleNamespace(
++        manifest=SimpleNamespace(
++            model=PIT_OPTIMIZER_R1_MODEL,
++            call_budgets=plans,
++        )
++    )
++    pricing = object()
++    lease = object()
++    optimizer_services = object()
++    expected = object()
++
++    def authenticate(config: Any, supplied: Any) -> None:
++        assert config.source_transmission_authorized is True
++        assert config.authorization_window_id == "window_test"
++        assert supplied is readiness
++        events.append("authenticate")
++
++    def freeze(model: str) -> object:
++        assert model == PIT_OPTIMIZER_R1_MODEL
++        events.append("freeze")
++        return pricing
++
++    def preflight(plan: Any, supplied: object) -> None:
++        assert supplied is pricing
++        events.append(f"preflight-{plan.call_index}")
++
++    def open_lease(config: Any, supplied: Any, frozen: object) -> object:
++        assert config is v2_gate
++        assert supplied is readiness
++        assert frozen is pricing
++        events.append("lease")
++        return lease
++
++    def build_services(
++        supplied: Any,
++        frozen: object,
++        opened: object,
++    ) -> object:
++        assert supplied is readiness
++        assert frozen is pricing
++        assert opened is lease
++        events.append("services")
++        return optimizer_services
++
++    def run(*, readiness: Any, services: object) -> object:
++        assert readiness is globals_readiness
++        assert services is optimizer_services
++        events.append("controller")
++        return expected
++
++    globals_readiness = readiness
++    monkeypatch.setattr(optimization, "run_pit_optimizer_v2", run)
++
++    result = agent_loop._dispatch_pit_optimizer_v2(
++        v2_gate,
++        prepare=lambda _config: pytest.fail("canary used prepare"),
++        build_live_services=lambda config: (
++            agent_loop._preauthorize_pit_optimizer_v2_live_run(
++                config,
++                readiness=readiness,
++                authenticate=authenticate,
++                freeze_pricing=freeze,
++                preflight_call=preflight,
++                open_run_lease=open_lease,
++                build_services=build_services,
++            )
++        ),
++    )
++
++    assert result is expected
++    assert events == [
++        "authenticate",
++        "freeze",
++        "preflight-1",
++        "preflight-2",
++        "preflight-3",
++        "preflight-4",
++        "preflight-5",
++        "preflight-6",
++        "lease",
++        "services",
++        "controller",
++    ]
++
++
++def test_pit_optimizer_v2_prepare_lines_seal_exact_canary_command(
++    v2_gate: Any,
++) -> None:
++    """Break caught: the handoff could omit authority or widen the sealed ceilings."""
++    import agent_loop
++    from core.pit_optimizer_controller import PitOptimizerReadiness
++
++    artifact_root = v2_gate.artifact_root
++    assert artifact_root is not None
++    artifact_root.mkdir()
++    readiness_path = artifact_root / "run_test.readiness.json"
++    readiness_path.write_bytes(b"synthetic readiness\n")
++    readiness = object.__new__(PitOptimizerReadiness)
++    manifest = SimpleNamespace(
++        run_id="run_test",
++        authorization_requirement=SimpleNamespace(
++            window_id="window_test",
++            sha256=v2_gate.authorization_requirement_sha256,
++        ),
++    )
++    for name, value in (
++        ("schema_version", 2),
++        ("manifest", manifest),
++        ("manifest_sha256", v2_gate.optimizer_manifest_sha256),
++        ("readiness_sha256", hashlib.sha256(readiness_path.read_bytes()).hexdigest()),
++        ("artifact_path", readiness_path.resolve()),
++        ("parity", object()),
++        ("baseline_discovery", object()),
++        ("provider_seed", object()),
++    ):
++        object.__setattr__(readiness, name, value)
++
++    lines = agent_loop._pit_optimizer_v2_prepare_lines(
++        replace(
++            v2_gate,
++            phase="prepare",
++            readiness_artifact=None,
++            readiness_sha256=None,
++            authorization_window_id=None,
++            source_transmission_authorized=False,
++        ),
++        readiness,
++    )
++
++    assert lines[0].startswith("PIT_OPTIMIZER_READY=")
++    assert lines[1].startswith("PIT_OPTIMIZER_CANARY_COMMAND=")
++    command = lines[1].split("=", 1)[1]
++    for fragment in (
++        "--gate pit_optimizer",
++        "--optimization-phase canary",
++        "--authorize-policy-source-transmission",
++        "--max-api-calls 6",
++        "--max-tokens 448000",
++        "--max-usd 0.40",
++        "--max-iterations 2",
++        v2_gate.optimizer_manifest_sha256,
++        readiness.readiness_sha256,
++        v2_gate.verified_parity_sha256,
++        v2_gate.authorization_requirement_sha256,
++        "window_test",
++    ):
++        assert fragment in command
++    assert "--apply" not in command
++
++    foreign_path = artifact_root / "foreign.readiness.json"
++    foreign_path.write_bytes(readiness_path.read_bytes())
++    object.__setattr__(readiness, "artifact_path", foreign_path.resolve())
++    with pytest.raises(agent_loop.ConfigurationError, match="derived readiness"):
++        agent_loop._pit_optimizer_v2_prepare_lines(
++            replace(
++                v2_gate,
++                phase="prepare",
++                readiness_artifact=None,
++                readiness_sha256=None,
++                authorization_window_id=None,
++                source_transmission_authorized=False,
++            ),
++            readiness,
++        )
++
++
++def test_pit_optimizer_v2_summary_excludes_provider_content_and_raw_hashes(
++    tmp_path: Path,
++) -> None:
++    """Break caught: the user summary could leak opaque identities or provider data."""
++    import agent_loop
++    from core.pit_optimizer_controller import (
++        OptimizerBudgetSummary,
++        PitOptimizerResult,
++    )
++
++    result = PitOptimizerResult(
++        schema_version=2,
++        phase="canary",
++        status="discovery_complete",
++        terminal_code="iteration_limit",
++        terminal_detail=None,
++        exit_code=0,
++        run_id="run_summary",
++        readiness_sha256="a" * 64,
++        manifest_sha256="b" * 64,
++        iterations_started=2,
++        iterations_completed=2,
++        valid_evaluations=2,
++        incumbent_updates=1,
++        non_improving_streak=1,
++        discovery_winner=SimpleNamespace(
++            changed_paths=("core/strategy_policy/entry.py",),
++            changed_symbols=("core.strategy_policy.entry.evaluate_entry",),
++            identity_sha256="c" * 64,
++        ),
++        hidden_validation_opened=False,
++        validation_reservation_sha256=None,
++        long_replay_eligible=None,
++        budget=OptimizerBudgetSummary(6, 100, 50, 150, 0.25, 0, 0.0, 0),
++        artifact_root=tmp_path.resolve(),
++        artifact_paths=(),
++        source_modified=False,
++        cleanup_complete=True,
++    )
++
++    summary = agent_loop._pit_optimizer_v2_summary(result)
++
++    assert set(summary) == {
++        "schema_version",
++        "phase",
++        "status",
++        "terminal_code",
++        "exit_code",
++        "run_id",
++        "iterations_started",
++        "iterations_completed",
++        "valid_evaluations",
++        "incumbent_updates",
++        "incumbent",
++        "hidden_validation_opened",
++        "long_replay_eligible",
++        "budget",
++        "artifact_root",
++        "source_modified",
++        "cleanup_complete",
++    }
++    assert summary["incumbent"] == {
++        "changed_paths": ["core/strategy_policy/entry.py"],
++        "changed_symbols": ["core.strategy_policy.entry.evaluate_entry"],
++    }
++    encoded = json.dumps(summary, sort_keys=True)
++    assert result.manifest_sha256 not in encoded
++    assert result.readiness_sha256 not in encoded
++    assert result.discovery_winner.identity_sha256 not in encoded
++
++
+ def _task5_raw_patch(
+     *,
+     path: str,
+     removed: tuple[str, ...] = ("old",),
+     added: tuple[str, ...] = ("new",),
+ ) -> str:
+     return (
+         f"diff --git a/{path} b/{path}\n"
+         "index 1111111..2222222 100644\n"
+         f"--- a/{path}\n"
+@@ -429,21 +789,21 @@ class _Task5FakeDockerControl:
+                 hashlib.sha256(b"").hexdigest(),
+                 hashlib.sha256(f"{operation} timed out".encode("utf-8")).hexdigest(),
+                 timed_out=True,
+             )
+         if operation == "create":
+             self.name = args[args.index("--name") + 1]
+             self.owner = args[args.index("--label") + 1].split("=", 1)[1]
+             self.stored_owner = (
+                 "0" * 64 if self.stored_owner_mismatch else self.owner
+             )
+-            self.image = args[-5]
++            self.image = args[args.index("--workdir") + 2]
+             self.exists = True
+             if self.raise_after_create is not None:
+                 raise self.raise_after_create
+             if self.fail_after_create:
+                 return ProcessResult(
+                     125,
+                     "",
+                     "create transport fault",
+                     hashlib.sha256(b"").hexdigest(),
+                     hashlib.sha256(b"create transport fault").hexdigest(),
+@@ -687,20 +1047,24 @@ def test_policy_daemon_cleanup_checks_status_and_exact_id(
+         (
+             "cleanup",
+             {
+                 "kill": "daemon_kill",
+                 "wait": "daemon_wait",
+                 "rm": "daemon_rm",
+             }[operation],
+             failure_kind,
+         )
+     }
++    if operation == "kill" and failure_kind == "nonzero":
++        # A worker may consume EOF and stop before the force-cleanup command.
++        # Successful force-removal plus exact-ID absence is terminal proof.
++        expected = set()
+     if operation == "rm":
+         expected.add(("cleanup", "daemon_absence_verify", "present"))
+     assert {
+         (error.phase.value, error.action.value, error.reason.value)
+         for error in errors
+     } == expected
+     absence_query = control.calls[-1]
+     assert f"id={control.container_id}" in absence_query
+     assert not any("label=" in value for value in absence_query)
+     control.exists = False
+@@ -866,21 +1230,22 @@ def test_policy_worker_command_mount_allowlist_and_cleanup_use_only_fakes(
+         ("--security-opt", "no-new-privileges"),
+         ("--pids-limit", "32"),
+         ("--memory", "256m"),
+         ("--cpus", "1.0"),
+         ("--tmpfs", "/tmp:rw,noexec,nosuid,size=16m"),
+     )
+     assert "--read-only" in create
+     for option, value in required_pairs:
+         index = create.index(option)
+         assert create[index + 1] == value
+-    assert create[-4:] == ("python", "-B", "-m", "core.strategy_policy.worker")
++    assert create[create.index("--entrypoint") + 1] == "python"
++    assert create[-3:] == ("-B", "-m", "core.strategy_policy.worker")
+     mount = create[create.index("--mount") + 1]
+     assert mount.endswith(",dst=/workspace/policy,readonly")
+     package_root = Path(mount.split(",src=", 1)[1].split(",dst=", 1)[0])
+     assert package_root != candidate
+     assert str(candidate) not in " ".join(argv)
+     packaged = tuple(
+         sorted(
+             path.relative_to(package_root).as_posix()
+             for path in package_root.rglob("*")
+             if path.is_file()
+@@ -897,20 +1262,22 @@ def test_policy_worker_command_mount_allowlist_and_cleanup_use_only_fakes(
+     )
+     assert not any(name in mount for name in ("credentials", "pit.sqlite3", ".git"))
+     assert kwargs["shell"] is False
+     assert kwargs["close_fds"] is True
+     assert kwargs["stdin"] == subprocess.PIPE
+     assert kwargs["stdout"] == subprocess.PIPE
+     assert kwargs["stderr"] == subprocess.PIPE
+     environment = kwargs["env"]
+     assert isinstance(environment, dict)
+     assert "OPENROUTER_API_KEY" not in environment
++    if os.name == "nt":
++        assert environment["SYSTEMDRIVE"] == os.environ["SYSTEMDRIVE"]
+     assert runner.method_timeout_seconds == 1.0
+     assert runner.fold_timeout_seconds == 900.0
+     assert create[create.index("--env") + 1] == "PYTHONHASHSEED=0"
+     label = create[create.index("--label") + 1]
+     assert re.fullmatch(r"pit-policy\.owner=[0-9a-f]{64}", label)
+     assert argv == [
+         "C:\\fake\\docker.exe",
+         "start",
+         "--attach",
+         "--interactive",
+diff --git a/tests/test_pit_optimization_contract.py b/tests/test_pit_optimization_contract.py
+index 018cda5..0da6f72 100644
+--- a/tests/test_pit_optimization_contract.py
++++ b/tests/test_pit_optimization_contract.py
+@@ -219,69 +219,81 @@ def _canary_fixture(tmp_path: Path) -> tuple[
+         "causal_invariants": {
+             "entry_execution_timing": {"value": "next_session_open"},
+             "point_in_time": {"value": True},
+         },
+         "exit_policy": {"stop_loss_pct": {"value": 0.07}},
+     }
+     effective_policy_sha256 = _canonical_digest(effective_policy)
+     baseline_full = asdict(_metrics())
+     baseline_holdout = asdict(_metrics(annualized=1.0, drawdown=-5.0, total=4.0, trades=20))
+     source_sha256 = hashlib.sha256(source_path.read_bytes()).hexdigest()
++    evaluation_contract = optimization._evaluation_contract(
++        verification_subset=False,
++        verification_scope=None,
++    )
++    catalog_payload = [
++        {
++            "candidate_id": item.candidate_id,
++            "constant_name": item.constant_name,
++            "policy_field": item.policy_field,
++            "old_value": item.old_value,
++            "new_value": item.new_value,
++            "path": item.path,
++            "old_line": item.old_line,
++            "new_line": item.new_line,
++        }
++        for item in catalog.values()
++    ]
+     primitive: dict[str, object] = {
+         "schema_version": 1,
+         "gate": "pit_optimization",
+         "phase": "ready",
+         "identities": {
+             "entry_contract_source_sha256": source_sha256,
+             "pit_bundle_sha256": "1af306ef1e46797473cd186fc48938ed6694ae25f5943c9f1905b528307cc2eb",
+             "baseline_manifest_sha256": "f99eb6aade8b567b319accb95dadd80789064aacf1cb8b85d0cc31379caf6382",
+             "effective_policy_sha256": effective_policy_sha256,
+         },
+         "budget_contract": {
+             "samples": 1,
+             "iterations": 1,
+             "max_calls": 3,
+             "max_usd": 0.50,
+             "apply": False,
+             "provider_retries": 0,
+         },
++        "evaluation_contract": evaluation_contract,
++        "candidate_catalog": catalog_payload,
+         "effective_policy": effective_policy,
+         "baseline": {
+             "full": _aggregate_window(baseline_full),
+             "holdout": _aggregate_window(baseline_holdout),
+             "leader_basket": {},
+         },
++        "prior_discovery_feedback": [],
+         "evidence_ids": [
+             "metric.full.cash",
+             "metric.full.entry_funnel",
+             "metric.full.objective",
+             "metric.full.trade_quality",
+             "metric.holdout.objective",
+         ],
+         "invariant_ids": [
+             "invariant.completed_session_facts",
+             "invariant.deterministic_accounting",
+             "invariant.immutable_input_identity",
+             "invariant.next_session_execution",
+             "invariant.no_leverage",
+             "invariant.point_in_time",
+         ],
+     }
+-    provider_payload = {
+-        "schema_version": 1,
+-        "identities": primitive["identities"],
+-        "baseline_metrics": primitive["baseline"],
+-        "candidate_ids": list(catalog),
+-        "evidence_ids": primitive["evidence_ids"],
+-        "invariant_ids": primitive["invariant_ids"],
+-        "editable_path": "core/canslim/entry_contract.py",
+-    }
++    provider_payload = optimization._provider_payload(primitive)
+     artifact_root.mkdir()
+     readiness_bytes = _canonical_bytes(primitive)
+     readiness_sha256 = hashlib.sha256(readiness_bytes).hexdigest()
+     readiness_path = artifact_root / "readiness.json"
+     readiness_path.write_bytes(readiness_bytes)
+     readiness = PitOptimizationReadiness(
+         readiness_sha256=readiness_sha256,
+         artifact_path=readiness_path,
+         artifact_sha256=readiness_sha256,
+         effective_policy_sha256=effective_policy_sha256,
+@@ -885,21 +897,24 @@ def test_canary_rejects_open_citations_or_a_changed_coder_replacement_without_re
+     broken_role: str,
+     response: dict[str, object],
+     match: str,
+ ) -> None:
+     readiness, source_root, candidate_root, artifact_root = _canary_fixture(tmp_path)
+     candidate = candidate_catalog()["min_rs_score_075"]
+     valid = {
+         "orchestrator": {
+             "action": "continue",
+             "domain": "return_drawdown",
+-            "evidence_ids": ["metric.full.objective"],
++            "evidence_ids": [
++                "metric.full.objective",
++                "metric.holdout.objective",
++            ],
+         },
+         "reasoner": {
+             "hypothesis": "Try one bounded controller candidate.",
+             "evidence_ids": ["metric.full.objective"],
+             "invariant_ids": ["invariant.point_in_time"],
+             "candidate_id": candidate.candidate_id,
+             "skip": False,
+             "skip_reason": "",
+         },
+         "coder": {
+@@ -969,21 +984,24 @@ def test_canary_rejects_readiness_or_sealed_input_mutation_before_another_call(
+     def call_role(role: str, dynamic: dict[str, object], parser: object) -> PitOptimizationRoleCall:
+         nonlocal sealed_input_mutated
+         roles.append(role)
+         sealed_input_mutated = True
+         readiness.artifact_path.write_text("{}\n", encoding="utf-8")
+         payload = parser(
+             json.dumps(
+                 {
+                     "action": "continue",
+                     "domain": "return_drawdown",
+-                    "evidence_ids": ["metric.full.objective"],
++                    "evidence_ids": [
++                        "metric.full.objective",
++                        "metric.holdout.objective",
++                    ],
+                 }
+             )
+         )
+         return PitOptimizationRoleCall(
+             role=role,
+             call_index=1,
+             payload=payload,
+             cost_usd=0.01,
+             accounting_complete=True,
+             audit_sha256="a" * 64,
+@@ -1021,21 +1039,24 @@ def test_canary_rejects_readiness_or_sealed_input_mutation_before_another_call(
+ def test_canary_requires_complete_monotonic_three_call_accounting_without_retry(
+     tmp_path: Path,
+ ) -> None:
+     readiness, source_root, candidate_root, artifact_root = _canary_fixture(tmp_path)
+     roles: list[str] = []
+     candidate = candidate_catalog()["min_rs_score_075"]
+     responses = (
+         {
+             "action": "continue",
+             "domain": "return_drawdown",
+-            "evidence_ids": ["metric.full.objective"],
++            "evidence_ids": [
++                "metric.full.objective",
++                "metric.holdout.objective",
++            ],
+         },
+         {
+             "hypothesis": "Try one bounded controller candidate.",
+             "evidence_ids": ["metric.full.objective"],
+             "invariant_ids": ["invariant.point_in_time"],
+             "candidate_id": candidate.candidate_id,
+             "skip": False,
+             "skip_reason": "",
+         },
+     )
+@@ -1266,20 +1287,23 @@ def test_optimizer_canary_has_a_separate_closed_audit_manifest(
+         "phase": "canary",
+         "baseline_run": values["baseline"],
+         "baseline_manifest_sha256": "f99eb6aade8b567b319accb95dadd80789064aacf1cb8b85d0cc31379caf6382",
+         "pit_bundle": values["bundle"],
+         "pit_bundle_sha256": "1af306ef1e46797473cd186fc48938ed6694ae25f5943c9f1905b528307cc2eb",
+         "effective_policy_sha256": "d" * 64,
+         "readiness_sha256": "e" * 64,
+         "max_usd": 0.5,
+         "max_api_calls": 3,
+         "max_iterations": 1,
++        "verification_subset": False,
++        "prior_discovery_feedback": None,
++        "prior_discovery_feedback_sha256": None,
+         "apply": False,
+     }
+ 
+ 
+ def test_cli_routes_optimizer_canary_through_the_network_none_docker_gate(
+     tmp_path: Path,
+     monkeypatch: pytest.MonkeyPatch,
+ ) -> None:
+     readiness, source_root, candidate_root, artifact_root = _canary_fixture(tmp_path)
+     controller_root = (tmp_path / "controller").resolve()
+diff --git a/tests/test_pit_optimizer_v2.py b/tests/test_pit_optimizer_v2.py
+index ef9409c..f1c0b20 100644
+--- a/tests/test_pit_optimizer_v2.py
++++ b/tests/test_pit_optimizer_v2.py
+@@ -1848,20 +1848,180 @@ def _patch_authenticated_readiness(
+ 
+     def authenticate(path: Path, *, source_root: Path) -> tuple[dict[str, object], str]:
+         assert Path(path).resolve() == readiness_path.resolve()
+         assert Path(source_root).resolve() == Path(inputs["source_root"]).resolve()
+         assert isinstance(readiness, dict)
+         return readiness, readiness_sha256
+ 
+     monkeypatch.setattr(parity, "_authenticated_readiness", authenticate)
+ 
+ 
++@pytest.fixture
++def v2_gate(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> contract.PitOptimizerGateConfig:
++    """Return one canonical, fully authenticated schema-v2 canary gate."""
++    inputs, _expected = _builder_fixture(tmp_path)
++    _patch_authenticated_readiness(monkeypatch, inputs)
++    manifest = contract.build_subset_manifest(**inputs)
++    manifest_path = tmp_path / "optimizer-manifest.json"
++    contract.write_optimizer_manifest(manifest, manifest_path)
++    readiness_path = Path(inputs["artifact_root"]) / (
++        f"{manifest.run_id}.readiness.json"
++    )
++    readiness = {
++        "schema_version": 2,
++        "manifest": asdict(manifest),
++        "manifest_sha256": manifest.sha256,
++        "parity": {},
++        "baseline_discovery": {},
++        "provider_seed": {},
++    }
++    readiness_path.write_bytes(_canonical_file_bytes(readiness))
++    readiness_sha256 = hashlib.sha256(readiness_path.read_bytes()).hexdigest()
++    git_executable = tmp_path / "git.exe"
++    docker_executable = tmp_path / "docker.exe"
++    git_executable.write_bytes(b"synthetic executable")
++    docker_executable.write_bytes(b"synthetic executable")
++    return contract.PitOptimizerGateConfig(
++        phase="canary",
++        baseline_run=Path(inputs["baseline_run"]),
++        baseline_manifest_sha256=manifest.baseline_manifest_sha256,
++        pit_bundle=Path(inputs["pit_bundle"]),
++        pit_bundle_sha256=manifest.pit_bundle_sha256,
++        effective_policy_sha256=manifest.effective_policy_sha256,
++        optimizer_manifest=manifest_path,
++        optimizer_manifest_sha256=manifest.sha256,
++        verified_parity_artifact=Path(inputs["verified_parity_path"]),
++        verified_parity_sha256=manifest.parity_attestation_sha256,
++        readiness_artifact=readiness_path,
++        readiness_sha256=readiness_sha256,
++        authorization_window_id=manifest.authorization_requirement.window_id,
++        authorization_requirement_sha256=manifest.authorization_requirement.sha256,
++        source_transmission_authorized=True,
++        max_usd=0.40,
++        max_api_calls=6,
++        max_tokens=448_000,
++        max_iterations=2,
++        apply=False,
++        source_root=Path(inputs["source_root"]),
++        permanent_runtime_root=Path(inputs["permanent_runtime_root"]),
++        controller_temp_parent=Path(inputs["controller_temp_parent"]),
++        artifact_root=Path(inputs["artifact_root"]),
++        git_executable=git_executable,
++        docker_executable=docker_executable,
++        sandbox_image=str(inputs["sandbox_image"]),
++    )
++
++
++def test_pit_optimizer_v2_config_prepare_rejects_source_authorization_and_canary_requires_it(
++    v2_gate: contract.PitOptimizerGateConfig,
++) -> None:
++    """Break caught: phase selection could silently grant source transmission."""
++    with pytest.raises(ValueError, match="prepare.*transmission"):
++        replace(
++            v2_gate,
++            phase="prepare",
++            source_transmission_authorized=True,
++        ).validate()
++    with pytest.raises(ValueError, match="source transmission"):
++        replace(
++            v2_gate,
++            phase="canary",
++            source_transmission_authorized=False,
++        ).validate()
++
++
++def test_pit_optimizer_v2_config_canary_requires_exact_sealed_authority(
++    v2_gate: contract.PitOptimizerGateConfig,
++) -> None:
++    """Break caught: a canary could widen or substitute its sealed authority."""
++    v2_gate.validate()
++    for changed, message in (
++        ({"authorization_window_id": "window_foreign"}, "authorization window"),
++        ({"authorization_requirement_sha256": "f" * 64}, "requirement"),
++        ({"max_iterations": 1}, "iterations|ceilings"),
++        ({"max_api_calls": 7}, "ceilings"),
++        ({"max_tokens": 448_001}, "ceilings"),
++        ({"max_usd": 0.41}, "ceilings"),
++        ({"apply": True}, "apply"),
++    ):
++        with pytest.raises(ValueError, match=message):
++            replace(v2_gate, **changed).validate()
++
++
++def test_pit_optimizer_v2_config_builder_derives_prepare_and_requires_canary_identities(
++    v2_gate: contract.PitOptimizerGateConfig,
++) -> None:
++    """Break caught: CLI values could bypass manifest-owned identity and ceilings."""
++    import agent_loop
++
++    common = {
++        "optimization_phase": "prepare",
++        "baseline_run": v2_gate.baseline_run,
++        "baseline_manifest_sha256": v2_gate.baseline_manifest_sha256,
++        "pit_bundle": v2_gate.pit_bundle,
++        "pit_bundle_sha256": v2_gate.pit_bundle_sha256,
++        "effective_policy_sha256": v2_gate.effective_policy_sha256,
++        "optimizer_manifest": v2_gate.optimizer_manifest,
++        "optimizer_manifest_sha256": v2_gate.optimizer_manifest_sha256,
++        "verified_parity": v2_gate.verified_parity_artifact,
++        "verified_parity_sha256": v2_gate.verified_parity_sha256,
++        "readiness_sha256": None,
++        "optimizer_authorization_window_id": None,
++        "optimizer_authorization_requirement_sha256": None,
++        "authorize_policy_source_transmission": False,
++        "artifact_root": v2_gate.readiness_artifact.parent,
++        "repo_root": v2_gate.source_root,
++        "permanent_runtime_root": v2_gate.permanent_runtime_root,
++        "controller_temp_parent": v2_gate.controller_temp_parent,
++        "git_executable": v2_gate.git_executable,
++        "docker_executable": v2_gate.docker_executable,
++        "sandbox_image": v2_gate.sandbox_image,
++        "max_usd": 0.40,
++        "max_api_calls": 6,
++        "max_tokens": 448_000,
++        "max_iterations": 2,
++        "apply": False,
++    }
++    prepare = agent_loop._build_pit_optimizer_v2_config(
++        SimpleNamespace(**common)
++    )
++    assert prepare == replace(
++        v2_gate,
++        phase="prepare",
++        readiness_artifact=None,
++        readiness_sha256=None,
++        authorization_window_id=None,
++        source_transmission_authorized=False,
++    )
++
++    canary = agent_loop._build_pit_optimizer_v2_config(
++        SimpleNamespace(
++            **{
++                **common,
++                "optimization_phase": "canary",
++                "readiness_sha256": v2_gate.readiness_sha256,
++                "optimizer_authorization_window_id": (
++                    v2_gate.authorization_window_id
++                ),
++                "optimizer_authorization_requirement_sha256": (
++                    v2_gate.authorization_requirement_sha256
++                ),
++                "authorize_policy_source_transmission": True,
++            }
++        )
++    )
++    assert canary == v2_gate
++
++
+ def test_manifest_builder_is_provider_free_canonical_and_source_budgeted(
+     tmp_path: Path,
+     monkeypatch: pytest.MonkeyPatch,
+ ) -> None:
+     """Break caught: preparation could execute source or seal a context that cannot fit."""
+     inputs, expected = _builder_fixture(tmp_path)
+     _patch_authenticated_readiness(monkeypatch, inputs)
+ 
+     manifest = contract.build_subset_manifest(**inputs)
+     second = contract.build_subset_manifest(**inputs)
+@@ -2029,20 +2189,214 @@ def test_manifest_builder_is_provider_free_canonical_and_source_budgeted(
+ 
+     with pytest.raises(ValueError, match="source bundle"):
+         contract.build_subset_manifest(
+             **{
+                 **inputs,
+                 "candidate_bounds": contract.PatchBounds(3, 12, 80, 32 * 1024),
+             }
+         )
+ 
+ 
++def test_build_subset_manifest_cli_is_exact_and_provider_free(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++    capsys: pytest.CaptureFixture[str],
++) -> None:
++    """Break caught: manifest construction could widen inputs or invoke live services."""
++    import agent_loop
++    import core.pit_optimizer_authorization as authorization
++    import core.pit_optimizer_controller as controller
++    import core.pit_policy_parity as parity
++
++    inputs, _expected = _builder_fixture(tmp_path)
++    _patch_authenticated_readiness(monkeypatch, inputs)
++    git_executable = tmp_path / "git.exe"
++    docker_executable = tmp_path / "docker.exe"
++    git_executable.write_bytes(b"synthetic executable")
++    docker_executable.write_bytes(b"synthetic executable")
++    output = tmp_path / "optimizer-manifest-cli.json"
++    events: list[str] = []
++    seen: dict[str, object] = {}
++    original_build = contract.build_subset_manifest
++    original_write = contract.write_optimizer_manifest
++    original_command = contract.build_prepare_command
++
++    def build(**kwargs: object) -> contract.PitOptimizerRunManifest:
++        events.append("build")
++        seen["build"] = kwargs
++        return original_build(**kwargs)
++
++    def write(
++        manifest: contract.PitOptimizerRunManifest,
++        path: Path,
++    ) -> tuple[Path, str]:
++        events.append("write")
++        seen["output"] = path
++        return original_write(manifest, path)
++
++    def command(
++        manifest: contract.PitOptimizerRunManifest,
++        **kwargs: object,
++    ) -> str:
++        events.append("command")
++        seen["command"] = kwargs
++        return original_command(manifest, **kwargs)
++
++    def forbidden(*_args: object, **_kwargs: object) -> None:
++        pytest.fail("provider, replay, grant, or hidden evaluation was invoked")
++
++    monkeypatch.setattr(contract, "build_subset_manifest", build)
++    monkeypatch.setattr(contract, "write_optimizer_manifest", write)
++    monkeypatch.setattr(contract, "build_prepare_command", command)
++    monkeypatch.setattr(agent_loop.OpenRouterGateway, "__init__", forbidden)
++    monkeypatch.setattr(
++        authorization.AuthorizationLedger,
++        "record_grant_and_window",
++        forbidden,
++    )
++    monkeypatch.setattr(parity, "capture_parity_reference", forbidden)
++    monkeypatch.setattr(parity, "verify_parity_reference", forbidden)
++    monkeypatch.setattr(controller, "_run_hidden_once", forbidden)
++
++    result = evaluation.main(
++        [
++            "build-subset-manifest",
++            "--readiness",
++            str(inputs["legacy_readiness_path"]),
++            "--verified-parity",
++            str(inputs["verified_parity_path"]),
++            "--pit-bundle",
++            str(inputs["pit_bundle"]),
++            "--baseline-run",
++            str(inputs["baseline_run"]),
++            "--source-root",
++            str(inputs["source_root"]),
++            "--permanent-runtime-root",
++            str(inputs["permanent_runtime_root"]),
++            "--controller-temp-parent",
++            str(inputs["controller_temp_parent"]),
++            "--artifact-root",
++            str(inputs["artifact_root"]),
++            "--git-executable",
++            str(git_executable),
++            "--docker-executable",
++            str(docker_executable),
++            "--sandbox-image",
++            str(inputs["sandbox_image"]),
++            "--iterations",
++            "2",
++            "--investigator-static-bytes",
++            "8000",
++            "--investigator-dynamic-bytes",
++            "80000",
++            "--investigator-input-tokens",
++            "88000",
++            "--investigator-output-tokens",
++            "4000",
++            "--investigator-response-bytes",
++            "8192",
++            "--investigator-max-usd",
++            "0.05",
++            "--author-static-bytes",
++            "12000",
++            "--author-dynamic-bytes",
++            "76000",
++            "--author-input-tokens",
++            "88000",
++            "--author-output-tokens",
++            "8000",
++            "--author-response-bytes",
++            "16384",
++            "--author-max-usd",
++            "0.10",
++            "--critic-static-bytes",
++            "8000",
++            "--critic-dynamic-bytes",
++            "24000",
++            "--critic-input-tokens",
++            "32000",
++            "--critic-output-tokens",
++            "4000",
++            "--critic-response-bytes",
++            "8192",
++            "--critic-max-usd",
++            "0.05",
++            "--max-files",
++            "3",
++            "--max-hunks",
++            "12",
++            "--max-changed-lines",
++            "80",
++            "--max-diff-bytes",
++            "8192",
++            "--output",
++            str(output),
++        ]
++    )
++
++    assert result == 0
++    assert events == ["build", "write", "command"]
++    built = seen["build"]
++    assert isinstance(built, dict)
++    assert built == {
++        **inputs,
++        "call_budgets": _call_budgets(),
++        "candidate_bounds": contract.PatchBounds(3, 12, 80, 8 * 1024),
++        "max_iterations": 2,
++    }
++    assert seen["output"] == output.resolve()
++    manifest_bytes = output.read_bytes()
++    manifest_value = json.loads(manifest_bytes)
++    assert len(manifest_value["call_budgets"]) == 6
++    assert sum(
++        item["max_input_tokens"] + item["max_output_tokens"]
++        for item in manifest_value["call_budgets"]
++    ) == 448_000
++    assert sum(item["max_usd"] for item in manifest_value["call_budgets"]) == pytest.approx(
++        0.40
++    )
++    assert manifest_value["policy_source_scope"]["editable_paths"] == list(
++        contract.PolicySourceScope(
++            **{
++                **manifest_value["policy_source_scope"],
++                "initial_policy_source_sha256s": tuple(
++                    tuple(item)
++                    for item in manifest_value["policy_source_scope"][
++                        "initial_policy_source_sha256s"
++                    ]
++                ),
++                "editable_paths": tuple(
++                    manifest_value["policy_source_scope"]["editable_paths"]
++                ),
++                "hard_patch_bounds": contract.PatchBounds(
++                    **manifest_value["policy_source_scope"]["hard_patch_bounds"]
++                ),
++                "candidate_bounds": contract.PatchBounds(
++                    **manifest_value["policy_source_scope"]["candidate_bounds"]
++                ),
++            }
++        ).editable_paths
++    )
++    stdout = capsys.readouterr().out.splitlines()
++    assert tuple(line.split("=", 1)[0] for line in stdout) == (
++        "PIT_OPTIMIZER_MANIFEST",
++        "PIT_OPTIMIZER_PREPARE_COMMAND",
++    )
++    emitted = json.loads(stdout[0].split("=", 1)[1])
++    assert emitted["manifest"] == manifest_value
++    assert emitted["authorization"] == {
++        "max_calls": 6,
++        "max_tokens": 448_000,
++        "max_usd": 0.40,
++    }
++
++
+ def test_manifest_builder_rejects_fabricated_non_git_source_identity(
+     tmp_path: Path,
+ ) -> None:
+     """Break caught: caller-provided source hashes could authorize unrelated file bytes."""
+     inputs, _expected = _builder_fixture(tmp_path)
+     inputs["source_root"] = Path(inputs["source_root"]) / "core"
+ 
+     with pytest.raises(ValueError, match="Git repository root"):
+         contract.build_subset_manifest(**inputs)
+ 
+@@ -2111,25 +2465,40 @@ def test_gate_and_prepare_command_authenticate_without_granting_authority(
+         replace(gate, optimizer_manifest_sha256="0" * 64).validate()
+     parity_mismatch = replace(manifest, parity_attestation_sha256="8" * 64)
+     parity_mismatch_path = tmp_path / "optimizer-manifest-parity-mismatch.json"
+     contract.write_optimizer_manifest(parity_mismatch, parity_mismatch_path)
+     with pytest.raises(ValueError, match="parity identity differs from manifest"):
+         replace(
+             gate,
+             optimizer_manifest=parity_mismatch_path,
+             optimizer_manifest_sha256=parity_mismatch.sha256,
+         ).validate()
++    readiness_path = Path(inputs["artifact_root"]) / (
++        f"{manifest.run_id}.readiness.json"
++    )
++    readiness_path.write_bytes(
++        _canonical_file_bytes(
++            {
++                "schema_version": 2,
++                "manifest": asdict(manifest),
++                "manifest_sha256": manifest.sha256,
++                "parity": {},
++                "baseline_discovery": {},
++                "provider_seed": {},
++            }
++        )
++    )
+     run_gate = replace(
+         gate,
+-        phase="run",
+-        readiness_artifact=inputs["legacy_readiness_path"],
+-        readiness_sha256=manifest.legacy_readiness_sha256,
++        phase="canary",
++        readiness_artifact=readiness_path,
++        readiness_sha256=hashlib.sha256(readiness_path.read_bytes()).hexdigest(),
+         authorization_window_id=manifest.authorization_requirement.window_id,
+         source_transmission_authorized=True,
+     )
+     run_gate.validate()
+     readiness_mismatch = replace(manifest, legacy_readiness_sha256="8" * 64)
+     readiness_mismatch_path = tmp_path / "optimizer-manifest-readiness-mismatch.json"
+     contract.write_optimizer_manifest(readiness_mismatch, readiness_mismatch_path)
+     with pytest.raises(ValueError, match="readiness identity differs from manifest"):
+         replace(
+             run_gate,
+@@ -2154,35 +2523,36 @@ def test_gate_and_prepare_command_authenticate_without_granting_authority(
+         baseline_run_path=inputs["baseline_run"],
+         repo_root=inputs["source_root"],
+         permanent_runtime_root=inputs["permanent_runtime_root"],
+         controller_temp_parent=inputs["controller_temp_parent"],
+         artifact_root=inputs["artifact_root"],
+         git_executable=git_executable,
+         docker_executable=docker_executable,
+         sandbox_image=inputs["sandbox_image"],
+     )
+ 
+-    assert "core.pit_optimization prepare-v2" in command
++    assert "agent_loop.py" in command
++    assert "--gate pit_optimizer" in command
++    assert "--optimization-phase prepare" in command
+     for value in (
+         manifest.sha256,
+-        manifest.legacy_readiness_sha256,
+         manifest.parity_attestation_sha256,
+         manifest.pit_bundle_sha256,
+         manifest.baseline_manifest_sha256,
+         manifest.authorization_requirement.sha256,
+         str(inputs["permanent_runtime_root"].resolve()),
+         str(git_executable.resolve()),
+         str(docker_executable.resolve()),
+     ):
+         assert value in command
+     assert "authorization-window" not in command
+-    assert "source-transmission-authorized" not in command
++    assert "authorize-policy-source-transmission" not in command
+     assert "credential" not in command.lower()
+ 
+ 
+ @pytest.fixture
+ def v2_manifest(
+     tmp_path: Path,
+     monkeypatch: pytest.MonkeyPatch,
+ ) -> contract.PitOptimizerRunManifest:
+     """Build the one authenticated synthetic schema-v2 manifest used by Task 6."""
+     inputs, _expected = _builder_fixture(tmp_path)
+@@ -2554,20 +2924,47 @@ def _task6_authorized_ledger(
+             additional_calls=calls,
+             additional_tokens=tokens,
+             additional_usd=usd,
+             policy_source_scope_sha256=manifest.policy_source_scope.sha256,
+         ),
+         operator_approval_reference=f"approval-{grant_id}",
+     )
+     return AuthorizationLedger(ledger_path, manifest), ledger_path, window
+ 
+ 
++def test_pit_optimizer_v2_authorization_window_query_is_read_only(
++    tmp_path: Path,
++    v2_manifest: contract.PitOptimizerRunManifest,
++) -> None:
++    """The live builder authenticates authority without reading private records."""
++    from core.pit_optimizer_authorization import AuthorizationError
++
++    ledger, ledger_path, window = _task6_authorized_ledger(tmp_path, v2_manifest)
++    before = ledger_path.read_bytes()
++
++    authenticated = ledger.authenticate_window(
++        window_id=window.window_id,
++        authorization_requirement_sha256=(
++            v2_manifest.authorization_requirement.sha256
++        ),
++    )
++
++    assert authenticated == window
++    assert ledger_path.read_bytes() == before
++    with pytest.raises(AuthorizationError, match="requirement mismatch"):
++        ledger.authenticate_window(
++            window_id=window.window_id,
++            authorization_requirement_sha256="f" * 64,
++        )
++    assert ledger_path.read_bytes() == before
++
++
+ def test_pit_optimizer_v2_frozen_pricing_has_one_canonical_decimal_identity() -> None:
+     """Break caught: a later float/rate reinterpretation could change reserved cost."""
+     from agent_loop import freeze_pricing_record
+ 
+     pricing = freeze_pricing_record(
+         "deepseek/deepseek-r1",
+         {"prompt": 2, "completion": 8},
+     )
+     expected_payload = {
+         "model": "deepseek/deepseek-r1",
+@@ -9750,10 +10147,207 @@ def test_worker_protocol_json_line_policy_client_dispatches_and_closes_once() ->
+     client = JsonLinePolicyClient(session=session, interface_version=1)
+     assert client.evaluate_entry(snapshots[0]) == decisions["evaluate_entry"]
+     assert client.recommend_capacity(snapshots[1]) == decisions["recommend_capacity"]
+     assert client.recommend_allocation(snapshots[2]) == decisions["recommend_allocation"]
+     assert client.select_eviction(snapshots[3]) == decisions["select_eviction"]
+     assert client.evaluate_exit(snapshots[4]) == decisions["evaluate_exit"]
+     assert [method for method, _snapshot in session.calls] == list(decisions)
+     client.close()
+     client.close()
+     assert session.closed == 1
++
++
++def test_policy_worker_docker_smoke(
++    tmp_path: Path,
++    request: pytest.FixtureRequest,
++) -> None:
++    """Run one synthetic policy package in the pinned, networkless worker."""
++    import agent_loop
++    from core.strategy_policy.contracts import CapacityDecision, CapacitySnapshot
++    from core.strategy_policy.worker import PolicyDeterminismProbe
++
++    if request.config.option.keyword != "policy_worker_docker_smoke":
++        pytest.skip("Docker smoke runs only through its prescribed exact selector")
++    image = (
++        "localhost/rs-agent-loop@sha256:"
++        "7ecfb4ebb3b327940bef347e4c82e82fb4a0e8b40fc63b92b2536fe8c83acf1c"
++    )
++    docker_value = shutil.which("docker")
++    if docker_value is None and os.name == "nt":
++        local_app_data = os.environ.get("LOCALAPPDATA")
++        if local_app_data:
++            candidate = (
++                Path(local_app_data)
++                / "Programs"
++                / "DockerDesktop"
++                / "resources"
++                / "bin"
++                / "docker.exe"
++            )
++            if candidate.is_file():
++                docker_value = str(candidate)
++    if docker_value is None:
++        pytest.skip("Docker executable is unavailable for the policy-worker smoke")
++    docker = Path(docker_value).resolve()
++
++    docker_config = tmp_path / "docker-smoke-config"
++    docker_temp = tmp_path / "docker-smoke-temp"
++    docker_home = tmp_path / "docker-smoke-home"
++    for directory in (docker_config, docker_temp, docker_home):
++        directory.mkdir()
++    allowed = {"PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT"}
++    if os.name == "nt":
++        allowed.add("SYSTEMDRIVE")
++    environment = agent_loop._canonical_environment(os.environ, allowed)
++    environment.update(
++        {
++            "DOCKER_CONFIG": str(docker_config),
++            "HOME": str(docker_home),
++            "USERPROFILE": str(docker_home),
++            "TEMP": str(docker_temp),
++            "TMP": str(docker_temp),
++        }
++    )
++    version = agent_loop._bounded_process(
++        (str(docker), "version", "--format", "{{json .}}"),
++        env=environment,
++        timeout=15.0,
++        output_limit=64 * 1024,
++    )
++    if version.timed_out or version.returncode != 0:
++        pytest.skip("Docker daemon is unavailable for the policy-worker smoke")
++    image_check = agent_loop._bounded_process(
++        (str(docker), "image", "inspect", image),
++        env=environment,
++        timeout=15.0,
++        output_limit=64 * 1024,
++    )
++    if image_check.timed_out or image_check.returncode != 0:
++        pytest.skip("Pinned policy-worker image is unavailable; no pull was attempted")
++
++    source_root = Path(__file__).resolve().parents[1]
++    controller_root = (tmp_path / "controller").resolve()
++    runtime_root = (tmp_path / "runtime").resolve()
++    controller_root.mkdir()
++    runtime_root.mkdir()
++    policy_root = (tmp_path / "synthetic-policy").resolve()
++    for name in ("entry.py", "risk.py", "exit.py"):
++        target = policy_root / "core" / "strategy_policy" / name
++        target.parent.mkdir(parents=True, exist_ok=True)
++        shutil.copyfile(source_root / "core" / "strategy_policy" / name, target)
++    (policy_root / "credentials.env").write_text(
++        "SYNTHETIC_TOKEN=must-not-be-mounted\n",
++        encoding="utf-8",
++    )
++    (policy_root / "pit.sqlite3").write_bytes(b"synthetic sealed data")
++
++    capability = agent_loop.configure_docker_executable(
++        docker,
++        source_root=source_root,
++        controller_root=controller_root,
++        permanent_runtime_root=runtime_root,
++    )
++    runner = agent_loop.PolicyWorkerRunner(
++        image=image,
++        engine=capability,
++        temp_parent=controller_root,
++    )
++    repeated = CapacitySnapshot(None, 25, 0, 3, 1.0, False)
++    unrelated = CapacitySnapshot(5, 25, 2, 1, 0.5, True)
++    client = None
++    session = None
++    container_id = None
++    package_parent = None
++    try:
++        client = runner.client_factory(
++            candidate_root=policy_root,
++            interface_version=1,
++            fold_run_id="synthetic_smoke",
++            determinism_probes=(
++                PolicyDeterminismProbe(
++                    "recommend_capacity",
++                    repeated,
++                    unrelated,
++                ),
++            ),
++        )()
++        session = client._session
++        daemon = session._daemon
++        container_id = daemon.container_id
++        package_parent = session.package_root.parent
++        inspect = agent_loop._bounded_process(
++            (str(docker), "inspect", container_id),
++            env=environment,
++            timeout=15.0,
++            output_limit=64 * 1024,
++        )
++        if inspect.timed_out or inspect.returncode != 0:
++            raise AssertionError("task-created policy worker could not be inspected")
++        payload = json.loads(inspect.stdout)
++        if type(payload) is not list or len(payload) != 1:
++            raise AssertionError("task-created policy worker inspection is malformed")
++        item = payload[0]
++        host = item.get("HostConfig")
++        config = item.get("Config")
++        mounts = item.get("Mounts")
++        if not isinstance(host, dict) or not isinstance(config, dict):
++            raise AssertionError("task-created policy worker inspection is incomplete")
++        if (
++            host.get("NetworkMode") != "none"
++            or host.get("ReadonlyRootfs") is not True
++            or host.get("Memory") > 1024 * 1024 * 1024
++            or host.get("NanoCpus") > 1_000_000_000
++            or host.get("PidsLimit") > 32
++            or host.get("CapDrop") != ["ALL"]
++            or host.get("SecurityOpt") != ["no-new-privileges"]
++            or config.get("User") != "65532:65532"
++        ):
++            raise AssertionError("task-created policy worker limits are not closed")
++        if (
++            type(mounts) is not list
++            or len(mounts) != 1
++            or mounts[0].get("Type") != "bind"
++            or mounts[0].get("Destination") != "/workspace/policy"
++            or mounts[0].get("RW") is not False
++            or Path(mounts[0].get("Source", "")).resolve()
++            != session.package_root.resolve()
++        ):
++            raise AssertionError("task-created policy worker mount allowlist differs")
++        mounted_text = json.dumps(mounts, sort_keys=True)
++        if (
++            str(policy_root) in mounted_text
++            or "credentials.env" in mounted_text
++            or "pit.sqlite3" in mounted_text
++        ):
++            raise AssertionError("task-created policy worker received a forbidden mount")
++        decision = client.recommend_capacity(repeated)
++        if decision != CapacityDecision(None, False):
++            raise AssertionError("synthetic policy worker output is not deterministic")
++    finally:
++        if client is not None:
++            client.close()
++        if container_id is not None:
++            absence = agent_loop._bounded_process(
++                (
++                    str(docker),
++                    "container",
++                    "ls",
++                    "--all",
++                    "--quiet",
++                    "--no-trunc",
++                    "--filter",
++                    f"id={container_id}",
++                ),
++                env=environment,
++                timeout=15.0,
++                output_limit=64 * 1024,
++            )
++            if (
++                absence.timed_out
++                or absence.returncode != 0
++                or absence.stdout.strip()
++            ):
++                raise AssertionError("task-created policy worker cleanup is incomplete")
++        if package_parent is not None and package_parent.exists():
++            raise AssertionError("task-created policy package cleanup is incomplete")
++        if session is not None and session._process.poll() is None:
++            raise AssertionError("task-created policy process cleanup is incomplete")

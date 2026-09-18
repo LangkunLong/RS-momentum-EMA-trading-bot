@@ -1,0 +1,11 @@
+# Replacement campaign04: forbidden authoring mode selected
+
+The actual launch (exec18078) exited1, statusfailed at recovery:stage_failed after one accepted investigator call. The response selected full_source_escape. This manifest has search.allow_full_source_escape=false, and LocalRoleRequestFactoryV5.author_request rejects that selection before an author call. No candidate/evaluator/critic/checkpoint was produced; cleanup completed and sleepguardrestored.
+
+Reported actual usage:1call,2564tokens,$0.01921. Campaign03+04 totals3calls,10679tokens,$0.055885. Both permitted campaign attempts are used; nine call slots remaining under the12call allowance do not authorize another campaign automatically.
+
+Root cause: the investigator schema offers symbol_edits and full_source_escape without carrying the manifest-level capability into provider generation. The full_source flag on RoleSchemaAuthority is author-request-specific and alwaysfalse for investigators, even in enabled campaigns, so reading it as the campaign permission would introduce a regression.
+
+Repair contract: pass the authenticated manifest search permission from the existing production gateway into its existing transport and the shared wire-schema projector. False narrows investigator mode tosymbol_edits; True permitsboth. Legacy callers omitting the new keyword retain existing behavior. Preparation must use the same actualmanifestpermission and projector. Canonicalrequest/schema artifacts and historical parser remain unchanged. Existing author-request authorization guard remains the final boundary.
+
+No further provider call is authorized after this replacement. Local repair/review/preparation can continue. The requested two-round campaign and post-completion Luna handoff remain outstanding; do not describe zeroevaluated rounds as end-to-end optimizer success.

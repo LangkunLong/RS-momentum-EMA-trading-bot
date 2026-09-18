@@ -1,0 +1,1583 @@
+# Review package: 380594dcd936d91d9129190e5df54525cb8b3d0d..52837cd
+
+## Commits
+52837cd feat: seal PIT market reference symbols
+
+## Files changed
+ build_pit_bundle.py             |  78 +++++++++---
+ core/alpaca_pit_backfill.py     |  32 +++--
+ core/pit_data.py                | 257 ++++++++++++++++++++++++++++++++--------
+ core/pit_provenance.py          |  34 +++++-
+ export_pit_prices.py            |  97 ++++++++++-----
+ tests/test_export_pit_prices.py |  19 +++
+ tests/test_pit_data.py          |  20 +++-
+ verify_pit_bundle.py            |  58 ++++++++-
+ 8 files changed, 479 insertions(+), 116 deletions(-)
+
+## Diff
+diff --git a/build_pit_bundle.py b/build_pit_bundle.py
+index 63fa98f..9376fc0 100644
+--- a/build_pit_bundle.py
++++ b/build_pit_bundle.py
+@@ -8,20 +8,25 @@ import hashlib
+ import json
+ import math
+ import os
+ import sqlite3
+ import tempfile
+ from datetime import date
+ from pathlib import Path
+ from typing import Any, Iterable, Mapping
+ 
+ from core.pit_data import PITDataBundle, sha256_file
++from core.pit_provenance import (
++    PIT_NON_TRADABLE_REFERENCE_SYMBOLS,
++    pit_canonical_json,
++    pit_canonical_json_sha256,
++)
+ 
+ _MEMBERSHIP_COLUMNS = ("effective_date", "ticker", "member")
+ _PRICE_COLUMNS = ("trade_date", "ticker", "open", "high", "low", "close", "volume")
+ _FUNDAMENTAL_COLUMNS = (
+     "ticker", "statement_type", "period_end", "public_date", "basic_eps",
+     "diluted_eps", "total_revenue", "net_income", "common_stock",
+     "total_stockholders_equity", "shares_outstanding",
+     "held_percent_institutions", "institution_count", "prev_institution_count",
+ )
+ _STATEMENT_TYPES = {"quarterly", "annual", "balance", "institutional"}
+@@ -104,25 +109,20 @@ def _json_input(path: str | Path) -> tuple[Path, Mapping[str, object]]:
+     resolved = _regular_input(path)
+     try:
+         value = json.loads(resolved.read_text(encoding="utf-8"))
+     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+         raise ValueError(f"invalid provenance JSON: {resolved}") from exc
+     if not isinstance(value, dict):
+         raise ValueError("provenance JSON must contain an object")
+     return resolved, value
+ 
+ 
+-def _canonical_json_sha256(value: object) -> str:
+-    payload = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+-    return hashlib.sha256(payload).hexdigest()
+-
+-
+ def _load_membership(path: Path, cutoff: str) -> list[tuple[str, str, int]]:
+     result: list[tuple[str, str, int]] = []
+     seen: set[tuple[str, str]] = set()
+     for row in _rows(path, _MEMBERSHIP_COLUMNS):
+         effective = _iso_date(row["effective_date"], field="effective_date")
+         if effective > cutoff:
+             raise ValueError("membership event is after data_cutoff")
+         ticker = _ticker(row["ticker"])
+         member = _int(row["member"], field="member", allow_blank=False)
+         if member not in {0, 1}:
+@@ -241,23 +241,31 @@ def _provenance_metadata(
+     if prices_provenance.get("start_date") != warmup_start:
+         raise ValueError("prices provenance start_date does not match warmup_start")
+     if prices_provenance.get("end_date") != cutoff:
+         raise ValueError("prices provenance end_date does not match data_cutoff")
+     if membership_provenance.get("first_effective_date") != evaluation_start:
+         raise ValueError("membership provenance does not seed evaluation_start")
+ 
+     contracts = prices_provenance.get("price_identity_request_contracts")
+     if not isinstance(contracts, dict) or not contracts:
+         raise ValueError("prices provenance has no price identity request contracts")
+-    contract_sha = _canonical_json_sha256(contracts)
++    contract_sha = pit_canonical_json_sha256(contracts)
+     if prices_provenance.get("price_identity_request_contracts_sha256") != contract_sha:
+         raise ValueError("prices provenance identity contract digest is invalid")
++    reference_values = list(PIT_NON_TRADABLE_REFERENCE_SYMBOLS)
++    if (
++        prices_provenance.get("non_tradable_reference_symbols_json")
++        != pit_canonical_json(reference_values)
++        or prices_provenance.get("non_tradable_reference_symbols_sha256")
++        != pit_canonical_json_sha256(reference_values)
++    ):
++        raise ValueError("prices provenance reference-symbol contract is invalid")
+     raw_exclusions = prices_provenance.get("symbols_with_no_prices")
+     if not isinstance(raw_exclusions, list):
+         raise ValueError("prices provenance price exclusions must be a list")
+     exclusions = {_ticker(value) for value in raw_exclusions}
+     if len(exclusions) != len(raw_exclusions):
+         raise ValueError("prices provenance has duplicate price exclusions")
+ 
+     def required_text(source: Mapping[str, object], key: str) -> str:
+         value = source.get(key)
+         if not isinstance(value, str) or not value.strip():
+@@ -275,22 +283,29 @@ def _provenance_metadata(
+         "membership_revision_id": required_text(membership_provenance, "revision_id"),
+         "membership_raw_sha256": _digest(membership_provenance.get("raw_sha256"), field="raw_sha256"),
+         "membership_symbol_map_sha256": _digest(membership_provenance.get("symbol_map_sha256"), field="symbol_map_sha256"),
+         "membership_security_names_sha256": membership_names_sha,
+         "prices_source_kind": required_text(prices_provenance, "source_kind"),
+         "prices_upstream_source_sha256": _digest(prices_provenance.get("source_sha256"), field="source_sha256"),
+         "price_identity_map_sha256": _digest(prices_provenance.get("price_identity_map_sha256"), field="price_identity_map_sha256"),
+         "price_identity_request_contracts_sha256": contract_sha,
+         "spy_trading_days_sha256": spy_days_sha,
+         "price_exclusion_count": str(len(exclusions)),
+-        "price_exclusions_sha256": _canonical_json_sha256(sorted(exclusions)),
++        "price_exclusions_sha256": pit_canonical_json_sha256(sorted(exclusions)),
+         "fundamentals_source_kind": required_text(fundamentals_provenance, "source"),
++        "non_tradable_reference_symbols_json": pit_canonical_json(
++            list(PIT_NON_TRADABLE_REFERENCE_SYMBOLS)
++        ),
++        "non_tradable_reference_symbols_sha256": pit_canonical_json_sha256(
++            list(PIT_NON_TRADABLE_REFERENCE_SYMBOLS)
++        ),
++        "source_universe": "sp500",
+     }
+     if metadata["fundamentals_source_kind"] != "SEC EDGAR official bulk archives":
+         raise ValueError("fundamentals provenance source is not the approved SEC bulk archive source")
+     for key in ("submissions_archive_sha256", "companyfacts_archive_sha256", "identity_manifest_csv_sha256"):
+         metadata[f"fundamentals_{key}"] = _digest(fundamentals_provenance.get(key), field=key)
+     return metadata, exclusions
+ 
+ 
+ def _integrity_gate(
+     *, cutoff: str, evaluation_start: str, warmup_start: str,
+@@ -301,52 +316,83 @@ def _integrity_gate(
+     cutoff_date = date.fromisoformat(cutoff)
+     eval_date = date.fromisoformat(evaluation_start)
+     warmup_date = date.fromisoformat(warmup_start)
+     if not warmup_date < eval_date <= cutoff_date:
+         raise ValueError("date contract must satisfy warmup_start < evaluation_start <= data_cutoff")
+     if cutoff != "2025-12-31":
+         raise ValueError("five-year baseline data_cutoff must be 2025-12-31")
+     membership_symbols = {row[1] for row in membership}
+     price_symbols = {row[1] for row in prices}
+     fundamental_symbols = {row[0] for row in fundamentals}
++    reference_symbols = set(PIT_NON_TRADABLE_REFERENCE_SYMBOLS)
+     missing_prices = membership_symbols.difference(price_symbols, price_exclusions)
+     if missing_prices:
+         raise ValueError(f"membership tickers lack prices or explicit exclusion: {sorted(missing_prices)}")
+     if not price_exclusions.issubset(membership_symbols) or price_exclusions.intersection(price_symbols):
+         raise ValueError("price exclusions must be membership-only symbols without price rows")
+     outside = fundamental_symbols.difference(membership_symbols)
+     if outside:
+         raise ValueError(f"fundamental tickers are outside membership: {sorted(outside)}")
+-    if "SPY" not in price_symbols or "SPY" in membership_symbols:
+-        raise ValueError("SPY must exist in prices and not in membership")
+-    if not price_symbols.issubset(membership_symbols.union({"SPY"})):
+-        raise ValueError("prices contain symbols outside membership plus SPY")
++    if reference_symbols.intersection(membership_symbols):
++        raise ValueError("market references must not exist in membership")
++    if reference_symbols.intersection(fundamental_symbols):
++        raise ValueError("market references must not exist in fundamentals")
++    if not reference_symbols.issubset(price_symbols):
++        raise ValueError("IWM, QQQ, and SPY must all exist in prices")
++    if not price_symbols.issubset(membership_symbols.union(reference_symbols)):
++        raise ValueError("prices contain symbols outside membership plus references")
++    raw_contracts = prices_provenance.get("price_identity_request_contracts")
++    if not isinstance(raw_contracts, dict) or {
++        _ticker(value) for value in raw_contracts
++    } != membership_symbols.union(reference_symbols):
++        raise ValueError(
++            "price identity request contracts do not exactly cover membership plus references"
++        )
+     first_price = date.fromisoformat(min(row[0] for row in prices))
+     if first_price < warmup_date or first_price > date(2020, 1, 2):
+         raise ValueError("earliest price must be within warmup start through 2020-01-02")
+     if date.fromisoformat(min(row[0] for row in membership)) > eval_date:
+         raise ValueError("membership history does not seed the evaluation start")
+     active: set[str] = set()
+     events: dict[str, list[tuple[str, int]]] = {}
+     for effective, ticker, member in membership:
+         events.setdefault(effective, []).append((ticker, member))
+-    all_spy_days = sorted({row[0] for row in prices if row[1] == "SPY"})
+-    if not all_spy_days:
+-        raise ValueError("no evaluation-period SPY sessions")
++    reference_days = {
++        reference: sorted({row[0] for row in prices if row[1] == reference})
++        for reference in PIT_NON_TRADABLE_REFERENCE_SYMBOLS
++    }
++    if any(not days for days in reference_days.values()):
++        raise ValueError("market-reference price calendars must be non-empty")
++    if len({tuple(days) for days in reference_days.values()}) != 1:
++        raise ValueError("IWM, QQQ, and SPY trading-session calendars must be identical")
++    all_spy_days = reference_days["SPY"]
+     if all_spy_days[0] != "2020-01-02" or all_spy_days[-1] != cutoff:
+-        raise ValueError("SPY calendar does not cover the exact five-year baseline")
++        raise ValueError("market-reference calendar does not cover the exact five-year baseline")
+     spy_payload = ("trade_date\n" + "\n".join(all_spy_days) + "\n").encode()
+     spy_digest = hashlib.sha256(spy_payload).hexdigest()
+     if prices_provenance.get("spy_trading_days_sha256") != spy_digest:
+         raise ValueError("recomputed SPY calendar digest does not match prices provenance")
+     if prices_provenance.get("spy_first_date") != all_spy_days[0] or prices_provenance.get("spy_last_date") != all_spy_days[-1]:
+         raise ValueError("prices provenance SPY date range is inconsistent")
++    expected_reference_coverage = {
++        reference: {
++            "first_date": days[0],
++            "last_date": days[-1],
++            "session_count": len(days),
++        }
++        for reference, days in reference_days.items()
++    }
++    if (
++        prices_provenance.get("reference_symbol_coverage")
++        != expected_reference_coverage
++    ):
++        raise ValueError("prices provenance market-reference coverage is inconsistent")
+     if _int(prices_provenance.get("price_row_count"), field="price_row_count", allow_blank=False) != len(prices):
+         raise ValueError("prices provenance row count is inconsistent")
+     if _int(membership_provenance.get("event_count"), field="event_count", allow_blank=False) != len(membership):
+         raise ValueError("membership provenance event count is inconsistent")
+     if _int(membership_provenance.get("symbol_count"), field="symbol_count", allow_blank=False) != len(membership_symbols):
+         raise ValueError("membership provenance symbol count is inconsistent")
+     if membership_provenance.get("last_effective_date") != max(row[0] for row in membership):
+         raise ValueError("membership provenance last effective date is inconsistent")
+     spy_days = [day for day in all_spy_days if day >= evaluation_start]
+     prices_by_day: dict[str, set[str]] = {}
+@@ -484,21 +530,21 @@ def main() -> int:
+     )
+     _integrity_gate(cutoff=cutoff, evaluation_start=evaluation_start, warmup_start=warmup_start,
+                     membership=membership, prices=prices, fundamentals=fundamentals,
+                     price_exclusions=price_exclusions,
+                     membership_provenance=membership_provenance,
+                     prices_provenance=prices_provenance)
+     if before_hashes != {path: sha256_file(path) for path in inputs}:
+         raise ValueError("an input changed while the bundle was being built")
+ 
+     metadata = {
+-        "bundle_kind": "canslim_pit_v1", "schema_version": "1", "data_cutoff": cutoff,
++        "bundle_kind": "canslim_pit_v2", "schema_version": "2", "data_cutoff": cutoff,
+         "evaluation_start": evaluation_start, "warmup_start": warmup_start,
+         **provenance_metadata,
+     }
+     output.parent.mkdir(parents=True, exist_ok=True)
+     staged: list[tuple[Path, Path]] = []
+     temp_paths: list[Path] = []
+     try:
+         descriptor, temp_name = tempfile.mkstemp(prefix=f".{output.name}.", suffix=".tmp", dir=output.parent)
+         os.close(descriptor)
+         temp_output = Path(temp_name)
+diff --git a/core/alpaca_pit_backfill.py b/core/alpaca_pit_backfill.py
+index 85c3fb4..311e61c 100644
+--- a/core/alpaca_pit_backfill.py
++++ b/core/alpaca_pit_backfill.py
+@@ -22,20 +22,22 @@ from pathlib import Path
+ from statistics import median
+ from typing import Callable, Iterable, Iterator, Mapping, Sequence
+ 
+ import pandas as pd
+ from alpaca.data.enums import Adjustment, DataFeed
+ from alpaca.data.historical import StockHistoricalDataClient
+ from alpaca.data.requests import StockBarsRequest
+ from alpaca.data.timeframe import TimeFrame
+ from dotenv import dotenv_values
+ 
++from core.pit_provenance import PIT_NON_TRADABLE_REFERENCE_SYMBOLS
++
+ PRICE_COLUMNS = ("trade_date", "ticker", "open", "high", "low", "close", "volume")
+ REQUEST_ALIASES = {"BF.B": "BF-B", "BRK.B": "BRK-B"}
+ MAX_SYMBOLS_PER_REQUEST = 100
+ 
+ 
+ @dataclass(frozen=True)
+ class AlpacaSnapshot:
+     path: Path
+     retrieved_at_utc: str
+     requested_symbol_count: int
+@@ -417,23 +419,26 @@ def _fetch_alpaca_sip_snapshot(
+     api_key: str,
+     secret_key: str,
+     adjustment: Adjustment,
+     identities: Mapping[str, ProviderIdentity],
+     client_factory: Callable[..., object] = StockHistoricalDataClient,
+ ) -> AlpacaSnapshot:
+     """Fetch exact SIP daily-bar chunks for one fixed adjustment mode."""
+     if output_path.exists() or output_path.is_symlink():
+         raise ValueError("Alpaca snapshot output must not already exist")
+     canonical = tuple(sorted(set(canonical_symbols)))
+-    if tuple(canonical_symbols) != canonical or "SPY" not in canonical:
+-        raise ValueError("provider symbols must be sorted, unique, and include SPY")
+-    if membership_symbol_count != len(canonical) - 1:
++    references = set(PIT_NON_TRADABLE_REFERENCE_SYMBOLS)
++    if tuple(canonical_symbols) != canonical or not references.issubset(canonical):
++        raise ValueError(
++            "provider symbols must be sorted, unique, and include IWM, QQQ, and SPY"
++        )
++    if membership_symbol_count != len(set(canonical) - references):
+         raise ValueError("membership symbol count does not match the provider request")
+     if set(identities) != set(canonical):
+         raise ValueError("provider identity contracts differ from requested symbols")
+     for symbol, identity in identities.items():
+         if (
+             identity.canonical_symbol != symbol
+             or not start <= identity.admitted_start <= identity.admitted_end <= end
+             or not identity.admitted_end <= identity.identity_asof <= end
+         ):
+             raise ValueError("provider identity contract is invalid")
+@@ -505,36 +510,43 @@ def _fetch_alpaca_sip_snapshot(
+             if returned.intersection(chunk_returned):
+                 raise ValueError("Alpaca SIP alias results are ambiguous across chunks")
+             returned.update(chunk_returned)
+             chunk_path = root / f"chunk-{chunk_number:02d}.csv"
+             _write_chunk(chunk_path, rows)
+             chunk_paths.append(chunk_path)
+         if returned != set(canonical):
+             missing = sorted(set(canonical) - returned)
+             raise ValueError(f"Alpaca SIP returned no valid rows for requested symbol {missing[0]}")
+         row_count = _merge_chunks(chunk_paths, output_path)
+-    spy_dates: list[date] = []
++    reference_dates: dict[str, list[date]] = {
++        reference: [] for reference in PIT_NON_TRADABLE_REFERENCE_SYMBOLS
++    }
+     with output_path.open("r", encoding="utf-8", newline="") as stream:
+         reader = csv.DictReader(stream)
+         for row in reader:
+-            if row["ticker"] == "SPY":
+-                spy_dates.append(date.fromisoformat(row["trade_date"]))
+-    if tuple(spy_dates) != expected_days:
+-        output_path.unlink(missing_ok=True)
+-        raise ValueError("Alpaca SIP does not provide complete SPY coverage for the required calendar")
++            ticker = row["ticker"]
++            if ticker in reference_dates:
++                reference_dates[ticker].append(date.fromisoformat(row["trade_date"]))
++    for reference, observed_dates in reference_dates.items():
++        if tuple(observed_dates) != expected_days:
++            output_path.unlink(missing_ok=True)
++            raise ValueError(
++                f"Alpaca SIP does not provide complete {reference} coverage "
++                "for the required calendar"
++            )
+     return AlpacaSnapshot(
+         path=output_path,
+         retrieved_at_utc=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+         requested_symbol_count=len(canonical),
+         requested_membership_symbol_count=membership_symbol_count,
+         returned_symbol_count=len(returned),
+-        returned_membership_symbol_count=len(returned - {"SPY"}),
++        returned_membership_symbol_count=len(returned - references),
+         chunk_count=len(request_groups),
+         row_count=row_count,
+         adjustment=adjustment.value,
+         identity_group_count=len(canonical_by_asof),
+     )
+ 
+ 
+ def fetch_alpaca_sip_snapshot(
+     canonical_symbols: Sequence[str],
+     *,
+diff --git a/core/pit_data.py b/core/pit_data.py
+index 5721f53..4a1cfc4 100644
+--- a/core/pit_data.py
++++ b/core/pit_data.py
+@@ -1,21 +1,21 @@
+ """Read-only point-in-time dataset resolver for historical backtests.
+ 
+ The normal backtest cache is a convenience cache of provider responses.  It
+ is not a point-in-time dataset because it contains today's index membership and
+ does not carry public dates for every fundamental record.  This module defines
+ the stricter bundle used by ``pit-canslim`` and ``leader-basket`` modes.
+ 
+ The bundle is a SQLite database with four required tables:
+ 
+ ``dataset_metadata(key TEXT PRIMARY KEY, value TEXT)``
+-    Must contain ``schema_version=1`` and a non-empty ``data_cutoff``.
++    Current bundles contain ``schema_version=2`` and a non-empty ``data_cutoff``.
+ ``membership(effective_date TEXT, ticker TEXT, member INTEGER)``
+     Dated index membership transitions.  ``member`` is 0 or 1.
+ ``price(trade_date TEXT, ticker TEXT, open REAL, high REAL, low REAL,
+ close REAL, volume REAL)``
+     Split-adjusted daily bars.
+ ``fundamentals(ticker TEXT, statement_type TEXT, period_end TEXT,
+ public_date TEXT, basic_eps REAL, diluted_eps REAL, total_revenue REAL,
+ net_income REAL, common_stock REAL, total_stockholders_equity REAL,
+ shares_outstanding REAL, held_percent_institutions REAL,
+ institution_count INTEGER, prev_institution_count INTEGER)``
+@@ -35,23 +35,29 @@ import sqlite3
+ from dataclasses import dataclass
+ from datetime import date, datetime
+ from itertools import groupby
+ from pathlib import Path
+ from types import MappingProxyType
+ from typing import Any, Iterable, Mapping
+ 
+ import pandas as pd
+ 
+ from core.leader_evaluation import PointInTimeUniverse
+-from core.pit_provenance import PIT_PUBLIC_DATES_ATTR
++from core.pit_provenance import (
++    PIT_NON_TRADABLE_REFERENCE_SYMBOLS,
++    PIT_PUBLIC_DATES_ATTR,
++    pit_canonical_json,
++    pit_canonical_json_sha256,
++)
+ 
+ _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
++_SECURITY_LINEAGE_ID_RE = re.compile(r"^[a-z][a-z0-9_]{0,47}$")
+ _REQUIRED_TABLES = {"dataset_metadata", "membership", "price", "fundamentals"}
+ _REQUIRED_PRICE_COLUMNS = {
+     "trade_date",
+     "ticker",
+     "open",
+     "high",
+     "low",
+     "close",
+     "volume",
+ }
+@@ -103,20 +109,25 @@ _REQUIRED_METADATA = {
+     "spy_trading_days_sha256",
+     "price_identity_map_sha256",
+     "price_identity_request_contracts_sha256",
+     "price_exclusion_count",
+     "price_exclusions_sha256",
+     "fundamentals_source_kind",
+     "fundamentals_submissions_archive_sha256",
+     "fundamentals_companyfacts_archive_sha256",
+     "fundamentals_identity_manifest_csv_sha256",
+ }
++_REQUIRED_V2_METADATA = {
++    "non_tradable_reference_symbols_json",
++    "non_tradable_reference_symbols_sha256",
++    "source_universe",
++}
+ _SAME_ISSUER_CONTINUITIES = {
+     "same_issuer_rename",
+     "same_issuer_ticker_reuse",
+     "legacy_survivor_rename",
+     "accounting_acquirer_rename",
+ }
+ 
+ 
+ @dataclass(frozen=True)
+ class IdentityTransition:
+@@ -243,25 +254,20 @@ def _regular_file(path: str | Path) -> Path:
+ 
+ def _canonical_ticker(value: object) -> str:
+     if not isinstance(value, str):
+         raise ValueError("ticker must be text")
+     ticker = value.strip().upper()
+     if not ticker or len(ticker) > 8 or any(char not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ.-" for char in ticker):
+         raise ValueError("ticker is not canonical")
+     return ticker
+ 
+ 
+-def _canonical_json_sha256(value: object) -> str:
+-    payload = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+-    return hashlib.sha256(payload).hexdigest()
+-
+-
+ def _json_file(path: str | Path) -> tuple[Path, Mapping[str, object]]:
+     candidate = Path(path)
+     if not candidate.is_file() or candidate.is_symlink():
+         raise ValueError("provenance must be a regular non-link JSON file")
+     resolved = candidate.resolve()
+     try:
+         value = json.loads(resolved.read_text(encoding="utf-8"))
+     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+         raise ValueError("provenance JSON is invalid") from exc
+     if not isinstance(value, dict):
+@@ -315,21 +321,35 @@ class PITDataBundle:
+     def _initialize_connection(self, connection: sqlite3.Connection) -> None:
+         """Apply one shared read-only validation initializer to an open connection."""
+ 
+         self._connection = connection
+         try:
+             self._connection.row_factory = sqlite3.Row
+             self._connection.execute("PRAGMA query_only=ON")
+             self._validate_schema()
+             self.metadata = self._load_metadata()
+             self.membership = self._load_membership()
+-            self._symbols = self._load_symbols()
++            self._tradable_symbols = frozenset(
++                event.ticker for event in self.membership.events
++            )
++            self._reference_symbols = frozenset(
++                PIT_NON_TRADABLE_REFERENCE_SYMBOLS
++                if self.metadata["schema_version"] == "2"
++                else ("SPY",)
++            )
++            self._price_symbols = self._load_symbols()
++            self._symbols = (
++                self._price_symbols
++                if self.metadata["schema_version"] == "2"
++                else self._price_symbols.union(self._tradable_symbols)
++            )
++            self._security_lineage_ids: Mapping[str, str] | None = None
+             self._validate_integrity()
+             self._fundamentals_provider_cache: dict[str, _FundamentalsProviderState] = {}
+         except Exception:
+             self._connection.close()
+             raise
+ 
+     def close(self) -> None:
+         try:
+             self._connection.close()
+         finally:
+@@ -366,27 +386,45 @@ class PITDataBundle:
+         if not _REQUIRED_FUNDAMENTAL_COLUMNS.issubset(self._table_columns("fundamentals")):
+             raise ValueError("fundamentals columns are invalid")
+         for table in sorted(_REQUIRED_TABLES - {"dataset_metadata"}):
+             count = int(self._connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+             if count == 0:
+                 raise ValueError(f"point-in-time bundle table is empty: {table}")
+ 
+     def _load_metadata(self) -> dict[str, str]:
+         rows = self._connection.execute("SELECT key, value FROM dataset_metadata").fetchall()
+         metadata = {str(row[0]): str(row[1]) for row in rows}
+-        if metadata.get("schema_version") != "1":
+-            raise ValueError("point-in-time bundle schema_version must be 1")
+-        missing = _REQUIRED_METADATA.difference(metadata)
++        schema_version = metadata.get("schema_version")
++        if schema_version not in {"1", "2"}:
++            raise ValueError("point-in-time bundle schema_version must be 1 or 2")
++        required = _REQUIRED_METADATA.union(
++            _REQUIRED_V2_METADATA if schema_version == "2" else ()
++        )
++        missing = required.difference(metadata)
+         if missing:
+             raise ValueError(f"point-in-time bundle metadata is incomplete: {sorted(missing)}")
+-        if metadata.get("bundle_kind") != "canslim_pit_v1":
++        expected_kind = "canslim_pit_v2" if schema_version == "2" else "canslim_pit_v1"
++        if metadata.get("bundle_kind") != expected_kind:
+             raise ValueError("point-in-time bundle kind is invalid")
++        if schema_version == "2":
++            reference_values = list(PIT_NON_TRADABLE_REFERENCE_SYMBOLS)
++            if (
++                metadata["non_tradable_reference_symbols_json"]
++                != pit_canonical_json(reference_values)
++                or metadata["non_tradable_reference_symbols_sha256"]
++                != pit_canonical_json_sha256(reference_values)
++            ):
++                raise ValueError(
++                    "point-in-time bundle reference-symbol metadata is invalid"
++                )
++            if metadata["source_universe"] != "sp500":
++                raise ValueError("point-in-time bundle source universe is invalid")
+         cutoff = metadata.get("data_cutoff", "").strip()
+         if not cutoff:
+             raise ValueError("point-in-time bundle data_cutoff is required")
+         try:
+             cutoff_date = date.fromisoformat(cutoff)
+             evaluation_start = date.fromisoformat(metadata["evaluation_start"])
+             warmup_start = date.fromisoformat(metadata["warmup_start"])
+         except (TypeError, ValueError) as exc:
+             raise ValueError("point-in-time bundle date metadata is invalid") from exc
+         if not warmup_start < evaluation_start <= cutoff_date:
+@@ -413,23 +451,21 @@ class PITDataBundle:
+                 {
+                     "effective_date": effective_date.date().isoformat(),
+                     "ticker": _canonical_ticker(row[1]),
+                     "member": bool(member),
+                 }
+             )
+         return PointInTimeUniverse.from_rows(normalized)
+ 
+     def _load_symbols(self) -> frozenset[str]:
+         prices = self._connection.execute("SELECT DISTINCT ticker FROM price").fetchall()
+-        symbols = {_canonical_ticker(row[0]) for row in prices}
+-        symbols.update(event.ticker for event in self.membership.events)
+-        return frozenset(symbols)
++        return frozenset(_canonical_ticker(row[0]) for row in prices)
+ 
+     def _validate_integrity(self) -> None:
+         duplicate_membership = self._connection.execute(
+             "SELECT 1 FROM membership GROUP BY effective_date,ticker HAVING COUNT(*) > 1 LIMIT 1"
+         ).fetchone()
+         duplicate_prices = self._connection.execute(
+             "SELECT 1 FROM price GROUP BY trade_date,ticker HAVING COUNT(*) > 1 LIMIT 1"
+         ).fetchone()
+         duplicate_fundamentals = self._connection.execute(
+             "SELECT 1 FROM fundamentals GROUP BY ticker,statement_type,period_end,public_date "
+@@ -449,28 +485,69 @@ class PITDataBundle:
+             (self.metadata["data_cutoff"], self.metadata["data_cutoff"]),
+         ).fetchone()
+         if after_cutoff:
+             raise ValueError("point-in-time bundle contains rows after data_cutoff")
+         nonmember_fundamental = self._connection.execute(
+             "SELECT 1 FROM fundamentals f WHERE NOT EXISTS "
+             "(SELECT 1 FROM membership m WHERE m.ticker=f.ticker) LIMIT 1"
+         ).fetchone()
+         if nonmember_fundamental:
+             raise ValueError("point-in-time bundle contains fundamentals outside membership")
+-        spy_membership = self._connection.execute(
+-            "SELECT 1 FROM membership WHERE ticker='SPY' LIMIT 1"
+-        ).fetchone()
+-        spy_price = self._connection.execute(
+-            "SELECT 1 FROM price WHERE ticker='SPY' LIMIT 1"
+-        ).fetchone()
+-        if spy_membership or not spy_price:
+-            raise ValueError("point-in-time bundle SPY membership/price invariant failed")
++        if self.metadata["schema_version"] == "2":
++            fundamental_symbols = {
++                _canonical_ticker(row[0])
++                for row in self._connection.execute(
++                    "SELECT DISTINCT ticker FROM fundamentals"
++                ).fetchall()
++            }
++            if self._reference_symbols.intersection(self._tradable_symbols):
++                raise ValueError(
++                    "point-in-time bundle references must not appear in membership"
++                )
++            if self._reference_symbols.intersection(fundamental_symbols):
++                raise ValueError(
++                    "point-in-time bundle references must not appear in fundamentals"
++                )
++            if not self._reference_symbols.issubset(self._price_symbols):
++                raise ValueError(
++                    "point-in-time bundle prices do not contain every market reference"
++                )
++            outside_prices = self._price_symbols.difference(
++                self._tradable_symbols.union(self._reference_symbols)
++            )
++            if outside_prices:
++                raise ValueError(
++                    "point-in-time bundle prices contain symbols outside tradables and references"
++                )
++            reference_calendars = {
++                reference: tuple(
++                    str(row[0])
++                    for row in self._connection.execute(
++                        "SELECT trade_date FROM price WHERE ticker=? ORDER BY trade_date",
++                        (reference,),
++                    ).fetchall()
++                )
++                for reference in PIT_NON_TRADABLE_REFERENCE_SYMBOLS
++            }
++            if len(set(reference_calendars.values())) != 1:
++                raise ValueError(
++                    "point-in-time bundle market-reference calendars are not identical"
++                )
++        else:
++            spy_membership = self._connection.execute(
++                "SELECT 1 FROM membership WHERE ticker='SPY' LIMIT 1"
++            ).fetchone()
++            spy_price = self._connection.execute(
++                "SELECT 1 FROM price WHERE ticker='SPY' LIMIT 1"
++            ).fetchone()
++            if spy_membership or not spy_price:
++                raise ValueError("point-in-time bundle SPY membership/price invariant failed")
+         first_price = self._connection.execute("SELECT MIN(trade_date) FROM price").fetchone()[0]
+         if first_price is None:
+             raise ValueError("point-in-time bundle has no prices")
+         first_price_date = date.fromisoformat(str(first_price))
+         warmup_start = date.fromisoformat(self.metadata["warmup_start"])
+         if first_price_date < warmup_start or first_price_date > date(2020, 1, 2):
+             raise ValueError("point-in-time bundle does not satisfy the warm-up price boundary")
+         evaluation_start = self.metadata["evaluation_start"]
+         spy_days = [
+             str(row[0])
+@@ -483,35 +560,75 @@ class PITDataBundle:
+             raise ValueError("point-in-time bundle has no evaluation-period SPY sessions")
+         counts = [len(self.membership.members_at(day)) for day in spy_days]
+         if min(counts) < 495 or max(counts) > 510:
+             raise ValueError("point-in-time bundle membership count is outside 495 through 510")
+ 
+     @property
+     def data_cutoff(self) -> pd.Timestamp:
+         return pd.Timestamp(self.metadata["data_cutoff"])
+ 
+     def symbols(self) -> tuple[str, ...]:
+-        return tuple(sorted(self._symbols))
++        """Compatibility alias for :meth:`price_symbols`."""
++
++        if self.metadata["schema_version"] == "1":
++            return tuple(sorted(self._symbols))
++        return self.price_symbols()
++
++    def tradable_symbols(self) -> tuple[str, ...]:
++        """Return immutable membership identities eligible for trading."""
++
++        return tuple(sorted(self._tradable_symbols))
++
++    def reference_symbols(self) -> tuple[str, ...]:
++        """Return immutable non-tradable market-reference identities."""
++
++        return tuple(
++            reference
++            for reference in PIT_NON_TRADABLE_REFERENCE_SYMBOLS
++            if reference in self._reference_symbols
++        )
++
++    def price_symbols(self) -> tuple[str, ...]:
++        """Return identities with at least one price row in the bundle."""
++
++        return tuple(sorted(self._price_symbols))
++
++    def security_lineage_id(self, ticker: str) -> str:
++        """Return a tradable's authenticated price-identity chain identifier."""
++
++        symbol = _canonical_ticker(ticker)
++        if symbol not in self._tradable_symbols:
++            raise ValueError("security lineage is available only for tradable symbols")
++        if self._security_lineage_ids is None:
++            raise ValueError("security lineages require authenticated prices provenance")
++        return self._security_lineage_ids[symbol]
++
++    def security_lineage_ids(self) -> Mapping[str, str]:
++        """Return every authenticated tradable-to-lineage binding immutably."""
++
++        if self._security_lineage_ids is None:
++            raise ValueError("security lineages require authenticated prices provenance")
++        return self._security_lineage_ids
+ 
+     def load_price_identity_transition_contract(
+         self,
+         prices_provenance: str | Path,
+     ) -> PriceIdentityTransitionContract:
+         """Load reviewed holding transitions bound to this exact bundle."""
+         path, provenance = _json_file(prices_provenance)
+         provenance_sha = sha256_file(path)
+         if provenance_sha != self.metadata["prices_provenance_sha256"]:
+             raise ValueError("prices provenance does not match the bundle metadata digest")
+         raw_contracts = provenance.get("price_identity_request_contracts")
+         if not isinstance(raw_contracts, dict) or not raw_contracts:
+             raise ValueError("prices provenance has no identity request contract")
+-        contract_sha = _canonical_json_sha256(raw_contracts)
++        contract_sha = pit_canonical_json_sha256(raw_contracts)
+         if contract_sha != self.metadata["price_identity_request_contracts_sha256"]:
+             raise ValueError("price identity request contract digest does not match the bundle")
+         if provenance.get("price_identity_request_contracts_sha256") != contract_sha:
+             raise ValueError("prices provenance identity contract digest is internally inconsistent")
+         if provenance.get("price_identity_map_sha256") != self.metadata.get("price_identity_map_sha256"):
+             raise ValueError("prices provenance identity map digest does not match the bundle")
+         expected_fields = {
+             "provider_symbol",
+             "identity_asof",
+             "admitted_start",
+@@ -522,28 +639,35 @@ class PITDataBundle:
+             "factor_anchor",
+         }
+         identities: dict[str, Mapping[str, object]] = {}
+         for raw_ticker, raw_identity in raw_contracts.items():
+             ticker = _canonical_ticker(raw_ticker)
+             if ticker != raw_ticker or not isinstance(raw_identity, dict) or set(raw_identity) != expected_fields:
+                 raise ValueError("prices provenance contains an invalid identity contract row")
+             start = date.fromisoformat(str(raw_identity["admitted_start"]))
+             end = date.fromisoformat(str(raw_identity["admitted_end"]))
+             date.fromisoformat(str(raw_identity["identity_asof"]))
+-            if end < start or not isinstance(raw_identity["chain_id"], str):
++            if (
++                end < start
++                or not isinstance(raw_identity["chain_id"], str)
++                or _SECURITY_LINEAGE_ID_RE.fullmatch(raw_identity["chain_id"])
++                is None
++            ):
+                 raise ValueError("prices provenance identity bounds are invalid")
+             if not isinstance(raw_identity["continuity_kind"], str):
+                 raise ValueError("prices provenance continuity kind is invalid")
+             identities[ticker] = MappingProxyType(dict(raw_identity))
+-        required_identities = {event.ticker for event in self.membership.events}.union({"SPY"})
++        required_identities = self._tradable_symbols.union(self._reference_symbols)
+         if set(identities) != required_identities:
+-            raise ValueError("prices provenance identities do not exactly cover membership plus SPY")
++            raise ValueError(
++                "prices provenance identities do not exactly cover tradables plus references"
++            )
+ 
+         events_by_date: dict[date, dict[bool, list[str]]] = {}
+         for event in self.membership.events:
+             grouped = events_by_date.setdefault(event.effective_date, {True: [], False: []})
+             grouped[event.member].append(event.ticker)
+         transitions: list[IdentityTransition] = []
+         for effective, grouped in sorted(events_by_date.items()):
+             for predecessor in sorted(grouped[False]):
+                 predecessor_identity = identities.get(predecessor)
+                 if predecessor_identity is None:
+@@ -564,26 +688,33 @@ class PITDataBundle:
+                 if successors:
+                     transitions.append(
+                         IdentityTransition(
+                             effective,
+                             predecessor,
+                             successors[0],
+                             chain_id,
+                             str(identities[successors[0]]["continuity_kind"]),
+                         )
+                     )
+-        return PriceIdentityTransitionContract(
++        contract = PriceIdentityTransitionContract(
+             provenance_sha,
+             contract_sha,
+             identities,
+             tuple(transitions),
+         )
++        self._security_lineage_ids = MappingProxyType(
++            {
++                ticker: str(contract.identities[ticker]["chain_id"])
++                for ticker in sorted(self._tradable_symbols)
++            }
++        )
++        return contract
+ 
+     def manifest(self) -> dict[str, object]:
+         """Return content-free identity and coverage facts for audit logs."""
+ 
+         price_coverage = self._connection.execute(
+             "SELECT MIN(trade_date), MAX(trade_date), COUNT(*), COUNT(DISTINCT ticker) FROM price"
+         ).fetchone()
+         fundamental_coverage = self._connection.execute(
+             "SELECT MIN(public_date), MAX(public_date), COUNT(*), COUNT(DISTINCT ticker) FROM fundamentals"
+         ).fetchone()
+@@ -591,52 +722,74 @@ class PITDataBundle:
+             "SELECT MIN(effective_date), MAX(effective_date), COUNT(*), COUNT(DISTINCT ticker) FROM membership"
+         ).fetchone()
+         spy_days = [
+             str(row[0])
+             for row in self._connection.execute(
+                 "SELECT trade_date FROM price WHERE ticker='SPY' AND trade_date >= ? ORDER BY trade_date",
+                 (self.metadata["evaluation_start"],),
+             ).fetchall()
+         ]
+         membership_counts = [len(self.membership.members_at(day)) for day in spy_days]
+-        return {
++        reference_coverage = {
++            reference: {
++                "first_date": coverage[0],
++                "last_date": coverage[1],
++                "session_count": int(coverage[2]),
++            }
++            for reference in self.reference_symbols()
++            for coverage in (
++                self._connection.execute(
++                    "SELECT MIN(trade_date), MAX(trade_date), COUNT(*) "
++                    "FROM price WHERE ticker=?",
++                    (reference,),
++                ).fetchone(),
++            )
++        }
++        coverage_manifest: dict[str, object] = {
++            "price": {
++                "first_date": price_coverage[0],
++                "last_date": price_coverage[1],
++                "rows": int(price_coverage[2]),
++                "symbols": int(price_coverage[3]),
++            },
++            "fundamentals": {
++                "first_public_date": fundamental_coverage[0],
++                "last_public_date": fundamental_coverage[1],
++                "rows": int(fundamental_coverage[2]),
++                "symbols": int(fundamental_coverage[3]),
++            },
++            "membership": {
++                "first_effective_date": membership_coverage[0],
++                "last_effective_date": membership_coverage[1],
++                "events": int(membership_coverage[2]),
++                "symbols": int(membership_coverage[3]),
++                "evaluation_session_min_members": min(membership_counts),
++                "evaluation_session_max_members": max(membership_counts),
++            },
++        }
++        manifest: dict[str, object] = {
+             "bundle_sha256": self.sha256,
+             "schema_version": self.metadata["schema_version"],
+             "data_cutoff": str(self.data_cutoff.date()),
+             "evaluation_start": self.metadata["evaluation_start"],
+             "warmup_start": self.metadata["warmup_start"],
+             "membership_events": len(self.membership.events),
+             "symbol_count": len(self._symbols),
+             "metadata": dict(sorted(self.metadata.items())),
+-            "coverage": {
+-                "price": {
+-                    "first_date": price_coverage[0],
+-                    "last_date": price_coverage[1],
+-                    "rows": int(price_coverage[2]),
+-                    "symbols": int(price_coverage[3]),
+-                },
+-                "fundamentals": {
+-                    "first_public_date": fundamental_coverage[0],
+-                    "last_public_date": fundamental_coverage[1],
+-                    "rows": int(fundamental_coverage[2]),
+-                    "symbols": int(fundamental_coverage[3]),
+-                },
+-                "membership": {
+-                    "first_effective_date": membership_coverage[0],
+-                    "last_effective_date": membership_coverage[1],
+-                    "events": int(membership_coverage[2]),
+-                    "symbols": int(membership_coverage[3]),
+-                    "evaluation_session_min_members": min(membership_counts),
+-                    "evaluation_session_max_members": max(membership_counts),
+-                },
+-            },
++            "coverage": coverage_manifest,
+         }
++        if self.metadata["schema_version"] == "2":
++            manifest["non_tradable_reference_symbols"] = list(
++                self.reference_symbols()
++            )
++            coverage_manifest["references"] = reference_coverage
++        return manifest
+ 
+     def members_at(self, when: str | datetime | pd.Timestamp) -> frozenset[str]:
+         if isinstance(when, datetime):
+             when = when.date().isoformat()
+         elif isinstance(when, pd.Timestamp):
+             when = when.date().isoformat()
+         return self.membership.members_at(when)
+ 
+     def _query_prices(
+         self,
+diff --git a/core/pit_provenance.py b/core/pit_provenance.py
+index af224bb..e3d3805 100644
+--- a/core/pit_provenance.py
++++ b/core/pit_provenance.py
+@@ -1,5 +1,35 @@
+-"""Lightweight shared names for point-in-time provenance metadata."""
++"""Lightweight shared names and canonical point-in-time provenance helpers."""
++
++from __future__ import annotations
++
++import hashlib
++import json
+ 
+ PIT_PUBLIC_DATES_ATTR = "pit_public_date_by_period"
++PIT_NON_TRADABLE_REFERENCE_SYMBOLS = ("IWM", "QQQ", "SPY")
++
++
++def pit_canonical_json(value: object) -> str:
++    """Return the stable compact JSON representation used by PIT provenance."""
++
++    return json.dumps(value, allow_nan=False, sort_keys=True, separators=(",", ":"))
++
++
++def pit_canonical_json_bytes(value: object) -> bytes:
++    """Return canonical PIT JSON as one newline-terminated UTF-8 record."""
++
++    return (pit_canonical_json(value) + "\n").encode("utf-8")
++
++
++def pit_canonical_json_sha256(value: object) -> str:
++    """Hash the canonical newline-terminated PIT JSON representation."""
++
++    return hashlib.sha256(pit_canonical_json_bytes(value)).hexdigest()
+ 
+-__all__ = ["PIT_PUBLIC_DATES_ATTR"]
++__all__ = [
++    "PIT_NON_TRADABLE_REFERENCE_SYMBOLS",
++    "PIT_PUBLIC_DATES_ATTR",
++    "pit_canonical_json",
++    "pit_canonical_json_bytes",
++    "pit_canonical_json_sha256",
++]
+diff --git a/export_pit_prices.py b/export_pit_prices.py
+index e4cce05..ab6d38a 100644
+--- a/export_pit_prices.py
++++ b/export_pit_prices.py
+@@ -25,20 +25,25 @@ from urllib.parse import quote
+ 
+ from core.alpaca_pit_backfill import (
+     ProviderIdentity,
+     REQUEST_ALIASES,
+     _apply_cutoff_split_factors,
+     _derive_cutoff_split_factors,
+     fetch_alpaca_sip_raw_calibration,
+     fetch_alpaca_sip_snapshot,
+     load_alpaca_credentials,
+ )
++from core.pit_provenance import (
++    PIT_NON_TRADABLE_REFERENCE_SYMBOLS,
++    pit_canonical_json,
++    pit_canonical_json_sha256,
++)
+ 
+ _BASELINE_START = date(2020, 1, 1)
+ _BASELINE_END = date(2025, 12, 31)
+ _EXPECTED_SCHEMA = [
+     (0, "cache_key", "TEXT", 0, None, 1),
+     (1, "cache_kind", "TEXT", 1, None, 0),
+     (2, "created_at", "TEXT", 1, None, 0),
+     (3, "payload", "BLOB", 1, None, 0),
+ ]
+ _MEMBERSHIP_COLUMNS = ("effective_date", "ticker", "member")
+@@ -221,21 +226,23 @@ def _load_identity_bounds(
+                 or _TICKER_RE.fullmatch(canonical) is None
+                 or canonical not in membership.tickers
+                 or not _BASELINE_START <= effective_start <= effective_end <= cutoff
+                 or not row.get("reason", "").strip()
+             ):
+                 raise ValueError(f"reviewed symbol-history row {row_number} is invalid")
+             mapped[canonical] = max(mapped.get(canonical, effective_end), effective_end)
+     if not mapped:
+         raise ValueError("reviewed symbol-history map contains no canonical identities")
+     end_dates = {ticker: mapped.get(ticker, cutoff) for ticker in membership.tickers}
+-    end_dates["SPY"] = cutoff
++    end_dates.update(
++        {reference: cutoff for reference in PIT_NON_TRADABLE_REFERENCE_SYMBOLS}
++    )
+     return IdentityBounds(
+         path,
+         expected_sha256,
+         end_dates,
+         len(mapped),
+         tuple(sorted(mapped)),
+     )
+ 
+ 
+ def _load_price_identity_manifest(
+@@ -344,21 +351,21 @@ def _provider_symbol(canonical_ticker: str) -> str:
+         canonical_ticker,
+     )
+ 
+ 
+ def _complete_price_identities(
+     membership: Membership,
+     manifest: PriceIdentityManifest,
+     cutoff: date,
+ ) -> dict[str, PriceIdentity]:
+     identities = dict(manifest.identities)
+-    for ticker in (*membership.tickers, "SPY"):
++    for ticker in (*membership.tickers, *PIT_NON_TRADABLE_REFERENCE_SYMBOLS):
+         if ticker not in identities:
+             identities[ticker] = PriceIdentity(
+                 ticker,
+                 _provider_symbol(ticker),
+                 cutoff,
+                 _BASELINE_START,
+                 cutoff,
+                 f"unmapped_{ticker.casefold().replace('-', '_').replace('.', '_')}",
+                 "unmapped_cutoff_identity",
+                 None,
+@@ -489,21 +496,23 @@ def _copy_and_validate_cache(source: Path, expected_sha256: str, root: Path) ->
+     if "price" not in kinds:
+         raise ValueError("cache contains no price payloads")
+     keys_sha256 = hashlib.sha256("".join(canonical_keys).encode()).hexdigest()
+     return CacheSnapshot(destination, expected_sha256, len(rows), keys_sha256)
+ 
+ 
+ def _canonical_request(path: Path, membership: Membership, start: date, end: date) -> None:
+     value = {
+         "end_date": end.isoformat(),
+         "start_date": start.isoformat(),
+-        "tickers": sorted({*membership.tickers, "SPY"}),
++        "tickers": sorted(
++            {*membership.tickers, *PIT_NON_TRADABLE_REFERENCE_SYMBOLS}
++        ),
+         "version": 1,
+     }
+     path.write_bytes((json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode())
+     os.chmod(path, stat.S_IREAD)
+ 
+ 
+ def _docker_call(executable: Path, args: Sequence[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
+     environment = {
+         key: value
+         for key, value in os.environ.items()
+@@ -820,23 +829,25 @@ def _expected_trading_days(start: date, end: date) -> tuple[date, ...]:
+ 
+ 
+ def _validate_prices(
+     path: Path,
+     membership: Membership,
+     start: date,
+     end: date,
+     *,
+     enforce_gates: bool = True,
+ ) -> tuple[dict[str, object], tuple[date, ...]]:
+-    requested = {*membership.tickers, "SPY"}
++    requested = {*membership.tickers, *PIT_NON_TRADABLE_REFERENCE_SYMBOLS}
+     closes: dict[date, set[str]] = {}
+-    spy_days: list[date] = []
++    reference_days: dict[str, list[date]] = {
++        reference: [] for reference in PIT_NON_TRADABLE_REFERENCE_SYMBOLS
++    }
+     previous: tuple[date, str] | None = None
+     first_price_date: date | None = None
+     last_price_date: date | None = None
+     price_row_count = 0
+     with path.open("r", encoding="utf-8", newline="") as stream:
+         reader = csv.DictReader(stream)
+         if tuple(reader.fieldnames or ()) != _PRICE_COLUMNS:
+             raise ValueError("worker prices CSV has an unexpected header")
+         for row_number, row in enumerate(reader, start=2):
+             try:
+@@ -853,36 +864,36 @@ def _validate_prices(
+                 or any(not math.isfinite(value) for value in numbers)
+                 or any(value <= 0 for value in numbers[:4])
+                 or numbers[4] < 0
+             ):
+                 raise ValueError(f"worker prices row {row_number} violates the output contract")
+             previous = identity
+             price_row_count += 1
+             first_price_date = first_price_date or trade_date
+             last_price_date = trade_date
+             closes.setdefault(trade_date, set()).add(ticker)
+-            if ticker == "SPY":
+-                spy_days.append(trade_date)
+-    expected_spy = _expected_trading_days(start, end)
+-    if not spy_days or first_price_date is None or last_price_date is None:
+-        raise ValueError("worker prices CSV contains no SPY or price rows")
++            if ticker in reference_days:
++                reference_days[ticker].append(trade_date)
++    expected_days = _expected_trading_days(start, end)
++    if first_price_date is None or last_price_date is None:
++        raise ValueError("worker prices CSV contains no price rows")
+     events_by_date: dict[date, list[tuple[str, bool]]] = {}
+     for effective, ticker, member in membership.events:
+         events_by_date.setdefault(effective, []).append((ticker, member))
+     active: set[str] = set()
+     expected_by_symbol = {ticker: 0 for ticker in membership.tickers}
+     covered_by_symbol = {ticker: 0 for ticker in membership.tickers}
+     pairs = 0
+     covered = 0
+     event_dates = sorted(events_by_date)
+     event_index = 0
+-    for trading_day in expected_spy:
++    for trading_day in expected_days:
+         while event_index < len(event_dates) and event_dates[event_index] <= trading_day:
+             for ticker, member in events_by_date[event_dates[event_index]]:
+                 if member:
+                     active.add(ticker)
+                 else:
+                     active.discard(ticker)
+             event_index += 1
+         day_closes = closes.get(trading_day, set())
+         pairs += len(active)
+         for ticker in active:
+@@ -898,40 +909,57 @@ def _validate_prices(
+         ticker
+         for ticker in membership.tickers
+         if 0 < covered_by_symbol[ticker] < expected_by_symbol[ticker]
+     )
+     metrics: dict[str, object] = {
+         "member_trading_day_pairs": pairs,
+         "covered_member_trading_day_pairs": covered,
+         "coverage_pct": round(coverage_ratio * 100, 8),
+         "symbols_with_no_prices": no_prices,
+         "symbols_with_partial_prices": partial,
+-        "spy_first_date": spy_days[0].isoformat(),
+-        "spy_last_date": spy_days[-1].isoformat(),
++        "reference_symbol_coverage": {
++            reference: {
++                "first_date": days[0].isoformat() if days else None,
++                "last_date": days[-1].isoformat() if days else None,
++                "session_count": len(days),
++            }
++            for reference, days in reference_days.items()
++        },
++        "spy_first_date": (
++            reference_days["SPY"][0].isoformat() if reference_days["SPY"] else None
++        ),
++        "spy_last_date": (
++            reference_days["SPY"][-1].isoformat() if reference_days["SPY"] else None
++        ),
+         "price_row_count": price_row_count,
+     }
+-    if enforce_gates and tuple(spy_days) != expected_spy:
+-        missing = sorted(set(expected_spy) - set(spy_days))
+-        unexpected = sorted(set(spy_days) - set(expected_spy))
+-        detail = f"; first missing trading day: {missing[0]}" if missing else ""
+-        if unexpected:
+-            detail += f"; first unexpected day: {unexpected[0]}"
+-        raise ValueError(
+-            "SPY coverage is incomplete for 2020-01-01 through 2025-12-31"
+-            f"; observed SPY: {spy_days[0]} through {spy_days[-1]}"
+-            f"; observed prices: {first_price_date} through {last_price_date}"
+-            f"; member coverage: {covered}/{pairs} ({coverage_ratio:.8%})"
+-            + detail
+-        )
++    if enforce_gates:
++        for reference, days in reference_days.items():
++            if tuple(days) == expected_days:
++                continue
++            missing = sorted(set(expected_days) - set(days))
++            unexpected = sorted(set(days) - set(expected_days))
++            detail = f"; first missing trading day: {missing[0]}" if missing else ""
++            if unexpected:
++                detail += f"; first unexpected day: {unexpected[0]}"
++            observed = f"{days[0]} through {days[-1]}" if days else "no sessions"
++            raise ValueError(
++                f"{reference} reference coverage is incomplete for "
++                "2020-01-01 through 2025-12-31"
++                f"; observed {reference}: {observed}"
++                f"; observed prices: {first_price_date} through {last_price_date}"
++                f"; member coverage: {covered}/{pairs} ({coverage_ratio:.8%})"
++                + detail
++            )
+     if enforce_gates and coverage_ratio < 0.98:
+         raise ValueError(f"member/trading-day close coverage is below 98%: {coverage_ratio:.6%}")
+-    return metrics, tuple(spy_days)
++    return metrics, tuple(reference_days["SPY"])
+ 
+ 
+ def _relative_difference(left: float, right: float) -> float:
+     return abs(left - right) / max(abs(left), abs(right), 1e-12)
+ 
+ 
+ def _percentile(values: Sequence[float], percentile: float) -> float:
+     if not values:
+         return 0.0
+     ordered = sorted(values)
+@@ -1535,21 +1563,23 @@ def export(args: argparse.Namespace) -> dict[str, object]:
+             args.end_date,
+             enforce_gates=not alpaca_sip_backfill,
+         )
+         publication_prices = prices_path
+         alpaca_snapshot_path: Path | None = None
+         merge_metrics: dict[str, object] = {}
+         provider_provenance: dict[str, object] = {}
+         if alpaca_sip_backfill:
+             env_path = Path(alpaca_env_file_value) if alpaca_env_file_value is not None else None
+             api_key, secret_key = load_alpaca_credentials(env_path)
+-            provider_symbols = tuple(sorted({*membership.tickers, "SPY"}))
++            provider_symbols = tuple(
++                sorted({*membership.tickers, *PIT_NON_TRADABLE_REFERENCE_SYMBOLS})
++            )
+             expected_trading_days = _expected_trading_days(args.start_date, args.end_date)
+             split_snapshot = fetch_alpaca_sip_snapshot(
+                 provider_symbols,
+                 membership_symbol_count=len(membership.tickers),
+                 start=args.start_date,
+                 end=args.end_date,
+                 expected_trading_days=expected_trading_days,
+                 output_path=root / "alpaca_sip_split.csv",
+                 api_key=api_key,
+                 secret_key=secret_key,
+@@ -1557,21 +1587,24 @@ def export(args: argparse.Namespace) -> dict[str, object]:
+             )
+             factor_anchor_symbols = tuple(
+                 sorted(
+                     ticker
+                     for ticker, identity in price_identities.items()
+                     if identity.factor_anchor
+                 )
+             )
+             raw_snapshot = fetch_alpaca_sip_raw_calibration(
+                 factor_anchor_symbols,
+-                membership_symbol_count=len(factor_anchor_symbols) - 1,
++                membership_symbol_count=len(
++                    set(factor_anchor_symbols)
++                    - set(PIT_NON_TRADABLE_REFERENCE_SYMBOLS)
++                ),
+                 start=args.start_date,
+                 end=args.end_date,
+                 expected_trading_days=expected_trading_days,
+                 output_path=root / "alpaca_sip_raw.csv",
+                 api_key=api_key,
+                 secret_key=secret_key,
+                 identities={
+                     ticker: provider_identities[ticker] for ticker in factor_anchor_symbols
+                 },
+             )
+@@ -1726,20 +1759,26 @@ def export(args: argparse.Namespace) -> dict[str, object]:
+         provenance: dict[str, object] = {
+             "source_kind": (
+                 "existing_hash_pinned_cache_plus_alpaca_sip_snapshot"
+                 if alpaca_sip_backfill
+                 else "existing_hash_pinned_cache"
+             ),
+             "source_sha256": snapshot.sha256,
+             "cache_key_count": snapshot.key_count,
+             "cache_keys_sha256": snapshot.keys_sha256,
+             "membership_sha256": _sha256_file(membership_path),
++            "non_tradable_reference_symbols_json": pit_canonical_json(
++                list(PIT_NON_TRADABLE_REFERENCE_SYMBOLS)
++            ),
++            "non_tradable_reference_symbols_sha256": pit_canonical_json_sha256(
++                list(PIT_NON_TRADABLE_REFERENCE_SYMBOLS)
++            ),
+             "start_date": args.start_date.isoformat(),
+             "end_date": args.end_date.isoformat(),
+             "sandbox_image": args.sandbox_image,
+             "prices_sha256": _sha256_file(publication_prices),
+             **metrics,
+             **provider_provenance,
+         }
+         spy_text = _csv_text([(value.isoformat(),) for value in spy_days], ("trade_date",))
+         provenance["spy_trading_days_sha256"] = hashlib.sha256(spy_text.encode()).hexdigest()
+         _publish(
+diff --git a/tests/test_export_pit_prices.py b/tests/test_export_pit_prices.py
+index f8717ce..17a7bc9 100644
+--- a/tests/test_export_pit_prices.py
++++ b/tests/test_export_pit_prices.py
+@@ -71,20 +71,39 @@ def test_price_identity_manifest_accepts_only_reviewed_class_share_provider_form
+ ) -> None:
+     path = tmp_path / "price-identities.csv"
+     membership, history, digest = _write_minimal_price_identity_manifest(path)
+ 
+     manifest = exporter._load_price_identity_manifest(
+         path, digest, membership, history, date(2025, 12, 31)
+     )
+ 
+     assert manifest.identities["BF-B"].provider_symbol == "BF.B"
+     assert manifest.identities["BRK-B"].provider_symbol == "BRK.B"
++    completed = exporter._complete_price_identities(
++        membership, manifest, date(2025, 12, 31)
++    )
++    assert tuple(completed) == ("BF-B", "BRK-B", "IWM", "PSKY", "QQQ", "SPY")
++    assert {
++        reference: completed[reference].chain_id for reference in ("IWM", "QQQ", "SPY")
++    } == {"IWM": "unmapped_iwm", "QQQ": "unmapped_qqq", "SPY": "unmapped_spy"}
++    request = tmp_path / "request.json"
++    exporter._canonical_request(
++        request, membership, date(2020, 1, 1), date(2025, 12, 31)
++    )
++    assert exporter.json.loads(request.read_text(encoding="utf-8"))["tickers"] == [
++        "BF-B",
++        "BRK-B",
++        "IWM",
++        "PSKY",
++        "QQQ",
++        "SPY",
++    ]
+ 
+ 
+ def test_price_identity_manifest_rejects_unreviewed_provider_symbol_mismatch(
+     tmp_path: Path,
+ ) -> None:
+     path = tmp_path / "price-identities.csv"
+     membership, history, digest = _write_minimal_price_identity_manifest(
+         path, psky_provider="PARA"
+     )
+ 
+diff --git a/tests/test_pit_data.py b/tests/test_pit_data.py
+index 1138dda..1535764 100644
+--- a/tests/test_pit_data.py
++++ b/tests/test_pit_data.py
+@@ -6,47 +6,49 @@ import csv
+ import hashlib
+ from pathlib import Path
+ import sqlite3
+ from types import SimpleNamespace
+ 
+ import pandas as pd
+ import pytest
+ 
+ import export_pit_prices as exporter
+ from core.pit_data import PITDataBundle
++from core.pit_provenance import PIT_NON_TRADABLE_REFERENCE_SYMBOLS
+ 
+ 
+ def _cache(path: Path, *, extra_table: bool = False) -> str:
+     with sqlite3.connect(path) as conn:
+         conn.execute(
+             "CREATE TABLE dataset_cache (cache_key TEXT PRIMARY KEY, cache_kind TEXT NOT NULL, "
+             "created_at TEXT NOT NULL, payload BLOB NOT NULL)"
+         )
+         conn.execute(
+             "INSERT INTO dataset_cache VALUES (?, ?, ?, ?)",
+             (
+-                "price::1d::2024-01-02::2024-01-05::AAPL,SPY",
++                "price::1d::2024-01-02::2024-01-05::AAPL,IWM,QQQ,SPY",
+                 "price",
+                 "2024-01-06T00:00:00Z",
+                 b"worker-controlled-not-a-pickle",
+             ),
+         )
+         if extra_table:
+             conn.execute("CREATE TABLE surprise (payload BLOB)")
+     return hashlib.sha256(path.read_bytes()).hexdigest()
+ 
+ 
+ def _price_rows(*, missing_spy: bool = False, partial_aapl: bool = False, duplicate: bool = False) -> list[tuple[object, ...]]:
+     rows: list[tuple[object, ...]] = []
+     for index, day in enumerate(("2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05")):
+-        if not missing_spy:
+-            rows.append((day, "SPY", 100, 101, 99, 100, 1_000))
++        for reference in PIT_NON_TRADABLE_REFERENCE_SYMBOLS:
++            if not (missing_spy and reference == "SPY"):
++                rows.append((day, reference, 100, 101, 99, 100, 1_000))
+         if not (partial_aapl and index == 3):
+             rows.append((day, "AAPL", 100, 101, 99, 100, 1_000))
+     if duplicate:
+         rows.append(("2024-01-05", "AAPL", 100, 101, 99, 100, 1_000))
+     return sorted(rows)
+ 
+ 
+ def _write_prices(path: Path, rows: list[tuple[object, ...]]) -> None:
+     with path.open("x", encoding="utf-8", newline="") as stream:
+         writer = csv.writer(stream, lineterminator="\n")
+@@ -54,40 +56,48 @@ def _write_prices(path: Path, rows: list[tuple[object, ...]]) -> None:
+         writer.writerows(rows)
+ 
+ 
+ def _membership() -> exporter.Membership:
+     return exporter.Membership(((pd.Timestamp("2024-01-02").date(), "AAPL", True),), ("AAPL",))
+ 
+ 
+ def test_worker_cache_and_spy_aapl_export_are_validated_without_payload_deserialization(
+     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+ ) -> None:
+-    """Break caught: host decoded worker data or rejected a complete SPY/AAPL export."""
++    """Break caught: host decoded worker data or rejected a complete reference/AAPL export."""
+     source = tmp_path / "worker.sqlite3"
+     digest = _cache(source)
+     monkeypatch.setattr(
+         "pickle.loads",
+         lambda *_: (_ for _ in ()).throw(AssertionError("worker payload was deserialized")),
+     )
+     destination = tmp_path / "copy"
+     destination.mkdir()
+     snapshot = exporter._copy_and_validate_cache(source, digest, destination)
+     prices = tmp_path / "prices.csv"
+     _write_prices(prices, _price_rows())
+     metrics, spy_days = exporter._validate_prices(
+         prices,
+         _membership(),
+         pd.Timestamp("2024-01-02").date(),
+         pd.Timestamp("2024-01-05").date(),
+     )
+     assert snapshot.key_count == 1
+     assert metrics["coverage_pct"] == 100.0
++    assert metrics["reference_symbol_coverage"] == {
++        reference: {
++            "first_date": "2024-01-02",
++            "last_date": "2024-01-05",
++            "session_count": 4,
++        }
++        for reference in ("IWM", "QQQ", "SPY")
++    }
+     assert tuple(str(item) for item in spy_days) == ("2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05")
+ 
+ 
+ @pytest.mark.parametrize(
+     ("wrong_hash", "extra_table", "expected"),
+     [(True, False, "cache changed"), (False, True, "unexpected SQLite")],
+ )
+ def test_worker_cache_rejects_bad_hash_and_extra_schema(
+     tmp_path: Path, wrong_hash: bool, extra_table: bool, expected: str,
+ ) -> None:
+@@ -96,21 +106,21 @@ def test_worker_cache_rejects_bad_hash_and_extra_schema(
+     destination = tmp_path / "copy"
+     destination.mkdir()
+     with pytest.raises(ValueError, match=expected):
+         exporter._copy_and_validate_cache(source, "0" * 64 if wrong_hash else digest, destination)
+ 
+ 
+ @pytest.mark.parametrize(
+     ("rows", "expected"),
+     [
+         (_price_rows(duplicate=True), "violates the output contract"),
+-        (_price_rows(missing_spy=True), "contains no SPY"),
++        (_price_rows(missing_spy=True), "SPY reference coverage is incomplete"),
+         (_price_rows(partial_aapl=True), "below 98%"),
+     ],
+ )
+ def test_worker_price_export_rejects_duplicate_missing_spy_and_partial_member_coverage(
+     tmp_path: Path, rows: list[tuple[object, ...]], expected: str,
+ ) -> None:
+     path = tmp_path / "prices.csv"
+     _write_prices(path, rows)
+     with pytest.raises(ValueError, match=expected):
+         exporter._validate_prices(path, _membership(), pd.Timestamp("2024-01-02").date(), pd.Timestamp("2024-01-05").date())
+diff --git a/verify_pit_bundle.py b/verify_pit_bundle.py
+index 49309de..eac8139 100644
+--- a/verify_pit_bundle.py
++++ b/verify_pit_bundle.py
+@@ -1,70 +1,124 @@
+ """Verify a point-in-time bundle read-only against exact sources and manifest."""
+ 
+ from __future__ import annotations
+ 
+ import argparse
++import csv
+ import json
+ from pathlib import Path
+ from typing import Any
+ 
+ from core.pit_data import PITDataBundle, sha256_file
++from core.pit_provenance import (
++    PIT_NON_TRADABLE_REFERENCE_SYMBOLS,
++    pit_canonical_json,
++    pit_canonical_json_sha256,
++)
+ 
+ 
+ def _regular_file(path: str | Path, *, label: str) -> Path:
+     value = Path(path)
+     if not value.is_file() or value.is_symlink():
+         raise ValueError(f"{label} must be a regular non-link file")
+     return value.resolve()
+ 
+ 
+ def _compare_manifest(actual: dict[str, Any], expected: dict[str, Any]) -> None:
+     normalized = dict(actual)
+     normalized["symbols"] = normalized.pop("symbol_count")
+     if expected != normalized:
+         differing = sorted(key for key in set(expected).union(normalized) if expected.get(key) != normalized.get(key))
+         raise ValueError(f"manifest does not exactly match the bundle: {differing}")
+ 
+ 
+-def _verify_exact_sources(bundle: PITDataBundle, args: argparse.Namespace) -> None:
++def _verify_exact_sources(
++    bundle: PITDataBundle,
++    args: argparse.Namespace,
++    manifest: dict[str, Any],
++) -> None:
+     fields = {
+         "membership_csv": "membership_source_sha256",
+         "prices_csv": "prices_source_sha256",
+         "fundamentals_csv": "fundamentals_source_sha256",
+         "membership_provenance": "membership_provenance_sha256",
+         "prices_provenance": "prices_provenance_sha256",
+         "fundamentals_provenance": "fundamentals_provenance_sha256",
+     }
+     for name, metadata_key in fields.items():
+         raw_path = getattr(args, name)
+         path = _regular_file(raw_path, label=name.replace("_", " "))
+         if sha256_file(path) != bundle.metadata[metadata_key]:
+             raise ValueError(f"exact source digest mismatch: {name}")
+     bundle.load_price_identity_transition_contract(args.prices_provenance)
++    if bundle.metadata["schema_version"] == "1":
++        return
++    prices_path = _regular_file(args.prices_csv, label="prices csv")
++    reference_dates: dict[str, set[str]] = {
++        reference: set() for reference in PIT_NON_TRADABLE_REFERENCE_SYMBOLS
++    }
++    with prices_path.open("r", encoding="utf-8", newline="") as stream:
++        reader = csv.DictReader(stream)
++        for row in reader:
++            ticker = row.get("ticker")
++            if ticker in reference_dates:
++                reference_dates[ticker].add(str(row.get("trade_date", "")))
++    source_coverage = {
++        reference: {
++            "first_date": days[0],
++            "last_date": days[-1],
++            "session_count": len(days),
++        }
++        for reference, observed in reference_dates.items()
++        for days in (sorted(observed),)
++        if days
++    }
++    expected_references = list(PIT_NON_TRADABLE_REFERENCE_SYMBOLS)
++    if (
++        manifest.get("non_tradable_reference_symbols") != expected_references
++        or manifest.get("coverage", {}).get("references") != source_coverage
++    ):
++        raise ValueError("bundle manifest reference coverage differs from prices source")
++    provenance_path = _regular_file(
++        args.prices_provenance, label="prices provenance"
++    )
++    try:
++        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
++    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
++        raise ValueError("prices provenance JSON is invalid") from exc
++    if (
++        not isinstance(provenance, dict)
++        or provenance.get("reference_symbol_coverage") != source_coverage
++        or provenance.get("non_tradable_reference_symbols_json")
++        != pit_canonical_json(expected_references)
++        or provenance.get("non_tradable_reference_symbols_sha256")
++        != pit_canonical_json_sha256(expected_references)
++    ):
++        raise ValueError("prices provenance reference coverage differs from prices source")
+ 
+ 
+ def main() -> int:
+     parser = argparse.ArgumentParser(description="Verify a strict point-in-time SQLite bundle")
+     parser.add_argument("--bundle", required=True)
+     parser.add_argument("--sha256", required=True)
+     parser.add_argument("--manifest", required=True, help="required manifest-last commit marker")
+     parser.add_argument("--membership-csv", required=True)
+     parser.add_argument("--prices-csv", required=True)
+     parser.add_argument("--fundamentals-csv", required=True)
+     parser.add_argument("--membership-provenance", required=True)
+     parser.add_argument("--prices-provenance", required=True)
+     parser.add_argument("--fundamentals-provenance", required=True)
+     args = parser.parse_args()
+ 
+     with PITDataBundle(args.bundle, expected_sha256=args.sha256) as bundle:
+         actual = bundle.manifest()
+-        _verify_exact_sources(bundle, args)
++        _verify_exact_sources(bundle, args, actual)
+     manifest_path = _regular_file(args.manifest, label="manifest")
+     try:
+         expected = json.loads(manifest_path.read_text(encoding="utf-8"))
+     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+         raise ValueError("manifest JSON is invalid") from exc
+     if not isinstance(expected, dict):
+         raise ValueError("manifest must contain a JSON object")
+     _compare_manifest(actual, expected)
+     print(json.dumps(actual, sort_keys=True))
+     return 0

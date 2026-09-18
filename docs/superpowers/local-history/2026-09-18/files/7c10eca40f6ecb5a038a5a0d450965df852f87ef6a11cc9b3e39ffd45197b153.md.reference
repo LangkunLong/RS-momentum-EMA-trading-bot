@@ -1,0 +1,281 @@
+### Task 3: Route the Simulator Through the Extracted Baseline Policy
+
+**Files:**
+
+- Create: core/strategy_policy/runtime.py
+- Modify: core/backtest_engine.py
+- Verify: core/engine_policy.py
+- Modify: tests/test_strategy_policy.py
+- Modify: tests/test_pit_policy_parity.py
+- Modify: tests/test_backtest_engine.py
+- Modify: tests/test_backtest_custom_strategy_contract.py
+- Modify: tests/test_task11_effective_policy_contract.py only if an assertion is needed for the separate interface identity
+
+**Interfaces:**
+
+- Produces: InProcessPolicyClient; simulator policy_client_factory injection with one fresh client per run; engine-side closed decision validators; projected capacity/eviction/allocation transition.
+- Consumes: the Task 1 pure modules and trusted entry/market/portfolio/current-bar facts. Candidate code never receives an engine object. The Task 2 reference remains sealed until final-HEAD verification in Task 9.
+
+**Simulator constructor addition:**
+
+    policy_client_factory: StrategyPolicyClientFactory | None = None
+
+None constructs an InProcessPolicyClient factory from the three baseline policy modules. At the start of every run(), the simulator calls the factory exactly once; a finally block closes that client and clears the run-local reference. Injected tests/workers also supply factories, never a reusable client instance. The client never receives the bundle, provider, history frame, date, symbol, Trade, or simulator.
+
+**Trusted adapter skeleton:**
+
+    @dataclass(slots=True)
+    class PendingEntry:
+        signal: dict[str, object]
+        capacity: CapacityDecision
+
+    @dataclass(frozen=True, slots=True)
+    class ProjectedEntryTransition:
+        eviction_slot: int | None
+        eviction_symbol: str | None
+        eviction_price: float | None
+        entry_open: float
+        portfolio_equity_at_entry_open: float
+        projected_cash: float
+        projected_gross_long_notional: float
+
+    @dataclass(frozen=True, slots=True)
+    class ValidatedEntryTransition:
+        projection: ProjectedEntryTransition
+        quantity: float
+        buy_notional: float
+        stop_price: float
+
+    PortfolioSimulator._build_entry_snapshot(
+        *,
+        row: Mapping[str, object],
+        facts: CanslimEntryFacts,
+        market_allowed: bool,
+        market_state: Mapping[str, object],
+    ) -> EntrySnapshot
+    PortfolioSimulator._resolve_capacity(
+        *,
+        eligible_signal_count: int,
+        cash_fraction: float,
+    ) -> CapacityDecision
+    PortfolioSimulator._build_eviction_snapshot(
+        *,
+        pending: PendingEntry,
+        ticker_ohlcv: Mapping[str, pd.DataFrame],
+        entry_date: pd.Timestamp,
+    ) -> EvictionSnapshot
+    PortfolioSimulator._project_entry_transition(
+        *,
+        pending: PendingEntry,
+        ticker_ohlcv: Mapping[str, pd.DataFrame],
+        entry_date: pd.Timestamp,
+        eviction: EvictionDecision,
+    ) -> ProjectedEntryTransition | None
+    PortfolioSimulator._validate_entry_transition(
+        projection: ProjectedEntryTransition,
+        recommendation: AllocationDecision,
+    ) -> ValidatedEntryTransition
+    PortfolioSimulator._apply_entry_transition(
+        transition: ValidatedEntryTransition,
+        pending: PendingEntry,
+        entry_date: pd.Timestamp,
+    ) -> None
+    PortfolioSimulator._build_exit_snapshot(
+        *,
+        trade: Trade,
+        current_high: float,
+        current_low: float,
+        current_close: float,
+        history_session_count: int,
+        ema_today: float | None,
+        consecutive_closes_below_ema: bool,
+        protective_stop_candidates: tuple[float, ...],
+    ) -> ExitSnapshot
+    PortfolioSimulator._apply_exit_decision(
+        symbol: str,
+        trade: Trade,
+        decision: ExitDecision,
+        close: float,
+        date_str: str,
+    ) -> None
+
+- [ ] **Step 1: Add failing factory-lifecycle and entry/ranking tests.** Require one fresh policy client and one close per run, including an injected simulator failure and two consecutive parity-fold runs in tests/test_pit_policy_parity.py. Cover full and technical-only entry re-canonicalization, institutional-data reweighting, nullable finite rank validation, stable rank order, and rejection of a policy decision containing a date, symbol, fill price, nonfinite score, or unknown field.
+
+  Add this lifecycle anchor to `tests/test_backtest_engine.py`; the entry/rank table stays in the single parameterized `tests/test_strategy_policy.py` matrix from Task 1:
+
+  ```python
+  class _ExplodingFetcher:
+      def fetch_price_data(self, *_args, **_kwargs):
+          raise RuntimeError("injected fetch failure")
+
+
+  class _CountingClient(InProcessPolicyClient):
+      def __init__(self, closed: list[int]) -> None:
+          self._closed_events = closed
+
+      def close(self) -> None:
+          self._closed_events.append(1)
+
+
+  def test_policy_factory_creates_and_closes_once_per_run():
+      made: list[_CountingClient] = []
+      closed: list[int] = []
+
+      def factory() -> _CountingClient:
+          client = _CountingClient(closed)
+          made.append(client)
+          return client
+
+      simulator = PortfolioSimulator(
+          data_fetcher=_ExplodingFetcher(),
+          policy_client_factory=factory,
+      )
+      for _ in range(2):
+          with pytest.raises(RuntimeError, match="injected fetch failure"):
+              simulator.run(["AAPL"], start_date="2021-06-25", end_date="2021-09-20")
+      assert len({id(client) for client in made}) == 2
+      assert closed == [1, 1]
+      assert simulator._policy_client is None
+  ```
+- [ ] **Step 2: Run the entry/factory slice and confirm the new assertions fail.**
+
+      python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_strategy_policy.py tests/test_backtest_custom_strategy_contract.py tests/test_pit_policy_parity.py -k "policy_client_factory or entry_policy or policy_rank"
+
+  Expected: failures name the missing InProcessPolicyClient/factory adapter; unrelated existing entry cases stay green.
+- [ ] **Step 3: Implement runtime.py plus only the factory, entry, and ranking adapters.** Construct the baseline client factory when the constructor argument is None. Create one run-local client at run() entry, close it in finally, and clear it before returning or re-raising. CanslimStrategy and _canonicalize_signal_row construct the same complete trusted EntrySnapshot and invoke that client; remove duplicate direct evaluate_entry_contract authority only after both seams agree. Map only validated nullable finite ranks back to signal rows. Re-run the Step 2 command; expected: green.
+
+  Add this exact baseline adapter, then wrap the existing run body in a private `_run_with_policy_client_active` method without reordering it:
+
+  ```python
+  class InProcessPolicyClient:
+      interface_version = POLICY_INTERFACE_VERSION
+
+      def evaluate_entry(self, snapshot):
+          return entry.evaluate_entry(snapshot)
+
+      def recommend_capacity(self, snapshot):
+          return risk.recommend_capacity(snapshot)
+
+      def recommend_allocation(self, snapshot):
+          return risk.recommend_allocation(snapshot)
+
+      def select_eviction(self, snapshot):
+          return risk.select_eviction(snapshot)
+
+      def evaluate_exit(self, snapshot):
+          return exit.evaluate_exit(snapshot)
+
+      def close(self) -> None:
+          return None
+  ```
+
+  ```python
+  client = self._policy_client_factory()
+  if client.interface_version != POLICY_INTERFACE_VERSION:
+      raise ValueError("policy interface version mismatch")
+  self._policy_client = client
+  try:
+      return self._run_with_policy_client_active(
+          tickers,
+          lookback_weeks,
+          start_date=start_date,
+          end_date=end_date,
+          history_start_date=history_start_date,
+          benchmark_symbol=benchmark_symbol,
+          checkpoint_path=checkpoint_path,
+          progress_log_path=progress_log_path,
+          resume=resume,
+          checkpoint_every_days=checkpoint_every_days,
+          checkpoint_code_identity=checkpoint_code_identity,
+      )
+  finally:
+      try:
+          client.close()
+      finally:
+          self._policy_client = None
+  ```
+- [ ] **Step 4: Add failing capacity-carrier tests.** Cover uncapped None, finite free slots, full capacity with eviction disabled, exactly one replacement candidate with eviction enabled, invalid finite capacity outside 1..maximum_policy_positions, and a capacity lowered below current holdings that blocks new entries without liquidating anything. Assert _evaluate_signals returns PendingEntry values carrying the validated signal-session CapacityDecision, checkpoint round-trip preserves it, and next-session _enter_position enforces that carried decision even when simulator defaults differ.
+
+  ```python
+  def test_pending_entry_round_trip_and_carried_capacity():
+      pending = PendingEntry(
+          signal={"symbol": "NEW", "rs_score": 90.0},
+          capacity=CapacityDecision(max_positions=1, eviction_enabled=False),
+      )
+      assert PendingEntry.from_primitive(pending.to_primitive()) == pending
+      simulator = PortfolioSimulator(max_positions=None, enable_eviction=True)
+      simulator._open_positions = {"OLD": object()}
+      assert simulator._capacity_state(pending) == (True, False)
+  ```
+- [ ] **Step 5: Run the capacity slice and confirm it fails at _resolve_capacity.**
+
+      python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_backtest_engine.py -k "policy_capacity"
+
+- [ ] **Step 6: Implement _resolve_capacity and PendingEntry before signal truncation.** Call recommend_capacity exactly once per eligible signal batch. None preserves every eligible signal. A finite limit uses trusted current holdings to calculate open slots; a full portfolio admits at most one replacement candidate only when eviction is enabled. Return and checkpoint PendingEntry(signal copy, validated CapacityDecision), then make next-session _enter_position revalidate and enforce that carried max_positions/eviction_enabled rather than self.max_positions/self.enable_eviction. Re-run the Step 5 command; expected: green.
+
+  ```python
+  @dataclass(slots=True)
+  class PendingEntry:
+      signal: dict[str, object]
+      capacity: CapacityDecision
+
+      def to_primitive(self) -> dict[str, object]:
+          return {
+              "signal": dict(self.signal),
+              "capacity": {
+                  "max_positions": self.capacity.max_positions,
+                  "eviction_enabled": self.capacity.eviction_enabled,
+              },
+          }
+
+      @classmethod
+      def from_primitive(cls, raw: Mapping[str, object]) -> "PendingEntry":
+          signal = raw.get("signal")
+          capacity = raw.get("capacity")
+          if not isinstance(signal, Mapping) or not isinstance(capacity, Mapping):
+              raise ValueError("pending entry checkpoint is invalid")
+          max_positions = capacity.get("max_positions")
+          eviction_enabled = capacity.get("eviction_enabled")
+          if max_positions is not None and (
+              type(max_positions) is not int or max_positions < 1
+          ):
+              raise ValueError("pending capacity is invalid")
+          if type(eviction_enabled) is not bool:
+              raise ValueError("pending eviction flag is invalid")
+          return cls(
+              signal=dict(signal),
+              capacity=CapacityDecision(
+                  max_positions=max_positions,
+                  eviction_enabled=eviction_enabled,
+              ),
+          )
+
+  def _capacity_state(self, pending: PendingEntry) -> tuple[bool, bool]:
+      limit = pending.capacity.max_positions
+      full = limit is not None and len(self._open_positions) >= limit
+      return full, bool(full and pending.capacity.eviction_enabled)
+  ```
+- [ ] **Step 7: Add failing projected eviction/allocation tests.** Build stable opaque slots in insertion order and reject an unknown slot, missing causal open, candidate fill price, or mutation during projection. Reject nonpositive/nonfinite risk, stop distance, notional cap, derived quantity, entry price, stop, or notional; risk_fraction above 0.01; stop_distance_fraction above 0.08; projected cash below buy notional; projected gross long notional above equity; and actual rounded loss-at-stop above either the 1% engine ceiling or the recommended risk budget. Assert a failed validation leaves cash, positions, trades, and transactions byte-for-byte unchanged.
+- [ ] **Step 8: Run the projected-transition slice and confirm it fails before any mutation.**
+
+      python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_backtest_engine.py -k "policy_eviction or policy_allocation or projected_entry_transition"
+
+- [ ] **Step 9: Implement select, project, validate, and apply as separate helpers.** Let policy select only an opaque eviction slot. The engine resolves its symbol and causal open, projects sell proceeds/cash/gross exposure without calling the mutating _try_evict path, then builds AllocationSnapshot. From the validated recommendation, derive target notional, quantity, and a cent-rounded stop. Prove every Step 7 invariant before either sell or buy, use that exact stop in Trade, and then apply the prevalidated sell-plus-buy transition. Re-run the Step 8 command; expected: green.
+- [ ] **Step 10: Add failing exit-adapter tests.** Cover engine-owned hard stop before any policy call, early-winner activation/release, multiple crossed scale-out tiers in one bar, rejection of an uncrossed tier before mutation, stagnation close, EMA close, and an existing-parity EMA stop above current close. Require next_stop_price to equal one trusted protective_stop_candidates value no lower than current stop, validate the complete action plan before mutation, and reject candidate fill prices or invalid action order.
+- [ ] **Step 11: Run the exit slice and confirm the policy adapter is missing.**
+
+      python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_backtest_engine.py -k "policy_exit"
+
+- [ ] **Step 12: Implement the exit adapter without moving accounting authority.** Increment days/peak in trusted code, execute the existing hard-stop precheck, and build the sorted unique protective_stop_candidates from current stop plus causally enabled breakeven/EMA values. Construct ExitSnapshot from causal scalars and active thresholds, then validate the complete plan before mutation. For every scale-out, require the trigger to be configured and current_high to have crossed the engine-derived tier price; fill close actions only at trusted current close; apply only a selected trusted stop candidate. Re-run the Step 11 command; expected: green.
+- [ ] **Step 13: Preserve and verify policy attestation.** The schema-v1 effective-engine-policy bytes and digest remain unchanged; POLICY_INTERFACE_VERSION is recorded separately in result/candidate identity and old policy source labels are untouched.
+
+      python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_task11_effective_policy_contract.py
+
+- [ ] **Step 14: Run the focused integration set and commit the extracted policy.** Final real-fold parity waits until every implementation commit is complete, so its clean source identity cannot become stale.
+
+      python -B -m pytest -p no:cacheprovider --no-cov -q tests/test_strategy_policy.py tests/test_pit_policy_parity.py tests/test_backtest_engine.py tests/test_backtest_custom_strategy_contract.py tests/test_backtest_open_causality.py tests/test_task11_effective_policy_contract.py
+      git add core/strategy_policy/runtime.py core/backtest_engine.py tests/test_strategy_policy.py tests/test_pit_policy_parity.py tests/test_backtest_engine.py tests/test_backtest_custom_strategy_contract.py tests/test_task11_effective_policy_contract.py
+      git commit -m "refactor: execute strategy through pure policy"
+
+---
+
