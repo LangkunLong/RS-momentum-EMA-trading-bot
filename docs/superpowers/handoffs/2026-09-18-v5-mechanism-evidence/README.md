@@ -1,66 +1,64 @@
 # Codex Start Here: V5 Mechanism Evidence
 
 **Date:** 2026-09-18  
-**Status:** Documentation-only planning handoff. No implementation or verification results.  
-**Source inspected:** `9aa52976f898c27f78c1857ceecde6a7b22a5aab`.
+**Revision:** 2 — incorporate latest-main feedback-loop review  
+**Status:** Documentation-only handoff. Implementation and runtime verification remain pending.  
+**Reviewed source:** `15ba962743da2c2ca73becdf85bc639c4f670dfa`.
 
-## Requested work
+## What changed after PR #60
 
-The owner wants the V5 agent loop to learn from focused experiments: commit a hypothesis, compare
-parent/candidate decisions on the same causal inputs, and give the critic measured support,
-contradiction or insufficient evidence rather than an explanation based only on a backtest score.
+The owner requested a deeper review of latest main and comparison with GLM's experiment-driven infrastructure work. That review confirms that V5 already retains experiment evidence and actually sends authenticated critic feedback into later investigator requests. The earlier conversational claim that a new generic hypothesis-memory subsystem was missing was incorrect.
 
-The immediate request was to publish plans in the repository for Codex agents. The delivered
-artifacts are this handoff, a design and a staged implementation plan; no strategy or executable
-code is changed by the planning commit.
+The revised work improves the content of that feedback and proves its round-to-round delivery. It does not replace the investigator, author, critic, archive, or evaluator.
+
+The biggest acceptance change is in Task 5: a critic report alone no longer completes the evidence work. The measured finding, applicability, and limitations must also appear in the next investigator's actual bounded request, including after memory compression and restart.
 
 ## Reading order
 
-1. Read repository guidance and the [preserved September 9 handoff](../2026-09-09-pit-optimizer-v5/README.md).
-2. Read the [mechanism evidence design](../../specs/2026-09-18-v5-mechanism-evidence-design.md).
-3. Follow the [implementation plan](../../plans/2026-09-18-v5-mechanism-evidence.md), starting with Task 0.
+1. Read repository guidance and the [preserved September 9 checkpoint](../2026-09-09-pit-optimizer-v5/README.md).
+2. Read the [source review and GLM comparison](../../reviews/2026-09-18-v5-glm-loop-review.md). It separates code findings, design risks, and unverified claims.
+3. Read the revised [design](../../specs/2026-09-18-v5-mechanism-evidence-design.md).
+4. Follow the revised [implementation plan](../../plans/2026-09-18-v5-mechanism-evidence.md), beginning with Task 0.
 
-The inspected base has a paused development campaign, `semantic_mode="disabled_development"`,
-and standing restrictions on reading/running tests and synthetic trials. Those are not lifted by
-this documentation. Resolve authorization for later implementation and the affected checks first.
-Do not resume the saved campaign, use its old grant, read heldout data, make paid calls, or run orders.
+The reviewed main includes archived local-history snapshots. Treat active `core/pit_optimizer_v5/` code as the implementation, not similarly named archived `.reference` files.
 
-## Architectural decisions to preserve
+## Existing components to reuse
 
-- Build an additive evidence extension, not a replacement optimizer or another agent framework.
-- Freeze experiment predictions before authoring; bind candidate bytes before measuring them.
-- Compare against the exact authored parent, separately from the campaign baseline.
-- Keep identical-input mechanism measurements separate from downstream portfolio effects.
-- Retain fixed-suite IDs, legacy hashes, early rejection, semantic modes and CAGR ranking.
-- Use bounded change-aware probes only under explicit authority; disabled development stays disabled.
-- Persist local versioned sidecars; send only issued, sanitized aggregate evidence to the critic.
-- Keep unsupported, unexercised, skipped, failed and contradicted results distinct and visible.
-- Never equate a finite probe match with universal policy equivalence, or local support with proof
-  of future trading performance.
+```text
+ExperimentRecordV5 + checkpoint
+    -> project_investigator_memory_v5
+    -> LocalRoleRequestFactoryV5._investigator_parts
+    -> authenticated reissued evidence + critic/campaign directions
+    -> InvestigatorRoleInputV5
+    -> model-ranked hypotheses
+    -> deterministic novelty selection
+    -> persisted RoundIntentPayloadV5 before authoring
+    -> bounded author/variants/evaluation/critic
+    -> next record and request
+```
+
+Do not add another generic memory system. Bind the new operational mechanism spec at the existing hypothesis boundary and project conditional measured findings through the existing request path.
+
+## Boundaries and priorities
+
+Preserve strategy logic, canonical entry rules, evaluator truth, cost assumptions, CAGR ranking, fingerprints, early rejection, old serialized artifacts, and provider limits. Keep exact authored-parent comparisons separate from campaign-baseline comparisons.
+
+Keep measured support/contradiction/insufficiency distinct from critic interpretation and execution failure. Retain low-frequency measurements named by a hypothesis, explicit missingness, and scenario/episode context. Do not lose a negative qualifier when compacting a finding.
+
+The saved development campaign remains paused with semantic checks explicitly disabled. This review does not enable them, run tests, invoke providers, inspect market datasets, access qualification, or resume old grants. Later implementation must resolve the relevant execution/test restrictions explicitly. No orders or deployment are in scope.
+
+The first implementation slice uses supplied authorized evidence and bounded offline checks. It does not require an LLM call. Information reaching a request is not proof that the model uses it well; that is a separate future experiment.
 
 ## Delegation
 
-One agent reconciles current source and finalizes contracts. After contract review, a probe agent
-and a report agent may work on their separate new files. A single integration owner handles existing
-runtime/provider/memory/artifact seams. An independent reviewer checks compatibility and evidence
-integrity. No parallel edits to shared adapter files.
-
-All proposed implementation/test filenames are identified in the plan. They were not created by
-this documentation commit. Existing test coverage was not inspected or assumed.
+One owner reconciles current source, permissions and contracts. Separate probe and report agents may then work on their own new files. A single integrator owns existing runtime/provider/memory/artifact seams and Task 5's end-to-end trace. An independent reviewer checks compatibility, provenance, final-packet budgets and the exact diff. Avoid parallel edits to shared adapters.
 
 ## Suggested owner-to-Codex instruction
 
-> Read this handoff, the linked design and the implementation plan. Begin with Task 0 and report
-> source drift, the scoped file map and any remaining authorization restrictions. Treat this as an
-> evidence-only extension: no strategy, evaluator, ranking, qualification, campaign or broker changes.
-> Do not execute tests, synthetic trials, provider calls or saved campaigns merely because the plan
-> describes them. Once the owner explicitly authorizes implementation and the necessary bounded
-> checks, work in the documented dependency order and retain exact verification evidence.
+> Read this revision-2 handoff, the source review, design, and implementation plan. Start with Task 0 and reconcile the actual checkout, scoped file map, and remaining authorization restrictions. Reuse V5's existing hypothesis memory and feedback pipeline. Build the evidence-only extension in the documented dependency order. Completion must demonstrate the measured finding in the next investigator request after persistence, compaction and restart, not only in a critic report. Do not change strategy, evaluator, ranking, qualification, or broker behavior. Do not run tests, synthetic trials, providers, or saved campaigns merely because this plan describes them; obtain the necessary bounded authorization first.
 
-## What the planning change verified
+## Review limitations
 
-Repository source and selected design/handoff material were read through GitHub at the inspected
-base. Test files, raw datasets and campaign runtime artifacts were not inspected for this work.
-The planning change does not claim passing tests, corrected bugs, completed implementation, actual
-mechanism observations, backtest results or improved returns. Publication details and the exact
-resulting documentation commit are recorded by the pull request.
+The review traced selected active source paths and read the three original planning documents. It did not inspect project test files, run project code, verify campaign outcomes, or measure model/strategy performance. The GLM comparison uses accessible primary-source material; the full blog and unpublished experiment harness were not available for complete reproduction. See the review's source limitations.
+
+Publication details belong to the new documentation PR. PR #60 remains the historical initial plan; this revision is not evidence that its implementation has started or completed.
