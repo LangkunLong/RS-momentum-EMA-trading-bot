@@ -1,225 +1,151 @@
 # V5 Mechanism Evidence: Design
 
 **Date:** 2026-09-18  
+**Revision:** 2 — complete evidence-to-next-hypothesis handoff  
 **Status:** Proposed implementation design; documentation only, not implemented or runtime-verified.  
-**Inspected base:** `9aa52976f898c27f78c1857ceecde6a7b22a5aab` on `main`.
+**Reviewed main:** `15ba962743da2c2ca73becdf85bc639c4f670dfa`.
+
+This revision incorporates the [source review and GLM comparison](../reviews/2026-09-18-v5-glm-loop-review.md). It replaces the initial design text from PR #60 without changing that plan's strategy, evaluator, historical-artifact, or execution boundaries.
 
 ## Purpose and authorization
 
-Make a candidate's claimed mechanism independently inspectable: state the prediction before the
-change is evaluated, compare parent and candidate on identical causal inputs, and distinguish
-mechanism observations from portfolio consequences. Improve experimental information, not the
-strategy or its score in this workstream.
+Make a candidate's claimed mechanism independently inspectable, then deliver the resulting measured finding to the next investigator. State predictions before evaluation, compare exact parent and candidate on identical causal inputs, distinguish local behavior from portfolio consequences, and preserve limitations through memory and request construction.
 
-The current request authorizes publishing plans for Codex. It does not authorize implementation,
-reading/running tests, synthetic trials, model calls, dataset access, campaign resumption, or orders.
-The [September 9 handoff](../handoffs/2026-09-09-pit-optimizer-v5/README.md) and its execution/test
-restrictions remain in effect. A later implementation request must resolve those restrictions
-explicitly before the affected work begins. Do not interpret a task checkbox as execution permission.
+V5 already has hypothesis memory and a implemented critic-to-investigator feedback path. Do not build another generic memory, optimizer, or model role. The additional work is measurement quality and continuity, not adding a loop that already exists.
 
-See the [implementation plan](../plans/2026-09-18-v5-mechanism-evidence.md) and
-[Codex handoff](../handoffs/2026-09-18-v5-mechanism-evidence/README.md).
+The current request authorizes source review and publication of revised plans. It does not authorize implementation, reading/running project tests, synthetic trials, market-dataset access, model calls, campaign resumption, or orders. The [September 9 checkpoint](../handoffs/2026-09-09-pit-optimizer-v5/README.md) remains a preserved historical execution boundary. Later implementation must resolve the relevant restrictions explicitly; a task checkbox is not an execution grant.
 
-## Verified starting points and limits
+Read the [implementation plan](../plans/2026-09-18-v5-mechanism-evidence.md) and [Codex handoff](../handoffs/2026-09-18-v5-mechanism-evidence/README.md).
 
-Paths below were inspected directly or through indexed source excerpts at the inspected base.
-They are integration starting points, not a claim of complete source review or passing tests.
+## Existing architecture to reuse
 
-| Source | Relevant existing responsibility |
-| --- | --- |
-| `core/pit_optimizer_v5/contracts.py` | `HypothesisV5`, directional `MetricPredictionV5`, and `CriticReviewV5` prediction-versus-observation fields. |
-| `core/pit_optimizer_v5/probes.py` | Versioned fixed snapshots, six policy methods, canonical probe identities, fingerprints, and typed failures. |
-| `core/pit_optimizer_v5/runtime.py` | Investigator/author/critic stages, semantic/quick/discovery stages, candidate outcomes and cleanup. |
-| `core/pit_optimizer_v5/diagnostics.py` | Signal and entry outcomes, fill-cost reconciliation, portfolio observations and report inputs. |
-| `core/pit_optimizer_v5/production_runtime.py` | Parent-delta and role-evidence projection. |
-| `core/pit_optimizer_v5/provider.py` | Closed provider contracts and evidence vocabulary. |
-| `core/pit_optimizer_v5/search.py` | Authenticated four-episode evidence and base-cost campaign CAGR. |
-| `core/pit_optimizer_v5/development_preparation.py` | Development preparation explicitly selects `semantic_mode="disabled_development"`. |
+The review links exact source locations. These are source findings, not runtime verification:
 
-Re-read exact adapter seams, `memory.py`, and `artifacts.py` before implementation. Existing test
-filenames and coverage have not been established by this planning change. Proposed new test files
-in the plan are not assertions that those files already exist.
+- `ExperimentRecordV5` stores hypotheses, template identities, observations, statuses, and bound critic reviews.
+- `project_investigator_memory_v5` provides complete selected-parent lineage, relevant feedback, and compact summaries under a budget.
+- `LocalRoleRequestFactoryV5._investigator_parts` authenticates earlier role artifacts, reissues their cited evidence, and supplies experiment and campaign directions to `InvestigatorRoleInputV5`.
+- `select_novel_hypothesis_v5` selects the first model-ranked controller-novel hypothesis. The runtime journals `RoundIntentPayloadV5` before requesting author code.
+- The author creates a bounded template; local variants pass existing validation, semantic, quick, and discovery stages. A batch critic reviews testable outcomes before records and checkpoints are published.
 
-The saved development campaign is paused and has semantic checks disabled. Consequently, fixed
-probe limitations are a design risk, not an established explanation for that campaign's results.
-The older [V5 architecture](2026-09-04-pit-optimizer-v5-hybrid-architecture-design.md) remains the
-baseline design. This extension does not supersede its search or execution rules.
+The model proposes and ranks hypotheses. Engineers and trusted code define the observable quantities, safety/correctness invariants, execution limits, and evidence interpretation rules. A correctly bound citation is not proof that the model's explanation is true.
 
 ## Non-negotiable boundaries
 
-- Do not change strategy policies, canonical entry floors, settings, stops, sizing, orders, fills,
-  cost assumptions, evaluator arithmetic, four-episode requirements, or CAGR ranking.
-- Do not alter `agent_loop.py` or add another general-purpose agent framework.
-- Do not read confirmation/qualification data or expose it to search, probes, or role memory.
-  Keep raw discovery rows, symbols, exact historical sessions, source text, credentials, and local
-  paths out of provider-facing evidence as required by the current sanitization boundary.
-- Preserve V2-V5 readers and existing canonical bytes, hashes, fingerprints, manifests, checkpoints,
-  and resume behavior. Never append optional fields to hashed legacy records as an informal migration.
-- Do not edit prepared campaign artifacts, old grants, baseline authorities, or runtime state.
-  A new source revision is not authorization to reuse a source-bound old grant.
-- Keep untrusted candidate execution inside existing bounded policy-worker/sandbox facilities.
-  AST parsing is not permission to execute a candidate in the controller process.
-- Keep `apply=false`, all trading entry points untouched, and no new retries, schema-repair calls,
-  model calls, or automatic campaign launches.
+- No strategy policies, canonical entry floors, settings, stops, sizing, orders, fills, cost assumptions, evaluator arithmetic, discovery requirements, or CAGR-ranking changes.
+- No changes to `agent_loop.py`, no new general agent framework, no new model role, retries, repair calls, or automatic campaign launches. Keep `apply=false`.
+- No confirmation/qualification access. Keep raw discovery rows, symbols, exact historical sessions, credentials, paths, and unapproved source content out of investigator/critic evidence. Do not alter the existing authorized author-source boundary.
+- Preserve V2–V5 readers and existing canonical bytes, hashes, fingerprints, manifests, checkpoints, and resume behavior. Do not append optional fields to hashed legacy records as an informal migration.
+- Do not modify prepared campaign artifacts, old grants, baseline authorities, or runtime state. A new source revision does not inherit an old source-bound execution grant.
+- Execute untrusted candidate code only through an explicitly composed bounded policy worker/sandbox. AST validation is not permission to import it into the controller.
+- Preserve fixed-suite admission and `disabled_development`; explanatory evidence does not create a new promotion or rejection criterion.
 
-## Architecture: an evidence extension, not a new optimizer
+## 1. Bind a testable mechanism at the existing hypothesis boundary
 
-Use small, pure modules alongside V5 and narrow adapters into the existing pipeline. The first
-vertical slice is a deterministic report built from supplied, authenticated evidence; runtime
-integration follows only after its contract is reviewed. Runtime enablement must be opt-in for a
-new authorized diagnostic context, never inferred from a nonempty directory or environment flag.
+Add an independent versioned `MechanismExperimentSpecV1`, not a replacement for `HypothesisV5`. Bind it alongside the existing selected-hypothesis round intent, before authoring and observation.
 
-### 1. Commit the question before observing candidate results
+The spec references the existing hypothesis and exact parent revision. It declares the target method and permitted changed symbols, registered observables and units, direction and tolerance, aggregation, relevant-case predicate, denominator, minimum relevant cases, protected controls, and disconfirming observations. Include a controller-owned recipe ID/version and explicit synthetic/discovery-only provenance.
 
-Propose an independent versioned `MechanismExperimentSpecV1`, not a replacement for `HypothesisV5`.
-It references the existing hypothesis and contains:
+Predicates and recipes are closed declarative values validated against registered fields. Reject arbitrary Python, `eval`, executable assertions, unsupported metrics, ambiguous units, non-finite values, and invalid combinations. Do not convert vague model prose into authoritative expected results silently.
 
-- parent policy revision and hypothesis IDs;
-- target policy method and permitted changed symbols;
-- registered observables, units, direction, comparison tolerance, aggregation, denominator, and
-  minimum relevant-case count;
-- a controller-owned case-selection predicate and probe recipe ID/version;
-- protected same-input behaviors and disconfirming observations;
-- discovery/synthetic provenance restrictions and an explicit no-heldout scope.
+Use two identities: freeze the specification before authoring; after rendering, bind the exact candidate, parent, spec, evaluator, scenario, case corpus, recipe, and execution limits before measurement. Do not require a candidate hash before the candidate exists.
 
-Predicates and recipes are closed declarative values validated against registered field paths;
-never accept model-authored Python, `eval`, arbitrary imports, or executable assertions. Ambiguous
-units, unsupported metrics, non-finite values, and invalid combinations fail spec validation.
-Do not infer an expected outcome from a candidate's observed behavior or a critic's later prose.
+An operator-supplied typed specification is sufficient for the first offline slice. The existing investigator's structured predictions may populate registered fields where meaning is unambiguous. Fully model-authored operational specifications need an explicit closed-schema design, not another paid role or a human required to invent every hypothesis.
 
-Freeze and hash the spec after selecting the hypothesis and before authoring/evaluation. Candidate
-source does not exist yet: after rendering, create a separate binding to the exact candidate,
-parent, spec, evaluator, input corpus, suite/recipe, and scenario identities before measurement.
-This two-step binding avoids requiring an impossible pre-authoring candidate SHA.
+Retrospective explanations may be retained as retrospective; they must never be relabeled precommitted evidence.
 
-A human/operator-supplied typed spec is sufficient for the first slice. Reuse existing structured
-predictions where their meaning is unambiguous. Do not add a paid role or silently translate free
-text into authoritative expected results. Historical explanations without a precommitted spec may
-be labeled retrospective, but cannot be upgraded to preregistered evidence.
+## 2. Separate local mechanism tests from portfolio consequences
 
-### 2. Compare like with like
+Use the exact authored parent as control; label campaign-baseline comparisons separately. Both policies receive byte-identical validated snapshots under the same bounded worker and declared reset/repetition behavior.
 
-Use the exact parent revision that the author changed as the control. A campaign baseline may be
-reported separately, but must not be mislabeled as that parent.
+Measure independently:
 
-Both policies receive byte-identical validated snapshots under the same evaluator and worker
-conditions. Preserve canonical inputs and full local decision records; role summaries carry only
-approved aggregates and issued evidence IDs. Repeatability must use the existing deterministic
-worker contract, including the declared reset/isolation behavior.
+1. Whether the relevant condition occurred and the intended decision changed.
+2. Whether protected decisions remained unchanged on identical inputs.
+3. What changed after those decisions interacted with the portfolio.
 
-Separate three questions:
+The third requires a separately matched existing replay comparison, not a same-input policy comparison. Changed exits may change later cash and entries without any edit to entry logic. Do not demand identical full portfolio traces after an intentional strategy intervention.
 
-1. Did the relevant input condition occur, and did the intended decision change?
-2. Did protected decisions remain unchanged on identical inputs?
-3. What happened after the changed decisions interacted with the portfolio?
+Retain full local observations and canonical identities. Input-condition coverage is not branch coverage: report branch coverage unavailable unless trusted instrumentation measures it. A diff, predicate match, or changed final action alone does not establish that a particular branch ran.
 
-The third is a separately matched replay comparison, not a same-input unit comparison. Different
-exits can change subsequent cash and entries even when entry code is untouched. Do not require
-whole-portfolio traces to remain identical after an intentional strategy intervention.
+## 3. Use bounded change-aware probes
 
-Input-condition coverage is not branch coverage. Unless trusted worker instrumentation establishes
-that a specific branch executed, report branch coverage as unavailable. Never infer it solely from
-a source diff, a predicate match, or a changed final decision.
+Retain the trusted fixed suite and its version unchanged. Supplemental recipes may cover allowed numeric boundaries, legal missing values, and matched negative controls. Derive cases deterministically from the frozen recipe and allowed source changes before execution; do not search retrospectively for favorable examples.
 
-### 3. Add bounded change-aware probes without changing admission rules
+For a synthetic fraction-valued fixture, thresholds 0.40 and 0.60 agree at 0.20 and 0.80 but differ at 0.50. This illustrates finite-suite incompleteness, not a proposed trading threshold.
 
-Retain the trusted fixed suite and its version unchanged. Supplemental case recipes can cover
-validated numeric boundaries, an explicit missing-value case when legal, and matched negative
-controls. Derive cases deterministically from allowed source changes and the frozen recipe before
-execution; do not search for favorable cases after seeing results.
+Validate types, units, coherent snapshot constraints, finite values, and bounds. A perturbation that cannot yield a valid snapshot is unsupported, not a fabricated market state. Bound cases, repetitions, CPU, memory, output, and time. No Cartesian sweep, symbolic executor, or unrestricted candidate `exec`/`eval` is introduced.
 
-Example for a synthetic fraction-valued test policy only: thresholds 0.40 and 0.60 produce the same
-decisions at 0.20 and 0.80, but differ at 0.50. This is a witness to fixed-suite incompleteness, not a
-proposed edit to the bot's canonical entry thresholds.
+Any later discovery snapshots must follow a precommitted selection rule over authorized discovery inputs, not winners or future outcomes. Market-data extraction is not part of this first slice.
 
-Validate field types, units, coherent snapshot constraints, finite values, and bounds. If a generic
-perturbation cannot create a valid snapshot, record it as unsupported rather than manufacture a
-market state. Use controller-owned adapters for compound fields. Bound case count, repetitions,
-CPU, memory, output, and time; no Cartesian sweep or new symbolic executor.
+Finite agreement means no difference observed on those cases, not universal equivalence. Nevertheless, this slice preserves existing early rejection and fingerprint deduplication. Supplemental witnesses cannot rescue a rejected candidate. A rescue policy is a separate versioned search-semantics decision.
 
-Discovery snapshots must be selected by a committed rule from authorized discovery inputs, not
-winning trades or future outcomes. No discovery-data extraction is part of the first slice.
+## 4. Compute evidence rather than trusting critic prose
 
-A finite suite supports only "no difference observed on these cases." It does not prove universal
-policy equivalence. Nevertheless, this workstream does not weaken current early rejection,
-fingerprint deduplication, or archive eligibility. Supplemental evidence may reveal a missed
-witness while the existing outcome remains unchanged. A rescue path would require a separate
-search-semantics proposal with versioned identities and equal-budget evaluation.
+`MechanismEvidenceReportV1` is a proposed independent record with these sections:
 
-### 4. Keep validity, observability, and mechanism support distinct
-
-Propose a `MechanismEvidenceReportV1` with separate sections:
-
-| Section | Contents |
+| Section | Required content |
 | --- | --- |
-| Identity/provenance | Spec and candidate binding, parent, corpus, evaluator, scenario, and recipe digests. |
-| Execution | `completed`, `not_run`, or `failed`, plus typed reason and bounded resource usage. |
-| Coverage | Total cases, relevant cases, changed decisions, protected controls, unsupported cases, and branch-coverage availability. |
-| Predictions | Parent and candidate measurements, paired delta, units, denominator, tolerance, and status for each preregistered observable. |
-| Consequences | References to matched existing quick/discovery reports; per-episode/scenario deltas only when available. |
-| Limitations | Missing measurements, unsupported cases, local scope, and whether evidence is prospective or retrospective. |
+| Identity | Spec/binding, hypothesis, exact parent/candidate, corpus, evaluator, scenario, and recipe identities. |
+| Execution | `completed`, `not_run`, or `failed`, typed reason, resource limits and usage. |
+| Coverage | Total/relevant cases, changed decisions, protected controls, unsupported cases, and branch-coverage availability. |
+| Predictions | Measurements, units, numerator/denominator, tolerance, paired delta, and assessment for every declared observable. |
+| Consequences | Matched existing quick/discovery report references, with episode and scenario context. |
+| Limitations | Missing evidence, unsupported applicability, local scope, and prospective versus retrospective status. |
 
-Prediction statuses are `supported_on_cases`, `contradicted_on_cases`, or `insufficient_evidence`.
-A whole report may summarize mixed outcomes but must retain every individual outcome and its
-reason. Zero relevant cases, missing denominators, or too few cases are insufficient evidence,
-not support. Policy crashes, timeouts, protocol violations and corrupt artifacts are execution or
-validity failures, not statistical evidence against the hypothesis.
+Prediction assessments are `supported_on_cases`, `contradicted_on_cases`, and `insufficient_evidence`. Retain every individual result when a report is mixed. Zero relevant cases, missing denominators, or too few observations are insufficient evidence. Policy crashes, timeouts, protocol failures, and corrupt artifacts are execution/validity failures, not scientific refutations.
 
-These are observations within evaluated cases, not proof of market causality or future returns.
-A higher portfolio score with unsupported mechanism evidence remains an unexplained score change.
-Do not add a confidence score, weighted reward, new risk limit, or promotion gate.
+Reuse available `EvaluationReportV5` and diagnostic measurements. A requested metric missing from the evaluator is unavailable; do not derive it from unrelated aggregates or extend evaluator arithmetic in this slice.
 
-### 5. Persist additively and project conservatively
+For enabled evidence projection, prioritize the declared prediction, comparator, controls, and limitations over generic context. A named low-frequency exit or rejection reason must not disappear merely because it is outside a top-four display summary. Retrieve it by registered identity when available, or state why it is unavailable.
 
-Use versioned, content-addressed sidecar records under a new campaign-owned subdirectory, with a
-create-only index bound to the exact existing experiment identity. Paths are canonical relative
-paths; reject traversal, symlinks, digest mismatches, mismatched parents, and unknown references.
-Reuse existing artifact primitives where possible, rather than duplicate a storage framework.
+These assessments apply only to the evaluated cases. Higher CAGR cannot turn an unsupported mechanism into a confirmed finding. Do not add a confidence score, weighted reward, risk limit, or selection gate.
 
-The sidecar has its own immutable execution/capability binding and resume cursor. Existing V5
-record/checkpoint serializers remain byte-identical. Disabled legacy runs must not create sidecars,
-request new fields, or change decisions. A missing optional legacy sidecar means unavailable; a
-missing or corrupt sidecar required by an enabled extension fails that extension closed.
+## 5. Persist additively and close the next-hypothesis handoff
 
-A resumed diagnostic reuses a completed matching sidecar without rerunning candidate code.
-Interrupted writes cannot be advertised as completed evidence. Reconciliation is local and
-idempotent; it never triggers another provider call or rewrites old campaign state.
+Use create-only, versioned, content-addressed sidecars and a canonical index linked to the existing experiment identity. Reuse safe-path, digest, and atomic-write primitives. Reject traversal, symlinks, mismatched parents, corrupt bytes, unknown references, and heldout provenance.
 
-Project only registered, sanitized aggregates through the existing evidence-ID mechanism. Do not
-invent unregistered metric prefixes, repurpose unrelated existing metrics, or smuggle extra keys
-through a closed provider schema. Review the prefix registry, schema, request digest, context size,
-and campaign admission/token bounds together before wiring any new role input.
+Existing record/checkpoint serializers remain byte-identical. Disabled legacy operation creates no new files or messages and changes no decisions. An absent optional legacy sidecar means unavailable; missing or corrupt evidence required by an enabled extension fails that extension closed. Completed matching sidecars are reused on restart; partial writes are not successful evidence and never trigger provider retries.
 
-The existing critic's prediction-versus-observation and evidence-ID fields remain sufficient.
-Critic prose cannot change measured statuses. Persist failed and inconclusive experiments locally,
-but retain only bounded, approved aggregates in provider context. Qualification evidence remains
-absent from both.
+### Conditional findings, not a second memory system
 
-### 6. Make enablement and semantic mode explicit
+A proposed `MechanismLearningProjectionV1` is a bounded view of authenticated records and reports, implemented with the report/projection code. It is not another database or an LLM-authored knowledge base. Preserve:
 
-Propose a separate authenticated extension capability referencing the exact manifest/source/spec
-and bounded resources for a new diagnostic context. Review its composition before implementation;
-an unbound optional flag is not an acceptable shortcut. Existing manifests and prepared authorities
-must not be edited in place.
+- the original hypothesis, exact parent/experiment/report identities;
+- applicability conditions actually tested, comparisons and protected controls;
+- observed measurements and individual assessment/coverage/validity states;
+- negative, mixed, unsupported, and not-run findings;
+- a separately labeled critic interpretation and next direction, when one exists.
 
-If `semantic_mode="disabled_development"`, do not call the supplemental policy runner, fabricate a
-fingerprint, or silently turn semantics back on. Report `not_run` with the explicit mode reason in
-an enabled report context; ordinary disabled legacy runs remain unchanged. Re-enabling semantic
-checks for development is a separate decision outside this plan.
+An author template is an unevaluated candidate structure until evidence exists. Do not call it a validated optimization skeleton merely because it is reusable code. A conditional finding does not become a universal strategy rule or evidence for a different data/evaluator context.
 
-Where required-mode integration is later authorized, supplemental observations may be collected in
-the existing bounded validation/semantic stage before its terminal decision, without changing that
-decision or its ordering. Do not rerun a previously rejected candidate behind the controller's back.
-Run costs count against the original deadline; timeouts must not purchase new time or retries.
+### Two consumers: critic and next investigator
 
-## Initial acceptance and deferred work
+Issue only registered sanitized evidence through the existing provider boundary. Review metric vocabulary, sanitization, schema authority, exact request digest, evidence count, token/cost bounds, and admission together. Prefer the existing role-input shapes when sufficient; any necessary schema change must be explicitly versioned and disabled for legacy operation.
 
-The first slice succeeds when a reviewer can reconstruct whether a declared mechanism was exercised
-and supported using deterministic local evidence, without trusting critic prose. It must also show
-legacy-off equivalence, no heldout/provider leakage, truthful unsupported/failed outcomes, and
-unchanged ranking. No strategy improvement or campaign result is required or claimed.
+The critic receives deterministic mechanism measurements plus limitations. The next investigator must receive the relevant measured finding independently of which measurements the critic happened to cite. Do not depend on narrative summaries to preserve a contradiction or a missing denominator.
 
-Deferred: new strategy hypotheses, strategy tuning, changed semantic admission, qualification
-consumption ledgers, statistical selection corrections, new test frameworks, full-market replay,
-agent-model comparisons, infrastructure performance work, and live/paper deployment. These are
-separate workstreams, not implied implementation tasks.
+Reissued evidence must preserve unambiguous experiment, parent, episode ordinal, scenario, units, and report linkage. Multiple observations can share a metric name. Do not infer their grouping from an evidence ordinal, hash, or prose explanation. Keep raw rows and local paths out of the role view; retain authenticated provenance locally and expose only permitted identifiers/aggregates.
+
+Keep full records locally. For the extension's bounded projection, record complete/summarized/omitted evidence and reasons. A retained claim cannot lose its scope or negative qualifier. If mandatory relevant evidence cannot fit, return an explicit bounded-projection failure rather than truncating it into a misleading statement.
+
+Do not silently change legacy oldest-first projection ordering or parent-lineage retention. The latest campaign direction already has a separate retention path; preserve it. Measure the final serialized request and transport/schema overhead after reissuance, not just the internal memory projection. Reuse existing admission controls; no budget increase or hidden extra call is authorized.
+
+Supplying relevant context does not prove that an LLM uses it. This slice proves delivery and grounded evidence, not improved hypothesis quality.
+
+## 6. Keep execution mode and timing explicit
+
+Enable only through a new authenticated extension capability bound to exact source, manifest, spec, corpus, and resource limits. Do not infer permission from a directory, environment variable, or nonempty report.
+
+With `semantic_mode="disabled_development"`, no supplemental worker is called and no fingerprint is invented. In an enabled report context emit `not_run` with the mode reason; legacy-off remains a true no-op. Re-enabling development semantic checks is a separate decision.
+
+Before required-mode execution, identify the concrete registered bounded executor and its authorization. Do not assume a base adapter's fingerprint method is a runnable implementation or substitute controller-process execution.
+
+Where separately authorized, collect supplemental observations in the existing bounded validation/semantic stage without changing its terminal decision or ordering. All work consumes the original stage/round deadline. Do not rerun a previously rejected candidate, reset deadlines, or add retries.
+
+## Completion and deferred work
+
+The first slice completes when a reviewer can reconstruct the mechanism assessment and inspect the same scoped finding in the next investigator's actual request, including after restart and memory pressure. Legacy-off equivalence, provider/heldout boundaries, truthful failures, and unchanged selection must be demonstrated by the authorized checks.
+
+A separate controlled model study would be required to claim better hypothesis generation; independent qualification would be required for generalization claims. Neither is implied by wiring tests.
+
+Deferred: new strategies, strategy tuning, new novelty/ranking rules, interactive pre-authoring diagnostic requests, fixed-probe rescue, automatic test generation, cross-campaign knowledge retrieval, qualification-consumption ledgers, statistical selection corrections, full-market replay, paid model comparisons, evaluator-performance changes, and deployment. These are separate workstreams, not hidden requirements or execution permissions.
