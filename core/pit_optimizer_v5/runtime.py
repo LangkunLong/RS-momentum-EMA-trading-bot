@@ -856,6 +856,43 @@ class OwnedCleanupV5(Protocol):
     ) -> CleanupResultPayloadV5: ...
 
 
+@runtime_checkable
+class MechanismRuntimeExtensionV5(Protocol):
+    """Optional, explicitly supplied mechanism evidence seam.
+
+    The absent branch is a true no-op.  Implementations are responsible for
+    authenticating their capability and for keeping all mechanism sidecars
+    outside the legacy round journal and durable experiment records.
+    """
+
+    def before_authoring(
+        self,
+        *,
+        round_intent: RoundIntentPayloadV5,
+        campaign_id: str | None = None,
+        round_index: int | None = None,
+        parent_candidate: object | None = None,
+    ) -> None: ...
+
+    def observe_candidate(
+        self,
+        *,
+        experiment_id: str,
+        candidate_revision: object,
+        candidate_source_bundle: SourceBundleV5,
+        semantic_outcome: str,
+        semantic_recovered: bool,
+        deadline_monotonic: float | None,
+    ) -> object | None: ...
+
+    def finalize_report(
+        self,
+        *,
+        experiment_id: str,
+        candidate_evidence: object,
+    ) -> object | None: ...
+
+
 @dataclass(frozen=True, slots=True)
 class FeedbackRoundDependenciesV5:
     persistence: RoundPersistenceV5
@@ -868,6 +905,7 @@ class FeedbackRoundDependenciesV5:
     clock: RuntimeClockV5
     cancellation: RuntimeCancellationV5
     cleanup: OwnedCleanupV5
+    mechanism: MechanismRuntimeExtensionV5 | None = None
 
     def __post_init__(self) -> None:
         protocols = (
@@ -884,6 +922,8 @@ class FeedbackRoundDependenciesV5:
         )
         if any(not isinstance(value, protocol) for value, protocol in protocols):
             raise ValueError("feedback-round dependency does not implement its V5 protocol")
+        if self.mechanism is not None and not isinstance(self.mechanism, MechanismRuntimeExtensionV5):
+            raise ValueError("feedback-round mechanism extension does not implement its V5 protocol")
 
 
 class _RuntimeAbort(RuntimeError):
@@ -2135,6 +2175,8 @@ class _Runtime:
             return replace(candidate, artifact_refs=self._artifact_refs(candidate.artifact_refs, (semantic_ref,)))
 
         semantic_stage = self._candidate_stage(identity.sha256, "semantic_probe")
+        semantic_recovered = semantic_stage is not None
+        semantic_outcome: CandidateStageOutcomeV5 | None = None
         if self.inputs.manifest.semantic_mode == "disabled_development":
             if semantic_stage is None:
                 semantic_ref = self.journal.append(
@@ -2157,6 +2199,7 @@ class _Runtime:
                 status="quick_ready",
                 artifact_refs=self._artifact_refs(candidate.artifact_refs, (semantic_ref,)),
             )
+            semantic_outcome = "behaviorally_distinct"
         else:
             if semantic_stage is not None:
                 semantic_ref = self.journal.payload_reference(semantic_stage)
@@ -2177,6 +2220,7 @@ class _Runtime:
                     raise _RuntimeAbort(
                         RuntimeFailureV5("recovery", "invalid_dependency_result", experiment_id=identity.sha256)
                     )
+                semantic_outcome = semantic_stage.outcome
                 candidate = replace(
                     candidate,
                     semantic_fingerprint=fingerprint,
@@ -2238,7 +2282,7 @@ class _Runtime:
                     )
                     self._check_finished(probe_deadline, experiment_id=identity.sha256)
                     return failed
-                semantic_outcome: CandidateStageOutcomeV5 = (
+                semantic_outcome = (
                     "behavioral_equivalent"
                     if comparison.classification == BEHAVIORAL_EQUIVALENT_ON_SUITE_V1
                     else "sibling_equivalent"
@@ -2270,6 +2314,30 @@ class _Runtime:
                     return candidate
 
             self._seen_semantic_fingerprints.add(fingerprint.fingerprint_sha256)
+        mechanism = self.dependencies.mechanism
+        if mechanism is not None and candidate.status == "quick_ready" and semantic_outcome == "behaviorally_distinct":
+            try:
+                mechanism.observe_candidate(
+                    experiment_id=identity.sha256,
+                    candidate_revision=variant.policy_revision,
+                    candidate_source_bundle=variant.source_bundle,
+                    semantic_outcome=semantic_outcome,
+                    semantic_recovered=semantic_recovered,
+                    deadline_monotonic=(
+                        None
+                        if semantic_recovered or self.inputs.manifest.semantic_mode == "disabled_development"
+                        else probe_deadline.expires_at_monotonic
+                    ),
+                )
+            except _RuntimeAbort:
+                raise
+            except BaseException:
+                # Capability/authentication and recovery failures remain typed
+                # runtime configuration failures; they are not scientific
+                # contradictions and must not become candidate findings.
+                raise _RuntimeAbort(
+                    RuntimeFailureV5("recovery", "invalid_dependency_result", experiment_id=identity.sha256)
+                ) from None
         quick_failure = self._candidate_stage(identity.sha256, "quick_evaluation")
         if quick_failure is not None:
             if quick_failure.outcome != "quick_evaluation_failed":
@@ -3058,16 +3126,31 @@ class _Runtime:
             raise _RuntimeAbort(RuntimeFailureV5("novelty", "invalid_dependency_result"))
         decision = novelty
         state_after_novelty = record_novelty_attempt_v5(projection.state, decision)
-        self._round_intent(
-            RoundIntentPayloadV5(
-                parent_revision_sha256=parent.policy_identity_sha256,
-                parent_semantic_fingerprint_sha256=parent.semantic_fingerprint_sha256,
-                pit_data_scope=self.inputs.manifest.pit_data_scope,
-                semantic_mode=self.inputs.manifest.semantic_mode,
-                hypothesis=decision.hypothesis,
-                discovery_plan_sha256=self.inputs.panel_plan.discovery_plan_sha256,
-            )
+        round_intent = RoundIntentPayloadV5(
+            parent_revision_sha256=parent.policy_identity_sha256,
+            parent_semantic_fingerprint_sha256=parent.semantic_fingerprint_sha256,
+            pit_data_scope=self.inputs.manifest.pit_data_scope,
+            semantic_mode=self.inputs.manifest.semantic_mode,
+            hypothesis=decision.hypothesis,
+            discovery_plan_sha256=self.inputs.panel_plan.discovery_plan_sha256,
         )
+        self._round_intent(round_intent)
+        mechanism = self.dependencies.mechanism
+        if mechanism is not None:
+            try:
+                mechanism.before_authoring(
+                    round_intent=round_intent,
+                    campaign_id=self.inputs.campaign_id,
+                    round_index=self.inputs.round_index,
+                    parent_candidate=parent,
+                )
+            except _RuntimeAbort:
+                raise
+            except BaseException:
+                # A missing or late authenticated extension is a recovery or
+                # configuration failure.  It never changes a candidate's
+                # scientific status or gets recorded as a contradiction.
+                raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result")) from None
 
         author_request = self.dependencies.requests.author_request(
             self.inputs,
@@ -3095,6 +3178,18 @@ class _Runtime:
 
         candidates = self._render_and_quick_screen(parent=parent, decision=decision, template=template)
         candidates = self._evaluate_discovery(candidates)
+        if mechanism is not None:
+            try:
+                for candidate in candidates:
+                    if type(candidate) is CandidateEvidenceV5:
+                        mechanism.finalize_report(
+                            experiment_id=candidate.experiment_id,
+                            candidate_evidence=candidate,
+                        )
+            except _RuntimeAbort:
+                raise
+            except BaseException:
+                raise _RuntimeAbort(RuntimeFailureV5("recovery", "invalid_dependency_result")) from None
         if not candidates or any(item.status == "quick_ready" for item in candidates):
             raise _RuntimeAbort(RuntimeFailureV5("discovery_evaluation", "invalid_dependency_result"))
         critic_candidates = tuple(
@@ -3291,6 +3386,7 @@ __all__ = [
     "FeedbackRoundInputV5",
     "FeedbackRoundResultV5",
     "MaterializedVariantV5",
+    "MechanismRuntimeExtensionV5",
     "LeaseAwareCandidateRuntimeV5",
     "NoveltyResolutionV5",
     "NoveltyResolverV5",

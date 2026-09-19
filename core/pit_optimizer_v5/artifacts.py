@@ -2065,6 +2065,18 @@ class LocalArtifactRepositoryV5:
             raise ArtifactSchemaFailureV5(reference)
         return content
 
+    def has_binary_state(self, *, namespace: str, key: str) -> bool:
+        """Read-only exact existence check for one adapter-owned binary slot."""
+
+        safe_namespace = _safe_component(namespace, "binary state namespace")
+        safe_key = _safe_component(key, "binary state key")
+        relative = f"adapter-blobs/{safe_namespace}/{safe_key}.bin"
+        try:
+            self._read_relative(relative)
+        except ArtifactMissingV5:
+            return False
+        return True
+
     @contextmanager
     def adapter_state_transition(self, *, namespace: str, key: str) -> Iterator[None]:
         """Serialize one exact durable adapter-state transition across processes."""
@@ -2689,6 +2701,49 @@ class LocalArtifactRepositoryV5:
         if not matches:
             raise ArtifactSchemaFailureV5()
         return tuple(matches)
+
+    def load_authenticated_role_requests(
+        self,
+        *,
+        campaign_id: str,
+        round_index: int,
+        role: RoleNameV5 | None = None,
+    ) -> tuple[tuple[ArtifactRefV5, RoleCallKeyV5, RoleRequestV5], ...]:
+        """Enumerate exact authenticated role requests at one round boundary.
+
+        This is intentionally narrower than the private request identity
+        lookup above.  It authenticates every selected request envelope and
+        returns only the requested campaign/round (and optional role), so a
+        mechanism extension can prove that its precommitment was published
+        before authoring began without changing the six-field role-request
+        schema or consulting raw paths from outside the repository API.
+        """
+
+        if type(campaign_id) is not str or not campaign_id.strip():
+            raise ValueError("role-request campaign is invalid")
+        if type(round_index) is not int or round_index <= 0:
+            raise ValueError("role-request round is invalid")
+        if role is not None and role not in {"investigator", "author", "critic"}:
+            raise ValueError("role-request role is invalid")
+        try:
+            names = self._names(("roles", "requests"))
+        except ArtifactMissingV5:
+            return ()
+        matches: list[tuple[ArtifactRefV5, RoleCallKeyV5, RoleRequestV5]] = []
+        for name in names:
+            if re.fullmatch(r"[0-9a-f]{64}\.json", name) is None:
+                raise ArtifactSchemaFailureV5()
+            relative = f"roles/requests/{name}"
+            raw = self._read_relative(relative)
+            reference = ArtifactRefV5(relative, hashlib.sha256(raw).hexdigest())
+            call, request = self._load_role_request_entry(reference)
+            if (
+                call.campaign_id == campaign_id
+                and call.round_index == round_index
+                and (role is None or call.role == role)
+            ):
+                matches.append((reference, call, request))
+        return tuple(sorted(matches, key=lambda item: item[1].sha256))
 
     def append_role_attempt(self, attempt: RoleAttemptFactsV5) -> ArtifactRefV5:
         if type(attempt) is not RoleAttemptFactsV5:
