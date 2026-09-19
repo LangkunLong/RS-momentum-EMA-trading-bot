@@ -1290,6 +1290,13 @@ class _MechanismSyntheticCandidateRuntime(SyntheticCandidateRuntimeV5):
         return _static_fingerprint(distinct=True, variant=variant)
 
 
+class _FailingDiscoveryMechanismCandidateRuntime(_MechanismSyntheticCandidateRuntime):
+    """Keep the supplied-port path real while failing discovery evaluation."""
+
+    def evaluate_episode(self, materialized, episode, *, deadline):
+        raise RuntimeError("fixture discovery failure")
+
+
 class _LazyFixtureMechanismExtension:
     """Compose the real extension from the runtime's authenticated intent.
 
@@ -2680,6 +2687,224 @@ def test_runtime_extension_is_called_after_render_and_finalized_separately(tmp_p
     assert any(path.name.endswith("-binding.bin") for path in tmp_path.rglob("*"))
     assert any(path.name.endswith("-run.bin") for path in tmp_path.rglob("*"))
     assert any(path.name.endswith("-report.bin") for path in tmp_path.rglob("*"))
+
+
+@pytest.mark.parametrize("status", ("quick_rejected", "timed_out", "cancelled", "evaluation_failed"))
+def test_noncomplete_candidate_status_keeps_local_report_and_evaluator_absence(
+    tmp_path: Path,
+    status: str,
+) -> None:
+    repository, capability, _, _ = _capability(tmp_path)
+    extension = MechanismRuntimeExtensionV1(repository, capability, worker_factory=_fixture_workers)
+    result = run_legacy_fixture(
+        mechanism=extension,
+        round_intent=capability.round_intent,
+        parent_candidate=capability.parent_candidate,
+        authenticated_manifest=capability.authenticated_manifest,
+        return_candidate=True,
+    )
+    experiment_id = result["decision"]["experiment_id"]
+    bound = extension._bound[experiment_id]
+    candidate = replace(
+        result["_candidate"],
+        status=status,
+        discovery_episodes=(),
+        campaign_evidence=None,
+        failure_code=(None if status == "quick_rejected" else f"{status}_fixture"),
+    )
+
+    report = extension.finalize_report(experiment_id=experiment_id, candidate_evidence=candidate)
+    assert report is not None
+    local = next(item for item in report.predictions if item.metric_id == "exit.decision_changed_count")
+    evaluator = next(item for item in report.predictions if item.metric_id == "evaluator.exit_attribution_count")
+    assert local.availability == "measured"
+    assert local.assessment == "contradicted_on_cases"
+    assert evaluator.availability == "unavailable"
+    assert evaluator.unavailable_reason == "evaluator_metric_missing"
+    assert all(item.unavailable_reason != "execution_failed" for item in report.predictions)
+
+    capability_out, bound_out, run_out, report_out, intent_out = extension.role_request_evidence(experiment_id)
+    assert capability_out == capability
+    assert bound_out == bound
+    assert run_out.execution.status == "completed"
+    assert report_out == report
+    issued: list[tuple[str, object]] = []
+    projection = MechanismRoleRequestAdapterV1(repository).project_current_evidence(
+        candidate=candidate,
+        intent=intent_out,
+        capability=capability_out,
+        bound=bound_out,
+        run=run_out,
+        report=report_out,
+        issue_evidence=lambda metric_id, value: (
+            issued.append((metric_id, value)) or f"v5.final-fix.{len(issued)}"
+        ),
+    )
+    assert projection.execution == report.execution
+    assert any(
+        row.prediction.metric_id == "exit.decision_changed_count" and row.prediction.availability == "measured"
+        for row in projection.rows
+    )
+    assert any(
+        row.prediction.metric_id == "evaluator.exit_attribution_count"
+        and row.prediction.availability == "unavailable"
+        and row.prediction.unavailable_reason == "evaluator_metric_missing"
+        for row in projection.rows
+    )
+
+
+def test_supplied_port_quick_rejections_reach_mixed_current_critic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A valid survivor rejection stays in the critic batch with local evidence."""
+
+    import core.pit_optimizer_v5.runtime as runtime_module
+
+    repository, capability, _, _ = _capability(
+        tmp_path,
+        hypotheses_per_investigator=3,
+        max_variants_per_template=3,
+        max_discovery_survivors_per_template=3,
+        fixture_entry=True,
+    )
+    authenticated = capability.authenticated_manifest
+    raw = repository.repository
+    inputs, composed = compose_fixture_round_v5(repository=raw, authorities=authenticated, round_index=1)
+    monkeypatch.setattr(
+        runtime_module,
+        "select_manifest_discovery_survivors_v5",
+        lambda **kwargs: tuple(kwargs["candidates"][:1]),
+    )
+    calls = {"factory": 0}
+    extension = _LazyFixtureMechanismExtension(
+        repository,
+        capability,
+        worker_factory=_counting_fixture_factory(calls),
+    )
+    adapter = MechanismRoleRequestAdapterV1(repository, authenticated_manifest=authenticated)
+    requests = LocalRoleRequestFactoryV5(repository=raw, manifest=authenticated.manifest, mechanism_adapter=adapter)
+    candidates = _MechanismSyntheticCandidateRuntime(raw, inputs)
+    dependencies = replace(
+        composed,
+        invoker=_MechanismFixtureRoleInvoker(authenticated.manifest),
+        requests=requests,
+        candidates=candidates,
+        cleanup=candidates,
+        mechanism=extension,
+    )
+
+    result = run_feedback_round_v5(inputs, dependencies)
+    assert result.status == "completed", result.failure
+    assert result.checkpoint is not None
+    assert len(extension._reports) == 3
+    assert len(extension._reports) == len(extension._runs)
+    assert calls["factory"] == 3
+    critic_events = tuple(
+        item
+        for event in raw.load_round_events(campaign_id=inputs.campaign_id, round_index=inputs.round_index)
+        for item in (raw.load_round_payload(event.payload_ref, expected_kind=event.event_kind),)
+        if type(item) is RoleCompletionPayloadV5 and item.role == "critic"
+    )
+    assert len(critic_events) == 1
+    critic = raw.load_role_invocation(critic_events[0])
+    assert type(critic.request.role_input) is MechanismRoleInputV1
+    assert {item.experiment_id for item in critic.request.role_input.projections} == set(extension._reports)
+    assert any(
+        item.status == "quick_rejected"
+        for ref in result.record_refs
+        for item in (StoredExperimentRecordV5(reference=ref, record=raw.load_experiment(ref)).record,)
+    )
+
+
+def test_supplied_port_discovery_failure_keeps_local_report_and_completes_round(
+    tmp_path: Path,
+) -> None:
+    repository, capability, _, _ = _capability(
+        tmp_path,
+        hypotheses_per_investigator=3,
+        max_variants_per_template=3,
+        max_discovery_survivors_per_template=3,
+        fixture_entry=True,
+    )
+    authenticated = capability.authenticated_manifest
+    raw = repository.repository
+    inputs, composed = compose_fixture_round_v5(repository=raw, authorities=authenticated, round_index=1)
+    calls = {"factory": 0}
+    extension = _LazyFixtureMechanismExtension(
+        repository,
+        capability,
+        worker_factory=_counting_fixture_factory(calls),
+    )
+    adapter = MechanismRoleRequestAdapterV1(repository, authenticated_manifest=authenticated)
+    requests = LocalRoleRequestFactoryV5(repository=raw, manifest=authenticated.manifest, mechanism_adapter=adapter)
+    candidates = _FailingDiscoveryMechanismCandidateRuntime(raw, inputs)
+    dependencies = replace(
+        composed,
+        invoker=_MechanismFixtureRoleInvoker(authenticated.manifest),
+        requests=requests,
+        candidates=candidates,
+        cleanup=candidates,
+        mechanism=extension,
+    )
+
+    result = run_feedback_round_v5(inputs, dependencies)
+    assert result.status == "completed", result.failure
+    assert result.checkpoint is not None
+    assert len(extension._reports) == 3
+    assert calls["factory"] == 3
+    assert all(
+        next(item for item in report.predictions if item.metric_id == "exit.decision_changed_count").availability
+        == "measured"
+        for report in extension._reports.values()
+    )
+    records = tuple(raw.load_experiment(ref) for ref in result.record_refs)
+    assert records and all(item.status == "evaluation_failed" for item in records)
+
+    restarted = MechanismArtifactRepositoryV5(LocalArtifactRepositoryV5(tmp_path))
+    recovered_checkpoint, recovered_state = restarted.repository.recover_projection(
+        LocalArchiveReducerFactoryV5(restarted.repository).recovery_reducer(inputs)
+    )
+    recovered_records = tuple(
+        StoredExperimentRecordV5(reference=ref, record=restarted.repository.load_experiment(ref))
+        for ref in recovered_checkpoint.record_refs
+    )
+    recovered_projection = SearchProjectionV5(
+        checkpoint=recovered_checkpoint,
+        state=recovered_state,
+        stored_records=recovered_records,
+    )
+    recovered_parent = select_parent_v5(
+        state=recovered_state,
+        baseline=inputs.baseline,
+        discovery_plan=inputs.panel_plan,
+        evaluator_contract=inputs.evaluator_contract,
+        stored_records=recovered_records,
+    )
+    restarted_factory = LocalRoleRequestFactoryV5(
+        repository=restarted.repository,
+        manifest=inputs.manifest,
+        mechanism_adapter=MechanismRoleRequestAdapterV1(
+            restarted,
+            authenticated_manifest=authenticated,
+        ),
+    )
+    restarted_inputs = replace(inputs, round_index=2)
+    investigator_request = restarted_factory.investigator_request(
+        restarted_inputs,
+        recovered_projection,
+        recovered_parent,
+    )
+    assert type(investigator_request.role_input) is MechanismRoleInputV1
+    assert {item.experiment_id for item in investigator_request.role_input.projections} == {
+        item.record.experiment_id for item in recovered_records
+    }
+    assert investigator_request.role_input.omitted == ()
+    assert all(
+        any(
+            row.prediction.metric_id == "exit.decision_changed_count"
+            and row.prediction.availability == "measured"
+            for row in item.rows
+        )
+        for item in investigator_request.role_input.projections
+    )
 
 
 def test_runtime_rejected_candidates_do_not_open_supplemental_workers(tmp_path: Path) -> None:

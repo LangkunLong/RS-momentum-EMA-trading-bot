@@ -36,6 +36,7 @@ from core.pit_optimizer_v5.contracts import (
 from core.pit_optimizer_v5.memory import (
     RoundIntentPayloadV5,
     StoredExperimentRecordV5,
+    is_testable_experiment_status_v5,
     round_event_payload_primitive_v5,
 )
 from core.pit_optimizer_v5.manifest import (
@@ -1956,7 +1957,7 @@ class MechanismArtifactRepositoryV5:
         candidate_revision = candidate_record.policy_revision
         if (
             candidate_stored.record.experiment_id != experiment_id
-            or candidate_stored.record.status not in {"evaluated", "zero_trade"}
+            or not is_testable_experiment_status_v5(candidate_stored.record.status)
             or candidate_revision is None
             or candidate_revision.sha256 != expected_candidate_revision_sha256
             or candidate_source_bundle.sha256 != expected_candidate_source_bundle_sha256
@@ -2106,7 +2107,7 @@ class MechanismArtifactRepositoryV5:
             raise MechanismCapabilityError("mechanism candidate record differs from checkpoint authority")
         if (
             record.round_index != round_index
-            or record.status not in {"evaluated", "zero_trade"}
+            or not is_testable_experiment_status_v5(record.status)
             or record.pit_data_scope != authenticated.manifest.pit_data_scope
             or record.semantic_mode != authenticated.manifest.semantic_mode
             or record.experiment_identity.discovery_plan_sha256 != authenticated.panel_plan.discovery_plan_sha256
@@ -2453,10 +2454,9 @@ class MechanismRuntimeExtensionV1:
 
         if (
             type(candidate_evidence) is not CandidateEvidenceV5
-            or candidate_evidence.status not in {"evaluated", "zero_trade"}
-            or len(candidate_evidence.discovery_episodes) != 4
+            or not is_testable_experiment_status_v5(candidate_evidence.status)
         ):
-            raise MechanismCapabilityError("finalization requires complete post-evaluation candidate evidence")
+            raise MechanismCapabilityError("finalization requires an admitted candidate status")
         supplied_matches = self._matched_evaluations_for_candidate(bound, candidate_evidence)
         self.repository.append_report(bound, run, matched_evaluations=supplied_matches)
         report = self.repository.load_report(bound)
@@ -2479,7 +2479,7 @@ class MechanismRuntimeExtensionV1:
 
         This exposes only typed in-memory objects created by the precommitted
         extension.  It performs no repository repair or discovery and is valid
-        only after ``finalize_report`` has stored the complete report.
+        only after ``finalize_report`` has stored the complete local report.
         """
 
         experiment_id = _digest(experiment_id, "mechanism role experiment ID")

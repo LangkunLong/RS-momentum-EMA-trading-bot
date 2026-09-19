@@ -885,7 +885,7 @@ class MechanismRoleRequestAdapterV1:
             or candidate.materialized.variant.source_bundle != bound.candidate_source_bundle
             or candidate.template.hypothesis_id != intent.hypothesis.hypothesis_id
             or candidate.template.parent_revision_sha256 != capability.parent_revision.sha256
-            or candidate.status not in {"evaluated", "zero_trade"}
+            or not is_testable_experiment_status_v5(candidate.status)
         ):
             raise MechanismCapabilityError("current mechanism candidate authority differs")
 
@@ -1271,7 +1271,7 @@ class LocalRoleRequestFactoryV5:
             ]
             complete_ids = {item.experiment_id for item in memory.complete_feedback}
             for stored in retained_records:
-                if stored.record.status not in {"evaluated", "zero_trade"}:
+                if not is_testable_experiment_status_v5(stored.record.status):
                     omitted.append(
                         MechanismMemoryDispositionV1(
                             experiment_id=stored.record.experiment_id,
