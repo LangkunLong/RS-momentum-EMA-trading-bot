@@ -594,13 +594,18 @@ class LocalCandidateBaseOperationsV5:
 _ROLE_SAFE_SYNTHETIC_CPU_LIMITATION_V1 = (
     "CPU and peak memory were not measured or enforced by the synthetic fixture port."
 )
+_ROLE_SAFE_SYNTHETIC_UNAVAILABLE_LIMITATION_V1 = "The synthetic fixture port cannot assert CPU or memory enforcement."
 _ROLE_SAFE_SYNTHETIC_RESOURCE_LIMITATION_V1 = (
     "Processor time and peak memory were not measured or enforced by the synthetic fixture port."
 )
+_ROLE_SAFE_LIMITATION_RENDERERS_V1 = {
+    _ROLE_SAFE_SYNTHETIC_CPU_LIMITATION_V1: _ROLE_SAFE_SYNTHETIC_RESOURCE_LIMITATION_V1,
+    _ROLE_SAFE_SYNTHETIC_UNAVAILABLE_LIMITATION_V1: _ROLE_SAFE_SYNTHETIC_RESOURCE_LIMITATION_V1,
+}
 
 
 def _role_safe_limitation_v1(value: str) -> str:
-    """Render the one known fixture limitation without changing its report bytes.
+    """Render known fixture limitations without changing their report bytes.
 
     The role envelope rejects arbitrary all-uppercase symbol-like tokens because
     they can be ticker material.  The authenticated synthetic probe's ``CPU``
@@ -609,9 +614,7 @@ def _role_safe_limitation_v1(value: str) -> str:
     retained verbatim and remains subject to the normal role validator.
     """
 
-    if value == _ROLE_SAFE_SYNTHETIC_CPU_LIMITATION_V1:
-        return _ROLE_SAFE_SYNTHETIC_RESOURCE_LIMITATION_V1
-    return value
+    return _ROLE_SAFE_LIMITATION_RENDERERS_V1.get(value, value)
 
 
 class MechanismRoleRequestAdapterV1:

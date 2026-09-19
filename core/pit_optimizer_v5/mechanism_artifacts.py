@@ -2457,7 +2457,10 @@ class MechanismRuntimeExtensionV1:
             or not is_testable_experiment_status_v5(candidate_evidence.status)
         ):
             raise MechanismCapabilityError("finalization requires an admitted candidate status")
-        supplied_matches = self._matched_evaluations_for_candidate(bound, candidate_evidence)
+        if any(item.metric_id == "evaluator.exit_attribution_count" for item in bound.capability.spec.metrics):
+            supplied_matches = self._matched_evaluations_for_candidate(bound, candidate_evidence)
+        else:
+            supplied_matches = ()
         self.repository.append_report(bound, run, matched_evaluations=supplied_matches)
         report = self.repository.load_report(bound)
         if type(report) is not MechanismEvidenceReportV1:

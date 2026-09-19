@@ -771,6 +771,7 @@ def collect_mechanism_observations_v1(
         check_deadline()
         candidate_session = candidate_worker.open()
         sessions.append((candidate_worker, candidate_session))
+        check_deadline()
         output_bytes = 0
         first_by_case: dict[int, MechanismPairedObservationV1] = {}
         for repetition in range(repetitions):
@@ -778,19 +779,24 @@ def collect_mechanism_observations_v1(
                 check_deadline()
                 try:
                     parent_worker.reset(parent_session, case)
+                    check_deadline()
                     candidate_worker.reset(candidate_session, case)
+                    check_deadline()
                     parent_raw = parent_worker.evaluate(
                         parent_session,
                         case,
                         deadline_monotonic=deadline_monotonic,
                     )
+                    check_deadline()
                     candidate_raw = candidate_worker.evaluate(
                         candidate_session,
                         case,
                         deadline_monotonic=deadline_monotonic,
                     )
+                    check_deadline()
                     parent, parent_json, parent_sha256 = _validate_decision(case.snapshot, parent_raw)
                     candidate, candidate_json, candidate_sha256 = _validate_decision(case.snapshot, candidate_raw)
+                    check_deadline()
                 except _ObservationFailure:
                     raise
                 except TimeoutError as exc:
@@ -857,6 +863,13 @@ def collect_mechanism_observations_v1(
             execution_status = "failed"
             execution_reason = "execution_failed"
             limitations.append("Worker cleanup failed after the observation attempt.")
+        elif execution_status == "completed":
+            try:
+                check_deadline()
+            except _ObservationFailure as exc:
+                execution_status = "failed"
+                execution_reason = exc.reason
+                limitations.append(str(exc))
 
     execution = MechanismExecutionV1(status=execution_status, reason=execution_reason)
     return _run(

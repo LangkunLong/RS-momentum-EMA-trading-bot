@@ -2653,6 +2653,118 @@ def test_runtime_finalization_matches_authenticated_parent_discovery_context(tmp
     assert any(path.name == complete_path.name for path in repository.repository.root.rglob("*.json"))
 
 
+def test_local_only_finalization_omits_undeclared_evaluator_contexts(tmp_path: Path) -> None:
+    repository, capability, _, _ = _capability(tmp_path)
+    local_spec = replace(capability.spec, metrics=capability.spec.metrics[:2])
+    local_corpus = build_mechanism_observation_corpus_v1(local_spec, seed_snapshot=_seed_snapshot())
+    local_capability = replace(capability, spec=local_spec, corpus=local_corpus)
+    extension = MechanismRuntimeExtensionV1(repository, local_capability, worker_factory=_fixture_workers)
+    result = run_legacy_fixture(
+        mechanism=extension,
+        round_intent=local_capability.round_intent,
+        parent_candidate=local_capability.parent_candidate,
+        authenticated_manifest=local_capability.authenticated_manifest,
+        return_candidate=True,
+    )
+    experiment_id = result["decision"]["experiment_id"]
+    bound = extension._bound[experiment_id]
+
+    report = extension.finalize_report(
+        experiment_id=experiment_id,
+        candidate_evidence=_post_evaluation_candidate(result["_candidate"], local_capability, bound),
+    )
+
+    assert report is not None
+    assert tuple(item.metric_id for item in report.predictions) == (
+        "exit.decision_changed_count",
+        "exit.protected_control_unchanged_count",
+    )
+    assert report.consequence_contexts == ()
+
+
+def test_worker_unavailable_limitation_survives_typed_role_request(tmp_path: Path) -> None:
+    repository, capability, _, _ = _capability(tmp_path)
+    local_spec = replace(capability.spec, metrics=capability.spec.metrics[:2])
+    local_corpus = build_mechanism_observation_corpus_v1(local_spec, seed_snapshot=_seed_snapshot())
+    capability = replace(capability, spec=local_spec, corpus=local_corpus)
+
+    def enforced_fixture_workers(bound):
+        parent, candidate = _fixture_workers(bound)
+        parent.registration = replace(parent.registration, cpu_memory_enforced=True)
+        candidate.registration = replace(candidate.registration, cpu_memory_enforced=True)
+        return parent, candidate
+
+    extension = MechanismRuntimeExtensionV1(
+        repository,
+        capability,
+        worker_factory=enforced_fixture_workers,
+    )
+    result = run_legacy_fixture(
+        mechanism=extension,
+        round_intent=capability.round_intent,
+        parent_candidate=capability.parent_candidate,
+        authenticated_manifest=capability.authenticated_manifest,
+        return_candidate=True,
+    )
+    experiment_id = result["decision"]["experiment_id"]
+    bound = extension._bound[experiment_id]
+    candidate = replace(
+        _post_evaluation_candidate(result["_candidate"], capability, bound),
+        discovery_episodes=(),
+    )
+    report = extension.finalize_report(experiment_id=experiment_id, candidate_evidence=candidate)
+    assert report is not None
+    assert report.execution.status == "not_run"
+    limitation = "The synthetic fixture port cannot assert CPU or memory enforcement."
+    assert limitation in report.limitations
+
+    issued: list[RoleEvidenceItemV5] = []
+    base_evidence_id = "v5.boundary.worker-unavailable.base"
+    issued.append(RoleEvidenceItemV5(base_evidence_id, "episode.base.closed_trades", 0))
+
+    def issue(metric_id: str, value: object) -> str:
+        evidence_id = f"v5.boundary.worker-unavailable.{len(issued) + 1}"
+        issued.append(RoleEvidenceItemV5(evidence_id, metric_id, value))
+        return evidence_id
+
+    projection = MechanismRoleRequestAdapterV1(repository).project_current_evidence(
+        candidate=candidate,
+        intent=capability.round_intent,
+        capability=capability,
+        bound=bound,
+        run=extension._runs[experiment_id],
+        report=report,
+        issue_evidence=issue,
+    )
+    role_input = MechanismRoleInputV1(
+        role="investigator",
+        base_input=InvestigatorRoleInputV5((base_evidence_id,), (), ()),
+        projection=projection,
+    )
+    request = build_role_request_v5(
+        role="investigator",
+        role_input=role_input,
+        issued_evidence=RoleEvidenceV5(5, tuple(issued)),
+        expected_binding=RoleBindingV5(
+            capability.parent_revision.sha256,
+            None,
+            (),
+            capability.round_intent.discovery_plan_sha256,
+        ),
+        schema_authority=role_schema_authority_from_manifest_v5(
+            role="investigator",
+            manifest=capability.authenticated_manifest.manifest,
+        ),
+        max_output_tokens=4096,
+    )
+
+    assert request.role == "investigator"
+    assert "Processor time and peak memory were not measured or enforced by the synthetic fixture port." in (
+        projection.limitations
+    )
+    assert limitation not in projection.limitations
+
+
 def test_runtime_extension_is_called_after_render_and_finalized_separately(tmp_path: Path) -> None:
     repository, capability, candidate_bundle, candidate_revision = _capability(tmp_path)
     extension = MechanismRuntimeExtensionV1(

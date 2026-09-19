@@ -1195,6 +1195,93 @@ def test_deadline_is_caller_owned_and_does_not_retry_worker_calls() -> None:
     assert not parent.opened and not candidate.opened
 
 
+def test_deadline_after_final_evaluation_rejects_late_observation_and_cleans_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import core.pit_optimizer_v5.mechanism_probes as mechanism_probes
+
+    class _Clock:
+        now = 0.0
+
+    clock = _Clock()
+    monkeypatch.setattr(mechanism_probes.time, "monotonic", lambda: clock.now)
+    spec = _observation_spec(values=(Decimal("0.50"),))
+    corpus = build_mechanism_observation_corpus_v1(spec, seed_snapshot=_exit_seed())
+    binding = _observation_binding(spec, corpus)
+    parent, candidate = _fixture_workers(binding, corpus)
+
+    class _LateCandidateWorker(SyntheticFixtureWorkerV1):
+        def evaluate(
+            self,
+            session: object,
+            case: MechanismPairedCaseV1,
+            *,
+            deadline_monotonic: float | None,
+        ) -> object:
+            decision = super().evaluate(session, case, deadline_monotonic=deadline_monotonic)
+            clock.now = 1.0
+            return decision
+
+    candidate = _LateCandidateWorker(
+        registration=candidate.registration,
+        decisions_by_input_identity=candidate.decisions_by_input_identity,
+    )
+
+    run = collect_mechanism_observations_v1(
+        spec,
+        binding,
+        corpus,
+        parent_worker=parent,
+        candidate_worker=candidate,
+        deadline_monotonic=0.5,
+    )
+
+    assert run.execution.status == "failed"
+    assert run.execution.reason == "timeout"
+    assert run.observations == ()
+    assert parent.closed and candidate.closed
+
+
+def test_deadline_expiry_during_cleanup_is_not_reported_as_completed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import core.pit_optimizer_v5.mechanism_probes as mechanism_probes
+
+    class _Clock:
+        now = 0.0
+
+    clock = _Clock()
+    monkeypatch.setattr(mechanism_probes.time, "monotonic", lambda: clock.now)
+    spec = _observation_spec(values=(Decimal("0.50"),))
+    corpus = build_mechanism_observation_corpus_v1(spec, seed_snapshot=_exit_seed())
+    binding = _observation_binding(spec, corpus)
+    parent, candidate = _fixture_workers(binding, corpus)
+
+    class _LateCleanupWorker(SyntheticFixtureWorkerV1):
+        def close(self, session: object) -> None:
+            super().close(session)
+            clock.now = 1.0
+
+    candidate = _LateCleanupWorker(
+        registration=candidate.registration,
+        decisions_by_input_identity=candidate.decisions_by_input_identity,
+    )
+
+    run = collect_mechanism_observations_v1(
+        spec,
+        binding,
+        corpus,
+        parent_worker=parent,
+        candidate_worker=candidate,
+        deadline_monotonic=0.5,
+    )
+
+    assert run.execution.status == "failed"
+    assert run.execution.reason == "timeout"
+    assert len(run.observations) == 1
+    assert parent.closed and candidate.closed
+
+
 def test_paired_observation_preserves_canonical_decision_bytes_and_case_identity() -> None:
     spec = _observation_spec(values=(Decimal("0.50"),))
     corpus = build_mechanism_observation_corpus_v1(spec, seed_snapshot=_exit_seed())
