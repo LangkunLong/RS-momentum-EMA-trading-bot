@@ -37,6 +37,13 @@ from core.pit_optimizer_v5.contracts import (
     canonical_sha256_v5,
 )
 from core.pit_optimizer_v5.policy_scope import EDITABLE_POLICY_PATHS_V5
+from core.pit_optimizer_v5.mechanism_contracts import (
+    MechanismControlV1,
+    MechanismCoverageV1,
+    MechanismExecutionV1,
+    MechanismPredicateV1,
+    MechanismPredictionResultV1,
+)
 
 
 RoleNameV5 = Literal["investigator", "author", "critic"]
@@ -869,8 +876,18 @@ def _validate_metric_id(value: object) -> str:
     metric_id = _canonical_id(value, "aggregate metric ID")
     metric_parts = frozenset(re.split(r"[._-]+", metric_id))
     collapsed = metric_id.replace("_", "").replace("-", "").replace(".", "")
+    mechanism_extension_metric = False
+    for base_metric in _MECHANISM_ROLE_METRIC_IDS_V1:
+        for suffix in _MECHANISM_ROLE_METRIC_SUFFIXES_V1:
+            if metric_id == _mechanism_role_metric_id_v1(base_metric, suffix):
+                mechanism_extension_metric = True
+                break
+        if mechanism_extension_metric:
+            break
     if (
         not metric_id.startswith(_ALLOWED_EVIDENCE_METRIC_PREFIXES)
+        and metric_id not in _MECHANISM_ROLE_METRIC_IDS_V1
+        and not mechanism_extension_metric
         or _FORBIDDEN_METRIC_PARTS.intersection(metric_parts)
         or any(fragment in collapsed for fragment in _FORBIDDEN_KEY_FRAGMENTS)
         or re.search(r"(?:^|[._-])value(?:$|[._-])", metric_id)
@@ -986,6 +1003,258 @@ class ExperimentMemoryAggregateV5:
             value is not None for value in (self.parent_revision_sha256, self.policy_revision_sha256, self.round_index)
         ):
             raise ValueError("compact memory cannot carry incomplete lineage metadata")
+
+
+_MECHANISM_ROLE_METRIC_IDS_V1 = frozenset(
+    {
+        "exit.decision_changed_count",
+        "exit.protected_control_unchanged_count",
+        "evaluator.exit_attribution_count",
+    }
+)
+_MECHANISM_ROLE_METRIC_SUFFIXES_V1 = frozenset(
+    {"parent", "candidate", "numerator", "denominator", "delta", "unavailable"}
+)
+
+
+def _mechanism_role_metric_id_v1(metric_id: object, suffix: object | None = None) -> str:
+    if type(metric_id) is not str or metric_id not in _MECHANISM_ROLE_METRIC_IDS_V1:
+        raise ValueError("mechanism role metric is not registered")
+    if suffix is None:
+        return metric_id
+    if type(suffix) is not str or suffix not in _MECHANISM_ROLE_METRIC_SUFFIXES_V1:
+        raise ValueError("mechanism role metric suffix is not registered")
+    return f"{metric_id}.{suffix}"
+
+
+@dataclass(frozen=True, slots=True)
+class MechanismEvidenceRowV1:
+    """One typed finding with all identity dimensions kept beside its IDs.
+
+    Numeric measurement values remain in the request's ordinary RoleEvidence
+    items.  This row carries their request-local references and the qualifiers
+    that make equal metric names from different episodes unambiguous.
+    """
+
+    stage: Literal["report", "quick", "discovery"]
+    episode_id: str | None
+    episode_ordinal: int | None
+    scenario_id: str | None
+    report_sha256: str
+    hypothesis_id: str
+    experiment_id: str
+    parent_revision_sha256: str
+    candidate_revision_sha256: str
+    parent_source_bundle_sha256: str
+    candidate_source_bundle_sha256: str
+    evaluator_contract_sha256: str
+    corpus_sha256: str
+    prediction: MechanismPredictionResultV1
+    evidence_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.stage not in {"report", "quick", "discovery"}:
+            raise ValueError("mechanism role row stage is invalid")
+        if self.stage == "report":
+            if any(value is not None for value in (self.episode_id, self.episode_ordinal, self.scenario_id)):
+                raise ValueError("report-level mechanism row cannot carry evaluator grouping")
+        else:
+            if type(self.episode_id) is not str or not self.episode_id.strip():
+                raise ValueError("evaluator mechanism row requires an episode ID")
+            if self.stage == "quick":
+                if self.episode_ordinal is not None:
+                    raise ValueError("quick mechanism row cannot carry an ordinal")
+            elif type(self.episode_ordinal) is not int or self.episode_ordinal <= 0:
+                raise ValueError("discovery mechanism row requires a positive ordinal")
+            if type(self.scenario_id) is not str or not self.scenario_id.strip():
+                raise ValueError("evaluator mechanism row requires a scenario ID")
+        for value, label in (
+            (self.report_sha256, "mechanism role report"),
+            (self.experiment_id, "mechanism role experiment"),
+            (self.parent_revision_sha256, "mechanism role parent revision"),
+            (self.candidate_revision_sha256, "mechanism role candidate revision"),
+            (self.parent_source_bundle_sha256, "mechanism role parent source"),
+            (self.candidate_source_bundle_sha256, "mechanism role candidate source"),
+            (self.evaluator_contract_sha256, "mechanism role evaluator"),
+            (self.corpus_sha256, "mechanism role corpus"),
+        ):
+            _digest(value, label)
+        _canonical_id(self.hypothesis_id, "mechanism role hypothesis")
+        if type(self.prediction) is not MechanismPredictionResultV1:
+            raise ValueError("mechanism role prediction is invalid")
+        _mechanism_role_metric_id_v1(self.prediction.metric_id)
+        _evidence_id_tuple(self.evidence_ids, "mechanism role row evidence")
+
+
+@dataclass(frozen=True, slots=True)
+class MechanismRoleProjectionV1:
+    """Closed, provider-safe projection of one authenticated mechanism report."""
+
+    experiment_id: str
+    hypothesis_id: str
+    hypothesis_claim: str
+    predicted_changes: tuple[MetricPredictionV5, ...]
+    report_sha256: str
+    parent_revision_sha256: str
+    candidate_revision_sha256: str
+    parent_source_bundle_sha256: str
+    candidate_source_bundle_sha256: str
+    evaluator_contract_sha256: str
+    corpus_sha256: str
+    execution: MechanismExecutionV1
+    controls: tuple[MechanismControlV1, ...]
+    applicability: MechanismPredicateV1
+    coverage: MechanismCoverageV1
+    rows: tuple[MechanismEvidenceRowV1, ...]
+    limitations: tuple[str, ...]
+    memory_selection: Literal["complete", "summary"] = "complete"
+    schema_version: Literal[1] = 1
+
+    def __post_init__(self) -> None:
+        for value, label in (
+            (self.experiment_id, "mechanism projection experiment"),
+            (self.report_sha256, "mechanism projection report"),
+            (self.parent_revision_sha256, "mechanism projection parent revision"),
+            (self.candidate_revision_sha256, "mechanism projection candidate revision"),
+            (self.parent_source_bundle_sha256, "mechanism projection parent source"),
+            (self.candidate_source_bundle_sha256, "mechanism projection candidate source"),
+            (self.evaluator_contract_sha256, "mechanism projection evaluator"),
+            (self.corpus_sha256, "mechanism projection corpus"),
+        ):
+            _digest(value, label)
+        _canonical_id(self.hypothesis_id, "mechanism projection hypothesis")
+        _validate_safe_text(self.hypothesis_claim, "mechanism projection hypothesis claim")
+        if (
+            type(self.predicted_changes) is not tuple
+            or not self.predicted_changes
+            or any(type(item) is not MetricPredictionV5 for item in self.predicted_changes)
+        ):
+            raise ValueError("mechanism projection predictions are invalid")
+        prediction_ids = tuple(item.metric_id for item in self.predicted_changes)
+        if len(set(prediction_ids)) != len(prediction_ids):
+            raise ValueError("mechanism projection predictions must be unique")
+        if type(self.execution) is not MechanismExecutionV1:
+            raise ValueError("mechanism projection execution is invalid")
+        if (
+            type(self.controls) is not tuple
+            or not self.controls
+            or any(type(item) is not MechanismControlV1 for item in self.controls)
+            or len({item.control_id for item in self.controls}) != len(self.controls)
+        ):
+            raise ValueError("mechanism projection controls are invalid")
+        if type(self.applicability) is not MechanismPredicateV1 or type(self.coverage) is not MechanismCoverageV1:
+            raise ValueError("mechanism projection typed context is invalid")
+        if (
+            type(self.rows) is not tuple
+            or not self.rows
+            or len(self.rows) > 128
+            or any(type(item) is not MechanismEvidenceRowV1 for item in self.rows)
+        ):
+            raise ValueError("mechanism projection rows are invalid")
+        keys = tuple(
+            (
+                item.stage,
+                item.episode_id,
+                item.episode_ordinal,
+                item.scenario_id,
+                item.prediction.metric_id,
+            )
+            for item in self.rows
+        )
+        if len(set(keys)) != len(keys):
+            raise ValueError("mechanism projection rows are not context-unique")
+        for item in self.rows:
+            if (
+                item.report_sha256 != self.report_sha256
+                or item.hypothesis_id != self.hypothesis_id
+                or item.experiment_id != self.experiment_id
+                or item.parent_revision_sha256 != self.parent_revision_sha256
+                or item.candidate_revision_sha256 != self.candidate_revision_sha256
+                or item.parent_source_bundle_sha256 != self.parent_source_bundle_sha256
+                or item.candidate_source_bundle_sha256 != self.candidate_source_bundle_sha256
+                or item.evaluator_contract_sha256 != self.evaluator_contract_sha256
+                or item.corpus_sha256 != self.corpus_sha256
+            ):
+                raise ValueError("mechanism projection row identity differs")
+        if (
+            type(self.limitations) is not tuple
+            or any(type(item) is not str or not item.strip() or len(item) > 512 for item in self.limitations)
+            or len(self.limitations) > 32
+        ):
+            raise ValueError("mechanism projection limitations are invalid")
+        if self.memory_selection not in {"complete", "summary"}:
+            raise ValueError("mechanism projection memory selection is invalid")
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise ValueError("mechanism projection schema version is unsupported")
+
+    @property
+    def evidence_ids(self) -> tuple[str, ...]:
+        return tuple(evidence_id for row in self.rows for evidence_id in row.evidence_ids)
+
+
+@dataclass(frozen=True, slots=True)
+class MechanismMemoryDispositionV1:
+    """Visible memory accounting for a finding omitted from the projection."""
+
+    experiment_id: str
+    disposition: Literal["omitted"]
+    reason: Literal["not_retained_by_memory_budget", "not_authenticated"]
+
+    def __post_init__(self) -> None:
+        _digest(self.experiment_id, "mechanism omitted experiment")
+        if self.disposition != "omitted":
+            raise ValueError("mechanism memory disposition is invalid")
+        if self.reason not in {"not_retained_by_memory_budget", "not_authenticated"}:
+            raise ValueError("mechanism memory omission reason is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class MechanismRoleInputV1:
+    """Explicit opt-in wrapper around an unchanged investigator or critic input."""
+
+    role: Literal["investigator", "critic"]
+    base_input: InvestigatorRoleInputV5 | CriticRoleInputV5
+    projection: MechanismRoleProjectionV1 | tuple[MechanismRoleProjectionV1, ...]
+    omitted: tuple[MechanismMemoryDispositionV1, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.role not in {"investigator", "critic"}:
+            raise ValueError("mechanism role wrapper role is invalid")
+        expected = InvestigatorRoleInputV5 if self.role == "investigator" else CriticRoleInputV5
+        if type(self.base_input) is not expected:
+            raise ValueError("mechanism role wrapper base input differs from its role")
+        projections = self.projections
+        if (not projections and not self.omitted) or any(
+            type(item) is not MechanismRoleProjectionV1 for item in projections
+        ):
+            raise ValueError("mechanism role wrapper projections are invalid")
+        if len({item.experiment_id for item in projections}) != len(projections):
+            raise ValueError("mechanism role wrapper experiments must be unique")
+        if (
+            type(self.omitted) is not tuple
+            or any(type(item) is not MechanismMemoryDispositionV1 for item in self.omitted)
+            or len({item.experiment_id for item in self.omitted}) != len(self.omitted)
+        ):
+            raise ValueError("mechanism role wrapper memory omissions are invalid")
+        if set(item.experiment_id for item in self.omitted).intersection(item.experiment_id for item in projections):
+            raise ValueError("mechanism role wrapper cannot omit a projected experiment")
+
+    @property
+    def projections(self) -> tuple[MechanismRoleProjectionV1, ...]:
+        if type(self.projection) is MechanismRoleProjectionV1:
+            return (self.projection,)
+        if type(self.projection) is tuple:
+            return self.projection
+        raise ValueError("mechanism role wrapper projection is invalid")
+
+    @property
+    def base(self) -> InvestigatorRoleInputV5 | CriticRoleInputV5:
+        return self.base_input
+
+
+# Short aliases keep the versioned extension vocabulary discoverable without
+# adding a second wire shape.
+MechanismProjectionV1 = MechanismRoleProjectionV1
 
 
 @dataclass(frozen=True, slots=True)
@@ -1311,7 +1580,7 @@ class CriticRoleInputV5:
                 raise ValueError("critic aggregate experiments must be unique")
 
 
-RoleInputV5 = InvestigatorRoleInputV5 | AuthorRoleInputV5 | CriticRoleInputV5
+RoleInputV5 = InvestigatorRoleInputV5 | AuthorRoleInputV5 | CriticRoleInputV5 | MechanismRoleInputV1
 
 
 def _validate_hypothesis_text(hypothesis: HypothesisV5) -> None:
@@ -1368,27 +1637,105 @@ def _decode_hypothesis(value: object) -> HypothesisV5:
 def _role_citation_sequence(role_input: RoleInputV5) -> tuple[str, ...]:
     """Return the one authoritative citation order for each closed role input."""
 
-    if type(role_input) is InvestigatorRoleInputV5:
-        return (
-            *role_input.aggregate_evaluator_evidence,
-            *(evidence_id for row in role_input.archive_family_summaries for evidence_id in row.evidence_ids),
-            *(evidence_id for row in role_input.critic_directions for evidence_id in row.evidence_ids),
-            *(evidence_id for row in role_input.campaign_directions for evidence_id in row.evidence_ids),
-            *(evidence_id for row in role_input.experiment_summaries for evidence_id in row.evidence_ids),
+    extension = role_input if type(role_input) is MechanismRoleInputV1 else None
+    base_input = extension.base_input if extension is not None else role_input
+    if type(base_input) is InvestigatorRoleInputV5:
+        base_citations = (
+            *base_input.aggregate_evaluator_evidence,
+            *(evidence_id for row in base_input.archive_family_summaries for evidence_id in row.evidence_ids),
+            *(evidence_id for row in base_input.critic_directions for evidence_id in row.evidence_ids),
+            *(evidence_id for row in base_input.campaign_directions for evidence_id in row.evidence_ids),
+            *(evidence_id for row in base_input.experiment_summaries for evidence_id in row.evidence_ids),
         )
-    if type(role_input) is AuthorRoleInputV5:
-        return role_input.hypothesis.evidence_ids
-    assert type(role_input) is CriticRoleInputV5
+    elif type(base_input) is AuthorRoleInputV5:
+        base_citations = base_input.hypothesis.evidence_ids
+    else:
+        assert type(base_input) is CriticRoleInputV5
+        base_citations = (
+            *(
+                evidence_id
+                for row in base_input.evaluation_summaries
+                for scenario in row.scenarios
+                for evidence_id in scenario.evidence_ids
+            ),
+            *(evidence_id for row in base_input.semantic_differences for evidence_id in row.evidence_ids),
+            *(evidence_id for row in base_input.typed_failures for evidence_id in row.evidence_ids),
+        )
+    if extension is None:
+        return base_citations
     return (
-        *(
-            evidence_id
-            for row in role_input.evaluation_summaries
-            for scenario in row.scenarios
-            for evidence_id in scenario.evidence_ids
-        ),
-        *(evidence_id for row in role_input.semantic_differences for evidence_id in row.evidence_ids),
-        *(evidence_id for row in role_input.typed_failures for evidence_id in row.evidence_ids),
+        *base_citations,
+        *(evidence_id for projection in extension.projections for row in projection.rows for evidence_id in row.evidence_ids),
     )
+
+
+def _validate_mechanism_role_projection(
+    projection: MechanismRoleProjectionV1,
+    *,
+    issued_evidence: RoleEvidenceV5,
+) -> None:
+    if type(projection) is not MechanismRoleProjectionV1:
+        raise ValueError("mechanism role projection is invalid")
+    extension_ids = projection.evidence_ids
+    if not extension_ids or len(set(extension_ids)) != len(extension_ids):
+        raise ValueError("mechanism role projection must carry issued evidence IDs")
+    if any(not row.evidence_ids for row in projection.rows):
+        raise ValueError("mechanism role projection rows require evidence IDs")
+    declared_metric_ids = {item.metric_id for item in projection.predicted_changes}
+    row_metric_ids = {row.prediction.metric_id for row in projection.rows}
+    if not declared_metric_ids.issubset(row_metric_ids):
+        raise ValueError("mechanism role projection omits a declared prediction")
+    unavailable_reason = {
+        "not_run": "not_run",
+        "failed": "execution_failed",
+    }.get(projection.execution.status)
+    if unavailable_reason is not None and any(
+        row.prediction.availability != "unavailable"
+        or row.prediction.unavailable_reason != unavailable_reason
+        for row in projection.rows
+    ):
+        raise ValueError("mechanism role projection execution status differs from its predictions")
+    if projection.execution.status == "completed" and any(
+        row.prediction.availability == "unavailable"
+        and row.prediction.unavailable_reason in {"not_run", "execution_failed"}
+        for row in projection.rows
+    ):
+        raise ValueError("mechanism role projection completed status carries worker failure availability")
+    issued_items = {item.evidence_id: item for item in issued_evidence.items}
+    issued = set(issued_items)
+    if not set(extension_ids).issubset(issued):
+        raise ValueError("mechanism role projection cites evidence outside this request")
+    for row in projection.rows:
+        prediction = row.prediction
+        _mechanism_role_metric_id_v1(prediction.metric_id)
+        expected_values = (
+            {"unavailable": None}
+            if prediction.availability == "unavailable"
+            else {
+                "parent": prediction.parent_value,
+                "candidate": prediction.candidate_value,
+                "numerator": prediction.numerator,
+                "denominator": prediction.denominator,
+                "delta": prediction.paired_delta,
+            }
+        )
+        expected_metric_ids = {
+            _mechanism_role_metric_id_v1(prediction.metric_id, suffix)
+            for suffix in expected_values
+        }
+        actual_metric_ids = {issued_items[evidence_id].metric_id for evidence_id in row.evidence_ids}
+        if actual_metric_ids != expected_metric_ids:
+            raise ValueError("mechanism role row evidence cardinality differs from its prediction")
+        for evidence_id in row.evidence_ids:
+            metric_id = issued_items[evidence_id].metric_id
+            suffix = metric_id.rsplit(".", 1)[-1]
+            if issued_items[evidence_id].value != expected_values[suffix]:
+                raise ValueError("mechanism role row evidence value differs from its prediction")
+    if any(
+        row.prediction.metric_id not in _MECHANISM_ROLE_METRIC_IDS_V1
+        for row in projection.rows
+    ):
+        raise ValueError("mechanism role row metric is not registered")
 
 
 def _validate_role_input(
@@ -1398,25 +1745,35 @@ def _validate_role_input(
     binding: RoleBindingV5,
     schema_authority: RoleSchemaAuthorityV5,
     issued_ids: tuple[str, ...],
+    issued_evidence: RoleEvidenceV5,
 ) -> None:
+    extension = role_input if type(role_input) is MechanismRoleInputV1 else None
+    base_input = extension.base_input if extension is not None else role_input
+    if extension is not None:
+        if role not in {"investigator", "critic"} or extension.role != role:
+            raise ValueError("mechanism role wrapper differs from the request role")
+        for projection in extension.projections:
+            _validate_mechanism_role_projection(projection, issued_evidence=issued_evidence)
     if role == "investigator":
-        if type(role_input) is not InvestigatorRoleInputV5:
+        if type(base_input) is not InvestigatorRoleInputV5:
             raise ValueError("investigator input must use its closed V5 schema")
-        _scan_aggregate_value(canonical_primitive_v5(role_input))
+        _scan_aggregate_value(canonical_primitive_v5(base_input))
+        if extension is not None:
+            _scan_aggregate_value(canonical_primitive_v5(extension))
     elif role == "author":
-        if type(role_input) is not AuthorRoleInputV5:
+        if type(base_input) is not AuthorRoleInputV5 or extension is not None:
             raise ValueError("author input must use its closed V5 schema")
-        if role_input.full_source_escape is not schema_authority.allow_full_source_escape:
+        if base_input.full_source_escape is not schema_authority.allow_full_source_escape:
             raise ValueError("author full-source mode differs from its schema authority")
-        hypothesis = role_input.hypothesis
+        hypothesis = base_input.hypothesis
         if hypothesis.hypothesis_id != binding.hypothesis_id:
             raise ValueError("author hypothesis differs from its expected binding")
-        if role_input.policy_contracts.policy_scope_sha256 != schema_authority.policy_scope_sha256:
+        if base_input.policy_contracts.policy_scope_sha256 != schema_authority.policy_scope_sha256:
             raise ValueError("author V3 policy contracts differ from schema authority")
-        parent_revision = role_input.policy_contracts.parent_revision
+        parent_revision = base_input.policy_contracts.parent_revision
         if parent_revision.sha256 != binding.parent_revision_sha256:
             raise ValueError("author parent revision differs from its expected binding")
-        if tuple(source.path for source in role_input.editable_sources) != schema_authority.author_policy_paths:
+        if tuple(source.path for source in base_input.editable_sources) != schema_authority.author_policy_paths:
             raise ValueError("author sources differ from their exact path authority")
         authorized_paths = frozenset(schema_authority.author_policy_paths)
         expected_sources = tuple(
@@ -1429,19 +1786,21 @@ def _validate_role_input(
             raise ValueError("author source bytes differ from the authenticated parent revision")
         _validate_hypothesis_text(hypothesis)
     else:
-        if type(role_input) is not CriticRoleInputV5:
+        if type(base_input) is not CriticRoleInputV5:
             raise ValueError("critic input must use its closed V5 schema")
         for label, values in (
-            ("evaluation summaries", role_input.evaluation_summaries),
-            ("predictions", role_input.predictions),
-            ("semantic differences", role_input.semantic_differences),
-            ("typed failures", role_input.typed_failures),
+            ("evaluation summaries", base_input.evaluation_summaries),
+            ("predictions", base_input.predictions),
+            ("semantic differences", base_input.semantic_differences),
+            ("typed failures", base_input.typed_failures),
         ):
-            if label == "semantic differences" and role_input.semantic_evidence_unavailable:
+            if label == "semantic differences" and base_input.semantic_evidence_unavailable:
                 continue
             if tuple(item.experiment_id for item in values) != binding.experiment_ids:
                 raise ValueError(f"critic {label} differs from the complete experiment batch")
-        _scan_aggregate_value(canonical_primitive_v5(role_input))
+        _scan_aggregate_value(canonical_primitive_v5(base_input))
+        if extension is not None:
+            _scan_aggregate_value(canonical_primitive_v5(extension))
     _evidence_id_tuple(issued_ids, "issued role evidence", required=True)
     citations = _role_citation_sequence(role_input)
     _evidence_id_tuple(citations, "role citation sequence", required=True)
@@ -1473,7 +1832,10 @@ class RoleRequestV5:
             "author": AuthorRoleInputV5,
             "critic": CriticRoleInputV5,
         }[role]
-        if type(self.role_input) is not expected_input_type:
+        if type(self.role_input) is MechanismRoleInputV1:
+            if role == "author" or self.role_input.role != role:
+                raise ValueError("role input differs from its closed V5 role schema")
+        elif type(self.role_input) is not expected_input_type:
             raise ValueError("role input differs from its closed V5 role schema")
         if type(self.role_evidence) is not RoleEvidenceV5 or not self.role_evidence.items:
             raise ValueError("role request requires bounded V5 aggregate evidence")
@@ -1508,6 +1870,7 @@ class RoleRequestV5:
             binding=self.expected_binding,
             schema_authority=self.schema_authority,
             issued_ids=tuple(item.evidence_id for item in self.role_evidence.items),
+            issued_evidence=self.role_evidence,
         )
         messages = _freeze_json(
             (
@@ -3846,6 +4209,11 @@ __all__ = [
     "FreshPersistedRoleRequestV5",
     "GatewayCompletionProviderV5",
     "IssuedEvidenceV5",
+    "MechanismEvidenceRowV1",
+    "MechanismMemoryDispositionV1",
+    "MechanismProjectionV1",
+    "MechanismRoleInputV1",
+    "MechanismRoleProjectionV1",
     "InvestigatorRoleInputV5",
     "LedgerRoleTerminalAuthorityV5",
     "LedgerBackedRoleInvokerV5",

@@ -877,6 +877,7 @@ class MechanismPersistedEvidenceV1:
     binding: MechanismObservationBindingV1
     run: MechanismObservationRunV1
     report: MechanismEvidenceReportV1
+    parent_source_bundle_sha256: str | None = None
 
 
 def _wire(kind: str, content: bytes) -> bytes:
@@ -2050,7 +2051,141 @@ class MechanismArtifactRepositoryV5:
             binding=binding,
             run=run,
             report=report,
+            parent_source_bundle_sha256=expected_parent_source_bundle_sha256,
         )
+
+    def load_existing_evidence_for_record(
+        self,
+        *,
+        campaign_id: str,
+        round_index: int,
+        manifest_ref: ArtifactRefV5,
+        manifest_source_identity_sha256: str,
+        stored_record: StoredExperimentRecordV5,
+    ) -> tuple[MechanismPersistedEvidenceV1, RoundIntentPayloadV5] | None:
+        """Discover one persisted finding through authenticated legacy authority.
+
+        This restart path is deliberately narrower than capability loading.  It
+        authenticates the manifest, round-intent event, checkpoint record, and
+        the record's inline policy-source edge, then delegates to the existing
+        complete-index reader.  Every state read uses ``repair=False`` (or an
+        immutable artifact reader), so an orphan cannot mint an authority file
+        while historical memory is being projected into a new request.
+        """
+
+        campaign_id = _campaign(campaign_id)
+        round_index = _positive(round_index, "mechanism round")
+        if type(manifest_ref) is not ArtifactRefV5:
+            raise ValueError("mechanism manifest reference is invalid")
+        manifest_source_identity_sha256 = _digest(
+            manifest_source_identity_sha256,
+            "mechanism manifest source identity SHA-256",
+        )
+        if type(stored_record) is not StoredExperimentRecordV5:
+            raise ValueError("mechanism stored record is invalid")
+
+        try:
+            authenticated = authenticate_campaign_manifest_v5(
+                repository=self.repository,
+                manifest_ref=manifest_ref,
+            )
+        except (ArtifactRepositoryFailureV5, ManifestAuthenticationFailureV5, TypeError, ValueError) as exc:
+            raise MechanismCapabilityError("mechanism manifest authority is unavailable") from exc
+        if (
+            authenticated.manifest.campaign_id != campaign_id
+            or manifest_source_identity_sha256_v1(authenticated) != manifest_source_identity_sha256
+        ):
+            raise MechanismCapabilityError("mechanism manifest authority differs from this repository")
+
+        try:
+            record = self.repository.load_experiment(stored_record.reference)
+            self._require_checkpoint_record(stored_record.reference)
+        except (ArtifactRepositoryFailureV5, TypeError, ValueError) as exc:
+            raise MechanismCapabilityError("mechanism candidate checkpoint authority is unavailable") from exc
+        if record != stored_record.record:
+            raise MechanismCapabilityError("mechanism candidate record differs from checkpoint authority")
+        if (
+            record.round_index != round_index
+            or record.status not in {"evaluated", "zero_trade"}
+            or record.pit_data_scope != authenticated.manifest.pit_data_scope
+            or record.semantic_mode != authenticated.manifest.semantic_mode
+            or record.experiment_identity.discovery_plan_sha256 != authenticated.panel_plan.discovery_plan_sha256
+        ):
+            raise MechanismCapabilityError("mechanism candidate record semantic authority differs")
+
+        index = self._load_precommitment_index_by_identity(
+            campaign_id=campaign_id,
+            round_index=round_index,
+        )
+        if index is None:
+            return None
+        self._validate_precommitment_index_identity(
+            campaign_id=campaign_id,
+            round_index=round_index,
+            index=index,
+        )
+
+        try:
+            events = self.repository.load_round_events(campaign_id=campaign_id, round_index=round_index)
+            payloads = tuple(
+                self.repository.load_round_payload(event.payload_ref, expected_kind=event.event_kind)
+                for event in events
+            )
+        except (ArtifactRepositoryFailureV5, TypeError, ValueError) as exc:
+            raise MechanismCapabilityError("mechanism round history is unavailable") from exc
+        intents = tuple(item for item in payloads if type(item) is RoundIntentPayloadV5)
+        if len(intents) != 1:
+            raise MechanismCapabilityError("mechanism round history lacks one authenticated intent")
+        intent = intents[0]
+
+        if (
+            index.manifest_ref != manifest_ref
+            or index.manifest_source_identity_sha256 != manifest_source_identity_sha256
+            or index.round_intent_sha256 != round_intent_sha256_v1(intent)
+            or intent.parent_revision_sha256 != index.parent_revision_sha256
+            or intent.hypothesis.sha256 != index.hypothesis_sha256
+            or intent.discovery_plan_sha256 != authenticated.panel_plan.discovery_plan_sha256
+            or intent.pit_data_scope != authenticated.manifest.pit_data_scope
+            or intent.semantic_mode != authenticated.manifest.semantic_mode
+            or record.hypothesis.sha256 != index.hypothesis_sha256
+            or record.parent_revision_sha256 != index.parent_revision_sha256
+        ):
+            raise MechanismCapabilityError("mechanism saved round intent differs from record authority")
+
+        candidate_revision = record.policy_revision
+        if candidate_revision is None:
+            raise MechanismCapabilityError("mechanism candidate lacks policy revision authority")
+        candidate_source_refs = tuple(
+            reference
+            for reference in record.artifact_refs
+            if reference.relative_path == f"adapter-state/policy-source/{candidate_revision.sha256}.json"
+        )
+        if len(candidate_source_refs) != 1:
+            raise MechanismCapabilityError("mechanism candidate lacks one inline policy-source authority")
+        candidate_source_ref = candidate_source_refs[0]
+        if candidate_source_ref.sha256 == "":
+            raise MechanismCapabilityError("mechanism candidate source authority is empty")
+
+        persisted = self.load_existing_evidence(
+            campaign_id=campaign_id,
+            round_index=round_index,
+            experiment_id=record.experiment_id,
+            manifest_ref=manifest_ref,
+            manifest_source_identity_sha256=manifest_source_identity_sha256,
+            precommitment_id=index.precommitment_id,
+            expected_parent_revision_sha256=index.parent_revision_sha256,
+            expected_parent_revision_ref=index.parent_revision_ref,
+            expected_parent_source_bundle_sha256=index.parent_source_bundle_sha256,
+            expected_spec_sha256=index.spec_sha256,
+            expected_corpus_sha256=index.corpus_sha256,
+            expected_candidate_record_ref=stored_record.reference,
+            expected_candidate_revision_sha256=candidate_revision.sha256,
+            expected_candidate_source_bundle_sha256=candidate_source_ref.sha256,
+            expected_candidate_source_bundle_ref=candidate_source_ref,
+        )
+        if persisted is None:
+            return None
+        return persisted, intent
 
 
 class MechanismRuntimeExtensionV1:
@@ -2076,6 +2211,7 @@ class MechanismRuntimeExtensionV1:
         self._precommitted = False
         self._bound: dict[str, MechanismBoundCandidateV1] = {}
         self._runs: dict[str, MechanismObservationRunV1] = {}
+        self._reports: dict[str, MechanismEvidenceReportV1] = {}
 
     def before_authoring(
         self,
@@ -2323,7 +2459,38 @@ class MechanismRuntimeExtensionV1:
             raise MechanismCapabilityError("finalization requires complete post-evaluation candidate evidence")
         supplied_matches = self._matched_evaluations_for_candidate(bound, candidate_evidence)
         self.repository.append_report(bound, run, matched_evaluations=supplied_matches)
-        return self.repository.load_report(bound)
+        report = self.repository.load_report(bound)
+        if type(report) is not MechanismEvidenceReportV1:
+            raise MechanismArtifactCorrupt("mechanism finalized report is unavailable")
+        self._reports[experiment_id] = report
+        return report
+
+    def role_request_evidence(
+        self,
+        experiment_id: str,
+    ) -> tuple[
+        MechanismExtensionCapabilityV1,
+        MechanismBoundCandidateV1,
+        MechanismObservationRunV1,
+        MechanismEvidenceReportV1,
+        RoundIntentPayloadV5,
+    ]:
+        """Return authenticated current-round evidence for the critic adapter.
+
+        This exposes only typed in-memory objects created by the precommitted
+        extension.  It performs no repository repair or discovery and is valid
+        only after ``finalize_report`` has stored the complete report.
+        """
+
+        experiment_id = _digest(experiment_id, "mechanism role experiment ID")
+        bound = self._bound.get(experiment_id)
+        run = self._runs.get(experiment_id)
+        report = self._reports.get(experiment_id)
+        if bound is None or run is None or report is None or not self._precommitted:
+            raise MechanismCapabilityError("current mechanism role evidence is incomplete")
+        if report.binding != bound.binding or run.binding != bound.binding:
+            raise MechanismArtifactCorrupt("current mechanism role evidence binding differs")
+        return self.capability, bound, run, report, self.capability.round_intent
 
 
 __all__ = [

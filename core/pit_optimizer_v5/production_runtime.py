@@ -10,7 +10,7 @@ import math
 import re
 import threading
 import time
-from typing import Literal
+from typing import Callable, Literal
 
 from core.pit_optimizer_v5.artifacts import ArchiveSnapshotV5, LocalArtifactRepositoryV5
 from core.pit_optimizer_v5.campaign_admission import require_live_role_admission_v5
@@ -56,6 +56,25 @@ from core.pit_optimizer_v5.memory import (
     reduce_experiment_journal_v5,
     project_investigator_memory_v5,
 )
+from core.pit_optimizer_v5.mechanism_artifacts import (
+    MechanismBoundCandidateV1,
+    MechanismArtifactRepositoryV5,
+    MechanismCapabilityError,
+    MechanismExtensionCapabilityV1,
+    MechanismObservationRunV1,
+    manifest_source_identity_sha256_v1,
+    round_intent_sha256_v1,
+)
+from core.pit_optimizer_v5.mechanism_contracts import (
+    MechanismEvidenceReportV1,
+    MechanismPredictionResultV1,
+    validate_mechanism_report_against_spec_v1,
+    validate_mechanism_spec_hypothesis_v1,
+)
+from core.pit_optimizer_v5.manifest import (
+    AuthenticatedCampaignManifestV5,
+    authenticate_campaign_manifest_v5,
+)
 from core.pit_optimizer_v5.policy_scope import EDITABLE_POLICY_PATHS_V5
 from core.pit_optimizer_v5.probes import (
     PROBE_SUITE_ID_V5,
@@ -79,6 +98,10 @@ from core.pit_optimizer_v5.provider import (
     ExperimentPredictionAggregateV5,
     ExperimentSemanticDifferenceAggregateV5,
     InvestigatorRoleInputV5,
+    MechanismEvidenceRowV1,
+    MechanismMemoryDispositionV1,
+    MechanismRoleInputV1,
+    MechanismRoleProjectionV1,
     RoleBindingV5,
     RoleInvocationPackageV5,
     RoleRequestV5,
@@ -568,14 +591,408 @@ class LocalCandidateBaseOperationsV5:
         raise RuntimeError("semantic_probe_requires_registered_sandbox_execution")
 
 
+_ROLE_SAFE_SYNTHETIC_CPU_LIMITATION_V1 = (
+    "CPU and peak memory were not measured or enforced by the synthetic fixture port."
+)
+_ROLE_SAFE_SYNTHETIC_RESOURCE_LIMITATION_V1 = (
+    "Processor time and peak memory were not measured or enforced by the synthetic fixture port."
+)
+
+
+def _role_safe_limitation_v1(value: str) -> str:
+    """Render the one known fixture limitation without changing its report bytes.
+
+    The role envelope rejects arbitrary all-uppercase symbol-like tokens because
+    they can be ticker material.  The authenticated synthetic probe's ``CPU``
+    label is a legitimate limitation, so the adapter uses a stable descriptive
+    rendering at the role boundary.  Other authenticated report text is
+    retained verbatim and remains subject to the normal role validator.
+    """
+
+    if value == _ROLE_SAFE_SYNTHETIC_CPU_LIMITATION_V1:
+        return _ROLE_SAFE_SYNTHETIC_RESOURCE_LIMITATION_V1
+    return value
+
+
+class MechanismRoleRequestAdapterV1:
+    """Project authenticated persisted findings into one role request.
+
+    The adapter receives only a checkpoint-authorized record and a callback to
+    the request-local evidence builder.  It cannot mint capabilities, inspect
+    raw mechanism paths, or reuse evidence IDs from an earlier role request.
+    """
+
+    def __init__(
+        self,
+        repository: MechanismArtifactRepositoryV5,
+        authenticated_manifest: AuthenticatedCampaignManifestV5 | None = None,
+    ) -> None:
+        if type(repository) is not MechanismArtifactRepositoryV5:
+            raise ValueError("mechanism request adapter requires MechanismArtifactRepositoryV5")
+        if authenticated_manifest is not None and type(authenticated_manifest) is not AuthenticatedCampaignManifestV5:
+            raise ValueError("mechanism request adapter manifest authority is invalid")
+        self._repository = repository
+        self._authenticated_manifest = authenticated_manifest
+
+    @property
+    def authenticated_manifest(self) -> AuthenticatedCampaignManifestV5 | None:
+        return self._authenticated_manifest
+
+    def _manifest_context(self) -> tuple[ArtifactRefV5, str] | None:
+        if self._authenticated_manifest is None:
+            return None
+        return (
+            self._authenticated_manifest.manifest_ref,
+            manifest_source_identity_sha256_v1(self._authenticated_manifest),
+        )
+
+    @property
+    def manifest_context(self) -> tuple[ArtifactRefV5, str] | None:
+        return self._manifest_context()
+
+    @staticmethod
+    def _prediction_row_ids(
+        prediction: MechanismPredictionResultV1,
+        *,
+        issue_evidence: Callable[[str, object], str],
+    ) -> tuple[str, ...]:
+        metric_id = prediction.metric_id
+        if prediction.availability == "unavailable":
+            return (issue_evidence(f"{metric_id}.unavailable", None),)
+        return tuple(
+            issue_evidence(f"{metric_id}.{suffix}", value)
+            for suffix, value in (
+                ("parent", prediction.parent_value),
+                ("candidate", prediction.candidate_value),
+                ("numerator", prediction.numerator),
+                ("denominator", prediction.denominator),
+                ("delta", prediction.paired_delta),
+            )
+        )
+
+    def project_persisted_record(
+        self,
+        *,
+        campaign_id: str,
+        round_index: int,
+        manifest_ref: ArtifactRefV5,
+        manifest_source_identity_sha256: str,
+        stored_record: StoredExperimentRecordV5,
+        issue_evidence: Callable[[str, object], str],
+        memory_selection: Literal["complete", "summary"] = "complete",
+    ) -> MechanismRoleProjectionV1 | None:
+        if not callable(issue_evidence):
+            raise ValueError("mechanism request adapter requires an evidence issuer")
+        discovered = self._repository.load_existing_evidence_for_record(
+            campaign_id=campaign_id,
+            round_index=round_index,
+            manifest_ref=manifest_ref,
+            manifest_source_identity_sha256=manifest_source_identity_sha256,
+            stored_record=stored_record,
+        )
+        if discovered is None:
+            return None
+        persisted, intent = discovered
+        record = stored_record.record
+        candidate_revision = record.policy_revision
+        if candidate_revision is None:
+            raise MechanismCapabilityError("selected mechanism record lacks candidate revision")
+        candidate_source_refs = tuple(
+            reference
+            for reference in record.artifact_refs
+            if reference.relative_path == f"adapter-state/policy-source/{candidate_revision.sha256}.json"
+        )
+        if len(candidate_source_refs) != 1:
+            raise MechanismCapabilityError("selected mechanism record lacks candidate source identity")
+        candidate_source_sha256 = candidate_source_refs[0].sha256
+        parent_source_sha256 = persisted.parent_source_bundle_sha256
+        if parent_source_sha256 is None:
+            raise MechanismCapabilityError("selected mechanism finding lacks parent source identity")
+        try:
+            authenticated = authenticate_campaign_manifest_v5(
+                repository=self._repository.repository,
+                manifest_ref=manifest_ref,
+            )
+        except (ValueError, TypeError) as exc:
+            raise MechanismCapabilityError("selected mechanism manifest cannot be reauthenticated") from exc
+        if (
+            persisted.index.experiment_id != record.experiment_id
+            or persisted.binding.experiment_id != record.experiment_id
+            or persisted.binding.hypothesis_sha256 != intent.hypothesis.sha256
+            or persisted.binding.parent_revision_sha256 != persisted.spec.parent_revision_sha256
+            or persisted.binding.candidate_bytes_sha256 != candidate_source_sha256
+            or persisted.binding.corpus_sha256 != persisted.index.corpus_sha256
+            or manifest_source_identity_sha256_v1(authenticated) != manifest_source_identity_sha256
+            or persisted.binding.evaluator_contract_sha256 != authenticated.evaluator_contract.sha256
+        ):
+            raise MechanismCapabilityError("selected mechanism finding identity differs")
+
+        if (
+            (
+                record.hypothesis.hypothesis_id,
+                record.hypothesis.rank,
+                record.hypothesis.primary_mechanism,
+                record.hypothesis.causal_claim,
+                record.hypothesis.predicted_changes,
+                record.hypothesis.author_instructions,
+                record.hypothesis.authoring_mode,
+            )
+            != (
+                intent.hypothesis.hypothesis_id,
+                intent.hypothesis.rank,
+                intent.hypothesis.primary_mechanism,
+                intent.hypothesis.causal_claim,
+                intent.hypothesis.predicted_changes,
+                intent.hypothesis.author_instructions,
+                intent.hypothesis.authoring_mode,
+            )
+        ):
+            raise MechanismCapabilityError("selected mechanism hypothesis differs from authenticated intent")
+        try:
+            validate_mechanism_spec_hypothesis_v1(
+                persisted.spec,
+                intent.hypothesis,
+                parent_revision_sha256=persisted.spec.parent_revision_sha256,
+                round_intent_sha256=round_intent_sha256_v1(intent),
+            )
+        except (TypeError, ValueError, ArithmeticError) as exc:
+            raise MechanismCapabilityError("selected mechanism spec differs from authenticated intent") from exc
+
+        report = persisted.report
+        binding = persisted.binding
+        rows: list[MechanismEvidenceRowV1] = []
+
+        def add_row(
+            *,
+            stage: Literal["report", "quick", "discovery"],
+            episode_id: str | None,
+            episode_ordinal: int | None,
+            scenario_id: str | None,
+            prediction: MechanismPredictionResultV1,
+        ) -> None:
+            rows.append(
+                MechanismEvidenceRowV1(
+                    stage=stage,
+                    episode_id=episode_id,
+                    episode_ordinal=episode_ordinal,
+                    scenario_id=scenario_id,
+                    report_sha256=report.sha256,
+                    hypothesis_id=intent.hypothesis.hypothesis_id,
+                    experiment_id=record.experiment_id,
+                    parent_revision_sha256=persisted.spec.parent_revision_sha256,
+                    candidate_revision_sha256=candidate_revision.sha256,
+                    parent_source_bundle_sha256=parent_source_sha256,
+                    candidate_source_bundle_sha256=candidate_source_sha256,
+                    evaluator_contract_sha256=binding.evaluator_contract_sha256,
+                    corpus_sha256=persisted.index.corpus_sha256,
+                    prediction=prediction,
+                    evidence_ids=self._prediction_row_ids(prediction, issue_evidence=issue_evidence),
+                )
+            )
+
+        for prediction in report.predictions:
+            add_row(
+                stage="report",
+                episode_id=None,
+                episode_ordinal=None,
+                scenario_id=None,
+                prediction=prediction,
+            )
+        for group in report.consequence_contexts:
+            context = group.context
+            if (
+                context.evaluator_contract_sha256 != binding.evaluator_contract_sha256
+                or context.parent_policy_identity_sha256 != persisted.spec.parent_revision_sha256
+                or context.candidate_policy_identity_sha256 != candidate_revision.sha256
+                or context.parent_source_bundle_sha256 != parent_source_sha256
+                or context.candidate_source_bundle_sha256 != candidate_source_sha256
+            ):
+                raise MechanismCapabilityError("mechanism evaluator context differs from checkpoint authority")
+            stage: Literal["quick", "discovery"] = context.stage
+            for prediction in group.predictions:
+                add_row(
+                    stage=stage,
+                    episode_id=context.episode_id,
+                    episode_ordinal=context.episode_ordinal,
+                    scenario_id=context.scenario_id,
+                    prediction=prediction,
+                )
+        return MechanismRoleProjectionV1(
+            experiment_id=record.experiment_id,
+            hypothesis_id=intent.hypothesis.hypothesis_id,
+            hypothesis_claim=intent.hypothesis.causal_claim,
+            predicted_changes=intent.hypothesis.predicted_changes,
+            report_sha256=report.sha256,
+            parent_revision_sha256=persisted.spec.parent_revision_sha256,
+            candidate_revision_sha256=candidate_revision.sha256,
+            parent_source_bundle_sha256=parent_source_sha256,
+            candidate_source_bundle_sha256=candidate_source_sha256,
+            evaluator_contract_sha256=binding.evaluator_contract_sha256,
+            corpus_sha256=persisted.index.corpus_sha256,
+            execution=report.execution,
+            controls=persisted.spec.controls,
+            applicability=persisted.spec.applicability,
+            coverage=report.coverage,
+            rows=tuple(rows),
+            limitations=(
+                *(_role_safe_limitation_v1(item) for item in report.limitations),
+                *( ("memory.selection=summary; sidecar restored from authenticated history.",)
+                   if memory_selection == "summary" else () ),
+            ),
+            memory_selection=memory_selection,
+        )
+
+    def project_current_evidence(
+        self,
+        *,
+        candidate: CandidateEvidenceV5,
+        intent: RoundIntentPayloadV5,
+        capability: MechanismExtensionCapabilityV1,
+        bound: MechanismBoundCandidateV1,
+        run: MechanismObservationRunV1,
+        report: MechanismEvidenceReportV1,
+        issue_evidence: Callable[[str, object], str],
+    ) -> MechanismRoleProjectionV1:
+        """Project a just-finalized current candidate before publication.
+
+        Current-round candidates do not have legacy checkpoint records yet.  The
+        runtime extension supplies the authenticated capability, pre-measurement
+        binding, run, and report; this method validates those identities and
+        creates fresh critic-request evidence IDs without using the historical
+        discovery path or minting any repository authority.
+        """
+
+        if (
+            type(candidate) is not CandidateEvidenceV5
+            or type(intent) is not RoundIntentPayloadV5
+            or type(capability) is not MechanismExtensionCapabilityV1
+            or type(bound) is not MechanismBoundCandidateV1
+            or type(run) is not MechanismObservationRunV1
+            or type(report) is not MechanismEvidenceReportV1
+            or not callable(issue_evidence)
+        ):
+            raise MechanismCapabilityError("current mechanism role evidence is not fully typed")
+        capability.revalidate(round_intent=intent)
+        if bound.capability != capability or report.binding != bound.binding or run.binding != bound.binding:
+            raise MechanismCapabilityError("current mechanism role evidence binding differs")
+        try:
+            validate_mechanism_report_against_spec_v1(capability.spec, report)
+        except (TypeError, ValueError, ArithmeticError) as exc:
+            raise MechanismCapabilityError("current mechanism role report is not authenticated") from exc
+        if (
+            candidate.experiment_id != bound.experiment_id
+            or candidate.materialized.variant.policy_revision != bound.candidate_revision
+            or candidate.materialized.variant.source_bundle != bound.candidate_source_bundle
+            or candidate.template.hypothesis_id != intent.hypothesis.hypothesis_id
+            or candidate.template.parent_revision_sha256 != capability.parent_revision.sha256
+            or candidate.status not in {"evaluated", "zero_trade"}
+        ):
+            raise MechanismCapabilityError("current mechanism candidate authority differs")
+
+        binding = bound.binding
+        candidate_revision_sha256 = bound.candidate_revision.sha256
+        candidate_source_sha256 = bound.candidate_source_bundle.sha256
+        parent_revision_sha256 = capability.parent_revision.sha256
+        parent_source_sha256 = capability.parent_source_bundle.sha256
+        report_sha256 = report.sha256
+        rows: list[MechanismEvidenceRowV1] = []
+
+        def add_row(
+            *,
+            stage: Literal["report", "quick", "discovery"],
+            episode_id: str | None,
+            episode_ordinal: int | None,
+            scenario_id: str | None,
+            prediction: MechanismPredictionResultV1,
+        ) -> None:
+            rows.append(
+                MechanismEvidenceRowV1(
+                    stage=stage,
+                    episode_id=episode_id,
+                    episode_ordinal=episode_ordinal,
+                    scenario_id=scenario_id,
+                    report_sha256=report_sha256,
+                    hypothesis_id=intent.hypothesis.hypothesis_id,
+                    experiment_id=candidate.experiment_id,
+                    parent_revision_sha256=parent_revision_sha256,
+                    candidate_revision_sha256=candidate_revision_sha256,
+                    parent_source_bundle_sha256=parent_source_sha256,
+                    candidate_source_bundle_sha256=candidate_source_sha256,
+                    evaluator_contract_sha256=binding.evaluator_contract_sha256,
+                    corpus_sha256=capability.corpus.sha256,
+                    prediction=prediction,
+                    evidence_ids=self._prediction_row_ids(prediction, issue_evidence=issue_evidence),
+                )
+            )
+
+        for prediction in report.predictions:
+            add_row(
+                stage="report",
+                episode_id=None,
+                episode_ordinal=None,
+                scenario_id=None,
+                prediction=prediction,
+            )
+        for group in report.consequence_contexts:
+            context = group.context
+            if (
+                context.evaluator_contract_sha256 != binding.evaluator_contract_sha256
+                or context.parent_policy_identity_sha256 != parent_revision_sha256
+                or context.candidate_policy_identity_sha256 != candidate_revision_sha256
+                or context.parent_source_bundle_sha256 != parent_source_sha256
+                or context.candidate_source_bundle_sha256 != candidate_source_sha256
+            ):
+                raise MechanismCapabilityError("current mechanism evaluator context differs")
+            stage: Literal["quick", "discovery"] = context.stage
+            for prediction in group.predictions:
+                add_row(
+                    stage=stage,
+                    episode_id=context.episode_id,
+                    episode_ordinal=context.episode_ordinal,
+                    scenario_id=context.scenario_id,
+                    prediction=prediction,
+                )
+        return MechanismRoleProjectionV1(
+            experiment_id=candidate.experiment_id,
+            hypothesis_id=intent.hypothesis.hypothesis_id,
+            hypothesis_claim=intent.hypothesis.causal_claim,
+            predicted_changes=intent.hypothesis.predicted_changes,
+            report_sha256=report_sha256,
+            parent_revision_sha256=parent_revision_sha256,
+            candidate_revision_sha256=candidate_revision_sha256,
+            parent_source_bundle_sha256=parent_source_sha256,
+            candidate_source_bundle_sha256=candidate_source_sha256,
+            evaluator_contract_sha256=binding.evaluator_contract_sha256,
+            corpus_sha256=capability.corpus.sha256,
+            execution=report.execution,
+            controls=capability.spec.controls,
+            applicability=capability.spec.applicability,
+            coverage=report.coverage,
+            rows=tuple(rows),
+            limitations=tuple(_role_safe_limitation_v1(item) for item in report.limitations),
+            memory_selection="complete",
+        )
+
+
 class LocalRoleRequestFactoryV5:
     """Build exact bounded role requests from authenticated runtime projections."""
 
-    def __init__(self, *, repository: LocalArtifactRepositoryV5, manifest: CampaignManifestV5) -> None:
+    def __init__(
+        self,
+        *,
+        repository: LocalArtifactRepositoryV5,
+        manifest: CampaignManifestV5,
+        mechanism_adapter: MechanismRoleRequestAdapterV1 | None = None,
+    ) -> None:
         if type(repository) is not LocalArtifactRepositoryV5 or type(manifest) is not CampaignManifestV5:
             raise ValueError("local role-request factory authority is invalid")
+        if mechanism_adapter is not None and type(mechanism_adapter) is not MechanismRoleRequestAdapterV1:
+            raise ValueError("local role-request mechanism adapter authority is invalid")
+        if mechanism_adapter is not None and mechanism_adapter.authenticated_manifest is None:
+            raise ValueError("local role-request mechanism adapter requires authenticated manifest authority")
         self._repository = repository
         self._manifest = manifest
+        self._mechanism_adapter = mechanism_adapter
 
     @property
     def maximum_output_tokens(self) -> int:
@@ -589,6 +1006,10 @@ class LocalRoleRequestFactoryV5:
     @property
     def manifest(self) -> CampaignManifestV5:
         return self._manifest
+
+    @property
+    def mechanism_adapter(self) -> MechanismRoleRequestAdapterV1 | None:
+        return self._mechanism_adapter
 
     def _guarded_request(
         self,
@@ -633,7 +1054,7 @@ class LocalRoleRequestFactoryV5:
         inputs: FeedbackRoundInputV5,
         projection: SearchProjectionV5,
         parent: ParentCandidateV5,
-    ) -> tuple[InvestigatorRoleInputV5, RoleEvidenceV5]:
+    ) -> tuple[InvestigatorRoleInputV5 | MechanismRoleInputV1, RoleEvidenceV5]:
         if inputs.manifest != self._manifest:
             raise ValueError("investigator request manifest differs")
         evidence = _EvidenceBuilderV5("investigator")
@@ -821,13 +1242,70 @@ class LocalRoleRequestFactoryV5:
                     record.round_index if hypothesis is not None else None,
                 )
             )
-        role_input = InvestigatorRoleInputV5(
+        base_role_input = InvestigatorRoleInputV5(
             tuple(evaluator_ids),
             tuple(families),
             tuple(directions),
             tuple(campaign_directions),
             tuple(summaries),
         )
+        role_input: InvestigatorRoleInputV5 | MechanismRoleInputV1 = base_role_input
+        mechanism_context = None if self.mechanism_adapter is None else self.mechanism_adapter.manifest_context
+        if self.mechanism_adapter is not None and mechanism_context is not None:
+            mechanism_manifest_ref, mechanism_manifest_source_identity = mechanism_context
+            if self.mechanism_adapter.authenticated_manifest.manifest != inputs.manifest:  # type: ignore[union-attr]
+                raise MechanismCapabilityError("mechanism adapter manifest differs from this role factory")
+            retained_ids = tuple(item.experiment_id for item in (*memory.complete_feedback, *memory.summaries))
+            stored_by_experiment = {item.record.experiment_id: item for item in projection.stored_records}
+            retained_records = tuple(stored_by_experiment[experiment_id] for experiment_id in retained_ids)
+            projections = []
+            retained_id_set = set(retained_ids)
+            omitted = [
+                MechanismMemoryDispositionV1(
+                    experiment_id=stored.record.experiment_id,
+                    disposition="omitted",
+                    reason="not_retained_by_memory_budget",
+                )
+                for stored in projection.stored_records
+                if stored.record.experiment_id not in retained_id_set
+            ]
+            complete_ids = {item.experiment_id for item in memory.complete_feedback}
+            for stored in retained_records:
+                if stored.record.status not in {"evaluated", "zero_trade"}:
+                    omitted.append(
+                        MechanismMemoryDispositionV1(
+                            experiment_id=stored.record.experiment_id,
+                            disposition="omitted",
+                            reason="not_authenticated",
+                        )
+                    )
+                    continue
+                mechanism_projection = self.mechanism_adapter.project_persisted_record(
+                    campaign_id=inputs.campaign_id,
+                    round_index=stored.record.round_index,
+                    manifest_ref=mechanism_manifest_ref,
+                    manifest_source_identity_sha256=mechanism_manifest_source_identity,
+                    stored_record=stored,
+                    issue_evidence=evidence.add,
+                    memory_selection=("complete" if stored.record.experiment_id in complete_ids else "summary"),
+                )
+                if mechanism_projection is not None:
+                    projections.append(mechanism_projection)
+                else:
+                    omitted.append(
+                        MechanismMemoryDispositionV1(
+                            experiment_id=stored.record.experiment_id,
+                            disposition="omitted",
+                            reason="not_authenticated",
+                        )
+                    )
+            if projections or omitted:
+                role_input = MechanismRoleInputV1(
+                    role="investigator",
+                    base_input=base_role_input,
+                    projection=tuple(projections),
+                    omitted=tuple(omitted),
+                )
         return role_input, evidence.build()
 
     def investigator_request(
@@ -1041,7 +1519,7 @@ class LocalRoleRequestFactoryV5:
         except KeyError:
             raise ValueError("critic panel lacks the canonical scenario grid") from None
 
-    def critic_request(
+    def _critic_request_unchecked(
         self,
         inputs: FeedbackRoundInputV5,
         projection: SearchProjectionV5,
@@ -1159,24 +1637,108 @@ class LocalRoleRequestFactoryV5:
             )
             for candidate in candidates
         )
+        return build_role_request_v5(
+            role="critic",
+            role_input=CriticRoleInputV5(
+                tuple(evaluations),
+                predictions,
+                tuple(semantic_rows),
+                tuple(failures),
+                semantic_evidence_unavailable=inputs.manifest.semantic_mode == "disabled_development",
+            ),
+            issued_evidence=evidence.build(),
+            expected_binding=RoleBindingV5(
+                decision.parent.policy_identity_sha256,
+                decision.hypothesis.hypothesis_id,
+                experiment_ids,
+                inputs.panel_plan.discovery_plan_sha256,
+            ),
+            schema_authority=role_schema_authority_from_manifest_v5(
+                role="critic",
+                manifest=inputs.manifest,
+            ),
+            max_output_tokens=self.maximum_output_tokens,
+        )
+
+    def critic_request(
+        self,
+        inputs: FeedbackRoundInputV5,
+        projection: SearchProjectionV5,
+        decision: ScheduledHypothesisV5,
+        candidates: tuple[CandidateEvidenceV5, ...],
+    ) -> RoleRequestV5:
+        return self._guarded_request(
+            inputs,
+            self._critic_request_unchecked(inputs, projection, decision, candidates),
+        )
+
+    def critic_request_with_mechanism(
+        self,
+        inputs: FeedbackRoundInputV5,
+        projection: SearchProjectionV5,
+        decision: ScheduledHypothesisV5,
+        candidates: tuple[CandidateEvidenceV5, ...],
+        *,
+        mechanism_evidence: tuple[object, ...],
+    ) -> RoleRequestV5:
+        """Add current finalized mechanism reports to the critic request.
+
+        The ordinary critic components are built without admission, its
+        evidence IDs are replayed in the same order, and only the final
+        augmented request is admitted.  Only the explicitly supplied current
+        extension bundles append fresh IDs and a versioned wrapper; no
+        checkpoint lookup is used for candidates that are still unpublished.
+        """
+
+        base = self._critic_request_unchecked(inputs, projection, decision, candidates)
+        if self._mechanism_adapter is None:
+            raise MechanismCapabilityError("current mechanism critic projection requires an adapter")
+        if type(mechanism_evidence) is not tuple or len(mechanism_evidence) != len(candidates):
+            raise MechanismCapabilityError("current mechanism critic evidence count differs")
+        context = self._mechanism_adapter.manifest_context
+        if context is None:
+            raise MechanismCapabilityError("current mechanism critic projection lacks manifest authority")
+        manifest_ref, manifest_source_identity = context
+        evidence = _EvidenceBuilderV5("critic")
+        for item in base.role_evidence.items:
+            if evidence.add(item.metric_id, item.value) != item.evidence_id:
+                raise MechanismCapabilityError("legacy critic evidence cannot be replayed")
+        projections = []
+        for candidate, bundle in zip(candidates, mechanism_evidence, strict=True):
+            if type(bundle) is not tuple or len(bundle) != 5:
+                raise MechanismCapabilityError("current mechanism critic bundle is invalid")
+            capability, bound, run, report, intent = bundle
+            if (
+                capability.authenticated_manifest.manifest != inputs.manifest
+                or capability.authenticated_manifest.manifest_ref != manifest_ref
+                or manifest_source_identity_sha256_v1(capability.authenticated_manifest)
+                != manifest_source_identity
+                or intent.hypothesis != decision.hypothesis
+            ):
+                raise MechanismCapabilityError("current mechanism critic hypothesis differs")
+            projections.append(
+                self._mechanism_adapter.project_current_evidence(
+                    candidate=candidate,
+                    intent=intent,
+                    capability=capability,
+                    bound=bound,
+                    run=run,
+                    report=report,
+                    issue_evidence=evidence.add,
+                )
+            )
+        role_input = MechanismRoleInputV1(
+            role="critic",
+            base_input=base.role_input,
+            projection=tuple(projections),
+        )
         return self._guarded_request(
             inputs,
             build_role_request_v5(
                 role="critic",
-                role_input=CriticRoleInputV5(
-                    tuple(evaluations),
-                    predictions,
-                    tuple(semantic_rows),
-                    tuple(failures),
-                    semantic_evidence_unavailable=inputs.manifest.semantic_mode == "disabled_development",
-                ),
+                role_input=role_input,
                 issued_evidence=evidence.build(),
-                expected_binding=RoleBindingV5(
-                    decision.parent.policy_identity_sha256,
-                    decision.hypothesis.hypothesis_id,
-                    experiment_ids,
-                    inputs.panel_plan.discovery_plan_sha256,
-                ),
+                expected_binding=base.expected_binding,
                 schema_authority=role_schema_authority_from_manifest_v5(
                     role="critic",
                     manifest=inputs.manifest,

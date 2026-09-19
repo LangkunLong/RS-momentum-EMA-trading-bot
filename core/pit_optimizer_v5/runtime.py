@@ -84,6 +84,7 @@ from core.pit_optimizer_v5.provider import (
     FixtureRoleTerminalAuthorityV5,
     LedgerRoleTerminalAuthorityV5,
     LedgerBackedRoleInvokerV5,
+    MechanismRoleInputV1,
     PersistedRoleRequestV5,
     RecoverableRoleInvokerV5,
     RoleCallKeyV5,
@@ -1202,9 +1203,15 @@ class _Runtime:
     ) -> None:
         if type(request) is not RoleRequestV5 or request.role != role:
             raise _RuntimeAbort(RuntimeFailureV5(role, "invalid_dependency_result", role=role))  # type: ignore[arg-type]
+        critic_input = (
+            request.role_input.base_input
+            if type(request.role_input) is MechanismRoleInputV1
+            else request.role_input
+        )
         if role == "critic" and (
-            type(request.role_input) is not CriticRoleInputV5
-            or request.role_input.semantic_evidence_unavailable != (self.inputs.manifest.semantic_mode == "disabled_development")
+            type(critic_input) is not CriticRoleInputV5
+            or critic_input.semantic_evidence_unavailable
+            != (self.inputs.manifest.semantic_mode == "disabled_development")
         ):
             raise _RuntimeAbort(RuntimeFailureV5("critic", "invalid_dependency_result", role="critic"))
         binding = request.expected_binding
@@ -3203,12 +3210,27 @@ class _Runtime:
         critic_ref: ArtifactRefV5 | None = None
         if critic_candidates:
             experiment_ids = tuple(item.experiment_id for item in critic_candidates)
-            critic_request = self.dependencies.requests.critic_request(
-                self.inputs,
-                projection,
-                decision,
-                critic_candidates,
-            )
+            mechanism = self.dependencies.mechanism
+            mechanism_request_builder = getattr(self.dependencies.requests, "critic_request_with_mechanism", None)
+            mechanism_evidence_loader = getattr(mechanism, "role_request_evidence", None)
+            if mechanism is not None and callable(mechanism_request_builder) and callable(mechanism_evidence_loader):
+                mechanism_evidence = tuple(
+                    mechanism_evidence_loader(item.experiment_id) for item in critic_candidates
+                )
+                critic_request = mechanism_request_builder(
+                    self.inputs,
+                    projection,
+                    decision,
+                    critic_candidates,
+                    mechanism_evidence=mechanism_evidence,
+                )
+            else:
+                critic_request = self.dependencies.requests.critic_request(
+                    self.inputs,
+                    projection,
+                    decision,
+                    critic_candidates,
+                )
             critic_package = self._complete_role(
                 request=critic_request,
                 role="critic",
