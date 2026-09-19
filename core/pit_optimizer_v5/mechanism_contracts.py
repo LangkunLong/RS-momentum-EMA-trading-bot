@@ -47,7 +47,9 @@ MECHANISM_DENOMINATORS_V1 = (
     "evaluator_cases",
 )
 MECHANISM_AGGREGATIONS_V1 = ("paired_case_delta",)
+MECHANISM_CONSEQUENCE_AGGREGATIONS_V1 = ("sum_contexts_v1",)
 MECHANISM_PROVENANCES_V1 = ("synthetic_offline", "authorized_discovery")
+MECHANISM_EVALUATOR_STAGES_V1 = ("quick", "discovery")
 MECHANISM_DIAGNOSTIC_SECTIONS_V1 = ("exit_attribution",)
 MECHANISM_EXIT_REASON_IDS_V1 = (
     "ma_violation",
@@ -64,6 +66,7 @@ MECHANISM_DISCONFIRMING_IDS_V1 = (
 MECHANISM_UNAVAILABLE_REASONS_V1 = (
     "evaluator_metric_missing",
     "execution_failed",
+    "mixed_context",
     "not_run",
     "unsupported_case",
 )
@@ -356,6 +359,8 @@ class MechanismMetricSpecV1(_CanonicalMechanismV1):
                 raise ValueError("non-evaluator metric cannot carry a diagnostic selector")
             if self.denominator == "evaluator_cases":
                 raise ValueError("paired metric cannot use evaluator_cases denominator")
+            if self.metric_id == "exit.decision_changed_count" and self.denominator != "relevant_cases":
+                raise ValueError("conditional decision metric requires relevant_cases denominator")
 
     @classmethod
     def from_primitive(cls, value: object) -> MechanismMetricSpecV1:
@@ -966,6 +971,7 @@ class MechanismPredictionResultV1(_CanonicalMechanismV1):
         Literal[
             "evaluator_metric_missing",
             "execution_failed",
+            "mixed_context",
             "not_run",
             "unsupported_case",
         ]
@@ -1010,6 +1016,8 @@ class MechanismPredictionResultV1(_CanonicalMechanismV1):
                 raise ValueError("unavailable prediction requires a closed reason")
             if self.unavailable_reason == "evaluator_metric_missing" and not expected_evaluator:
                 raise ValueError("evaluator metric missing reason requires an evaluator prediction")
+            if self.unavailable_reason == "mixed_context" and not expected_evaluator:
+                raise ValueError("mixed context reason requires an evaluator prediction")
             if any(
                 value is not None
                 for value in (self.parent_value, self.candidate_value, self.numerator, self.paired_delta)
@@ -1053,6 +1061,7 @@ class MechanismPredictionResultV1(_CanonicalMechanismV1):
         reason: Literal[
             "evaluator_metric_missing",
             "execution_failed",
+            "mixed_context",
             "not_run",
             "unsupported_case",
         ],
@@ -1185,6 +1194,217 @@ class MechanismPredictionResultV1(_CanonicalMechanismV1):
         )
 
 
+@dataclass(frozen=True, slots=True)
+class MechanismEvaluatorContextV1(_CanonicalMechanismV1):
+    """Identity of one matched parent/candidate evaluator consequence."""
+
+    stage: Literal["quick", "discovery"]
+    episode_id: str
+    episode_ordinal: int | None
+    scenario_id: str
+    evaluator_contract_sha256: str
+    panel_sha256: str
+    parent_policy_identity_sha256: str
+    candidate_policy_identity_sha256: str
+    parent_source_bundle_sha256: str
+    candidate_source_bundle_sha256: str
+    parent_report_sha256: str
+    candidate_report_sha256: str
+
+    def __post_init__(self) -> None:
+        if self.stage not in MECHANISM_EVALUATOR_STAGES_V1:
+            raise ValueError("evaluator context stage is unsupported")
+        _identifier(self.episode_id, "evaluator context episode ID")
+        if self.stage == "quick" and self.episode_id != "quick":
+            raise ValueError("quick evaluator contexts require the registered quick episode ID")
+        if self.episode_ordinal is None:
+            if self.stage != "quick":
+                raise ValueError("only quick evaluator contexts may be unnumbered")
+        else:
+            _count(self.episode_ordinal, "evaluator context episode ordinal", positive=True, maximum=100_000)
+            if self.stage == "quick":
+                raise ValueError("quick evaluator contexts must be unnumbered")
+        _identifier(self.scenario_id, "evaluator context scenario ID")
+        for value, label in (
+            (self.evaluator_contract_sha256, "evaluator context evaluator SHA-256"),
+            (self.panel_sha256, "evaluator context panel SHA-256"),
+            (self.parent_policy_identity_sha256, "evaluator context parent policy SHA-256"),
+            (self.candidate_policy_identity_sha256, "evaluator context candidate policy SHA-256"),
+            (self.parent_source_bundle_sha256, "evaluator context parent source bundle SHA-256"),
+            (self.candidate_source_bundle_sha256, "evaluator context candidate source bundle SHA-256"),
+            (self.parent_report_sha256, "evaluator context parent report SHA-256"),
+            (self.candidate_report_sha256, "evaluator context candidate report SHA-256"),
+        ):
+            _digest(value, label)
+        if self.parent_policy_identity_sha256 == self.candidate_policy_identity_sha256:
+            raise ValueError("evaluator context parent and candidate policies must differ")
+
+    @classmethod
+    def from_primitive(cls, value: object) -> MechanismEvaluatorContextV1:
+        raw = _require_fields(
+            value,
+            {
+                "stage",
+                "episode_id",
+                "episode_ordinal",
+                "scenario_id",
+                "evaluator_contract_sha256",
+                "panel_sha256",
+                "parent_policy_identity_sha256",
+                "candidate_policy_identity_sha256",
+                "parent_source_bundle_sha256",
+                "candidate_source_bundle_sha256",
+                "parent_report_sha256",
+                "candidate_report_sha256",
+            },
+            "evaluator context",
+        )
+        return cls(
+            stage=raw["stage"],  # type: ignore[arg-type]
+            episode_id=raw["episode_id"],  # type: ignore[arg-type]
+            episode_ordinal=raw["episode_ordinal"],  # type: ignore[arg-type]
+            scenario_id=raw["scenario_id"],  # type: ignore[arg-type]
+            evaluator_contract_sha256=raw["evaluator_contract_sha256"],  # type: ignore[arg-type]
+            panel_sha256=raw["panel_sha256"],  # type: ignore[arg-type]
+            parent_policy_identity_sha256=raw["parent_policy_identity_sha256"],  # type: ignore[arg-type]
+            candidate_policy_identity_sha256=raw["candidate_policy_identity_sha256"],  # type: ignore[arg-type]
+            parent_source_bundle_sha256=raw["parent_source_bundle_sha256"],  # type: ignore[arg-type]
+            candidate_source_bundle_sha256=raw["candidate_source_bundle_sha256"],  # type: ignore[arg-type]
+            parent_report_sha256=raw["parent_report_sha256"],  # type: ignore[arg-type]
+            candidate_report_sha256=raw["candidate_report_sha256"],  # type: ignore[arg-type]
+        )
+
+
+def mechanism_evaluator_context_key_v1(
+    context: MechanismEvaluatorContextV1,
+) -> tuple[str, str, int | None, str, str, str, str, str, str, str]:
+    """Return the semantic evaluator identity without report payload digests."""
+
+    if type(context) is not MechanismEvaluatorContextV1:
+        raise ValueError("evaluator context is invalid")
+    return (
+        context.stage,
+        context.episode_id,
+        context.episode_ordinal,
+        context.scenario_id,
+        context.evaluator_contract_sha256,
+        context.panel_sha256,
+        context.parent_policy_identity_sha256,
+        context.candidate_policy_identity_sha256,
+        context.parent_source_bundle_sha256,
+        context.candidate_source_bundle_sha256,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class MechanismEvaluatorContextGroupV1(_CanonicalMechanismV1):
+    """Per-context evaluator rows retained alongside report-level predictions."""
+
+    context: MechanismEvaluatorContextV1
+    predictions: tuple[MechanismPredictionResultV1, ...]
+    aggregate_formula: Literal["sum_contexts_v1"] = "sum_contexts_v1"
+
+    def __post_init__(self) -> None:
+        if type(self.context) is not MechanismEvaluatorContextV1:
+            raise ValueError("evaluator context group identity is invalid")
+        predictions = _tuple(self.predictions, "evaluator context predictions", maximum=16)
+        if not predictions or any(type(item) is not MechanismPredictionResultV1 for item in predictions):
+            raise ValueError("evaluator context predictions are invalid")
+        if len({item.metric_id for item in predictions}) != len(predictions):
+            raise ValueError("evaluator context predictions must be unique")
+        if any(item.metric_id != "evaluator.exit_attribution_count" for item in predictions):
+            raise ValueError("evaluator context can only carry the registered evaluator metric")
+        if self.aggregate_formula not in MECHANISM_CONSEQUENCE_AGGREGATIONS_V1:
+            raise ValueError("evaluator context aggregate formula is unsupported")
+
+    @classmethod
+    def from_primitive(cls, value: object) -> MechanismEvaluatorContextGroupV1:
+        raw = _require_fields(
+            value,
+            {"context", "predictions", "aggregate_formula"},
+            "evaluator context group",
+        )
+        predictions = raw["predictions"]
+        if type(predictions) is not list:
+            raise ValueError("evaluator context predictions are invalid")
+        return cls(
+            context=MechanismEvaluatorContextV1.from_primitive(raw["context"]),
+            predictions=tuple(MechanismPredictionResultV1.from_primitive(item) for item in predictions),
+            aggregate_formula=raw["aggregate_formula"],  # type: ignore[arg-type]
+        )
+
+
+def aggregate_mechanism_evaluator_predictions_v1(
+    metric: MechanismMetricSpecV1,
+    predictions: tuple[MechanismPredictionResultV1, ...],
+    *,
+    minimum_relevant_cases: int,
+) -> MechanismPredictionResultV1:
+    """Apply the registered evaluator aggregation to retained context rows."""
+
+    if type(metric) is not MechanismMetricSpecV1 or metric.metric_id != "evaluator.exit_attribution_count":
+        raise ValueError("evaluator aggregation requires the registered evaluator metric")
+    if type(predictions) is not tuple or any(type(item) is not MechanismPredictionResultV1 for item in predictions):
+        raise ValueError("evaluator aggregation predictions are invalid")
+    for prediction in predictions:
+        if (
+            prediction.metric_id != metric.metric_id
+            or prediction.unit != metric.unit
+            or prediction.direction != metric.direction
+            or prediction.denominator_kind != metric.denominator
+            or prediction.selector != metric.selector
+            or prediction.tolerance != metric.tolerance
+            or prediction.minimum_relevant_cases != minimum_relevant_cases
+        ):
+            raise ValueError("evaluator aggregation prediction meaning differs from the metric")
+    if not predictions:
+        return MechanismPredictionResultV1.unavailable(
+            metric,
+            minimum_relevant_cases=minimum_relevant_cases,
+            reason="evaluator_metric_missing",
+        )
+    if all(
+        item.availability == "unavailable" and item.unavailable_reason == "evaluator_metric_missing"
+        for item in predictions
+    ):
+        return MechanismPredictionResultV1.unavailable(
+            metric,
+            minimum_relevant_cases=minimum_relevant_cases,
+            reason="evaluator_metric_missing",
+        )
+    if any(item.availability != "measured" for item in predictions):
+        return MechanismPredictionResultV1.unavailable(
+            metric,
+            minimum_relevant_cases=minimum_relevant_cases,
+            reason="mixed_context",
+        )
+    tolerance = int(metric.tolerance)
+    deltas = tuple(int(item.paired_delta) for item in predictions if item.paired_delta is not None)
+    if any(delta > tolerance for delta in deltas) and any(delta < -tolerance for delta in deltas):
+        return MechanismPredictionResultV1.unavailable(
+            metric,
+            minimum_relevant_cases=minimum_relevant_cases,
+            reason="mixed_context",
+        )
+    assessments = {item.assessment for item in predictions if item.assessment != "insufficient_evidence"}
+    if len(assessments) > 1:
+        return MechanismPredictionResultV1.unavailable(
+            metric,
+            minimum_relevant_cases=minimum_relevant_cases,
+            reason="mixed_context",
+        )
+    parent_value = sum(int(item.parent_value) for item in predictions if item.parent_value is not None)
+    candidate_value = sum(int(item.candidate_value) for item in predictions if item.candidate_value is not None)
+    return MechanismPredictionResultV1.from_measurement(
+        metric,
+        parent_value=Decimal(parent_value),
+        candidate_value=Decimal(candidate_value),
+        numerator=Decimal(candidate_value),
+        denominator=len(predictions),
+        minimum_relevant_cases=minimum_relevant_cases,
+    )
+
+
 def _resource_usage_exceeds_budget(
     usage: MechanismResourceUsageV1,
     budget: MechanismResourceBudgetV1,
@@ -1215,6 +1435,7 @@ class MechanismEvidenceReportV1(_CanonicalMechanismV1):
     predictions: tuple[MechanismPredictionResultV1, ...]
     limitations: tuple[str, ...]
     consequence_report_sha256: str | None = None
+    consequence_contexts: tuple[MechanismEvaluatorContextGroupV1, ...] = ()
     schema_version: Literal[1] = MECHANISM_SCHEMA_VERSION_V1
 
     def __post_init__(self) -> None:
@@ -1250,6 +1471,12 @@ class MechanismEvidenceReportV1(_CanonicalMechanismV1):
             raise ValueError("evidence limitations are invalid")
         if self.consequence_report_sha256 is not None:
             _digest(self.consequence_report_sha256, "consequence report SHA-256")
+        consequence_contexts = _tuple(self.consequence_contexts, "consequence contexts", maximum=64)
+        if any(type(item) is not MechanismEvaluatorContextGroupV1 for item in consequence_contexts):
+            raise ValueError("consequence contexts are invalid")
+        context_keys = tuple(mechanism_evaluator_context_key_v1(item.context) for item in consequence_contexts)
+        if len(set(context_keys)) != len(context_keys):
+            raise ValueError("consequence contexts must be semantically unique")
         if type(self.schema_version) is not int or self.schema_version != MECHANISM_SCHEMA_VERSION_V1:
             raise ValueError("evidence report schema version is unsupported")
 
@@ -1264,13 +1491,15 @@ class MechanismEvidenceReportV1(_CanonicalMechanismV1):
                 "predictions",
                 "limitations",
                 "consequence_report_sha256",
+                "consequence_contexts",
                 "schema_version",
             },
             "evidence report",
         )
         predictions = raw["predictions"]
         limitations = raw["limitations"]
-        if type(predictions) is not list or type(limitations) is not list:
+        consequence_contexts = raw["consequence_contexts"]
+        if type(predictions) is not list or type(limitations) is not list or type(consequence_contexts) is not list:
             raise ValueError("evidence report collections are invalid")
         return cls(
             binding=MechanismObservationBindingV1.from_primitive(raw["binding"]),
@@ -1279,6 +1508,9 @@ class MechanismEvidenceReportV1(_CanonicalMechanismV1):
             predictions=tuple(MechanismPredictionResultV1.from_primitive(item) for item in predictions),
             limitations=tuple(limitations),
             consequence_report_sha256=raw["consequence_report_sha256"],  # type: ignore[arg-type]
+            consequence_contexts=tuple(
+                MechanismEvaluatorContextGroupV1.from_primitive(item) for item in consequence_contexts
+            ),
             schema_version=raw["schema_version"],  # type: ignore[arg-type]
         )
 
@@ -1307,6 +1539,34 @@ def validate_mechanism_report_against_spec_v1(
             or result.minimum_relevant_cases != spec.minimum_relevant_cases
         ):
             raise ValueError("report prediction meaning differs from the frozen mechanism spec")
+    evaluator_metric = declared.get("evaluator.exit_attribution_count")
+    if report.consequence_contexts and evaluator_metric is None:
+        raise ValueError("consequence contexts require the declared evaluator metric")
+    context_keys = tuple(mechanism_evaluator_context_key_v1(item.context) for item in report.consequence_contexts)
+    if len(set(context_keys)) != len(context_keys):
+        raise ValueError("consequence contexts are semantically duplicated")
+    for group in report.consequence_contexts:
+        context = group.context
+        if (
+            context.evaluator_contract_sha256 != report.binding.evaluator_contract_sha256
+            or context.parent_policy_identity_sha256 != report.binding.parent_revision_sha256
+            or context.candidate_source_bundle_sha256 != report.binding.candidate_bytes_sha256
+            or context.scenario_id != report.binding.scenario_id
+        ):
+            raise ValueError("consequence context identity differs from the observation binding")
+        for result in group.predictions:
+            if evaluator_metric is None:
+                raise ValueError("consequence context metric is not declared")
+            if (
+                result.metric_id != evaluator_metric.metric_id
+                or result.unit != evaluator_metric.unit
+                or result.direction != evaluator_metric.direction
+                or result.denominator_kind != evaluator_metric.denominator
+                or result.selector != evaluator_metric.selector
+                or result.tolerance != evaluator_metric.tolerance
+                or result.minimum_relevant_cases != spec.minimum_relevant_cases
+            ):
+                raise ValueError("consequence context prediction meaning differs from the frozen mechanism spec")
     unavailable_reason = _expected_unavailable_reason(report.execution)
     if unavailable_reason is not None:
         if any(
@@ -1319,6 +1579,16 @@ def validate_mechanism_report_against_spec_v1(
         for result in report.predictions
     ):
         raise ValueError("completed report cannot use an execution failure availability reason")
+    if report.execution.status == "completed" and evaluator_metric is not None:
+        evaluator_result = next(item for item in report.predictions if item.metric_id == evaluator_metric.metric_id)
+        retained = tuple(group.predictions[0] for group in report.consequence_contexts)
+        expected = aggregate_mechanism_evaluator_predictions_v1(
+            evaluator_metric,
+            retained,
+            minimum_relevant_cases=spec.minimum_relevant_cases,
+        )
+        if evaluator_result != expected:
+            raise ValueError("report evaluator aggregate differs from retained consequence contexts")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1338,6 +1608,7 @@ class MechanismLearningProjectionV1(_CanonicalMechanismV1):
     coverage: MechanismCoverageV1
     predictions: tuple[MechanismPredictionResultV1, ...]
     limitations: tuple[str, ...]
+    consequence_contexts: tuple[MechanismEvaluatorContextGroupV1, ...] = ()
     critic_interpretation: str | None = None
     critic_next_direction: str | None = None
     critic_interpretation_is_retrospective: bool = True
@@ -1378,6 +1649,62 @@ class MechanismLearningProjectionV1(_CanonicalMechanismV1):
             raise ValueError("projection predictions are invalid")
         if len({item.metric_id for item in predictions}) != len(predictions):
             raise ValueError("projection predictions must be unique")
+        consequence_contexts = _tuple(self.consequence_contexts, "projection consequence contexts", maximum=64)
+        if any(type(item) is not MechanismEvaluatorContextGroupV1 for item in consequence_contexts):
+            raise ValueError("projection consequence contexts are invalid")
+        context_keys = tuple(mechanism_evaluator_context_key_v1(item.context) for item in consequence_contexts)
+        if len(set(context_keys)) != len(context_keys):
+            raise ValueError("projection consequence contexts must be semantically unique")
+        evaluator_predictions = tuple(
+            item for item in predictions if item.metric_id == "evaluator.exit_attribution_count"
+        )
+        if len(evaluator_predictions) > 1:
+            raise ValueError("projection must retain at most one evaluator metric")
+        evaluator_prediction = evaluator_predictions[0] if evaluator_predictions else None
+        if consequence_contexts and evaluator_prediction is None:
+            raise ValueError("projection consequence contexts require the declared evaluator metric")
+        if evaluator_prediction is not None:
+            evaluator_metric = MechanismMetricSpecV1(
+                metric_id=evaluator_prediction.metric_id,
+                unit=evaluator_prediction.unit,
+                direction=evaluator_prediction.direction,
+                tolerance=evaluator_prediction.tolerance,
+                denominator=evaluator_prediction.denominator_kind,
+                selector=evaluator_prediction.selector,
+            )
+            for group in consequence_contexts:
+                context = group.context
+                if (
+                    context.evaluator_contract_sha256 != self.binding.evaluator_contract_sha256
+                    or context.parent_policy_identity_sha256 != self.binding.parent_revision_sha256
+                    or context.candidate_source_bundle_sha256 != self.binding.candidate_bytes_sha256
+                    or context.scenario_id != self.binding.scenario_id
+                ):
+                    raise ValueError("projection consequence context identity differs from its binding")
+                for result in group.predictions:
+                    if (
+                        result.metric_id != evaluator_prediction.metric_id
+                        or result.unit != evaluator_prediction.unit
+                        or result.direction != evaluator_prediction.direction
+                        or result.denominator_kind != evaluator_prediction.denominator_kind
+                        or result.selector != evaluator_prediction.selector
+                        or result.tolerance != evaluator_prediction.tolerance
+                        or result.minimum_relevant_cases != evaluator_prediction.minimum_relevant_cases
+                    ):
+                        raise ValueError("projection consequence context meaning differs from its evaluator metric")
+        unavailable_reason = _expected_unavailable_reason(self.execution)
+        if unavailable_reason is not None and any(
+            item.availability != "unavailable" or item.unavailable_reason != unavailable_reason for item in predictions
+        ):
+            raise ValueError("projection execution status and prediction availability differ")
+        if self.execution.status == "completed" and evaluator_prediction is not None:
+            expected = aggregate_mechanism_evaluator_predictions_v1(
+                evaluator_metric,
+                tuple(group.predictions[0] for group in consequence_contexts),
+                minimum_relevant_cases=evaluator_prediction.minimum_relevant_cases,
+            )
+            if evaluator_prediction != expected:
+                raise ValueError("projection evaluator aggregate differs from retained consequence contexts")
         limitations = _tuple(self.limitations, "projection limitations", maximum=32)
         if any(type(item) is not str or not item.strip() or len(item) > 512 for item in limitations):
             raise ValueError("projection limitations are invalid")
@@ -1418,6 +1745,7 @@ class MechanismLearningProjectionV1(_CanonicalMechanismV1):
             coverage=report.coverage,
             predictions=report.predictions,
             limitations=report.limitations,
+            consequence_contexts=report.consequence_contexts,
             critic_interpretation=critic_interpretation,
             critic_next_direction=critic_next_direction,
         )
@@ -1440,6 +1768,7 @@ class MechanismLearningProjectionV1(_CanonicalMechanismV1):
                 "coverage",
                 "predictions",
                 "limitations",
+                "consequence_contexts",
                 "critic_interpretation",
                 "critic_next_direction",
                 "critic_interpretation_is_retrospective",
@@ -1450,7 +1779,13 @@ class MechanismLearningProjectionV1(_CanonicalMechanismV1):
         predictions = raw["predictions"]
         limitations = raw["limitations"]
         controls = raw["controls"]
-        if type(predictions) is not list or type(limitations) is not list or type(controls) is not list:
+        consequence_contexts = raw["consequence_contexts"]
+        if (
+            type(predictions) is not list
+            or type(limitations) is not list
+            or type(controls) is not list
+            or type(consequence_contexts) is not list
+        ):
             raise ValueError("learning projection collections are invalid")
         return cls(
             experiment_id=raw["experiment_id"],  # type: ignore[arg-type]
@@ -1466,6 +1801,9 @@ class MechanismLearningProjectionV1(_CanonicalMechanismV1):
             coverage=MechanismCoverageV1.from_primitive(raw["coverage"]),
             predictions=tuple(MechanismPredictionResultV1.from_primitive(item) for item in predictions),
             limitations=tuple(limitations),
+            consequence_contexts=tuple(
+                MechanismEvaluatorContextGroupV1.from_primitive(item) for item in consequence_contexts
+            ),
             critic_interpretation=raw["critic_interpretation"],  # type: ignore[arg-type]
             critic_next_direction=raw["critic_next_direction"],  # type: ignore[arg-type]
             critic_interpretation_is_retrospective=raw["critic_interpretation_is_retrospective"],  # type: ignore[arg-type]
@@ -1475,12 +1813,14 @@ class MechanismLearningProjectionV1(_CanonicalMechanismV1):
 
 __all__ = [
     "MECHANISM_AGGREGATIONS_V1",
+    "MECHANISM_CONSEQUENCE_AGGREGATIONS_V1",
     "MECHANISM_ALLOWED_SYMBOLS_V1",
     "MECHANISM_CONTROL_IDS_V1",
     "MECHANISM_DENOMINATORS_V1",
     "MECHANISM_DIAGNOSTIC_SECTIONS_V1",
     "MECHANISM_DIRECTIONS_V1",
     "MECHANISM_DISCONFIRMING_IDS_V1",
+    "MECHANISM_EVALUATOR_STAGES_V1",
     "MECHANISM_EXIT_REASON_IDS_V1",
     "MECHANISM_INPUT_UNITS_V1",
     "MECHANISM_MAX_CANONICAL_JSON_BYTES_V1",
@@ -1500,6 +1840,8 @@ __all__ = [
     "MechanismDiagnosticSelectorV1",
     "MechanismDisconfirmingObservationV1",
     "MechanismEvidenceReportV1",
+    "MechanismEvaluatorContextGroupV1",
+    "MechanismEvaluatorContextV1",
     "MechanismExecutionV1",
     "MechanismExperimentSpecV1",
     "MechanismLearningProjectionV1",
@@ -1510,7 +1852,9 @@ __all__ = [
     "MechanismRecipeV1",
     "MechanismResourceBudgetV1",
     "MechanismResourceUsageV1",
+    "aggregate_mechanism_evaluator_predictions_v1",
     "bind_mechanism_observation_v1",
+    "mechanism_evaluator_context_key_v1",
     "validate_mechanism_observation_binding_v1",
     "validate_mechanism_report_against_spec_v1",
     "validate_mechanism_spec_hypothesis_v1",
