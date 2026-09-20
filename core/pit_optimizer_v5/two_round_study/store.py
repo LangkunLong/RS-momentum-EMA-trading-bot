@@ -144,6 +144,23 @@ class StudyStoreV1:
         except (OSError, ValueError, TypeError) as exc:
             raise _translate_storage_failure(exc, "study read failed") from exc
 
+    def list_refs(self, *, kind: str, maximum_entries: int = STUDY_MAX_BLOBS_PER_NAMESPACE_V1) -> tuple[ArtifactRefV5, ...]:
+        """Enumerate one bounded controller-owned study namespace read-only."""
+
+        namespace, _ = _namespace(kind)
+        if type(maximum_entries) is not int or maximum_entries <= 0 or maximum_entries > STUDY_MAX_BLOBS_PER_NAMESPACE_V1:
+            raise StudyAdmissionError("study namespace enumeration bound is invalid")
+        try:
+            return self.repository.list_binary_state_refs(
+                namespace=namespace,
+                maximum_entries=maximum_entries,
+                maximum_bytes=STUDY_MAX_NAMESPACE_BYTES_V1,
+            )
+        except (ArtifactDigestMismatchV5, ArtifactMissingV5, ArtifactNonCanonicalV5, ArtifactRelocatedV5, ArtifactSchemaFailureV5, ArtifactRepositoryFailureV5) as exc:
+            raise _translate_storage_failure(exc, "study namespace enumeration failed") from exc
+        except (OSError, ValueError, TypeError) as exc:
+            raise _translate_storage_failure(exc, "study namespace enumeration failed") from exc
+
     def put_contract(self, *, kind: str, key: str, value: object) -> ArtifactRefV5:
         try:
             content = study_contract_bytes_v1(value)
