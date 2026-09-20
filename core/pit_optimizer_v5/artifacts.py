@@ -2077,6 +2077,92 @@ class LocalArtifactRepositoryV5:
             return False
         return True
 
+    def list_binary_state_refs(
+        self,
+        *,
+        namespace: str,
+        maximum_entries: int,
+        maximum_bytes: int,
+    ) -> tuple[ArtifactRefV5, ...]:
+        """Enumerate one adapter blob namespace under explicit read bounds.
+
+        This method intentionally exposes references only.  It never creates a
+        missing directory and uses the repository's component-relative
+        directory/read capabilities for every entry.
+        """
+
+        safe_namespace = _safe_component(namespace, "binary state namespace")
+        if type(maximum_entries) is not int or maximum_entries <= 0:
+            raise ValueError("binary state entry bound is invalid")
+        if type(maximum_bytes) is not int or maximum_bytes <= 0:
+            raise ValueError("binary state byte bound is invalid")
+        try:
+            directory_context = self._directory(("adapter-blobs", safe_namespace), create=False)
+        except ArtifactMissingV5:
+            return ()
+        try:
+            directory = directory_context.__enter__()
+        except ArtifactMissingV5:
+            return ()
+        try:
+            try:
+                scan_path = _windows_extended_path(directory.path) if os.name == "nt" else directory.path
+                names: list[str] = []
+                with os.scandir(scan_path) as entries:
+                    for entry in entries:
+                        names.append(entry.name)
+                        if len(names) > maximum_entries:
+                            raise ArtifactSchemaFailureV5(
+                                ArtifactRefV5(f"adapter-blobs/{safe_namespace}/directory", "0" * 64)
+                            )
+                names.sort()
+            except OSError as exc:
+                raise ArtifactRelocatedV5(
+                    ArtifactRefV5(f"adapter-blobs/{safe_namespace}/directory", "0" * 64),
+                    f"adapter-blobs/{safe_namespace}",
+                ) from exc
+            references: list[ArtifactRefV5] = []
+            total_bytes = 0
+            for name in names:
+                if not name.endswith(".bin"):
+                    raise ArtifactSchemaFailureV5(
+                        ArtifactRefV5(f"adapter-blobs/{safe_namespace}/{name}", "0" * 64)
+                    )
+                key = name[:-4]
+                try:
+                    _safe_component(key, "binary state key")
+                except ValueError as exc:
+                    raise ArtifactSchemaFailureV5(
+                        ArtifactRefV5(f"adapter-blobs/{safe_namespace}/{name}", "0" * 64)
+                    ) from exc
+                try:
+                    if not directory.entry_exists(name):
+                        raise ArtifactSchemaFailureV5(
+                            ArtifactRefV5(f"adapter-blobs/{safe_namespace}/{name}", "0" * 64)
+                        )
+                except ValueError as exc:
+                    raise ArtifactRelocatedV5(
+                        ArtifactRefV5(f"adapter-blobs/{safe_namespace}/{name}", "0" * 64),
+                        f"adapter-blobs/{safe_namespace}/{name}",
+                    ) from exc
+                relative = f"adapter-blobs/{safe_namespace}/{name}"
+                try:
+                    content = self._read_relative(relative)
+                except ArtifactRepositoryFailureV5:
+                    raise
+                except (OSError, ValueError) as exc:
+                    raise ArtifactRelocatedV5(
+                        ArtifactRefV5(relative, "0" * 64),
+                        relative,
+                    ) from exc
+                total_bytes += len(content)
+                if total_bytes > maximum_bytes:
+                    raise ArtifactSchemaFailureV5(ArtifactRefV5(relative, hashlib.sha256(content).hexdigest()))
+                references.append(ArtifactRefV5(relative, hashlib.sha256(content).hexdigest()))
+            return tuple(references)
+        finally:
+            directory_context.__exit__(None, None, None)
+
     @contextmanager
     def adapter_state_transition(self, *, namespace: str, key: str) -> Iterator[None]:
         """Serialize one exact durable adapter-state transition across processes."""
