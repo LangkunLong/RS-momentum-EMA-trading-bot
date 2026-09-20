@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
+from datetime import date
 import hashlib
 from pathlib import Path
 
@@ -409,19 +410,19 @@ def _build_manifest(
     lineage = PanelSecurityLineage("study-fixture-lineage", ("SPY",), ("sp500",))
     panel_specs = {
         "quick": EvaluationPanelSpec.from_lineages(
-            purpose="quick", sessions=("2025-01-01", "2025-01-02"), lineages=(lineage,)
+            purpose="quick", sessions=("2025-01-01", "2026-01-01"), lineages=(lineage,)
         ),
         "discovery-1": EvaluationPanelSpec.from_lineages(
-            purpose="discovery", sessions=("2025-02-01", "2025-02-02"), lineages=(lineage,)
+            purpose="discovery", sessions=("2026-02-01", "2027-02-01"), lineages=(lineage,)
         ),
         "discovery-2": EvaluationPanelSpec.from_lineages(
-            purpose="discovery", sessions=("2025-03-01", "2025-03-02"), lineages=(lineage,)
+            purpose="discovery", sessions=("2027-03-01", "2028-02-29"), lineages=(lineage,)
         ),
         "discovery-3": EvaluationPanelSpec.from_lineages(
-            purpose="discovery", sessions=("2025-04-01", "2025-04-02"), lineages=(lineage,)
+            purpose="discovery", sessions=("2029-04-01", "2030-04-01"), lineages=(lineage,)
         ),
         "discovery-4": EvaluationPanelSpec.from_lineages(
-            purpose="discovery", sessions=("2025-05-01", "2025-05-02"), lineages=(lineage,)
+            purpose="discovery", sessions=("2030-05-01", "2031-05-01"), lineages=(lineage,)
         ),
     }
     panel_refs = {
@@ -502,12 +503,32 @@ def _build_manifest(
     )
     evaluator_ref = repository.create_typed_artifact("evaluator/study-evaluator.json", evaluator)
 
+    portfolio_input = baseline_configuration.portfolio_evaluator_inputs[0]
     report = _zero_report()
+    scenario_endpoints = {
+        "base": (portfolio_input.ending_equity, portfolio_input.base_annualized_return_pct),
+        "gross": (portfolio_input.gross_ending_equity, portfolio_input.gross_annualized_return_pct),
+        "stress": (portfolio_input.stress_ending_equity, portfolio_input.stress_annualized_return_pct),
+    }
     episodes: list[EpisodeEvaluationV5] = []
     for index in range(1, 5):
         panel = panel_specs[f"discovery-{index}"]
         scenarios = tuple(
-            ScenarioPanelEvaluationV5(scenario.scenario_id, Decimal("100"), Decimal("100"), report)
+            ScenarioPanelEvaluationV5(
+                scenario.scenario_id,
+                portfolio_input.starting_equity,
+                scenario_endpoints[scenario.scenario_id][0],
+                replace(
+                    report,
+                    portfolio_total_return_pct=(
+                        (scenario_endpoints[scenario.scenario_id][0] / portfolio_input.starting_equity)
+                        - Decimal("1")
+                    )
+                    * Decimal("100"),
+                    portfolio_annualized_return_pct=scenario_endpoints[scenario.scenario_id][1],
+                    gross_annualized_return_pct=portfolio_input.gross_annualized_return_pct,
+                ),
+            )
             for scenario in initial_friction_grid_v5()
         )
         evaluation = PanelEvaluationV5(
@@ -517,7 +538,7 @@ def _build_manifest(
             policy_identity_sha256=baseline_configuration.policy_revision.sha256,
             start_date=panel.start_date,
             end_date=panel.end_date,
-            elapsed_calendar_days=(panel.end_date and 1),
+            elapsed_calendar_days=(date.fromisoformat(panel.end_date) - date.fromisoformat(panel.start_date)).days,
             selection_scenario_id="base",
             scenarios=scenarios,
         )

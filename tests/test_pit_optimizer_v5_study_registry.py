@@ -5,9 +5,11 @@ from __future__ import annotations
 from dataclasses import replace
 from decimal import Decimal
 import builtins
+from datetime import date
 import hashlib
 import importlib
 import json
+from itertools import pairwise
 from pathlib import Path
 
 import pytest
@@ -525,3 +527,24 @@ def test_fixture_rejects_nonempty_missing_and_corrupt_roots_without_repair(tmp_p
         )
     assert manifest_path.read_bytes() == b"corrupt"
     assert original != b"corrupt"
+
+
+def test_fixture_calendar_and_portfolio_inputs_match_the_frozen_runtime(tmp_path: Path) -> None:
+    fixture = create_study_fixture_v1(root=tmp_path / "calendar-fixture")
+    plan = fixture.manifest.panel_plan
+    episodes = (plan.mechanics, plan.quick, *plan.discovery)
+    for episode in episodes:
+        assert (date.fromisoformat(episode.end_date) - date.fromisoformat(episode.start_date)).days == 365
+    discovery_intervals = tuple(
+        (date.fromisoformat(episode.start_date), date.fromisoformat(episode.end_date))
+        for episode in plan.discovery
+    )
+    assert all(left[1] <= right[0] for left, right in pairwise(discovery_intervals))
+
+    registry = build_study_registry_v1()
+    for p0 in registry.configuration("P0").portfolio_evaluator_inputs:
+        a = next(item for item in registry.configuration("A").portfolio_evaluator_inputs if item.round_index == p0.round_index)
+        s = next(item for item in registry.configuration("S").portfolio_evaluator_inputs if item.round_index == p0.round_index)
+        assert p0.days == a.days == s.days == 365
+        assert p0.ending_equity < a.ending_equity < s.ending_equity
+        assert p0.base_annualized_return_pct < a.base_annualized_return_pct < s.base_annualized_return_pct
