@@ -162,6 +162,13 @@ class StudyStoreV1:
             raise _translate_storage_failure(exc, "study namespace enumeration failed") from exc
 
     def put_contract(self, *, kind: str, key: str, value: object) -> ArtifactRefV5:
+        # StudyImportV1 is defined in the adapter layer rather than the closed
+        # response-contract registry.  Keep its registration narrow and lazy
+        # so importing the store does not create a module cycle.
+        from .imports import StudyImportV1
+
+        if type(value) is StudyImportV1:
+            return self.put(kind=kind, key=key, content=value.canonical_bytes())
         try:
             content = study_contract_bytes_v1(value)
         except StudyContractError:

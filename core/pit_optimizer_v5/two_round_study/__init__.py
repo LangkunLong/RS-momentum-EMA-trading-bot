@@ -49,6 +49,15 @@ from .live_calls import (
     study_transport_settings_sha256_v1,
 )
 from .transport import StudyOpenRouterGatewayV1
+from .imports import (
+    IMPORT_SCHEMA_VERSION_V1,
+    IMPORT_TRANSLATOR_VERSION_V1,
+    StudyImportInvokerV1,
+    StudyImportV1,
+    authenticate_study_import_v1,
+    create_study_import_v1,
+    verify_imported_package_v1,
+)
 
 __all__ = [
     "ArtifactBackedReasonV1",
@@ -94,4 +103,11 @@ __all__ = [
     "study_transport_settings_sha256_v1",
     "recover_study_call_v1",
     "run_study_call_v1",
+    "IMPORT_SCHEMA_VERSION_V1",
+    "IMPORT_TRANSLATOR_VERSION_V1",
+    "StudyImportInvokerV1",
+    "StudyImportV1",
+    "authenticate_study_import_v1",
+    "create_study_import_v1",
+    "verify_imported_package_v1",
 ]
