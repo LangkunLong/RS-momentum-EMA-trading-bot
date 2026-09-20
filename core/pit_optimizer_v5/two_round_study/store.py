@@ -166,8 +166,17 @@ class StudyStoreV1:
         # response-contract registry.  Keep its registration narrow and lazy
         # so importing the store does not create a module cycle.
         from .imports import StudyImportV1
+        from .compiler import CompiledStudyExperimentV1, StudyCommitmentIndexV1, StudyDraftBindingV1
+        from .contrast import CaseContrastResultV1, StudyContrastV1
 
-        if type(value) is StudyImportV1:
+        if type(value) in {
+            StudyImportV1,
+            StudyCommitmentIndexV1,
+            StudyDraftBindingV1,
+            StudyContrastV1,
+            CaseContrastResultV1,
+            CompiledStudyExperimentV1,
+        }:
             return self.put(kind=kind, key=key, content=value.canonical_bytes())
         try:
             content = study_contract_bytes_v1(value)

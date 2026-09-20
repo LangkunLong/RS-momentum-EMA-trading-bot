@@ -58,6 +58,18 @@ from .imports import (
     create_study_import_v1,
     verify_imported_package_v1,
 )
+from .compiler import (
+    CompiledStudyExperimentV1,
+    StudyCommitmentIndexV1,
+    StudyDraftBindingV1,
+    compile_study_experiment_v1,
+)
+from .contrast import (
+    CaseContrastResultV1,
+    StudyContrastV1,
+    compare_case_patterns_v1,
+    evaluate_case_contrast_v1,
+)
 
 __all__ = [
     "ArtifactBackedReasonV1",
@@ -110,4 +122,12 @@ __all__ = [
     "authenticate_study_import_v1",
     "create_study_import_v1",
     "verify_imported_package_v1",
+    "CompiledStudyExperimentV1",
+    "StudyCommitmentIndexV1",
+    "StudyDraftBindingV1",
+    "compile_study_experiment_v1",
+    "CaseContrastResultV1",
+    "StudyContrastV1",
+    "compare_case_patterns_v1",
+    "evaluate_case_contrast_v1",
 ]
