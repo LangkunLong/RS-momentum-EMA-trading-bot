@@ -1129,6 +1129,8 @@ def _load_committed_graph(
         or binding.import_ref != index.import_ref
         or binding.draft_ref != index.draft_ref
         or binding.round_intent_ref != index.round_intent_ref
+        or binding.journal_campaign_id != index.campaign_id
+        or binding.journal_round_index != index.round_index
         or binding.parent_revision_sha256 != index.parent_revision_sha256
         or binding.parent_source_bundle_ref != index.parent_source_bundle_ref
         or spec.sha256 != index.spec_ref.sha256
@@ -1198,12 +1200,62 @@ def _reject_orphaned_graph(
     preflight: FixturePreflightV1,
     graph_refs: tuple[ArtifactRefV5, ArtifactRefV5, ArtifactRefV5, ArtifactRefV5],
 ) -> None:
+    # Graph leaves are content addressed and can be shared by two immutable
+    # arm slots (the frozen observation corpus is the normal example).  A
+    # namespace-wide path match is therefore not enough to call a candidate
+    # orphan: first authenticate every existing stable commitment index and
+    # retain only graph references that an index actually owns.  Unindexed
+    # bytes remain a hard failure, including a same-hash corpus left by an
+    # interrupted compile.
+    owned_graph_refs: set[ArtifactRefV5] = set()
+    for commitment_ref in store.list_refs(kind="commitments"):
+        raw = _read_study_bytes(store, commitment_ref, "existing study commitment index")
+        try:
+            index = StudyCommitmentIndexV1.from_canonical_json(raw)
+        except (StudyContractError, TypeError, ValueError, ArithmeticError) as exc:
+            raise StudyAuthorityError("existing study commitment index is not authenticated") from exc
+        if index.storage_ref != commitment_ref:
+            raise StudyAuthorityError("existing study commitment index reference differs from its bytes")
+        try:
+            imported_raw = _read_study_bytes(store, index.import_ref, "existing study commitment import")
+            existing_import = StudyImportV1.from_canonical_json(imported_raw)
+            expected_slot_path = (
+                f"adapter-blobs/study-v1-commitments/"
+                f"{_commitment_slot_key(arm=index.arm, campaign_id=index.campaign_id, round_index=index.round_index)}.bin"
+            )
+            if (
+                commitment_ref.relative_path != expected_slot_path
+                or existing_import.storage_ref != index.import_ref
+                or existing_import.arm != index.arm
+                or existing_import.fixture_call.campaign_id != index.campaign_id
+                or existing_import.fixture_call.round_index != index.round_index
+            ):
+                raise StudyAuthorityError("existing study commitment index ownership is invalid")
+            _load_committed_graph(store=store, imported=existing_import, index=index)
+        except (UnicodeDecodeError, StudyContractError, TypeError, ValueError, ArithmeticError) as exc:
+            raise StudyAuthorityError("existing study commitment graph is not authenticated") from exc
+        graph_pairs = (
+            ("draft-bindings", index.binding_ref),
+            ("mechanism-specs", index.spec_ref),
+            ("mechanism-corpora", index.corpus_ref),
+            ("contrasts", index.contrast_ref),
+        )
+        for kind, graph_ref in graph_pairs:
+            matching = tuple(item for item in store.list_refs(kind=kind) if item == graph_ref)
+            if len(matching) != 1:
+                raise StudyAuthorityError("existing study commitment graph is incomplete")
+            _read_study_bytes(store, graph_ref, f"existing {kind} graph")
+            owned_graph_refs.add(graph_ref)
+
     for kind, reference in zip(
         ("draft-bindings", "mechanism-specs", "mechanism-corpora", "contrasts"),
         graph_refs,
         strict=True,
     ):
-        if any(item.relative_path == reference.relative_path for item in store.list_refs(kind=kind)):
+        if (
+            any(item.relative_path == reference.relative_path for item in store.list_refs(kind=kind))
+            and reference not in owned_graph_refs
+        ):
             raise StudyPrecommitmentError("study commitment has orphaned graph bytes without its stable index")
     # A prior process may have persisted a different binding before it was
     # interrupted, so checking only the current candidate hashes would allow a

@@ -39,6 +39,7 @@ from core.pit_optimizer_v5.two_round_study.compiler import (
     CompiledStudyExperimentV1,
     StudyCommitmentIndexV1,
     StudyDraftBindingV1,
+    _reject_orphaned_graph,
     _validate_parent_authority,
     compile_study_experiment_v1,
 )
@@ -784,6 +785,84 @@ def test_orphaned_graph_cannot_acquire_a_new_stable_slot(tmp_path: Path, monkeyp
             parent=context.parent,
             seed_snapshot=changed_seed,
             registry=context.registry,
+        )
+
+
+def test_authenticated_shared_corpus_can_be_reused_by_another_arm_slot(tmp_path: Path) -> None:
+    context = _compile_context(tmp_path)
+    _compile_before_authoring(context)
+    commitment_ref = context.store.list_refs(kind="commitments")[0]
+    index = StudyCommitmentIndexV1.from_canonical_json(context.store.read(commitment_ref))
+    other_import = SimpleNamespace(
+        storage_ref=ArtifactRefV5(
+            "adapter-blobs/study-v1-imports/other.bin",
+            "0" * 64,
+        )
+    )
+    candidate_refs = (
+        ArtifactRefV5("adapter-blobs/study-v1-draft-bindings/other.bin", "1" * 64),
+        index.spec_ref,
+        index.corpus_ref,
+        ArtifactRefV5("adapter-blobs/study-v1-contrasts/other.bin", "2" * 64),
+    )
+    _reject_orphaned_graph(
+        store=context.store,
+        imported=other_import,  # type: ignore[arg-type]
+        preflight=context.preflight,
+        graph_refs=candidate_refs,
+    )
+
+
+def test_corrupt_existing_commitment_owner_fails_before_shared_leaf_reuse(tmp_path: Path, monkeypatch) -> None:
+    context = _compile_context(tmp_path)
+    _compile_before_authoring(context)
+    commitment_ref = context.store.list_refs(kind="commitments")[0]
+    original_read = context.store.read
+
+    def read(reference):
+        if reference == commitment_ref:
+            return b"{}"
+        return original_read(reference)
+
+    monkeypatch.setattr(context.store, "read", read)
+    with pytest.raises(StudyAuthorityError, match="commitment index"):
+        _reject_orphaned_graph(
+            store=context.store,
+            imported=SimpleNamespace(storage_ref=ArtifactRefV5("other.bin", "0" * 64)),  # type: ignore[arg-type]
+            preflight=context.preflight,
+            graph_refs=(
+                ArtifactRefV5("adapter-blobs/study-v1-draft-bindings/other.bin", "1" * 64),
+                ArtifactRefV5("adapter-blobs/study-v1-mechanism-specs/other.bin", "2" * 64),
+                ArtifactRefV5("adapter-blobs/study-v1-mechanism-corpora/other.bin", "3" * 64),
+                ArtifactRefV5("adapter-blobs/study-v1-contrasts/other.bin", "4" * 64),
+            ),
+        )
+
+
+def test_own_slot_orphan_stays_rejected_when_other_graph_is_hidden(tmp_path: Path, monkeypatch) -> None:
+    context = _compile_context(tmp_path)
+    _compile_before_authoring(context)
+    commitment_ref = context.store.list_refs(kind="commitments")[0]
+    index = StudyCommitmentIndexV1.from_canonical_json(context.store.read(commitment_ref))
+    original_list_refs = context.store.list_refs
+
+    def list_refs(*, kind: str, maximum_entries: int = 4096):
+        if kind == "commitments":
+            return ()
+        return original_list_refs(kind=kind, maximum_entries=maximum_entries)
+
+    monkeypatch.setattr(context.store, "list_refs", list_refs)
+    with pytest.raises(StudyPrecommitmentError, match="orphaned graph bytes"):
+        _reject_orphaned_graph(
+            store=context.store,
+            imported=SimpleNamespace(storage_ref=ArtifactRefV5("other.bin", "0" * 64)),  # type: ignore[arg-type]
+            preflight=context.preflight,
+            graph_refs=(
+                ArtifactRefV5("adapter-blobs/study-v1-draft-bindings/other.bin", "1" * 64),
+                ArtifactRefV5("adapter-blobs/study-v1-mechanism-specs/other.bin", "2" * 64),
+                index.corpus_ref,
+                ArtifactRefV5("adapter-blobs/study-v1-contrasts/other.bin", "3" * 64),
+            ),
         )
 
 

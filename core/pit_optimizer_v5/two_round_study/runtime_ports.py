@@ -530,24 +530,27 @@ def _investigator_artifact(request: RoleRequestV5) -> InvestigatorArtifactV5:
     if not evidence_ids:
         raise ValueError("study investigator request has no issued evidence")
     hypothesis = HypothesisV5(
-        hypothesis_id="study-exit-mechanism-v1",
+        hypothesis_id="study-exit-v1",
         rank=1,
         primary_mechanism="exit",
-        causal_claim="The exit threshold changes decisions while preserving the protected control.",
+        # Keep the frozen fixture claim explicit but compact: round-one
+        # memory must retain S's full feedback and A's summary under the
+        # production 3072-byte cap while A's full feedback still compacts.
+        causal_claim="Exit threshold changes decisions; protected control holds.",
         predicted_changes=(
             MetricPredictionV5(
                 "exit.decision_changed_count",
                 "increase",
-                "Applicable cases change.",
+                "Change.",
             ),
             MetricPredictionV5(
                 "exit.protected_control_unchanged_count",
                 "unchanged",
-                "The protected control remains unchanged.",
+                "Control holds.",
             ),
         ),
         evidence_ids=evidence_ids[:1],
-        author_instructions="Use one bounded exit replacement.",
+        author_instructions="Bounded exit edit",
         authoring_mode="symbol_edits",
     )
     return InvestigatorArtifactV5((hypothesis,))
@@ -565,7 +568,11 @@ def _critic_artifact(request: RoleRequestV5, *, round_index: int) -> CriticArtif
         # mechanism bundle after the fresh arm-specific precommitment.
         projection_by_experiment = {item.experiment_id: item for item in request.role_input.projections}
         evidence_ids = base_ids if round_index == 1 else citations
-        explanation = "Synthetic panels support the comparative result."
+        explanation = (
+            "Synthetic comparison."
+            if round_index == 1
+            else "Synthetic panels support the comparative result."
+        )
     else:
         base_ids = _base_citations(request)
         evidence_ids = base_ids
@@ -578,7 +585,11 @@ def _critic_artifact(request: RoleRequestV5, *, round_index: int) -> CriticArtif
         review_evidence = tuple(base_ids[:1])
         review_explanation = explanation
         disposition = "promote"
-        next_direction = "Repeat the paired local check on the next bounded campaign."
+        next_direction = (
+            "Repeat."
+            if round_index == 1
+            else "Repeat the paired local check on the next bounded campaign."
+        )
         if round_index == 2 and experiment_id in projection_by_experiment:
             projection = projection_by_experiment[experiment_id]
             mechanism_ids = tuple(projection.evidence_ids)
@@ -607,7 +618,7 @@ def _critic_artifact(request: RoleRequestV5, *, round_index: int) -> CriticArtif
         reviews.append(
             CriticReviewV5(
                 experiment_id,
-                "Synthetic portfolio result is as supplied.",
+                "Synthetic result." if round_index == 1 else "Synthetic portfolio result is as supplied.",
                 review_explanation,
                 review_evidence,
                 disposition,
@@ -623,8 +634,8 @@ def _critic_artifact(request: RoleRequestV5, *, round_index: int) -> CriticArtif
         ) or evidence_ids
     return CriticArtifactV5(
         tuple(reviews),
-        explanation if round_index == 2 else "Synthetic panels support the candidate comparison.",
-        "Repeat the paired local check on the next bounded campaign.",
+        explanation if round_index == 2 else "Synthetic comparison.",
+        "Repeat." if round_index == 1 else "Repeat the paired local check on the next bounded campaign.",
         tuple(evidence_ids[:1]),
     )
 
