@@ -17,7 +17,6 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
 
-from core.engine_policy import effective_engine_policy_sha256
 from core.pit_optimizer_command import (
     authenticated_python_executable,
     render_pit_optimizer_v3_command,
@@ -35,6 +34,21 @@ from core.pit_optimizer_evaluation import (
     ValidationWindowIdentity,
     discovery_score_from_folds,
 )
+
+
+def __getattr__(name: str):
+    """Lazily preserve the historical engine-policy helper re-export."""
+
+    if name != "effective_engine_policy_sha256":
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from core.engine_policy import effective_engine_policy_sha256
+
+    globals()[name] = effective_engine_policy_sha256
+    return effective_engine_policy_sha256
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | {"effective_engine_policy_sha256"})
 
 
 ENTRY_CONTRACT_PATH = "core/canslim/entry_contract.py"
@@ -1507,6 +1521,12 @@ def build_subset_manifest(
     effective_policy = legacy_readiness.get("effective_policy")
     if not isinstance(effective_policy, Mapping):
         raise ValueError("legacy readiness effective policy is absent")
+    # Keep the legacy helper off the import path for read-only/offline study
+    # commands.  The contract module historically re-exported this name, so
+    # ``__getattr__`` below preserves that identity-compatible alias without
+    # importing the settings-backed engine policy module eagerly.
+    from core.engine_policy import effective_engine_policy_sha256
+
     effective_policy_sha256 = effective_engine_policy_sha256(effective_policy)
     if identities.get("effective_policy_sha256") != effective_policy_sha256:
         raise ValueError("legacy readiness effective policy identity differs")

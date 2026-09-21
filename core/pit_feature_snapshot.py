@@ -22,16 +22,11 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from datetime import date
+from importlib import import_module
 
 import numpy as np
 import pandas as pd
 
-from core.canslim.fiscal_periods import match_fiscal_year_over_year_periods
-from core.canslim.l_leader_laggard import (
-    calculate_group_rs,
-    finite_rs_snapshot,
-)
-from core.industry_group import load_pit_industry_assignments_as_of
 from core.pit_data import PITDataBundle, PriceIdentityTransitionContract
 from core.pit_provenance import PIT_PUBLIC_DATES_ATTR
 from core.pit_universe_v3 import UNIVERSE_IDS
@@ -39,6 +34,35 @@ from core.pit_universe_v3 import UNIVERSE_IDS
 
 _REFERENCE_SYMBOLS = frozenset({"SPY", "QQQ", "IWM"})
 _EPS_LABELS = ("Diluted EPS", "Basic EPS", "Net Income")
+_DEFERRED_FEATURE_IMPORTS = {
+    "match_fiscal_year_over_year_periods": "core.canslim.fiscal_periods",
+    "calculate_group_rs": "core.canslim.l_leader_laggard",
+    "finite_rs_snapshot": "core.canslim.l_leader_laggard",
+    "load_pit_industry_assignments_as_of": "core.industry_group",
+}
+
+
+def _resolve_deferred_feature(name: str):
+    """Resolve one legacy calculation name without changing its identity."""
+
+    if name in globals():
+        return globals()[name]
+    module_name = _DEFERRED_FEATURE_IMPORTS.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(module_name), name)
+    globals()[name] = value
+    return value
+
+
+def __getattr__(name: str):
+    if name in _DEFERRED_FEATURE_IMPORTS:
+        return _resolve_deferred_feature(name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(_DEFERRED_FEATURE_IMPORTS))
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,7 +112,7 @@ def build_entry_features_v3(
         bundle, symbol, session, rs_snapshot, require_active=True,
         allow_schema_v2_development=allow_schema_v2_development,
     )
-    assignments = load_pit_industry_assignments_as_of(
+    assignments = _resolve_deferred_feature("load_pit_industry_assignments_as_of")(
         bundle,
         session=session,
         symbols=active_symbols,
@@ -97,7 +121,7 @@ def build_entry_features_v3(
     groups = {ticker: assignment.group_id for ticker, assignment in assignments.items()}
     target_group = groups.get(symbol)
     group_rs = (
-        calculate_group_rs(
+        _resolve_deferred_feature("calculate_group_rs")(
             target_group,
             active_symbols=active_symbols,
             symbol_groups=groups,
@@ -153,7 +177,7 @@ def build_holding_features_v3(
         identity_transition_contract=identity_transition_contract,
     )
     assignment_symbols = active_symbols.union((symbol,))
-    assignments = load_pit_industry_assignments_as_of(
+    assignments = _resolve_deferred_feature("load_pit_industry_assignments_as_of")(
         bundle,
         session=session,
         symbols=assignment_symbols,
@@ -162,7 +186,7 @@ def build_holding_features_v3(
     groups = {ticker: assignment.group_id for ticker, assignment in assignments.items()}
     target_group = groups.get(symbol)
     group_rs = (
-        calculate_group_rs(
+        _resolve_deferred_feature("calculate_group_rs")(
             target_group,
             active_symbols=active_symbols,
             symbol_groups=groups,
@@ -237,7 +261,7 @@ def _validated_context(
     # Legacy membership can include a ticker before its admitted price history
     # is available (for example BBWI in early 2021). Preserve the causal engine's
     # omissions; holding RS stays None and no industry mean is computed in V2.
-    validated_rs = finite_rs_snapshot(
+    validated_rs = _resolve_deferred_feature("finite_rs_snapshot")(
         rs_snapshot, required_symbols=() if schema_version == "2" else active_symbols
     )
     return symbol, active_symbols, validated_rs
@@ -406,7 +430,7 @@ def _earnings_acceleration(quarterly: pd.DataFrame) -> float | None:
         if not isinstance(series, pd.Series):
             raise ValueError("PIT quarterly earnings row is invalid")
         _validate_optional_series(series, field=label)
-        comparisons = match_fiscal_year_over_year_periods(series)
+        comparisons = _resolve_deferred_feature("match_fiscal_year_over_year_periods")(series)
         if comparisons and comparisons[0].matched:
             return _growth_acceleration(series)
     return None
@@ -428,7 +452,7 @@ def _growth_acceleration_for_label(
 
 
 def _growth_acceleration(series: pd.Series) -> float | None:
-    matches = match_fiscal_year_over_year_periods(series)
+    matches = _resolve_deferred_feature("match_fiscal_year_over_year_periods")(series)
     if len(matches) < 2 or not matches[0].matched or not matches[1].matched:
         return None
     newest = _growth(matches[0].current_value, matches[0].prior_value)

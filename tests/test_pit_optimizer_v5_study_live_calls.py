@@ -261,11 +261,103 @@ def test_build_study_call_keeps_fixture_and_live_identities_distinct(tmp_path: P
 
 
 def test_legacy_fixture_request_and_schema_goldens_remain_unchanged(tmp_path: Path) -> None:
-    _fixture, request, preflight, _manifest, _built, *_ = _study_context(tmp_path)
-    assert hashlib.sha256(preflight.request_bytes).hexdigest() == (
+    from core.pit_optimizer_evaluation import EvaluationPanelSpec, PanelSecurityLineage
+    from core.pit_optimizer_v5.artifacts import _canonical_panel_json_bytes, _panel_json_value
+    from core.pit_optimizer_v5.contracts import CampaignPanelPlanV5, EpisodePlanV5, canonical_json_bytes_v5
+    from core.pit_optimizer_v5.provider import role_request_artifact_primitive_v5
+
+    fixture, request, preflight, _manifest, _built, *_ = _study_context(tmp_path)
+    schema = request.schema_authority
+    lineage = PanelSecurityLineage("study-fixture-lineage", ("SPY",), ("sp500",))
+    old_specs = {
+        "quick": EvaluationPanelSpec.from_lineages(
+            purpose="quick",
+            sessions=("2025-01-01", "2025-01-02"),
+            lineages=(lineage,),
+        ),
+        "discovery-1": EvaluationPanelSpec.from_lineages(
+            purpose="discovery",
+            sessions=("2025-02-01", "2025-02-02"),
+            lineages=(lineage,),
+        ),
+        "discovery-2": EvaluationPanelSpec.from_lineages(
+            purpose="discovery",
+            sessions=("2025-03-01", "2025-03-02"),
+            lineages=(lineage,),
+        ),
+        "discovery-3": EvaluationPanelSpec.from_lineages(
+            purpose="discovery",
+            sessions=("2025-04-01", "2025-04-02"),
+            lineages=(lineage,),
+        ),
+        "discovery-4": EvaluationPanelSpec.from_lineages(
+            purpose="discovery",
+            sessions=("2025-05-01", "2025-05-02"),
+            lineages=(lineage,),
+        ),
+    }
+
+    def old_ref(name: str) -> ArtifactRefV5:
+        raw = _canonical_panel_json_bytes(_panel_json_value(old_specs[name]))
+        return ArtifactRefV5(f"panels/study-{name}.json", hashlib.sha256(raw).hexdigest())
+
+    def old_episode(name: str, panel_name: str, ordinal: int | None = None) -> EpisodePlanV5:
+        panel = old_specs[panel_name]
+        return EpisodePlanV5(
+            episode_id=f"study-{name}",
+            episode_ordinal=ordinal,
+            purpose=panel.purpose,
+            start_date=panel.start_date,
+            end_date=panel.end_date,
+            lineage_ids=tuple(item.security_lineage_id for item in panel.lineages),
+            panel_ref=old_ref(panel_name),
+        )
+
+    old_plan = CampaignPanelPlanV5(
+        schema_version=5,
+        pit_bundle_ref=fixture.manifest.panel_plan.pit_bundle_ref,
+        prices_provenance_ref=fixture.manifest.panel_plan.prices_provenance_ref,
+        partition_seed_sha256=fixture.manifest.panel_plan.partition_seed_sha256,
+        target_sha256=fixture.manifest.panel_plan.target_sha256,
+        mechanics=old_episode("mechanics", "quick"),
+        quick=old_episode("quick", "quick"),
+        discovery=tuple(old_episode(f"discovery-{i}", f"discovery-{i}", i) for i in range(1, 5)),
+        confirmation_plan_sha256=fixture.manifest.panel_plan.confirmation_plan_sha256,
+        qualification_plan_sha256=fixture.manifest.panel_plan.qualification_plan_sha256,
+    )
+    legacy_request = build_role_request_v5(
+        role="investigator",
+        role_input=request.role_input,
+        issued_evidence=request.role_evidence,
+        expected_binding=RoleBindingV5(
+            fixture.manifest.baseline_policy_revision.sha256,
+            None,
+            (),
+            old_plan.discovery_plan_sha256,
+        ),
+        schema_authority=schema,
+        max_output_tokens=request.max_output_tokens,
+    )
+    legacy_call = RoleCallKeyV5(
+        campaign_id=preflight.call.campaign_id,
+        round_index=2,
+        role="investigator",
+        role_position=1,
+        attempt_kind="primary",
+        attempt_index=1,
+        request_sha256=legacy_request.sha256,
+    )
+    legacy_request_bytes = canonical_json_bytes_v5(
+        role_request_artifact_primitive_v5(call=legacy_call, request=legacy_request)
+    )
+    assert hashlib.sha256(legacy_request_bytes).hexdigest() == (
         "5b0aa19f15244e70dad0d2dc4307161f1cef2168d7b34633e4546d650474addc"
     )
-    assert hashlib.sha256(request.schema_authority.canonical_schema_json).hexdigest() == (
+    assert hashlib.sha256(preflight.request_bytes).hexdigest() == (
+        "fe5aa25cce1ad99c2d515ffc46ee79fa512459ce1fb5d5a07798e812ad64af44"
+    )
+    assert legacy_request_bytes != preflight.request_bytes
+    assert hashlib.sha256(schema.canonical_schema_json).hexdigest() == (
         "91be86e4ebdc8874e26a9f1f2f91485cab15ad9a13fe407c9ec4e74576a496a0"
     )
 

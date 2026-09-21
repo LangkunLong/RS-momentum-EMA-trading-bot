@@ -58,17 +58,35 @@ from .contracts import (
     validate_episode_plan_panel_v5,
     validate_sandbox_profile_resources_v5,
 )
-from .evaluator import (
-    AuthenticatedPitBundleV5,
-    BaselineWorkerBindingV5,
-    BaselineWorkerFactoryV5,
-    CandidateWorkerBindingV5,
-    CandidateWorkerFactoryV5,
-    EvaluationReportBuilderV5,
-    PitPanelEvaluatorV5,
-    SimulationRunnerV5,
-    SimulatorFactoryV5,
+_LAZY_EVALUATOR_EXPORTS = frozenset(
+    {
+        "AuthenticatedPitBundleV5",
+        "BaselineWorkerBindingV5",
+        "BaselineWorkerFactoryV5",
+        "CandidateWorkerBindingV5",
+        "CandidateWorkerFactoryV5",
+        "EvaluationReportBuilderV5",
+        "PitPanelEvaluatorV5",
+        "SimulationRunnerV5",
+        "SimulatorFactoryV5",
+    }
 )
+
+
+def __getattr__(name: str):
+    if name not in _LAZY_EVALUATOR_EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from importlib import import_module
+
+    value = getattr(import_module(".evaluator", __name__), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | _LAZY_EVALUATOR_EXPORTS)
+
+
 from .controller_roles import FileBackedControllerRoleInvokerV5
 from .runtime import (
     CandidateExecutionAuthorityV5,

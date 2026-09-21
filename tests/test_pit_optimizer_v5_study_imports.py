@@ -7,6 +7,7 @@ from pathlib import Path
 import time
 import hashlib
 import json
+import stat
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -75,6 +76,7 @@ from core.pit_optimizer_v5.two_round_study.registry import build_study_registry_
 from core.pit_optimizer_v5.two_round_study.schema import study_response_schema_v1
 from core.pit_optimizer_v5.two_round_study.schema import parse_study_response_v1
 from core.pit_optimizer_v5.two_round_study.store import StudyStoreV1
+from core.pit_optimizer_v5.two_round_study.driver import _long_path
 
 from tests.test_pit_optimizer_v5_study_ledger import _CountingFake, _completion, _response_for
 from tests.test_pit_optimizer_v5_study_live_calls import _study_context
@@ -1924,3 +1926,59 @@ def test_stock_fixture_verifier_rejects_imported_t_as_non_canned(tmp_path: Path)
     fixture.repository.append_round_event(event)
     with pytest.raises(ValueError, match="deterministic responses"):
         verify_fixture_run_v5(repository=fixture.repository, manifest=fixture.manifest.manifest)
+
+
+def test_fixture_manifest_discovery_is_long_path_safe(tmp_path: Path) -> None:
+    """The fixed evaluator manifest remains discoverable beyond MAX_PATH."""
+
+    fixture_root = tmp_path / ("task8-import-long-root-" + ("x" * 210))
+    fixture = create_study_fixture_v1(root=Path(_long_path(fixture_root)))
+    manifest_path = fixture_root / "evaluator" / "study-manifest.json"
+    assert len(str(manifest_path)) > 260
+    assert study_imports._fixture_manifest_reference(fixture.repository) == fixture.manifest.manifest_ref
+
+
+@pytest.mark.parametrize("mutation", ("missing", "duplicate", "corrupt"))
+def test_fixture_manifest_discovery_rejects_missing_duplicate_or_corrupt(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    fixture = create_study_fixture_v1(root=tmp_path / f"manifest-{mutation}")
+    manifest_path = fixture.repository.root / "evaluator" / "study-manifest.json"
+    if mutation == "missing":
+        manifest_path.unlink()
+    elif mutation == "duplicate":
+        (fixture.repository.root / "evaluator" / "duplicate-manifest.json").write_bytes(
+            manifest_path.read_bytes()
+        )
+    else:
+        manifest_path.write_bytes(b"{\"schema_version\": 5,\"artifact_type\":\"campaign-manifest\"}")
+    with pytest.raises(StudyAuthorityError, match="ambiguous or unavailable|is unavailable"):
+        study_imports._fixture_manifest_reference(fixture.repository)
+
+
+def test_fixture_manifest_discovery_rejects_reparse_entry(tmp_path: Path, monkeypatch) -> None:
+    fixture = create_study_fixture_v1(root=tmp_path / "manifest-reparse")
+    evaluator = fixture.repository.root / "evaluator"
+
+    class _ReparseEntry:
+        name = "reparse-manifest.json"
+
+        def stat(self, *, follow_symlinks: bool):
+            del follow_symlinks
+            return SimpleNamespace(
+                st_mode=stat.S_IFLNK,
+                st_file_attributes=getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400),
+            )
+
+    class _Scan:
+        def __enter__(self):
+            return iter((_ReparseEntry(),))
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            del exc_type, exc_value, traceback
+            return False
+
+    monkeypatch.setattr(study_imports.os, "scandir", lambda _path: _Scan())
+    with pytest.raises(StudyAuthorityError, match="reparse point"):
+        list(study_imports._fixture_manifest_entries(evaluator.parent))

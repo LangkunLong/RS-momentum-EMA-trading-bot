@@ -12,8 +12,12 @@ from dataclasses import dataclass
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
-from typing import Literal
+import stat
+from typing import Iterator, Literal
+
+from core.pit_optimizer_artifacts import _windows_extended_path
 
 from core.pit_optimizer_v5.artifacts import (
     ArchiveSnapshotV5,
@@ -104,6 +108,57 @@ def _is_fixture_manifest_path(value: str) -> bool:
         and path.parent.as_posix() == "evaluator"
         and path.name.endswith("manifest.json")
     )
+
+
+def _long_path(path: Path) -> str:
+    return _windows_extended_path(path) if os.name == "nt" else str(path)
+
+
+def _long_directory(path: Path, label: str) -> None:
+    try:
+        metadata = os.stat(_long_path(path), follow_symlinks=False)
+    except OSError as exc:
+        raise StudyAuthorityError(f"{label} is unavailable") from exc
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or bool(getattr(metadata, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    ):
+        raise StudyAuthorityError(f"{label} is not a fixed directory")
+
+
+def _fixture_manifest_entries(root: Path) -> Iterator[str]:
+    """Enumerate only the fixed evaluator manifest directory with long I/O."""
+
+    _long_directory(root, "fixture campaign manifest root")
+    evaluator = root / "evaluator"
+    _long_directory(evaluator, "fixture campaign evaluator directory")
+    try:
+        with os.scandir(_long_path(evaluator)) as iterator:
+            entries = sorted(iterator, key=lambda item: item.name)
+    except OSError as exc:
+        raise StudyAuthorityError("fixture campaign evaluator directory is unavailable") from exc
+    for entry in entries:
+        name = entry.name
+        if not name or name in {".", ".."} or "/" in name or "\\" in name:
+            raise StudyAuthorityError("fixture campaign manifest path is invalid")
+        try:
+            metadata = entry.stat(follow_symlinks=False)
+            reparse = stat.S_ISLNK(metadata.st_mode) or bool(
+                getattr(metadata, "st_file_attributes", 0)
+                & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+            )
+            if reparse:
+                raise StudyAuthorityError("fixture campaign evaluator contains a reparse point")
+            if not stat.S_ISREG(metadata.st_mode) or not name.endswith(".json"):
+                continue
+            relative_path = f"evaluator/{name}"
+            if _is_fixture_manifest_path(relative_path):
+                yield relative_path
+        except StudyAuthorityError:
+            raise
+        except OSError as exc:
+            raise StudyAuthorityError("fixture campaign manifest entry is unavailable") from exc
 
 
 def _strict_json(raw: bytes, label: str) -> object:
@@ -581,11 +636,8 @@ def _fixture_manifest_reference(repository: LocalArtifactRepositoryV5) -> Artifa
     candidates: list[ArtifactRefV5] = []
     try:
         root = repository.root.resolve(strict=True)
-        for path in sorted(root.rglob("*.json")):
-            relative_path = path.relative_to(root).as_posix()
-            if path.is_symlink() or not path.is_file() or not _is_fixture_manifest_path(relative_path):
-                continue
-            raw = path.read_bytes()
+        for relative_path in _fixture_manifest_entries(root):
+            raw = repository._read_relative(relative_path)
             reference = ArtifactRefV5(relative_path, _sha256(raw))
             authenticated_bytes = repository.authenticate_exact(reference)
             if authenticated_bytes.content != raw:
