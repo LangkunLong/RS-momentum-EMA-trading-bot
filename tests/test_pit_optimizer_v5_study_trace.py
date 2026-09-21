@@ -133,7 +133,83 @@ def test_export_preserves_original_manifest_bytes_and_required_bundle_paths(prep
     assert manifest_entries[0]["source_relative_path"] == prepared_study.manifest_ref.relative_path
     assert manifest_entries[0]["source_sha256"] == prepared_study.manifest_ref.sha256
     assert manifest_entries[0]["sha256"] == hashlib.sha256(original_manifest).hexdigest()
+    assert index["provenance_semantics"] == {
+        "reference_encoding": "authority|relative_path|sha256",
+        "original_artifact_upstream_refs": {
+            "relationship": "authenticated_content_match_alias",
+            "match_key": ["relative_path", "sha256"],
+            "establishes_causal_dependency": False,
+            "establishes_owning_authority": False,
+            "owning_authority_fields": ["authority", "source_relative_path", "source_sha256"],
+        },
+        "derivative_artifact_upstream_refs": {
+            "relationship": "authenticated_input_reference",
+        },
+    }
     original_entries = [item for item in index["artifacts"] if item["authority"] != "export-derivative"]
+    primary_authority = next(
+        item["authority"]
+        for item in original_entries
+        if str(item["authority"]).startswith("round-two-primary:")
+    )
+    precommitment_candidates = []
+    for item in original_entries:
+        source_path = str(item["source_relative_path"])
+        if (
+            item["authority"] != primary_authority
+            or not source_path.startswith("adapter-state/mechanism-v5/")
+            or not source_path.endswith(".json")
+        ):
+            continue
+        raw = _long_read_bytes(output / Path(*str(item["relative_path"]).split("/")))
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(value, dict)
+            and value.get("round_index") == 1
+            and "spec_ref" in value
+            and "corpus_ref" in value
+        ):
+            precommitment_candidates.append((item, value))
+    assert len(precommitment_candidates) == 1
+    primary_precommitment, precommitment_value = precommitment_candidates[0]
+    inherited_leaf_refs = tuple(precommitment_value[key] for key in ("spec_ref", "corpus_ref"))
+    assert precommitment_value["round_index"] == 1
+    for leaf_ref in inherited_leaf_refs:
+        assert set(leaf_ref) == {"relative_path", "sha256"}
+        primary_leaf = next(
+            item
+            for item in original_entries
+            if item["authority"] == primary_authority
+            and item["source_relative_path"] == leaf_ref["relative_path"]
+            and item["source_sha256"] == leaf_ref["sha256"]
+        )
+        expected_own_arm_edge = (
+            f"{primary_precommitment['authority']}|{leaf_ref['relative_path']}|{leaf_ref['sha256']}"
+        )
+        assert expected_own_arm_edge in primary_precommitment["upstream_refs"]
+        assert primary_leaf["upstream_refs"] == []
+        withheld_leaf = next(
+            item
+            for item in original_entries
+            if str(item["authority"]).startswith("round-two-withheld:")
+            and item["source_relative_path"] == leaf_ref["relative_path"]
+            and item["source_sha256"] == leaf_ref["sha256"]
+        )
+        expected_cross_root_alias = (
+            f"{withheld_leaf['authority']}|{leaf_ref['relative_path']}|{leaf_ref['sha256']}"
+        )
+        assert expected_cross_root_alias in primary_precommitment["upstream_refs"]
+    derivative_entries = [item for item in index["artifacts"] if item["authority"] == "export-derivative"]
+    assert {item["relative_path"] for item in derivative_entries} == {"rubric-results.json", "trace.md"}
+    assert all(item["upstream_refs"] for item in derivative_entries)
+    assert any(
+        ref.startswith(f"{primary_authority}|")
+        for item in derivative_entries
+        for ref in item["upstream_refs"]
+    )
     assert original_entries
     source_paths = {str(item["source_relative_path"]) for item in original_entries}
     assert any(Path(path).name == "checkpoint.json" for path in source_paths)
@@ -148,6 +224,7 @@ def test_export_preserves_original_manifest_bytes_and_required_bundle_paths(prep
     assert _inventory(prepared_study.root) == before
     trace = (output / "trace.md").read_text(encoding="utf-8")
     for marker in (
+        "### Export provenance semantics",
         "## Side-by-side generated role proposals",
         "## P0→A and P1→B proposals",
         "## Raw mechanism case/control observations",

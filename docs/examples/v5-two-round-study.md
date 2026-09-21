@@ -111,6 +111,16 @@ directory wholesale, relocate an original root, or reserialize bytes under an
 old hash. The original root remains the authority for device/path identity;
 the export proves the bytes carried into the portable bundle.
 
+For original artifact entries, each `upstream_refs` value is an authenticated
+content-match alias based on the same relative path and SHA-256 digest. A
+matching value may identify the same bytes under another authenticated root;
+it does not establish a causal dependency or owning authority edge. The entry's
+`authority`, `source_relative_path`, and `source_sha256` remain the owning
+authenticated identity. For derivative `rubric-results.json` and `trace.md`,
+`upstream_refs` are authenticated input references used to construct those
+derivatives. The machine-readable `provenance_semantics` block in
+`artifact-index.json` records these meanings.
+
 `trace.md` shows the generated investigator/author/critic artifacts per arm,
 P0→A beside the actual P1→B records, raw parent/candidate case and control
 decisions, fixed and live request sizes and caps, admission/equivalence

@@ -273,10 +273,13 @@ def _raw_json_text(raw: bytes) -> str:
 def _embedded_reference_pairs(raw: bytes) -> tuple[tuple[str, str], ...]:
     """Return exact ArtifactRef-shaped edges embedded in an original byte blob.
 
-    The export index records provenance only when the edge can be resolved to
+    The export index records a reference only when the pair can be resolved to
     an independently authenticated source authority.  A relative path alone
     is insufficient here because both descendant roots intentionally reuse
-    names such as ``checkpoint.json`` and ``archive.json``.
+    names such as ``checkpoint.json`` and ``archive.json``.  The pair itself
+    carries only path and digest; resolved values are labelled as authenticated
+    content-match aliases; resolving them does not establish causal
+    dependencies or owning authority edges.
     """
 
     try:
@@ -649,6 +652,12 @@ def _trace_markdown(
         (
             "## Provenance and limits",
             "",
+            "### Export provenance semantics",
+            "",
+            "- original artifact `upstream_refs` are authenticated content-match aliases: each value names a same-path, same-SHA-256 match under an authenticated root, but does not establish a causal dependency or owning authority edge.",
+            "- derivative artifact `upstream_refs` are authenticated input references used to construct the derivative export files; they do not replace original root authority.",
+            "- each original entry's `authority`, `source_relative_path`, and `source_sha256` retain the authenticated owning root, path, and bytes.",
+            "",
             f"- study ID: `{prepared.manifest.study_id}`",
             f"- source revision: `{prepared.manifest.source_revision}`",
             f"- selected parent: `{prepared.selected_parent_configuration_id}`",
@@ -694,12 +703,23 @@ def export_study_trace_v1(
     entries: list[dict[str, object]] = []
     occupied: set[str] = set()
 
-    # Build a root-qualified lookup once from the same authenticated graph
-    # that supplied ``bound_refs``.  Embedded ArtifactRef values are the only
-    # upstream edges admitted to the index; an unresolvable pair is omitted
-    # rather than being replaced with a guessed relative path.  This keeps
-    # repeated paths in the two descendants distinct and makes the portable
-    # index useful without treating it as a new authority.
+    # Build root-qualified content-match aliases once from the same
+    # authenticated graph that supplied ``bound_refs``.  Embedded ArtifactRef
+    # values are the only identities admitted to this lookup; an unresolvable
+    # pair is omitted rather than replaced with a guessed relative path.  Each
+    # value later placed in an original artifact's ``upstream_refs`` is an
+    # authenticated same-path, same-digest match; resolving it does not
+    # establish a causal or owning-authority edge.  The entry's
+    # authority/source fields remain authoritative.
+    # This keeps repeated paths in the two descendants distinct without making
+    # the portable index a new authority.
+    #
+    # Derivative entries use the resulting authenticated identity set as input
+    # references.  Their separate meaning is declared in the index metadata
+    # and human-readable trace below.
+    #
+    # The lookup remains keyed by the exact pair so no runtime authorization
+    # rule is changed by the export labels.
     provenance: dict[tuple[str, str], set[str]] = {}
 
     def register(reference: ArtifactRefV5, authority: str) -> None:
@@ -834,6 +854,19 @@ def export_study_trace_v1(
                 "study_root": str(prepared.root),
                 "study_store_root_identity_sha256": store.repository.root_identity_sha256,
                 "portable_bundle_note": "The export root has a distinct filesystem identity and cannot replace the original authority root.",
+            },
+            "provenance_semantics": {
+                "reference_encoding": "authority|relative_path|sha256",
+                "original_artifact_upstream_refs": {
+                    "relationship": "authenticated_content_match_alias",
+                    "match_key": ["relative_path", "sha256"],
+                    "establishes_causal_dependency": False,
+                    "establishes_owning_authority": False,
+                    "owning_authority_fields": ["authority", "source_relative_path", "source_sha256"],
+                },
+                "derivative_artifact_upstream_refs": {
+                    "relationship": "authenticated_input_reference",
+                },
             },
             "artifacts": entries,
         }
