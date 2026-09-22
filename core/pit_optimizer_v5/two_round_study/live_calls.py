@@ -1056,6 +1056,14 @@ def _study_prompt(*, registry: FrozenBehaviorRegistryV1) -> dict[str, object]:
         },
     }
     for configuration in registry.configurations:
+        semantics = dict(family_semantics[configuration.family])
+        if (
+            configuration.family == "xor"
+            and dict(configuration.parameters).get("operator") == "always_on"
+        ):
+            semantics["missing_input"] = (
+                "toggle the parent early_winner_hold decision when ATR is missing"
+            )
         candidates.append(
             {
                 "configuration_id": configuration.configuration_id,
@@ -1065,7 +1073,7 @@ def _study_prompt(*, registry: FrozenBehaviorRegistryV1) -> dict[str, object]:
                     [name, canonical_primitive_v5(value)]
                     for name, value in configuration.parameters
                 ],
-                "family_semantics": family_semantics[configuration.family],
+                "family_semantics": semantics,
             }
         )
     return {

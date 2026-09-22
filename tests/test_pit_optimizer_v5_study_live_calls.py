@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 import hashlib
+import json
 from pathlib import Path
 import time
 
@@ -258,6 +259,43 @@ def test_build_study_call_keeps_fixture_and_live_identities_distinct(tmp_path: P
     assert preflight.request_sha256 == request.sha256
     assert built.sha256 != request.sha256
     assert built.fixture_request_sha256 == request.sha256
+
+
+def test_study_prompt_describes_always_on_missing_atr_toggle() -> None:
+    from core.pit_optimizer_v5.two_round_study.live_calls import study_prompt_bytes_v1
+    from core.pit_optimizer_v5.two_round_study.registry import build_study_registry_v1
+
+    registry = build_study_registry_v1()
+    prompt_bytes = study_prompt_bytes_v1(registry=registry)
+    prompt = json.loads(prompt_bytes)
+    candidates = {item["configuration_id"]: item for item in prompt["candidate_families"]}
+    parent = registry.configuration("S")
+    parent_input = next(item for item in parent.synthetic_evaluator_inputs if item.input_value is None)
+    parent_output = next(
+        item for item in parent.synthetic_evaluator_outputs if item.input_identity_sha256 == parent_input.input_identity_sha256
+    )
+    parent_hold = json.loads(parent_output.decision_json)["early_winner_hold"]
+
+    for configuration in registry.configurations:
+        if configuration.family != "xor":
+            continue
+        missing_input = next(item for item in configuration.synthetic_evaluator_inputs if item.input_value is None)
+        missing_output = next(
+            item
+            for item in configuration.synthetic_evaluator_outputs
+            if item.input_identity_sha256 == missing_input.input_identity_sha256
+        )
+        toggles_parent = json.loads(missing_output.decision_json)["early_winner_hold"] != parent_hold
+        expected = (
+            "toggle the parent early_winner_hold decision when ATR is missing"
+            if toggles_parent
+            else "preserve the parent decision when ATR is missing"
+        )
+        assert candidates[configuration.configuration_id]["family_semantics"]["missing_input"] == expected
+
+    assert b'"expected_changed"' not in prompt_bytes
+    assert b'"synthetic_evaluator_outputs"' not in prompt_bytes
+    assert b'"portfolio_evaluator_inputs"' not in prompt_bytes
 
 
 def test_legacy_fixture_request_and_schema_goldens_remain_unchanged(tmp_path: Path) -> None:
