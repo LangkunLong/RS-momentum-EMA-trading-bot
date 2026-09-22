@@ -922,6 +922,7 @@ class StudyCandidateRuntimeV1:
             raise ValueError("synthetic scenario is outside the frozen endpoint set")
         ending_equity, annualized_return = endpoint
         total = ((ending_equity / outcome.starting_equity) - Decimal("1")) * Decimal("100")
+        gross_total = ((outcome.gross_ending_equity / outcome.starting_equity) - Decimal("1")) * Decimal("100")
         return replace(
             base_report,
             portfolio_annualized_return_pct=annualized_return,
@@ -932,7 +933,7 @@ class StudyCandidateRuntimeV1:
             average_cash_pct=Decimal("50"),
             turnover_pct=Decimal("0"),
             total_friction_usd=Decimal("0"),
-            friction_drag_pct=Decimal("0"),
+            friction_drag_pct=gross_total - total,
         )
 
     def _panel(self, materialized: MaterializedVariantV5, episode: EpisodePlanV5, *, discovery: bool) -> PanelEvaluationV5:

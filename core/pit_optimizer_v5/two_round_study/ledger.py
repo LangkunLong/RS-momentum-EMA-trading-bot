@@ -62,6 +62,7 @@ _OVERSIZE_RESPONSE_REASON = (
 )
 _OVERSIZE_RESPONSE_LIMITATION = "exact provider bytes exceed the frozen 4 MiB raw-response bound"
 _IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,191}\Z")
+_PENDING_REQUEST_PREFIX = "pending-"
 
 
 def _sha256(raw: bytes) -> str:
@@ -426,6 +427,127 @@ class StudyReservationV1:
     @classmethod
     def from_canonical_json(cls, raw: bytes | str) -> "StudyReservationV1":
         return _decode_canonical(cls, raw, "study reservation")
+
+
+@dataclass(frozen=True, slots=True)
+class _StudyReservationPublicationV1:
+    """Authenticated intent for a reservation's three-record publication.
+
+    The envelope lives in the existing request namespace so an interrupted
+    create-only sequence remains readable by old stores and export walkers.
+    It binds the exact request and reservation bytes that recovery is allowed
+    to publish; the envelope itself never authorizes provider dispatch.
+    """
+
+    study_id: str
+    arm: StudyArmV1
+    request_sha256: str
+    reservation_sha256: str
+    grant_sha256: str
+    manifest_sha256: str
+    repository_root_identity_sha256: str
+    audit_domain: str
+    request: StudyCallRequestV1
+    reservation: StudyReservationV1
+    publication_sha256: str
+    schema_version: Literal[1] = _SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        _text(self.study_id, "reservation publication study ID")
+        if self.arm not in {"primary", "withheld"}:
+            raise StudyContractError("reservation publication arm is invalid")
+        for value, label in (
+            (self.request_sha256, "reservation publication request"),
+            (self.reservation_sha256, "reservation publication reservation"),
+            (self.grant_sha256, "reservation publication grant"),
+            (self.manifest_sha256, "reservation publication manifest"),
+            (self.repository_root_identity_sha256, "reservation publication root"),
+        ):
+            _digest(value, label)
+        _identifier(self.audit_domain, "reservation publication audit domain")
+        if type(self.request) is not StudyCallRequestV1 or type(self.reservation) is not StudyReservationV1:
+            raise StudyContractError("reservation publication records are invalid")
+        if (
+            self.request.study_id != self.study_id
+            or self.request.arm != self.arm
+            or self.request.sha256 != self.request_sha256
+            or self.reservation.study_id != self.study_id
+            or self.reservation.arm != self.arm
+            or self.reservation.request_sha256 != self.request_sha256
+            or self.reservation.reservation_sha256 != self.reservation_sha256
+        ):
+            raise StudyContractError("reservation publication records are not bound")
+        _digest(self.publication_sha256, "reservation publication identity")
+        if self.publication_sha256 != _sha256(canonical_json_bytes_v5(self.authenticated_payload())):
+            raise StudyContractError("reservation publication digest differs from its payload")
+        if type(self.schema_version) is not int or self.schema_version != _SCHEMA_VERSION:
+            raise StudyContractError("reservation publication schema version is invalid")
+
+    def authenticated_payload(self) -> dict[str, object]:
+        return {
+            "study_id": self.study_id,
+            "arm": self.arm,
+            "request_sha256": self.request_sha256,
+            "reservation_sha256": self.reservation_sha256,
+            "grant_sha256": self.grant_sha256,
+            "manifest_sha256": self.manifest_sha256,
+            "repository_root_identity_sha256": self.repository_root_identity_sha256,
+            "audit_domain": self.audit_domain,
+            "request": self.request.to_primitive(),
+            "reservation": self.reservation.to_primitive(),
+        }
+
+    def to_primitive(self) -> dict[str, object]:
+        result = self.authenticated_payload()
+        result.update({"publication_sha256": self.publication_sha256, "schema_version": self.schema_version})
+        return result
+
+    def canonical_bytes(self) -> bytes:
+        return canonical_json_bytes_v5(self.to_primitive())
+
+    @classmethod
+    def from_primitive(cls, value: object) -> "_StudyReservationPublicationV1":
+        raw = _strict(
+            value,
+            {
+                "study_id",
+                "arm",
+                "request_sha256",
+                "reservation_sha256",
+                "grant_sha256",
+                "manifest_sha256",
+                "repository_root_identity_sha256",
+                "audit_domain",
+                "request",
+                "reservation",
+                "publication_sha256",
+                "schema_version",
+            },
+            "study reservation publication",
+        )
+        try:
+            request = StudyCallRequestV1.from_primitive(raw["request"])
+            reservation = StudyReservationV1.from_primitive(raw["reservation"])
+        except (StudyContractError, TypeError, ValueError) as exc:
+            raise StudyContractError("study reservation publication records are invalid") from exc
+        return cls(
+            study_id=raw["study_id"],  # type: ignore[arg-type]
+            arm=raw["arm"],  # type: ignore[arg-type]
+            request_sha256=raw["request_sha256"],  # type: ignore[arg-type]
+            reservation_sha256=raw["reservation_sha256"],  # type: ignore[arg-type]
+            grant_sha256=raw["grant_sha256"],  # type: ignore[arg-type]
+            manifest_sha256=raw["manifest_sha256"],  # type: ignore[arg-type]
+            repository_root_identity_sha256=raw["repository_root_identity_sha256"],  # type: ignore[arg-type]
+            audit_domain=raw["audit_domain"],  # type: ignore[arg-type]
+            request=request,
+            reservation=reservation,
+            publication_sha256=raw["publication_sha256"],  # type: ignore[arg-type]
+            schema_version=raw["schema_version"],  # type: ignore[arg-type]
+        )
+
+    @classmethod
+    def from_canonical_json(cls, raw: bytes | str) -> "_StudyReservationPublicationV1":
+        return _decode_canonical(cls, raw, "study reservation publication")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1081,6 +1203,62 @@ class StudyLedgerV1:
     def _read_kind(self, kind: str) -> tuple[tuple[ArtifactRefV5, bytes], ...]:
         return tuple((reference, self.store.read(reference)) for reference in self._refs(kind))
 
+    @staticmethod
+    def _publication_key(reservation_sha256: str) -> str:
+        return f"{_PENDING_REQUEST_PREFIX}{reservation_sha256}"
+
+    def _reservation_publications(self) -> tuple[tuple[ArtifactRefV5, _StudyReservationPublicationV1], ...]:
+        """Read and authenticate pending reservation intent envelopes."""
+
+        result: list[tuple[ArtifactRefV5, _StudyReservationPublicationV1]] = []
+        request_namespace = "adapter-blobs/study-v1-requests/"
+        seen_requests: set[str] = set()
+        seen_reservations: set[str] = set()
+        for ref in self._refs("requests"):
+            if not ref.relative_path.startswith(request_namespace):
+                raise StudyAuthorityError("study request namespace contains an orphan record")
+            key = ref.relative_path.rsplit("/", 1)[-1][:-4]
+            if not key.startswith(_PENDING_REQUEST_PREFIX):
+                continue
+            raw = self.store.read(ref)
+            if ref.relative_path != f"{request_namespace}{key}.bin" or ref.sha256 != _sha256(raw):
+                raise StudyAuthorityError("study reservation publication reference differs from its bytes")
+            try:
+                publication = _StudyReservationPublicationV1.from_canonical_json(raw)
+            except (StudyContractError, StudyAdmissionError, TypeError, ValueError) as exc:
+                raise StudyAuthorityError("study reservation publication is not authenticated") from exc
+            if key != self._publication_key(publication.reservation_sha256):
+                raise StudyAuthorityError("study reservation publication path is not deterministic")
+            if (
+                publication.study_id != self.study_id
+                or publication.grant_sha256 != self.grant.sha256
+                or publication.manifest_sha256 != self.manifest.sha256
+                or publication.repository_root_identity_sha256 != self.store.repository.root_identity_sha256
+                or publication.audit_domain != self.grant.audit_domain
+                or publication.arm not in self.grant.arm_slots
+            ):
+                raise StudyAuthorityError("study reservation publication authority identity differs")
+            try:
+                self._validate_request(publication.request, require_current=False)
+                self._validate_reservation_request_binding(publication.reservation, publication.request)
+            except (StudyAdmissionError, StudyAuthorityError, StudyContractError) as exc:
+                raise StudyAuthorityError("study reservation publication request is not authorized") from exc
+            reservation = publication.reservation
+            if (
+                reservation.grant_sha256 != self.grant.sha256
+                or reservation.manifest_sha256 != self.manifest.sha256
+                or reservation.repository_root_identity_sha256 != self.store.repository.root_identity_sha256
+                or reservation.audit_domain != self.grant.audit_domain
+                or reservation.slot_id != f"{self.study_id}:{reservation.arm}"
+            ):
+                raise StudyAuthorityError("study reservation publication reservation authority differs")
+            if publication.request_sha256 in seen_requests or publication.reservation_sha256 in seen_reservations:
+                raise StudyAuthorityError("study reservation publications contain a duplicate identity")
+            seen_requests.add(publication.request_sha256)
+            seen_reservations.add(publication.reservation_sha256)
+            result.append((ref, publication))
+        return tuple(sorted(result, key=lambda item: item[1].reservation.sequence))
+
     def _reservations(self) -> tuple[tuple[ArtifactRefV5, StudyReservationV1], ...]:
         result = []
         for ref, raw in self._read_kind("reservations"):
@@ -1110,6 +1288,36 @@ class StudyLedgerV1:
         if len({item.slot_id for _ref_value, item in ordered}) > 2:
             raise StudyAuthorityError("study reservations exceed the two shared arm slots")
         return ordered
+
+    def read_only_reservation_projection(
+        self,
+    ) -> tuple[tuple[StudyReservationV1, ArtifactRefV5 | None, ArtifactRefV5 | None], ...]:
+        """Return the authenticated persisted/envelope reservation union without repair.
+
+        Each tuple contains the reservation, its ordinary reservation reference
+        when materialized, and its publication reference when envelope-bound.
+        The latter keeps an interrupted publication visible to read-only
+        accounting without granting dispatch or mutating the study store.
+        """
+
+        reservations = self._reservations()
+        terminals = self._terminals()
+        self._authenticate_graph_orphans(reservations, terminals)
+        publication_refs = {
+            publication.reservation_sha256: reference
+            for reference, publication in self._reservation_publications()
+        }
+        persisted_ids = {reservation.reservation_sha256 for _reference, reservation in reservations}
+        projected = [
+            (reservation, reference, publication_refs.get(reservation.reservation_sha256))
+            for reference, reservation in reservations
+        ]
+        projected.extend(
+            (publication.reservation, None, reference)
+            for reference, publication in self._reservation_publications()
+            if publication.reservation_sha256 not in persisted_ids
+        )
+        return tuple(sorted(projected, key=lambda item: item[0].sequence))
 
     def _terminals(self) -> tuple[AuthenticatedStudyTerminalV1, ...]:
         result = []
@@ -1262,6 +1470,19 @@ class StudyLedgerV1:
             if reservation.request_sha256 == request.sha256:
                 return reservation
         return None
+
+    def _find_reservation_publication(
+        self,
+        request: StudyCallRequestV1,
+    ) -> _StudyReservationPublicationV1 | None:
+        matches = [
+            publication
+            for _ref_value, publication in self._reservation_publications()
+            if publication.request_sha256 == request.sha256
+        ]
+        if len(matches) > 1:
+            raise StudyAuthorityError("study request has duplicate reservation publications")
+        return matches[0] if matches else None
 
     def _has_provider_accounting_prefix(self, request: StudyCallRequestV1) -> bool:
         if self._response_metadata(request) is not None or self._raw_response_reference(request) is not None:
@@ -1616,6 +1837,23 @@ class StudyLedgerV1:
             if existing_terminal is not None:
                 raise StudyAdmissionError("study request already has a terminal")
             reservations = self._reservations()
+            publications = self._reservation_publications()
+            request_keys = {
+                ref.relative_path.rsplit("/", 1)[-1][:-4]
+                for ref in self._refs("requests")
+                if not ref.relative_path.rsplit("/", 1)[-1][:-4].startswith(_PENDING_REQUEST_PREFIX)
+            }
+            reservation_keys = {item.reservation_sha256 for _ref_value, item in reservations}
+            incomplete_publications = tuple(
+                publication
+                for _ref_value, publication in publications
+                if publication.request_sha256 not in request_keys
+                or publication.reservation_sha256 not in reservation_keys
+            )
+            if incomplete_publications:
+                if any(item.request_sha256 == request.sha256 for item in incomplete_publications):
+                    raise StudyPendingAccounting("study request has an unrepaired reservation publication")
+                raise StudyPendingAccounting("an unrepaired study reservation publication blocks admission")
             if self._find_admission_rejection(request) is not None:
                 raise StudyAdmissionError("study request has a prior pre-dispatch rejection")
             existing = self._find_reservation(request)
@@ -1683,8 +1921,41 @@ class StudyLedgerV1:
                 sequence=sequence,
                 reservation_sha256=_sha256(canonical_json_bytes_v5(payload)),
             )
-            self.store.put(kind="reservations", key=reservation.reservation_sha256, content=reservation.canonical_bytes())
+            publication_payload = {
+                "study_id": self.study_id,
+                "arm": request.arm,
+                "request_sha256": request.sha256,
+                "reservation_sha256": reservation.reservation_sha256,
+                "grant_sha256": self.grant.sha256,
+                "manifest_sha256": self.manifest.sha256,
+                "repository_root_identity_sha256": self.store.repository.root_identity_sha256,
+                "audit_domain": self.grant.audit_domain,
+                "request": request.to_primitive(),
+                "reservation": reservation.to_primitive(),
+            }
+            publication = _StudyReservationPublicationV1(
+                study_id=self.study_id,
+                arm=request.arm,
+                request_sha256=request.sha256,
+                reservation_sha256=reservation.reservation_sha256,
+                grant_sha256=self.grant.sha256,
+                manifest_sha256=self.manifest.sha256,
+                repository_root_identity_sha256=self.store.repository.root_identity_sha256,
+                audit_domain=self.grant.audit_domain,
+                request=request,
+                reservation=reservation,
+                publication_sha256=_sha256(canonical_json_bytes_v5(publication_payload)),
+            )
+            # Publish intent first, then the independently addressable request
+            # and reservation records.  Each partial prefix is recoverable from
+            # the authenticated envelope; no prefix can authorize dispatch.
+            self.store.put(
+                kind="requests",
+                key=self._publication_key(reservation.reservation_sha256),
+                content=publication.canonical_bytes(),
+            )
             self.store.put(kind="requests", key=request.sha256, content=request.canonical_bytes())
+            self.store.put(kind="reservations", key=reservation.reservation_sha256, content=reservation.canonical_bytes())
             self._owner_capabilities[reservation.invocation_owner] = object()
             return reservation
 
@@ -2311,6 +2582,51 @@ class StudyLedgerV1:
         existing = self._find_terminal(request)
         if existing is not None:
             return self.verify_terminal(existing.reference)
+        publication = self._find_reservation_publication(request)
+        if publication is not None:
+            # The envelope is the sole authority for repairing a partial
+            # reservation publication.  A caller-supplied request without an
+            # envelope is still a clean no-write prefix.
+            with self._lock, self._transition():
+                # Reauthenticate while holding the transition lock.  A
+                # long-lived reader must reject downstream or conflicting
+                # bytes appended after construction before it mutates state.
+                self._authenticate_graph_orphans(self._reservations(), self._terminals())
+                request_refs = tuple(
+                    ref
+                    for ref in self._refs("requests")
+                    if ref.relative_path == f"adapter-blobs/study-v1-requests/{request.sha256}.bin"
+                )
+                if len(request_refs) > 1:
+                    raise StudyAuthorityError("study request has duplicate authenticated records")
+                if request_refs:
+                    if self._stored_request(request.sha256).canonical_bytes() != publication.request.canonical_bytes():
+                        raise StudyAuthorityError("study request differs from its reservation publication")
+                else:
+                    self.store.put(kind="requests", key=request.sha256, content=publication.request.canonical_bytes())
+                reservations = self._reservations()
+                existing_reservation = next(
+                    (
+                        item
+                        for _ref_value, item in reservations
+                        if item.reservation_sha256 == publication.reservation_sha256
+                    ),
+                    None,
+                )
+                if (
+                    existing_reservation is not None
+                    and existing_reservation.canonical_bytes() != publication.reservation.canonical_bytes()
+                ):
+                    raise StudyAuthorityError("study reservation differs from its reservation publication")
+                if existing_reservation is None:
+                    self.store.put(
+                        kind="reservations",
+                        key=publication.reservation.reservation_sha256,
+                        content=publication.reservation.canonical_bytes(),
+                    )
+                # Reauthenticate after the repair so no downstream evidence
+                # can be attached to a partial prefix.
+                self._authenticate_graph_orphans(self._reservations(), self._terminals())
         reservation = self._find_reservation(request)
         if reservation is None:
             return None
@@ -2643,18 +2959,49 @@ class StudyLedgerV1:
         reservations: tuple[tuple[ArtifactRefV5, StudyReservationV1], ...],
         terminals: tuple[AuthenticatedStudyTerminalV1, ...],
     ) -> None:
+        publications = self._reservation_publications()
+        publication_by_request = {item.request_sha256: item for _ref_value, item in publications}
         reservation_requests = {item.request_sha256 for _ref_value, item in reservations}
+        reservation_by_request = {item.request_sha256: item for _ref_value, item in reservations}
+        reservation_by_sha = {item.reservation_sha256: item for _ref_value, item in reservations}
+        pending_reservations = [
+            publication.reservation
+            for _ref_value, publication in publications
+            if publication.reservation_sha256 not in reservation_by_sha
+        ]
+        combined_reservations = [item for _ref_value, item in reservations] + pending_reservations
+        ordered_sequences = tuple(sorted(item.sequence for item in combined_reservations))
+        if ordered_sequences != tuple(range(1, len(ordered_sequences) + 1)):
+            raise StudyAuthorityError("study reservation sequence has a gap or duplicate")
+        if len({item.request_sha256 for item in combined_reservations}) != len(combined_reservations):
+            raise StudyAuthorityError("study reservations contain a duplicate request")
+        if len({item.arm for item in combined_reservations}) != len(combined_reservations):
+            raise StudyAuthorityError("study reservations contain a duplicate arm slot")
+        if len({item.slot_id for item in combined_reservations}) > 2:
+            raise StudyAuthorityError("study reservations exceed the two shared arm slots")
         request_refs = self._refs("requests")
-        request_keys = set()
+        request_keys: set[str] = set()
         for ref in request_refs:
             if not ref.relative_path.startswith("adapter-blobs/study-v1-requests/"):
                 raise StudyAuthorityError("study request namespace contains an orphan record")
-            request = self._stored_request(ref.relative_path.rsplit("/", 1)[-1][:-4])
+            key = ref.relative_path.rsplit("/", 1)[-1][:-4]
+            if key.startswith(_PENDING_REQUEST_PREFIX):
+                continue
+            request = self._stored_request(key)
             request_keys.add(request.sha256)
-        if request_keys != reservation_requests:
+        for _ref_value, publication in publications:
+            stored_reservation = reservation_by_sha.get(publication.reservation_sha256)
+            if (
+                stored_reservation is not None
+                and stored_reservation.canonical_bytes() != publication.reservation.canonical_bytes()
+            ):
+                raise StudyAuthorityError("study reservation differs from its authenticated publication")
+            if publication.request_sha256 in request_keys:
+                if self._stored_request(publication.request_sha256).canonical_bytes() != publication.request.canonical_bytes():
+                    raise StudyAuthorityError("study request differs from its authenticated publication")
+        publication_requests = set(publication_by_request)
+        if (request_keys ^ reservation_requests) - publication_requests:
             raise StudyAuthorityError("study request records do not exactly match reservations")
-        reservation_by_request = {item.request_sha256: item for _ref_value, item in reservations}
-        reservation_by_sha = {item.reservation_sha256: item for _ref_value, item in reservations}
         for _ref_value, reservation in reservations:
             request = self._stored_request(reservation.request_sha256)
             self._validate_reservation_request_binding(reservation, request)
@@ -2665,6 +3012,24 @@ class StudyLedgerV1:
         dispatch_request_keys = {claim.request_sha256 for claim in dispatch_claims}
         admission_rejections = self._admission_rejections()
         rejection_by_request = {item.request_sha256: item for _ref_value, item in admission_rejections}
+        reconciliation_events = self._reconciliations()
+        incomplete_publication_requests = {
+            publication.request_sha256
+            for _ref_value, publication in publications
+            if publication.request_sha256 not in request_keys or publication.reservation_sha256 not in reservation_by_sha
+        }
+        if incomplete_publication_requests and (
+            incomplete_publication_requests & dispatch_request_keys
+            or incomplete_publication_requests & terminal_requests
+            or incomplete_publication_requests & rejection_by_request.keys()
+            or any(event.request_sha256 in incomplete_publication_requests for event in reconciliation_events)
+            or any(
+                ref.relative_path.rsplit("/", 1)[-1][:-4] in incomplete_publication_requests
+                for kind in ("responses", "raw-responses", "raw-response-failures", "parsed")
+                for ref in self._refs(kind)
+            )
+        ):
+            raise StudyAuthorityError("incomplete reservation publication has downstream accounting evidence")
         response_keys: set[str] = set()
         response_metadata: dict[str, dict[str, object]] = {}
         for ref in self._refs("responses"):
@@ -2821,7 +3186,7 @@ class StudyLedgerV1:
             expected_response_ref = raw_refs.get(terminal.request_sha256) or failure_refs.get(terminal.request_sha256)
             if expected_response_ref is None or terminal.terminal.response_ref != expected_response_ref:
                 raise StudyAuthorityError("study terminal response reference is not authenticated")
-        for event in self._reconciliations():
+        for event in reconciliation_events:
             if event.request_sha256 not in reservation_requests:
                 raise StudyAuthorityError("reconciliation event has no reservation")
             if event.request_sha256 in rejection_by_request:

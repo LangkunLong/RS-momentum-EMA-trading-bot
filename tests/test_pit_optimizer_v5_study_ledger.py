@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
+import hashlib
 
 import pytest
 
@@ -17,7 +18,12 @@ from core.pit_optimizer_v5.two_round_study.contracts import (
     StudyPendingAccounting,
     StudyResponseV1,
 )
-from core.pit_optimizer_v5.two_round_study.ledger import StudyLedgerV1, run_study_call_v1
+from core.pit_optimizer_v5.two_round_study.ledger import (
+    StudyLedgerV1,
+    StudyReservationV1,
+    _StudyReservationPublicationV1,
+    run_study_call_v1,
+)
 from core.pit_optimizer_v5.provider import RoleFailureCode
 
 
@@ -149,6 +155,200 @@ def test_fresh_reader_keeps_a_reservation_only_prefix_pending(tmp_path) -> None:
     assert {
         kind: store.list_refs(kind=kind)
         for kind in ("reservations", "dispatches", "responses", "raw-responses", "parsed", "terminals")
+    } == before
+
+
+@pytest.mark.parametrize(
+    ("when", "publication_index"),
+    tuple(
+        (when, index)
+        for index in range(1, 4)
+        for when in ("before", "after")
+    ),
+)
+def test_interrupted_reservation_publication_reopens_and_recovers_without_dispatch(
+    tmp_path,
+    monkeypatch,
+    when,
+    publication_index,
+) -> None:
+    """Every publication boundary leaves a recoverable pending spend only."""
+
+    context = __import__("tests.test_pit_optimizer_v5_study_live_calls", fromlist=["_study_context"])._study_context(tmp_path)
+    _fixture, _fixture_request, _preflight, manifest, request, store, grant, _approval, ledger, *_rest = context
+    original_put = store.put
+    calls = 0
+
+    def fault_injected_put(*, kind, key, content):
+        nonlocal calls
+        calls += 1
+        if when == "before" and calls == publication_index:
+            raise RuntimeError(f"fault before publication {calls}")
+        reference = original_put(kind=kind, key=key, content=content)
+        if when == "after" and calls == publication_index:
+            raise RuntimeError(f"fault after publication {calls}")
+        return reference
+
+    monkeypatch.setattr(store, "put", fault_injected_put)
+    with pytest.raises(RuntimeError, match="fault"):
+        ledger.reserve(request)
+
+    before_recovery = {
+        kind: store.list_refs(kind=kind)
+        for kind in ("requests", "reservations", "dispatches", "responses", "raw-responses", "parsed", "terminals")
+    }
+    # A fresh reader must authenticate the incomplete publication envelope and
+    # remain read-only.  Disable the one-shot fault before exercising the
+    # explicit repair path so recovery writes can be observed independently.
+    monkeypatch.setattr(store, "put", original_put)
+    reader = StudyLedgerV1(store, manifest, grant, approval=None)
+    assert {
+        kind: store.list_refs(kind=kind)
+        for kind in ("requests", "reservations", "dispatches", "responses", "raw-responses", "parsed", "terminals")
+    } == before_recovery
+    try:
+        recovered = reader.recover(request)
+    except StudyPendingAccounting:
+        recovered = None
+    assert recovered is None
+    after_recovery = {
+        kind: store.list_refs(kind=kind)
+        for kind in ("requests", "reservations", "dispatches", "responses", "raw-responses", "parsed", "terminals")
+    }
+    normal_request_refs = tuple(
+        ref for ref in after_recovery["requests"] if ref.relative_path.endswith(f"/{request.sha256}.bin")
+    )
+    if before_recovery["requests"] or before_recovery["reservations"]:
+        assert normal_request_refs and len(after_recovery["reservations"]) == 1
+        assert reader._stored_request(request.sha256).canonical_bytes() == request.canonical_bytes()
+    else:
+        # A fault before the first publication is a clean zero-write prefix;
+        # recovery must not invent a request or reservation from its argument.
+        assert not normal_request_refs
+        assert not after_recovery["reservations"]
+    assert store.list_refs(kind="dispatches") == ()
+    assert store.list_refs(kind="responses") == ()
+    assert store.list_refs(kind="raw-responses") == ()
+    assert store.list_refs(kind="parsed") == ()
+    assert store.list_refs(kind="terminals") == ()
+    assert calls >= publication_index
+
+
+@pytest.mark.parametrize("corruption", ("downstream", "conflicting_request"))
+def test_recovery_reauthenticates_partial_publication_before_any_repair_write(tmp_path, corruption) -> None:
+    context = __import__("tests.test_pit_optimizer_v5_study_live_calls", fromlist=["_study_context"])._study_context(tmp_path)
+    _fixture, _fixture_request, _preflight, manifest, request, store, grant, _approval, ledger, *_rest = context
+    original_put = store.put
+    calls = 0
+
+    def fail_before_request(*, kind, key, content):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("fault before request publication")
+        return original_put(kind=kind, key=key, content=content)
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(store, "put", fail_before_request)
+        with pytest.raises(RuntimeError, match="fault"):
+            ledger.reserve(request)
+        monkeypatch.setattr(store, "put", original_put)
+        reader = StudyLedgerV1(store, manifest, grant, approval=None)
+        if corruption == "downstream":
+            store.put(kind="parsed", key=request.sha256, content=canonical_json_bytes_v5({}))
+        else:
+            conflicting = replace(request, max_output_tokens=request.max_output_tokens - 1)
+            store.put(kind="requests", key=request.sha256, content=conflicting.canonical_bytes())
+        before = {
+            kind: store.list_refs(kind=kind)
+            for kind in ("requests", "reservations", "dispatches", "responses", "raw-responses", "parsed", "terminals")
+        }
+        with pytest.raises(StudyAuthorityError):
+            reader.recover(request)
+        assert {
+            kind: store.list_refs(kind=kind)
+            for kind in ("requests", "reservations", "dispatches", "responses", "raw-responses", "parsed", "terminals")
+        } == before
+    finally:
+        monkeypatch.undo()
+
+
+def test_pending_publication_sequence_is_authenticated_before_repair(tmp_path) -> None:
+    context = __import__("tests.test_pit_optimizer_v5_study_live_calls", fromlist=["_study_context"])._study_context(tmp_path)
+    _fixture, _fixture_request, _preflight, manifest, request, store, grant, approval, _ledger, *_rest = context
+    owner = "forged-owner"
+    prospective_cost = _ledger._prospective_cost(request)
+    reservation_payload = {
+        "study_id": grant.study_id,
+        "arm": request.arm,
+        "request_sha256": request.sha256,
+        "grant_sha256": grant.sha256,
+        "manifest_sha256": manifest.sha256,
+        "repository_root_identity_sha256": store.repository.root_identity_sha256,
+        "audit_domain": grant.audit_domain,
+        "slot_id": f"{grant.study_id}:{request.arm}",
+        "invocation_owner": owner,
+        "prospective_input_tokens": request.input_bound_bytes,
+        "prospective_output_tokens": request.max_output_tokens,
+        "prospective_cost_usd": str(prospective_cost),
+        "sequence": 99,
+    }
+    reservation = StudyReservationV1(
+        study_id=grant.study_id,
+        arm=request.arm,
+        request_sha256=request.sha256,
+        grant_sha256=grant.sha256,
+        manifest_sha256=manifest.sha256,
+        repository_root_identity_sha256=store.repository.root_identity_sha256,
+        audit_domain=grant.audit_domain,
+        slot_id=f"{grant.study_id}:{request.arm}",
+        invocation_owner=owner,
+        prospective_input_tokens=request.input_bound_bytes,
+        prospective_output_tokens=request.max_output_tokens,
+        prospective_cost_usd=prospective_cost,
+        sequence=99,
+        reservation_sha256=hashlib.sha256(canonical_json_bytes_v5(reservation_payload)).hexdigest(),
+    )
+    publication_payload = {
+        "study_id": grant.study_id,
+        "arm": request.arm,
+        "request_sha256": request.sha256,
+        "reservation_sha256": reservation.reservation_sha256,
+        "grant_sha256": grant.sha256,
+        "manifest_sha256": manifest.sha256,
+        "repository_root_identity_sha256": store.repository.root_identity_sha256,
+        "audit_domain": grant.audit_domain,
+        "request": request.to_primitive(),
+        "reservation": reservation.to_primitive(),
+    }
+    publication = _StudyReservationPublicationV1(
+        study_id=grant.study_id,
+        arm=request.arm,
+        request_sha256=request.sha256,
+        reservation_sha256=reservation.reservation_sha256,
+        grant_sha256=grant.sha256,
+        manifest_sha256=manifest.sha256,
+        repository_root_identity_sha256=store.repository.root_identity_sha256,
+        audit_domain=grant.audit_domain,
+        request=request,
+        reservation=reservation,
+        publication_sha256=hashlib.sha256(canonical_json_bytes_v5(publication_payload)).hexdigest(),
+    )
+    store.put(
+        kind="requests",
+        key=f"pending-{reservation.reservation_sha256}",
+        content=publication.canonical_bytes(),
+    )
+    before = {
+        kind: store.list_refs(kind=kind)
+        for kind in ("requests", "reservations", "dispatches", "responses", "raw-responses", "parsed", "terminals")
+    }
+    with pytest.raises(StudyAuthorityError, match="sequence"):
+        StudyLedgerV1(store, manifest, grant, approval=approval)
+    assert {
+        kind: store.list_refs(kind=kind)
+        for kind in ("requests", "reservations", "dispatches", "responses", "raw-responses", "parsed", "terminals")
     } == before
 
 

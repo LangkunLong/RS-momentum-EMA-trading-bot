@@ -510,6 +510,9 @@ def _build_manifest(
         "gross": (portfolio_input.gross_ending_equity, portfolio_input.gross_annualized_return_pct),
         "stress": (portfolio_input.stress_ending_equity, portfolio_input.stress_annualized_return_pct),
     }
+    gross_total_return_pct = (
+        (portfolio_input.gross_ending_equity / portfolio_input.starting_equity) - Decimal("1")
+    ) * Decimal("100")
     episodes: list[EpisodeEvaluationV5] = []
     for index in range(1, 5):
         panel = panel_specs[f"discovery-{index}"]
@@ -527,6 +530,12 @@ def _build_manifest(
                     * Decimal("100"),
                     portfolio_annualized_return_pct=scenario_endpoints[scenario.scenario_id][1],
                     gross_annualized_return_pct=portfolio_input.gross_annualized_return_pct,
+                    friction_drag_pct=gross_total_return_pct
+                    - (
+                        (scenario_endpoints[scenario.scenario_id][0] / portfolio_input.starting_equity)
+                        - Decimal("1")
+                    )
+                    * Decimal("100"),
                 ),
             )
             for scenario in initial_friction_grid_v5()

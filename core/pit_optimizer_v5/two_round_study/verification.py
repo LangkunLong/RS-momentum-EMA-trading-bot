@@ -950,6 +950,7 @@ def _verify_fixture_arm(
     prepared: PreparedStudyV1,
     arm: Literal["primary", "withheld"],
     ledger: StudyLedgerV1 | None,
+    reservation_projection: tuple[tuple[StudyReservationV1, ArtifactRefV5 | None, ArtifactRefV5 | None], ...],
 ) -> tuple[StudyArmVerificationV1, tuple[ArtifactRefV5, ...], RoleInvocationPackageV5 | None]:
     fixture = reopen_study_fixture_v1(
         root=prepared.fixture_path(arm),
@@ -1226,12 +1227,15 @@ def _verify_fixture_arm(
             import_pairs.append((import_ref, value))
     if len(import_pairs) > 1:
         raise StudyAuthorityError(f"{arm} has duplicate imported responses")
-    reservation_pairs: list[tuple[ArtifactRefV5, StudyReservationV1]] = []
-    for reservation_ref in store.list_refs(kind="reservations"):
-        reservation = _decode_contract(store, reservation_ref, StudyReservationV1, "study reservation")
-        if reservation.arm == arm:
-            reservation_pairs.append((reservation_ref, reservation))
-    if len(reservation_pairs) > 1:
+    if ledger is None:
+        arm_reservations: list[tuple[StudyReservationV1, ArtifactRefV5 | None, ArtifactRefV5 | None]] = []
+        for reservation_ref in store.list_refs(kind="reservations"):
+            reservation = _decode_contract(store, reservation_ref, StudyReservationV1, "study reservation")
+            if reservation.arm == arm:
+                arm_reservations.append((reservation, reservation_ref, None))
+    else:
+        arm_reservations = [item for item in reservation_projection if item[0].arm == arm]
+    if len(arm_reservations) > 1:
         raise StudyAuthorityError(f"{arm} has duplicate reservations")
     terminal_pairs: list[tuple[ArtifactRefV5, StudyCallTerminalV1]] = []
     for terminal_ref in store.list_refs(kind="terminals"):
@@ -1437,7 +1441,7 @@ def _verify_fixture_arm(
     elif (
         terminal_pairs
         or import_pairs
-        or reservation_pairs
+        or arm_reservations
         or events
         or commitment_refs
         or round_two_precommitment_present
@@ -1501,18 +1505,31 @@ def _verify_fixture_arm(
         usage["terminal_receipt"] = canonical_primitive_v5(terminal.receipt)
         usage["terminal_failure_code"] = None if terminal.failure_code is None else terminal.failure_code.value
         usage["terminal_failure_reason"] = terminal.failure_reason
-    active_reservations = tuple(
-        reservation
-        for _reference, reservation in reservation_pairs
+    active_reservation_entries = tuple(
+        (reservation, reservation_ref, publication_ref)
+        for reservation, reservation_ref, publication_ref in arm_reservations
         if not any(terminal.reservation_sha256 == reservation.reservation_sha256 for _ref, terminal in terminal_pairs)
         and not any(rejection.reservation_sha256 == reservation.reservation_sha256 for _ref, rejection in rejection_pairs)
     )
+    active_reservations = tuple(reservation for reservation, _reservation_ref, _publication_ref in active_reservation_entries)
     usage["pending_reservations"] = [canonical_primitive_v5(item) for item in active_reservations]
     usage["pending_prospective_totals"] = {
         "input_tokens": sum(item.prospective_input_tokens for item in active_reservations),
         "output_tokens": sum(item.prospective_output_tokens for item in active_reservations),
         "cost_usd": canonical_primitive_v5(sum((item.prospective_cost_usd for item in active_reservations), start=0)),
     }
+    pending_provenance = [
+        {
+            "reservation_sha256": reservation.reservation_sha256,
+            "authority": f"study-store:{store.repository.root_identity_sha256}",
+            "reservation_ref": None if reservation_ref is None else reservation_ref.to_primitive(),
+            "publication_ref": publication_ref.to_primitive(),
+        }
+        for reservation, reservation_ref, publication_ref in active_reservation_entries
+        if publication_ref is not None
+    ]
+    if pending_provenance:
+        usage["pending_reservation_provenance"] = pending_provenance
     usage["recovery_record_count"] = sum(1 for event in events if "recovery" in event.event_kind)
     return (
         StudyArmVerificationV1(
@@ -1723,8 +1740,14 @@ def verify_study_v1(
     # authorities and must not be silently merged.
     all_refs: dict[tuple[str, str, str, str], ArtifactRefV5] = {}
     packages: dict[str, RoleInvocationPackageV5 | None] = {}
+    reservation_projection = () if ledger is None else ledger.read_only_reservation_projection()
     for arm in _ARM_NAMES:
-        verified, refs, package = _verify_fixture_arm(prepared=prepared, arm=arm, ledger=ledger)
+        verified, refs, package = _verify_fixture_arm(
+            prepared=prepared,
+            arm=arm,
+            ledger=ledger,
+            reservation_projection=reservation_projection,
+        )
         arms.append(verified)
         packages[arm] = package
         for ref in refs:
@@ -1829,6 +1852,18 @@ def verify_study_v1(
             and primary_arm.case_contrast == withheld_arm.case_contrast
         ):
             confounds.append("paired_attribution_equal_or_nondiscriminating_pair: " + pair_label)
+            attribution = "inconclusive"
+        elif not all(
+            item.production_assessment in {"supported_on_cases", "contradicted_on_cases"}
+            for item in arms
+        ):
+            confounds.append("paired_attribution_insufficient_production_evidence: " + pair_label)
+            attribution = "inconclusive"
+        elif not all(
+            item.case_contrast in {"matched_on_cases", "contradicted_on_cases"}
+            for item in arms
+        ):
+            confounds.append("paired_attribution_unavailable_or_unmeasured_contrast: " + pair_label)
             attribution = "inconclusive"
         elif (
             primary_arm.production_assessment == "supported_on_cases"
