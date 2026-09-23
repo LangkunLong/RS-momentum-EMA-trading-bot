@@ -2522,6 +2522,96 @@ class CompletionResultV5:
             raise ValueError("provider completion response state is invalid")
 
 
+class ProviderResponseAccountingErrorV5(Exception):
+    """A provider returned model content but not complete accounting facts."""
+
+    __slots__ = ("response_text", "provider_request_id", "phase", "code")
+
+    def __init__(self, *, response_text: str, provider_request_id: str | None, phase: str, code: str) -> None:
+        if type(response_text) is not str:
+            raise ValueError("observed provider response text is invalid")
+        if provider_request_id is not None:
+            _text(provider_request_id, "observed provider request ID")
+            if len(provider_request_id.encode("utf-8")) > 512:
+                raise ValueError("observed provider request ID is invalid")
+        if phase not in {"response_accounting"}:
+            raise ValueError("observed provider failure phase is invalid")
+        if type(code) is not str or not re.fullmatch(r"[a-z0-9_]{1,64}", code):
+            raise ValueError("observed provider failure code is invalid")
+        super().__init__("provider response requires authoritative accounting")
+        self.response_text = response_text
+        self.provider_request_id = provider_request_id
+        self.phase = phase
+        self.code = code
+
+
+class ProviderFailureDiagnosticV5(Exception):
+    """Safe, bounded metadata for an unresolved provider failure."""
+
+    __slots__ = ("phase", "code", "http_status", "provider_request_id")
+
+    _CODES = {
+        "credential": {"credential_rejected", "credential_unavailable"},
+        "client_init": {"client_initialization_failed"},
+        "transport": {"http_status", "request_timeout", "transport_failure"},
+        "unknown": {"unclassified"},
+        "response_accounting": {"response_content_oversized"},
+    }
+
+    def __init__(
+        self,
+        *,
+        phase: str,
+        code: str,
+        http_status: int | None = None,
+        provider_request_id: str | None = None,
+    ) -> None:
+        if phase not in self._CODES or code not in self._CODES[phase]:
+            raise ValueError("provider failure diagnostic phase or code is invalid")
+        if http_status is not None and (type(http_status) is not int or not 100 <= http_status <= 599):
+            raise ValueError("provider failure diagnostic status is invalid")
+        if provider_request_id is not None:
+            _text(provider_request_id, "provider failure diagnostic request ID")
+            if len(provider_request_id.encode("utf-8")) > 512:
+                raise ValueError("provider failure diagnostic request ID is invalid")
+        super().__init__("provider invocation did not yield an accounted completion")
+        self.phase = phase
+        self.code = code
+        self.http_status = http_status
+        self.provider_request_id = provider_request_id
+
+    @classmethod
+    def from_exception(cls, exc: BaseException) -> "ProviderFailureDiagnosticV5":
+        """Classify only safe exception type and explicit scalar fields."""
+
+        status = getattr(exc, "status_code", None)
+        http_status = status if type(status) is int and 100 <= status <= 599 else None
+        request_id = getattr(exc, "request_id", None)
+        provider_request_id = None
+        if (
+            type(request_id) is str
+            and request_id == request_id.strip()
+            and request_id
+            and "\x00" not in request_id
+        ):
+            try:
+                if len(request_id.encode("utf-8")) <= 512:
+                    provider_request_id = request_id
+            except UnicodeEncodeError:
+                pass
+        if http_status in {401, 403}:
+            return cls(phase="credential", code="credential_rejected", http_status=http_status, provider_request_id=provider_request_id)
+        if isinstance(exc, PermissionError):
+            return cls(phase="unknown", code="unclassified", http_status=http_status, provider_request_id=provider_request_id)
+        if isinstance(exc, (ImportError, ModuleNotFoundError)):
+            return cls(phase="client_init", code="client_initialization_failed", http_status=http_status, provider_request_id=provider_request_id)
+        if isinstance(exc, TimeoutError):
+            return cls(phase="transport", code="request_timeout", http_status=http_status, provider_request_id=provider_request_id)
+        if http_status is not None:
+            return cls(phase="transport", code="http_status", http_status=http_status, provider_request_id=provider_request_id)
+        return cls(phase="unknown", code="unclassified", http_status=None, provider_request_id=provider_request_id)
+
+
 @runtime_checkable
 class CompletionProvider(Protocol):
     """Provider-neutral boundary whose one method performs exactly one completion."""
@@ -4223,6 +4313,8 @@ __all__ = [
     "ParsedRoleArtifactV5",
     "PersistedRoleRequestV5",
     "ProviderCompletionRequestV5",
+    "ProviderFailureDiagnosticV5",
+    "ProviderResponseAccountingErrorV5",
     "PrimaryMechanismV5",
     "RecoverableRoleInvokerV5",
     "RecoveredRoleTerminalV5",

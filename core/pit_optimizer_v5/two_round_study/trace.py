@@ -47,6 +47,9 @@ _STORE_KINDS = (
     "responses",
     "raw-responses",
     "raw-response-failures",
+    "observed-raw-responses",
+    "response-observations",
+    "provider-diagnostics",
     "reconciliations",
     "terminals",
     "parsed",
@@ -243,7 +246,22 @@ def _store_destination(kind: str, reference: ArtifactRefV5, raw: bytes) -> str:
         return f"imports/{owner}/{kind}/{_safe_component(key)}.bin"
     if kind in {"commitments", "contrasts"}:
         return f"case-contrasts/{owner}/{kind}/{_safe_component(key)}.bin"
-    if kind in {"calls", "requests", "reservations", "dispatches", "responses", "raw-responses", "raw-response-failures", "reconciliations", "terminals", "parsed", "admission-rejections"}:
+    if kind in {
+        "calls",
+        "requests",
+        "reservations",
+        "dispatches",
+        "responses",
+        "raw-responses",
+        "raw-response-failures",
+        "observed-raw-responses",
+        "response-observations",
+        "provider-diagnostics",
+        "reconciliations",
+        "terminals",
+        "parsed",
+        "admission-rejections",
+    }:
         return f"live-study-calls/{owner}/{kind}/{_safe_component(key)}.bin"
     if kind in {"registry", "rubrics", "preflights", "schemas", "parsers", "prompts", "draft-bindings", "mechanism-specs", "mechanism-corpora", "mechanism-links"}:
         return f"behavior-registry/{kind}/{_safe_component(key)}.bin"

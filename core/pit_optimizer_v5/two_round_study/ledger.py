@@ -18,6 +18,8 @@ from core.pit_optimizer_v5.artifacts import ArtifactRefV5
 from core.pit_optimizer_v5.contracts import canonical_json_bytes_v5, canonical_primitive_v5
 from core.pit_optimizer_v5.provider import (
     CompletionResultV5,
+    ProviderFailureDiagnosticV5,
+    ProviderResponseAccountingErrorV5,
     RoleBindingV5,
     RoleAttemptFactsV5,
     RoleFailureCode,
@@ -1437,6 +1439,169 @@ class StudyLedgerV1:
         completion = _completion_from_metadata(value["completion_metadata"], response_text)
         return metadata_ref, completion
 
+    def _provider_diagnostic_records(self) -> dict[str, tuple[ArtifactRefV5, dict[str, object]]]:
+        """Read safe pending-provider diagnostic envelopes without exception text."""
+
+        result: dict[str, tuple[ArtifactRefV5, dict[str, object]]] = {}
+        namespace = "adapter-blobs/study-v1-provider-diagnostics/"
+        fields = {
+            "request_sha256", "reservation_sha256", "claim_sha256", "grant_sha256", "manifest_sha256",
+            "phase", "code", "http_status", "provider_request_id", "accounting_status",
+        }
+        for ref in self._refs("provider-diagnostics"):
+            if not ref.relative_path.startswith(namespace):
+                raise StudyAuthorityError("study provider diagnostic namespace contains an orphan record")
+            key = ref.relative_path.rsplit("/", 1)[-1][:-4]
+            if ref.relative_path != f"{namespace}{key}.bin":
+                raise StudyAuthorityError("study provider diagnostic path is not deterministic")
+            _digest(key, "study provider diagnostic request")
+            if key in result:
+                raise StudyAuthorityError("study provider diagnostic is duplicated")
+            raw = self.store.read(ref)
+            try:
+                value = _decode_canonical_json_object(raw, "study provider diagnostic")
+                payload = _strict(value, fields, "study provider diagnostic")
+                if canonical_json_bytes_v5(payload) != raw:
+                    raise StudyAuthorityError("study provider diagnostic is not canonical")
+                for field in ("request_sha256", "reservation_sha256", "claim_sha256", "grant_sha256", "manifest_sha256"):
+                    _digest(payload[field], f"study provider diagnostic {field}")
+                if payload["request_sha256"] != key or payload["accounting_status"] != "pending":
+                    raise StudyAuthorityError("study provider diagnostic identity or accounting state is invalid")
+                ProviderFailureDiagnosticV5(
+                    phase=payload["phase"],  # type: ignore[arg-type]
+                    code=payload["code"],  # type: ignore[arg-type]
+                    http_status=payload["http_status"],  # type: ignore[arg-type]
+                    provider_request_id=payload["provider_request_id"],  # type: ignore[arg-type]
+                )
+            except (StudyContractError, TypeError, ValueError) as exc:
+                raise StudyAuthorityError("study provider diagnostic is invalid") from exc
+            if ref.sha256 != _sha256(raw):
+                raise StudyAuthorityError("study provider diagnostic reference differs from bytes")
+            result[key] = (ref, payload)
+        return result
+
+    def _observed_response_records(
+        self,
+    ) -> dict[str, tuple[ArtifactRefV5, dict[str, object], ArtifactRefV5 | None, bytes | None]]:
+        """Read bounded pending-accounting observations with their exact bytes."""
+
+        observation_refs: dict[str, ArtifactRefV5] = {}
+        for ref in self._refs("response-observations"):
+            namespace = "adapter-blobs/study-v1-response-observations/"
+            if not ref.relative_path.startswith(namespace):
+                raise StudyAuthorityError("study response observation namespace contains an orphan record")
+            key = ref.relative_path.rsplit("/", 1)[-1][:-4]
+            if ref.relative_path != f"{namespace}{key}.bin":
+                raise StudyAuthorityError("study response observation path is not deterministic")
+            _digest(key, "study response observation request")
+            if key in observation_refs:
+                raise StudyAuthorityError("study response observation is duplicated")
+            observation_refs[key] = ref
+        raw_refs: dict[str, ArtifactRefV5] = {}
+        for ref in self._refs("observed-raw-responses"):
+            namespace = "adapter-blobs/study-v1-observed-raw-responses/"
+            if not ref.relative_path.startswith(namespace):
+                raise StudyAuthorityError("study observed raw response namespace contains an orphan record")
+            key = ref.relative_path.rsplit("/", 1)[-1][:-4]
+            if ref.relative_path != f"{namespace}{key}.bin":
+                raise StudyAuthorityError("study observed raw response path is not deterministic")
+            _digest(key, "study observed raw response request")
+            if key in raw_refs:
+                raise StudyAuthorityError("study observed raw response is duplicated")
+            raw_refs[key] = ref
+        if not set(raw_refs).issubset(observation_refs):
+            raise StudyAuthorityError("study observed raw response has no authenticated observation envelope")
+        result: dict[str, tuple[ArtifactRefV5, dict[str, object], ArtifactRefV5 | None, bytes | None]] = {}
+        fields = {
+            "request_sha256",
+            "reservation_sha256",
+            "claim_sha256",
+            "grant_sha256",
+            "manifest_sha256",
+            "phase",
+            "code",
+            "provider_request_id",
+            "raw_response_sha256",
+            "raw_response_length",
+            "accounting_status",
+        }
+        for key, observation_ref in observation_refs.items():
+            observation_raw = self.store.read(observation_ref)
+            try:
+                value = _decode_canonical_json_object(observation_raw, "study response observation")
+                payload = _strict(value, fields, "study response observation")
+                if canonical_json_bytes_v5(payload) != observation_raw:
+                    raise StudyAuthorityError("study response observation is not canonical")
+                for field in (
+                    "request_sha256",
+                    "reservation_sha256",
+                    "claim_sha256",
+                    "grant_sha256",
+                    "manifest_sha256",
+                    "raw_response_sha256",
+                ):
+                    _digest(payload[field], f"study response observation {field}")
+                if payload["request_sha256"] != key:
+                    raise StudyAuthorityError("study response observation request differs from its path")
+                if payload["phase"] != "response_accounting":
+                    raise StudyAuthorityError("study response observation phase is invalid")
+                if type(payload["code"]) is not str or re.fullmatch(r"[a-z0-9_]{1,64}", payload["code"]) is None:
+                    raise StudyAuthorityError("study response observation code is invalid")
+                if payload["provider_request_id"] is not None:
+                    _text(payload["provider_request_id"], "study response observation provider request ID", maximum=512)
+                if type(payload["raw_response_length"]) is not int or not 0 <= payload["raw_response_length"] <= _MAX_RESPONSE_BYTES:
+                    raise StudyAuthorityError("study response observation raw response length is invalid")
+                if payload["accounting_status"] != "pending":
+                    raise StudyAuthorityError("study response observation accounting status is invalid")
+            except (StudyContractError, TypeError, ValueError) as exc:
+                raise StudyAuthorityError("study response observation is invalid") from exc
+            if observation_ref.sha256 != _sha256(observation_raw):
+                raise StudyAuthorityError("study response observation reference differs from bytes")
+            raw_ref = raw_refs.get(key)
+            raw = None if raw_ref is None else self.store.read(raw_ref)
+            if raw_ref is not None:
+                assert raw is not None
+                if raw_ref.sha256 != _sha256(raw):
+                    raise StudyAuthorityError("study observed raw response reference differs from bytes")
+                if payload["raw_response_sha256"] != raw_ref.sha256 or payload["raw_response_length"] != len(raw):
+                    raise StudyAuthorityError("study response observation differs from its exact raw bytes")
+            result[key] = (observation_ref, payload, raw_ref, raw)
+        return result
+
+    def _observed_response_record(
+        self,
+        request: StudyCallRequestV1,
+    ) -> tuple[ArtifactRefV5, dict[str, object], ArtifactRefV5 | None, bytes | None] | None:
+        return self._observed_response_records().get(request.sha256)
+
+    def _assert_completion_agrees_with_observation(
+        self,
+        request: StudyCallRequestV1,
+        completion: CompletionResultV5,
+        *,
+        allow_missing_raw: bool = False,
+    ) -> bool:
+        """Authenticate response identity; return whether envelope bytes need restoration."""
+
+        observed = self._observed_response_record(request)
+        if observed is None:
+            return False
+        _observation_ref, payload, _raw_ref, raw = observed
+        incoming = completion.response_text.encode("utf-8")
+        if raw is None:
+            if not allow_missing_raw:
+                raise StudyPendingAccounting("preserved provider response bytes are not durably available")
+            if (
+                payload["raw_response_sha256"] != _sha256(incoming)
+                or payload["raw_response_length"] != len(incoming)
+                or payload["provider_request_id"] != completion.provider_request_id
+            ):
+                raise StudyAuthorityError("accounted completion differs from the preserved provider response observation")
+            return True
+        if raw != incoming or payload["provider_request_id"] != completion.provider_request_id:
+            raise StudyAuthorityError("accounted completion differs from the preserved provider response observation")
+        return False
+
     def _parse_authenticated_response(self, request: StudyCallRequestV1, raw: bytes) -> StudyResponseV1:
         """Use the one study parser for normal and recovery paths."""
 
@@ -2082,6 +2247,7 @@ class StudyLedgerV1:
             self._validate_reservation_request_binding(reservation, request)
             if not any(claim.request_sha256 == request.sha256 for claim in self._dispatch_claims()):
                 raise StudyAuthorityError("provider response has no authenticated dispatch claim")
+            self._assert_completion_agrees_with_observation(request, completion)
             if self._find_terminal(request) is not None:
                 raise StudyAdmissionError("study request already has a terminal")
             existing = self._response_record(request)
@@ -2109,6 +2275,88 @@ class StudyLedgerV1:
                 self._persist_raw_failure(request, completion)
             return response_record_ref
 
+    def persist_provider_diagnostic_for_pending_accounting(
+        self, request: StudyCallRequestV1, diagnostic: ProviderFailureDiagnosticV5
+    ) -> None:
+        """Persist only safe phase/code/status/ID for an unresolved handoff."""
+
+        self._validate_request(request)
+        if type(diagnostic) is not ProviderFailureDiagnosticV5:
+            raise StudyContractError("provider failure diagnostic is invalid")
+        with self._lock, self._transition():
+            reservation = self._find_reservation(request)
+            if reservation is None:
+                raise StudyAuthorityError("provider diagnostic has no durable reservation")
+            self._validate_reservation_request_binding(reservation, request)
+            claims = tuple(claim for claim in self._dispatch_claims() if claim.request_sha256 == request.sha256)
+            if len(claims) != 1:
+                raise StudyAuthorityError("provider diagnostic has no authenticated dispatch claim")
+            claim = claims[0]
+            payload = {
+                "request_sha256": request.sha256,
+                "reservation_sha256": reservation.reservation_sha256,
+                "claim_sha256": claim.claim_sha256,
+                "grant_sha256": self.grant.sha256,
+                "manifest_sha256": self.manifest.sha256,
+                "phase": diagnostic.phase,
+                "code": diagnostic.code,
+                "http_status": diagnostic.http_status,
+                "provider_request_id": diagnostic.provider_request_id,
+                "accounting_status": "pending",
+            }
+            self.store.put(kind="provider-diagnostics", key=request.sha256, content=canonical_json_bytes_v5(payload))
+
+    def persist_observed_response_for_pending_accounting(
+        self, request: StudyCallRequestV1, observed: ProviderResponseAccountingErrorV5
+    ) -> None:
+        """Durably preserve returned model content without inventing usage."""
+        self._validate_request(request)
+        if type(observed) is not ProviderResponseAccountingErrorV5:
+            raise StudyContractError("observed provider accounting error is invalid")
+        if not self.grant.response_persistence_consent:
+            return
+        raw = observed.response_text.encode("utf-8")
+        if len(raw) > _MAX_RESPONSE_BYTES:
+            self.persist_provider_diagnostic_for_pending_accounting(
+                request,
+                ProviderFailureDiagnosticV5(
+                    phase="response_accounting",
+                    code="response_content_oversized",
+                    provider_request_id=observed.provider_request_id,
+                ),
+            )
+            return
+        with self._lock, self._transition():
+            reservation = self._find_reservation(request)
+            if reservation is None:
+                raise StudyAuthorityError("observed provider response has no durable reservation")
+            self._validate_reservation_request_binding(reservation, request)
+            claims = tuple(claim for claim in self._dispatch_claims() if claim.request_sha256 == request.sha256)
+            if len(claims) != 1:
+                raise StudyAuthorityError("observed provider response has no authenticated dispatch claim")
+            claim = claims[0]
+            payload = {
+                "request_sha256": request.sha256,
+                "reservation_sha256": reservation.reservation_sha256,
+                "claim_sha256": claim.claim_sha256,
+                "grant_sha256": self.grant.sha256,
+                "manifest_sha256": self.manifest.sha256,
+                "phase": observed.phase,
+                "code": observed.code,
+                "provider_request_id": observed.provider_request_id,
+                "raw_response_sha256": _sha256(raw),
+                "raw_response_length": len(raw),
+                "accounting_status": "pending",
+            }
+            # Publish the bound envelope first.  If the later byte write is
+            # interrupted, reopen can retain a safe pending prefix instead of
+            # treating a legitimate write boundary as an orphan.
+            self.store.put(kind="response-observations", key=request.sha256, content=canonical_json_bytes_v5(payload))
+            try:
+                self.store.put(kind="observed-raw-responses", key=request.sha256, content=raw)
+            except (StudyAdmissionError, StudyAuthorityError):
+                return
+
     def reconcile_pending_usage(
         self,
         request: StudyCallRequestV1,
@@ -2124,12 +2372,23 @@ class StudyLedgerV1:
             raise StudyContractError("reconciled completion is invalid")
         _text(provider_reference, "reconciliation provider reference", maximum=512)
         with self._lock, self._transition():
+            # A long-lived ledger instance may see append-only records written
+            # after construction. Reauthenticate the pinned authority and the
+            # full bounded graph under the transition lock before using an
+            # envelope to restore provider bytes.
+            self._authenticate_authority_records(publish=False)
+            self._authenticate_setup_graph()
+            self._authenticate_graph_orphans(self._reservations(), self._terminals())
             reservation = self._find_reservation(request)
             if reservation is None:
                 raise StudyAuthorityError("reconciliation has no durable reservation")
             self._validate_reservation_request_binding(reservation, request)
-            if not any(claim.request_sha256 == request.sha256 for claim in self._dispatch_claims()):
+            claims = tuple(claim for claim in self._dispatch_claims() if claim.request_sha256 == request.sha256)
+            if len(claims) != 1:
                 raise StudyAuthorityError("reconciliation has no authenticated dispatch claim")
+            claim = claims[0]
+            if claim.reservation_sha256 != reservation.reservation_sha256:
+                raise StudyAuthorityError("reconciliation dispatch claim differs from its reservation")
             incoming_bytes = completion.response_text.encode("utf-8")
             incoming_completion_hash = _completion_fingerprint(
                 completion,
@@ -2155,8 +2414,24 @@ class StudyLedgerV1:
             metadata_record = self._response_metadata(request)
             if response is not None and response[1] != completion:
                 raise StudyAuthorityError("reconciliation conflicts with the persisted usage receipt")
-            if metadata_record is not None and _completion_metadata_primitive(completion) != metadata_record[1]["completion_metadata"]:
-                raise StudyAuthorityError("reconciliation conflicts with the persisted usage metadata")
+            if metadata_record is not None:
+                if _completion_metadata_primitive(completion) != metadata_record[1]["completion_metadata"]:
+                    raise StudyAuthorityError("reconciliation conflicts with the persisted usage metadata")
+                if (
+                    metadata_record[1]["response_sha256"] != _sha256(incoming_bytes)
+                    or metadata_record[1]["response_length"] != len(incoming_bytes)
+                ):
+                    raise StudyAuthorityError("reconciliation response differs from the persisted usage metadata")
+            restore_observed_raw = self._assert_completion_agrees_with_observation(
+                request,
+                completion,
+                allow_missing_raw=True,
+            )
+            if restore_observed_raw:
+                # Publish only the exact byte sequence authenticated by the
+                # observation envelope. The normal reconciliation path below
+                # then writes its separate usage receipt and settles once.
+                self.store.put(kind="observed-raw-responses", key=request.sha256, content=incoming_bytes)
             if metadata_record is None:
                 self._persist_response(request, completion)
             raw_ref = self._raw_response_reference(request)
@@ -3010,6 +3285,37 @@ class StudyLedgerV1:
         terminal_by_request = {item.request_sha256: item for item in terminals}
         dispatch_claims = self._dispatch_claims()
         dispatch_request_keys = {claim.request_sha256 for claim in dispatch_claims}
+        claim_by_request = {claim.request_sha256: claim for claim in dispatch_claims}
+        diagnostics = self._provider_diagnostic_records()
+        observations = self._observed_response_records()
+        for request_sha256, (_diagnostic_ref, diagnostic) in diagnostics.items():
+            reservation = reservation_by_request.get(request_sha256)
+            claim = claim_by_request.get(request_sha256)
+            if reservation is None or claim is None:
+                raise StudyAuthorityError("study provider diagnostic has no authenticated reservation and dispatch claim")
+            if (
+                diagnostic["reservation_sha256"] != reservation.reservation_sha256
+                or diagnostic["claim_sha256"] != claim.claim_sha256
+                or diagnostic["grant_sha256"] != self.grant.sha256
+                or diagnostic["manifest_sha256"] != self.manifest.sha256
+            ):
+                raise StudyAuthorityError("study provider diagnostic authority binding differs")
+        for request_sha256, (_observation_ref, observation, _raw_ref, _raw) in observations.items():
+            reservation = reservation_by_request.get(request_sha256)
+            claim = claim_by_request.get(request_sha256)
+            if reservation is None or claim is None:
+                raise StudyAuthorityError("study response observation has no authenticated reservation and dispatch claim")
+            if (
+                observation["reservation_sha256"] != reservation.reservation_sha256
+                or observation["claim_sha256"] != claim.claim_sha256
+                or observation["grant_sha256"] != self.grant.sha256
+                or observation["manifest_sha256"] != self.manifest.sha256
+            ):
+                raise StudyAuthorityError("study response observation authority binding differs")
+            request = self._stored_request(request_sha256)
+            self._validate_reservation_request_binding(reservation, request)
+            if claim.reservation_sha256 != reservation.reservation_sha256:
+                raise StudyAuthorityError("study response observation dispatch claim differs from its reservation")
         admission_rejections = self._admission_rejections()
         rejection_by_request = {item.request_sha256: item for _ref_value, item in admission_rejections}
         reconciliation_events = self._reconciliations()
@@ -3025,7 +3331,7 @@ class StudyLedgerV1:
             or any(event.request_sha256 in incomplete_publication_requests for event in reconciliation_events)
             or any(
                 ref.relative_path.rsplit("/", 1)[-1][:-4] in incomplete_publication_requests
-                for kind in ("responses", "raw-responses", "raw-response-failures", "parsed")
+                for kind in ("responses", "raw-responses", "raw-response-failures", "observed-raw-responses", "response-observations", "provider-diagnostics", "parsed")
                 for ref in self._refs(kind)
             )
         ):
@@ -3094,6 +3400,17 @@ class StudyLedgerV1:
             failure_refs[key] = ref
         if set(raw_refs) & set(failure_refs):
             raise StudyAuthorityError("study response has both raw and unavailable persistence records")
+        for key, (_observation_ref, observation, _observed_raw_ref, observed_raw) in observations.items():
+            if key in response_metadata:
+                accounted = _completion_from_metadata(response_metadata[key]["completion_metadata"], "")
+                if accounted.provider_request_id != observation["provider_request_id"]:
+                    raise StudyAuthorityError("accounted completion differs from the preserved provider response observation")
+            if observed_raw is None and key in response_metadata:
+                raise StudyAuthorityError("accounted completion follows an incomplete preserved response observation")
+            if observed_raw is not None and key in raw_values and raw_values[key] != observed_raw:
+                raise StudyAuthorityError("accounted completion differs from the preserved provider response observation")
+            if key in failure_refs:
+                raise StudyAuthorityError("observed provider response conflicts with unavailable raw response marker")
         failure_keys = {
             ref.relative_path.rsplit("/", 1)[-1][:-4]
             for ref in self._refs("raw-response-failures")
@@ -3287,15 +3604,23 @@ def run_study_call_v1(
         )
     except (StudyAdmissionError, StudyAuthorityError, StudyContractError) as exc:
         if any(claim.request_sha256 == request.sha256 for claim in ledger._dispatch_claims()):
+            ledger.persist_provider_diagnostic_for_pending_accounting(request, ProviderFailureDiagnosticV5.from_exception(exc))
             raise StudyPendingAccounting("study provider dispatch has unresolved accounting") from exc
         ledger.reject_pre_dispatch(
             reservation,
             reason=str(exc).strip() or "study provider dispatch was rejected before provider handoff",
         )
         raise
+    except ProviderResponseAccountingErrorV5 as exc:
+        ledger.persist_observed_response_for_pending_accounting(request, exc)
+        raise StudyPendingAccounting("study provider dispatch has unresolved accounting") from exc
+    except ProviderFailureDiagnosticV5 as exc:
+        ledger.persist_provider_diagnostic_for_pending_accounting(request, exc)
+        raise StudyPendingAccounting("study provider dispatch has unresolved accounting") from exc
     except BaseException as exc:
-        # No zero-usage completion is synthesized.  Recovery must block until
-        # a provider response or an authenticated usage reconciliation exists.
+        # No zero-usage completion is synthesized.  Persist only closed safe
+        # diagnostic fields; exception text, headers, and credentials never enter the study store.
+        ledger.persist_provider_diagnostic_for_pending_accounting(request, ProviderFailureDiagnosticV5.from_exception(exc))
         raise StudyPendingAccounting("study provider dispatch has unresolved accounting") from exc
     if type(completion) is not CompletionResultV5:
         raise StudyPendingAccounting("study provider returned an untyped completion")

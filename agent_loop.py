@@ -3871,7 +3871,7 @@ class OpenRouterGateway:
 
         import asyncio
 
-        from core.pit_optimizer_v5.provider import CompletionResultV5, wire_role_messages_v5, wire_role_schema_v5
+        from core.pit_optimizer_v5.provider import CompletionResultV5, ProviderResponseAccountingErrorV5, wire_role_messages_v5, wire_role_schema_v5
 
         if (
             type(request_sha256) is not str
@@ -3961,22 +3961,44 @@ class OpenRouterGateway:
             response = asyncio.run(complete_before_deadline())
         else:
             raise ConfigurationError("V5 synchronous provider boundary requires a controller thread")
-        usage = _usage_from_response(response, require_complete=True)
-        if (
-            usage.prompt_tokens is None
-            or usage.completion_tokens is None
-            or usage.cost_usd is None
-        ):
-            raise AccountingValidationError(
-                "V5 provider accounting is incomplete",
-                code=AccountingFailureCode.INLINE_USAGE_MISSING,
-            )
         raw_model = _read_field(response, "model")
         returned_model = raw_model if isinstance(raw_model, str) and raw_model.strip() else "unknown"
         choices = _read_field(response, "choices")
         choice = choices[0] if isinstance(choices, (list, tuple)) and len(choices) == 1 else None
         content = _read_field(choice, "message", "content")
         response_text = content if isinstance(content, str) else ""
+        raw_request_id = _read_field(response, "id")
+        # The opaque provider ID is optional evidence.  Do not let an unsafe
+        # optional ID prevent preservation of otherwise observed model bytes.
+        request_id = None
+        if (
+            type(raw_request_id) is str
+            and raw_request_id
+            and raw_request_id == raw_request_id.strip()
+            and "\x00" not in raw_request_id
+        ):
+            try:
+                if len(raw_request_id.encode("utf-8")) <= 512:
+                    request_id = raw_request_id
+            except UnicodeEncodeError:
+                pass
+        try:
+            usage = _usage_from_response(response, require_complete=True)
+        except AccountingValidationError as exc:
+            code = getattr(exc, "code", None)
+            code_value = getattr(code, "value", None)
+            raise ProviderResponseAccountingErrorV5(response_text=response_text, provider_request_id=request_id, phase="response_accounting", code=(code_value if isinstance(code_value, str) else "inline_usage_invalid")) from exc
+        if (
+            usage.prompt_tokens is None
+            or usage.completion_tokens is None
+            or usage.cost_usd is None
+        ):
+            raise ProviderResponseAccountingErrorV5(
+                response_text=response_text,
+                provider_request_id=request_id,
+                phase="response_accounting",
+                code="inline_usage_missing",
+            )
         accepted = bool(
             _read_field(response, "error") is None
             and choice is not None
@@ -3985,8 +4007,6 @@ class OpenRouterGateway:
             and response_text.strip()
             and returned_model == model
         )
-        raw_request_id = _read_field(response, "id")
-        request_id = raw_request_id if isinstance(raw_request_id, str) and raw_request_id.strip() else None
         return CompletionResultV5(
             response_text=response_text,
             accepted=accepted,

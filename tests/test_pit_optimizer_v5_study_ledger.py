@@ -11,10 +11,16 @@ import pytest
 
 from core.pit_optimizer_v5.artifacts import ArtifactRefV5, LocalArtifactRepositoryV5
 from core.pit_optimizer_v5.contracts import InvestigatorArtifactV5, canonical_json_bytes_v5
-from core.pit_optimizer_v5.provider import CompletionResultV5, RoleTerminalReceiptV5, wire_role_messages_v5
+from core.pit_optimizer_v5.provider import (
+    CompletionResultV5,
+    ProviderResponseAccountingErrorV5,
+    RoleTerminalReceiptV5,
+    wire_role_messages_v5,
+)
 from core.pit_optimizer_v5.two_round_study.contracts import (
     StudyAdmissionError,
     StudyAuthorityError,
+    StudyContractError,
     StudyPendingAccounting,
     StudyResponseV1,
 )
@@ -23,6 +29,7 @@ from core.pit_optimizer_v5.two_round_study.ledger import (
     StudyReservationV1,
     _StudyReservationPublicationV1,
     run_study_call_v1,
+    _MAX_RESPONSE_BYTES,
 )
 from core.pit_optimizer_v5.provider import RoleFailureCode
 
@@ -591,6 +598,391 @@ def test_untyped_usage_from_a_counting_fake_stays_pending_at_caller_boundary(tmp
     assert fake.calls == 1
     assert store.list_refs(kind="terminals") == ()
     assert len(store.list_refs(kind="dispatches")) == 1
+
+
+@pytest.mark.parametrize(
+    ("provider_id", "expected_provider_id"),
+    (
+        ("safe-sdk-response-id", "safe-sdk-response-id"),
+        ("x" * 513, None),
+        ("unpaired-surrogate-\ud800", None),
+    ),
+)
+def test_fake_sdk_missing_usage_retains_content_through_actual_gateway_boundary(
+    tmp_path, provider_id, expected_provider_id
+) -> None:
+    import types
+    import time
+    from agent_loop import OpenRouterGateway
+
+    context = __import__("tests.test_pit_optimizer_v5_study_live_calls", fromlist=["_study_context"])._study_context(tmp_path)
+    _fixture, fixture_request, _preflight, manifest, request, store, grant, _approval, ledger, *_ = context
+    response = types.SimpleNamespace(
+        model=request.model,
+        id=provider_id,
+        choices=(types.SimpleNamespace(message=types.SimpleNamespace(content='{"exact":"sdk content"}', refusal=None), finish_reason="stop"),),
+        usage=None,
+    )
+
+    class Completions:
+        async def create(self, **_kwargs):
+            return response
+
+    client = types.SimpleNamespace(chat=types.SimpleNamespace(completions=Completions()))
+    gateway = OpenRouterGateway(client=client, api_key="offline-test-key", timeout_seconds=5, max_attempts=1)
+    with pytest.raises(ProviderResponseAccountingErrorV5) as raised:
+        gateway.request_pit_optimizer_v5_json_once(
+            request_sha256=request.sha256,
+            model=request.model,
+            messages=request.messages,
+            response_schema_json=request.schema_json,
+            max_output_tokens=request.max_output_tokens,
+            wall_deadline=time.monotonic() + 4.0,
+            allow_full_source_escape=False,
+        )
+    observed = raised.value
+    assert observed.response_text == '{"exact":"sdk content"}'
+    assert observed.provider_request_id == expected_provider_id
+    assert observed.code == "inline_usage_missing"
+
+    class ReraiseObserved:
+        def invoke_json_once(self, **_kwargs):
+            raise observed
+
+    with pytest.raises(StudyPendingAccounting, match="unresolved accounting"):
+        run_study_call_v1(
+            request=request,
+            fixture_request=fixture_request,
+            ledger=ledger,
+            gateway=ReraiseObserved(),
+            deadline_monotonic=1.0,
+        )
+    raw_refs = store.list_refs(kind="observed-raw-responses")
+    assert len(raw_refs) == 1
+    assert store.read(raw_refs[0]) == b'{"exact":"sdk content"}'
+    assert store.list_refs(kind="responses") == ()
+    assert store.list_refs(kind="terminals") == ()
+    assert store.list_refs(kind="imports") == ()
+    reader = StudyLedgerV1(store, manifest, grant, approval=None)
+    with pytest.raises(StudyPendingAccounting, match="no authenticated provider usage"):
+        reader.recover(request)
+
+
+def test_incomplete_accounting_preserves_observed_model_content_and_safe_id_without_settling(tmp_path) -> None:
+    context = __import__("tests.test_pit_optimizer_v5_study_live_calls", fromlist=["_study_context"])._study_context(tmp_path)
+    _fixture, fixture_request, _preflight, manifest, request, store, grant, _approval, ledger, *_ = context
+
+    class IncompleteUsageFake:
+        calls = 0
+
+        def invoke_json_once(self, **_kwargs):
+            type(self).calls += 1
+            raise ProviderResponseAccountingErrorV5(
+                response_text='{"exact":"returned model content"}',
+                provider_request_id="safe-request-1",
+                phase="response_accounting",
+                code="inline_usage_missing",
+            )
+
+    with pytest.raises(StudyPendingAccounting, match="unresolved accounting"):
+        run_study_call_v1(
+            request=request,
+            fixture_request=fixture_request,
+            ledger=ledger,
+            gateway=IncompleteUsageFake(),
+            deadline_monotonic=1.0,
+        )
+    assert store.list_refs(kind="terminals") == ()
+    assert store.list_refs(kind="responses") == ()
+    raw_refs = store.list_refs(kind="observed-raw-responses")
+    observation_refs = store.list_refs(kind="response-observations")
+    assert len(raw_refs) == len(observation_refs) == 1
+    assert store.read(raw_refs[0]) == b'{"exact":"returned model content"}'
+    observation = __import__("json").loads(store.read(observation_refs[0]))
+    assert observation["phase"] == "response_accounting"
+    assert observation["code"] == "inline_usage_missing"
+    assert observation["provider_request_id"] == "safe-request-1"
+    assert observation["claim_sha256"] == ledger._dispatch_claims()[0].claim_sha256
+    reader = StudyLedgerV1(store, manifest, grant, approval=None)
+    with pytest.raises(StudyPendingAccounting, match="no authenticated provider usage"):
+        reader.recover(request)
+    mismatched = CompletionResultV5(
+        response_text='{"exact":"replacement"}',
+        accepted=True,
+        input_tokens=1,
+        output_tokens=1,
+        provider_request_id="safe-request-1",
+        returned_model=request.model,
+        cost_usd=Decimal("0"),
+        external_attempt_count=1,
+        response_received=True,
+    )
+    with pytest.raises(StudyAuthorityError, match="preserved provider response observation"):
+        ledger.persist_response_for_request(request, mismatched)
+    assert store.list_refs(kind="responses") == ()
+    assert store.list_refs(kind="terminals") == ()
+    assert store.list_refs(kind="imports") == ()
+
+
+
+def test_observation_envelope_prefix_reopens_pending_after_raw_write_interruption(tmp_path, monkeypatch) -> None:
+    context = __import__("tests.test_pit_optimizer_v5_study_live_calls", fromlist=["_study_context"])._study_context(tmp_path)
+    _fixture, fixture_request, _preflight, manifest, request, store, grant, _approval, ledger, *_ = context
+
+    class IncompleteUsageFake:
+        def invoke_json_once(self, **_kwargs):
+            raise ProviderResponseAccountingErrorV5(
+                response_text='{"exact":"returned model content"}',
+                provider_request_id="safe-request-1",
+                phase="response_accounting",
+                code="inline_usage_missing",
+            )
+
+    original_put = type(store).put
+
+    def interrupt_observed_raw_write(self, *, kind, key, content):
+        if kind == "observed-raw-responses":
+            raise StudyAdmissionError("simulated observed raw persistence interruption")
+        return original_put(self, kind=kind, key=key, content=content)
+
+    monkeypatch.setattr(type(store), "put", interrupt_observed_raw_write)
+    with pytest.raises(StudyPendingAccounting, match="unresolved accounting"):
+        run_study_call_v1(
+            request=request,
+            fixture_request=fixture_request,
+            ledger=ledger,
+            gateway=IncompleteUsageFake(),
+            deadline_monotonic=1.0,
+        )
+    assert store.list_refs(kind="response-observations")
+    assert store.list_refs(kind="observed-raw-responses") == ()
+    assert store.list_refs(kind="responses") == ()
+    assert store.list_refs(kind="terminals") == ()
+    assert store.list_refs(kind="imports") == ()
+    reader = StudyLedgerV1(store, manifest, grant, approval=None)
+    with pytest.raises(StudyPendingAccounting, match="no authenticated provider usage"):
+        reader.recover(request)
+
+    monkeypatch.undo()
+    orphan_context = __import__("tests.test_pit_optimizer_v5_study_live_calls", fromlist=["_study_context"])._study_context(tmp_path / "orphan")
+    _fixture, _fixture_request, _preflight, orphan_manifest, _request, orphan_store, orphan_grant, _approval, _ledger, *_ = orphan_context
+    orphan_store.put(kind="observed-raw-responses", key="0" * 64, content=b"orphan")
+    with pytest.raises(StudyAuthorityError, match="observed raw response has no authenticated observation envelope"):
+        StudyLedgerV1(orphan_store, orphan_manifest, orphan_grant, approval=None)
+
+
+def _interrupted_observation_prefix_for_reconciliation(tmp_path, monkeypatch):
+    context = __import__("tests.test_pit_optimizer_v5_study_live_calls", fromlist=["_study_context"])._study_context(tmp_path)
+    _fixture, fixture_request, _preflight, manifest, request, store, grant, approval, _ledger, *_ = context
+    response_text = _response_for(fixture_request).canonical_bytes().decode("utf-8")
+
+    class IncompleteUsageFake:
+        calls = 0
+
+        def invoke_json_once(self, **_kwargs):
+            self.calls += 1
+            raise ProviderResponseAccountingErrorV5(
+                response_text=response_text,
+                provider_request_id="safe-request-1",
+                phase="response_accounting",
+                code="inline_usage_missing",
+            )
+
+    gateway = IncompleteUsageFake()
+    original_put = type(store).put
+
+    def interrupt_observed_raw_write(self, *, kind, key, content):
+        if kind == "observed-raw-responses":
+            raise StudyAdmissionError("simulated observed raw persistence interruption")
+        return original_put(self, kind=kind, key=key, content=content)
+
+    monkeypatch.setattr(type(store), "put", interrupt_observed_raw_write)
+    with pytest.raises(StudyPendingAccounting, match="unresolved accounting"):
+        run_study_call_v1(
+            request=request,
+            fixture_request=fixture_request,
+            ledger=_ledger,
+            gateway=gateway,
+            deadline_monotonic=1.0,
+        )
+    assert gateway.calls == 1
+    assert len(store.list_refs(kind="response-observations")) == 1
+    assert store.list_refs(kind="observed-raw-responses") == ()
+
+    monkeypatch.setattr(type(store), "put", original_put)
+    reader = StudyLedgerV1(store, manifest, grant, approval=None)
+    with pytest.raises(StudyPendingAccounting, match="no authenticated provider usage"):
+        reader.recover(request)
+    writer = StudyLedgerV1(store, manifest, grant, approval=approval)
+    completion = replace(
+        _completion(request=request, response_text=response_text),
+        provider_request_id="safe-request-1",
+    )
+
+    return manifest, request, store, grant, writer, reader, completion, response_text, gateway
+
+
+def test_reconciliation_restores_exact_observed_bytes_after_envelope_prefix(tmp_path, monkeypatch) -> None:
+    manifest, request, store, grant, writer, _reader, completion, response_text, gateway = (
+        _interrupted_observation_prefix_for_reconciliation(tmp_path, monkeypatch)
+    )
+    terminal = writer.reconcile_pending_usage(
+        request,
+        completion=completion,
+        provider_reference="synthetic-authoritative-reconciliation-1",
+    )
+
+    assert terminal.failure_code is None
+    assert store.read(store.list_refs(kind="observed-raw-responses")[0]) == response_text.encode("utf-8")
+    assert StudyLedgerV1(store, manifest, grant, approval=None).verify_terminal(terminal.reference) == terminal
+    assert gateway.calls == 1
+    counts_before_retry = {
+        kind: len(store.list_refs(kind=kind))
+        for kind in ("observed-raw-responses", "responses", "raw-responses", "reconciliations", "terminals")
+    }
+    assert writer.reconcile_pending_usage(
+        request,
+        completion=completion,
+        provider_reference="synthetic-authoritative-reconciliation-1",
+    ) == terminal
+    assert {
+        kind: len(store.list_refs(kind=kind))
+        for kind in counts_before_retry
+    } == counts_before_retry
+    assert gateway.calls == 1
+
+
+@pytest.mark.parametrize("mutation", ("same_length_content", "different_length_content", "provider_request_id"))
+def test_reconciliation_rejects_observation_mismatch_without_writes(tmp_path, monkeypatch, mutation) -> None:
+    _manifest, request, store, _grant, writer, _reader, completion, _response_text, gateway = (
+        _interrupted_observation_prefix_for_reconciliation(tmp_path, monkeypatch)
+    )
+    if mutation == "same_length_content":
+        replacement = " " if completion.response_text[-1] != " " else "x"
+        completion = replace(completion, response_text=completion.response_text[:-1] + replacement)
+    elif mutation == "different_length_content":
+        completion = replace(completion, response_text=completion.response_text + " ")
+    else:
+        completion = replace(completion, provider_request_id="different-safe-request")
+
+    with pytest.raises(StudyAuthorityError, match="observation"):
+        writer.reconcile_pending_usage(
+            request,
+            completion=completion,
+            provider_reference="synthetic-authoritative-reconciliation-1",
+        )
+    for kind in ("observed-raw-responses", "responses", "raw-responses", "reconciliations", "terminals"):
+        assert store.list_refs(kind=kind) == ()
+    assert gateway.calls == 1
+
+
+def test_unauthorized_reconciliation_does_not_restore_observation_bytes(tmp_path, monkeypatch) -> None:
+    _manifest, request, store, _grant, _writer, reader, completion, _response_text, gateway = (
+        _interrupted_observation_prefix_for_reconciliation(tmp_path, monkeypatch)
+    )
+    with pytest.raises(StudyAuthorityError, match="explicit approval"):
+        reader.reconcile_pending_usage(
+            request,
+            completion=completion,
+            provider_reference="synthetic-authoritative-reconciliation-1",
+        )
+    for kind in ("observed-raw-responses", "responses", "raw-responses", "reconciliations", "terminals"):
+        assert store.list_refs(kind=kind) == ()
+    assert gateway.calls == 1
+
+
+@pytest.mark.parametrize(
+    ("failure", "phase", "code", "status", "request_id"),
+    (
+        (TimeoutError("sensitive timeout detail"), "transport", "request_timeout", None, None),
+        (ImportError("sensitive SDK detail"), "client_init", "client_initialization_failed", None, None),
+        (
+            type("HttpFailure", (Exception,), {"status_code": 503, "request_id": "safe-request-503"})("sensitive HTTP detail"),
+            "transport",
+            "http_status",
+            503,
+            "safe-request-503",
+        ),
+        (
+            type("HttpFailure", (Exception,), {"status_code": 503, "request_id": "unsafe-\ud800"})("sensitive HTTP detail"),
+            "transport",
+            "http_status",
+            503,
+            None,
+        ),
+        (StudyContractError("sensitive post-claim contract detail"), "unknown", "unclassified", None, None),
+    ),
+)
+def test_unresolved_provider_failures_persist_only_safe_bound_diagnostics(
+    tmp_path, failure, phase, code, status, request_id
+) -> None:
+    context = __import__("tests.test_pit_optimizer_v5_study_live_calls", fromlist=["_study_context"])._study_context(tmp_path)
+    _fixture, fixture_request, _preflight, manifest, request, store, grant, _approval, ledger, *_ = context
+
+    class FailureFake:
+        def invoke_json_once(self, **_kwargs):
+            raise failure
+
+    with pytest.raises(StudyPendingAccounting, match="unresolved accounting"):
+        run_study_call_v1(
+            request=request,
+            fixture_request=fixture_request,
+            ledger=ledger,
+            gateway=FailureFake(),
+            deadline_monotonic=1.0,
+        )
+    refs = store.list_refs(kind="provider-diagnostics")
+    assert len(refs) == 1
+    raw = store.read(refs[0])
+    diagnostic = __import__("json").loads(raw)
+    assert diagnostic["phase"] == phase
+    assert diagnostic["code"] == code
+    assert diagnostic["http_status"] == status
+    assert diagnostic["provider_request_id"] == request_id
+    assert b"sensitive" not in raw
+    assert store.list_refs(kind="responses") == ()
+    assert store.list_refs(kind="terminals") == ()
+    assert store.list_refs(kind="imports") == ()
+    reader = StudyLedgerV1(store, manifest, grant, approval=None)
+    with pytest.raises(StudyPendingAccounting, match="no authenticated provider usage"):
+        reader.recover(request)
+
+
+def test_oversized_observed_content_records_safe_diagnostic_without_raw_persistence(tmp_path) -> None:
+    context = __import__("tests.test_pit_optimizer_v5_study_live_calls", fromlist=["_study_context"])._study_context(tmp_path)
+    _fixture, fixture_request, _preflight, manifest, request, store, grant, _approval, ledger, *_ = context
+
+    class OversizedIncompleteUsageFake:
+        def invoke_json_once(self, **_kwargs):
+            raise ProviderResponseAccountingErrorV5(
+                response_text="x" * (_MAX_RESPONSE_BYTES + 1),
+                provider_request_id="safe-oversized-id",
+                phase="response_accounting",
+                code="inline_usage_missing",
+            )
+
+    with pytest.raises(StudyPendingAccounting, match="unresolved accounting"):
+        run_study_call_v1(
+            request=request,
+            fixture_request=fixture_request,
+            ledger=ledger,
+            gateway=OversizedIncompleteUsageFake(),
+            deadline_monotonic=1.0,
+        )
+    diagnostics = store.list_refs(kind="provider-diagnostics")
+    assert len(diagnostics) == 1
+    value = __import__("json").loads(store.read(diagnostics[0]))
+    assert value["phase"] == "response_accounting"
+    assert value["code"] == "response_content_oversized"
+    assert value["provider_request_id"] == "safe-oversized-id"
+    assert store.list_refs(kind="response-observations") == ()
+    assert store.list_refs(kind="observed-raw-responses") == ()
+    assert store.list_refs(kind="responses") == ()
+    assert store.list_refs(kind="terminals") == ()
+    assert store.list_refs(kind="imports") == ()
+    reader = StudyLedgerV1(store, manifest, grant, approval=None)
+    with pytest.raises(StudyPendingAccounting, match="no authenticated provider usage"):
+        reader.recover(request)
 
 
 def test_negative_usage_from_a_counting_fake_stays_pending_at_caller_boundary(tmp_path) -> None:

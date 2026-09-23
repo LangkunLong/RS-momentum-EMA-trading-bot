@@ -13,13 +13,16 @@ import pytest
 
 from core.pit_optimizer_v5.artifacts import ArtifactRefV5
 from core.pit_optimizer_v5.artifacts import LocalArtifactRepositoryV5
-from core.pit_optimizer_v5.two_round_study.contracts import StudyAuthorityError
+from core.pit_optimizer_v5.two_round_study.contracts import StudyAdmissionError, StudyAuthorityError
 from core.pit_optimizer_v5.two_round_study.driver import (
     _long_exists,
     _long_files,
     _long_read_bytes,
+    execute_study_arm_v1,
     prepare_two_round_study_v1,
 )
+from core.pit_optimizer_v5.two_round_study.__main__ import _offline_ledger
+from core.pit_optimizer_v5.provider import ProviderResponseAccountingErrorV5
 from core.pit_optimizer_v5.two_round_study.store import StudyStoreV1
 from core.pit_optimizer_v5.two_round_study.trace import _trace_markdown, export_study_trace_v1
 from core.pit_optimizer_v5.two_round_study.verification import (
@@ -146,6 +149,8 @@ def test_export_preserves_original_manifest_bytes_and_required_bundle_paths(prep
             "relationship": "authenticated_input_reference",
         },
     }
+
+
     original_entries = [item for item in index["artifacts"] if item["authority"] != "export-derivative"]
     primary_authority = next(
         item["authority"]
@@ -244,6 +249,146 @@ def test_export_preserves_original_manifest_bytes_and_required_bundle_paths(prep
     ).decode("utf-8")
     assert "live-generated responses and admitted provider accounting" in live_trace
     assert "offline synthetic responses and fake-transport accounting" not in live_trace
+
+
+def test_pending_provider_observation_survives_readonly_verification_and_exact_export(owned_root: Path) -> None:
+    prepared = prepare_two_round_study_v1(
+        root=owned_root / "pending-observation" / "study",
+        mode="offline_fixture",
+        provider_settings=None,
+    )
+    ledger = _offline_ledger(prepared)
+    observed_text = '{"observed":"SDK model content"}'
+
+    class IncompleteUsageGateway:
+        def invoke_json_once(self, **_kwargs):
+            raise ProviderResponseAccountingErrorV5(
+                response_text=observed_text,
+                provider_request_id="safe-observed-id",
+                phase="response_accounting",
+                code="inline_usage_missing",
+            )
+
+    primary_result = execute_study_arm_v1(
+        prepared=prepared,
+        arm="primary",
+        ledger=ledger,
+        gateway=IncompleteUsageGateway(),
+    )
+    assert primary_result.state == "incomplete"
+
+    reloaded = load_prepared_study_v1(root=prepared.root)
+    store = StudyStoreV1(reloaded.store_repository())
+    readonly_ledger = type(ledger)(store, reloaded.manifest, ledger.grant, approval=None)
+    before_verify = _inventory(reloaded.root)
+    verification = verify_study_v1(prepared=reloaded, store=store, ledger=readonly_ledger)
+    assert _inventory(reloaded.root) == before_verify
+
+    primary_key = prepared.live_call_for("primary").sha256
+    observation_ref = store.list_refs(kind="response-observations")[0]
+    observed_raw_ref = store.list_refs(kind="observed-raw-responses")[0]
+    assert store.list_refs(kind="provider-diagnostics") == ()
+    expected = {
+        f"live-study-calls/shared/response-observations/{primary_key}.bin": store.read(
+            observation_ref
+        ),
+        f"live-study-calls/shared/observed-raw-responses/{primary_key}.bin": observed_text.encode("utf-8"),
+    }
+    assert observed_raw_ref.relative_path.endswith(f"/{primary_key}.bin")
+    output = owned_root / "pending-observation-export"
+    export_study_trace_v1(prepared=reloaded, verification=verification, store=store, output=output)
+    assert _inventory(reloaded.root) == before_verify
+    for relative, source_bytes in expected.items():
+        exported = _long_read_bytes(output / Path(*relative.split("/")))
+        assert exported == source_bytes
+
+
+def test_pending_provider_diagnostic_survives_readonly_verification_and_exact_export(owned_root: Path) -> None:
+    prepared = prepare_two_round_study_v1(
+        root=owned_root / "pending-diagnostic" / "study",
+        mode="offline_fixture",
+        provider_settings=None,
+    )
+    ledger = _offline_ledger(prepared)
+
+    class TimeoutGateway:
+        def invoke_json_once(self, **_kwargs):
+            raise TimeoutError("private timeout detail")
+
+    result = execute_study_arm_v1(prepared=prepared, arm="primary", ledger=ledger, gateway=TimeoutGateway())
+    assert result.state == "incomplete"
+
+    reloaded = load_prepared_study_v1(root=prepared.root)
+    store = StudyStoreV1(reloaded.store_repository())
+    readonly_ledger = type(ledger)(store, reloaded.manifest, ledger.grant, approval=None)
+    before_verify = _inventory(reloaded.root)
+    verification = verify_study_v1(prepared=reloaded, store=store, ledger=readonly_ledger)
+    assert _inventory(reloaded.root) == before_verify
+
+    request_key = prepared.live_call_for("primary").sha256
+    diagnostic_ref = store.list_refs(kind="provider-diagnostics")[0]
+    diagnostic = store.read(diagnostic_ref)
+    assert b"private timeout detail" not in diagnostic
+    output = owned_root / "pending-diagnostic-export"
+    export_study_trace_v1(prepared=reloaded, verification=verification, store=store, output=output)
+    exported_diagnostic = output / "live-study-calls" / "shared" / "provider-diagnostics" / f"{request_key}.bin"
+    assert _long_read_bytes(exported_diagnostic) == diagnostic
+    assert _inventory(reloaded.root) == before_verify
+
+
+def test_interrupted_observation_envelope_reopens_verifies_and_exports_as_pending(
+    owned_root: Path, monkeypatch
+) -> None:
+    prepared = prepare_two_round_study_v1(
+        root=owned_root / "pending-prefix" / "study",
+        mode="offline_fixture",
+        provider_settings=None,
+    )
+    ledger = _offline_ledger(prepared)
+    observed_text = '{"observed":"exact returned text"}'
+
+    class IncompleteUsageGateway:
+        def invoke_json_once(self, **_kwargs):
+            raise ProviderResponseAccountingErrorV5(
+                response_text=observed_text,
+                provider_request_id="safe-prefix-id",
+                phase="response_accounting",
+                code="inline_usage_missing",
+            )
+
+    original_put = StudyStoreV1.put
+
+    def interrupt_raw_write(self, *, kind, key, content):
+        if kind == "observed-raw-responses":
+            raise StudyAdmissionError("simulated interrupted raw write")
+        return original_put(self, kind=kind, key=key, content=content)
+
+    monkeypatch.setattr(StudyStoreV1, "put", interrupt_raw_write)
+    result = execute_study_arm_v1(
+        prepared=prepared,
+        arm="primary",
+        ledger=ledger,
+        gateway=IncompleteUsageGateway(),
+    )
+    assert result.state == "incomplete"
+    monkeypatch.setattr(StudyStoreV1, "put", original_put)
+
+    reloaded = load_prepared_study_v1(root=prepared.root)
+    store = StudyStoreV1(reloaded.store_repository())
+    readonly_ledger = type(ledger)(store, reloaded.manifest, ledger.grant, approval=None)
+    before_verify = _inventory(reloaded.root)
+    verification = verify_study_v1(prepared=reloaded, store=store, ledger=readonly_ledger)
+    assert _inventory(reloaded.root) == before_verify
+
+    request_key = prepared.live_call_for("primary").sha256
+    observation_ref = store.list_refs(kind="response-observations")[0]
+    assert store.list_refs(kind="observed-raw-responses") == ()
+    output = owned_root / "pending-prefix-export"
+    export_study_trace_v1(prepared=reloaded, verification=verification, store=store, output=output)
+    exported_envelope = output / "live-study-calls" / "shared" / "response-observations" / f"{request_key}.bin"
+    assert _long_read_bytes(exported_envelope) == store.read(observation_ref)
+    assert not (output / "live-study-calls" / "shared" / "observed-raw-responses" / f"{request_key}.bin").exists()
+    assert _inventory(reloaded.root) == before_verify
 
 
 def test_export_rejects_nested_destination_and_unbound_verification_before_writing(prepared_study, owned_root: Path, monkeypatch) -> None:

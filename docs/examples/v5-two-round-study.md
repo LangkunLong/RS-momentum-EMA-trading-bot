@@ -91,6 +91,70 @@ new call or turn unknown usage into a zero-cost receipt.
 The review step is separate from execution and binds exact artifacts rather
 than treating citation presence as semantic proof.
 
+## Diagnose and recover a pending call
+
+A provider diagnostic is bounded metadata for an unresolved handoff. It stores
+a safe phase and code, an optional HTTP status from 100 through 599, an optional
+provider request ID of at most 512 UTF-8 bytes, and `accounting_status=pending`.
+The record never includes exception text, response headers, or credentials.
+For example, `transport/request_timeout` identifies the observed exception
+class; it does not establish whether the provider received the request or what
+it billed.
+
+When the SDK returns a model content string but inline usage is missing or
+invalid, `response-observations` authenticates the request, reservation,
+dispatch claim, grant, and manifest. If response persistence was authorized,
+`observed-raw-responses` contains the exact SDK model content encoded as UTF-8.
+Those bytes are not a captured HTTP response body. The observation envelope is
+written first, so a valid interruption after the envelope and before the raw
+write reopens as pending. It does not create a usage receipt, terminal, or
+import. Oversized content is represented only by a bounded diagnostic.
+
+`verify` and `export` reopen the same study read-only. They authenticate and
+preserve the diagnostic, observation envelope, and any observed content bytes
+in the exact-byte trace while leaving pending accounting unresolved. They do
+not retry, call a provider, or reconcile usage.
+
+Recovery uses the exact persisted manifest, grant, and request:
+
+1. Call `recover_study_call_v1` or `StudyLedgerV1.recover` only to settle a
+   response and usage record that are already fully authenticated. A diagnostic
+   by itself, or an envelope with no raw-content write, cannot be settled by
+   automatic recovery into a terminal.
+2. After independently authenticating an authoritative provider usage record,
+   pass its `CompletionResultV5` and provider reference to
+   `StudyLedgerV1.reconcile_pending_usage`. Its content and provider request
+   ID must agree with any preserved observation. If the observation envelope
+   exists but its raw-content write was interrupted, this explicit authorized
+   path restores the missing observed blob only when the UTF-8 response bytes'
+   SHA256 and length and the provider request ID exactly match the authenticated
+   envelope. It rechecks current authority, reservation, dispatch claim, and any
+   prior usage receipt while holding the repository transition lock; a mismatch
+   or missing approval publishes no replacement bytes or terminal. The normal
+   usage receipt and settlement path then continues. This local reconciliation
+   does not make a provider call.
+3. If no authoritative usage is available, leave the reservation pending.
+   Its one-shot slot stays used and the study must not dispatch a retry, reuse
+   the grant, or infer zero spend. A successful authenticated terminal can
+   then be imported through the existing live sequence; a terminal failure
+   does not imply an import.
+
+`recover`, `resume_study_arm_v1`, and `reconcile_pending_usage` are recovery
+operations that may publish local records. Only verification and export are
+read-only.
+
+## Grant price units
+
+`StudyGrantV1.input_price_upper_bound` and
+`StudyGrantV1.output_price_upper_bound` are **USD per million tokens**. Enter
+the approved provider rates in these units; do not pass USD-per-token values.
+The reservation's conservative prospective cost is
+`(input_bound_bytes × input_price_upper_bound + max_output_tokens × output_price_upper_bound) / 1,000,000`
+USD. The request byte bound is used as the input-side cap. Grant fields such as
+`per_call_usd_ceiling` and `cumulative_usd_ceiling` remain total USD amounts.
+Check the persisted reservation's prospective cost against the approved
+proposal before dispatch.
+
 If a reservation, response, terminal, import, or round-two publication is
 partial, stop transport and inspect the recorded state. Do not prepare a new
 manifest or reuse a grant to make a preferred result complete. Verification

@@ -13,7 +13,7 @@ import re
 import time
 from typing import Mapping
 
-from core.pit_optimizer_v5.provider import CompletionResultV5
+from core.pit_optimizer_v5.provider import CompletionResultV5, ProviderFailureDiagnosticV5
 
 from .contracts import StudyAuthorityError, StudyContractError
 from .ledger import StudyDispatchClaimV1, StudyLedgerV1
@@ -103,7 +103,7 @@ class StudyOpenRouterGatewayV1:
         )
         credential = os.environ.get(self.credential_environment_variable)
         if not credential:
-            raise StudyAuthorityError("the selected study credential is unavailable")
+            raise ProviderFailureDiagnosticV5(phase="credential", code="credential_unavailable")
         # Import the legacy gateway only after admission and credential lookup.
         # Supplying api_key explicitly prevents its constructor from consulting
         # dotenv/environment state again.
