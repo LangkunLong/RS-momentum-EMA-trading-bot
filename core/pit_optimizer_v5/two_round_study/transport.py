@@ -107,14 +107,19 @@ class StudyOpenRouterGatewayV1:
         # Import the legacy gateway only after admission and credential lookup.
         # Supplying api_key explicitly prevents its constructor from consulting
         # dotenv/environment state again.
-        from agent_loop import OpenRouterGateway
+        try:
+            from agent_loop import OpenRouterGateway
 
-        gateway = OpenRouterGateway(
-            api_key=credential,
-            run_id=self.run_id,
-            timeout_seconds=self.timeout_seconds,
-            max_attempts=1,
-        )
+            gateway = OpenRouterGateway(
+                api_key=credential,
+                run_id=self.run_id,
+                timeout_seconds=self.timeout_seconds,
+                max_attempts=1,
+            )
+        except ProviderFailureDiagnosticV5:
+            raise
+        except BaseException as exc:
+            raise ProviderFailureDiagnosticV5.from_exception(exc, stage="gateway_init") from None
         result = gateway.request_pit_optimizer_v5_json_once(
             request_sha256=request_sha256,
             model=model,

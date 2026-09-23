@@ -3871,153 +3871,265 @@ class OpenRouterGateway:
 
         import asyncio
 
-        from core.pit_optimizer_v5.provider import CompletionResultV5, ProviderResponseAccountingErrorV5, wire_role_messages_v5, wire_role_schema_v5
-
-        if (
-            type(request_sha256) is not str
-            or re.fullmatch(r"[0-9a-f]{64}", request_sha256) is None
-            or type(model) is not str
-            or not model.strip()
-            or type(messages) is not tuple
-            or not messages
-            or any(not isinstance(item, Mapping) for item in messages)
-            or type(response_schema_json) is not bytes
-            or type(max_output_tokens) is not int
-            or max_output_tokens < 1
-            or type(wall_deadline) is not float
-            or not math.isfinite(wall_deadline)
-        ):
-            raise ConfigurationError("V5 provider request is invalid")
-        try:
-            schema = json.loads(
-                response_schema_json.decode("utf-8"),
-                object_pairs_hook=lambda pairs: (
-                    (_ for _ in ()).throw(ValueError("duplicate schema key"))
-                    if len({key for key, _value in pairs}) != len(pairs)
-                    else dict(pairs)
-                ),
-            )
-        except (UnicodeDecodeError, ValueError, TypeError):
-            raise ConfigurationError("V5 provider schema is invalid") from None
-        if not isinstance(schema, Mapping):
-            raise ConfigurationError("V5 provider schema is invalid")
-        transport_messages = wire_role_messages_v5(messages)
-        remaining = min(self.timeout_seconds, wall_deadline - time.monotonic())
-        if remaining <= 0:
-            raise ConfigurationError("V5 provider deadline is exhausted")
-        arguments = dict(
-            model=model,
-            messages=transport_messages,
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "pit_optimizer_v5_role",
-                    "strict": True,
-                    "schema": wire_role_schema_v5(schema, allow_full_source_escape=allow_full_source_escape),
-                },
-            },
-            stream=False,
-            max_tokens=max_output_tokens,
-            timeout=remaining,
-            extra_headers={"X-Session-Id": f"{self.run_id}:pit-optimizer-v5:{request_sha256[:16]}"},
-            extra_body={
-                "provider": {"require_parameters": True},
-                "reasoning": {"exclude": True},
-            },
+        from core.pit_optimizer_v5.provider import (
+            CompletionResultV5,
+            ProviderFailureDiagnosticV5,
+            ProviderResponseAccountingErrorV5,
+            wire_role_messages_v5,
+            wire_role_schema_v5,
         )
+
+        try:
+            if (
+                type(request_sha256) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", request_sha256) is None
+                or type(model) is not str
+                or not model.strip()
+                or type(messages) is not tuple
+                or not messages
+                or any(not isinstance(item, Mapping) for item in messages)
+                or type(response_schema_json) is not bytes
+                or type(max_output_tokens) is not int
+                or max_output_tokens < 1
+                or type(wall_deadline) is not float
+                or not math.isfinite(wall_deadline)
+            ):
+                raise ConfigurationError("V5 provider request is invalid")
+            try:
+                schema = json.loads(
+                    response_schema_json.decode("utf-8"),
+                    object_pairs_hook=lambda pairs: (
+                        (_ for _ in ()).throw(ValueError("duplicate schema key"))
+                        if len({key for key, _value in pairs}) != len(pairs)
+                        else dict(pairs)
+                    ),
+                )
+            except (UnicodeDecodeError, ValueError, TypeError):
+                raise ConfigurationError("V5 provider schema is invalid") from None
+            if not isinstance(schema, Mapping):
+                raise ConfigurationError("V5 provider schema is invalid")
+            transport_messages = wire_role_messages_v5(messages)
+            remaining = min(self.timeout_seconds, wall_deadline - time.monotonic())
+            if remaining <= 0:
+                raise ConfigurationError("V5 provider deadline is exhausted")
+            arguments = dict(
+                model=model,
+                messages=transport_messages,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "pit_optimizer_v5_role",
+                        "strict": True,
+                        "schema": wire_role_schema_v5(schema, allow_full_source_escape=allow_full_source_escape),
+                    },
+                },
+                stream=False,
+                max_tokens=max_output_tokens,
+                timeout=remaining,
+                extra_headers={"X-Session-Id": f"{self.run_id}:pit-optimizer-v5:{request_sha256[:16]}"},
+                extra_body={
+                    "provider": {"require_parameters": True},
+                    "reasoning": {"exclude": True},
+                },
+            )
+        except ProviderFailureDiagnosticV5:
+            raise
+        except BaseException as exc:
+            raise ProviderFailureDiagnosticV5.from_exception(exc, stage="request_preparation") from None
 
         async def complete_before_deadline():
             client = self._client
             owned_client = client is None
             if owned_client:
-                from openai import AsyncOpenAI
+                try:
+                    from openai import AsyncOpenAI
 
-                headers: dict[str, str] = {}
-                if self.app_url:
-                    headers["HTTP-Referer"] = self.app_url
-                if self.app_name:
-                    headers["X-Title"] = self.app_name
-                client = AsyncOpenAI(
-                    api_key=self.api_key,
-                    base_url=OPENROUTER_BASE_URL,
-                    timeout=remaining,
-                    max_retries=0,
-                    default_headers=headers,
-                )
+                    headers: dict[str, str] = {}
+                    if self.app_url:
+                        headers["HTTP-Referer"] = self.app_url
+                    if self.app_name:
+                        headers["X-Title"] = self.app_name
+                    client = AsyncOpenAI(
+                        api_key=self.api_key,
+                        base_url=OPENROUTER_BASE_URL,
+                        timeout=remaining,
+                        max_retries=0,
+                        default_headers=headers,
+                    )
+                except BaseException as exc:
+                    raise ProviderFailureDiagnosticV5.from_exception(exc, stage="client_init") from None
+            response = None
+            primary_failure = None
+            cleanup_diagnostic = None
             try:
                 # HTTP per-operation timeouts alone do not bound a slow-drip
                 # response. Cancellation also bounds the entire live request.
                 left = min(remaining, wall_deadline - time.monotonic())
                 if left <= 0:
-                    raise TimeoutError("V5 provider deadline is exhausted")
-                return await asyncio.wait_for(client.chat.completions.create(**arguments), timeout=left)
+                    primary_failure = ProviderFailureDiagnosticV5.from_exception(
+                        TimeoutError(), stage="request_preparation"
+                    )
+                else:
+                    try:
+                        response = await asyncio.wait_for(client.chat.completions.create(**arguments), timeout=left)
+                    except (ProviderFailureDiagnosticV5, ProviderResponseAccountingErrorV5) as exc:
+                        primary_failure = exc
+                    except BaseException as exc:
+                        primary_failure = ProviderFailureDiagnosticV5.from_exception(exc, stage="transport")
             finally:
                 if owned_client:
-                    await client.close()
+                    try:
+                        close_left = min(remaining, wall_deadline - time.monotonic())
+                        if close_left <= 0:
+                            raise TimeoutError()
+                        await asyncio.wait_for(client.close(), timeout=close_left)
+                    except BaseException as exc:
+                        cleanup = ProviderFailureDiagnosticV5.from_exception(exc, stage="client_cleanup")
+                        cleanup_diagnostic = (cleanup.phase, cleanup.code)
+                        if primary_failure is not None and isinstance(
+                            primary_failure, (ProviderFailureDiagnosticV5, ProviderResponseAccountingErrorV5)
+                        ):
+                            primary_failure.cleanup_diagnostic = cleanup_diagnostic
+                        elif response is None:
+                            primary_failure = cleanup
+            if primary_failure is not None:
+                raise primary_failure
+            return response, cleanup_diagnostic
 
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            response = asyncio.run(complete_before_deadline())
+            response, cleanup_diagnostic = asyncio.run(complete_before_deadline())
         else:
-            raise ConfigurationError("V5 synchronous provider boundary requires a controller thread")
-        raw_model = _read_field(response, "model")
-        returned_model = raw_model if isinstance(raw_model, str) and raw_model.strip() else "unknown"
-        choices = _read_field(response, "choices")
-        choice = choices[0] if isinstance(choices, (list, tuple)) and len(choices) == 1 else None
-        content = _read_field(choice, "message", "content")
-        response_text = content if isinstance(content, str) else ""
-        raw_request_id = _read_field(response, "id")
-        # The opaque provider ID is optional evidence.  Do not let an unsafe
-        # optional ID prevent preservation of otherwise observed model bytes.
+            raise ProviderFailureDiagnosticV5.from_exception(
+                ConfigurationError("V5 synchronous provider boundary requires a controller thread"),
+                stage="request_preparation",
+            )
         request_id = None
-        if (
-            type(raw_request_id) is str
-            and raw_request_id
-            and raw_request_id == raw_request_id.strip()
-            and "\x00" not in raw_request_id
-        ):
-            try:
-                if len(raw_request_id.encode("utf-8")) <= 512:
-                    request_id = raw_request_id
-            except UnicodeEncodeError:
-                pass
+        try:
+            raw_request_id = _read_field(response, "id")
+            if (
+                type(raw_request_id) is str
+                and raw_request_id
+                and raw_request_id == raw_request_id.strip()
+                and "\x00" not in raw_request_id
+            ):
+                try:
+                    if len(raw_request_id.encode("utf-8")) <= 512:
+                        request_id = raw_request_id
+                except UnicodeEncodeError:
+                    pass
+        except BaseException:
+            # The provider request ID is optional. A hostile/broken SDK response
+            # accessor must not erase independently available content or usage.
+            request_id = None
+        try:
+            raw_model = _read_field(response, "model")
+            returned_model = raw_model if isinstance(raw_model, str) and raw_model.strip() else "unknown"
+        except BaseException:
+            returned_model = "unknown"
+        choice = None
+        content = None
+        try:
+            choices = _read_field(response, "choices")
+            choice = choices[0] if isinstance(choices, (list, tuple)) and len(choices) == 1 else None
+            content = _read_field(choice, "message", "content")
+        except BaseException:
+            # When usage is complete, missing content is an accounted rejected
+            # response. Otherwise it remains pending with a safe extraction code.
+            content = None
+        has_content = isinstance(content, str)
+        response_text = content if has_content else ""
+
+        # The opaque provider ID is optional evidence; the safe subset was
+        # captured before response parsing so later failures retain it.
         try:
             usage = _usage_from_response(response, require_complete=True)
         except AccountingValidationError as exc:
+            if not has_content:
+                raise ProviderFailureDiagnosticV5(
+                    phase="response_extraction",
+                    code="response_content_unavailable",
+                    provider_request_id=request_id,
+                    cleanup_diagnostic=cleanup_diagnostic,
+                ) from None
             code = getattr(exc, "code", None)
             code_value = getattr(code, "value", None)
-            raise ProviderResponseAccountingErrorV5(response_text=response_text, provider_request_id=request_id, phase="response_accounting", code=(code_value if isinstance(code_value, str) else "inline_usage_invalid")) from exc
+            raise ProviderResponseAccountingErrorV5(
+                response_text=response_text,
+                provider_request_id=request_id,
+                phase="response_accounting",
+                code=(code_value if isinstance(code_value, str) else "inline_usage_invalid"),
+                cleanup_diagnostic=cleanup_diagnostic,
+            ) from None
+        except BaseException:
+            if not has_content:
+                raise ProviderFailureDiagnosticV5(
+                    phase="response_extraction",
+                    code="response_content_unavailable",
+                    provider_request_id=request_id,
+                    cleanup_diagnostic=cleanup_diagnostic,
+                ) from None
+            raise ProviderResponseAccountingErrorV5(
+                response_text=response_text,
+                provider_request_id=request_id,
+                phase="response_accounting",
+                code="response_accounting_failed",
+                cleanup_diagnostic=cleanup_diagnostic,
+            ) from None
         if (
             usage.prompt_tokens is None
             or usage.completion_tokens is None
             or usage.cost_usd is None
         ):
+            if not has_content:
+                raise ProviderFailureDiagnosticV5(
+                    phase="response_extraction",
+                    code="response_content_unavailable",
+                    provider_request_id=request_id,
+                    cleanup_diagnostic=cleanup_diagnostic,
+                )
             raise ProviderResponseAccountingErrorV5(
                 response_text=response_text,
                 provider_request_id=request_id,
                 phase="response_accounting",
                 code="inline_usage_missing",
+                cleanup_diagnostic=cleanup_diagnostic,
             )
-        accepted = bool(
-            _read_field(response, "error") is None
-            and choice is not None
-            and _read_field(choice, "finish_reason") == "stop"
-            and _read_field(choice, "message", "refusal") is None
-            and response_text.strip()
-            and returned_model == model
-        )
-        return CompletionResultV5(
-            response_text=response_text,
-            accepted=accepted,
-            input_tokens=usage.prompt_tokens,
-            output_tokens=usage.completion_tokens,
-            provider_request_id=request_id,
-            returned_model=returned_model,
-            cost_usd=Decimal(str(usage.cost_usd)),
-            external_attempt_count=1,
-            response_received=True,
-        )
+        accepted = False
+        if has_content and choice is not None and returned_model == model:
+            try:
+                accepted = bool(
+                    _read_field(response, "error") is None
+                    and _read_field(choice, "finish_reason") == "stop"
+                    and _read_field(choice, "message", "refusal") is None
+                    and response_text.strip()
+                )
+            except BaseException:
+                # We have exact content and complete usage. If optional
+                # response metadata is malformed, preserve both as rejected.
+                accepted = False
+        try:
+            return CompletionResultV5(
+                response_text=response_text,
+                accepted=accepted,
+                input_tokens=usage.prompt_tokens,
+                output_tokens=usage.completion_tokens,
+                provider_request_id=request_id,
+                returned_model=returned_model,
+                cost_usd=Decimal(str(usage.cost_usd)),
+                external_attempt_count=1,
+                response_received=True,
+                cleanup_diagnostic=cleanup_diagnostic,
+            )
+        except BaseException:
+            raise ProviderResponseAccountingErrorV5(
+                response_text=response_text,
+                provider_request_id=request_id,
+                phase="response_accounting",
+                code="response_processing_failed",
+                cleanup_diagnostic=cleanup_diagnostic,
+            ) from None
 
     def request(
         self,

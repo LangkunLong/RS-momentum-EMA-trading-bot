@@ -22,7 +22,7 @@ from core.pit_optimizer_v5.two_round_study.driver import (
     prepare_two_round_study_v1,
 )
 from core.pit_optimizer_v5.two_round_study.__main__ import _offline_ledger
-from core.pit_optimizer_v5.provider import ProviderResponseAccountingErrorV5
+from core.pit_optimizer_v5.provider import ProviderFailureDiagnosticV5, ProviderResponseAccountingErrorV5
 from core.pit_optimizer_v5.two_round_study.store import StudyStoreV1
 from core.pit_optimizer_v5.two_round_study.trace import _trace_markdown, export_study_trace_v1
 from core.pit_optimizer_v5.two_round_study.verification import (
@@ -267,6 +267,7 @@ def test_pending_provider_observation_survives_readonly_verification_and_exact_e
                 provider_request_id="safe-observed-id",
                 phase="response_accounting",
                 code="inline_usage_missing",
+                cleanup_diagnostic=("client_cleanup", "client_cleanup_failed"),
             )
 
     primary_result = execute_study_arm_v1(
@@ -286,6 +287,11 @@ def test_pending_provider_observation_survives_readonly_verification_and_exact_e
 
     primary_key = prepared.live_call_for("primary").sha256
     observation_ref = store.list_refs(kind="response-observations")[0]
+    observation_payload = json.loads(store.read(observation_ref))
+    assert observation_payload["cleanup_diagnostic"] == {
+        "phase": "client_cleanup",
+        "code": "client_cleanup_failed",
+    }
     observed_raw_ref = store.list_refs(kind="observed-raw-responses")[0]
     assert store.list_refs(kind="provider-diagnostics") == ()
     expected = {
@@ -313,7 +319,11 @@ def test_pending_provider_diagnostic_survives_readonly_verification_and_exact_ex
 
     class TimeoutGateway:
         def invoke_json_once(self, **_kwargs):
-            raise TimeoutError("private timeout detail")
+            raise ProviderFailureDiagnosticV5(
+                phase="transport",
+                code="request_timeout",
+                cleanup_diagnostic=("client_cleanup", "client_cleanup_failed"),
+            )
 
     result = execute_study_arm_v1(prepared=prepared, arm="primary", ledger=ledger, gateway=TimeoutGateway())
     assert result.state == "incomplete"
@@ -328,7 +338,11 @@ def test_pending_provider_diagnostic_survives_readonly_verification_and_exact_ex
     request_key = prepared.live_call_for("primary").sha256
     diagnostic_ref = store.list_refs(kind="provider-diagnostics")[0]
     diagnostic = store.read(diagnostic_ref)
-    assert b"private timeout detail" not in diagnostic
+    diagnostic_payload = json.loads(diagnostic)
+    assert diagnostic_payload["cleanup_diagnostic"] == {
+        "phase": "client_cleanup",
+        "code": "client_cleanup_failed",
+    }
     output = owned_root / "pending-diagnostic-export"
     export_study_trace_v1(prepared=reloaded, verification=verification, store=store, output=output)
     exported_diagnostic = output / "live-study-calls" / "shared" / "provider-diagnostics" / f"{request_key}.bin"

@@ -2503,6 +2503,7 @@ class CompletionResultV5:
     cost_usd: Decimal
     external_attempt_count: Literal[1]
     response_received: bool
+    cleanup_diagnostic: tuple[str, str] | None = None
 
     def __post_init__(self) -> None:
         if type(self.response_text) is not str:
@@ -2520,14 +2521,27 @@ class CompletionResultV5:
             raise ValueError("provider completion must attest exactly one external attempt")
         if type(self.response_received) is not bool or (self.accepted and not self.response_received):
             raise ValueError("provider completion response state is invalid")
+        if self.cleanup_diagnostic is not None and self.cleanup_diagnostic != (
+            "client_cleanup",
+            "client_cleanup_failed",
+        ):
+            raise ValueError("provider completion cleanup diagnostic is invalid")
 
 
 class ProviderResponseAccountingErrorV5(Exception):
     """A provider returned model content but not complete accounting facts."""
 
-    __slots__ = ("response_text", "provider_request_id", "phase", "code")
+    __slots__ = ("response_text", "provider_request_id", "phase", "code", "cleanup_diagnostic")
 
-    def __init__(self, *, response_text: str, provider_request_id: str | None, phase: str, code: str) -> None:
+    def __init__(
+        self,
+        *,
+        response_text: str,
+        provider_request_id: str | None,
+        phase: str,
+        code: str,
+        cleanup_diagnostic: tuple[str, str] | None = None,
+    ) -> None:
         if type(response_text) is not str:
             raise ValueError("observed provider response text is invalid")
         if provider_request_id is not None:
@@ -2538,22 +2552,43 @@ class ProviderResponseAccountingErrorV5(Exception):
             raise ValueError("observed provider failure phase is invalid")
         if type(code) is not str or not re.fullmatch(r"[a-z0-9_]{1,64}", code):
             raise ValueError("observed provider failure code is invalid")
+        if cleanup_diagnostic is not None and cleanup_diagnostic != (
+            "client_cleanup",
+            "client_cleanup_failed",
+        ):
+            raise ValueError("observed provider cleanup diagnostic is invalid")
         super().__init__("provider response requires authoritative accounting")
         self.response_text = response_text
         self.provider_request_id = provider_request_id
         self.phase = phase
         self.code = code
+        self.cleanup_diagnostic = cleanup_diagnostic
 
 
 class ProviderFailureDiagnosticV5(Exception):
     """Safe, bounded metadata for an unresolved provider failure."""
 
-    __slots__ = ("phase", "code", "http_status", "provider_request_id")
+    __slots__ = ("phase", "code", "http_status", "provider_request_id", "cleanup_diagnostic")
 
     _CODES = {
         "credential": {"credential_rejected", "credential_unavailable"},
+        "gateway_init": {"gateway_initialization_failed"},
         "client_init": {"client_initialization_failed"},
-        "transport": {"http_status", "request_timeout", "transport_failure"},
+        "request_preparation": {"request_preparation_failed"},
+        "transport": {
+            "api_connection_error",
+            "api_timeout",
+            "http_status",
+            "request_timeout",
+            "transport_failure",
+        },
+        "client_cleanup": {"client_cleanup_failed"},
+        "response_extraction": {
+            "response_extraction_failed",
+            "response_content_unavailable",
+            "response_decoding_failed",
+            "response_validation_failed",
+        },
         "unknown": {"unclassified"},
         "response_accounting": {"response_content_oversized"},
     }
@@ -2565,6 +2600,7 @@ class ProviderFailureDiagnosticV5(Exception):
         code: str,
         http_status: int | None = None,
         provider_request_id: str | None = None,
+        cleanup_diagnostic: tuple[str, str] | None = None,
     ) -> None:
         if phase not in self._CODES or code not in self._CODES[phase]:
             raise ValueError("provider failure diagnostic phase or code is invalid")
@@ -2574,42 +2610,132 @@ class ProviderFailureDiagnosticV5(Exception):
             _text(provider_request_id, "provider failure diagnostic request ID")
             if len(provider_request_id.encode("utf-8")) > 512:
                 raise ValueError("provider failure diagnostic request ID is invalid")
+        if cleanup_diagnostic is not None and cleanup_diagnostic != (
+            "client_cleanup",
+            "client_cleanup_failed",
+        ):
+            raise ValueError("provider failure cleanup diagnostic is invalid")
         super().__init__("provider invocation did not yield an accounted completion")
         self.phase = phase
         self.code = code
         self.http_status = http_status
         self.provider_request_id = provider_request_id
+        self.cleanup_diagnostic = cleanup_diagnostic
 
     @classmethod
-    def from_exception(cls, exc: BaseException) -> "ProviderFailureDiagnosticV5":
+    def from_exception(
+        cls,
+        exc: BaseException,
+        *,
+        stage: str | None = None,
+        provider_request_id: str | None = None,
+        cleanup_diagnostic: tuple[str, str] | None = None,
+    ) -> "ProviderFailureDiagnosticV5":
         """Classify only safe exception type and explicit scalar fields."""
 
-        status = getattr(exc, "status_code", None)
+        try:
+            status = getattr(exc, "status_code", None)
+        except Exception:
+            status = None
         http_status = status if type(status) is int and 100 <= status <= 599 else None
-        request_id = getattr(exc, "request_id", None)
-        provider_request_id = None
-        if (
-            type(request_id) is str
-            and request_id == request_id.strip()
-            and request_id
-            and "\x00" not in request_id
-        ):
+        exception_type = type(exc)
+        exception_module = getattr(exception_type, "__module__", "")
+        exception_name = getattr(exception_type, "__name__", "")
+        is_openai_exception = type(exception_module) is str and (
+            exception_module == "openai" or exception_module.startswith("openai.")
+        )
+        if provider_request_id is None:
             try:
-                if len(request_id.encode("utf-8")) <= 512:
-                    provider_request_id = request_id
+                request_id = getattr(exc, "request_id", None)
+            except Exception:
+                request_id = None
+        else:
+            request_id = provider_request_id
+        def bounded_request_id(value: object) -> str | None:
+            if (
+                type(value) is not str
+                or not value
+                or value != value.strip()
+                or "\x00" in value
+            ):
+                return None
+            try:
+                return value if len(value.encode("utf-8")) <= 512 else None
             except UnicodeEncodeError:
-                pass
+                return None
+
+        safe_request_id = bounded_request_id(request_id)
+        # APIResponseValidationError does not expose request_id on all SDK
+        # versions, but its response may retain the one explicitly whitelisted
+        # scalar header. Never serialize the response, headers, or body.
+        if safe_request_id is None and is_openai_exception and exception_name == "APIResponseValidationError":
+            try:
+                response = getattr(exc, "response", None)
+                headers = getattr(response, "headers", None)
+                candidate = headers.get("x-request-id") if headers is not None else None
+            except Exception:
+                candidate = None
+            safe_request_id = bounded_request_id(candidate)
+
+        def make(*, phase: str, code: str, status: int | None, request_id: str | None):
+            return cls(
+                phase=phase,
+                code=code,
+                http_status=status,
+                provider_request_id=request_id,
+                cleanup_diagnostic=cleanup_diagnostic,
+            )
+
+        if stage == "gateway_init":
+            return make(phase="gateway_init", code="gateway_initialization_failed", status=http_status, request_id=safe_request_id)
+        if stage == "client_init":
+            return make(phase="client_init", code="client_initialization_failed", status=http_status, request_id=safe_request_id)
+        if stage == "request_preparation":
+            return make(phase="request_preparation", code="request_preparation_failed", status=http_status, request_id=safe_request_id)
+        if stage == "client_cleanup":
+            return make(phase="client_cleanup", code="client_cleanup_failed", status=http_status, request_id=safe_request_id)
+        if stage == "response_extraction":
+            return make(phase="response_extraction", code="response_extraction_failed", status=http_status, request_id=safe_request_id)
         if http_status in {401, 403}:
-            return cls(phase="credential", code="credential_rejected", http_status=http_status, provider_request_id=provider_request_id)
-        if isinstance(exc, PermissionError):
-            return cls(phase="unknown", code="unclassified", http_status=http_status, provider_request_id=provider_request_id)
+            return make(phase="credential", code="credential_rejected", status=http_status, request_id=safe_request_id)
+        if stage == "transport" and is_openai_exception and exception_name == "APIResponseValidationError":
+            return make(
+                phase="response_extraction",
+                code="response_validation_failed",
+                status=http_status,
+                request_id=safe_request_id,
+            )
+        if (
+            stage == "transport"
+            and exception_module in {"json", "json.decoder"}
+            and exception_name == "JSONDecodeError"
+        ):
+            return make(
+                phase="response_extraction",
+                code="response_decoding_failed",
+                status=http_status,
+                request_id=safe_request_id,
+            )
+        if stage == "transport" and is_openai_exception:
+            if exception_name == "APITimeoutError":
+                return make(phase="transport", code="api_timeout", status=http_status, request_id=safe_request_id)
+            if exception_name == "APIConnectionError":
+                return make(phase="transport", code="api_connection_error", status=http_status, request_id=safe_request_id)
+        if stage == "transport":
+            if isinstance(exc, TimeoutError):
+                return make(phase="transport", code="request_timeout", status=http_status, request_id=safe_request_id)
+            if http_status is not None:
+                return make(phase="transport", code="http_status", status=http_status, request_id=safe_request_id)
+            return make(phase="transport", code="transport_failure", status=None, request_id=safe_request_id)
+        if isinstance(exc, PermissionError) and stage != "transport":
+            return make(phase="unknown", code="unclassified", status=http_status, request_id=safe_request_id)
         if isinstance(exc, (ImportError, ModuleNotFoundError)):
-            return cls(phase="client_init", code="client_initialization_failed", http_status=http_status, provider_request_id=provider_request_id)
+            return make(phase="client_init", code="client_initialization_failed", status=http_status, request_id=safe_request_id)
         if isinstance(exc, TimeoutError):
-            return cls(phase="transport", code="request_timeout", http_status=http_status, provider_request_id=provider_request_id)
+            return make(phase="transport", code="request_timeout", status=http_status, request_id=safe_request_id)
         if http_status is not None:
-            return cls(phase="transport", code="http_status", http_status=http_status, provider_request_id=provider_request_id)
-        return cls(phase="unknown", code="unclassified", http_status=None, provider_request_id=provider_request_id)
+            return make(phase="transport", code="http_status", status=http_status, request_id=safe_request_id)
+        return make(phase="unknown", code="unclassified", status=None, request_id=safe_request_id)
 
 
 @runtime_checkable

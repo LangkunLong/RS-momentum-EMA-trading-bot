@@ -266,7 +266,7 @@ def _receipt_from(value: object) -> RoleTerminalReceiptV5:
 
 
 def _completion_metadata_primitive(value: CompletionResultV5) -> dict[str, object]:
-    return {
+    result: dict[str, object] = {
         "accepted": value.accepted,
         "input_tokens": value.input_tokens,
         "output_tokens": value.output_tokens,
@@ -276,21 +276,48 @@ def _completion_metadata_primitive(value: CompletionResultV5) -> dict[str, objec
         "external_attempt_count": value.external_attempt_count,
         "response_received": value.response_received,
     }
+    if value.cleanup_diagnostic is not None:
+        result["cleanup_diagnostic"] = {
+            "phase": value.cleanup_diagnostic[0],
+            "code": value.cleanup_diagnostic[1],
+        }
+    return result
+
+
+def _optional_cleanup_diagnostic(value: Mapping[str, object]) -> tuple[str, str] | None:
+    if "cleanup_diagnostic" not in value:
+        return None
+    raw = _strict(
+        value["cleanup_diagnostic"],
+        {"phase", "code"},
+        "study cleanup diagnostic",
+    )
+    diagnostic = ProviderFailureDiagnosticV5(
+        phase=raw["phase"],  # type: ignore[arg-type]
+        code=raw["code"],  # type: ignore[arg-type]
+    )
+    if (diagnostic.phase, diagnostic.code) != ("client_cleanup", "client_cleanup_failed"):
+        raise StudyAuthorityError("study cleanup diagnostic phase or code is invalid")
+    return diagnostic.phase, diagnostic.code
 
 
 def _completion_from_metadata(value: object, response_text: str) -> CompletionResultV5:
+    base_fields = {
+        "accepted",
+        "input_tokens",
+        "output_tokens",
+        "provider_request_id",
+        "returned_model",
+        "cost_usd",
+        "external_attempt_count",
+        "response_received",
+    }
+    if not isinstance(value, Mapping):
+        raise StudyAuthorityError("study completion metadata is invalid")
+    expected_fields = base_fields | ({"cleanup_diagnostic"} if "cleanup_diagnostic" in value else set())
     raw = _strict(
         value,
-        {
-            "accepted",
-            "input_tokens",
-            "output_tokens",
-            "provider_request_id",
-            "returned_model",
-            "cost_usd",
-            "external_attempt_count",
-            "response_received",
-        },
+        expected_fields,
         "study completion",
     )
     return CompletionResultV5(
@@ -303,6 +330,7 @@ def _completion_from_metadata(value: object, response_text: str) -> CompletionRe
         cost_usd=_decimal_from(raw["cost_usd"], "study completion cost"),
         external_attempt_count=raw["external_attempt_count"],  # type: ignore[arg-type]
         response_received=raw["response_received"],  # type: ignore[arg-type]
+        cleanup_diagnostic=_optional_cleanup_diagnostic(raw),
     )
 
 
@@ -1460,7 +1488,8 @@ class StudyLedgerV1:
             raw = self.store.read(ref)
             try:
                 value = _decode_canonical_json_object(raw, "study provider diagnostic")
-                payload = _strict(value, fields, "study provider diagnostic")
+                diagnostic_fields = fields | ({"cleanup_diagnostic"} if "cleanup_diagnostic" in value else set())
+                payload = _strict(value, diagnostic_fields, "study provider diagnostic")
                 if canonical_json_bytes_v5(payload) != raw:
                     raise StudyAuthorityError("study provider diagnostic is not canonical")
                 for field in ("request_sha256", "reservation_sha256", "claim_sha256", "grant_sha256", "manifest_sha256"):
@@ -1472,6 +1501,7 @@ class StudyLedgerV1:
                     code=payload["code"],  # type: ignore[arg-type]
                     http_status=payload["http_status"],  # type: ignore[arg-type]
                     provider_request_id=payload["provider_request_id"],  # type: ignore[arg-type]
+                    cleanup_diagnostic=_optional_cleanup_diagnostic(payload),
                 )
             except (StudyContractError, TypeError, ValueError) as exc:
                 raise StudyAuthorityError("study provider diagnostic is invalid") from exc
@@ -1529,7 +1559,8 @@ class StudyLedgerV1:
             observation_raw = self.store.read(observation_ref)
             try:
                 value = _decode_canonical_json_object(observation_raw, "study response observation")
-                payload = _strict(value, fields, "study response observation")
+                observation_fields = fields | ({"cleanup_diagnostic"} if "cleanup_diagnostic" in value else set())
+                payload = _strict(value, observation_fields, "study response observation")
                 if canonical_json_bytes_v5(payload) != observation_raw:
                     raise StudyAuthorityError("study response observation is not canonical")
                 for field in (
@@ -1553,6 +1584,7 @@ class StudyLedgerV1:
                     raise StudyAuthorityError("study response observation raw response length is invalid")
                 if payload["accounting_status"] != "pending":
                     raise StudyAuthorityError("study response observation accounting status is invalid")
+                _optional_cleanup_diagnostic(payload)
             except (StudyContractError, TypeError, ValueError) as exc:
                 raise StudyAuthorityError("study response observation is invalid") from exc
             if observation_ref.sha256 != _sha256(observation_raw):
@@ -2304,6 +2336,11 @@ class StudyLedgerV1:
                 "provider_request_id": diagnostic.provider_request_id,
                 "accounting_status": "pending",
             }
+            if diagnostic.cleanup_diagnostic is not None:
+                payload["cleanup_diagnostic"] = {
+                    "phase": diagnostic.cleanup_diagnostic[0],
+                    "code": diagnostic.cleanup_diagnostic[1],
+                }
             self.store.put(kind="provider-diagnostics", key=request.sha256, content=canonical_json_bytes_v5(payload))
 
     def persist_observed_response_for_pending_accounting(
@@ -2323,6 +2360,7 @@ class StudyLedgerV1:
                     phase="response_accounting",
                     code="response_content_oversized",
                     provider_request_id=observed.provider_request_id,
+                    cleanup_diagnostic=observed.cleanup_diagnostic,
                 ),
             )
             return
@@ -2348,6 +2386,11 @@ class StudyLedgerV1:
                 "raw_response_length": len(raw),
                 "accounting_status": "pending",
             }
+            if observed.cleanup_diagnostic is not None:
+                payload["cleanup_diagnostic"] = {
+                    "phase": observed.cleanup_diagnostic[0],
+                    "code": observed.cleanup_diagnostic[1],
+                }
             # Publish the bound envelope first.  If the later byte write is
             # interrupted, reopen can retain a safe pending prefix instead of
             # treating a legitimate write boundary as an orphan.
