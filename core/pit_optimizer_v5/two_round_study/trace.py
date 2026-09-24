@@ -459,6 +459,19 @@ def _fresh_authenticated_verification(
     return fresh
 
 
+def _has_authenticated_live_completion(verification: StudyVerificationV1) -> bool:
+    """Whether both arms have completed, imported, settled live evidence."""
+
+    return all(
+        arm.state == "completed"
+        and arm.terminal_ref is not None
+        and arm.import_ref is not None
+        and arm.usage.get("terminal_usage") is not None
+        and arm.usage.get("terminal_failure_code") is None
+        for arm in verification.arms
+    )
+
+
 def _trace_markdown(
     prepared: PreparedStudyV1,
     verification: StudyVerificationV1,
@@ -468,20 +481,31 @@ def _trace_markdown(
 ) -> bytes:
     verdict = verification.verdicts
     is_offline = prepared.mode == "offline_fixture"
-    mode_label = (
-        "offline synthetic responses and fake-transport accounting"
-        if is_offline
-        else "live-generated responses and admitted provider accounting"
-    )
+    has_authenticated_live_completion = not is_offline and _has_authenticated_live_completion(verification)
+    if is_offline:
+        mode_label = "offline synthetic responses and fake-transport accounting"
+    elif has_authenticated_live_completion:
+        mode_label = "live-generated responses and admitted provider accounting"
+    else:
+        mode_label = "live-study evidence/accounting with at least one arm not fully completed"
     if is_offline:
         accounting_note = (
             "This export is an offline synthetic fixture replay: responses and fake-transport accounting are "
             "recorded test facts with zero provider cost or execution. Evidence use is **not_assessed**."
         )
+    elif has_authenticated_live_completion:
+        accounting_note = (
+            "This export describes a live-generated study attempt with authenticated completed provider "
+            "responses and admitted provider accounting. Verify/export performs no new dispatch and preserves "
+            "recorded usage only."
+        )
     else:
         accounting_note = (
-            "This export describes a live-generated study attempt and its admitted provider accounting. "
-            "Verify/export performs no new dispatch and preserves recorded usage only."
+            "Completion, retained responses, and settled accounting are reported per arm. Retained response bytes "
+            "remain evidence even when accounting is pending. A settled failure can retain authoritative usage "
+            "without a successful or imported output. Missing response or accounting fields remain unavailable; "
+            "arm state alone does not establish provider handoff or billing. Pending prospective holds are not actual "
+            "cost. Verify/export performs no new dispatch, retry, or accounting settlement."
         )
     lines = [
         "# V5 two-round study trace",
@@ -533,9 +557,13 @@ def _trace_markdown(
                 )
         lines.append("")
     lines.extend((
-        "## Side-by-side generated role proposals",
+        "## Side-by-side generated role proposals"
+        if (is_offline or has_authenticated_live_completion)
+        else "## Side-by-side persisted role proposal artifacts",
         "",
-        "The following canonical artifact blocks are the exact persisted investigator, author, and critic outputs for each arm. The two arms are shown separately so an equal artifact does not erase its authority identity.",
+        "The following canonical artifact blocks are exact persisted investigator, author, and critic outputs when present. "
+        "The two arms are shown separately so an equal artifact does not erase its authority identity; an unavailable "
+        "block does not assert a generated output.",
         "",
     ))
     roles = sorted(
@@ -553,7 +581,7 @@ def _trace_markdown(
     lines.extend((
         "## P0→A and P1→B proposals",
         "",
-        "P0→A is the historical round-one proposal retained by the closed ancestor. P1→B is the round-two proposal retained by each descendant checkpoint; the selected parent, policy revision, and predictions remain arm-qualified.",
+        "P0→A is the historical round-one proposal retained by the closed ancestor. P1→B is retained when its round-two proposal phase was persisted; the selected parent, policy revision, and predictions remain arm-qualified when present.",
         "",
     ))
     for arm in ("primary", "withheld"):
@@ -631,7 +659,7 @@ def _trace_markdown(
                 (
                     "## Grant caps and attempt mode",
                     "",
-                    f"- execution mode: **{'offline synthetic zero-cost fixture replay' if is_offline else 'live-generated provider attempt'}**",
+                    f"- execution mode: **{'offline synthetic zero-cost fixture replay' if is_offline else 'live-generated provider attempt with authenticated completed accounting' if has_authenticated_live_completion else 'live-study evidence with per-arm completion/accounting status'}**",
                     f"- grant identity/root: `{grant_refs[0].sha256}` / `{grant.repository_root_identity_sha256}`",
                     f"- input token cap: **{grant.input_token_ceiling}**; output token cap: **{grant.output_token_ceiling}**; cumulative token cap: **{grant.cumulative_token_ceiling}**",
                     f"- per-call USD cap: **{grant.per_call_usd_ceiling}**; cumulative USD cap: **{grant.cumulative_usd_ceiling}**; per-call deadline seconds: **{grant.per_call_deadline_seconds}**",
@@ -679,8 +707,8 @@ def _trace_markdown(
             f"- study ID: `{prepared.manifest.study_id}`",
             f"- source revision: `{prepared.manifest.source_revision}`",
             f"- selected parent: `{prepared.selected_parent_configuration_id}`",
-            "- original P0→A is retained in round-one evidence; actual P1→B is retained in each descendant graph.",
-            f"- exported artifact entries: **{len(entries)}**",
+            "- original P0→A is retained in round-one evidence; actual P1→B is retained in a descendant graph when its round-two phase was persisted.",
+            f"- artifact-index entries (including `trace.md`; excluding self-referential `artifact-index.json`): **{len(entries) + 1}**",
             "- raw provider text, empty raw bytes, typed failures and incomplete states are preserved when present; no receipt is converted into a successful import.",
             "- this trace does not claim a fully working self-recursive optimizer or statistical reliability from a finite synthetic case lattice.",
             "",

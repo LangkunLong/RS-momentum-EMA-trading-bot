@@ -241,14 +241,79 @@ def test_export_preserves_original_manifest_bytes_and_required_bundle_paths(prep
         "offline synthetic fixture replay",
     ):
         assert marker in trace, marker
-    live_trace = _trace_markdown(
-        replace(reloaded, mode="live_study"),
+    assert (
+        f"artifact-index entries (including `trace.md`; excluding self-referential `artifact-index.json`): **{len(index['artifacts'])}**"
+        in trace
+    )
+    def completed_live_arm(arm):
+        return replace(
+            arm,
+            state="completed",
+            terminal_ref=ArtifactRefV5(f"terminals/{arm.arm}", "a" * 64),
+            import_ref=ArtifactRefV5(f"imports/{arm.arm}", "b" * 64),
+            usage={
+                **arm.usage,
+                "terminal_usage": {"input_tokens": 1, "output_tokens": 1},
+                "terminal_failure_code": None,
+            },
+        )
+
+    completed_primary, completed_withheld = tuple(
+        completed_live_arm(arm) for arm in verification.arms
+    )
+    completed_verification = replace(
         verification,
+        arms=(completed_primary, completed_withheld),
+    )
+    completed_live_trace = _trace_markdown(
+        replace(reloaded, mode="live_study"),
+        completed_verification,
         [],
         store=None,
     ).decode("utf-8")
-    assert "live-generated responses and admitted provider accounting" in live_trace
-    assert "offline synthetic responses and fake-transport accounting" not in live_trace
+    assert "live-generated responses and admitted provider accounting" in completed_live_trace
+    assert "offline synthetic responses and fake-transport accounting" not in completed_live_trace
+
+    pending_withheld = replace(
+        completed_withheld,
+        state="incomplete",
+        terminal_ref=None,
+        import_ref=None,
+    )
+    mixed_verification = replace(
+        verification,
+        arms=(completed_primary, pending_withheld),
+    )
+    mixed_live_trace = _trace_markdown(
+        replace(reloaded, mode="live_study"),
+        mixed_verification,
+        [],
+        store=None,
+    ).decode("utf-8")
+    assert "live-study evidence/accounting with at least one arm not fully completed" in mixed_live_trace
+    assert "Completion, retained responses, and settled accounting are reported per arm" in mixed_live_trace
+    assert "Retained response bytes remain evidence even when accounting is pending" in mixed_live_trace
+    assert "arm state alone does not establish provider handoff or billing" in mixed_live_trace
+    assert "live-generated responses and admitted provider accounting" not in mixed_live_trace
+
+    settled_failure_primary = replace(
+        completed_primary,
+        state="incomplete",
+        import_ref=None,
+        usage={
+            **completed_primary.usage,
+            "terminal_failure_code": "response_accounting_failed",
+            "terminal_usage": {"input_tokens": 1, "output_tokens": 1},
+        },
+    )
+    settled_failure_trace = _trace_markdown(
+        replace(reloaded, mode="live_study"),
+        replace(verification, arms=(settled_failure_primary, completed_withheld)),
+        [],
+        store=None,
+    ).decode("utf-8")
+    assert "A settled failure can retain authoritative usage without a successful or imported output" in settled_failure_trace
+    assert "Pending prospective holds are not actual cost" in settled_failure_trace
 
 
 def test_pending_provider_observation_survives_readonly_verification_and_exact_export(owned_root: Path) -> None:

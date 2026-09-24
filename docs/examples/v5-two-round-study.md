@@ -104,6 +104,16 @@ are explicit approved values chosen before dispatch. Unknown usage remains
 pending for `reconcile_pending_usage`; that recovery helper cannot dispatch a
 new call or turn unknown usage into a zero-cost receipt.
 
+A pending prospective reservation is an authorization hold, not settled usage,
+zero cost, a charge, or available budget. Keep it separate from authenticated
+terminal usage until an approved reconciliation supplies matching accounting.
+
+Diagnostic readiness must use the SDK-default HTTP client construction that the
+admitted gateway uses; a capture helper must not substitute a transport or
+client and silently change proxy, redirect, or limit behavior. Record the tool
+sandbox permissions and network execution context with the diagnostic result so
+that a successful mock path is not presented as live-routing evidence.
+
 The old prepared attempts keep their original source provenance. Reviewing
 corrected source does not authorize rerunning an old attempt wrapper or writing
 through an existing study's one-shot slot.
