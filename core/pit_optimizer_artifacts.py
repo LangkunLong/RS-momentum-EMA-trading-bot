@@ -839,6 +839,37 @@ def _write_create_only_in_directory(
     return directory.path / name, hashlib.sha256(payload).hexdigest()
 
 
+def _publish_create_only_link(
+    source: _DirectoryAccess,
+    source_name: str,
+    target: _DirectoryAccess,
+    target_name: str,
+) -> None:
+    """Atomically publish a complete sibling file without replacing a target."""
+
+    source.assert_current()
+    target.assert_current()
+    if os.name == "nt":
+        # Windows os.rename is atomic and raises when the target already
+        # exists; keep the staging file and published file on the same volume.
+        os.rename(
+            _windows_extended_path(source.path / source_name),
+            _windows_extended_path(target.path / target_name),
+        )
+    else:
+        os.link(
+            source_name,
+            target_name,
+            src_dir_fd=source.descriptor,
+            dst_dir_fd=target.descriptor,
+            follow_symlinks=False,
+        )
+    source.assert_current()
+    target.assert_current()
+    _sync_directory_access(target)
+    target.assert_current()
+
+
 def _open_temporary_file(
     directory: _DirectoryAccess,
     target_name: str,

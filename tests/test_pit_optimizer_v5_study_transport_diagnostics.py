@@ -7,6 +7,8 @@ import json
 import os
 from pathlib import Path
 import socket
+import site
+import ssl
 import subprocess
 import sys
 import time
@@ -57,6 +59,7 @@ def _install_external_network_block(monkeypatch):
 
     monkeypatch.setattr(socket, "socketpair", reserved_socketpair)
     monkeypatch.setattr(socket, "create_connection", blocked)
+    monkeypatch.setattr(socket, "getaddrinfo", blocked)
     monkeypatch.setattr(socket.socket, "connect", blocked)
     monkeypatch.setattr(socket.socket, "connect_ex", blocked)
     return loopback_pair
@@ -664,7 +667,7 @@ def test_dual_response_extraction_and_accounting_failures_keep_bounded_categorie
             message["content"] = None
         if usage_shape == "invalid_total":
             body["usage"]["total_tokens"] -= 1
-        return httpx.Response(200, json=body)
+        return httpx.Response(200, headers={"x-request-id": "http-request-id-distinct"}, json=body)
 
     if content_shape == "missing":
         # The SDK model normalizes omitted nullable `content` to None. Inject
@@ -706,6 +709,13 @@ def test_dual_response_extraction_and_accounting_failures_keep_bounded_categorie
     assert diagnostic["content_failure"] == expected_content_failure
     assert diagnostic["accounting_failure"] == expected_accounting_failure
     assert diagnostic["provider_request_id"] == "sdk-response-id-safe"
+    http_observation = next(
+        json.loads(store.read(ref))
+        for ref in store.list_refs(kind="transport-observations")
+        if ref.relative_path.endswith("-payload.bin")
+    )
+    assert http_observation["observation"]["http_request_id"] == "http-request-id-distinct"
+    assert http_observation["observation"]["response_id"] == "sdk-response-id-safe"
     assert store.list_refs(kind="responses") == ()
     assert store.list_refs(kind="raw-responses") == ()
     assert store.list_refs(kind="response-observations") == ()
@@ -875,6 +885,10 @@ def test_actual_mocktransport_cleanup_metadata_reopens_and_exports_exact_bytes(t
             {
                 "PYTHON_DOTENV_DISABLED": "1",
                 "PYTHONDONTWRITEBYTECODE": "1",
+                # Fresh reopen uses the accepted interpreter below and this
+                # synthetic explicit user-site base, never inherited profile
+                # or environment values.
+                "PYTHONUSERBASE": site.USER_BASE,
                 "V5_TRANSPORT_GUARD_INSTALLED_MARKER": str(installed_marker),
                 "V5_TRANSPORT_TRIPWIRE_MARKER": str(tripwire_marker),
             }
@@ -884,7 +898,12 @@ def test_actual_mocktransport_cleanup_metadata_reopens_and_exports_exact_bytes(t
         started = time.monotonic()
         record("fresh_reopen_child_start", child=child_index)
         try:
-            result = original_run(args, *positional, **kwargs)
+            # Validate the production launcher request above, then run
+            # its same -c program with the pinned accepted interpreter.
+            # The production py launcher itself remains outside this
+            # offline test's credential/network surface.
+            accepted_child_command = [sys.executable, *command[2:]]
+            result = original_run(accepted_child_command, *positional, **kwargs)
         except subprocess.TimeoutExpired:
             record(
                 "fresh_reopen_child_timeout",
@@ -1048,6 +1067,16 @@ def test_actual_mocktransport_cleanup_metadata_reopens_and_exports_exact_bytes(t
     assert len(raw_entries) == 1
     exported_raw = output / Path(*str(raw_entries[0]["relative_path"]).split("/"))
     assert _long_read_bytes(exported_raw) == raw_bytes
+    transport_refs = store.list_refs(kind="transport-observations")
+    assert transport_refs
+    for transport_ref in transport_refs:
+        transport_bytes = store.read(transport_ref)
+        matching_transport = [
+            item for item in index["artifacts"] if item["source_sha256"] == transport_ref.sha256
+        ]
+        assert len(matching_transport) == 1
+        exported_transport = output / Path(*str(matching_transport[0]["relative_path"]).split("/"))
+        assert _long_read_bytes(exported_transport) == transport_bytes
     assert StudyLedgerV1(store, prepared.manifest, ledger.grant, approval=None).recover(request) == terminal
     _assert_no_sensitive_artifact_bytes(prepared.root)
     record(
@@ -1233,3 +1262,825 @@ def test_cleanup_diagnostic_validation_is_strict_for_all_three_envelope_shapes(
     monkeypatch.setattr(store, "read", tampered_observation_read)
     with pytest.raises(StudyAuthorityError, match="response observation is invalid"):
         ledger._observed_response_records()
+    monkeypatch.setattr(store, "read", original_read)
+
+
+def _install_external_network_block_many(monkeypatch, count: int):
+    pairs = [socket.socketpair() for _ in range(count)]
+    available_pairs = list(pairs)
+
+    def reserved_socketpair(*_args, **_kwargs):
+        if not available_pairs:
+            raise AssertionError("unexpected event-loop socketpair")
+        return available_pairs.pop(0)
+
+    def blocked(*_args, **_kwargs):
+        raise AssertionError("external networking and DNS are blocked in this test")
+
+    monkeypatch.setattr(socket, "socketpair", reserved_socketpair)
+    monkeypatch.setattr(socket, "create_connection", blocked)
+    monkeypatch.setattr(socket, "getaddrinfo", blocked)
+    monkeypatch.setattr(socket.socket, "connect", blocked)
+    monkeypatch.setattr(socket.socket, "connect_ex", blocked)
+    return pairs
+
+
+def _set_synthetic_sdk_environment(monkeypatch):
+    synthetic_environment = {
+        "PYTHON_DOTENV_DISABLED": "1",
+        "OPENAI_WEBHOOK_SECRET": "synthetic-test-only-webhook-secret",
+        "OPENAI_API_KEY": "synthetic-test-only-openai-key",
+        "OPENROUTER_API_KEY": "synthetic-test-only-credential",
+        "V5_TRANSPORT_TEST_TOKEN": "synthetic-test-only-credential",
+        "HTTPS_PROXY": "http://127.0.0.1:18881",
+        "HTTP_PROXY": "http://127.0.0.1:18882",
+        "ALL_PROXY": "http://127.0.0.1:18883",
+        "NO_PROXY": "",
+        "https_proxy": "http://127.0.0.1:18881",
+        "http_proxy": "http://127.0.0.1:18882",
+        "all_proxy": "http://127.0.0.1:18883",
+        "no_proxy": "",
+    }
+    monkeypatch.setattr(os, "environ", synthetic_environment)
+    return synthetic_environment
+
+
+def _install_default_sdk_transport_mock(monkeypatch, handler, *, close_fails: bool = False):
+    """Patch the SDK-created transports only after default client construction."""
+
+    # Replace the mapping without copying, enumerating, or querying the real
+    # process environment. SDK and HTTPX constructor reads see only synthetic
+    # test values, including when they consult optional environment settings.
+    synthetic_environment = _set_synthetic_sdk_environment(monkeypatch)
+
+    created = []
+    requests = []
+    transport_ids = set()
+    real_constructor = openai.AsyncOpenAI
+
+    if close_fails:
+        class ClosingFailureClient(real_constructor):
+            async def close(self) -> None:
+                await super().close()
+                raise RuntimeError("synthetic sensitive cleanup detail")
+
+        client_type = ClosingFailureClient
+    else:
+        client_type = real_constructor
+
+    def construct(**kwargs):
+        assert os.environ is synthetic_environment
+        assert "http_client" not in kwargs
+        client = client_type(**kwargs)
+        http_client = client._client
+        transports = {http_client._transport}
+        transports.update(transport for transport in http_client._mounts.values() if transport is not None)
+        transport_ids.update(id(transport) for transport in transports)
+        timeout = http_client.timeout
+        pools = tuple(getattr(transport, "_pool", None) for transport in transports)
+        tls_verify_modes = tuple(
+            getattr(getattr(pool, "_ssl_context", None), "verify_mode", None)
+            for pool in pools
+        )
+        created.append(
+            {
+                "client": client,
+                "http_client": http_client,
+                "default_transport": http_client._transport,
+                "mounts": tuple(transport for transport in http_client._mounts.values() if transport is not None),
+                "trust_env": http_client._trust_env,
+                "response_hooks": tuple(http_client.event_hooks.get("response", ())),
+                "settings": {
+                    "configured_timeout": kwargs.get("timeout"),
+                    "timeout": tuple(
+                        (name, getattr(timeout, name, None))
+                        for name in ("connect", "read", "write", "pool")
+                    ),
+                    "max_retries": client.max_retries,
+                    "follow_redirects": http_client.follow_redirects,
+                    "limits": tuple(
+                        (
+                            getattr(pool, "_max_connections", None),
+                            getattr(pool, "_max_keepalive_connections", None),
+                        )
+                        for pool in pools
+                    ),
+                    "tls_verify_modes": tls_verify_modes,
+                },
+            }
+        )
+
+        for transport_type in {type(transport) for transport in transports}:
+            original = transport_type.handle_async_request
+
+            async def intercepted(transport, request, _original=original):
+                if id(transport) in transport_ids:
+                    requests.append(request)
+                    response = handler(request)
+                    if asyncio.iscoroutine(response):
+                        response = await response
+                    return response
+                return await _original(transport, request)
+
+            monkeypatch.setattr(transport_type, "handle_async_request", intercepted)
+        return client
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", construct)
+    return created, requests
+
+
+def _direct_v5_request(gateway, *, observer=None):
+    return gateway.request_pit_optimizer_v5_json_once(
+        request_sha256=hashlib.sha256(b"synthetic-v5-diagnostic-request").hexdigest(),
+        model="openai/gpt-5.4",
+        messages=({"role": "user", "content": {"probe": "synthetic diagnostic"}},),
+        response_schema_json=(
+            b'{"type":"object","properties":{"status":{"type":"string"}},'
+            b'"required":["status"],"additionalProperties":false}'
+        ),
+        max_output_tokens=32,
+        wall_deadline=time.monotonic() + 15.0,
+        allow_full_source_escape=False,
+        http_observation=observer,
+    )
+
+
+def _gateway_for_default_sdk_test():
+    return agent_loop.OpenRouterGateway(
+        api_key="synthetic-test-only-credential",
+        run_id="integrated-transport-test",
+        timeout_seconds=10.0,
+        max_attempts=1,
+    )
+
+
+def _minimal_sdk_completion_body(*, response_id: str = "body-generation-id-safe"):
+    return {
+        "id": response_id,
+        "object": "chat.completion",
+        "created": 1,
+        "model": "openai/gpt-5.4",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": '{"status":"ok"}'},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 4, "completion_tokens": 3, "total_tokens": 7, "cost": 0.000123},
+    }
+
+
+def test_actual_study_gateway_uses_same_sdk_owned_client_settings_as_diagnostic(
+    tmp_path, monkeypatch
+) -> None:
+    from core.pit_optimizer_v5.transport_diagnostic import run_transport_diagnostic_once_v1
+
+    _set_synthetic_sdk_environment(monkeypatch)
+    pairs = _install_external_network_block_many(monkeypatch, 2)
+    context = _test_gateway_context(tmp_path, monkeypatch)
+    fixture, fixture_request, manifest, request, store, grant, ledger, _unused_gateway = context
+    study_gateway = StudyOpenRouterGatewayV1(
+        ledger=ledger,
+        credential_environment_variable="V5_TRANSPORT_TEST_TOKEN",
+        timeout_seconds=10.0,
+    )
+
+    def test_only_admission(*, request_sha256, model, messages, response_schema_json, max_output_tokens):
+        return ledger.claim_dispatch(
+            request_sha256=request_sha256,
+            model=model,
+            messages=messages,
+            response_schema_json=response_schema_json,
+            max_output_tokens=max_output_tokens,
+        )
+
+    study_gateway._admitted = test_only_admission
+    requests = []
+
+    def handler(http_request):
+        requests.append(http_request)
+        if len(requests) == 1:
+            return httpx.Response(
+                200,
+                headers={"x-request-id": "diagnostic-http-id"},
+                json=_minimal_sdk_completion_body(response_id="diagnostic-body-id"),
+                request=http_request,
+            )
+        return httpx.Response(
+            200,
+            headers={"x-request-id": "study-http-id"},
+            json=_sdk_body(request, fixture_request),
+            request=http_request,
+        )
+
+    created, intercepted_requests = _install_default_sdk_transport_mock(monkeypatch, handler)
+    try:
+        diagnostic = run_transport_diagnostic_once_v1(
+            _gateway_for_default_sdk_test(),
+            request_sha256=hashlib.sha256(b"synthetic-v5-diagnostic-equivalence").hexdigest(),
+            model="openai/gpt-5.4",
+            messages=({"role": "user", "content": {"probe": "synthetic diagnostic"}},),
+            response_schema_json=(
+                b'{"type":"object","properties":{"status":{"type":"string"}},'
+                b'"required":["status"],"additionalProperties":false}'
+            ),
+            max_output_tokens=32,
+            wall_deadline=time.monotonic() + 15.0,
+            redactions=("synthetic-test-only-credential", "synthetic-test-only-webhook-secret"),
+            allow_full_source_escape=False,
+        )
+        assert diagnostic.outcome == "completion_received", (
+            diagnostic.failure_phase,
+            diagnostic.failure_code,
+            diagnostic.observation,
+            len(intercepted_requests),
+            len(requests),
+        )
+        terminal = run_study_call_v1(
+            request=request,
+            fixture_request=fixture_request,
+            ledger=ledger,
+            gateway=study_gateway,
+            deadline_monotonic=time.monotonic() + 60.0,
+        )
+    finally:
+        for pair in pairs:
+            pair[0].close()
+            pair[1].close()
+
+    assert terminal.terminal.usage.input_tokens == 7
+    assert terminal.terminal.usage.output_tokens == 5
+    assert len(created) == len(intercepted_requests) == len(requests) == 2
+    first, second = created
+    for item in created:
+        assert item["trust_env"] is True
+        assert item["default_transport"] is item["http_client"]._transport
+        assert item["mounts"]
+        assert item["settings"]["max_retries"] == 0
+        assert item["settings"]["follow_redirects"] == first["settings"]["follow_redirects"]
+        assert item["settings"]["tls_verify_modes"]
+        assert all(mode == ssl.CERT_REQUIRED for mode in item["settings"]["tls_verify_modes"])
+    assert first["settings"] == second["settings"]
+    assert first["trust_env"] == second["trust_env"] is True
+    assert len(first["mounts"]) == len(second["mounts"])
+    assert study_gateway.last_http_observation["capture_status"] == "observed"
+    observation_refs = store.list_refs(kind="transport-observations")
+    assert len(observation_refs) == 2
+    reopened = StudyLedgerV1(store, manifest, grant, approval=None)
+    assert reopened.recover(request) == terminal
+
+
+def test_study_observation_sink_failure_keeps_accounting_and_final_snapshot(tmp_path, monkeypatch) -> None:
+    _set_synthetic_sdk_environment(monkeypatch)
+    pairs = _install_external_network_block_many(monkeypatch, 1)
+    context = _test_gateway_context(tmp_path, monkeypatch)
+    fixture, fixture_request, manifest, request, store, grant, ledger, _unused_gateway = context
+    gateway = StudyOpenRouterGatewayV1(
+        ledger=ledger,
+        credential_environment_variable="V5_TRANSPORT_TEST_TOKEN",
+        timeout_seconds=10.0,
+    )
+
+    def test_only_admission(*, request_sha256, model, messages, response_schema_json, max_output_tokens):
+        return ledger.claim_dispatch(
+            request_sha256=request_sha256,
+            model=model,
+            messages=messages,
+            response_schema_json=response_schema_json,
+            max_output_tokens=max_output_tokens,
+        )
+
+    gateway._admitted = test_only_admission
+    original_persist = ledger.persist_transport_observation_for_request
+
+    def fail_optional_observation(*_args, **_kwargs):
+        raise OSError("synthetic observation sink interruption")
+
+    monkeypatch.setattr(ledger, "persist_transport_observation_for_request", fail_optional_observation)
+    created, requests = _install_default_sdk_transport_mock(
+        monkeypatch,
+        lambda http_request: httpx.Response(
+            200,
+            json=_sdk_body(request, fixture_request),
+            request=http_request,
+        ),
+    )
+    try:
+        terminal = run_study_call_v1(
+            request=request,
+            fixture_request=fixture_request,
+            ledger=ledger,
+            gateway=gateway,
+            deadline_monotonic=time.monotonic() + 60.0,
+        )
+    finally:
+        for pair in pairs:
+            pair[0].close()
+            pair[1].close()
+
+    assert len(created) == len(requests) == 1
+    assert terminal.terminal.usage.input_tokens == 7
+    assert terminal.terminal.usage.output_tokens == 5
+    assert gateway.last_http_observation["persistence_failures"] == 2
+    assert gateway.last_http_observation["capture_status"] == "observed"
+    assert store.list_refs(kind="transport-observations") == ()
+    monkeypatch.setattr(ledger, "persist_transport_observation_for_request", original_persist)
+    reopened = StudyLedgerV1(store, manifest, grant, approval=None)
+    assert reopened.recover(request) == terminal
+
+
+def test_execute_study_arm_transport_receipt_wraps_once_and_falls_back_safely(
+    tmp_path, monkeypatch
+) -> None:
+    from core.pit_optimizer_v5.transport_diagnostic import (
+        execute_study_arm_with_transport_receipt_v1,
+    )
+
+    context = _test_gateway_context(tmp_path, monkeypatch)
+    _fixture, _fixture_request, _manifest, _request, _store, _grant, _ledger, gateway = context
+    gateway.last_http_observation = {
+        "capture_status": "observed",
+        "persistence_failures": 2,
+        "observations": [{"stage": "headers", "http_status": 200}],
+    }
+    prepared = SimpleNamespace(manifest=SimpleNamespace(study_id="synthetic-study-id"))
+    sentinel = object()
+    calls = []
+
+    def execute_once(**kwargs):
+        calls.append(kwargs)
+        gateway.last_http_observation = {
+            "capture_status": "observed",
+            "persistence_failures": 2,
+            "observations": [{"stage": "headers", "http_status": 200}],
+        }
+        return sentinel
+
+    import core.pit_optimizer_v5.two_round_study.driver as driver_module
+
+    monkeypatch.setattr(driver_module, "execute_study_arm_v1", execute_once)
+    fallbacks = []
+
+    def interrupted_receipt_sink(_raw):
+        raise OSError("synthetic receipt sink interruption")
+
+    result = execute_study_arm_with_transport_receipt_v1(
+        prepared=prepared,
+        arm="primary",
+        ledger=context[6],
+        gateway=gateway,
+        receipt_sink=interrupted_receipt_sink,
+        fallback_stdout=fallbacks.append,
+    )
+
+    assert result is sentinel
+    assert len(calls) == 1
+    assert calls[0] == {
+        "prepared": prepared,
+        "arm": "primary",
+        "ledger": context[6],
+        "gateway": gateway,
+    }
+    assert len(fallbacks) == 1
+    assert fallbacks[0].endswith("\n")
+    receipt = json.loads(fallbacks[0])
+    assert receipt == {
+        "schema_version": 1,
+        "study_id": "synthetic-study-id",
+        "arm": "primary",
+        "outcome": "returned",
+        "observation": gateway.last_http_observation,
+    }
+
+
+def test_execute_study_arm_receipt_does_not_reuse_prior_gateway_observation(
+    tmp_path, monkeypatch
+) -> None:
+    from core.pit_optimizer_v5.transport_diagnostic import (
+        execute_study_arm_with_transport_receipt_v1,
+    )
+
+    context = _test_gateway_context(tmp_path, monkeypatch)
+    _fixture, _fixture_request, _manifest, _request, _store, _grant, ledger, gateway = context
+    gateway.last_http_observation = {
+        "capture_status": "observed",
+        "persistence_failures": 0,
+        "observations": [{"stage": "payload", "http_status": 200}],
+    }
+    prepared = SimpleNamespace(manifest=SimpleNamespace(study_id="synthetic-study-id"))
+    captured = []
+
+    def fail_before_dispatch(**_kwargs):
+        raise StudyAuthorityError("synthetic local pre-dispatch rejection")
+
+    import core.pit_optimizer_v5.two_round_study.driver as driver_module
+
+    monkeypatch.setattr(driver_module, "execute_study_arm_v1", fail_before_dispatch)
+    with pytest.raises(StudyAuthorityError):
+        execute_study_arm_with_transport_receipt_v1(
+            prepared=prepared,
+            arm="withheld",
+            ledger=ledger,
+            gateway=gateway,
+            receipt_sink=captured.append,
+        )
+
+    assert len(captured) == 1
+    receipt = json.loads(captured[0])
+    assert receipt["outcome"] == "raised"
+    assert receipt["observation"] == {"capture_status": "not_available"}
+    assert gateway.last_http_observation is None
+
+
+def test_default_sdk_owned_transport_callable_runner_returns_authoritative_receipt(tmp_path, monkeypatch) -> None:
+    from core.pit_optimizer_v5.transport_diagnostic import run_transport_diagnostic_once_v1
+
+    pairs = _install_external_network_block_many(monkeypatch, 1)
+    created, requests = _install_default_sdk_transport_mock(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            headers={"x-request-id": "http-request-id-safe"},
+            json=_minimal_sdk_completion_body(),
+            request=request,
+        ),
+    )
+    gateway = _gateway_for_default_sdk_test()
+    receipt = run_transport_diagnostic_once_v1(
+        gateway,
+        request_sha256=hashlib.sha256(b"synthetic-v5-diagnostic-request").hexdigest(),
+        model="openai/gpt-5.4",
+        messages=({"role": "user", "content": {"probe": "synthetic diagnostic"}},),
+        response_schema_json=(
+            b'{"type":"object","properties":{"status":{"type":"string"}},'
+            b'"required":["status"],"additionalProperties":false}'
+        ),
+        max_output_tokens=32,
+        wall_deadline=time.monotonic() + 15.0,
+        redactions=("synthetic-test-only-credential", "synthetic-test-only-webhook-secret"),
+        expected_response_text='{"status":"ok"}',
+        allow_full_source_escape=False,
+    )
+    assert len(created) == len(requests) == 1
+    assert created[0]["trust_env"] is True
+    assert created[0]["default_transport"] is created[0]["http_client"]._transport
+    assert created[0]["mounts"]
+    assert created[0]["client"].max_retries == 0
+    assert created[0]["response_hooks"] == tuple(created[0]["http_client"].event_hooks.get("response", ()))
+    assert receipt.outcome == "completion_received"
+    assert receipt.authoritative_cost_usd == "0.000123"
+    assert receipt.accounting_status == "complete"
+    assert receipt.response_matches_expected is True
+    assert receipt.completion is not None
+    assert receipt.completion.response_text == '{"status":"ok"}'
+    assert receipt.completion.provider_request_id == "body-generation-id-safe"
+    assert receipt.completion.returned_model == "openai/gpt-5.4"
+    assert receipt.completion.response_received is True
+    assert receipt.observation["capture_status"] == "observed"
+    observed = receipt.observation["observations"]
+    assert [item["stage"] for item in observed] == ["headers", "payload"]
+    payload_observation = observed[-1]
+    assert payload_observation["http_request_id"] == "http-request-id-safe"
+    assert payload_observation["response_id"] == "body-generation-id-safe"
+    encoded_receipt = json.dumps(receipt.to_primitive(), sort_keys=True)
+    assert "synthetic-test-only-credential" not in encoded_receipt
+    assert "synthetic-test-only-webhook-secret" not in encoded_receipt
+    assert '{"status":"ok"}' not in encoded_receipt
+    for pair in pairs:
+        pair[0].close()
+        pair[1].close()
+
+
+def test_callable_runner_preserves_dual_failure_categories_and_cleanup(tmp_path, monkeypatch) -> None:
+    from core.pit_optimizer_v5.transport_diagnostic import run_transport_diagnostic_once_v1
+
+    pairs = _install_external_network_block_many(monkeypatch, 1)
+    body = _minimal_sdk_completion_body()
+    body["choices"][0]["message"].pop("content")
+    body["usage"].pop("cost")
+    created, requests = _install_default_sdk_transport_mock(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            headers={"x-request-id": "http-request-id-dual"},
+            json=body,
+            request=request,
+        ),
+        close_fails=True,
+    )
+    gateway = _gateway_for_default_sdk_test()
+    receipt = run_transport_diagnostic_once_v1(
+        gateway,
+        request_sha256=hashlib.sha256(b"synthetic-v5-dual-failure").hexdigest(),
+        model="openai/gpt-5.4",
+        messages=({"role": "user", "content": {"probe": "synthetic diagnostic"}},),
+        response_schema_json=(
+            b'{"type":"object","properties":{"status":{"type":"string"}},'
+            b'"required":["status"],"additionalProperties":false}'
+        ),
+        max_output_tokens=32,
+        wall_deadline=time.monotonic() + 15.0,
+        redactions=("synthetic-test-only-credential", "synthetic sensitive cleanup detail"),
+        allow_full_source_escape=False,
+    )
+    assert len(created) == len(requests) == 1
+    assert receipt.outcome == "provider_failure"
+    assert receipt.accounting_status == "pending"
+    assert receipt.failure_phase == "response_extraction"
+    assert receipt.failure_code == "response_content_unavailable"
+    assert receipt.content_failure == "content_non_string"
+    assert receipt.accounting_failure == "inline_usage_missing"
+    assert receipt.cleanup_diagnostic == ("client_cleanup", "client_cleanup_failed")
+    assert receipt.failure is not None
+    primitive = receipt.to_primitive()
+    assert primitive["content_failure"] == "content_non_string"
+    assert primitive["accounting_failure"] == "inline_usage_missing"
+    assert primitive["cleanup_diagnostic"] == {
+        "phase": "client_cleanup",
+        "code": "client_cleanup_failed",
+    }
+    encoded = json.dumps(primitive, sort_keys=True)
+    assert "synthetic sensitive cleanup detail" not in encoded
+    assert "synthetic-test-only-credential" not in encoded
+    for pair in pairs:
+        pair[0].close()
+        pair[1].close()
+
+
+@pytest.mark.parametrize("case", ("connection", "partial_read_timeout"))
+def test_default_sdk_observer_on_off_preserves_failure_category(case, monkeypatch) -> None:
+    from core.pit_optimizer_v5.provider import ProviderHttpObservationCollectorV1
+
+    pairs = _install_external_network_block_many(monkeypatch, 2)
+    call_count = 0
+
+    def handler(request):
+        nonlocal call_count
+        call_count += 1
+        if case == "connection":
+            raise httpx.ConnectError("synthetic connect detail", request=request)
+
+        class PartialTimeoutStream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield b'{"id":"partial-safe",'
+                raise httpx.ReadTimeout("synthetic partial body timeout", request=request)
+
+            async def aclose(self):
+                return None
+
+        return httpx.Response(200, stream=PartialTimeoutStream(), request=request)
+
+    created, requests = _install_default_sdk_transport_mock(monkeypatch, handler)
+    outcomes = []
+    snapshots = []
+    for observed in (False, True):
+        gateway = _gateway_for_default_sdk_test()
+        collector = ProviderHttpObservationCollectorV1() if observed else None
+        try:
+            _direct_v5_request(gateway, observer=collector)
+        except ProviderFailureDiagnosticV5 as diagnostic:
+            outcomes.append(("provider_failure", diagnostic.phase, diagnostic.code))
+        except ProviderResponseAccountingErrorV5 as diagnostic:
+            outcomes.append(("accounting_failure", diagnostic.phase, diagnostic.code))
+        else:
+            outcomes.append(("completion",))
+        snapshots.append(None if collector is None else collector.snapshot())
+    assert outcomes[0] == outcomes[1]
+    assert outcomes[0][0] == "provider_failure"
+    assert len(created) == 2
+    assert len(requests) == call_count == 2
+    assert all(item["trust_env"] is True for item in created)
+    assert all(item["client"].max_retries == 0 for item in created)
+    assert all(item["response_hooks"] == tuple(item["http_client"].event_hooks.get("response", ())) for item in created)
+    if case == "connection":
+        assert snapshots[1]["capture_status"] == "no_http_response_observed"
+        assert snapshots[1]["observations"][0]["stage"] == "no_response"
+    else:
+        assert snapshots[1]["capture_status"] == "observed"
+        assert [item["stage"] for item in snapshots[1]["observations"]] == ["headers"]
+    snapshot_json = json.dumps(snapshots[1], sort_keys=True)
+    assert "synthetic connect detail" not in snapshot_json
+    assert "synthetic partial body timeout" not in snapshot_json
+    for pair in pairs:
+        pair[0].close()
+        pair[1].close()
+
+
+@pytest.mark.parametrize("case", ("missing_content", "incomplete_accounting", "dual_failure", "malformed_finish_reason"))
+def test_default_sdk_observer_on_off_preserves_response_extraction_outcomes(case, monkeypatch) -> None:
+    from core.pit_optimizer_v5.provider import ProviderHttpObservationCollectorV1
+
+    pairs = _install_external_network_block_many(monkeypatch, 2)
+
+    def handler(request):
+        body = _minimal_sdk_completion_body()
+        if case in {"missing_content", "dual_failure"}:
+            body["choices"][0]["message"].pop("content")
+        if case in {"incomplete_accounting", "dual_failure"}:
+            body["usage"].pop("cost")
+        if case == "malformed_finish_reason":
+            body["choices"][0]["finish_reason"] = {"unexpected": "shape"}
+        return httpx.Response(200, json=body, request=request)
+
+    created, requests = _install_default_sdk_transport_mock(monkeypatch, handler)
+    outcomes = []
+    snapshots = []
+    for observed in (False, True):
+        gateway = _gateway_for_default_sdk_test()
+        collector = ProviderHttpObservationCollectorV1() if observed else None
+        try:
+            completion = _direct_v5_request(gateway, observer=collector)
+            outcomes.append(("completion", completion.accepted, completion.response_text, completion.cost_usd))
+        except ProviderFailureDiagnosticV5 as diagnostic:
+            outcomes.append(
+                (
+                    "provider_failure",
+                    diagnostic.phase,
+                    diagnostic.code,
+                    diagnostic.content_failure,
+                    diagnostic.accounting_failure,
+                )
+            )
+        except ProviderResponseAccountingErrorV5 as diagnostic:
+            outcomes.append(("accounting_failure", diagnostic.phase, diagnostic.code, diagnostic.response_text))
+        snapshots.append(None if collector is None else collector.snapshot())
+    assert outcomes[0] == outcomes[1]
+    assert len(created) == len(requests) == 2
+    assert all(item["trust_env"] is True for item in created)
+    assert all(item["client"].max_retries == 0 for item in created)
+    if case == "missing_content":
+        assert outcomes[0][0:3] == ("completion", False, "")
+    elif case == "incomplete_accounting":
+        assert outcomes[0][:3] == ("accounting_failure", "response_accounting", "inline_usage_missing")
+    elif case == "dual_failure":
+        assert outcomes[0] == (
+            "provider_failure",
+            "response_extraction",
+            "response_content_unavailable",
+            "content_non_string",
+            "inline_usage_missing",
+        )
+    else:
+        # OpenAI 2.54.0 normalizes an unexpected finish_reason object to its
+        # nullable field instead of rejecting the otherwise valid response.
+        assert outcomes[0][0] == "completion"
+        assert outcomes[0][1] is False
+        assert outcomes[0][2] == '{"status":"ok"}'
+        assert snapshots[1]["observations"][-1]["response_id"] == "body-generation-id-safe"
+        assert snapshots[1]["observations"][-1]["prompt_tokens"] == 4
+        assert snapshots[1]["observations"][-1]["finish_reasons"] == ["missing"]
+    assert snapshots[1]["observations"][-1]["response_id"] == "body-generation-id-safe"
+    for pair in pairs:
+        pair[0].close()
+        pair[1].close()
+
+
+def test_atomic_transport_sidecar_fault_before_publication_is_ignored_on_reopen(tmp_path, monkeypatch) -> None:
+    import core.pit_optimizer_v5.artifacts as artifacts_module
+
+    context = _test_gateway_context(tmp_path, monkeypatch)
+    _fixture, _fixture_request, manifest, _request, store, grant, _ledger, _gateway = context
+    original_publish = artifacts_module._publish_create_only_link
+
+    def interrupted_before_publication(*_args, **_kwargs):
+        raise OSError("synthetic interruption before sidecar publication")
+
+    monkeypatch.setattr(artifacts_module, "_publish_create_only_link", interrupted_before_publication)
+    with pytest.raises(StudyAuthorityError):
+        store.put_atomic(
+            kind="transport-observations",
+            key=f"{'a' * 64}-00-headers",
+            content=b'{"synthetic":"partial-stage"}',
+        )
+    monkeypatch.setattr(artifacts_module, "_publish_create_only_link", original_publish)
+    assert store.list_refs(kind="transport-observations") == ()
+    reopened = StudyLedgerV1(store, manifest, grant, approval=None)
+    assert reopened.manifest == manifest
+    stage_namespace = "staging-study-v1-transport-observations"
+    store.repository.append_binary_state(namespace=stage_namespace, key="interrupted", content=b'{"partial":')
+    assert StudyLedgerV1(store, manifest, grant, approval=None).manifest == manifest
+
+
+def test_sdk_owned_redirect_intermediate_id_remains_advisory_to_completion_identity(
+    tmp_path, monkeypatch
+) -> None:
+    _set_synthetic_sdk_environment(monkeypatch)
+    pairs = _install_external_network_block_many(monkeypatch, 1)
+    context = _test_gateway_context(tmp_path, monkeypatch)
+    fixture_request, request, manifest, store, grant, gateway = (
+        context[1], context[3], context[2], context[4], context[5], context[7]
+    )
+    requests = []
+
+    def handler(http_request):
+        requests.append(http_request)
+        if len(requests) == 1:
+            return httpx.Response(
+                302,
+                headers={
+                    "Location": "https://openrouter.ai/api/v1/chat/completions?redirected=1",
+                    "x-request-id": "redirect-http-id",
+                },
+                json={"id": "redirect-generation-id"},
+                request=http_request,
+            )
+        return httpx.Response(
+            200,
+            headers={"x-request-id": "final-http-id"},
+            json=_sdk_body(request, fixture_request),
+            request=http_request,
+        )
+
+    created, intercepted = _install_default_sdk_transport_mock(monkeypatch, handler)
+    try:
+        terminal = _run(context, gateway)
+    finally:
+        for pair in pairs:
+            pair[0].close()
+            pair[1].close()
+    assert len(created) == 1
+    assert len(requests) == len(intercepted) == 2
+    assert created[0]["settings"]["follow_redirects"] is True
+    assert created[0]["client"].max_retries == 0
+    assert terminal.terminal.usage.input_tokens == 7
+    payloads = [
+        json.loads(store.read(ref))
+        for ref in store.list_refs(kind="transport-observations")
+        if ref.relative_path.endswith("-payload.bin")
+    ]
+    assert [item["exchange_index"] for item in payloads] == [0, 1]
+    assert [item["observation"]["response_id"] for item in payloads] == [
+        "redirect-generation-id",
+        "sdk-response-id-safe",
+    ]
+    assert [item["observation"]["http_request_id"] for item in payloads] == [
+        "redirect-http-id",
+        "final-http-id",
+    ]
+    assert StudyLedgerV1(store, manifest, grant, approval=None).recover(request) == terminal
+
+
+def test_distinct_http_and_generation_ids_remain_advisory_to_completion_identity(
+    tmp_path, monkeypatch
+) -> None:
+    _set_synthetic_sdk_environment(monkeypatch)
+    pairs = _install_external_network_block_many(monkeypatch, 1)
+    context = _test_gateway_context(tmp_path, monkeypatch)
+    fixture, fixture_request, manifest, request, store, grant, ledger, gateway = context
+    created, requests = _install_default_sdk_transport_mock(
+        monkeypatch,
+        lambda http_request: httpx.Response(
+            200,
+            headers={"x-request-id": "http-request-id-domain"},
+            json=_sdk_body(request, fixture_request),
+            request=http_request,
+        ),
+    )
+    try:
+        terminal = _run(context, gateway)
+    finally:
+        for pair in pairs:
+            pair[0].close()
+            pair[1].close()
+    assert len(requests) == len(created) == 1
+    assert created[0]["trust_env"] is True
+    assert created[0]["default_transport"] is created[0]["http_client"]._transport
+    assert terminal.terminal.usage.input_tokens == 7
+    transport_payloads = [
+        json.loads(store.read(ref))
+        for ref in store.list_refs(kind="transport-observations")
+        if ref.relative_path.endswith("-payload.bin")
+    ]
+    assert [item["exchange_index"] for item in transport_payloads] == [0]
+    assert [item["observation"]["response_id"] for item in transport_payloads] == ["sdk-response-id-safe"]
+    assert [item["observation"]["http_request_id"] for item in transport_payloads] == [
+        "http-request-id-domain"
+    ]
+    assert StudyLedgerV1(store, manifest, grant, approval=None).recover(request) == terminal
+
+
+def test_transport_observation_invalid_decimal_is_a_value_error() -> None:
+    from core.pit_optimizer_v5.provider import ProviderHttpObservationV1
+
+    valid = ProviderHttpObservationV1(
+        stage="payload",
+        http_status=200,
+        http_request_id=None,
+        response_id=None,
+        returned_model=None,
+        choice_count=0,
+        finish_reasons=(),
+        prompt_tokens=None,
+        completion_tokens=None,
+        total_tokens=None,
+        cost_usd=None,
+        payload_length=0,
+        payload_sha256=None,
+        projection_state="captured",
+        error_category="none",
+    )
+    invalid = valid.to_primitive()
+    invalid["cost_usd"] = "not-a-decimal"
+    with pytest.raises(ValueError, match="provider HTTP observation cost is invalid"):
+        ProviderHttpObservationV1.from_primitive(invalid)

@@ -76,11 +76,20 @@ provider/model, limits, and authority; this guide grants none of them.
    authorization.
 4. Issue the fresh authorization with `authorize_study_execution_v1`, then
    construct an approval-bound `StudyLedgerV1` and the exact
-   `StudyOpenRouterGatewayV1` transport. Call `execute_study_arm_v1` once for
-   each arm. Each arm has one investigator dispatch for its lifetime, reserves
-   before transport, and settles one terminal. Provider-internal retries and
-   any interruption must be disclosed in persisted accounting facts; study
-   retries, schema-repair calls, and extra dispatches are zero.
+   `StudyOpenRouterGatewayV1` transport. For each arm, call
+   `execute_study_arm_with_transport_receipt_v1` from
+   `core.pit_optimizer_v5.transport_diagnostic`; it calls
+   `execute_study_arm_v1` once and preserves the complete normal import,
+   verification, and runtime flow. With no receipt sink it writes one bounded
+   JSON receipt line to stdout after the arm. If the caller supplies a local
+   create-only `receipt_sink(bytes)`, also pass `fallback_stdout=sys.stdout.write`
+   so a sink error gets one safe-line fallback. The receipt contains the final
+   in-memory observation snapshot and never model content. Each arm still has
+   one investigator dispatch for its lifetime, reserves before transport, and
+   settles one terminal. Provider-internal retries and any interruption must
+   be disclosed in persisted accounting facts; study retries, schema-repair
+   calls, and extra dispatches are zero. The existing offline CLI keeps its
+   single-JSON output path and is unchanged.
 5. If a transport was interrupted after reservation or response persistence,
    `resume_study_arm_v1` and `StudyLedgerV1.recover` are local recovery paths,
    not read-only verification: they can publish runtime records and recover
@@ -113,6 +122,38 @@ admitted gateway uses; a capture helper must not substitute a transport or
 client and silently change proxy, redirect, or limit behavior. Record the tool
 sandbox permissions and network execution context with the diagnostic result so
 that a successful mock path is not presented as live-routing evidence.
+
+The supported integrated callable is
+`core.pit_optimizer_v5.transport_diagnostic.run_transport_diagnostic_once_v1`.
+It accepts a fresh `agent_loop.OpenRouterGateway` whose SDK client has not yet
+been constructed, plus already-prepared request inputs. It invokes
+`request_pit_optimizer_v5_json_once` once and returns a closed `to_primitive()`
+receipt with bounded HTTP projection and authoritative SDK accounting status.
+The typed `completion` or `failure` fields are available to the caller in
+memory; they may contain exact model content and must not be printed or copied
+into diagnostic files. The runner does not load credentials, create a grant,
+reserve a study call, or choose a route. An authorized caller must supply those
+inputs and may call it only within the separately approved request scope.
+`StudyOpenRouterGatewayV1` sends its already-admitted request through the same
+one-shot invocation helper and persists its bounded response observations as
+request-bound sidecars. Sidecar header request IDs and JSON body response IDs
+remain separate advisory fields; they do not create new settlement or
+reconciliation identity rules. A live Python orchestrator must use
+`execute_study_arm_with_transport_receipt_v1` around the existing
+`execute_study_arm_v1` call; this is the documented next call path, not a new
+grant or live-slot authorization. The wrapper invokes the study arm once and
+emits one final safe receipt after the normal lifecycle. If optional sidecar
+storage fails, its persistence-failure count is available in that in-memory
+snapshot and final receipt. A hard process interruption or failed receipt
+output can prevent that snapshot from becoming durable; exact exports contain
+only sidecars that were atomically published.
+
+The historical `.superpowers/reviews/2026-09-23-live-chain-diagnostic/diagnostic_once.py`
+uses a caller-supplied HTTPX transport and remains immutable historical
+evidence. Its successful mock result does not establish the integrated path's
+live readiness. The new SDK-default tests block external network access and use
+in-memory HTTPX responses; current live network permissions and routing remain
+unchecked, and no live slot is authorized by this implementation.
 
 The old prepared attempts keep their original source provenance. Reviewing
 corrected source does not authorize rerunning an old attempt wrapper or writing

@@ -99,6 +99,7 @@ _STORE_KINDS = (
     "observed-raw-responses",
     "response-observations",
     "provider-diagnostics",
+    "transport-observations",
     "reconciliations",
     "terminals",
     "parsed",

@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import stat
 import types
 from contextlib import contextmanager
@@ -20,6 +21,7 @@ from core.pit_optimizer_artifacts import (
     _atomic_replace_in_directory,
     _is_link_or_reparse,
     _metadata_identity,
+    _publish_create_only_link,
     _write_create_only_in_directory,
     _windows_extended_path,
 )
@@ -2033,6 +2035,59 @@ class LocalArtifactRepositoryV5:
         except (OSError, ValueError):
             raise ArtifactRelocatedV5(reference, relative) from None
         return reference
+
+    def append_binary_state_atomic(self, *, namespace: str, key: str, content: bytes) -> ArtifactRefV5:
+        """Create one immutable blob by atomically publishing a complete staging file.
+
+        This narrow variant keeps crash-torn bytes in an isolated staging
+        namespace, so enumeration of the published namespace remains valid.
+        It is intended for optional sidecars whose writer may be interrupted.
+        """
+
+        safe_namespace = _safe_component(namespace, "binary state namespace")
+        safe_key = _safe_component(key, "binary state key")
+        if type(content) is not bytes:
+            raise ValueError("binary state content must be immutable bytes")
+        reference = ArtifactRefV5(
+            f"adapter-blobs/{safe_namespace}/{safe_key}.bin",
+            hashlib.sha256(content).hexdigest(),
+        )
+        staging_namespace = _safe_component(f"staging-{safe_namespace}", "binary staging namespace")
+        staging_key = secrets.token_hex(16)
+        staging_reference = self.append_binary_state(
+            namespace=staging_namespace,
+            key=staging_key,
+            content=content,
+        )
+        if staging_reference.sha256 != reference.sha256:
+            raise ArtifactDigestMismatchV5(reference, staging_reference.sha256)
+        source_parts = _safe_relative_path(staging_reference.relative_path)
+        target_parts = _safe_relative_path(reference.relative_path)
+        try:
+            with self._directory(tuple(source_parts[:-1]), create=False) as source, self._directory(
+                tuple(target_parts[:-1]), create=True
+            ) as target:
+                _publish_create_only_link(source, source_parts[-1], target, target_parts[-1])
+                # POSIX publishes by a hard link and then removes the staging
+                # name. Windows os.rename already moved the staging name.
+                if os.name != "nt":
+                    source.unlink(source_parts[-1])
+            return reference
+        except FileExistsError:
+            try:
+                with self._directory(tuple(source_parts[:-1]), create=False) as source:
+                    source.unlink(source_parts[-1])
+            except (ArtifactRepositoryFailureV5, OSError, ValueError):
+                pass
+            existing = self._read_relative(reference.relative_path)
+            actual = hashlib.sha256(existing).hexdigest()
+            if existing != content or actual != reference.sha256:
+                raise ArtifactDigestMismatchV5(reference, actual) from None
+            return reference
+        except ArtifactRepositoryFailureV5:
+            raise
+        except (OSError, ValueError):
+            raise ArtifactRelocatedV5(reference, reference.relative_path) from None
 
     def load_binary_state(
         self,

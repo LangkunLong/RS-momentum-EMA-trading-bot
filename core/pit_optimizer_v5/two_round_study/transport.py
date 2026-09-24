@@ -13,7 +13,12 @@ import re
 import time
 from typing import Mapping
 
-from core.pit_optimizer_v5.provider import CompletionResultV5, ProviderFailureDiagnosticV5
+from core.pit_optimizer_v5.provider import (
+    CompletionResultV5,
+    ProviderFailureDiagnosticV5,
+    ProviderHttpObservationCollectorV1,
+)
+from core.pit_optimizer_v5.transport_diagnostic import invoke_v5_json_once_observed
 
 from .contracts import StudyAuthorityError, StudyContractError
 from .ledger import StudyDispatchClaimV1, StudyLedgerV1
@@ -49,6 +54,7 @@ class StudyOpenRouterGatewayV1:
         self.run_id = run_id or f"study-{ledger.study_id}"
         self.timeout_seconds = float(timeout_seconds)
         self.transport_settings_sha256 = study_transport_settings_sha256_v1()
+        self.last_http_observation: Mapping[str, object] | None = None
 
     def _admitted(
         self,
@@ -85,6 +91,9 @@ class StudyOpenRouterGatewayV1:
         schema_repair_calls: int,
         deadline_monotonic: float,
     ) -> CompletionResultV5:
+        # This gateway can be reused for another arm; an early validation or
+        # admission failure must not expose the previous call's snapshot.
+        self.last_http_observation = None
         if automatic_retries != 0 or schema_repair_calls != 0:
             raise StudyContractError("study transport retries and schema repair are permanently disabled")
         if type(deadline_monotonic) is not float or not math.isfinite(deadline_monotonic):
@@ -101,9 +110,20 @@ class StudyOpenRouterGatewayV1:
             response_schema_json=response_schema_json,
             max_output_tokens=max_output_tokens,
         )
+        stored_request = self.ledger._stored_request(request_sha256)
+        observer = ProviderHttpObservationCollectorV1(
+            sink=lambda exchange_index, observation: self.ledger.persist_transport_observation_for_request(
+                stored_request,
+                exchange_index=exchange_index,
+                observation=observation,
+            )
+        )
         credential = os.environ.get(self.credential_environment_variable)
         if not credential:
-            raise ProviderFailureDiagnosticV5(phase="credential", code="credential_unavailable")
+            diagnostic = ProviderFailureDiagnosticV5(phase="credential", code="credential_unavailable")
+            observer.record_no_response_failure(diagnostic)
+            self.last_http_observation = observer.snapshot()
+            raise diagnostic
         # Import the legacy gateway only after admission and credential lookup.
         # Supplying api_key explicitly prevents its constructor from consulting
         # dotenv/environment state again.
@@ -116,19 +136,29 @@ class StudyOpenRouterGatewayV1:
                 timeout_seconds=self.timeout_seconds,
                 max_attempts=1,
             )
-        except ProviderFailureDiagnosticV5:
+        except ProviderFailureDiagnosticV5 as diagnostic:
+            observer.record_no_response_failure(diagnostic)
+            self.last_http_observation = observer.snapshot()
             raise
         except BaseException as exc:
-            raise ProviderFailureDiagnosticV5.from_exception(exc, stage="gateway_init") from None
-        result = gateway.request_pit_optimizer_v5_json_once(
-            request_sha256=request_sha256,
-            model=model,
-            messages=messages,
-            response_schema_json=response_schema_json,
-            max_output_tokens=max_output_tokens,
-            wall_deadline=deadline_monotonic,
-            allow_full_source_escape=False,
-        )
+            diagnostic = ProviderFailureDiagnosticV5.from_exception(exc, stage="gateway_init")
+            observer.record_no_response_failure(diagnostic)
+            self.last_http_observation = observer.snapshot()
+            raise diagnostic from None
+        try:
+            result = invoke_v5_json_once_observed(
+                gateway,
+                request_sha256=request_sha256,
+                model=model,
+                messages=messages,
+                response_schema_json=response_schema_json,
+                max_output_tokens=max_output_tokens,
+                wall_deadline=deadline_monotonic,
+                allow_full_source_escape=False,
+                observer=observer,
+            )
+        finally:
+            self.last_http_observation = observer.snapshot()
         if type(result) is not CompletionResultV5:
             raise StudyContractError("study gateway returned an invalid completion")
         return result

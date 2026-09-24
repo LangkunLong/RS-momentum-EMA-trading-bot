@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields, is_dataclass
-from decimal import Context, Decimal, ROUND_CEILING, localcontext
+from decimal import Context, Decimal, InvalidOperation, ROUND_CEILING, localcontext
 from enum import StrEnum
 import hashlib
 import json
@@ -13,7 +13,7 @@ import re
 import sys
 import time
 from types import MappingProxyType
-from typing import Literal, Protocol, get_args, get_type_hints, runtime_checkable
+from typing import Callable, Literal, Protocol, get_args, get_type_hints, runtime_checkable
 
 from core.pit_optimizer_v5.candidate_ir import (
     LiteralAxisV5,
@@ -2526,6 +2526,346 @@ class CompletionResultV5:
             "client_cleanup_failed",
         ):
             raise ValueError("provider completion cleanup diagnostic is invalid")
+
+
+_HTTP_FINISH_REASONS_V1 = {"stop", "length", "content_filter", "tool_calls", "function_call", "other", "missing"}
+_HTTP_PROJECTION_STATES_V1 = {
+    "headers_only",
+    "captured",
+    "malformed_json",
+    "payload_oversized",
+    "payload_not_object",
+    "projection_failed",
+    "no_response",
+}
+_HTTP_ERROR_CATEGORIES_V1 = {
+    "none",
+    "provider_error",
+    "http_error_without_error_object",
+    "malformed_error_payload",
+}
+_HTTP_IDENTIFIER_RE_V1 = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/+-]{0,255}\Z")
+
+
+def _safe_http_identifier_v1(value: object, *, redactions: tuple[str, ...]) -> str | None:
+    if type(value) is not str or _HTTP_IDENTIFIER_RE_V1.fullmatch(value) is None:
+        return None
+    if any(secret and secret in value for secret in redactions):
+        return None
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderHttpObservationV1:
+    """A closed, bounded projection of one HTTP exchange, never the raw body."""
+
+    stage: Literal["headers", "payload", "no_response"]
+    http_status: int | None
+    http_request_id: str | None
+    response_id: str | None
+    returned_model: str | None
+    choice_count: int | None
+    finish_reasons: tuple[str, ...]
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    total_tokens: int | None
+    cost_usd: str | None
+    payload_length: int | None
+    payload_sha256: str | None
+    projection_state: str
+    error_category: str
+    failure_phase: str | None = None
+    failure_code: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.stage not in {"headers", "payload", "no_response"}:
+            raise ValueError("provider HTTP observation stage is invalid")
+        if self.http_status is not None and (
+            type(self.http_status) is not int or not 100 <= self.http_status <= 599
+        ):
+            raise ValueError("provider HTTP observation status is invalid")
+        for label, value in (
+            ("HTTP request ID", self.http_request_id),
+            ("response ID", self.response_id),
+            ("returned model", self.returned_model),
+        ):
+            if value is not None and (
+                type(value) is not str
+                or not value
+                or len(value.encode("utf-8")) > 256
+                or any(ord(char) < 0x21 or ord(char) > 0x7E for char in value)
+            ):
+                raise ValueError(f"provider HTTP observation {label} is invalid")
+        for label, value in (
+            ("choice count", self.choice_count),
+            ("prompt tokens", self.prompt_tokens),
+            ("completion tokens", self.completion_tokens),
+            ("total tokens", self.total_tokens),
+        ):
+            if value is not None and (type(value) is not int or not 0 <= value <= 1_000_000_000):
+                raise ValueError(f"provider HTTP observation {label} is invalid")
+        if (
+            type(self.finish_reasons) is not tuple
+            or len(self.finish_reasons) > 8
+            or any(reason not in _HTTP_FINISH_REASONS_V1 for reason in self.finish_reasons)
+        ):
+            raise ValueError("provider HTTP observation finish reasons are invalid")
+        if self.cost_usd is not None:
+            if type(self.cost_usd) is not str or len(self.cost_usd) > 40:
+                raise ValueError("provider HTTP observation cost is invalid")
+            try:
+                cost = Decimal(self.cost_usd)
+            except InvalidOperation as exc:
+                raise ValueError("provider HTTP observation cost is invalid") from exc
+            if not cost.is_finite() or cost < 0 or format(cost, "f") != self.cost_usd:
+                raise ValueError("provider HTTP observation cost is invalid")
+        if self.payload_length is not None and (
+            type(self.payload_length) is not int or not 0 <= self.payload_length <= 1_000_000_000
+        ):
+            raise ValueError("provider HTTP observation payload length is invalid")
+        if self.payload_sha256 is not None and re.fullmatch(r"[0-9a-f]{64}", self.payload_sha256) is None:
+            raise ValueError("provider HTTP observation payload digest is invalid")
+        if self.payload_sha256 is not None and self.payload_length is None:
+            raise ValueError("provider HTTP observation payload identity is incomplete")
+        if self.projection_state not in _HTTP_PROJECTION_STATES_V1:
+            raise ValueError("provider HTTP observation projection state is invalid")
+        if self.error_category not in _HTTP_ERROR_CATEGORIES_V1:
+            raise ValueError("provider HTTP observation error category is invalid")
+        if self.stage == "headers":
+            if self.http_status is None or self.projection_state != "headers_only":
+                raise ValueError("provider HTTP header observation is invalid")
+            if any(
+                value is not None
+                for value in (
+                    self.response_id,
+                    self.returned_model,
+                    self.choice_count,
+                    self.prompt_tokens,
+                    self.completion_tokens,
+                    self.total_tokens,
+                    self.cost_usd,
+                    self.payload_length,
+                    self.payload_sha256,
+                )
+            ) or self.finish_reasons:
+                raise ValueError("provider HTTP header observation contains payload fields")
+        elif self.stage == "payload":
+            if self.http_status is None or self.payload_length is None:
+                raise ValueError("provider HTTP payload observation is incomplete")
+        else:
+            if (
+                self.http_status is not None
+                or self.http_request_id is not None
+                or self.response_id is not None
+                or self.returned_model is not None
+                or self.choice_count is not None
+                or self.finish_reasons
+                or self.prompt_tokens is not None
+                or self.completion_tokens is not None
+                or self.total_tokens is not None
+                or self.cost_usd is not None
+                or self.payload_length is not None
+                or self.payload_sha256 is not None
+                or self.projection_state != "no_response"
+                or self.failure_phase is None
+                or self.failure_code is None
+            ):
+                raise ValueError("provider HTTP no-response observation is invalid")
+            if self.failure_phase not in ProviderFailureDiagnosticV5._CODES or self.failure_code not in ProviderFailureDiagnosticV5._CODES[self.failure_phase]:
+                raise ValueError("provider HTTP no-response failure is invalid")
+        if self.stage != "no_response" and (self.failure_phase is not None or self.failure_code is not None):
+            raise ValueError("provider HTTP response contains no-response failure fields")
+
+    def to_primitive(self) -> dict[str, object]:
+        return {
+            "stage": self.stage,
+            "http_status": self.http_status,
+            "http_request_id": self.http_request_id,
+            "response_id": self.response_id,
+            "returned_model": self.returned_model,
+            "choice_count": self.choice_count,
+            "finish_reasons": list(self.finish_reasons),
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
+            "cost_usd": self.cost_usd,
+            "payload_length": self.payload_length,
+            "payload_sha256": self.payload_sha256,
+            "projection_state": self.projection_state,
+            "error_category": self.error_category,
+            "failure_phase": self.failure_phase,
+            "failure_code": self.failure_code,
+        }
+
+    @classmethod
+    def from_primitive(cls, value: object) -> "ProviderHttpObservationV1":
+        expected = {
+            "stage",
+            "http_status",
+            "http_request_id",
+            "response_id",
+            "returned_model",
+            "choice_count",
+            "finish_reasons",
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "cost_usd",
+            "payload_length",
+            "payload_sha256",
+            "projection_state",
+            "error_category",
+            "failure_phase",
+            "failure_code",
+        }
+        if not isinstance(value, Mapping) or set(value) != expected:
+            raise ValueError("provider HTTP observation fields are invalid")
+        finish_reasons = value["finish_reasons"]
+        if type(finish_reasons) is not list or any(type(item) is not str for item in finish_reasons):
+            raise ValueError("provider HTTP observation finish reasons are invalid")
+        return cls(
+            stage=value["stage"],  # type: ignore[arg-type]
+            http_status=value["http_status"],  # type: ignore[arg-type]
+            http_request_id=value["http_request_id"],  # type: ignore[arg-type]
+            response_id=value["response_id"],  # type: ignore[arg-type]
+            returned_model=value["returned_model"],  # type: ignore[arg-type]
+            choice_count=value["choice_count"],  # type: ignore[arg-type]
+            finish_reasons=tuple(finish_reasons),
+            prompt_tokens=value["prompt_tokens"],  # type: ignore[arg-type]
+            completion_tokens=value["completion_tokens"],  # type: ignore[arg-type]
+            total_tokens=value["total_tokens"],  # type: ignore[arg-type]
+            cost_usd=value["cost_usd"],  # type: ignore[arg-type]
+            payload_length=value["payload_length"],  # type: ignore[arg-type]
+            payload_sha256=value["payload_sha256"],  # type: ignore[arg-type]
+            projection_state=value["projection_state"],  # type: ignore[arg-type]
+            error_category=value["error_category"],  # type: ignore[arg-type]
+            failure_phase=value["failure_phase"],  # type: ignore[arg-type]
+            failure_code=value["failure_code"],  # type: ignore[arg-type]
+        )
+
+
+class ProviderHttpObservationCollectorV1:
+    """Keep bounded observation state and isolate optional persistence failures."""
+
+    __slots__ = (
+        "_sink",
+        "_redactions",
+        "_observations",
+        "_persistence_failures",
+        "_capture_failures",
+        "_failure_phase",
+        "_failure_code",
+    )
+
+    def __init__(
+        self,
+        *,
+        sink: Callable[[int, ProviderHttpObservationV1], object] | None = None,
+        redactions: tuple[str, ...] = (),
+    ) -> None:
+        if sink is not None and not callable(sink):
+            raise ValueError("provider HTTP observation sink is invalid")
+        if type(redactions) is not tuple or any(type(value) is not str for value in redactions):
+            raise ValueError("provider HTTP observation redactions are invalid")
+        self._sink = sink
+        self._redactions = tuple(value for value in redactions if value)
+        self._observations: list[tuple[int, ProviderHttpObservationV1]] = []
+        self._persistence_failures = 0
+        self._capture_failures = 0
+        self._failure_phase: str | None = None
+        self._failure_code: str | None = None
+
+    @property
+    def redactions(self) -> tuple[str, ...]:
+        return self._redactions
+
+    def add_redaction(self, value: str) -> None:
+        if type(value) is str and value and value not in self._redactions:
+            self._redactions = (*self._redactions, value)
+
+    @property
+    def observations(self) -> tuple[tuple[int, ProviderHttpObservationV1], ...]:
+        return tuple(self._observations)
+
+    @property
+    def persistence_failures(self) -> int:
+        return self._persistence_failures
+
+    def mark_capture_failure(self) -> None:
+        self._capture_failures += 1
+
+    def note_failure(self, diagnostic: "ProviderFailureDiagnosticV5") -> None:
+        if type(diagnostic) is ProviderFailureDiagnosticV5:
+            self._failure_phase = diagnostic.phase
+            self._failure_code = diagnostic.code
+
+    def record(self, exchange_index: int, observation: ProviderHttpObservationV1) -> None:
+        if type(exchange_index) is not int or not 0 <= exchange_index <= 31:
+            self._persistence_failures += 1
+            return
+        if type(observation) is not ProviderHttpObservationV1:
+            self._persistence_failures += 1
+            return
+        if len(self._observations) < 64:
+            self._observations.append((exchange_index, observation))
+        else:
+            self._persistence_failures += 1
+            return
+        if self._sink is not None:
+            try:
+                self._sink(exchange_index, observation)
+            except BaseException:
+                self._persistence_failures += 1
+
+    def record_no_response_failure(self, diagnostic: "ProviderFailureDiagnosticV5") -> None:
+        if type(diagnostic) is not ProviderFailureDiagnosticV5:
+            return
+        self.note_failure(diagnostic)
+        if self._observations:
+            return
+        try:
+            observation = ProviderHttpObservationV1(
+                stage="no_response",
+                http_status=None,
+                http_request_id=None,
+                response_id=None,
+                returned_model=None,
+                choice_count=None,
+                finish_reasons=(),
+                prompt_tokens=None,
+                completion_tokens=None,
+                total_tokens=None,
+                cost_usd=None,
+                payload_length=None,
+                payload_sha256=None,
+                projection_state="no_response",
+                error_category="none",
+                failure_phase=diagnostic.phase,
+                failure_code=diagnostic.code,
+            )
+            self.record(0, observation)
+        except BaseException:
+            self._persistence_failures += 1
+
+    def snapshot(self) -> dict[str, object]:
+        capture_status = (
+            "observed"
+            if any(observation.stage in {"headers", "payload"} for _index, observation in self._observations)
+            else "capture_failed"
+            if self._capture_failures
+            else "no_http_response_observed"
+        )
+        return {
+            "observations": [
+                {"exchange_index": index, **observation.to_primitive()}
+                for index, observation in self._observations
+            ],
+            "capture_status": capture_status,
+            "persistence_failures": self._persistence_failures,
+            "capture_failures": self._capture_failures,
+            "failure_phase": self._failure_phase,
+            "failure_code": self._failure_code,
+        }
 
 
 class ProviderResponseAccountingErrorV5(Exception):

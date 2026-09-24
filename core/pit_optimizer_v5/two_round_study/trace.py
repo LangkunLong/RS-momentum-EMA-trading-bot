@@ -50,6 +50,7 @@ _STORE_KINDS = (
     "observed-raw-responses",
     "response-observations",
     "provider-diagnostics",
+    "transport-observations",
     "reconciliations",
     "terminals",
     "parsed",
@@ -257,6 +258,7 @@ def _store_destination(kind: str, reference: ArtifactRefV5, raw: bytes) -> str:
         "observed-raw-responses",
         "response-observations",
         "provider-diagnostics",
+        "transport-observations",
         "reconciliations",
         "terminals",
         "parsed",
@@ -690,7 +692,11 @@ def _trace_markdown(
         "",
     ))
     if store is not None:
-        counts = {kind: len(store.list_refs(kind=kind)) for kind in _STORE_KINDS}
+        counts = {
+            kind: len(store.list_refs(kind=kind))
+            for kind in _STORE_KINDS
+            if kind != "transport-observations" or store.list_refs(kind=kind)
+        }
         _append_json_block(lines, "authenticated study-store namespace counts", counts)
     for arm in verification.arms:
         lines.extend((f"### {arm.arm}", "", f"- state: **{arm.state}**", f"- errors: {list(arm.errors) or 'none'}", f"- recorded usage/accounting: `{_json_text(arm.usage)}`", ""))

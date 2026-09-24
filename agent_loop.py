@@ -3066,6 +3066,146 @@ def _usage_from_response(
         ) from exc
 
 
+def _provider_http_identifier_v1(value: object, *, redactions: tuple[str, ...]) -> str | None:
+    from core.pit_optimizer_v5.provider import _safe_http_identifier_v1
+
+    return _safe_http_identifier_v1(value, redactions=redactions)
+
+
+def _provider_http_int_v1(value: object) -> int | None:
+    if type(value) is int and 0 <= value <= 1_000_000_000:
+        return value
+    return None
+
+
+def _provider_http_cost_v1(value: object) -> str | None:
+    if type(value) not in {int, float, Decimal}:
+        return None
+    try:
+        value_decimal = Decimal(str(value))
+    except InvalidOperation:
+        return None
+    if not value_decimal.is_finite() or value_decimal < 0:
+        return None
+    normalized = format(value_decimal, "f")
+    if len(normalized) > 40:
+        return None
+    return normalized
+
+
+def _provider_http_observation_v1(
+    *,
+    status: object,
+    http_request_id: object,
+    payload_bytes: bytes,
+    redactions: tuple[str, ...],
+):
+    """Project only closed fields from a fully read HTTP response body."""
+
+    from core.pit_optimizer_v5.provider import ProviderHttpObservationV1
+
+    http_status = status if type(status) is int and 100 <= status <= 599 else None
+    safe_http_request_id = _provider_http_identifier_v1(http_request_id, redactions=redactions)
+    payload_length = len(payload_bytes)
+    payload_sha256 = (
+        hashlib.sha256(payload_bytes).hexdigest()
+        if payload_length <= 1_048_576
+        else None
+    )
+    values: dict[str, object] = {
+        "stage": "payload",
+        "http_status": http_status,
+        "http_request_id": safe_http_request_id,
+        "response_id": None,
+        "returned_model": None,
+        "choice_count": None,
+        "finish_reasons": (),
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "total_tokens": None,
+        "cost_usd": None,
+        "payload_length": payload_length,
+        "payload_sha256": payload_sha256,
+        "projection_state": "captured",
+        "error_category": "none",
+    }
+    if payload_length > 1_048_576:
+        values["projection_state"] = "payload_oversized"
+        return ProviderHttpObservationV1(**values)
+    try:
+        payload = json.loads(
+            payload_bytes.decode("utf-8"),
+            object_pairs_hook=lambda pairs: (
+                (_ for _ in ()).throw(ValueError("duplicate response key"))
+                if len({key for key, _value in pairs}) != len(pairs)
+                else dict(pairs)
+            ),
+            parse_constant=lambda _value: (_ for _ in ()).throw(ValueError("invalid response number")),
+        )
+    except (UnicodeDecodeError, ValueError, TypeError, json.JSONDecodeError):
+        values["projection_state"] = "malformed_json"
+        return ProviderHttpObservationV1(**values)
+    if not isinstance(payload, Mapping):
+        values["projection_state"] = "payload_not_object"
+        return ProviderHttpObservationV1(**values)
+
+    response_id = _provider_http_identifier_v1(payload.get("id"), redactions=redactions)
+    model_value = payload.get("model")
+    safe_model = None
+    if type(model_value) is str:
+        try:
+            if (
+                len(model_value.encode("utf-8")) <= 256
+                and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/+-]{0,255}", model_value)
+                and not any(secret and secret in model_value for secret in redactions)
+            ):
+                safe_model = model_value
+        except UnicodeEncodeError:
+            safe_model = None
+    choices = payload.get("choices")
+    choice_count = len(choices) if isinstance(choices, list) and len(choices) <= 1_000_000_000 else None
+    finish_reasons = ()
+    if isinstance(choices, list):
+        known_finish_reasons = {"stop", "length", "content_filter", "tool_calls", "function_call"}
+        finish_reasons = tuple(
+            value
+            if type(value) is str and value in known_finish_reasons
+            else "other"
+            if type(value) is str
+            else "missing"
+            for value in (
+                item.get("finish_reason") if isinstance(item, Mapping) else None
+                for item in choices[:8]
+            )
+        )
+    usage = payload.get("usage")
+    usage = usage if isinstance(usage, Mapping) else {}
+    usage_cost = _provider_http_cost_v1(usage.get("cost"))
+    response_cost = _provider_http_cost_v1(payload.get("cost"))
+    cost = usage_cost if usage_cost is not None else response_cost
+    if usage_cost is not None and response_cost is not None and usage_cost != response_cost:
+        cost = None
+    error = payload.get("error", _MISSING_FIELD)
+    if error is _MISSING_FIELD or error is None:
+        error_category = "http_error_without_error_object" if http_status is not None and http_status >= 400 else "none"
+    elif isinstance(error, Mapping):
+        error_category = "provider_error"
+    else:
+        error_category = "malformed_error_payload"
+    values.update(
+        response_id=response_id,
+        returned_model=safe_model,
+        choice_count=choice_count,
+        finish_reasons=finish_reasons,
+        prompt_tokens=_provider_http_int_v1(usage.get("prompt_tokens")),
+        completion_tokens=_provider_http_int_v1(usage.get("completion_tokens")),
+        total_tokens=_provider_http_int_v1(usage.get("total_tokens")),
+        cost_usd=cost,
+        error_category=error_category,
+    )
+    return ProviderHttpObservationV1(**values)
+
+
 def _complete_pit_optimizer_usage_with_frozen_pricing(
     usage: Usage,
     pricing: "OptimizerPricingSnapshot",
@@ -3866,6 +4006,7 @@ class OpenRouterGateway:
         max_output_tokens: int,
         wall_deadline: float,
         allow_full_source_escape: bool | None = None,
+        http_observation=None,
     ) -> object:
         """Perform one retry-free V5 JSON-schema completion without owning its ledger."""
 
@@ -3874,10 +4015,15 @@ class OpenRouterGateway:
         from core.pit_optimizer_v5.provider import (
             CompletionResultV5,
             ProviderFailureDiagnosticV5,
+            ProviderHttpObservationCollectorV1,
+            ProviderHttpObservationV1,
             ProviderResponseAccountingErrorV5,
             wire_role_messages_v5,
             wire_role_schema_v5,
         )
+
+        if type(http_observation) is ProviderHttpObservationCollectorV1:
+            http_observation.add_redaction(self.api_key)
 
         try:
             if (
@@ -3893,6 +4039,10 @@ class OpenRouterGateway:
                 or max_output_tokens < 1
                 or type(wall_deadline) is not float
                 or not math.isfinite(wall_deadline)
+                or (
+                    http_observation is not None
+                    and type(http_observation) is not ProviderHttpObservationCollectorV1
+                )
             ):
                 raise ConfigurationError("V5 provider request is invalid")
             try:
@@ -3932,10 +4082,15 @@ class OpenRouterGateway:
                     "reasoning": {"exclude": True},
                 },
             )
-        except ProviderFailureDiagnosticV5:
+        except ProviderFailureDiagnosticV5 as diagnostic:
+            if http_observation is not None:
+                http_observation.record_no_response_failure(diagnostic)
             raise
         except BaseException as exc:
-            raise ProviderFailureDiagnosticV5.from_exception(exc, stage="request_preparation") from None
+            diagnostic = ProviderFailureDiagnosticV5.from_exception(exc, stage="request_preparation")
+            if http_observation is not None:
+                http_observation.record_no_response_failure(diagnostic)
+            raise diagnostic from None
 
         async def complete_before_deadline():
             client = self._client
@@ -3961,7 +4116,91 @@ class OpenRouterGateway:
             response = None
             primary_failure = None
             cleanup_diagnostic = None
+            response_hooks = None
+            response_hook = None
+            hook_attached = False
+            exchange_index = 0
             try:
+                if http_observation is not None:
+                    try:
+                        sdk_http_client = getattr(client, "_client", None)
+                        event_hooks = getattr(sdk_http_client, "event_hooks", None)
+                        candidate_hooks = event_hooks.get("response") if isinstance(event_hooks, Mapping) else None
+                        if isinstance(candidate_hooks, list):
+                            response_hooks = candidate_hooks
+
+                            async def observe_http_response(http_response):
+                                nonlocal exchange_index
+                                current_index = exchange_index
+                                exchange_index += 1
+                                try:
+                                    response_status = getattr(http_response, "status_code", None)
+                                    response_headers = getattr(http_response, "headers", None)
+                                    raw_http_request_id = (
+                                        response_headers.get("x-request-id")
+                                        if response_headers is not None
+                                        else None
+                                    )
+                                    header_observation = ProviderHttpObservationV1(
+                                        stage="headers",
+                                        http_status=(
+                                            response_status
+                                            if type(response_status) is int and 100 <= response_status <= 599
+                                            else None
+                                        ),
+                                        http_request_id=_provider_http_identifier_v1(
+                                            raw_http_request_id,
+                                            redactions=http_observation.redactions,
+                                        ),
+                                        response_id=None,
+                                        returned_model=None,
+                                        choice_count=None,
+                                        finish_reasons=(),
+                                        prompt_tokens=None,
+                                        completion_tokens=None,
+                                        total_tokens=None,
+                                        cost_usd=None,
+                                        payload_length=None,
+                                        payload_sha256=None,
+                                        projection_state="headers_only",
+                                        error_category="none",
+                                    )
+                                    http_observation.record(current_index, header_observation)
+                                except BaseException:
+                                    http_observation.mark_capture_failure()
+
+                                # This is the same non-streaming body read that the SDK
+                                # performs. A transport read or cancellation error must
+                                # propagate so the SDK preserves its usual classification.
+                                await http_response.aread()
+                                try:
+                                    response_status = getattr(http_response, "status_code", None)
+                                    response_headers = getattr(http_response, "headers", None)
+                                    raw_http_request_id = (
+                                        response_headers.get("x-request-id")
+                                        if response_headers is not None
+                                        else None
+                                    )
+                                    raw_payload = getattr(http_response, "content", None)
+                                    if type(raw_payload) is not bytes:
+                                        raise TypeError("HTTP response content is unavailable")
+                                    payload_observation = _provider_http_observation_v1(
+                                        status=response_status,
+                                        http_request_id=raw_http_request_id,
+                                        payload_bytes=raw_payload,
+                                        redactions=http_observation.redactions,
+                                    )
+                                    http_observation.record(current_index, payload_observation)
+                                except BaseException:
+                                    http_observation.mark_capture_failure()
+
+                            response_hook = observe_http_response
+                            response_hooks.append(response_hook)
+                            hook_attached = True
+                        else:
+                            http_observation.mark_capture_failure()
+                    except BaseException:
+                        http_observation.mark_capture_failure()
                 # HTTP per-operation timeouts alone do not bound a slow-drip
                 # response. Cancellation also bounds the entire live request.
                 left = min(remaining, wall_deadline - time.monotonic())
@@ -3977,34 +4216,56 @@ class OpenRouterGateway:
                     except BaseException as exc:
                         primary_failure = ProviderFailureDiagnosticV5.from_exception(exc, stage="transport")
             finally:
-                if owned_client:
-                    try:
-                        close_left = min(remaining, wall_deadline - time.monotonic())
-                        if close_left <= 0:
-                            raise TimeoutError()
-                        await asyncio.wait_for(client.close(), timeout=close_left)
-                    except BaseException as exc:
-                        cleanup = ProviderFailureDiagnosticV5.from_exception(exc, stage="client_cleanup")
-                        cleanup_diagnostic = (cleanup.phase, cleanup.code)
-                        if primary_failure is not None and isinstance(
-                            primary_failure, (ProviderFailureDiagnosticV5, ProviderResponseAccountingErrorV5)
-                        ):
-                            primary_failure.cleanup_diagnostic = cleanup_diagnostic
-                        elif response is None:
-                            primary_failure = cleanup
+                try:
+                    if owned_client:
+                        try:
+                            close_left = min(remaining, wall_deadline - time.monotonic())
+                            if close_left <= 0:
+                                raise TimeoutError()
+                            await asyncio.wait_for(client.close(), timeout=close_left)
+                        except BaseException as exc:
+                            cleanup = ProviderFailureDiagnosticV5.from_exception(exc, stage="client_cleanup")
+                            cleanup_diagnostic = (cleanup.phase, cleanup.code)
+                            if primary_failure is not None and isinstance(
+                                primary_failure, (ProviderFailureDiagnosticV5, ProviderResponseAccountingErrorV5)
+                            ):
+                                primary_failure.cleanup_diagnostic = cleanup_diagnostic
+                            elif response is None:
+                                primary_failure = cleanup
+                finally:
+                    if hook_attached and response_hooks is not None and response_hook is not None:
+                        try:
+                            for hook_index, current_hook in enumerate(response_hooks):
+                                if current_hook is response_hook:
+                                    del response_hooks[hook_index]
+                                    break
+                        except BaseException:
+                            if http_observation is not None:
+                                http_observation.mark_capture_failure()
             if primary_failure is not None:
+                if http_observation is not None and isinstance(primary_failure, ProviderFailureDiagnosticV5):
+                    http_observation.note_failure(primary_failure)
+                    http_observation.record_no_response_failure(primary_failure)
                 raise primary_failure
             return response, cleanup_diagnostic
 
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            response, cleanup_diagnostic = asyncio.run(complete_before_deadline())
+            try:
+                response, cleanup_diagnostic = asyncio.run(complete_before_deadline())
+            except ProviderFailureDiagnosticV5 as diagnostic:
+                if http_observation is not None:
+                    http_observation.record_no_response_failure(diagnostic)
+                raise
         else:
-            raise ProviderFailureDiagnosticV5.from_exception(
+            diagnostic = ProviderFailureDiagnosticV5.from_exception(
                 ConfigurationError("V5 synchronous provider boundary requires a controller thread"),
                 stage="request_preparation",
             )
+            if http_observation is not None:
+                http_observation.record_no_response_failure(diagnostic)
+            raise diagnostic
         request_id = None
         try:
             raw_request_id = _read_field(response, "id")

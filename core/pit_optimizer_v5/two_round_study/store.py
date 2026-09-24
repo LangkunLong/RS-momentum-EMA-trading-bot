@@ -63,6 +63,14 @@ class StudyStoreV1:
         self.repository = repository
 
     def put(self, *, kind: str, key: str, content: bytes) -> ArtifactRefV5:
+        return self._put(kind=kind, key=key, content=content, atomic=False)
+
+    def put_atomic(self, *, kind: str, key: str, content: bytes) -> ArtifactRefV5:
+        """Publish immutable sidecar bytes without exposing a torn final file."""
+
+        return self._put(kind=kind, key=key, content=content, atomic=True)
+
+    def _put(self, *, kind: str, key: str, content: bytes, atomic: bool) -> ArtifactRefV5:
         namespace, _ = _namespace(kind)
         safe_key = _component(key, "study key")
         if type(content) is not bytes:
@@ -74,7 +82,7 @@ class StudyStoreV1:
                 namespace=namespace,
                 key=STUDY_NAMESPACE_QUOTA_LOCK_KEY_V1,
             ):
-                return self._put_locked(namespace=namespace, key=safe_key, content=content)
+                return self._put_locked(namespace=namespace, key=safe_key, content=content, atomic=atomic)
         except (StudyAdmissionError, StudyAuthorityError):
             raise
         except (ArtifactDigestMismatchV5, ArtifactMissingV5, ArtifactNonCanonicalV5, ArtifactRelocatedV5, ArtifactSchemaFailureV5, ArtifactRepositoryFailureV5) as exc:
@@ -82,7 +90,7 @@ class StudyStoreV1:
         except (OSError, ValueError, TypeError) as exc:
             raise _translate_storage_failure(exc, "study storage operation failed") from exc
 
-    def _put_locked(self, *, namespace: str, key: str, content: bytes) -> ArtifactRefV5:
+    def _put_locked(self, *, namespace: str, key: str, content: bytes, atomic: bool = False) -> ArtifactRefV5:
         expected_path = f"adapter-blobs/{namespace}/{key}.bin"
         refs = self.repository.list_binary_state_refs(
             namespace=namespace,
@@ -114,6 +122,8 @@ class StudyStoreV1:
             raise StudyAdmissionError("study namespace exceeds its blob count limit")
         if total_bytes + len(content) > STUDY_MAX_NAMESPACE_BYTES_V1:
             raise StudyAdmissionError("study namespace exceeds its byte limit")
+        if atomic:
+            return self.repository.append_binary_state_atomic(namespace=namespace, key=key, content=content)
         return self.repository.append_binary_state(namespace=namespace, key=key, content=content)
 
     def read(self, reference: ArtifactRefV5) -> bytes:

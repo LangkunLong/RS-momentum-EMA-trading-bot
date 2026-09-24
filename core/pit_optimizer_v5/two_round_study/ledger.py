@@ -19,6 +19,7 @@ from core.pit_optimizer_v5.contracts import canonical_json_bytes_v5, canonical_p
 from core.pit_optimizer_v5.provider import (
     CompletionResultV5,
     ProviderFailureDiagnosticV5,
+    ProviderHttpObservationV1,
     ProviderResponseAccountingErrorV5,
     RoleBindingV5,
     RoleAttemptFactsV5,
@@ -1519,6 +1520,103 @@ class StudyLedgerV1:
                 raise StudyAuthorityError("study provider diagnostic reference differs from bytes")
             result[key] = (ref, payload)
         return result
+
+    def _transport_observation_records(
+        self,
+    ) -> dict[str, tuple[tuple[ArtifactRefV5, dict[str, object], ProviderHttpObservationV1], ...]]:
+        """Read bounded HTTP projections and their exact authority envelopes."""
+
+        grouped: dict[str, list[tuple[ArtifactRefV5, dict[str, object], ProviderHttpObservationV1]]] = {}
+        namespace = "adapter-blobs/study-v1-transport-observations/"
+        fields = {
+            "request_sha256",
+            "reservation_sha256",
+            "claim_sha256",
+            "grant_sha256",
+            "manifest_sha256",
+            "exchange_index",
+            "observation",
+        }
+        seen: set[tuple[str, int, str]] = set()
+        for ref in self._refs("transport-observations"):
+            if not ref.relative_path.startswith(namespace):
+                raise StudyAuthorityError("study transport observation namespace contains an orphan record")
+            key = ref.relative_path.rsplit("/", 1)[-1][:-4]
+            match = re.fullmatch(r"([0-9a-f]{64})-([0-9]{2})-(headers|payload|no_response)", key)
+            if ref.relative_path != f"{namespace}{key}.bin" or match is None:
+                raise StudyAuthorityError("study transport observation path is not deterministic")
+            request_sha256, index_text, stage = match.groups()
+            exchange_index = int(index_text)
+            if exchange_index > 31 or (request_sha256, exchange_index, stage) in seen:
+                raise StudyAuthorityError("study transport observation is duplicated or out of range")
+            seen.add((request_sha256, exchange_index, stage))
+            raw = self.store.read(ref)
+            try:
+                value = _decode_canonical_json_object(raw, "study transport observation")
+                payload = _strict(value, fields, "study transport observation")
+                if canonical_json_bytes_v5(payload) != raw:
+                    raise StudyAuthorityError("study transport observation is not canonical")
+                for field in ("request_sha256", "reservation_sha256", "claim_sha256", "grant_sha256", "manifest_sha256"):
+                    _digest(payload[field], f"study transport observation {field}")
+                if (
+                    payload["request_sha256"] != request_sha256
+                    or payload["exchange_index"] != exchange_index
+                    or type(payload["exchange_index"]) is not int
+                ):
+                    raise StudyAuthorityError("study transport observation identity differs from its path")
+                observation = ProviderHttpObservationV1.from_primitive(payload["observation"])
+                if observation.stage != stage:
+                    raise StudyAuthorityError("study transport observation stage differs from its path")
+            except (StudyContractError, TypeError, ValueError) as exc:
+                raise StudyAuthorityError("study transport observation is invalid") from exc
+            if ref.sha256 != _sha256(raw):
+                raise StudyAuthorityError("study transport observation reference differs from bytes")
+            grouped.setdefault(request_sha256, []).append((ref, payload, observation))
+        return {
+            request_sha256: tuple(sorted(records, key=lambda item: (item[2].stage, item[1]["exchange_index"])))
+            for request_sha256, records in grouped.items()
+        }
+
+    def persist_transport_observation_for_request(
+        self,
+        request: StudyCallRequestV1,
+        *,
+        exchange_index: int,
+        observation: ProviderHttpObservationV1,
+    ) -> None:
+        """Create a bounded request-bound HTTP observation at the response hook."""
+
+        self._validate_request(request)
+        if (
+            type(exchange_index) is not int
+            or not 0 <= exchange_index <= 31
+            or type(observation) is not ProviderHttpObservationV1
+        ):
+            raise StudyContractError("study transport observation is invalid")
+        with self._lock, self._transition():
+            reservation = self._find_reservation(request)
+            if reservation is None:
+                raise StudyAuthorityError("study transport observation has no durable reservation")
+            self._validate_reservation_request_binding(reservation, request)
+            claims = tuple(claim for claim in self._dispatch_claims() if claim.request_sha256 == request.sha256)
+            if len(claims) != 1:
+                raise StudyAuthorityError("study transport observation has no authenticated dispatch claim")
+            claim = claims[0]
+            payload = {
+                "request_sha256": request.sha256,
+                "reservation_sha256": reservation.reservation_sha256,
+                "claim_sha256": claim.claim_sha256,
+                "grant_sha256": self.grant.sha256,
+                "manifest_sha256": self.manifest.sha256,
+                "exchange_index": exchange_index,
+                "observation": observation.to_primitive(),
+            }
+            key = f"{request.sha256}-{exchange_index:02d}-{observation.stage}"
+            self.store.put_atomic(
+                kind="transport-observations",
+                key=key,
+                content=canonical_json_bytes_v5(payload),
+            )
 
     def _observed_response_records(
         self,
@@ -3407,6 +3505,7 @@ class StudyLedgerV1:
         claim_by_request = {claim.request_sha256: claim for claim in dispatch_claims}
         diagnostics = self._provider_diagnostic_records()
         observations = self._observed_response_records()
+        transport_observations = self._transport_observation_records()
         for request_sha256, (_diagnostic_ref, diagnostic) in diagnostics.items():
             reservation = reservation_by_request.get(request_sha256)
             claim = claim_by_request.get(request_sha256)
@@ -3445,6 +3544,23 @@ class StudyLedgerV1:
                     and diagnostic_id != observation_id
                 ):
                     raise StudyAuthorityError("provider diagnostic differs from the preserved response observation")
+        for request_sha256, records in transport_observations.items():
+            reservation = reservation_by_request.get(request_sha256)
+            claim = claim_by_request.get(request_sha256)
+            if reservation is None or claim is None:
+                raise StudyAuthorityError("study transport observation has no authenticated reservation and dispatch claim")
+            request = self._stored_request(request_sha256)
+            self._validate_reservation_request_binding(reservation, request)
+            if claim.reservation_sha256 != reservation.reservation_sha256:
+                raise StudyAuthorityError("study transport observation dispatch claim differs from its reservation")
+            for _ref_value, payload, _transport_observation in records:
+                if (
+                    payload["reservation_sha256"] != reservation.reservation_sha256
+                    or payload["claim_sha256"] != claim.claim_sha256
+                    or payload["grant_sha256"] != self.grant.sha256
+                    or payload["manifest_sha256"] != self.manifest.sha256
+                ):
+                    raise StudyAuthorityError("study transport observation authority binding differs")
         admission_rejections = self._admission_rejections()
         rejection_by_request = {item.request_sha256: item for _ref_value, item in admission_rejections}
         reconciliation_events = self._reconciliations()
@@ -3460,7 +3576,7 @@ class StudyLedgerV1:
             or any(event.request_sha256 in incomplete_publication_requests for event in reconciliation_events)
             or any(
                 ref.relative_path.rsplit("/", 1)[-1][:-4] in incomplete_publication_requests
-                for kind in ("responses", "raw-responses", "raw-response-failures", "observed-raw-responses", "response-observations", "provider-diagnostics", "parsed")
+                for kind in ("responses", "raw-responses", "raw-response-failures", "observed-raw-responses", "response-observations", "provider-diagnostics", "transport-observations", "parsed")
                 for ref in self._refs(kind)
             )
         ):
