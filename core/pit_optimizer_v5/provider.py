@@ -2568,7 +2568,32 @@ class ProviderResponseAccountingErrorV5(Exception):
 class ProviderFailureDiagnosticV5(Exception):
     """Safe, bounded metadata for an unresolved provider failure."""
 
-    __slots__ = ("phase", "code", "http_status", "provider_request_id", "cleanup_diagnostic")
+    __slots__ = (
+        "phase",
+        "code",
+        "http_status",
+        "provider_request_id",
+        "cleanup_diagnostic",
+        "content_failure",
+        "accounting_failure",
+    )
+
+    _CONTENT_FAILURES = {
+        "choice_structure_invalid",
+        "message_structure_invalid",
+        "content_missing",
+        "content_non_string",
+        "content_accessor_failed",
+    }
+    _ACCOUNTING_FAILURES = {
+        "inline_usage_missing",
+        "inline_usage_invalid",
+        "inline_cost_conflict",
+        "inline_total_mismatch",
+        "inline_cached_exceeds_prompt",
+        "inline_reasoning_exceeds_completion",
+        "response_accounting_failed",
+    }
 
     _CODES = {
         "credential": {"credential_rejected", "credential_unavailable"},
@@ -2601,6 +2626,8 @@ class ProviderFailureDiagnosticV5(Exception):
         http_status: int | None = None,
         provider_request_id: str | None = None,
         cleanup_diagnostic: tuple[str, str] | None = None,
+        content_failure: str | None = None,
+        accounting_failure: str | None = None,
     ) -> None:
         if phase not in self._CODES or code not in self._CODES[phase]:
             raise ValueError("provider failure diagnostic phase or code is invalid")
@@ -2615,12 +2642,23 @@ class ProviderFailureDiagnosticV5(Exception):
             "client_cleanup_failed",
         ):
             raise ValueError("provider failure cleanup diagnostic is invalid")
+        if (content_failure is None) != (accounting_failure is None):
+            raise ValueError("provider failure categories must be present together")
+        if content_failure is not None and (
+            phase != "response_extraction"
+            or code != "response_content_unavailable"
+            or content_failure not in self._CONTENT_FAILURES
+            or accounting_failure not in self._ACCOUNTING_FAILURES
+        ):
+            raise ValueError("provider failure categories are invalid")
         super().__init__("provider invocation did not yield an accounted completion")
         self.phase = phase
         self.code = code
         self.http_status = http_status
         self.provider_request_id = provider_request_id
         self.cleanup_diagnostic = cleanup_diagnostic
+        self.content_failure = content_failure
+        self.accounting_failure = accounting_failure
 
     @classmethod
     def from_exception(

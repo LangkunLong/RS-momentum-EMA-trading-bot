@@ -7,6 +7,14 @@ persisted graph and its accounting records authenticate; it is not evidence of
 real provider spend, a self-recursive optimizer, or a statistically reliable
 market result.
 
+This guide describes the V5 contract and its recovery boundaries. It does not
+authorize a new study preparation, provider request, grant, retry, slot reuse,
+or retained-study mutation. Offline verification and export of an already
+authorized study are read-only. A future live attempt requires fresh, explicit
+authorization for its exact manifest, request, grant, budget, and dispatch; a
+new source revision by itself does not authorize dispatch or make an earlier
+attempt safe to rerun.
+
 ## Offline CLI
 
 The CLI creates a fresh synthetic repository only when the root is absent. An
@@ -44,11 +52,19 @@ call. A completed arm can still have an unsuccessful or contradictory typed
 outcome; the verifier retains its arm-level measurements and does not replace
 them with a combined success flag.
 
-## Explicit live Python sequence
+## Future live execution requires separate authorization
 
-A live study is a separate, user-authorized operation. The caller must execute
-this sequence with a current grant and an admitted gateway; the CLI has no live
-subcommand and never discovers credentials implicitly:
+A live study is a separate operation and is outside the offline workflow. Only
+after separate user authorization may a caller use this sequence with a current
+grant and an admitted gateway; the CLI has no live subcommand and never
+discovers credentials implicitly:
+
+This generic sequence is not admission to use any currently retained study.
+The existing primary attempts remain pending, withheld arms remain
+`not_started`, and consumed primary slots stay used. Do not reuse the
+source-pinned wrapper from the stopped attempt. A future execution proposal
+must separately bind its exact source/runtime and concrete manifest, request,
+provider/model, limits, and authority; this guide grants none of them.
 
 1. Call `prepare_two_round_study_v1` with a new absolute root and inspect both
    exact F preflight requests, schemas, selected parent, registry, rubric, and
@@ -88,6 +104,10 @@ are explicit approved values chosen before dispatch. Unknown usage remains
 pending for `reconcile_pending_usage`; that recovery helper cannot dispatch a
 new call or turn unknown usage into a zero-cost receipt.
 
+The old prepared attempts keep their original source provenance. Reviewing
+corrected source does not authorize rerunning an old attempt wrapper or writing
+through an existing study's one-shot slot.
+
 The review step is separate from execution and binds exact artifacts rather
 than treating citation presence as semantic proof.
 
@@ -100,6 +120,17 @@ The record never includes exception text, response headers, or credentials.
 For example, `transport/request_timeout` identifies the observed exception
 class; it does not establish whether the provider received the request or what
 it billed.
+
+When both content extraction and usage accounting fail, a new diagnostic also
+stores independent closed `content_failure` and `accounting_failure` codes.
+Content categories distinguish an invalid choice structure, invalid message
+structure, a missing or non-string content field, and a failed accessor.
+Accounting categories preserve the existing safe inline usage validation code,
+or use a generic accounting-failure code when the source cannot support more
+precision. These are bounded adapter/SDK observations; the SDK may normalize a
+wire-level omitted nullable content field to `None`. No raw exception details
+are persisted. Existing diagnostic bytes without these optional fields remain
+valid and are exported unchanged.
 
 When the SDK returns a model content string but inline usage is missing or
 invalid, `response-observations` authenticates the request, reservation,
@@ -114,6 +145,18 @@ import. Oversized content is represented only by a bounded diagnostic.
 preserve the diagnostic, observation envelope, and any observed content bytes
 in the exact-byte trace while leaving pending accounting unresolved. They do
 not retry, call a provider, or reconcile usage.
+
+Content availability and accounting are separate facts. If the SDK did not
+yield string content and accounting is incomplete, the diagnostic records the
+bounded adapter/SDK extraction and accounting categories, while original
+response bytes remain unavailable. The categories report what the adapter
+observed; for example, the SDK may normalize a wire-level omitted nullable
+content field to `None`. If content is a string but accounting is incomplete,
+an authorized observation may retain those exact SDK model-content bytes. If
+accounting is complete but content is missing or non-string, the adapter may
+settle a rejected completion with normalized `response_text=""`; this sentinel
+means no string content was extracted and does not recover the original HTTP
+body or provider bytes.
 
 Recovery uses the exact persisted manifest, grant, and request:
 
@@ -133,7 +176,22 @@ Recovery uses the exact persisted manifest, grant, and request:
    or missing approval publishes no replacement bytes or terminal. The normal
    usage receipt and settlement path then continues. This local reconciliation
    does not make a provider call.
-3. If no authoritative usage is available, leave the reservation pending.
+3. If the pending diagnostic retains a nonempty provider request ID, every
+   incoming response, observation, or reconciled completion must use that same
+   ID. An absent legacy ID adds no identity constraint. An identity mismatch is
+   rejected before response metadata, raw bytes, observed bytes, reconciliation
+   events, or terminals are written. Reopened verification cross-checks any
+   diagnostic against observations and accounted completions; long-lived
+   recovery reauthenticates the current graph under the transition lock.
+   Legacy `provider_request_id=null` remains unbound; an empty-string diagnostic
+   ID remains invalid under the existing schema.
+4. If authoritative accounting is available for a diagnostic that says no
+   string content was extracted, the failed completion may use the adapter's
+   empty-text sentinel only when its provider request ID matches the retained
+   diagnostic. It settles an accounted failed completion with no import and no
+   automatic retry. It does not claim recovered original response bytes or
+   make a scientific result successful.
+5. If no authoritative usage is available, leave the reservation pending.
    Its one-shot slot stays used and the study must not dispatch a retry, reuse
    the grant, or infer zero spend. A successful authenticated terminal can
    then be imported through the existing live sequence; a terminal failure
@@ -142,6 +200,15 @@ Recovery uses the exact persisted manifest, grant, and request:
 `recover`, `resume_study_arm_v1`, and `reconcile_pending_usage` are recovery
 operations that may publish local records. Only verification and export are
 read-only.
+
+## Scientific interpretation
+
+Diagnostics, response availability, authoritative usage, and terminal outcome
+describe different parts of an attempt. None alone establishes evidence use,
+feedback attribution, experiment completion, authored-code execution, or
+optimization improvement. An accounted failed completion remains a failed
+attempt and does not validate a hypothesis or satisfy a successful-primary
+gate.
 
 ## Grant price units
 

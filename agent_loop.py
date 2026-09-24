@@ -4030,14 +4030,31 @@ class OpenRouterGateway:
             returned_model = "unknown"
         choice = None
         content = None
+        content_failure = None
         try:
             choices = _read_field(response, "choices")
-            choice = choices[0] if isinstance(choices, (list, tuple)) and len(choices) == 1 else None
-            content = _read_field(choice, "message", "content")
+            if not isinstance(choices, (list, tuple)) or len(choices) != 1:
+                content_failure = "choice_structure_invalid"
+            else:
+                choice = choices[0]
+                if choice is None:
+                    content_failure = "choice_structure_invalid"
+                else:
+                    message = _read_field(choice, "message")
+                    if message is None:
+                        content_failure = "message_structure_invalid"
+                    else:
+                        content = _present_field(message, "content")
+                        if content is _MISSING_FIELD:
+                            content = None
+                            content_failure = "content_missing"
+                        elif not isinstance(content, str):
+                            content_failure = "content_non_string"
         except BaseException:
             # When usage is complete, missing content is an accounted rejected
             # response. Otherwise it remains pending with a safe extraction code.
             content = None
+            content_failure = "content_accessor_failed"
         has_content = isinstance(content, str)
         response_text = content if has_content else ""
 
@@ -4047,11 +4064,24 @@ class OpenRouterGateway:
             usage = _usage_from_response(response, require_complete=True)
         except AccountingValidationError as exc:
             if not has_content:
+                try:
+                    code = getattr(exc, "code", None)
+                    code_value = getattr(code, "value", None)
+                except Exception:
+                    code_value = None
+                accounting_failure = (
+                    code_value
+                    if type(code_value) is str
+                    and code_value in ProviderFailureDiagnosticV5._ACCOUNTING_FAILURES
+                    else "response_accounting_failed"
+                )
                 raise ProviderFailureDiagnosticV5(
                     phase="response_extraction",
                     code="response_content_unavailable",
                     provider_request_id=request_id,
                     cleanup_diagnostic=cleanup_diagnostic,
+                    content_failure=content_failure or "content_accessor_failed",
+                    accounting_failure=accounting_failure,
                 ) from None
             code = getattr(exc, "code", None)
             code_value = getattr(code, "value", None)
@@ -4069,6 +4099,8 @@ class OpenRouterGateway:
                     code="response_content_unavailable",
                     provider_request_id=request_id,
                     cleanup_diagnostic=cleanup_diagnostic,
+                    content_failure=content_failure or "content_accessor_failed",
+                    accounting_failure="response_accounting_failed",
                 ) from None
             raise ProviderResponseAccountingErrorV5(
                 response_text=response_text,
@@ -4088,6 +4120,8 @@ class OpenRouterGateway:
                     code="response_content_unavailable",
                     provider_request_id=request_id,
                     cleanup_diagnostic=cleanup_diagnostic,
+                    content_failure=content_failure or "content_accessor_failed",
+                    accounting_failure="inline_usage_missing",
                 )
             raise ProviderResponseAccountingErrorV5(
                 response_text=response_text,

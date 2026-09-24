@@ -13,6 +13,7 @@ from core.pit_optimizer_v5.artifacts import ArtifactRefV5, LocalArtifactReposito
 from core.pit_optimizer_v5.contracts import InvestigatorArtifactV5, canonical_json_bytes_v5
 from core.pit_optimizer_v5.provider import (
     CompletionResultV5,
+    ProviderFailureDiagnosticV5,
     ProviderResponseAccountingErrorV5,
     RoleTerminalReceiptV5,
     wire_role_messages_v5,
@@ -865,7 +866,7 @@ def test_reconciliation_rejects_observation_mismatch_without_writes(tmp_path, mo
     else:
         completion = replace(completion, provider_request_id="different-safe-request")
 
-    with pytest.raises(StudyAuthorityError, match="observation"):
+    with pytest.raises(StudyAuthorityError, match="observation|provider request ID"):
         writer.reconcile_pending_usage(
             request,
             completion=completion,
@@ -889,6 +890,301 @@ def test_unauthorized_reconciliation_does_not_restore_observation_bytes(tmp_path
     for kind in ("observed-raw-responses", "responses", "raw-responses", "reconciliations", "terminals"):
         assert store.list_refs(kind=kind) == ()
     assert gateway.calls == 1
+
+
+def test_pending_diagnostic_identity_blocks_writes_then_resumes_failed_reconciliation(
+    tmp_path, monkeypatch
+) -> None:
+    context = __import__("tests.test_pit_optimizer_v5_study_live_calls", fromlist=["_study_context"])._study_context(tmp_path)
+    _fixture, fixture_request, _preflight, manifest, request, store, grant, _approval, ledger, *_ = context
+    ledger.reserve(request)
+    ledger.claim_dispatch(
+        request_sha256=request.sha256,
+        model=request.model,
+        messages=request.messages,
+        response_schema_json=request.schema_json,
+        max_output_tokens=request.max_output_tokens,
+    )
+    ledger.persist_provider_diagnostic_for_pending_accounting(
+        request,
+        ProviderFailureDiagnosticV5(
+            phase="response_extraction",
+            code="response_content_unavailable",
+            provider_request_id="retained-request-A",
+            content_failure="content_non_string",
+            accounting_failure="inline_usage_missing",
+        ),
+    )
+    wrong = replace(
+        _completion(request=request, response_text="", accepted=False, response_received=True),
+        provider_request_id="different-request-B",
+    )
+    with pytest.raises(StudyAuthorityError, match="provider request ID"):
+        ledger.persist_response_for_request(request, wrong)
+    with pytest.raises(StudyAuthorityError, match="provider request ID"):
+        ledger.persist_observed_response_for_pending_accounting(
+            request,
+            ProviderResponseAccountingErrorV5(
+                response_text='{"observed":"content"}',
+                provider_request_id="different-request-B",
+                phase="response_accounting",
+                code="inline_usage_missing",
+            ),
+        )
+    with pytest.raises(StudyAuthorityError, match="provider request ID"):
+        ledger.reconcile_pending_usage(
+            request,
+            completion=wrong,
+            provider_reference="synthetic-authoritative-reference",
+        )
+    assert store.list_refs(kind="responses") == ()
+    assert store.list_refs(kind="raw-responses") == ()
+    assert store.list_refs(kind="response-observations") == ()
+    assert store.list_refs(kind="observed-raw-responses") == ()
+    assert store.list_refs(kind="reconciliations") == ()
+    assert store.list_refs(kind="terminals") == ()
+
+    reopened = StudyLedgerV1(store, manifest, grant, approval=None)
+    with pytest.raises(StudyAuthorityError, match="provider request ID"):
+        reopened.persist_response_for_request(request, replace(wrong, provider_request_id=None))
+    assert store.list_refs(kind="responses") == ()
+    assert store.list_refs(kind="raw-responses") == ()
+
+    matching = replace(wrong, provider_request_id="retained-request-A")
+    provider_reference = "synthetic-accounting-record-reference"
+    original_put = type(store).put
+
+    def interrupt_reconciliation_event(self, *, kind, key, content):
+        if self is store and kind == "reconciliations":
+            raise StudyPendingAccounting("simulated reconciliation event interruption")
+        return original_put(self, kind=kind, key=key, content=content)
+
+    monkeypatch.setattr(type(store), "put", interrupt_reconciliation_event)
+    with pytest.raises(StudyPendingAccounting, match="simulated reconciliation event interruption"):
+        ledger.reconcile_pending_usage(
+            request,
+            completion=matching,
+            provider_reference=provider_reference,
+        )
+    monkeypatch.setattr(type(store), "put", original_put)
+    assert len(store.list_refs(kind="responses")) == 1
+    assert len(store.list_refs(kind="raw-responses")) == 1
+    assert store.list_refs(kind="reconciliations") == ()
+    assert store.list_refs(kind="terminals") == ()
+
+    terminal = ledger.reconcile_pending_usage(
+        request,
+        completion=matching,
+        provider_reference=provider_reference,
+    )
+    assert terminal.failure_code is RoleFailureCode.TRANSPORT
+    assert terminal.usage.provider_request_id == "retained-request-A"
+    assert store.list_refs(kind="imports") == ()
+    before_replay = {
+        kind: len(store.list_refs(kind=kind))
+        for kind in ("responses", "raw-responses", "reconciliations", "terminals")
+    }
+    assert ledger.reconcile_pending_usage(
+        request,
+        completion=matching,
+        provider_reference=provider_reference,
+    ) == terminal
+    assert {
+        kind: len(store.list_refs(kind=kind))
+        for kind in before_replay
+    } == before_replay
+    assert StudyLedgerV1(store, manifest, grant, approval=None).verify_terminal(terminal.reference) == terminal
+
+
+def test_diagnostic_writer_rejects_reverse_identity_conflict_but_keeps_idless_legacy_shape(tmp_path) -> None:
+    context = __import__("tests.test_pit_optimizer_v5_study_live_calls", fromlist=["_study_context"])._study_context(tmp_path)
+    _fixture, fixture_request, _preflight, manifest, request, store, grant, _approval, ledger, *_ = context
+    ledger.reserve(request)
+    ledger.claim_dispatch(
+        request_sha256=request.sha256,
+        model=request.model,
+        messages=request.messages,
+        response_schema_json=request.schema_json,
+        max_output_tokens=request.max_output_tokens,
+    )
+    completion = replace(
+        _completion(request=request, response_text="", accepted=False, response_received=True),
+        provider_request_id="retained-response-ID",
+    )
+    ledger.persist_response_for_request(request, completion)
+    mismatched_diagnostic = ProviderFailureDiagnosticV5(
+        phase="transport",
+        code="request_timeout",
+        provider_request_id="different-diagnostic-ID",
+    )
+    with pytest.raises(StudyAuthorityError, match="provider request ID"):
+        ledger.persist_provider_diagnostic_for_pending_accounting(request, mismatched_diagnostic)
+    assert store.list_refs(kind="provider-diagnostics") == ()
+
+    idless_diagnostic = ProviderFailureDiagnosticV5(
+        phase="transport",
+        code="request_timeout",
+        provider_request_id=None,
+    )
+    ledger.persist_provider_diagnostic_for_pending_accounting(request, idless_diagnostic)
+    diagnostic_ref = store.list_refs(kind="provider-diagnostics")[0]
+    assert __import__("json").loads(store.read(diagnostic_ref))["provider_request_id"] is None
+    terminal = ledger.recover(request)
+    assert terminal is not None and terminal.failure_code is RoleFailureCode.TRANSPORT
+    assert StudyLedgerV1(store, manifest, grant, approval=None).verify_terminal(terminal.reference) == terminal
+
+
+def test_recover_reauthenticates_diagnostic_identity_after_early_graph_check(tmp_path, monkeypatch) -> None:
+    context = __import__("tests.test_pit_optimizer_v5_study_live_calls", fromlist=["_study_context"])._study_context(tmp_path)
+    _fixture, _fixture_request, _preflight, manifest, request, store, grant, _approval, ledger, *_ = context
+    reservation = ledger.reserve(request)
+    claim = ledger.claim_dispatch(
+        request_sha256=request.sha256,
+        model=request.model,
+        messages=request.messages,
+        response_schema_json=request.schema_json,
+        max_output_tokens=request.max_output_tokens,
+    )
+    completion = replace(
+        _completion(request=request, response_text="", accepted=False, response_received=True),
+        provider_request_id="response-ID-A",
+    )
+    ledger.persist_response_for_request(request, completion)
+
+    diagnostic_payload = {
+        "request_sha256": request.sha256,
+        "reservation_sha256": reservation.reservation_sha256,
+        "claim_sha256": claim.claim_sha256,
+        "grant_sha256": grant.sha256,
+        "manifest_sha256": manifest.sha256,
+        "phase": "response_extraction",
+        "code": "response_content_unavailable",
+        "http_status": None,
+        "provider_request_id": "late-diagnostic-ID-B",
+        "accounting_status": "pending",
+        "content_failure": "content_non_string",
+        "accounting_failure": "inline_usage_missing",
+    }
+    original_response_record = ledger._response_record
+    before_after_injection: dict[str, tuple[tuple[str, str], ...]] = {}
+    injected = False
+
+    def inject_after_early_graph_check(call_request):
+        nonlocal injected
+        if not injected:
+            injected = True
+            store.put(
+                kind="provider-diagnostics",
+                key=request.sha256,
+                content=canonical_json_bytes_v5(diagnostic_payload),
+            )
+            kinds = (
+                "provider-diagnostics",
+                "responses",
+                "raw-responses",
+                "parsed",
+                "reconciliations",
+                "terminals",
+                "imports",
+            )
+            before_after_injection.update(
+                {
+                    kind: tuple((ref.relative_path, ref.sha256) for ref in store.list_refs(kind=kind))
+                    for kind in kinds
+                }
+            )
+        return original_response_record(call_request)
+
+    monkeypatch.setattr(ledger, "_response_record", inject_after_early_graph_check)
+    with pytest.raises(StudyAuthorityError, match="pending provider diagnostic"):
+        ledger.recover(request)
+    assert injected
+    assert before_after_injection
+    assert {
+        kind: tuple((ref.relative_path, ref.sha256) for ref in store.list_refs(kind=kind))
+        for kind in before_after_injection
+    } == before_after_injection
+
+
+@pytest.mark.parametrize("prior_artifact", ("response", "observation"))
+def test_reauthenticated_graph_rejects_diagnostic_id_conflicting_with_prior_artifact(
+    tmp_path, prior_artifact
+) -> None:
+    context = __import__("tests.test_pit_optimizer_v5_study_live_calls", fromlist=["_study_context"])._study_context(tmp_path)
+    _fixture, _fixture_request, _preflight, manifest, request, store, grant, _approval, ledger, *_ = context
+    reservation = ledger.reserve(request)
+    claim = ledger.claim_dispatch(
+        request_sha256=request.sha256,
+        model=request.model,
+        messages=request.messages,
+        response_schema_json=request.schema_json,
+        max_output_tokens=request.max_output_tokens,
+    )
+    retained_id = "prior-artifact-ID"
+    if prior_artifact == "response":
+        completion = replace(
+            _completion(request=request, response_text="", accepted=False, response_received=True),
+            provider_request_id=retained_id,
+        )
+        ledger.persist_response_for_request(request, completion)
+    else:
+        ledger.persist_observed_response_for_pending_accounting(
+            request,
+            ProviderResponseAccountingErrorV5(
+                response_text='{"observed":"content"}',
+                provider_request_id=retained_id,
+                phase="response_accounting",
+                code="inline_usage_missing",
+            ),
+        )
+
+    diagnostic_payload = {
+        "request_sha256": request.sha256,
+        "reservation_sha256": reservation.reservation_sha256,
+        "claim_sha256": claim.claim_sha256,
+        "grant_sha256": grant.sha256,
+        "manifest_sha256": manifest.sha256,
+        "phase": "response_extraction",
+        "code": "response_content_unavailable",
+        "http_status": None,
+        "provider_request_id": "conflicting-diagnostic-ID",
+        "accounting_status": "pending",
+        "content_failure": "content_non_string",
+        "accounting_failure": "inline_usage_missing",
+    }
+    store.put(
+        kind="provider-diagnostics",
+        key=request.sha256,
+        content=canonical_json_bytes_v5(diagnostic_payload),
+    )
+    kinds = (
+        "provider-diagnostics",
+        "response-observations",
+        "observed-raw-responses",
+        "responses",
+        "raw-responses",
+        "reconciliations",
+        "terminals",
+        "imports",
+    )
+    before = {
+        kind: tuple((ref.relative_path, ref.sha256) for ref in store.list_refs(kind=kind))
+        for kind in kinds
+    }
+
+    def assert_unchanged() -> None:
+        assert {
+            kind: tuple((ref.relative_path, ref.sha256) for ref in store.list_refs(kind=kind))
+            for kind in kinds
+        } == before
+
+    with pytest.raises(StudyAuthorityError, match="diagnostic differs|accounted completion"):
+        StudyLedgerV1(store, manifest, grant, approval=None)
+    assert_unchanged()
+
+    with pytest.raises(StudyAuthorityError, match="diagnostic differs|pending provider diagnostic"):
+        ledger.recover(request)
+    assert_unchanged()
 
 
 @pytest.mark.parametrize(

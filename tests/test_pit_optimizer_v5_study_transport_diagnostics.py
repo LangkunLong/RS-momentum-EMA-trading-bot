@@ -17,6 +17,7 @@ import openai
 import pytest
 
 import agent_loop
+from core.pit_optimizer_v5.artifacts import ArtifactRefV5
 from core.pit_optimizer_v5.provider import CompletionResultV5, ProviderFailureDiagnosticV5, ProviderResponseAccountingErrorV5
 from core.pit_optimizer_v5.two_round_study.contracts import StudyAuthorityError, StudyContractError, StudyPendingAccounting
 from core.pit_optimizer_v5.two_round_study.driver import prepare_two_round_study_v1
@@ -622,12 +623,152 @@ def test_response_extraction_without_string_content_keeps_safe_id_and_cleanup_di
     assert diagnostic["phase"] == "response_extraction"
     assert diagnostic["code"] == "response_content_unavailable"
     assert diagnostic["provider_request_id"] == "sdk-response-id-safe"
+    assert diagnostic["content_failure"] == "choice_structure_invalid"
+    assert diagnostic["accounting_failure"] == "inline_usage_missing"
     assert diagnostic["cleanup_diagnostic"] == {
         "phase": "client_cleanup",
         "code": "client_cleanup_failed",
     }
     assert store.list_refs(kind="response-observations") == ()
     assert store.list_refs(kind="observed-raw-responses") == ()
+
+
+@pytest.mark.parametrize(
+    ("content_shape", "usage_shape", "expected_content_failure", "expected_accounting_failure"),
+    (
+        ("missing", "missing", "content_missing", "inline_usage_missing"),
+        ("non_string", "invalid_total", "content_non_string", "inline_total_mismatch"),
+        ("accessor", "accessor", "content_accessor_failed", "response_accounting_failed"),
+    ),
+)
+def test_dual_response_extraction_and_accounting_failures_keep_bounded_categories(
+    tmp_path,
+    monkeypatch,
+    content_shape,
+    usage_shape,
+    expected_content_failure,
+    expected_accounting_failure,
+) -> None:
+    pair = _install_external_network_block(monkeypatch)
+    context = _test_gateway_context(tmp_path, monkeypatch)
+    _fixture, _fixture_request, manifest, request, store, _grant, _ledger, gateway = context
+    requests = []
+
+    def handler(http_request):
+        requests.append(http_request)
+        body = _sdk_body(request, _fixture_request, with_usage=usage_shape != "missing")
+        message = body["choices"][0]["message"]
+        if content_shape == "missing":
+            message.pop("content")
+        elif content_shape == "non_string":
+            message["content"] = None
+        if usage_shape == "invalid_total":
+            body["usage"]["total_tokens"] -= 1
+        return httpx.Response(200, json=body)
+
+    if content_shape == "missing":
+        # The SDK model normalizes omitted nullable `content` to None. Inject
+        # an absent post-SDK field here to test the adapter's distinct missing
+        # branch without claiming the SDK preserves the wire distinction.
+        present_field = agent_loop._present_field
+
+        def missing_sdk_content(value, name):
+            if name == "content":
+                return agent_loop._MISSING_FIELD
+            return present_field(value, name)
+
+        monkeypatch.setattr(agent_loop, "_present_field", missing_sdk_content)
+    elif content_shape == "accessor":
+        read_field = agent_loop._read_field
+
+        def fail_choices_accessor(value, *path):
+            if path in {("choices",), ("usage",)}:
+                raise RuntimeError("sensitive response accessor detail")
+            return read_field(value, *path)
+
+        monkeypatch.setattr(agent_loop, "_read_field", fail_choices_accessor)
+
+    clients = _install_mock_async_openai(monkeypatch, handler)
+    try:
+        with pytest.raises(StudyPendingAccounting):
+            _run(context, gateway)
+    finally:
+        pair[0].close()
+        pair[1].close()
+
+    assert len(requests) == len(clients) == 1
+    assert clients[0].max_retries == 0
+    diagnostic = json.loads(store.read(store.list_refs(kind="provider-diagnostics")[0]))
+    assert (diagnostic["phase"], diagnostic["code"]) == (
+        "response_extraction",
+        "response_content_unavailable",
+    )
+    assert diagnostic["content_failure"] == expected_content_failure
+    assert diagnostic["accounting_failure"] == expected_accounting_failure
+    assert diagnostic["provider_request_id"] == "sdk-response-id-safe"
+    assert store.list_refs(kind="responses") == ()
+    assert store.list_refs(kind="raw-responses") == ()
+    assert store.list_refs(kind="response-observations") == ()
+    assert store.list_refs(kind="observed-raw-responses") == ()
+    _assert_no_sensitive_artifact_bytes(store.repository.root, b"sensitive response accessor detail")
+    reopened = StudyLedgerV1(store, manifest, _grant, approval=None)
+    with pytest.raises(StudyPendingAccounting, match="no authenticated provider usage"):
+        reopened.recover(request)
+
+
+@pytest.mark.parametrize("mutation", ("unknown_content", "missing_accounting", "null_categories"))
+def test_persisted_dual_failure_categories_reject_malformed_envelopes(
+    tmp_path, monkeypatch, mutation
+) -> None:
+    context = _test_gateway_context(tmp_path, monkeypatch)
+    _fixture, _fixture_request, manifest, request, store, grant, ledger, _gateway = context
+    ledger.reserve(request)
+    ledger.claim_dispatch(
+        request_sha256=request.sha256,
+        model=request.model,
+        messages=request.messages,
+        response_schema_json=request.schema_json,
+        max_output_tokens=request.max_output_tokens,
+    )
+    ledger.persist_provider_diagnostic_for_pending_accounting(
+        request,
+        ProviderFailureDiagnosticV5(
+            phase="response_extraction",
+            code="response_content_unavailable",
+            provider_request_id="safe-dual-failure-id",
+            content_failure="content_non_string",
+            accounting_failure="inline_usage_missing",
+        ),
+    )
+    source_ref = store.list_refs(kind="provider-diagnostics")[0]
+    payload = json.loads(store.read(source_ref))
+    if mutation == "unknown_content":
+        payload["content_failure"] = "raw accessor exception"
+    elif mutation == "missing_accounting":
+        payload.pop("accounting_failure")
+    else:
+        payload["content_failure"] = None
+        payload["accounting_failure"] = None
+    forged_bytes = canonical_json_bytes_v5(payload)
+    forged_ref = ArtifactRefV5(source_ref.relative_path, hashlib.sha256(forged_bytes).hexdigest())
+    reader = StudyLedgerV1(store, manifest, grant, approval=None)
+    original_refs = StudyLedgerV1._refs
+    original_read = StudyStoreV1.read
+
+    def forged_refs(self, kind):
+        if self is reader and kind == "provider-diagnostics":
+            return (forged_ref,)
+        return original_refs(self, kind)
+
+    def forged_read(self, ref):
+        if self is store and ref == forged_ref:
+            return forged_bytes
+        return original_read(self, ref)
+
+    monkeypatch.setattr(StudyLedgerV1, "_refs", forged_refs)
+    monkeypatch.setattr(StudyStoreV1, "read", forged_read)
+    with pytest.raises(StudyAuthorityError):
+        reader._provider_diagnostic_records()
 
 
 def test_nonstring_content_with_complete_usage_settles_rejected_without_http_body_bytes(

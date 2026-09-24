@@ -320,9 +320,12 @@ def test_pending_provider_diagnostic_survives_readonly_verification_and_exact_ex
     class TimeoutGateway:
         def invoke_json_once(self, **_kwargs):
             raise ProviderFailureDiagnosticV5(
-                phase="transport",
-                code="request_timeout",
+                phase="response_extraction",
+                code="response_content_unavailable",
+                provider_request_id="safe-response-id",
                 cleanup_diagnostic=("client_cleanup", "client_cleanup_failed"),
+                content_failure="content_non_string",
+                accounting_failure="inline_usage_missing",
             )
 
     result = execute_study_arm_v1(prepared=prepared, arm="primary", ledger=ledger, gateway=TimeoutGateway())
@@ -343,6 +346,8 @@ def test_pending_provider_diagnostic_survives_readonly_verification_and_exact_ex
         "phase": "client_cleanup",
         "code": "client_cleanup_failed",
     }
+    assert diagnostic_payload["content_failure"] == "content_non_string"
+    assert diagnostic_payload["accounting_failure"] == "inline_usage_missing"
     output = owned_root / "pending-diagnostic-export"
     export_study_trace_v1(prepared=reloaded, verification=verification, store=store, output=output)
     exported_diagnostic = output / "live-study-calls" / "shared" / "provider-diagnostics" / f"{request_key}.bin"

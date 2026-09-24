@@ -1488,7 +1488,15 @@ class StudyLedgerV1:
             raw = self.store.read(ref)
             try:
                 value = _decode_canonical_json_object(raw, "study provider diagnostic")
+                category_fields = {"content_failure", "accounting_failure"} & set(value)
+                if category_fields and category_fields != {"content_failure", "accounting_failure"}:
+                    raise StudyAuthorityError("study provider diagnostic categories are incomplete")
+                if category_fields and any(
+                    type(value[field]) is not str for field in ("content_failure", "accounting_failure")
+                ):
+                    raise StudyAuthorityError("study provider diagnostic categories are invalid")
                 diagnostic_fields = fields | ({"cleanup_diagnostic"} if "cleanup_diagnostic" in value else set())
+                diagnostic_fields |= category_fields
                 payload = _strict(value, diagnostic_fields, "study provider diagnostic")
                 if canonical_json_bytes_v5(payload) != raw:
                     raise StudyAuthorityError("study provider diagnostic is not canonical")
@@ -1502,6 +1510,8 @@ class StudyLedgerV1:
                     http_status=payload["http_status"],  # type: ignore[arg-type]
                     provider_request_id=payload["provider_request_id"],  # type: ignore[arg-type]
                     cleanup_diagnostic=_optional_cleanup_diagnostic(payload),
+                    content_failure=payload.get("content_failure"),  # type: ignore[arg-type]
+                    accounting_failure=payload.get("accounting_failure"),  # type: ignore[arg-type]
                 )
             except (StudyContractError, TypeError, ValueError) as exc:
                 raise StudyAuthorityError("study provider diagnostic is invalid") from exc
@@ -1615,6 +1625,7 @@ class StudyLedgerV1:
     ) -> bool:
         """Authenticate response identity; return whether envelope bytes need restoration."""
 
+        self._assert_provider_request_id_consistency(request, completion.provider_request_id)
         observed = self._observed_response_record(request)
         if observed is None:
             return False
@@ -1633,6 +1644,54 @@ class StudyLedgerV1:
         if raw != incoming or payload["provider_request_id"] != completion.provider_request_id:
             raise StudyAuthorityError("accounted completion differs from the preserved provider response observation")
         return False
+
+    def _assert_provider_request_id_consistency(
+        self,
+        request: StudyCallRequestV1,
+        incoming_provider_request_id: str | None,
+        *,
+        writing_diagnostic: bool = False,
+    ) -> None:
+        """Bind new provider evidence to every retained nonempty request ID."""
+
+        retained_ids: list[str] = []
+        diagnostic = self._provider_diagnostic_records().get(request.sha256)
+        if diagnostic is not None:
+            payload = diagnostic[1]
+            reservation = self._find_reservation(request)
+            claims = tuple(claim for claim in self._dispatch_claims() if claim.request_sha256 == request.sha256)
+            if reservation is None or len(claims) != 1:
+                raise StudyAuthorityError("pending provider diagnostic has no authenticated reservation and claim")
+            if (
+                payload["reservation_sha256"] != reservation.reservation_sha256
+                or payload["claim_sha256"] != claims[0].claim_sha256
+                or payload["grant_sha256"] != self.grant.sha256
+                or payload["manifest_sha256"] != self.manifest.sha256
+            ):
+                raise StudyAuthorityError("pending provider diagnostic authority binding differs")
+            value = payload["provider_request_id"]
+            if isinstance(value, str) and value:
+                retained_ids.append(value)
+        # A new ID-less diagnostic adds no identity claim and remains
+        # compatible with older response/observation records that have IDs.
+        # An existing nonempty diagnostic is still immutable and checked.
+        if writing_diagnostic and not incoming_provider_request_id:
+            if any(incoming_provider_request_id != retained for retained in retained_ids):
+                raise StudyAuthorityError("provider request ID conflicts with retained attempt identity")
+            return
+        observed = self._observed_response_record(request)
+        if observed is not None:
+            value = observed[1]["provider_request_id"]
+            if isinstance(value, str) and value:
+                retained_ids.append(value)
+        metadata = self._response_metadata(request)
+        if metadata is not None:
+            completion = _completion_from_metadata(metadata[1]["completion_metadata"], "")
+            value = completion.provider_request_id
+            if isinstance(value, str) and value:
+                retained_ids.append(value)
+        if any(incoming_provider_request_id != retained for retained in retained_ids):
+            raise StudyAuthorityError("provider request ID conflicts with retained attempt identity")
 
     def _parse_authenticated_response(self, request: StudyCallRequestV1, raw: bytes) -> StudyResponseV1:
         """Use the one study parser for normal and recovery paths."""
@@ -2324,6 +2383,11 @@ class StudyLedgerV1:
             if len(claims) != 1:
                 raise StudyAuthorityError("provider diagnostic has no authenticated dispatch claim")
             claim = claims[0]
+            self._assert_provider_request_id_consistency(
+                request,
+                diagnostic.provider_request_id,
+                writing_diagnostic=True,
+            )
             payload = {
                 "request_sha256": request.sha256,
                 "reservation_sha256": reservation.reservation_sha256,
@@ -2341,6 +2405,9 @@ class StudyLedgerV1:
                     "phase": diagnostic.cleanup_diagnostic[0],
                     "code": diagnostic.cleanup_diagnostic[1],
                 }
+            if diagnostic.content_failure is not None:
+                payload["content_failure"] = diagnostic.content_failure
+                payload["accounting_failure"] = diagnostic.accounting_failure
             self.store.put(kind="provider-diagnostics", key=request.sha256, content=canonical_json_bytes_v5(payload))
 
     def persist_observed_response_for_pending_accounting(
@@ -2373,6 +2440,7 @@ class StudyLedgerV1:
             if len(claims) != 1:
                 raise StudyAuthorityError("observed provider response has no authenticated dispatch claim")
             claim = claims[0]
+            self._assert_provider_request_id_consistency(request, observed.provider_request_id)
             payload = {
                 "request_sha256": request.sha256,
                 "reservation_sha256": reservation.reservation_sha256,
@@ -2432,6 +2500,7 @@ class StudyLedgerV1:
             claim = claims[0]
             if claim.reservation_sha256 != reservation.reservation_sha256:
                 raise StudyAuthorityError("reconciliation dispatch claim differs from its reservation")
+            self._assert_provider_request_id_consistency(request, completion.provider_request_id)
             incoming_bytes = completion.response_text.encode("utf-8")
             incoming_completion_hash = _completion_fingerprint(
                 completion,
@@ -2979,6 +3048,13 @@ class StudyLedgerV1:
             if raw != completion.response_text.encode("utf-8"):
                 raise StudyAuthorityError("study raw response differs from the usage record")
         with self._lock, self._transition():
+            # A long-lived ledger can observe new pending diagnostics after its
+            # constructor. Reauthenticate the full current graph under the
+            # transition lock before parsing or settling a durable response.
+            self._authenticate_authority_records(publish=False)
+            self._authenticate_setup_graph()
+            self._authenticate_graph_orphans(self._reservations(), self._terminals())
+            self._assert_provider_request_id_consistency(request, completion.provider_request_id)
             existing = self._find_terminal(request)
             if existing is not None:
                 return self.verify_terminal(existing.reference)
@@ -3359,6 +3435,16 @@ class StudyLedgerV1:
             self._validate_reservation_request_binding(reservation, request)
             if claim.reservation_sha256 != reservation.reservation_sha256:
                 raise StudyAuthorityError("study response observation dispatch claim differs from its reservation")
+            diagnostic_record = diagnostics.get(request_sha256)
+            if diagnostic_record is not None:
+                diagnostic_id = diagnostic_record[1]["provider_request_id"]
+                observation_id = observation["provider_request_id"]
+                if (
+                    isinstance(diagnostic_id, str)
+                    and diagnostic_id
+                    and diagnostic_id != observation_id
+                ):
+                    raise StudyAuthorityError("provider diagnostic differs from the preserved response observation")
         admission_rejections = self._admission_rejections()
         rejection_by_request = {item.request_sha256: item for _ref_value, item in admission_rejections}
         reconciliation_events = self._reconciliations()
@@ -3400,6 +3486,12 @@ class StudyLedgerV1:
                 raise StudyAuthorityError("study response metadata is not authenticated")
             response_keys.add(key)
             response_metadata[key] = metadata_record[1]
+        for key, (_diagnostic_ref, diagnostic) in diagnostics.items():
+            diagnostic_id = diagnostic["provider_request_id"]
+            if isinstance(diagnostic_id, str) and diagnostic_id and key in response_metadata:
+                accounted = _completion_from_metadata(response_metadata[key]["completion_metadata"], "")
+                if accounted.provider_request_id != diagnostic_id:
+                    raise StudyAuthorityError("accounted completion differs from the pending provider diagnostic")
         raw_keys: set[str] = set()
         raw_values: dict[str, bytes] = {}
         raw_refs: dict[str, ArtifactRefV5] = {}
