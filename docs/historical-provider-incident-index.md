@@ -2,6 +2,8 @@
 
 **Scope:** read-only index of four retained primary study attempts and eight exports. This index does not settle historical billing, reopen studies, authorize provider activity, or modify the retained evidence.
 
+**Research boundary:** this is a closed inventory of these provider incidents, not a benchmark or a general optimizer history. The index does not establish completion of the model-authored two-round acceptance cycle or a GLM replication. Assess that separately against [issue #91](https://github.com/LangkunLong/RS-momentum-EMA-trading-bot/issues/91); do not count incomplete provider attempts as completed rounds or infer optimizer-wide results from this inventory.
+
 The current retained artifact root is .artifacts. The September 26 artifact README says its four study roots and eight exports were verified during relocation, with 3,843 selected files hash-checked. The original ignored evidence remains in the original checkout at C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.artifacts; it is absent from this issue worktree. The README explicitly identifies new-study, new-time-zero-export, and new-incomplete-export as study three.
 
 The logical study_id value study-v5-two-round-example is reused across the records. It does not uniquely identify a study. Distinguish each attempt using its retained root, manifest SHA-256, store/root identity SHA-256, and request identity.
@@ -36,6 +38,7 @@ The logical study_id value study-v5-two-round-example is reused across the recor
 - **Incident:** evidence/incidents/study-four-execution/.
 - **Identity:** logical study ID study-v5-two-round-example; manifest d60db4a101e9af4692afdd0425d1720eefeb488d370331390002ed1a7220b3ff; store/root f9f391ff623c5e62422ffb8f1821db47304c441a2009d7a8f5f729eaa6d054ee; issued grant 9159b09c3d7f0760f230864e8c69078cab25bb9ea26e04517784455e3529a80f; primary L request fc378dc94956a9606f071b09a2e342822be19b13041b837af583ce31389528c2.
 - **Outcome:** the one primary attempt ended with api_connection_error, null HTTP status, null provider request ID, no terminal, and pending accounting. Delivery and charge are not established. The withheld arm was not started. Actual usage and cost are unknown.
+- **Export caveat:** `study-four-incomplete-primary-export/trace.md` contains a known presentation error: it claims live-generated responses/admitted accounting and reports 235 artifacts, while the authenticated index has 236 entries and the primary has no response or terminal. See `evidence/incidents/study-four-execution/primary-export-presentation-erratum.md`; keep the export unchanged and use its authenticated index and primary closeout for those facts.
 
 ## Export count and accounting
 
