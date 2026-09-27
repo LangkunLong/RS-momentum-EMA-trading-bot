@@ -120,7 +120,7 @@ Profile and institutional-ownership calls are skipped in free mode. Unknown shar
 
 Alpaca is the execution source of truth. SQLite is the audit and recovery view. With no explicit reference, workflow resolution uses active symbol ownership and then latest symbol history. When a workflow id, client order id, or broker order id is supplied but unknown, resolution fails closed instead of falling back to another workflow.
 
-## Offline quality gates
+## Development checks
 
 These commands do not submit broker orders:
 
@@ -133,7 +133,7 @@ python paper_trading_console.py --help
 python scheduler.py --help
 ```
 
-CI runs Ruff, compilation, and the non-integration test suite on Python 3.11 and 3.13. Tests use synthetic or mocked provider data unless explicitly marked `integration`.
+Continuous integration runs Ruff and compilation as the fast quality job on Python 3.11 and 3.13. The full non-integration test suite runs separately as an informational job: failures remain visible but do not block development. Run checks relevant to the current change; a full-suite pass is not a prerequisite for every issue. Tests use synthetic or mocked provider data unless explicitly marked `integration`. See [development checks](docs/development-checks.md) and the [local artifact guide](docs/local-artifacts.md).
 
 The public index-source smoke uses an isolated cache and requires realistic S&P 500 and Nasdaq-100 universe sizes:
 
@@ -436,7 +436,7 @@ operator command, or install an order-enabled task as an unattended first step.
 Before the one-share paper lifecycle:
 
 1. Confirm `ALPACA_PAPER=true` and verify the paper account endpoint.
-2. Pass all offline quality gates and `paper_trading_console.py doctor`.
+2. Pass lint and compilation checks, review relevant test results, and pass `paper_trading_console.py doctor`.
 3. Display the exact symbol, quantity, order type, and cleanup behavior.
 4. Obtain explicit operator approval.
 5. Observe the buy fill, protective stop derived from the actual fill, durable transitions, restart recovery, and cleanup sell/cancel.

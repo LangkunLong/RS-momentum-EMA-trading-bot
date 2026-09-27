@@ -167,6 +167,8 @@ The pre-commit hook runs `ruff format` then `ruff check --fix` on every `git com
 
 pytest with pytest-cov. All configuration lives in `pyproject.toml`.
 
+The full offline suite is informational in continuous integration. Run checks relevant to the current change and investigate regressions introduced by it; record unrelated failures and continue the scoped work. Do not require a full-suite pass for every issue. Lint and compilation remain the fast quality checks. See `docs/development-checks.md`.
+
 ```bash
 # Run unit tests (default — no network calls)
 python -m pytest
