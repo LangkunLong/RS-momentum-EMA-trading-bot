@@ -398,16 +398,45 @@ Generated outputs are ignored under `scan_results/`, `backtest_results*`, and `.
 
 ## Paper-mode dry runs and diagnostics
 
-Validate configuration and broker connectivity without submitting an order:
+Get a local readiness report without contacting providers or submitting an
+order:
 
 ```powershell
 python paper_trading_console.py doctor
 python paper_trading_console.py checklist
+```
+
+These commands report configuration presence separately from provider access,
+preserve missing evidence as `UNVERIFIED`, and inspect an existing SQLite store
+read-only. They do not initialize a missing store. Exit code `2` means required
+readiness evidence remains unverified; it is not a readiness approval.
+
+Provider checks require an explicit opt-in:
+
+```powershell
+python paper_trading_console.py doctor --probe-external
+```
+
+That command makes one Alpaca paper-account operation and one each of the FMP
+statement and historical-price endpoint operations. FMP checks can consume the
+configured request allowance. The FMP price entitlement result is separate
+from the application's active market-price source, which is Alpaca.
+
+For a fresh no-order strategy observation:
+
+```powershell
 python paper_trading_console.py run-now
 python auto_trader.py --dry-run
 ```
 
-The dry run still performs provider reads and may take time. It prints intended entries/exits but does not submit them.
+The dry run still performs provider reads and may take time. It prints intended
+entries/exits but does not submit them. Retain the output with the checkout
+revision and runtime identity, data freshness/coverage, and rejection reasons.
+No buy signal is required for a valid dry run.
+
+See [the paper runtime readiness runbook](docs/paper-runtime-readiness.md) for
+canonical checkout/interpreter/store inventory, scheduler and service-health
+evidence, and alignment with #97's deployment identity contract.
 
 Treat FMP `402` responses for income statements or balance sheets as a deployment blocker for strategy entries when `REQUIRE_FUNDAMENTALS_FOR_BUYS=true`. The scan still completes and reports technical/watchlist results, but candidates with unavailable fundamentals intentionally cannot pass the buy gate. Upgrade the FMP plan or select and validate a replacement fundamental-data provider; do not weaken the gate merely to make orders appear.
 
@@ -436,7 +465,7 @@ operator command, or install an order-enabled task as an unattended first step.
 Before the one-share paper lifecycle:
 
 1. Confirm `ALPACA_PAPER=true` and verify the paper account endpoint.
-2. Pass lint and compilation checks, review relevant test results, and pass `paper_trading_console.py doctor`.
+2. Pass the scoped checks and review `paper_trading_console.py doctor`; resolve failures and collect the separate external, scheduler, service, and dry-run evidence. An exit code of `2` means evidence is unverified, not that the deployment passed readiness.
 3. Display the exact symbol, quantity, order type, and cleanup behavior.
 4. Obtain explicit operator approval.
 5. Observe the buy fill, protective stop derived from the actual fill, durable transitions, restart recovery, and cleanup sell/cancel.

@@ -15,15 +15,24 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import hashlib
+import importlib.metadata
+import json
+import sqlite3
+import subprocess
+import sys
+from contextlib import closing
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from enum import Enum
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 import pandas as pd
 
 from auto_trader import _rank_entry_candidates, run_auto_trader
 from config import settings
+from core.data_client import _fmp_get
 from core.execution_store import get_execution_store
 from core.gmail_oauth import (
     GmailOAuthError,
@@ -41,7 +50,7 @@ from core.order_execution import (
     get_open_positions,
 )
 from setup_windows_task import LOG_FILE as SCHEDULER_LOG
-from setup_windows_task import register_task, show_status
+from setup_windows_task import TASK_NAME, _schtasks, register_task, show_status
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -56,79 +65,331 @@ class CheckResult:
     severity: str = "ok"
 
 
-def run_doctor() -> int:
-    """Validate the local paper-trading deployment configuration."""
-    checks = [
-        _check_paper_mode(),
-        _check_api_keys_present(),
-        _check_execution_store_path(),
-        _check_scan_results_dir(),
-        _check_email_configuration(),
-        _check_alpaca_connectivity(),
-    ]
-
-    print("=" * 60)
-    print("PAPER TRADING DOCTOR")
-    print("=" * 60)
-    failures = 0
-    for check in checks:
-        marker = "OK" if check.ok else "FAIL"
-        print(f"[{marker}] {check.name}: {check.detail}")
-        if not check.ok:
-            failures += 1
-
-    print("-" * 60)
-    if failures:
-        print(f"Doctor finished with {failures} failing check(s).")
-        return 1
-
-    print("Doctor finished cleanly. Paper deployment is ready.")
-    return 0
+class EvidenceStatus(str, Enum):
+    PASS = "PASS"
+    FAIL = "FAIL"
+    UNVERIFIED = "UNVERIFIED"
 
 
-def run_checklist(limit: int = 10) -> int:
-    """Run a single pre-paper-trading checklist across config, broker, store, and signals."""
-    checks = [
-        _check_paper_mode(),
-        _check_api_keys_present(),
-        _check_execution_store_path(),
-        _check_execution_store_health(limit=limit),
-        _check_scan_results_dir(),
-        _check_recent_signal_quality(limit=limit),
-        _check_email_configuration(),
-        _check_alpaca_connectivity(),
-    ]
+@dataclass(frozen=True)
+class ReadinessCheck:
+    name: str
+    status: EvidenceStatus
+    detail: str
 
-    print("=" * 60)
-    print("PAPER TRADING CHECKLIST")
-    print("=" * 60)
 
-    failures = 0
-    warnings = 0
-    for check in checks:
-        marker = _format_check_marker(check)
-        print(f"[{marker}] {check.name}: {check.detail}")
-        if not check.ok or check.severity == "fail":
-            failures += 1
-        elif check.severity == "warn":
-            warnings += 1
+def run_doctor(*, probe_external: bool = False) -> int:
+    """Report readiness evidence without contacting providers unless explicitly requested."""
+    return _print_readiness_report(
+        "PAPER TRADING READINESS",
+        _collect_readiness_checks(probe_external=probe_external),
+    )
 
-    print("-" * 60)
-    if failures:
-        print(
-            f"Checklist finished with {failures} failure(s) and {warnings} warning(s). "
-            "Do not enable paper automation yet."
+
+def run_checklist(limit: int = 10, *, probe_external: bool = False) -> int:
+    """Show readiness evidence plus recent scan observations; never imply approval."""
+    checks = _collect_readiness_checks(probe_external=probe_external)
+    signal_check = _check_recent_signal_quality(limit=limit)
+    checks.append(_readiness_from_legacy_check(signal_check))
+    return _print_readiness_report("PAPER TRADING CHECKLIST", checks)
+
+
+def _collect_readiness_checks(*, probe_external: bool) -> list[ReadinessCheck]:
+    """Collect local evidence and explicitly label checks that need an observed run."""
+    required_keys = bool(settings.ALPACA_API_KEY and settings.ALPACA_SECRET_KEY and settings.FMP_API_KEY)
+    if _is_paper_mode() and required_keys:
+        config = ReadinessCheck("Configuration", EvidenceStatus.PASS, "paper mode selected; required key settings are present")
+    elif not _is_paper_mode():
+        config = ReadinessCheck("Configuration", EvidenceStatus.FAIL, "paper mode is not selected")
+    else:
+        config = ReadinessCheck("Configuration", EvidenceStatus.FAIL, "one or more required key settings are missing")
+
+    checks = [config]
+
+    if probe_external:
+        checks.extend(
+            _check_external_access(
+                alpaca_account_reader=lambda: _get_trading_client().get_account(),
+                fmp_get=_fmp_get,
+                paper_mode=_is_paper_mode(),
+                fmp_key_present=bool(settings.FMP_API_KEY),
+            )
         )
-        return 1
-
-    if warnings:
-        print(
-            f"Checklist finished with {warnings} warning(s) and no hard failures. "
-            "Safe for supervised paper testing, but review the warnings first."
+    else:
+        checks.extend(
+            [
+                ReadinessCheck("Alpaca connectivity", EvidenceStatus.UNVERIFIED, "not probed; pass --probe-external for one paper-account read"),
+                ReadinessCheck("Paper account identity", EvidenceStatus.UNVERIFIED, "account fingerprint not observed"),
+                ReadinessCheck("FMP statement entitlement", EvidenceStatus.UNVERIFIED, "not probed; pass --probe-external for one statement request"),
+                ReadinessCheck("FMP price entitlement", EvidenceStatus.UNVERIFIED, "not probed; pass --probe-external for one price request"),
+            ]
         )
-        return 0
 
-    print("Checklist finished cleanly. Safe to begin supervised paper trading.")
+    checks.extend(
+        [
+            _check_execution_store_read_only(),
+            _check_scheduler_installation(),
+            ReadinessCheck(
+                "Service health",
+                EvidenceStatus.UNVERIFIED,
+                "task installation does not establish a healthy process, heartbeat, stream, or reconciliation state",
+            ),
+            ReadinessCheck(
+                "Strategy dry run",
+                EvidenceStatus.UNVERIFIED,
+                "no fresh no-order strategy-run evidence was supplied to this report",
+            ),
+        ]
+    )
+    account_identity = next(check for check in checks if check.name == "Paper account identity")
+    account_fingerprint = "unverified"
+    if account_identity.status is EvidenceStatus.PASS and "paper account fingerprint=" in account_identity.detail:
+        account_fingerprint = account_identity.detail.partition("paper account fingerprint=")[2]
+    identity = _runtime_identity_record(account_fingerprint=account_fingerprint)
+    checks.insert(
+        0,
+        ReadinessCheck(
+            "Runtime identity",
+            EvidenceStatus.UNVERIFIED,
+            json.dumps(identity, sort_keys=True, separators=(",", ":"))
+            + "; canonical deployment selection/approval is not recorded",
+        ),
+    )
+    return checks
+
+
+def _runtime_identity_record(*, account_fingerprint: str = "unverified") -> dict[str, object]:
+    """Build safe execution identity facts; credentials and raw account IDs are excluded."""
+    source_revision = "unknown"
+    source_tree_dirty: bool | None = None
+    try:
+        revision_result = subprocess.run(
+            ["git", "-C", str(PROJECT_DIR), "rev-parse", "HEAD"],
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=2,
+        )
+        source_revision = revision_result.stdout.strip() or "unknown"
+        status_result = subprocess.run(
+            ["git", "-C", str(PROJECT_DIR), "status", "--porcelain"],
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=2,
+        )
+        source_tree_dirty = bool(status_result.stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    installed_versions: dict[str, str] = {}
+    for package in ("alpaca-py", "pandas", "requests"):
+        try:
+            installed_versions[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            installed_versions[package] = "missing"
+
+    paper_mode = _is_paper_mode()
+    return {
+        "source_revision": source_revision,
+        "runtime_identity": {
+            "checkout_path": str(PROJECT_DIR),
+            "source_tree_dirty": source_tree_dirty,
+            "interpreter_path": sys.executable,
+            "interpreter_version": sys.version.split()[0],
+            "dependency_profile": {
+                "manifest": "pyproject.toml",
+                "manifest_sha256": _sha256_file_or_unavailable(PROJECT_DIR / "pyproject.toml"),
+                "lock_manifest": "requirements-lock.txt",
+                "lock_manifest_sha256": _sha256_file_or_unavailable(PROJECT_DIR / "requirements-lock.txt"),
+                "installed_versions": installed_versions,
+            },
+            "configuration_profile": {
+                "paper_mode": paper_mode,
+                "alpaca_stock_feed": str(settings.ALPACA_STOCK_FEED),
+                "fmp_plan": str(settings.FMP_PLAN),
+                "price_source": "Alpaca",
+                "statement_source": "Financial Modeling Prep",
+            },
+            "persistent_store_path": str(settings.EXECUTION_STORE_DB_PATH),
+            "paper_environment": {
+                "broker": "Alpaca",
+                "mode": "paper" if paper_mode else "not-paper",
+                "account_fingerprint": account_fingerprint,
+            },
+        },
+    }
+
+
+def _sha256_file_or_unavailable(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return "unavailable"
+
+
+def _check_external_access(
+    *,
+    alpaca_account_reader: Callable[[], object],
+    fmp_get: Callable[[str, Optional[dict]], object],
+    paper_mode: bool,
+    fmp_key_present: bool,
+    symbol: str = "AAPL",
+    today: date | None = None,
+) -> list[ReadinessCheck]:
+    """Check three provider claims independently; callers supply external adapters."""
+    if not paper_mode:
+        alpaca = ReadinessCheck("Alpaca connectivity", EvidenceStatus.FAIL, "paper mode is false; account probe was refused")
+        account_identity = ReadinessCheck("Paper account identity", EvidenceStatus.UNVERIFIED, "account probe was refused")
+    else:
+        try:
+            account = alpaca_account_reader()
+            if account is None:
+                raise ValueError("empty account response")
+            alpaca = ReadinessCheck("Alpaca connectivity", EvidenceStatus.PASS, "paper account endpoint returned a response")
+            raw_account_id = str(getattr(account, "id", "") or "").strip()
+            if raw_account_id:
+                fingerprint = hashlib.sha256(raw_account_id.encode("utf-8")).hexdigest()[:16]
+                account_identity = ReadinessCheck(
+                    "Paper account identity",
+                    EvidenceStatus.PASS,
+                    f"paper account fingerprint=sha256:{fingerprint}",
+                )
+            else:
+                account_identity = ReadinessCheck(
+                    "Paper account identity",
+                    EvidenceStatus.UNVERIFIED,
+                    "account endpoint replied but returned no account identifier to fingerprint",
+                )
+        except Exception as exc:  # noqa: BLE001
+            alpaca = ReadinessCheck(
+                "Alpaca connectivity",
+                EvidenceStatus.FAIL,
+                f"paper account request failed ({type(exc).__name__})",
+            )
+            account_identity = ReadinessCheck("Paper account identity", EvidenceStatus.UNVERIFIED, "account identity was not returned")
+
+    statement = _check_fmp_records(
+        "FMP statement entitlement",
+        endpoint="income-statement",
+        params={"symbol": symbol, "period": "quarter", "limit": 1},
+        fmp_get=fmp_get,
+        key_present=fmp_key_present,
+    )
+    day = today or date.today()
+    prices = _check_fmp_records(
+        "FMP price entitlement",
+        endpoint="historical-price-eod/full",
+        params={"symbol": symbol, "from": (day - timedelta(days=10)).isoformat(), "to": day.isoformat()},
+        fmp_get=fmp_get,
+        key_present=fmp_key_present,
+    )
+    return [alpaca, account_identity, statement, prices]
+
+
+def _check_fmp_records(
+    name: str,
+    *,
+    endpoint: str,
+    params: dict,
+    fmp_get: Callable[[str, Optional[dict]], object],
+    key_present: bool,
+) -> ReadinessCheck:
+    if not key_present:
+        return ReadinessCheck(name, EvidenceStatus.UNVERIFIED, "FMP key setting is missing; endpoint was not probed")
+    try:
+        response = fmp_get(endpoint, params)
+    except Exception as exc:  # noqa: BLE001
+        return ReadinessCheck(name, EvidenceStatus.UNVERIFIED, f"request did not establish entitlement ({type(exc).__name__})")
+    if isinstance(response, (list, tuple)) and response and isinstance(response[0], dict):
+        record = response[0]
+        required_fields = {"symbol", "date", "close"} if endpoint == "historical-price-eod/full" else {"symbol", "date", "revenue"}
+        missing_fields = sorted(field for field in required_fields if record.get(field) in (None, ""))
+        if str(record.get("symbol", "")).upper() != str(params.get("symbol", "")).upper():
+            missing_fields.append("matching_symbol")
+        if missing_fields:
+            return ReadinessCheck(
+                name,
+                EvidenceStatus.UNVERIFIED,
+                f"endpoint response did not establish required sample fields: {', '.join(missing_fields)}",
+            )
+        detail = f"endpoint returned {len(response)} usable record(s) for the representative probe"
+        if endpoint == "historical-price-eod/full":
+            detail += "; this entitlement probe is separate from the app's Alpaca price source"
+        return ReadinessCheck(name, EvidenceStatus.PASS, detail)
+    return ReadinessCheck(
+        name,
+        EvidenceStatus.UNVERIFIED,
+        "endpoint returned no usable records; entitlement is not established (empty data and access failures are indistinguishable)",
+    )
+
+
+def _check_execution_store_read_only() -> ReadinessCheck:
+    """Inspect an existing execution store without creating, migrating, or writing it."""
+    db_path = Path(settings.EXECUTION_STORE_DB_PATH)
+    if not db_path.exists():
+        return ReadinessCheck("Persistence", EvidenceStatus.UNVERIFIED, f"store does not exist at {db_path}; no file was created")
+    if not db_path.is_file():
+        return ReadinessCheck("Persistence", EvidenceStatus.FAIL, f"configured store path is not a file: {db_path}")
+
+    try:
+        with closing(sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=0.5)) as connection:
+            integrity = connection.execute("PRAGMA quick_check").fetchone()
+            tables = {
+                row[0]
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            }
+    except sqlite3.Error as exc:
+        return ReadinessCheck("Persistence", EvidenceStatus.FAIL, f"read-only store inspection failed ({type(exc).__name__})")
+
+    required_tables = {"workflow_snapshots", "workflow_transitions", "workflow_order_refs", "active_positions"}
+    if not integrity or integrity[0] != "ok":
+        return ReadinessCheck("Persistence", EvidenceStatus.FAIL, "read-only SQLite integrity check failed")
+    if not required_tables.issubset(tables):
+        return ReadinessCheck("Persistence", EvidenceStatus.FAIL, "existing SQLite file lacks the expected execution-store schema")
+    return ReadinessCheck("Persistence", EvidenceStatus.PASS, f"existing execution store passed read-only checks at {db_path}")
+
+
+def _check_scheduler_installation() -> ReadinessCheck:
+    try:
+        return_code, output = _schtasks("/Query", "/TN", TASK_NAME, "/FO", "LIST")
+    except OSError as exc:
+        return ReadinessCheck("Scheduler installation", EvidenceStatus.UNVERIFIED, f"read-only task query unavailable ({type(exc).__name__})")
+    if return_code == 0:
+        return ReadinessCheck("Scheduler installation", EvidenceStatus.PASS, f"task {TASK_NAME!r} is registered; action details still require identity review")
+    lowered = output.lower()
+    if "cannot find" in lowered or "does not exist" in lowered or "not found" in lowered:
+        return ReadinessCheck("Scheduler installation", EvidenceStatus.FAIL, f"task {TASK_NAME!r} was not found by the read-only query")
+    return ReadinessCheck("Scheduler installation", EvidenceStatus.UNVERIFIED, "read-only task query did not establish installation")
+
+
+def _readiness_from_legacy_check(check: CheckResult) -> ReadinessCheck:
+    if not check.ok or check.severity == "fail":
+        status = EvidenceStatus.FAIL
+    elif check.severity == "warn":
+        status = EvidenceStatus.UNVERIFIED
+    else:
+        status = EvidenceStatus.PASS
+    return ReadinessCheck(check.name, status, check.detail)
+
+
+def _print_readiness_report(heading: str, checks: list[ReadinessCheck]) -> int:
+    print("=" * 60)
+    print(heading)
+    print("=" * 60)
+    for check in checks:
+        print(f"[{check.status.value}] {check.name}: {check.detail}")
+    failures = sum(check.status is EvidenceStatus.FAIL for check in checks)
+    unverified = sum(check.status is EvidenceStatus.UNVERIFIED for check in checks)
+    print("-" * 60)
+    print(f"Evidence summary: passed={len(checks) - failures - unverified}, failed={failures}, unverified={unverified}")
+    if failures:
+        print("Readiness is incomplete because one or more checks failed. This report does not authorize order submission.")
+        return 1
+    if unverified:
+        print("Readiness is incomplete because required evidence remains unverified. This report does not authorize order submission.")
+        return 2
+    print("All reported checks passed. Confirm deployment identity and policy compatibility separately before activation.")
     return 0
 
 
@@ -371,20 +632,20 @@ def _check_api_keys_present() -> CheckResult:
 
 
 def _check_execution_store_path() -> CheckResult:
-    try:
-        db_path = Path(settings.EXECUTION_STORE_DB_PATH)
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        return CheckResult("Execution store", True, str(db_path))
-    except Exception as exc:  # noqa: BLE001
-        return CheckResult("Execution store", False, str(exc))
+    db_path = Path(settings.EXECUTION_STORE_DB_PATH)
+    if db_path.exists() and not db_path.is_file():
+        return CheckResult("Execution store", False, f"configured path is not a file: {db_path}")
+    if not db_path.exists():
+        return CheckResult("Execution store", True, f"configured path does not exist; left untouched: {db_path}", severity="warn")
+    return CheckResult("Execution store", True, f"configured existing store: {db_path}")
 
 
 def _check_scan_results_dir() -> CheckResult:
-    try:
-        SCAN_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-        return CheckResult("Scan results directory", True, str(SCAN_RESULTS_DIR))
-    except Exception as exc:  # noqa: BLE001
-        return CheckResult("Scan results directory", False, str(exc))
+    if not SCAN_RESULTS_DIR.exists():
+        return CheckResult("Scan results directory", True, f"not present; left untouched: {SCAN_RESULTS_DIR}", severity="warn")
+    if not SCAN_RESULTS_DIR.is_dir():
+        return CheckResult("Scan results directory", False, f"configured path is not a directory: {SCAN_RESULTS_DIR}")
+    return CheckResult("Scan results directory", True, str(SCAN_RESULTS_DIR))
 
 
 def _check_email_configuration() -> CheckResult:
@@ -408,26 +669,11 @@ def _check_email_configuration() -> CheckResult:
     )
 
 
-def _check_alpaca_connectivity() -> CheckResult:
-    try:
-        client = _get_trading_client()
-        account = client.get_account()
-        return CheckResult("Alpaca connectivity", True, f"connected; equity=${float(account.equity):,.2f}")
-    except Exception as exc:  # noqa: BLE001
-        return CheckResult("Alpaca connectivity", False, str(exc))
-
-
 def _check_execution_store_health(limit: int) -> CheckResult:
-    try:
-        rows = get_execution_store().list_recent_workflows(limit=max(1, int(limit)))
-        db_path = Path(settings.EXECUTION_STORE_DB_PATH)
-        detail = f"reachable at {db_path} | recent workflows={len(rows)}"
-        if not rows:
-            detail += " (expected for a brand-new paper deployment)"
-            return CheckResult("Execution store health", True, detail, severity="warn")
-        return CheckResult("Execution store health", True, detail)
-    except Exception as exc:  # noqa: BLE001
-        return CheckResult("Execution store health", False, str(exc), severity="fail")
+    del limit  # Compatibility argument; health inspection deliberately does not load workflows.
+    check = _check_execution_store_read_only()
+    severity = "ok" if check.status is EvidenceStatus.PASS else "warn" if check.status is EvidenceStatus.UNVERIFIED else "fail"
+    return CheckResult("Execution store health", check.status is not EvidenceStatus.FAIL, check.detail, severity=severity)
 
 
 def _check_recent_signal_quality(limit: int) -> CheckResult:
@@ -554,9 +800,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Paper trading deployment and observation console")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser("doctor", help="Validate paper-trading deployment prerequisites")
+    doctor_parser = subparsers.add_parser("doctor", help="Report paper-trading readiness evidence")
+    doctor_parser.add_argument(
+        "--probe-external",
+        action="store_true",
+        help="Make one Alpaca account read and one each of the FMP statement and price endpoints",
+    )
     checklist_parser = subparsers.add_parser("checklist", help="Run the full pre-paper-trading checklist")
     checklist_parser.add_argument("--limit", type=int, default=10, help="Rows to inspect in store/signal checks")
+    checklist_parser.add_argument(
+        "--probe-external",
+        action="store_true",
+        help="Make one Alpaca account read and one each of the FMP statement and price endpoints",
+    )
 
     status_parser = subparsers.add_parser("status", help="Show paper account, signals, and workflow status")
     status_parser.add_argument("--limit", type=int, default=10, help="Rows to show in status sections")
@@ -626,9 +882,9 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     if args.command == "doctor":
-        return run_doctor()
+        return run_doctor(probe_external=args.probe_external)
     if args.command == "checklist":
-        return run_checklist(limit=args.limit)
+        return run_checklist(limit=args.limit, probe_external=args.probe_external)
     if args.command == "status":
         return print_status(limit=args.limit)
     if args.command == "run-now":
