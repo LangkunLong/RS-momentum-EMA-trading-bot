@@ -1476,7 +1476,7 @@ def build_coverage_report(
                 "short_history_fallback_minimum_closes": 60,
                 "cross_section_scope": "active dated members for each decision session",
             },
-            "financial_semantics_note": "Financial feature calculations use the recorded calculator identity, committed source revision, and canonical module Git blob above; #71 accepted validation is included in this source revision.",
+            "financial_semantics_note": "Financial feature calculations use the recorded calculator identity, committed source revision, and canonical module Git blob above; #71 corrected semantics are included in this source revision. Issue acceptance remains a separate decision.",
             "annual_revenue_growth_note": "Report-only formula per #66: latest and immediately preceding reported annual revenue observations; not added to baseline policy.",
         },
         "four_status_assessment": {
