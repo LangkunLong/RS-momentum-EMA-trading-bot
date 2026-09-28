@@ -52,67 +52,373 @@ def test_default_doctor_does_not_contact_provider_endpoints() -> None:
     external_check.assert_not_called()
 
 
-def test_external_provider_probes_distinguish_alpaca_statements_prices_and_account_identity() -> None:
+def test_external_provider_probes_are_fixed_and_cover_strategy_fmp_inputs(tmp_path: Path) -> None:
     calls: list[tuple[str, dict]] = []
+    positions_calls = 0
+    orders_calls = 0
 
     def fake_fmp_get(endpoint: str, params: dict) -> list[dict[str, object]]:
         calls.append((endpoint, params))
         if endpoint == "income-statement":
-            return [{"symbol": "AAPL", "date": "2026-06-30", "revenue": 100}]
+            return [{
+                "symbol": "AAPL", "date": "2026-06-30", "revenue": 100,
+                "epsDiluted": 2.5, "netIncome": 50,
+            }]
+        if endpoint == "balance-sheet-statement":
+            return [{"symbol": "AAPL", "date": "2026-06-30", "totalStockholdersEquity": 500}]
         return [{"symbol": "AAPL", "date": "2026-09-25", "close": 250.0}]
 
-    checks = console._check_external_access(
-        alpaca_account_reader=lambda: SimpleNamespace(id="account-123"),
-        fmp_get=fake_fmp_get,
-        paper_mode=True,
-        fmp_key_present=True,
-        symbol="AAPL",
-        today=date(2026, 9, 27),
-    )
+    def read_positions() -> list[object]:
+        nonlocal positions_calls
+        positions_calls += 1
+        return []
 
-    assert [check.status for check in checks] == [
-        console.EvidenceStatus.PASS,
-        console.EvidenceStatus.PASS,
-        console.EvidenceStatus.PASS,
-        console.EvidenceStatus.PASS,
+    def read_orders() -> list[object]:
+        nonlocal orders_calls
+        orders_calls += 1
+        return []
+
+    with patch.object(console.settings, "EXECUTION_STORE_DB_PATH", str(tmp_path / "missing.sqlite3")):
+        checks = console._check_external_access(
+            alpaca_account_reader=lambda: SimpleNamespace(id="account-123"),
+            alpaca_positions_reader=read_positions,
+            alpaca_orders_reader=read_orders,
+            fmp_get=fake_fmp_get,
+            paper_mode=True,
+            fmp_key_present=True,
+            fmp_ledger_ready=True,
+            symbol="AAPL",
+            today=date(2026, 9, 27),
+        )
+
+    assert [check.name for check in checks] == [
+        "Alpaca connectivity", "Paper account identity", "Broker positions",
+        "Broker open orders", "Broker/local reconciliation", "FMP quarterly income",
+        "FMP annual income", "FMP annual balance sheet", "FMP price entitlement",
     ]
+    assert [check.status for check in checks[5:]] == [console.EvidenceStatus.PASS] * 4
+    assert checks[4].status is console.EvidenceStatus.UNVERIFIED
+    assert checks[2].status is console.EvidenceStatus.PASS
+    assert checks[3].status is console.EvidenceStatus.PASS
     assert checks[0].name == "Alpaca connectivity"
     assert checks[1].name == "Paper account identity"
     assert "account-123" not in checks[1].detail
     assert "sha256:" in checks[1].detail
+    assert positions_calls == 1
+    assert orders_calls == 1
     assert calls == [
-        ("income-statement", {"symbol": "AAPL", "period": "quarter", "limit": 1}),
+        ("income-statement", {"symbol": "AAPL", "period": "quarter", "limit": 5}),
+        ("income-statement", {"symbol": "AAPL", "period": "annual", "limit": 5}),
+        ("balance-sheet-statement", {"symbol": "AAPL", "limit": 5}),
         ("historical-price-eod/full", {"symbol": "AAPL", "from": "2026-09-17", "to": "2026-09-27"}),
     ]
 
 
-def test_external_probe_refuses_alpaca_account_read_when_paper_mode_is_false() -> None:
+def test_external_probe_refuses_all_provider_reads_when_paper_mode_is_false() -> None:
     account_reader = MagicMock(side_effect=AssertionError("live account probe must not run"))
+    positions_reader = MagicMock(side_effect=AssertionError("live positions read must not run"))
+    orders_reader = MagicMock(side_effect=AssertionError("live open-orders read must not run"))
+    fmp_get = MagicMock(side_effect=AssertionError("FMP read must not run when paper mode is false"))
     checks = console._check_external_access(
         alpaca_account_reader=account_reader,
-        fmp_get=lambda endpoint, params: [],
+        alpaca_positions_reader=positions_reader,
+        alpaca_orders_reader=orders_reader,
+        fmp_get=fmp_get,
         paper_mode=False,
-        fmp_key_present=False,
+        fmp_key_present=True,
+        fmp_ledger_ready=True,
         today=date(2026, 9, 27),
     )
 
     assert checks[0].status is console.EvidenceStatus.FAIL
     assert checks[1].status is console.EvidenceStatus.UNVERIFIED
+    assert all(check.status is console.EvidenceStatus.UNVERIFIED for check in checks[2:])
     account_reader.assert_not_called()
+    positions_reader.assert_not_called()
+    orders_reader.assert_not_called()
+    fmp_get.assert_not_called()
+
+
+def test_doctor_wiring_refuses_every_provider_when_paper_mode_is_false() -> None:
+    account_reader = MagicMock(side_effect=AssertionError("account call must be blocked"))
+    positions_reader = MagicMock(side_effect=AssertionError("positions call must be blocked"))
+    orders_reader = MagicMock(side_effect=AssertionError("open-orders call must be blocked"))
+    fmp_get = MagicMock(side_effect=AssertionError("FMP call must be blocked"))
+    with (
+        patch("paper_trading_console._is_paper_mode", return_value=False),
+        patch("paper_trading_console._get_trading_client", return_value=SimpleNamespace(get_account=account_reader)),
+        patch("paper_trading_console.get_open_positions", positions_reader),
+        patch("paper_trading_console.get_open_orders", orders_reader),
+        patch("paper_trading_console._fmp_get", fmp_get),
+        patch("paper_trading_console._check_execution_store_binding", return_value=console.ReadinessCheck("Execution store binding", console.EvidenceStatus.UNVERIFIED, "unknown")),
+        patch("paper_trading_console._check_execution_store_read_only", return_value=console.ReadinessCheck("Persistence", console.EvidenceStatus.UNVERIFIED, "unknown")),
+        patch("paper_trading_console._check_scheduler_installation", return_value=console.ReadinessCheck("Scheduler installation", console.EvidenceStatus.UNVERIFIED, "unknown")),
+        patch("paper_trading_console._runtime_identity_record", return_value={}),
+    ):
+        console._collect_readiness_checks(probe_external=True)
+
+    account_reader.assert_not_called()
+    positions_reader.assert_not_called()
+    orders_reader.assert_not_called()
+    fmp_get.assert_not_called()
+
+
+def test_external_probe_skips_broker_inventory_when_account_read_fails(tmp_path: Path) -> None:
+    positions_reader = MagicMock(side_effect=AssertionError("inventory reads require connected account"))
+    orders_reader = MagicMock(side_effect=AssertionError("inventory reads require connected account"))
+    fmp_get = MagicMock(return_value=[])
+    with patch.object(console.settings, "EXECUTION_STORE_DB_PATH", str(tmp_path / "missing.sqlite3")):
+        checks = console._check_external_access(
+            alpaca_account_reader=MagicMock(side_effect=TimeoutError),
+            alpaca_positions_reader=positions_reader,
+            alpaca_orders_reader=orders_reader,
+            fmp_get=fmp_get,
+            paper_mode=True,
+            fmp_key_present=True,
+            fmp_ledger_ready=True,
+            today=date(2026, 9, 27),
+        )
+
+    assert checks[0].status is console.EvidenceStatus.FAIL
+    assert all(check.status is console.EvidenceStatus.UNVERIFIED for check in checks[2:5])
+    positions_reader.assert_not_called()
+    orders_reader.assert_not_called()
+    assert fmp_get.call_count == 4
 
 
 def test_empty_fmp_probe_does_not_claim_endpoint_entitlement() -> None:
     checks = console._check_external_access(
         alpaca_account_reader=lambda: SimpleNamespace(id="account-123"),
+        alpaca_positions_reader=lambda: [],
+        alpaca_orders_reader=lambda: [],
         fmp_get=lambda endpoint, params: [],
         paper_mode=True,
         fmp_key_present=True,
+        fmp_ledger_ready=True,
         today=date(2026, 9, 27),
     )
 
+    assert all(check.status is console.EvidenceStatus.UNVERIFIED for check in checks[5:])
+    assert "not established" in checks[5].detail
+
+
+def test_missing_fmp_ledger_blocks_all_fmp_calls() -> None:
+    fmp_get = MagicMock(side_effect=AssertionError("must not create or call without existing ledger"))
+    checks = console._check_external_access(
+        alpaca_account_reader=lambda: SimpleNamespace(id="account-123"),
+        alpaca_positions_reader=lambda: [],
+        alpaca_orders_reader=lambda: [],
+        fmp_get=fmp_get,
+        paper_mode=True,
+        fmp_key_present=True,
+        fmp_ledger_ready=False,
+    )
+
+    assert all(check.status is console.EvidenceStatus.UNVERIFIED for check in checks[5:])
+    fmp_get.assert_not_called()
+
+
+def _create_reconciliation_store(path: Path, *, position: tuple[str, str, float] | None = None) -> None:
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE workflow_snapshots (
+                workflow_id TEXT PRIMARY KEY, symbol TEXT NOT NULL, state TEXT,
+                broker_order_id TEXT NOT NULL DEFAULT '', entry_plan_json TEXT,
+                created_at_utc TEXT NOT NULL, updated_at_utc TEXT NOT NULL
+            );
+            CREATE TABLE workflow_transitions (
+                id INTEGER PRIMARY KEY, timestamp_utc TEXT NOT NULL, workflow_id TEXT NOT NULL,
+                symbol TEXT NOT NULL, from_state TEXT, to_state TEXT NOT NULL,
+                event TEXT NOT NULL, details_json TEXT NOT NULL
+            );
+            CREATE TABLE workflow_order_refs (
+                id INTEGER PRIMARY KEY, workflow_id TEXT NOT NULL, symbol TEXT NOT NULL,
+                broker_order_id TEXT NOT NULL DEFAULT '', client_order_id TEXT NOT NULL DEFAULT '',
+                order_role TEXT NOT NULL, created_at_utc TEXT NOT NULL
+            );
+            CREATE TABLE active_positions (
+                symbol TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, qty REAL NOT NULL,
+                entry_price REAL NOT NULL, opened_at_utc TEXT NOT NULL, updated_at_utc TEXT NOT NULL
+            );
+            """
+        )
+        if position:
+            symbol, workflow_id, qty = position
+            connection.execute(
+                "INSERT INTO active_positions VALUES (?, ?, ?, 100, 'now', 'now')",
+                (symbol, workflow_id, qty),
+            )
+            connection.execute(
+                "INSERT INTO workflow_snapshots VALUES (?, ?, 'protective_stop_active', '', NULL, 'now', 'now')",
+                (workflow_id, symbol),
+            )
+            connection.execute(
+                "INSERT INTO workflow_order_refs VALUES (1, ?, ?, 'order-1', 'client-1', 'protective_stop', 'now')",
+                (workflow_id, symbol),
+            )
+
+
+def test_broker_reconciliation_never_passes_without_store(tmp_path: Path, monkeypatch) -> None:
+    missing_store = tmp_path / "missing.sqlite3"
+    monkeypatch.setenv("EXECUTION_STORE_DB_PATH", str(missing_store))
+    monkeypatch.setattr(console.settings, "EXECUTION_STORE_DB_PATH", str(missing_store))
+
+    _, _, reconciliation = console._check_broker_inventory(
+        positions_reader=lambda: [],
+        orders_reader=lambda: [],
+        paper_mode=True,
+        account_identity_verified=True,
+        store_ready=True,
+    )
+
+    assert reconciliation.status is console.EvidenceStatus.UNVERIFIED
+
+
+def test_broker_reconciliation_never_passes_when_inventory_read_fails(tmp_path: Path, monkeypatch) -> None:
+    store = tmp_path / "execution.sqlite3"
+    _create_reconciliation_store(store)
+    monkeypatch.setenv("EXECUTION_STORE_DB_PATH", str(store))
+    monkeypatch.setattr(console.settings, "EXECUTION_STORE_DB_PATH", str(store))
+
+    positions, orders, reconciliation = console._check_broker_inventory(
+        positions_reader=lambda: (_ for _ in ()).throw(TimeoutError()),
+        orders_reader=lambda: [],
+        paper_mode=True,
+        account_identity_verified=True,
+        store_ready=True,
+    )
+
+    assert positions.status is console.EvidenceStatus.FAIL
+    assert orders.status is console.EvidenceStatus.PASS
+    assert reconciliation.status is console.EvidenceStatus.UNVERIFIED
+
+
+def test_open_orders_at_fixed_cap_cannot_prove_complete_inventory() -> None:
+    _, orders, reconciliation = console._check_broker_inventory(
+        positions_reader=lambda: [],
+        orders_reader=lambda: [SimpleNamespace()] * 2,
+        paper_mode=True,
+        account_identity_verified=True,
+        open_orders_limit=2,
+    )
+
+    assert orders.status is console.EvidenceStatus.UNVERIFIED
+    assert "full inventory is unknown" in orders.detail
+    assert reconciliation.status is console.EvidenceStatus.UNVERIFIED
+
+
+def test_broker_reconciliation_requires_owned_workflow_stop_of_matching_remaining_qty(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store = tmp_path / "execution.sqlite3"
+    _create_reconciliation_store(store, position=("AAPL", "wf-1", 2))
+    monkeypatch.setenv("EXECUTION_STORE_DB_PATH", str(store))
+    monkeypatch.setattr(console.settings, "EXECUTION_STORE_DB_PATH", str(store))
+    before = store.read_bytes()
+    position = SimpleNamespace(symbol="AAPL", qty=2, avg_entry_price=100)
+    stop = SimpleNamespace(
+        symbol="AAPL", id="order-1", client_order_id="client-1", side="sell", type="stop",
+        qty="2.5", filled_qty="0.5", status="new", time_in_force="gtc",
+    )
+
+    positions, orders, reconciliation = console._check_broker_inventory(
+        positions_reader=lambda: [position],
+        orders_reader=lambda: [stop],
+        paper_mode=True,
+        account_identity_verified=True,
+        store_ready=True,
+    )
+
+    assert positions.status is console.EvidenceStatus.PASS
+    assert orders.status is console.EvidenceStatus.PASS
+    assert reconciliation.status is console.EvidenceStatus.PASS
+    assert store.read_bytes() == before
+
+
+def test_broker_reconciliation_fails_for_wrong_workflow_state_or_orphan_stop(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store = tmp_path / "execution.sqlite3"
+    _create_reconciliation_store(store, position=("AAPL", "wf-1", 2))
+    with sqlite3.connect(store) as connection:
+        connection.execute("UPDATE workflow_snapshots SET state='protective_stop_failed'")
+    monkeypatch.setenv("EXECUTION_STORE_DB_PATH", str(store))
+    monkeypatch.setattr(console.settings, "EXECUTION_STORE_DB_PATH", str(store))
+    stop = SimpleNamespace(
+        symbol="AAPL", id="order-1", client_order_id="client-1", side="sell", type="stop",
+        qty="2", filled_qty="0", status="new", time_in_force="gtc",
+    )
+
+    _, _, reconciliation = console._check_broker_inventory(
+        positions_reader=lambda: [SimpleNamespace(symbol="AAPL", qty=2)],
+        orders_reader=lambda: [stop],
+        paper_mode=True,
+        account_identity_verified=True,
+        store_ready=True,
+    )
+
+    assert reconciliation.status is console.EvidenceStatus.FAIL
+    assert "workflow_state:AAPL" in reconciliation.detail
+
+
+def test_execution_store_binding_requires_absolute_existing_env_path(tmp_path: Path, monkeypatch) -> None:
+    store = tmp_path / "execution.sqlite3"
+    store.touch()
+    monkeypatch.setattr(console.settings, "EXECUTION_STORE_DB_PATH", str(store))
+    monkeypatch.delenv("EXECUTION_STORE_DB_PATH", raising=False)
+    assert console._check_execution_store_binding().status is console.EvidenceStatus.UNVERIFIED
+
+    monkeypatch.setenv("EXECUTION_STORE_DB_PATH", str(store))
+    assert console._check_execution_store_binding().status is console.EvidenceStatus.PASS
+
+
+def test_default_readiness_collection_preserves_existing_ledger_and_cache(tmp_path: Path, monkeypatch) -> None:
+    store = tmp_path / "execution.sqlite3"
+    ledger = tmp_path / "fmp_request_usage.json"
+    cache = tmp_path / "fundamentals"
+    ledger.write_text('{"window_start":"fixed","count":17}', encoding="utf-8")
+    cache.mkdir()
+    cached_sample = cache / "existing.pkl"
+    cached_sample.write_bytes(b"existing-cache-bytes")
+    ledger_before = ledger.read_bytes()
+    cache_before = cached_sample.read_bytes()
+
+    monkeypatch.delenv("EXECUTION_STORE_DB_PATH", raising=False)
+    with (
+        patch.object(console.settings, "EXECUTION_STORE_DB_PATH", str(store)),
+        patch.object(console.settings, "FMP_REQUEST_LEDGER_PATH", str(ledger)),
+        patch.object(console.settings, "FUNDAMENTALS_CACHE_DIR", str(cache)),
+        patch("paper_trading_console._check_scheduler_installation", return_value=console.ReadinessCheck("Scheduler installation", console.EvidenceStatus.UNVERIFIED, "unknown")),
+    ):
+        checks = console._collect_readiness_checks(probe_external=False)
+
+    binding = next(check for check in checks if check.name == "Execution store binding")
+    assert binding.status is console.EvidenceStatus.UNVERIFIED
+    assert ledger.read_bytes() == ledger_before
+    assert cached_sample.read_bytes() == cache_before
+    assert not store.exists()
+
+
+def test_external_probe_does_not_run_broker_inventory_without_account_identity() -> None:
+    positions_reader = MagicMock(return_value=[])
+    orders_reader = MagicMock(return_value=[])
+    checks = console._check_external_access(
+        alpaca_account_reader=lambda: SimpleNamespace(),
+        alpaca_positions_reader=positions_reader,
+        alpaca_orders_reader=orders_reader,
+        fmp_get=lambda endpoint, params: [],
+        paper_mode=True,
+        fmp_key_present=False,
+        fmp_ledger_ready=False,
+    )
+
+    assert checks[1].status is console.EvidenceStatus.UNVERIFIED
     assert checks[2].status is console.EvidenceStatus.UNVERIFIED
     assert checks[3].status is console.EvidenceStatus.UNVERIFIED
-    assert "not established" in checks[2].detail
+    assert checks[4].status is console.EvidenceStatus.UNVERIFIED
+    positions_reader.assert_not_called()
+    orders_reader.assert_not_called()
 
 
 def test_read_only_persistence_check_does_not_create_missing_store(tmp_path: Path) -> None:
@@ -176,6 +482,8 @@ def test_runtime_identity_uses_shared_names_and_keeps_strategy_identity_separate
         "dependency_profile",
         "configuration_profile",
         "persistent_store_path",
+        "fmp_request_ledger_path",
+        "fmp_cache_path",
         "paper_environment",
     }.issubset(runtime)
     assert runtime["paper_environment"]["account_fingerprint"] == "sha256:0123456789abcdef"

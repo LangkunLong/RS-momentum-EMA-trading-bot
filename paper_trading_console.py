@@ -18,6 +18,8 @@ import argparse
 import hashlib
 import importlib.metadata
 import json
+import math
+import os
 import sqlite3
 import subprocess
 import sys
@@ -55,6 +57,7 @@ from setup_windows_task import TASK_NAME, _schtasks, register_task, show_status
 
 PROJECT_DIR = Path(__file__).resolve().parent
 SCAN_RESULTS_DIR = PROJECT_DIR / settings.RESULTS_DIR
+READINESS_OPEN_ORDER_LIMIT = 500
 
 
 @dataclass(frozen=True)
@@ -104,15 +107,27 @@ def _collect_readiness_checks(*, probe_external: bool) -> list[ReadinessCheck]:
     else:
         config = ReadinessCheck("Configuration", EvidenceStatus.FAIL, "one or more required key settings are missing")
 
-    checks = [config]
+    store_binding = _check_execution_store_binding()
+    persistence = _check_execution_store_read_only()
+    checks = [config, store_binding]
 
     if probe_external:
         checks.extend(
             _check_external_access(
                 alpaca_account_reader=lambda: _get_trading_client().get_account(),
+                alpaca_positions_reader=lambda: get_open_positions(raise_on_error=True),
+                alpaca_orders_reader=lambda: get_open_orders(
+                    limit=READINESS_OPEN_ORDER_LIMIT,
+                    raise_on_error=True,
+                ),
                 fmp_get=_fmp_get,
                 paper_mode=_is_paper_mode(),
                 fmp_key_present=bool(settings.FMP_API_KEY),
+                fmp_ledger_ready=_existing_fmp_ledger_is_available(),
+                store_ready=(
+                    store_binding.status is EvidenceStatus.PASS
+                    and persistence.status is EvidenceStatus.PASS
+                ),
             )
         )
     else:
@@ -120,14 +135,19 @@ def _collect_readiness_checks(*, probe_external: bool) -> list[ReadinessCheck]:
             [
                 ReadinessCheck("Alpaca connectivity", EvidenceStatus.UNVERIFIED, "not probed; pass --probe-external for one paper-account read"),
                 ReadinessCheck("Paper account identity", EvidenceStatus.UNVERIFIED, "account fingerprint not observed"),
-                ReadinessCheck("FMP statement entitlement", EvidenceStatus.UNVERIFIED, "not probed; pass --probe-external for one statement request"),
+                ReadinessCheck("Broker positions", EvidenceStatus.UNVERIFIED, "not probed; pass --probe-external for one read-only positions request"),
+                ReadinessCheck("Broker open orders", EvidenceStatus.UNVERIFIED, "not probed; pass --probe-external for one read-only open-orders request"),
+                ReadinessCheck("Broker/local reconciliation", EvidenceStatus.UNVERIFIED, "broker and existing store have not been compared"),
+                ReadinessCheck("FMP quarterly income", EvidenceStatus.UNVERIFIED, "not probed"),
+                ReadinessCheck("FMP annual income", EvidenceStatus.UNVERIFIED, "not probed"),
+                ReadinessCheck("FMP annual balance sheet", EvidenceStatus.UNVERIFIED, "not probed"),
                 ReadinessCheck("FMP price entitlement", EvidenceStatus.UNVERIFIED, "not probed; pass --probe-external for one price request"),
             ]
         )
 
     checks.extend(
         [
-            _check_execution_store_read_only(),
+            persistence,
             _check_scheduler_installation(),
             ReadinessCheck(
                 "Service health",
@@ -212,6 +232,8 @@ def _runtime_identity_record(*, account_fingerprint: str = "unverified") -> dict
                 "statement_source": "Financial Modeling Prep",
             },
             "persistent_store_path": str(settings.EXECUTION_STORE_DB_PATH),
+            "fmp_request_ledger_path": str(settings.FMP_REQUEST_LEDGER_PATH),
+            "fmp_cache_path": str(settings.FUNDAMENTALS_CACHE_DIR),
             "paper_environment": {
                 "broker": "Alpaca",
                 "mode": "paper" if paper_mode else "not-paper",
@@ -228,53 +250,148 @@ def _sha256_file_or_unavailable(path: Path) -> str:
         return "unavailable"
 
 
+def _check_execution_store_binding() -> ReadinessCheck:
+    """Require the selected execution store to be explicitly and absolutely bound."""
+    raw_path = os.environ.get("EXECUTION_STORE_DB_PATH", "").strip()
+    if not raw_path:
+        return ReadinessCheck(
+            "Execution store binding",
+            EvidenceStatus.UNVERIFIED,
+            "no explicit absolute EXECUTION_STORE_DB_PATH is set",
+        )
+
+    supplied_path = Path(raw_path).expanduser()
+    if not supplied_path.is_absolute():
+        return ReadinessCheck(
+            "Execution store binding",
+            EvidenceStatus.UNVERIFIED,
+            "EXECUTION_STORE_DB_PATH is not absolute",
+        )
+
+    try:
+        resolved_path = supplied_path.resolve(strict=True)
+        configured_path = Path(settings.EXECUTION_STORE_DB_PATH).resolve(strict=False)
+    except OSError as exc:
+        return ReadinessCheck(
+            "Execution store binding",
+            EvidenceStatus.UNVERIFIED,
+            f"configured store path could not be resolved ({type(exc).__name__})",
+        )
+    if not resolved_path.is_file():
+        return ReadinessCheck(
+            "Execution store binding",
+            EvidenceStatus.UNVERIFIED,
+            "explicit store path does not identify an existing file",
+        )
+    if resolved_path != configured_path:
+        return ReadinessCheck(
+            "Execution store binding",
+            EvidenceStatus.FAIL,
+            "explicit path does not match the path resolved by application settings",
+        )
+    return ReadinessCheck(
+        "Execution store binding",
+        EvidenceStatus.PASS,
+        f"existing absolute store bound at {resolved_path}",
+    )
+
+
+def _existing_fmp_ledger_is_available() -> bool:
+    """Only probe FMP when its existing request ledger can preserve accounting."""
+    path = Path(settings.FMP_REQUEST_LEDGER_PATH)
+    return path.is_absolute() and path.is_file()
+
+
 def _check_external_access(
     *,
     alpaca_account_reader: Callable[[], object],
+    alpaca_positions_reader: Callable[[], list[object]],
+    alpaca_orders_reader: Callable[[], list[object]],
     fmp_get: Callable[[str, Optional[dict]], object],
     paper_mode: bool,
     fmp_key_present: bool,
+    fmp_ledger_ready: bool = False,
+    store_ready: bool = False,
     symbol: str = "AAPL",
     today: date | None = None,
 ) -> list[ReadinessCheck]:
-    """Check three provider claims independently; callers supply external adapters."""
+    """Collect a fixed three-read Alpaca and four-request FMP probe."""
     if not paper_mode:
         alpaca = ReadinessCheck("Alpaca connectivity", EvidenceStatus.FAIL, "paper mode is false; account probe was refused")
         account_identity = ReadinessCheck("Paper account identity", EvidenceStatus.UNVERIFIED, "account probe was refused")
-    else:
-        try:
-            account = alpaca_account_reader()
-            if account is None:
-                raise ValueError("empty account response")
-            alpaca = ReadinessCheck("Alpaca connectivity", EvidenceStatus.PASS, "paper account endpoint returned a response")
-            raw_account_id = str(getattr(account, "id", "") or "").strip()
-            if raw_account_id:
-                fingerprint = hashlib.sha256(raw_account_id.encode("utf-8")).hexdigest()[:16]
-                account_identity = ReadinessCheck(
-                    "Paper account identity",
-                    EvidenceStatus.PASS,
-                    f"paper account fingerprint=sha256:{fingerprint}",
-                )
-            else:
-                account_identity = ReadinessCheck(
-                    "Paper account identity",
-                    EvidenceStatus.UNVERIFIED,
-                    "account endpoint replied but returned no account identifier to fingerprint",
-                )
-        except Exception as exc:  # noqa: BLE001
-            alpaca = ReadinessCheck(
-                "Alpaca connectivity",
-                EvidenceStatus.FAIL,
-                f"paper account request failed ({type(exc).__name__})",
-            )
-            account_identity = ReadinessCheck("Paper account identity", EvidenceStatus.UNVERIFIED, "account identity was not returned")
+        blocked = "not probed; all provider requests require paper mode"
+        return [
+            alpaca,
+            account_identity,
+            ReadinessCheck("Broker positions", EvidenceStatus.UNVERIFIED, blocked),
+            ReadinessCheck("Broker open orders", EvidenceStatus.UNVERIFIED, blocked),
+            ReadinessCheck("Broker/local reconciliation", EvidenceStatus.UNVERIFIED, "paper-mode provider gate refused broker reads"),
+            ReadinessCheck("FMP quarterly income", EvidenceStatus.UNVERIFIED, blocked),
+            ReadinessCheck("FMP annual income", EvidenceStatus.UNVERIFIED, blocked),
+            ReadinessCheck("FMP annual balance sheet", EvidenceStatus.UNVERIFIED, blocked),
+            ReadinessCheck("FMP price entitlement", EvidenceStatus.UNVERIFIED, blocked),
+        ]
 
-    statement = _check_fmp_records(
-        "FMP statement entitlement",
+    account: object | None = None
+    try:
+        account = alpaca_account_reader()
+        if account is None:
+            raise ValueError("empty account response")
+        alpaca = ReadinessCheck("Alpaca connectivity", EvidenceStatus.PASS, "paper account endpoint returned a response")
+        raw_account_id = str(getattr(account, "id", "") or "").strip()
+        if raw_account_id:
+            fingerprint = hashlib.sha256(raw_account_id.encode("utf-8")).hexdigest()[:16]
+            account_identity = ReadinessCheck(
+                "Paper account identity",
+                EvidenceStatus.PASS,
+                f"paper account fingerprint=sha256:{fingerprint}",
+            )
+        else:
+            account_identity = ReadinessCheck(
+                "Paper account identity",
+                EvidenceStatus.UNVERIFIED,
+                "account endpoint replied but returned no account identifier to fingerprint",
+            )
+    except Exception as exc:  # noqa: BLE001
+        alpaca = ReadinessCheck(
+            "Alpaca connectivity",
+            EvidenceStatus.FAIL,
+            f"paper account request failed ({type(exc).__name__})",
+        )
+        account_identity = ReadinessCheck("Paper account identity", EvidenceStatus.UNVERIFIED, "account identity was not returned")
+
+    positions, open_orders, reconciliation = _check_broker_inventory(
+        positions_reader=alpaca_positions_reader,
+        orders_reader=alpaca_orders_reader,
+        paper_mode=True,
+        account_identity_verified=account_identity.status is EvidenceStatus.PASS,
+        store_ready=store_ready,
+    )
+
+    fmp_limit = min(int(settings.FMP_FREE_MAX_RECORDS), 5)
+    quarterly = _check_fmp_records(
+        "FMP quarterly income",
         endpoint="income-statement",
-        params={"symbol": symbol, "period": "quarter", "limit": 1},
+        params={"symbol": symbol, "period": "quarter", "limit": fmp_limit},
         fmp_get=fmp_get,
         key_present=fmp_key_present,
+        accounting_ready=fmp_ledger_ready,
+    )
+    annual = _check_fmp_records(
+        "FMP annual income",
+        endpoint="income-statement",
+        params={"symbol": symbol, "period": "annual", "limit": fmp_limit},
+        fmp_get=fmp_get,
+        key_present=fmp_key_present,
+        accounting_ready=fmp_ledger_ready,
+    )
+    balance = _check_fmp_records(
+        "FMP annual balance sheet",
+        endpoint="balance-sheet-statement",
+        params={"symbol": symbol, "limit": fmp_limit},
+        fmp_get=fmp_get,
+        key_present=fmp_key_present,
+        accounting_ready=fmp_ledger_ready,
     )
     day = today or date.today()
     prices = _check_fmp_records(
@@ -283,8 +400,243 @@ def _check_external_access(
         params={"symbol": symbol, "from": (day - timedelta(days=10)).isoformat(), "to": day.isoformat()},
         fmp_get=fmp_get,
         key_present=fmp_key_present,
+        accounting_ready=fmp_ledger_ready,
     )
-    return [alpaca, account_identity, statement, prices]
+    return [alpaca, account_identity, positions, open_orders, reconciliation, quarterly, annual, balance, prices]
+
+
+def _check_broker_inventory(
+    *,
+    positions_reader: Callable[[], list[object]],
+    orders_reader: Callable[[], list[object]],
+    paper_mode: bool,
+    account_identity_verified: bool,
+    store_ready: bool = False,
+    open_orders_limit: int = READINESS_OPEN_ORDER_LIMIT,
+) -> tuple[ReadinessCheck, ReadinessCheck, ReadinessCheck]:
+    """Read broker inventory and compare it with the selected store without mutation."""
+    if not paper_mode:
+        refused = ReadinessCheck("Broker positions", EvidenceStatus.UNVERIFIED, "paper mode is false; read refused")
+        orders = ReadinessCheck("Broker open orders", EvidenceStatus.UNVERIFIED, "paper mode is false; read refused")
+        return refused, orders, ReadinessCheck("Broker/local reconciliation", EvidenceStatus.UNVERIFIED, "broker reads refused")
+    if not account_identity_verified:
+        blocked = "not read; verified paper-account identity is required first"
+        return (
+            ReadinessCheck("Broker positions", EvidenceStatus.UNVERIFIED, blocked),
+            ReadinessCheck("Broker open orders", EvidenceStatus.UNVERIFIED, blocked),
+            ReadinessCheck("Broker/local reconciliation", EvidenceStatus.UNVERIFIED, blocked),
+        )
+
+    positions_value: list[object] | None = None
+    orders_value: list[object] | None = None
+    try:
+        positions_value = positions_reader()
+        if not isinstance(positions_value, list):
+            raise ValueError("positions response was not a list")
+        positions_check = ReadinessCheck("Broker positions", EvidenceStatus.PASS, f"read {len(positions_value)} open position(s)")
+    except Exception as exc:  # noqa: BLE001
+        positions_value = None
+        positions_check = ReadinessCheck("Broker positions", EvidenceStatus.FAIL, f"read failed ({type(exc).__name__})")
+    try:
+        orders_value = orders_reader()
+        if not isinstance(orders_value, list):
+            raise ValueError("open-orders response was not a list")
+        if len(orders_value) >= open_orders_limit:
+            orders_check = ReadinessCheck(
+                "Broker open orders",
+                EvidenceStatus.UNVERIFIED,
+                f"read reached the {open_orders_limit}-order cap; full inventory is unknown",
+            )
+            orders_value = None
+        else:
+            orders_check = ReadinessCheck("Broker open orders", EvidenceStatus.PASS, f"read {len(orders_value)} open order(s)")
+    except Exception as exc:  # noqa: BLE001
+        orders_value = None
+        orders_check = ReadinessCheck("Broker open orders", EvidenceStatus.FAIL, f"read failed ({type(exc).__name__})")
+
+    if positions_value is None or orders_value is None:
+        reconciliation = ReadinessCheck(
+            "Broker/local reconciliation",
+            EvidenceStatus.UNVERIFIED,
+            "both broker inventory reads are required; no comparison was made",
+        )
+    else:
+        reconciliation = _compare_broker_inventory_with_store(
+            positions_value,
+            orders_value,
+            store_ready=store_ready,
+        )
+    return positions_check, orders_check, reconciliation
+
+
+def _compare_broker_inventory_with_store(
+    positions: list[object],
+    open_orders: list[object],
+    *,
+    store_ready: bool,
+) -> ReadinessCheck:
+    """Compare complete observations to a verified explicit store using read-only SQL."""
+    if not store_ready:
+        return ReadinessCheck(
+            "Broker/local reconciliation",
+            EvidenceStatus.UNVERIFIED,
+            "explicit existing store binding and read-only schema checks are required",
+        )
+    binding = _check_execution_store_binding()
+    if binding.status is not EvidenceStatus.PASS:
+        return ReadinessCheck("Broker/local reconciliation", EvidenceStatus.UNVERIFIED, "explicit existing store binding is unavailable")
+    persistence = _check_execution_store_read_only()
+    if persistence.status is not EvidenceStatus.PASS:
+        return ReadinessCheck("Broker/local reconciliation", EvidenceStatus.UNVERIFIED, "read-only store integrity/schema checks are unavailable")
+
+    db_path = Path(settings.EXECUTION_STORE_DB_PATH)
+    try:
+        with closing(sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=0.5)) as connection:
+            integrity = connection.execute("PRAGMA quick_check").fetchone()
+            if not integrity or integrity[0] != "ok":
+                return ReadinessCheck("Broker/local reconciliation", EvidenceStatus.UNVERIFIED, "store integrity was not established")
+            local_rows = connection.execute(
+                "SELECT symbol, workflow_id, qty FROM active_positions"
+            ).fetchall()
+            snapshot_rows = connection.execute(
+                "SELECT workflow_id, symbol, state FROM workflow_snapshots"
+            ).fetchall()
+            ref_rows = connection.execute(
+                "SELECT workflow_id, symbol, broker_order_id, client_order_id, order_role FROM workflow_order_refs"
+            ).fetchall()
+    except (OSError, sqlite3.Error) as exc:
+        return ReadinessCheck(
+            "Broker/local reconciliation",
+            EvidenceStatus.UNVERIFIED,
+            f"read-only store comparison unavailable ({type(exc).__name__})",
+        )
+
+    local: dict[str, tuple[str, float]] = {}
+    conflicts: list[str] = []
+    for raw_symbol, raw_workflow_id, raw_qty in local_rows:
+        symbol = str(raw_symbol or "").strip().upper()
+        workflow_id = str(raw_workflow_id or "").strip()
+        try:
+            qty = float(raw_qty)
+        except (TypeError, ValueError):
+            conflicts.append(f"local_qty:{symbol or 'unknown'}")
+            continue
+        if not symbol or not workflow_id or not math.isfinite(qty) or qty <= 0:
+            conflicts.append(f"local_position:{symbol or 'unknown'}")
+            continue
+        if symbol in local:
+            conflicts.append(f"duplicate_local_position:{symbol}")
+            continue
+        local[symbol] = (workflow_id, qty)
+
+    workflows: dict[str, tuple[str, str]] = {}
+    for raw_workflow_id, raw_symbol, raw_state in snapshot_rows:
+        workflow_id = str(raw_workflow_id or "").strip()
+        symbol = str(raw_symbol or "").strip().upper()
+        if not workflow_id or not symbol or workflow_id in workflows:
+            conflicts.append(f"workflow_snapshot:{symbol or 'unknown'}")
+            continue
+        workflows[workflow_id] = (symbol, str(raw_state or ""))
+
+    refs: set[tuple[str, str, str, str, str]] = set()
+    for raw_workflow_id, raw_symbol, raw_broker_id, raw_client_id, raw_role in ref_rows:
+        refs.add((
+            str(raw_workflow_id or "").strip(),
+            str(raw_symbol or "").strip().upper(),
+            str(raw_broker_id or "").strip(),
+            str(raw_client_id or "").strip(),
+            str(raw_role or "").strip(),
+        ))
+
+    broker: dict[str, float] = {}
+    for position in positions:
+        symbol = str(getattr(position, "symbol", "") or "").strip().upper()
+        try:
+            qty = float(position.qty)
+        except (TypeError, ValueError, AttributeError):
+            return ReadinessCheck("Broker/local reconciliation", EvidenceStatus.UNVERIFIED, "broker position shape could not be compared")
+        if not symbol or not math.isfinite(qty) or qty <= 0 or symbol in broker:
+            return ReadinessCheck("Broker/local reconciliation", EvidenceStatus.UNVERIFIED, "broker positions are malformed or duplicated")
+        broker[symbol] = qty
+
+    for symbol in sorted(broker.keys() | local.keys()):
+        if symbol not in broker or symbol not in local or abs(broker[symbol] - local[symbol][1]) > 1e-6:
+            conflicts.append(f"position:{symbol}")
+            continue
+        workflow_id = local[symbol][0]
+        if workflows.get(workflow_id) != (symbol, "protective_stop_active"):
+            conflicts.append(f"workflow_state:{symbol}")
+
+    stop_orders: dict[str, list[tuple[object, str, str, str]]] = {}
+    for order in open_orders:
+        symbol = str(getattr(order, "symbol", "") or "").strip().upper()
+        broker_id = str(getattr(order, "id", "") or "").strip()
+        client_id = str(getattr(order, "client_order_id", "") or "").strip()
+        if not broker_id and not client_id:
+            conflicts.append(f"unidentified_order:{symbol or 'unknown'}")
+            continue
+        owners = {
+            (workflow_id, ref_symbol, role)
+            for workflow_id, ref_symbol, ref_broker_id, ref_client_id, role in refs
+            if (broker_id and ref_broker_id == broker_id) or (client_id and ref_client_id == client_id)
+        }
+        if len(owners) != 1:
+            conflicts.append(f"order_ownership:{symbol or 'unknown'}")
+        owner_workflow = next(iter(owners))[0] if len(owners) == 1 else ""
+        if len(owners) == 1:
+            _, ref_symbol, _ = next(iter(owners))
+            if ref_symbol != symbol or workflows.get(owner_workflow, ("", ""))[0] != symbol:
+                conflicts.append(f"order_symbol:{symbol or 'unknown'}")
+
+        side = str(getattr(order, "side", "")).split(".")[-1].lower()
+        order_type = str(getattr(order, "type", "")).split(".")[-1].lower()
+        if side == "sell" and order_type in {"stop", "stop_limit"}:
+            stop_orders.setdefault(symbol, []).append((order, owner_workflow, broker_id, client_id))
+
+    for symbol, qty in broker.items():
+        stops = stop_orders.get(symbol, [])
+        if len(stops) != 1:
+            conflicts.append(f"stop_count:{symbol}")
+            continue
+        order, owner_workflow, broker_id, client_id = stops[0]
+        owner_refs = {
+            (workflow_id, role)
+            for workflow_id, ref_symbol, ref_broker_id, ref_client_id, role in refs
+            if ref_symbol == symbol
+            and ((broker_id and ref_broker_id == broker_id) or (client_id and ref_client_id == client_id))
+        }
+        if owner_workflow != local.get(symbol, ("", 0))[0] or owner_refs != {(owner_workflow, "protective_stop")}:
+            conflicts.append(f"stop_ownership:{symbol}")
+        status = str(getattr(order, "status", "")).split(".")[-1].lower()
+        time_in_force = str(getattr(order, "time_in_force", "")).split(".")[-1].lower()
+        if status not in {"new", "partially_filled"} or time_in_force != "gtc" or str(getattr(order, "type", "")).split(".")[-1].lower() != "stop":
+            conflicts.append(f"stop_state:{symbol}")
+        try:
+            order_qty = float(order.qty)
+            filled_qty = float(getattr(order, "filled_qty", 0) or 0)
+            remaining_qty = order_qty - filled_qty
+        except (TypeError, ValueError):
+            conflicts.append(f"stop_qty:{symbol}")
+            continue
+        if not math.isfinite(remaining_qty) or remaining_qty <= 0 or abs(remaining_qty - qty) > 1e-6:
+            conflicts.append(f"stop_qty:{symbol}")
+
+    for symbol in sorted(set(stop_orders) - set(broker)):
+        conflicts.append(f"orphan_stop:{symbol or 'unknown'}")
+
+    if conflicts:
+        distinct = sorted(set(conflicts))
+        sample = ", ".join(distinct[:10])
+        return ReadinessCheck(
+            "Broker/local reconciliation",
+            EvidenceStatus.FAIL,
+            f"{len(distinct)} conflict(s): {sample}; no repair was attempted",
+        )
+    return ReadinessCheck(
+        "Broker/local reconciliation",
+        EvidenceStatus.PASS,
+        f"{len(broker)} position(s) and {len(open_orders)} open order(s) match local workflow ownership and stop coverage",
+    )
 
 
 def _check_fmp_records(
@@ -294,17 +646,49 @@ def _check_fmp_records(
     params: dict,
     fmp_get: Callable[[str, Optional[dict]], object],
     key_present: bool,
+    accounting_ready: bool = True,
 ) -> ReadinessCheck:
     if not key_present:
         return ReadinessCheck(name, EvidenceStatus.UNVERIFIED, "FMP key setting is missing; endpoint was not probed")
+    if not accounting_ready:
+        return ReadinessCheck(name, EvidenceStatus.UNVERIFIED, "existing FMP request ledger is missing; endpoint was not probed")
     try:
         response = fmp_get(endpoint, params)
     except Exception as exc:  # noqa: BLE001
         return ReadinessCheck(name, EvidenceStatus.UNVERIFIED, f"request did not establish entitlement ({type(exc).__name__})")
     if isinstance(response, (list, tuple)) and response and isinstance(response[0], dict):
         record = response[0]
-        required_fields = {"symbol", "date", "close"} if endpoint == "historical-price-eod/full" else {"symbol", "date", "revenue"}
-        missing_fields = sorted(field for field in required_fields if record.get(field) in (None, ""))
+        earnings_fields: tuple[str, ...] = ()
+        if endpoint == "historical-price-eod/full":
+            required_fields = {"symbol", "date", "close"}
+            numeric_fields = {"close"}
+            missing_fields: list[str] = []
+        elif endpoint == "balance-sheet-statement":
+            required_fields = {"symbol", "date", "totalStockholdersEquity"}
+            numeric_fields = {"totalStockholdersEquity"}
+            missing_fields = []
+        elif params.get("period") == "annual":
+            required_fields = {"symbol", "date", "revenue", "netIncome"}
+            numeric_fields = {"revenue", "netIncome"}
+            missing_fields = []
+        else:
+            required_fields = {"symbol", "date", "revenue"}
+            numeric_fields = {"revenue"}
+            missing_fields = []
+            earnings_fields = ("epsDiluted", "eps", "netIncome")
+        missing_fields.extend(sorted(field for field in required_fields if record.get(field) in (None, "")))
+        for field in sorted(numeric_fields):
+            try:
+                value = float(record[field])
+                invalid = not math.isfinite(value)
+                if endpoint == "balance-sheet-statement":
+                    invalid = invalid or value <= 0
+                if invalid:
+                    missing_fields.append(f"finite_{field}")
+            except (KeyError, TypeError, ValueError):
+                missing_fields.append(f"numeric_{field}")
+        if earnings_fields and not any(_is_finite_number(record.get(field)) for field in earnings_fields):
+            missing_fields.append("numeric_earnings_metric")
         if str(record.get("symbol", "")).upper() != str(params.get("symbol", "")).upper():
             missing_fields.append("matching_symbol")
         if missing_fields:
@@ -313,7 +697,7 @@ def _check_fmp_records(
                 EvidenceStatus.UNVERIFIED,
                 f"endpoint response did not establish required sample fields: {', '.join(missing_fields)}",
             )
-        detail = f"endpoint returned {len(response)} usable record(s) for the representative probe"
+        detail = f"endpoint returned {len(response)} representative record(s); wider coverage remains unverified"
         if endpoint == "historical-price-eod/full":
             detail += "; this entitlement probe is separate from the app's Alpaca price source"
         return ReadinessCheck(name, EvidenceStatus.PASS, detail)
@@ -322,6 +706,13 @@ def _check_fmp_records(
         EvidenceStatus.UNVERIFIED,
         "endpoint returned no usable records; entitlement is not established (empty data and access failures are indistinguishable)",
     )
+
+
+def _is_finite_number(value: object) -> bool:
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
 
 
 def _check_execution_store_read_only() -> ReadinessCheck:
@@ -804,14 +1195,14 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_parser.add_argument(
         "--probe-external",
         action="store_true",
-        help="Make one Alpaca account read and one each of the FMP statement and price endpoints",
+        help="Make up to three read-only Alpaca reads and four bounded FMP requests",
     )
     checklist_parser = subparsers.add_parser("checklist", help="Run the full pre-paper-trading checklist")
     checklist_parser.add_argument("--limit", type=int, default=10, help="Rows to inspect in store/signal checks")
     checklist_parser.add_argument(
         "--probe-external",
         action="store_true",
-        help="Make one Alpaca account read and one each of the FMP statement and price endpoints",
+        help="Make up to three read-only Alpaca reads and four bounded FMP requests",
     )
 
     status_parser = subparsers.add_parser("status", help="Show paper account, signals, and workflow status")

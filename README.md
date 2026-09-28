@@ -408,8 +408,10 @@ python paper_trading_console.py checklist
 
 These commands report configuration presence separately from provider access,
 preserve missing evidence as `UNVERIFIED`, and inspect an existing SQLite store
-read-only. They do not initialize a missing store. Exit code `2` means required
-readiness evidence remains unverified; it is not a readiness approval.
+read-only. They require an explicit absolute `EXECUTION_STORE_DB_PATH` binding
+before they can attest the selected operational store. They do not initialize a
+missing store. Exit code `2` means required readiness evidence remains
+unverified; it is not a readiness approval.
 
 Provider checks require an explicit opt-in:
 
@@ -417,10 +419,19 @@ Provider checks require an explicit opt-in:
 python paper_trading_console.py doctor --probe-external
 ```
 
-That command makes one Alpaca paper-account operation and one each of the FMP
-statement and historical-price endpoint operations. FMP checks can consume the
-configured request allowance. The FMP price entitlement result is separate
-from the application's active market-price source, which is Alpaca.
+That command makes at most three read-only Alpaca operations (account,
+positions, open orders; open orders are capped at 500) and four logical FMP
+requests (quarterly income, annual income, annual balance sheet, historical price). Broker inventory is compared
+with the explicitly bound existing workflow store; disagreements are reported
+without repair. Reaching the open-order cap, a missing or unreadable store, or
+incomplete broker reads keeps reconciliation `UNVERIFIED`. The FMP probes require the existing request
+ledger and use the existing data-client accounting; they can consume request
+allowance. Free-plan transport retries are disabled, so the four logical
+requests produce at most four HTTP attempts. Paid-plan transport retries are
+bounded by `HTTP_RETRY_TOTAL` (five retries plus the initial attempt per
+endpoint). The FMP price entitlement result is separate from the application's
+active market-price source, which is Alpaca. A false `ALPACA_PAPER` setting
+refuses all provider probes.
 
 For a fresh no-order strategy observation:
 
