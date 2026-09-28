@@ -257,6 +257,24 @@ def _create_reconciliation_store(path: Path, *, position: tuple[str, str, float]
                 "INSERT INTO workflow_order_refs VALUES (1, ?, ?, 'order-1', 'client-1', 'protective_stop', 'now')",
                 (workflow_id, symbol),
             )
+            connection.execute(
+                """
+                INSERT INTO workflow_transitions
+                    (id, timestamp_utc, workflow_id, symbol, from_state, to_state, event, details_json)
+                VALUES (1, 'now', ?, ?, 'buy_fill_received', 'protective_stop_active',
+                    'protective_stop_reconciled', ?)
+                """,
+                (
+                    workflow_id,
+                    symbol,
+                    json.dumps({
+                        "success": True,
+                        "stop_order_id": "order-1",
+                        "client_order_id": "client-1",
+                        "stop_price": 90,
+                    }),
+                ),
+            )
 
 
 def test_broker_reconciliation_never_passes_without_store(tmp_path: Path, monkeypatch) -> None:
@@ -360,6 +378,169 @@ def test_broker_reconciliation_fails_for_wrong_workflow_state_or_orphan_stop(
 
     assert reconciliation.status is console.EvidenceStatus.FAIL
     assert "workflow_state:AAPL" in reconciliation.detail
+
+
+@pytest.mark.parametrize(
+    ("workflow_state", "notification_sent"),
+    [
+        ("buy_fill_notification_pending", None),
+        ("buy_fill_notification_sent", True),
+        ("buy_fill_notification_failed", False),
+    ],
+)
+def test_broker_reconciliation_accepts_notification_state_after_durable_stop(
+    tmp_path: Path,
+    monkeypatch,
+    workflow_state: str,
+    notification_sent: bool | None,
+) -> None:
+    store = tmp_path / "execution.sqlite3"
+    _create_reconciliation_store(store, position=("AAPL", "wf-1", 2))
+    with sqlite3.connect(store) as connection:
+        connection.execute("UPDATE workflow_snapshots SET state=?", (workflow_state,))
+        connection.execute(
+            """
+            INSERT INTO workflow_transitions
+                (id, timestamp_utc, workflow_id, symbol, from_state, to_state, event, details_json)
+            VALUES (2, 'later', 'wf-1', 'AAPL', 'protective_stop_active',
+                'buy_fill_notification_pending', 'buy_fill_notification_claimed', '{"channel":"email"}')
+            """
+        )
+        if notification_sent is not None:
+            connection.execute(
+                """
+                INSERT INTO workflow_transitions
+                    (id, timestamp_utc, workflow_id, symbol, from_state, to_state, event, details_json)
+                VALUES (3, 'later', 'wf-1', 'AAPL', 'buy_fill_notification_pending', ?, 'buy_fill_notified', ?)
+                """,
+                (
+                    workflow_state,
+                    json.dumps({"channel": "email", "sent": notification_sent}),
+                ),
+            )
+    monkeypatch.setenv("EXECUTION_STORE_DB_PATH", str(store))
+    monkeypatch.setattr(console.settings, "EXECUTION_STORE_DB_PATH", str(store))
+    stop = SimpleNamespace(
+        symbol="AAPL", id="order-1", client_order_id="client-1", side="sell", type="stop",
+        qty="2", filled_qty="0", status="new", time_in_force="gtc",
+    )
+
+    _, _, reconciliation = console._check_broker_inventory(
+        positions_reader=lambda: [SimpleNamespace(symbol="AAPL", qty=2)],
+        orders_reader=lambda: [stop],
+        paper_mode=True,
+        account_identity_verified=True,
+        store_ready=True,
+    )
+
+    assert reconciliation.status is console.EvidenceStatus.PASS
+
+
+def test_broker_reconciliation_requires_durable_stop_transition_matching_current_stop(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store = tmp_path / "execution.sqlite3"
+    _create_reconciliation_store(store, position=("AAPL", "wf-1", 2))
+    with sqlite3.connect(store) as connection:
+        connection.execute(
+            "UPDATE workflow_snapshots SET state='buy_fill_notification_sent'"
+        )
+        connection.execute(
+            "UPDATE workflow_transitions SET details_json=? WHERE event='protective_stop_reconciled'",
+            (json.dumps({"success": True, "stop_order_id": "old-order", "client_order_id": "old-client"}),),
+        )
+    monkeypatch.setenv("EXECUTION_STORE_DB_PATH", str(store))
+    monkeypatch.setattr(console.settings, "EXECUTION_STORE_DB_PATH", str(store))
+    stop = SimpleNamespace(
+        symbol="AAPL", id="order-1", client_order_id="client-1", side="sell", type="stop",
+        qty="2", filled_qty="0", status="new", time_in_force="gtc",
+    )
+
+    _, _, reconciliation = console._check_broker_inventory(
+        positions_reader=lambda: [SimpleNamespace(symbol="AAPL", qty=2)],
+        orders_reader=lambda: [stop],
+        paper_mode=True,
+        account_identity_verified=True,
+        store_ready=True,
+    )
+
+    assert reconciliation.status is console.EvidenceStatus.FAIL
+    assert "protective_stop_history:AAPL" in reconciliation.detail
+
+
+def test_broker_reconciliation_rejects_owned_open_sell_alongside_protective_stop(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store = tmp_path / "execution.sqlite3"
+    _create_reconciliation_store(store, position=("AAPL", "wf-1", 2))
+    with sqlite3.connect(store) as connection:
+        connection.execute(
+            "INSERT INTO workflow_order_refs VALUES (2, 'wf-1', 'AAPL', 'exit-1', 'wf-1-exit', 'exit_order', 'now')"
+        )
+    monkeypatch.setenv("EXECUTION_STORE_DB_PATH", str(store))
+    monkeypatch.setattr(console.settings, "EXECUTION_STORE_DB_PATH", str(store))
+    stop = SimpleNamespace(
+        symbol="AAPL", id="order-1", client_order_id="client-1", side="sell", type="stop",
+        qty="2", filled_qty="0", status="new", time_in_force="gtc",
+    )
+    exit_order = SimpleNamespace(
+        symbol="AAPL", id="exit-1", client_order_id="wf-1-exit", side="sell", type="limit",
+        qty="2", filled_qty="0", status="new", time_in_force="day",
+    )
+
+    _, _, reconciliation = console._check_broker_inventory(
+        positions_reader=lambda: [SimpleNamespace(symbol="AAPL", qty=2)],
+        orders_reader=lambda: [stop, exit_order],
+        paper_mode=True,
+        account_identity_verified=True,
+        store_ready=True,
+    )
+
+    assert reconciliation.status is console.EvidenceStatus.FAIL
+    assert "open_sell_order:AAPL" in reconciliation.detail
+
+
+@pytest.mark.parametrize(
+    ("workflow_state", "expected_status"),
+    [
+        ("signal_accepted", console.EvidenceStatus.FAIL),
+        ("order_submitted", console.EvidenceStatus.PASS),
+    ],
+)
+def test_broker_reconciliation_checks_open_entry_workflow_state(
+    tmp_path: Path,
+    monkeypatch,
+    workflow_state: str,
+    expected_status: console.EvidenceStatus,
+) -> None:
+    store = tmp_path / "execution.sqlite3"
+    _create_reconciliation_store(store)
+    with sqlite3.connect(store) as connection:
+        connection.execute(
+            "INSERT INTO workflow_snapshots VALUES ('wf-entry', 'MSFT', ?, '', NULL, 'now', 'now')",
+            (workflow_state,),
+        )
+        connection.execute(
+            "INSERT INTO workflow_order_refs VALUES (1, 'wf-entry', 'MSFT', 'entry-1', 'wf-entry', 'entry_order', 'now')"
+        )
+    monkeypatch.setenv("EXECUTION_STORE_DB_PATH", str(store))
+    monkeypatch.setattr(console.settings, "EXECUTION_STORE_DB_PATH", str(store))
+    entry_order = SimpleNamespace(
+        symbol="MSFT", id="entry-1", client_order_id="wf-entry", side="buy", type="limit",
+        qty="2", filled_qty="0", status="new", time_in_force="day",
+    )
+
+    _, _, reconciliation = console._check_broker_inventory(
+        positions_reader=lambda: [],
+        orders_reader=lambda: [entry_order],
+        paper_mode=True,
+        account_identity_verified=True,
+        store_ready=True,
+    )
+
+    assert reconciliation.status is expected_status
+    if expected_status is console.EvidenceStatus.FAIL:
+        assert "entry_order_state:MSFT" in reconciliation.detail
 
 
 def test_execution_store_binding_requires_absolute_existing_env_path(tmp_path: Path, monkeypatch) -> None:

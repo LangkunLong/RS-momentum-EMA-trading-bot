@@ -58,6 +58,14 @@ from setup_windows_task import TASK_NAME, _schtasks, register_task, show_status
 PROJECT_DIR = Path(__file__).resolve().parent
 SCAN_RESULTS_DIR = PROJECT_DIR / settings.RESULTS_DIR
 READINESS_OPEN_ORDER_LIMIT = 500
+READINESS_PROTECTED_POSITION_WORKFLOW_STATES = frozenset(
+    {
+        "protective_stop_active",
+        "buy_fill_notification_pending",
+        "buy_fill_notification_sent",
+        "buy_fill_notification_failed",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -501,6 +509,14 @@ def _compare_broker_inventory_with_store(
             snapshot_rows = connection.execute(
                 "SELECT workflow_id, symbol, state FROM workflow_snapshots"
             ).fetchall()
+            stop_transition_rows = connection.execute(
+                """
+                SELECT workflow_id, symbol, to_state, details_json
+                FROM workflow_transitions
+                WHERE event = 'protective_stop_reconciled'
+                ORDER BY id
+                """
+            ).fetchall()
             ref_rows = connection.execute(
                 "SELECT workflow_id, symbol, broker_order_id, client_order_id, order_role FROM workflow_order_refs"
             ).fetchall()
@@ -538,6 +554,20 @@ def _compare_broker_inventory_with_store(
             continue
         workflows[workflow_id] = (symbol, str(raw_state or ""))
 
+    latest_stop_transition: dict[str, tuple[str, str, dict[str, object] | None]] = {}
+    for raw_workflow_id, raw_symbol, raw_state, raw_details in stop_transition_rows:
+        workflow_id = str(raw_workflow_id or "").strip()
+        symbol = str(raw_symbol or "").strip().upper()
+        try:
+            details = json.loads(str(raw_details or "{}"))
+        except (TypeError, ValueError):
+            details = None
+        latest_stop_transition[workflow_id] = (
+            symbol,
+            str(raw_state or ""),
+            details if isinstance(details, dict) else None,
+        )
+
     refs: set[tuple[str, str, str, str, str]] = set()
     for raw_workflow_id, raw_symbol, raw_broker_id, raw_client_id, raw_role in ref_rows:
         refs.add((
@@ -564,7 +594,12 @@ def _compare_broker_inventory_with_store(
             conflicts.append(f"position:{symbol}")
             continue
         workflow_id = local[symbol][0]
-        if workflows.get(workflow_id) != (symbol, "protective_stop_active"):
+        workflow = workflows.get(workflow_id)
+        if (
+            workflow is None
+            or workflow[0] != symbol
+            or workflow[1] not in READINESS_PROTECTED_POSITION_WORKFLOW_STATES
+        ):
             conflicts.append(f"workflow_state:{symbol}")
 
     stop_orders: dict[str, list[tuple[object, str, str, str]]] = {}
@@ -575,23 +610,46 @@ def _compare_broker_inventory_with_store(
         if not broker_id and not client_id:
             conflicts.append(f"unidentified_order:{symbol or 'unknown'}")
             continue
-        owners = {
+        matched_refs = {
             (workflow_id, ref_symbol, role)
             for workflow_id, ref_symbol, ref_broker_id, ref_client_id, role in refs
             if (broker_id and ref_broker_id == broker_id) or (client_id and ref_client_id == client_id)
         }
+        owners = {(workflow_id, ref_symbol) for workflow_id, ref_symbol, _ in matched_refs}
         if len(owners) != 1:
             conflicts.append(f"order_ownership:{symbol or 'unknown'}")
         owner_workflow = next(iter(owners))[0] if len(owners) == 1 else ""
+        owner_symbol = next(iter(owners))[1] if len(owners) == 1 else ""
+        owner_roles = {role for _, _, role in matched_refs}
         if len(owners) == 1:
-            _, ref_symbol, _ = next(iter(owners))
-            if ref_symbol != symbol or workflows.get(owner_workflow, ("", ""))[0] != symbol:
+            if owner_symbol != symbol or workflows.get(owner_workflow, ("", ""))[0] != symbol:
                 conflicts.append(f"order_symbol:{symbol or 'unknown'}")
 
         side = str(getattr(order, "side", "")).split(".")[-1].lower()
         order_type = str(getattr(order, "type", "")).split(".")[-1].lower()
-        if side == "sell" and order_type in {"stop", "stop_limit"}:
+        if side == "sell" and order_type == "stop":
+            if owner_roles != {"protective_stop"}:
+                conflicts.append(f"stop_ownership:{symbol or 'unknown'}")
             stop_orders.setdefault(symbol, []).append((order, owner_workflow, broker_id, client_id))
+        elif side == "sell":
+            conflicts.append(f"open_sell_order:{symbol or 'unknown'}")
+        elif side == "buy":
+            if owner_roles not in ({"entry_order"}, {"entry_order", "buy_fill"}):
+                conflicts.append(f"entry_order_role:{symbol or 'unknown'}")
+                continue
+            owner_workflow_data = workflows.get(owner_workflow)
+            owner_state = owner_workflow_data[1] if owner_workflow_data else ""
+            local_position = local.get(symbol)
+            if local_position is None:
+                if owner_state != "order_submitted":
+                    conflicts.append(f"entry_order_state:{symbol or 'unknown'}")
+            elif (
+                local_position[0] != owner_workflow
+                or owner_state not in READINESS_PROTECTED_POSITION_WORKFLOW_STATES
+            ):
+                conflicts.append(f"entry_order_state:{symbol or 'unknown'}")
+        else:
+            conflicts.append(f"open_order_side:{symbol or 'unknown'}")
 
     for symbol, qty in broker.items():
         stops = stop_orders.get(symbol, [])
@@ -607,6 +665,29 @@ def _compare_broker_inventory_with_store(
         }
         if owner_workflow != local.get(symbol, ("", 0))[0] or owner_refs != {(owner_workflow, "protective_stop")}:
             conflicts.append(f"stop_ownership:{symbol}")
+        durable_transition = latest_stop_transition.get(owner_workflow)
+        if durable_transition is None:
+            conflicts.append(f"protective_stop_history:{symbol}")
+        else:
+            transition_symbol, transition_state, details = durable_transition
+            confirmed_order = (
+                details is not None
+                and (
+                    (bool(broker_id) and str(details.get("stop_order_id", "") or "").strip() == broker_id)
+                    or (
+                        bool(client_id)
+                        and str(details.get("client_order_id", "") or "").strip() == client_id
+                    )
+                )
+            )
+            if (
+                transition_symbol != symbol
+                or transition_state != "protective_stop_active"
+                or details is None
+                or details.get("success") is not True
+                or not confirmed_order
+            ):
+                conflicts.append(f"protective_stop_history:{symbol}")
         status = str(getattr(order, "status", "")).split(".")[-1].lower()
         time_in_force = str(getattr(order, "time_in_force", "")).split(".")[-1].lower()
         if status not in {"new", "partially_filled"} or time_in_force != "gtc" or str(getattr(order, "type", "")).split(".")[-1].lower() != "stop":

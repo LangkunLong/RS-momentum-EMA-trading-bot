@@ -421,11 +421,18 @@ python paper_trading_console.py doctor --probe-external
 
 That command makes at most three read-only Alpaca operations (account,
 positions, open orders; open orders are capped at 500) and four logical FMP
-requests (quarterly income, annual income, annual balance sheet, historical price). Broker inventory is compared
-with the explicitly bound existing workflow store; disagreements are reported
-without repair. Reaching the open-order cap, a missing or unreadable store, or
-incomplete broker reads keeps reconciliation `UNVERIFIED`. The FMP probes require the existing request
-ledger and use the existing data-client accounting; they can consume request
+requests (quarterly income, annual income, annual balance sheet, historical
+price). Broker inventory is compared with the explicitly bound existing
+workflow store; disagreements are reported
+without repair. Every returned order must have a unique local owner and a
+compatible workflow state. Any non-protective sell order blocks reconciliation;
+an entry buy must be in a submitted workflow or a protected partial-fill
+workflow. Notification states count as protected only when the latest durable
+successful stop transition matches the current broker stop and its remaining
+quantity matches the position. Reaching the open-order cap, a missing or
+unreadable store, or incomplete broker reads keeps reconciliation
+`UNVERIFIED`. The FMP probes require the existing request ledger and use the
+existing data-client accounting; they can consume request
 allowance. Free-plan transport retries are disabled, so the four logical
 requests produce at most four HTTP attempts. Paid-plan transport retries are
 bounded by `HTTP_RETRY_TOTAL` (five retries plus the initial attempt per
