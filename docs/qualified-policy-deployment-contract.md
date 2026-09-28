@@ -1,6 +1,6 @@
 # Issue #97 — Qualified policy deployment and compatibility contract
 
-**Contract draft:** v1
+**Contract:** v1, accepted as a definition on 2026-09-28
 **Source revision checked:** `c628a3af3c2c14dd684340d1b695ce91f8438842`
 **Branch:** `codex/issue-97-qualified-policy-contract`
 **Review state:** source checked; #80 confirmed canonical identity names and core defaults; #66/#80 missingness projection alignment is closed after #97 adopted the corrected rows. #80 commit `e951f676a4639a6e87c8a27c2caffc64a5913375` also records the V5 decision-snapshot `trade.qty` scale-out basis, including completed add-ons, frozen per tier intent as the paper-parity definition. Partial-fill/tier progression and lifecycle remain future adapter behavior; no current paper support is claimed. #107 runtime identity wording aligns with this proposal.
@@ -211,12 +211,12 @@ The #80 owner confirmed the canonical six identity names and said the reservatio
 
 | Dimension | Published/saved status | Current work result |
 | --- | --- | --- |
-| **Implementation** | **Not assessed** | Definition artifact drafted. No policy loader, state store, action adapter, runtime change, or deployment implementation was made or accepted. |
+| **Implementation** | **Not assessed** | Definition artifact completed and accepted. No policy loader, state store, action adapter, runtime change, or deployment implementation was made or accepted. |
 | **Required inputs** | **Not assessed** | Existing V3 contracts and #66/#80 definition material were available for this design. Current provider/account/runtime readiness remains unverified and is not an input to accept this definition. |
 | **Acceptance evidence** | **Not assessed** | An independent review mapped all three published criteria and found the definition and #66/#80 cross-contract points aligned at #80 commit `e951f676a4639a6e87c8a27c2caffc64a5913375`. Saved status remains unchanged as requested. Paper-adapter lifecycle, runtime readiness and policy promotion are not claimed; fill/tier execution remains downstream work. |
 | **Dependencies** | **Ready to start** | #97 has no registered start prerequisite. Shared-contract alignment is acceptance coordination; downstream adapter issues retain their own prerequisites and inputs. |
 
-Do not collapse these fields into one completion status. A known missing adapter, an unavailable provider field, unverified runtime, an intentional fixed-baseline choice, and open acceptance review are different states.
+Do not collapse these fields into one completion status. A known missing adapter, an unavailable provider field, unverified runtime, an intentional fixed-baseline choice, and acceptance of this definition are different states.
 
 ## Source references checked
 

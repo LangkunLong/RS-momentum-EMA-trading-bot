@@ -1,6 +1,6 @@
 # Research reproducibility and evidence index
 
-**Checked:** 2026-09-27. **Purpose:** locate canonical source, runtime identities, retained inputs and evidence for issue #81. This is an index, not a claim that historical studies were rerun or that the evaluator is currently runnable.
+**Checked:** 2026-09-27. **Accepted:** 2026-09-28 for issue #81's index scope. **Purpose:** locate canonical source, runtime identities, retained inputs and evidence. This is an index, not a claim that historical studies were rerun or that the evaluator is currently runnable.
 
 ## Start with the source identity
 

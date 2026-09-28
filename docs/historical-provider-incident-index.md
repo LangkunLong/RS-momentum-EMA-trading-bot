@@ -54,7 +54,7 @@ No reconciliation was performed for this index. Any future reconciliation requir
 
 - **Implementation:** this issue deliverable is a documentation index; no provider implementation change was needed.
 - **Required inputs:** the retained artifact root and incident records are available in the original checkout according to .artifacts/README.md and the relocation manifest. They are not present in this issue worktree.
-- **Acceptance evidence:** targeted reads of the named incident records support the identities and states above. The relocation README reports the saved 3,843-file hash verification. This index did not recalculate those hashes or change evidence. Independent acceptance review remains open; the saved issue status is not changed by this document.
+- **Acceptance evidence:** targeted reads of the named incident records support the identities and states above. The relocation README reports the saved 3,843-file hash verification. This index did not recalculate those hashes or change evidence. The owner accepted this truthful index on 2026-09-28 while the four primary actual costs remain unknown.
 - **Dependencies:** ready to start as recorded in the issue register. Historical billing reconciliation is not required to accept a truthful index.
 
 ## Records reviewed
