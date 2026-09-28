@@ -62,6 +62,19 @@ Each worker starts at `2c01e76` in a separate worktree. On 2026-09-28, fresh rea
 | #67 | Reporter, corrected freshness alignment, fixed histories and full development measurement complete | Artificial records and exact retained S&P-only V2 bundle available; production union is outside reporter implementation | The four published criteria pass bounded local review; actual per-decision policy consumption and production coverage are not established; GitHub issue remains open pending publication | #66 accepted; #71 calculator v2 bound in the report |
 | #82 | Existing V5 simulator/evaluator/workers retained; focused tests and receipt integrated | Artificial bars, policies and declared synthetic costs available; Docker Engine unavailable | 15 integrated focused checks passed; actual candidate sandbox execution and pinned image availability remain unverified; issue remains open | #80 and #81 accepted on starting main |
 | #68 | Exact authenticated rename-boundary fix, tests and source receipt integrated | S&P events retained; explicit V3 price transitions plus admitted full Nasdaq and Russell dated history absent | 14 integrated focused checks and 13 source hashes verified; no complete three-index lineage artifact or production acceptance; issue remains open | #66 accepted; later production joins consume an accepted lineage artifact |
-| #71 | Adjacent-quarter acceleration/freshness corrections and calculator v2 integrated; annual growth and ROE dispositions documented | Fixed financial histories and exact retained development bundle available | 29 integrated focused checks and portable identities verified; measured feature-output impact, not policy/trade error; three unrelated broader parity failures recorded; issue remains open | #66 accepted; #67 binds corrected identity |
+| #71 | Adjacent-quarter acceleration/freshness corrections and calculator v2 integrated; annual growth and ROE dispositions documented | Fixed financial histories and exact retained development bundle available | Four published criteria pass bounded local review; 29 focused checks and portable identities verified; three broader failures are proven pre-existing and remain unresolved; GitHub issue remains open pending publication | #66 accepted; #67 binds corrected identity |
+
+The three #71 broader parity failures were run at both accepted starting main
+`2c01e76a878a338ab2b743c38c4f1310aab3f75b` and the integrated source
+`4bf32a3a327421b62d8977b4f4109b0341955e29`. Both revisions produced the
+same two `entry market context is invalid` failures and one `schema_version`
+KeyError. The failing test file and both origin files have identical Git blob
+identities and SHA-256 values across revisions; the changed #71 module is
+absent from all three traces. The lead independently checked those six
+revision/blob comparisons and reran the three failing cases on the integrated
+branch. The exact audit is in
+`docs/historical-financial-parity-baseline-audit-issue71.md` and its JSON
+companion. These failures predate #71; they are not represented as passing or
+silently fixed.
 
 No provider/model/broker calls, paper environment mutation, historical cost-goal restart, lowered production gate or scheduled check is authorized by this work. #107 remains with task `01a0e4f0-ab3b-7b52-a933-3b6779300819`.

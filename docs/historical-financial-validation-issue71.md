@@ -2,8 +2,8 @@
 
 Issue #71 validates annual growth, quarterly acceleration, ROE, freshness,
 fiscal matching, and revision timing against the accepted #66 contract. This is
-a local implementation and evidence report; lead review and issue acceptance
-remain separate.
+a local implementation and evidence report. The later bounded lead review is
+recorded below; GitHub publication and issue closure remain separate.
 
 ## Identities and inputs
 
@@ -134,7 +134,8 @@ missing-observation behavior independently.
 - **Acceptance evidence:** Reproductions, before/after feature-output counts,
   identities, and focused checks are available for lead review. The three
   broader parity failures above remain unresolved outside this file scope;
-  issue #71 acceptance has not been asserted here.
+  the original worker receipt did not assert acceptance; the later bounded
+  lead review appears below.
 - **Dependencies:** Satisfied for start and this scoped result. The accepted
   #66 contract is present at the starting revision; no additional unconditional
   child dependency applies.
@@ -143,3 +144,24 @@ missing-observation behavior independently.
 coverage/research artifacts must bind `pit-financial-features-v2` through the
 shared feature identity owned by #80; the #67 owner has been notified. Older
 artifacts remain bound to their original source identities.
+
+## Bounded acceptance review
+
+The lead reviewed the published #71 criteria on the integrated source. The
+bounded financial-semantics validation is accepted locally:
+
+| Published criterion | Review result |
+| --- | --- |
+| Skipped periods, adjacent-quarter acceleration, income/equity alignment and restated older periods | Pass. Fixed cases and period traces cover each condition. |
+| Each observed mismatch has a reproducible case and bounded correction or documented modeling decision | Pass. Skipped-quarter acceleration and empty-newer-quarter freshness were corrected; skipped annual years and unmatched ROE periods have explicit accepted #66 dispositions. |
+| Historical impact measured before retrospective error claims; changed definitions versioned | Pass. The same retained development bundle was evaluated before and after the correction, with 138,038 earnings-acceleration and 158,883 revenue-acceleration priced security-sessions changing to unavailable. These are feature outputs, not trading errors. Calculator identity is `pit-financial-features-v2`. |
+| Corrected identity and newly comparable results, with old reports preserved | Pass for the named development feature comparison. The #67 measured report binds calculator v2 and its Git blob; prior source-specific reports were not relabeled. No strategy-performance comparison is inferred. |
+
+The three broader `tests/test_fundamental_input_parity.py` failures are
+separately reproduced on accepted starting main `2c01e76` and integrated
+source `4bf32a3` in the [baseline audit](historical-financial-parity-baseline-audit-issue71.md).
+The failing tests and their `core/backtest_engine.py`/`core/pit_data.py` origin
+blobs are identical at both revisions; none of the traces enters the changed
+#71 calculator module. The failures remain real and unresolved, but they
+predate #71 and do not block this bounded semantics acceptance. GitHub issue
+closure remains pending publication of the integrated work.
