@@ -15,6 +15,7 @@ import gzip
 import hashlib
 import json
 import math
+import subprocess
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import date
@@ -292,6 +293,43 @@ def sha256_file(path: str | Path) -> str:
         for block in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _verify_committed_source(source_revision: str) -> str:
+    """Require the named source to be the clean checked-out commit.
+
+    Return the canonical Git blob ID for the financial feature module so the
+    report can bind its calculator identity independently of checkout line
+    endings.
+    """
+
+    repository = Path(__file__).resolve().parents[1]
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if head != source_revision:
+        raise ValueError("source_revision does not match the checked-out commit")
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    if status:
+        raise ValueError("coverage measurement requires a clean committed source tree")
+    calculator_blob = subprocess.run(
+        ["git", "rev-parse", f"{source_revision}:core/pit_feature_snapshot.py"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    return calculator_blob
 
 
 def resolve_asof_observation(
@@ -866,7 +904,12 @@ def _reason_for_unready(
         return None
     if raw_count == 0:
         detail = str(payload.get("reason") or "")
-        return "absent" if not detail.startswith("absent_") else detail
+        if detail.startswith("absent_") or detail in {
+            "classification_absent",
+            "missing_current_session_price",
+        }:
+            return detail
+        return "absent"
     if visible_count == 0:
         return "not_yet_public"
     return str(payload.get("reason") or "insufficient_history")
@@ -1031,6 +1074,7 @@ def build_coverage_report(
         or any(character not in "0123456789abcdef" for character in source_revision)
     ):
         raise ValueError("source_revision must be a full lowercase Git SHA-1")
+    financial_calculator_blob = _verify_committed_source(source_revision)
     bundle_file = Path(bundle_path)
     manifest_file = Path(bundle_manifest_path)
     provenance_file = Path(prices_provenance_path)
@@ -1423,13 +1467,16 @@ def build_coverage_report(
                 "FINANCIAL_FEATURE_CALCULATOR_ID",
                 "unversioned_current_source",
             ),
+            "financial_feature_calculator_source_revision": source_revision,
+            "financial_feature_calculator_git_blob": financial_calculator_blob,
+            "financial_feature_calculator_source_path": "core/pit_feature_snapshot.py",
             "relative_strength_parameters": {
                 "trading_days_per_quarter": settings.TRADING_DAYS_PER_QUARTER,
                 "quarter_weights": [settings.RS_Q1_WEIGHT, settings.RS_Q2_WEIGHT, settings.RS_Q3_WEIGHT, settings.RS_Q4_WEIGHT],
                 "short_history_fallback_minimum_closes": 60,
                 "cross_section_scope": "active dated members for each decision session",
             },
-            "financial_semantics_note": "Existing source calculators are measured without mutation. Quarterly/annual growth and ROE remain subject to the active #71 validation; regenerate interpretation after any accepted formula/version change.",
+            "financial_semantics_note": "Financial feature calculations use the recorded calculator identity, committed source revision, and canonical module Git blob above; #71 accepted validation is included in this source revision.",
             "annual_revenue_growth_note": "Report-only formula per #66: latest and immediately preceding reported annual revenue observations; not added to baseline policy.",
         },
         "four_status_assessment": {

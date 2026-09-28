@@ -4,7 +4,7 @@
 
 ## Run
 
-Run from the repository root with the matching bundle, manifest, price provenance, feature specification, and a full lowercase source commit SHA:
+Run from a clean repository root with the matching bundle, manifest, price provenance, feature specification, and a full lowercase source commit SHA. The reporter verifies that the supplied SHA is the checked-out `HEAD` and rejects a dirty source tree. The report binds the financial calculator ID to this commit and to the canonical Git blob ID for `core/pit_feature_snapshot.py`, which is stable across checkout line endings.
 
 ```powershell
 python -m core.pit_coverage `
