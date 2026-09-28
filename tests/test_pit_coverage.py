@@ -14,6 +14,7 @@ from core.pit_coverage import (
     _quarterly_revenue_state,
     _accumulate_cell,
     _finalize_accumulator,
+    _fundamental_age_state,
     _new_accumulator,
     build_coverage_report,
     classify_lookback,
@@ -77,6 +78,28 @@ def test_late_classification_requires_public_and_effective_dates() -> None:
 def test_warmup_status_uses_required_history_without_imputation() -> None:
     assert classify_lookback(49, 50) == (False, "insufficient_history")
     assert classify_lookback(50, 50) == (True, None)
+
+
+def test_fundamental_age_ignores_a_newer_all_missing_quarter_and_keeps_provenance() -> None:
+    history = pd.DataFrame(
+        [[1.2, None], [100.0, None]],
+        index=["Diluted EPS", "Total Revenue"],
+        columns=pd.to_datetime(["2024-03-31", "2024-06-30"]),
+    )
+    history.attrs[PIT_PUBLIC_DATES_ATTR] = {
+        "2024-03-31": "2024-05-01",
+        "2024-06-30": "2024-08-01",
+    }
+
+    state = _fundamental_age_state(history, date(2024, 9, 2))
+
+    assert coverage.pit_feature_snapshot_module._fundamental_age_days(
+        history, date(2024, 9, 2)
+    ) == 124
+    assert state["calculable"] is True
+    assert state["available_history"] == 1
+    assert state["selected_period_ends"] == ["2024-03-31"]
+    assert state["selected_available_from_sessions"] == ["2024-05-01"]
 
 
 def test_latest_unmatched_quarter_is_not_replaced_by_an_older_match() -> None:

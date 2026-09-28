@@ -545,6 +545,45 @@ def _selected_public_dates(frame: pd.DataFrame, periods: Iterable[Any]) -> list[
     return sorted(set(dates))
 
 
+def _latest_observed_quarterly_public_period(
+    quarterly: pd.DataFrame,
+) -> tuple[str, str] | None:
+    """Return the latest public/period pair with at least one observed fact."""
+
+    raw_public_dates = quarterly.attrs.get(PIT_PUBLIC_DATES_ATTR, {})
+    candidates: list[tuple[date, date]] = []
+    for column in quarterly.columns:
+        period_timestamp = pd.Timestamp(column)
+        if pd.isna(period_timestamp):
+            raise ValueError("PIT quarterly period provenance is invalid")
+        period = period_timestamp.date()
+        values = quarterly.loc[:, column].to_numpy().ravel()
+        if not any(not pd.isna(value) for value in values):
+            continue
+        public_text = raw_public_dates.get(period.isoformat())
+        if not isinstance(public_text, str):
+            raise ValueError("PIT quarterly fundamentals are missing public-date provenance")
+        candidates.append((date.fromisoformat(public_text), period))
+    if not candidates:
+        return None
+    public_date, period = max(candidates)
+    return period.isoformat(), public_date.isoformat()
+
+
+def _fundamental_age_state(quarterly: pd.DataFrame, session: date) -> dict[str, Any]:
+    age = pit_feature_snapshot_module._fundamental_age_days(quarterly, session)
+    latest = _latest_observed_quarterly_public_period(quarterly)
+    return _feature_state(
+        calculated=age,
+        reason="absent_visible_quarterly_observation",
+        required_history=1,
+        available_history=int(age is not None),
+        selected_periods=() if latest is None else (latest[0],),
+        selected_public_dates=() if latest is None else (latest[1],),
+        lookback_ready=age is not None,
+    )
+
+
 def _latest_matched_periods(series: pd.Series | None, limit: int) -> tuple[Any, ...]:
     if series is None:
         return ()
@@ -767,15 +806,7 @@ def _financial_states(
             ),
         )
 
-        quarterly_dates = quarterly.attrs.get(PIT_PUBLIC_DATES_ATTR, {})
-        newest_quarter_date = None
-        if isinstance(quarterly_dates, Mapping) and quarterly_dates:
-            newest_quarter_date = max(str(value) for value in quarterly_dates.values())
-        fundamental_age = (
-            (boundary - date.fromisoformat(newest_quarter_date)).days
-            if newest_quarter_date is not None
-            else None
-        )
+        fundamental_age = _fundamental_age_state(quarterly, boundary)
 
         def company_state(
             feature: str,
@@ -824,14 +855,7 @@ def _financial_states(
                 and company.get("prev_institution_count") is not None
                 else None,
             ),
-            "fundamental_age_days": _feature_state(
-                calculated=fundamental_age,
-                reason="absent_visible_quarterly_observation",
-                required_history=1,
-                available_history=int(fundamental_age is not None),
-                selected_public_dates=(() if newest_quarter_date is None else (newest_quarter_date,)),
-                lookback_ready=(fundamental_age is not None),
-            ),
+            "fundamental_age_days": fundamental_age,
         }
         states[ticker].append((boundary, state))
     return dict(states)
