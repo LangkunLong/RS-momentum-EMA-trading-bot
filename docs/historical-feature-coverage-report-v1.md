@@ -132,3 +132,24 @@ measurement.
 | Required inputs | Artificial histories and the retained authenticated development bundle were available. A production three-index bundle is not required to implement or measure this reporter. |
 | Acceptance evidence | The four published criterion checks have fixed and measured evidence above. Actual per-decision consumption was not replayed; production coverage and issue closure are not claimed. |
 | Dependencies | Accepted #66 was present at the starting revision. #71's corrected calculator identity is bound in this result. |
+
+## Bounded acceptance review
+
+The lead reviewed the published #67 criteria against the integrated reporter,
+fixed-history tests, exact-source development run, and independently checked
+output. The bounded **reporter** result is accepted locally:
+
+| Published criterion | Review result |
+| --- | --- |
+| Explicit denominators and exclusions for each field and calculation | Pass. Each of 20 fields has source, publication, lookback, calculation, and policy-input counts over 631,965 dated member security-sessions; excluded benchmarks and missing inputs are identified. |
+| Meaningful missing-period, late-classification, restatement, and warm-up checks | Pass. Fixed cases exercise each condition, including the #71 all-missing newer-quarter correction. |
+| A freshly measured development denominator | Pass. The reporter produced 1,255 decision sessions and 631,965 member security-sessions; an independent event sweep and gzip row count matched. |
+| Fixed-history market, price-RS, and industry denominators with missing benchmark/price/classification cases | Pass. The synthetic report case checks all three denominators and explicit unavailable reasons. |
+
+This acceptance is limited to the reporter and the named development artifact.
+`policy_input_stage` means a calculated value is available to its declared
+interface. `declared_policy_consumer_status` and `consumer_paths` describe
+known code paths. `actual_policy_consumption` remains
+`not_measured_no_policy_replay` for every row; no per-decision read or strategy
+effect is inferred. The result does not accept a production data bundle or the
+three-index universe. GitHub publication and issue closure remain separate.
