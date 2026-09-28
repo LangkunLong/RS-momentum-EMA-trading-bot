@@ -10,10 +10,11 @@ that contains no row after the completed ``session``.  Price formulas are:
 * volume ratio: session volume / mean volume over the prior 50 sessions.
 
 Quarterly earnings/sales acceleration is the newest year-over-year growth rate
-minus the immediately preceding quarter's year-over-year growth rate.  A
-fundamental's age is measured from the newest visible quarterly public date,
-never from its period end.  Missing observations become ``None``; observed
-booleans, NaN, or infinities fail closed.
+minus the immediately preceding fiscal quarter's year-over-year growth rate;
+an intervening missing quarter makes acceleration unavailable. A fundamental's
+age is measured from the newest visible quarterly observation's normalized
+first-usable session, never from its period end. Missing observations become
+``None``; observed booleans, NaN, or infinities fail closed.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ from core.pit_universe_v3 import UNIVERSE_IDS
 
 _REFERENCE_SYMBOLS = frozenset({"SPY", "QQQ", "IWM"})
 _EPS_LABELS = ("Diluted EPS", "Basic EPS", "Net Income")
+FINANCIAL_FEATURE_CALCULATOR_ID = "pit-financial-features-v2"
 _DEFERRED_FEATURE_IMPORTS = {
     "match_fiscal_year_over_year_periods": "core.canslim.fiscal_periods",
     "calculate_group_rs": "core.canslim.l_leader_laggard",
@@ -455,6 +457,10 @@ def _growth_acceleration(series: pd.Series) -> float | None:
     matches = _resolve_deferred_feature("match_fiscal_year_over_year_periods")(series)
     if len(matches) < 2 or not matches[0].matched or not matches[1].matched:
         return None
+    newest_quarter = pd.Period(matches[0].current_period, freq="Q")
+    previous_quarter = pd.Period(matches[1].current_period, freq="Q")
+    if newest_quarter.ordinal - previous_quarter.ordinal != 1:
+        return None
     newest = _growth(matches[0].current_value, matches[0].prior_value)
     previous = _growth(matches[1].current_value, matches[1].prior_value)
     if newest is None or previous is None:
@@ -474,14 +480,35 @@ def _growth(current: object, prior: object) -> float | None:
 
 
 def _fundamental_age_days(quarterly: pd.DataFrame, session: date) -> int | None:
+    observed_periods: set[date] = set()
+    for column in quarterly.columns:
+        try:
+            timestamp = pd.Timestamp(column)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("PIT quarterly period provenance is invalid") from exc
+        if pd.isna(timestamp):
+            raise ValueError("PIT quarterly period provenance is invalid")
+        values = quarterly.loc[:, column].to_numpy().ravel()
+        for value in values:
+            if value is None:
+                continue
+            try:
+                missing = pd.isna(value)
+            except (TypeError, ValueError):
+                missing = False
+            if isinstance(missing, (bool, np.bool_)) and missing:
+                continue
+            observed_periods.add(timestamp.date())
+            break
+
     raw_public_dates = quarterly.attrs.get(PIT_PUBLIC_DATES_ATTR)
     if raw_public_dates is None:
-        if quarterly.empty:
+        if not observed_periods:
             return None
         raise ValueError("PIT quarterly fundamentals are missing public-date provenance")
     if not isinstance(raw_public_dates, Mapping):
         raise ValueError("PIT quarterly public-date provenance is invalid")
-    public_dates: list[date] = []
+    public_dates_by_period: dict[date, date] = {}
     for raw_period, raw_public_date in raw_public_dates.items():
         if not isinstance(raw_period, str) or not isinstance(raw_public_date, str):
             raise ValueError("PIT quarterly public-date provenance is invalid")
@@ -492,7 +519,17 @@ def _fundamental_age_days(quarterly: pd.DataFrame, session: date) -> int | None:
             raise ValueError("PIT quarterly public-date provenance is invalid") from exc
         if public_date <= period or public_date > session:
             raise ValueError("PIT quarterly public date is outside the causal session")
-        public_dates.append(public_date)
+        public_dates_by_period[period] = public_date
+    missing_periods = observed_periods.difference(public_dates_by_period)
+    if missing_periods:
+        period = min(missing_periods)
+        raise ValueError(
+            f"PIT quarterly fundamentals have no public date for {period.isoformat()}"
+        )
+    public_dates = [
+        public_dates_by_period[period]
+        for period in observed_periods
+    ]
     if not public_dates:
         return None
     return (session - max(public_dates)).days
