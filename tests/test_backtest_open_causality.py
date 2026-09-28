@@ -5,9 +5,24 @@ from dataclasses import dataclass
 import pandas as pd
 import pytest
 
-from core.backtest_engine import PendingEntry, PortfolioSimulator, Trade, _calculate_rs_snapshot
+from core.backtest_engine import (
+    PendingEntry,
+    PortfolioSimulator,
+    SimulationResultV5,
+    Trade,
+    _calculate_rs_snapshot,
+)
+from core.backtest_fills import ExecutionProfileV5, FrictionScenario
 from core.momentum_analysis import calculate_rs_snapshot
-from core.strategy_policy import BenchmarkContextV1, CapacityDecision, MarketContextV1
+from core.strategy_policy import (
+    BenchmarkContextV1,
+    CapacityDecision,
+    ExitAction,
+    ExitDecision,
+    ExitSnapshot,
+    MarketContextV1,
+)
+from core.strategy_policy.runtime import InProcessPolicyClient
 
 
 _CONTEXT_SYMBOLS = tuple(f"CTX{number:02d}" for number in range(10))
@@ -506,3 +521,236 @@ def test_pivotless_pending_entry_requires_exact_next_session_open(bar_state: str
 
     assert simulator._transactions == []
     assert simulator._entry_outcomes[-1].outcome == "entry_rejected_missing_data"
+
+
+_RESEARCH_03_V5_EXECUTION_INPUTS = {
+    "schema_version": 1,
+    "symbol": "LEAD",
+    "evaluation_dates": ["2026-06-01", "2026-06-02", "2026-06-03"],
+    "evaluation_sessions": 30,
+    "warmup_sessions": 260,
+    "initial_capital": 10_000.0,
+    "position_risk_fraction": 0.01,
+    "stop_loss_fraction": 0.08,
+    "signal_close": 102.0,
+    "entry_open": 100.0,
+    "policy_action": "close",
+    "policy_reason": "policy_exit",
+    "exit_bars": {
+        "next_open": {"open": 103.0, "low": 101.0, "close": 102.0},
+        "gap_stop": {"open": 80.0, "low": 75.0, "close": 79.0},
+    },
+    "friction": {
+        "scenario_id": "fixture-10-20-10-bps",
+        "half_spread_bps": 10,
+        "market_impact_bps": 20,
+        "commission_bps": 10,
+    },
+}
+
+
+class _CloseAtNextOpportunityClient(InProcessPolicyClient):
+    def __init__(self, exit_snapshots: list[ExitSnapshot]) -> None:
+        self.exit_snapshots = exit_snapshots
+
+    def evaluate_exit(self, snapshot: ExitSnapshot) -> ExitDecision:
+        self.exit_snapshots.append(snapshot)
+        return ExitDecision(
+            actions=(ExitAction("close", None, None, "policy_exit"),),
+            next_stop_price=None,
+            early_winner_hold=snapshot.early_winner_hold,
+            scale_out_tier=snapshot.scale_out_tier,
+            breakeven_armed=snapshot.breakeven_armed,
+            ema_trailing_active=snapshot.ema_trailing_active,
+        )
+
+
+@pytest.mark.parametrize(
+    (
+        "exit_bar",
+        "expected_reason",
+        "expected_sell_reference",
+        "expected_cash",
+        "expected_total_friction",
+        "expected_preempted",
+        "expected_executed_next_open",
+        "expected_stop_kind",
+    ),
+    [
+        (
+            _RESEARCH_03_V5_EXECUTION_INPUTS["exit_bars"]["next_open"],
+            "policy_exit",
+            103.0,
+            10_027.24,
+            10.11,
+            0,
+            1,
+            None,
+        ),
+        (
+            _RESEARCH_03_V5_EXECUTION_INPUTS["exit_bars"]["gap_stop"],
+            "stop_loss",
+            80.0,
+            9_742.03,
+            8.96,
+            1,
+            0,
+            "gap_stop",
+        ),
+    ],
+    ids=("policy-next-open", "gap-stop-preempts-policy"),
+)
+def test_v5_portfolio_fills_at_next_open_and_gap_stops_preempt_policy_exit(
+    monkeypatch: pytest.MonkeyPatch,
+    exit_bar: dict[str, float],
+    expected_reason: str,
+    expected_sell_reference: float,
+    expected_cash: float,
+    expected_total_friction: float,
+    expected_preempted: int,
+    expected_executed_next_open: int,
+    expected_stop_kind: str | None,
+) -> None:
+    """Break caught: V5 close timing, gap-stop ordering, fill price, or cash costs drift."""
+    evaluation_dates = pd.bdate_range(
+        "2026-06-01", periods=_RESEARCH_03_V5_EXECUTION_INPUTS["evaluation_sessions"]
+    )
+    lead = _with_warmup_and_canonical_entry(
+        _ohlcv(
+            evaluation_dates,
+            opens=[100.0, 100.0, exit_bar["open"]]
+            + [100.0] * (len(evaluation_dates) - 3),
+            closes=[100.0, 101.0, exit_bar["close"]]
+            + [100.0] * (len(evaluation_dates) - 3),
+            lows=[100.0, 99.0, exit_bar["low"]]
+            + [99.0] * (len(evaluation_dates) - 3),
+        ),
+        evaluation_dates[0],
+    )
+    full_dates = pd.DatetimeIndex(lead.index)
+    prices = {"LEAD": lead, **_reference_prices(full_dates)}
+    closes = pd.DataFrame(
+        {"LEAD": lead["Close"], **_context_closes(full_dates)}
+    )
+    fetcher = _StaticFetcher(prices, closes)
+    strategy = _DatedSignals(
+        {("LEAD", evaluation_dates[0]): _signal("LEAD", evaluation_dates[0])}
+    )
+    exit_snapshots: list[ExitSnapshot] = []
+    execution_profile = ExecutionProfileV5(
+        schema_version=5,
+        close_policy_exit_timing="next_open",
+        gap_stop_rule="open_then_stop",
+        end_of_test_rule="last_session_close",
+        friction_model="half_spread_plus_market_impact_plus_commission_bps",
+    )
+    friction_scenario = FrictionScenario(
+        scenario_id="fixture-10-20-10-bps",
+        half_spread_bps=10,
+        market_impact_bps=20,
+        commission_bps=10,
+    )
+    simulator = PortfolioSimulator(
+        initial_capital=_RESEARCH_03_V5_EXECUTION_INPUTS["initial_capital"],
+        position_risk_pct=_RESEARCH_03_V5_EXECUTION_INPUTS["position_risk_fraction"],
+        stop_loss_pct=_RESEARCH_03_V5_EXECUTION_INPUTS["stop_loss_fraction"],
+        signal_every_n_days=1,
+        technical_only=True,
+        stagnation_days=999,
+        data_fetcher=fetcher,
+        strategy=strategy,
+        policy_client_factory=lambda: _CloseAtNextOpportunityClient(exit_snapshots),
+        execution_profile=execution_profile,
+        friction_scenario=friction_scenario,
+    )
+    monkeypatch.setattr(
+        "core.backtest_engine.get_sp500_tickers", lambda: list(_CONTEXT_SYMBOLS)
+    )
+
+    result = simulator.run(
+        ["LEAD"],
+        start_date=str(evaluation_dates[0].date()),
+        end_date=str(evaluation_dates[-1].date()),
+        history_start_date=str(lead.index[0].date()),
+    )
+    assert type(result) is SimulationResultV5
+    assert len(exit_snapshots) == 1
+    assert result.config["execution_profile_sha256"] == execution_profile.sha256
+    assert result.config["friction_scenario"] == {
+        "scenario_id": "fixture-10-20-10-bps",
+        "half_spread_bps": 10,
+        "market_impact_bps": 20,
+        "commission_bps": 10,
+    }
+    assert result.transaction_log["Action"].tolist() == ["BUY", "SELL"]
+    assert result.transaction_log["Date"].tolist() == [
+        str(evaluation_dates[1].date()),
+        str(evaluation_dates[2].date()),
+    ]
+    assert result.transaction_log["Reason"].tolist()[-1] == expected_reason
+    assert result.trades[0].exit_reason == expected_reason
+    assert result.trades[0].exit_date == str(evaluation_dates[2].date())
+    assert result.fill_log["Action"].tolist() == ["BUY", "SELL"]
+    assert result.fill_log["ReferencePrice"].tolist() == [
+        100.0,
+        expected_sell_reference,
+    ]
+    assert result.fill_log["ExecutionPrice"].tolist() == pytest.approx(
+        [100.3, expected_sell_reference * 0.997]
+    )
+    friction = _RESEARCH_03_V5_EXECUTION_INPUTS["friction"]
+    risk_budget = (
+        _RESEARCH_03_V5_EXECUTION_INPUTS["initial_capital"]
+        * _RESEARCH_03_V5_EXECUTION_INPUTS["position_risk_fraction"]
+    )
+    target_notional = (
+        risk_budget / _RESEARCH_03_V5_EXECUTION_INPUTS["stop_loss_fraction"]
+    )
+    buy_execution = _RESEARCH_03_V5_EXECUTION_INPUTS["entry_open"] * (
+        1 + (friction["half_spread_bps"] + friction["market_impact_bps"]) / 10_000
+    )
+    buy_cash_per_share = buy_execution * (
+        1 + friction["commission_bps"] / 10_000
+    )
+    derived_quantity = target_notional / buy_cash_per_share
+    rounded_stop = round(
+        buy_execution
+        * (1 - _RESEARCH_03_V5_EXECUTION_INPUTS["stop_loss_fraction"]),
+        2,
+    )
+    risk_limited_quantity = risk_budget / (buy_execution - rounded_stop)
+    assert derived_quantity < risk_limited_quantity
+    assert result.fill_log["Quantity"].iloc[0] == pytest.approx(derived_quantity)
+    assert result.fill_log["Quantity"].iloc[1] == pytest.approx(derived_quantity)
+    assert result.fill_log["CashDelta"].iloc[0] == -round(target_notional, 2)
+    expected_sell_cash = round(
+        expected_sell_reference
+        * (1 - (friction["half_spread_bps"] + friction["market_impact_bps"]) / 10_000)
+        * derived_quantity
+        * (1 - friction["commission_bps"] / 10_000),
+        2,
+    )
+    assert expected_cash == pytest.approx(
+        _RESEARCH_03_V5_EXECUTION_INPUTS["initial_capital"]
+        - target_notional
+        + expected_sell_cash
+    )
+    stop_kinds = result.fill_log["StopReferenceKind"].tolist()
+    stop_prices = result.fill_log["StopPrice"].tolist()
+    assert pd.isna(stop_kinds[0])
+    assert stop_kinds[1] == expected_stop_kind
+    assert pd.isna(stop_prices[0])
+    if expected_stop_kind:
+        assert stop_prices[1] == pytest.approx(92.28)
+    else:
+        assert pd.isna(stop_prices[1])
+    assert result.fill_cost_totals["total_friction_usd"] == pytest.approx(
+        expected_total_friction
+    )
+    assert result.equity_curve.iloc[-1] == pytest.approx(expected_cash)
+    assert result.policy_intent_outcomes["queued"] == 1
+    assert result.policy_intent_outcomes["preempted_by_stop"] == expected_preempted
+    assert (
+        result.policy_intent_outcomes["executed_next_open"]
+        == expected_executed_next_open
+    )
