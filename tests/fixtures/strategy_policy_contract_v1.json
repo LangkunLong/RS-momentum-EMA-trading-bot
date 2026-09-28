@@ -1,0 +1,179 @@
+{
+  "fixture_contract": "strategy-policy-contract-v1",
+  "source_revision": "e6ca0dd3ae9915ddc9b03116d890fa9d53a85727",
+  "identity": {
+    "optimizer_version": 5,
+    "policy_interface_version": 3,
+    "historical_data_format_version": 3,
+    "schema_2_feature_use": "development_only_with_explicit_flag",
+    "legacy_pit_reader_also_accepts_schema_1": true,
+    "v5_editable_policy_paths": [
+      "core/strategy_policy/v3/entry.py",
+      "core/strategy_policy/v3/risk.py",
+      "core/strategy_policy/v3/position.py",
+      "core/strategy_policy/v3/exit.py"
+    ]
+  },
+  "market_context": {
+    "schema_version": 1,
+    "session": "2026-08-27",
+    "oneil_regime": "confirmed_uptrend",
+    "distribution_days": 2,
+    "follow_through": false,
+    "benchmarks": [
+      {"symbol": "SPY", "close_to_sma_50_fraction": 0.05, "close_to_sma_200_fraction": 0.1, "realized_volatility_20d_fraction": 0.2},
+      {"symbol": "QQQ", "close_to_sma_50_fraction": 0.05, "close_to_sma_200_fraction": 0.1, "realized_volatility_20d_fraction": 0.2},
+      {"symbol": "IWM", "close_to_sma_50_fraction": 0.05, "close_to_sma_200_fraction": 0.1, "realized_volatility_20d_fraction": 0.2}
+    ],
+    "active_constituent_count": 100,
+    "breadth_above_50_fraction": 0.6,
+    "breadth_50_coverage_fraction": 0.9,
+    "breadth_above_200_fraction": 0.55,
+    "breadth_200_coverage_fraction": 0.8,
+    "median_rs_score": 72.0,
+    "rs_at_least_80_fraction": 0.4,
+    "rs_coverage_fraction": 0.95
+  },
+  "source_availability": {
+    "source_public_date": "2026-08-26",
+    "first_eligible_session": "2026-08-27",
+    "normalized_public_date_is_already_shifted": true,
+    "expected_policy_session": "2026-08-27"
+  },
+  "missingness_projection": [
+    {
+      "detail_state": "not_yet_public",
+      "capability_state": "not_yet_public",
+      "detail": {"applies_to": "expected_source_observation", "source_public_date": "2026-08-28", "first_eligible_session": "2026-08-31", "as_of_feature_may_remain_present_from_prior_observation": true}
+    },
+    {
+      "detail_state": "absent",
+      "capability_state": "unavailable",
+      "detail": {"source_or_scope_searched": "supported filing source for issuer and period"}
+    },
+    {
+      "detail_state": "unsupported_scope",
+      "capability_state": "unavailable",
+      "detail": {"unsupported_scope_reason": "foreign 20-F financial features are deferred"}
+    },
+    {
+      "detail_state": "insufficient_history",
+      "capability_state": "unavailable",
+      "detail": {"required_sessions": 65, "observed_sessions": 41}
+    },
+    {
+      "detail_state": "stale_by_declared_rule",
+      "capability_state": "stale",
+      "detail": {"declared_rule": "fixture age limit", "observed_age_days": 91}
+    },
+    {
+      "detail_state": "invalid",
+      "capability_state": "unavailable",
+      "detail": {"reason": "invalid", "validation_failure": "conflicting duplicate values for one fiscal period"}
+    },
+    {
+      "detail_state": "observed",
+      "capability_state": "present",
+      "value": 0.0,
+      "detail": {"units": "decimal_fraction", "period": "2026-Q2", "as_of": "2026-08-27", "source_id": "fixture-source-1"}
+    }
+  ],
+  "additional_boundary_outcomes": [
+    {
+      "capability_state": "not_applicable",
+      "precondition": "An explicit versioned applicability rule says this entity/decision does not require the feature.",
+      "detail": {"applicability_rule_id": "feature-contract-v2-rule-7", "entity_scope": "specified entity class", "decision_scope": "specified decision"}
+    },
+    {
+      "capability_state": "calculation_failure",
+      "precondition": "A transform fails despite valid source inputs; this is not a projection of invalid source/provenance.",
+      "detail": {"source_state": "observed", "calculator_id": "fixture-calculator-v1", "failure_reason": "deterministic transform error"}
+    }
+  ],
+  "current_v3_portfolio_reconciliation": {
+    "inputs": {
+      "equity": 10000.0,
+      "cash": 4000.0,
+      "peak_equity": 11000.0,
+      "position_notionals": [4000.0, 2000.0],
+      "position_open_risks": [250.0, 50.0],
+      "pending_entry_count": 2,
+      "sector_notionals": {"consumer_staples": 2000.0, "technology": 4000.0},
+      "industry_notionals": {"beverages": 2000.0, "software": 4000.0}
+    },
+    "expected": {
+      "gross_exposure_fraction": 0.6,
+      "drawdown_fraction": 0.09090909090909091,
+      "open_risk_fraction": 0.03,
+      "pending_entry_count": 2,
+      "sector_exposures": [["consumer_staples", 0.2], ["technology", 0.4]],
+      "industry_exposures": [["beverages", 0.2], ["software", 0.4]]
+    },
+    "proves": "Current StrategyPolicyAdapterV3 trusted accounting and classification reconciliation only. pending_entry_count is not a cash or risk reservation."
+  },
+  "current_v3_add_on_baseline": {
+    "inputs": {
+      "entry_price": 100.0,
+      "current_price": 110.0,
+      "current_quantity": 20.0,
+      "equity": 10000.0,
+      "cash": 7800.0,
+      "open_position_risk": 100.0,
+      "days_held": 10,
+      "add_on_count": 0,
+      "highest_price": 120.0,
+      "lowest_price": 95.0,
+      "features": {
+        "current_rs_score": 78.0,
+        "industry_group_rs": 72.0,
+        "atr_20_fraction": 0.04,
+        "volume_ratio": 1.3
+      }
+    },
+    "expected": {
+      "current_notional_fraction": 0.22,
+      "remaining_cash_fraction": 0.78,
+      "baseline_decision": {"add": false, "risk_fraction": 0.0, "notional_fraction_cap": null, "reason_code": "baseline_no_add_on"}
+    },
+    "proves": "Current V3 baseline deliberately declines additions; the host validator independently rejects unfunded or over-risk requests."
+  },
+  "current_v5_exit_quantity_basis": {
+    "first_entry_filled_shares": 20.0,
+    "later_completed_add_on_fill_shares": 4.0,
+    "trade_quantity_at_exit_decision": 24.0,
+    "exit_snapshot_original_qty": 24.0,
+    "tier_fraction_of_exit_snapshot_quantity": 0.25,
+    "simulator_scale_out_shares": 6.0,
+    "source_semantics": "V5 builds ExitSnapshot.original_qty from trade.qty; completed add-on fills increase trade.qty and update weighted entry. A queued exit executes before a same-open add-on and cancels conflicting same-symbol add-ons."
+  },
+  "proposed_paper_lifecycle_examples": {
+    "status": "deterministic_contract_examples_only_not_current_v3_or_paper_adapter_support",
+    "pending_entry_partial_fill_cancel_restart": {
+      "commitment": {"notional": 1000.0, "risk": 80.0},
+      "after_partial_fill": {
+        "confirmed_filled": {"notional": 400.0, "risk": 32.0},
+        "remaining_reservation": {"notional": 600.0, "risk": 48.0},
+        "accounted_total": {"notional": 1000.0, "risk": 80.0}
+      },
+      "after_restart_reconciliation": {
+        "confirmed_filled": {"notional": 400.0, "risk": 32.0},
+        "remaining_reservation": {"notional": 600.0, "risk": 48.0}
+      },
+      "after_terminal_cancel": {
+        "confirmed_filled": {"notional": 400.0, "risk": 32.0},
+        "remaining_reservation": {"notional": 0.0, "risk": 0.0},
+        "released": {"notional": 600.0, "risk": 48.0}
+      }
+    },
+    "original_quantity_scale_out_partial_fill_restart": {
+      "status": "proposed_snapshot_quantity_basis_pending_paper_adapter_evidence",
+      "decision_snapshot_filled_shares_including_prior_add_ons": 20.0,
+      "tier_fraction_of_snapshot_quantity": 0.25,
+      "target_shares": 5.0,
+      "first_confirmed_fill_shares": 2.0,
+      "residual_shares_after_restart_reconciliation": 3.0,
+      "final_confirmed_fill_shares": 5.0,
+      "tier_advances_after_target_is_filled_or_explicitly_resolved": true
+    }
+  }
+}
