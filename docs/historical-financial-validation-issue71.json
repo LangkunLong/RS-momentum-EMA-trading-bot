@@ -11,7 +11,9 @@
   "changed_calculator_identity": {
     "id": "pit-financial-features-v2",
     "source_path": "core/pit_feature_snapshot.py",
-    "source_sha256": "a72cab3f7a7ab9888bb417d404a70ddf3d6b38e5ef6147c7b8a9d55a283c3261",
+    "source_git_blob_oid": "8e4020316d13c3de36dac8995fe4743bf888e70c",
+    "source_git_blob_sha256": "e209504b6232c6755a080dba2edfbc877fa8400b5f419ba0c8a514c3a629ab9c",
+    "worker_worktree_sha256_at_receipt_creation": "a72cab3f7a7ab9888bb417d404a70ddf3d6b38e5ef6147c7b8a9d55a283c3261",
     "policy_interface_version": 3,
     "historical_data_format_version": 2
   },
@@ -95,17 +97,24 @@
   "artifacts": [
     {
       "path": "docs/historical-financial-validation-issue71.md",
-      "sha256": "2c538723cbb8bccd32776e5c43612c5883940259c1ef72313e7157acb229daab"
+      "git_blob_oid": "8089ca09edbf510c78fb0e38e9e9a70781ecd7d7",
+      "git_blob_sha256": "2c538723cbb8bccd32776e5c43612c5883940259c1ef72313e7157acb229daab",
+      "worker_worktree_sha256_at_receipt_creation": "2c538723cbb8bccd32776e5c43612c5883940259c1ef72313e7157acb229daab"
     },
     {
       "path": "core/pit_feature_snapshot.py",
-      "sha256": "a72cab3f7a7ab9888bb417d404a70ddf3d6b38e5ef6147c7b8a9d55a283c3261"
+      "git_blob_oid": "8e4020316d13c3de36dac8995fe4743bf888e70c",
+      "git_blob_sha256": "e209504b6232c6755a080dba2edfbc877fa8400b5f419ba0c8a514c3a629ab9c",
+      "worker_worktree_sha256_at_receipt_creation": "a72cab3f7a7ab9888bb417d404a70ddf3d6b38e5ef6147c7b8a9d55a283c3261"
     },
     {
       "path": "tests/test_historical06_financial_semantics.py",
-      "sha256": "b7eaac154009145f9f28e3d05de63cd0f7d1ebac64573c3bb5ef6653178a8de2"
+      "git_blob_oid": "e85b71a0eac2060855d193734175f9b02dac6c9d",
+      "git_blob_sha256": "b7eaac154009145f9f28e3d05de63cd0f7d1ebac64573c3bb5ef6653178a8de2",
+      "worker_worktree_sha256_at_receipt_creation": "b7eaac154009145f9f28e3d05de63cd0f7d1ebac64573c3bb5ef6653178a8de2"
     }
   ],
+  "artifact_hash_semantics": "git_blob_oid and git_blob_sha256 identify canonical tracked file bytes independent of checkout line endings; worker_worktree_sha256_at_receipt_creation is specific to the original worker checkout.",
   "statuses": {
     "implementation": "Correction, calculator identity, fixed cases, and result report committed on codex/issue-71-fiscal-semantics at 3d8a0edbc793b1a435849daead96ffaa9c165d97.",
     "required_inputs": "Fixed financial histories and the exact retained development bundle were available; complete vendor history is unnecessary.",
