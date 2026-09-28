@@ -339,6 +339,14 @@ def _normalize(
         )
         for row in transitions
     }
+    transition_successors = {
+        (
+            str(row["effective_date"]),
+            str(row["predecessor"]),
+            str(row["chain_id"]),
+        ): str(row["successor"])
+        for row in transitions
+    }
     output: list[tuple[str, str, str, int]] = []
     source_bindings: list[dict[str, object]] = []
     coalesced = 0
@@ -346,6 +354,9 @@ def _normalize(
     for universe_id in _UNIVERSES:
         membership_path, provenance_path, provenance = sources[universe_id]
         rows = _source_rows(membership_path, universe_id=universe_id)
+        source_additions = {
+            (effective, ticker) for effective, ticker, member in rows if member == 1
+        }
         source_kind, retrieved_at = _validate_source_provenance(
             universe_id=universe_id,
             membership_path=membership_path,
@@ -359,13 +370,25 @@ def _normalize(
             identity = identities.get(ticker)
             if identity is None:
                 raise ValueError(f"membership ticker has no authenticated price identity: {ticker}")
-            if not str(identity["admitted_start"]) <= effective <= str(
+            lineage = str(identity["chain_id"])
+            within_identity_dates = str(identity["admitted_start"]) <= effective <= str(
                 identity["admitted_end"]
-            ):
+            )
+            # A rename becomes effective on the successor's first date, while
+            # the predecessor's last price-identity date is the prior session.
+            # Bind that membership removal only to the exact authenticated
+            # transition boundary; other out-of-range rows remain invalid.
+            successor = transition_successors.get((effective, ticker, lineage))
+            authenticated_transition_exit = (
+                member == 0
+                and successor is not None
+                and (effective, successor) in source_additions
+            )
+            if not within_identity_dates and not authenticated_transition_exit:
                 raise ValueError(
                     f"membership event is outside authenticated identity bounds: {ticker}"
                 )
-            grouped.setdefault((effective, str(identity["chain_id"])), []).append(
+            grouped.setdefault((effective, lineage), []).append(
                 (ticker, member)
             )
         lineage_state: set[str] = set()
