@@ -14,8 +14,10 @@
     "price_identity_request_contracts_sha256_recomputed": "273727c248f57b7376b6cf269312325cdd059287e1f4ed16ab5ce63617ceabc7",
     "request_contract_key_count": 607,
     "price_identity_transitions_field_present": false,
-    "price_history_start": "2020-01-01",
-    "price_history_end": "2025-12-31"
+    "price_request_window_start": "2020-01-01",
+    "price_request_window_end": "2025-12-31",
+    "observed_price_row_start": "2020-01-02",
+    "observed_price_row_end": "2025-12-31"
   },
   "evidence_binding": {
     "method": "Issuer/SEC transition evidence is bound by official URL, filing accession or issuer release identity, and a document-section locator. Those issuer/SEC source bytes were not retained, so their per-source byte hashes are null. Separately retained Nasdaq index notices are listed with their existing source hashes. The sibling SHA-256 file hashes this ledger's exact bytes.",
@@ -263,11 +265,19 @@
       "primary_evidence": [
         {
           "authority": "U.S. Securities and Exchange Commission, Healthpeak Form 8-K",
+          "accession": "0001104659-24-029661",
+          "url": "https://www.sec.gov/Archives/edgar/data/765880/000110465924029661/tm247564d1_8k.htm",
+          "document_date": "2024-02-28",
+          "locator": "Cover (Healthpeak Properties, Inc., CIK 765880; Common Stock PEAK); Item 2.01; Item 8.01 Change in Ticker Symbol",
+          "supports": "The continuing Healthpeak registrant's common stock is registered as PEAK; the filing says Healthpeak Common Stock is expected to begin trading as DOC at the 2024-03-04 open. Item 2.01 describes the merger and issuance of Healthpeak common stock to Physicians Realty shareholders, supporting the mapped accounting-acquirer continuity kind."
+        },
+        {
+          "authority": "U.S. Securities and Exchange Commission, Physicians Realty Trust Form 8-K",
           "accession": "0001104659-24-029662",
           "url": "https://www.sec.gov/Archives/edgar/data/1574540/000110465924029662/tm247597d1_8k.htm",
-          "document_date": "2024-03-04",
-          "locator": "Securities registered table; Item 8.01 Change in Ticker Symbol",
-          "supports": "Healthpeak common stock begins trading as DOC at the 2024-03-04 open. The filing is by the existing Healthpeak registrant; Physicians Realty shares convert into Healthpeak common shares in the completed merger. This supports the mapped accounting-acquirer continuity kind."
+          "document_date": "2024-02-28",
+          "locator": "Cover; Introductory Note; Items 2.01 and 8.01",
+          "supports": "Supplemental merger evidence: Physicians Realty Trust shares convert into Healthpeak common stock, and Healthpeak Common Stock is expected to begin trading as DOC at the 2024-03-04 open."
         }
       ],
       "source_byte_sha256": null
@@ -362,7 +372,7 @@
           "authority": "U.S. Securities and Exchange Commission, Fiserv Exhibit 99.1",
           "accession": "0001193125-23-154199",
           "url": "https://www.sec.gov/Archives/edgar/data/798354/000119312523154199/d470900dex991.htm",
-          "document_date": "2023-05-16",
+          "document_date": "2023-05-25",
           "locator": "Ticker and listing-transfer announcement",
           "supports": "Fiserv common stock transfers from Nasdaq under FISV to NYSE under FI, beginning 2023-06-07."
         },
@@ -401,7 +411,7 @@
       ],
       "representation_gap": "Do not truncate the existing FISV row or extend FI. The accepted source chronology has three date-bounded symbol episodes but the current identity contract keys one interval by ticker string and cannot distinguish the pre-2023 and post-2025 FISV episodes.",
       "proposed_safe_disposition": "Keep both transition edges out of the integrated transition list and quarantine this chain from accepted continuity joins until a reviewed segment-ID contract and resolver can encode the three episodes.",
-      "validation_gap": "The V3 transition reader checks that the successor is admitted on the effective date but does not enforce that predecessor.admitted_end is before that date or that predecessor.admitted_start is before it. The normalizer's authenticated_transition_exit can also bypass predecessor date bounds. Enforce predecessor and successor chronology separately from a future segment-ID schema."
+      "validation_gap": "The shared V3 PriceIdentityTransitionContract in core/pit_data.py checks successor admission at the effective date but does not enforce predecessor admitted_start/admitted_end bounds. The membership normalizer now enforces predecessor dates in both _load_price_identity and direct _normalize calls. Segment-ID support for the repeated FISV symbol remains unresolved."
     },
     {
       "predecessor": "VIAC",
