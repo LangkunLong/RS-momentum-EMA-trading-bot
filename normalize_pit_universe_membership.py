@@ -145,6 +145,38 @@ def _required_text(source: Mapping[str, object], field: str) -> str:
     return value
 
 
+def _validate_transition_date_bounds(
+    predecessor: Mapping[str, object],
+    successor: Mapping[str, object],
+    effective_date: object,
+) -> None:
+    effective = _iso_date(effective_date, field="transition effective_date")
+    predecessor_start = _iso_date(
+        predecessor.get("admitted_start"), field="predecessor admitted_start"
+    )
+    predecessor_end = _iso_date(
+        predecessor.get("admitted_end"), field="predecessor admitted_end"
+    )
+    successor_start = _iso_date(
+        successor.get("admitted_start"), field="successor admitted_start"
+    )
+    successor_end = _iso_date(
+        successor.get("admitted_end"), field="successor admitted_end"
+    )
+    if (
+        predecessor_start > predecessor_end
+        or predecessor_start >= effective
+        or predecessor_end >= effective
+    ):
+        raise ValueError(
+            "price identity transition predecessor is not admitted before boundary"
+        )
+    if not successor_start <= effective <= successor_end:
+        raise ValueError(
+            "price identity transition successor is not admitted at boundary"
+        )
+
+
 def _load_price_identity(
     provenance: Mapping[str, object],
 ) -> tuple[dict[str, Mapping[str, object]], tuple[Mapping[str, object], ...], str, str]:
@@ -205,11 +237,13 @@ def _load_price_identity(
             or successor_identity is None
             or predecessor_identity["chain_id"] != lineage
             or successor_identity["chain_id"] != lineage
-            or successor_identity["continuity_kind"] != continuity
-            or not str(successor_identity["admitted_start"]) <= effective
-            <= str(successor_identity["admitted_end"])
         ):
             raise ValueError("price identity transition disagrees with identity rows")
+        if successor_identity["continuity_kind"] != continuity:
+            raise ValueError("price identity transition disagrees with identity rows")
+        _validate_transition_date_bounds(
+            predecessor_identity, successor_identity, effective
+        )
         if predecessor in predecessor_boundaries or successor in successor_boundaries:
             raise ValueError("price identity transition boundary is ambiguous")
         predecessor_boundaries.add(predecessor)
@@ -330,6 +364,22 @@ def _normalize(
     identities: Mapping[str, Mapping[str, object]],
     transitions: tuple[Mapping[str, object], ...],
 ) -> tuple[list[tuple[str, str, str, int]], list[dict[str, object]], int]:
+    for transition in transitions:
+        predecessor_ticker = _ticker(
+            transition.get("predecessor"), field="transition predecessor"
+        )
+        successor_ticker = _ticker(
+            transition.get("successor"), field="transition successor"
+        )
+        predecessor_identity = identities.get(predecessor_ticker)
+        successor_identity = identities.get(successor_ticker)
+        if predecessor_identity is None or successor_identity is None:
+            raise ValueError("price identity transition references an unknown identity")
+        _validate_transition_date_bounds(
+            predecessor_identity,
+            successor_identity,
+            transition.get("effective_date"),
+        )
     transition_index = {
         (
             str(row["effective_date"]),

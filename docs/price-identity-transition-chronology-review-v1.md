@@ -1,6 +1,6 @@
 # Price identity transition chronology review
 
-Status: evidence review and fixture proposal only. No shared reader, provenance input, identity map, or price export was modified. This note does not emit a `price_identity_transitions` list or mark issue #68 accepted.
+Status: the one-way predecessor-date guard is now enforced by the membership normalizer and covered by direct fixtures. The shared `PriceIdentityTransitionContract` in `core/pit_data.py` remains unchanged, as do the provenance input, identity map, and price export. This note does not emit a Fiserv `price_identity_transitions` edge or mark issue #68 accepted.
 
 ## Evidence-backed Fiserv chronology
 
@@ -18,7 +18,7 @@ Accordingly, FISV→FI effective 2023-06-07 and FI→FISV effective 2025-11-11 a
 
 ## Contract and reader gap
 
-`PriceIdentityTransitionContract` and the V3 normalizer identify nodes by ticker string. The transition shape contains `predecessor` and `successor` ticker strings but no identity-segment identifier. A valid dated chain here repeats the ticker symbol after two transitions, so it cannot be faithfully represented by truncating or extending the existing two identity rows. The current reader also validates successor admission at the edge but does not require the predecessor interval to end before the edge; the normalizer's authenticated transition-exit exception can bypass predecessor bounds. The source contract does not permit this overlap.
+`PriceIdentityTransitionContract` and the V3 normalizer identify nodes by ticker string. The transition shape contains `predecessor` and `successor` ticker strings but no identity-segment identifier. A valid dated chain here repeats the ticker symbol after two transitions, so it cannot be faithfully represented by truncating or extending the existing two identity rows. The shared `PriceIdentityTransitionContract` still validates successor admission without requiring the predecessor interval to end before the edge. The membership normalizer now rejects that overlap both while loading transitions and when `_normalize` is called directly, including on its authenticated transition-exit path. The source contract does not permit this overlap.
 
 Preferred contract design for a coordinated follow-up: assign each continuous symbol episode a stable, unique identity-segment ID, and make transitions reference those IDs. Keep `provider_symbol` as a separate field, allowing the same ticker to appear in more than one non-overlapping segment. A Fiserv example would have three nodes—FISV through 2023-06-06, FI from 2023-06-07 through 2025-11-10, and FISV from 2025-11-11—connected by the two effective-dated transitions. The implementation must preserve the current hash binding to the request contract and define how an open holding resolves when the displayed ticker is reused. Until the schema and resolver support this, quarantine the Fiserv transition chain from accepted continuity joins and fail closed for this chain; do not emit either edge as an integrated transition.
 
@@ -26,13 +26,13 @@ Before integration, the validator should at minimum enforce `predecessor.admitte
 
 ## Proposed fixtures for a coordinated reader change
 
-These are specifications only; no test files were added or run.
+The one-way predecessor-date and normalizer removal-bypass cases are covered in `tests/test_normalize_pit_universe_membership.py`; the focused test module passes. Exchange-session adjacency still requires event-specific evidence review. Fixtures 5–6 remain proposals for a coordinated segment-contract change.
 
-1. Accept a single rename when the predecessor ends before the effective date, the successor is admitted on that date, the edge metadata matches both identities, and the relevant exchange-session boundary is adjacent.
-2. Reject a transition when the predecessor's `admitted_end` is on or after the effective date, even if the successor is admitted on that date.
-3. Reject a transition when the predecessor's `admitted_start` is after the transition date.
-4. Reject a membership removal outside the predecessor identity bounds even when a matching successor addition exists on the effective date.
-5. Represent FISV→FI→FISV as three unique segment IDs with non-overlapping date ranges; verify both effective-date edges and verify that ticker-symbol reuse does not create a graph cycle or ambiguous holding resolution.
-6. Reject a two-row FISV/FI representation that truncates the first FISV interval and therefore loses the 2025-11-11 FISV segment.
+1. For a single rename, allow a boundary only when the predecessor ends before the effective date and the successor is admitted on it; keep exchange-session adjacency as a separate evidence-derived check.
+2. Reject a transition when the predecessor's `admitted_end` is on or after the effective date, even if the successor is admitted on that date. Covered by the loader and direct-normalizer fixtures.
+3. Reject a transition when the predecessor's `admitted_start` is on or after the transition date. Covered by the loader and direct-normalizer fixtures.
+4. Reject a membership removal outside the predecessor identity bounds even when a matching successor addition exists on the effective date. Covered by the direct-normalizer fixture.
+5. Represent FISV→FI→FISV as three unique segment IDs with non-overlapping date ranges; verify both effective-date edges and verify that ticker-symbol reuse does not create a graph cycle or ambiguous holding resolution. Pending coordinated schema work.
+6. Reject a two-row FISV/FI representation that truncates the first FISV interval and therefore loses the 2025-11-11 FISV segment. Pending coordinated schema work.
 
 Acceptance remains blocked for the Fiserv transition chain until the identity-segment schema, the retained request-contract mapping, and resolver semantics are jointly reviewed and the existing price export is reconciled against the dated episodes. No historical index membership rows were acquired or added in this review.
