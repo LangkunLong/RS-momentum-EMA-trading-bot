@@ -10,7 +10,11 @@ from pathlib import Path
 import pytest
 
 from core.pit_provenance import pit_canonical_json_sha256
-from normalize_pit_universe_membership import _load_price_identity, _normalize
+from normalize_pit_universe_membership import (
+    _csv_bytes,
+    _load_price_identity,
+    _normalize,
+)
 
 
 _UNIVERSES = ("nasdaq100", "russell2000", "sp500")
@@ -93,6 +97,172 @@ def _price_identity_provenance(
     }
 
 
+def _fiserv_segmented_price_identity(
+    tmp_path: Path,
+) -> tuple[dict[str, object], tuple[object, ...]]:
+    contracts: dict[str, dict[str, object]] = {
+        "FI": {
+            "provider_symbol": "FI",
+            "identity_asof": "2025-11-10",
+            "admitted_start": "2023-06-07",
+            "admitted_end": "2025-11-10",
+            "chain_id": "fiserv",
+            "continuity_kind": "same_issuer_ticker_reuse",
+            "warmup_predecessor": "FISV",
+            "factor_anchor": False,
+        },
+        "FISV": {
+            "provider_symbol": "FISV",
+            "identity_asof": "2025-12-31",
+            "admitted_start": "2020-01-01",
+            "admitted_end": "2025-12-31",
+            "chain_id": "fiserv",
+            "continuity_kind": "same_issuer_ticker_reuse",
+            "warmup_predecessor": None,
+            "factor_anchor": True,
+        },
+        "IWM": {
+            "provider_symbol": "IWM",
+            "identity_asof": "2025-12-31",
+            "admitted_start": "2020-01-01",
+            "admitted_end": "2025-12-31",
+            "chain_id": "ref_iwm",
+            "continuity_kind": "same_issuer_rename",
+            "warmup_predecessor": None,
+            "factor_anchor": True,
+        },
+        "QQQ": {
+            "provider_symbol": "QQQ",
+            "identity_asof": "2025-12-31",
+            "admitted_start": "2020-01-01",
+            "admitted_end": "2025-12-31",
+            "chain_id": "ref_qqq",
+            "continuity_kind": "same_issuer_rename",
+            "warmup_predecessor": None,
+            "factor_anchor": True,
+        },
+        "SPY": {
+            "provider_symbol": "SPY",
+            "identity_asof": "2025-12-31",
+            "admitted_start": "2020-01-01",
+            "admitted_end": "2025-12-31",
+            "chain_id": "ref_spy",
+            "continuity_kind": "same_issuer_rename",
+            "warmup_predecessor": None,
+            "factor_anchor": True,
+        },
+    }
+    parent_digest = pit_canonical_json_sha256(contracts)
+    segment_contract: dict[str, object] = {
+        "schema_version": 1,
+        "parent_price_identity_request_contracts_sha256": parent_digest,
+        "segments": [
+            {
+                "segment_id": "fiserv-fisv-pre-2023",
+                "provider_symbol": "FISV",
+                "chain_id": "fiserv",
+                "continuity_kind": "same_issuer_ticker_reuse",
+                "admitted_start": "2020-01-01",
+                "admitted_end": "2023-06-06",
+                "factor_anchor": False,
+            },
+            {
+                "segment_id": "fiserv-fi-2023-2025",
+                "provider_symbol": "FI",
+                "chain_id": "fiserv",
+                "continuity_kind": "same_issuer_ticker_reuse",
+                "admitted_start": "2023-06-07",
+                "admitted_end": "2025-11-10",
+                "factor_anchor": False,
+            },
+            {
+                "segment_id": "fiserv-fisv-post-2025",
+                "provider_symbol": "FISV",
+                "chain_id": "fiserv",
+                "continuity_kind": "same_issuer_ticker_reuse",
+                "admitted_start": "2025-11-11",
+                "admitted_end": "2025-12-31",
+                "factor_anchor": True,
+            },
+        ],
+        "transitions": [
+            {
+                "effective_date": "2023-06-07",
+                "predecessor_segment_id": "fiserv-fisv-pre-2023",
+                "successor_segment_id": "fiserv-fi-2023-2025",
+                "chain_id": "fiserv",
+                "continuity_kind": "same_issuer_ticker_reuse",
+                "source_assertion_ids": ["synthetic-fiserv-2023"],
+            },
+            {
+                "effective_date": "2025-11-11",
+                "predecessor_segment_id": "fiserv-fi-2023-2025",
+                "successor_segment_id": "fiserv-fisv-post-2025",
+                "chain_id": "fiserv",
+                "continuity_kind": "same_issuer_ticker_reuse",
+                "source_assertion_ids": ["synthetic-fiserv-2025"],
+            },
+        ],
+        "source_assertions": [],
+    }
+    assertions: list[dict[str, object]] = []
+    for assertion_id, effective, index in (
+        ("synthetic-fiserv-2023", "2023-06-07", 0),
+        ("synthetic-fiserv-2025", "2025-11-11", 1),
+    ):
+        source_bytes = f"synthetic non-evidentiary bytes {index}\n".encode()
+        source_path = tmp_path / f"fiserv-synthetic-{index}.bin"
+        source_path.write_bytes(source_bytes)
+        assertions.append(
+            {
+                "assertion_id": assertion_id,
+                "authority": "Synthetic test fixture; not source evidence",
+                "url": f"https://example.test/fiserv-shape-{index}",
+                "accession": None,
+                "document_date": "2023-05-01" if index == 0 else "2025-10-01",
+                "locator": "Synthetic shape-only assertion",
+                "effective_date": effective,
+                "supports": "Synthetic test data; no real filing or source claim.",
+                "source_byte_sha256": hashlib.sha256(source_bytes).hexdigest(),
+                "source_document_path": source_path.name,
+            }
+        )
+    segment_contract["source_assertions"] = assertions
+    provenance: dict[str, object] = {
+        "price_identity_request_contracts": contracts,
+        "price_identity_request_contracts_sha256": parent_digest,
+        "price_identity_transitions": [],
+        "price_identity_segments_v1": segment_contract,
+        "price_identity_segments_v1_sha256": pit_canonical_json_sha256(
+            segment_contract
+        ),
+    }
+    return provenance, _load_price_identity(provenance, source_root=tmp_path)
+
+
+def _fiserv_membership_sources(
+    tmp_path: Path,
+    *,
+    include_handoff_events: bool,
+) -> dict[str, tuple[Path, Path, dict[str, object]]]:
+    events = [
+        ("2020-01-02", "FISV", 1),
+    ]
+    if include_handoff_events:
+        events.extend(
+            [
+                ("2023-06-07", "FI", 1),
+                ("2023-06-07", "FISV", 0),
+                ("2025-11-11", "FI", 0),
+                ("2025-11-11", "FISV", 1),
+            ]
+        )
+    return {
+        universe: _source(tmp_path, universe, list(events))
+        for universe in _UNIVERSES
+    }
+
+
 def test_normalization_preserves_overlaps_renames_and_short_lived_memberships(
     tmp_path: Path,
 ) -> None:
@@ -155,6 +325,84 @@ def test_normalization_preserves_overlaps_renames_and_short_lived_memberships(
     ]
     assert coalesced == 1
     assert [item["universe_id"] for item in source_bindings] == list(_UNIVERSES)
+
+
+def test_segmented_normalizer_coalesces_both_fiserv_handoffs_and_keeps_v3_rows(
+    tmp_path: Path,
+) -> None:
+    _, loaded = _fiserv_segmented_price_identity(tmp_path)
+    identities, transitions, _, _, segment_contract = loaded
+    sources = _fiserv_membership_sources(
+        tmp_path, include_handoff_events=True
+    )
+
+    rows, _, coalesced = _normalize(
+        sources,
+        identities=identities,
+        transitions=transitions,
+        segment_contract=segment_contract,
+    )
+
+    assert rows == [
+        ("2020-01-02", "fiserv", "nasdaq100", 1),
+        ("2020-01-02", "fiserv", "russell2000", 1),
+        ("2020-01-02", "fiserv", "sp500", 1),
+    ]
+    assert coalesced == 6
+    assert all(len(row) == 4 for row in rows)
+    assert _csv_bytes(rows).splitlines()[0] == (
+        b"effective_date,security_lineage_id,universe_id,member"
+    )
+
+
+def test_segmented_normalizer_preserves_lineage_without_handoff_membership_events(
+    tmp_path: Path,
+) -> None:
+    _, loaded = _fiserv_segmented_price_identity(tmp_path)
+    identities, transitions, _, _, segment_contract = loaded
+    sources = _fiserv_membership_sources(
+        tmp_path, include_handoff_events=False
+    )
+
+    rows, _, coalesced = _normalize(
+        sources,
+        identities=identities,
+        transitions=transitions,
+        segment_contract=segment_contract,
+    )
+
+    assert rows == [
+        ("2020-01-02", "fiserv", "nasdaq100", 1),
+        ("2020-01-02", "fiserv", "russell2000", 1),
+        ("2020-01-02", "fiserv", "sp500", 1),
+    ]
+    assert coalesced == 0
+
+
+def test_segmented_normalizer_rejects_membership_event_outside_segment(
+    tmp_path: Path,
+) -> None:
+    _, loaded = _fiserv_segmented_price_identity(tmp_path)
+    identities, transitions, _, _, segment_contract = loaded
+    sources = {
+        universe: _source(
+            tmp_path,
+            universe,
+            [
+                ("2020-01-02", "FISV", 1),
+                ("2023-06-08", "FISV", 0),
+            ],
+        )
+        for universe in _UNIVERSES
+    }
+
+    with pytest.raises(ValueError, match="outside its authenticated price identity segment"):
+        _normalize(
+            sources,
+            identities=identities,
+            transitions=transitions,
+            segment_contract=segment_contract,
+        )
 
 
 @pytest.mark.parametrize(

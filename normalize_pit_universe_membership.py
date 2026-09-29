@@ -15,6 +15,11 @@ from pathlib import Path
 from typing import Any
 
 from core.pit_data import sha256_file
+from core.pit_data import (
+    IdentityTransition,
+    PriceIdentityTransitionContract,
+    _parse_price_identity_segments_v1,
+)
 from core.pit_provenance import (
     PIT_NON_TRADABLE_REFERENCE_SYMBOLS,
     pit_canonical_json_bytes,
@@ -179,7 +184,16 @@ def _validate_transition_date_bounds(
 
 def _load_price_identity(
     provenance: Mapping[str, object],
-) -> tuple[dict[str, Mapping[str, object]], tuple[Mapping[str, object], ...], str, str]:
+    *,
+    source_root: Path | None = None,
+    prices_provenance_sha256: str | None = None,
+) -> tuple[
+    dict[str, Mapping[str, object]],
+    tuple[Mapping[str, object], ...],
+    str,
+    str,
+    PriceIdentityTransitionContract | None,
+]:
     raw_identities = provenance.get("price_identity_request_contracts")
     if not isinstance(raw_identities, dict) or not raw_identities:
         raise ValueError("prices provenance has no price identity request contracts")
@@ -254,10 +268,66 @@ def _load_price_identity(
     declared_transition_digest = provenance.get("price_identity_transitions_sha256")
     if declared_transition_digest is not None and declared_transition_digest != transition_digest:
         raise ValueError("prices provenance transition digest is invalid")
+    has_segment_object = "price_identity_segments_v1" in provenance
+    has_segment_digest = "price_identity_segments_v1_sha256" in provenance
+    if has_segment_object != has_segment_digest:
+        raise ValueError("price identity segment object and digest must appear together")
+    segment_contract: PriceIdentityTransitionContract | None = None
+    segmented_chains: set[str] = set()
+    if has_segment_object:
+        if source_root is None:
+            raise ValueError(
+                "segment-aware price identity requires a retained source evidence directory"
+            )
+        legacy_contract_edges = tuple(
+            IdentityTransition(
+                date.fromisoformat(str(row["effective_date"])),
+                str(row["predecessor"]),
+                str(row["successor"]),
+                str(row["chain_id"]),
+                str(row["continuity_kind"]),
+            )
+            for row in transitions
+        )
+        segments, segment_transitions, source_assertions = (
+            _parse_price_identity_segments_v1(
+                provenance.get("price_identity_segments_v1"),
+                declared_sha256=provenance.get("price_identity_segments_v1_sha256"),
+                parent_contract_sha256=identity_digest,
+                evidence_root=source_root,
+                identities=identities,
+                ticker_transitions=legacy_contract_edges,
+                data_cutoff=max(
+                    date.fromisoformat(
+                        _iso_date(item["admitted_end"], field="admitted_end")
+                    )
+                    for item in identities.values()
+                ),
+            )
+        )
+        segment_parent_digest = identity_digest
+        segment_digest = str(provenance["price_identity_segments_v1_sha256"])
+        segment_contract = PriceIdentityTransitionContract(
+            prices_provenance_sha256 or pit_canonical_json_sha256(provenance),
+            identity_digest,
+            identities,
+            legacy_contract_edges,
+            segments,
+            segment_transitions,
+            source_assertions,
+            segment_parent_digest,
+            segment_digest,
+            source_root,
+        )
+        segmented_chains = {
+            item.chain_id for item in segment_contract.segments.values()
+        }
     chains: dict[str, set[str]] = {}
     for ticker, identity in identities.items():
         chains.setdefault(str(identity["chain_id"]), set()).add(ticker)
     for chain_id, tickers in chains.items():
+        if chain_id in segmented_chains:
+            continue
         anchors = {
             ticker for ticker in tickers if identities[ticker]["factor_anchor"] is True
         }
@@ -291,7 +361,7 @@ def _load_price_identity(
             current = successor
         if visited != tickers:
             raise ValueError(f"price identity chain is disconnected: {chain_id}")
-    return identities, tuple(transitions), identity_digest, transition_digest
+    return identities, tuple(transitions), identity_digest, transition_digest, segment_contract
 
 
 def _source_rows(path: Path, *, universe_id: str) -> list[tuple[str, str, int]]:
@@ -363,7 +433,27 @@ def _normalize(
     *,
     identities: Mapping[str, Mapping[str, object]],
     transitions: tuple[Mapping[str, object], ...],
+    segment_contract: PriceIdentityTransitionContract | None = None,
 ) -> tuple[list[tuple[str, str, str, int]], list[dict[str, object]], int]:
+    if segment_contract is not None:
+        if (
+            dict(segment_contract.identities) != dict(identities)
+            or segment_contract.request_contracts_sha256
+            != pit_canonical_json_sha256(identities)
+        ):
+            raise ValueError("segment contract disagrees with normalized identity rows")
+        contract_legacy_transitions = tuple(
+            {
+                "effective_date": item.effective_date.isoformat(),
+                "predecessor": item.predecessor,
+                "successor": item.successor,
+                "chain_id": item.chain_id,
+                "continuity_kind": item.continuity_kind,
+            }
+            for item in segment_contract.transitions
+        )
+        if contract_legacy_transitions != transitions:
+            raise ValueError("segment contract disagrees with legacy identity transitions")
     for transition in transitions:
         predecessor_ticker = _ticker(
             transition.get("predecessor"), field="transition predecessor"
@@ -397,6 +487,29 @@ def _normalize(
         ): str(row["successor"])
         for row in transitions
     }
+    segment_transition_index: set[tuple[str, str, str, str]] = set()
+    segment_transition_successors: dict[tuple[str, str, str], str] = {}
+    segmented_chains: set[str] = set()
+    if segment_contract is not None:
+        segmented_chains = {
+            item.chain_id for item in segment_contract.segments.values()
+        }
+        for edge in segment_contract.segment_transitions:
+            predecessor = segment_contract.segments[edge.predecessor_segment_id]
+            successor = segment_contract.segments[edge.successor_segment_id]
+            effective = edge.effective_date.isoformat()
+            segment_transition_index.add(
+                (
+                    effective,
+                    predecessor.provider_symbol,
+                    successor.provider_symbol,
+                    edge.chain_id,
+                )
+            )
+            key = (effective, predecessor.provider_symbol, edge.chain_id)
+            if key in segment_transition_successors:
+                raise ValueError("segment transition ticker boundary is ambiguous")
+            segment_transition_successors[key] = successor.provider_symbol
     output: list[tuple[str, str, str, int]] = []
     source_bindings: list[dict[str, object]] = []
     coalesced = 0
@@ -421,6 +534,30 @@ def _normalize(
             if identity is None:
                 raise ValueError(f"membership ticker has no authenticated price identity: {ticker}")
             lineage = str(identity["chain_id"])
+            if lineage in segmented_chains and segment_contract is not None:
+                active_segments = [
+                    item
+                    for item in segment_contract.segments.values()
+                    if item.chain_id == lineage
+                    and item.admitted_start.isoformat() <= effective <= item.admitted_end.isoformat()
+                    and item.provider_symbol == ticker
+                ]
+                successor = segment_transition_successors.get(
+                    (effective, ticker, lineage)
+                )
+                segment_exit = (
+                    member == 0
+                    and successor is not None
+                    and (effective, successor) in source_additions
+                )
+                if len(active_segments) != 1 and not segment_exit:
+                    raise ValueError(
+                        f"membership event is outside its authenticated price identity segment: {ticker}"
+                    )
+                if len(active_segments) > 1:
+                    raise ValueError("membership ticker is ambiguous across identity segments")
+                grouped.setdefault((effective, lineage), []).append((ticker, member))
+                continue
             within_identity_dates = str(identity["admitted_start"]) <= effective <= str(
                 identity["admitted_end"]
             )
@@ -461,6 +598,8 @@ def _normalize(
                 or lineage not in lineage_state
                 or (effective, removals[0], additions[0], lineage)
                 not in transition_index
+                and (effective, removals[0], additions[0], lineage)
+                not in segment_transition_index
             ):
                 raise ValueError(
                     f"ambiguous same-lineage membership transitions: {universe_id} {lineage}"
@@ -548,12 +687,36 @@ def main() -> int:
     if output_csv == output_provenance or {output_csv, output_provenance}.intersection(inputs):
         raise ValueError("outputs must differ from each other and all inputs")
 
-    before = {path: sha256_file(path) for path in inputs}
-    identities, transitions, identity_digest, transition_digest = _load_price_identity(
-        prices_provenance
+    (
+        identities,
+        transitions,
+        identity_digest,
+        transition_digest,
+        segment_contract,
+    ) = _load_price_identity(
+        prices_provenance,
+        source_root=prices_path.parent,
+        prices_provenance_sha256=sha256_file(prices_path),
     )
+    if segment_contract is not None:
+        manifest_inputs = set(inputs)
+        for assertion in segment_contract.source_assertions.values():
+            source_document_path = (
+                prices_path.parent / assertion.source_document_path
+            ).resolve(strict=True)
+            if source_document_path in manifest_inputs:
+                raise ValueError(
+                    "retained source documents must be distinct from provenance and membership inputs"
+                )
+            if sha256_file(source_document_path) != assertion.source_byte_sha256:
+                raise ValueError("retained source document changed during identity loading")
+            inputs.add(source_document_path)
+    before = {path: sha256_file(path) for path in inputs}
     rows, source_bindings, coalesced = _normalize(
-        sources, identities=identities, transitions=transitions
+        sources,
+        identities=identities,
+        transitions=transitions,
+        segment_contract=segment_contract,
     )
     csv_payload = _csv_bytes(rows)
     csv_digest = hashlib.sha256(csv_payload).hexdigest()
@@ -578,6 +741,10 @@ def main() -> int:
         "universe_count": len(_UNIVERSES),
         "universe_event_counts": universe_counts,
     }
+    if segment_contract is not None:
+        provenance["price_identity_segments_v1_sha256"] = (
+            segment_contract.segment_contract_sha256
+        )
     provenance_payload = pit_canonical_json_bytes(provenance)
     if before != {path: sha256_file(path) for path in inputs}:
         raise ValueError("an input changed while membership was being normalized")

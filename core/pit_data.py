@@ -32,12 +32,13 @@ import json
 import math
 import re
 import sqlite3
-from dataclasses import dataclass
-from datetime import date, datetime
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
 from itertools import groupby
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any, Callable, Iterable, Mapping
+from urllib.parse import urlsplit
 
 import pandas as pd
 
@@ -146,6 +147,41 @@ class IdentityTransition:
 
 
 @dataclass(frozen=True)
+class PriceIdentitySegment:
+    segment_id: str
+    provider_symbol: str
+    chain_id: str
+    continuity_kind: str
+    admitted_start: date
+    admitted_end: date
+    factor_anchor: bool
+
+
+@dataclass(frozen=True)
+class PriceIdentitySegmentTransition:
+    effective_date: date
+    predecessor_segment_id: str
+    successor_segment_id: str
+    chain_id: str
+    continuity_kind: str
+    source_assertion_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PriceIdentitySourceAssertion:
+    assertion_id: str
+    authority: str
+    url: str
+    accession: str | None
+    document_date: date
+    locator: str
+    effective_date: date
+    supports: str
+    source_byte_sha256: str
+    source_document_path: str
+
+
+@dataclass(frozen=True)
 class PriceIdentityTransitionContract:
     """Hash-bound rules for carrying an open holding across ticker identities."""
 
@@ -153,6 +189,14 @@ class PriceIdentityTransitionContract:
     request_contracts_sha256: str
     identities: Mapping[str, Mapping[str, object]]
     transitions: tuple[IdentityTransition, ...]
+    segments: Mapping[str, PriceIdentitySegment] = field(default_factory=dict)
+    segment_transitions: tuple[PriceIdentitySegmentTransition, ...] = ()
+    source_assertions: Mapping[str, PriceIdentitySourceAssertion] = field(
+        default_factory=dict
+    )
+    segment_parent_request_contracts_sha256: str | None = None
+    segment_contract_sha256: str | None = None
+    _source_evidence_root: Path | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         frozen = {
@@ -160,6 +204,12 @@ class PriceIdentityTransitionContract:
             for ticker, values in self.identities.items()
         }
         object.__setattr__(self, "identities", MappingProxyType(frozen))
+        object.__setattr__(self, "segments", MappingProxyType(dict(self.segments)))
+        object.__setattr__(
+            self,
+            "source_assertions",
+            MappingProxyType(dict(self.source_assertions)),
+        )
         boundary_predecessors: set[tuple[date, str]] = set()
         boundary_successors: set[tuple[date, str]] = set()
         for transition in self.transitions:
@@ -179,6 +229,127 @@ class PriceIdentityTransitionContract:
                 raise ValueError("holding transition boundary is not one-to-one")
             boundary_predecessors.add(predecessor_key)
             boundary_successors.add(successor_key)
+        has_segment_state = bool(
+            self.segments
+            or self.segment_transitions
+            or self.source_assertions
+            or self.segment_parent_request_contracts_sha256
+            or self.segment_contract_sha256
+        )
+        if has_segment_state:
+            if (
+                not self.segments
+                or not self.segment_transitions
+                or not self.source_assertions
+                or self.segment_parent_request_contracts_sha256
+                != self.request_contracts_sha256
+                or self._source_evidence_root is None
+            ):
+                raise ValueError("segmented identity construction requires verified source evidence")
+            segment_payload = _segment_contract_object(
+                self.segment_parent_request_contracts_sha256,
+                self.segments,
+                self.segment_transitions,
+                self.source_assertions,
+            )
+            parsed_segments, parsed_transitions, parsed_assertions = (
+                _parse_price_identity_segments_v1(
+                    segment_payload,
+                    declared_sha256=self.segment_contract_sha256,
+                    parent_contract_sha256=self.request_contracts_sha256,
+                    evidence_root=self._source_evidence_root,
+                    identities=frozen,
+                    ticker_transitions=self.transitions,
+                    data_cutoff=max(
+                        item.admitted_end for item in self.segments.values()
+                    ),
+                )
+            )
+            if (
+                dict(parsed_segments) != dict(self.segments)
+                or parsed_transitions != self.segment_transitions
+                or dict(parsed_assertions) != dict(self.source_assertions)
+            ):
+                raise ValueError("segmented identity construction is not canonical")
+        elif self._source_evidence_root is not None:
+            raise ValueError("source evidence root is present without a segment contract")
+
+    def has_segmented_chain(self, chain_id: str) -> bool:
+        return any(segment.chain_id == chain_id for segment in self.segments.values())
+
+    def resolve_segment(
+        self, segment_id: str, on_date: date | str
+    ) -> PriceIdentitySegment:
+        """Resolve a dated segment forward through its validated lineage path."""
+        origin = self.segments.get(segment_id)
+        if origin is None:
+            raise ValueError("price identity segment is not in the hash-bound contract")
+        when = _identity_date(on_date)
+        if when < origin.admitted_start:
+            raise ValueError("price identity segment is not admitted on the requested date")
+        return self._active_segment_for_chain(origin.chain_id, when)
+
+    def resolve_ticker_for_lineage(
+        self, lineage_id: str, on_date: date | str
+    ) -> str:
+        """Return the unique active provider symbol for a segmented lineage."""
+        when = _identity_date(on_date)
+        segment = self._active_segment_for_chain(lineage_id, when)
+        return segment.provider_symbol
+
+    def _active_segment_for_chain(
+        self, chain_id: str, when: date
+    ) -> PriceIdentitySegment:
+        active = [
+            segment
+            for segment in self.segments.values()
+            if segment.chain_id == chain_id
+            and segment.admitted_start <= when <= segment.admitted_end
+        ]
+        if len(active) != 1:
+            raise ValueError(
+                f"segmented lineage must have exactly one active price identity: {chain_id}"
+            )
+        current = active[0]
+        # The loader has already validated the full path. Walk it anyway so a
+        # manually constructed contract cannot silently jump across a gap.
+        visited: set[str] = set()
+        while True:
+            if current.segment_id in visited:
+                raise ValueError("price identity segment path contains a cycle")
+            visited.add(current.segment_id)
+            outgoing = [
+                item
+                for item in self.segment_transitions
+                if item.predecessor_segment_id == current.segment_id
+                and item.chain_id == chain_id
+                and item.effective_date <= when
+            ]
+            if len(outgoing) > 1:
+                raise ValueError("price identity segment path is ambiguous")
+            if not outgoing:
+                return current
+            successor = self.segments.get(outgoing[0].successor_segment_id)
+            if successor is None or not successor.admitted_start <= when <= successor.admitted_end:
+                raise ValueError("price identity segment successor is not active at boundary")
+            current = successor
+
+    def _resolve_segmented_holding(self, symbol: str, when: date) -> str | None:
+        matching = [
+            item for item in self.segments.values() if item.provider_symbol == symbol
+        ]
+        if not matching:
+            return None
+        candidate_chains = {
+            item.chain_id for item in matching if item.admitted_start <= when
+        }
+        if len(candidate_chains) != 1:
+            if not candidate_chains:
+                raise ValueError(
+                    f"open holding identity is not admitted on the requested date: {symbol}"
+                )
+            raise ValueError("ticker-only segmented holding resolution is ambiguous")
+        return self.resolve_ticker_for_lineage(next(iter(candidate_chains)), when)
 
     def resolve_open_holding(self, ticker: str, on_date: date | str) -> str:
         """Return an approved identity or fail closed after an ended identity."""
@@ -204,9 +375,10 @@ class PriceIdentityTransitionContract:
         ticker_validator: Callable[[object], str],
     ) -> str:
         symbol = ticker_validator(ticker)
-        when = date.fromisoformat(on_date) if isinstance(on_date, str) else on_date
-        if not isinstance(when, date):
-            raise ValueError("holding transition date is invalid")
+        when = _identity_date(on_date)
+        segmented_resolution = self._resolve_segmented_holding(symbol, when)
+        if segmented_resolution is not None:
+            return segmented_resolution
         matches = [
             item
             for item in self.transitions
@@ -242,6 +414,421 @@ class PriceIdentityTransitionContract:
         if not active:
             raise ValueError(f"open holding crossed an unhandled same-issuer transition: {symbol}")
         return symbol
+
+
+def _parse_identity_date(value: object, field_name: str) -> date:
+    if not isinstance(value, str):
+        raise ValueError(f"price identity segment {field_name} is invalid")
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"price identity segment {field_name} is invalid") from exc
+    if parsed.isoformat() != value:
+        raise ValueError(f"price identity segment {field_name} is invalid")
+    return parsed
+
+
+def _gap_contains_only_weekend_dates(left_end: date, right_start: date) -> bool:
+    """Allow only closed Saturday/Sunday dates between inclusive segments."""
+    current = left_end + timedelta(days=1)
+    while current < right_start:
+        if current.weekday() < 5:
+            return False
+        current += timedelta(days=1)
+    return True
+
+
+def _segment_contract_object(
+    parent_digest: str,
+    segments: Mapping[str, PriceIdentitySegment],
+    transitions: tuple[PriceIdentitySegmentTransition, ...],
+    assertions: Mapping[str, PriceIdentitySourceAssertion],
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "parent_price_identity_request_contracts_sha256": parent_digest,
+        "segments": [
+            {
+                "segment_id": item.segment_id,
+                "provider_symbol": item.provider_symbol,
+                "chain_id": item.chain_id,
+                "continuity_kind": item.continuity_kind,
+                "admitted_start": item.admitted_start.isoformat(),
+                "admitted_end": item.admitted_end.isoformat(),
+                "factor_anchor": item.factor_anchor,
+            }
+            for item in sorted(
+                segments.values(),
+                key=lambda item: (item.chain_id, item.admitted_start, item.segment_id),
+            )
+        ],
+        "transitions": [
+            {
+                "effective_date": item.effective_date.isoformat(),
+                "predecessor_segment_id": item.predecessor_segment_id,
+                "successor_segment_id": item.successor_segment_id,
+                "chain_id": item.chain_id,
+                "continuity_kind": item.continuity_kind,
+                "source_assertion_ids": list(item.source_assertion_ids),
+            }
+            for item in sorted(
+                transitions,
+                key=lambda item: (
+                    item.effective_date,
+                    item.predecessor_segment_id,
+                    item.successor_segment_id,
+                    item.chain_id,
+                    item.continuity_kind,
+                ),
+            )
+        ],
+        "source_assertions": [
+            {
+                "assertion_id": item.assertion_id,
+                "authority": item.authority,
+                "url": item.url,
+                "accession": item.accession,
+                "document_date": item.document_date.isoformat(),
+                "locator": item.locator,
+                "effective_date": item.effective_date.isoformat(),
+                "supports": item.supports,
+                "source_byte_sha256": item.source_byte_sha256,
+                "source_document_path": item.source_document_path,
+            }
+            for item in sorted(assertions.values(), key=lambda item: item.assertion_id)
+        ],
+    }
+
+
+def _parse_price_identity_segments_v1(
+    raw_contract: object,
+    *,
+    declared_sha256: object,
+    parent_contract_sha256: str,
+    evidence_root: Path,
+    identities: Mapping[str, Mapping[str, object]],
+    ticker_transitions: tuple[IdentityTransition, ...],
+    data_cutoff: date,
+) -> tuple[
+    Mapping[str, PriceIdentitySegment],
+    tuple[PriceIdentitySegmentTransition, ...],
+    Mapping[str, PriceIdentitySourceAssertion],
+]:
+    if not isinstance(raw_contract, dict) or set(raw_contract) != {
+        "schema_version",
+        "parent_price_identity_request_contracts_sha256",
+        "segments",
+        "transitions",
+        "source_assertions",
+    }:
+        raise ValueError("prices provenance contains an invalid segment contract")
+    if type(raw_contract["schema_version"]) is not int or raw_contract["schema_version"] != 1:
+        raise ValueError("price identity segment schema version is unsupported")
+    if (
+        raw_contract["parent_price_identity_request_contracts_sha256"]
+        != parent_contract_sha256
+    ):
+        raise ValueError("price identity segment parent digest does not match request contracts")
+    if (
+        not isinstance(declared_sha256, str)
+        or _DIGEST_RE.fullmatch(declared_sha256) is None
+        or pit_canonical_json_sha256(raw_contract) != declared_sha256
+    ):
+        raise ValueError("price identity segment contract digest does not match its object")
+
+    raw_segments = raw_contract["segments"]
+    raw_transitions = raw_contract["transitions"]
+    raw_assertions = raw_contract["source_assertions"]
+    if (
+        not isinstance(raw_segments, list)
+        or not raw_segments
+        or not isinstance(raw_transitions, list)
+        or not raw_transitions
+        or not isinstance(raw_assertions, list)
+        or not raw_assertions
+    ):
+        raise ValueError("price identity segment contract is incomplete")
+
+    segment_fields = {
+        "segment_id",
+        "provider_symbol",
+        "chain_id",
+        "continuity_kind",
+        "admitted_start",
+        "admitted_end",
+        "factor_anchor",
+    }
+    segments: dict[str, PriceIdentitySegment] = {}
+    previous_segment_key: tuple[str, date, str] | None = None
+    for raw_segment in raw_segments:
+        if not isinstance(raw_segment, dict) or set(raw_segment) != segment_fields:
+            raise ValueError("prices provenance contains an invalid price identity segment")
+        try:
+            segment_id = raw_segment["segment_id"]
+            provider_symbol = _canonical_ticker_v3(raw_segment["provider_symbol"])
+            chain_id = raw_segment["chain_id"]
+            continuity_kind = raw_segment["continuity_kind"]
+            admitted_start = _parse_identity_date(
+                raw_segment["admitted_start"], "admitted start"
+            )
+            admitted_end = _parse_identity_date(
+                raw_segment["admitted_end"], "admitted end"
+            )
+            factor_anchor = raw_segment["factor_anchor"]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("prices provenance contains an invalid price identity segment") from exc
+        if (
+            not isinstance(segment_id, str)
+            or re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", segment_id) is None
+            or segment_id in segments
+            or provider_symbol != raw_segment["provider_symbol"]
+            or provider_symbol not in identities
+            or not isinstance(chain_id, str)
+            or _SECURITY_LINEAGE_ID_RE.fullmatch(chain_id) is None
+            or not isinstance(continuity_kind, str)
+            or continuity_kind not in _SAME_ISSUER_CONTINUITIES
+            or type(factor_anchor) is not bool
+            or admitted_end < admitted_start
+            or admitted_end > data_cutoff
+        ):
+            raise ValueError("prices provenance contains an invalid price identity segment")
+        identity = identities[provider_symbol]
+        if (
+            identity.get("provider_symbol") != provider_symbol
+            or identity.get("chain_id") != chain_id
+            or identity.get("continuity_kind") != continuity_kind
+            or admitted_start < date.fromisoformat(str(identity["admitted_start"]))
+            or admitted_end > date.fromisoformat(str(identity["admitted_end"]))
+        ):
+            raise ValueError("price identity segment disagrees with its parent identity")
+        key = (chain_id, admitted_start, segment_id)
+        if previous_segment_key is not None and key <= previous_segment_key:
+            raise ValueError("price identity segments are not canonical-sorted")
+        previous_segment_key = key
+        segments[segment_id] = PriceIdentitySegment(
+            segment_id,
+            provider_symbol,
+            chain_id,
+            continuity_kind,
+            admitted_start,
+            admitted_end,
+            factor_anchor,
+        )
+
+    assertion_fields = {
+        "assertion_id",
+        "authority",
+        "url",
+        "accession",
+        "document_date",
+        "locator",
+        "effective_date",
+        "supports",
+        "source_byte_sha256",
+        "source_document_path",
+    }
+    assertions: dict[str, PriceIdentitySourceAssertion] = {}
+    previous_assertion_id: str | None = None
+    evidence_root = evidence_root.resolve(strict=True)
+    for raw_assertion in raw_assertions:
+        if not isinstance(raw_assertion, dict) or set(raw_assertion) != assertion_fields:
+            raise ValueError("prices provenance contains an invalid source assertion")
+        assertion_id = raw_assertion["assertion_id"]
+        authority = raw_assertion["authority"]
+        url = raw_assertion["url"]
+        accession = raw_assertion["accession"]
+        locator = raw_assertion["locator"]
+        supports = raw_assertion["supports"]
+        source_hash = raw_assertion["source_byte_sha256"]
+        source_path_value = raw_assertion["source_document_path"]
+        if (
+            not isinstance(assertion_id, str)
+            or not assertion_id
+            or assertion_id in assertions
+            or (previous_assertion_id is not None and assertion_id <= previous_assertion_id)
+            or not all(isinstance(value, str) and value.strip() for value in (authority, url, locator, supports))
+            or (accession is not None and (not isinstance(accession, str) or not accession.strip()))
+            or not isinstance(source_hash, str)
+            or _DIGEST_RE.fullmatch(source_hash) is None
+            or not isinstance(source_path_value, str)
+            or not source_path_value.strip()
+        ):
+            raise ValueError("prices provenance contains an invalid source assertion")
+        parsed_url = urlsplit(url)
+        if parsed_url.scheme != "https" or not parsed_url.hostname or parsed_url.username or parsed_url.password:
+            raise ValueError("price identity source assertion URL must be HTTPS")
+        if "\\" in source_path_value or ":" in source_path_value:
+            raise ValueError("price identity source document path is invalid")
+        source_relative_path = PurePosixPath(source_path_value)
+        if (
+            source_relative_path.is_absolute()
+            or not source_relative_path.parts
+            or any(part in {"", ".", ".."} for part in source_relative_path.parts)
+        ):
+            raise ValueError("price identity source document path is invalid")
+        try:
+            retained_path = evidence_root.joinpath(*source_relative_path.parts)
+            current_path = evidence_root
+            for part in source_relative_path.parts:
+                current_path = current_path / part
+                if current_path.is_symlink():
+                    raise ValueError("price identity source document cannot be a symlink")
+            source_path = retained_path.resolve(strict=True)
+            if not source_path.is_relative_to(evidence_root) or not source_path.is_file():
+                raise ValueError("price identity source document is not retained beside provenance")
+            retained_sha256 = sha256_file(source_path)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ValueError("price identity source document is unavailable") from exc
+        if retained_sha256 != source_hash:
+            raise ValueError("price identity source document hash does not match assertion")
+        assertion = PriceIdentitySourceAssertion(
+            assertion_id,
+            authority,
+            url,
+            accession,
+            _parse_identity_date(raw_assertion["document_date"], "source document date"),
+            locator,
+            _parse_identity_date(raw_assertion["effective_date"], "source effective date"),
+            supports,
+            source_hash,
+            source_path_value,
+        )
+        assertions[assertion_id] = assertion
+        previous_assertion_id = assertion_id
+
+    transition_fields = {
+        "effective_date",
+        "predecessor_segment_id",
+        "successor_segment_id",
+        "chain_id",
+        "continuity_kind",
+        "source_assertion_ids",
+    }
+    segment_transitions: list[PriceIdentitySegmentTransition] = []
+    previous_transition_key: tuple[date, str, str, str, str] | None = None
+    referenced_assertions: set[str] = set()
+    edge_pairs: set[tuple[str, str]] = set()
+    incoming: set[str] = set()
+    outgoing: set[str] = set()
+    for raw_transition in raw_transitions:
+        if not isinstance(raw_transition, dict) or set(raw_transition) != transition_fields:
+            raise ValueError("prices provenance contains an invalid segment transition")
+        try:
+            effective_date = _parse_identity_date(
+                raw_transition["effective_date"], "transition effective date"
+            )
+            predecessor_id = raw_transition["predecessor_segment_id"]
+            successor_id = raw_transition["successor_segment_id"]
+            chain_id = raw_transition["chain_id"]
+            continuity_kind = raw_transition["continuity_kind"]
+            assertion_ids = raw_transition["source_assertion_ids"]
+        except (KeyError, ValueError) as exc:
+            raise ValueError("prices provenance contains an invalid segment transition") from exc
+        predecessor = segments.get(predecessor_id) if isinstance(predecessor_id, str) else None
+        successor = segments.get(successor_id) if isinstance(successor_id, str) else None
+        if (
+            predecessor is None
+            or successor is None
+            or predecessor_id == successor_id
+            or predecessor.chain_id != chain_id
+            or successor.chain_id != chain_id
+            or predecessor.continuity_kind != continuity_kind
+            or successor.continuity_kind != continuity_kind
+            or continuity_kind not in _SAME_ISSUER_CONTINUITIES
+            or predecessor.admitted_end >= effective_date
+            or not _gap_contains_only_weekend_dates(
+                predecessor.admitted_end, effective_date
+            )
+            or successor.admitted_start != effective_date
+            or not isinstance(assertion_ids, list)
+            or not assertion_ids
+            or any(not isinstance(item, str) for item in assertion_ids)
+            or assertion_ids != sorted(set(assertion_ids))
+        ):
+            raise ValueError("prices provenance contains an invalid segment transition")
+        key = (effective_date, predecessor_id, successor_id, chain_id, continuity_kind)
+        if previous_transition_key is not None and key <= previous_transition_key:
+            raise ValueError("price identity segment transitions are not canonical-sorted")
+        previous_transition_key = key
+        if (predecessor_id, successor_id) in edge_pairs or predecessor_id in outgoing or successor_id in incoming:
+            raise ValueError("price identity segment path contains a branch")
+        edge_pairs.add((predecessor_id, successor_id))
+        outgoing.add(predecessor_id)
+        incoming.add(successor_id)
+        for assertion_id in assertion_ids:
+            assertion = assertions.get(assertion_id)
+            if assertion is None or assertion.effective_date != effective_date:
+                raise ValueError("segment transition source assertion is missing or misdated")
+            referenced_assertions.add(assertion_id)
+        segment_transitions.append(
+            PriceIdentitySegmentTransition(
+                effective_date,
+                predecessor_id,
+                successor_id,
+                chain_id,
+                continuity_kind,
+                tuple(assertion_ids),
+            )
+        )
+    if referenced_assertions != set(assertions):
+        raise ValueError("segment source assertions must be referenced exactly by transitions")
+
+    segmented_chains = {segment.chain_id for segment in segments.values()}
+    if any(item.chain_id in segmented_chains for item in ticker_transitions):
+        raise ValueError("legacy and segment transitions both describe the same lineage")
+    for chain_id in segmented_chains:
+        chain_segments = sorted(
+            (item for item in segments.values() if item.chain_id == chain_id),
+            key=lambda item: (item.admitted_start, item.segment_id),
+        )
+        parent_symbols = {
+            ticker
+            for ticker, identity in identities.items()
+            if identity.get("chain_id") == chain_id
+        }
+        if {item.provider_symbol for item in chain_segments} != parent_symbols:
+            raise ValueError("segment path does not cover every parent identity in its lineage")
+        anchors = [item for item in chain_segments if item.factor_anchor]
+        parent_anchors = [
+            ticker
+            for ticker in parent_symbols
+            if identities[ticker].get("factor_anchor") is True
+        ]
+        if (
+            len(anchors) != 1
+            or len(parent_anchors) != 1
+            or anchors[0].provider_symbol != parent_anchors[0]
+        ):
+            raise ValueError("segment path must preserve exactly one parent factor anchor")
+        if len(chain_segments) < 2:
+            raise ValueError("segmented lineage must contain a dated transition")
+        expected_edges = {
+            (left.segment_id, right.segment_id)
+            for left, right in zip(chain_segments, chain_segments[1:], strict=False)
+        }
+        actual_edges = {
+            pair
+            for pair in edge_pairs
+            if segments[pair[0]].chain_id == chain_id
+        }
+        if expected_edges != actual_edges:
+            raise ValueError("price identity segment path is disconnected or cyclic")
+        for left, right in zip(chain_segments, chain_segments[1:], strict=False):
+            if (
+                left.admitted_end >= right.admitted_start
+                or not _gap_contains_only_weekend_dates(
+                    left.admitted_end, right.admitted_start
+                )
+            ):
+                raise ValueError(
+                    "price identity segment path contains an overlap or unexplained session gap"
+                )
+
+    return (
+        MappingProxyType(segments),
+        tuple(segment_transitions),
+        MappingProxyType(assertions),
+    )
 
 
 @dataclass
@@ -287,6 +874,22 @@ def _canonical_ticker(value: object) -> str:
     if not ticker or len(ticker) > 8 or any(char not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ.-" for char in ticker):
         raise ValueError("ticker is not canonical")
     return ticker
+
+
+def _identity_date(value: date | str) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = date.fromisoformat(value)
+        except ValueError as exc:
+            raise ValueError("holding transition date is invalid") from exc
+        if parsed.isoformat() != value:
+            raise ValueError("holding transition date is invalid")
+        return parsed
+    raise ValueError("holding transition date is invalid")
 
 
 def _canonical_ticker_v3(value: object) -> str:
@@ -958,11 +1561,42 @@ class PITDataBundle:
                                 ),
                             )
                         )
+        segments: Mapping[str, PriceIdentitySegment] = MappingProxyType({})
+        segment_transitions: tuple[PriceIdentitySegmentTransition, ...] = ()
+        source_assertions: Mapping[str, PriceIdentitySourceAssertion] = MappingProxyType({})
+        segment_parent_digest: str | None = None
+        segment_digest: str | None = None
+        evidence_root: Path | None = None
+        has_segment_object = "price_identity_segments_v1" in provenance
+        has_segment_digest = "price_identity_segments_v1_sha256" in provenance
+        if has_segment_object != has_segment_digest:
+            raise ValueError("price identity segment object and digest must appear together")
+        if has_segment_object:
+            segment_parent_digest = contract_sha
+            segment_digest = provenance.get("price_identity_segments_v1_sha256")
+            evidence_root = path.resolve(strict=True).parent
+            segments, segment_transitions, source_assertions = (
+                _parse_price_identity_segments_v1(
+                    provenance.get("price_identity_segments_v1"),
+                    declared_sha256=segment_digest,
+                    parent_contract_sha256=contract_sha,
+                    evidence_root=evidence_root,
+                    identities=identities,
+                    ticker_transitions=tuple(transitions),
+                    data_cutoff=self.data_cutoff.date(),
+                )
+            )
         contract = PriceIdentityTransitionContract(
             provenance_sha,
             contract_sha,
             identities,
             tuple(transitions),
+            segments,
+            segment_transitions,
+            source_assertions,
+            segment_parent_digest,
+            segment_digest,
+            evidence_root,
         )
         self._security_lineage_ids = MappingProxyType(
             {
