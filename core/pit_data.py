@@ -246,6 +246,16 @@ class PriceIdentityTransitionContract:
                 or self._source_evidence_root is None
             ):
                 raise ValueError("segmented identity construction requires verified source evidence")
+            parent_identity_payload = {
+                ticker: dict(values) for ticker, values in frozen.items()
+            }
+            if (
+                pit_canonical_json_sha256(parent_identity_payload)
+                != self.request_contracts_sha256
+            ):
+                raise ValueError(
+                    "segmented identity construction does not match the parent request-contract digest"
+                )
             segment_payload = _segment_contract_object(
                 self.segment_parent_request_contracts_sha256,
                 self.segments,

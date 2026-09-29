@@ -355,6 +355,32 @@ def test_segment_contract_direct_constructor_cannot_bypass_validation(
         )
 
 
+def test_segment_contract_constructor_recomputes_parent_identity_digest(
+    tmp_path: Path,
+) -> None:
+    bundle, provenance_path = _bundle_with_segments(tmp_path)
+    contract = bundle.load_price_identity_transition_contract(provenance_path)
+    altered_identities = {
+        ticker: dict(identity) for ticker, identity in contract.identities.items()
+    }
+    altered_identities["SPY"]["admitted_end"] = "2025-12-30"
+    altered_identities["SPY"]["identity_asof"] = "2025-12-30"
+
+    with pytest.raises(ValueError, match="parent request-contract digest"):
+        PriceIdentityTransitionContract(
+            contract.prices_provenance_sha256,
+            contract.request_contracts_sha256,
+            altered_identities,
+            contract.transitions,
+            contract.segments,
+            contract.segment_transitions,
+            contract.source_assertions,
+            contract.segment_parent_request_contracts_sha256,
+            contract.segment_contract_sha256,
+            provenance_path.parent,
+        )
+
+
 @pytest.mark.parametrize(
     "edit",
     [
