@@ -88,6 +88,13 @@ user started Docker; the lead verified a Linux/amd64 Docker Engine 29.7.2 via a
 scoped host-level check. The pinned Python base and seven historical evaluator
 images are local, but none of those images matches the integrated V5 evaluator
 source-map SHA-256 `a55875a2ea021ec27a9fd18d8e09b180ce9186fcaf1b3bbb14036db871e11fb4`.
+A new Linux/amd64 image has been built from canonical Git-blob source bytes and
+independently inspected:
+`pit-optimizer-v5-evaluator@sha256:bf842ff5e0dc741f95e96129d224c24d7834feef23c4c20fdfe1d5297d54b527`,
+with the same runtime-source label and UID/GID 65532. Its version-pinned lock
+has no per-distribution hashes, and pip resolved two additional transitive
+packages; the immutable image digest records the realized build. Actual
+owned-container parent/candidate execution and cleanup remain pending.
 
 | Published criterion | Evidence and disposition |
 | --- | --- |
@@ -97,9 +104,9 @@ source-map SHA-256 `a55875a2ea021ec27a9fd18d8e09b180ce9186fcaf1b3bbb14036db871e1
 
 | Status | Current assessment |
 | --- | --- |
-| Implementation | Existing simulator/evaluator/workers and focused tests integrated; current-source image build and actual container run in progress. |
-| Required inputs | Synthetic bars/policies available; Docker Engine now available; correctly matched evaluator image still to build/authenticate. |
-| Acceptance evidence | 15 selected focused checks pass; actual candidate execution, image identity and owned cleanup pending. |
+| Implementation | Existing simulator/evaluator/workers and focused tests integrated; exact-source image built; actual container run in progress. |
+| Required inputs | Synthetic bars/policies, Docker Engine and a correctly matched local evaluator image now available. |
+| Acceptance evidence | 15 selected focused checks pass; exact-source image inspected; actual parent/candidate execution and owned cleanup pending. |
 | Dependencies | Accepted #80 and #81 satisfied; production PIT bundle and empirical costs are outside the bounded synthetic verification. |
 
 ## #68 — historical membership and lineage
@@ -109,7 +116,13 @@ and [acquisition/transition plan](historical-membership-acquisition-plan-v1.md)
 bind the retained S&P event sample and its limits, missing admitted Nasdaq and
 Russell histories, and the absent explicit V3 price-identity transitions. The
 normalizer's authenticated rename-boundary fix and focused fixtures pass, but
-they cannot substitute for a three-index historical artifact.
+they cannot substitute for a three-index historical artifact. The [chronology
+review](price-identity-transition-chronology-review-v1.md) verifies from Fiserv
+issuer and SEC records that the same common stock changed FISV→FI on 2023-06-07
+and FI→FISV on 2025-11-11. The retained one-row-per-ticker price identity map
+overlaps FISV and FI, and cannot express the three distinct symbol episodes.
+The integrated normalizer now rejects overlapping predecessor dates; a
+segment-identity contract and reconciliation of this chain remain outstanding.
 
 | Published criterion | Evidence and disposition |
 | --- | --- |
@@ -119,9 +132,9 @@ they cannot substitute for a three-index historical artifact.
 
 | Status | Current assessment |
 | --- | --- |
-| Implementation | V3 normalizer and exact rename-boundary fix integrated; source-acquisition/transition plan recorded. |
+| Implementation | V3 normalizer, exact rename-boundary fix and fail-closed predecessor chronology guard integrated; source-acquisition/transition plan recorded. Repeated-ticker segment representation remains unimplemented. |
 | Required inputs | Complete admitted S&P/Nasdaq/Russell dated source history, rights/access basis, and authenticated V3 price transitions missing. |
-| Acceptance evidence | 14 focused checks and 13 retained source hashes verified; no production union or coverage acceptance. |
+| Acceptance evidence | 20 focused membership checks and 13 retained source hashes verified; Fiserv primary chronology retained, but no complete production union or coverage acceptance. |
 | Dependencies | Accepted #66 satisfied; later production joins depend on an accepted lineage artifact. |
 
 ## Integrated verification and next review
