@@ -1,13 +1,13 @@
 # Four-issue acceptance packet (working review)
 
-**Review date:** 2026-09-28. **Integrated branch:** `codex/four-issue-integration`.
+**Review dates:** 2026-09-28–29. **Integrated branch:** `codex/four-issue-integration`.
 This packet remains open for #68 source-backed data delivery. It records bounded
 local acceptance separately from GitHub issue
 closure. No issue in this packet is closed by the document.
 
 ## Exact issue and contract basis
 
-The lead fetched the current GitHub bodies of [#67](https://github.com/LangkunLong/RS-momentum-EMA-trading-bot/issues/67), [#82](https://github.com/LangkunLong/RS-momentum-EMA-trading-bot/issues/82), [#68](https://github.com/LangkunLong/RS-momentum-EMA-trading-bot/issues/68), and [#71](https://github.com/LangkunLong/RS-momentum-EMA-trading-bot/issues/71) on 2026-09-28. All four were open, with zero issue comments. Their criterion text below is mapped to evidence without substituting a worker completion or passing fixture for acceptance. The start contracts [#66](https://github.com/LangkunLong/RS-momentum-EMA-trading-bot/issues/66) and [#80](https://github.com/LangkunLong/RS-momentum-EMA-trading-bot/issues/80), the #82 acceptance prerequisite [#81](https://github.com/LangkunLong/RS-momentum-EMA-trading-bot/issues/81), and the separate paper boundary [#97](https://github.com/LangkunLong/RS-momentum-EMA-trading-bot/issues/97) were closed when fetched; their local accepted documents are unchanged on this branch.
+The lead fetched the current GitHub bodies of [#67](https://github.com/LangkunLong/RS-momentum-EMA-trading-bot/issues/67), [#82](https://github.com/LangkunLong/RS-momentum-EMA-trading-bot/issues/82), [#68](https://github.com/LangkunLong/RS-momentum-EMA-trading-bot/issues/68), and [#71](https://github.com/LangkunLong/RS-momentum-EMA-trading-bot/issues/71) on 2026-09-28 and rechecked them on 2026-09-29. All four remain open and their acceptance criteria are unchanged. Their criterion text below is mapped to evidence without substituting a worker completion or passing fixture for acceptance. The start contracts [#66](https://github.com/LangkunLong/RS-momentum-EMA-trading-bot/issues/66) and [#80](https://github.com/LangkunLong/RS-momentum-EMA-trading-bot/issues/80), the #82 acceptance prerequisite [#81](https://github.com/LangkunLong/RS-momentum-EMA-trading-bot/issues/81), and the separate paper boundary [#97](https://github.com/LangkunLong/RS-momentum-EMA-trading-bot/issues/97) were closed when fetched; their local accepted documents are unchanged on this branch.
 
 | Accepted contract | Git blob at this review source |
 | --- | --- |
@@ -28,8 +28,9 @@ are unchanged by that upstream movement.
 
 ## #67 — historical feature availability
 
-**Current bounded recommendation:** ready for acceptance of the reporter and
-named development measurement. Production-universe coverage and actual
+**Current bounded recommendation:** the reporter and named development
+measurement passed at their recorded source; a final integrated-source rerun is
+pending below. Production-universe coverage and actual
 decision-by-decision policy consumption remain unverified claims outside that
 bounded acceptance.
 
@@ -88,8 +89,10 @@ and are neither fixed nor silently treated as passing.
 
 ## #82 — evaluator and candidate execution
 
-**Current bounded recommendation:** ready for synthetic evaluator and candidate
-container acceptance. The selected 15 focused tests verified
+**Current bounded recommendation:** the earlier exact-source synthetic evaluator
+and candidate containers passed at source map `a55875…`. The latest integrated
+source map changed after #68 identity work, so final-source container acceptance
+is pending. The selected 15 focused tests verified
 the actual V5 portfolio simulator on synthetic next-open and gap-stop paths,
 matched evaluator argument forwarding, fixed behavior probes and supplemental
 mechanism gates as distinct stages. [The #82 receipt](research-03-simulation-verification-2026-09-28.md)
@@ -138,9 +141,9 @@ run or production/strategy performance.
 
 | Status | Current assessment |
 | --- | --- |
-| Implementation | Existing simulator/evaluator/workers and focused tests integrated; exact-source image built and two actual candidate-path containers executed. |
-| Required inputs | Synthetic bars/policies, Docker Engine and a correctly matched local evaluator image now available. |
-| Acceptance evidence | 15 selected focused checks and five final-branch focused cases pass; tracked source-matched image receipt, parent/candidate zero exits, matching fingerprint and owned cleanup independently verified. |
+| Implementation | Existing simulator/evaluator/workers and focused tests integrated; an image and two actual candidate-path containers were executed at the recorded earlier source map. |
+| Required inputs | Synthetic bars/policies and Docker Engine available. A correctly matched final-source image and permitted runner path remain pending. |
+| Acceptance evidence | Earlier 15 selected focused checks and actual parent/candidate zero exits, matching fingerprint and owned cleanup are retained under their original map. Final integrated-source container evidence remains unverified. |
 | Dependencies | Accepted #80 and #81 satisfied; production PIT bundle and empirical costs are outside the bounded synthetic verification. |
 
 ## #68 — historical membership and lineage
@@ -155,8 +158,10 @@ review](price-identity-transition-chronology-review-v1.md) verifies from Fiserv
 issuer and SEC records that the same common stock changed FISV→FI on 2023-06-07
 and FI→FISV on 2025-11-11. The retained one-row-per-ticker price identity map
 overlaps FISV and FI, and cannot express the three distinct symbol episodes.
-The integrated normalizer now rejects overlapping predecessor dates; a
-segment-identity contract and reconciliation of this chain remain outstanding.
+The integrated normalizer rejects overlapping predecessor dates. An opt-in,
+hash-bound segment-identity resolver now represents the FISV→FI→FISV episodes
+and is exercised only by synthetic retained-byte fixtures; production source
+assertions and the three-index membership artifact remain outstanding.
 The [partial transition evidence ledger](price-identity-transition-evidence-ledger-v1.json)
 is SHA-256 `b4468d45277bbadeb7739f5e47884644609e36f469a479ec52c54311828735d2`.
 It binds the retained 607-key request contract (digest `273727c248f57b7376b6cf269312325cdd059287e1f4ed16ab5ce63617ceabc7`),
@@ -164,10 +169,17 @@ classifies 13 one-way candidates as supported by cited primary evidence only,
 and leaves Fiserv unresolved. It emits no integrated transition and adds zero
 membership rows. The issuer/SEC source bytes were not retained; URL,
 filing/release identity and section locators are the bounded source references.
+On 2026-09-29 a single ABC→COR SEC filing byte-retention attempt, using a
+project-identifying User-Agent, was refused by SEC's automated-access gate.
+No file or source-byte hash was produced; the official citation remains a
+view-only fact check. No bulk retry was made. The [SEC access policy](https://www.sec.gov/search-filings/edgar-search-assistance/accessing-edgar-data)
+permits public downloads subject to declared traffic and fair access, but this
+host's refused request does not supply an admissible retained source receipt.
 The [segment-contract decision](price-identity-segment-contract-decision-v1.md)
-records a proposed dated segment ID and resolver contract for the FISV→FI→FISV
-case. It is a design and synthetic rejection matrix only: no production segment
-object, V3 transition, membership row or evaluator-source change was made.
+records the dated segment-ID and resolver design. Its opt-in implementation is
+integrated with synthetic rejection tests; no production segment object, V3
+transition or membership row was emitted. This implementation changed the
+evaluator source map, so the earlier #82 image does not verify it.
 
 | Published criterion | Evidence and disposition |
 | --- | --- |
@@ -177,9 +189,9 @@ object, V3 transition, membership row or evaluator-source change was made.
 
 | Status | Current assessment |
 | --- | --- |
-| Implementation | V3 normalizer, exact rename-boundary fix and fail-closed predecessor chronology guard integrated; source-acquisition/transition and repeated-ticker segment plans recorded. Repeated-ticker segment representation remains unimplemented. |
-| Required inputs | Complete admitted S&P/Nasdaq/Russell dated source history, rights/access basis, and authenticated V3 price transitions missing. |
-| Acceptance evidence | 20 focused membership checks, 13 retained acquisition-source hashes, partial ledger hash and 607-key price-contract digest verified; Fiserv primary chronology cited, but no complete production union or coverage acceptance. |
+| Implementation | V3 normalizer, rename-boundary and chronology guards, opt-in repeated-ticker segment resolver, and fail-closed builder classification integrated. A provider-native event adapter and production transition artifact remain unimplemented pending exact source inputs. |
+| Required inputs | Complete admitted S&P/Nasdaq/Russell dated source history, rights/access basis, retained source-byte/provider-file receipts, and authenticated V3 price transitions missing. |
+| Acceptance evidence | Integrated focused set passed 80 checks across four issues; 13 retained acquisition-source hashes, partial ledger hash and 607-key price-contract digest verified. Fiserv primary chronology is cited, but no complete production union or membership coverage acceptance exists. |
 | Dependencies | Accepted #66 satisfied; later production joins depend on an accepted lineage artifact. |
 
 ### #68 source-access decision remaining
@@ -205,11 +217,18 @@ history or authorize a reconstructed index database.
 
 At integrated revision `cc141dc` (later revisions changed documents and a
 checkout line-ending attribute, not runtime or test source),
-the lead ran the #67/#71/#68 focused set: **59 passed**. The selected #82
+the lead ran the #67/#71/#68 focused set: **59 passed**. After integrating the
+#68 segment, parent-hash and builder fixes through `0276af9`, the focused
+#67/#71/#68/#82 set passed **80 tests**. The three broader #71 parity cases
+still reproduced the baseline's two market-context errors and one missing
+`schema_version` error at `0276af9`; they remain unresolved. The selected #82
 focused set passed **15** at its recorded source revision; five key cases
 passed again after the #82 receipt was integrated. The lead independently
-recomputed the current canonical 56-path V5 source-map hash, matched the
+recomputed the earlier canonical 56-path V5 source-map hash, matched the
 tracked receipt to its raw capture hash, and inspected the immutable local
-image and empty V5-owned container list. The broad offline suite remains
+image and empty V5-owned container list. The latest 56-path map is
+`a6cec2a9092f07b0a9e084c16a2fb3add5743ea69d4dfe5ee962415a3b6f37bc`,
+which requires a new matched image and actual container run before #82 final
+source acceptance. The broad offline suite remains
 informational. No model/provider experiment, order, paper-runtime change, production
 bundle acceptance or issue closure is inferred from these tests.
