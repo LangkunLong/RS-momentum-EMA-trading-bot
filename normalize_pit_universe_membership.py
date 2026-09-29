@@ -11,7 +11,7 @@ import re
 import tempfile
 from collections.abc import Mapping
 from datetime import date, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from core.pit_data import sha256_file
@@ -59,6 +59,11 @@ _IDENTITY_FIELDS = frozenset(
 _TRANSITION_FIELDS = frozenset(
     {"effective_date", "predecessor", "successor", "chain_id", "continuity_kind"}
 )
+_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+_EVENT_ROW_LOCATOR_RE = re.compile(r"bytes:(0|[1-9][0-9]*)-(0|[1-9][0-9]*)\Z")
+_NONPRODUCTION_EVIDENCE_MODE = "nonproduction_fixture"
+_EVENT_CSV_INTEGRITY_MODE = "nonproduction_event_csv_integrity_v1"
+_ADMISSION_STATUSES = frozenset({"production", _NONPRODUCTION_EVIDENCE_MODE})
 
 
 def _regular_file(path: str | Path, *, label: str) -> Path:
@@ -148,6 +153,39 @@ def _required_text(source: Mapping[str, object], field: str) -> str:
     if not isinstance(value, str) or not value or value.strip() != value:
         raise ValueError(f"provenance {field} must be non-empty trimmed text")
     return value
+
+
+def _resolve_retained_event_csv(
+    provenance_path: Path, raw_path: object
+) -> Path:
+    if (
+        not isinstance(raw_path, str)
+        or not raw_path.strip()
+        or "\\" in raw_path
+        or ":" in raw_path
+    ):
+        raise ValueError("retained event CSV path is invalid")
+    relative = PurePosixPath(raw_path)
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        raise ValueError("retained event CSV path is invalid")
+    root = provenance_path.resolve(strict=True).parent
+    candidate = root.joinpath(*relative.parts)
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError("retained event CSV cannot be a symlink")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("retained event CSV is unavailable") from exc
+    if not resolved.is_relative_to(root) or not resolved.is_file():
+        raise ValueError("retained event CSV is unavailable")
+    return resolved
 
 
 def _validate_transition_date_bounds(
@@ -406,9 +444,10 @@ def _validate_source_provenance(
     *,
     universe_id: str,
     membership_path: Path,
+    provenance_path: Path,
     rows: list[tuple[str, str, int]],
     provenance: Mapping[str, object],
-) -> tuple[str, str]:
+) -> tuple[str, str, str, str, str | None, str | None]:
     if provenance.get("universe_id") != universe_id:
         raise ValueError(f"{universe_id} provenance universe/source mismatch")
     if provenance.get("membership_sha256") != sha256_file(membership_path):
@@ -422,9 +461,148 @@ def _validate_source_provenance(
     symbols = {row[1] for row in rows}
     if _positive_int(provenance.get("symbol_count"), field="symbol_count") != len(symbols):
         raise ValueError(f"{universe_id} provenance symbol count is inconsistent")
+    admission_status = provenance.get("admission_status")
+    evidence_mode = provenance.get("source_evidence_mode")
+    if (
+        not isinstance(admission_status, str)
+        or admission_status not in _ADMISSION_STATUSES
+    ):
+        raise ValueError(f"{universe_id} provenance admission status is invalid")
+    if admission_status == "production":
+        raise ValueError(
+            f"{universe_id} production admission requires a reviewed provider-native event adapter"
+        )
+    if evidence_mode == _NONPRODUCTION_EVIDENCE_MODE:
+        if admission_status != _NONPRODUCTION_EVIDENCE_MODE or any(
+            key in provenance
+            for key in (
+                "event_csv_integrity_path",
+                "event_csv_integrity_format",
+                "event_csv_integrity_sha256",
+                "event_row_evidence",
+                "event_row_evidence_sha256",
+            )
+        ):
+            raise ValueError(
+                f"{universe_id} fixture evidence mode is misclassified"
+            )
+        raw_source_sha256 = None
+        event_evidence_sha256 = None
+    elif evidence_mode == _EVENT_CSV_INTEGRITY_MODE:
+        # Nonproduction-only: this verifies a retained event-CSV copy, not
+        # provider-native source rows, rights, or independent event meaning.
+        if admission_status != _NONPRODUCTION_EVIDENCE_MODE:
+            raise ValueError(
+                f"{universe_id} event CSV integrity evidence is nonproduction only"
+            )
+        if provenance.get("event_csv_integrity_format") != "pit_event_csv_v1":
+            raise ValueError(
+                f"{universe_id} event CSV integrity format is unsupported"
+            )
+        artifact_path = _resolve_retained_event_csv(
+            provenance_path, provenance.get("event_csv_integrity_path")
+        )
+        if artifact_path in {membership_path.resolve(), provenance_path.resolve()}:
+            raise ValueError(
+                f"{universe_id} retained event CSV must be distinct from input CSV and provenance"
+            )
+        raw_source_sha256 = provenance.get("event_csv_integrity_sha256")
+        event_evidence = provenance.get("event_row_evidence")
+        event_evidence_sha256 = provenance.get("event_row_evidence_sha256")
+        if (
+            not isinstance(raw_source_sha256, str)
+            or _SHA256_RE.fullmatch(raw_source_sha256) is None
+            or sha256_file(artifact_path) != raw_source_sha256
+            or not isinstance(event_evidence, list)
+            or len(event_evidence) != len(rows)
+            or not isinstance(event_evidence_sha256, str)
+            or _SHA256_RE.fullmatch(event_evidence_sha256) is None
+            or pit_canonical_json_sha256(event_evidence) != event_evidence_sha256
+        ):
+            raise ValueError(
+                f"{universe_id} provenance does not bind retained event CSV integrity evidence"
+            )
+        evidence_fields = {
+            "effective_date",
+            "ticker",
+            "member",
+            "row_locator",
+            "row_sha256",
+        }
+        raw_artifact = artifact_path.read_bytes()
+        if hashlib.sha256(raw_artifact).hexdigest() != raw_source_sha256:
+            raise ValueError(f"{universe_id} retained event CSV changed during validation")
+        expected_source_rows: list[bytes] = []
+        current_offset = len(b"effective_date,ticker,member\n")
+        for expected, raw_evidence in zip(rows, event_evidence, strict=True):
+            if not isinstance(raw_evidence, dict) or set(raw_evidence) != evidence_fields:
+                raise ValueError(
+                    f"{universe_id} event evidence row schema is invalid"
+                )
+            raw_ticker = raw_evidence["ticker"]
+            canonical_ticker = _ticker(raw_ticker, field="event ticker")
+            evidence_key = (
+                _iso_date(raw_evidence["effective_date"], field="event effective_date"),
+                canonical_ticker,
+                raw_evidence["member"],
+            )
+            if (
+                raw_ticker != canonical_ticker
+                or
+                type(raw_evidence["member"]) is not int
+                or raw_evidence["member"] not in {0, 1}
+                or evidence_key != expected
+            ):
+                raise ValueError(
+                    f"{universe_id} event evidence does not match canonical membership events"
+                )
+            expected_source_row = (
+                f"{expected[0]},{expected[1]},{expected[2]}\n".encode("utf-8")
+            )
+            expected_source_rows.append(expected_source_row)
+            locator = raw_evidence["row_locator"]
+            row_sha256 = raw_evidence["row_sha256"]
+            match = (
+                _EVENT_ROW_LOCATOR_RE.fullmatch(locator)
+                if isinstance(locator, str)
+                else None
+            )
+            if (
+                match is None
+                or not isinstance(row_sha256, str)
+                or _SHA256_RE.fullmatch(row_sha256) is None
+            ):
+                raise ValueError(
+                    f"{universe_id} event CSV row locator or hash is invalid"
+                )
+            byte_start, byte_end = (int(item) for item in match.groups())
+            expected_end = current_offset + len(expected_source_row)
+            if (
+                byte_start != current_offset
+                or byte_end != expected_end
+                or raw_artifact[byte_start:byte_end] != expected_source_row
+                or hashlib.sha256(expected_source_row).hexdigest() != row_sha256
+            ):
+                raise ValueError(
+                    f"{universe_id} event CSV locator/hash does not bind its exact row"
+                )
+            current_offset = expected_end
+        expected_artifact = b"effective_date,ticker,member\n" + b"".join(
+            expected_source_rows
+        )
+        if raw_artifact != expected_artifact:
+            raise ValueError(
+                f"{universe_id} retained event CSV contains unindexed or unsupported rows"
+            )
+    else:
+        raise ValueError(f"{universe_id} provenance source evidence mode is invalid")
     return (
         _required_text(provenance, "source_kind"),
         _timestamp(provenance.get("retrieved_at_utc"), field="retrieved_at_utc"),
+        str(evidence_mode),
+        str(admission_status),
+        raw_source_sha256,
+        event_evidence_sha256,
     )
 
 
@@ -512,6 +690,8 @@ def _normalize(
             segment_transition_successors[key] = successor.provider_symbol
     output: list[tuple[str, str, str, int]] = []
     source_bindings: list[dict[str, object]] = []
+    source_admission_statuses: set[str] = set()
+    source_evidence_modes: set[str] = set()
     coalesced = 0
     reference_symbols = set(PIT_NON_TRADABLE_REFERENCE_SYMBOLS)
     for universe_id in _UNIVERSES:
@@ -520,12 +700,22 @@ def _normalize(
         source_additions = {
             (effective, ticker) for effective, ticker, member in rows if member == 1
         }
-        source_kind, retrieved_at = _validate_source_provenance(
+        (
+            source_kind,
+            retrieved_at,
+            evidence_mode,
+            admission_status,
+            raw_source_sha256,
+            event_evidence_sha256,
+        ) = _validate_source_provenance(
             universe_id=universe_id,
             membership_path=membership_path,
+            provenance_path=provenance_path,
             rows=rows,
             provenance=provenance,
         )
+        source_admission_statuses.add(admission_status)
+        source_evidence_modes.add(evidence_mode)
         grouped: dict[tuple[str, str], list[tuple[str, int]]] = {}
         for effective, ticker, member in rows:
             if ticker in reference_symbols:
@@ -611,10 +801,16 @@ def _normalize(
                 "membership_sha256": sha256_file(membership_path),
                 "provenance_sha256": sha256_file(provenance_path),
                 "retrieved_at_utc": retrieved_at,
+                "admission_status": admission_status,
+                "source_evidence_mode": evidence_mode,
+                "event_csv_integrity_sha256": raw_source_sha256,
+                "event_row_evidence_sha256": event_evidence_sha256,
                 "source_kind": source_kind,
                 "universe_id": universe_id,
             }
         )
+    if len(source_admission_statuses) != 1 or len(source_evidence_modes) != 1:
+        raise ValueError("membership sources must use one consistent evidence mode")
     output.sort()
     if not output:
         raise ValueError("normalized membership is empty")
@@ -711,6 +907,20 @@ def main() -> int:
             if sha256_file(source_document_path) != assertion.source_byte_sha256:
                 raise ValueError("retained source document changed during identity loading")
             inputs.add(source_document_path)
+    manifest_inputs = set(inputs)
+    for universe_id in _UNIVERSES:
+        _, source_provenance_path, source_provenance = sources[universe_id]
+        if source_provenance.get("source_evidence_mode") != _EVENT_CSV_INTEGRITY_MODE:
+            continue
+        artifact_path = _resolve_retained_event_csv(
+            source_provenance_path,
+            source_provenance.get("event_csv_integrity_path"),
+        )
+        if artifact_path in manifest_inputs:
+            raise ValueError(
+                "retained event CSV artifacts must be distinct from membership and provenance inputs"
+            )
+        inputs.add(artifact_path)
     before = {path: sha256_file(path) for path in inputs}
     rows, source_bindings, coalesced = _normalize(
         sources,
@@ -725,6 +935,9 @@ def main() -> int:
         universe: sum(row[2] == universe for row in rows) for universe in _UNIVERSES
     }
     provenance = {
+        "admission_status": next(
+            iter({str(item["admission_status"]) for item in source_bindings})
+        ),
         "coalesced_transition_count": coalesced,
         "event_count": len(rows),
         "first_effective_date": rows[0][0],
@@ -737,6 +950,9 @@ def main() -> int:
         "price_identity_transitions_sha256": transition_digest,
         "prices_provenance_sha256": sha256_file(prices_path),
         "schema_version": 3,
+        "source_evidence_mode": next(
+            iter({str(item["source_evidence_mode"]) for item in source_bindings})
+        ),
         "source_universes": list(_UNIVERSES),
         "universe_count": len(_UNIVERSES),
         "universe_event_counts": universe_counts,

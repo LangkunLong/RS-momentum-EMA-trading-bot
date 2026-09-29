@@ -5,15 +5,29 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import sqlite3
+from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from core.pit_provenance import pit_canonical_json_sha256
+import build_pit_bundle as bundle_builder
+from build_pit_bundle import (
+    _load_v3_identity_contract,
+    _require_v3_production_source_evidence,
+)
+from core.pit_data import PITDataBundle
+from core.pit_provenance import (
+    PIT_NON_TRADABLE_REFERENCE_SYMBOLS,
+    pit_canonical_json,
+    pit_canonical_json_sha256,
+)
 from normalize_pit_universe_membership import (
     _csv_bytes,
     _load_price_identity,
     _normalize,
+    _validate_source_provenance,
 )
 
 
@@ -43,9 +57,54 @@ def _source(
         "symbol_count": len(symbols),
         "source_kind": "deterministic fixture",
         "retrieved_at_utc": _RETRIEVED_AT,
+        "admission_status": "nonproduction_fixture",
+        "source_evidence_mode": "nonproduction_fixture",
     }
     provenance_path = tmp_path / f"{universe_id}.json"
     provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+    return membership_path, provenance_path, provenance
+
+
+def _source_with_event_csv_integrity(
+    tmp_path: Path,
+    universe_id: str,
+    events: list[tuple[str, str, int]],
+) -> tuple[Path, Path, dict[str, object]]:
+    membership_path, provenance_path, provenance = _source(
+        tmp_path, universe_id, events
+    )
+    artifact_path = tmp_path / f"{universe_id}_canonical_event_copy.csv"
+    payload = bytearray(b"effective_date,ticker,member\n")
+    evidence: list[dict[str, object]] = []
+    for effective, ticker, member in events:
+        row = f"{effective},{ticker},{member}\n".encode("utf-8")
+        byte_start = len(payload)
+        payload.extend(row)
+        byte_end = len(payload)
+        evidence.append(
+            {
+                "effective_date": effective,
+                "ticker": ticker,
+                "member": member,
+                "row_locator": f"bytes:{byte_start}-{byte_end}",
+                "row_sha256": hashlib.sha256(row).hexdigest(),
+            }
+        )
+    artifact_path.write_bytes(bytes(payload))
+    provenance.update(
+        {
+            "admission_status": "nonproduction_fixture",
+            "source_evidence_mode": "nonproduction_event_csv_integrity_v1",
+            "event_csv_integrity_path": artifact_path.name,
+            "event_csv_integrity_format": "pit_event_csv_v1",
+            "event_csv_integrity_sha256": hashlib.sha256(payload).hexdigest(),
+            "event_row_evidence": evidence,
+            "event_row_evidence_sha256": pit_canonical_json_sha256(evidence),
+        }
+    )
+    provenance_path.write_text(
+        json.dumps(provenance, sort_keys=True), encoding="utf-8"
+    )
     return membership_path, provenance_path, provenance
 
 
@@ -403,6 +462,242 @@ def test_segmented_normalizer_rejects_membership_event_outside_segment(
             transitions=transitions,
             segment_contract=segment_contract,
         )
+
+
+def test_retained_event_csv_integrity_binds_one_exact_row_per_event(tmp_path: Path) -> None:
+    events = [
+        ("2021-01-01", "AAA", 1),
+        ("2021-03-01", "AAA", 0),
+    ]
+    membership_path, provenance_path, provenance = _source_with_event_csv_integrity(
+        tmp_path, "sp500", events
+    )
+
+    result = _validate_source_provenance(
+        universe_id="sp500",
+        membership_path=membership_path,
+        provenance_path=provenance_path,
+        rows=events,
+        provenance=provenance,
+    )
+
+    assert result[2:] == (
+        "nonproduction_event_csv_integrity_v1",
+        "nonproduction_fixture",
+        provenance["event_csv_integrity_sha256"],
+        provenance["event_row_evidence_sha256"],
+    )
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        "missing_event",
+        "duplicate_event",
+        "unknown_event",
+        "bad_row_hash",
+        "reused_locator",
+        "bad_source_hash",
+        "unsupported_format",
+        "unindexed_source_row",
+    ],
+)
+def test_retained_event_csv_integrity_rejects_incomplete_or_mismatched_evidence(
+    tmp_path: Path,
+    edit: str,
+) -> None:
+    events = [
+        ("2021-01-01", "AAA", 1),
+        ("2021-03-01", "AAA", 0),
+    ]
+    membership_path, provenance_path, provenance = _source_with_event_csv_integrity(
+        tmp_path, "sp500", events
+    )
+    event_evidence = deepcopy(provenance["event_row_evidence"])
+    artifact_path = tmp_path / str(provenance["event_csv_integrity_path"])
+    if edit == "missing_event":
+        event_evidence.pop()
+    elif edit == "duplicate_event":
+        event_evidence[1] = deepcopy(event_evidence[0])
+    elif edit == "unknown_event":
+        event_evidence[1]["ticker"] = "ZZZ"
+    elif edit == "bad_row_hash":
+        event_evidence[1]["row_sha256"] = "0" * 64
+    elif edit == "reused_locator":
+        event_evidence[1]["row_locator"] = event_evidence[0]["row_locator"]
+    elif edit == "bad_source_hash":
+        provenance["event_csv_integrity_sha256"] = "0" * 64
+    elif edit == "unsupported_format":
+        provenance["event_csv_integrity_format"] = "provider_html_v1"
+    elif edit == "unindexed_source_row":
+        artifact_path.write_bytes(artifact_path.read_bytes() + b"2021-04-01,BBB,1\n")
+        provenance["event_csv_integrity_sha256"] = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+    provenance["event_row_evidence"] = event_evidence
+    provenance["event_row_evidence_sha256"] = pit_canonical_json_sha256(event_evidence)
+    provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        _validate_source_provenance(
+            universe_id="sp500",
+            membership_path=membership_path,
+            provenance_path=provenance_path,
+            rows=events,
+            provenance=provenance,
+        )
+
+
+def test_fixture_source_evidence_requires_explicit_nonproduction_mode(
+    tmp_path: Path,
+) -> None:
+    events = [("2021-01-01", "AAA", 1)]
+    membership_path, provenance_path, provenance = _source(
+        tmp_path, "sp500", events
+    )
+    provenance.pop("admission_status")
+
+    with pytest.raises(ValueError, match="admission status is invalid"):
+        _validate_source_provenance(
+            universe_id="sp500",
+            membership_path=membership_path,
+            provenance_path=provenance_path,
+            rows=events,
+            provenance=provenance,
+        )
+
+
+@pytest.mark.parametrize(
+    "evidence_mode",
+    ("nonproduction_fixture", "nonproduction_event_csv_integrity_v1"),
+)
+def test_builder_requires_explicit_nonproduction_fixture_opt_in(
+    evidence_mode: str,
+) -> None:
+    provenance = {
+        "admission_status": "nonproduction_fixture",
+        "source_evidence_mode": evidence_mode,
+    }
+
+    with pytest.raises(ValueError, match="explicit fixture-build opt-in"):
+        _require_v3_production_source_evidence(provenance)
+    assert (
+        _require_v3_production_source_evidence(
+            provenance, allow_nonproduction_fixture=True
+        )
+        == "nonproduction_fixture"
+    )
+
+
+def test_builder_never_admits_production_without_provider_native_adapter() -> None:
+    with pytest.raises(ValueError, match="reviewed provider-native event adapter"):
+        _require_v3_production_source_evidence(
+            {
+                "admission_status": "production",
+                "source_evidence_mode": "provider_native",
+            },
+            allow_nonproduction_fixture=True,
+        )
+
+
+def test_builder_v3_identity_loader_preserves_legacy_five_value_shape(
+    tmp_path: Path,
+) -> None:
+    provenance = _price_identity_provenance("2021-01-01", "2021-06-09")
+    provenance_path = tmp_path / "legacy-prices-provenance.json"
+    provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+
+    loaded = _load_v3_identity_contract(provenance_path, provenance)
+
+    assert len(loaded) == 5
+    assert loaded[0]["OLD"]["chain_id"] == "renamed_co"
+    assert loaded[4] is None
+
+
+def test_builder_v3_identity_loader_uses_source_root_for_opt_in_segments(
+    tmp_path: Path,
+) -> None:
+    provenance, _ = _fiserv_segmented_price_identity(tmp_path)
+    provenance_path = tmp_path / "segmented-prices-provenance.json"
+    provenance_path.write_text(json.dumps(provenance, sort_keys=True), encoding="utf-8")
+
+    loaded = _load_v3_identity_contract(provenance_path, provenance)
+
+    assert len(loaded) == 5
+    segment_contract = loaded[4]
+    assert segment_contract is not None
+    assert segment_contract.resolve_ticker_for_lineage("fiserv", "2023-06-07") == "FI"
+    assert segment_contract.resolve_ticker_for_lineage("fiserv", "2025-11-11") == "FISV"
+
+
+def test_labeled_nonproduction_v3_bundle_round_trips_metadata_and_four_columns(
+    tmp_path: Path,
+) -> None:
+    references = list(PIT_NON_TRADABLE_REFERENCE_SYMBOLS)
+    metadata = {
+        "bundle_kind": "canslim_pit_v3",
+        "schema_version": "3",
+        "data_cutoff": "2020-01-03",
+        "evaluation_start": "2020-01-03",
+        "warmup_start": "2020-01-02",
+        "membership_admission_status": "nonproduction_fixture",
+        "membership_source_evidence_mode": "nonproduction_fixture",
+        "membership_source_sha256": "a" * 64,
+        "prices_source_sha256": "a" * 64,
+        "fundamentals_source_sha256": "a" * 64,
+        "membership_provenance_sha256": "a" * 64,
+        "prices_provenance_sha256": "a" * 64,
+        "fundamentals_provenance_sha256": "a" * 64,
+        "membership_source_kind": "normalized_three_universe_membership",
+        "membership_revision_id": "a" * 64,
+        "membership_raw_sha256": "a" * 64,
+        "membership_symbol_map_sha256": "a" * 64,
+        "membership_security_names_sha256": "a" * 64,
+        "prices_source_kind": "synthetic fixture",
+        "prices_upstream_source_sha256": "a" * 64,
+        "spy_trading_days_sha256": "a" * 64,
+        "price_identity_map_sha256": "a" * 64,
+        "price_identity_request_contracts_sha256": "a" * 64,
+        "price_identity_transitions_sha256": "a" * 64,
+        "price_exclusion_count": "0",
+        "price_exclusions_sha256": "a" * 64,
+        "fundamentals_source_kind": "SEC EDGAR official bulk archives",
+        "fundamentals_submissions_archive_sha256": "a" * 64,
+        "fundamentals_companyfacts_archive_sha256": "a" * 64,
+        "fundamentals_identity_manifest_csv_sha256": "a" * 64,
+        "non_tradable_reference_symbols_json": pit_canonical_json(references),
+        "non_tradable_reference_symbols_sha256": pit_canonical_json_sha256(references),
+        "source_universes_json": pit_canonical_json(list(_UNIVERSES)),
+    }
+    output = tmp_path / "nonproduction-v3.sqlite3"
+    bundle_builder._create_bundle_v3(
+        output,
+        metadata=metadata,
+        membership=[("2020-01-03", "fixture_lineage", "sp500", 1)],
+        prices=[
+            ("2020-01-03", ticker, 100.0, 101.0, 99.0, 100.0, 1000.0)
+            for ticker in (*references, "FIXT")
+        ],
+        fundamentals=[("FIXT", "quarterly", "2019-09-30", "2020-01-03", *([None] * 10))],
+        industry=[("FIXT", "2020-01-03", "fixture", 1, "FIXT", "[]")],
+    )
+
+    connection = sqlite3.connect(output)
+    try:
+        loaded_metadata = PITDataBundle._load_metadata(
+            SimpleNamespace(_connection=connection)
+        )
+        membership_columns = tuple(
+            row[1] for row in connection.execute("PRAGMA table_info(membership_v3)")
+        )
+    finally:
+        connection.close()
+    assert loaded_metadata["membership_admission_status"] == "nonproduction_fixture"
+    assert loaded_metadata["membership_source_evidence_mode"] == "nonproduction_fixture"
+    assert membership_columns == (
+        "effective_date",
+        "security_lineage_id",
+        "universe_id",
+        "member",
+    )
 
 
 @pytest.mark.parametrize(
