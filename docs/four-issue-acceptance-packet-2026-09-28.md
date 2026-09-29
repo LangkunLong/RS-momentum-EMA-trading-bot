@@ -1,8 +1,8 @@
 # Four-issue acceptance packet (working review)
 
 **Review date:** 2026-09-28. **Integrated branch:** `codex/four-issue-integration`.
-This packet remains open for #82 actual container evidence and #68 source-backed
-data delivery. It records bounded local acceptance separately from GitHub issue
+This packet remains open for #68 source-backed data delivery. It records bounded
+local acceptance separately from GitHub issue
 closure. No issue in this packet is closed by the document.
 
 ## Exact issue and contract basis
@@ -35,6 +35,9 @@ bounded acceptance.
 | Fixed market breadth, price RS and industry denominators, including missing inputs | Pass. The report reconciles breadth 50/200, price RS, benchmark sessions, missing lookbacks and absent classifications. Industry-group RS is unavailable on every development member session because the bundle lacks dated industry snapshots. |
 
 The report's calculator identity is `pit-financial-features-v2`. Its
+canonical `core/pit_feature_snapshot.py` Git blob is
+`8e4020316d13c3de36dac8995fe4743bf888e70c`, and the measured reporter
+source revision is `4fdadd285a87c1dd9b1f5f2c27d8fa696d5e9bfb`.
 `policy_input_stage` indicates a value is available at a declared interface;
 `consumer_paths` are static mappings. Every row records
 `actual_policy_consumption=not_measured_no_policy_replay`. The development
@@ -79,7 +82,8 @@ and are neither fixed nor silently treated as passing.
 
 ## #82 — evaluator and candidate execution
 
-**Current recommendation:** not ready. The selected 15 focused tests verified
+**Current bounded recommendation:** ready for synthetic evaluator and candidate
+container acceptance. The selected 15 focused tests verified
 the actual V5 portfolio simulator on synthetic next-open and gap-stop paths,
 matched evaluator argument forwarding, fixed behavior probes and supplemental
 mechanism gates as distinct stages. [The #82 receipt](research-03-simulation-verification-2026-09-28.md)
@@ -93,20 +97,44 @@ independently inspected:
 `pit-optimizer-v5-evaluator@sha256:bf842ff5e0dc741f95e96129d224c24d7834feef23c4c20fdfe1d5297d54b527`,
 with the same runtime-source label and UID/GID 65532. Its version-pinned lock
 has no per-distribution hashes, and pip resolved two additional transitive
-packages; the immutable image digest records the realized build. Actual
-owned-container parent/candidate execution and cleanup remain pending.
+packages; the immutable image digest records the realized build. The lead
+independently recomputed the 56-path canonical Git-blob source map at current
+HEAD as `a55875a2ea021ec27a9fd18d8e09b180ce9186fcaf1b3bbb14036db871e11fb4`.
+
+On the actual Linux Docker runtime, `DockerPanelEvaluatorV5` and
+`LocalContainerExecutorV5` ran separate parent and comment-only candidate
+containers from that immutable image. Both exited zero, returned 11 fixed-suite
+observations and the same semantic fingerprint
+`671a50c126b412b90fcaa466a034cade8d151686a90a8c1c1103c4f621ab4fc1`.
+The 3,584-byte outputs have different full hashes because request and policy
+identities differ. Both stayed below the 67,108,864-byte output bound, used no
+scenario-data mount and no container network, and reported complete owned
+cleanup; the lead's separate filtered Docker listing found no V5 containers.
+The [tracked container receipt](research-03-candidate-container-evidence-2026-09-28.json)
+is SHA-256 `2dc4cfce92a5996f60e636e8f13a550858d5e160d3b9916a7628dd3d2aaff1f8`
+and binds the full local trace SHA-256
+`691dbcf0181310c42e426729493197e0109d85ca7f7c3f04c898b006799cd672`.
+The parent/candidate policy-revision identities are
+`76f67d16b97d91f99d757fdbfc513f64c2b0d8f6cb09f57a45e14ff67ac217f9`
+and `6d3008e8eaba6153b84cdba4c916df184eae06d5b7dbab2a872bced0595ed606`;
+their four-file source-bundle hashes are
+`109a61992ac79317446861c4cb2053f2704239eb1f8eacfe2b2d27ca2cf7456e`
+and `7c033b6436ece98b9b0bc0b39b578ac0067e332dfde35ef791e59ea7c3ab3bc4`.
+The receipt retains separate request, command, container and output hashes.
+This proves a bounded fixed semantic candidate run, not a historical PIT panel
+run or production/strategy performance.
 
 | Published criterion | Evidence and disposition |
 | --- | --- |
-| Distinguish historical simulation, fixed probes and supplemental observations | Bounded host evidence passes; actual candidate container probe is pending. |
-| Match parent/candidate assumptions; expose enabled/skipped stages | Evaluator forwarding fixture passes with distinct policy identities, but an actual parent/candidate container comparison is pending. |
-| Bounded reproduction of failures and documented existing passing path | Selected failure/timeout/cleanup mechanism checks and a passing simulator path are documented. Actual owned-container execution and cleanup evidence are pending. |
+| Distinguish historical simulation, fixed probes and supplemental observations | Pass for the bounded synthetic scope. The host simulator, actual fixed-suite container probes and supplemental mechanism gates have separate receipts and stage labels. |
+| Match parent/candidate assumptions; expose enabled/skipped stages | Pass for the bounded synthetic scope. The evaluator forwarding fixture and actual parent/comment-only candidate runs retain distinct policy/source identities, one image/source map, identical fixed suite and matching semantic fingerprint; no historical PIT data stage was enabled. |
+| Bounded reproduction of failures and documented existing passing path | Pass for the bounded synthetic scope. Selected failure/timeout/cleanup mechanism checks, a passing simulator path, and two actual zero-exit containers with owned cleanup are documented. An earlier pre-Docker host-harness import failure is not a candidate result. |
 
 | Status | Current assessment |
 | --- | --- |
-| Implementation | Existing simulator/evaluator/workers and focused tests integrated; exact-source image built; actual container run in progress. |
+| Implementation | Existing simulator/evaluator/workers and focused tests integrated; exact-source image built and two actual candidate-path containers executed. |
 | Required inputs | Synthetic bars/policies, Docker Engine and a correctly matched local evaluator image now available. |
-| Acceptance evidence | 15 selected focused checks pass; exact-source image inspected; actual parent/candidate execution and owned cleanup pending. |
+| Acceptance evidence | 15 selected focused checks and five final-branch focused cases pass; tracked source-matched image receipt, parent/candidate zero exits, matching fingerprint and owned cleanup independently verified. |
 | Dependencies | Accepted #80 and #81 satisfied; production PIT bundle and empirical costs are outside the bounded synthetic verification. |
 
 ## #68 — historical membership and lineage
@@ -123,6 +151,17 @@ and FI→FISV on 2025-11-11. The retained one-row-per-ticker price identity map
 overlaps FISV and FI, and cannot express the three distinct symbol episodes.
 The integrated normalizer now rejects overlapping predecessor dates; a
 segment-identity contract and reconciliation of this chain remain outstanding.
+The [partial transition evidence ledger](price-identity-transition-evidence-ledger-v1.json)
+is SHA-256 `b4468d45277bbadeb7739f5e47884644609e36f469a479ec52c54311828735d2`.
+It binds the retained 607-key request contract (digest `273727c248f57b7376b6cf269312325cdd059287e1f4ed16ab5ce63617ceabc7`),
+classifies 13 one-way candidates as supported by cited primary evidence only,
+and leaves Fiserv unresolved. It emits no integrated transition and adds zero
+membership rows. The issuer/SEC source bytes were not retained; URL,
+filing/release identity and section locators are the bounded source references.
+The [segment-contract decision](price-identity-segment-contract-decision-v1.md)
+records a proposed dated segment ID and resolver contract for the FISV→FI→FISV
+case. It is a design and synthetic rejection matrix only: no production segment
+object, V3 transition, membership row or evaluator-source change was made.
 
 | Published criterion | Evidence and disposition |
 | --- | --- |
@@ -132,17 +171,39 @@ segment-identity contract and reconciliation of this chain remain outstanding.
 
 | Status | Current assessment |
 | --- | --- |
-| Implementation | V3 normalizer, exact rename-boundary fix and fail-closed predecessor chronology guard integrated; source-acquisition/transition plan recorded. Repeated-ticker segment representation remains unimplemented. |
+| Implementation | V3 normalizer, exact rename-boundary fix and fail-closed predecessor chronology guard integrated; source-acquisition/transition and repeated-ticker segment plans recorded. Repeated-ticker segment representation remains unimplemented. |
 | Required inputs | Complete admitted S&P/Nasdaq/Russell dated source history, rights/access basis, and authenticated V3 price transitions missing. |
-| Acceptance evidence | 20 focused membership checks and 13 retained source hashes verified; Fiserv primary chronology retained, but no complete production union or coverage acceptance. |
+| Acceptance evidence | 20 focused membership checks, 13 retained acquisition-source hashes, partial ledger hash and 607-key price-contract digest verified; Fiserv primary chronology cited, but no complete production union or coverage acceptance. |
 | Dependencies | Accepted #66 satisfied; later production joins depend on an accepted lineage artifact. |
+
+### #68 source-access decision remaining
+
+The [acquisition plan](historical-membership-acquisition-plan-v1.md) specifies
+the exact deliverables and rights questions. The preferred next input is any
+already licensed, rights-cleared historical constituent package the user can
+provide: a complete 2020-12-31 seed (or an earlier complete snapshot), every
+effective 2021-01-01–2025-12-31 addition/removal and correction, stable
+security/share-class identifiers, and written permission for internal research,
+local retention and a derived dated lineage artifact for each of S&P 500,
+Nasdaq-100 and Russell 2000. The incremental acquisition cost is unknown until
+existing entitlements are checked. If these files are unavailable, the concrete
+alternative is a quote and rights inquiry to S&P DJI constituent/corporate-
+action data, Nasdaq GIW/GIFFD historical NDX composition, and FTSE Russell
+DDS/historical RUT constituents and daily changes. Product price, 2021
+lookback and derivation rights are unknown; no purchase or license commitment
+has been made. With neither input, #68 stays open. Individual public notices
+and the 13 evidence-only rename leads cannot fill the complete seed/event
+history or authorize a reconstructed index database.
 
 ## Integrated verification and next review
 
-At integrated revision `12cf6e51306b196d9c49e9a3de8020ec249c4d56`,
-the lead ran the #67/#71/#68 focused set: **34 passed**. The selected #82
-focused set passed **15** at its recorded source revision. The broad offline
-suite remains informational. This packet will be updated against the final
-integrated revision after the active #82 container verification and #68 source
-work. No model/provider experiment, order, paper-runtime change, production
+At integrated revision `cc141dc` (later revisions changed documents and a
+checkout line-ending attribute, not runtime or test source),
+the lead ran the #67/#71/#68 focused set: **59 passed**. The selected #82
+focused set passed **15** at its recorded source revision; five key cases
+passed again after the #82 receipt was integrated. The lead independently
+recomputed the current canonical 56-path V5 source-map hash, matched the
+tracked receipt to its raw capture hash, and inspected the immutable local
+image and empty V5-owned container list. The broad offline suite remains
+informational. No model/provider experiment, order, paper-runtime change, production
 bundle acceptance or issue closure is inferred from these tests.
