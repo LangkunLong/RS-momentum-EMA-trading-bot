@@ -28,13 +28,14 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 import pandas as pd
 
 from auto_trader import _rank_entry_candidates, run_auto_trader
 from config import settings
-from core.data_client import _fmp_get
+from core.alpaca_client_policy import alpaca_http_request_budget, single_attempt_alpaca_requests
+from core.data_client import _fmp_get, fmp_request_budget
 from core.execution_store import get_execution_store
 from core.gmail_oauth import (
     GmailOAuthError,
@@ -58,6 +59,8 @@ from setup_windows_task import TASK_NAME, _schtasks, register_task, show_status
 PROJECT_DIR = Path(__file__).resolve().parent
 SCAN_RESULTS_DIR = PROJECT_DIR / settings.RESULTS_DIR
 READINESS_OPEN_ORDER_LIMIT = 500
+READINESS_ALPACA_HTTP_REQUEST_LIMIT = 3
+READINESS_FMP_REQUEST_LIMIT = 4
 READINESS_PROTECTED_POSITION_WORKFLOW_STATES = frozenset(
     {
         "protective_stop_active",
@@ -120,24 +123,29 @@ def _collect_readiness_checks(*, probe_external: bool) -> list[ReadinessCheck]:
     checks = [config, store_binding]
 
     if probe_external:
-        checks.extend(
-            _check_external_access(
-                alpaca_account_reader=lambda: _get_trading_client().get_account(),
-                alpaca_positions_reader=lambda: get_open_positions(raise_on_error=True),
-                alpaca_orders_reader=lambda: get_open_orders(
-                    limit=READINESS_OPEN_ORDER_LIMIT,
-                    raise_on_error=True,
-                ),
-                fmp_get=_fmp_get,
-                paper_mode=_is_paper_mode(),
-                fmp_key_present=bool(settings.FMP_API_KEY),
-                fmp_ledger_ready=_existing_fmp_ledger_is_available(),
-                store_ready=(
-                    store_binding.status is EvidenceStatus.PASS
-                    and persistence.status is EvidenceStatus.PASS
-                ),
+        with (
+            alpaca_http_request_budget(READINESS_ALPACA_HTTP_REQUEST_LIMIT),
+            single_attempt_alpaca_requests(),
+            fmp_request_budget(READINESS_FMP_REQUEST_LIMIT),
+        ):
+            checks.extend(
+                _check_external_access(
+                    alpaca_account_reader=lambda: _get_trading_client().get_account(),
+                    alpaca_positions_reader=lambda: get_open_positions(raise_on_error=True),
+                    alpaca_orders_reader=lambda: get_open_orders(
+                        limit=READINESS_OPEN_ORDER_LIMIT,
+                        raise_on_error=True,
+                    ),
+                    fmp_get=_fmp_get,
+                    paper_mode=_is_paper_mode(),
+                    fmp_key_present=bool(settings.FMP_API_KEY),
+                    fmp_ledger_ready=_existing_fmp_ledger_is_available(),
+                    store_ready=(
+                        store_binding.status is EvidenceStatus.PASS
+                        and persistence.status is EvidenceStatus.PASS
+                    ),
+                )
             )
-        )
     else:
         checks.extend(
             [
@@ -1215,9 +1223,19 @@ def _format_check_marker(check: CheckResult) -> str:
     return "OK"
 
 
-def run_now(*, dry_run: bool) -> int:
-    """Run the trading cycle immediately."""
-    run_auto_trader(dry_run=dry_run)
+def run_now(
+    *,
+    dry_run: bool,
+    symbol: str | None = None,
+    skip_exits: bool = False,
+) -> int:
+    """Run one immediate cycle, optionally limited to one explicit symbol."""
+    kwargs: dict[str, Any] = {"dry_run": dry_run}
+    if symbol is not None:
+        kwargs["symbol"] = symbol
+    if skip_exits:
+        kwargs["skip_exits"] = True
+    run_auto_trader(**kwargs)
     return 0
 
 
@@ -1307,6 +1325,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="Refused here; use scheduler.py --enable-orders --now",
     )
+    run_now_parser.add_argument(
+        "--symbol",
+        help="Scan only this symbol; configured extra symbols are excluded",
+    )
+    run_now_parser.add_argument(
+        "--skip-exits",
+        action="store_true",
+        help="Skip exit monitoring for a bounded entry scan",
+    )
 
     install_parser = subparsers.add_parser(
         "install-task",
@@ -1365,7 +1392,13 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                 "paper_trading_console.py run-now is dry-run only; "
                 "use `python scheduler.py --enable-orders --now` for the canonical order path"
             )
-        return run_now(dry_run=True)
+        if args.symbol and not args.skip_exits:
+            parser.error("run-now --symbol requires --skip-exits for a bounded scan")
+        return run_now(
+            dry_run=True,
+            symbol=args.symbol,
+            skip_exits=args.skip_exits,
+        )
     if args.command == "install-task":
         return register_task(dry_run=not args.enable_orders)
     if args.command == "task-status":

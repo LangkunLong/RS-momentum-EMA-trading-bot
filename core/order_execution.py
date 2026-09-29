@@ -36,6 +36,7 @@ from alpaca.trading.requests import (
 )
 
 from config import settings
+from core.alpaca_client_policy import configure_alpaca_rest_client
 from core.execution_store import get_execution_store
 from core.execution_workflow import (
     build_exit_client_order_id,
@@ -120,7 +121,7 @@ def _get_trading_client() -> TradingClient:
                 "ALPACA_API_KEY and ALPACA_SECRET_KEY must be set. See .env.example."
             )
         _trading_client = TradingClient(api_key, secret_key, paper=True)
-    return _trading_client
+    return configure_alpaca_rest_client(_trading_client)
 
 
 def _is_paper_mode() -> bool:

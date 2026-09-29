@@ -46,6 +46,8 @@ Set `EXECUTION_STORE_DB_PATH` in both interactive and scheduled-task environment
 
 Preserve the selected database, FMP request ledger, and fundamentals cache at their existing paths. Do not copy them into a fresh checkout to reset usage, make a different store appear canonical, or let readiness initialize them. This readiness work uses read-only store inspection; it does not test writes or migrate a store. A separate write test would need its own explicitly identified scratch store and would not prove the operational store can accept writes.
 
+Before a strategy dry run, preserve the execution database with SQLite's backup API so WAL state is included. Also back up the FMP request ledger, fundamentals cache, RS-score cache, and ticker-membership cache. The bounded scan can update these caches and increment the existing FMP ledger; it must not replace or reset the ledger.
+
 ## Explicit provider probes
 
 Only after the paper environment and finite request scope are authorized, run:
@@ -66,13 +68,21 @@ For service health, record an observation from the intended scheduler session: p
 
 ## Strategy dry-run evidence
 
-Only after provider scope and the chosen runtime are ready, run the no-order cycle under the same interpreter and checkout:
+Only after provider scope and the chosen runtime are ready, run the bounded no-order cycle under the same interpreter and checkout:
 
 ```powershell
-& $python paper_trading_console.py run-now --dry-run
+& $python paper_trading_console.py run-now --dry-run --symbol AAPL --skip-exits
 ```
 
-This run fetches current data and can consume provider allowance. Retain its output with the `source_revision` and `runtime_identity`, timestamp, symbol/universe scope, data freshness/coverage, and intelligible candidate decisions/rejection reasons. It must not submit orders. A no-buy outcome is valid. Preserve configured entry requirements and report unavailable statement or price data as such; do not manufacture a buy signal or loosen filters for acceptance.
+This explicit-symbol mode scans AAPL as the sole candidate, excludes configured extra symbols, skips exit monitoring, and remains dry-run only. It still computes AAPL's relative strength against the full S&P 500 comparison universe; the symbol limit does not narrow that market context. The bounded scan allows at most 43 actual Alpaca HTTP attempts across bulk prices and optional entry-price checks, with SDK retries disabled (zero retries). Pagination requests count individually toward the HTTP cap. It allows at most three incremental FMP logical requests, independently of the existing ledger count, plus at most three index-source requests. If an Alpaca batch fails or is empty in bounded mode, the scan aborts and discards partial universe data. A nonempty response can still omit individual symbols, so compare returned RS coverage with the requested universe and report missing symbols as gaps rather than implying complete coverage.
+
+Set `ALPACA_HTTP_TIMEOUT_SECONDS`, `FMP_HTTP_TIMEOUT_SECONDS`, and `INDEX_TICKER_HTTP_TIMEOUT_SECONDS` to 15 for this process. These are per-request connect/read inactivity timeouts, not an end-to-end deadline. Run the process under a separate 20-minute watchdog that retains stdout, stderr, exit status, and a timeout receipt if terminated. The doctor probe has its own caps: at most three actual Alpaca HTTP attempts and four FMP logical requests. Across doctor plus this scan, the maximum FMP increment is seven requests.
+
+The run makes provider reads and can consume allowance. It may refresh the RS-score and ticker-membership caches, increment the existing FMP request ledger by up to three, and add up to three fundamentals-cache entries. Although it submits no orders, an actionable candidate that is not already held or pending and passes sizing may cause the dry-run workflow path to append up to three transition rows and one workflow snapshot to the execution database; schema checks may also establish SQLite metadata/sidecars. Preserve and serialize access to the database before running it.
+
+Retain an acceptance receipt with the exact source revision and dirty-tree state, runtime identity, command and timestamp, configured bounds/timeouts/watchdog outcome, and sanitized stdout/stderr. Record requested and returned universe counts/symbol coverage, RS comparison universe, freshness, missing-data and rejection reasons, and the no-order outcome. Capture before/after FMP ledger counts and checksum, cache backup/reference paths, and execution-store before/after integrity and row counts if the dry-run path touched it. The receipt must distinguish provider denial, quota exhaustion, missing data, incomplete coverage, timeout, and a valid no-buy result when the evidence allows that distinction. Never include credentials or raw account identifiers.
+
+A no-buy outcome is valid. Preserve configured entry requirements and report unavailable statement or price data as such; do not manufacture a buy signal or loosen filters for acceptance.
 
 Do not use `--enable-orders`, install an order-enabled task, or run a paper-order lifecycle as part of #107 readiness reporting. The separately gated baseline lifecycle belongs to #108; qualified-policy promotion belongs to #109 after its listed prerequisites.
 

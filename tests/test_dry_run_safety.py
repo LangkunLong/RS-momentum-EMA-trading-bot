@@ -4,6 +4,8 @@ from datetime import datetime
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from auto_trader import (
     monitor_and_exit_positions,
     monitor_exits_hourly,
@@ -56,6 +58,37 @@ def test_auto_trader_propagates_dry_run_to_exit_monitor() -> None:
         run_auto_trader(dry_run=True)
 
     monitor.assert_called_once_with(dry_run=True)
+
+
+def test_auto_trader_passes_explicit_symbol_without_extra_symbols() -> None:
+    with (
+        patch("auto_trader.monitor_and_exit_positions", return_value=[]) as monitor,
+        patch("auto_trader.scan_for_canslim_stocks", return_value=([], [], "uptrend")) as scan,
+    ):
+        run_auto_trader(dry_run=True, skip_exits=True, symbol="aapl")
+
+    monitor.assert_not_called()
+    scan.assert_called_once_with(
+        custom_list=["AAPL"],
+        include_extra_symbols=False,
+        retry_failed_market_data_chunks=False,
+    )
+
+
+def test_auto_trader_rejects_live_explicit_symbol_scan() -> None:
+    with patch("auto_trader.scan_for_canslim_stocks") as scan:
+        with pytest.raises(ValueError, match="dry-run only"):
+            run_auto_trader(dry_run=False, skip_exits=True, symbol="AAPL")
+
+    scan.assert_not_called()
+
+
+def test_auto_trader_requires_exits_skipped_for_explicit_symbol_scan() -> None:
+    with patch("auto_trader.scan_for_canslim_stocks") as scan:
+        with pytest.raises(ValueError, match="exit monitoring to be skipped"):
+            run_auto_trader(dry_run=True, symbol="AAPL")
+
+    scan.assert_not_called()
 
 
 def test_scheduler_propagates_dry_run_to_all_exit_monitors() -> None:

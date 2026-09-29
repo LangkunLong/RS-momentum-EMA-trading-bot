@@ -921,6 +921,28 @@ def test_main_run_now_preserves_explicit_dry_run_flag() -> None:
     mock_run.assert_called_once_with(dry_run=True)
 
 
+def test_main_run_now_can_bound_one_symbol_and_skip_exit_monitoring() -> None:
+    with patch("paper_trading_console.run_auto_trader") as mock_run:
+        rc = console.main(["run-now", "--symbol", "AAPL", "--skip-exits"])
+
+    assert rc == 0
+    mock_run.assert_called_once_with(
+        dry_run=True,
+        symbol="AAPL",
+        skip_exits=True,
+    )
+
+
+def test_main_run_now_requires_skip_exits_for_explicit_symbol(capsys) -> None:
+    with patch("paper_trading_console.run_auto_trader") as mock_run:
+        with pytest.raises(SystemExit) as exc_info:
+            console.main(["run-now", "--symbol", "AAPL"])
+
+    assert exc_info.value.code == 2
+    mock_run.assert_not_called()
+    assert "requires --skip-exits" in capsys.readouterr().err
+
+
 def test_main_run_now_refuses_orders_and_directs_to_canonical_scheduler(capsys) -> None:
     with patch("paper_trading_console.run_auto_trader") as mock_run:
         with pytest.raises(SystemExit) as exc_info:
