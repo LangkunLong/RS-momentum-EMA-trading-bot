@@ -19,6 +19,12 @@ The lead fetched the current GitHub bodies of [#67](https://github.com/LangkunLo
 The first three contracts govern historical data, policy inputs and version-five
 research. #97 separates any qualified policy from paper execution; this work
 does not change the operational database, scheduler, broker or paper runtime.
+Before publication, upstream `main` advanced from the accepted starting commit
+`2c01e76a878a338ab2b743c38c4f1310aab3f75b` to `7097ff3ff62dd0427495c24a0d69a40638693952`
+through the separate #107 paper-runtime merge. Its six changed files have no
+path overlap with this branch's 24 changed files. The #107 work and its review
+remain separate; this branch's evaluator source map and evidence identities
+are unchanged by that upstream movement.
 
 ## #67 — historical feature availability
 
