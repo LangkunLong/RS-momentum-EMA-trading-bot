@@ -19,6 +19,7 @@ from core.data_client import (
     _fund_cache_get,
     _fund_cache_set,
     _fmp_get,
+    fmp_request_budget,
     fetch_quarterly_income_statement,
     fetch_annual_income_statement,
     fetch_company_info,
@@ -45,6 +46,7 @@ def reset_fmp_session_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     )
     _dc_module._fmp_quota_exhausted = False
     _dc_module._fmp_budget_warning_emitted = False
+    _dc_module._fmp_run_budget_remaining = None
     _dc_module._fmp_unavailable_endpoints.clear()
     _dc_module._fmp_reported_endpoint_failures.clear()
     if hasattr(_dc_module, "reset_fmp_request_context"):
@@ -52,6 +54,7 @@ def reset_fmp_session_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     yield
     _dc_module._fmp_quota_exhausted = False
     _dc_module._fmp_budget_warning_emitted = False
+    _dc_module._fmp_run_budget_remaining = None
     _dc_module._fmp_unavailable_endpoints.clear()
     _dc_module._fmp_reported_endpoint_failures.clear()
 
@@ -61,6 +64,27 @@ def _success_response(payload: object | None = None) -> MagicMock:
     response.status_code = 200
     response.json.return_value = [] if payload is None else payload
     return response
+
+
+def test_fmp_run_budget_is_incremental_and_preserves_existing_ledger(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(_dc_module.settings, "FMP_PLAN", "free", raising=False)
+    now = datetime(2026, 9, 29, 12, 0, tzinfo=ZoneInfo("America/New_York"))
+    window_start = _dc_module._fmp_window_start(now).isoformat()
+    ledger = tmp_path / "fmp-request-usage.json"
+    ledger.write_text(json.dumps({"window_start": window_start, "count": 5}), encoding="utf-8")
+    monkeypatch.setattr(_dc_module, "_fmp_now_et", lambda: now)
+
+    with fmp_request_budget(1):
+        assert _dc_module._reserve_fmp_request() is True
+        assert _dc_module._reserve_fmp_request() is False
+
+    assert json.loads(ledger.read_text(encoding="utf-8")) == {
+        "window_start": window_start,
+        "count": 6,
+    }
 
 
 # ─── _fmp_get error handling ─────────────────────────────────────────────────

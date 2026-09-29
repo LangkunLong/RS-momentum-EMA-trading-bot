@@ -95,7 +95,7 @@ def _fetch_index_from_wikipedia(index_key: str, display_name: str) -> List[str]:
     try:
         response = requests.get(
             url,
-            timeout=30,
+            timeout=settings.INDEX_TICKER_HTTP_TIMEOUT_SECONDS,
             headers={"User-Agent": "Mozilla/5.0 (compatible; trading-bot/1.0)"},
         )
         response.raise_for_status()
@@ -269,7 +269,7 @@ class IndexTickerFetcher:
             # 1. Fetch the main fund page
             page_resp = requests.get(
                 fund_url,
-                timeout=30,
+                timeout=settings.INDEX_TICKER_HTTP_TIMEOUT_SECONDS,
                 headers={
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
                     "Accept-Language": "en-US,en;q=0.9",
@@ -299,7 +299,7 @@ class IndexTickerFetcher:
             # 3. Fetch the CSV
             response = requests.get(
                 csv_url,
-                timeout=30,
+                timeout=settings.INDEX_TICKER_HTTP_TIMEOUT_SECONDS,
                 headers={
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
                     "Accept-Language": "en-US,en;q=0.9",

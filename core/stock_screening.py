@@ -246,6 +246,7 @@ def screen_stocks_canslim_detailed(
     require_bullish_market: bool = REQUIRE_BULLISH_MARKET_FOR_BUYS,
     require_fundamentals: bool = REQUIRE_FUNDAMENTALS_FOR_BUYS,
     strict_breakout: bool = STRICT_BREAKOUT_FOR_BUYS,
+    retry_failed_market_data_chunks: bool = True,
 ) -> Tuple[List[Dict[str, object]], List[Dict[str, object]], MarketTrend]:
     """Screen multiple stocks for CANSLIM characteristics.
 
@@ -270,6 +271,7 @@ def screen_stocks_canslim_detailed(
     rs_scores_df = calculate_rs_scores_for_tickers(
         symbols_list,
         as_of_session=as_of_session,
+        retry_failed_chunks=retry_failed_market_data_chunks,
     )
 
     if debug and not rs_scores_df.empty:

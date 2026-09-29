@@ -155,6 +155,7 @@ def calculate_rs_scores_for_tickers(
     percentile_multiplier: Optional[float] = None,
     percentile_min: Optional[float] = None,
     as_of_session: object = None,
+    retry_failed_chunks: bool = True,
 ) -> pd.DataFrame:
     """Download price data and compute RS scores for a list of tickers.
 
@@ -216,7 +217,12 @@ def calculate_rs_scores_for_tickers(
 
     print(f"Downloading data for {len(all_tickers)} tickers via Alpaca...")
 
-    full_data = fetch_bulk_close_prices(all_tickers, period=period, chunk_size=chunk_size)
+    full_data = fetch_bulk_close_prices(
+        all_tickers,
+        period=period,
+        chunk_size=chunk_size,
+        retry_failed_chunks=retry_failed_chunks,
+    )
 
     if full_data.empty:
         print("All downloads failed.")
