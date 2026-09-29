@@ -727,7 +727,10 @@ def fetch_bulk_close_prices(
 
     When ``retry_failed_chunks`` is False, the first failed or empty batch aborts
     the download and discards partial data so callers cannot rank an incomplete
-    universe or trigger recursive request splitting.
+    universe or trigger recursive request splitting. A nonempty batch response
+    can still omit individual symbols; callers that require complete universe
+    coverage must compare returned columns with the requested symbols and report
+    missing coverage explicitly.
 
     """
     cache_key = ("bulk_close_prices", tuple(sorted(tickers)), period)
