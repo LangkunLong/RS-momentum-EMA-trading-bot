@@ -1368,12 +1368,14 @@ def get_open_positions(*, raise_on_error: bool = False) -> list[PositionSummary]
 def get_open_orders(
     symbol: Optional[str] = None,
     *,
+    limit: Optional[int] = None,
     raise_on_error: bool = False,
 ) -> list[Order]:
     """Return pending orders, optionally filtered to a single symbol.
 
     Args:
         symbol: If provided, only return orders for this ticker.
+        limit: Optional maximum order count for a bounded observation.
 
     Returns:
         List of Alpaca Order objects. Empty on error unless
@@ -1381,7 +1383,13 @@ def get_open_orders(
     """
     client = _get_trading_client()
     try:
-        req = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol] if symbol else None)
+        request_fields = {
+            "status": QueryOrderStatus.OPEN,
+            "symbols": [symbol] if symbol else None,
+        }
+        if limit is not None:
+            request_fields["limit"] = max(1, int(limit))
+        req = GetOrdersRequest(**request_fields)
         return client.get_orders(req)
     except Exception as exc:  # noqa: BLE001
         if raise_on_error:

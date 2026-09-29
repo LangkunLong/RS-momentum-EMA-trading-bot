@@ -1554,6 +1554,16 @@ class TestGetOpenOrders:
         assert isinstance(req, GetOrdersRequest)
         assert req.symbols == ["AAPL"]
 
+    def test_passes_explicit_order_limit(self) -> None:
+        client = MagicMock()
+        client.get_orders.return_value = []
+
+        with _patched_client(client):
+            get_open_orders(limit=37, raise_on_error=True)
+
+        req = client.get_orders.call_args[0][0]
+        assert req.limit == 37
+
     def test_returns_empty_list_on_error(self) -> None:
         client = MagicMock()
         client.get_orders.side_effect = RuntimeError("timeout")
