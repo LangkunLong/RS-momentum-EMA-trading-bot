@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from decimal import Decimal
 from dataclasses import replace
 import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
+import traceback
 
 import pytest
 
@@ -61,13 +64,21 @@ from core.pit_optimizer_v5.manifest import (
     build_campaign_manifest_v5,
 )
 from core.pit_optimizer_v5.memory import (
+    CandidateStageResultPayloadV5,
+    EpisodeEvidencePayloadV5,
+    ExperimentFeedbackV5,
+    ExperimentMemorySummaryV5,
+    InvestigatorMemoryProjectionV5,
     ExperimentRecordV5,
     RoleCompletionPayloadV5,
+    RoundOutcomePayloadV5,
     RoundEventV5,
     RoundIntentPayloadV5,
+    RuntimeFailureAuthorityV5,
     StoredExperimentRecordV5,
     event_kind_for_payload_v5,
     project_investigator_memory_v5,
+    round_event_payload_primitive_v5,
 )
 from core.pit_optimizer_v5.mechanism_artifacts import (
     MechanismArtifactCorrupt,
@@ -1387,6 +1398,167 @@ def _counting_fixture_factory(counter: dict[str, int]):
     return factory
 
 
+def _run_issue90_mechanism_round(tmp_path: Path, *, memory_budget: int, monkeypatch: pytest.MonkeyPatch):
+    """Run one full provider-free controller round with persisted V1 measurements."""
+
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    repository, capability, _, _ = _capability(
+        tmp_path,
+        hypotheses_per_investigator=3,
+        max_variants_per_template=3,
+        max_discovery_survivors_per_template=3,
+        investigator_memory_max_bytes=memory_budget,
+        archive_capacity=1,
+        fixture_entry=True,
+    )
+    authenticated = capability.authenticated_manifest
+    raw = repository.repository
+    inputs, composed = compose_fixture_round_v5(
+        repository=raw,
+        authorities=authenticated,
+        round_index=1,
+    )
+    extension = _LazyFixtureMechanismExtension(repository, capability, worker_factory=_fixture_workers)
+    adapter = MechanismRoleRequestAdapterV1(repository, authenticated_manifest=authenticated)
+    requests = LocalRoleRequestFactoryV5(
+        repository=raw,
+        manifest=authenticated.manifest,
+        mechanism_adapter=adapter,
+    )
+    guarded_requests = []
+    original_guard = requests._guarded_request
+
+    def observe_guard(inputs, request):
+        guarded_requests.append(request)
+        return original_guard(inputs, request)
+
+    monkeypatch.setattr(requests, "_guarded_request", observe_guard)
+    candidates = _MechanismSyntheticCandidateRuntime(raw, inputs)
+    dependencies = replace(
+        composed,
+        invoker=_MechanismFixtureRoleInvoker(authenticated.manifest),
+        requests=requests,
+        candidates=candidates,
+        cleanup=candidates,
+        mechanism=extension,
+    )
+    result = run_feedback_round_v5(inputs, dependencies)
+    events = raw.load_round_events(campaign_id=inputs.campaign_id, round_index=inputs.round_index)
+    payloads = tuple(raw.load_round_payload(event.payload_ref, expected_kind=event.event_kind) for event in events)
+    completions = tuple(item for item in payloads if type(item) is RoleCompletionPayloadV5)
+    return {
+        "repository": repository,
+        "authenticated": authenticated,
+        "raw": raw,
+        "inputs": inputs,
+        "extension": extension,
+        "guarded_requests": guarded_requests,
+        "result": result,
+        "events": events,
+        "payloads": payloads,
+        "role_completions": completions,
+    }
+
+
+def _issue90_summary_budget_from_records(
+    *,
+    parent,
+    stored_records: tuple[StoredExperimentRecordV5, ...],
+) -> tuple[int, str, dict[str, int]]:
+    """Derive the smallest exact projection budget that retains one sibling summary."""
+
+    selected_parent_records = tuple(
+        item for item in stored_records if item.reference == parent.selected_parent_record_ref
+    )
+    if parent.selected_parent_record_ref is None:
+        lineage_records = ()
+    else:
+        if len(selected_parent_records) != 1:
+            raise AssertionError("selected parent must name one checkpoint-authorized fixture record")
+        lineage_records = selected_parent_records
+    remaining = tuple(
+        item
+        for item in stored_records
+        if item not in lineage_records and item.record.hypothesis.primary_mechanism == "exit"
+    )
+    if not remaining:
+        raise AssertionError("fixture round must retain at least one non-lineage exit sibling")
+    first_sibling = min(remaining, key=lambda item: (item.record.round_index, item.record.experiment_id))
+    lineage_feedback = tuple(ExperimentFeedbackV5.from_stored(item) for item in lineage_records)
+    base = InvestigatorMemoryProjectionV5(
+        selected_parent_revision_sha256=parent.policy_identity_sha256,
+        relevant_mechanism="exit",
+        complete_feedback=lineage_feedback,
+        summaries=(),
+    )
+    with_sibling_summary = InvestigatorMemoryProjectionV5(
+        selected_parent_revision_sha256=parent.policy_identity_sha256,
+        relevant_mechanism="exit",
+        complete_feedback=lineage_feedback,
+        summaries=(ExperimentMemorySummaryV5.from_stored(first_sibling),),
+    )
+    with_sibling_complete = InvestigatorMemoryProjectionV5(
+        selected_parent_revision_sha256=parent.policy_identity_sha256,
+        relevant_mechanism="exit",
+        complete_feedback=(*lineage_feedback, ExperimentFeedbackV5.from_stored(first_sibling)),
+        summaries=(),
+    )
+    budget = len(with_sibling_summary.canonical_json_bytes())
+    sizes = {
+        "selected_parent_lineage_bytes": len(base.canonical_json_bytes()),
+        "selected_parent_plus_sibling_summary_bytes": budget,
+        "selected_parent_plus_sibling_complete_bytes": len(with_sibling_complete.canonical_json_bytes()),
+        "high_budget_complete_memory_bytes": len(
+            project_investigator_memory_v5(
+                stored_records=stored_records,
+                selected_parent_revision_sha256=parent.policy_identity_sha256,
+                selected_parent_record_ref=parent.selected_parent_record_ref,
+                relevant_mechanism="exit",
+                maximum_bytes=96 * 1024,
+            ).canonical_json_bytes()
+        ),
+    }
+    if not (sizes["selected_parent_lineage_bytes"] < budget < sizes["selected_parent_plus_sibling_complete_bytes"]):
+        raise AssertionError("derived memory budget does not fall between lineage and full sibling feedback")
+    return budget, first_sibling.record.experiment_id, sizes
+
+
+def _issue90_json_ready(value):
+    """Convert frozen request primitives into ordinary JSON containers."""
+
+    if isinstance(value, Mapping):
+        return {str(key): _issue90_json_ready(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_issue90_json_ready(item) for item in value]
+    if hasattr(value, "to_primitive"):
+        return _issue90_json_ready(value.to_primitive())
+    if isinstance(value, Decimal):
+        return str(value)
+    if value is None or type(value) in {str, int, float, bool}:
+        return value
+    raise TypeError(f"unsupported issue-90 evidence value: {type(value).__name__}")
+
+
+def _issue90_artifact_path(root: Path, stem: str) -> Path:
+    """Choose a stable numbered evidence path without overwriting prior runs."""
+
+    index = 1
+    while True:
+        candidate = root / f"{stem}-{index:02d}"
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+
+def _issue90_persist_recovery_record(name: str, evidence: dict[str, object]) -> None:
+    evidence_directory = os.environ.get("ISSUE_90_EVIDENCE_DIR")
+    if not evidence_directory:
+        return
+    root = Path(evidence_directory).absolute()
+    root.mkdir(parents=True, exist_ok=True)
+    (root / name).write_bytes(canonical_json_bytes_v5(_issue90_json_ready(evidence)) + b"\n")
+
+
 def _append_author_request(
     repository: MechanismArtifactRepositoryV5,
     capability: MechanismExtensionCapabilityV1,
@@ -2403,50 +2575,117 @@ def _assert_synthetic_role_admission(request, manifest) -> tuple[int, Decimal]:
 
 
 def test_full_runtime_run_supplied_ports_publishes_after_current_critic_evidence(
-    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The supplied-port runtime runs the real role/checkpoint chronology once."""
 
-    repository, capability, _, _ = _capability(
-        tmp_path,
-        hypotheses_per_investigator=3,
-        max_variants_per_template=3,
-        max_discovery_survivors_per_template=3,
-        fixture_entry=True,
+    evidence_directory = os.environ.get("ISSUE_90_EVIDENCE_DIR")
+    evidence_root = (
+        Path(evidence_directory).absolute()
+        if evidence_directory
+        else Path(__file__).resolve().parents[1] / ".artifacts" / "issue-90"
     )
-    authenticated = capability.authenticated_manifest
-    raw = repository.repository
-    inputs, composed = compose_fixture_round_v5(
-        repository=raw,
-        authorities=authenticated,
-        round_index=1,
+    evidence_root.mkdir(parents=True, exist_ok=True)
+    fixture_root = _issue90_artifact_path(evidence_root, "run")
+    calibration_root = fixture_root / "c"
+    acceptance_root = fixture_root / "a"
+    longest_fixture_filename = Path("adapter-state-authority") / "mechanism-v5" / ("f" * 64 + "-binding.json")
+    planned_roots = tuple(
+        root.absolute()
+        for root in (
+            calibration_root,
+            acceptance_root,
+            evidence_root / "diag-01",
+            evidence_root / "ctl-01",
+        )
     )
-    extension = _LazyFixtureMechanismExtension(repository, capability, worker_factory=_fixture_workers)
-    adapter = MechanismRoleRequestAdapterV1(repository, authenticated_manifest=authenticated)
-    requests = LocalRoleRequestFactoryV5(
-        repository=raw,
-        manifest=authenticated.manifest,
-        mechanism_adapter=adapter,
+    preflight_paths = tuple((root / longest_fixture_filename).absolute() for root in planned_roots)
+    assert all(root.is_absolute() for root in planned_roots)
+    assert all(
+        not left.is_relative_to(right) and not right.is_relative_to(left)
+        for index, left in enumerate(planned_roots)
+        for right in planned_roots[index + 1 :]
     )
-    guarded_requests = []
-    original_guard = requests._guarded_request
+    assert max(len(str(path)) for path in preflight_paths) < 260, "fixture paths exceed the Windows path limit"
 
-    def observe_guard(inputs, request):
-        guarded_requests.append(request)
-        return original_guard(inputs, request)
-
-    monkeypatch.setattr(requests, "_guarded_request", observe_guard)
-    candidates = _MechanismSyntheticCandidateRuntime(raw, inputs)
-    dependencies = replace(
-        composed,
-        invoker=_MechanismFixtureRoleInvoker(authenticated.manifest),
-        requests=requests,
-        candidates=candidates,
-        cleanup=candidates,
-        mechanism=extension,
+    calibration = _run_issue90_mechanism_round(
+        calibration_root,
+        memory_budget=3072,
+        monkeypatch=monkeypatch,
     )
-    result = run_feedback_round_v5(inputs, dependencies)
+    calibration_repository = calibration["raw"]
+    calibration_inputs = replace(calibration["inputs"], round_index=2)
+    calibration_checkpoint, calibration_state = calibration_repository.recover_projection(
+        LocalArchiveReducerFactoryV5(calibration_repository).recovery_reducer(calibration_inputs)
+    )
+    assert calibration_checkpoint is not None
+    calibration_records = tuple(
+        StoredExperimentRecordV5(reference=reference, record=calibration_repository.load_experiment(reference))
+        for reference in calibration_checkpoint.record_refs
+    )
+    calibration_parent = select_parent_v5(
+        state=calibration_state,
+        baseline=calibration_inputs.baseline,
+        discovery_plan=calibration_inputs.panel_plan,
+        evaluator_contract=calibration_inputs.evaluator_contract,
+        stored_records=calibration_records,
+    )
+    memory_budget, summary_experiment_id, memory_sizes = _issue90_summary_budget_from_records(
+        parent=calibration_parent,
+        stored_records=calibration_records,
+    )
+    calibration_memory = project_investigator_memory_v5(
+        stored_records=calibration_records,
+        selected_parent_revision_sha256=calibration_parent.policy_identity_sha256,
+        selected_parent_record_ref=calibration_parent.selected_parent_record_ref,
+        relevant_mechanism="exit",
+        maximum_bytes=memory_budget,
+    )
+    assert len(calibration_memory.canonical_json_bytes()) <= memory_budget
+    assert summary_experiment_id in {item.experiment_id for item in calibration_memory.summaries}
+    if calibration_parent.selected_parent_record_ref is not None:
+        assert calibration_parent.selected_parent_record_ref in {
+            item.record_ref for item in calibration_memory.complete_feedback
+        }
+    if evidence_directory:
+        calibration_record = {
+            "evidence_kind": "controlled_controller_memory_budget_calibration",
+            "provider_calls": 0,
+            "campaign_id": calibration["inputs"].campaign_id,
+            "calibration_manifest_memory_budget_bytes": 3072,
+            "derived_fixture_memory_budget_bytes": memory_budget,
+            "selected_parent_experiment_id": (
+                None
+                if calibration_parent.selected_parent_record_ref is None
+                else next(
+                    item.record.experiment_id
+                    for item in calibration_records
+                    if item.reference == calibration_parent.selected_parent_record_ref
+                )
+            ),
+            "sibling_summary_experiment_id": summary_experiment_id,
+            "canonical_projection_sizes": memory_sizes,
+            "calibration_record_ids": [item.record.experiment_id for item in calibration_records],
+            "calibration_report_sha256s": sorted(item.sha256 for item in calibration["extension"]._reports.values()),
+        }
+        (evidence_root / "memory-budget-calibration.json").write_bytes(
+            canonical_json_bytes_v5(calibration_record) + b"\n"
+        )
+
+    execution = _run_issue90_mechanism_round(
+        acceptance_root,
+        memory_budget=memory_budget,
+        monkeypatch=monkeypatch,
+    )
+    authenticated = execution["authenticated"]
+    raw = execution["raw"]
+    inputs = execution["inputs"]
+    extension = execution["extension"]
+    guarded_requests = execution["guarded_requests"]
+    result = execution["result"]
+    events = execution["events"]
+    payloads = execution["payloads"]
+    role_completions = execution["role_completions"]
     assert result.status == "completed", result.failure
     assert result.checkpoint is not None
     assert result.cleanup is not None and result.cleanup.cleanup_complete
@@ -2454,9 +2693,6 @@ def test_full_runtime_run_supplied_ports_publishes_after_current_critic_evidence
     assert all(run.execution.status == "completed" for run in extension._runs.values())
     assert all(run.coverage.total_cases > 0 for run in extension._runs.values())
 
-    events = raw.load_round_events(campaign_id=inputs.campaign_id, round_index=inputs.round_index)
-    payloads = tuple(raw.load_round_payload(event.payload_ref, expected_kind=event.event_kind) for event in events)
-    role_completions = tuple(item for item in payloads if type(item) is RoleCompletionPayloadV5)
     assert tuple(item.role for item in role_completions) == ("investigator", "author", "critic")
     _assert_fixture_role_chronology(
         raw,
@@ -2511,6 +2747,827 @@ def test_full_runtime_run_supplied_ports_publishes_after_current_critic_evidence
     )
     assert input_bound > len(canonical_json_bytes_v5(critic_package.request.messages))
     assert cost_bound > 0
+
+    # Reopen the actual repository and build round two's investigator request
+    # through the ordinary request factory. Repeat the reconstruction from a
+    # second repository object, then run round two and compare its persisted
+    # investigator package with that exact constructed request.
+    def reopened_next_request():
+        reopened_raw = LocalArtifactRepositoryV5(acceptance_root)
+        next_inputs, next_dependencies = compose_fixture_round_v5(
+            repository=reopened_raw,
+            authorities=authenticated,
+            round_index=2,
+        )
+        checkpoint, state = reopened_raw.recover_projection(
+            LocalArchiveReducerFactoryV5(reopened_raw).recovery_reducer(next_inputs)
+        )
+        assert checkpoint is not None
+        stored = tuple(
+            StoredExperimentRecordV5(reference=reference, record=reopened_raw.load_experiment(reference))
+            for reference in checkpoint.record_refs
+        )
+        recovered_projection = SearchProjectionV5(checkpoint, state, stored)
+        recovered_parent = select_parent_v5(
+            state=state,
+            baseline=next_inputs.baseline,
+            discovery_plan=next_inputs.panel_plan,
+            evaluator_contract=next_inputs.evaluator_contract,
+            stored_records=stored,
+        )
+        reopened_mechanisms = MechanismArtifactRepositoryV5(reopened_raw)
+        adapter = MechanismRoleRequestAdapterV1(
+            reopened_mechanisms,
+            authenticated_manifest=authenticated,
+        )
+        factory = LocalRoleRequestFactoryV5(
+            repository=reopened_raw,
+            manifest=next_inputs.manifest,
+            mechanism_adapter=adapter,
+        )
+        request = factory.investigator_request(next_inputs, recovered_projection, recovered_parent)
+        next_dependencies = replace(next_dependencies, requests=factory)
+        return reopened_raw, next_inputs, next_dependencies, recovered_projection, recovered_parent, request
+
+    first_reopen = reopened_next_request()
+    second_reopen = reopened_next_request()
+    next_request = first_reopen[-1]
+    assert second_reopen[-1].sha256 == next_request.sha256
+    assert second_reopen[-1].messages == next_request.messages
+    assert canonical_json_bytes_v5(second_reopen[-1].to_primitive()) == canonical_json_bytes_v5(
+        next_request.to_primitive()
+    )
+    acceptance_budget, summary_experiment_id, acceptance_sizes = _issue90_summary_budget_from_records(
+        parent=first_reopen[4],
+        stored_records=first_reopen[3].stored_records,
+    )
+    assert acceptance_budget == memory_budget
+    selected_memory = project_investigator_memory_v5(
+        stored_records=first_reopen[3].stored_records,
+        selected_parent_revision_sha256=first_reopen[4].policy_identity_sha256,
+        selected_parent_record_ref=first_reopen[4].selected_parent_record_ref,
+        relevant_mechanism="exit",
+        maximum_bytes=memory_budget,
+    )
+    assert summary_experiment_id in {item.experiment_id for item in selected_memory.summaries}
+    if first_reopen[4].selected_parent_record_ref is not None:
+        assert first_reopen[4].selected_parent_record_ref in {
+            item.record_ref for item in selected_memory.complete_feedback
+        }
+    assert type(next_request.role_input) is MechanismRoleInputV1
+    assert next_request.role_input.projections
+    report_rows = tuple(
+        row for item in next_request.role_input.projections for row in item.rows if row.stage == "report"
+    )
+    measured = tuple(
+        row
+        for row in report_rows
+        if row.prediction.metric_id == "exit.decision_changed_count" and row.prediction.availability == "measured"
+    )
+    unavailable = tuple(
+        row
+        for row in report_rows
+        if row.prediction.metric_id == "evaluator.exit_attribution_count"
+        and row.prediction.availability == "unavailable"
+        and row.prediction.unavailable_reason == "evaluator_metric_missing"
+    )
+    assert measured and unavailable
+    assert any(row.prediction.assessment == "contradicted_on_cases" for row in measured)
+    assert all(row.prediction.unit == "count" and row.prediction.denominator > 0 for row in measured)
+    assert any(item.memory_selection == "summary" for item in next_request.role_input.projections)
+    assert any(
+        "memory.selection=summary; sidecar restored from authenticated history." in item.limitations
+        for item in next_request.role_input.projections
+    )
+    assert all(item.applicability.field == "features.atr_20_fraction" for item in next_request.role_input.projections)
+
+    # Preserve a pristine round-one store for an unwrapped diagnostic, then
+    # execute the next round through the public controller entry point. The
+    # controller's own request factory must produce and persist the request
+    # reconstructed above from the reopened store.
+    longest_store_path = max(len(str(path.absolute())) for path in acceptance_root.rglob("*"))
+    assert longest_store_path < 260, f"fixture store path exceeds the Windows path limit: {longest_store_path}"
+    diagnostic_base = _issue90_artifact_path(evidence_root, "diag")
+    shutil.copytree(acceptance_root, diagnostic_base)
+
+    controller_requests = []
+    controller_factory = second_reopen[2].requests
+    original_controller_guard = controller_factory._guarded_request
+
+    def capture_controller_request(request_inputs, request):
+        controller_requests.append(request)
+        return original_controller_guard(request_inputs, request)
+
+    monkeypatch.setattr(controller_factory, "_guarded_request", capture_controller_request)
+    role_observations = {"invokes": [], "reconciliations": []}
+    role_invoker = _Issue90CountingRoleInvoker(authenticated.manifest, observations=role_observations)
+    candidate_observations = {"quick": 0, "discovery": 0}
+    candidate_runtime = _Issue90CountingCandidateRuntime(second_reopen[0], second_reopen[1], candidate_observations)
+    controller_dependencies = replace(
+        second_reopen[2],
+        invoker=role_invoker,
+        candidates=candidate_runtime,
+        cleanup=candidate_runtime,
+    )
+    controller_result = run_feedback_round_v5(second_reopen[1], controller_dependencies)
+    controller_events = second_reopen[0].load_round_events(
+        campaign_id=inputs.campaign_id,
+        round_index=2,
+    )
+    controller_payloads = tuple(
+        second_reopen[0].load_round_payload(event.payload_ref, expected_kind=event.event_kind)
+        for event in controller_events
+    )
+    controller_role_requests = second_reopen[0].load_authenticated_role_requests(
+        campaign_id=inputs.campaign_id,
+        round_index=2,
+    )
+    controller_investigator = tuple(item for item in controller_requests if item.role == "investigator")
+    assert len(controller_investigator) == 1
+    assert controller_investigator[0].sha256 == next_request.sha256
+    assert canonical_json_bytes_v5(_issue90_json_ready(controller_investigator[0].to_primitive())) == (
+        canonical_json_bytes_v5(_issue90_json_ready(next_request.to_primitive()))
+    )
+    persisted_investigator = tuple(item for item in controller_role_requests if item[1].role == "investigator")
+    assert len(persisted_investigator) == 1
+    assert persisted_investigator[0][2].sha256 == next_request.sha256
+    assert controller_result.status == "failed"
+    assert controller_result.failure is not None
+    assert (controller_result.failure.stage, controller_result.failure.code) == ("recovery", "stage_failed")
+    assert controller_result.checkpoint is None
+    assert controller_result.terminal_outcome is not None
+    assert type(controller_result.terminal_outcome.authority) is RuntimeFailureAuthorityV5
+    assert controller_result.terminal_outcome.authority.stage == controller_result.failure.stage
+    assert controller_result.terminal_outcome.authority.failure_code == controller_result.failure.code
+    controller_completions = tuple(item for item in controller_payloads if type(item) is RoleCompletionPayloadV5)
+    controller_terminal = tuple(item for item in controller_payloads if type(item) is RoundOutcomePayloadV5)
+    assert tuple(item.role for item in controller_completions) == ("investigator", "author", "critic")
+    assert len(controller_terminal) == 1
+    assert type(controller_terminal[0].authority) is RuntimeFailureAuthorityV5
+    assert (controller_terminal[0].authority.stage, controller_terminal[0].authority.failure_code) == (
+        "recovery",
+        "stage_failed",
+    )
+    assert tuple(role for role, _call, _request in role_observations["invokes"]) == (
+        "investigator",
+        "author",
+        "critic",
+    )
+    assert role_observations["reconciliations"] == []
+    assert candidate_observations == {"quick": 3, "discovery": 12}
+
+    # Run the internal controller on the untouched copy to reveal any exception
+    # that the public wrapper maps to recovery/stage_failed. This remains a
+    # provider-free diagnostic on the exact same synthetic fixture history.
+    diagnostic_raw = LocalArtifactRepositoryV5(diagnostic_base)
+    diagnostic_inputs, diagnostic_dependencies = compose_fixture_round_v5(
+        repository=diagnostic_raw,
+        authorities=authenticated,
+        round_index=2,
+    )
+    diagnostic_mechanisms = MechanismArtifactRepositoryV5(diagnostic_raw)
+    diagnostic_factory = LocalRoleRequestFactoryV5(
+        repository=diagnostic_raw,
+        manifest=diagnostic_inputs.manifest,
+        mechanism_adapter=MechanismRoleRequestAdapterV1(
+            diagnostic_mechanisms,
+            authenticated_manifest=authenticated,
+        ),
+    )
+    diagnostic_requests = []
+    original_diagnostic_guard = diagnostic_factory._guarded_request
+
+    def capture_diagnostic_request(request_inputs, request):
+        diagnostic_requests.append(request)
+        return original_diagnostic_guard(request_inputs, request)
+
+    diagnostic_factory._guarded_request = capture_diagnostic_request
+    diagnostic_role_observations = {"invokes": [], "reconciliations": []}
+    diagnostic_invoker = _Issue90CountingRoleInvoker(
+        authenticated.manifest,
+        observations=diagnostic_role_observations,
+    )
+    diagnostic_candidate_observations = {"quick": 0, "discovery": 0}
+    diagnostic_candidate = _Issue90CountingCandidateRuntime(
+        diagnostic_raw,
+        diagnostic_inputs,
+        diagnostic_candidate_observations,
+    )
+    diagnostic_dependencies = replace(
+        diagnostic_dependencies,
+        invoker=diagnostic_invoker,
+        requests=diagnostic_factory,
+        candidates=diagnostic_candidate,
+        cleanup=diagnostic_candidate,
+    )
+    from core.pit_optimizer_v5 import runtime as runtime_module
+
+    diagnostic_outcome = None
+    diagnostic_exception = None
+    try:
+        diagnostic_outcome = runtime_module._Runtime(diagnostic_inputs, diagnostic_dependencies).run()
+    except BaseException as exc:
+        diagnostic_exception = {
+            "type": type(exc).__name__,
+            "message": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+    assert diagnostic_requests and diagnostic_requests[0].sha256 == next_request.sha256
+    assert diagnostic_outcome is None
+    assert diagnostic_exception is not None
+    assert diagnostic_exception["type"] == "ArchiveCapacityInsufficientV5"
+    assert tuple(role for role, _call, _request in diagnostic_role_observations["invokes"]) == (
+        "investigator",
+        "author",
+        "critic",
+    )
+    assert diagnostic_candidate_observations == {"quick": 3, "discovery": 12}
+
+    controller_store = _issue90_artifact_path(evidence_root, "ctl")
+    shutil.copytree(acceptance_root, controller_store)
+    if evidence_directory:
+        diagnostic_evidence = {
+            "evidence_kind": "unwrapped_synthetic_controller_diagnostic",
+            "provider_calls": 0,
+            "diagnostic_store": str(diagnostic_base),
+            "controller_store_after_public_run": str(controller_store),
+            "longest_source_store_path_chars": longest_store_path,
+            "public_controller_status": controller_result.status,
+            "public_controller_failure": None
+            if controller_result.failure is None
+            else {
+                "stage": controller_result.failure.stage,
+                "code": controller_result.failure.code,
+                "role": controller_result.failure.role,
+                "experiment_id": controller_result.failure.experiment_id,
+            },
+            "public_controller_terminal_outcome": None
+            if controller_result.terminal_outcome is None
+            else _issue90_json_ready(round_event_payload_primitive_v5(controller_result.terminal_outcome)),
+            "public_request_sha256": controller_investigator[0].sha256,
+            "persisted_investigator_request": {
+                "path": persisted_investigator[0][0].relative_path,
+                "sha256": persisted_investigator[0][0].sha256,
+                "call_sha256": persisted_investigator[0][1].sha256,
+            },
+            "public_guarded_requests": [
+                {"role": item.role, "request_sha256": item.sha256} for item in controller_requests
+            ],
+            "public_role_invocations": [
+                {"role": role, "call_sha256": call_sha, "request_sha256": request_sha}
+                for role, call_sha, request_sha in role_observations["invokes"]
+            ],
+            "public_role_reconciliations": [
+                {"role": role, "call_sha256": call_sha, "request_sha256": request_sha}
+                for role, call_sha, request_sha in role_observations["reconciliations"]
+            ],
+            "public_candidate_counts": candidate_observations,
+            "public_event_summaries": [
+                {
+                    "sequence": event.sequence,
+                    "event_kind": event.event_kind,
+                    "event_sha256": event.sha256,
+                    "payload_type": type(payload).__name__,
+                    "payload": _issue90_json_ready(round_event_payload_primitive_v5(payload)),
+                }
+                for event, payload in zip(controller_events, controller_payloads, strict=True)
+            ],
+            "unwrapped_internal_outcome": None
+            if diagnostic_outcome is None
+            else {
+                "status": diagnostic_outcome.status,
+                "failure": None
+                if diagnostic_outcome.failure is None
+                else {
+                    "stage": diagnostic_outcome.failure.stage,
+                    "code": diagnostic_outcome.failure.code,
+                    "role": diagnostic_outcome.failure.role,
+                },
+            },
+            "unwrapped_internal_exception": diagnostic_exception,
+            "unwrapped_request_sha256s": [item.sha256 for item in diagnostic_requests],
+            "unwrapped_role_invocations": [
+                {"role": role, "call_sha256": call_sha, "request_sha256": request_sha}
+                for role, call_sha, request_sha in diagnostic_role_observations["invokes"]
+            ],
+            "unwrapped_candidate_counts": diagnostic_candidate_observations,
+        }
+        (evidence_root / "round2-controller-recovery.json").write_bytes(
+            canonical_json_bytes_v5(diagnostic_evidence) + b"\n"
+        )
+
+    if evidence_directory:
+        request_evidence = {
+            "evidence_kind": "scripted_roles_and_synthetic_measurement_and_evaluation",
+            "provider_calls": 0,
+            "campaign_id": inputs.campaign_id,
+            "round_index": 2,
+            "memory_budget_bytes": inputs.manifest.search.investigator_memory_max_bytes,
+            "round_1_report_sha256s": sorted(item.sha256 for item in extension._reports.values()),
+            "round_1_event_ids": [item.sha256 for item in events],
+            "request_sha256": next_request.sha256,
+            "second_reopen_request_sha256": second_reopen[-1].sha256,
+            "request_payload": _issue90_json_ready(next_request.to_primitive()),
+            "messages": _issue90_json_ready(next_request.messages),
+            "acceptance_memory_budget_bytes": memory_budget,
+            "acceptance_canonical_projection_sizes": acceptance_sizes,
+            "summary_experiment_id": summary_experiment_id,
+            "ordinary_controller_status": controller_result.status,
+            "ordinary_controller_request_sha256": controller_investigator[0].sha256,
+            "ordinary_controller_store": str(controller_store),
+        }
+        (evidence_root / "next-request-synthetic.json").write_bytes(canonical_json_bytes_v5(request_evidence) + b"\n")
+
+
+class _Issue90CountingRoleInvoker:
+    """Count deterministic response/reconciliation paths and interrupt one role request."""
+
+    def __init__(self, manifest, *, interrupt_role: str | None = None, observations=None) -> None:
+        self.delegate = FixtureRoleInvokerV5(manifest)
+        self.interrupt_role = interrupt_role
+        self.observations = observations if observations is not None else {"invokes": [], "reconciliations": []}
+        self.calls = self.observations["invokes"]
+        self.reconciliation_calls = self.observations["reconciliations"]
+
+    def invoke_once(self, persisted, *, deadline_monotonic):
+        role = persisted.call.role
+        self.calls.append((role, persisted.call.sha256, persisted.request.sha256))
+        if role == self.interrupt_role:
+            self.interrupt_role = None
+            raise RuntimeError(f"synthetic interruption before the {role} response")
+        return self.delegate.invoke_once(persisted, deadline_monotonic=deadline_monotonic)
+
+    def reconcile_once(self, persisted):
+        self.reconciliation_calls.append((persisted.call.role, persisted.call.sha256, persisted.request.sha256))
+        return self.delegate.reconcile_once(persisted)
+
+
+class _Issue90CountingCandidateRuntime(SyntheticCandidateRuntimeV5):
+    """Count fixture evaluation calls and optionally fail one discovery execution."""
+
+    def __init__(self, repository, inputs, calls: dict[str, int], *, fail_first_discovery: bool = False) -> None:
+        super().__init__(repository, inputs)
+        self.calls = calls
+        self.fail_first_discovery = fail_first_discovery
+
+    def evaluate_quick(self, materialized, *, deadline):
+        self.calls["quick"] += 1
+        return super().evaluate_quick(materialized, deadline=deadline)
+
+    def evaluate_episode(self, materialized, episode, *, deadline):
+        self.calls["discovery"] += 1
+        if self.fail_first_discovery:
+            self.fail_first_discovery = False
+            raise RuntimeError("synthetic evaluator interruption before episode publication")
+        return super().evaluate_episode(materialized, episode, deadline=deadline)
+
+
+@pytest.mark.parametrize("interrupt_role", ("author", "critic"))
+def test_issue90_role_interruption_reopens_to_the_same_truthful_stop(
+    tmp_path: Path,
+    interrupt_role: str,
+) -> None:
+    repository, capability, _, _ = _capability(
+        tmp_path,
+        hypotheses_per_investigator=3,
+        max_variants_per_template=3,
+        max_discovery_survivors_per_template=3,
+        fixture_entry=True,
+    )
+    authenticated = capability.authenticated_manifest
+    inputs, dependencies = compose_fixture_round_v5(
+        repository=repository.repository,
+        authorities=authenticated,
+        round_index=1,
+    )
+    role_observations = {"invokes": [], "reconciliations": []}
+    role_invoker = _Issue90CountingRoleInvoker(
+        authenticated.manifest,
+        interrupt_role=interrupt_role,
+        observations=role_observations,
+    )
+    execution_calls = {"quick": 0, "discovery": 0}
+    candidate_runtime = _Issue90CountingCandidateRuntime(
+        repository.repository,
+        inputs,
+        execution_calls,
+    )
+    dependencies = replace(
+        dependencies,
+        invoker=role_invoker,
+        candidates=candidate_runtime,
+        cleanup=candidate_runtime,
+    )
+
+    first = run_feedback_round_v5(inputs, dependencies)
+    assert first.status == "failed"
+    assert first.failure is not None and first.failure.stage == interrupt_role
+    assert first.failure.code == "role_unrecoverable"
+    first_events = repository.repository.load_round_events(campaign_id=inputs.campaign_id, round_index=1)
+    first_payloads = tuple(
+        repository.repository.load_round_payload(item.payload_ref, expected_kind=item.event_kind)
+        for item in first_events
+    )
+    first_completions = tuple(item.role for item in first_payloads if type(item) is RoleCompletionPayloadV5)
+    assert first_completions == (("investigator",) if interrupt_role == "author" else ("investigator", "author"))
+    terminal = tuple(item for item in first_payloads if type(item) is RoundOutcomePayloadV5)
+    assert len(terminal) == 1
+    assert type(terminal[0].authority) is RuntimeFailureAuthorityV5
+    assert terminal[0].authority.stage == interrupt_role
+    assert terminal[0].authority.failure_code == "role_unrecoverable"
+    durable_requests = repository.repository.load_authenticated_role_requests(
+        campaign_id=inputs.campaign_id,
+        round_index=1,
+    )
+    expected_request_roles = (
+        ("investigator", "author")
+        if interrupt_role == "author"
+        else (
+            "investigator",
+            "author",
+            "critic",
+        )
+    )
+    assert tuple(sorted(call.role for _reference, call, _request in durable_requests)) == tuple(
+        sorted(expected_request_roles)
+    )
+    assert all(call.request_sha256 == request.sha256 for _reference, call, request in durable_requests)
+    first_calls = tuple(role_invoker.calls)
+    first_reconciliations = tuple(role_invoker.reconciliation_calls)
+    first_execution_counts = dict(execution_calls)
+
+    reopened = LocalArtifactRepositoryV5(tmp_path)
+    resumed_inputs, resumed_dependencies = compose_fixture_round_v5(
+        repository=reopened,
+        authorities=authenticated,
+        round_index=1,
+    )
+    resumed_candidate = _Issue90CountingCandidateRuntime(reopened, resumed_inputs, execution_calls)
+    resumed_invoker = _Issue90CountingRoleInvoker(
+        authenticated.manifest,
+        observations=role_observations,
+    )
+    resumed_dependencies = replace(
+        resumed_dependencies,
+        invoker=resumed_invoker,
+        candidates=resumed_candidate,
+        cleanup=resumed_candidate,
+    )
+    resumed = run_feedback_round_v5(resumed_inputs, resumed_dependencies)
+    assert resumed.status == "failed"
+    assert resumed.failure == first.failure
+    assert tuple(resumed_invoker.calls) == first_calls
+    assert tuple(resumed_invoker.reconciliation_calls) == first_reconciliations
+    assert execution_calls == first_execution_counts
+    reopened_events = reopened.load_round_events(campaign_id=inputs.campaign_id, round_index=1)
+    assert tuple(item.sha256 for item in reopened_events) == tuple(item.sha256 for item in first_events)
+    reopened_requests = reopened.load_authenticated_role_requests(
+        campaign_id=inputs.campaign_id,
+        round_index=1,
+    )
+    assert tuple((call.sha256, request.sha256) for _reference, call, request in reopened_requests) == tuple(
+        (call.sha256, request.sha256) for _reference, call, request in durable_requests
+    )
+    _issue90_persist_recovery_record(
+        f"recovery-role-{interrupt_role}.json",
+        {
+            "evidence_kind": "scripted_role_interruption_and_reopen",
+            "provider_calls": 0,
+            "campaign_id": inputs.campaign_id,
+            "round_index": 1,
+            "manifest_sha256": authenticated.manifest_ref.sha256,
+            "interrupted_role": interrupt_role,
+            "first_result": {
+                "status": first.status,
+                "failure": {
+                    "stage": first.failure.stage,
+                    "code": first.failure.code,
+                    "role": first.failure.role,
+                },
+                "terminal_outcome": round_event_payload_primitive_v5(terminal[0]),
+            },
+            "durable_role_requests": [
+                {
+                    "role": call.role,
+                    "call_sha256": call.sha256,
+                    "request_sha256": request.sha256,
+                    "artifact_path": reference.relative_path,
+                    "artifact_sha256": reference.sha256,
+                }
+                for reference, call, request in durable_requests
+            ],
+            "role_invocations_before_reopen": [
+                {"role": role, "call_sha256": call_sha, "request_sha256": request_sha}
+                for role, call_sha, request_sha in first_calls
+            ],
+            "role_reconciliations_before_reopen": [
+                {"role": role, "call_sha256": call_sha, "request_sha256": request_sha}
+                for role, call_sha, request_sha in first_reconciliations
+            ],
+            "candidate_calls_before_reopen": first_execution_counts,
+            "reopen_result": {
+                "status": resumed.status,
+                "failure": {
+                    "stage": resumed.failure.stage,
+                    "code": resumed.failure.code,
+                    "role": resumed.failure.role,
+                },
+                "new_role_invocations": len(resumed_invoker.calls) - len(first_calls),
+                "new_role_reconciliations": len(resumed_invoker.reconciliation_calls) - len(first_reconciliations),
+                "candidate_calls_after_reopen": execution_calls,
+            },
+            "event_ids_unchanged_after_reopen": tuple(item.sha256 for item in reopened_events)
+            == tuple(item.sha256 for item in first_events),
+            "durable_events": [
+                {
+                    "sequence": event.sequence,
+                    "event_kind": event.event_kind,
+                    "event_sha256": event.sha256,
+                    "payload": round_event_payload_primitive_v5(payload),
+                }
+                for event, payload in zip(first_events, first_payloads, strict=True)
+            ],
+        },
+    )
+
+
+def test_issue90_evaluator_interruption_and_checkpoint_recovery_do_not_repeat_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, capability, _, _ = _capability(
+        tmp_path,
+        hypotheses_per_investigator=3,
+        max_variants_per_template=3,
+        max_discovery_survivors_per_template=3,
+        fixture_entry=True,
+    )
+    authenticated = capability.authenticated_manifest
+    inputs, dependencies = compose_fixture_round_v5(
+        repository=repository.repository,
+        authorities=authenticated,
+        round_index=1,
+    )
+    role_observations = {"invokes": [], "reconciliations": []}
+    role_invoker = _Issue90CountingRoleInvoker(authenticated.manifest, observations=role_observations)
+    execution_calls = {"quick": 0, "discovery": 0}
+    candidate_runtime = _Issue90CountingCandidateRuntime(
+        repository.repository,
+        inputs,
+        execution_calls,
+        fail_first_discovery=True,
+    )
+    dependencies = replace(
+        dependencies,
+        invoker=role_invoker,
+        candidates=candidate_runtime,
+        cleanup=candidate_runtime,
+    )
+
+    first = run_feedback_round_v5(inputs, dependencies)
+    assert first.status == "completed", first.failure
+    events = repository.repository.load_round_events(campaign_id=inputs.campaign_id, round_index=1)
+    payloads = tuple(
+        repository.repository.load_round_payload(item.payload_ref, expected_kind=item.event_kind) for item in events
+    )
+    failed_stages = tuple(
+        item
+        for item in payloads
+        if type(item) is CandidateStageResultPayloadV5
+        and item.stage == "discovery_evaluation"
+        and item.outcome == "discovery_evaluation_failed"
+    )
+    assert len(failed_stages) == 1
+    assert failed_stages[0].failure_code == "discovery_evaluation_failed"
+    assert failed_stages[0].failure_ref is not None
+    assert not any(
+        type(item) is EpisodeEvidencePayloadV5 and item.experiment_id == failed_stages[0].experiment_id
+        for item in payloads
+    )
+    records = tuple(repository.repository.load_experiment(ref) for ref in first.record_refs)
+    failed_record = next(item for item in records if item.experiment_id == failed_stages[0].experiment_id)
+    assert failed_record.status == "evaluation_failed"
+    calls_before_recovery = tuple(role_invoker.calls)
+    reconciliations_before_recovery = tuple(role_invoker.reconciliation_calls)
+    execution_before_recovery = dict(execution_calls)
+    event_ids_before_recovery = tuple(item.sha256 for item in events)
+
+    reopened = LocalArtifactRepositoryV5(tmp_path)
+    resumed_inputs, resumed_dependencies = compose_fixture_round_v5(
+        repository=reopened,
+        authorities=authenticated,
+        round_index=1,
+    )
+    resumed_candidate = _Issue90CountingCandidateRuntime(reopened, resumed_inputs, execution_calls)
+    resumed_invoker = _Issue90CountingRoleInvoker(authenticated.manifest, observations=role_observations)
+    resumed_dependencies = replace(
+        resumed_dependencies,
+        invoker=resumed_invoker,
+        candidates=resumed_candidate,
+        cleanup=resumed_candidate,
+    )
+    resumed = run_feedback_round_v5(resumed_inputs, resumed_dependencies)
+    assert resumed.status == "completed"
+    assert resumed.checkpoint == first.checkpoint
+    assert tuple(resumed_invoker.calls) == calls_before_recovery
+    assert tuple(resumed_invoker.reconciliation_calls) == reconciliations_before_recovery
+    assert execution_calls == execution_before_recovery
+    assert tuple(item.sha256 for item in reopened.load_round_events(campaign_id=inputs.campaign_id, round_index=1)) == (
+        event_ids_before_recovery
+    )
+
+    # Simulate loss of the in-memory checkpoint result after durable feedback
+    # publication. Recovery must adopt the authenticated checkpoint and reuse
+    # the original role/evaluator events.
+    second_root = tmp_path / "checkpoint-interruption"
+    second_root.mkdir(parents=True, exist_ok=True)
+    second_repository, second_capability, _, _ = _capability(
+        second_root,
+        hypotheses_per_investigator=3,
+        max_variants_per_template=3,
+        max_discovery_survivors_per_template=3,
+        fixture_entry=True,
+    )
+    second_auth = second_capability.authenticated_manifest
+    second_inputs, second_dependencies = compose_fixture_round_v5(
+        repository=second_repository.repository,
+        authorities=second_auth,
+        round_index=1,
+    )
+    second_role_observations = {"invokes": [], "reconciliations": []}
+    second_role_invoker = _Issue90CountingRoleInvoker(
+        second_auth.manifest,
+        observations=second_role_observations,
+    )
+    second_execution_calls = {"quick": 0, "discovery": 0}
+    second_candidate = _Issue90CountingCandidateRuntime(
+        second_repository.repository,
+        second_inputs,
+        second_execution_calls,
+    )
+    second_dependencies = replace(
+        second_dependencies,
+        invoker=second_role_invoker,
+        candidates=second_candidate,
+        cleanup=second_candidate,
+    )
+    publish_projection = second_repository.repository.publish_projection
+    publication = {"count": 0}
+
+    def publish_then_interrupt(**kwargs):
+        checkpoint = publish_projection(**kwargs)
+        publication["count"] += 1
+        if publication["count"] == 1:
+            raise RuntimeError("synthetic process interruption after durable checkpoint publication")
+        return checkpoint
+
+    monkeypatch.setattr(second_repository.repository, "publish_projection", publish_then_interrupt)
+    interrupted = run_feedback_round_v5(second_inputs, second_dependencies)
+    assert interrupted.status == "failed"
+    assert interrupted.terminal_outcome is not None
+    committed_checkpoint = LocalArtifactRepositoryV5(second_root).load_checkpoint()
+    assert committed_checkpoint is not None
+    second_role_calls = tuple(second_role_invoker.calls)
+    second_reconciliation_calls = tuple(second_role_invoker.reconciliation_calls)
+    second_execution_counts = dict(second_execution_calls)
+    second_events = second_repository.repository.load_round_events(
+        campaign_id=second_inputs.campaign_id,
+        round_index=1,
+    )
+
+    second_reopened = LocalArtifactRepositoryV5(second_root)
+    recovered_inputs, recovered_dependencies = compose_fixture_round_v5(
+        repository=second_reopened,
+        authorities=second_auth,
+        round_index=1,
+    )
+    recovered_candidate = _Issue90CountingCandidateRuntime(
+        second_reopened,
+        recovered_inputs,
+        second_execution_calls,
+    )
+    recovered_invoker = _Issue90CountingRoleInvoker(
+        second_auth.manifest,
+        observations=second_role_observations,
+    )
+    recovered_dependencies = replace(
+        recovered_dependencies,
+        invoker=recovered_invoker,
+        candidates=recovered_candidate,
+        cleanup=recovered_candidate,
+    )
+    recovered = run_feedback_round_v5(recovered_inputs, recovered_dependencies)
+    assert recovered.status == "completed"
+    assert recovered.checkpoint == committed_checkpoint
+    assert tuple(recovered_invoker.calls) == second_role_calls
+    assert tuple(recovered_invoker.reconciliation_calls) == second_reconciliation_calls
+    assert second_execution_calls == second_execution_counts
+    recovered_events = second_reopened.load_round_events(campaign_id=second_inputs.campaign_id, round_index=1)
+    assert tuple(item.sha256 for item in recovered_events) == tuple(item.sha256 for item in second_events)
+    recovered_payloads = tuple(
+        second_reopened.load_round_payload(event.payload_ref, expected_kind=event.event_kind)
+        for event in recovered_events
+    )
+    second_terminal = tuple(item for item in recovered_payloads if type(item) is RoundOutcomePayloadV5)
+    assert len(second_terminal) == 1
+    assert interrupted.failure is not None
+    assert second_terminal[0].authority.stage == interrupted.failure.stage
+    assert second_terminal[0].authority.failure_code == interrupted.failure.code
+    _issue90_persist_recovery_record(
+        "recovery-evaluator-and-checkpoint.json",
+        {
+            "evidence_kind": "synthetic_evaluator_interruption_and_checkpoint_recovery",
+            "provider_calls": 0,
+            "campaign_id": inputs.campaign_id,
+            "round_index": 1,
+            "first_manifest_sha256": authenticated.manifest_ref.sha256,
+            "evaluator_interruption": {
+                "failed_experiment_id": failed_stages[0].experiment_id,
+                "failed_stage": round_event_payload_primitive_v5(failed_stages[0]),
+                "record_status": failed_record.status,
+                "role_invocations_before_reopen": [
+                    {"role": role, "call_sha256": call_sha, "request_sha256": request_sha}
+                    for role, call_sha, request_sha in calls_before_recovery
+                ],
+                "role_reconciliations_before_reopen": [
+                    {"role": role, "call_sha256": call_sha, "request_sha256": request_sha}
+                    for role, call_sha, request_sha in reconciliations_before_recovery
+                ],
+                "candidate_calls_before_reopen": execution_before_recovery,
+                "reopen_result": {
+                    "status": resumed.status,
+                    "checkpoint_generation": resumed.checkpoint.generation,
+                    "new_role_invocations": len(resumed_invoker.calls) - len(calls_before_recovery),
+                    "new_role_reconciliations": len(resumed_invoker.reconciliation_calls)
+                    - len(reconciliations_before_recovery),
+                    "candidate_calls_after_reopen": execution_calls,
+                },
+                "event_ids_unchanged_after_reopen": tuple(item.sha256 for item in events)
+                == tuple(
+                    item.sha256
+                    for item in reopened.load_round_events(
+                        campaign_id=inputs.campaign_id,
+                        round_index=1,
+                    )
+                ),
+                "durable_events": [
+                    {
+                        "sequence": event.sequence,
+                        "event_kind": event.event_kind,
+                        "event_sha256": event.sha256,
+                        "payload": round_event_payload_primitive_v5(payload),
+                    }
+                    for event, payload in zip(events, payloads, strict=True)
+                ],
+            },
+            "checkpoint_interruption": {
+                "second_manifest_sha256": second_auth.manifest_ref.sha256,
+                "injected_boundary": "after durable publish_projection, before returned checkpoint",
+                "first_result": {
+                    "status": interrupted.status,
+                    "failure": {
+                        "stage": interrupted.failure.stage,
+                        "code": interrupted.failure.code,
+                        "role": interrupted.failure.role,
+                    },
+                    "terminal_outcome": round_event_payload_primitive_v5(second_terminal[0]),
+                },
+                "committed_checkpoint": {
+                    "generation": committed_checkpoint.generation,
+                    "archive_sha256": committed_checkpoint.archive_sha256,
+                    "record_refs": [item.to_primitive() for item in committed_checkpoint.record_refs],
+                },
+                "role_invocations_before_reopen": [
+                    {"role": role, "call_sha256": call_sha, "request_sha256": request_sha}
+                    for role, call_sha, request_sha in second_role_calls
+                ],
+                "role_reconciliations_before_reopen": [
+                    {"role": role, "call_sha256": call_sha, "request_sha256": request_sha}
+                    for role, call_sha, request_sha in second_reconciliation_calls
+                ],
+                "candidate_calls_before_reopen": second_execution_counts,
+                "reopen_result": {
+                    "status": recovered.status,
+                    "checkpoint_generation": recovered.checkpoint.generation,
+                    "new_role_invocations": len(recovered_invoker.calls) - len(second_role_calls),
+                    "new_role_reconciliations": len(recovered_invoker.reconciliation_calls)
+                    - len(second_reconciliation_calls),
+                    "candidate_calls_after_reopen": second_execution_calls,
+                },
+                "event_ids_unchanged_after_reopen": tuple(item.sha256 for item in recovered_events)
+                == tuple(item.sha256 for item in second_events),
+                "durable_events": [
+                    {
+                        "sequence": event.sequence,
+                        "event_kind": event.event_kind,
+                        "event_sha256": event.sha256,
+                        "payload": round_event_payload_primitive_v5(payload),
+                    }
+                    for event, payload in zip(recovered_events, recovered_payloads, strict=True)
+                ],
+            },
+        },
+    )
 
 
 def test_disabled_development_never_opens_supplied_workers(tmp_path: Path) -> None:
@@ -2848,9 +3905,7 @@ def test_noncomplete_candidate_status_keeps_local_report_and_evaluator_absence(
         bound=bound_out,
         run=run_out,
         report=report_out,
-        issue_evidence=lambda metric_id, value: (
-            issued.append((metric_id, value)) or f"v5.final-fix.{len(issued)}"
-        ),
+        issue_evidence=lambda metric_id, value: issued.append((metric_id, value)) or f"v5.final-fix.{len(issued)}",
     )
     assert projection.execution == report.execution
     assert any(
@@ -2865,7 +3920,9 @@ def test_noncomplete_candidate_status_keeps_local_report_and_evaluator_absence(
     )
 
 
-def test_supplied_port_quick_rejections_reach_mixed_current_critic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_supplied_port_quick_rejections_reach_mixed_current_critic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A valid survivor rejection stays in the critic batch with local evidence."""
 
     import core.pit_optimizer_v5.runtime as runtime_module
@@ -3011,8 +4068,7 @@ def test_supplied_port_discovery_failure_keeps_local_report_and_completes_round(
     assert investigator_request.role_input.omitted == ()
     assert all(
         any(
-            row.prediction.metric_id == "exit.decision_changed_count"
-            and row.prediction.availability == "measured"
+            row.prediction.metric_id == "exit.decision_changed_count" and row.prediction.availability == "measured"
             for row in item.rows
         )
         for item in investigator_request.role_input.projections
