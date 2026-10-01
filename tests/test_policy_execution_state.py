@@ -520,6 +520,8 @@ def test_cancelled_underfill_needs_explicit_resolution_before_tier_advances() ->
         status=ActionStatus.RESOLVED,
         resolution_reason="Synthetic reconciliation confirms no further fill is due",
     )
+    projection = project_action_state(resolved)
+    assert projection.resolution_reason == "Synthetic reconciliation confirms no further fill is due"
     advanced = advance_holding_exit_tier(holding_after_cancel, resolved)
     assert advanced.last_exit_tier == 1
     assert advanced.remaining_quantity == Decimal("90")

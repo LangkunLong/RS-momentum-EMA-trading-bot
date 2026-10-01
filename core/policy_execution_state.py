@@ -1283,6 +1283,7 @@ class ActionStateProjection:
     role: ActionRole
     side: OrderSide
     status: ActionStatus
+    resolution_reason: str | None
     requested_quantity: Decimal
     confirmed_quantity: Decimal
     residual_quantity: Decimal
@@ -1397,6 +1398,7 @@ def project_action_state(intent: ActionIntent) -> ActionStateProjection:
         role=intent.role,
         side=intent.side,
         status=intent.status,
+        resolution_reason=intent.resolution_reason,
         requested_quantity=intent.requested_quantity,
         confirmed_quantity=intent.confirmed_filled_quantity,
         residual_quantity=residual,
