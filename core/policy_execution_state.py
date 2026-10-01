@@ -719,6 +719,8 @@ def apply_attempt_cumulative_fill(
 
 def request_attempt_cancel(intent: ActionIntent, attempt_number: int) -> ActionIntent:
     attempt = _get_attempt(intent, attempt_number)
+    if _attempt_is_unissued(attempt):
+        raise ValueError("an unissued order intent cannot receive a broker cancel request")
     if attempt.status is ActionAttemptStatus.CANCEL_REQUESTED:
         return intent
     if attempt.status in {ActionAttemptStatus.CANCELLED, ActionAttemptStatus.REJECTED, ActionAttemptStatus.FILLED}:
@@ -741,6 +743,8 @@ def confirm_attempt_terminal(
     if status not in {ActionAttemptStatus.CANCELLED, ActionAttemptStatus.REJECTED, ActionAttemptStatus.FILLED}:
         raise ValueError("broker terminal attempt status must be cancelled, rejected, or filled")
     attempt = _get_attempt(intent, attempt_number)
+    if _attempt_is_unissued(attempt):
+        raise ValueError("an unissued order intent cannot receive broker terminal evidence")
     if attempt.status in {ActionAttemptStatus.CANCELLED, ActionAttemptStatus.REJECTED, ActionAttemptStatus.FILLED}:
         if attempt.status is status:
             return intent
@@ -843,10 +847,20 @@ def add_attempt_order_aliases(
     broker_aliases = list(attempt.broker_order_aliases)
     if client_order_id is not None:
         client = _text(client_order_id, "client_order_id")
+        if any(
+            other.attempt_number != attempt_number and client in other.all_client_order_ids
+            for other in intent.order_attempts
+        ):
+            raise IdentityConflictError("client order identity already belongs to another attempt")
         if client != attempt.client_order_id and client not in client_aliases:
             client_aliases.append(client)
     if broker_order_id is not None:
         broker = _text(broker_order_id, "broker_order_id")
+        if any(
+            other.attempt_number != attempt_number and broker in other.all_broker_order_ids
+            for other in intent.order_attempts
+        ):
+            raise IdentityConflictError("broker order identity already belongs to another attempt")
         if broker != attempt.broker_order_id and broker not in broker_aliases:
             broker_aliases.append(broker)
     if tuple(client_aliases) == attempt.client_order_aliases and tuple(broker_aliases) == attempt.broker_order_aliases:
@@ -894,16 +908,30 @@ def resolve_action(
     if intent.status is ActionStatus.FILLED:
         return intent
     reason = _text(resolution_reason, "resolution_reason")
-    if any(
-        attempt.status not in {ActionAttemptStatus.CANCELLED, ActionAttemptStatus.REJECTED, ActionAttemptStatus.FILLED}
-        for attempt in intent.order_attempts
-    ):
+    if any(not _attempt_is_terminal_or_unissued(attempt) for attempt in intent.order_attempts):
         raise ValueError("all issued order attempts must be terminal before action reconciliation")
     if intent.status is ActionStatus.RESOLVED:
         if status is ActionStatus.RESOLVED and reason == intent.resolution_reason:
             return intent
         raise ValueError("explicitly resolved action cannot be changed")
     return replace(intent, status=status, resolution_reason=reason)
+
+
+def _attempt_is_terminal_or_unissued(attempt: ActionOrderAttempt) -> bool:
+    terminal = {ActionAttemptStatus.CANCELLED, ActionAttemptStatus.REJECTED, ActionAttemptStatus.FILLED}
+    if attempt.terminal_status in terminal or attempt.status in terminal:
+        return True
+    return _attempt_is_unissued(attempt)
+
+
+def _attempt_is_unissued(attempt: ActionOrderAttempt) -> bool:
+    return (
+        attempt.status is ActionAttemptStatus.INTENDED
+        and attempt.terminal_status is None
+        and attempt.confirmed_filled_quantity == 0
+        and not attempt.all_client_order_ids
+        and not attempt.all_broker_order_ids
+    )
 
 
 def assert_execution_session(intent: ActionIntent, session: date) -> None:
@@ -953,6 +981,7 @@ class HoldingEpisode:
     pending_action_ids: tuple[str, ...] = ()
     applied_action_fill_watermarks: tuple[tuple[str, Decimal], ...] = ()
     completed_addition_action_ids: tuple[str, ...] = ()
+    state_version: int | None = None
 
     def __post_init__(self) -> None:
         for name in ("deployment_generation_id", "security_id", "opening_action_id"):
@@ -1030,6 +1059,10 @@ class HoldingEpisode:
         object.__setattr__(self, "applied_action_fill_watermarks", tuple(sorted(watermarks.items())))
         additions = _unique_refs(self.completed_addition_action_ids, "completed_addition_action_ids")
         object.__setattr__(self, "completed_addition_action_ids", tuple(sorted(additions)))
+        if self.state_version is not None and (
+            not isinstance(self.state_version, int) or isinstance(self.state_version, bool) or self.state_version < 0
+        ):
+            raise ValueError("state_version must be a non-negative integer when available")
 
     @classmethod
     def open(
@@ -1372,6 +1405,7 @@ class ActionStateProjection:
     fraction_of_original_quantity: Decimal | None
     rounding_rule_id: str | None
     order_attempts: tuple[ActionOrderAttempt, ...]
+    state_version: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

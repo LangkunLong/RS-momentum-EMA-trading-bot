@@ -22,6 +22,7 @@ from core.policy_execution_state import (
     PolicyDeploymentIdentity,
     PortfolioStateSnapshot,
     advance_holding_exit_tier,
+    add_attempt_order_aliases,
     apply_action_fill_to_holding,
     apply_attempt_cumulative_fill,
     apply_cumulative_fill,
@@ -611,14 +612,13 @@ def test_late_terminal_fill_requires_reconciliation_before_remainder_and_keeps_i
     )
     assert first_terminal_again.status is ActionStatus.RECONCILIATION_REQUIRED
     assert first_terminal_again.order_attempts[1].status is ActionAttemptStatus.INTENDED
-    with pytest.raises(ValueError, match="order attempts must be terminal"):
-        resolve_action(
-            first_terminal_again,
-            status=ActionStatus.RESOLVED,
-            resolution_reason="Remainder submission was verified and terminal facts are needed",
-        )
-    with pytest.raises(ValueError, match="fully confirmed|explicitly resolved"):
-        advance_holding_exit_tier(holding_after_late_fill, first_terminal_again)
+    resolved_without_unsent_remainder = resolve_action(
+        first_terminal_again,
+        status=ActionStatus.RESOLVED,
+        resolution_reason="Synthetic evidence confirms the remainder was never submitted",
+    )
+    assert resolved_without_unsent_remainder.confirmed_filled_quantity == Decimal("25")
+    assert advance_holding_exit_tier(holding_after_late_fill, resolved_without_unsent_remainder).last_exit_tier == 1
 
     exact_target_live = apply_attempt_cumulative_fill(late_fill_a, 2, Decimal("25"))
     assert exact_target_live.confirmed_filled_quantity == Decimal("50")
@@ -699,6 +699,64 @@ def test_single_attempt_over_target_fill_can_resolve_without_changing_the_target
     assert resolved.requested_quantity == Decimal("10")
     assert resolved.confirmed_filled_quantity == Decimal("11")
     assert resolved.status is ActionStatus.RESOLVED
+
+
+def test_unissued_intents_can_resolve_without_fabricated_terminal_evidence() -> None:
+    action = build_action_intent(
+        decision=_decision(),
+        security_id="FIGI-BB1234",
+        role=ActionRole.ENTRY,
+        side=OrderSide.BUY,
+        requested_quantity=Decimal("10"),
+    )
+    resolved = resolve_action(
+        action,
+        status=ActionStatus.RESOLVED,
+        resolution_reason="The execution session passed before submission",
+    )
+    assert resolved.status is ActionStatus.RESOLVED
+    assert resolved.resolution_reason == "The execution session passed before submission"
+    with pytest.raises(ValueError, match="unissued order intent"):
+        request_attempt_cancel(action, 1)
+    with pytest.raises(ValueError, match="unissued order intent"):
+        confirm_attempt_terminal(action, 1, status=ActionAttemptStatus.CANCELLED)
+
+    issued = bind_attempt_order_refs(action, attempt_number=1, client_order_id="client-issued")
+    with pytest.raises(ValueError, match="issued order attempts must be terminal"):
+        resolve_action(
+            issued,
+            status=ActionStatus.RESOLVED,
+            resolution_reason="An issued order still needs broker terminal evidence",
+        )
+
+
+def test_order_reference_aliases_cannot_cross_attempt_boundaries() -> None:
+    action = build_action_intent(
+        decision=_decision(category=DecisionCategory.EXIT, subject_type=DecisionSubjectType.HOLDING),
+        security_id="FIGI-BB1234",
+        role=ActionRole.SCALE_OUT,
+        side=OrderSide.SELL,
+        requested_quantity=Decimal("50"),
+        holding_episode_id="holding-fixture",
+        exit_tier=1,
+        snapshot_original_quantity=Decimal("100"),
+        fraction_of_original_quantity=Decimal("0.5"),
+        rounding_rule_id="whole_share_floor_v1",
+    )
+    action = bind_attempt_order_refs(action, attempt_number=1, client_order_id="client-first", broker_order_id="broker-first")
+    action = request_attempt_cancel(action, 1)
+    action = confirm_attempt_terminal(action, 1, status=ActionAttemptStatus.CANCELLED)
+    action = create_single_remainder_attempt(action)
+    action = bind_attempt_order_refs(action, attempt_number=2, client_order_id="client-second", broker_order_id="broker-second")
+
+    with pytest.raises(IdentityConflictError, match="another attempt"):
+        add_attempt_order_aliases(action, attempt_number=1, client_order_id="client-second")
+    with pytest.raises(IdentityConflictError, match="another attempt"):
+        add_attempt_order_aliases(action, attempt_number=1, broker_order_id="broker-second")
+    with pytest.raises(IdentityConflictError, match="another attempt"):
+        add_attempt_order_aliases(action, attempt_number=2, client_order_id="client-first")
+    with pytest.raises(IdentityConflictError, match="another attempt"):
+        add_attempt_order_aliases(action, attempt_number=2, broker_order_id="broker-first")
 
 
 def test_stop_and_peak_evolve_monotonically_without_turning_missing_values_into_zero() -> None:
