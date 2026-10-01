@@ -14,12 +14,12 @@ Launch source `ab385d792e19ff6db39d87f1123f47f660fc1e1d`, tree `46a4b97a29f5fe05
 
 | Issue and published criterion | Required bounded evidence | Current disposition |
 | --- | --- | --- |
-| #72: exact original inputs and lineage-to-ticker transformation | Rehashed consumed originals, deterministic membership projection, separately bound destination V3/identity inputs | Implementation/review pending |
-| #72: coherent builder acceptance; reject foreign/relabelled provenance | Actual builder path with explicit synthetic fixture admission; swapped/tampered/foreign negatives; production guard retained | Implementation/review pending |
-| #72: unchanged values and publication timing | Original financial/audit row equivalence, preserved pre-membership lookback and alias histories, no second date shift | Implementation/review pending |
-| #69: warm-up/evaluation per-security/date coverage | Retained source denominators, missing/duplicate/invalid rows and reference calendars | Bounded measurement pending; full union absent |
-| #69: corporate actions explicit | Representative rename/reuse/delisting/merger/spin-off evidence with supported/excluded/unresolved disposition | Bounded assessment pending; no authenticated transition inferred |
-| #69: adjustment/identity/reference reconciliation | Measured identity/date cases, source adjustment evidence, SPY/QQQ/IWM sufficiency and limitations | Bounded assessment pending; full production input absent |
+| #72: exact original inputs and lineage-to-ticker transformation | Rehashed consumed originals, deterministic membership projection, separately bound destination V3/identity inputs | Final independent review found three defects; same owner correcting |
+| #72: coherent builder acceptance; reject foreign/relabelled provenance | Actual builder path with explicit synthetic fixture admission; swapped/tampered/foreign negatives; production guard retained | Final independent review found three defects; same owner correcting |
+| #72: unchanged values and publication timing | Original financial/audit row equivalence, preserved pre-membership lookback and alias histories, no second date shift | Final independent review found three defects; same owner correcting |
+| #69: warm-up/evaluation per-security/date coverage | Retained source denominators, missing/duplicate/invalid rows and reference calendars | Bounded measurement independently accepted at d24dc9c; full union absent |
+| #69: corporate actions explicit | Representative rename/reuse/delisting/merger/spin-off evidence with supported/excluded/unresolved disposition | Bounded assessment independently accepted; no authenticated transition inferred |
+| #69: adjustment/identity/reference reconciliation | Measured identity/date cases, source adjustment evidence, SPY/QQQ/IWM sufficiency and limitations | Bounded assessment independently accepted; full production input absent |
 | #70: actual field/lookback coverage by security/date | Exact source/export counts and deterministic sample availability/windows | Bounded measurement pending; full histories absent |
 | #70: forms/Q4/concepts explicit | Available source/audit measurements; unavailable/foreign treatment preserved | Bounded assessment pending |
 | #70: availability separate from period end and earlier observations retained | Publication/audit chain or explicit missing source evidence; pre-evaluation sample | Bounded assessment pending |
@@ -29,9 +29,9 @@ Launch source `ab385d792e19ff6db39d87f1123f47f660fc1e1d`, tree `46a4b97a29f5fe05
 
 | Issue | Implementation | Required inputs | Acceptance evidence | Dependencies |
 | --- | --- | --- | --- | --- |
-| #72 | Active, not yet accepted | Synthetic coherent inputs sufficient | Final implementation/tests/independent review/merge missing | #66 met; settled #68 interface consumed |
-| #69 bounded/full | Assessment active / full delivery incomplete | Retained inputs identified / complete source-backed union and histories absent | Bounded report not yet reviewed / full criteria unverified | Start #66 met; full acceptance requires #68 |
-| #70 bounded/full | Assessment active / full delivery incomplete | Retained exports identified; archive/audit availability under verification / complete histories absent | Bounded report not yet reviewed / full criteria unverified | Start #66 met; full acceptance requires #68 |
+| #72 | Corrective work active, not accepted | Synthetic inputs sufficient | Three final-review defects awaiting correction and re-review | #66 met; settled #68 interface consumed |
+| #69 bounded/full | Bounded complete, integrated as 0200146 / full delivery incomplete | Retained inputs measured / complete source-backed union and histories absent | Independent bounded review accepted / full criteria unverified | Start #66 met; full acceptance requires #68 |
+| #70 bounded/full | Bounded delivered at 174faca; scalar-trace correction active / full delivery incomplete | Alternate export and archives verified / full histories and generation lineage absent | Exact period/unit trace finding unresolved / full criteria unverified | Start #66 met; full acceptance requires #68 |
 | #68 preserved | Settled code retained; acquisition incomplete | Complete three-index history, source eligibility and transitions missing | Partial source receipts only | Open, outside this phase's bounded completion |
 
 ## Review and integration gates
@@ -43,3 +43,13 @@ Peer B owns later evaluator source-map/image closure. Peer C consumes the unchan
 ## Recommendation
 
 **Not ready yet.** Continue implementation, bounded measurement, independent review and integration. Keep full #68/#69/#70 open. This packet will be finalized with exact commits, evidence hashes, commands/results, review rulings and actual publication/merge state before any completion claim.
+
+## Integration update
+
+Protected main `68b5358e55df1d8a93851550f421e594541dc74e` integrated without conflicts as `255c6bfcbfe2f9bec1530d2eeb8b2feaacde3a6a`. B's new image evidence is retained at its actual source `a8662e85c4c06142183c707926e7c302c75e233d`. All 58 mapped runtime Git blobs are identical at lead `0200146e5a8511a2a0c235ea8a04564ce514c7ea`; no new image execution is claimed. Final corrected #72 import/source closure must still be inspected.
+
+#69 owner `d24dc9ccc7fe6b08f7e07a1f7f38a3772194849c` integrated unchanged as `0200146e5a8511a2a0c235ea8a04564ce514c7ea`. [Independent review](issue-69-bounded-independent-review.md) accepts the bounded assessment. Independent targeted comparison reproduces 610 overlapping FISV/FI sessions with zero exact OHLCV matches, contradicting the retained audit. Full #69 remains open.
+
+#72 frozen `df3892234ad4b95408b9354c445e9b3a61985328` is not accepted: mixed segmented/unsegmented identity loss, removed same-issuer alias lookbacks, and foreign synthetic-fixture membership hashes accepted under opt-in were independently reproduced. Same owner is correcting all three. Original 68-test evidence does not cover these counterexamples.
+
+#70 frozen `174faca` requires correction: its 1,946 scalar matches do not yet establish exact period/duration/unit provenance. An independent adversarial probe matched a wrong-period/wrong-unit fact. The owner is tightening matching, preserving the original receipt, and correcting the all-statement count label.
