@@ -115,7 +115,13 @@ SHA-256 `3c9edd0158dcb93f9de5edbfcf6f281dd8b25bcdd1ded6ad21473af5fd37be7c`,
 and reproduction-script SHA-256
 `bfec250376d6e03208ee83664513911f45adda271cb1522da918efc0166a5d50`. The
 complete failed-attempt receipt and successful output are retained in
-[`historical-financial-validation-issue71-adjacency-v3-reproduction.json`](/C:/Users/llong/.codex/worktrees/f1ba/RS-momentum-EMA-trading-bot/docs/historical-financial-validation-issue71-adjacency-v3-reproduction.json).
+[`historical-financial-validation-issue71-adjacency-v3-reproduction.json`](historical-financial-validation-issue71-adjacency-v3-reproduction.json).
+The receipt's calculator-file SHA-256 is the worker's runtime checkout-byte
+hash (`2d76ece95830386831d2bc4e21c688d894efea4d70872a9591a98ab0c3b2b703`). The portable committed Git blob for that same calculator is
+`71e562ffc00dc4e617f1cd625e3f13ea5fe3f81a`, whose raw bytes have SHA-256
+`c11693f07dffbdb5a3d9f9a60d7098759b2d6b9d97d10b0dd47d8dc4c553d905`.
+The checkout-byte difference is line endings; the calculator identity and
+versioned semantics are unchanged.
 
 The recipe CLI import/help path, four focused count and identity tests, and
 Ruff check pass. No calculator implementation or semantics changed in this
