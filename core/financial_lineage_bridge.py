@@ -51,6 +51,118 @@ _EXPORT_BRIDGE_KIND = "sec_fundamentals_lineage_projection_v1"
 _DEFAULT_MEMBERSHIP_START = "2021-01-01"
 
 
+def _canonical_window_date(value: object, *, field: str) -> date:
+    if not isinstance(value, str):
+        raise ValueError(f"financial lineage date window has invalid {field}")
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"financial lineage date window has invalid {field}") from exc
+    if parsed.isoformat() != value:
+        raise ValueError(f"financial lineage date window has noncanonical {field}")
+    return parsed
+
+
+def _canonical_date_window(
+    document: Mapping[str, object], *, start_field: str, end_field: str, label: str
+) -> tuple[str, str]:
+    start_value = document.get(start_field)
+    end_value = document.get(end_field)
+    start = _canonical_window_date(start_value, field=f"{label} start date")
+    end = _canonical_window_date(end_value, field=f"{label} end date")
+    if end < start:
+        raise ValueError(f"financial lineage date window is inverted for {label}")
+    return str(start_value), str(end_value)
+
+
+def _validate_date_window_contract(
+    prices_provenance: Mapping[str, object],
+    *,
+    projection: Mapping[str, object] | None = None,
+    export: Mapping[str, object] | None = None,
+    bridge: Mapping[str, object] | None = None,
+) -> tuple[str, str]:
+    """Bind projection and SEC declarations to the authenticated prices window."""
+
+    prices_start, prices_end = _canonical_date_window(
+        prices_provenance,
+        start_field="start_date",
+        end_field="end_date",
+        label="prices extraction",
+    )
+    prices_end_date = _canonical_window_date(
+        prices_end, field="prices extraction end date"
+    )
+    membership_starts: list[str] = []
+
+    if projection is not None:
+        projection_start, projection_end = _canonical_date_window(
+            projection,
+            start_field="extraction_start_date",
+            end_field="extraction_end_date",
+            label="projection extraction",
+        )
+        membership_start, membership_end = _canonical_date_window(
+            projection,
+            start_field="membership_window_start_date",
+            end_field="membership_window_end_date",
+            label="projection membership",
+        )
+        if (projection_start, projection_end) != (prices_start, prices_end):
+            raise ValueError(
+                "financial lineage projection extraction window differs from authenticated prices"
+            )
+        if membership_end != prices_end:
+            raise ValueError(
+                "financial lineage projection membership window differs from authenticated prices cutoff"
+            )
+        membership_starts.append(membership_start)
+
+    if export is not None:
+        export_start, export_end = _canonical_date_window(
+            export,
+            start_field="start_date",
+            end_field="end_date",
+            label="SEC export extraction",
+        )
+        export_membership_start = _canonical_window_date(
+            export.get("membership_start_date"), field="SEC export membership start date"
+        )
+        if (export_start, export_end) != (prices_start, prices_end):
+            raise ValueError(
+                "SEC export extraction window differs from authenticated prices"
+            )
+        if export_membership_start > prices_end_date:
+            raise ValueError("financial lineage membership date window is inverted")
+        membership_starts.append(export_membership_start.isoformat())
+
+    if bridge is not None:
+        bridge_start, bridge_end = _canonical_date_window(
+            bridge,
+            start_field="extraction_start_date",
+            end_field="extraction_end_date",
+            label="SEC bridge extraction",
+        )
+        bridge_membership_start = _canonical_window_date(
+            bridge.get("membership_start_date"), field="SEC bridge membership start date"
+        )
+        if (bridge_start, bridge_end) != (prices_start, prices_end):
+            raise ValueError(
+                "SEC bridge extraction window differs from authenticated prices"
+            )
+        if bridge_membership_start > prices_end_date:
+            raise ValueError("financial lineage membership date window is inverted")
+        membership_starts.append(bridge_membership_start.isoformat())
+
+    if membership_starts:
+        if len(set(membership_starts)) != 1:
+            raise ValueError(
+                "financial lineage membership start differs across projection, export, and bridge"
+            )
+
+    return prices_start, prices_end
+
+
 @dataclass(frozen=True, slots=True)
 class IdentityBoundary:
     """An authenticated date at which one lineage changes its ticker."""
@@ -778,6 +890,21 @@ def build_membership_projection(
         source_membership_provenance, "schema-V3 membership provenance"
     )
     prices_manifest = _json_mapping(source_prices_provenance, "prices provenance")
+    prices_start_date, prices_end_date = _canonical_date_window(
+        prices_manifest,
+        start_field="start_date",
+        end_field="end_date",
+        label="prices extraction",
+    )
+    _validate_date_window_contract(
+        prices_manifest,
+        projection={
+            "extraction_start_date": prices_start_date,
+            "extraction_end_date": prices_end_date,
+            "membership_window_start_date": membership_start_date,
+            "membership_window_end_date": prices_end_date,
+        },
+    )
     if source_membership_provenance.read_bytes() != pit_canonical_json_bytes(
         membership_manifest
     ):
@@ -823,7 +950,7 @@ def build_membership_projection(
         ),
         identity_boundaries=boundaries,
     )
-    membership_end_date = str(prices_manifest.get("end_date", ""))
+    membership_end_date = prices_end_date
     projection = _clip_projection_to_membership_window(
         projection,
         membership,
@@ -845,8 +972,8 @@ def build_membership_projection(
         identities=identities,
         transitions=transitions,
         segment_contract=segment_contract,
-        start_date=str(prices_manifest.get("start_date", "")),
-        end_date=str(prices_manifest.get("end_date", "")),
+        start_date=prices_start_date,
+        end_date=prices_end_date,
     )
     history_payload = _csv_bytes(_EXTRACTION_HISTORY_COLUMNS, history_rows)
     ticker_sha = _sha256_bytes(ticker_payload)
@@ -871,10 +998,10 @@ def build_membership_projection(
         "ticker_membership_csv": _relative_reference(output_provenance.parent, output_csv),
     }
     provenance: dict[str, object] = {
-        "extraction_end_date": str(prices_manifest["end_date"]),
+        "extraction_end_date": prices_end_date,
         "extraction_history_row_count": len(history_rows),
         "extraction_history_sha256": history_sha,
-        "extraction_start_date": str(prices_manifest["start_date"]),
+        "extraction_start_date": prices_start_date,
         "identity_request_contracts_sha256": identity_digest,
         "identity_segments_v1_sha256": segment_digest,
         "identity_transitions_sha256": transition_digest,
@@ -918,6 +1045,8 @@ def _validate_projection_provenance(
     transitions: Sequence[Mapping[str, object]],
     segment_contract: object | None,
     membership: Sequence[tuple[str, str, str, int]],
+    export_provenance: Mapping[str, object],
+    export_bridge: Mapping[str, object],
 ) -> tuple[Path, Path, Path]:
     if sha256_file(provenance_path) != expected_sha256:
         raise ValueError("financial lineage bridge projection provenance hash is invalid")
@@ -956,6 +1085,17 @@ def _validate_projection_provenance(
             or sha256_file(referenced) != sha256_file(expected_path)
         ):
             raise ValueError("financial lineage bridge binds foreign V3 inputs")
+    prices_manifest = _json_mapping(source_prices_provenance, "prices provenance")
+    prices_start_date, prices_end_date = _validate_date_window_contract(
+        prices_manifest,
+        projection=document,
+        export=export_provenance,
+        bridge=export_bridge,
+    )
+    expected_membership_start = _canonical_window_date(
+        export_provenance.get("membership_start_date"),
+        field="SEC export membership start date",
+    ).isoformat()
     projection_csv = _resolve_reference(
         provenance_path.parent, references["ticker_membership_csv"], "ticker membership CSV"
     )
@@ -990,8 +1130,8 @@ def _validate_projection_provenance(
     projection = _clip_projection_to_membership_window(
         projection,
         membership,
-        start_date=str(document.get("membership_window_start_date", "")),
-        end_date=str(document.get("membership_window_end_date", "")),
+        start_date=expected_membership_start,
+        end_date=prices_end_date,
     )
     expected_membership_bytes = _csv_bytes(
         _TICKER_MEMBERSHIP_COLUMNS, projection.ticker_events
@@ -1008,8 +1148,8 @@ def _validate_projection_provenance(
         identities=identities,
         transitions=transitions,
         segment_contract=segment_contract,
-        start_date=str(document.get("extraction_start_date", "")),
-        end_date=str(document.get("extraction_end_date", "")),
+        start_date=prices_start_date,
+        end_date=prices_end_date,
     )
     expected_history_bytes = _csv_bytes(_EXTRACTION_HISTORY_COLUMNS, history_rows)
     if (
@@ -1033,6 +1173,54 @@ def _validate_projection_provenance(
     return projection_csv, ledger_csv, history_csv
 
 
+def _projection_and_prices_window_sources(
+    projection_provenance_path: Path,
+) -> tuple[Mapping[str, object], Mapping[str, object]]:
+    projection_provenance_path = _regular_file(
+        projection_provenance_path, "financial lineage bridge projection provenance"
+    )
+    document = _json_mapping(
+        projection_provenance_path, "financial lineage bridge projection"
+    )
+    if projection_provenance_path.read_bytes() != pit_canonical_json_bytes(document):
+        raise ValueError("financial lineage bridge projection is not canonical JSON")
+    if (
+        document.get("schema_version") != 1
+        or document.get("kind") != _BRIDGE_KIND
+        or not isinstance(document.get("references"), dict)
+    ):
+        raise ValueError("financial lineage bridge projection schema is unsupported")
+    references = document["references"]
+    prices_path = _resolve_reference(
+        projection_provenance_path.parent,
+        references.get("source_prices_provenance"),
+        "source prices provenance",
+    )
+    if sha256_file(prices_path) != document.get("source_prices_provenance_sha256"):
+        raise ValueError("financial lineage bridge projection does not bind prices provenance")
+    prices_manifest = _json_mapping(prices_path, "prices provenance")
+    return document, prices_manifest
+
+
+def validate_export_window_contract(
+    *,
+    projection_provenance_path: Path,
+    export_provenance: Mapping[str, object],
+    export_bridge: Mapping[str, object],
+) -> None:
+    """Validate SEC publication dates against its projection and source prices."""
+
+    projection, prices_manifest = _projection_and_prices_window_sources(
+        projection_provenance_path
+    )
+    _validate_date_window_contract(
+        prices_manifest,
+        projection=projection,
+        export=export_provenance,
+        bridge=export_bridge,
+    )
+
+
 def make_export_bridge_record(
     *,
     output_dir: Path,
@@ -1044,13 +1232,10 @@ def make_export_bridge_record(
     projection_provenance_path = _regular_file(
         projection_provenance_path, "financial lineage bridge projection provenance"
     )
-    document = _json_mapping(projection_provenance_path, "financial lineage bridge projection")
-    if (
-        document.get("schema_version") != 1
-        or document.get("kind") != _BRIDGE_KIND
-        or not isinstance(document.get("references"), dict)
-    ):
-        raise ValueError("financial lineage bridge projection schema is unsupported")
+    document, prices_manifest = _projection_and_prices_window_sources(
+        projection_provenance_path
+    )
+    _validate_date_window_contract(prices_manifest, projection=document)
     references = document["references"]
     projected_membership = _resolve_reference(
         projection_provenance_path.parent,
@@ -1160,6 +1345,8 @@ def validate_export_bridge(
         transitions=transitions,
         segment_contract=segment_contract,
         membership=membership,
+        export_provenance=output_provenance,
+        export_bridge=bridge,
     )
     if projection_csv != ticker_csv:
         if sha256_file(projection_csv) != sha256_file(ticker_csv):

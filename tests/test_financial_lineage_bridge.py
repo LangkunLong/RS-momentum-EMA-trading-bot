@@ -26,12 +26,16 @@ from core.sec_pit_fundamentals import (
 from core.pit_provenance import pit_canonical_json_bytes, pit_canonical_json_sha256
 from core.financial_lineage_bridge import (
     IdentityBoundary,
+    _EXTRACTION_HISTORY_COLUMNS,
     _clip_projection_to_membership_window,
     _identity_extraction_history_rows,
+    _read_v3_membership,
+    _validate_date_window_contract,
     build_membership_projection,
     identity_boundaries_from_contract,
     main as bridge_main,
     project_v3_membership_to_ticker,
+    validate_export_window_contract,
 )
 
 
@@ -1078,6 +1082,130 @@ def _run_builder(args: list[str], monkeypatch: pytest.MonkeyPatch) -> int:
     return bundle_builder.main()
 
 
+def _coherently_change_projection_window(
+    args: list[str],
+    *,
+    projection_updates: dict[str, str],
+    update_export_declarations: bool = False,
+) -> tuple[bytes, bytes]:
+    """Change projection dates and rebind every history/provenance digest."""
+    fundamentals_provenance_path = Path(
+        args[args.index("--fundamentals-provenance") + 1]
+    )
+    prices_provenance_path = Path(args[args.index("--prices-provenance") + 1])
+    membership_csv = Path(args[args.index("--membership-csv") + 1])
+    export_provenance = json.loads(
+        fundamentals_provenance_path.read_text(encoding="utf-8")
+    )
+    bridge = export_provenance["financial_lineage_bridge_v1"]
+    projection_path = (
+        fundamentals_provenance_path.parent / bridge["projection_provenance_path"]
+    ).resolve()
+    projection = json.loads(projection_path.read_text(encoding="utf-8"))
+    ticker_path = (
+        projection_path.parent
+        / projection["references"]["ticker_membership_csv"]
+    ).resolve()
+    ledger_path = (
+        projection_path.parent / projection["references"]["lineage_projection_csv"]
+    ).resolve()
+    original_ticker_bytes = ticker_path.read_bytes()
+    original_ledger_bytes = ledger_path.read_bytes()
+    projection.update(projection_updates)
+
+    extraction_fields_changed = bool(
+        {"extraction_start_date", "extraction_end_date"}.intersection(
+            projection_updates
+        )
+    )
+    if extraction_fields_changed:
+        from normalize_pit_universe_membership import _load_price_identity
+
+        prices_provenance = json.loads(
+            prices_provenance_path.read_text(encoding="utf-8")
+        )
+        identities, transitions, _, _, segment_contract = _load_price_identity(
+            prices_provenance,
+            source_root=prices_provenance_path.parent,
+            prices_provenance_sha256=hashlib.sha256(
+                prices_provenance_path.read_bytes()
+            ).hexdigest(),
+        )
+        membership = _read_v3_membership(membership_csv)
+        history_rows = _identity_extraction_history_rows(
+            membership,
+            identities=identities,
+            transitions=transitions,
+            segment_contract=segment_contract,
+            start_date=projection["extraction_start_date"],
+            end_date=projection["extraction_end_date"],
+        )
+        history_path = (
+            projection_path.parent
+            / projection["references"]["lineage_extraction_history_csv"]
+        ).resolve()
+        _write_csv(history_path, _EXTRACTION_HISTORY_COLUMNS, list(history_rows))
+        projection["extraction_history_row_count"] = len(history_rows)
+        projection["extraction_history_sha256"] = hashlib.sha256(
+            history_path.read_bytes()
+        ).hexdigest()
+
+        history_by_ticker = {row[0]: row for row in history_rows}
+        resolved_history_path = fundamentals_provenance_path.parent / (
+            "financial_lineage_extraction_history.csv"
+        )
+        with resolved_history_path.open(
+            "r", encoding="utf-8", newline=""
+        ) as stream:
+            resolved_rows = list(csv.DictReader(stream))
+        for row in resolved_rows:
+            projected = history_by_ticker[row["ticker"]]
+            row["first_extraction_date"] = projected[1]
+            row["last_extraction_date"] = projected[2]
+        _write_csv(
+            resolved_history_path,
+            tuple(resolved_rows[0]),
+            [tuple(row[column] for column in resolved_rows[0]) for row in resolved_rows],
+        )
+        export_provenance["financial_lineage_extraction_history_sha256"] = (
+            hashlib.sha256(resolved_history_path.read_bytes()).hexdigest()
+        )
+        bridge["identity_extraction_history_csv_sha256"] = hashlib.sha256(
+            history_path.read_bytes()
+        ).hexdigest()
+
+    _write_json(projection_path, projection)
+    bridge["projection_provenance_sha256"] = hashlib.sha256(
+        projection_path.read_bytes()
+    ).hexdigest()
+    if update_export_declarations:
+        export_provenance["start_date"] = projection["extraction_start_date"]
+        export_provenance["end_date"] = projection["extraction_end_date"]
+        export_provenance["membership_start_date"] = projection[
+            "membership_window_start_date"
+        ]
+        bridge["extraction_start_date"] = projection["extraction_start_date"]
+        bridge["extraction_end_date"] = projection["extraction_end_date"]
+        bridge["membership_start_date"] = projection[
+            "membership_window_start_date"
+        ]
+    _write_json(fundamentals_provenance_path, export_provenance)
+
+    marker_path = fundamentals_provenance_path.parent / "fundamentals_publication.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["files"]["fundamentals_provenance.json"] = hashlib.sha256(
+        fundamentals_provenance_path.read_bytes()
+    ).hexdigest()
+    resolved_history_path = fundamentals_provenance_path.parent / (
+        "financial_lineage_extraction_history.csv"
+    )
+    marker["files"]["financial_lineage_extraction_history.csv"] = hashlib.sha256(
+        resolved_history_path.read_bytes()
+    ).hexdigest()
+    _write_json(marker_path, marker)
+    return original_ticker_bytes, original_ledger_bytes
+
+
 def test_production_builder_path_accepts_coherent_synthetic_bridge_and_warmup_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1108,6 +1236,210 @@ def test_production_builder_path_accepts_coherent_synthetic_bridge_and_warmup_ro
     with (tmp_path / "bundle_manifest.json").open(encoding="utf-8") as stream:
         manifest = json.load(stream)
     assert manifest["bundle_sha256"]
+
+
+def test_production_builder_rejects_rehashed_projection_with_shortened_extraction_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args, _membership_csv, fundamentals_csv = _actual_builder_case(tmp_path)
+    financial_rows_before = fundamentals_csv.read_bytes()
+    _coherently_change_projection_window(
+        args, projection_updates={"extraction_end_date": "2024-12-31"}
+    )
+    assert fundamentals_csv.read_bytes() == financial_rows_before
+
+    with pytest.raises(ValueError, match="projection extraction window differs"):
+        _run_builder(args, monkeypatch)
+
+
+def test_production_builder_rejects_rehashed_projection_with_changed_extraction_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args, _membership_csv, _fundamentals_csv = _actual_builder_case(tmp_path)
+    _coherently_change_projection_window(
+        args, projection_updates={"extraction_start_date": "2020-01-02"}
+    )
+
+    with pytest.raises(ValueError, match="projection extraction window differs"):
+        _run_builder(args, monkeypatch)
+
+
+def test_production_builder_rejects_projection_and_export_rebased_away_from_prices(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args, _membership_csv, _fundamentals_csv = _actual_builder_case(tmp_path)
+    _coherently_change_projection_window(
+        args,
+        projection_updates={"extraction_end_date": "2024-12-31"},
+        update_export_declarations=True,
+    )
+
+    with pytest.raises(ValueError, match="projection extraction window differs"):
+        _run_builder(args, monkeypatch)
+
+
+def test_production_builder_rejects_event_free_membership_start_relabel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args, _membership_csv, _fundamentals_csv = _actual_builder_case(tmp_path)
+    ticker_before, ledger_before = _coherently_change_projection_window(
+        args, projection_updates={"membership_window_start_date": "2021-01-02"}
+    )
+    exporter_provenance_path = Path(
+        args[args.index("--fundamentals-provenance") + 1]
+    )
+    exporter_provenance = json.loads(
+        exporter_provenance_path.read_text(encoding="utf-8")
+    )
+    bridge = exporter_provenance["financial_lineage_bridge_v1"]
+    projection_path = (
+        exporter_provenance_path.parent / bridge["projection_provenance_path"]
+    ).resolve()
+    projection = json.loads(projection_path.read_text(encoding="utf-8"))
+    ticker_path = (
+        projection_path.parent / projection["references"]["ticker_membership_csv"]
+    ).resolve()
+    ledger_path = (
+        projection_path.parent / projection["references"]["lineage_projection_csv"]
+    ).resolve()
+    assert ticker_path.read_bytes() == ticker_before
+    assert ledger_path.read_bytes() == ledger_before
+
+    with pytest.raises(ValueError, match="membership start differs"):
+        _run_builder(args, monkeypatch)
+
+
+def test_production_builder_rejects_membership_end_relabel_past_authenticated_cutoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args, _membership_csv, _fundamentals_csv = _actual_builder_case(tmp_path)
+    ticker_before, ledger_before = _coherently_change_projection_window(
+        args, projection_updates={"membership_window_end_date": "2024-12-31"}
+    )
+    exporter_provenance_path = Path(
+        args[args.index("--fundamentals-provenance") + 1]
+    )
+    exporter_provenance = json.loads(
+        exporter_provenance_path.read_text(encoding="utf-8")
+    )
+    projection_path = (
+        exporter_provenance_path.parent
+        / exporter_provenance["financial_lineage_bridge_v1"]["projection_provenance_path"]
+    ).resolve()
+    projection = json.loads(projection_path.read_text(encoding="utf-8"))
+    ticker_path = (
+        projection_path.parent / projection["references"]["ticker_membership_csv"]
+    ).resolve()
+    ledger_path = (
+        projection_path.parent / projection["references"]["lineage_projection_csv"]
+    ).resolve()
+    assert ticker_path.read_bytes() == ticker_before
+    assert ledger_path.read_bytes() == ledger_before
+
+    with pytest.raises(ValueError, match="membership window differs"):
+        _run_builder(args, monkeypatch)
+
+
+def test_sec_exporter_rejects_projection_outside_authenticated_price_window(
+    tmp_path: Path,
+) -> None:
+    args, _membership_csv, _fundamentals_csv = _actual_builder_case(tmp_path)
+    exporter_provenance_path = Path(
+        args[args.index("--fundamentals-provenance") + 1]
+    )
+    exporter_provenance = json.loads(
+        exporter_provenance_path.read_text(encoding="utf-8")
+    )
+    bridge = exporter_provenance["financial_lineage_bridge_v1"]
+    projection_path = (
+        exporter_provenance_path.parent / bridge["projection_provenance_path"]
+    ).resolve()
+    projection = json.loads(projection_path.read_text(encoding="utf-8"))
+    projection["extraction_end_date"] = "2024-12-31"
+    _write_json(projection_path, projection)
+    membership_path = (
+        exporter_provenance_path.parent / bridge["ticker_membership_csv_path"]
+    ).resolve()
+
+    with pytest.raises(ValueError, match="projection extraction window differs"):
+        sec_export.make_export_bridge_record(
+            output_dir=exporter_provenance_path.parent,
+            membership_csv=membership_path,
+            projection_provenance_path=projection_path,
+        )
+
+
+def test_sec_exporter_rejects_membership_window_changed_after_projection(
+    tmp_path: Path,
+) -> None:
+    args, _membership_csv, _fundamentals_csv = _actual_builder_case(tmp_path)
+    exporter_provenance_path = Path(
+        args[args.index("--fundamentals-provenance") + 1]
+    )
+    exporter_provenance = json.loads(
+        exporter_provenance_path.read_text(encoding="utf-8")
+    )
+    bridge = exporter_provenance["financial_lineage_bridge_v1"]
+    projection_path = (
+        exporter_provenance_path.parent / bridge["projection_provenance_path"]
+    ).resolve()
+    with pytest.raises(ValueError, match="membership start differs"):
+        validate_export_window_contract(
+            projection_provenance_path=projection_path,
+            export_provenance={
+                "start_date": "2020-01-01",
+                "end_date": "2025-12-31",
+                "membership_start_date": "2021-01-02",
+            },
+            export_bridge=bridge,
+        )
+
+
+@pytest.mark.parametrize(
+    ("prices", "projection"),
+    [
+        (
+            {"start_date": None, "end_date": "2025-12-31"},
+            {
+                "extraction_start_date": "2020-01-01",
+                "extraction_end_date": "2025-12-31",
+                "membership_window_start_date": "2021-01-01",
+                "membership_window_end_date": "2025-12-31",
+            },
+        ),
+        (
+            {"start_date": "2020-01-01", "end_date": "2025-12-31"},
+            {
+                "extraction_start_date": "2020-01-01",
+                "membership_window_start_date": "2021-01-01",
+                "membership_window_end_date": "2025-12-31",
+            },
+        ),
+        (
+            {"start_date": "2020-01-01", "end_date": "2025-12-31"},
+            {
+                "extraction_start_date": "2020-1-1",
+                "extraction_end_date": "2025-12-31",
+                "membership_window_start_date": "2021-01-01",
+                "membership_window_end_date": "2025-12-31",
+            },
+        ),
+        (
+            {"start_date": "2020-01-01", "end_date": "2025-12-31"},
+            {
+                "extraction_start_date": "2020-01-01",
+                "extraction_end_date": "2025-12-31",
+                "membership_window_start_date": "2026-01-01",
+                "membership_window_end_date": "2025-12-31",
+            },
+        ),
+    ],
+)
+def test_date_window_contract_rejects_missing_noncanonical_and_inverted_dates(
+    prices: dict[str, object], projection: dict[str, object]
+) -> None:
+    with pytest.raises(ValueError, match="financial lineage date window"):
+        _validate_date_window_contract(prices, projection=projection)
 
 
 def test_fixture_builder_rejects_unbound_destination_membership_hash(

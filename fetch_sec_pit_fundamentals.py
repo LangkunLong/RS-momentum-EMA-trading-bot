@@ -36,6 +36,7 @@ from core.sec_pit_fundamentals import (
 from core.financial_lineage_bridge import (
     make_export_bridge_record,
     sha256_file as lineage_sha256_file,
+    validate_export_window_contract,
 )
 
 
@@ -487,6 +488,15 @@ def publish_normalized_outputs(
             output_dir=output_dir,
             membership_csv=membership_csv,
             projection_provenance_path=membership_lineage_projection_provenance,
+        )
+        validate_export_window_contract(
+            projection_provenance_path=membership_lineage_projection_provenance,
+            export_provenance={
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+                "membership_start_date": membership_start_date.isoformat(),
+            },
+            export_bridge=export_bridge,
         )
         if (
             export_bridge["identity_extraction_history_csv_sha256"]

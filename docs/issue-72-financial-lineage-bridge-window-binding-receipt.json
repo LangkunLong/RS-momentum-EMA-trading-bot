@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "issue": 72,
+  "receipt_kind": "window_binding_corrective_followup",
+  "branch": "codex/issue-72-financial-lineage-bridge",
+  "baseline_commit": "32a52915853cfe1a240e7898796213b405c05c66",
+  "prior_receipts": [
+    {
+      "path": "docs/issue-72-financial-lineage-bridge-receipt.json",
+      "sha256": "0057134631331440645cb8040c44fb8724510ef9a314c8f9806d24bd6c9187b3",
+      "disposition": "preserved unchanged"
+    },
+    {
+      "path": "docs/issue-72-financial-lineage-bridge-followup-receipt.json",
+      "sha256": "2643716e576891a96f2326d298887a7511774ef337c100b429a72ba236e22f59",
+      "disposition": "preserved unchanged"
+    }
+  ],
+  "principal_evidence": {
+    "baseline_source_revision": "32a52915853cfe1a240e7898796213b405c05c66",
+    "baseline_script": ".artifacts/coordination/principal-reviews/issue72-32a529-evidence/window-binding-counterexample.py",
+    "baseline_script_sha256": "02fb9fbda40187e158a5721aa5b5923901a0578ecc76d458548b5e0780cfcd83",
+    "baseline_result": ".artifacts/coordination/principal-reviews/issue72-32a529-evidence/window-binding-result.json",
+    "baseline_result_sha256": "2e2465d20a852aa0f2d17f292ced115f6f6f1373ee7d33258aa9b2f0e8bd16e7",
+    "baseline_finding": "The frozen validator accepted both the coherent control and a self-consistently rehashed projection ending 2024-12-31 while prices, exporter, and bridge ended 2025-12-31; financial rows were unchanged.",
+    "correction_result": ".artifacts/coordination/principal-reviews/issue72-window-binding-correction-32a529/window-binding-correction-result.json",
+    "correction_result_sha256": "a25424c2f24ae16d4f51bb0eece0ec516200bbe979f198e178a13aa5e51af7f6",
+    "frozen_script_execution": "Not rerun; the original script and result were preserved byte-for-byte."
+  },
+  "corrected_window_contract": {
+    "extraction_start": "projection.extraction_start_date = prices.start_date = export.start_date = bridge.extraction_start_date",
+    "extraction_end": "projection.extraction_end_date = prices.end_date = export.end_date = bridge.extraction_end_date",
+    "membership_start": "projection.membership_window_start_date = export.membership_start_date = bridge.membership_start_date",
+    "membership_end": "projection.membership_window_end_date = prices.end_date = export.end_date",
+    "validation": "Date values must be canonical ISO dates; extraction and membership ranges are individually ordered. Extraction and membership starts remain independent. Projection and history reconstruction use authenticated prices bounds and the exporter membership start."
+  },
+  "verification": {
+    "focused_pytest": {
+      "command": "python -m pytest tests/test_financial_lineage_bridge.py tests/test_sec_pit_fundamentals.py -q -p no:cacheprovider -o addopts=''",
+      "result": "32 passed, 1 warning in 7.23s",
+      "warning": "The installed pytest does not recognize the existing pyproject.toml cache_dir option."
+    },
+    "ruff": {
+      "command": "python -m ruff check core/financial_lineage_bridge.py fetch_sec_pit_fundamentals.py tests/test_financial_lineage_bridge.py",
+      "result": "All checks passed"
+    },
+    "compileall": {
+      "command": "python -m compileall -q core/financial_lineage_bridge.py fetch_sec_pit_fundamentals.py tests/test_financial_lineage_bridge.py",
+      "exit_code": 0
+    },
+    "diff_check": {
+      "command": "git diff --check",
+      "exit_code": 0
+    },
+    "project_wide_suite": "Not run; prior Lead A direction to stop broad offline verification remains in effect."
+  },
+  "regression_cases": [
+    "Coherent synthetic export/builder control retains extraction 2020-01-01, membership start 2021-01-01, and four unchanged alias financial rows and public dates.",
+    "Rehashed shortened extraction end with regenerated raw and SEC extraction histories is rejected while fundamentals.csv remains byte-identical.",
+    "Rehashed changed extraction start is rejected against unchanged authenticated prices and exporter bounds.",
+    "Projection and export/bridge declarations changed together away from authenticated price bounds are rejected.",
+    "Event-free membership-start relabel is rejected while ticker membership and ledger bytes remain identical.",
+    "Membership end shortened across an event-free tail is rejected while ticker membership and ledger bytes remain identical.",
+    "SEC exporter rejects projection bounds outside hash-bound price provenance and rejects a changed export membership start.",
+    "Missing, noncanonical, and inverted date bounds are rejected."
+  ],
+  "retained_fixture_sha256": {
+    "root": ".artifacts/issue72-corrected-receipt-20261001-1",
+    "v3_membership_csv": "dab4eb5f12bf94e1c8ff1abeed355095204df40b4d825d1441f9f683a7de3718",
+    "prices_provenance": "c1c472ca84e2ffc739818631bcf3917bdda2ea54ea70fe1de688f1725982b7eb",
+    "fundamentals_csv": "3d7f4a324ca871265b7592100ce2949218fa13b1a6426500a1457360cb84be82",
+    "fundamentals_audit_csv": "93a023ed3ee1f9bf24b5f4eb125d574aa731d4236728f375b237304d8affb0b2",
+    "coherent_bundle": "85d1a599794d4a4d2e0f5808cc605336c42c80373937af60e0952acba01be487"
+  },
+  "source_sha256": {
+    "core/financial_lineage_bridge.py": "2faae533894381490b266cd676c1d7e8a9e64aa5a5bd55cab8b0fca9ac0e8abd",
+    "fetch_sec_pit_fundamentals.py": "ae1189388a401baa8d4d5f73ee34fd3986f083d5fd5beed11601e2502eda7a8f",
+    "tests/test_financial_lineage_bridge.py": "65427048f04dab8667553e970e953888dddfee7b5aa4e929bc15347a6056437"
+  },
+  "runtime": {
+    "platform": "Windows",
+    "python": "3.13.14",
+    "pytest": "9.0.2",
+    "ruff": "0.15.9",
+    "network_access": false
+  }
+}

@@ -2,7 +2,7 @@
 
 ## Local disposition
 
-The bridge, SEC exporter integration, schema-V3 builder checks, and follow-up corrections are committed locally on `codex/issue-72-financial-lineage-bridge`. The work has not been merged or published. The corrected evidence is in [the follow-up receipt](issue-72-financial-lineage-bridge-followup-receipt.json); [the original receipt](issue-72-financial-lineage-bridge-receipt.json) remains unchanged and describes the initial `df38922` implementation only.
+The bridge, SEC exporter integration, schema-V3 builder checks, and follow-up corrections are committed locally on `codex/issue-72-financial-lineage-bridge`. The work has not been merged or published. The latest date-window correction is documented in [the window-binding receipt](issue-72-financial-lineage-bridge-window-binding-receipt.json). [The earlier follow-up receipt](issue-72-financial-lineage-bridge-followup-receipt.json) and [the original receipt](issue-72-financial-lineage-bridge-receipt.json) remain unchanged.
 
 ## Data flow
 
@@ -13,6 +13,8 @@ Ticker membership represents index membership only. Events before the SEC member
 `fetch_sec_pit_fundamentals.py --membership-lineage-projection-provenance <projection.json>` verifies that its membership input is the retained projection, consumes the referenced extraction-history bytes in the existing `build_security_master` and `extract_fundamentals` flow, and publishes the resolved history plus a `financial_lineage_bridge_v1` object in `fundamentals_provenance.json`. The security-master CSV continues to contain actual membership episodes only.
 
 The schema-V3 builder resolves the retained references, rehashes the actual membership, security-master, identity-history, fundamentals, and audit files it consumes, and independently recomputes the membership projection and identity history from the destination V3 membership and identity contract. It checks that security-master membership episodes account for the exact projected intervals and that audit rows pair exactly with the financial rows. The production-source guard remains fail-closed. Synthetic fundamentals marked `synthetic fixture` bypass the SEC bridge checks only when the existing explicit `--allow-nonproduction-fixture` flag is present, and their provenance must directly bind the destination schema-V3 membership hash. SEC-source provenance always requires the bridge.
+
+The window contract now binds projection extraction start/end to the referenced, hash-bound prices provenance and the SEC export/bridge declarations. The projection membership start must equal the exporter and bridge starts; its membership end must equal the prices and exporter cutoff. Each date must be a canonical ISO date, and each window must be ordered. Extraction and membership starts remain independent. Builder reconstruction uses the authenticated prices bounds and exporter membership start, so rehashing a shortened projection history cannot change its declared meaning.
 
 ## Acceptance evidence
 
@@ -35,6 +37,8 @@ exit 0
 ```
 
 Negative controls cover foreign/relabelled V3 membership and exporter provenance, tampered fundamental values/public dates, audit rows, security-master rows, and projection ledger. The fixture-path regression rejects a zero membership hash without the SEC bridge and accepts the exact destination hash with explicit fixture opt-in. Pytest emits one pre-existing warning because `pyproject.toml` configures `cache_dir`, which the installed pytest does not recognize.
+
+The later P2 window-binding regression set uses the same coherent synthetic builder fixture. It rejects a shortened extraction end with regenerated history and updated projection/export hashes, a changed extraction start, projection and exporter bounds changed together away from authenticated prices, an event-free membership-start relabel whose ticker/ledger bytes stay identical, and a membership end shortened across an event-free tail. It also covers malformed, missing, noncanonical, and inverted dates. The positive builder control still preserves the 2020 extraction start, 2021 membership start, four alias rows, their original values, and their public dates. The principal counterexample and its original result are preserved under `.artifacts/coordination/principal-reviews/issue72-32a529-evidence/`; the new verification record is under `.artifacts/coordination/principal-reviews/issue72-window-binding-correction-32a529/`.
 
 The default project-wide `python -m pytest` run was started but stopped at 9% on Lead A's instruction after early failure markers appeared, including in `tests/test_agent_loop.py`. It produced no completed summary or failure count and is informational only; the focused corrected-source suite above is the acceptance run. The captured partial status is in `.artifacts/coordination/issue72-followup-full-suite-partial.txt`.
 
