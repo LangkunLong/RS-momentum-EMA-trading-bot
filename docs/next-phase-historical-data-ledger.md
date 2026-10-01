@@ -13,8 +13,8 @@ Launch base verified locally: `ab385d792e19ff6db39d87f1123f47f660fc1e1d`, tree `
 | Issue | Owner / worktree | Allowed edits | State |
 | --- | --- | --- | --- |
 | #69 bounded assessment | `01a0e67f-b51f-74e2-99c2-da49cd479ec6`, `C:/Users/llong/.codex/worktrees/3d87/RS-momentum-EMA-trading-bot` | Dedicated offline assessment script, report and small summary receipts; no shared product modules | Preserved owner; frozen delivery received and reviewed |
-| #70 bounded assessment | `01a0e67f-f999-7380-a36e-4438f207b46e`, `C:/Users/llong/.codex/worktrees/f1ba/RS-momentum-EMA-trading-bot` | Dedicated offline assessment script, report and small summary receipts; no shared exporter/calculator edits | Preserved owner; corrected bounded delivery independently accepted |
-| #72 bridge | `01a0f857-8241-7730-9067-6b212b1b22a2`, `C:/Users/llong/.codex/worktrees/2c6e/RS-momentum-EMA-trading-bot` | `core/sec_pit_fundamentals.py`, `build_pit_bundle.py`, dedicated bridge module/CLI if justified, targeted tests/docs | Preserved owner; corrected implementation independently accepted |
+| #70 bounded assessment | `01a0e67f-f999-7380-a36e-4438f207b46e`, `C:/Users/llong/.codex/worktrees/f1ba/RS-momentum-EMA-trading-bot` | Dedicated offline assessment script, report and small summary receipts; no shared exporter/calculator edits | Preserved owner; d0bb52f correction reviewed and integrated |
+| #72 bridge | `01a0f857-8241-7730-9067-6b212b1b22a2`, `C:/Users/llong/.codex/worktrees/2c6e/RS-momentum-EMA-trading-bot` | `core/sec_pit_fundamentals.py`, `build_pit_bundle.py`, dedicated bridge module/CLI if justified, targeted tests/docs | Preserved owner; ad62859 correction reviewed and integrated |
 
 Workers use GPT-6 Luna/xhigh. Lead uses selected Astra/high. Preserve old worker branches/commits; reuse worktrees with ordinary integration or a scoped branch from the exact base. No reset/force and no worker hierarchy. Workers report to this lead `01a0e67f-9969-7230-8a0c-f1c433a84ad8`.
 
@@ -35,14 +35,14 @@ Independent review refines the minimum boundary to deterministic V3 lineage-memb
 
 | Issue/scope | Implementation | Required inputs | Acceptance evidence | Dependencies |
 | --- | --- | --- | --- | --- |
-| #72 | Complete at32a5291, integrated at40f6b68 | Synthetic fixtures sufficient; original eligible input bindings required | Three findings resolved; independent review and86integrated tests passed | #66 accepted; settled #68 interface available |
+| #72 | Corrected at ad62859, integrated 5c6816e | Eligible synthetic inputs retained | W1 and prior three findings cleared by lead review; final100tests pass; principal acceptance/CI gate remains | #66 accepted; settled #68 interface available |
 | #69 bounded / full | Bounded assessment accepted and integrated / production incomplete | Retained sample measured / complete eligible union and prices missing | Independent bounded review accepted / full evidence absent | Start #66 met; full acceptance requires #68 |
-| #70 bounded / full | Corrected bounded assessment independently accepted and integrated / production incomplete | Alternate export and archive identities retained / complete eligible histories missing | Corrected bounded evidence independently accepted / full evidence absent | Start #66 met; full acceptance requires #68 |
+| #70 bounded / full | Corrected d0bb52f assessment reviewed and integrated / production incomplete | Retained inputs eligible for bounded report / complete histories missing | Expected slots corrected, trace preserved; runtime/receipt errata disclosed / full evidence absent | Start #66 met; full acceptance requires #68 |
 | #68 preserved obligation | Existing identity/admission code retained | Full source-backed union and transitions missing | Partial acquisition only; not ready | Remains open outside this bounded phase |
 
 ## Review, publication and notification
 
-Bounded #69/#70 and corrected #72 reviews are accepted and integrated locally. Final integration and documentation reviews passed. PR #117 is published. Required hosted CI and principal acceptance/merge remain ahead. PR #117 published; no remote merge, issue closure or achieved-goal notification yet. Store ready PR and exact evidence here for principal inspection; send the single final completion message only after accepted/merged #72 and both reviewed bounded reports are delivered.
+Original published head7a1 CI evidence remains dated. Both principal findings are now corrected and independently reviewed, integrated at5c6816e with100 focused passes, Ruff and306-file compilation. Corrective PR publication, required new-head CI and principal final acceptance/normal merge remain separate gates. No issue closure, merge or achieved original goal is claimed. The lead completion package supports independent principal acceptance; preserve all earlier reports and holds chronologically below.
 
 ### Launch receipts
 
@@ -94,3 +94,15 @@ Bounded #69/#70 and corrected #72 reviews are accepted and integrated locally. F
 - Authorized final interface disclosures successfully delivered to peer B `01a0f851-c7ac-7b81-87ab-3de389d47510` and peer C `01a0f851-dfb4-7081-90c1-81131013fee2`: exact final implementation40f6, unchanged61/58context map and71calculator, no production admission or new image execution. No principal progress/completion message sent.
 
 - Published reviewed PR **#117**: https://github.com/LangkunLong/RS-momentum-EMA-trading-bot/pull/117, initial packet head `9e80525`, using normal fast-forward push of preserved `codex/four-issue-integration`; attached to this chat. Required hosted checks and principal final acceptance/normal merge pending. No principal achieved-goal message sent; no issue auto-closure requested.
+
+- Principal independently reproduced NEW P2 window-binding graph inconsistency on32a5291: altered projection/history end2024-12-31 accepted against authenticated prices/export/bridge end2025-12-31, with all affected graph hashes updated and original financial rows unchanged. Prior readiness is superseded; PR117 acceptance/merge held. Same72owner dispatched targeted start/end and applicable membership-window correction; same independent reviewer preparing focused re-review. No replacement worker, data acquisition or old expensive run.
+- Principal original evidence `.artifacts/coordination/principal-reviews/issue72-32a529-evidence/window-binding-counterexample.py` and `window-binding-result.json` fully read and copied locally with hashes. Preserve prior32a source, four-row receipt, independent reviews and86-test result under their original definitions.
+
+- PR117 description now visibly marks acceptance/merge HOLD for the new window-binding finding, without rewriting source history or changing the reviewed head. Previous local readiness receipt is explicitly superseded. Independent R4 plan records extraction/prices/export/bridge equality plus distinct membership-window constraints; sent to same owner.
+
+- NEW principal #70 finding: observed quarterly matches can skip missing intervening or annual-anchored terminal quarters, falsely reporting full lookback at8f389406. Strict scalar-origin correction is cleared separately. Same70owner dispatched expected-slot correction using accepted parameterized core.pit_coverage helper, with missingness and actualanalyze_export regressions. Prior receipts preserved; same independent reviewer preparing re-review. Bounded70 acceptance held; #69 acceptance intact.
+
+
+- Corrective source integrated normally:72ad62859 ->1c331f4;70d0bb52f ->5c6816e56dbd3149b6d81d645d03c5d0c9687482. Independent W1 original-counterexample replay rejects; F1 expected-slot counts reconciled. New100-test/2warning/13.14s, Ruff and306-file compile proof retained separately. All61context/58runtime files and71calculator unchanged. Owner command outputs authenticated. #70 inherited archive-read wording and missing contemporaneous runtime capture explicitly qualified; original receipts unchanged. Current packet maps all criteria/fourstatuses and retains production gaps.
+
+- Principal found a63-character test SHA in the new72 receipt/result. Same owner80e2bfda6c369a5f55d6cf635ad015d9c2ff1262 corrected only the declaration and linked result digest, integrated5e97ccf. Original32a/df389 receipts unchanged. Reviewer explicitly withdraws its earlier all-three-hashes-match assertion and audits declarations mechanically; actual32-pass and integrated100-pass evidence remain valid. No test/fixture rerun for this documentation correction.

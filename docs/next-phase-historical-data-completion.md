@@ -1,12 +1,12 @@
 # Lead A acceptance packet — historical integration
 
-Prepared 2026-10-01. **Implementation and bounded assessments are ready for final principal acceptance and normal merge, subject to required CI. Published as PR #117; merge is pending. No achieved-goal notification has been sent.** Full #68/#69/#70 production data delivery remains incomplete.
+Prepared 2026-10-01. **Both principal findings are corrected and independently reviewed on the final integrated source below. The local focused verification passes. PR #117 remains held for required checks on the corrective published head and principal final acceptance/normal merge.** Full #68/#69/#70 production data delivery remains incomplete. No issue closure, merge or achieved original four-issue goal is claimed.
 
 ## Exact source and integration
 
 - Launch base: `ab385d792e19ff6db39d87f1123f47f660fc1e1d`.
 - Protected main integrated: `68b5358e55df1d8a93851550f421e594541dc74e`, through merge `255c6bfcbfe2f9bec1530d2eeb8b2feaacde3a6a`.
-- Final integrated implementation and verification source: **`40f6b68983f4520ca811f33d0078947771d0ba02`**. Later packet commits change documentation only; they are not relabelled as measurement or test executions.
+- Latest integrated implementation and verification source: **`5c6816e56dbd3149b6d81d645d03c5d0c9687482`**. #72 owner `ad628594b7708568bb97cb7d69e53745d96fdf35` integrated as `1c331f4`; #70 owner `d0bb52f94ae68aa26fd90e8c0a295456850516c2` integrated as `5c6816e`. Later packet commits change documentation only and retain these actual execution identities. Earlier `40f6b689` verification remains dated evidence.
 - #69 owner `d24dc9ccc7fe6b08f7e07a1f7f38a3772194849c`, integrated unchanged as `0200146e5a8511a2a0c235ea8a04564ce514c7ea`.
 - #70 owner initial `174faca79cecfa0a710bbc4112fd2c81f225f281`, corrected `8f389406f1c7339662387d446cbbffd997b810e8`; integrated as `b675399` and `f6d7474`. Lead clarified historical/current reproduction commands to write scratch outputs; independent review accepted this report-only change.
 - #72 owner initial `df3892234ad4b95408b9354c445e9b3a61985328`, corrected **`32a52915853cfe1a240e7898796213b405c05c66`**; integrated unchanged as `d54255a` and `40f6b68`.
@@ -17,9 +17,9 @@ Prepared 2026-10-01. **Implementation and bounded assessments are ready for fina
 
 | Issue/scope | Implementation | Required inputs | Acceptance evidence | Dependencies | Recommendation |
 | --- | --- | --- | --- | --- | --- |
-| #72 bridge | Complete, independently reviewed and integrated | Actual deterministic synthetic membership/identity/filing inputs supplied for this implementation issue | All three criteria reviewed; real parser-to-builder case, negatives and final 86-test integration pass | #66 met; settled V3 interface consumed; production acquisition separate | **Ready for principal acceptance/merge after required CI** |
+| #72 bridge | Complete, independently reviewed at ad62859; integrated at 5c6816e | Eligible synthetic graph and original counterexample retained | Date binding corrected; independent original-case rejection plus final 100-test result; principal final acceptance pending | #66 met; V3 interface consumed; production acquisition separate | **Ready for principal acceptance; merge gate remains** |
 | #69 bounded / full | Bounded assessment complete / full production delivery incomplete | Retained S&P sample verified / full eligible union, price/action sources and use basis missing | Independent lead and principal bounded acceptance / full criteria partial and unresolved | Full production acceptance requires eligible #68 | **Accept bounded report; keep full issue open** |
-| #70 bounded / full | Corrected bounded assessment complete / full production delivery incomplete | Alternate export/archives verified within stated sample / complete histories, identity and generation lineage missing | Independently accepted two-snapshot/three-issuer trace / full criteria partial | #66 start met; production acceptance requires eligible #68 | **Accept bounded report; keep full issue open** |
+| #70 bounded / full | Bounded assessment complete and independently reviewed / production delivery incomplete | Retained sample eligible for bounded assessment / complete histories, identity and generation lineage missing | Strict scalar trace retained; expected-quarter counts corrected and reconciled; explicit receipt/runtime limits | #66 start met; production acceptance requires eligible #68 | **Accept bounded assessment; keep full issue open** |
 | #68 preserved obligation | Existing identity/admission code retained; acquisition incomplete | Full source-backed historical S&P 500/Nasdaq-100/Russell 2000 union and authenticated transitions missing | Partial receipts only; no production admission | Remains a full-data dependency | **Not ready; keep open** |
 
 A successful bridge does not authenticate a production dataset. Measured price row presence does not establish feature readiness, and scalar source tracing does not establish full financial coverage. No policy-consumption, strategy qualification or paper-runtime claim follows.
@@ -61,7 +61,7 @@ Principal independently accepted exact owner d24/integrated020; report `2026-10-
 
 The 145,010-row alternate export is a different generation from the prior acquisition export declaring 142,329 rows. The current provenance mismatches its publication marker; removing only net_income_concept_priority in memory exactly reconstructs marker-bound metadata but does not prove generation history. Corrected trace reuses the earlier full ZIP digest attestation and rereads only six selected members; this reuse and its unchanged-path/size assumption are explicit. The independent reviewer verified identical selected-member hashes and unchanged non-trace measurements. No acquisition occurred.
 
-## Final integrated verification and runtime continuity
+## Earlier integrated verification and runtime continuity (40f6b689)
 
 At **40f6b68983f4520ca811f33d0078947771d0ba02**, Windows 11 / Python 3.13.14:
 
@@ -85,4 +85,55 @@ No operational database, scheduler, broker or paper state changed. No provider/m
 
 ## Publication and final acceptance
 
-Published [PR #117](https://github.com/LangkunLong/RS-momentum-EMA-trading-bot/pull/117), initially at packet commit `9e80525`. No issue is closed by this package. Ready for principal final review and normal eligible merge after required CI. The principal owns final acceptance/merge and may then accept #72's implementation criteria; full #68/#69/#70 remain open. Record PR/head, hosted checks, actual merge and the single completion-message receipt in the ledger when they occur. Until then this is a reviewed acceptance-ready package, not a claim that the phase has been merged or its goal achieved.
+Published [PR #117](https://github.com/LangkunLong/RS-momentum-EMA-trading-bot/pull/117), initially at packet commit `9e80525`. No issue is closed by this package. The corrective package is ready for principal final review and normal eligible merge after required CI on its published head. The principal owns final acceptance/merge and may then accept #72's implementation criteria; full #68/#69/#70 remain open. Record PR/head, hosted checks, actual merge and the single completion-message receipt in the ledger when they occur. Until then this is a reviewed acceptance-ready package, not a claim that the phase has been merged or its goal achieved.
+
+## Historical principal correction hold - date-window consistency
+
+After publication, principal review reproduced an additional P2 finding on owner `32a52915853cfe1a240e7898796213b405c05c66`: the validator accepts a projection/extraction history ending 2024-12-31 while independently bound prices/export/bridge retain 2025-12-31, if affected graph hashes are coherently regenerated. Financial rows remain unchanged. Previous passing reviews and 86-test results do not cover this counterexample and are not final acceptance.
+
+The same #72 owner is correcting extraction start/end and applicable membership-window consistency against authenticated contracts, preserving the distinct warm-up and membership ranges. Required regression evidence includes both start and end mismatches, applicable membership bounds and coherent acceptance. No old report, image, data or runtime remeasurement is needed. Original principal executable/result are retained at `C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.artifacts/coordination/principal-reviews/issue72-32a529-evidence/` and copied locally under `.artifacts/coordination/principal-window-binding-*`.
+
+Prior readiness recommendations above are superseded by this hold until the correction, independent review and final focused verification are complete. #69 bounded acceptance remains intact; #70 principal review continues. Full #68/#69/#70 production criteria remain open.
+
+## Historical principal correction hold - #70 expected quarterly slots
+
+A second principal finding on `8f389406f1c7339662387d446cbbffd997b810e8` clears the strict unique scalar-origin trace but rejects the quarterly full-lookback readiness measurement: selecting the newest observed matches can skip intervening missing quarters or an annual-anchored unavailable latest quarter. Both principal in-memory controls incorrectly return one ready member.
+
+The same #70 owner is using accepted `core.pit_coverage._quarterly_eps_full_window` semantics for four EPS/two revenue slots, with as-of-visible annual anchors and explicit missingness, without changing shared calculation code. Required evidence includes missing-intervening and missing-terminal negatives plus coherent positives through actual analyze_export. Observed match counts may remain separately labelled. Prior receipts remain under their original definitions; new bounded proof will supersede only affected readiness findings. No old #67/#71/#82 run or acquisition is required.
+
+The earlier bounded #70 acceptance recommendation is superseded pending this correction and final independent review. Its 1,946 strict scalar-origin matches remain separately valid evidence; that fact does not validate full-lookback readiness.
+
+
+## Final corrective acceptance evidence (5c6816e)
+
+### #72 W1 — authenticated date-window binding
+
+Owner `ad628594b7708568bb97cb7d69e53745d96fdf35` binds projection extraction start/end to authenticated prices and export/bridge bounds; membership start is shared across projection/export/bridge, and membership end equals cutoff. Canonical dates and ordered windows are required, while warm-up and membership starts remain distinct. Reconstruction consumes the authenticated bounds. The unchanged original input graph, alias lookbacks, mixed identities, production guard and value/publication semantics remain reviewed.
+
+[Independent review](issue-72-window-binding-independent-review.md) replays the principal's actual coherently rehashed shortened-window case: original control accepts; altered graph rejects with the specific semantic mismatch. Owner actual 32-test/Ruff/compile outputs are authenticated and retained under `.artifacts/coordination/issue72-window-binding-owner-command-outputs.json`; [versioned receipt](issue-72-financial-lineage-bridge-window-binding-receipt.json) preserves both earlier receipts. New integrated tests include the actual synthetic parser/master/extractor/publisher/builder path. The earlier bundle hash above remains its original run identity, not a newly asserted bundle digest.
+
+### #70 F1 — expected quarterly slots
+
+Owner `d0bb52f94ae68aa26fd90e8c0a295456850516c2` uses unchanged accepted `core.pit_coverage._quarterly_eps_full_window` semantics, anchored only by an as-of-visible annual period with an observed financial scalar. Annual values never fill quarterly gaps. [Versioned addendum](issue-70-bounded-source-assessment-quarterly-lookback-v2.json) binds script SHA256 `290155b6ea16c330ad00785501610a637d151cd2c1637e2fe7a80960484b165d`, actual execution HEAD `8f389406`, source inputs and prior trace; final owner packaging is a distinct revision. [Independent review](issue-70-quarter-slot-independent-review.md) checks original scope plus correction and reconciles all counts.
+
+| Profile | 2021 ready / members | 2021 matched + missing slots | 2025 ready / members | 2025 matched + missing slots |
+| --- | --- | --- | --- | --- |
+| Basic EPS, 4 slots | 0 / 505 | 1238 + 782 = 2020 | 0 / 503 | 1358 + 654 = 2012 |
+| Diluted EPS, 4 slots | 0 / 505 | 1237 + 783 = 2020 | 0 / 503 | 1361 + 651 = 2012 |
+| Revenue, 2 slots | 364 / 505 | 792 + 218 = 1010 | 395 / 503 | 859 + 147 = 1006 |
+
+Prior observed-period ready labels (EPS366/394, revenue426/463) remain historical diagnostics. A now retains missing terminal October at both snapshots: EPS3/4 and revenue1/2, not ready. Aggregate missing counts above are derived from the retained fixed denominators and matched histograms; typed reasons and slot dates are retained for A/AMZN/MSFT only. Annual/ROE and 1,946 strict source-origin trace results are reused, not recomputed or relabelled.
+
+The measured addendum's generic inherited archive-reuse sentence incorrectly says members are read again. The report now explicitly corrects that sentence: this revision opened **zero** archive members and recomputed **no** source trace. Prior whole-ZIP attestation remains an unchanged-path/size assumption, not fresh cryptographic verification. Original receipt bytes are preserved. V2 did not contemporaneously capture package versions; prior and later same-worker Python3.13.14/pandas3.0.1 observations are disclosed as such. This runtime provenance limitation is distinct from the actual authenticated measurement commands and source/input identities. Reproduction commands pin each historical script and write scratch receipts.
+
+### Final integrated checks and unchanged interfaces
+
+At `5c6816e56dbd3149b6d81d645d03c5d0c9687482`: **100 focused tests passed, 2 existing warnings, 13.14 seconds**; whole-repository Ruff passed; all **306 tracked Python files** compiled in memory. [Exact verification receipt](lead-a-historical-correction-verification.json) contains actual commands, runtime, log hashes and owner source equivalence. No broad suite or historical study was rerun.
+
+All **61 image-context / 58 runtime Git files** remain byte-identical to B's tested `a8662e85c4c06142183c707926e7c302c75e233d`; evaluator map `ea44827dc78dcc3f4a4293929e4897345d1f0daa7faef6fbd50cdbb00757d2af` and #71 calculator blob `71e562ffc00dc4e617f1cd625e3f13ea5fe3f81a` are unchanged. No new container execution is claimed. The earlier #67/#71/#82 acceptance evidence remains under its actual source/input/image definitions. Full #68/#69/#70 remain open; bounded acceptance does not admit production data or downstream qualification.
+
+Fresh #70/#72 issue reads on 2026-10-01 preserve the exact original unchecked criteria and required-input scope, with the principal's current hold appended. Local corrective evidence supersedes the unresolved local work described in the two historical hold sections above; it does not remove the principal's final acceptance gate. Required hosted checks must bind the new published head before normal merge.
+
+### Receipt-only correction after verification
+
+Principal inspection identified a missing character in the new #72 receipt's test-source digest (63 characters rather than 64). Same owner correction `80e2bfda6c369a5f55d6cf635ad015d9c2ff1262`, integrated as `5e97ccf`, repairs that declaration and the linked correction-result hash. The correct tested working-byte SHA256 is `65427048f04dab8667553e970e953888dddefee7b5aa4e929bc15347a6056437`. Implementation and tests are unchanged from the verified `5c6816e` source; no execution is repeated or relabelled. Original df389/32a receipts and baseline counterexample remain unchanged. The independent review retains and corrects its earlier mistaken hash-match assertion.

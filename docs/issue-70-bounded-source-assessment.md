@@ -22,6 +22,10 @@ Fifteen source-trace tests pass. They exercise both the qualification helper and
 
 ## Quarterly full-lookback correction
 
+**Receipt clarification:** the v2 addendum inherits a generic `source_identity.archive_digest_reuse.same_path_and_same_size_assumption` sentence saying selected ZIP members are read again. That sentence describes the earlier corrected source trace and is inaccurate for this addendum. The actual v2 path opens **zero** archive members and does **not** recompute the trace, as its explicit `source_trace_reuse` fields and authenticated execution establish. Preserve the measured receipt bytes with this erratum. Whole-ZIP identity remains the disclosed prior-attestation assumption.
+
+The addendum retains aggregate matched-slot histograms for every snapshot member and typed missing reasons/slot dates for A, AMZN and MSFT only; it is not a full per-security reason matrix. Its measurement command and exact script/input identities are retained, but package versions were not captured contemporaneously in the v2 receipt. Prior receipt and later same-worker inspection show Python 3.13.14/pandas 3.0.1/Windows 11; those observations are not relabelled as a measurement-time runtime snapshot.
+
 The `8f389406` receipt corrected source-origin matching but still treated the latest four or two *observed* quarterly matches as a complete full-lookback window. That skips wholly absent fiscal quarters and misses a terminal Q4 when an annual filing is visible but has no quarterly Q4 row. The `quarterly-lookback-v2` addendum now measures expected calendar slots through the existing accepted `core.pit_coverage._quarterly_eps_full_window` helper. It anchors only to the latest as-of-visible annual fiscal end with any exported financial value, preserves 84–105-day cadence gaps and unavailable terminal quarters, and never uses an annual amount as a quarterly value. Annual adjacent-available measurements and the pure financial calculator remain unchanged.
 
 The addendum preserves the prior observed-match counts under an explicit observed-period label and separately reports full-window matched slots/readiness. It rehashes the non-ZIP source inputs, requires their hashes and sizes to match the committed corrected receipt, and reuses that receipt's archive digest attestation and source trace. It reopens no ZIP member and emits only quarterly EPS (four slots) and revenue (two slots) profile corrections for the two existing snapshots. The CSV/audit rows are read to recompute those profiles; the CompanyFacts scalar trace is not repeated.
@@ -159,7 +163,7 @@ The original run verified 9 input digests, joined all 145,010 export rows to aud
 
 The corrected rerun used the same bounded inputs and wrote a separate 102,952-byte receipt. Its SHA-256 is `7e690f3a6e0dd116f5a0b20267fcf6e8eebdd37ba9271eafbb8675c62819c5a8`; the corrected assessment script SHA-256 is `c26a9de43bcf12c11f9f802df12c273301553dfa3f06f21affcec0beaaae3c46`. The receipt identifies repository head `174faca79cecfa0a710bbc4112fd2c81f225f281` and the reused digest-attestation details.
 
-Reproduce the corrected run with current source and a new scratch output (the retained original receipt remains the read-only archive-digest attestation):
+Reproduce the historical scalar-origin corrected run with source at `8f389406f1c7339662387d446cbbffd997b810e8` and a new scratch output (the retained original receipt remains the read-only archive-digest attestation). Later source has different quarterly-window semantics and does not reproduce this receipt's original definitions:
 
 ```powershell
 python tools\assess_issue70_retained_source.py `
@@ -171,7 +175,7 @@ python tools\assess_issue70_retained_source.py `
   --output .artifacts\coordination\issue70-corrected-reproduction.json
 ```
 
-Regenerate only the quarterly lookback revision, reusing the committed corrected receipt's source/archive attestations and source trace:
+Reproduce only the quarterly lookback revision using source at `d0bb52f94ae68aa26fd90e8c0a295456850516c2` (or the byte-equivalent integrated script), reusing the committed corrected receipt's source/archive attestations and source trace. Write a new scratch file and preserve all tracked receipts:
 
 ```powershell
 python tools\assess_issue70_retained_source.py `
@@ -180,7 +184,7 @@ python tools\assess_issue70_retained_source.py `
   --trading-days-csv 'C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.artifacts\data\acquisition\acquisition\raw\local-cache\prices\spy_trading_days.csv' `
   --comparison-import-provenance 'C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.artifacts\data\acquisition\acquisition\raw\local-cache\import-provenance.json' `
   --quarterly-lookback-revision-from docs\issue-70-bounded-source-assessment-receipt-corrected.json `
-  --output docs\issue-70-bounded-source-assessment-quarterly-lookback-v2.json
+  --output .artifacts\coordination\issue70-quarterly-lookback-v2-reproduction.json
 ```
 
 Eighteen focused tests passed with `python -m pytest tests/test_assess_issue70_retained_source.py -q -p no:cacheprovider --no-cov`. This includes the 15 source-trace controls and three real `analyze_export` calendar-slot controls. The full suite was not run. The CLI help and bounded assessments were run; a live GitHub refresh from this worktree was unavailable through the configured proxy, so the report uses the lead-captured OPEN issue body.
