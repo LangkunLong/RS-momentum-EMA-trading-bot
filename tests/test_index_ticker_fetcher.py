@@ -52,6 +52,101 @@ def test_ishares_403_uses_index_specific_fallback(tmp_path) -> None:
     fallback.assert_called_once_with("sp500", "S&P 500")
 
 
+def test_valid_wikipedia_fallback_is_recorded_after_ishares_refusal(tmp_path) -> None:
+    response = requests.Response()
+    response.status_code = 403
+    response.url = "https://example.invalid/index"
+    expected = [f"T{i}" for i in range(100)]
+    fetcher = IndexTickerFetcher(cache_dir=tmp_path)
+    observation = SchedulerObservation("index-alternate-source")
+
+    with (
+        patch("core.index_ticker_fetcher.requests.get", return_value=response),
+        patch.object(fetcher, "_fetch_index_tickers_fallback", return_value=expected),
+        activate_scheduler_observation(observation),
+    ):
+        result = fetcher._fetch_index_tickers("nasdaq100", "Nasdaq 100")
+
+    assert result == expected
+    receipt = observation.to_receipt()
+    assert receipt["service_health"] == "healthy"
+    assert any(
+        event["kind"] == "index_request"
+        and event["key"] == "ishares_page"
+        and event["details"]["http_status"] == 403
+        for event in receipt["events"]
+    )
+    assert any(
+        event["kind"] == "index_universe"
+        and event["status"] == "fallback_selected"
+        and event["details"]["source"] == "wikipedia"
+        for event in receipt["events"]
+    )
+
+
+def test_total_index_source_failure_marks_full_universe_unavailable(tmp_path) -> None:
+    fetcher = IndexTickerFetcher(cache_dir=tmp_path)
+    observation = SchedulerObservation("index-no-source")
+
+    with (
+        patch(
+            "core.index_ticker_fetcher.requests.get",
+            side_effect=requests.Timeout("offline"),
+        ) as get,
+        activate_scheduler_observation(observation),
+    ):
+        result = fetcher._fetch_index_tickers("russell2000", "Russell 2000")
+
+    receipt = observation.to_receipt()
+    assert result == ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL"]
+    get.assert_called_once()
+    assert receipt["service_health"] == "failed"
+    assert receipt["required_input_coverage"] == "failed"
+    assert any(
+        event["kind"] == "index_universe" and event["status"] == "unavailable"
+        for event in receipt["events"]
+    )
+    assert receipt["input_gaps"] == [
+        {
+            "symbol": "russell2000",
+            "endpoint": "index-universe",
+            "reason": "no_complete_index_source",
+            "coverage_status": "failed",
+        }
+    ]
+
+
+def test_observation_source_failure_does_not_overwrite_complete_index_cache(tmp_path) -> None:
+    fetcher = IndexTickerFetcher(cache_dir=tmp_path)
+    original = {
+        "timestamp": datetime.now().isoformat(),
+        "indices": ["russell2000"],
+        "tickers": {"russell2000": [f"R{i}" for i in range(2000)]},
+    }
+    fetcher.cache_file.write_text(json.dumps(original), encoding="utf-8")
+    before = fetcher.cache_file.read_bytes()
+    observation = SchedulerObservation("preserve-index-cache")
+
+    with (
+        patch(
+            "core.index_ticker_fetcher.requests.get",
+            side_effect=requests.Timeout("offline"),
+        ),
+        activate_scheduler_observation(observation),
+    ):
+        fetcher.get_all_tickers(indices=["russell2000"], force_refresh=True)
+
+    receipt = observation.to_receipt()
+    assert observation.to_receipt()["service_health"] == "failed"
+    assert fetcher.cache_file.read_bytes() == before
+    assert any(
+        event["kind"] == "index_cache"
+        and event["status"] == "write_skipped"
+        and event["details"]["indices"] == ["russell2000"]
+        for event in receipt["events"]
+    )
+
+
 def test_ishares_page_and_csv_attempts_are_counted(tmp_path) -> None:
     tickers = [f"T{chr(65 + index // 26)}{chr(65 + index % 26)}" for index in range(100)]
     page = Mock(status_code=200)

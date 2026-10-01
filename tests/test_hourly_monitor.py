@@ -115,6 +115,24 @@ class TestFetchHourlyOhlcv:
 
         assert result.empty
 
+    def test_observation_propagates_typed_hourly_provider_error(self):
+        from core.data_client import ObservedHourlyBarReadError, fetch_hourly_ohlcv
+        from core.scheduler_observation import SchedulerObservation, activate_scheduler_observation
+
+        mock_client = MagicMock()
+        mock_client.get_stock_bars.side_effect = RuntimeError("API down")
+        observation = SchedulerObservation("hourly-provider-failure")
+
+        with (
+            activate_scheduler_observation(observation),
+            patch("core.data_client._get_alpaca_client", return_value=mock_client),
+            patch("core.data_client._cache_get", return_value=None),
+            pytest.raises(ObservedHourlyBarReadError) as exc_info,
+        ):
+            fetch_hourly_ohlcv("FAIL", days=5)
+
+        assert exc_info.value.provider_error_type == "RuntimeError"
+
     def test_returns_cached_result_without_api_call(self):
         from core.data_client import fetch_hourly_ohlcv
 
@@ -429,6 +447,29 @@ def test_observation_records_insufficient_hourly_bars_as_unavailable() -> None:
     assert receipt["service_health"] == "unverified"
     assert receipt["required_input_coverage"] == "unverified"
     assert receipt["events"][-1]["status"] == "unavailable"
+
+
+def test_hourly_provider_error_is_not_reported_as_insufficient_bars() -> None:
+    from auto_trader import monitor_exits_hourly
+    from core.data_client import ObservedHourlyBarReadError
+
+    observation = SchedulerObservation("hourly-error-outcome")
+    position = _make_position("NVDA")
+    provider_error = ObservedHourlyBarReadError("NVDA", RuntimeError("offline"))
+    with (
+        activate_scheduler_observation(observation),
+        patch("auto_trader.get_open_positions", return_value=[position]),
+        patch("auto_trader.check_exit_signals", return_value=[]),
+        patch("auto_trader.fetch_hourly_ohlcv", side_effect=provider_error),
+    ):
+        assert monitor_exits_hourly(dry_run=True) == []
+
+    unavailable = [
+        event for event in observation.to_receipt()["events"]
+        if event["kind"] == "exit_bar_read" and event["status"] == "unavailable"
+    ]
+    assert unavailable[-1]["details"]["reason"] == "bar_read_failed"
+    assert unavailable[-1]["details"]["error_type"] == "RuntimeError"
 
 
 # ---------------------------------------------------------------------------

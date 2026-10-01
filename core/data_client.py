@@ -813,6 +813,15 @@ def fetch_ohlcv(
     return df
 
 
+class ObservedHourlyBarReadError(RuntimeError):
+    """Typed failure for an hourly bars provider read during observation."""
+
+    def __init__(self, symbol: str, cause: Exception) -> None:
+        self.symbol = symbol
+        self.provider_error_type = type(cause).__name__
+        super().__init__(f"Hourly bars unavailable for {symbol}")
+
+
 def fetch_hourly_ohlcv(
     symbol: str,
     days: int = 30,
@@ -854,7 +863,9 @@ def fetch_hourly_ohlcv(
     try:
         barset = client.get_stock_bars(request_params)
         df = barset.df
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        if current_scheduler_observation() is not None:
+            raise ObservedHourlyBarReadError(symbol, exc) from exc
         empty = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
         return empty
 

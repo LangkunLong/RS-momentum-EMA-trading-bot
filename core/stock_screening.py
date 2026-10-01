@@ -369,14 +369,19 @@ def screen_stocks_canslim_detailed(
     rs_covered = 0
     observation = current_scheduler_observation()
     for symbol in symbols_list:
+        rs_available = False
+        rs_val = 0.0
         try:
             match = rs_scores_df[rs_scores_df["Ticker"] == symbol]
             if not match.empty:
-                rs_val = float(match.iloc[0]["RS_Score"])
-                if pd.notna(match.iloc[0]["RS_Score"]):
+                raw_rs_score = match.iloc[0]["RS_Score"]
+                if pd.notna(raw_rs_score):
+                    rs_val = float(raw_rs_score)
+                    rs_available = True
                     rs_covered += 1
+                else:
+                    rs_not_found += 1
             else:
-                rs_val = 0
                 rs_not_found += 1
         except Exception:
             rs_val = 0
@@ -388,11 +393,7 @@ def screen_stocks_canslim_detailed(
         else:
             rs_below_threshold += 1
             if observation is not None:
-                reason = (
-                    "rs_score_unavailable"
-                    if match.empty or pd.isna(match.iloc[0]["RS_Score"])
-                    else "below_canonical_rs_floor"
-                )
+                reason = "below_canonical_rs_floor" if rs_available else "rs_score_unavailable"
                 observation.record_scan_coverage(
                     candidate_outcomes=[
                         {

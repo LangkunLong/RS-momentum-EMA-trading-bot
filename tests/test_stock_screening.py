@@ -393,6 +393,27 @@ def test_observation_records_scan_coverage_and_exact_deferred_endpoint_reason() 
     }
 
 
+def test_observation_reports_unavailable_rs_for_malformed_comparison_frame() -> None:
+    observation = SchedulerObservation("malformed-rs")
+    market = _make_view()["market_trend"]
+    with (
+        activate_scheduler_observation(observation),
+        patch("core.stock_screening.evaluate_market_direction", return_value=market),
+        patch(
+            "core.stock_screening.calculate_rs_scores_for_tickers",
+            return_value=pd.DataFrame(),
+        ),
+    ):
+        result = screen_stocks_canslim_detailed(
+            symbols=["AAPL"], start_date="2026-01-01"
+        )
+
+    assert result[:2] == ([], [])
+    candidate = observation.to_receipt()["scan_coverage"]["candidate_outcomes"][0]
+    assert candidate["symbol"] == "AAPL"
+    assert candidate["reasons"] == ["rs_score_unavailable"]
+
+
 def test_canslim_marks_missing_statements_as_quota_deferred() -> None:
     """A request-boundary denial must propagate into the scanner-facing metrics."""
     dates = pd.bdate_range("2026-01-01", periods=60)

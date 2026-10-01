@@ -1,6 +1,10 @@
 """Tests for the scheduler observation outcome contract."""
 
-from core.scheduler_observation import SchedulerObservation
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from auto_trader import run_auto_trader
+from core.scheduler_observation import SchedulerObservation, activate_scheduler_observation
 
 
 def test_local_ledger_deferral_is_degraded_input_not_service_failure():
@@ -66,3 +70,28 @@ def test_required_input_coverage_can_be_unverified_or_failed():
 
     assert receipt["required_input_coverage"] == "failed"
     assert receipt["service_health"] == "healthy"
+
+
+def test_scan_phase_exit_work_is_recorded_with_no_open_positions():
+    observation = SchedulerObservation(run_id="empty-exit-pass")
+    market = SimpleNamespace(is_bullish=True, score=1.0, distribution_days=0, follow_through=False)
+    with (
+        activate_scheduler_observation(observation),
+        patch("auto_trader.require_paper_mode"),
+        patch("auto_trader.monitor_and_exit_positions", return_value=[]) as monitor,
+        patch("auto_trader.scan_for_canslim_stocks", return_value=([], [], market)),
+    ):
+        result = run_auto_trader(dry_run=True, skip_entries=True)
+
+    assert result.exited == ()
+    monitor.assert_called_once_with(dry_run=True)
+    phase_events = [
+        (event["status"], event["key"])
+        for event in observation.to_receipt()["events"]
+        if event["kind"] == "scheduler_work"
+    ]
+    assert phase_events == [
+        ("due", "exit_check:scan_phase"),
+        ("started", "exit_check:scan_phase"),
+        ("completed", "exit_check:scan_phase"),
+    ]

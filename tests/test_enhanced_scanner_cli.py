@@ -1,7 +1,7 @@
 """CLI safety tests for the provider-backed scanner."""
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import pytest
 
@@ -69,6 +69,11 @@ def test_observation_records_full_large_cap_request_and_validation_counts() -> N
             "screen_stocks_canslim_detailed",
             return_value=([], [], market),
         ) as screen,
+        patch.object(
+            observation,
+            "record_scan_coverage",
+            wraps=observation.record_scan_coverage,
+        ) as record_coverage,
     ):
         result = enhanced_scanner.scan_for_canslim_stocks(sectors="large_cap")
 
@@ -80,3 +85,5 @@ def test_observation_records_full_large_cap_request_and_validation_counts() -> N
     coverage = observation.to_receipt()["scan_coverage"]
     assert coverage["requested"] == 8
     assert coverage["validated"] == 7
+    assert record_coverage.call_args_list.count(call(requested=8)) == 1
+    assert record_coverage.call_args_list.count(call(validated=7)) == 1

@@ -66,6 +66,28 @@ When `ALPACA_PAPER` is false, the probe refuses **all** provider calls, includin
 
 For service health, record an observation from the intended scheduler session: process/session identity, recent log timestamp and outcome, and any required fill-stream and startup stop-reconciliation readiness. A dry-run scheduler does not have the same broker-stream requirements as an order-enabled session. A registered task that has not run, a stale log, a failed last result, or a missing required readiness marker is not healthy-service evidence.
 
+### Bounded ordinary-scheduler observation for #107
+
+The checkout-local ignored helper `.artifacts/issue-107-normal-scheduler/run-normal-dry-run-once.ps1` prepares one bounded observation of the ordinary scheduler path. Its offline self-test is safe to run without provider credentials:
+
+```powershell
+pwsh -NoProfile -File .artifacts/issue-107-normal-scheduler/run-normal-dry-run-once.ps1 -OfflineSelfTest
+```
+
+That mode launches only dummy Python children with the scheduler-shaped argument list. It checks inherited notification credentials are cleared in the child, all four request/retry settings are exact, stdout/stderr and receipts are retained, the 45-minute watchdog path terminates a child tree, and wrapper/kill failures produce truthful receipts. The self-test reports `provider_calls=0` and does not inspect or touch runtime, provider, scheduler-task, ledger, cache, or database state.
+
+The helper's normal mode is a separate operational action and was not run as part of this implementation. Before using it, select the intended checkout and interpreter, set `EXECUTION_STORE_DB_PATH` to the existing absolute database, ensure the existing FMP request ledger is present, and obtain the separate authorization for provider reads. It records source/runtime identity plus before/after local captures, hashes the ledger before launch, and refuses to start if the paper setting, five execution-store tables, or ledger are unavailable. It launches only:
+
+```text
+scheduler.py --dry-run --now --session --observe-health
+```
+
+The child environment blanks notification identity and fixes Alpaca, FMP, and index request timeouts to 15 seconds with zero Alpaca SDK retries. The scheduler includes its Alpaca market-clock preflight inside a 256 HTTP-attempt ceiling, permits at most six iShares/Wikipedia requests, and sets the FMP process allowance to the lowest of 198 requests, the CLI bound, the configured daily ceiling, and the existing ledger's remaining allowance. FMP local-ledger deferrals are recorded as incomplete inputs; process-cap denials and provider/transport failures are separate service issues. Execution-store writes are capped at six workflow transitions and two snapshots. A 45-minute watchdog terminates the child process tree if needed.
+
+Raw stdout/stderr files are captured from process start. Sanitized copies and the scheduler receipt are created only after child exit is confirmed. If the child remains alive after bounded termination, the helper does not read post-run database, ledger, or cache state. Its SQLite captures include row counts and deterministic content hashes for `workflow_snapshots`, `workflow_transitions`, `workflow_order_refs`, `active_positions`, and `workflow_notification_claims`; unexpected deltas outside the bounded snapshot/transition allowance fail the outer receipt. Raw files stay local because they may contain unsanitized diagnostics.
+
+This observation exercises the existing full `large_cap` scan selection, normal exit checks, and scheduler cadence without submitting orders or starting the fill monitor. A valid result distinguishes service health, required-input coverage, and #107 overall readiness. A missed due check, stale or incomplete input, clock issue, failed read, resource denial, or escaped notification prevents a readiness pass. Even a clean offline or provider-backed observation cannot prove the installed disabled Task Scheduler action points at this checkout, establish canonical runtime selection, or make #107 overall readiness `PASS`; preserve it as one bounded acceptance artifact and compare its exact source/runtime identity with the separate #97 deployment record.
+
 ## Strategy dry-run evidence
 
 Only after provider scope and the chosen runtime are ready, run the bounded no-order cycle under the same interpreter and checkout:

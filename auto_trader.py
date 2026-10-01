@@ -112,6 +112,25 @@ def _record_exit_check(interval: str, symbol: str, outcome: str) -> None:
         observation.record_event("exit_check", f"{interval}:{symbol}", outcome, {})
 
 
+def _run_scan_phase_exit_check(callback):
+    """Include the cycle's initial exit pass in bounded scheduler evidence."""
+    observation = current_scheduler_observation()
+    if observation is None:
+        return callback()
+    key = "exit_check:scan_phase"
+    observation.record_event("scheduler_work", key, "due", {"phase": "scan_phase"})
+    observation.record_event("scheduler_work", key, "started", {})
+    try:
+        result = callback()
+    except Exception as exc:
+        details = {"phase": "scan_phase", "error_type": type(exc).__name__}
+        observation.record_event("scheduler_work", key, "failed", details)
+        observation.latch_service_issue("exit_check_work_failed", details)
+        raise
+    observation.record_event("scheduler_work", key, "completed", {})
+    return result
+
+
 def _validate_execution_readiness_callback(
     *,
     dry_run: bool,
@@ -424,7 +443,10 @@ def monitor_and_exit_positions(
             raise
         except Exception as exc:  # noqa: BLE001
             _record_exit_bars_unavailable(
-                "daily", pos.symbol, "bar_read_failed", error_type=type(exc).__name__
+                "daily",
+                pos.symbol,
+                "bar_read_failed",
+                error_type=getattr(exc, "provider_error_type", type(exc).__name__),
             )
             print(f"[WARN] MA check failed for {pos.symbol}: {exc}")
 
@@ -533,7 +555,10 @@ def monitor_exits_hourly(
             raise
         except Exception as exc:  # noqa: BLE001
             _record_exit_bars_unavailable(
-                "hourly", pos.symbol, "bar_read_failed", error_type=type(exc).__name__
+                "hourly",
+                pos.symbol,
+                "bar_read_failed",
+                error_type=getattr(exc, "provider_error_type", type(exc).__name__),
             )
             print(f"[WARN] Hourly MA check failed for {pos.symbol}: {exc}")
 
@@ -719,11 +744,15 @@ def run_auto_trader(
     if not skip_exits:
         print("\n--- Phase 1: Exit monitoring ---")
         if execution_ready is None:
-            exited = monitor_and_exit_positions(dry_run=dry_run)
+            exited = _run_scan_phase_exit_check(
+                lambda: monitor_and_exit_positions(dry_run=dry_run)
+            )
         else:
-            exited = monitor_and_exit_positions(
-                dry_run=dry_run,
-                execution_ready=execution_ready,
+            exited = _run_scan_phase_exit_check(
+                lambda: monitor_and_exit_positions(
+                    dry_run=dry_run,
+                    execution_ready=execution_ready,
+                )
             )
         if exited:
             print(f"Exited {len(exited)} position(s): {', '.join(exited)}")

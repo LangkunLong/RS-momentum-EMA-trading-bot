@@ -91,6 +91,8 @@ def _run_observed_work(
     key: str,
     scheduled_at: datetime,
     callback,
+    *,
+    missed_due_keys: set[tuple[str, str, str]] | None = None,
 ):
     """Record one due scheduler action while preserving its ordinary callback."""
     observation = current_scheduler_observation()
@@ -102,12 +104,22 @@ def _run_observed_work(
         "due",
         {"scheduled_at": scheduled_at.isoformat()},
     )
+    started_at = _now_et()
     observation.record_event(
         "scheduler_work",
         f"{kind}:{key}",
         "started",
-        {"started_at": _now_et().isoformat()},
+        {"started_at": started_at.isoformat()},
     )
+    if (started_at - scheduled_at).total_seconds() > _LOOP_SLEEP_SECS:
+        _record_missed_observed_work(
+            observation,
+            kind,
+            key,
+            scheduled_at,
+            started_at,
+            missed_due_keys,
+        )
     try:
         result = callback()
     except Exception as exc:
@@ -124,6 +136,82 @@ def _run_observed_work(
         {},
     )
     return result
+
+
+def _record_missed_observed_work(
+    observation: SchedulerObservation,
+    kind: str,
+    key: str,
+    scheduled_at: datetime,
+    observed_at: datetime,
+    missed_due_keys: set[tuple[str, str, str]] | None = None,
+) -> None:
+    """Latch one due scheduler slot that passed beyond the loop tolerance."""
+    identity = (kind, key, scheduled_at.isoformat())
+    if missed_due_keys is not None:
+        if identity in missed_due_keys:
+            return
+        missed_due_keys.add(identity)
+    details = {
+        "scheduled_at": scheduled_at.isoformat(),
+        "observed_at": observed_at.isoformat(),
+        "late_seconds": max(0, int((observed_at - scheduled_at).total_seconds())),
+    }
+    observation.record_event(
+        "scheduler_work", f"{kind}:{key}", "missed", details
+    )
+    observation.latch_service_issue(
+        "scheduled_work_missed", {"kind": kind, "key": key, **details}, unverified=True
+    )
+
+
+def _reconcile_missed_observed_work(
+    observation: SchedulerObservation,
+    now: datetime,
+    session_started_at: datetime,
+    attempted_hourly_due: set[datetime],
+    last_daily_exit: datetime,
+    missed_due_keys: set[tuple[str, str, str]],
+) -> None:
+    """Record hourly and daily slots that elapsed during long scheduler work."""
+    cutoff = now - timedelta(seconds=_LOOP_SLEEP_SECS)
+    if now.date() == session_started_at.date():
+        for hour in sorted(_HOURLY_CHECK_HOURS):
+            due = now.replace(hour=hour, minute=1, second=0, microsecond=0)
+            if session_started_at <= due <= cutoff and due not in attempted_hourly_due:
+                _record_missed_observed_work(
+                    observation,
+                    "exit_check",
+                    "hourly",
+                    due,
+                    now,
+                    missed_due_keys,
+                )
+
+    if last_daily_exit.year == 1:
+        due = session_started_at
+        if due <= cutoff:
+            _record_missed_observed_work(
+                observation,
+                "exit_check",
+                "daily_fallback",
+                due,
+                now,
+                missed_due_keys,
+            )
+        return
+
+    due = last_daily_exit + timedelta(seconds=_DAILY_EXIT_INTERVAL_SECS)
+    while due <= cutoff:
+        _record_missed_observed_work(
+            observation,
+            "exit_check",
+            "daily_fallback",
+            due,
+            now,
+            missed_due_keys,
+        )
+        due += timedelta(seconds=_DAILY_EXIT_INTERVAL_SECS)
 
 
 def _record_observation_resource_snapshots(observation: SchedulerObservation) -> None:
@@ -289,14 +377,31 @@ def _run_scheduler_locked(
 
     try:
         session_date: date | None = None
+        observation_session_started_at: datetime | None = None
         if stop_after_session:
             started_at = _now_et()
             session_date = started_at.date()
+            if observe_health:
+                observation_session_started_at = started_at
             if _session_is_complete(started_at, session_date):
                 print(
                     f"[SCHEDULER] {started_at.strftime('%Y-%m-%d %H:%M ET')} — "
                     "no bounded weekday session remains to run."
                 )
+                if observe_health:
+                    observation = current_scheduler_observation()
+                    if observation is not None:
+                        observation.record_event(
+                            "scheduler",
+                            "bounded_session",
+                            "unavailable",
+                            {"started_at": started_at.isoformat()},
+                        )
+                        observation.latch_service_issue(
+                            "bounded_session_unavailable",
+                            {"started_at": started_at.isoformat()},
+                            unverified=True,
+                        )
                 return
 
         if observe_health:
@@ -324,6 +429,8 @@ def _run_scheduler_locked(
         last_hourly_exit_hour: int = -1
         last_quiet_log: datetime = datetime.min.replace(tzinfo=_ET)
         session_seen_open_date: date | None = None
+        attempted_hourly_due: set[datetime] = set()
+        missed_due_keys: set[tuple[str, str, str]] = set()
 
         # Optional immediate scan at startup.
         if run_now:
@@ -366,6 +473,17 @@ def _run_scheduler_locked(
 
             now = _now_et()
             today = now.date()
+
+            observation = current_scheduler_observation() if observe_health else None
+            if observation is not None and observation_session_started_at is not None:
+                _reconcile_missed_observed_work(
+                    observation,
+                    now,
+                    observation_session_started_at,
+                    attempted_hourly_due,
+                    last_daily_exit,
+                    missed_due_keys,
+                )
 
             if session_date is not None and _session_is_complete(now, session_date):
                 print(
@@ -475,8 +593,13 @@ def _run_scheduler_locked(
                             scheduled_at = now.replace(
                                 minute=1, second=0, microsecond=0
                             )
+                            attempted_hourly_due.add(scheduled_at)
                             exited = _run_observed_work(
-                                "exit_check", "hourly", scheduled_at, run_hourly_check
+                                "exit_check",
+                                "hourly",
+                                scheduled_at,
+                                run_hourly_check,
+                                missed_due_keys=missed_due_keys,
                             )
                         else:
                             exited = run_hourly_check()
@@ -509,12 +632,16 @@ def _run_scheduler_locked(
 
                         if observe_health:
                             due_at = (
-                                now
+                                observation_session_started_at or now
                                 if last_daily_exit.year == 1
                                 else last_daily_exit + timedelta(seconds=_DAILY_EXIT_INTERVAL_SECS)
                             )
                             exited = _run_observed_work(
-                                "exit_check", "daily_fallback", due_at, run_daily_check
+                                "exit_check",
+                                "daily_fallback",
+                                due_at,
+                                run_daily_check,
+                                missed_due_keys=missed_due_keys,
                             )
                         else:
                             exited = run_daily_check()
@@ -781,53 +908,70 @@ def _run_cli_args(args: argparse.Namespace) -> int:
                 )
             return 2
     if args.fmp_daily_budget is not None:
-        settings.FMP_DAILY_REQUEST_BUDGET = args.fmp_daily_budget
+        if args.observe_health:
+            settings.FMP_DAILY_REQUEST_BUDGET = min(
+                int(settings.FMP_DAILY_REQUEST_BUDGET), args.fmp_daily_budget
+            )
+        else:
+            settings.FMP_DAILY_REQUEST_BUDGET = args.fmp_daily_budget
     if args.observe_health:
         observation = SchedulerObservation(
             run_id=f"scheduler-{uuid4().hex}"
         )
         with activate_scheduler_observation(observation):
             fmp_limit = fmp_observation_request_limit(198)
-            try:
-                with (
-                    single_attempt_alpaca_requests(),
-                    alpaca_http_request_budget(256),
-                    fmp_request_budget(fmp_limit),
-                ):
-                    try:
-                        run_scheduler(
-                            dry_run=True,
-                            run_now=True,
-                            stop_after_session=True,
-                            observe_health=True,
-                        )
-                    except SchedulerAlreadyRunningError as exc:
-                        print(f"[SCHEDULER] {exc}; observation did not start.")
-                        observation.latch_service_issue(
-                            "scheduler_already_running", {}, unverified=True
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        print(f"[SCHEDULER ERROR] Observation failed: {exc}")
-                        observation.record_event(
-                            "scheduler", "observation", "failed",
-                            {"error_type": type(exc).__name__},
-                        )
-                        if observation.to_receipt()["service_health"] == "healthy":
+            missing_ledger = any(
+                issue["code"] in {"fmp_ledger_missing", "fmp_ledger_unreadable"}
+                for issue in observation.to_receipt()["issues"]
+            )
+            if missing_ledger:
+                _record_observation_resource_snapshots(observation)
+            else:
+                try:
+                    with (
+                        single_attempt_alpaca_requests(),
+                        alpaca_http_request_budget(256),
+                        fmp_request_budget(fmp_limit),
+                    ):
+                        try:
+                            run_scheduler(
+                                dry_run=True,
+                                run_now=True,
+                                stop_after_session=True,
+                                observe_health=True,
+                            )
+                        except SchedulerAlreadyRunningError as exc:
+                            print(f"[SCHEDULER] {exc}; observation did not start.")
                             observation.latch_service_issue(
-                                "scheduler_observation_failed",
+                                "scheduler_already_running", {}, unverified=True
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            print(f"[SCHEDULER ERROR] Observation failed: {exc}")
+                            observation.record_event(
+                                "scheduler", "observation", "failed",
                                 {"error_type": type(exc).__name__},
                             )
-                    finally:
-                        _record_observation_resource_snapshots(observation)
-            except RuntimeError as exc:
-                print(f"[SCHEDULER ERROR] Could not activate observation budgets: {exc}")
-                observation.latch_service_issue(
-                    "observation_budget_activation_failed",
-                    {"error_type": type(exc).__name__},
-                )
+                            if observation.to_receipt()["service_health"] == "healthy":
+                                observation.latch_service_issue(
+                                    "scheduler_observation_failed",
+                                    {"error_type": type(exc).__name__},
+                                )
+                        finally:
+                            _record_observation_resource_snapshots(observation)
+                except RuntimeError as exc:
+                    print(f"[SCHEDULER ERROR] Could not activate observation budgets: {exc}")
+                    observation.latch_service_issue(
+                        "observation_budget_activation_failed",
+                        {"error_type": type(exc).__name__},
+                    )
         receipt = observation.to_receipt()
         print("SCHEDULER_OBSERVATION_RECEIPT=" + json.dumps(receipt, sort_keys=True))
-        return 1 if receipt["service_health"] != "healthy" else 0
+        return (
+            1
+            if receipt["service_health"] != "healthy"
+            or receipt["overall_readiness"] == "fail"
+            else 0
+        )
     try:
         run_scheduler(
             dry_run=not args.enable_orders,

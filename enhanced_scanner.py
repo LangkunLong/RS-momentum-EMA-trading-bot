@@ -123,10 +123,6 @@ def scan_for_canslim_stocks(
     if observation is not None:
         observation.record_scan_coverage(requested=len(symbols))
 
-    observation = current_scheduler_observation()
-    if observation is not None:
-        observation.record_scan_coverage(requested=len(symbols))
-
     print(f"Scanning {len(symbols)} stocks for CANSLIM opportunities...")
     print(f"Canonical RS Entry Floor: {MIN_RS_SCORE} (fixed)")
     print(f"Canonical CANSLIM Entry Floor: {MIN_COMPOSITE_SCORE} (fixed)")
@@ -146,8 +142,6 @@ def scan_for_canslim_stocks(
         symbols,
         retry_failed_chunks=retry_failed_market_data_chunks,
     )
-    if observation is not None:
-        observation.record_scan_coverage(validated=len(valid_symbols))
     if observation is not None:
         observation.record_scan_coverage(validated=len(valid_symbols))
 
