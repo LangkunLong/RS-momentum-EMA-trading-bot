@@ -718,6 +718,33 @@ def _action_from_row(conn: sqlite3.Connection, row: sqlite3.Row) -> ActionIntent
     )
 
 
+def _replacement_holding_id(intent: ActionIntent) -> str:
+    """Derive the only holding episode a replacement opening action may own."""
+    return HoldingEpisode.open(
+        deployment_generation_id=intent.deployment_generation_id,
+        security_id=intent.security_id,
+        symbol=intent.broker_symbol,
+        broker_symbol=intent.broker_symbol,
+        opening_action_id=intent.logical_action_id,
+        initial_filled_quantity=Decimal("1"),
+        entry_price=None,
+    ).holding_episode_id
+
+
+def _validate_replacement_holding(intent: ActionIntent, holding: HoldingEpisode) -> None:
+    if (
+        intent.role is ActionRole.REPLACEMENT
+        and (
+            holding.holding_episode_id != _replacement_holding_id(intent)
+            or holding.opening_action_id != intent.logical_action_id
+            or holding.deployment_generation_id != intent.deployment_generation_id
+            or holding.security_id != intent.security_id
+            or holding.broker_symbol != intent.broker_symbol
+        )
+    ):
+        raise ValueError("replacement holding episode must be its own opening holding")
+
+
 def _provider_order_references(
     conn: sqlite3.Connection,
     logical_action_id: str,
@@ -1780,6 +1807,12 @@ class PolicyExecutionStateStore:
         with self._transaction(write=True) as conn:
             self._require_ready(conn)
             self._validate_deployment_scope(intent.decision.deployment_identity)
+            if (
+                intent.role is ActionRole.REPLACEMENT
+                and intent.holding_episode_id is not None
+                and intent.holding_episode_id != _replacement_holding_id(intent)
+            ):
+                raise ValueError("replacement holding episode must be its own opening holding")
             existing = conn.execute(
                 "SELECT * FROM policy_state_actions WHERE logical_action_id=?",
                 (intent.logical_action_id,),
@@ -1799,6 +1832,7 @@ class PolicyExecutionStateStore:
                 if holding_row is None:
                     raise ValueError("action holding episode is not recorded")
                 holding = _holding_from_row(holding_row)
+                _validate_replacement_holding(intent, holding)
                 updated_holding = register_pending_action(holding, intent)
                 pending_holding = (updated_holding, int(holding_row["state_version"]))
             self._store_action(conn, intent, version=0, event_kind="action_intended")
@@ -1918,8 +1952,14 @@ class PolicyExecutionStateStore:
 
             holding_id = intent.holding_episode_id
             holding_row = None if holding_id is None else self._holding_row(conn, holding_id)
+            if intent.role is ActionRole.REPLACEMENT:
+                expected_opening_holding_id = _replacement_holding_id(intent)
+                if holding_id is not None and holding_id != expected_opening_holding_id:
+                    raise ValueError("replacement holding episode must be its own opening holding")
+                if holding_row is not None:
+                    _validate_replacement_holding(intent, _holding_from_row(holding_row))
             if holding_row is None:
-                if intent.role is not ActionRole.ENTRY or cumulative_quantity == previous_quantity:
+                if intent.role not in {ActionRole.ENTRY, ActionRole.REPLACEMENT} or cumulative_quantity == previous_quantity:
                     if expected_holding_version is not None:
                         raise ConcurrentStateUpdateError("action has no holding at the expected version")
                 elif expected_holding_version is not None:
@@ -1980,7 +2020,7 @@ class PolicyExecutionStateStore:
 
             new_holding: HoldingEpisode | None = None
             current_holding_version: int | None = None
-            if delta_quantity > 0 and holding_row is None and intent.role is ActionRole.ENTRY:
+            if delta_quantity > 0 and holding_row is None and intent.role in {ActionRole.ENTRY, ActionRole.REPLACEMENT}:
                 fill_price = (
                     None
                     if delta_notional is None or delta_fees is None
@@ -2038,7 +2078,7 @@ class PolicyExecutionStateStore:
                         incremental_fill_notional=delta_notional,
                         incremental_fees=delta_fees,
                     )
-                    if intent.role in {ActionRole.ENTRY, ActionRole.ADDITION}:
+                    if intent.role in {ActionRole.ENTRY, ActionRole.REPLACEMENT, ActionRole.ADDITION}:
                         matching_risk_basis = (
                             current_holding.committed_risk_basis is not None
                             and current_holding.committed_risk_basis == updated_intent.risk_basis

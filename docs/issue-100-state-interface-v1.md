@@ -48,10 +48,12 @@ must be explicitly resolved, never silently retargeted.
 ## Holding, action and fill semantics
 
 `HoldingEpisode` is pinned to its opening generation, stable security ID,
-broker symbol, opening action, and opening decision. It keeps first confirmed
-opening quantity immutable; later fills of that same opening order increase
-remaining quantity but never count as additions. Confirmed add-on actions
-track per-action cumulative watermarks, add count, aggregate added quantity,
+broker symbol, opening action, and opening decision. `ENTRY` and
+`REPLACEMENT` are opening roles: the first positive confirmed fill creates the
+holding, and later cumulative fills of that same action increase remaining
+quantity without changing the initial fill quantity or counting as additions.
+Confirmed add-on actions track per-action cumulative watermarks, add count,
+aggregate added quantity,
 weighted cost basis when execution notional/fees are known, and remaining
 quantity. Sells update remaining quantity and realized P&L only from confirmed
 execution notional/fees; if those facts are unavailable, cost/P&L remains
@@ -72,10 +74,15 @@ Peaks and confirmed stops are monotonic under this contract.
 
 `ActionIntent` has a stable logical identity separate from attempt identities.
 Entry/add-on/replacement IDs include generation, decision, security, role and
-subject. A scale-out tier ID is unique by generation + holding episode + tier
-across decision sessions; its immutable origin decision, snapshot quantity,
-requested fraction, rounded target, and rounding-rule ID remain attached. A
-later decision cannot re-open an unresolved tier with a new quantity.
+subject. `ENTRY` and `REPLACEMENT` omit the generated opening holding ID from
+their logical identity and immutable payload, so attaching the holding after
+its first fill preserves action identity. A replacement may only attach the
+holding episode derived from its own generation, security and opening action;
+it cannot be attached to an unrelated existing holding. A scale-out tier ID
+is unique by generation + holding episode + tier across decision sessions;
+its immutable origin decision, snapshot quantity, requested fraction, rounded
+target, and rounding-rule ID remain attached. A later decision cannot re-open
+an unresolved tier with a new quantity.
 
 Each order attempt has a numbered identity and immutable client/broker order
 references. The initial order is attempt 1; #97's conservative bounded
@@ -112,8 +119,8 @@ identical event applies zero delta; reusing the event ID for a different
 payload fails closed. Attempt-level watermarks are monotonic and aggregate
 action fills are their sum. One SQLite transaction must record the receipt,
 update attempt/action residual cash and risk, apply holding quantity/cost/P&L
-or opening-entry continuation, append history, and apply any resulting
-completion/tier transition. Reads composing those rows use one read
+or opening `ENTRY` or `REPLACEMENT` continuation, append history, and apply
+any resulting completion/tier transition. Reads composing those rows use one read
 transaction. No projection may expose a partial fill transaction.
 A different event at an unchanged quantity watermark is receipt-only: it does
 not refine previously unknown notional or fees. If both the stored and new
@@ -222,8 +229,10 @@ version/checksum or database identity fails closed.
   payload_sha256, observed_at, expected_action_version,
   expected_holding_version)` atomically records the receipt, attempt/action
   state, holding quantity/accounting update, and history. It creates the
-  opening holding on its first confirmed entry fill; later fills increase its
-  quantity without changing initial fill quantity or add count. A transaction
+  opening holding on the first confirmed `ENTRY` or `REPLACEMENT` fill; later
+  fills increase its quantity without changing initial fill quantity or add
+  count. A partially filled opening entry or replacement may coexist with a
+  stop update while its residual order remains pending. A transaction
   failure rolls back every write.
 - `record_holding_episode(holding, *, expected_version, evidence_ref)` accepts
   only an evidence-backed change to the `position_reconciliation_required`

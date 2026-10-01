@@ -105,6 +105,7 @@ _OPEN_STATUSES = frozenset(
 )
 _TIER_COMPLETION_STATUSES = frozenset({ActionStatus.FILLED, ActionStatus.RESOLVED})
 _TERMINAL_STATUSES = frozenset({ActionStatus.FILLED, ActionStatus.RESOLVED})
+_OPENING_ACTION_ROLES = frozenset({ActionRole.ENTRY, ActionRole.REPLACEMENT})
 
 
 def _text(value: object, name: str) -> str:
@@ -549,7 +550,10 @@ class ActionIntent:
             identity["holding_episode_id"] = self.holding_episode_id
             identity["exit_tier"] = self.exit_tier
         else:
-            if self.role is not ActionRole.ENTRY:
+            if self.role is ActionRole.REPLACEMENT:
+                # Preserve the pre-fill identity shape while keeping the generated holding out.
+                identity["holding_episode_id"] = None
+            elif self.role is not ActionRole.ENTRY:
                 identity["holding_episode_id"] = self.holding_episode_id
             identity["decision_id"] = self.decision.decision_id
         object.__setattr__(self, "logical_action_id", f"action:sha256:{_canonical_digest(identity)}")
@@ -567,7 +571,7 @@ class ActionIntent:
             "deployment_generation_id": self.deployment_generation_id,
             "decision_id": self.decision.decision_id,
             "security_id": self.security_id,
-            "holding_episode_id": None if self.role is ActionRole.ENTRY else self.holding_episode_id,
+            "holding_episode_id": None if self.role in _OPENING_ACTION_ROLES else self.holding_episode_id,
             "role": self.role.value,
             "side": self.side.value,
             "requested_quantity": str(self.requested_quantity),
@@ -1146,10 +1150,25 @@ def _apply_action_fill_to_holding(
     incremental_fill_notional: Decimal | None,
     incremental_fees: Decimal | None,
 ) -> HoldingEpisode:
-    opening_fill = intent.role is ActionRole.ENTRY and intent.logical_action_id == holding.opening_action_id
+    opening_fill = intent.role in _OPENING_ACTION_ROLES and intent.logical_action_id == holding.opening_action_id
+    if opening_fill and (
+        intent.deployment_generation_id != holding.deployment_generation_id
+        or intent.security_id != holding.security_id
+        or intent.broker_symbol != holding.broker_symbol
+        or (intent.holding_episode_id is not None and intent.holding_episode_id != holding.holding_episode_id)
+    ):
+        raise ValueError("opening action identity does not match this holding episode")
+    if intent.role is ActionRole.REPLACEMENT and not opening_fill:
+        raise ValueError("replacement action must continue its own opening holding episode")
     if not opening_fill and intent.holding_episode_id != holding.holding_episode_id:
         raise ValueError("action does not belong to this holding episode")
-    if intent.role not in {ActionRole.ENTRY, ActionRole.ADDITION, ActionRole.SCALE_OUT, ActionRole.CLOSE}:
+    if intent.role not in {
+        ActionRole.ENTRY,
+        ActionRole.REPLACEMENT,
+        ActionRole.ADDITION,
+        ActionRole.SCALE_OUT,
+        ActionRole.CLOSE,
+    }:
         raise ValueError("action role does not change holding quantity")
     watermarks = dict(holding.applied_action_fill_watermarks)
     prior = watermarks.get(intent.logical_action_id, Decimal("0"))
@@ -1165,10 +1184,12 @@ def _apply_action_fill_to_holding(
     if fees is not None and fees < 0:
         raise ValueError("incremental_fees must be non-negative")
 
-    if intent.role in {ActionRole.ENTRY, ActionRole.ADDITION}:
+    if intent.role in {ActionRole.ENTRY, ActionRole.REPLACEMENT, ActionRole.ADDITION}:
         remaining = holding.remaining_quantity + delta
         additions = holding.completed_additions_quantity + (delta if intent.role is ActionRole.ADDITION else 0)
-        opening_later = holding.opening_later_fills_quantity + (delta if intent.role is ActionRole.ENTRY else 0)
+        opening_later = holding.opening_later_fills_quantity + (
+            delta if intent.role in _OPENING_ACTION_ROLES else 0
+        )
         old_cost = holding.cost_basis
         if notional is None or fees is None or old_cost is None:
             cost_basis = None
@@ -1291,10 +1312,12 @@ def propose_stop_update(
         raise PendingActionConflictError("a stop update is already awaiting broker confirmation")
     pending_entry_ids = {intent.logical_action_id for intent in coexisting_entry_intents}
     if len(pending_entry_ids) > 1 or set(holding.pending_action_ids) != pending_entry_ids:
-        raise PendingActionConflictError("only a verified partially filled entry may coexist with a stop update")
+        raise PendingActionConflictError(
+            "only a verified partially filled entry or replacement may coexist with a stop update"
+        )
     for entry in coexisting_entry_intents:
         if (
-            entry.role is not ActionRole.ENTRY
+            entry.role not in _OPENING_ACTION_ROLES
             or entry.side is not OrderSide.BUY
             or entry.holding_episode_id != holding.holding_episode_id
             or entry.deployment_generation_id != holding.deployment_generation_id
@@ -1306,7 +1329,9 @@ def propose_stop_update(
             or entry.order_attempts[0].status is not ActionAttemptStatus.PARTIALLY_FILLED
             or entry.order_attempts[0].terminal_status is not None
         ):
-            raise PendingActionConflictError("only a verified partially filled entry may coexist with a stop update")
+            raise PendingActionConflictError(
+                "only a verified partially filled entry or replacement may coexist with a stop update"
+            )
     intent = StopUpdateIntent(
         deployment_generation_id=holding.deployment_generation_id,
         decision_id=decision.decision_id,
