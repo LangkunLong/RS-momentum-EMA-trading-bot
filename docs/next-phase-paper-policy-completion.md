@@ -18,7 +18,11 @@ Completion requires all nine original #98/#99/#100 criteria, independent specifi
 | #100 additions, exit tiers, stops, peaks and pending intentions persist | 18 pure + 13 store focused tests at frozen1847869; lead chain retains completed addition and partial entry | Full review requires unknown-risk, unsafe-write, late-tier-fill and partial-entry-protection corrections |
 | #100 timing, missed sessions, conflicts, migrations and rollback recover safely | Pure missed-session/remainder cases; temporary-store transactional migration, failure injection, rollback and mixed-generation tests | Caller-version pointer ABA and pending-conflict recovery need fixes; deployment and actual-store migration excluded |
 
-## Completion gates
+## Latest combined checkpoint
+
+Consumer compatibility6f225eec1c9434f0ae035383cabba43797f33ba2 is locally integrated at lead `c6ee7ceae26e2f6825a1635c874007ee59f156b8`. All three tests in `tests/test_paper_policy_chain.py` pass at this checkpoint (chunkeb2707: 3passed, 2warnings in4.26s), including the unchanged later-session/mixed-generation case. Receipt `.artifacts/lead-c/combined-chain-c6ee7ce.md`. Independent consumer re-review is active; remaining #100 findings2–5/7, final combined review and updated-source verification still prevent full acceptance. The earlier failures below are preserved history, not current results for this checkpoint.
+
+## Completion gates and retained earlier evidence
 
 The first combined execution at application headdcbf6d0 returned two failures at partial-entry protective-stop setup. Stable regression committeda3ef2b7; receipt `.artifacts/lead-c/combined-first-run-dcbf6d0.md`. After integrating owner fixes67ad856 andc2b6111, exact application head `46b0d8ef28a6ce3f4220da77fb6f7ae8f8091a04` passed both unchanged tests (chunk68fe13: 2passed, 2warnings in2.06s). This verifies their same-session restart/reservation/resolution and negative-account assertions. Independent scoped re-review approved store findings1 and6 atc2b6111.
 
