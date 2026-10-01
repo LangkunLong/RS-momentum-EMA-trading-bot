@@ -1,15 +1,23 @@
 """Tests for I/O boundary code — API calls are mocked to prevent network hits."""
 
 import os
+import json
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+from zoneinfo import ZoneInfo
 
 import pandas as pd
+import pytest
+import requests
 from alpaca.data.enums import DataFeed
 
 import enhanced_scanner
+from core import data_client
 from core.data_client import fetch_bulk_close_prices, fetch_bulk_ohlcv, fetch_ohlcv, validate_ticker
+from core.data_client import fmp_request_budget, reset_fmp_request_context
+from core.scheduler_observation import SchedulerObservation, activate_scheduler_observation
 
 # ─── export_results_to_csv ────────────────────────────────────────────────────
 
@@ -244,3 +252,187 @@ def test_bulk_ohlcv_isolates_one_invalid_symbol() -> None:
         result = fetch_bulk_ohlcv(["GOOD1", "BAD", "GOOD2"], period="5d", chunk_size=3)
 
     assert set(result) == {"GOOD1", "GOOD2"}
+
+
+_FMP_TEST_NOW = datetime(2026, 10, 1, 15, 30, tzinfo=ZoneInfo("America/New_York"))
+_FMP_TEST_WINDOW = "2026-10-01T15:00:00-04:00"
+
+
+def _prepare_observed_fmp_ledger(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    count: int = 0,
+    allowance: int = 5,
+    window_start: str = _FMP_TEST_WINDOW,
+    exists: bool = True,
+) -> Path:
+    ledger_path = tmp_path / "fmp-usage.json"
+    if exists:
+        ledger_path.write_text(
+            json.dumps({"window_start": window_start, "count": count}),
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(data_client.settings, "FMP_REQUEST_LEDGER_PATH", str(ledger_path))
+    monkeypatch.setattr(data_client.settings, "FMP_DAILY_REQUEST_BUDGET", allowance)
+    monkeypatch.setattr(data_client.settings, "FMP_API_KEY", "test-key")
+    monkeypatch.setattr(data_client.settings, "FMP_PLAN", "free")
+    monkeypatch.setattr(data_client.settings, "FMP_SUPPRESS_REPEATED_ENDPOINT_ERRORS", True)
+    monkeypatch.setattr(data_client, "_fmp_now_et", lambda: _FMP_TEST_NOW)
+    monkeypatch.setattr(data_client, "_fmp_quota_exhausted", False)
+    data_client._fmp_unavailable_endpoints.clear()
+    data_client._fmp_reported_endpoint_failures.clear()
+    reset_fmp_request_context()
+    return ledger_path
+
+
+def test_fmp_process_cap_is_not_reported_as_local_ledger_deferral(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    ledger_path = _prepare_observed_fmp_ledger(monkeypatch, tmp_path)
+    get = Mock()
+    monkeypatch.setattr(data_client._fmp_session, "get", get)
+    observation = SchedulerObservation("test")
+
+    with fmp_request_budget(0), activate_scheduler_observation(observation):
+        result = data_client._fmp_get("income-statement", {"symbol": "AAPL"})
+        reason = data_client.fmp_request_deferral_reason()
+
+    assert result == []
+    assert reason == "process_cap"
+    get.assert_not_called()
+    assert json.loads(ledger_path.read_text(encoding="utf-8"))["count"] == 0
+    assert observation.to_receipt()["service_health"] == "failed"
+
+
+def test_fmp_local_ledger_exhaustion_degrades_coverage_only(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    ledger_path = _prepare_observed_fmp_ledger(
+        monkeypatch, tmp_path, count=5, allowance=5
+    )
+    get = Mock()
+    monkeypatch.setattr(data_client._fmp_session, "get", get)
+    observation = SchedulerObservation("test")
+
+    with fmp_request_budget(1), activate_scheduler_observation(observation):
+        result = data_client._fmp_get("income-statement", {"symbol": "AAPL"})
+        reason = data_client.fmp_request_deferral_reason()
+
+    receipt = observation.to_receipt()
+    assert result == []
+    assert reason == "local_ledger"
+    get.assert_not_called()
+    assert json.loads(ledger_path.read_text(encoding="utf-8"))["count"] == 5
+    assert receipt["service_health"] == "healthy"
+    assert receipt["required_input_coverage"] == "degraded"
+    assert receipt["input_gaps"] == [
+        {
+            "symbol": "AAPL",
+            "endpoint": "income-statement",
+            "reason": "local_ledger_exhausted",
+            "coverage_status": "degraded",
+        }
+    ]
+
+
+@pytest.mark.parametrize("ledger_state", ["missing_at_start", "deleted_after_preflight", "unreadable"])
+def test_fmp_observation_fails_closed_when_ledger_is_missing_or_unreadable(
+    ledger_state: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    ledger_path = _prepare_observed_fmp_ledger(
+        monkeypatch,
+        tmp_path,
+        exists=ledger_state != "missing_at_start",
+    )
+    if ledger_state == "deleted_after_preflight":
+        ledger_path.unlink()
+    elif ledger_state == "unreadable":
+        ledger_path.write_text("not-json", encoding="utf-8")
+    get = Mock()
+    monkeypatch.setattr(data_client._fmp_session, "get", get)
+    observation = SchedulerObservation("test")
+
+    with fmp_request_budget(1), activate_scheduler_observation(observation):
+        result = data_client._fmp_get("income-statement", {"symbol": "AAPL"})
+        reason = data_client.fmp_request_deferral_reason()
+
+    assert result == []
+    assert reason == ("ledger_unreadable" if ledger_state == "unreadable" else "ledger_missing")
+    get.assert_not_called()
+    assert observation.to_receipt()["service_health"] == "failed"
+    assert not ledger_path.exists() or ledger_path.read_text(encoding="utf-8") == "not-json"
+
+
+def test_existing_prior_window_fmp_ledger_rolls_over(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    ledger_path = _prepare_observed_fmp_ledger(
+        monkeypatch, tmp_path, count=5, window_start="2026-09-30T15:00:00-04:00"
+    )
+    response = Mock(status_code=200)
+    response.json.return_value = [{"symbol": "AAPL"}]
+    response.raise_for_status.return_value = None
+    get = Mock(return_value=response)
+    monkeypatch.setattr(data_client._fmp_session, "get", get)
+    observation = SchedulerObservation("test")
+
+    with fmp_request_budget(1), activate_scheduler_observation(observation):
+        result = data_client._fmp_get("income-statement", {"symbol": "AAPL"})
+
+    assert result == [{"symbol": "AAPL"}]
+    assert json.loads(ledger_path.read_text(encoding="utf-8")) == {
+        "window_start": _FMP_TEST_WINDOW,
+        "count": 1,
+    }
+    assert observation.to_receipt()["service_health"] == "healthy"
+
+
+@pytest.mark.parametrize("status_code", [402, 403, 404, 429])
+def test_fmp_provider_refusal_statuses_are_distinct_failures(
+    status_code: int,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    ledger_path = _prepare_observed_fmp_ledger(monkeypatch, tmp_path)
+    response = Mock(status_code=status_code)
+    get = Mock(return_value=response)
+    monkeypatch.setattr(data_client._fmp_session, "get", get)
+    observation = SchedulerObservation("test")
+
+    with fmp_request_budget(1), activate_scheduler_observation(observation):
+        result = data_client._fmp_get("income-statement", {"symbol": "AAPL"})
+        reason = data_client.fmp_request_deferral_reason()
+
+    receipt = observation.to_receipt()
+    assert result == []
+    assert reason == "provider_refusal"
+    get.assert_called_once()
+    assert json.loads(ledger_path.read_text(encoding="utf-8"))["count"] == 1
+    assert receipt["service_health"] == "failed"
+    assert receipt["issues"][-1]["details"]["http_status"] == status_code
+
+
+def test_fmp_transport_error_is_not_reported_as_quota_deferral(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    ledger_path = _prepare_observed_fmp_ledger(monkeypatch, tmp_path)
+    get = Mock(side_effect=requests.exceptions.Timeout("offline"))
+    monkeypatch.setattr(data_client._fmp_session, "get", get)
+    observation = SchedulerObservation("test")
+
+    with fmp_request_budget(1), activate_scheduler_observation(observation):
+        result = data_client._fmp_get("income-statement", {"symbol": "AAPL"})
+        reason = data_client.fmp_request_deferral_reason()
+
+    assert result == []
+    assert reason == "transport_error"
+    get.assert_called_once()
+    assert json.loads(ledger_path.read_text(encoding="utf-8"))["count"] == 1
+    assert observation.to_receipt()["service_health"] == "failed"

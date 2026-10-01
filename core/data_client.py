@@ -29,6 +29,13 @@ from alpaca.data.timeframe import TimeFrame
 
 from config import settings
 from core.alpaca_client_policy import configure_alpaca_rest_client
+from core.scheduler_observation import (
+    current_scheduler_observation,
+    latch_service_issue,
+    record_event,
+    record_input_gap,
+    record_resource_denial,
+)
 
 
 def _fetch_company_profile(symbol: str, fmp_get_fn):
@@ -237,11 +244,21 @@ def _is_fmp_free_plan() -> bool:
 def reset_fmp_request_context() -> None:
     """Clear request-defer state for the current scanner worker."""
     _fmp_request_context.quota_deferred = False
+    _fmp_request_context.deferral_reason = None
 
 
 def fmp_request_was_deferred() -> bool:
     """Return whether the current worker was denied by the local FMP budget."""
     return bool(getattr(_fmp_request_context, "quota_deferred", False))
+
+
+def fmp_request_deferral_reason() -> str | None:
+    """Return the last typed FMP denial or provider outcome for this worker."""
+    return getattr(_fmp_request_context, "deferral_reason", None)
+
+
+def _set_fmp_deferral_reason(reason: str) -> None:
+    _fmp_request_context.deferral_reason = reason
 
 
 def _fmp_now_et() -> datetime:
@@ -280,13 +297,16 @@ def _write_fmp_usage(path: str, usage: dict[str, Any]) -> bool:
 def _reserve_fmp_request() -> bool:
     """Reserve one persisted free-tier request before any network I/O."""
     global _fmp_budget_warning_emitted, _fmp_run_budget_remaining
+    observation_active = current_scheduler_observation() is not None
 
     if not _is_fmp_free_plan():
         with _fmp_budget_lock:
             if _fmp_run_budget_remaining is None:
                 return True
             if _fmp_run_budget_remaining <= 0:
-                _fmp_request_context.quota_deferred = True
+                _set_fmp_deferral_reason("process_cap")
+                if not observation_active:
+                    _fmp_request_context.quota_deferred = True
                 return False
             _fmp_run_budget_remaining -= 1
             return True
@@ -296,7 +316,12 @@ def _reserve_fmp_request() -> bool:
     budget = int(settings.FMP_DAILY_REQUEST_BUDGET)
 
     with _fmp_budget_lock:
-        if _fmp_run_budget_remaining is not None and _fmp_run_budget_remaining <= 0:
+        if (
+            not observation_active
+            and _fmp_run_budget_remaining is not None
+            and _fmp_run_budget_remaining <= 0
+        ):
+            _set_fmp_deferral_reason("process_cap")
             _fmp_request_context.quota_deferred = True
             return False
 
@@ -309,15 +334,29 @@ def _reserve_fmp_request() -> bool:
             if saved.get("window_start") == window_start:
                 usage["count"] = max(int(saved.get("count", 0)), 0)
         except FileNotFoundError:
-            pass
+            if observation_active:
+                _set_fmp_deferral_reason("ledger_missing")
+                latch_service_issue("fmp_ledger_missing", {"ledger_state": "missing"})
+                return False
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            _fmp_request_context.quota_deferred = True
+            _set_fmp_deferral_reason("ledger_unreadable")
+            if observation_active:
+                latch_service_issue("fmp_ledger_unreadable", {"ledger_state": "unreadable"})
+            else:
+                _fmp_request_context.quota_deferred = True
             if not _fmp_budget_warning_emitted:
                 print("[FMP] Request usage ledger is unreadable; failing closed to protect the free-plan quota.")
                 _fmp_budget_warning_emitted = True
             return False
 
+        if _fmp_run_budget_remaining is not None and _fmp_run_budget_remaining <= 0:
+            _set_fmp_deferral_reason("process_cap")
+            if not observation_active:
+                _fmp_request_context.quota_deferred = True
+            return False
+
         if usage["count"] >= budget:
+            _set_fmp_deferral_reason("local_ledger")
             _fmp_request_context.quota_deferred = True
             if not _fmp_budget_warning_emitted:
                 print(
@@ -333,7 +372,11 @@ def _reserve_fmp_request() -> bool:
                 _fmp_run_budget_remaining -= 1
             return True
 
-        _fmp_request_context.quota_deferred = True
+        _set_fmp_deferral_reason("ledger_write_failed")
+        if observation_active:
+            latch_service_issue("fmp_ledger_write_failed", {"ledger_state": "write_failed"})
+        else:
+            _fmp_request_context.quota_deferred = True
         if not _fmp_budget_warning_emitted:
             print("[FMP] Could not persist request usage; failing closed to protect the free-plan quota.")
             _fmp_budget_warning_emitted = True
@@ -438,7 +481,25 @@ def _fmp_get(endpoint: str, params: Optional[dict] = None) -> Any:
             request_params["limit"] = int(settings.FMP_FREE_MAX_RECORDS)
     request_params["apikey"] = _fmp_api_key()
     if not _reserve_fmp_request():
+        symbol = str((params or {}).get("symbol", "unknown"))
+        reason = fmp_request_deferral_reason()
+        if reason == "local_ledger":
+            record_input_gap(
+                symbol,
+                endpoint,
+                "local_ledger_exhausted",
+                coverage_status="degraded",
+            )
+        elif reason == "process_cap":
+            record_resource_denial("fmp_cap_denied", {"endpoint": endpoint})
         return []
+
+    record_event(
+        "fmp_request",
+        endpoint,
+        "reserved",
+        {"symbol": str((params or {}).get("symbol", "unknown"))},
+    )
 
     try:
         resp = _fmp_session.get(
@@ -449,18 +510,40 @@ def _fmp_get(endpoint: str, params: Optional[dict] = None) -> Any:
     except requests.exceptions.RetryError:
         # Retry adapter exhausted all attempts — treat as a persistent failure.
         _fmp_quota_exhausted = True
+        _set_fmp_deferral_reason("transport_error")
+        record_event("fmp_request", endpoint, "transport_error", {"error_type": "RetryError"})
+        latch_service_issue("fmp_transport_error", {"endpoint": endpoint, "error_type": "RetryError"})
         print("[FMP] All retries exhausted. Skipping FMP for remainder of session.")
         return []
-    except requests.exceptions.RequestException:
+    except requests.exceptions.RequestException as exc:
+        _set_fmp_deferral_reason("transport_error")
+        record_event(
+            "fmp_request",
+            endpoint,
+            "transport_error",
+            {"error_type": type(exc).__name__},
+        )
+        latch_service_issue(
+            "fmp_transport_error",
+            {"endpoint": endpoint, "error_type": type(exc).__name__},
+        )
         return []
+
+    def record_provider_refusal() -> None:
+        _set_fmp_deferral_reason("provider_refusal")
+        details = {"endpoint": endpoint, "http_status": int(resp.status_code)}
+        record_event("fmp_request", endpoint, "provider_refusal", details)
+        latch_service_issue("fmp_provider_refusal", details)
 
     # 402: endpoint not included in the current plan.
     if resp.status_code == 402:
+        record_provider_refusal()
         _mark_fmp_endpoint_unavailable(endpoint, f"HTTP 402 on '{endpoint}': endpoint not available in current plan tier.")
         return []
 
     # 403: authentication or permission failure — surface it clearly.
     if resp.status_code == 403:
+        record_provider_refusal()
         _mark_fmp_endpoint_unavailable(
             endpoint,
             f"HTTP 403 on '{endpoint}': access denied — verify FMP_API_KEY and plan permissions.",
@@ -469,6 +552,7 @@ def _fmp_get(endpoint: str, params: Optional[dict] = None) -> Any:
 
     # 404: endpoint unavailable on current base URL / plan tier. Suppress repeats.
     if resp.status_code == 404:
+        record_provider_refusal()
         _mark_fmp_endpoint_unavailable(
             endpoint,
             f"HTTP 404 on '{endpoint}': endpoint unavailable on the current FMP base URL or plan tier.",
@@ -478,12 +562,14 @@ def _fmp_get(endpoint: str, params: Optional[dict] = None) -> Any:
     # 429: quota/rate limit reached. Stop hammering the provider for this run.
     if resp.status_code == 429:
         _fmp_quota_exhausted = True
+        record_provider_refusal()
         print(f"[FMP] HTTP 429 on '{endpoint}': rate limit or quota reached. Skipping FMP for remainder of session.")
         return []
 
     try:
         resp.raise_for_status()
     except requests.RequestException:
+        record_provider_refusal()
         print(f"[FMP] HTTP {resp.status_code} on '{endpoint}'.")
         return []
     data = resp.json()
@@ -494,6 +580,7 @@ def _fmp_get(endpoint: str, params: Optional[dict] = None) -> Any:
             quota_keywords = ("limit reached", "too many request", "quota", "upgrade", "subscribe")
             if any(kw in str(error_msg).lower() for kw in quota_keywords):
                 _fmp_quota_exhausted = True
+                record_provider_refusal()
                 print(f"[FMP] Quota/limit error: {error_msg}. Skipping FMP for remainder of session.")
             else:
                 print(f"[FMP] Error on '{endpoint}': {error_msg}")
