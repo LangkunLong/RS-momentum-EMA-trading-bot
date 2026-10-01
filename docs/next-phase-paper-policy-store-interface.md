@@ -1,6 +1,18 @@
-# Lead C store/workflow interface proposal
+# Lead C store/workflow interface record
 
-Status: exact additive proposal retained for principal-owned overlap review; not implementation acceptance or deployment authority. Starting application source `ab385d792e19ff6db39d87f1123f47f660fc1e1d`.
+Status: frozen implementation checkpoint and earlier proposal retained for principal-owned overlap review; not implementation acceptance or deployment authority. Starting application source `ab385d792e19ff6db39d87f1123f47f660fc1e1d`.
+
+## Implemented checkpoint1847869, pending corrections
+
+Source d52fb22deedc74361f6e4ae4a0113dc4f215c3c2/report1847869884103f86c3053579dfb1b82145a93096 implements the additive store. Exact committed method signatures, DTO fields and every migration statement are extracted in `.artifacts/lead-c/store-api-schema-1847869.json`, SHA256 `8e549f6c18c3cf960747ffea44d0ad2099730782e305a66e6ab7ecf3974b2a39`. The repeatable extractor `build_store_interface_inventory.py` reads Git blobs and AST literals without importing application code or opening a database. Store raw Git SHA256 is `d385e0c85e79ded5fcb209a908ba212969fc7e963820aa5c2a931148ee11ddbd`.
+
+The checkpoint has 27 public constructor/method signatures and 16 schema objects: 15 tables plus the unique `policy_state_one_tier_intent` index. In addition to the original proposal below, the implemented schema includes `policy_state_action_history` and `policy_state_stop_updates`. Schema version1 checksum, computed by the implementation's newline-joined statement rule, is `09301def3abe2391194b0c03adbef7e05b6cfad2e5a38b8dabbf54f835bee67e`. This records a definition; no operational migration was performed. Existing `core/execution_store.py` and `core/execution_workflow.py` have no source changes from the accepted base.
+
+Implemented naming replaces proposed `put_deployment_identity` with `register_deployment_identity`, `update_portfolio_snapshot` with `record_portfolio_snapshot`, and exposes `record_action_intent` plus named cumulative-fill transitions for creation of holdings. Public readers include the individual action, holding, deployment chain, active generation, order aliases, stop intent and portfolio readers. The consumer composes them through `load_policy_execution_snapshot(*, deployment_generation_id, portfolio_snapshot_id)` to obtain one consistent transaction: current portfolio/deployment plus same-account/store holdings and relevant actions across their original pinned generations. Persisted holding and action projections expose `state_version` for CAS callers. The snapshot does not rewrite origin clocks to the current valuation clock.
+
+Full independent review requires seven fixes before acceptance: unknown aggregate risk, uncertainty retention during reference binding, protected holding transitions, late-fill tier recovery, provider-scoped aliases/versioning, partial-entry protection ingestion, and caller-version pointer CAS. The last may change the public pointer signature; protection correction may also add or constrain a writer. Regenerate the exact inventory after corrected source freezes. The 31 focused owner tests and lead's two passing feature-identity tests do not imply those defects are resolved; two first combined tests currently fail at partial-entry protection. Full report: `.artifacts/lead-c/issue-100-full-independent-review-1847869.md`.
+
+The following sections retain the earlier proposal and design rulings as history; implemented names and the frozen artifact above take precedence for this checkpoint. Final API/schema acceptance remains pending corrections and combined review.
 
 Owner #100: chat `01a0f861-76d9-7b11-9722-724643c52221`, worktree2286. Its mutable proposal is `docs/issue-100-state-interface-v1.md`. The revised frozen lead copy is `.artifacts/lead-c/issue-100-schema-proposal-d4c32c84.md`, SHA256 `d4c32c84fce585b9a08349dd4d3f2e920663b2e3904736c678a926a7a8bfc857`. It incorporates the design-review rulings below. The earlier b96ea401 proposal remains retained as review input; it is superseded.
 
