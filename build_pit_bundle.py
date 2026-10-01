@@ -15,7 +15,11 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from core.pit_data import PITDataBundle, sha256_file
+from core.pit_data import (
+    PITDataBundle,
+    PriceIdentityTransitionContract,
+    sha256_file,
+)
 from core.pit_provenance import (
     PIT_NON_TRADABLE_REFERENCE_SYMBOLS,
     pit_canonical_json,
@@ -581,7 +585,13 @@ def _v3_ticker_for_lineage(
     as_of: str,
     identities: Mapping[str, Mapping[str, object]],
     transitions: tuple[Mapping[str, object], ...],
+    segment_contract: PriceIdentityTransitionContract | None = None,
 ) -> str:
+    if (
+        segment_contract is not None
+        and segment_contract.has_segmented_chain(lineage)
+    ):
+        return segment_contract.resolve_ticker_for_lineage(lineage, as_of)
     successor_dates = {
         str(item["successor"]): str(item["effective_date"])
         for item in transitions
@@ -646,7 +656,13 @@ def _v3_provenance_metadata(
     industry_provenance_path: Path,
     industry_provenance: Mapping[str, object],
     allow_nonproduction_fixture: bool = False,
-) -> tuple[dict[str, str], set[str], dict[str, Mapping[str, object]], tuple[Mapping[str, object], ...]]:
+) -> tuple[
+    dict[str, str],
+    set[str],
+    dict[str, Mapping[str, object]],
+    tuple[Mapping[str, object], ...],
+    PriceIdentityTransitionContract | None,
+]:
     membership_sha = sha256_file(membership_path)
     prices_sha = sha256_file(prices_path)
     fundamentals_sha = sha256_file(fundamentals_path)
@@ -826,6 +842,21 @@ def _v3_provenance_metadata(
         fundamentals_provenance.get("security_names_csv_sha256"),
         field="security_names_csv_sha256",
     )
+    fundamentals_source_kind = _required_v3_text(
+        fundamentals_provenance, "source"
+    )
+    synthetic_fundamentals_fixture = (
+        admission_status == "nonproduction_fixture"
+        and allow_nonproduction_fixture
+        and fundamentals_source_kind == "synthetic fixture"
+    )
+    if (
+        fundamentals_source_kind != "SEC EDGAR official bulk archives"
+        and not synthetic_fundamentals_fixture
+    ):
+        raise ValueError(
+            "fundamentals provenance source is not the approved SEC bulk archive source"
+        )
     metadata = {
         "membership_admission_status": admission_status,
         "membership_source_evidence_mode": str(
@@ -859,7 +890,7 @@ def _v3_provenance_metadata(
         ),
         "price_exclusion_count": str(len(exclusions)),
         "price_exclusions_sha256": pit_canonical_json_sha256(sorted(exclusions)),
-        "fundamentals_source_kind": _required_v3_text(fundamentals_provenance, "source"),
+        "fundamentals_source_kind": fundamentals_source_kind,
         "industry_source_kind": industry_source_kind,
         "industry_retrieved_at_utc": industry_retrieved_at,
         "industry_row_count": str(len(industry)),
@@ -867,8 +898,6 @@ def _v3_provenance_metadata(
         "non_tradable_reference_symbols_sha256": pit_canonical_json_sha256(reference_values),
         "source_universes_json": pit_canonical_json(list(_V3_SOURCE_UNIVERSES)),
     }
-    if metadata["fundamentals_source_kind"] != "SEC EDGAR official bulk archives":
-        raise ValueError("fundamentals provenance source is not the approved SEC bulk archive source")
     for key in (
         "submissions_archive_sha256",
         "companyfacts_archive_sha256",
@@ -881,7 +910,7 @@ def _v3_provenance_metadata(
         raise ValueError("fundamentals export is empty")
     if date.fromisoformat(evaluation_start) > date.fromisoformat(cutoff):
         raise ValueError("evaluation_start is after data_cutoff")
-    return metadata, exclusions, identities, transitions
+    return metadata, exclusions, identities, transitions, segment_contract
 
 
 def _required_v3_text(source: Mapping[str, object], key: str) -> str:
@@ -1054,6 +1083,7 @@ def _integrity_gate_v3(
     price_exclusions: set[str],
     identities: Mapping[str, Mapping[str, object]],
     transitions: tuple[Mapping[str, object], ...],
+    segment_contract: PriceIdentityTransitionContract | None = None,
 ) -> None:
     cutoff_date = date.fromisoformat(cutoff)
     evaluation_date = date.fromisoformat(evaluation_start)
@@ -1093,7 +1123,9 @@ def _integrity_gate_v3(
         raise ValueError("each source universe must seed evaluation_start")
     active_union = set().union(*active_by_universe.values())
     for lineage in active_union:
-        _v3_ticker_for_lineage(lineage, evaluation_start, identities, transitions)
+        _v3_ticker_for_lineage(
+            lineage, evaluation_start, identities, transitions, segment_contract
+        )
 
     industry_by_date: dict[str, set[str]] = {}
     industry_groups: dict[tuple[str, str], set[str]] = {}
@@ -1109,7 +1141,9 @@ def _integrity_gate_v3(
         active = _v3_active_lineages(membership, as_of)
         union = set().union(*active.values())
         expected = {
-            _v3_ticker_for_lineage(lineage, as_of, identities, transitions)
+            _v3_ticker_for_lineage(
+                lineage, as_of, identities, transitions, segment_contract
+            )
             for lineage in union
         }
         if observed != expected:
@@ -1359,6 +1393,7 @@ def main() -> int:
             price_exclusions,
             identities,
             transitions,
+            segment_contract,
         ) = _v3_provenance_metadata(
             membership_path=membership_path,
             prices_path=prices_path,
@@ -1392,6 +1427,7 @@ def main() -> int:
             price_exclusions=price_exclusions,
             identities=identities,
             transitions=transitions,
+            segment_contract=segment_contract,
         )
     else:
         membership = _load_membership(membership_path, cutoff)

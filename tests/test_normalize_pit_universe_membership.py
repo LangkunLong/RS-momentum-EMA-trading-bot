@@ -6,6 +6,7 @@ import csv
 import hashlib
 import json
 import sqlite3
+import sys
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,11 +14,12 @@ from types import SimpleNamespace
 import pytest
 
 import build_pit_bundle as bundle_builder
+import normalize_pit_universe_membership as membership_normalizer
 from build_pit_bundle import (
     _load_v3_identity_contract,
     _require_v3_production_source_evidence,
 )
-from core.pit_data import PITDataBundle
+from core.pit_data import PITDataBundle, sha256_file
 from core.pit_provenance import (
     PIT_NON_TRADABLE_REFERENCE_SYMBOLS,
     pit_canonical_json,
@@ -626,6 +628,247 @@ def test_builder_v3_identity_loader_uses_source_root_for_opt_in_segments(
     assert segment_contract is not None
     assert segment_contract.resolve_ticker_for_lineage("fiserv", "2023-06-07") == "FI"
     assert segment_contract.resolve_ticker_for_lineage("fiserv", "2025-11-11") == "FISV"
+
+
+def test_v3_builder_resolves_all_fiserv_segment_episodes_end_to_end(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Use shape-only data labeled as a nonproduction fixture through both CLIs."""
+    prices_provenance, _ = _fiserv_segmented_price_identity(tmp_path)
+    warmup_start = "2020-01-02"
+    evaluation_start = "2024-01-02"
+    cutoff = "2025-12-31"
+    reference_days = (
+        warmup_start,
+        "2023-06-06",
+        evaluation_start,
+        "2025-11-11",
+        cutoff,
+    )
+    reference_symbols = tuple(PIT_NON_TRADABLE_REFERENCE_SYMBOLS)
+    price_rows = [
+        (day, ticker, "100", "101", "99", "100", "1000")
+        for ticker, days in (
+            ("FISV", (warmup_start, "2023-06-06", "2025-11-11")),
+            ("FI", ("2023-06-07", evaluation_start, "2025-11-10")),
+        )
+        for day in days
+    ]
+    price_rows.extend(
+        (day, ticker, "100", "101", "99", "100", "1000")
+        for day in reference_days
+        for ticker in reference_symbols
+    )
+    price_rows.sort(key=lambda row: (row[0], row[1]))
+    prices_path = tmp_path / "prices.csv"
+    with prices_path.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.writer(stream, lineterminator="\n")
+        writer.writerow(("trade_date", "ticker", "open", "high", "low", "close", "volume"))
+        writer.writerows(price_rows)
+
+    reference_coverage = {
+        ticker: {
+            "first_date": reference_days[0],
+            "last_date": reference_days[-1],
+            "session_count": len(reference_days),
+        }
+        for ticker in reference_symbols
+    }
+    spy_days_payload = (
+        "trade_date\n" + "\n".join(reference_days) + "\n"
+    ).encode("utf-8")
+    prices_provenance.update(
+        {
+            "prices_sha256": sha256_file(prices_path),
+            "price_row_count": len(price_rows),
+            "start_date": warmup_start,
+            "end_date": cutoff,
+            "source_kind": "synthetic fixture",
+            "source_sha256": "1" * 64,
+            "price_identity_map_sha256": "2" * 64,
+            "reference_symbol_coverage": reference_coverage,
+            "spy_trading_days_sha256": hashlib.sha256(spy_days_payload).hexdigest(),
+            "non_tradable_reference_symbols_json": pit_canonical_json(
+                list(reference_symbols)
+            ),
+            "non_tradable_reference_symbols_sha256": pit_canonical_json_sha256(
+                list(reference_symbols)
+            ),
+            "symbols_with_no_prices": [],
+        }
+    )
+    prices_provenance_path = tmp_path / "prices-provenance.json"
+    prices_provenance_path.write_text(
+        pit_canonical_json(prices_provenance) + "\n", encoding="utf-8"
+    )
+
+    membership_sources = _fiserv_membership_sources(
+        tmp_path, include_handoff_events=True
+    )
+    membership_path = tmp_path / "membership-v3.csv"
+    membership_provenance_path = tmp_path / "membership-v3.json"
+    normalizer_argv = [
+        "normalize_pit_universe_membership.py",
+        "--sp500-membership",
+        str(membership_sources["sp500"][0]),
+        "--sp500-provenance",
+        str(membership_sources["sp500"][1]),
+        "--nasdaq100-membership",
+        str(membership_sources["nasdaq100"][0]),
+        "--nasdaq100-provenance",
+        str(membership_sources["nasdaq100"][1]),
+        "--russell2000-membership",
+        str(membership_sources["russell2000"][0]),
+        "--russell2000-provenance",
+        str(membership_sources["russell2000"][1]),
+        "--prices-provenance",
+        str(prices_provenance_path),
+        "--output-csv",
+        str(membership_path),
+        "--output-provenance",
+        str(membership_provenance_path),
+    ]
+    monkeypatch.setattr(sys, "argv", normalizer_argv)
+    assert membership_normalizer.main() == 0
+
+    fundamentals_path = tmp_path / "fundamentals.csv"
+    with fundamentals_path.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.writer(stream, lineterminator="\n")
+        writer.writerow(
+            (
+                "ticker",
+                "statement_type",
+                "period_end",
+                "public_date",
+                "basic_eps",
+                "diluted_eps",
+                "total_revenue",
+                "net_income",
+                "common_stock",
+                "total_stockholders_equity",
+                "shares_outstanding",
+                "held_percent_institutions",
+                "institution_count",
+                "prev_institution_count",
+            )
+        )
+        writer.writerows(
+            (
+                ticker,
+                "quarterly",
+                "2019-12-31",
+                "2020-01-03",
+                "1",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+            )
+            for ticker in ("FI", "FISV")
+        )
+    fundamentals_provenance_path = tmp_path / "fundamentals-provenance.json"
+    fundamentals_provenance = {
+        "fundamentals_sha256": sha256_file(fundamentals_path),
+        "fundamental_row_count": 2,
+        "membership_csv_sha256": sha256_file(membership_path),
+        "start_date": warmup_start,
+        "end_date": cutoff,
+        "public_date_rule": bundle_builder._PUBLIC_DATE_RULE,
+        "security_names_csv_sha256": "3" * 64,
+        "source": "synthetic fixture",
+        "submissions_archive_sha256": "4" * 64,
+        "companyfacts_archive_sha256": "5" * 64,
+        "identity_manifest_csv_sha256": "6" * 64,
+    }
+    fundamentals_provenance_path.write_text(
+        pit_canonical_json(fundamentals_provenance) + "\n", encoding="utf-8"
+    )
+
+    industry_path = tmp_path / "industry.csv"
+    industry_rows = [
+        (ticker, as_of, "fixture-industry", "1", json.dumps([ticker]), json.dumps(["fixture-evidence"]))
+        for as_of, ticker in (
+            ("2023-06-06", "FISV"),
+            (evaluation_start, "FI"),
+            ("2025-11-11", "FISV"),
+        )
+    ]
+    industry_rows.sort(key=lambda row: (row[0], row[1]))
+    with industry_path.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.writer(stream, lineterminator="\n")
+        writer.writerow(
+            ("symbol", "as_of_date", "group_id", "group_rank", "group_members", "evidence_ids")
+        )
+        writer.writerows(industry_rows)
+    industry_provenance_path = tmp_path / "industry-provenance.json"
+    industry_provenance = {
+        "industry_sha256": sha256_file(industry_path),
+        "membership_csv_sha256": sha256_file(membership_path),
+        "data_cutoff": cutoff,
+        "row_count": len(industry_rows),
+        "symbol_count": len({row[0] for row in industry_rows}),
+        "first_as_of_date": min(row[1] for row in industry_rows),
+        "last_as_of_date": max(row[1] for row in industry_rows),
+        "source_kind": "synthetic fixture",
+        "retrieved_at_utc": _RETRIEVED_AT,
+    }
+    industry_provenance_path.write_text(
+        pit_canonical_json(industry_provenance) + "\n", encoding="utf-8"
+    )
+
+    bundle_path = tmp_path / "fiserv-v3.sqlite3"
+    manifest_path = tmp_path / "fiserv-v3-manifest.json"
+    builder_argv = [
+        "build_pit_bundle.py",
+        "--schema-version",
+        "3",
+        "--membership-csv",
+        str(membership_path),
+        "--prices-csv",
+        str(prices_path),
+        "--fundamentals-csv",
+        str(fundamentals_path),
+        "--industry-csv",
+        str(industry_path),
+        "--data-cutoff",
+        cutoff,
+        "--evaluation-start",
+        evaluation_start,
+        "--warmup-start",
+        warmup_start,
+        "--membership-provenance",
+        str(membership_provenance_path),
+        "--prices-provenance",
+        str(prices_provenance_path),
+        "--fundamentals-provenance",
+        str(fundamentals_provenance_path),
+        "--industry-provenance",
+        str(industry_provenance_path),
+        "--allow-nonproduction-fixture",
+        "--output",
+        str(bundle_path),
+        "--manifest-output",
+        str(manifest_path),
+    ]
+    monkeypatch.setattr(sys, "argv", builder_argv)
+    assert bundle_builder.main() == 0
+
+    with PITDataBundle(
+        bundle_path,
+        expected_sha256=sha256_file(bundle_path),
+        prices_provenance=prices_provenance_path,
+    ) as bundle:
+        assert bundle.metadata["membership_admission_status"] == "nonproduction_fixture"
+        assert bundle.metadata["membership_source_evidence_mode"] == "nonproduction_fixture"
+        assert bundle.metadata["fundamentals_source_kind"] == "synthetic fixture"
+        assert bundle.membership_v3.members_at("2023-06-06") == frozenset({"FISV"})
+        assert bundle.membership_v3.members_at(evaluation_start) == frozenset({"FI"})
+        assert bundle.membership_v3.members_at("2025-11-11") == frozenset({"FISV"})
 
 
 def test_labeled_nonproduction_v3_bundle_round_trips_metadata_and_four_columns(
