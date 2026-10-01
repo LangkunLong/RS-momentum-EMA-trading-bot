@@ -19,7 +19,7 @@ from core.pit_provenance import PIT_PUBLIC_DATES_ATTR
 
 
 def test_financial_feature_calculator_identity_is_versioned() -> None:
-    assert FINANCIAL_FEATURE_CALCULATOR_ID == "pit-financial-features-v2"
+    assert FINANCIAL_FEATURE_CALCULATOR_ID == "pit-financial-features-v3"
 
 
 def _quarterly_history() -> pd.DataFrame:
@@ -62,6 +62,44 @@ def test_acceleration_uses_the_two_newest_adjacent_quarters() -> None:
 
     # Q4 YoY is 50%, Q3 YoY is 33 1/3%; acceleration is their 16 2/3 pp delta.
     assert _earnings_acceleration(quarterly) == pytest.approx(1 / 6)
+
+
+def test_acceleration_accepts_adjacent_52_week_fiscal_periods_in_one_calendar_quarter() -> None:
+    quarterly = pd.DataFrame(
+        [
+            [2.0, 5.0, 3.0, 6.0],
+            [200.0, 500.0, 300.0, 600.0],
+        ],
+        index=["Diluted EPS", "Total Revenue"],
+        columns=pd.to_datetime(
+            ["2022-07-02", "2022-10-01", "2023-07-01", "2023-09-30"]
+        ),
+    )
+
+    # The 91-day fiscal-quarter endpoints are adjacent despite both mapping to
+    # calendar Q3. YoY growth is 50% then 20%, so acceleration is -30 pp.
+    assert (date(2023, 9, 30) - date(2023, 7, 1)).days == 91
+    assert _earnings_acceleration(quarterly) == pytest.approx(-0.30)
+    assert _growth_acceleration_for_label(quarterly, "Total Revenue") == pytest.approx(-0.30)
+
+
+def test_acceleration_keeps_a_skipped_52_week_fiscal_quarter_unavailable() -> None:
+    quarterly = pd.DataFrame(
+        [
+            [2.0, 5.0, 3.0, 6.0],
+            [200.0, 500.0, 300.0, 600.0],
+        ],
+        index=["Diluted EPS", "Total Revenue"],
+        columns=pd.to_datetime(
+            ["2022-04-02", "2022-10-01", "2023-04-01", "2023-09-30"]
+        ),
+    )
+
+    # These matched observations are 182 days apart (one missing quarter).
+    # Their calendar Q2→Q3 labels must not make them appear adjacent.
+    assert (date(2023, 9, 30) - date(2023, 4, 1)).days == 182
+    assert _earnings_acceleration(quarterly) is None
+    assert _growth_acceleration_for_label(quarterly, "Total Revenue") is None
 
 
 def test_annual_growth_trace_preserves_the_reported_period_gap() -> None:

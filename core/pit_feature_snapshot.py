@@ -11,8 +11,11 @@ that contains no row after the completed ``session``.  Price formulas are:
 
 Quarterly earnings/sales acceleration is the newest year-over-year growth rate
 minus the immediately preceding fiscal quarter's year-over-year growth rate;
-an intervening missing quarter makes acceleration unavailable. A fundamental's
-age is measured from the newest visible quarterly observation's normalized
+an intervening missing quarter makes acceleration unavailable. Since source
+period-end dates do not carry a fiscal-quarter number, adjacency uses a 12–15
+week endpoint cadence, covering ordinary 13-week quarters and a 14-week
+53-week-year quarter with one week of endpoint tolerance. A fundamental's age
+is measured from the newest visible quarterly observation's normalized
 first-usable session, never from its period end. Missing observations become
 ``None``; observed booleans, NaN, or infinities fail closed.
 """
@@ -35,7 +38,9 @@ from core.pit_universe_v3 import UNIVERSE_IDS
 
 _REFERENCE_SYMBOLS = frozenset({"SPY", "QQQ", "IWM"})
 _EPS_LABELS = ("Diluted EPS", "Basic EPS", "Net Income")
-FINANCIAL_FEATURE_CALCULATOR_ID = "pit-financial-features-v2"
+_MIN_ADJACENT_FISCAL_QUARTER_DAYS = 84
+_MAX_ADJACENT_FISCAL_QUARTER_DAYS = 105
+FINANCIAL_FEATURE_CALCULATOR_ID = "pit-financial-features-v3"
 _DEFERRED_FEATURE_IMPORTS = {
     "match_fiscal_year_over_year_periods": "core.canslim.fiscal_periods",
     "calculate_group_rs": "core.canslim.l_leader_laggard",
@@ -457,9 +462,12 @@ def _growth_acceleration(series: pd.Series) -> float | None:
     matches = _resolve_deferred_feature("match_fiscal_year_over_year_periods")(series)
     if len(matches) < 2 or not matches[0].matched or not matches[1].matched:
         return None
-    newest_quarter = pd.Period(matches[0].current_period, freq="Q")
-    previous_quarter = pd.Period(matches[1].current_period, freq="Q")
-    if newest_quarter.ordinal - previous_quarter.ordinal != 1:
+    period_gap_days = (matches[0].current_period - matches[1].current_period).days
+    if not (
+        _MIN_ADJACENT_FISCAL_QUARTER_DAYS
+        <= period_gap_days
+        <= _MAX_ADJACENT_FISCAL_QUARTER_DAYS
+    ):
         return None
     newest = _growth(matches[0].current_value, matches[0].prior_value)
     previous = _growth(matches[1].current_value, matches[1].prior_value)
