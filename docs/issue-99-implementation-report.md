@@ -52,7 +52,9 @@ SHA-256 evidence hashes (the synthetic records are inline in the test source):
 | `core/strategy_policy/account_reconciliation.py` | `1b67c78ee2ea6b32f5f5b19721c3d91fcbd2e00651cca9281e5db9bbf465edab` |
 | `tests/test_strategy_policy_account_reconciliation.py` | `5961150b5040bbdb0bc29879920a89f9ac3833cb7db6c18b28caaff9cf6ac3ac6` |
 
-## Verification record
+## Prior verification record (`e12a8a7`, report `f89172d`)
+
+The following 35-test receipt is from commit `e12a8a7`, before the independent-review fixes committed as `f9575a5`. It is historical evidence for that parent only; it was not rerun on `f9575a5`. The focused review-finding regressions for `f9575a5` are recorded below.
 
 Command:
 
