@@ -384,6 +384,9 @@ def test_replacement_partial_full_fills_keep_identity_risk_and_protection_after_
         )
         store.record_portfolio_snapshot(portfolio)
         snapshot = read_chain(store, deployment, portfolio)
+        assert [action for action in snapshot.action_projections if action.logical_action_id == action_id] == [
+            persisted
+        ]
         uncovered = reconcile_chain_snapshot(account, snapshot)
         assert not uncovered.ready
         assert uncovered.portfolio_features is None
