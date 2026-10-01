@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import date
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 import core.pit_coverage as coverage
 from core.pit_coverage import (
@@ -16,6 +18,7 @@ from core.pit_coverage import (
     _finalize_accumulator,
     _fundamental_age_state,
     _new_accumulator,
+    _price_metrics,
     build_coverage_report,
     classify_lookback,
     resolve_asof_classification,
@@ -78,6 +81,129 @@ def test_late_classification_requires_public_and_effective_dates() -> None:
 def test_warmup_status_uses_required_history_without_imputation() -> None:
     assert classify_lookback(49, 50) == (False, "insufficient_history")
     assert classify_lookback(50, 50) == (True, None)
+
+
+def test_atr20_requires_a_prior_close_and_twenty_true_ranges() -> None:
+    sessions = pd.bdate_range("2024-01-02", periods=21)
+    close = [100.0 + index for index in range(21)]
+    prices = pd.DataFrame(
+        {
+            "Open": close,
+            "High": [value + 1.0 for value in close],
+            "Low": [value - 1.0 for value in close],
+            "Close": close,
+            "Volume": [1000.0] * len(close),
+        },
+        index=sessions,
+    )
+
+    twenty_bar_metrics = _price_metrics(prices.iloc[:20], sessions[:20])
+    twenty_one_bar_metrics = _price_metrics(prices, sessions)
+
+    assert pd.isna(twenty_bar_metrics["atr_20_fraction"].iloc[-1])
+    assert twenty_one_bar_metrics["atr_20_fraction"].iloc[-1] == pytest.approx(
+        2.0 / close[-1]
+    )
+
+
+def test_quarterly_eps_full_window_counts_matched_growth_slots_not_source_rows() -> None:
+    periods = pd.to_datetime(
+        [
+            "2022-03-31",
+            "2022-09-30",
+            "2022-12-31",
+            "2023-03-31",
+            "2023-06-30",
+            "2023-09-30",
+            "2023-12-31",
+            "2024-03-31",
+        ]
+    )
+    eps = pd.Series([1.0, 1.0, 1.0, 1.2, 1.2, 1.2, 1.2, 1.3], index=periods)
+
+    window = coverage._quarterly_eps_full_window(eps)
+
+    assert window["ready"] is False
+    assert window["required_growth_slots"] == 4
+    assert window["represented_period_slots"] == 4
+    assert window["reported_level_count"] == 8
+    assert window["matched_growth_slots"] == 3
+    assert window["missing_growth_slots"] == 1
+    assert window["missing_slot_reason_counts"] == {"missing_comparable_period": 1}
+    assert window["slots"][3]["current_period_end"] == "2023-06-30"
+    assert window["slots"][3]["reason"] == "missing_comparable_period"
+
+
+def test_annual_full_window_flags_skipped_fiscal_year_separately() -> None:
+    periods = pd.to_datetime(
+        ["2020-12-31", "2021-12-31", "2023-12-31", "2024-12-31"]
+    )
+    eps = pd.Series([100.0, 120.0, 90.0, 150.0], index=periods)
+
+    window = coverage._annual_growth_full_window(eps)
+
+    assert window["ready"] is True
+    assert window["matched_growth_slots"] == 3
+    assert window["missing_growth_slots"] == 0
+    assert window["consecutive_fiscal_years_ready"] is False
+    assert window["skipped_fiscal_year_gaps"] == [
+        {
+            "current_period_end": "2023-12-31",
+            "comparison_period_end": "2021-12-31",
+            "skipped_fiscal_years": 1,
+            "slot": 2,
+        }
+    ]
+
+
+def test_full_window_summary_tracks_session_slots_reasons_and_distinct_tickers() -> None:
+    periods = pd.to_datetime(
+        [
+            "2022-03-31",
+            "2022-09-30",
+            "2022-12-31",
+            "2023-03-31",
+            "2023-06-30",
+            "2023-09-30",
+            "2023-12-31",
+            "2024-03-31",
+        ]
+    )
+    window = coverage._quarterly_eps_full_window(
+        pd.Series([1.0, 1.0, 1.0, 1.2, 1.2, 1.2, 1.2, 1.3], index=periods)
+    )
+    spec = next(spec for spec in FEATURE_SPECS if spec.feature_id == "quarterly_eps_growth")
+    cell = _cell(
+        spec=spec,
+        raw_count=8,
+        visible_count=8,
+        future_count=0,
+        payload={
+            "calculable": True,
+            "lookback_ready": True,
+            "required_history": 2,
+            "available_history": 8,
+            "reason": None,
+            "selected_period_ends": [],
+            "selected_available_from_sessions": [],
+            "metric_family": "diluted_eps",
+            "full_window": window,
+        },
+    )
+    assert cell["full_window"]["missing_growth_slots"] == 1
+    overall = _new_accumulator()
+    year = _new_accumulator()
+
+    _accumulate_cell(overall, year, "ABCD", cell)
+    _accumulate_cell(overall, year, "ABCD", cell)
+    summary = _finalize_accumulator(overall)["full_window_coverage"]
+
+    assert summary["denominator_security_sessions"] == 2
+    assert summary["ready_security_sessions"] == 0
+    assert summary["matched_growth_slots"] == 6
+    assert summary["missing_growth_slots"] == 2
+    assert summary["missing_slot_reason_counts"] == {"missing_comparable_period": 2}
+    assert summary["unique_tickers_with_missing_slots"] == 1
 
 
 def test_fundamental_age_ignores_a_newer_all_missing_quarter_and_keeps_provenance() -> None:
@@ -351,6 +477,16 @@ def test_small_fixed_history_report_keeps_market_rs_and_industry_denominators(
     assert report["features"]["relative_strength_score"]["overall"]["reason_counts"][
         "insufficient_history"
     ] == 3
+    quarterly_full_window = report["features"]["quarterly_eps_growth"]["overall"][
+        "full_window_coverage"
+    ]
+    assert quarterly_full_window["denominator_security_sessions"] == 39
+    assert quarterly_full_window["ready_security_sessions"] == 0
+    assert quarterly_full_window["required_growth_slots"] == 156
+    assert quarterly_full_window["missing_growth_slots"] == 156
+    assert quarterly_full_window["missing_slot_reason_counts"] == {
+        "absent_source_observation": 156
+    }
     assert report["features"]["breadth_above_50"]["overall"][
         "calculable_security_sessions"
     ] == 33
@@ -375,5 +511,10 @@ def test_small_fixed_history_report_keeps_market_rs_and_industry_denominators(
     with coverage.gzip.open(
         tmp_path / "report" / "security_session_coverage.jsonl.gz", "rt", encoding="utf-8"
     ) as row_file:
-        assert sum(1 for _line in row_file) == 39
+        first_row = json.loads(next(row_file))
+        assert first_row["features"]["quarterly_eps_growth"]["full_window"][
+            "required_growth_slots"
+        ] == 4
+        assert first_row["features"]["quarterly_eps_growth"]["full_window"]["ready"] is False
+        assert sum(1 for _line in row_file) == 38
     bundle._connection.close()

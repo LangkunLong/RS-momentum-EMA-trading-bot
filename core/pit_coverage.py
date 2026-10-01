@@ -45,7 +45,12 @@ from core.pit_feature_snapshot import (
 from core.pit_provenance import PIT_PUBLIC_DATES_ATTR
 
 
-REPORT_SCHEMA = "historical_feature_coverage_v1"
+REPORT_SCHEMA = "historical_feature_coverage_v2"
+_FULL_WINDOW_REQUIRED_SLOTS = {
+    "quarterly_eps_growth": 4,
+    "annual_eps_growth": 3,
+    "annual_revenue_growth": 3,
+}
 _DIGEST_LENGTH = 64
 _SOURCE_FIELDS: dict[str, dict[str, tuple[str, ...]]] = {
     "quarterly_eps_growth": {"quarterly": ("diluted_eps", "basic_eps", "net_income")},
@@ -530,6 +535,245 @@ def _series_row(frame: pd.DataFrame, patterns: tuple[str, ...]) -> pd.Series | N
     return None
 
 
+def _eps_series_for_family(
+    frame: pd.DataFrame, metric_family: Any
+) -> pd.Series | None:
+    pattern_by_family = {
+        "diluted_eps": "Diluted EPS",
+        "basic_eps": "Basic EPS",
+        "net_income": "Net Income",
+    }
+    pattern = pattern_by_family.get(str(metric_family))
+    return None if pattern is None else _series_row(frame, (pattern,))
+
+
+def _finite_number_or_none(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _missing_full_window(
+    required_slots: int, reason: str, *, annual: bool = False
+) -> dict[str, Any]:
+    slots = [
+        {
+            "slot": slot_number,
+            "current_period_end": None,
+            "comparison_period_end": None,
+            "comparison_period_matched": False,
+            "status": "missing",
+            "reason": reason,
+        }
+        for slot_number in range(1, required_slots + 1)
+    ]
+    result = {
+        "ready": False,
+        "required_growth_slots": required_slots,
+        "represented_period_slots": 0,
+        "reported_level_count": 0,
+        "matched_growth_slots": 0,
+        "missing_growth_slots": required_slots,
+        "missing_slot_reason_counts": {reason: required_slots},
+        "slots": slots,
+        "skipped_fiscal_year_gaps": [],
+    }
+    if annual:
+        result["consecutive_fiscal_years_ready"] = False
+    return result
+
+
+def _growth_window_payload(
+    *,
+    required_slots: int,
+    represented_period_slots: int,
+    reported_level_count: int,
+    slots: list[dict[str, Any]],
+    skipped_fiscal_year_gaps: list[dict[str, Any]] | None = None,
+    annual: bool = False,
+) -> dict[str, Any]:
+    matched = sum(slot["status"] == "matched" for slot in slots)
+    missing_reasons = Counter(
+        str(slot["reason"])
+        for slot in slots
+        if slot["status"] != "matched" and slot.get("reason") is not None
+    )
+    gaps = skipped_fiscal_year_gaps or []
+    ready = matched == required_slots
+    result = {
+        "ready": ready,
+        "required_growth_slots": required_slots,
+        "represented_period_slots": represented_period_slots,
+        "reported_level_count": reported_level_count,
+        "matched_growth_slots": matched,
+        "missing_growth_slots": required_slots - matched,
+        "missing_slot_reason_counts": dict(sorted(missing_reasons.items())),
+        "slots": slots,
+        "skipped_fiscal_year_gaps": gaps,
+    }
+    if annual:
+        result["consecutive_fiscal_years_ready"] = ready and not gaps
+    return result
+
+
+def _quarterly_eps_full_window(
+    series: pd.Series | None, required_slots: int = 4
+) -> dict[str, Any]:
+    if series is None:
+        return _missing_full_window(required_slots, "absent_source_observation")
+
+    matches = match_fiscal_year_over_year_periods(series)
+    slots: list[dict[str, Any]] = []
+    for slot_number in range(1, required_slots + 1):
+        if slot_number > len(matches):
+            slots.append(
+                {
+                    "slot": slot_number,
+                    "current_period_end": None,
+                    "comparison_period_end": None,
+                    "comparison_period_matched": False,
+                    "status": "missing",
+                    "reason": "insufficient_reported_periods",
+                }
+            )
+            continue
+
+        match = matches[slot_number - 1]
+        current_period = match.current_period.isoformat()
+        comparison_period = (
+            None if match.prior_period is None else match.prior_period.isoformat()
+        )
+        reason = None
+        current = _finite_number_or_none(match.current_value)
+        prior = _finite_number_or_none(match.prior_value)
+        if current is None:
+            reason = (
+                "missing_current_value"
+                if pd.isna(match.current_value)
+                else "invalid_nonfinite_current_value"
+            )
+        elif not match.matched:
+            reason = "missing_comparable_period"
+        elif prior is None:
+            reason = (
+                "missing_comparison_value"
+                if pd.isna(match.prior_value)
+                else "invalid_nonfinite_comparison_value"
+            )
+        elif prior <= 0 or bool(np.isclose(prior, 0.0)):
+            reason = "invalid_nonpositive_or_near_zero_comparison_value"
+        elif _finite_number_or_none((current / prior) - 1.0) is None:
+            reason = "invalid_nonfinite_growth"
+
+        slots.append(
+            {
+                "slot": slot_number,
+                "current_period_end": current_period,
+                "comparison_period_end": comparison_period,
+                "comparison_period_matched": bool(match.matched),
+                "status": "matched" if reason is None else "missing",
+                "reason": reason,
+            }
+        )
+
+    return _growth_window_payload(
+        required_slots=required_slots,
+        represented_period_slots=min(len(matches), required_slots),
+        reported_level_count=int(series.notna().sum()),
+        slots=slots,
+    )
+
+
+def _annual_growth_full_window(
+    series: pd.Series | None,
+    required_slots: int = 3,
+    *,
+    reject_near_zero_prior: bool = True,
+) -> dict[str, Any]:
+    if series is None:
+        return _missing_full_window(required_slots, "absent_source_observation", annual=True)
+
+    levels = series.dropna().sort_index()
+    latest_levels = list(levels.iloc[-(required_slots + 1) :].items())
+    slots: list[dict[str, Any]] = []
+    skipped_gaps: list[dict[str, Any]] = []
+    pair_count = min(max(0, len(latest_levels) - 1), required_slots)
+    for slot_number in range(1, required_slots + 1):
+        if slot_number > pair_count:
+            slots.append(
+                {
+                    "slot": slot_number,
+                    "current_period_end": None,
+                    "comparison_period_end": None,
+                    "comparison_period_matched": False,
+                    "status": "missing",
+                    "reason": "insufficient_reported_periods",
+                    "skipped_fiscal_years": 0,
+                }
+            )
+            continue
+
+        current_label, current_raw = latest_levels[-slot_number]
+        comparison_label, comparison_raw = latest_levels[-slot_number - 1]
+        current_period = pd.Timestamp(current_label).date()
+        comparison_period = pd.Timestamp(comparison_label).date()
+        skipped_years = max(0, current_period.year - comparison_period.year - 1)
+        current = _finite_number_or_none(current_raw)
+        prior = _finite_number_or_none(comparison_raw)
+        reason = None
+        if current is None:
+            reason = (
+                "missing_current_value"
+                if pd.isna(current_raw)
+                else "invalid_nonfinite_current_value"
+            )
+        elif prior is None:
+            reason = (
+                "missing_comparison_value"
+                if pd.isna(comparison_raw)
+                else "invalid_nonfinite_comparison_value"
+            )
+        elif prior <= 0 or (reject_near_zero_prior and bool(np.isclose(prior, 0.0))):
+            reason = (
+                "invalid_nonpositive_or_near_zero_comparison_value"
+                if reject_near_zero_prior
+                else "invalid_nonpositive_comparison_value"
+            )
+        elif _finite_number_or_none((current / prior) - 1.0) is None:
+            reason = "invalid_nonfinite_growth"
+
+        slot = {
+            "slot": slot_number,
+            "current_period_end": current_period.isoformat(),
+            "comparison_period_end": comparison_period.isoformat(),
+            "comparison_period_matched": True,
+            "status": "matched" if reason is None else "missing",
+            "reason": reason,
+            "skipped_fiscal_years": skipped_years,
+        }
+        slots.append(slot)
+        if skipped_years:
+            skipped_gaps.append(
+                {
+                    "current_period_end": current_period.isoformat(),
+                    "comparison_period_end": comparison_period.isoformat(),
+                    "skipped_fiscal_years": skipped_years,
+                    "slot": slot_number,
+                }
+            )
+
+    return _growth_window_payload(
+        required_slots=required_slots,
+        represented_period_slots=pair_count,
+        reported_level_count=len(levels),
+        slots=slots,
+        skipped_fiscal_year_gaps=skipped_gaps,
+        annual=True,
+    )
+
+
 def _selected_public_dates(frame: pd.DataFrame, periods: Iterable[Any]) -> list[str]:
     raw = frame.attrs.get(PIT_PUBLIC_DATES_ATTR, {})
     if not isinstance(raw, Mapping):
@@ -712,6 +956,9 @@ def _financial_states(
                 not in {"no_visible_observation", "no_comparable_prior_period", "insufficient_annual_history"}
             ),
         )
+        q_eps["full_window"] = _quarterly_eps_full_window(
+            _eps_series_for_family(quarterly, c_trace.metric_family)
+        )
 
         q_revenue = _quarterly_revenue_state(quarterly)
         eps_series = _series_row(quarterly, ("Diluted EPS", "Basic EPS", "Net Income"))
@@ -768,7 +1015,14 @@ def _financial_states(
                 )
             ),
         )
+        a_state["full_window"] = _annual_growth_full_window(
+            _eps_series_for_family(annual, a_trace.metric_family)
+        )
         annual_revenue = _annual_revenue_state(annual)
+        annual_revenue["full_window"] = _annual_growth_full_window(
+            _series_row(annual, ("Total Revenue", "Revenue")),
+            reject_near_zero_prior=False,
+        )
 
         roe = _calculate_roe(annual, balance) if not annual.empty and not balance.empty else None
         net_income_series = _series_row(annual, ("Net Income",))
@@ -874,6 +1128,7 @@ def _price_metrics(frame: pd.DataFrame, sessions: pd.DatetimeIndex) -> pd.DataFr
         (high - low, (high - prior_close).abs(), (low - prior_close).abs()),
         axis=1,
     ).max(axis=1)
+    true_range.iloc[0] = np.nan
     dollar_volume = close * volume
     available = pd.Series(np.arange(1, len(frame) + 1), index=frame.index, dtype="int32")
     result = pd.DataFrame(index=frame.index)
@@ -965,7 +1220,7 @@ def _cell(
         unavailable_stage = "invalid"
     else:
         unavailable_stage = "insufficient_history"
-    return {
+    result = {
         "source_observation_rows": int(raw_count),
         "public_observation_rows": int(visible_count),
         "not_yet_public_observation_rows": int(future_count),
@@ -987,6 +1242,21 @@ def _cell(
         "selected_available_from_sessions": list(payload.get("selected_available_from_sessions", ())),
         "metric_family": payload.get("metric_family"),
     }
+    if spec.feature_id in _FULL_WINDOW_REQUIRED_SLOTS:
+        full_window = payload.get("full_window")
+        if not isinstance(full_window, Mapping):
+            missing_reason = (
+                "not_yet_public"
+                if visible_count == 0 and raw_count > 0
+                else ("absent_source_observation" if raw_count == 0 else "no_visible_reported_period")
+            )
+            full_window = _missing_full_window(
+                _FULL_WINDOW_REQUIRED_SLOTS[spec.feature_id],
+                missing_reason,
+                annual=spec.feature_id != "quarterly_eps_growth",
+            )
+        result["full_window"] = dict(full_window)
+    return result
 
 
 def _empty_state(reason: str, minimum_history: int | None) -> dict[str, Any]:
@@ -1437,6 +1707,33 @@ def build_coverage_report(
         "source_revision": source_revision,
         "feature_contract": "historical-feature-specification-v1",
         "feature_contract_sha256": sha256_file(feature_spec_file),
+        "full_window_coverage_contract": {
+            "separate_from_latest_value_stages": True,
+            "raw_source_row_counts_are_not_matched_growth_slots": True,
+            "features": {
+                "quarterly_eps_growth": {
+                    "required_growth_slots": 4,
+                    "readiness": "all four newest fiscal-quarter slots have a valid same-period prior-year comparison",
+                },
+                "annual_eps_growth": {
+                    "required_growth_slots": 3,
+                    "level_basis": (
+                        "four newest nonmissing annual values from the EPS family "
+                        "selected by the existing A evaluator"
+                    ),
+                    "readiness": "all three adjacent reported-level growth slots are valid",
+                },
+                "annual_revenue_growth": {
+                    "required_growth_slots": 3,
+                    "level_basis": "four newest nonmissing reported annual revenue values",
+                    "readiness": "all three adjacent reported-level growth slots are valid",
+                },
+            },
+            "annual_fiscal_year_gaps": (
+                "Adjacent available annual observations remain the comparison basis; "
+                "skipped fiscal years are separately enumerated and do not alter the existing score."
+            ),
+        },
         "historical_data_format_version": schema_version,
         "optimizer_version": 5,
         "policy_interface_version": 3,
@@ -1558,7 +1855,62 @@ def _new_accumulator() -> dict[str, Any]:
         "unique_tickers_by_reason": defaultdict(set),
         "policy_input_reason_counts": Counter(),
         "unique_tickers_by_policy_input_reason": defaultdict(set),
+        "full_window": _new_full_window_accumulator(),
     }
+
+
+def _new_full_window_accumulator() -> dict[str, Any]:
+    return {
+        "denominator_security_sessions": 0,
+        "ready_security_sessions": 0,
+        "incomplete_security_sessions": 0,
+        "unique_ready_tickers": set(),
+        "unique_incomplete_tickers": set(),
+        "required_growth_slots": 0,
+        "matched_growth_slots": 0,
+        "missing_growth_slots": 0,
+        "missing_slot_reason_counts": Counter(),
+        "unique_tickers_with_missing_slots": set(),
+        "fiscal_year_gap_slots": 0,
+        "skipped_fiscal_years": 0,
+        "security_sessions_with_skipped_fiscal_years": 0,
+        "unique_tickers_with_skipped_fiscal_years": set(),
+        "consecutive_fiscal_years_ready_security_sessions": None,
+    }
+
+
+def _accumulate_full_window(
+    accumulator: dict[str, Any], ticker: str, full_window: Mapping[str, Any]
+) -> None:
+    accumulator["denominator_security_sessions"] += 1
+    ready = bool(full_window.get("ready"))
+    ready_key = "ready_security_sessions" if ready else "incomplete_security_sessions"
+    unique_key = "unique_ready_tickers" if ready else "unique_incomplete_tickers"
+    accumulator[ready_key] += 1
+    accumulator[unique_key].add(ticker)
+    accumulator["required_growth_slots"] += int(full_window.get("required_growth_slots", 0))
+    accumulator["matched_growth_slots"] += int(full_window.get("matched_growth_slots", 0))
+    missing = int(full_window.get("missing_growth_slots", 0))
+    accumulator["missing_growth_slots"] += missing
+    if missing:
+        accumulator["unique_tickers_with_missing_slots"].add(ticker)
+        for reason, count in full_window.get("missing_slot_reason_counts", {}).items():
+            accumulator["missing_slot_reason_counts"][str(reason)] += int(count)
+
+    fiscal_gaps = full_window.get("skipped_fiscal_year_gaps", ())
+    if fiscal_gaps:
+        accumulator["fiscal_year_gap_slots"] += len(fiscal_gaps)
+        accumulator["skipped_fiscal_years"] += sum(
+            int(gap.get("skipped_fiscal_years", 0)) for gap in fiscal_gaps
+        )
+        accumulator["security_sessions_with_skipped_fiscal_years"] += 1
+        accumulator["unique_tickers_with_skipped_fiscal_years"].add(ticker)
+
+    if "consecutive_fiscal_years_ready" in full_window:
+        if accumulator["consecutive_fiscal_years_ready_security_sessions"] is None:
+            accumulator["consecutive_fiscal_years_ready_security_sessions"] = 0
+        if bool(full_window["consecutive_fiscal_years_ready"]):
+            accumulator["consecutive_fiscal_years_ready_security_sessions"] += 1
 
 
 def _accumulate_cell(
@@ -1584,10 +1936,15 @@ def _accumulate_cell(
         if policy_reason is not None:
             accumulator["policy_input_reason_counts"][policy_reason] += 1
             accumulator["unique_tickers_by_policy_input_reason"][policy_reason].add(ticker)
+        if isinstance(cell.get("full_window"), Mapping):
+            _accumulate_full_window(
+                accumulator["full_window"], ticker, cell["full_window"]
+            )
 
 
 def _finalize_accumulator(value: dict[str, Any]) -> dict[str, Any]:
-    result = dict(value)
+    full_window = value.get("full_window")
+    result = {key: item for key, item in value.items() if key != "full_window"}
     for key, item in tuple(result.items()):
         if isinstance(item, set):
             result[key] = len(item)
@@ -1606,6 +1963,27 @@ def _finalize_accumulator(value: dict[str, Any]) -> dict[str, Any]:
         "policy_input_ready_security_sessions",
     ):
         result[key.replace("_security_sessions", "_fraction")] = _ratio(result[key], denominator)
+    if (
+        isinstance(full_window, Mapping)
+        and int(full_window.get("denominator_security_sessions", 0)) > 0
+    ):
+        finalized_full_window: dict[str, Any] = {}
+        for key, item in full_window.items():
+            if isinstance(item, set):
+                finalized_full_window[key] = len(item)
+            elif isinstance(item, Counter):
+                finalized_full_window[key] = dict(sorted(item.items()))
+            else:
+                finalized_full_window[key] = item
+        full_denominator = int(finalized_full_window["denominator_security_sessions"])
+        finalized_full_window["ready_fraction"] = _ratio(
+            finalized_full_window["ready_security_sessions"], full_denominator
+        )
+        finalized_full_window["matched_growth_slot_fraction"] = _ratio(
+            finalized_full_window["matched_growth_slots"],
+            finalized_full_window["required_growth_slots"],
+        )
+        result["full_window_coverage"] = finalized_full_window
     return result
 
 
