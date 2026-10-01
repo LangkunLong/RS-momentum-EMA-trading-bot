@@ -462,12 +462,14 @@ def _identity_extraction_history_rows(
         raise ValueError("financial extraction date bounds are invalid")
     relevant_lineages = {row[1] for row in membership}
     candidates: list[tuple[str, date, date, str, str]] = []
+    segmented_lineages: set[str] = set()
     if segment_contract is not None:
         segments = getattr(segment_contract, "segments", None)
         if not isinstance(segments, Mapping):
             raise ValueError("price identity segment contract is invalid")
         for segment_id, segment in segments.items():
             lineage = str(getattr(segment, "chain_id", ""))
+            segmented_lineages.add(lineage)
             if lineage not in relevant_lineages:
                 continue
             ticker = str(getattr(segment, "provider_symbol", ""))
@@ -479,7 +481,9 @@ def _identity_extraction_history_rows(
             clipped_end = min(last, segment_end)
             if clipped_start <= clipped_end:
                 candidates.append((ticker, clipped_start, clipped_end, lineage, str(segment_id)))
-    else:
+
+    legacy_lineages = relevant_lineages.difference(segmented_lineages)
+    if legacy_lineages:
         chain_by_ticker = {
             ticker: str(identity.get("chain_id", ""))
             for ticker, identity in identities.items()
@@ -487,7 +491,7 @@ def _identity_extraction_history_rows(
         bounds: dict[str, list[date]] = {}
         for ticker, identity in identities.items():
             lineage = chain_by_ticker[ticker]
-            if lineage not in relevant_lineages:
+            if lineage not in legacy_lineages:
                 continue
             try:
                 segment_start = date.fromisoformat(str(identity["admitted_start"]))
@@ -506,7 +510,7 @@ def _identity_extraction_history_rows(
                 effective = date.fromisoformat(str(transition["effective_date"]))
             except (KeyError, ValueError) as exc:
                 raise ValueError("price identity extraction transition is invalid") from exc
-            if lineage not in relevant_lineages:
+            if lineage not in legacy_lineages:
                 continue
             if predecessor in bounds:
                 bounds[predecessor][1] = min(bounds[predecessor][1], effective - timedelta(days=1))

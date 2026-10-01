@@ -19,6 +19,7 @@ from core.sec_pit_fundamentals import (
     FundamentalAuditRow,
     FundamentalExportResult,
     FundamentalRow,
+    IdentityExtractionRow,
     SecurityMasterResult,
     SecurityMasterRow,
 )
@@ -149,7 +150,7 @@ def test_projection_rejects_overlapping_lineages_mapped_to_the_same_ticker() -> 
         )
 
 
-def test_validated_fiserv_segment_history_keeps_repeated_fisv_episodes(
+def test_segment_contract_keeps_ordinary_history_in_a_mixed_universe(
     tmp_path: Path,
 ) -> None:
     segment_fixtures = runpy.run_path(
@@ -159,27 +160,39 @@ def test_validated_fiserv_segment_history_keeps_repeated_fisv_episodes(
     bundle, prices_provenance = _bundle_with_segments(tmp_path)
     contract = bundle.load_price_identity_transition_contract(prices_provenance)
     membership = (
-        ("2020-01-01", "fiserv", "sp500", 1),
+        ("2021-01-04", "fiserv", "sp500", 1),
+        ("2021-01-04", "ordinary", "sp500", 1),
         ("2025-12-31", "fiserv", "sp500", 0),
+        ("2025-12-31", "ordinary", "sp500", 0),
     )
+    identities = dict(contract.identities)
+    identities["ORD"] = {
+        "chain_id": "ordinary",
+        "admitted_start": "2020-01-01",
+        "admitted_end": "2025-12-31",
+    }
     projection = project_v3_membership_to_ticker(
         membership,
-        resolve_ticker_for_lineage=lambda lineage, when: contract.resolve_ticker_for_lineage(
-            lineage, when
+        resolve_ticker_for_lineage=lambda lineage, when: (
+            contract.resolve_ticker_for_lineage(lineage, when)
+            if contract.has_segmented_chain(lineage)
+            else "ORD"
         ),
         identity_boundaries=identity_boundaries_from_contract((), contract),
     )
     assert projection.ticker_events == (
-        ("2020-01-01", "FISV", 1),
+        ("2021-01-04", "FISV", 1),
+        ("2021-01-04", "ORD", 1),
         ("2023-06-07", "FI", 1),
         ("2023-06-07", "FISV", 0),
         ("2025-11-11", "FI", 0),
         ("2025-11-11", "FISV", 1),
         ("2025-12-31", "FISV", 0),
+        ("2025-12-31", "ORD", 0),
     )
     history = _identity_extraction_history_rows(
         membership,
-        identities=contract.identities,
+        identities=identities,
         transitions=(),
         segment_contract=contract,
         start_date="2020-01-01",
@@ -189,7 +202,315 @@ def test_validated_fiserv_segment_history_keeps_repeated_fisv_episodes(
         ("FI", "2023-06-07", "2025-11-10", "fiserv", "fiserv-fi-2023-2025"),
         ("FISV", "2020-01-01", "2023-06-06", "fiserv", "fiserv-fisv-pre-2023"),
         ("FISV", "2025-11-11", "2025-12-31", "fiserv", "fiserv-fisv-post-2025"),
+        ("ORD", "2020-01-01", "2025-12-31", "ordinary", ""),
     )
+
+    membership_csv = tmp_path / "mixed_membership.csv"
+    _write_csv(
+        membership_csv,
+        ("effective_date", "ticker", "member"),
+        [tuple(map(str, row)) for row in projection.ticker_events],
+    )
+    history_csv = tmp_path / "mixed_identity_history.csv"
+    _write_csv(
+        history_csv,
+        (
+            "ticker",
+            "first_extraction_date",
+            "last_extraction_date",
+            "security_lineage_id",
+            "identity_segment_id",
+        ),
+        list(history),
+    )
+    names_csv = tmp_path / "mixed_security_names.csv"
+    _write_csv(
+        names_csv,
+        ("ticker", "company_name"),
+        [("FI", "Fiserv Inc"), ("FISV", "Fiserv Inc"), ("ORD", "Ordinary Co")],
+    )
+    identity_csv = tmp_path / "mixed_identity_manifest.csv"
+    _write_csv(
+        identity_csv,
+        (
+            "canonical_ticker", "provider_symbol", "identity_asof", "admitted_start",
+            "admitted_end", "chain_id", "continuity_kind", "warmup_predecessor",
+            "factor_anchor", "evidence_url",
+        ),
+        [
+            ("FI", "FI", "2025-11-10", "2023-06-07", "2025-11-10", "fiserv", "same_issuer_ticker_reuse", "FISV", "0", "synthetic://fi"),
+            ("FISV", "FISV", "2025-12-31", "2020-01-01", "2025-12-31", "fiserv", "same_issuer_ticker_reuse", "", "1", "synthetic://fisv"),
+            ("ORD", "ORD", "2025-12-31", "2020-01-01", "2025-12-31", "ordinary", "standalone", "", "1", "synthetic://ord"),
+        ],
+    )
+    submissions_zip = tmp_path / "mixed_submissions.zip"
+    empty_recent = {
+        "accessionNumber": [], "form": [], "filingDate": [], "acceptanceDateTime": []
+    }
+    with zipfile.ZipFile(submissions_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for cik, name, tickers in (
+            (798354, "Fiserv Inc", ["FISV", "FI"]),
+            (2, "Ordinary Co", ["ORD"]),
+        ):
+            archive.writestr(
+                f"CIK{cik:010d}.json",
+                json.dumps({
+                    "cik": cik,
+                    "name": name,
+                    "tickers": tickers,
+                    "formerNames": [],
+                    "filings": {"recent": empty_recent, "files": []},
+                }),
+            )
+    security_master = sec_export.build_security_master(
+        membership_csv,
+        names_csv,
+        submissions_zip,
+        identity_csv,
+        start_date=date(2021, 1, 1),
+        end_date=date(2025, 12, 31),
+        extraction_start_date=date(2020, 1, 1),
+        identity_extraction_history_csv=history_csv,
+    )
+    assert any(row.ticker == "ORD" for row in security_master.identity_extraction_rows)
+
+    companyfacts_zip = tmp_path / "mixed_companyfacts.zip"
+    with zipfile.ZipFile(companyfacts_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for cik, name, accession, filed, period_end, quarter_start, value in (
+            (798354, "Fiserv Inc", "000000000120230001", "2023-01-01", "2022-12-31", "2022-10-01", 1.0),
+            (2, "Ordinary Co", "000000000220200001", "2020-01-02", "2019-12-31", "2019-10-01", 3.0),
+        ):
+            archive.writestr(
+                f"CIK{cik:010d}.json",
+                json.dumps({
+                    "cik": cik,
+                    "entityName": name,
+                    "facts": {
+                        "us-gaap": {
+                            "EarningsPerShareBasic": {
+                                "units": {
+                                    "USD/shares": [{
+                                        "accn": accession,
+                                        "form": "10-Q",
+                                        "filed": filed,
+                                        "end": period_end,
+                                        "start": quarter_start,
+                                        "fy": period_end[:4],
+                                        "fp": "Q4",
+                                        "val": value,
+                                    }]
+                                }
+                            }
+                        }
+                    },
+                }),
+            )
+    spy_csv = tmp_path / "mixed_spy_days.csv"
+    _write_csv(
+        spy_csv,
+        ("trade_date",),
+        [(day,) for day in ("2020-01-03", "2023-01-03", "2025-12-31")],
+    )
+    fundamentals = sec_export.extract_fundamentals(
+        companyfacts_zip,
+        security_master,
+        spy_csv,
+        start_date=date(2020, 1, 1),
+        end_date=date(2025, 12, 31),
+    )
+    assert any(row.ticker == "ORD" and row.basic_eps == 3.0 for row in fundamentals.rows)
+
+
+def test_same_issuer_reentry_keeps_intervening_alias_fundamentals(
+    tmp_path: Path,
+) -> None:
+    facts_path = tmp_path / "companyfacts.zip"
+    facts = {
+        "cik": 798354,
+        "entityName": "Fiserv Inc",
+        "facts": {
+            "us-gaap": {
+                "EarningsPerShareBasic": {
+                    "units": {
+                        "USD/shares": [
+                            {
+                                "accn": "000000000120230001",
+                                "form": "10-Q",
+                                "filed": "2023-01-01",
+                                "end": "2022-12-31",
+                                "start": "2022-10-01",
+                                "fy": "2022",
+                                "fp": "Q4",
+                                "val": 1.0,
+                            },
+                            {
+                                "accn": "000000000120240001",
+                                "form": "10-Q",
+                                "filed": "2024-01-02",
+                                "end": "2023-12-31",
+                                "start": "2023-10-01",
+                                "fy": "2023",
+                                "fp": "Q4",
+                                "val": 2.0,
+                            },
+                        ]
+                    }
+                }
+            }
+        },
+    }
+    _write_json_zip(facts_path, "CIK0000798354.json", facts)
+    spy_csv = tmp_path / "spy_days.csv"
+    _write_csv(
+        spy_csv,
+        ("trade_date",),
+        [(day,) for day in ("2023-01-03", "2024-01-03", "2025-12-31")],
+    )
+    security_master = SecurityMasterResult(
+        rows=(
+            SecurityMasterRow(
+                "FISV", "0000798354", "Fiserv Inc", date(2021, 1, 4), date(2023, 6, 6), "identity_manifest"
+            ),
+            SecurityMasterRow(
+                "FI", "0000798354", "Fiserv Inc", date(2023, 6, 7), date(2025, 11, 10), "identity_manifest"
+            ),
+            SecurityMasterRow(
+                "FISV", "0000798354", "Fiserv Inc", date(2025, 11, 11), date(2025, 12, 31), "identity_manifest"
+            ),
+        ),
+        exclusions=(),
+        acceptance_by_cik={},
+        membership_union=("FI", "FISV"),
+        identity_manifest_sha256="a" * 64,
+        submissions_archive_sha256="b" * 64,
+        missing_submission_fragments=0,
+        identity_extraction_rows=(
+            IdentityExtractionRow(
+                "FISV", "0000798354", "Fiserv Inc", date(2020, 1, 1), date(2023, 6, 6),
+                "fiserv", "fiserv-fisv-pre-2023", "identity_manifest"
+            ),
+            IdentityExtractionRow(
+                "FI", "0000798354", "Fiserv Inc", date(2023, 6, 7), date(2025, 11, 10),
+                "fiserv", "fiserv-fi-2023-2025", "identity_manifest"
+            ),
+            IdentityExtractionRow(
+                "FISV", "0000798354", "Fiserv Inc", date(2025, 11, 11), date(2025, 12, 31),
+                "fiserv", "fiserv-fisv-post-2025", "identity_manifest"
+            ),
+        ),
+    )
+
+    extracted = sec_export.extract_fundamentals(
+        facts_path,
+        security_master,
+        spy_csv,
+        start_date=date(2020, 1, 1),
+        end_date=date(2025, 12, 31),
+    )
+
+    assert [
+        (row.ticker, row.public_date.isoformat(), row.basic_eps)
+        for row in extracted.rows
+    ] == [
+        ("FI", "2023-01-03", 1.0),
+        ("FI", "2024-01-03", 2.0),
+        ("FISV", "2023-01-03", 1.0),
+        ("FISV", "2024-01-03", 2.0),
+    ]
+
+
+def test_reused_ticker_keeps_each_issuer_inside_its_own_window(
+    tmp_path: Path,
+) -> None:
+    facts_path = tmp_path / "companyfacts.zip"
+
+    def payload(cik: int, name: str, records: list[tuple[str, str, str, str, float]]) -> dict[str, object]:
+        return {
+            "cik": cik,
+            "entityName": name,
+            "facts": {
+                "us-gaap": {
+                    "EarningsPerShareBasic": {
+                        "units": {
+                            "USD/shares": [
+                                {
+                                    "accn": accession,
+                                    "form": "10-Q",
+                                    "filed": filed,
+                                    "end": period_end,
+                                    "start": quarter_start,
+                                    "fy": period_end[:4],
+                                    "fp": "Q4",
+                                    "val": value,
+                                }
+                                for accession, filed, period_end, quarter_start, value in records
+                            ]
+                        }
+                    }
+                }
+            },
+        }
+
+    with zipfile.ZipFile(facts_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "CIK0000000001.json",
+            json.dumps(payload(1, "Old Issuer", [
+                ("000000000120210001", "2021-01-01", "2020-12-31", "2020-10-01", 0.5),
+                ("000000000120240001", "2024-01-02", "2022-12-31", "2022-10-01", 5.0),
+            ])),
+        )
+        archive.writestr(
+            "CIK0000000002.json",
+            json.dumps(payload(2, "New Issuer", [
+                ("000000000220210001", "2021-08-01", "2021-06-30", "2021-04-01", 10.0),
+                ("000000000220240001", "2024-01-02", "2023-12-31", "2023-10-01", 2.0),
+            ])),
+        )
+    spy_csv = tmp_path / "spy_days.csv"
+    _write_csv(
+        spy_csv,
+        ("trade_date",),
+        [(day,) for day in ("2021-01-04", "2021-08-02", "2024-01-03", "2025-12-31")],
+    )
+    security_master = SecurityMasterResult(
+        rows=(
+            SecurityMasterRow(
+                "REUSE", "0000000001", "Old Issuer", date(2020, 1, 1), date(2022, 12, 31), "identity_manifest"
+            ),
+            SecurityMasterRow(
+                "REUSE", "0000000002", "New Issuer", date(2023, 1, 1), date(2025, 12, 31), "identity_manifest"
+            ),
+        ),
+        exclusions=(),
+        acceptance_by_cik={},
+        membership_union=("REUSE",),
+        identity_manifest_sha256="c" * 64,
+        submissions_archive_sha256="d" * 64,
+        missing_submission_fragments=0,
+        identity_extraction_rows=(
+            IdentityExtractionRow(
+                "REUSE", "0000000001", "Old Issuer", date(2020, 1, 1), date(2022, 12, 31),
+                "old_issuer", "", "identity_manifest"
+            ),
+            IdentityExtractionRow(
+                "REUSE", "0000000002", "New Issuer", date(2023, 1, 1), date(2025, 12, 31),
+                "new_issuer", "", "identity_manifest"
+            ),
+        ),
+    )
+
+    extracted = sec_export.extract_fundamentals(
+        facts_path,
+        security_master,
+        spy_csv,
+        start_date=date(2020, 1, 1),
+        end_date=date(2025, 12, 31),
+    )
+
+    assert [(row.public_date.isoformat(), row.basic_eps) for row in extracted.rows] == [
+        ("2021-01-04", 0.5),
+        ("2024-01-03", 2.0),
+    ]
 
 
 def _write_csv(path: Path, header: tuple[str, ...], rows: list[tuple[str, ...]]) -> None:
@@ -767,22 +1088,48 @@ def test_production_builder_path_accepts_coherent_synthetic_bridge_and_warmup_ro
     with fundamentals_csv.open("r", encoding="utf-8", newline="") as stream:
         exported = list(csv.DictReader(stream))
     assert [(row["ticker"], row["period_end"], row["public_date"], row["basic_eps"]) for row in exported] == [
+        ("NEW", "2019-12-31", "2020-01-02", "0.75"),
         ("NEW", "2019-12-31", "2020-01-06", "1.25"),
         ("OLD", "2019-12-31", "2020-01-02", "0.75"),
+        ("OLD", "2019-12-31", "2020-01-06", "1.25"),
     ]
     with sqlite3.connect(tmp_path / "bundle.sqlite3") as connection:
         sqlite_rows = connection.execute(
-            "SELECT ticker, period_end, public_date, basic_eps FROM fundamentals ORDER BY ticker"
+            "SELECT ticker, period_end, public_date, basic_eps FROM fundamentals ORDER BY ticker, public_date"
         ).fetchall()
         dataset_metadata = dict(connection.execute("SELECT key, value FROM dataset_metadata"))
     assert sqlite_rows == [
+        ("NEW", "2019-12-31", "2020-01-02", 0.75),
         ("NEW", "2019-12-31", "2020-01-06", 1.25),
         ("OLD", "2019-12-31", "2020-01-02", 0.75),
+        ("OLD", "2019-12-31", "2020-01-06", 1.25),
     ]
     assert len(dataset_metadata["financial_lineage_extraction_history_sha256"]) == 64
     with (tmp_path / "bundle_manifest.json").open(encoding="utf-8") as stream:
         manifest = json.load(stream)
     assert manifest["bundle_sha256"]
+
+
+def test_fixture_builder_rejects_unbound_destination_membership_hash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args, membership_csv, _fundamentals_csv = _actual_builder_case(tmp_path)
+    provenance_path = Path(args[args.index("--fundamentals-provenance") + 1])
+    document = json.loads(provenance_path.read_text(encoding="utf-8"))
+    document["source"] = "synthetic fixture"
+    document.pop("financial_lineage_bridge_v1")
+    document["membership_csv_sha256"] = "0" * 64
+    _write_json(provenance_path, document)
+
+    with pytest.raises(
+        ValueError,
+        match="synthetic fixture fundamentals provenance does not bind schema-V3 membership",
+    ):
+        _run_builder(args, monkeypatch)
+
+    document["membership_csv_sha256"] = hashlib.sha256(membership_csv.read_bytes()).hexdigest()
+    _write_json(provenance_path, document)
+    assert _run_builder(args, monkeypatch) == 0
 
 
 def test_production_builder_rejects_foreign_membership_relabelled_behind_bridge(

@@ -1497,24 +1497,76 @@ def extract_fundamentals(
 
     windows = _cik_windows(security_master.rows)
     history_by_ticker: dict[str, list[IdentityExtractionRow]] = defaultdict(list)
+    history_by_lineage: dict[str, list[IdentityExtractionRow]] = defaultdict(list)
     for row in security_master.identity_extraction_rows:
         history_by_ticker[row.ticker].append(row)
+        history_by_lineage[row.security_lineage_id].append(row)
     all_rows: list[FundamentalRow] = []
     all_audit: list[FundamentalAuditRow] = []
     statement_symbols: dict[str, set[str]] = defaultdict(set)
     no_facts: set[str] = set()
     for ticker in sorted(set(windows).union(history_by_ticker)):
         selected: list[_Candidate] = []
+        selected_candidate_keys: set[tuple[str, str, str, date, date]] = set()
         if ticker in history_by_ticker:
-            for history in history_by_ticker[ticker]:
-                for candidate in by_cik.get(history.cik, ()):
-                    if not (
-                        history.first_extraction_date
-                        <= candidate.public_date
-                        <= history.last_extraction_date
-                    ):
-                        continue
-                    selected.append(candidate)
+            ticker_history = history_by_ticker[ticker]
+            ticker_ciks = {row.cik for row in ticker_history}
+            ticker_ciks.update(windows.get(ticker, {}))
+            if len(ticker_ciks) == 1:
+                # A single CIK remains a ticker-scoped SEC fundamentals source
+                # across all of its same-issuer aliases and historical filings.
+                only_cik = next(iter(ticker_ciks))
+                selected.extend(by_cik.get(only_cik, ()))
+            else:
+                alias_ranges: dict[str, list[tuple[date, date]]] = defaultdict(list)
+                active_ticker_ranges: dict[str, list[tuple[date, date]]] = defaultdict(list)
+                lineage_ciks = {
+                    (row.security_lineage_id, row.cik) for row in ticker_history
+                }
+                for lineage, cik in sorted(lineage_ciks):
+                    for alias in history_by_lineage[lineage]:
+                        if alias.cik == cik:
+                            alias_ranges[cik].append(
+                                (alias.first_extraction_date, alias.last_extraction_date)
+                            )
+                for history in ticker_history:
+                    active_ticker_ranges[history.cik].append(
+                        (history.first_extraction_date, history.last_extraction_date)
+                    )
+                for cik, (lower, upper) in windows.get(ticker, {}).items():
+                    membership_range = (
+                        lower or start_date,
+                        upper or end_date,
+                    )
+                    alias_ranges[cik].append(membership_range)
+                    active_ticker_ranges[cik].append(membership_range)
+
+                for cik in sorted(ticker_ciks):
+                    own_ranges = alias_ranges.get(cik, ())
+                    competing_ranges = tuple(
+                        interval
+                        for other_cik, intervals in active_ticker_ranges.items()
+                        if other_cik != cik
+                        for interval in intervals
+                    )
+                    for candidate in by_cik.get(cik, ()):
+                        if not any(first <= candidate.public_date <= last for first, last in own_ranges):
+                            continue
+                        if any(
+                            first <= candidate.public_date <= last
+                            for first, last in competing_ranges
+                        ):
+                            continue
+                        candidate_key = (
+                            cik,
+                            candidate.accession,
+                            candidate.statement_type,
+                            candidate.period_end,
+                            candidate.public_date,
+                        )
+                        if candidate_key not in selected_candidate_keys:
+                            selected_candidate_keys.add(candidate_key)
+                            selected.append(candidate)
         else:
             for cik, (lower, upper) in windows[ticker].items():
                 for candidate in by_cik.get(cik, ()):

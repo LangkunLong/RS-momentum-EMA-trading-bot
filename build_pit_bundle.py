@@ -754,6 +754,10 @@ def _v3_provenance_metadata(
         and fundamentals_provenance.get("source") == "synthetic fixture"
     )
     if synthetic_fundamentals_fixture:
+        if fundamentals_provenance.get("membership_csv_sha256") != membership_sha:
+            raise ValueError(
+                "synthetic fixture fundamentals provenance does not bind schema-V3 membership"
+            )
         # Fixture-only test bundles do not claim to be SEC exports. Production
         # SEC provenance always requires the complete lineage and source bridge.
         lineage_bridge_metadata = {}
