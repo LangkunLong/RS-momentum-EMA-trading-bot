@@ -1,6 +1,15 @@
 # Lead C source and import inventory
 
-Current hold: principal C-R1 supersedes whole-package acceptance of the candidate below. Its exact inventories remain immutable historical evidence. Replacement fill/holding/identity corrections are active with the original owners; regenerate source/API inventories for the corrected integrated application after relevant validation and independent review. Principal authenticated the inherited application closure against accepted main and found no separate dependency blocker.
+Corrected application/test candidate: `c48d95ca12ea792fcaf7b18004ad90f62d9aabaa`, tree `0e32d17c66156b7d700c69df9d7c43da81b513bc`. Producer source `2881118`, producer report/erratum `f14562a`, consumer test/report `b207822`, unchanged consumer implementation `d2a0677`, and lead chain `0ad64e9` are integrated. Producer and final integrated independent C-R1 reviews approve specification and quality for all nine bounded offline criteria, with no new Critical or Important findings. The integrated review is retained unchanged in `docs/next-phase-paper-policy-c-r1-independent-review.md`. Principal delta acceptance, required remote CI and normal merge remain pending. The earlier ea2e145 publication payload stays held and immutable.
+
+Actual source-bound evidence is 48 producer cases, 7 selected consumer cases and 11 combined/identity cases. The historical 107-pass checkpoint belongs to d2c4082. Raw Git equality binds executed source/test files to the corrected candidate; six changed Python blobs also compile under Python 3.13. No provider, broker, operational store, runtime or legacy execution entry point was used or modified by this correction.
+
+Current exact source inventory: `.artifacts/lead-c/source-inventory-c48d95c.json`, SHA256 `e19c0ab43dd12864b4dbc50bec2b83978f9fed2f20a6456ada8e8b352199fe73`. API/schema inventory: `store-api-schema-c48d95c.json`, SHA256 `9994d08c49ec0f652b867033b613a154564f25374e38569459b61f75d3e38d13`. Static comparison confirms all 28 public signatures, read DTO fields and schema statements unchanged; schema-v1 digest remains `b1eead321b213c54e3eca905b603cf00d7237d9b2d84f74085dda909b91b7190`. Accepted calculator blob `71e562ffc00dc4e617f1cd625e3f13ea5fe3f81a` and legacy execution entry points are unchanged.
+
+The corrected consumption contract is `.artifacts/lead-c/consumption-contract-c48d95c.md`; it adds opening REPLACEMENT semantics without new caller API or operational migration authority. Static import evidence is not dynamic evaluator/image acceptance. Principal independently authenticated inherited application closure against accepted main in its earlier review.
+
+## Historical pre-C-R1 checkpoints
+
 
 Status: frozen integrated application candidate `d2c4082746017dd4ecb14d709d71a7c12b1fc2d5`, tree `1e511574341e425f6ec2c326991a8dfaa6f49f38`. Final independent integrated specification and quality review approve all nine bounded offline criteria. This is not principal acceptance, evaluator-closure or image acceptance. Later documentation-only publication commits retain this validated application/test target and require their own exact changed-path payload inventory.
 
