@@ -11,10 +11,15 @@ import re
 import tempfile
 from collections.abc import Mapping
 from datetime import date, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from core.pit_data import sha256_file
+from core.pit_data import (
+    IdentityTransition,
+    PriceIdentityTransitionContract,
+    _parse_price_identity_segments_v1,
+)
 from core.pit_provenance import (
     PIT_NON_TRADABLE_REFERENCE_SYMBOLS,
     pit_canonical_json_bytes,
@@ -54,6 +59,11 @@ _IDENTITY_FIELDS = frozenset(
 _TRANSITION_FIELDS = frozenset(
     {"effective_date", "predecessor", "successor", "chain_id", "continuity_kind"}
 )
+_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+_EVENT_ROW_LOCATOR_RE = re.compile(r"bytes:(0|[1-9][0-9]*)-(0|[1-9][0-9]*)\Z")
+_NONPRODUCTION_EVIDENCE_MODE = "nonproduction_fixture"
+_EVENT_CSV_INTEGRITY_MODE = "nonproduction_event_csv_integrity_v1"
+_ADMISSION_STATUSES = frozenset({"production", _NONPRODUCTION_EVIDENCE_MODE})
 
 
 def _regular_file(path: str | Path, *, label: str) -> Path:
@@ -145,9 +155,83 @@ def _required_text(source: Mapping[str, object], field: str) -> str:
     return value
 
 
+def _resolve_retained_event_csv(
+    provenance_path: Path, raw_path: object
+) -> Path:
+    if (
+        not isinstance(raw_path, str)
+        or not raw_path.strip()
+        or "\\" in raw_path
+        or ":" in raw_path
+    ):
+        raise ValueError("retained event CSV path is invalid")
+    relative = PurePosixPath(raw_path)
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        raise ValueError("retained event CSV path is invalid")
+    root = provenance_path.resolve(strict=True).parent
+    candidate = root.joinpath(*relative.parts)
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError("retained event CSV cannot be a symlink")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("retained event CSV is unavailable") from exc
+    if not resolved.is_relative_to(root) or not resolved.is_file():
+        raise ValueError("retained event CSV is unavailable")
+    return resolved
+
+
+def _validate_transition_date_bounds(
+    predecessor: Mapping[str, object],
+    successor: Mapping[str, object],
+    effective_date: object,
+) -> None:
+    effective = _iso_date(effective_date, field="transition effective_date")
+    predecessor_start = _iso_date(
+        predecessor.get("admitted_start"), field="predecessor admitted_start"
+    )
+    predecessor_end = _iso_date(
+        predecessor.get("admitted_end"), field="predecessor admitted_end"
+    )
+    successor_start = _iso_date(
+        successor.get("admitted_start"), field="successor admitted_start"
+    )
+    successor_end = _iso_date(
+        successor.get("admitted_end"), field="successor admitted_end"
+    )
+    if (
+        predecessor_start > predecessor_end
+        or predecessor_start >= effective
+        or predecessor_end >= effective
+    ):
+        raise ValueError(
+            "price identity transition predecessor is not admitted before boundary"
+        )
+    if not successor_start <= effective <= successor_end:
+        raise ValueError(
+            "price identity transition successor is not admitted at boundary"
+        )
+
+
 def _load_price_identity(
     provenance: Mapping[str, object],
-) -> tuple[dict[str, Mapping[str, object]], tuple[Mapping[str, object], ...], str, str]:
+    *,
+    source_root: Path | None = None,
+    prices_provenance_sha256: str | None = None,
+) -> tuple[
+    dict[str, Mapping[str, object]],
+    tuple[Mapping[str, object], ...],
+    str,
+    str,
+    PriceIdentityTransitionContract | None,
+]:
     raw_identities = provenance.get("price_identity_request_contracts")
     if not isinstance(raw_identities, dict) or not raw_identities:
         raise ValueError("prices provenance has no price identity request contracts")
@@ -205,11 +289,13 @@ def _load_price_identity(
             or successor_identity is None
             or predecessor_identity["chain_id"] != lineage
             or successor_identity["chain_id"] != lineage
-            or successor_identity["continuity_kind"] != continuity
-            or not str(successor_identity["admitted_start"]) <= effective
-            <= str(successor_identity["admitted_end"])
         ):
             raise ValueError("price identity transition disagrees with identity rows")
+        if successor_identity["continuity_kind"] != continuity:
+            raise ValueError("price identity transition disagrees with identity rows")
+        _validate_transition_date_bounds(
+            predecessor_identity, successor_identity, effective
+        )
         if predecessor in predecessor_boundaries or successor in successor_boundaries:
             raise ValueError("price identity transition boundary is ambiguous")
         predecessor_boundaries.add(predecessor)
@@ -220,10 +306,66 @@ def _load_price_identity(
     declared_transition_digest = provenance.get("price_identity_transitions_sha256")
     if declared_transition_digest is not None and declared_transition_digest != transition_digest:
         raise ValueError("prices provenance transition digest is invalid")
+    has_segment_object = "price_identity_segments_v1" in provenance
+    has_segment_digest = "price_identity_segments_v1_sha256" in provenance
+    if has_segment_object != has_segment_digest:
+        raise ValueError("price identity segment object and digest must appear together")
+    segment_contract: PriceIdentityTransitionContract | None = None
+    segmented_chains: set[str] = set()
+    if has_segment_object:
+        if source_root is None:
+            raise ValueError(
+                "segment-aware price identity requires a retained source evidence directory"
+            )
+        legacy_contract_edges = tuple(
+            IdentityTransition(
+                date.fromisoformat(str(row["effective_date"])),
+                str(row["predecessor"]),
+                str(row["successor"]),
+                str(row["chain_id"]),
+                str(row["continuity_kind"]),
+            )
+            for row in transitions
+        )
+        segments, segment_transitions, source_assertions = (
+            _parse_price_identity_segments_v1(
+                provenance.get("price_identity_segments_v1"),
+                declared_sha256=provenance.get("price_identity_segments_v1_sha256"),
+                parent_contract_sha256=identity_digest,
+                evidence_root=source_root,
+                identities=identities,
+                ticker_transitions=legacy_contract_edges,
+                data_cutoff=max(
+                    date.fromisoformat(
+                        _iso_date(item["admitted_end"], field="admitted_end")
+                    )
+                    for item in identities.values()
+                ),
+            )
+        )
+        segment_parent_digest = identity_digest
+        segment_digest = str(provenance["price_identity_segments_v1_sha256"])
+        segment_contract = PriceIdentityTransitionContract(
+            prices_provenance_sha256 or pit_canonical_json_sha256(provenance),
+            identity_digest,
+            identities,
+            legacy_contract_edges,
+            segments,
+            segment_transitions,
+            source_assertions,
+            segment_parent_digest,
+            segment_digest,
+            source_root,
+        )
+        segmented_chains = {
+            item.chain_id for item in segment_contract.segments.values()
+        }
     chains: dict[str, set[str]] = {}
     for ticker, identity in identities.items():
         chains.setdefault(str(identity["chain_id"]), set()).add(ticker)
     for chain_id, tickers in chains.items():
+        if chain_id in segmented_chains:
+            continue
         anchors = {
             ticker for ticker in tickers if identities[ticker]["factor_anchor"] is True
         }
@@ -257,7 +399,7 @@ def _load_price_identity(
             current = successor
         if visited != tickers:
             raise ValueError(f"price identity chain is disconnected: {chain_id}")
-    return identities, tuple(transitions), identity_digest, transition_digest
+    return identities, tuple(transitions), identity_digest, transition_digest, segment_contract
 
 
 def _source_rows(path: Path, *, universe_id: str) -> list[tuple[str, str, int]]:
@@ -302,9 +444,10 @@ def _validate_source_provenance(
     *,
     universe_id: str,
     membership_path: Path,
+    provenance_path: Path,
     rows: list[tuple[str, str, int]],
     provenance: Mapping[str, object],
-) -> tuple[str, str]:
+) -> tuple[str, str, str, str, str | None, str | None]:
     if provenance.get("universe_id") != universe_id:
         raise ValueError(f"{universe_id} provenance universe/source mismatch")
     if provenance.get("membership_sha256") != sha256_file(membership_path):
@@ -318,9 +461,148 @@ def _validate_source_provenance(
     symbols = {row[1] for row in rows}
     if _positive_int(provenance.get("symbol_count"), field="symbol_count") != len(symbols):
         raise ValueError(f"{universe_id} provenance symbol count is inconsistent")
+    admission_status = provenance.get("admission_status")
+    evidence_mode = provenance.get("source_evidence_mode")
+    if (
+        not isinstance(admission_status, str)
+        or admission_status not in _ADMISSION_STATUSES
+    ):
+        raise ValueError(f"{universe_id} provenance admission status is invalid")
+    if admission_status == "production":
+        raise ValueError(
+            f"{universe_id} production admission requires a reviewed provider-native event adapter"
+        )
+    if evidence_mode == _NONPRODUCTION_EVIDENCE_MODE:
+        if admission_status != _NONPRODUCTION_EVIDENCE_MODE or any(
+            key in provenance
+            for key in (
+                "event_csv_integrity_path",
+                "event_csv_integrity_format",
+                "event_csv_integrity_sha256",
+                "event_row_evidence",
+                "event_row_evidence_sha256",
+            )
+        ):
+            raise ValueError(
+                f"{universe_id} fixture evidence mode is misclassified"
+            )
+        raw_source_sha256 = None
+        event_evidence_sha256 = None
+    elif evidence_mode == _EVENT_CSV_INTEGRITY_MODE:
+        # Nonproduction-only: this verifies a retained event-CSV copy, not
+        # provider-native source rows, rights, or independent event meaning.
+        if admission_status != _NONPRODUCTION_EVIDENCE_MODE:
+            raise ValueError(
+                f"{universe_id} event CSV integrity evidence is nonproduction only"
+            )
+        if provenance.get("event_csv_integrity_format") != "pit_event_csv_v1":
+            raise ValueError(
+                f"{universe_id} event CSV integrity format is unsupported"
+            )
+        artifact_path = _resolve_retained_event_csv(
+            provenance_path, provenance.get("event_csv_integrity_path")
+        )
+        if artifact_path in {membership_path.resolve(), provenance_path.resolve()}:
+            raise ValueError(
+                f"{universe_id} retained event CSV must be distinct from input CSV and provenance"
+            )
+        raw_source_sha256 = provenance.get("event_csv_integrity_sha256")
+        event_evidence = provenance.get("event_row_evidence")
+        event_evidence_sha256 = provenance.get("event_row_evidence_sha256")
+        if (
+            not isinstance(raw_source_sha256, str)
+            or _SHA256_RE.fullmatch(raw_source_sha256) is None
+            or sha256_file(artifact_path) != raw_source_sha256
+            or not isinstance(event_evidence, list)
+            or len(event_evidence) != len(rows)
+            or not isinstance(event_evidence_sha256, str)
+            or _SHA256_RE.fullmatch(event_evidence_sha256) is None
+            or pit_canonical_json_sha256(event_evidence) != event_evidence_sha256
+        ):
+            raise ValueError(
+                f"{universe_id} provenance does not bind retained event CSV integrity evidence"
+            )
+        evidence_fields = {
+            "effective_date",
+            "ticker",
+            "member",
+            "row_locator",
+            "row_sha256",
+        }
+        raw_artifact = artifact_path.read_bytes()
+        if hashlib.sha256(raw_artifact).hexdigest() != raw_source_sha256:
+            raise ValueError(f"{universe_id} retained event CSV changed during validation")
+        expected_source_rows: list[bytes] = []
+        current_offset = len(b"effective_date,ticker,member\n")
+        for expected, raw_evidence in zip(rows, event_evidence, strict=True):
+            if not isinstance(raw_evidence, dict) or set(raw_evidence) != evidence_fields:
+                raise ValueError(
+                    f"{universe_id} event evidence row schema is invalid"
+                )
+            raw_ticker = raw_evidence["ticker"]
+            canonical_ticker = _ticker(raw_ticker, field="event ticker")
+            evidence_key = (
+                _iso_date(raw_evidence["effective_date"], field="event effective_date"),
+                canonical_ticker,
+                raw_evidence["member"],
+            )
+            if (
+                raw_ticker != canonical_ticker
+                or
+                type(raw_evidence["member"]) is not int
+                or raw_evidence["member"] not in {0, 1}
+                or evidence_key != expected
+            ):
+                raise ValueError(
+                    f"{universe_id} event evidence does not match canonical membership events"
+                )
+            expected_source_row = (
+                f"{expected[0]},{expected[1]},{expected[2]}\n".encode("utf-8")
+            )
+            expected_source_rows.append(expected_source_row)
+            locator = raw_evidence["row_locator"]
+            row_sha256 = raw_evidence["row_sha256"]
+            match = (
+                _EVENT_ROW_LOCATOR_RE.fullmatch(locator)
+                if isinstance(locator, str)
+                else None
+            )
+            if (
+                match is None
+                or not isinstance(row_sha256, str)
+                or _SHA256_RE.fullmatch(row_sha256) is None
+            ):
+                raise ValueError(
+                    f"{universe_id} event CSV row locator or hash is invalid"
+                )
+            byte_start, byte_end = (int(item) for item in match.groups())
+            expected_end = current_offset + len(expected_source_row)
+            if (
+                byte_start != current_offset
+                or byte_end != expected_end
+                or raw_artifact[byte_start:byte_end] != expected_source_row
+                or hashlib.sha256(expected_source_row).hexdigest() != row_sha256
+            ):
+                raise ValueError(
+                    f"{universe_id} event CSV locator/hash does not bind its exact row"
+                )
+            current_offset = expected_end
+        expected_artifact = b"effective_date,ticker,member\n" + b"".join(
+            expected_source_rows
+        )
+        if raw_artifact != expected_artifact:
+            raise ValueError(
+                f"{universe_id} retained event CSV contains unindexed or unsupported rows"
+            )
+    else:
+        raise ValueError(f"{universe_id} provenance source evidence mode is invalid")
     return (
         _required_text(provenance, "source_kind"),
         _timestamp(provenance.get("retrieved_at_utc"), field="retrieved_at_utc"),
+        str(evidence_mode),
+        str(admission_status),
+        raw_source_sha256,
+        event_evidence_sha256,
     )
 
 
@@ -329,7 +611,43 @@ def _normalize(
     *,
     identities: Mapping[str, Mapping[str, object]],
     transitions: tuple[Mapping[str, object], ...],
+    segment_contract: PriceIdentityTransitionContract | None = None,
 ) -> tuple[list[tuple[str, str, str, int]], list[dict[str, object]], int]:
+    if segment_contract is not None:
+        if (
+            dict(segment_contract.identities) != dict(identities)
+            or segment_contract.request_contracts_sha256
+            != pit_canonical_json_sha256(identities)
+        ):
+            raise ValueError("segment contract disagrees with normalized identity rows")
+        contract_legacy_transitions = tuple(
+            {
+                "effective_date": item.effective_date.isoformat(),
+                "predecessor": item.predecessor,
+                "successor": item.successor,
+                "chain_id": item.chain_id,
+                "continuity_kind": item.continuity_kind,
+            }
+            for item in segment_contract.transitions
+        )
+        if contract_legacy_transitions != transitions:
+            raise ValueError("segment contract disagrees with legacy identity transitions")
+    for transition in transitions:
+        predecessor_ticker = _ticker(
+            transition.get("predecessor"), field="transition predecessor"
+        )
+        successor_ticker = _ticker(
+            transition.get("successor"), field="transition successor"
+        )
+        predecessor_identity = identities.get(predecessor_ticker)
+        successor_identity = identities.get(successor_ticker)
+        if predecessor_identity is None or successor_identity is None:
+            raise ValueError("price identity transition references an unknown identity")
+        _validate_transition_date_bounds(
+            predecessor_identity,
+            successor_identity,
+            transition.get("effective_date"),
+        )
     transition_index = {
         (
             str(row["effective_date"]),
@@ -339,19 +657,65 @@ def _normalize(
         )
         for row in transitions
     }
+    transition_successors = {
+        (
+            str(row["effective_date"]),
+            str(row["predecessor"]),
+            str(row["chain_id"]),
+        ): str(row["successor"])
+        for row in transitions
+    }
+    segment_transition_index: set[tuple[str, str, str, str]] = set()
+    segment_transition_successors: dict[tuple[str, str, str], str] = {}
+    segmented_chains: set[str] = set()
+    if segment_contract is not None:
+        segmented_chains = {
+            item.chain_id for item in segment_contract.segments.values()
+        }
+        for edge in segment_contract.segment_transitions:
+            predecessor = segment_contract.segments[edge.predecessor_segment_id]
+            successor = segment_contract.segments[edge.successor_segment_id]
+            effective = edge.effective_date.isoformat()
+            segment_transition_index.add(
+                (
+                    effective,
+                    predecessor.provider_symbol,
+                    successor.provider_symbol,
+                    edge.chain_id,
+                )
+            )
+            key = (effective, predecessor.provider_symbol, edge.chain_id)
+            if key in segment_transition_successors:
+                raise ValueError("segment transition ticker boundary is ambiguous")
+            segment_transition_successors[key] = successor.provider_symbol
     output: list[tuple[str, str, str, int]] = []
     source_bindings: list[dict[str, object]] = []
+    source_admission_statuses: set[str] = set()
+    source_evidence_modes: set[str] = set()
     coalesced = 0
     reference_symbols = set(PIT_NON_TRADABLE_REFERENCE_SYMBOLS)
     for universe_id in _UNIVERSES:
         membership_path, provenance_path, provenance = sources[universe_id]
         rows = _source_rows(membership_path, universe_id=universe_id)
-        source_kind, retrieved_at = _validate_source_provenance(
+        source_additions = {
+            (effective, ticker) for effective, ticker, member in rows if member == 1
+        }
+        (
+            source_kind,
+            retrieved_at,
+            evidence_mode,
+            admission_status,
+            raw_source_sha256,
+            event_evidence_sha256,
+        ) = _validate_source_provenance(
             universe_id=universe_id,
             membership_path=membership_path,
+            provenance_path=provenance_path,
             rows=rows,
             provenance=provenance,
         )
+        source_admission_statuses.add(admission_status)
+        source_evidence_modes.add(evidence_mode)
         grouped: dict[tuple[str, str], list[tuple[str, int]]] = {}
         for effective, ticker, member in rows:
             if ticker in reference_symbols:
@@ -359,13 +723,49 @@ def _normalize(
             identity = identities.get(ticker)
             if identity is None:
                 raise ValueError(f"membership ticker has no authenticated price identity: {ticker}")
-            if not str(identity["admitted_start"]) <= effective <= str(
+            lineage = str(identity["chain_id"])
+            if lineage in segmented_chains and segment_contract is not None:
+                active_segments = [
+                    item
+                    for item in segment_contract.segments.values()
+                    if item.chain_id == lineage
+                    and item.admitted_start.isoformat() <= effective <= item.admitted_end.isoformat()
+                    and item.provider_symbol == ticker
+                ]
+                successor = segment_transition_successors.get(
+                    (effective, ticker, lineage)
+                )
+                segment_exit = (
+                    member == 0
+                    and successor is not None
+                    and (effective, successor) in source_additions
+                )
+                if len(active_segments) != 1 and not segment_exit:
+                    raise ValueError(
+                        f"membership event is outside its authenticated price identity segment: {ticker}"
+                    )
+                if len(active_segments) > 1:
+                    raise ValueError("membership ticker is ambiguous across identity segments")
+                grouped.setdefault((effective, lineage), []).append((ticker, member))
+                continue
+            within_identity_dates = str(identity["admitted_start"]) <= effective <= str(
                 identity["admitted_end"]
-            ):
+            )
+            # A rename becomes effective on the successor's first date, while
+            # the predecessor's last price-identity date is the prior session.
+            # Bind that membership removal only to the exact authenticated
+            # transition boundary; other out-of-range rows remain invalid.
+            successor = transition_successors.get((effective, ticker, lineage))
+            authenticated_transition_exit = (
+                member == 0
+                and successor is not None
+                and (effective, successor) in source_additions
+            )
+            if not within_identity_dates and not authenticated_transition_exit:
                 raise ValueError(
                     f"membership event is outside authenticated identity bounds: {ticker}"
                 )
-            grouped.setdefault((effective, str(identity["chain_id"])), []).append(
+            grouped.setdefault((effective, lineage), []).append(
                 (ticker, member)
             )
         lineage_state: set[str] = set()
@@ -388,6 +788,8 @@ def _normalize(
                 or lineage not in lineage_state
                 or (effective, removals[0], additions[0], lineage)
                 not in transition_index
+                and (effective, removals[0], additions[0], lineage)
+                not in segment_transition_index
             ):
                 raise ValueError(
                     f"ambiguous same-lineage membership transitions: {universe_id} {lineage}"
@@ -399,10 +801,16 @@ def _normalize(
                 "membership_sha256": sha256_file(membership_path),
                 "provenance_sha256": sha256_file(provenance_path),
                 "retrieved_at_utc": retrieved_at,
+                "admission_status": admission_status,
+                "source_evidence_mode": evidence_mode,
+                "event_csv_integrity_sha256": raw_source_sha256,
+                "event_row_evidence_sha256": event_evidence_sha256,
                 "source_kind": source_kind,
                 "universe_id": universe_id,
             }
         )
+    if len(source_admission_statuses) != 1 or len(source_evidence_modes) != 1:
+        raise ValueError("membership sources must use one consistent evidence mode")
     output.sort()
     if not output:
         raise ValueError("normalized membership is empty")
@@ -475,12 +883,50 @@ def main() -> int:
     if output_csv == output_provenance or {output_csv, output_provenance}.intersection(inputs):
         raise ValueError("outputs must differ from each other and all inputs")
 
-    before = {path: sha256_file(path) for path in inputs}
-    identities, transitions, identity_digest, transition_digest = _load_price_identity(
-        prices_provenance
+    (
+        identities,
+        transitions,
+        identity_digest,
+        transition_digest,
+        segment_contract,
+    ) = _load_price_identity(
+        prices_provenance,
+        source_root=prices_path.parent,
+        prices_provenance_sha256=sha256_file(prices_path),
     )
+    if segment_contract is not None:
+        manifest_inputs = set(inputs)
+        for assertion in segment_contract.source_assertions.values():
+            source_document_path = (
+                prices_path.parent / assertion.source_document_path
+            ).resolve(strict=True)
+            if source_document_path in manifest_inputs:
+                raise ValueError(
+                    "retained source documents must be distinct from provenance and membership inputs"
+                )
+            if sha256_file(source_document_path) != assertion.source_byte_sha256:
+                raise ValueError("retained source document changed during identity loading")
+            inputs.add(source_document_path)
+    manifest_inputs = set(inputs)
+    for universe_id in _UNIVERSES:
+        _, source_provenance_path, source_provenance = sources[universe_id]
+        if source_provenance.get("source_evidence_mode") != _EVENT_CSV_INTEGRITY_MODE:
+            continue
+        artifact_path = _resolve_retained_event_csv(
+            source_provenance_path,
+            source_provenance.get("event_csv_integrity_path"),
+        )
+        if artifact_path in manifest_inputs:
+            raise ValueError(
+                "retained event CSV artifacts must be distinct from membership and provenance inputs"
+            )
+        inputs.add(artifact_path)
+    before = {path: sha256_file(path) for path in inputs}
     rows, source_bindings, coalesced = _normalize(
-        sources, identities=identities, transitions=transitions
+        sources,
+        identities=identities,
+        transitions=transitions,
+        segment_contract=segment_contract,
     )
     csv_payload = _csv_bytes(rows)
     csv_digest = hashlib.sha256(csv_payload).hexdigest()
@@ -489,6 +935,9 @@ def main() -> int:
         universe: sum(row[2] == universe for row in rows) for universe in _UNIVERSES
     }
     provenance = {
+        "admission_status": next(
+            iter({str(item["admission_status"]) for item in source_bindings})
+        ),
         "coalesced_transition_count": coalesced,
         "event_count": len(rows),
         "first_effective_date": rows[0][0],
@@ -501,10 +950,17 @@ def main() -> int:
         "price_identity_transitions_sha256": transition_digest,
         "prices_provenance_sha256": sha256_file(prices_path),
         "schema_version": 3,
+        "source_evidence_mode": next(
+            iter({str(item["source_evidence_mode"]) for item in source_bindings})
+        ),
         "source_universes": list(_UNIVERSES),
         "universe_count": len(_UNIVERSES),
         "universe_event_counts": universe_counts,
     }
+    if segment_contract is not None:
+        provenance["price_identity_segments_v1_sha256"] = (
+            segment_contract.segment_contract_sha256
+        )
     provenance_payload = pit_canonical_json_bytes(provenance)
     if before != {path: sha256_file(path) for path in inputs}:
         raise ValueError("an input changed while membership was being normalized")

@@ -14,7 +14,10 @@ from typing import Literal, Protocol
 
 from core.backtest_engine import PortfolioSimulator, SimulationResultV5
 from core.backtest_fills import ExecutionProfileV5, FrictionScenario
-from core.pit_data import PriceIdentityTransitionContract
+from core.pit_data import (
+    PriceIdentityTransitionContract,
+    require_v5_production_membership_admission,
+)
 from core.pit_optimizer_evaluation import EvaluationPanelSpec
 from core.pit_provenance import pit_canonical_json_sha256
 from core.strategy_policy import (
@@ -325,6 +328,10 @@ class PitPanelEvaluatorV5:
     ) -> None:
         if pit_data_scope not in {"production", "development_sp500_v2"}:
             raise ValueError("evaluator PIT data scope is invalid")
+        if pit_data_scope == "production":
+            require_v5_production_membership_admission(
+                getattr(pit_bundle, "metadata", None), consumer="V5 evaluator"
+            )
         if pit_data_scope == "development_sp500_v2" and baseline_policy_revision is not None:
             raise ValueError("development data cannot authorize baseline evaluation")
         if type(contract) is not EvaluatorContractV5:

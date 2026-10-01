@@ -1,3 +1,5 @@
 core/strategy_policy/entry.py text eol=lf
 core/strategy_policy/risk.py text eol=lf
 core/strategy_policy/exit.py text eol=lf
+docs/price-identity-transition-evidence-ledger-v1.json text eol=lf
+docs/price-identity-transition-evidence-ledger-v1.sha256 text eol=lf

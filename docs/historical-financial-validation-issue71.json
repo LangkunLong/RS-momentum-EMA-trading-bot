@@ -1,0 +1,124 @@
+{
+  "issue": "#71",
+  "start_revision": "2c01e76a878a338ab2b743c38c4f1310aab3f75b",
+  "implementation_revision": "3d8a0edbc793b1a435849daead96ffaa9c165d97",
+  "accepted_feature_contract": "historical-feature-specification-v1",
+  "starting_calculator_identity": {
+    "declared": false,
+    "source_revision": "2c01e76a878a338ab2b743c38c4f1310aab3f75b",
+    "note": "Legacy output remains bound to its original source/result identity; no retroactive identity was assigned."
+  },
+  "changed_calculator_identity": {
+    "id": "pit-financial-features-v2",
+    "source_path": "core/pit_feature_snapshot.py",
+    "source_git_blob_oid": "8e4020316d13c3de36dac8995fe4743bf888e70c",
+    "source_git_blob_sha256": "e209504b6232c6755a080dba2edfbc877fa8400b5f419ba0c8a514c3a629ab9c",
+    "worker_worktree_sha256_at_receipt_creation": "a72cab3f7a7ab9888bb417d404a70ddf3d6b38e5ef6147c7b8a9d55a283c3261",
+    "policy_interface_version": 3,
+    "historical_data_format_version": 2
+  },
+  "input_bundle": {
+    "original_checkout_path": "C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.artifacts/data/development-sp500-v2/pit_bundle.sqlite3",
+    "bundle_sha256": "cf729b47d762ae86287bb8a87c28a1664e7475c74ef1aca736fbc240111349de",
+    "manifest_path": "C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.artifacts/data/development-sp500-v2/bundle_manifest.json",
+    "manifest_sha256": "3c9edd0158dcb93f9de5edbfcf6f281dd8b25bcdd1ded6ad21473af5fd37be7c",
+    "fundamental_source_identity": "SEC EDGAR official bulk archives",
+    "fundamental_source_sha256": "2f653eb5b91b4be79a2b33cd5b43e01749a25a9e5f74581a7f212bb6bd6bd56b",
+    "fundamental_public_date_provenance_path": "C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.artifacts/data/sec-fundamentals/fundamentals_provenance.json",
+    "fundamental_public_date_provenance_sha256": "79a4ff05e9ee18422200a9b1ebdbf28573b1e7d11f7b9c6268b69e710d7873d0",
+    "normalized_public_date_rule": "First supplied SPY trading day strictly after SEC acceptance calendar date; filed date fallback only."
+  },
+  "scan": {
+    "evaluation_start": "2021-01-01",
+    "evaluation_end": "2025-12-31",
+    "quarterly_records": 39470,
+    "price_security_sessions_all_symbols": 720785,
+    "price_security_sessions_for_quarterly_symbols": 685301,
+    "state_window_denominator_per_metric": 8696,
+    "measurement_kind": "development feature-output comparison",
+    "claims_excluded": [
+      "production feature coverage",
+      "policy consumption",
+      "strategy or portfolio impact",
+      "retrospective trading error"
+    ],
+    "earnings_acceleration": {
+      "changed_windows": 2222,
+      "affected_symbols": 529,
+      "changed_priced_security_sessions": 138038,
+      "change": "Previously non-null output becomes unavailable when the newest two matched current fiscal quarters are not adjacent."
+    },
+    "revenue_acceleration": {
+      "changed_windows": 2555,
+      "affected_symbols": 524,
+      "changed_priced_security_sessions": 158883,
+      "change": "Previously non-null output becomes unavailable when the newest two matched current fiscal quarters are not adjacent."
+    },
+    "reproducible_case": {
+      "ticker": "A",
+      "available_from": "2021-03-03",
+      "newest_current_period": "2021-01-31",
+      "previous_matched_current_period": "2020-07-31",
+      "old_earnings_acceleration": 0.4095238095238095,
+      "new_earnings_acceleration": null,
+      "old_revenue_acceleration": 0.15095573970192352,
+      "new_revenue_acceleration": null,
+      "affected_priced_security_sessions": 62
+    },
+    "freshness": {
+      "quarterly_rows_without_any_supported_snapshot_fact": 0,
+      "quarterly_rows_missing_period_or_public_date": 0,
+      "changed_bundle_outputs": 0
+    }
+  },
+  "fixed_case_dispositions": {
+    "annual_skipped_fiscal_year": "Keep #66 adjacent-reported-annual behavior. Trace period endpoints; a spanning value is not described as one-year growth.",
+    "income_equity_period_alignment": "Keep #66 latest annual net income divided by latest nonmissing equity. Preserve and disclose mismatched period endpoints.",
+    "restatements": "Earlier as-of outputs keep the earlier visible value; later as-of outputs may use the public restatement."
+  },
+  "verification": [
+    {
+      "command": "python -m pytest tests/test_historical06_financial_semantics.py tests/test_task11_earnings_provenance_contract.py -q -p no:cacheprovider -o addopts=''",
+      "result": "29 passed"
+    },
+    {
+      "command": "python -m pytest tests/test_fundamental_input_parity.py -q -p no:cacheprovider -o addopts='' -k \"sparse_july or missing_same_quarter or fiscal_yoy_calendar_edge or fiscal_matching_preserves or equal_distance_prior or exact_duplicate_periods or latest_nonfinite_period\"",
+      "result": "11 passed, 27 deselected"
+    },
+    {
+      "command": "python -m ruff check core/pit_feature_snapshot.py tests/test_historical06_financial_semantics.py",
+      "result": "All checks passed"
+    },
+    {
+      "command": "python -m pytest tests/test_fundamental_input_parity.py -q -p no:cacheprovider -o addopts='' --tb=line",
+      "result": "35 passed, 3 failed outside the #71 diff: two entry-market-context ValueErrors in core/backtest_engine.py and one missing schema_version KeyError in core/pit_data.py."
+    }
+  ],
+  "artifacts": [
+    {
+      "path": "docs/historical-financial-validation-issue71.md",
+      "git_blob_oid": "8089ca09edbf510c78fb0e38e9e9a70781ecd7d7",
+      "git_blob_sha256": "2c538723cbb8bccd32776e5c43612c5883940259c1ef72313e7157acb229daab",
+      "worker_worktree_sha256_at_receipt_creation": "2c538723cbb8bccd32776e5c43612c5883940259c1ef72313e7157acb229daab"
+    },
+    {
+      "path": "core/pit_feature_snapshot.py",
+      "git_blob_oid": "8e4020316d13c3de36dac8995fe4743bf888e70c",
+      "git_blob_sha256": "e209504b6232c6755a080dba2edfbc877fa8400b5f419ba0c8a514c3a629ab9c",
+      "worker_worktree_sha256_at_receipt_creation": "a72cab3f7a7ab9888bb417d404a70ddf3d6b38e5ef6147c7b8a9d55a283c3261"
+    },
+    {
+      "path": "tests/test_historical06_financial_semantics.py",
+      "git_blob_oid": "e85b71a0eac2060855d193734175f9b02dac6c9d",
+      "git_blob_sha256": "b7eaac154009145f9f28e3d05de63cd0f7d1ebac64573c3bb5ef6653178a8de2",
+      "worker_worktree_sha256_at_receipt_creation": "b7eaac154009145f9f28e3d05de63cd0f7d1ebac64573c3bb5ef6653178a8de2"
+    }
+  ],
+  "artifact_hash_semantics": "git_blob_oid and git_blob_sha256 identify canonical tracked file bytes independent of checkout line endings; worker_worktree_sha256_at_receipt_creation is specific to the original worker checkout.",
+  "statuses": {
+    "implementation": "Correction, calculator identity, fixed cases, and result report committed on codex/issue-71-fiscal-semantics at 3d8a0edbc793b1a435849daead96ffaa9c165d97.",
+    "required_inputs": "Fixed financial histories and the exact retained development bundle were available; complete vendor history is unnecessary.",
+    "acceptance_evidence": "Focused tests and before/after output measurements are available for lead review; issue acceptance is not asserted.",
+    "dependencies": "Satisfied: accepted #66 contract is present at the start revision; no additional unconditional child dependency applies."
+  }
+}

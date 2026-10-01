@@ -1,0 +1,481 @@
+{
+  "schema_version": "price-identity-transition-evidence-ledger-v1",
+  "assessment_date": "2026-09-28",
+  "scope": "Partial evidence review of retained V3 price-identity inputs. This ledger does not emit or amend price_identity_transitions, build a production membership union, or mark issue #68 accepted.",
+  "parent_inputs": {
+    "prices_provenance_path": "data/acquisition/acquisition/raw/local-cache/prices/prices_provenance.json",
+    "prices_provenance_sha256": "7fca2de6d408e232bca560f1df10aeae88433f3a58e1bb64f7bef20944f95ca5",
+    "prices_csv_path": "data/acquisition/acquisition/raw/local-cache/prices/prices.csv",
+    "prices_csv_sha256": "dd18e38d14356df2be9aea79bc777407d40750305dcf327a2f3552815c39c376",
+    "prices_csv_row_count": 866025,
+    "identity_map_path": "data/acquisition/acquisition/raw/local-cache/prices/pit_price_identity_map.csv",
+    "identity_map_sha256": "6a9ec69bc0fe05decea1b832cac8e26a611d706cce831d5687fa5424f9544955",
+    "price_identity_request_contracts_sha256_declared": "273727c248f57b7376b6cf269312325cdd059287e1f4ed16ab5ce63617ceabc7",
+    "price_identity_request_contracts_sha256_recomputed": "273727c248f57b7376b6cf269312325cdd059287e1f4ed16ab5ce63617ceabc7",
+    "request_contract_key_count": 607,
+    "price_identity_transitions_field_present": false,
+    "price_request_window_start": "2020-01-01",
+    "price_request_window_end": "2025-12-31",
+    "observed_price_row_start": "2020-01-02",
+    "observed_price_row_end": "2025-12-31"
+  },
+  "evidence_binding": {
+    "method": "Issuer/SEC transition evidence is bound by official URL, filing accession or issuer release identity, and a document-section locator. Those issuer/SEC source bytes were not retained, so their per-source byte hashes are null. Separately retained Nasdaq index notices are listed with their existing source hashes. The sibling SHA-256 file hashes this ledger's exact bytes.",
+    "issuer_transition_evidence_bytes_retained": false,
+    "vendor_or_broker_access": false,
+    "source_reuse_permission_review": "Issuer/SEC evidence is cited for identity facts only; this ledger does not copy provider membership data or alter price provenance."
+  },
+  "status_semantics": {
+    "accepted": "Primary evidence supports the same security/share-class continuity and effective date in the retained identity rows. This is an evidence disposition only; no transition has been emitted or integrated.",
+    "unresolved": "Primary evidence identifies the ticker event, but retained request-contract dates or coverage prevent a valid transition binding.",
+    "rejected": "A proposed edge is outside the explicit same-security transition contract and is not supported as a transition by the retained identity rows."
+  },
+  "contract_audit": {
+    "warmup_predecessor_candidate_count": 14,
+    "same_chain_and_provider_symbol_match": "All 14 predecessor-successor pairs have matching chain_id and provider_symbol equal to the corresponding ticker in the retained request contract.",
+    "date_boundary_result": "13 pairs are adjacent (predecessor admitted_end is the calendar day before successor admitted_start); FISV/FI is the sole overlap.",
+    "full_contract_overlap_result": "Among the 607 identities, the only multi-identity active-date collision in the same chain is FISV/FI, overlapping 2023-06-07 through 2025-11-10.",
+    "fiserv_ticker_reuse": "Primary issuer/SEC evidence establishes FISV through 2023-06-06, FI from 2023-06-07 through 2025-11-10, and FISV again beginning 2025-11-11. A one-row-per-ticker interval cannot encode these three episodes.",
+    "retained_price_rows_reviewed": {
+      "basis": "The retained prices.csv in the original checkout's ignored acquisition tree was read-only audited and is bound by prices_csv_sha256 in parent_inputs; it is not copied into Git.",
+      "FI": {
+        "row_count": 1473,
+        "first_date": "2020-01-02",
+        "last_date": "2025-11-10"
+      },
+      "FISV": {
+        "row_count": 1508,
+        "first_date": "2020-01-02",
+        "last_date": "2025-12-31"
+      },
+      "overlap_example_date": "2023-06-07",
+      "interpretation": "Provider rows for both symbols do not independently define point-in-time issuer-symbol admission or resolve the repeated FISV ticker episode."
+    },
+    "source_contract_overlap_permitted": false,
+    "canonical_contract_digest_verified": true
+  },
+  "retained_membership_history": {
+    "sp500": {
+      "path": "data/acquisition/acquisition/raw/local-sp500/membership.csv",
+      "sha256": "a12413a9134623b51350ad4671d4a678eeed8edf2241a9985d0d7d51957f5389",
+      "event_count": 711,
+      "distinct_ticker_count": 606,
+      "date_range": ["2021-01-01", "2025-12-22"],
+      "source_basis": "Secondary Wikipedia-derived event history with five official S&P DJI spot checks.",
+      "disposition": "Retained dated rows exist, but this is not a complete primary-source event ledger or a verified 2025-12-31 state."
+    },
+    "nasdaq100": {
+      "acquisition_manifest_path": "data/acquisition/acquisition/raw/nasdaq-public/acquisition-manifest.json",
+      "acquisition_manifest_sha256": "f41e2455e037c1dd6f1f26ca868fa30c7a8a8b84f1219960158d7178db0815b7",
+      "complete_membership_pair_created": false,
+      "selected_official_notice_hashes": {
+        "2022_fb_meta_corporate_action": "4dc3542bfa694f8ee0d67d0e08f4125e5b83c9d2755ec2b45478f162a99e5c96",
+        "2023_amended_annual_notice": "546b47527da186b3e7b1e65dea27cb59e1ff339e7b9c1df9b6cba1d2e0430594",
+        "2023_gehc_fiserv_notice": "ec580658c6beccb32061b38118130be654b64c4c41b14ef7acfdcb755121499b"
+      },
+      "secondary_history_extraction": {
+        "path": "data/acquisition/acquisition/raw/nasdaq-public/history-table-extraction-not-admitted.json",
+        "sha256": "07cd0820cb5317d56d1dcfd1cd3681f8b4dc718815f331c48bfd33ae3fda4620",
+        "parsed_rows": 61,
+        "dated_rows_2021_through_2025": 49,
+        "claimed_in_window_ticker_events": 89,
+        "admitted": false
+      },
+      "disposition": "Specific official notices support bounded event facts; no admissible complete 2021–2025 seed and event timeline is retained."
+    },
+    "russell2000": {
+      "membership_event_file_retained": false,
+      "dated_constituent_snapshot_retained": false,
+      "membership_provenance_pair_retained": false,
+      "disposition": "No Russell 2000 membership rows are retained."
+    },
+    "membership_rows_added_by_this_review": 0
+  },
+  "candidates": [
+    {
+      "predecessor": "BLL",
+      "successor": "BALL",
+      "effective_date": "2022-05-10",
+      "chain_id": "ball",
+      "continuity_kind": "same_issuer_rename",
+      "predecessor_admitted_end": "2022-05-09",
+      "successor_admitted_start": "2022-05-10",
+      "status": "accepted",
+      "transition_emitted": false,
+      "primary_evidence": [
+        {
+          "authority": "Ball Corporation investor relations",
+          "url": "https://investors.ball.com/news-presentations/press-releases/detail/82/ball-board-declares-quarterly-dividend-stock-ticker-symbol-changing-to-ball",
+          "document_date": "2022-04-27",
+          "locator": "Release body, ticker-change paragraphs",
+          "supports": "Ball Corporation's NYSE ticker changes from BLL to BALL effective at the start of trading on 2022-05-10; the release describes a symbol change for the same corporation."
+        }
+      ],
+      "source_byte_sha256": null
+    },
+    {
+      "predecessor": "ABC",
+      "successor": "COR",
+      "effective_date": "2023-08-30",
+      "chain_id": "cencora",
+      "continuity_kind": "same_issuer_rename",
+      "predecessor_admitted_end": "2023-08-29",
+      "successor_admitted_start": "2023-08-30",
+      "status": "accepted",
+      "transition_emitted": false,
+      "primary_evidence": [
+        {
+          "authority": "U.S. Securities and Exchange Commission, Cencora Form 8-K",
+          "accession": "0001104659-23-096698",
+          "url": "https://www.sec.gov/Archives/edgar/data/1140859/000110465923096698/tm2324358d1_8k.htm",
+          "document_date": "2023-08-30",
+          "locator": "Securities registered table; Item 5.03",
+          "supports": "The same registrant's common stock ceases trading as ABC and begins trading as COR at the 2023-08-30 market open; the name change does not affect stockholder rights."
+        }
+      ],
+      "source_byte_sha256": null
+    },
+    {
+      "predecessor": "ANTM",
+      "successor": "ELV",
+      "effective_date": "2022-06-28",
+      "chain_id": "elevance",
+      "continuity_kind": "same_issuer_rename",
+      "predecessor_admitted_end": "2022-06-27",
+      "successor_admitted_start": "2022-06-28",
+      "status": "accepted",
+      "transition_emitted": false,
+      "primary_evidence": [
+        {
+          "authority": "U.S. Securities and Exchange Commission, Elevance Health Form 10-Q",
+          "accession": "0001156039-22-000081",
+          "url": "https://www.sec.gov/Archives/edgar/data/1156039/000115603922000081/R8.htm",
+          "document_date": "2022-08-02",
+          "locator": "Note: Organization",
+          "supports": "The registrant reports that its name changed from Anthem, Inc. to Elevance Health, Inc. effective 2022-06-27 and it began trading under ELV on 2022-06-28."
+        }
+      ],
+      "source_byte_sha256": null
+    },
+    {
+      "predecessor": "COG",
+      "successor": "CTRA",
+      "effective_date": "2021-10-04",
+      "chain_id": "coterra",
+      "continuity_kind": "legacy_survivor_rename",
+      "predecessor_admitted_end": "2021-10-03",
+      "successor_admitted_start": "2021-10-04",
+      "status": "accepted",
+      "transition_emitted": false,
+      "primary_evidence": [
+        {
+          "authority": "U.S. Securities and Exchange Commission, Cabot Form 8-K",
+          "accession": "0001104659-21-120825",
+          "url": "https://www.sec.gov/Archives/edgar/data/858470/000110465921120825/tm2127863d4_8k.htm",
+          "document_date": "2021-09-29",
+          "locator": "Securities registered table; Item 5.07 merger structure",
+          "supports": "Cabot common stock is registered under COG; Cimarex's merger subsidiary merges into Cimarex, which survives as Cabot's wholly owned subsidiary. Cabot remains the parent issuer."
+        },
+        {
+          "authority": "U.S. Securities and Exchange Commission, Coterra/Cabot Exhibit 99.1",
+          "accession": "0001104659-21-122041",
+          "url": "https://www.sec.gov/Archives/edgar/data/858470/000110465921122041/tm2129019d1_ex99-1.htm",
+          "document_date": "2021-10-01",
+          "locator": "Opening paragraphs",
+          "supports": "Following the completed Cabot/Cimarex combination, Coterra common stock trades as COG until the open on 2021-10-04, then as CTRA."
+        }
+      ],
+      "source_byte_sha256": null
+    },
+    {
+      "predecessor": "RE",
+      "successor": "EG",
+      "effective_date": "2023-07-10",
+      "chain_id": "everest",
+      "continuity_kind": "same_issuer_rename",
+      "predecessor_admitted_end": "2023-07-09",
+      "successor_admitted_start": "2023-07-10",
+      "status": "accepted",
+      "transition_emitted": false,
+      "primary_evidence": [
+        {
+          "authority": "Everest Group investor relations",
+          "url": "https://investors.everestglobal.com/news/news-details/2023/Everest-to-Rebrand-Company-Name-and-NYSE-Ticker-to-Reflect-its-Evolution-Global-Growth-and-Diversification-Strategy/default.aspx",
+          "document_date": "2023-05-18",
+          "locator": "Release body and stock-information paragraph",
+          "supports": "Everest Re Group, Ltd. (NYSE: RE) announced its corporate name and ticker change to Everest Group, Ltd. (NYSE: EG), effective 2023-07-10; the release identifies Everest common stock as RE."
+        }
+      ],
+      "source_byte_sha256": null
+    },
+    {
+      "predecessor": "FB",
+      "successor": "META",
+      "effective_date": "2022-06-09",
+      "chain_id": "meta",
+      "continuity_kind": "same_issuer_rename",
+      "predecessor_admitted_end": "2022-06-08",
+      "successor_admitted_start": "2022-06-09",
+      "status": "accepted",
+      "transition_emitted": false,
+      "primary_evidence": [
+        {
+          "authority": "U.S. Securities and Exchange Commission, Meta Exhibit 99.1",
+          "accession": "0001326801-22-000070",
+          "url": "https://www.sec.gov/Archives/edgar/data/1326801/000132680122000070/may312022-exhibit991.htm",
+          "document_date": "2022-05-31",
+          "locator": "Ticker-change announcement paragraphs",
+          "supports": "Meta Platforms Class A common stock changes from FB to META before market open on 2022-06-09; the release says the class continues to be listed and shareholders need take no action."
+        }
+      ],
+      "source_byte_sha256": null
+    },
+    {
+      "predecessor": "FLT",
+      "successor": "CPAY",
+      "effective_date": "2024-03-25",
+      "chain_id": "corpay",
+      "continuity_kind": "same_issuer_rename",
+      "predecessor_admitted_end": "2024-03-24",
+      "successor_admitted_start": "2024-03-25",
+      "status": "accepted",
+      "transition_emitted": false,
+      "primary_evidence": [
+        {
+          "authority": "U.S. Securities and Exchange Commission, FLEETCOR Exhibit 99.1",
+          "accession": "0001628280-24-010593",
+          "url": "https://www.sec.gov/Archives/edgar/data/1175454/000162828024010593/exhibit991corpayrebrand_re.htm",
+          "document_date": "2024-03-07",
+          "locator": "Release headline and first paragraph",
+          "supports": "FLEETCOR Technologies, Inc. (NYSE: FLT) announced the Corpay name and ticker change; the Company's stock begins trading as CPAY on 2024-03-25."
+        }
+      ],
+      "source_byte_sha256": null
+    },
+    {
+      "predecessor": "PEAK",
+      "successor": "DOC",
+      "effective_date": "2024-03-04",
+      "chain_id": "healthpeak",
+      "continuity_kind": "accounting_acquirer_rename",
+      "predecessor_admitted_end": "2024-03-03",
+      "successor_admitted_start": "2024-03-04",
+      "status": "accepted",
+      "transition_emitted": false,
+      "primary_evidence": [
+        {
+          "authority": "U.S. Securities and Exchange Commission, Healthpeak Form 8-K",
+          "accession": "0001104659-24-029661",
+          "url": "https://www.sec.gov/Archives/edgar/data/765880/000110465924029661/tm247564d1_8k.htm",
+          "document_date": "2024-02-28",
+          "locator": "Cover (Healthpeak Properties, Inc., CIK 765880; Common Stock PEAK); Item 2.01; Item 8.01 Change in Ticker Symbol",
+          "supports": "The continuing Healthpeak registrant's common stock is registered as PEAK; the filing says Healthpeak Common Stock is expected to begin trading as DOC at the 2024-03-04 open. Item 2.01 describes the merger and issuance of Healthpeak common stock to Physicians Realty shareholders, supporting the mapped accounting-acquirer continuity kind."
+        },
+        {
+          "authority": "U.S. Securities and Exchange Commission, Physicians Realty Trust Form 8-K",
+          "accession": "0001104659-24-029662",
+          "url": "https://www.sec.gov/Archives/edgar/data/1574540/000110465924029662/tm247597d1_8k.htm",
+          "document_date": "2024-02-28",
+          "locator": "Cover; Introductory Note; Items 2.01 and 8.01",
+          "supports": "Supplemental merger evidence: Physicians Realty Trust shares convert into Healthpeak common stock, and Healthpeak Common Stock is expected to begin trading as DOC at the 2024-03-04 open."
+        }
+      ],
+      "source_byte_sha256": null
+    },
+    {
+      "predecessor": "NLOK",
+      "successor": "GEN",
+      "effective_date": "2022-11-08",
+      "chain_id": "gen",
+      "continuity_kind": "same_issuer_rename",
+      "predecessor_admitted_end": "2022-11-07",
+      "successor_admitted_start": "2022-11-08",
+      "status": "accepted",
+      "transition_emitted": false,
+      "primary_evidence": [
+        {
+          "authority": "U.S. Securities and Exchange Commission, Gen Digital Form 8-K",
+          "accession": "0001104659-22-115277",
+          "url": "https://www.sec.gov/Archives/edgar/data/849399/000110465922115277/tm2229813d1_8k.htm",
+          "document_date": "2022-11-07",
+          "locator": "Registrant and former-name fields; securities registered table; Item 5.03",
+          "supports": "Gen Digital Inc. reports NortonLifeLock Inc. as its former name under the same CIK/commission file number and the same $0.01 common-stock class."
+        },
+        {
+          "authority": "U.S. Securities and Exchange Commission, Gen Digital Exhibit 99.01",
+          "accession": "0001104659-22-115277",
+          "url": "https://www.sec.gov/Archives/edgar/data/849399/000110465922115277/tm2229813d1_ex99-01.htm",
+          "document_date": "2022-11-07",
+          "locator": "Ticker announcement paragraph",
+          "supports": "The ticker changes from NLOK to GEN beginning 2022-11-08; the release says shareholders need take no action. The Avast merger had closed earlier, while this ticker/name change is for the continuing listed NortonLifeLock common stock."
+        }
+      ],
+      "source_byte_sha256": null
+    },
+    {
+      "predecessor": "PKI",
+      "successor": "RVTY",
+      "effective_date": "2023-05-16",
+      "chain_id": "revvity",
+      "continuity_kind": "same_issuer_rename",
+      "predecessor_admitted_end": "2023-05-15",
+      "successor_admitted_start": "2023-05-16",
+      "status": "accepted",
+      "transition_emitted": false,
+      "primary_evidence": [
+        {
+          "authority": "U.S. Securities and Exchange Commission, Revvity Form 10-Q",
+          "accession": "0000031791-23-000011",
+          "url": "https://www.sec.gov/Archives/edgar/data/31791/000003179123000011/pki-20230702.htm",
+          "document_date": "2023-08-08",
+          "locator": "Management's Discussion and Analysis, Overview",
+          "supports": "The registrant reports its corporate name change from PerkinElmer, Inc. to Revvity, Inc. and a common-stock ticker change to RVTY effective 2023-05-16."
+        }
+      ],
+      "source_byte_sha256": null
+    },
+    {
+      "predecessor": "WLTW",
+      "successor": "WTW",
+      "effective_date": "2022-01-10",
+      "chain_id": "wtw",
+      "continuity_kind": "same_issuer_rename",
+      "predecessor_admitted_end": "2022-01-09",
+      "successor_admitted_start": "2022-01-10",
+      "status": "accepted",
+      "transition_emitted": false,
+      "primary_evidence": [
+        {
+          "authority": "U.S. Securities and Exchange Commission, Willis Towers Watson Form 8-K",
+          "accession": "0001193125-22-004045",
+          "url": "https://www.sec.gov/Archives/edgar/data/1140536/000119312522004045/d267396d8k.htm",
+          "document_date": "2022-01-07",
+          "locator": "Item 8.01 Other Events",
+          "supports": "The same ordinary shares continue to trade on Nasdaq as WTW beginning 2022-01-10, replacing WLTW; the filing says no shareholder action is required and the CUSIP remains unchanged."
+        }
+      ],
+      "source_byte_sha256": null
+    },
+    {
+      "predecessor": "FISV",
+      "successor": "FI",
+      "effective_date": "2023-06-07",
+      "chain_id": "fiserv",
+      "continuity_kind": "same_issuer_ticker_reuse",
+      "predecessor_admitted_end": "2025-12-31",
+      "successor_admitted_start": "2023-06-07",
+      "successor_admitted_end": "2025-11-10",
+      "status": "unresolved",
+      "transition_emitted": false,
+      "primary_evidence": [
+        {
+          "authority": "U.S. Securities and Exchange Commission, Fiserv Exhibit 99.1",
+          "accession": "0001193125-23-154199",
+          "url": "https://www.sec.gov/Archives/edgar/data/798354/000119312523154199/d470900dex991.htm",
+          "document_date": "2023-05-25",
+          "locator": "Ticker and listing-transfer announcement",
+          "supports": "Fiserv common stock transfers from Nasdaq under FISV to NYSE under FI, beginning 2023-06-07."
+        },
+        {
+          "authority": "Fiserv investor relations",
+          "url": "https://investors.fiserv.com/news-releases/news-release-details/fiserv-announces-transfer-stock-exchange-listing-nasdaq",
+          "document_date": "2025-10-29",
+          "locator": "Ticker-change announcement paragraph",
+          "supports": "Fiserv Class A common stock is expected to begin trading on Nasdaq under its original FISV symbol on 2025-11-11."
+        },
+        {
+          "authority": "U.S. Securities and Exchange Commission, Fiserv Form 8-A",
+          "accession": "0001193125-25-274207",
+          "url": "https://www.sec.gov/Archives/edgar/data/798354/000119312525274207/d53898d8a12b.htm",
+          "document_date": "2025-11-10",
+          "locator": "Explanatory Note and securities registered table",
+          "supports": "The same Fiserv common stock listing ceases on NYSE at the close on/about 2025-11-10 and begins on Nasdaq at the open on/about 2025-11-11 under FISV."
+        }
+      ],
+      "source_byte_sha256": null,
+      "required_transition_edges_not_yet_representable": [
+        {
+          "effective_date": "2023-06-07",
+          "predecessor_segment": "FISV through 2023-06-06",
+          "successor_segment": "FI from 2023-06-07 through 2025-11-10",
+          "chain_id": "fiserv",
+          "continuity_kind": "same_issuer_ticker_reuse"
+        },
+        {
+          "effective_date": "2025-11-11",
+          "predecessor_segment": "FI through 2025-11-10",
+          "successor_segment": "FISV from 2025-11-11",
+          "chain_id": "fiserv",
+          "continuity_kind": "same_issuer_ticker_reuse"
+        }
+      ],
+      "representation_gap": "Do not truncate the existing FISV row or extend FI. The accepted source chronology has three date-bounded symbol episodes but the current identity contract keys one interval by ticker string and cannot distinguish the pre-2023 and post-2025 FISV episodes.",
+      "proposed_safe_disposition": "Keep both transition edges out of the integrated transition list and quarantine this chain from accepted continuity joins until a reviewed segment-ID contract and resolver can encode the three episodes.",
+      "validation_gap": "The shared V3 PriceIdentityTransitionContract in core/pit_data.py checks successor admission at the effective date but does not enforce predecessor admitted_start/admitted_end bounds. The membership normalizer now enforces predecessor dates in both _load_price_identity and direct _normalize calls. Segment-ID support for the repeated FISV symbol remains unresolved."
+    },
+    {
+      "predecessor": "VIAC",
+      "successor": "PARA",
+      "effective_date": "2022-02-17",
+      "chain_id": "paramount_legacy",
+      "continuity_kind": "same_issuer_rename",
+      "predecessor_admitted_end": "2022-02-16",
+      "successor_admitted_start": "2022-02-17",
+      "status": "accepted",
+      "transition_emitted": false,
+      "primary_evidence": [
+        {
+          "authority": "U.S. Securities and Exchange Commission, ViacomCBS/Paramount Form 8-K",
+          "accession": "0000813828-22-000011",
+          "url": "https://www.sec.gov/Archives/edgar/data/813828/000081382822000011/viac-20220216.htm",
+          "document_date": "2022-02-16",
+          "locator": "Item 5.03 and registered securities table",
+          "supports": "The same company's Class B common stock changes ticker from VIAC to PARA at the 2022-02-17 market open; the company name changes from ViacomCBS Inc. to Paramount Global effective 2022-02-16."
+        }
+      ],
+      "source_byte_sha256": null
+    },
+    {
+      "predecessor": "CDAY",
+      "successor": "DAY",
+      "effective_date": "2024-02-01",
+      "chain_id": "dayforce",
+      "continuity_kind": "same_issuer_rename",
+      "predecessor_admitted_end": "2024-01-31",
+      "successor_admitted_start": "2024-02-01",
+      "status": "accepted",
+      "transition_emitted": false,
+      "primary_evidence": [
+        {
+          "authority": "U.S. Securities and Exchange Commission, Dayforce Form 8-K",
+          "accession": "0000950170-24-009619",
+          "url": "https://www.sec.gov/Archives/edgar/data/1725057/000095017024009619/day-20240131.htm",
+          "document_date": "2024-02-01",
+          "locator": "Item 5.03 and ticker-change paragraph",
+          "supports": "The same registrant's common stock ceases trading as CDAY and begins trading as DAY on the NYSE and TSX effective 2024-02-01."
+        }
+      ],
+      "source_byte_sha256": null
+    }
+  ],
+  "related_edge_disposition": [
+    {
+      "predecessor": "PARA",
+      "successor": "PSKY",
+      "status": "rejected",
+      "reason": "This is not one of the 14 warmup_predecessor edges. The retained PSKY identity has no warmup_predecessor, a separate chain_id (paramount_successor), and continuity_kind successor_reset, which is outside the current same-security transition kinds. Do not emit this edge under the current contract."
+    }
+  ],
+  "required_fixture_and_reader_review": {
+    "shared_reader_modified": false,
+    "source_contract_overlap_permitted": false,
+    "recommendation": "Coordinate a narrowly scoped validation change before integrating any transition list: require predecessor.admitted_start < effective_date, predecessor.admitted_end < effective_date, and successor.admitted_start <= effective_date <= successor.admitted_end; for a continuous ticker rename, require adjacent bounds or an explicit documented gap. Keep the membership-active-prior-session check separate.",
+    "implemented_normalizer_validation": "The membership normalizer validates predecessor dates in both _load_price_identity and direct _normalize calls. The shared core/pit_data.py transition contract remains unchanged.",
+    "segment_contract_fixtures_pending": [
+      "Represent FISV to FI to FISV as three unique segment IDs and two effective-dated edges without a ticker-key collision.",
+      "Reject a two-row FISV/FI representation that loses the FISV episode beginning 2025-11-11."
+    ]
+  },
+  "index_membership_rows_added_by_this_review": 0,
+  "issue_68_acceptance_claimed": false
+}

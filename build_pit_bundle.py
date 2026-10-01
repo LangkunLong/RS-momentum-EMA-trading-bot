@@ -15,7 +15,11 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from core.pit_data import PITDataBundle, sha256_file
+from core.pit_data import (
+    PITDataBundle,
+    PriceIdentityTransitionContract,
+    sha256_file,
+)
 from core.pit_provenance import (
     PIT_NON_TRADABLE_REFERENCE_SYMBOLS,
     pit_canonical_json,
@@ -46,6 +50,10 @@ _INDUSTRY_COLUMNS = (
     "evidence_ids",
 )
 _V3_SOURCE_UNIVERSES = ("nasdaq100", "russell2000", "sp500")
+_NONPRODUCTION_EVIDENCE_MODES = {
+    "nonproduction_fixture",
+    "nonproduction_event_csv_integrity_v1",
+}
 _TICKER_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ.-")
 _V3_TICKER_RE = re.compile(r"[A-Z0-9][A-Z0-9.-]{0,14}\Z")
 _LINEAGE_RE = re.compile(r"[a-z][a-z0-9_]{0,47}\Z")
@@ -577,7 +585,13 @@ def _v3_ticker_for_lineage(
     as_of: str,
     identities: Mapping[str, Mapping[str, object]],
     transitions: tuple[Mapping[str, object], ...],
+    segment_contract: PriceIdentityTransitionContract | None = None,
 ) -> str:
+    if (
+        segment_contract is not None
+        and segment_contract.has_segmented_chain(lineage)
+    ):
+        return segment_contract.resolve_ticker_for_lineage(lineage, as_of)
     successor_dates = {
         str(item["successor"]): str(item["effective_date"])
         for item in transitions
@@ -601,6 +615,25 @@ def _v3_ticker_for_lineage(
     return active[0]
 
 
+def _load_v3_identity_contract(
+    prices_provenance_path: Path,
+    prices_provenance: Mapping[str, object],
+) -> tuple[
+    dict[str, Mapping[str, object]],
+    tuple[Mapping[str, object], ...],
+    str,
+    str,
+    Any,
+]:
+    from normalize_pit_universe_membership import _load_price_identity
+
+    return _load_price_identity(
+        prices_provenance,
+        source_root=prices_provenance_path.parent,
+        prices_provenance_sha256=sha256_file(prices_provenance_path),
+    )
+
+
 def _v3_provenance_metadata(
     *,
     membership_path: Path,
@@ -622,9 +655,14 @@ def _v3_provenance_metadata(
     fundamentals_provenance: Mapping[str, object],
     industry_provenance_path: Path,
     industry_provenance: Mapping[str, object],
-) -> tuple[dict[str, str], set[str], dict[str, Mapping[str, object]], tuple[Mapping[str, object], ...]]:
-    from normalize_pit_universe_membership import _load_price_identity
-
+    allow_nonproduction_fixture: bool = False,
+) -> tuple[
+    dict[str, str],
+    set[str],
+    dict[str, Mapping[str, object]],
+    tuple[Mapping[str, object], ...],
+    PriceIdentityTransitionContract | None,
+]:
     membership_sha = sha256_file(membership_path)
     prices_sha = sha256_file(prices_path)
     fundamentals_sha = sha256_file(fundamentals_path)
@@ -633,6 +671,10 @@ def _v3_provenance_metadata(
         pit_canonical_json(membership_provenance) + "\n"
     ).encode("utf-8"):
         raise ValueError("schema-V3 membership provenance is not canonical JSON")
+    admission_status = _require_v3_production_source_evidence(
+        membership_provenance,
+        allow_nonproduction_fixture=allow_nonproduction_fixture,
+    )
     if (
         membership_provenance.get("schema_version") != 3
         or membership_provenance.get("kind") != "pit_universe_membership_v3"
@@ -660,6 +702,8 @@ def _v3_provenance_metadata(
         coalesced_transition_count=int(
             membership_provenance["coalesced_transition_count"]
         ),
+        admission_status=admission_status,
+        evidence_mode=str(membership_provenance["source_evidence_mode"]),
     )
 
     if prices_provenance.get("prices_sha256") != prices_sha:
@@ -674,8 +718,14 @@ def _v3_provenance_metadata(
         prices_provenance_path
     ):
         raise ValueError("membership provenance does not bind prices provenance")
-    identities, transitions, identity_digest, transition_digest = _load_price_identity(
-        prices_provenance
+    (
+        identities,
+        transitions,
+        identity_digest,
+        transition_digest,
+        segment_contract,
+    ) = _load_v3_identity_contract(
+        prices_provenance_path, prices_provenance
     )
     if (
         membership_provenance.get("price_identity_request_contracts_sha256")
@@ -684,6 +734,13 @@ def _v3_provenance_metadata(
         != transition_digest
     ):
         raise ValueError("membership provenance does not bind the price identity contract")
+    segment_digest = (
+        segment_contract.segment_contract_sha256
+        if segment_contract is not None
+        else None
+    )
+    if membership_provenance.get("price_identity_segments_v1_sha256") != segment_digest:
+        raise ValueError("membership provenance does not bind the price identity segments")
     if fundamentals_provenance.get("fundamentals_sha256") != fundamentals_sha:
         raise ValueError("fundamentals provenance does not bind the fundamentals CSV")
     if _int(
@@ -785,7 +842,26 @@ def _v3_provenance_metadata(
         fundamentals_provenance.get("security_names_csv_sha256"),
         field="security_names_csv_sha256",
     )
+    fundamentals_source_kind = _required_v3_text(
+        fundamentals_provenance, "source"
+    )
+    synthetic_fundamentals_fixture = (
+        admission_status == "nonproduction_fixture"
+        and allow_nonproduction_fixture
+        and fundamentals_source_kind == "synthetic fixture"
+    )
+    if (
+        fundamentals_source_kind != "SEC EDGAR official bulk archives"
+        and not synthetic_fundamentals_fixture
+    ):
+        raise ValueError(
+            "fundamentals provenance source is not the approved SEC bulk archive source"
+        )
     metadata = {
+        "membership_admission_status": admission_status,
+        "membership_source_evidence_mode": str(
+            membership_provenance["source_evidence_mode"]
+        ),
         "membership_source_sha256": membership_sha,
         "prices_source_sha256": prices_sha,
         "fundamentals_source_sha256": fundamentals_sha,
@@ -794,7 +870,7 @@ def _v3_provenance_metadata(
         "prices_provenance_sha256": sha256_file(prices_provenance_path),
         "fundamentals_provenance_sha256": sha256_file(fundamentals_provenance_path),
         "industry_provenance_sha256": sha256_file(industry_provenance_path),
-        "membership_source_kind": "authenticated_three_universe_membership",
+        "membership_source_kind": "normalized_three_universe_membership",
         "membership_revision_id": membership_inputs_sha,
         "membership_raw_sha256": membership_inputs_sha,
         "membership_security_names_sha256": security_names_sha,
@@ -814,7 +890,7 @@ def _v3_provenance_metadata(
         ),
         "price_exclusion_count": str(len(exclusions)),
         "price_exclusions_sha256": pit_canonical_json_sha256(sorted(exclusions)),
-        "fundamentals_source_kind": _required_v3_text(fundamentals_provenance, "source"),
+        "fundamentals_source_kind": fundamentals_source_kind,
         "industry_source_kind": industry_source_kind,
         "industry_retrieved_at_utc": industry_retrieved_at,
         "industry_row_count": str(len(industry)),
@@ -822,8 +898,6 @@ def _v3_provenance_metadata(
         "non_tradable_reference_symbols_sha256": pit_canonical_json_sha256(reference_values),
         "source_universes_json": pit_canonical_json(list(_V3_SOURCE_UNIVERSES)),
     }
-    if metadata["fundamentals_source_kind"] != "SEC EDGAR official bulk archives":
-        raise ValueError("fundamentals provenance source is not the approved SEC bulk archive source")
     for key in (
         "submissions_archive_sha256",
         "companyfacts_archive_sha256",
@@ -836,7 +910,7 @@ def _v3_provenance_metadata(
         raise ValueError("fundamentals export is empty")
     if date.fromisoformat(evaluation_start) > date.fromisoformat(cutoff):
         raise ValueError("evaluation_start is after data_cutoff")
-    return metadata, exclusions, identities, transitions
+    return metadata, exclusions, identities, transitions, segment_contract
 
 
 def _required_v3_text(source: Mapping[str, object], key: str) -> str:
@@ -863,12 +937,18 @@ def _validated_v3_membership_inputs(
     *,
     universe_event_counts: Mapping[str, int],
     coalesced_transition_count: int,
+    admission_status: str,
+    evidence_mode: str,
 ) -> list[dict[str, object]]:
     binding_keys = {
+        "admission_status",
+        "event_csv_integrity_sha256",
+        "event_row_evidence_sha256",
         "event_count",
         "membership_sha256",
         "provenance_sha256",
         "retrieved_at_utc",
+        "source_evidence_mode",
         "source_kind",
         "universe_id",
     }
@@ -889,6 +969,36 @@ def _validated_v3_membership_inputs(
             raise ValueError(
                 "schema-V3 membership provenance source binding order is invalid"
             )
+        if raw_binding["admission_status"] != admission_status or raw_binding[
+            "source_evidence_mode"
+        ] != evidence_mode:
+            raise ValueError(
+                "schema-V3 membership source binding evidence mode is inconsistent"
+            )
+        integrity_digest = raw_binding["event_csv_integrity_sha256"]
+        row_evidence_digest = raw_binding["event_row_evidence_sha256"]
+        if evidence_mode == "nonproduction_fixture":
+            if integrity_digest is not None or row_evidence_digest is not None:
+                raise ValueError(
+                    "schema-V3 fixture source bindings contain unexpected event evidence"
+                )
+        elif evidence_mode == "nonproduction_event_csv_integrity_v1":
+            if not isinstance(integrity_digest, str) or not isinstance(
+                row_evidence_digest, str
+            ):
+                raise ValueError(
+                    "schema-V3 event CSV integrity digests are invalid"
+                )
+            integrity_digest = _digest(
+                integrity_digest,
+                field="membership input event_csv_integrity_sha256",
+            )
+            row_evidence_digest = _digest(
+                row_evidence_digest,
+                field="membership input event_row_evidence_sha256",
+            )
+        else:
+            raise ValueError("schema-V3 membership evidence mode is unsupported")
         event_count = raw_binding["event_count"]
         if type(event_count) is not int or event_count <= 0:
             raise ValueError(
@@ -911,6 +1021,9 @@ def _validated_v3_membership_inputs(
             )
         validated.append(
             {
+                "admission_status": admission_status,
+                "event_csv_integrity_sha256": integrity_digest,
+                "event_row_evidence_sha256": row_evidence_digest,
                 "event_count": event_count,
                 "membership_sha256": _digest(
                     membership_digest, field="membership input membership_sha256"
@@ -922,6 +1035,7 @@ def _validated_v3_membership_inputs(
                     raw_binding["retrieved_at_utc"],
                     field="membership input retrieved_at_utc",
                 ),
+                "source_evidence_mode": evidence_mode,
                 "source_kind": _required_v3_text(raw_binding, "source_kind"),
                 "universe_id": expected_universe,
             }
@@ -931,6 +1045,30 @@ def _validated_v3_membership_inputs(
             "schema-V3 membership provenance coalesced event count is inconsistent"
         )
     return validated
+
+
+def _require_v3_production_source_evidence(
+    membership_provenance: Mapping[str, object],
+    *,
+    allow_nonproduction_fixture: bool = False,
+) -> str:
+    admission_status = membership_provenance.get("admission_status")
+    evidence_mode = membership_provenance.get("source_evidence_mode")
+    if admission_status == "production":
+        raise ValueError(
+            "schema-V3 production admission requires a reviewed provider-native event adapter"
+        )
+    if (
+        admission_status != "nonproduction_fixture"
+        or not isinstance(evidence_mode, str)
+        or evidence_mode not in _NONPRODUCTION_EVIDENCE_MODES
+    ):
+        raise ValueError("schema-V3 membership evidence classification is invalid")
+    if not allow_nonproduction_fixture:
+        raise ValueError(
+            "nonproduction V3 membership requires explicit fixture-build opt-in"
+        )
+    return "nonproduction_fixture"
 
 
 def _integrity_gate_v3(
@@ -945,6 +1083,7 @@ def _integrity_gate_v3(
     price_exclusions: set[str],
     identities: Mapping[str, Mapping[str, object]],
     transitions: tuple[Mapping[str, object], ...],
+    segment_contract: PriceIdentityTransitionContract | None = None,
 ) -> None:
     cutoff_date = date.fromisoformat(cutoff)
     evaluation_date = date.fromisoformat(evaluation_start)
@@ -984,7 +1123,9 @@ def _integrity_gate_v3(
         raise ValueError("each source universe must seed evaluation_start")
     active_union = set().union(*active_by_universe.values())
     for lineage in active_union:
-        _v3_ticker_for_lineage(lineage, evaluation_start, identities, transitions)
+        _v3_ticker_for_lineage(
+            lineage, evaluation_start, identities, transitions, segment_contract
+        )
 
     industry_by_date: dict[str, set[str]] = {}
     industry_groups: dict[tuple[str, str], set[str]] = {}
@@ -1000,7 +1141,9 @@ def _integrity_gate_v3(
         active = _v3_active_lineages(membership, as_of)
         union = set().union(*active.values())
         expected = {
-            _v3_ticker_for_lineage(lineage, as_of, identities, transitions)
+            _v3_ticker_for_lineage(
+                lineage, as_of, identities, transitions, segment_contract
+            )
             for lineage in union
         }
         if observed != expected:
@@ -1164,6 +1307,14 @@ def main() -> int:
     parser.add_argument("--industry-provenance")
     parser.add_argument("--output", required=True)
     parser.add_argument("--manifest-output", required=True, help="required manifest-last commit marker")
+    parser.add_argument(
+        "--allow-nonproduction-fixture",
+        action="store_true",
+        help=(
+            "allow a schema-V3 development bundle labeled nonproduction; "
+            "does not admit provider-native production evidence"
+        ),
+    )
     args = parser.parse_args()
 
     if args.schema_version == "3" and (
@@ -1176,6 +1327,8 @@ def main() -> int:
         args.industry_csv is not None or args.industry_provenance is not None
     ):
         parser.error("industry inputs are schema-version-3-only")
+    if args.schema_version != "3" and args.allow_nonproduction_fixture:
+        parser.error("--allow-nonproduction-fixture is schema-version-3-only")
 
     cutoff = _iso_date(args.data_cutoff, field="data_cutoff")
     evaluation_start = _iso_date(args.evaluation_start, field="evaluation_start")
@@ -1240,6 +1393,7 @@ def main() -> int:
             price_exclusions,
             identities,
             transitions,
+            segment_contract,
         ) = _v3_provenance_metadata(
             membership_path=membership_path,
             prices_path=prices_path,
@@ -1260,6 +1414,7 @@ def main() -> int:
             fundamentals_provenance=fundamentals_provenance,
             industry_provenance_path=industry_provenance_path,
             industry_provenance=industry_provenance,
+            allow_nonproduction_fixture=args.allow_nonproduction_fixture,
         )
         _integrity_gate_v3(
             cutoff=cutoff,
@@ -1272,6 +1427,7 @@ def main() -> int:
             price_exclusions=price_exclusions,
             identities=identities,
             transitions=transitions,
+            segment_contract=segment_contract,
         )
     else:
         membership = _load_membership(membership_path, cutoff)
