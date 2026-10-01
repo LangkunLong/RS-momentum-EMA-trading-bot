@@ -6,7 +6,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pandas as pd
+import pytest
 
+import core.pit_optimizer_v5.evaluator as evaluator_module
 from core.backtest_engine import SimulationResultV5
 from core.backtest_fills import ExecutionProfileV5
 from core.pit_data import PriceIdentityTransitionContract
@@ -85,8 +87,16 @@ def _zero_report() -> EvaluationReportV5:
 
 def test_baseline_and_candidate_receive_the_same_declared_simulation_inputs(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Verify evaluator forwarding and identity binding without executing candidate source."""
+    # This metadata-only fake isolates simulator argument forwarding. Real V3
+    # bundle admission is exercised by test_pit_optimizer_v5_membership_admission.
+    monkeypatch.setattr(
+        evaluator_module,
+        "require_v5_production_membership_admission",
+        lambda *_args, **_kwargs: None,
+    )
     prices_provenance = tmp_path / "prices-provenance.json"
     prices_provenance.write_text("{}\n", encoding="utf-8")
     prices_sha = hashlib.sha256(prices_provenance.read_bytes()).hexdigest()
