@@ -911,6 +911,88 @@ def test_stop_proposal_stays_blocked_by_pending_strategy_exit(tmp_path: Path) ->
     assert unchanged.state_version == pending_holding.state_version
 
 
+@pytest.mark.parametrize(
+    ("existing_risk_per_unit", "addition_risk_per_unit"),
+    ((None, Decimal("5")), (Decimal("5"), None)),
+)
+def test_addition_never_turns_unknown_aggregate_holding_risk_into_known_risk(
+    tmp_path: Path,
+    existing_risk_per_unit: Decimal | None,
+    addition_risk_per_unit: Decimal | None,
+) -> None:
+    store = _open_store(tmp_path)
+    store.migrate()
+    deployment = _deployment()
+    store.register_deployment_identity(deployment, lifecycle="prepared", handler_identity="fixture-handler", guard_id="guard-v1")
+    entry_decision = _decision(deployment)
+    entry_kwargs = {} if existing_risk_per_unit is None else {
+        "risk_per_unit": existing_risk_per_unit,
+        "risk_basis": "entry_to_protective_stop",
+    }
+    entry = build_action_intent(
+        decision=entry_decision,
+        security_id="FIGI-BB1234",
+        broker_symbol="ACME",
+        role=ActionRole.ENTRY,
+        side=OrderSide.BUY,
+        requested_quantity=Decimal("10"),
+        **entry_kwargs,
+    )
+    _record_decision(store, entry)
+    store.record_action_intent(entry, expected_version=None)
+    _record_fill(
+        store,
+        entry,
+        event_id="risk-opening-fill",
+        cumulative_quantity="10",
+        cumulative_notional="500",
+        expected_action_version=0,
+        expected_holding_version=None,
+    )
+    holding = store.load_holding_episode_for_action(entry.logical_action_id)
+    expected_known_risk = None if existing_risk_per_unit is None else Decimal("50")
+    assert holding.committed_risk == expected_known_risk
+
+    addition_decision = _decision(
+        deployment,
+        category=DecisionCategory.ADDITION,
+        subject_type=DecisionSubjectType.HOLDING,
+        subject_id=holding.holding_episode_id,
+        snapshot="b" * 64,
+    )
+    store.record_decision(addition_decision, policy_payload={}, guard_payload={}, effective_action_payload={})
+    addition_kwargs = {} if addition_risk_per_unit is None else {
+        "risk_per_unit": addition_risk_per_unit,
+        "risk_basis": "entry_to_protective_stop",
+    }
+    addition = build_action_intent(
+        decision=addition_decision,
+        security_id=holding.security_id,
+        broker_symbol=holding.broker_symbol,
+        holding_episode_id=holding.holding_episode_id,
+        role=ActionRole.ADDITION,
+        side=OrderSide.BUY,
+        requested_quantity=Decimal("2"),
+        **addition_kwargs,
+    )
+    store.record_action_intent(addition, expected_version=None)
+    pending_holding = store.load_holding_episode(holding.holding_episode_id)
+    _record_fill(
+        store,
+        addition,
+        event_id="risk-addition-fill",
+        cumulative_quantity="2",
+        cumulative_notional="100",
+        expected_action_version=0,
+        expected_holding_version=pending_holding.state_version,
+    )
+
+    updated_holding = store.load_holding_episode(holding.holding_episode_id)
+    assert updated_holding.remaining_quantity == Decimal("12")
+    assert updated_holding.committed_risk is None
+    assert updated_holding.committed_risk_basis is None
+
+
 def test_provider_scoped_order_aliases_survive_action_projection_reload(tmp_path: Path) -> None:
     store = _open_store(tmp_path)
     store.migrate()
