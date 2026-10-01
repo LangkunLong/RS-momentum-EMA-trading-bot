@@ -1,0 +1,115 @@
+{
+  "schema_version": 1,
+  "issue": 72,
+  "receipt_kind": "corrective_followup",
+  "branch": "codex/issue-72-financial-lineage-bridge",
+  "parent_commit": "df3892234ad4b95408b9354c445e9b3a61985328",
+  "original_receipt": {
+    "path": "docs/issue-72-financial-lineage-bridge-receipt.json",
+    "sha256": "0057134631331440645cb8040c44fb8724510ef9a314c8f9806d24bd6c9187b3",
+    "disposition": "preserved unchanged; describes the initial df38922 execution and is superseded for acceptance by this corrected receipt"
+  },
+  "review_findings_corrected": [
+    "Mixed segment contracts now retain ordinary and legacy identity extraction windows alongside segmented lineages.",
+    "Single-CIK same-issuer aliases retain the complete SEC filing history without changing filing values or public dates; multi-CIK ticker reuse remains separated by issuer windows.",
+    "The synthetic-fundamentals builder path requires its provenance to bind the exact destination schema-V3 membership hash, even when the SEC bridge is omitted under explicit fixture opt-in."
+  ],
+  "runtime": {
+    "platform": "Windows",
+    "python": "3.13.14",
+    "pytest": "9.0.2",
+    "ruff": "0.15.9",
+    "network_access": false
+  },
+  "verification": {
+    "focused_pytest": {
+      "command": "python -m pytest tests/test_financial_lineage_bridge.py tests/test_sec_pit_fundamentals.py tests/test_normalize_pit_universe_membership.py tests/test_pit_identity_segments.py tests/test_verify_pit_bundle.py -q -p no:cacheprovider -o addopts=''",
+      "result": "71 passed, 1 warning in 7.05s",
+      "warning": "pyproject.toml configures cache_dir, which the installed pytest does not recognize"
+    },
+    "ruff": {
+      "command": "python -m ruff check build_pit_bundle.py core/financial_lineage_bridge.py core/sec_pit_fundamentals.py fetch_sec_pit_fundamentals.py tests/test_financial_lineage_bridge.py",
+      "result": "All checks passed"
+    },
+    "compileall": {
+      "command": "python -m compileall -q build_pit_bundle.py core/financial_lineage_bridge.py core/sec_pit_fundamentals.py fetch_sec_pit_fundamentals.py",
+      "exit_code": 0
+    },
+    "diff_check": {
+      "command": "git diff --check",
+      "exit_code": 0
+    },
+    "project_wide_pytest": {
+      "command": "python -m pytest",
+      "status": "incomplete_informational",
+      "collected": 2944,
+      "deselected": 2,
+      "selected": 2942,
+      "last_visible_progress_percent": 9,
+      "observation": "Failure markers appeared early, including in tests/test_agent_loop.py, and as the run reached 9%. Lead A directed stopping broad offline verification. The run was stopped before a final summary, so no complete failure count is available; it is not acceptance evidence.",
+      "partial_log_path": ".artifacts/coordination/issue72-followup-full-suite-partial.txt"
+    },
+    "prior_df38922_session_output": {
+      "location": "Lead A worktree a9c1: .artifacts/coordination/issue72-retained-original-command-outputs.json",
+      "note": "Lead A retained the original 68-test and Ruff output. It was not rerun to reconstruct a log."
+    }
+  },
+  "corrected_positive_case": {
+    "kind": "synthetic SEC archives through the actual exporter and schema-V3 builder",
+    "case_builder": "tests/test_financial_lineage_bridge.py::_actual_builder_case",
+    "bundle_builder_exit_code": 0,
+    "bundle_sha256": "85d1a599794d4a4d2e0f5808cc605336c42c80373937af60e0952acba01be487",
+    "membership_window": {
+      "start": "2021-01-01",
+      "membership_seed": "2021-01-04"
+    },
+    "alias_history_rows": [
+      {"ticker": "NEW", "period_end": "2019-12-31", "public_date": "2020-01-02", "basic_eps": "0.75"},
+      {"ticker": "NEW", "period_end": "2019-12-31", "public_date": "2020-01-06", "basic_eps": "1.25"},
+      {"ticker": "OLD", "period_end": "2019-12-31", "public_date": "2020-01-02", "basic_eps": "0.75"},
+      {"ticker": "OLD", "period_end": "2019-12-31", "public_date": "2020-01-06", "basic_eps": "1.25"}
+    ],
+    "fundamental_row_count": 4,
+    "corrected_case_evidence_root": ".artifacts/issue72-corrected-receipt-20261001-1"
+  },
+  "regression_cases": {
+    "mixed_segmented_fiserv_and_ordinary_identity": "passed through identity-history projection, actual SEC security-master construction, and fundamentals extraction; ORD remains in extraction history and emits its EPS row",
+    "same_issuer_fisv_fi_fisv_reentry": "passed; both FISV and FI retain filings published during the same-CIK alias history",
+    "multi_issuer_reused_ticker": "passed; each CIK contributes only within its issuer window",
+    "fixture_hash_binding": "passed; zero destination hash rejected without bridge, exact destination hash accepted with explicit fixture opt-in"
+  },
+  "input_sha256": {
+    "v3_membership_csv": "dab4eb5f12bf94e1c8ff1abeed355095204df40b4d825d1441f9f683a7de3718",
+    "v3_membership_provenance": "8e3159f81d717ce1aaedeb91f62ef66d2d20f96e18d7770fa19ed66222f62a34",
+    "prices_csv": "6355cc1ba3ea2f509f934b17940a4d17335e30639f6ea0f133a3ebc185edf5c7",
+    "prices_provenance": "c1c472ca84e2ffc739818631bcf3917bdda2ea54ea70fe1de688f1725982b7eb",
+    "ticker_membership_csv": "6752b4be01ff21aac65e4595f344eb56af485ab45e6c25b15bcf4b9eb4531fbd",
+    "lineage_projection_ledger_csv": "abfaf344bc3386fab6b930ebdcf479b827639d6608c083faa25975199d993219",
+    "lineage_projection_provenance": "2336e4eab5e1a1c7135db42464241e22d9b482b349c888d2d3b073bc8b769b68",
+    "identity_extraction_history_csv": "6f9f4e81511b3aa2dbab737b080752147fa30d9695586c413b4ae3d288a59f93",
+    "security_names_csv": "a75d2f30479caf6753d480b7a7d0d7926abc80b76e45ce65bd03fc8432df5601",
+    "spy_trading_days_csv": "671b9839888db11dc818dc77f6e1250c85df5e6628fd37fdf6b1b2d1c72cb75e",
+    "identity_manifest_csv": "7be0c564fddaeb685c0d180a257a2f2008b0f33fec42e9e40a7cb39a9efa2174",
+    "submissions_archive_zip": "a2b9c3a38212642239acd53ce5ac654cf1cf27e19595b83844e9c71367d9ad24",
+    "companyfacts_archive_zip": "594f3d2b93968ad952cb27a48429496e9bb908535db5214602c627a483f33361",
+    "industry_csv": "2dbc011fdfa2202a608910c1837b3d90384db27518522b93294a56d2c37fcf10",
+    "industry_provenance": "adedde16261ea2cf67bc4d4542b3a58b6533efe7a7e8f6947c544bb1394b71cb"
+  },
+  "output_sha256": {
+    "security_master_csv": "3e2816b05da3ca99c1d50b9c39870b474826deaf2468090e5f184d2d44a72626",
+    "security_master_exclusions_csv": "47e826f5b949fec6bb7377a7b19acb5d31ec22960d53143eec650593f254f25c",
+    "financial_lineage_extraction_history_csv": "bd3c6432e47a26f951c4cb21cbfd9ea6d40bd0a28ebfa1f69fa09ff9ed5d6095",
+    "fundamentals_csv": "3d7f4a324ca871265b7592100ce2949218fa13b1a6426500a1457360cb84be82",
+    "fundamentals_audit_csv": "93a023ed3ee1f9bf24b5f4eb125d574aa731d4236728f375b237304d8affb0b2",
+    "fundamentals_provenance": "b2766ed6941c44bea84b4f8abfa4b2ee30185a864621e8849849c4039fc6127c",
+    "bundle_sqlite": "85d1a599794d4a4d2e0f5808cc605336c42c80373937af60e0952acba01be487",
+    "bundle_manifest": "2160136e08b11b6159fc5660fc35c99a975a6aafa929b67af83d4035df5eb94a"
+  },
+  "source_sha256": {
+    "build_pit_bundle.py": "4bccbd5fdb8d3b18a0aa01ec4fdbc3d6793be09acf4f15a3fa13e45ae8809541",
+    "core/financial_lineage_bridge.py": "1ae296d1e080667d6179f1e9f3a8f844f9c980a6c1551c17957505ec7b96a30f",
+    "core/sec_pit_fundamentals.py": "1260fb42ad82dfd509781b2240bf449d3298c9bf38aad6aaf8d90068e09afc82",
+    "fetch_sec_pit_fundamentals.py": "a4cc46b74701b8b380bb67a5252af5a46b9d9305b8365b2b883004ebc73e030b",
+    "tests/test_financial_lineage_bridge.py": "92236080af0613791cb352210ce12c80f8a0309ddb453715789d3e2c9d0869e5"
+  }
+}

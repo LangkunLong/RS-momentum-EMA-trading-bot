@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "issue": 72,
+  "base_commit": "ab385d792e19ff6db39d87f1123f47f660fc1e1d",
+  "branch": "codex/issue-72-financial-lineage-bridge",
+  "evidence": {
+    "kind": "local synthetic SEC export and schema-V3 build",
+    "network_access": false,
+    "membership_window": {
+      "start": "2021-01-01",
+      "membership_seed": "2021-01-04"
+    },
+    "identity_transition": {
+      "effective_date": "2020-01-03",
+      "predecessor": "OLD",
+      "successor": "NEW"
+    },
+    "financial_rows": [
+      {
+        "ticker": "OLD",
+        "period_end": "2019-12-31",
+        "public_date": "2020-01-02",
+        "basic_eps": "0.75"
+      },
+      {
+        "ticker": "NEW",
+        "period_end": "2019-12-31",
+        "public_date": "2020-01-06",
+        "basic_eps": "1.25"
+      }
+    ],
+    "builder_exit": 0,
+    "bundle_sha256": "5cdae4cdf8e19b91cc6d1ad080cccb629020aed56b983fe8915b8273dd9e85d4",
+    "builder_metadata_sha256": {
+      "membership_source_sha256": "dab4eb5f12bf94e1c8ff1abeed355095204df40b4d825d1441f9f683a7de3718",
+      "prices_provenance_sha256": "c1c472ca84e2ffc739818631bcf3917bdda2ea54ea70fe1de688f1725982b7eb",
+      "fundamentals_provenance_sha256": "03c0698bba4f3332ef36172f11e5203a41de51efe5eac3d67c348805a78241f8",
+      "financial_lineage_projection_sha256": "2336e4eab5e1a1c7135db42464241e22d9b482b349c888d2d3b073bc8b769b68",
+      "financial_lineage_projection_ledger_sha256": "abfaf344bc3386fab6b930ebdcf479b827639d6608c083faa25975199d993219",
+      "financial_lineage_extraction_history_sha256": "bd3c6432e47a26f951c4cb21cbfd9ea6d40bd0a28ebfa1f69fa09ff9ed5d6095",
+      "security_master_sha256": "3e2816b05da3ca99c1d50b9c39870b474826deaf2468090e5f184d2d44a72626",
+      "security_master_exclusions_sha256": "47e826f5b949fec6bb7377a7b19acb5d31ec22960d53143eec650593f254f25c",
+      "fundamentals_sha256": "04ca792eda9adc42642560fc75bce8f07b37f9a8e156d9eb022cf3a02f03f9b1",
+      "fundamentals_audit_sha256": "3ae74d910b1ebf6e14f4cf63390d5ffaab5a33c0ad6c0181b30543e114a60ef7",
+      "submissions_archive_sha256": "a2b9c3a38212642239acd53ce5ac654cf1cf27e19595b83844e9c71367d9ad24",
+      "companyfacts_archive_sha256": "594f3d2b93968ad952cb27a48429496e9bb908535db5214602c627a483f33361"
+    },
+    "archive_hash_disposition": "SEC archive hashes are declarations verified and emitted by the exporter for the synthetic ZIP inputs; the lineage bridge does not independently rehash ZIP bytes in the bundle builder.",
+    "test_command": "python -m pytest tests/test_financial_lineage_bridge.py::test_production_builder_path_accepts_coherent_synthetic_bridge_and_warmup_rows -q -s -p no:cacheprovider -o addopts=''"
+  }
+}

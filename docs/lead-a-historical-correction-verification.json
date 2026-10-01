@@ -1,0 +1,91 @@
+{
+  "integrated_revision": "5c6816e56dbd3149b6d81d645d03c5d0c9687482",
+  "python": "3.13.14 (tags/v3.13.14:fd17997, Jun 10 2026, 13:03:48) [MSC v.1944 64 bit (AMD64)]",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "test_temp_root": "C:/Users/llong/.codex/visualizations/2026/09/28/01a0e67f-9969-7230-8a0c-f1c433a84ad8/lead-a-correction-tests",
+  "commands": [
+    {
+      "label": "focused",
+      "command": [
+        "C:\\Users\\llong\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\python.exe",
+        "-m",
+        "pytest",
+        "tests/test_financial_lineage_bridge.py",
+        "tests/test_sec_pit_fundamentals.py",
+        "tests/test_normalize_pit_universe_membership.py",
+        "tests/test_pit_identity_segments.py",
+        "tests/test_verify_pit_bundle.py",
+        "tests/test_assess_issue70_retained_source.py",
+        "-q",
+        "-p",
+        "no:cacheprovider",
+        "-o",
+        "addopts="
+      ],
+      "exit_code": 0,
+      "log": "C:\\Users\\llong\\.codex\\worktrees\\a9c1\\RS-momentum-EMA-trading-bot\\.artifacts\\coordination\\lead-a-correction-verification\\focused.log",
+      "sha256": "697a16a71e1193110f0c03050a34ea5051297f3a85cb35d921eeb819f06c9581"
+    },
+    {
+      "label": "ruff",
+      "command": [
+        "C:\\Users\\llong\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\python.exe",
+        "-m",
+        "ruff",
+        "check",
+        "."
+      ],
+      "exit_code": 0,
+      "log": "C:\\Users\\llong\\.codex\\worktrees\\a9c1\\RS-momentum-EMA-trading-bot\\.artifacts\\coordination\\lead-a-correction-verification\\ruff.log",
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
+    }
+  ],
+  "tracked_python_files_compiled_in_memory": 306,
+  "owner_equivalence": {
+    "72": {
+      "revision": "ad628594b7708568bb97cb7d69e53745d96fdf35",
+      "files": {
+        "core/financial_lineage_bridge.py": {
+          "raw_git_sha256": "2faae533894381490b266cd676c1d7e8a9e64aa5a5bd55cab8b0fca9ac0e8abd",
+          "matches_owner": true
+        },
+        "fetch_sec_pit_fundamentals.py": {
+          "raw_git_sha256": "8a88bd33caa08aeeeba25f4312b64797478e463ba570e22f04c35ef479874a2c",
+          "matches_owner": true
+        },
+        "tests/test_financial_lineage_bridge.py": {
+          "raw_git_sha256": "d8139a8e2f989355d8c5f8677c799f3992053f0e9efd4bb11eefe714ac708caf",
+          "matches_owner": true
+        },
+        "docs/issue-72-financial-lineage-bridge-window-binding-receipt.json": {
+          "raw_git_sha256": "430cc557665e0f742def7885ceca017b8ad1621771310cfe0161fc282e37ec38",
+          "matches_owner": true
+        }
+      }
+    },
+    "70": {
+      "revision": "d0bb52f94ae68aa26fd90e8c0a295456850516c2",
+      "files": {
+        "tools/assess_issue70_retained_source.py": {
+          "raw_git_sha256": "290155b6ea16c330ad00785501610a637d151cd2c1637e2fe7a80960484b165d",
+          "matches_owner": true
+        },
+        "tests/test_assess_issue70_retained_source.py": {
+          "raw_git_sha256": "ee0823a50061083694eb1844935595bcc1bdf368f7a107838ffabbd24192260d",
+          "matches_owner": true
+        },
+        "docs/issue-70-bounded-source-assessment-quarterly-lookback-v2.json": {
+          "raw_git_sha256": "14e3781bbb1b7cd7511556d73a25a0e86331234a3b33454904a8ab70adb6349b",
+          "matches_owner": true
+        }
+      }
+    }
+  },
+  "image_evidence_source": "a8662e85c4c06142183c707926e7c302c75e233d",
+  "context_file_count": 61,
+  "runtime_file_count": 58,
+  "context_git_file_differences": [],
+  "evaluator_source_sha256": "ea44827dc78dcc3f4a4293929e4897345d1f0daa7faef6fbd50cdbb00757d2af",
+  "calculator_git_blob": "71e562ffc00dc4e617f1cd625e3f13ea5fe3f81a",
+  "limits": "No new source acquisition, archive trace, old coverage report, broad suite or container run. Original receipts retain original execution identities. Required hosted checks and principal final acceptance remain separate."
+}

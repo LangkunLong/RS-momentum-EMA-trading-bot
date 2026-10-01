@@ -1,0 +1,2373 @@
+{
+  "assessment_id": "historical-05-issue-70-bounded-retained-source-assessment",
+  "assessment_scope": "offline retained-export measurement and three-issuer source trace; no provider calls, re-acquisition, extraction, order logic, or strategy-score computation",
+  "code_identity": {
+    "bundle_builder_git_blob": "75cc9103a2e0508d20d1f68b958c8e498bb5245a",
+    "extractor_git_blob": "6622b03d1a12d06224efa4457d809f95f9572d8e",
+    "feature_calculator_git_blob": "71e562ffc00dc4e617f1cd625e3f13ea5fe3f81a",
+    "final_issue_71_calculator_blob": "71e562ffc00dc4e617f1cd625e3f13ea5fe3f81a",
+    "financial_calculator_identity": "pit-financial-features-v3",
+    "fiscal_matcher_git_blob": "14c3c994f70a06f7897288a0d397672dbf897d89",
+    "repository_head": "ab385d792e19ff6db39d87f1123f47f660fc1e1d",
+    "script_sha256": "601527fed1c6b408e3fe1057f141f2c3909c3775561814c3804d7246d1376de0"
+  },
+  "generated_at_utc": "2026-10-01T18:01:59.351942+00:00",
+  "generation_comparison": {
+    "acquisition_declared_audit_coverage_hashes": {
+      "fundamentals_audit_sha256": "b7281d16c0365377ba17b6bd6e2a9a8d7ea6d9d885d4c716d18bc86ee96de7f9",
+      "fundamentals_coverage_sha256": "2e67b44f0e625d85060263e1b5fd148d4816f0d44418f4a7b4d1e8d59a4276ae"
+    },
+    "acquisition_fundamental_row_count_from_retained_provenance": 142329,
+    "acquisition_import_manifest": "C:\\Projects\\trading_bot\\RS-momentum-EMA-trading-bot\\.artifacts\\data\\acquisition\\acquisition\\raw\\local-cache\\import-provenance.json",
+    "admission_status": "authenticated_previous_SP500_material_only_not_complete_V5_inputs",
+    "file_generations": {
+      "fundamentals.csv": {
+        "acquisition_generation_bytes": 10031683,
+        "acquisition_generation_sha256": "2f653eb5b91b4be79a2b33cd5b43e01749a25a9e5f74581a7f212bb6bd6bd56b",
+        "alternate_generation_bytes": 10319164,
+        "alternate_generation_sha256": "3cb2ecfcaa75cf9195d2ca91e159e62a283092f223fa2d3ed73d2e139456aab2",
+        "same_identity": false
+      },
+      "fundamentals_audit.csv": {
+        "acquisition_generation_bytes": null,
+        "acquisition_generation_sha256": null,
+        "alternate_generation_bytes": 147626063,
+        "alternate_generation_sha256": "bfcde58871671bcd77317a868c460c5a410de0fb3aff6fba25868939002f5424",
+        "same_identity": null
+      },
+      "fundamentals_coverage.json": {
+        "acquisition_generation_bytes": null,
+        "acquisition_generation_sha256": null,
+        "alternate_generation_bytes": 1757,
+        "alternate_generation_sha256": "3532f0fbd2d76729f3131cfdac600693051b0316fbbc1fc18e08246555f5d52b",
+        "same_identity": null
+      },
+      "membership.csv": {
+        "acquisition_generation_bytes": 12284,
+        "acquisition_generation_sha256": "a12413a9134623b51350ad4671d4a678eeed8edf2241a9985d0d7d51957f5389",
+        "alternate_generation_bytes": 12284,
+        "alternate_generation_sha256": "a12413a9134623b51350ad4671d4a678eeed8edf2241a9985d0d7d51957f5389",
+        "same_identity": true
+      },
+      "security_master.csv": {
+        "acquisition_generation_bytes": 41913,
+        "acquisition_generation_sha256": "902eab6e94c542e71b74db573cf6d8db9b4a90208b6fd30c394b03f5e944cbd3",
+        "alternate_generation_bytes": 41914,
+        "alternate_generation_sha256": "6f2a632b43a6dca4cdd046d6c3ae06815f9f1e000fb828b53dca25e6eeed5c42",
+        "same_identity": false
+      },
+      "security_master_exclusions.csv": {
+        "acquisition_generation_bytes": 4370,
+        "acquisition_generation_sha256": "a0862ae2f259651c5627ccb34d40ee420175ab048dab5eb7da7cb655c1d90529",
+        "alternate_generation_bytes": 4370,
+        "alternate_generation_sha256": "a0862ae2f259651c5627ccb34d40ee420175ab048dab5eb7da7cb655c1d90529",
+        "same_identity": true
+      }
+    },
+    "imported_at_utc": "2026-09-07T03:41:04.079945Z",
+    "retained_acquisition_files": {
+      "fundamentals.csv": {
+        "actual_sha256": "2f653eb5b91b4be79a2b33cd5b43e01749a25a9e5f74581a7f212bb6bd6bd56b",
+        "bound_by_original_provenance": true,
+        "bytes": 10031683,
+        "import_manifest_sha256": "2f653eb5b91b4be79a2b33cd5b43e01749a25a9e5f74581a7f212bb6bd6bd56b",
+        "matches_import_manifest": true
+      },
+      "fundamentals_audit.csv": {
+        "present": false
+      },
+      "fundamentals_coverage.csv": {
+        "present": false
+      },
+      "fundamentals_coverage.json": {
+        "present": false
+      },
+      "fundamentals_provenance.json": {
+        "actual_sha256": "d85a931541a71fc8c5b34746692cb56dbd34b6b08341df8610804f9727546755",
+        "bound_by_original_provenance": false,
+        "bytes": 2677,
+        "import_manifest_sha256": "d85a931541a71fc8c5b34746692cb56dbd34b6b08341df8610804f9727546755",
+        "matches_import_manifest": true
+      },
+      "security_master.csv": {
+        "actual_sha256": "902eab6e94c542e71b74db573cf6d8db9b4a90208b6fd30c394b03f5e944cbd3",
+        "bound_by_original_provenance": true,
+        "bytes": 41913,
+        "import_manifest_sha256": "902eab6e94c542e71b74db573cf6d8db9b4a90208b6fd30c394b03f5e944cbd3",
+        "matches_import_manifest": true
+      },
+      "security_master_exclusions.csv": {
+        "actual_sha256": "a0862ae2f259651c5627ccb34d40ee420175ab048dab5eb7da7cb655c1d90529",
+        "bound_by_original_provenance": true,
+        "bytes": 4370,
+        "import_manifest_sha256": "a0862ae2f259651c5627ccb34d40ee420175ab048dab5eb7da7cb655c1d90529",
+        "matches_import_manifest": true
+      }
+    }
+  },
+  "generation_row_count_comparison": {
+    "acquisition_generation_declared_row_count": 142329,
+    "alternate_generation_csv_bytes": 10319164,
+    "alternate_generation_declared_row_count": 145010,
+    "fundamentals_sha256s_match": false,
+    "row_count_delta": 2681
+  },
+  "interpretation_limits": [
+    "The assessed SEC-fundamentals export is a distinct generation from the acquisition cache used by the prior material-only packet; no claim is made that this alternate generation was consumed by that packet.",
+    "The current fundamentals_provenance.json hash differs from fundamentals_publication.json; removing only the net_income_concept_priority field reconstructs the marker-bound hash, but this byte reconstruction does not establish when or why that field was added or bind the alternate export atomically to the acquisition generation.",
+    "The aggregate exporter omits country, currency/unit, and source-origin columns; audit concepts and three bounded archive traces cannot establish universe-wide foreign or unit reconciliation.",
+    "Rows with more than one public-date vintage are revision candidates, not confirmed amendments solely from row multiplicity.",
+    "Q4 concept-consistent symbol-year candidates are not derived values and do not prove source-unit, currency, or accounting-basis reconciliation.",
+    "Snapshot coverage is reported for the two named member dates and the retained S&P membership seed only; it is not full V5 three-universe coverage or a benchmark score evaluation."
+  ],
+  "measurement": {
+    "audit": {
+      "export_audit_exact_row_join": {
+        "exact_ticker_statement_period_public_date_pairs_in_same_order": 145010,
+        "key_mismatch_examples": [],
+        "key_mismatch_or_export_missing_count": 0,
+        "rows_checked_from_audit": 145010,
+        "trailing_export_rows_without_audit_count": 0
+      },
+      "filed_date_range": [
+        "2009-04-15",
+        "2025-12-30"
+      ],
+      "fiscal_periods": {
+        "<missing>": 3,
+        "FY": 36532,
+        "Q1": 31010,
+        "Q2": 36212,
+        "Q3": 41122,
+        "Q4": 131
+      },
+      "fiscal_year_range": [
+        "2009",
+        "2027"
+      ],
+      "forms": {
+        "10-K": 36140,
+        "10-K/A": 443,
+        "10-Q": 107757,
+        "10-Q/A": 670
+      },
+      "inherited_metric_occurrence_counts": {
+        "basic_eps": 6079,
+        "common_stock": 13950,
+        "diluted_eps": 6089,
+        "net_income": 65,
+        "shares_outstanding": 1864,
+        "total_revenue": 6171,
+        "total_stockholders_equity": 373
+      },
+      "missing_audit_field_counts": {
+        "acceptance_datetime": 13
+      },
+      "not_emitted_form_rows": {
+        "10-KT": 0,
+        "10-QT": 0,
+        "20-F": 0,
+        "6-K": 0,
+        "8-K": 0
+      },
+      "public_date_basis_counts": {
+        "acceptance_datetime": 144997,
+        "filed_date_fallback": 13
+      },
+      "q4_evidence_in_retained_audit": {
+        "arithmetic_values_emitted": false,
+        "concept_consistent_candidate_examples": {
+          "basic_eps": [
+            "A:2010",
+            "A:2011",
+            "A:2012",
+            "A:2013",
+            "A:2014",
+            "A:2015",
+            "A:2016",
+            "A:2017",
+            "A:2018",
+            "A:2019"
+          ],
+          "diluted_eps": [
+            "A:2010",
+            "A:2011",
+            "A:2012",
+            "A:2013",
+            "A:2014",
+            "A:2015",
+            "A:2016",
+            "A:2017",
+            "A:2018",
+            "A:2019"
+          ],
+          "net_income": [
+            "A:2010",
+            "A:2011",
+            "A:2012",
+            "A:2013",
+            "A:2014",
+            "A:2015",
+            "A:2016",
+            "A:2022",
+            "A:2023",
+            "A:2024"
+          ],
+          "total_revenue": [
+            "A:2019",
+            "A:2020",
+            "A:2022",
+            "A:2023",
+            "A:2024",
+            "A:2025",
+            "AAL:2020",
+            "AAL:2021",
+            "AAL:2022",
+            "AAL:2023"
+          ]
+        },
+        "limitation": "candidate count uses audit fiscal-period/concept metadata; source units, currency, and accounting-basis reconciliation are not proved by this audit summary",
+        "q4_exported_nonempty_metric_source_values": {
+          "basic_eps": 2,
+          "diluted_eps": 2,
+          "net_income": 2
+        },
+        "q4_rows_by_form": {
+          "10-K": 128,
+          "10-Q": 3
+        },
+        "q4_rows_by_statement_type": {
+          "annual": 57,
+          "balance": 72,
+          "quarterly": 2
+        },
+        "quarterly_q4_row_examples": [
+          {
+            "fiscal_year": "2017",
+            "form": "10-Q",
+            "nonempty_metric_source_fields": [
+              "basic_eps",
+              "diluted_eps",
+              "net_income"
+            ],
+            "period_end": "2016-12-24",
+            "raw_numeric_values_written": false,
+            "source_accession_present": true,
+            "ticker": "KDP"
+          },
+          {
+            "fiscal_year": "2017",
+            "form": "10-Q",
+            "nonempty_metric_source_fields": [
+              "basic_eps",
+              "diluted_eps",
+              "net_income"
+            ],
+            "period_end": "2017-12-31",
+            "raw_numeric_values_written": false,
+            "source_accession_present": true,
+            "ticker": "KDP"
+          }
+        ],
+        "rows_with_fiscal_period_q4_tag_and_quarterly_export_statement": 2,
+        "rows_with_fiscal_period_q4_tag_any_statement_type": 131,
+        "symbol_years_with_explicit_q4_metric_concept": {
+          "basic_eps": 1,
+          "diluted_eps": 1,
+          "net_income": 1
+        },
+        "symbol_years_with_fy_q1_q2_q3_same_single_concept": {
+          "basic_eps": 6516,
+          "diluted_eps": 6524,
+          "net_income": 6538,
+          "total_revenue": 4468
+        }
+      },
+      "recognized_domestic_form_rows": {
+        "10-K": 36140,
+        "10-K/A": 443,
+        "10-Q": 107757,
+        "10-Q/A": 670
+      },
+      "row_count": 145010,
+      "source_concept_occurrence_counts_by_metric": {
+        "basic_eps": {
+          "us-gaap:EarningsPerShareBasic": 54423
+        },
+        "common_stock": {
+          "us-gaap:CommonStockValue": 47605
+        },
+        "diluted_eps": {
+          "us-gaap:EarningsPerShareDiluted": 54519
+        },
+        "net_income": {
+          "us-gaap:NetIncomeLoss": 49285,
+          "us-gaap:NetIncomeLossAvailableToCommonStockholdersBasic": 854,
+          "us-gaap:ProfitLoss": 7493
+        },
+        "shares_outstanding": {
+          "dei:EntityCommonStockSharesOutstanding": 31225
+        },
+        "total_revenue": {
+          "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax": 24939,
+          "us-gaap:Revenues": 21514
+        },
+        "total_stockholders_equity": {
+          "us-gaap:StockholdersEquity": 59138
+        }
+      },
+      "unique_accession_count": 31981,
+      "unique_ticker_count": 566
+    },
+    "bounded_archive_sample": {
+      "bounded_company_count": 3,
+      "foreign_coverage_limit": "This deterministic US issuer sample does not measure foreign issuers. The exporter/master has no country column; form counts are evidence only for the sampled CIKs.",
+      "scope": "For each of A, AMZN, and MSFT, opened only its single CIK JSON member in each already hash-verified ZIP. No archive-wide extraction or other archive member reads were performed.",
+      "symbols": {
+        "A": {
+          "cik": "0001090872",
+          "company_name": "Agilent Technologies",
+          "companyfacts_2020_2025": {
+            "10k_quarter_duration_observation_count": 0,
+            "annual_duration_observation_count": 84,
+            "calendar_year_frame_contains_q4_observation_count": 42,
+            "explicit_companyfacts_fiscal_period_q4_observation_count": 0,
+            "form_counts": {
+              "10-K": 88,
+              "10-Q": 320,
+              "8-K": 32
+            },
+            "quarterly_duration_observation_count": 140,
+            "selected_concept_observation_count": 440,
+            "values_written_to_receipt": false
+          },
+          "companyfacts_member": {
+            "crc32": "a2ed2ab4",
+            "name": "CIK0001090872.json",
+            "sha256_of_bounded_member_bytes": "a782d953c7f45eceb7e2f14e5aadf6d27f1836fb652fa32d40c0812f92dc719d",
+            "uncompressed_bytes": 5055055
+          },
+          "exact_export_audit_companyfacts_trace": {
+            "audit_row_count_for_symbol": 241,
+            "audit_rows_without_exact_export_pair": 0,
+            "exact_ticker_statement_period_public_date_pairs": 241,
+            "export_row_count_for_symbol": 241,
+            "export_rows_without_exact_audit_pair": 0,
+            "matched_companyfacts_units_by_metric": {
+              "basic_eps": {
+                "USD/shares": 105
+              },
+              "common_stock": {
+                "USD": 186
+              },
+              "diluted_eps": {
+                "USD/shares": 103
+              },
+              "net_income": {
+                "USD": 101
+              },
+              "shares_outstanding": {
+                "shares": 66
+              },
+              "total_revenue": {
+                "USD": 74
+              },
+              "total_stockholders_equity": {
+                "USD": 93
+              }
+            },
+            "metric_source_link_counts": {
+              "basic_eps": {
+                "csv_value_found_in_origin_facts": 101,
+                "exported_nonempty_values": 101,
+                "metric_source_links": 101,
+                "origin_key_companyfacts_candidates": 327
+              },
+              "common_stock": {
+                "csv_value_found_in_origin_facts": 92,
+                "exported_nonempty_values": 92,
+                "metric_source_links": 92,
+                "origin_key_companyfacts_candidates": 190
+              },
+              "diluted_eps": {
+                "csv_value_found_in_origin_facts": 101,
+                "exported_nonempty_values": 101,
+                "metric_source_links": 101,
+                "origin_key_companyfacts_candidates": 327
+              },
+              "net_income": {
+                "csv_value_found_in_origin_facts": 101,
+                "exported_nonempty_values": 101,
+                "metric_source_links": 101,
+                "origin_key_companyfacts_candidates": 327
+              },
+              "shares_outstanding": {
+                "csv_value_found_in_origin_facts": 66,
+                "exported_nonempty_values": 66,
+                "metric_source_links": 66,
+                "origin_key_companyfacts_candidates": 66
+              },
+              "total_revenue": {
+                "csv_value_found_in_origin_facts": 72,
+                "exported_nonempty_values": 72,
+                "inherited_source_links": 2,
+                "metric_source_links": 72,
+                "origin_key_companyfacts_candidates": 231
+              },
+              "total_stockholders_equity": {
+                "csv_value_found_in_origin_facts": 93,
+                "exported_nonempty_values": 93,
+                "metric_source_links": 93,
+                "origin_key_companyfacts_candidates": 198
+              }
+            },
+            "sample_origin_trace_examples": [
+              {
+                "companyfacts_origin_candidate_count": 3,
+                "csv_value_found_in_origin_facts": true,
+                "export_period_end": "2007-10-31",
+                "inherited_metric": false,
+                "matched_source_period_ends": [
+                  "2007-10-31"
+                ],
+                "matched_unit_names": [
+                  "USD/shares"
+                ],
+                "metric": "basic_eps",
+                "public_date": "2020-01-02",
+                "source_accession_present": true,
+                "source_concept": "us-gaap:EarningsPerShareBasic",
+                "source_filed_date": "2009-12-21",
+                "source_form": "10-K",
+                "statement_type": "annual"
+              },
+              {
+                "companyfacts_origin_candidate_count": 3,
+                "csv_value_found_in_origin_facts": true,
+                "export_period_end": "2007-10-31",
+                "inherited_metric": false,
+                "matched_source_period_ends": [
+                  "2007-10-31"
+                ],
+                "matched_unit_names": [
+                  "USD/shares"
+                ],
+                "metric": "diluted_eps",
+                "public_date": "2020-01-02",
+                "source_accession_present": true,
+                "source_concept": "us-gaap:EarningsPerShareDiluted",
+                "source_filed_date": "2009-12-21",
+                "source_form": "10-K",
+                "statement_type": "annual"
+              },
+              {
+                "companyfacts_origin_candidate_count": 3,
+                "csv_value_found_in_origin_facts": true,
+                "export_period_end": "2007-10-31",
+                "inherited_metric": false,
+                "matched_source_period_ends": [
+                  "2007-10-31"
+                ],
+                "matched_unit_names": [
+                  "USD"
+                ],
+                "metric": "net_income",
+                "public_date": "2020-01-02",
+                "source_accession_present": true,
+                "source_concept": "us-gaap:ProfitLoss",
+                "source_filed_date": "2009-12-21",
+                "source_form": "10-K",
+                "statement_type": "annual"
+              },
+              {
+                "companyfacts_origin_candidate_count": 3,
+                "csv_value_found_in_origin_facts": true,
+                "export_period_end": "2008-10-31",
+                "inherited_metric": false,
+                "matched_source_period_ends": [
+                  "2008-10-31"
+                ],
+                "matched_unit_names": [
+                  "USD/shares"
+                ],
+                "metric": "basic_eps",
+                "public_date": "2020-01-02",
+                "source_accession_present": true,
+                "source_concept": "us-gaap:EarningsPerShareBasic",
+                "source_filed_date": "2010-12-20",
+                "source_form": "10-K",
+                "statement_type": "annual"
+              },
+              {
+                "companyfacts_origin_candidate_count": 3,
+                "csv_value_found_in_origin_facts": true,
+                "export_period_end": "2008-10-31",
+                "inherited_metric": false,
+                "matched_source_period_ends": [
+                  "2008-10-31"
+                ],
+                "matched_unit_names": [
+                  "USD/shares"
+                ],
+                "metric": "diluted_eps",
+                "public_date": "2020-01-02",
+                "source_accession_present": true,
+                "source_concept": "us-gaap:EarningsPerShareDiluted",
+                "source_filed_date": "2010-12-20",
+                "source_form": "10-K",
+                "statement_type": "annual"
+              },
+              {
+                "companyfacts_origin_candidate_count": 3,
+                "csv_value_found_in_origin_facts": true,
+                "export_period_end": "2008-10-31",
+                "inherited_metric": false,
+                "matched_source_period_ends": [
+                  "2008-10-31"
+                ],
+                "matched_unit_names": [
+                  "USD"
+                ],
+                "metric": "net_income",
+                "public_date": "2020-01-02",
+                "source_accession_present": true,
+                "source_concept": "us-gaap:ProfitLoss",
+                "source_filed_date": "2010-12-20",
+                "source_form": "10-K",
+                "statement_type": "annual"
+              },
+              {
+                "companyfacts_origin_candidate_count": 3,
+                "csv_value_found_in_origin_facts": true,
+                "export_period_end": "2009-10-31",
+                "inherited_metric": false,
+                "matched_source_period_ends": [
+                  "2009-10-31"
+                ],
+                "matched_unit_names": [
+                  "USD/shares"
+                ],
+                "metric": "basic_eps",
+                "public_date": "2020-01-02",
+                "source_accession_present": true,
+                "source_concept": "us-gaap:EarningsPerShareBasic",
+                "source_filed_date": "2011-12-16",
+                "source_form": "10-K",
+                "statement_type": "annual"
+              },
+              {
+                "companyfacts_origin_candidate_count": 3,
+                "csv_value_found_in_origin_facts": true,
+                "export_period_end": "2009-10-31",
+                "inherited_metric": false,
+                "matched_source_period_ends": [
+                  "2009-10-31"
+                ],
+                "matched_unit_names": [
+                  "USD/shares"
+                ],
+                "metric": "diluted_eps",
+                "public_date": "2020-01-02",
+                "source_accession_present": true,
+                "source_concept": "us-gaap:EarningsPerShareDiluted",
+                "source_filed_date": "2011-12-16",
+                "source_form": "10-K",
+                "statement_type": "annual"
+              },
+              {
+                "companyfacts_origin_candidate_count": 3,
+                "csv_value_found_in_origin_facts": true,
+                "export_period_end": "2009-10-31",
+                "inherited_metric": false,
+                "matched_source_period_ends": [
+                  "2009-10-31"
+                ],
+                "matched_unit_names": [
+                  "USD"
+                ],
+                "metric": "total_revenue",
+                "public_date": "2020-01-02",
+                "source_accession_present": true,
+                "source_concept": "us-gaap:Revenues",
+                "source_filed_date": "2011-12-16",
+                "source_form": "10-K",
+                "statement_type": "annual"
+              },
+              {
+                "companyfacts_origin_candidate_count": 3,
+                "csv_value_found_in_origin_facts": true,
+                "export_period_end": "2009-10-31",
+                "inherited_metric": false,
+                "matched_source_period_ends": [
+                  "2009-10-31"
+                ],
+                "matched_unit_names": [
+                  "USD"
+                ],
+                "metric": "net_income",
+                "public_date": "2020-01-02",
+                "source_accession_present": true,
+                "source_concept": "us-gaap:ProfitLoss",
+                "source_filed_date": "2011-12-16",
+                "source_form": "10-K",
+                "statement_type": "annual"
+              },
+              {
+                "companyfacts_origin_candidate_count": 3,
+                "csv_value_found_in_origin_facts": true,
+                "export_period_end": "2010-10-31",
+                "inherited_metric": false,
+                "matched_source_period_ends": [
+                  "2010-10-31"
+                ],
+                "matched_unit_names": [
+                  "USD/shares"
+                ],
+                "metric": "basic_eps",
+                "public_date": "2020-01-02",
+                "source_accession_present": true,
+                "source_concept": "us-gaap:EarningsPerShareBasic",
+                "source_filed_date": "2012-12-20",
+                "source_form": "10-K",
+                "statement_type": "annual"
+              },
+              {
+                "companyfacts_origin_candidate_count": 3,
+                "csv_value_found_in_origin_facts": true,
+                "export_period_end": "2010-10-31",
+                "inherited_metric": false,
+                "matched_source_period_ends": [
+                  "2010-10-31"
+                ],
+                "matched_unit_names": [
+                  "USD/shares"
+                ],
+                "metric": "diluted_eps",
+                "public_date": "2020-01-02",
+                "source_accession_present": true,
+                "source_concept": "us-gaap:EarningsPerShareDiluted",
+                "source_filed_date": "2012-12-20",
+                "source_form": "10-K",
+                "statement_type": "annual"
+              }
+            ]
+          },
+          "submissions_2020_2025_recent_member": {
+            "acceptance_timestamp_or_date_matches": 25,
+            "filed_date_matches": 25,
+            "form_counts": {
+              "10-K": 6,
+              "10-Q": 18,
+              "144": 36,
+              "3": 13,
+              "3/A": 2,
+              "305B2": 1,
+              "4": 429,
+              "4/A": 23,
+              "424B5": 6,
+              "5": 4,
+              "8-K": 66,
+              "8-K/A": 2,
+              "ARS": 3,
+              "DEF 14A": 6,
+              "DEFA14A": 8,
+              "FWP": 3,
+              "PRE 14A": 2,
+              "S-3ASR": 1,
+              "S-8": 1,
+              "S-8 POS": 4,
+              "SC 13G": 2,
+              "SC 13G/A": 18,
+              "SCHEDULE 13G/A": 2,
+              "SD": 6
+            },
+            "form_matches": 25,
+            "fragment_members_opened": 0,
+            "sampled_accessions_found_in_recent_member": 25,
+            "sampled_audit_accession_count": 25
+          },
+          "submissions_member": {
+            "crc32": "a6bd3cc7",
+            "name": "CIK0001090872.json",
+            "recent_record_count": 1002,
+            "sha256_of_bounded_member_bytes": "4d73db27acd71ef749be90ed4c6a296d9516602851f77c8896f6d3f5bb396667",
+            "uncompressed_bytes": 158220
+          }
+        },
+        "AMZN": {
+          "cik": "0001018724",
+          "company_name": "Amazon",
+          "companyfacts_2020_2025": {
+            "10k_quarter_duration_observation_count": 16,
+            "annual_duration_observation_count": 100,
+            "calendar_year_frame_contains_q4_observation_count": 22,
+            "explicit_companyfacts_fiscal_period_q4_observation_count": 0,
+            "form_counts": {
+              "10-K": 111,
+              "10-Q": 409,
+              "DEF 14A": 5
+            },
+            "quarterly_duration_observation_count": 156,
+            "selected_concept_observation_count": 525,
+            "values_written_to_receipt": false
+          },
+          "companyfacts_member": {
+            "crc32": "8a98f2fe",
+            "name": "CIK0001018724.json",
+            "sha256_of_bounded_member_bytes": "e6aadb0da7384597dbd78f74d1379ffb7fd0829a4d2e797b6d7e442b5e1da0d7",
+            "uncompressed_bytes": 4477763
+          },
+          "exact_export_audit_companyfacts_trace": {
+            "audit_row_count_for_symbol": 332,
+            "audit_rows_without_exact_export_pair": 0,
+            "exact_ticker_statement_period_public_date_pairs": 332,
+            "export_row_count_for_symbol": 332,
+            "export_rows_without_exact_audit_pair": 0,
+            "matched_companyfacts_units_by_metric": {
+              "basic_eps": {
+                "USD/shares": 103
+              },
+              "common_stock": {
+                "USD": 286
+              },
+              "diluted_eps": {
+                "USD/shares": 103
+              },
+              "net_income": {
+                "USD": 102
+              },
+              "shares_outstanding": {
+                "shares": 66
+              },
+              "total_revenue": {
+                "USD": 64
+              },
+              "total_stockholders_equity": {
+                "USD": 165
+              }
+            },
+            "metric_source_link_counts": {
+              "basic_eps": {
+                "csv_value_found_in_origin_facts": 101,
+                "exported_nonempty_values": 101,
+                "metric_source_links": 101,
+                "origin_key_companyfacts_candidates": 464
+              },
+              "common_stock": {
+                "csv_value_found_in_origin_facts": 163,
+                "exported_nonempty_values": 163,
+                "inherited_source_links": 87,
+                "metric_source_links": 163,
+                "origin_key_companyfacts_candidates": 326
+              },
+              "diluted_eps": {
+                "csv_value_found_in_origin_facts": 101,
+                "exported_nonempty_values": 101,
+                "metric_source_links": 101,
+                "origin_key_companyfacts_candidates": 464
+              },
+              "net_income": {
+                "csv_value_found_in_origin_facts": 101,
+                "exported_nonempty_values": 101,
+                "metric_source_links": 101,
+                "origin_key_companyfacts_candidates": 606
+              },
+              "shares_outstanding": {
+                "csv_value_found_in_origin_facts": 66,
+                "exported_nonempty_values": 66,
+                "metric_source_links": 66,
+                "origin_key_companyfacts_candidates": 66
+              },
+              "total_revenue": {
+                "csv_value_found_in_origin_facts": 64,
+                "exported_nonempty_values": 64,
+                "metric_source_links": 64,
+                "origin_key_companyfacts_candidates": 279
+              },
+              "total_stockholders_equity": {
+                "csv_value_found_in_origin_facts": 165,
+                "exported_nonempty_values": 165,
+                "metric_source_links": 165,
+                "origin_key_companyfacts_candidates": 768
+              }
+            },
+            "sample_origin_trace_examples": [
+              {
+                "companyfacts_origin_candidate_count": 3,
+                "csv_value_found_in_origin_facts": true,
+                "export_period_end": "2007-12-31",
+                "inherited_metric": false,
+                "matched_source_period_ends": [
+                  "2007-12-31"
+                ],
+                "matched_unit_names": [
+                  "USD/shares"
+                ],
+                "metric": "basic_eps",
+                "public_date": "2020-01-02",
+                "source_accession_present": true,
+                "source_concept": "us-gaap:EarningsPerShareBasic",
+                "source_filed_date": "2010-01-29",
+                "source_form": "10-K",
+                "statement_type": "annual"
+              },
+              {
+                "companyfacts_origin_candidate_count": 3,
+                "csv_value_found_in_origin_facts": true,
+                "export_period_end": "2007-12-31",
+                "inherited_metric": false,
+                "matched_source_period_ends": [
+                  "2007-12-31"
+                ],
+                "matched_unit_names": [
+                  "USD/shares"
+                ],
+                "metric": "diluted_eps",
+                "public_date": "2020-01-02",
+                "source_accession_present": true,
+                "source_concept": "us-gaap:EarningsPerShareDiluted",
+                "source_filed_date": "2010-01-29",
+                "source_form": "10-K",
+                "statement_type": "annual"
+              },
+              {
+                "companyfacts_origin_candidate_count": 3,
+                "csv_value_found_in_origin_facts": true,
+                "export_period_end": "2007-12-31",
+                "inherited_metric": false,
+                "matched_source_period_ends": [
+                  "2007-12-31"
+                ],
+                "matched_unit_names": [
+                  "USD"
+                ],
+                "metric": "net_income",
+                "public_date": "2020-01-02",
+                "source_accession_present": true,
+                "source_concept": "us-gaap:NetIncomeLoss",
+                "source_filed_date": "2010-01-29",
+                "source_form": "10-K",
+                "statement_type": "annual"
+              },
+              {
+                "companyfacts_origin_candidate_count": 11,
+                "csv_value_found_in_origin_facts": true,
+                "export_period_end": "2008-12-31",
+                "inherited_metric": false,
+                "matched_source_period_ends": [
+                  "2008-12-31"
+                ],
+                "matched_unit_names": [
+                  "USD/shares"
+                ],
+                "metric": "basic_eps",
+                "public_date": "2020-01-02",
+                "source_accession_present": true,
+                "source_concept": "us-gaap:EarningsPerShareBasic",
+                "source_filed_date": "2011-01-28",
+                "source_form": "10-K",
+                "statement_type": "annual"
+              },
+              {
+                "companyfacts_origin_candidate_count": 11,
+                "csv_value_found_in_origin_facts": true,
+                "export_period_end": "2008-12-31",
+                "inherited_metric": false,
+                "matched_source_period_ends": [
+                  "2008-12-31"
+                ],
+                "matched_unit_names": [
+                  "USD/shares"
+                ],
+                "metric": "diluted_eps",
+                "public_date": "2020-01-02",
+                "source_accession_present": true,
+                "source_concept": "us-gaap:EarningsPerShareDiluted",
+                "source_filed_date": "2011-01-28",
+                "source_form": "10-K",
+                "statement_type": "annual"
+              },
+              {
+                "companyfacts_origin_candidate_count": 11,
+                "csv_value_found_in_origin_facts": true,
+                "export_period_end": "2008-12-31",
+                "inherited_metric": false,
+                "matched_source_period_ends": [
+                  "2008-12-31"
+                ],
+                "matched_unit_names": [
+                  "USD"
+                ],
+                "metric": "net_income",
+                "public_date": "2020-01-02",
+                "source_accession_present": true,
+                "source_concept": "us-gaap:NetIncomeLoss",
+                "source_filed_date": "2011-01-28",
+                "source_form": "10-K",
+                "statement_type": "annual"
+              },
+              {
+                "companyfacts_origin_candidate_count": 11,
+                "csv_value_found_in_origin_facts": true,
+                "export_period_end": "2009-12-31",
+                "inherited_metric": false,
+                "matched_source_period_ends": [
+                  "2009-12-31"
+                ],
+                "matched_unit_names": [
+                  "USD/shares"
+                ],
+                "metric": "basic_eps",
+                "public_date": "2020-01-02",
+                "source_accession_present": true,
+                "source_concept": "us-gaap:EarningsPerShareBasic",
+                "source_filed_date": "2012-02-01",
+                "source_form": "10-K",
+                "statement_type": "annual"
+              },
+              {
+                "companyfacts_origin_candidate_count": 11,
+                "csv_value_found_in_origin_facts": true,
+                "export_period_end": "2009-12-31",
+                "inherited_metric": false,
+                "matched_source_period_ends": [
+                  "2009-12-31"
+                ],
+                "matched_unit_names": [
+                  "USD/shares"
+                ],
+                "metric": "diluted_eps",
+                "public_date": "2020-01-02",
+                "source_accession_present": true,
+                "source_concept": "us-gaap:EarningsPerShareDiluted",
+                "source_filed_date": "2012-02-01",
+                "source_form": "10-K",
+                "statement_type": "annual"
+              },
+              {
+                "companyfacts_origin_candidate_count": 11,
+                "csv_value_found_in_origin_facts": true,
+                "export_period_end": "2009-12-31",
+                "inherited_metric": false,
+                "matched_source_period_ends": [
+                  "2009-12-31"
+                ],
+                "matched_unit_names": [
+                  "USD"
+                ],
+                "metric": "net_income",
+                "public_date": "2020-01-02",
+                "source_accession_present": true,
+                "source_concept": "us-gaap:NetIncomeLoss",
+                "source_filed_date": "2012-02-01",
+                "source_form": "10-K",
+                "statement_type": "annual"
+              },
+              {
+                "companyfacts_origin_candidate_count": 11,
+                "csv_value_found_in_origin_facts": true,
+                "export_period_end": "2010-12-31",
+                "inherited_metric": false,
+                "matched_source_period_ends": [
+                  "2010-12-31"
+                ],
+                "matched_unit_names": [
+                  "USD/shares"
+                ],
+                "metric": "basic_eps",
+                "public_date": "2020-01-02",
+                "source_accession_present": true,
+                "source_concept": "us-gaap:EarningsPerShareBasic",
+                "source_filed_date": "2013-01-30",
+                "source_form": "10-K",
+                "statement_type": "annual"
+              },
+              {
+                "companyfacts_origin_candidate_count": 11,
+                "csv_value_found_in_origin_facts": true,
+                "export_period_end": "2010-12-31",
+                "inherited_metric": false,
+                "matched_source_period_ends": [
+                  "2010-12-31"
+                ],
+                "matched_unit_names": [
+                  "USD/shares"
+                ],
+                "metric": "diluted_eps",
+                "public_date": "2020-01-02",
+                "source_accession_present": true,
+                "source_concept": "us-gaap:EarningsPerShareDiluted",
+                "source_filed_date": "2013-01-30",
+                "source_form": "10-K",
+                "statement_type": "annual"
+              },
+              {
+                "companyfacts_origin_candidate_count": 11,
+                "csv_value_found_in_origin_facts": true,
+                "export_period_end": "2010-12-31",
+                "inherited_metric": false,
+                "matched_source_period_ends": [
+                  "2010-12-31"
+                ],
+                "matched_unit_names": [
+                  "USD"
+                ],
+                "metric": "net_income",
+                "public_date": "2020-01-02",
+                "source_accession_present": true,
+                "source_concept": "us-gaap:NetIncomeLoss",
+                "source_filed_date": "2013-01-30",
+                "source_form": "10-K",
+                "statement_type": "annual"
+              }
+            ]
+          },
+          "submissions_2020_2025_recent_member": {
+            "acceptance_timestamp_or_date_matches": 21,
+            "filed_date_matches": 21,
+            "form_counts": {
+              "10-K": 5,
+              "10-Q": 16,
+              "13F-HR": 20,
+              "144": 181,
+              "144/A": 2,
+              "3": 10,
+              "3/A": 1,
+              "4": 472,
+              "424B2": 1,
+              "424B5": 7,
+              "8-K": 50,
+              "ARS": 3,
+              "CORRESP": 3,
+              "DEF 14A": 5,
+              "DEFA14A": 10,
+              "FWP": 4,
+              "IRANNOTICE": 1,
+              "N-PX": 2,
+              "PRE 14A": 1,
+              "PX14A6G": 45,
+              "S-3ASR": 1,
+              "S-8": 1,
+              "SC 13G": 4,
+              "SC 13G/A": 24,
+              "SCHEDULE 13G/A": 3,
+              "SD": 5,
+              "UPLOAD": 4
+            },
+            "form_matches": 21,
+            "fragment_members_opened": 0,
+            "sampled_accessions_found_in_recent_member": 21,
+            "sampled_audit_accession_count": 25
+          },
+          "submissions_member": {
+            "crc32": "08dbb9eb",
+            "name": "CIK0001018724.json",
+            "recent_record_count": 1000,
+            "sha256_of_bounded_member_bytes": "202c0ede2e13da021833aa987614478023b2231f3bcb850c35f5f057b4baa611",
+            "uncompressed_bytes": 159672
+          }
+        },
+        "MSFT": {
+          "cik": "0000789019",
+          "company_name": "Microsoft",
+          "companyfacts_2020_2025": {
+            "10k_quarter_duration_observation_count": 8,
+            "annual_duration_observation_count": 80,
+            "calendar_year_frame_contains_q4_observation_count": 36,
+            "explicit_companyfacts_fiscal_period_q4_observation_count": 0,
+            "form_counts": {
+              "10-K": 99,
+              "10-Q": 298,
+              "8-K": 15
+            },
+            "quarterly_duration_observation_count": 144,
+            "selected_concept_observation_count": 412,
+            "values_written_to_receipt": false
+          },
+          "companyfacts_member": {
+            "crc32": "46a72791",
+            "name": "CIK0000789019.json",
+            "sha256_of_bounded_member_bytes": "f8aae2965b20ad0df44bdf7ccbedf797d275b6b8dc030154a7a311361bb7246f",
+            "uncompressed_bytes": 4881196
+          },
+          "exact_export_audit_companyfacts_trace": {
+            "audit_row_count_for_symbol": 283,
+            "audit_rows_without_exact_export_pair": 0,
+            "exact_ticker_statement_period_public_date_pairs": 283,
+            "export_row_count_for_symbol": 283,
+            "export_rows_without_exact_audit_pair": 0,
+            "matched_companyfacts_units_by_metric": {
+              "basic_eps": {
+                "USD/shares": 101
+              },
+              "diluted_eps": {
+                "USD/shares": 101
+              },
+              "net_income": {
+                "USD": 100
+              },
+              "shares_outstanding": {
+                "shares": 65
+              },
+              "total_revenue": {
+                "USD": 76
+              },
+              "total_stockholders_equity": {
+                "USD": 118
+              }
+            },
+            "metric_source_link_counts": {
+              "basic_eps": {
+                "csv_value_found_in_origin_facts": 100,
+                "exported_nonempty_values": 100,
+                "metric_source_links": 100,
+                "origin_key_companyfacts_candidates": 448
+              },
+              "diluted_eps": {
+                "csv_value_found_in_origin_facts": 100,
+                "exported_nonempty_values": 100,
+                "metric_source_links": 100,
+                "origin_key_companyfacts_candidates": 448
+              },
+              "net_income": {
+                "csv_value_found_in_origin_facts": 100,
+                "exported_nonempty_values": 100,
+                "metric_source_links": 100,
+                "origin_key_companyfacts_candidates": 448
+              },
+              "shares_outstanding": {
+                "csv_value_found_in_origin_facts": 65,
+                "exported_nonempty_values": 65,
+                "metric_source_links": 65,
+                "origin_key_companyfacts_candidates": 65
+              },
+              "total_revenue": {
+                "csv_value_found_in_origin_facts": 76,
+                "exported_nonempty_values": 76,
+                "inherited_source_links": 5,
+                "metric_source_links": 76,
+                "origin_key_companyfacts_candidates": 335
+              },
+              "total_stockholders_equity": {
+                "csv_value_found_in_origin_facts": 118,
+                "exported_nonempty_values": 118,
+                "metric_source_links": 118,
+                "origin_key_companyfacts_candidates": 354
+              }
+            },
+            "sample_origin_trace_examples": [
+              {
+                "companyfacts_origin_candidate_count": 15,
+                "csv_value_found_in_origin_facts": true,
+                "export_period_end": "2008-06-30",
+                "inherited_metric": false,
+                "matched_source_period_ends": [
+                  "2008-06-30"
+                ],
+                "matched_unit_names": [
+                  "USD/shares"
+                ],
+                "metric": "basic_eps",
+                "public_date": "2020-01-02",
+                "source_accession_present": true,
+                "source_concept": "us-gaap:EarningsPerShareBasic",
+                "source_filed_date": "2010-07-30",
+                "source_form": "10-K",
+                "statement_type": "annual"
+              },
+              {
+                "companyfacts_origin_candidate_count": 15,
+                "csv_value_found_in_origin_facts": true,
+                "export_period_end": "2008-06-30",
+                "inherited_metric": false,
+                "matched_source_period_ends": [
+                  "2008-06-30"
+                ],
+                "matched_unit_names": [
+                  "USD/shares"
+                ],
+                "metric": "diluted_eps",
+                "public_date": "2020-01-02",
+                "source_accession_present": true,
+                "source_concept": "us-gaap:EarningsPerShareDiluted",
+                "source_filed_date": "2010-07-30",
+                "source_form": "10-K",
+                "statement_type": "annual"
+              },
+              {
+                "companyfacts_origin_candidate_count": 15,
+                "csv_value_found_in_origin_facts": true,
+                "export_period_end": "2008-06-30",
+                "inherited_metric": false,
+                "matched_source_period_ends": [
+                  "2008-06-30"
+                ],
+                "matched_unit_names": [
+                  "USD"
+                ],
+                "metric": "total_revenue",
+                "public_date": "2020-01-02",
+                "source_accession_present": true,
+                "source_concept": "us-gaap:Revenues",
+                "source_filed_date": "2010-07-30",
+                "source_form": "10-K",
+                "statement_type": "annual"
+              },
+              {
+                "companyfacts_origin_candidate_count": 15,
+                "csv_value_found_in_origin_facts": true,
+                "export_period_end": "2008-06-30",
+                "inherited_metric": false,
+                "matched_source_period_ends": [
+                  "2008-06-30"
+                ],
+                "matched_unit_names": [
+                  "USD"
+                ],
+                "metric": "net_income",
+                "public_date": "2020-01-02",
+                "source_accession_present": true,
+                "source_concept": "us-gaap:NetIncomeLoss",
+                "source_filed_date": "2010-07-30",
+                "source_form": "10-K",
+                "statement_type": "annual"
+              },
+              {
+                "companyfacts_origin_candidate_count": 11,
+                "csv_value_found_in_origin_facts": true,
+                "export_period_end": "2009-06-30",
+                "inherited_metric": false,
+                "matched_source_period_ends": [
+                  "2009-06-30"
+                ],
+                "matched_unit_names": [
+                  "USD/shares"
+                ],
+                "metric": "basic_eps",
+                "public_date": "2020-01-02",
+                "source_accession_present": true,
+                "source_concept": "us-gaap:EarningsPerShareBasic",
+                "source_filed_date": "2011-07-28",
+                "source_form": "10-K",
+                "statement_type": "annual"
+              },
+              {
+                "companyfacts_origin_candidate_count": 11,
+                "csv_value_found_in_origin_facts": true,
+                "export_period_end": "2009-06-30",
+                "inherited_metric": false,
+                "matched_source_period_ends": [
+                  "2009-06-30"
+                ],
+                "matched_unit_names": [
+                  "USD/shares"
+                ],
+                "metric": "diluted_eps",
+                "public_date": "2020-01-02",
+                "source_accession_present": true,
+                "source_concept": "us-gaap:EarningsPerShareDiluted",
+                "source_filed_date": "2011-07-28",
+                "source_form": "10-K",
+                "statement_type": "annual"
+              },
+              {
+                "companyfacts_origin_candidate_count": 15,
+                "csv_value_found_in_origin_facts": true,
+                "export_period_end": "2009-06-30",
+                "inherited_metric": true,
+                "matched_source_period_ends": [
+                  "2009-06-30"
+                ],
+                "matched_unit_names": [
+                  "USD"
+                ],
+                "metric": "total_revenue",
+                "public_date": "2020-01-02",
+                "source_accession_present": true,
+                "source_concept": "us-gaap:Revenues",
+                "source_filed_date": "2010-07-30",
+                "source_form": "10-K",
+                "statement_type": "annual"
+              },
+              {
+                "companyfacts_origin_candidate_count": 11,
+                "csv_value_found_in_origin_facts": true,
+                "export_period_end": "2009-06-30",
+                "inherited_metric": false,
+                "matched_source_period_ends": [
+                  "2009-06-30"
+                ],
+                "matched_unit_names": [
+                  "USD"
+                ],
+                "metric": "net_income",
+                "public_date": "2020-01-02",
+                "source_accession_present": true,
+                "source_concept": "us-gaap:NetIncomeLoss",
+                "source_filed_date": "2011-07-28",
+                "source_form": "10-K",
+                "statement_type": "annual"
+              },
+              {
+                "companyfacts_origin_candidate_count": 11,
+                "csv_value_found_in_origin_facts": true,
+                "export_period_end": "2010-06-30",
+                "inherited_metric": false,
+                "matched_source_period_ends": [
+                  "2010-06-30"
+                ],
+                "matched_unit_names": [
+                  "USD/shares"
+                ],
+                "metric": "basic_eps",
+                "public_date": "2020-01-02",
+                "source_accession_present": true,
+                "source_concept": "us-gaap:EarningsPerShareBasic",
+                "source_filed_date": "2012-07-26",
+                "source_form": "10-K",
+                "statement_type": "annual"
+              },
+              {
+                "companyfacts_origin_candidate_count": 11,
+                "csv_value_found_in_origin_facts": true,
+                "export_period_end": "2010-06-30",
+                "inherited_metric": false,
+                "matched_source_period_ends": [
+                  "2010-06-30"
+                ],
+                "matched_unit_names": [
+                  "USD/shares"
+                ],
+                "metric": "diluted_eps",
+                "public_date": "2020-01-02",
+                "source_accession_present": true,
+                "source_concept": "us-gaap:EarningsPerShareDiluted",
+                "source_filed_date": "2012-07-26",
+                "source_form": "10-K",
+                "statement_type": "annual"
+              },
+              {
+                "companyfacts_origin_candidate_count": 15,
+                "csv_value_found_in_origin_facts": true,
+                "export_period_end": "2010-06-30",
+                "inherited_metric": true,
+                "matched_source_period_ends": [
+                  "2010-06-30"
+                ],
+                "matched_unit_names": [
+                  "USD"
+                ],
+                "metric": "total_revenue",
+                "public_date": "2020-01-02",
+                "source_accession_present": true,
+                "source_concept": "us-gaap:Revenues",
+                "source_filed_date": "2010-07-30",
+                "source_form": "10-K",
+                "statement_type": "annual"
+              },
+              {
+                "companyfacts_origin_candidate_count": 11,
+                "csv_value_found_in_origin_facts": true,
+                "export_period_end": "2010-06-30",
+                "inherited_metric": false,
+                "matched_source_period_ends": [
+                  "2010-06-30"
+                ],
+                "matched_unit_names": [
+                  "USD"
+                ],
+                "metric": "net_income",
+                "public_date": "2020-01-02",
+                "source_accession_present": true,
+                "source_concept": "us-gaap:NetIncomeLoss",
+                "source_filed_date": "2012-07-26",
+                "source_form": "10-K",
+                "statement_type": "annual"
+              }
+            ]
+          },
+          "submissions_2020_2025_recent_member": {
+            "acceptance_timestamp_or_date_matches": 22,
+            "filed_date_matches": 22,
+            "form_counts": {
+              "10-K": 6,
+              "10-Q": 16,
+              "11-K": 17,
+              "144": 37,
+              "25-NSE": 1,
+              "3": 10,
+              "3/A": 1,
+              "4": 660,
+              "4/A": 4,
+              "424B3": 3,
+              "5": 2,
+              "8-K": 58,
+              "8-K/A": 1,
+              "ARS": 3,
+              "CORRESP": 4,
+              "D": 1,
+              "DEF 14A": 6,
+              "DEFA14A": 11,
+              "EFFECT": 3,
+              "PX14A6G": 34,
+              "S-3ASR": 3,
+              "S-4": 3,
+              "S-4/A": 2,
+              "S-8": 2,
+              "S-8 POS": 3,
+              "SC 13G/A": 8,
+              "SD": 6,
+              "UPLOAD": 4
+            },
+            "form_matches": 22,
+            "fragment_members_opened": 0,
+            "sampled_accessions_found_in_recent_member": 22,
+            "sampled_audit_accession_count": 25
+          },
+          "submissions_member": {
+            "crc32": "f1df7dbe",
+            "name": "CIK0000789019.json",
+            "recent_record_count": 1001,
+            "sha256_of_bounded_member_bytes": "ef3d1eed787e1d32831fbebbce56e7e151dd13dcc99cf727c427627625df9cfd",
+            "uncompressed_bytes": 183799
+          }
+        }
+      }
+    },
+    "coverage_manifest": {
+      "accession_join_fact_count": 782599,
+      "accession_join_row_count": 144997,
+      "accession_join_unique_count": 31979,
+      "ambiguous_exclusion_symbol_count": 0,
+      "annual_duration_omissions": 119373,
+      "annual_symbol_count": 563,
+      "balance_symbol_count": 566,
+      "companyfacts_missing_cik_count": 1,
+      "context_value_conflict_count": 41958,
+      "explicitly_excluded_symbol_count": 39,
+      "filed_date_fallback_count": 13,
+      "filed_date_fallback_fact_count": 44,
+      "filed_date_fallback_unique_count": 2,
+      "fundamental_row_count": 145010,
+      "later_snapshot_count": 50085,
+      "membership_union_symbol_count": 606,
+      "missing_submission_fragment_count": 0,
+      "no_fundamental_rows_symbol_count": 1,
+      "post_cutoff_fact_omissions": 31421,
+      "public_before_period_end_fact_omissions": 2,
+      "quarterly_duration_omissions": 1,
+      "quarterly_symbol_count": 566,
+      "quarterly_ytd_or_duration_omissions": 145839,
+      "resolved_cik_percentage": 93.56435644,
+      "resolved_or_closed_exclusion_percentage": 100.0,
+      "resolved_symbol_count": 567,
+      "revenue_concept_conflict_count": 5241,
+      "same_public_date_collision_count": 49504,
+      "selected_dei_EntityCommonStockSharesOutstanding": 29501,
+      "selected_us-gaap_CommonStockValue": 51091,
+      "selected_us-gaap_EarningsPerShareBasic": 67214,
+      "selected_us-gaap_EarningsPerShareDiluted": 67345,
+      "selected_us-gaap_NetIncomeLoss": 67079,
+      "selected_us-gaap_NetIncomeLossAvailableToCommonStockholdersBasic": 1376,
+      "selected_us-gaap_ProfitLoss": 9604,
+      "selected_us-gaap_RevenueFromContractWithCustomerExcludingAssessedTax": 21041,
+      "selected_us-gaap_Revenues": 28881,
+      "selected_us-gaap_StockholdersEquity": 80676,
+      "submission_companyfacts_filed_date_mismatch_count": 238,
+      "submission_companyfacts_form_variant_count": 612
+    },
+    "export": {
+      "field_coverage": {
+        "basic_eps": {
+          "distinct_ticker_count": 557,
+          "nonempty_row_count": 54423,
+          "statement_type_nonempty_rows": {
+            "annual": 14876,
+            "quarterly": 39547
+          }
+        },
+        "common_stock": {
+          "distinct_ticker_count": 501,
+          "nonempty_row_count": 47605,
+          "statement_type_nonempty_rows": {
+            "balance": 47605
+          }
+        },
+        "diluted_eps": {
+          "distinct_ticker_count": 557,
+          "nonempty_row_count": 54519,
+          "statement_type_nonempty_rows": {
+            "annual": 14915,
+            "quarterly": 39604
+          }
+        },
+        "net_income": {
+          "distinct_ticker_count": 566,
+          "nonempty_row_count": 57632,
+          "statement_type_nonempty_rows": {
+            "annual": 15665,
+            "quarterly": 41967
+          }
+        },
+        "shares_outstanding": {
+          "distinct_ticker_count": 535,
+          "nonempty_row_count": 31225,
+          "statement_type_nonempty_rows": {
+            "balance": 31225
+          }
+        },
+        "total_revenue": {
+          "distinct_ticker_count": 553,
+          "nonempty_row_count": 46453,
+          "statement_type_nonempty_rows": {
+            "annual": 12929,
+            "quarterly": 33524
+          }
+        },
+        "total_stockholders_equity": {
+          "distinct_ticker_count": 558,
+          "nonempty_row_count": 59138,
+          "statement_type_nonempty_rows": {
+            "balance": 59138
+          }
+        }
+      },
+      "period_end_range": [
+        "2006-09-24",
+        "2025-12-19"
+      ],
+      "public_date_range": [
+        "2020-01-02",
+        "2025-12-31"
+      ],
+      "revision_vintage_candidates": {
+        "interpretation": "retained public-date versions; audit can trace filings, but row multiplicity alone is not labeled a confirmed amendment",
+        "keys_with_duplicate_rows_at_same_public_date": 0,
+        "ticker_statement_period_keys_with_multiple_public_dates": 22790
+      },
+      "row_count": 145010,
+      "rows_with_period_end_and_public_date": 145010,
+      "rows_with_public_date_not_after_period_end": 0,
+      "statement_row_counts": {
+        "annual": 15668,
+        "balance": 87342,
+        "quarterly": 42000
+      },
+      "unique_ticker_count": 566
+    },
+    "membership_event_row_count": 711,
+    "membership_union_ticker_count": 606,
+    "publication_timing": {
+      "calendar_day_span_to_first_supplied_session": {
+        "max": 3914,
+        "median": 3.0,
+        "min": 1
+      },
+      "public_date_basis_row_counts": {
+        "acceptance_datetime": 144997,
+        "filed_date_fallback": 13
+      },
+      "rows_checked": 145010,
+      "rows_matching_first_spy_session_strictly_after_acceptance_or_filed_day": 145010,
+      "rows_with_missing_or_invalid_timing": 0,
+      "rows_with_unreproduced_normalization": 0,
+      "rule": "public_date is already the first supplied SPY session strictly after the acceptance calendar date, with filed-date fallback only; snapshot code does not shift it again"
+    },
+    "security_master": {
+      "foreign_or_country_status_column_present": false,
+      "mapping_basis_counts": {
+        "exact_current_name": 5,
+        "exact_current_ticker": 532,
+        "exact_former_name": 3,
+        "reviewed_baseline_cik": 9,
+        "reviewed_same_issuer_chain": 19
+      },
+      "repeated_ticker_interval_examples": {
+        "FISV": [
+          {
+            "cik": "0000798354",
+            "company_name": "Fiserv",
+            "first_membership_date": "2021-01-01",
+            "last_membership_date": "2023-06-06",
+            "mapping_basis": "reviewed_baseline_cik"
+          },
+          {
+            "cik": "0000798354",
+            "company_name": "Fiserv",
+            "first_membership_date": "2025-11-11",
+            "last_membership_date": "2025-12-31",
+            "mapping_basis": "reviewed_baseline_cik"
+          }
+        ]
+      },
+      "repeated_ticker_row_count": 1,
+      "row_count": 568,
+      "rows_missing_cik": 0,
+      "unique_cik_count": 549,
+      "unique_ticker_count": 567
+    },
+    "security_master_exclusion_reason_counts": {
+      "no_exact_sec_identity": 39
+    },
+    "security_master_exclusion_row_count": 39,
+    "security_master_membership_accounting": {
+      "coverage_manifest_exclusion_count": 39,
+      "coverage_manifest_membership_union_count": 606,
+      "coverage_manifest_resolved_count": 567,
+      "master_or_exclusion_tickers_outside_membership": 0,
+      "membership_tickers_without_master_or_exclusion": 0,
+      "membership_union_ticker_count_from_events": 606,
+      "security_master_exclusion_ticker_intersection_count": 0,
+      "unique_exclusion_ticker_count": 39,
+      "unique_security_master_ticker_count": 567
+    },
+    "snapshots": {
+      "2021-01-04": {
+        "asof_statement_period_records": 56009,
+        "members_with_any_exported_fact_asof": 465,
+        "members_with_any_shares_outstanding_value": 447,
+        "members_without_security_master_row": 36,
+        "membership_count": 505,
+        "profile_coverage": {
+          "annual.basic_eps": {
+            "current_observation_count_within_member_asof_rows": 5273,
+            "eligible_yoy_pair_count_in_recent_slots": 1257,
+            "members_by_eligible_slot_count": {
+              "0": 59,
+              "1": 17,
+              "2": 47,
+              "3": 382
+            },
+            "members_ready_for_full_lookback": 382,
+            "members_with_any_current_value": 454,
+            "required_yoy_slots": 3
+          },
+          "annual.diluted_eps": {
+            "current_observation_count_within_member_asof_rows": 5291,
+            "eligible_yoy_pair_count_in_recent_slots": 1259,
+            "members_by_eligible_slot_count": {
+              "0": 58,
+              "1": 18,
+              "2": 46,
+              "3": 383
+            },
+            "members_ready_for_full_lookback": 383,
+            "members_with_any_current_value": 454,
+            "required_yoy_slots": 3
+          },
+          "annual.net_income": {
+            "current_observation_count_within_member_asof_rows": 5530,
+            "eligible_yoy_pair_count_in_recent_slots": 1280,
+            "members_by_eligible_slot_count": {
+              "0": 51,
+              "1": 18,
+              "2": 46,
+              "3": 390
+            },
+            "members_ready_for_full_lookback": 390,
+            "members_with_any_current_value": 462,
+            "required_yoy_slots": 3
+          },
+          "annual.total_revenue": {
+            "current_observation_count_within_member_asof_rows": 3631,
+            "eligible_yoy_pair_count_in_recent_slots": 1300,
+            "members_by_eligible_slot_count": {
+              "0": 62,
+              "1": 7,
+              "2": 15,
+              "3": 421
+            },
+            "members_ready_for_full_lookback": 421,
+            "members_with_any_current_value": 445,
+            "required_yoy_slots": 3
+          },
+          "quarterly.basic_eps": {
+            "current_observation_count_within_member_asof_rows": 15086,
+            "eligible_yoy_pair_count_in_recent_slots": 1654,
+            "members_by_eligible_slot_count": {
+              "0": 63,
+              "1": 9,
+              "2": 20,
+              "3": 47,
+              "4": 366
+            },
+            "members_ready_for_full_lookback": 366,
+            "members_with_any_current_value": 459,
+            "required_yoy_slots": 4
+          },
+          "quarterly.diluted_eps": {
+            "current_observation_count_within_member_asof_rows": 15096,
+            "eligible_yoy_pair_count_in_recent_slots": 1653,
+            "members_by_eligible_slot_count": {
+              "0": 63,
+              "1": 10,
+              "2": 19,
+              "3": 47,
+              "4": 366
+            },
+            "members_ready_for_full_lookback": 366,
+            "members_with_any_current_value": 458,
+            "required_yoy_slots": 4
+          },
+          "quarterly.total_revenue": {
+            "current_observation_count_within_member_asof_rows": 9882,
+            "eligible_yoy_pair_count_in_recent_slots": 854,
+            "members_by_eligible_slot_count": {
+              "0": 77,
+              "1": 2,
+              "2": 426
+            },
+            "members_ready_for_full_lookback": 426,
+            "members_with_any_current_value": 451,
+            "required_yoy_slots": 2
+          }
+        },
+        "quarterly_revenue_v3_adjacent_acceleration_candidates": {
+          "cadence_days_inclusive": [
+            84,
+            105
+          ],
+          "calculator_identity": "pit-financial-features-v3",
+          "members_ready_for_latest_two_matched_growth_slots_with_84_to_105_day_gap_by_field": {
+            "basic_eps": 369,
+            "diluted_eps": 369,
+            "total_revenue": 395
+          }
+        },
+        "roe_input_availability": {
+          "definition": "availability only; latest nonmissing annual net income and latest nonmissing balance-sheet equity by period_end, as visible at the snapshot; no ROE score is calculated",
+          "members_with_latest_annual_net_income": 462,
+          "members_with_positive_latest_nonmissing_balance_equity": 429,
+          "members_with_positive_latest_nonmissing_balance_equity_and_annual_net_income": 427
+        },
+        "sample_security_asof_coverage": {
+          "A": {
+            "asof_export_period_record_count": 127,
+            "profile_coverage": {
+              "annual.basic_eps": {
+                "current_value_observation_count": 14,
+                "eligible_yoy_pair_count_in_recent_slots": 3,
+                "period_observation_count": 14,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 3
+              },
+              "annual.diluted_eps": {
+                "current_value_observation_count": 14,
+                "eligible_yoy_pair_count_in_recent_slots": 3,
+                "period_observation_count": 14,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 3
+              },
+              "annual.net_income": {
+                "current_value_observation_count": 14,
+                "eligible_yoy_pair_count_in_recent_slots": 3,
+                "period_observation_count": 14,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 3
+              },
+              "annual.total_revenue": {
+                "current_value_observation_count": 12,
+                "eligible_yoy_pair_count_in_recent_slots": 3,
+                "period_observation_count": 14,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 3
+              },
+              "quarterly.basic_eps": {
+                "current_value_observation_count": 37,
+                "eligible_yoy_pair_count_in_recent_slots": 4,
+                "period_observation_count": 37,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 4
+              },
+              "quarterly.diluted_eps": {
+                "current_value_observation_count": 37,
+                "eligible_yoy_pair_count_in_recent_slots": 4,
+                "period_observation_count": 37,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 4
+              },
+              "quarterly.total_revenue": {
+                "current_value_observation_count": 10,
+                "eligible_yoy_pair_count_in_recent_slots": 2,
+                "period_observation_count": 37,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 2
+              }
+            }
+          },
+          "AMZN": {
+            "asof_export_period_record_count": 146,
+            "profile_coverage": {
+              "annual.basic_eps": {
+                "current_value_observation_count": 13,
+                "eligible_yoy_pair_count_in_recent_slots": 3,
+                "period_observation_count": 13,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 3
+              },
+              "annual.diluted_eps": {
+                "current_value_observation_count": 13,
+                "eligible_yoy_pair_count_in_recent_slots": 3,
+                "period_observation_count": 13,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 3
+              },
+              "annual.net_income": {
+                "current_value_observation_count": 13,
+                "eligible_yoy_pair_count_in_recent_slots": 3,
+                "period_observation_count": 13,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 3
+              },
+              "annual.total_revenue": {
+                "current_value_observation_count": 4,
+                "eligible_yoy_pair_count_in_recent_slots": 3,
+                "period_observation_count": 13,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 3
+              },
+              "quarterly.basic_eps": {
+                "current_value_observation_count": 38,
+                "eligible_yoy_pair_count_in_recent_slots": 4,
+                "period_observation_count": 38,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 4
+              },
+              "quarterly.diluted_eps": {
+                "current_value_observation_count": 38,
+                "eligible_yoy_pair_count_in_recent_slots": 4,
+                "period_observation_count": 38,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 4
+              },
+              "quarterly.total_revenue": {
+                "current_value_observation_count": 10,
+                "eligible_yoy_pair_count_in_recent_slots": 2,
+                "period_observation_count": 38,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 2
+              }
+            }
+          },
+          "MSFT": {
+            "asof_export_period_record_count": 145,
+            "profile_coverage": {
+              "annual.basic_eps": {
+                "current_value_observation_count": 13,
+                "eligible_yoy_pair_count_in_recent_slots": 3,
+                "period_observation_count": 13,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 3
+              },
+              "annual.diluted_eps": {
+                "current_value_observation_count": 13,
+                "eligible_yoy_pair_count_in_recent_slots": 3,
+                "period_observation_count": 13,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 3
+              },
+              "annual.net_income": {
+                "current_value_observation_count": 13,
+                "eligible_yoy_pair_count_in_recent_slots": 3,
+                "period_observation_count": 13,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 3
+              },
+              "annual.total_revenue": {
+                "current_value_observation_count": 8,
+                "eligible_yoy_pair_count_in_recent_slots": 3,
+                "period_observation_count": 13,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 3
+              },
+              "quarterly.basic_eps": {
+                "current_value_observation_count": 37,
+                "eligible_yoy_pair_count_in_recent_slots": 4,
+                "period_observation_count": 37,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 4
+              },
+              "quarterly.diluted_eps": {
+                "current_value_observation_count": 37,
+                "eligible_yoy_pair_count_in_recent_slots": 4,
+                "period_observation_count": 37,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 4
+              },
+              "quarterly.total_revenue": {
+                "current_value_observation_count": 18,
+                "eligible_yoy_pair_count_in_recent_slots": 2,
+                "period_observation_count": 37,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 2
+              }
+            }
+          }
+        },
+        "unresolved_member_examples": [
+          "ABMD",
+          "AEP",
+          "ALXN",
+          "ANSS",
+          "ATVI",
+          "BK",
+          "CERN",
+          "CMA",
+          "COG",
+          "CTLT",
+          "CTXS",
+          "CXO",
+          "DFS",
+          "DISH",
+          "DRE",
+          "FBHS",
+          "FLIR",
+          "GPS",
+          "HBI",
+          "HES"
+        ]
+      },
+      "2025-12-31": {
+        "asof_statement_period_records": 83781,
+        "members_with_any_exported_fact_asof": 498,
+        "members_with_any_shares_outstanding_value": 470,
+        "members_without_security_master_row": 5,
+        "membership_count": 503,
+        "profile_coverage": {
+          "annual.basic_eps": {
+            "current_observation_count_within_member_asof_rows": 7637,
+            "eligible_yoy_pair_count_in_recent_slots": 1347,
+            "members_by_eligible_slot_count": {
+              "0": 25,
+              "1": 20,
+              "2": 47,
+              "3": 411
+            },
+            "members_ready_for_full_lookback": 411,
+            "members_with_any_current_value": 485,
+            "required_yoy_slots": 3
+          },
+          "annual.diluted_eps": {
+            "current_observation_count_within_member_asof_rows": 7663,
+            "eligible_yoy_pair_count_in_recent_slots": 1348,
+            "members_by_eligible_slot_count": {
+              "0": 24,
+              "1": 21,
+              "2": 47,
+              "3": 411
+            },
+            "members_ready_for_full_lookback": 411,
+            "members_with_any_current_value": 486,
+            "required_yoy_slots": 3
+          },
+          "annual.net_income": {
+            "current_observation_count_within_member_asof_rows": 8052,
+            "eligible_yoy_pair_count_in_recent_slots": 1381,
+            "members_by_eligible_slot_count": {
+              "0": 13,
+              "1": 21,
+              "2": 47,
+              "3": 422
+            },
+            "members_ready_for_full_lookback": 422,
+            "members_with_any_current_value": 496,
+            "required_yoy_slots": 3
+          },
+          "annual.total_revenue": {
+            "current_observation_count_within_member_asof_rows": 6017,
+            "eligible_yoy_pair_count_in_recent_slots": 1439,
+            "members_by_eligible_slot_count": {
+              "0": 21,
+              "1": 0,
+              "2": 7,
+              "3": 475
+            },
+            "members_ready_for_full_lookback": 475,
+            "members_with_any_current_value": 482,
+            "required_yoy_slots": 3
+          },
+          "quarterly.basic_eps": {
+            "current_observation_count_within_member_asof_rows": 22112,
+            "eligible_yoy_pair_count_in_recent_slots": 1799,
+            "members_by_eligible_slot_count": {
+              "0": 25,
+              "1": 9,
+              "2": 11,
+              "3": 64,
+              "4": 394
+            },
+            "members_ready_for_full_lookback": 394,
+            "members_with_any_current_value": 490,
+            "required_yoy_slots": 4
+          },
+          "quarterly.diluted_eps": {
+            "current_observation_count_within_member_asof_rows": 22153,
+            "eligible_yoy_pair_count_in_recent_slots": 1802,
+            "members_by_eligible_slot_count": {
+              "0": 24,
+              "1": 9,
+              "2": 11,
+              "3": 65,
+              "4": 394
+            },
+            "members_ready_for_full_lookback": 394,
+            "members_with_any_current_value": 490,
+            "required_yoy_slots": 4
+          },
+          "quarterly.total_revenue": {
+            "current_observation_count_within_member_asof_rows": 16951,
+            "eligible_yoy_pair_count_in_recent_slots": 927,
+            "members_by_eligible_slot_count": {
+              "0": 39,
+              "1": 1,
+              "2": 463
+            },
+            "members_ready_for_full_lookback": 463,
+            "members_with_any_current_value": 485,
+            "required_yoy_slots": 2
+          }
+        },
+        "quarterly_revenue_v3_adjacent_acceleration_candidates": {
+          "cadence_days_inclusive": [
+            84,
+            105
+          ],
+          "calculator_identity": "pit-financial-features-v3",
+          "members_ready_for_latest_two_matched_growth_slots_with_84_to_105_day_gap_by_field": {
+            "basic_eps": 403,
+            "diluted_eps": 404,
+            "total_revenue": 430
+          }
+        },
+        "roe_input_availability": {
+          "definition": "availability only; latest nonmissing annual net income and latest nonmissing balance-sheet equity by period_end, as visible at the snapshot; no ROE score is calculated",
+          "members_with_latest_annual_net_income": 496,
+          "members_with_positive_latest_nonmissing_balance_equity": 457,
+          "members_with_positive_latest_nonmissing_balance_equity_and_annual_net_income": 455
+        },
+        "sample_security_asof_coverage": {
+          "A": {
+            "asof_export_period_record_count": 187,
+            "profile_coverage": {
+              "annual.basic_eps": {
+                "current_value_observation_count": 19,
+                "eligible_yoy_pair_count_in_recent_slots": 3,
+                "period_observation_count": 19,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 3
+              },
+              "annual.diluted_eps": {
+                "current_value_observation_count": 19,
+                "eligible_yoy_pair_count_in_recent_slots": 3,
+                "period_observation_count": 19,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 3
+              },
+              "annual.net_income": {
+                "current_value_observation_count": 19,
+                "eligible_yoy_pair_count_in_recent_slots": 3,
+                "period_observation_count": 19,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 3
+              },
+              "annual.total_revenue": {
+                "current_value_observation_count": 17,
+                "eligible_yoy_pair_count_in_recent_slots": 3,
+                "period_observation_count": 19,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 3
+              },
+              "quarterly.basic_eps": {
+                "current_value_observation_count": 52,
+                "eligible_yoy_pair_count_in_recent_slots": 4,
+                "period_observation_count": 52,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 4
+              },
+              "quarterly.diluted_eps": {
+                "current_value_observation_count": 52,
+                "eligible_yoy_pair_count_in_recent_slots": 4,
+                "period_observation_count": 52,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 4
+              },
+              "quarterly.total_revenue": {
+                "current_value_observation_count": 25,
+                "eligible_yoy_pair_count_in_recent_slots": 2,
+                "period_observation_count": 52,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 2
+              }
+            }
+          },
+          "AMZN": {
+            "asof_export_period_record_count": 206,
+            "profile_coverage": {
+              "annual.basic_eps": {
+                "current_value_observation_count": 18,
+                "eligible_yoy_pair_count_in_recent_slots": 2,
+                "period_observation_count": 18,
+                "ready_for_full_lookback": false,
+                "required_yoy_slots": 3
+              },
+              "annual.diluted_eps": {
+                "current_value_observation_count": 18,
+                "eligible_yoy_pair_count_in_recent_slots": 2,
+                "period_observation_count": 18,
+                "ready_for_full_lookback": false,
+                "required_yoy_slots": 3
+              },
+              "annual.net_income": {
+                "current_value_observation_count": 18,
+                "eligible_yoy_pair_count_in_recent_slots": 2,
+                "period_observation_count": 18,
+                "ready_for_full_lookback": false,
+                "required_yoy_slots": 3
+              },
+              "annual.total_revenue": {
+                "current_value_observation_count": 9,
+                "eligible_yoy_pair_count_in_recent_slots": 3,
+                "period_observation_count": 18,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 3
+              },
+              "quarterly.basic_eps": {
+                "current_value_observation_count": 53,
+                "eligible_yoy_pair_count_in_recent_slots": 4,
+                "period_observation_count": 53,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 4
+              },
+              "quarterly.diluted_eps": {
+                "current_value_observation_count": 53,
+                "eligible_yoy_pair_count_in_recent_slots": 4,
+                "period_observation_count": 53,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 4
+              },
+              "quarterly.total_revenue": {
+                "current_value_observation_count": 25,
+                "eligible_yoy_pair_count_in_recent_slots": 2,
+                "period_observation_count": 53,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 2
+              }
+            }
+          },
+          "MSFT": {
+            "asof_export_period_record_count": 205,
+            "profile_coverage": {
+              "annual.basic_eps": {
+                "current_value_observation_count": 18,
+                "eligible_yoy_pair_count_in_recent_slots": 3,
+                "period_observation_count": 18,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 3
+              },
+              "annual.diluted_eps": {
+                "current_value_observation_count": 18,
+                "eligible_yoy_pair_count_in_recent_slots": 3,
+                "period_observation_count": 18,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 3
+              },
+              "annual.net_income": {
+                "current_value_observation_count": 18,
+                "eligible_yoy_pair_count_in_recent_slots": 3,
+                "period_observation_count": 18,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 3
+              },
+              "annual.total_revenue": {
+                "current_value_observation_count": 13,
+                "eligible_yoy_pair_count_in_recent_slots": 3,
+                "period_observation_count": 18,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 3
+              },
+              "quarterly.basic_eps": {
+                "current_value_observation_count": 52,
+                "eligible_yoy_pair_count_in_recent_slots": 4,
+                "period_observation_count": 52,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 4
+              },
+              "quarterly.diluted_eps": {
+                "current_value_observation_count": 52,
+                "eligible_yoy_pair_count_in_recent_slots": 4,
+                "period_observation_count": 52,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 4
+              },
+              "quarterly.total_revenue": {
+                "current_value_observation_count": 33,
+                "eligible_yoy_pair_count_in_recent_slots": 2,
+                "period_observation_count": 52,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 2
+              }
+            }
+          }
+        },
+        "unresolved_member_examples": [
+          "AEP",
+          "BK",
+          "DAY",
+          "HOLX",
+          "MMC"
+        ]
+      }
+    }
+  },
+  "runtime": {
+    "pandas": "3.0.1",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "python": "3.13.14",
+    "timezone": "UTC timestamps in source fields are parsed as UTC; membership dates remain calendar dates"
+  },
+  "schema_version": 1,
+  "source_identity": {
+    "annual_duration_days": [
+      300,
+      430
+    ],
+    "declared_fundamental_row_count": 145010,
+    "declared_security_master_exclusion_row_count": 39,
+    "declared_security_master_row_count": 568,
+    "filed_date_fallback_count_declared": 13,
+    "fundamentals_provenance_sha256": "79a4ff05e9ee18422200a9b1ebdbf28573b1e7d11f7b9c6268b69e710d7873d0",
+    "identity_manifest_csv_present_in_source_directory": false,
+    "identity_manifest_expected_sha256": "2dbf5357a98d2deca9a08b27fbbb7de01f4294d987e19065d7660266e1aeada3",
+    "institutional_fields_policy": "omitted_blank",
+    "public_date_rule": "first supplied SPY trading day strictly after SEC acceptance calendar date; filed date fallback only",
+    "publication_marker": {
+      "actual_provenance_sha256": "79a4ff05e9ee18422200a9b1ebdbf28573b1e7d11f7b9c6268b69e710d7873d0",
+      "actual_publication_marker_file_hash": "14be96843407c0a2f2bee40274929b99e08b1e5f2384ba5df47a4aaa273606d7",
+      "actual_sha256": "14be96843407c0a2f2bee40274929b99e08b1e5f2384ba5df47a4aaa273606d7",
+      "declared_provenance_sha256": "529ed088a5558c777ed935e6dda0951998d038993110a4974b98352d2f99a6d1",
+      "file": "fundamentals_publication.json",
+      "marker_bound_provenance_reconstruction": {
+        "excluded_current_metadata_field": "net_income_concept_priority",
+        "interpretation": "byte reconstruction only; it does not establish when, by whom, or why the current provenance field was added",
+        "reconstructed_hash_matches_publication_marker": true,
+        "reconstructed_sha256": "529ed088a5558c777ed935e6dda0951998d038993110a4974b98352d2f99a6d1"
+      },
+      "provenance_hash_matches_publication_marker": false,
+      "publication_marker_file_hash": null,
+      "referenced_file_hash_checks": {
+        "fundamentals.csv": {
+          "actual_sha256": "3cb2ecfcaa75cf9195d2ca91e159e62a283092f223fa2d3ed73d2e139456aab2",
+          "matches_publication_marker": true,
+          "publication_marker_sha256": "3cb2ecfcaa75cf9195d2ca91e159e62a283092f223fa2d3ed73d2e139456aab2"
+        },
+        "fundamentals_audit.csv": {
+          "actual_sha256": "bfcde58871671bcd77317a868c460c5a410de0fb3aff6fba25868939002f5424",
+          "matches_publication_marker": true,
+          "publication_marker_sha256": "bfcde58871671bcd77317a868c460c5a410de0fb3aff6fba25868939002f5424"
+        },
+        "fundamentals_coverage.json": {
+          "actual_sha256": "3532f0fbd2d76729f3131cfdac600693051b0316fbbc1fc18e08246555f5d52b",
+          "matches_publication_marker": true,
+          "publication_marker_sha256": "3532f0fbd2d76729f3131cfdac600693051b0316fbbc1fc18e08246555f5d52b"
+        },
+        "fundamentals_provenance.json": {
+          "actual_sha256": "79a4ff05e9ee18422200a9b1ebdbf28573b1e7d11f7b9c6268b69e710d7873d0",
+          "matches_publication_marker": false,
+          "publication_marker_sha256": "529ed088a5558c777ed935e6dda0951998d038993110a4974b98352d2f99a6d1"
+        },
+        "security_master.csv": {
+          "actual_sha256": "6f2a632b43a6dca4cdd046d6c3ae06815f9f1e000fb828b53dca25e6eeed5c42",
+          "matches_publication_marker": true,
+          "publication_marker_sha256": "6f2a632b43a6dca4cdd046d6c3ae06815f9f1e000fb828b53dca25e6eeed5c42"
+        },
+        "security_master_exclusions.csv": {
+          "actual_sha256": "a0862ae2f259651c5627ccb34d40ee420175ab048dab5eb7da7cb655c1d90529",
+          "matches_publication_marker": true,
+          "publication_marker_sha256": "a0862ae2f259651c5627ccb34d40ee420175ab048dab5eb7da7cb655c1d90529"
+        }
+      }
+    },
+    "quarterly_duration_days": [
+      70,
+      115
+    ],
+    "source": "SEC EDGAR official bulk archives",
+    "source_directory": "C:\\Projects\\trading_bot\\RS-momentum-EMA-trading-bot\\.artifacts\\data\\sec-fundamentals",
+    "source_membership_sha256": "a12413a9134623b51350ad4671d4a678eeed8edf2241a9985d0d7d51957f5389",
+    "source_window": {
+      "end_date": "2025-12-31",
+      "start_date": "2020-01-01"
+    },
+    "verified_inputs": [
+      {
+        "actual_sha256": "3cb2ecfcaa75cf9195d2ca91e159e62a283092f223fa2d3ed73d2e139456aab2",
+        "bytes": 10319164,
+        "expected_sha256": "3cb2ecfcaa75cf9195d2ca91e159e62a283092f223fa2d3ed73d2e139456aab2",
+        "file": "fundamentals.csv",
+        "matches_export_provenance": true
+      },
+      {
+        "actual_sha256": "bfcde58871671bcd77317a868c460c5a410de0fb3aff6fba25868939002f5424",
+        "bytes": 147626063,
+        "expected_sha256": "bfcde58871671bcd77317a868c460c5a410de0fb3aff6fba25868939002f5424",
+        "file": "fundamentals_audit.csv",
+        "matches_export_provenance": true
+      },
+      {
+        "actual_sha256": "3532f0fbd2d76729f3131cfdac600693051b0316fbbc1fc18e08246555f5d52b",
+        "bytes": 1757,
+        "expected_sha256": "3532f0fbd2d76729f3131cfdac600693051b0316fbbc1fc18e08246555f5d52b",
+        "file": "fundamentals_coverage.json",
+        "matches_export_provenance": true
+      },
+      {
+        "actual_sha256": "6f2a632b43a6dca4cdd046d6c3ae06815f9f1e000fb828b53dca25e6eeed5c42",
+        "bytes": 41914,
+        "expected_sha256": "6f2a632b43a6dca4cdd046d6c3ae06815f9f1e000fb828b53dca25e6eeed5c42",
+        "file": "security_master.csv",
+        "matches_export_provenance": true
+      },
+      {
+        "actual_sha256": "a0862ae2f259651c5627ccb34d40ee420175ab048dab5eb7da7cb655c1d90529",
+        "bytes": 4370,
+        "expected_sha256": "a0862ae2f259651c5627ccb34d40ee420175ab048dab5eb7da7cb655c1d90529",
+        "file": "security_master_exclusions.csv",
+        "matches_export_provenance": true
+      },
+      {
+        "actual_sha256": "d7b4b3c5f2fe014a203bdaef2197d2cba5683f434e965fc9bced1023a43c82ca",
+        "archive_sidecars_agree": true,
+        "bytes": 1407131132,
+        "expected_sha256": "d7b4b3c5f2fe014a203bdaef2197d2cba5683f434e965fc9bced1023a43c82ca",
+        "file": "companyfacts.zip",
+        "matches_export_provenance": true,
+        "zip_entry_count_declared": 20266,
+        "zip_uncompressed_bytes_declared": 19277465283
+      },
+      {
+        "actual_sha256": "928d67221c6e6183bc343e7234c1391448c15cd1dd644d36b425db2f99ba4350",
+        "archive_sidecars_agree": true,
+        "bytes": 1559612838,
+        "expected_sha256": "928d67221c6e6183bc343e7234c1391448c15cd1dd644d36b425db2f99ba4350",
+        "file": "submissions.zip",
+        "matches_export_provenance": true,
+        "zip_entry_count_declared": 987520,
+        "zip_uncompressed_bytes_declared": 5721893028
+      },
+      {
+        "actual_sha256": "a12413a9134623b51350ad4671d4a678eeed8edf2241a9985d0d7d51957f5389",
+        "bytes": 12284,
+        "expected_sha256": "a12413a9134623b51350ad4671d4a678eeed8edf2241a9985d0d7d51957f5389",
+        "file": "membership.csv",
+        "matches_export_provenance": true
+      },
+      {
+        "actual_sha256": "93d8ef415bd6be516fb32ebfa5986ad45cbc2077e5beaa9615943db8890be5b9",
+        "bytes": 16599,
+        "expected_sha256": "93d8ef415bd6be516fb32ebfa5986ad45cbc2077e5beaa9615943db8890be5b9",
+        "file": "spy_trading_days.csv",
+        "matches_export_provenance": true
+      }
+    ]
+  }
+}
