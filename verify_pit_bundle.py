@@ -193,6 +193,7 @@ def _verify_v3(
         exclusions,
         identities,
         transitions,
+        segment_contract,
     ) = bundle_builder._v3_provenance_metadata(
         membership_path=paths["membership_csv"],
         prices_path=paths["prices_csv"],
@@ -227,6 +228,7 @@ def _verify_v3(
         price_exclusions=exclusions,
         identities=identities,
         transitions=transitions,
+        segment_contract=segment_contract,
     )
     exact_tables = (
         (
