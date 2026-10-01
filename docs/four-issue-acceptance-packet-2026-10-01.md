@@ -17,12 +17,16 @@ The corrected reporter was measured from clean integration source
 `71e562ffc00dc4e617f1cd625e3f13ea5fe3f81a`. The earlier #82 local
 Docker image binds the 56-path map
 `3d57003a79ae5cc85cb3e4320568217e8b793a642363cca2c504caaba0aa82cf`
-at `d764c87`; current main integration changes that source closure and needs a
-new mapped image receipt.
+at `d764c87`; current main integration changed that source closure. The
+corrected 57-path map at `8a0896a` is
+`f6dee0745545308088887a924b9839efedd8f1beff1dfbfac82fd889935819f0`.
+A canonical local build and import smoke exist for this map; matched probes
+remain pending.
 The selected cross-issue suite passed **138 tests** at the measured source;
-after the current-main merge (`cc034abf40ba5671f5bfe5e711ba707a54a253c8`),
-the cross-issue suite plus tests for the newly merged data-client policy passed
-**152 tests**. Ruff and `git diff --check` passed. The broader offline suite
+after the current-main merge and 57-path image closure fix
+(`8a0896ac55dce180a14f3e06b08a1baaa1fd64e1`), the cross-issue suite
+plus tests for the newly merged data-client policy passed **152 tests**.
+Ruff and `git diff --check` passed. The broader offline suite
 is informational. Its three selected parity cases still fail exactly as
 described below.
 An independent #67 review identified a terminal-Q4 slot-placement case under
@@ -127,22 +131,30 @@ The local Docker Engine was 29.7.2, Linux/amd64. The retained `d764c87` local
 `33f331ece8a7b1e2b562860a0edf8a90ae9a0f1eb4cdecdaa6f7d80c35cbad56`,
 and `probe.log` SHA-256 is
 `4f49774aa112a6361e15cc91f5be50688ba8beb804c33c5bdea5c2c6efcae96b`.
+The [new integrated-image build/import receipt](issue-82-local-8a-build-import-receipt-2026-10-01.md)
+binds a 60-file raw-Git context, the corrected map, Docker backend image ID
+`sha256:1e0e6327f48e96d4f9754c6bae47969f0d8cf57f3c2b6cb8a10ab2ece28af0df`,
+and a successful no-network/no-mount panel import smoke with owned cleanup.
+It retains a failed config-digest reference attempt separately. It is partial
+evidence, not a matched parent/candidate run at `8a0896a`.
 
 | Exact published criterion | Current evidence and disposition |
 | --- | --- |
 | Distinguish simulation, fixed probes and supplemental observations | [Simulation receipt](research-03-simulation-verification-2026-09-28.md) separates synthetic next-open/gap-stop portfolio simulation, fixed 11-probe worker results, and supplemental mechanism checks. No historical PIT panel or empirical strategy campaign was run. |
-| Match parent/candidate assumptions; identify enabled/skipped stages | The `d764c87` Windows-host `DockerPanelEvaluatorV5 → LocalContainerExecutorV5` run mounted the same four-policy-file scope into separate parent and comment-only candidate containers from one immutable image. Policy revisions `76f67d16…` and `6d3008e8…`, source bundles `109a6199…` and `7c033b64…`, separate request/command/output hashes, and one matching 11-probe fingerprint `671a50c126b412b90fcaa466a034cade8d151686a90a8c1c1103c4f621ab4fc1` are in the receipt. Historical PIT panel and strategy campaign stages were skipped; no scenario data was mounted. The new integrated image map and import closure remain to be verified. |
+| Match parent/candidate assumptions; identify enabled/skipped stages | The `d764c87` Windows-host `DockerPanelEvaluatorV5 → LocalContainerExecutorV5` run mounted the same four-policy-file scope into separate parent and comment-only candidate containers from one immutable image. Policy revisions `76f67d16…` and `6d3008e8…`, source bundles `109a6199…` and `7c033b64…`, separate request/command/output hashes, and one matching 11-probe fingerprint `671a50c126b412b90fcaa466a034cade8d151686a90a8c1c1103c4f621ab4fc1` are in the receipt. Historical PIT panel and strategy campaign stages were skipped; no scenario data was mounted. The new integrated image imports its full panel path but has no matched parent/candidate output yet. |
 | Bounded failures, cleanup, existing passing path | Focused failure/timeout/cleanup mechanisms and synthetic next-open/gap-stop simulator paths pass in selected tests. The `d764c87` actual parent/candidate containers each exited zero, emitted 3,584 bytes below the 64 MiB bound, used `network=none`, `--pull never`, read-only root and policy mounts, and completed owned evaluator/workspace cleanup. Targeted checks found neither owned run container after cleanup; an independent daemon query found no container with the `pit-v5-` name prefix. The failed full-checkout and offline build setup attempts are retained as setup failures, not candidate results. |
 
 | Status | Assessment |
 | --- | --- |
-| Implementation | Existing simulator, evaluator, worker and focused mechanisms integrated; `main` added an imported helper absent from the current image allowlist, and the closure correction is pending. |
-| Required inputs | Synthetic bars/policies, canonical 59-file source context, pinned base/lockfile, and local Docker Engine were available. No production PIT data or provider input was needed for the bounded probe. |
-| Acceptance evidence | The earlier and `d764c87` local image/run receipts remain valid under their original source maps. A new integrated-map image, importability smoke, matched parent/candidate probes, and cleanup receipt are pending. The unpushed manual-only Actions package was blocked by automatic publication review and was not dispatched. No hosted run is claimed. |
+| Implementation | Existing simulator, evaluator, worker and focused mechanisms integrated; the new Alpaca helper is in the 57-path source and Docker allowlists. The corrected image built and imported the full panel path. |
+| Required inputs | Synthetic bars/policies, canonical 60-file source context, pinned base/lockfile, and local Docker Engine were available. The requested hosted route also needs temporary manual-workflow publication on GitHub's default branch; that publication is held. No production PIT data or provider input is needed for the bounded probe. |
+| Acceptance evidence | The earlier and `d764c87` local image/run receipts remain valid under their original source maps. The `8a0896a` local image and import-smoke receipt are retained; actual matched parent/candidate probe outputs and cleanup at this map remain missing. The unpushed manual-only Actions package was blocked by automatic publication review and was not dispatched. No hosted run is claimed. |
 | Dependencies | Accepted #80/#81; historical production PIT data and empirical costs are outside the bounded synthetic verification. |
 
 **Recommendation:** not ready for final integrated-source #82 acceptance until
-the changed image closure and bounded actual local container path are verified.
+matched parent/candidate containers execute at the corrected map and their
+output/cleanup evidence is reviewed. The user prefers the hosted runner;
+workflow publication and dispatch remain an explicit approval gate here.
 The `d764c87` run remains a valid dated synthetic result and does not accept a
 production PIT evaluation, historical strategy result, or global policy
 equivalence.
