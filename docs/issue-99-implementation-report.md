@@ -175,3 +175,9 @@ Three adjacent offline regression controls also passed (**3 passed**): `test_pol
 - This work does not establish real provider/broker behavior or runtime deployment acceptance.
 - Decimal source values are normalized to finite floats at the existing V3 feature boundary;
   this follows the current `PortfolioFeaturesV3` numeric contract.
+
+## Post-commit integrated review and evidence correction (2026-10-01)
+
+The final local integrated review at lead application revision `d2c4082746017dd4ecb14d709d71a7c12b1fc2d5` approves the specification and quality for all nine bounded offline criteria and closes the three consumer findings. The lead-reported six-module run completed with **107 passed, 2 warnings in 13.95 seconds**; Ruff passed, and 312 committed Python files compiled with Python 3.13. This local integrated approval supersedes the earlier status above that said the consumer delta review was pending. Principal review, publication, remote CI, and merge remain pending.
+
+The earlier artifact table is preserved as written. Its `595dc4e4742780667dab536d14c71ae8c8c27ec4e5cdb7901585881c806a84e1` entry is not the SHA-256 of the committed consumer module blob. The raw Git blob for `core/strategy_policy/account_reconciliation.py` at commit `d2a0677d53be5ff6bd5037b153f54f1bbf69acc3` was independently verified as `a5d28579374cfdbfb3528c53aca0fd217b6b3cc386ce437fe59490f1f7604f7f`. This correction is report-only; it does not change the source or tests.
