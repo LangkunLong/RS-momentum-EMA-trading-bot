@@ -1,0 +1,60 @@
+{
+  "source_revision": "40f6b68983f4520ca811f33d0078947771d0ba02",
+  "python": "3.13.14",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "test_tmp_root": "C:\\Users\\llong\\.codex\\visualizations\\2026\\09\\28\\01a0e67f-9969-7230-8a0c-f1c433a84ad8\\lead-a-tests-40f6b68",
+  "prior_attempt": ".artifacts/coordination/lead-a-final-verification/receipt.json",
+  "prior_attempt_disposition": "Invalid override inside source rejected by existing fixture before 68 tests; corrected override outside source. No product change.",
+  "commands": [
+    {
+      "name": "focused",
+      "command": [
+        "C:\\Users\\llong\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\python.exe",
+        "-m",
+        "pytest",
+        "tests/test_financial_lineage_bridge.py",
+        "tests/test_sec_pit_fundamentals.py",
+        "tests/test_normalize_pit_universe_membership.py",
+        "tests/test_pit_identity_segments.py",
+        "tests/test_verify_pit_bundle.py",
+        "tests/test_assess_issue70_retained_source.py",
+        "-q",
+        "-p",
+        "no:cacheprovider",
+        "-o",
+        "addopts="
+      ],
+      "exit_code": 0,
+      "log": ".artifacts\\coordination\\lead-a-final-verification-corrected\\focused.log",
+      "log_sha256": "2895261bf6309595c9b99dc9e9571d820d8060c46b0ca88ed141464f5a1058af"
+    },
+    {
+      "name": "ruff",
+      "command": [
+        "C:\\Users\\llong\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\python.exe",
+        "-m",
+        "ruff",
+        "check",
+        "."
+      ],
+      "exit_code": 0,
+      "log": ".artifacts\\coordination\\lead-a-final-verification-corrected\\ruff.log",
+      "log_sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
+    },
+    {
+      "name": "compile",
+      "command": [
+        "C:\\Users\\llong\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\python.exe",
+        "-m",
+        "compileall",
+        "-q",
+        "-x",
+        "[/\\\\](\\.git|\\.worktrees|\\.artifacts|\\.venv)[/\\\\]",
+        "."
+      ],
+      "exit_code": 0,
+      "log": ".artifacts\\coordination\\lead-a-final-verification-corrected\\compile.log",
+      "log_sha256": "aac48a247c59b74038bbdae728a217c048eee7cf2003c4e7b57293160e43146e"
+    }
+  ]
+}

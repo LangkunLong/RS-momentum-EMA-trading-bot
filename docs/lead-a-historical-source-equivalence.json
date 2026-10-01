@@ -1,0 +1,13 @@
+{
+  "integrated_revision": "40f6b68983f4520ca811f33d0078947771d0ba02",
+  "bridge_owner_revision": "32a52915853cfe1a240e7898796213b405c05c66",
+  "bridge_owner_git_file_differences": [],
+  "image_evidence_source": "a8662e85c4c06142183c707926e7c302c75e233d",
+  "runtime_file_count": 58,
+  "context_file_count": 61,
+  "context_git_file_differences": [],
+  "evaluator_source_sha256": "ea44827dc78dcc3f4a4293929e4897345d1f0daa7faef6fbd50cdbb00757d2af",
+  "tracked_python_files_compiled_in_memory": 306,
+  "calculator_git_blob": "71e562ffc00dc4e617f1cd625e3f13ea5fe3f81a",
+  "limits": "Exact raw Git context equivalence preserves B image evidence at its original execution identity; no new Docker execution claimed. Windows checkout source hashes may differ by line endings."
+}

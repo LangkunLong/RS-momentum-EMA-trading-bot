@@ -14,7 +14,7 @@ Launch base verified locally: `ab385d792e19ff6db39d87f1123f47f660fc1e1d`, tree `
 | --- | --- | --- | --- |
 | #69 bounded assessment | `01a0e67f-b51f-74e2-99c2-da49cd479ec6`, `C:/Users/llong/.codex/worktrees/3d87/RS-momentum-EMA-trading-bot` | Dedicated offline assessment script, report and small summary receipts; no shared product modules | Preserved owner; frozen delivery received and reviewed |
 | #70 bounded assessment | `01a0e67f-f999-7380-a36e-4438f207b46e`, `C:/Users/llong/.codex/worktrees/f1ba/RS-momentum-EMA-trading-bot` | Dedicated offline assessment script, report and small summary receipts; no shared exporter/calculator edits | Preserved owner; corrected bounded delivery independently accepted |
-| #72 bridge | `01a0f857-8241-7730-9067-6b212b1b22a2`, `C:/Users/llong/.codex/worktrees/2c6e/RS-momentum-EMA-trading-bot` | `core/sec_pit_fundamentals.py`, `build_pit_bundle.py`, dedicated bridge module/CLI if justified, targeted tests/docs | Preserved owner; three review corrections active |
+| #72 bridge | `01a0f857-8241-7730-9067-6b212b1b22a2`, `C:/Users/llong/.codex/worktrees/2c6e/RS-momentum-EMA-trading-bot` | `core/sec_pit_fundamentals.py`, `build_pit_bundle.py`, dedicated bridge module/CLI if justified, targeted tests/docs | Preserved owner; corrected implementation independently accepted |
 
 Workers use GPT-6 Luna/xhigh. Lead uses selected Astra/high. Preserve old worker branches/commits; reuse worktrees with ordinary integration or a scoped branch from the exact base. No reset/force and no worker hierarchy. Workers report to this lead `01a0e67f-9969-7230-8a0c-f1c433a84ad8`.
 
@@ -35,14 +35,14 @@ Independent review refines the minimum boundary to deterministic V3 lineage-memb
 
 | Issue/scope | Implementation | Required inputs | Acceptance evidence | Dependencies |
 | --- | --- | --- | --- | --- |
-| #72 | Corrective implementation active after df38922 | Synthetic fixtures sufficient; original eligible input bindings required | Three reproduced review findings unresolved | #66 accepted; settled #68 interface available |
+| #72 | Complete at32a5291, integrated at40f6b68 | Synthetic fixtures sufficient; original eligible input bindings required | Three findings resolved; independent review and86integrated tests passed | #66 accepted; settled #68 interface available |
 | #69 bounded / full | Bounded assessment accepted and integrated / production incomplete | Retained sample measured / complete eligible union and prices missing | Independent bounded review accepted / full evidence absent | Start #66 met; full acceptance requires #68 |
 | #70 bounded / full | Corrected bounded assessment independently accepted and integrated / production incomplete | Alternate export and archive identities retained / complete eligible histories missing | Corrected bounded evidence independently accepted / full evidence absent | Start #66 met; full acceptance requires #68 |
 | #68 preserved obligation | Existing identity/admission code retained | Full source-backed union and transitions missing | Partial acquisition only; not ready | Remains open outside this bounded phase |
 
 ## Review, publication and notification
 
-Bounded #69 review is accepted and integrated locally. #70/#72 corrections and final reviews remain pending. No next-phase PR, remote merge, issue closure or achieved-goal notification yet. Store ready PR and exact evidence here for principal inspection; send the single final completion message only after accepted/merged #72 and both reviewed bounded reports are delivered.
+Bounded #69/#70 and corrected #72 reviews are accepted and integrated locally. Final integration and documentation reviews passed. Required hosted CI/publication and principal acceptance/merge remain ahead. No next-phase PR, remote merge, issue closure or achieved-goal notification yet. Store ready PR and exact evidence here for principal inspection; send the single final completion message only after accepted/merged #72 and both reviewed bounded reports are delivered.
 
 ### Launch receipts
 
@@ -85,3 +85,10 @@ Bounded #69 review is accepted and integrated locally. #70/#72 corrections and f
 
 - #70 corrected `8f389406f1c7339662387d446cbbffd997b810e8` accepted by independent spec/quality review; integrated via `b675399` then `f6d7474`. Script, tests and both receipts retain exact Git contents. Clarified reproduction commands separately label original source and use scratch outputs. Clarification/integration independently accepted; reports `docs/issue-70-bounded-independent-review.md` and `docs/issue-69-70-integration-review.md`.
 - Windows CRLF checkout differences are explicitly separate from raw Git blob/retained execution identity. Mapping retained `.artifacts/coordination/issue69-70-integration-byte-equivalence.json`. No assessment remeasurement or old67/71/82 rerun performed.
+
+- #72 correction `32a52915853cfe1a240e7898796213b405c05c66` independently accepted; integrated through `d54255a` to final implementation `40f6b68983f4520ca811f33d0078947771d0ba02`. All three findings resolved; independent actual synthetic bundle hash matches corrected receipt `85d1a599...`. Original receipt preserved.
+- Final combined focused test86passed/2warnings7.29s; whole-repo Ruff passed; compileall exit0 with ignored-cache listing warnings; all306trackedPython files separately compiled in memory. Initial invalid inside-source temp override retained as failed setup, corrected without product change.
+- All61imagecontext/58runtime rawGit files equal B's tested a866 source. Calculator blob71e562f unchanged; no newDocker or old67/71/82 rerun. Final implementation and original owner identities are distinct from later report packaging commits.
+
+- Final independent integration and documentation reviews PASS; public copies `docs/lead-a-historical-final-integration-review.md` and `docs/lead-a-historical-final-documentation-review.md`. Publication ready under existing authority; requiredCI and principal final acceptance/normal merge remain gates.
+- Authorized final interface disclosures successfully delivered to peer B `01a0f851-c7ac-7b81-87ab-3de389d47510` and peer C `01a0f851-dfb4-7081-90c1-81131013fee2`: exact final implementation40f6, unchanged61/58context map and71calculator, no production admission or new image execution. No principal progress/completion message sent.
