@@ -2464,7 +2464,16 @@ class PolicyExecutionStateStore:
                 )
             if int(holding_row["state_version"]) != expected_holding_version:
                 raise ConcurrentStateUpdateError("holding changed since the caller read it")
-            updated_holding, proposed = propose_stop_in_state(holding, decision=decision, stop_price=stop_price)
+            pending_intents = tuple(
+                self._load_action(conn, action_id)[0]
+                for action_id in holding.pending_action_ids
+            )
+            updated_holding, proposed = propose_stop_in_state(
+                holding,
+                decision=decision,
+                stop_price=stop_price,
+                coexisting_entry_intents=pending_intents,
+            )
             identity = decision.deployment_identity
             conn.execute(
                 """INSERT INTO policy_state_stop_updates(
