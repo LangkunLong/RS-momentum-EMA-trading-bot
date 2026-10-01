@@ -9,6 +9,7 @@
 **Producer report-only disposition:** `d8e383ecf5cdae37f0a3828a056ff2d1b1e202af`
 **Latest producer source correction:** `43a0820dea9688fd8583f45ccb9704f172553954`
 **Latest producer review report:** `bfcaa5a8cfdcfc5e32edfd78e4dfd5bb65e5b2d5`
+**Replacement fill source dependency:** `2881118393ab99bf02037230cfe76d4160f69bae`
 
 ## Statuses
 
@@ -181,3 +182,17 @@ Three adjacent offline regression controls also passed (**3 passed**): `test_pol
 The final local integrated review at lead application revision `d2c4082746017dd4ecb14d709d71a7c12b1fc2d5` approves the specification and quality for all nine bounded offline criteria and closes the three consumer findings. The lead-reported six-module run completed with **107 passed, 2 warnings in 13.95 seconds**; Ruff passed, and 312 committed Python files compiled with Python 3.13. This local integrated approval supersedes the earlier status above that said the consumer delta review was pending. Principal review, publication, remote CI, and merge remain pending.
 
 The earlier artifact table is preserved as written. Its `595dc4e4742780667dab536d14c71ae8c8c27ec4e5cdb7901585881c806a84e1` entry is not the SHA-256 of the committed consumer module blob. The raw Git blob for `core/strategy_policy/account_reconciliation.py` at commit `d2a0677d53be5ff6bd5037b153f54f1bbf69acc3` was independently verified as `a5d28579374cfdbfb3528c53aca0fd217b6b3cc386ce437fe59490f1f7604f7f`. This correction is report-only; it does not change the source or tests.
+
+## Replacement fill lifecycle follow-up (2026-10-01)
+
+Producer source `2881118393ab99bf02037230cfe76d4160f69bae` (parent `bfcaa5a8cfdcfc5e32edfd78e4dfd5bb65e5b2d5`) was merged into the consumer branch as construction dependency by merge commit `916f980fb92114f8b3252e1fca177065262e3314`. #99 changed no producer files.
+
+The new temporary-SQLite regression follows a replacement buy through a confirmed partial fill, store restart and canonical read, protection of the acquired shares while the residual remains pending, a later cumulative full fill, protection resized to the final quantity, and replay of the final fill receipt after restart. It verifies the replacement action ID and holding ID remain stable, one canonical holding is linked to the terminal replacement action, actual ABC quantity/notional/risk are counted once, and only the unfilled two shares reserve cash (`$200`) and risk (`$20`). With three shares protected, reconciliation is ready with `$130` open position risk and `$150` total committed risk. After the remaining two shares fill, readiness stays blocked until the protective order covers all five shares; confirmed protection then yields `$150` open position risk with no remaining reservation. Replayed receipt leaves action and holding state unchanged. Missing-holding and missing-stop/unknown-risk controls both remain unready and publish no V3 features.
+
+Focused offline regression command:
+
+```text
+python -m pytest -p no:cacheprovider -o addopts='' -W ignore::pytest.PytestConfigWarning --tb=short tests/test_strategy_policy_account_reconciliation.py::test_canonical_replacement_partial_full_fill_restart_and_protection_lifecycle tests/test_strategy_policy_account_reconciliation.py::test_competing_entry_add_on_and_replacement_commit_cash_and_risk_once tests/test_strategy_policy_account_reconciliation.py::test_canonical_store_read_reconciles_old_generation_state_with_current_portfolio tests/test_strategy_policy_account_reconciliation.py::test_unknown_stop_is_unready_and_does_not_become_zero_risk tests/test_strategy_policy_account_reconciliation.py::test_canonical_holding_reconciliation_flag_survives_restart_until_evidenced_clear tests/test_strategy_policy_account_reconciliation.py::test_canonical_resolved_unissued_addition_and_remainder_release_reservations_after_restart tests/test_strategy_policy_account_reconciliation.py::test_flat_holding_history_needs_no_live_stop_and_allows_a_later_same_security_episode -q
+```
+
+Result: **7 passed**. Ruff passed for the consumer module and focused test file; `git diff --check` reported no whitespace errors. This is an additional selected consumer run; it does not replace the earlier lead-reported 107-pass receipt, which remains historical evidence for its original nine criteria. Independent producer/integrated review and principal delta review of this replacement lifecycle remain pending. No acceptance or publication decision is inferred from merging this producer construction dependency.
