@@ -14,6 +14,7 @@ import csv
 import hashlib
 import json
 import math
+import os
 import platform
 import statistics
 import subprocess
@@ -46,6 +47,22 @@ METRIC_FIELDS = (
     "shares_outstanding",
 )
 Q4_CAPABLE_FIELDS = ("basic_eps", "diluted_eps", "total_revenue", "net_income")
+EXPECTED_FACT_UNITS = {
+    "basic_eps": {"USD/shares"},
+    "diluted_eps": {"USD/shares"},
+    "total_revenue": {"USD"},
+    "net_income": {"USD"},
+    "common_stock": {"USD"},
+    "total_stockholders_equity": {"USD"},
+    "shares_outstanding": {"shares"},
+}
+DURATION_METRICS = {
+    "basic_eps",
+    "diluted_eps",
+    "total_revenue",
+    "net_income",
+}
+INSTANT_METRICS = {"common_stock", "total_stockholders_equity", "shares_outstanding"}
 FACT_CONCEPTS = {
     "basic_eps": (("us-gaap", "EarningsPerShareBasic"),),
     "diluted_eps": (("us-gaap", "EarningsPerShareDiluted"),),
@@ -129,6 +146,95 @@ def parse_number(value: str | None) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def qualify_companyfacts_match(
+    candidates: list[dict[str, Any]],
+    *,
+    csv_value: float,
+    metric: str,
+    statement_type: str,
+    export_period_end: str,
+) -> dict[str, Any]:
+    """Require an exact period, compatible statement duration, and expected unit."""
+    expected_units = EXPECTED_FACT_UNITS.get(metric)
+    if expected_units is None:
+        return {
+            "disposition": "unsupported_metric",
+            "qualifying_candidate_count": 0,
+            "matched_candidate": None,
+        }
+
+    target_end = parse_date(export_period_end)
+    exact_period = [
+        candidate
+        for candidate in candidates
+        if target_end is not None
+        and parse_date(str(candidate.get("period_end", ""))) == target_end
+    ]
+    if not exact_period:
+        disposition = "no_exact_period_end"
+        family_candidates: list[dict[str, Any]] = []
+        unit_candidates: list[dict[str, Any]] = []
+    else:
+        if metric in DURATION_METRICS:
+            compatible_statement = statement_type in {"quarterly", "annual"}
+        else:
+            compatible_statement = metric in INSTANT_METRICS and statement_type == "balance"
+        if not compatible_statement:
+            disposition = "no_compatible_statement_family"
+            family_candidates = []
+            unit_candidates = []
+        else:
+            family_candidates = []
+            for candidate in exact_period:
+                start = parse_date(str(candidate.get("period_start", "")))
+                if statement_type == "balance":
+                    compatible_duration = not candidate.get("period_start")
+                elif start is None or target_end is None:
+                    compatible_duration = False
+                else:
+                    days = (target_end - start).days
+                    compatible_duration = (
+                        70 <= days <= 115
+                        if statement_type == "quarterly"
+                        else 300 <= days <= 430
+                    )
+                if compatible_duration:
+                    family_candidates.append(candidate)
+            if not family_candidates:
+                disposition = "no_compatible_duration_family"
+                unit_candidates = []
+            else:
+                unit_candidates = [
+                    candidate
+                    for candidate in family_candidates
+                    if candidate.get("unit") in expected_units
+                ]
+                if not unit_candidates:
+                    disposition = "no_expected_unit"
+                elif len(unit_candidates) > 1:
+                    disposition = "ambiguous_multiple_qualifying_facts"
+                elif unit_candidates[0].get("value") is None:
+                    disposition = "no_numeric_source_value"
+                elif not math.isclose(
+                    unit_candidates[0]["value"],
+                    csv_value,
+                    rel_tol=1e-12,
+                    abs_tol=1e-12,
+                ):
+                    disposition = "source_value_mismatch"
+                else:
+                    disposition = "matched_unique"
+
+    matched_candidate = (
+        unit_candidates[0] if disposition == "matched_unique" else None
+    )
+    return {
+        "disposition": disposition,
+        "qualifying_candidate_count": len(unit_candidates),
+        "matched_candidate": matched_candidate,
+    }
+
+
 def parse_json_object(value: str | None) -> dict[str, Any]:
     if not value:
         return {}
@@ -158,6 +264,7 @@ def verify_inputs(
     membership_path: Path,
     trading_days_path: Path,
     comparison_manifest_path: Path | None,
+    reuse_archive_digests_from: Path | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None]:
     provenance_path = source_dir / "fundamentals_provenance.json"
     provenance = read_json(provenance_path)
@@ -166,6 +273,76 @@ def verify_inputs(
     publication = read_json(publication_path)
 
     checks: list[dict[str, Any]] = []
+    reused_archive_hashes: dict[str, dict[str, Any]] = {}
+    archive_digest_reuse: dict[str, Any] | None = None
+    if reuse_archive_digests_from is not None:
+        prior_path = reuse_archive_digests_from.resolve()
+        required_prior_path = (
+            REPO_ROOT / "docs/issue-70-bounded-source-assessment-receipt.json"
+        ).resolve()
+        if os.path.normcase(str(prior_path)) != os.path.normcase(
+            str(required_prior_path)
+        ):
+            raise ValueError("Archive digest reuse is limited to the committed original receipt")
+        try:
+            committed_prior_bytes = subprocess.check_output(
+                ["git", "show", "HEAD:docs/issue-70-bounded-source-assessment-receipt.json"],
+                cwd=REPO_ROOT,
+                stderr=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise ValueError("Cannot verify the prior receipt against the current commit") from exc
+        prior_bytes_for_commit_check = prior_path.read_bytes().replace(b"\r\n", b"\n")
+        if prior_bytes_for_commit_check != committed_prior_bytes.replace(b"\r\n", b"\n"):
+            raise ValueError("Prior receipt content differs from the committed original receipt")
+        prior_receipt = read_json(prior_path)
+        prior_source = prior_receipt.get("source_identity", {})
+        prior_source_dir = Path(prior_source.get("source_directory", "")).resolve()
+        if os.path.normcase(str(prior_source_dir)) != os.path.normcase(
+            str(source_dir.resolve())
+        ):
+            raise ValueError("Prior receipt source_directory does not match current source directory")
+        prior_checks = {
+            item.get("file"): item
+            for item in prior_source.get("verified_inputs", [])
+            if isinstance(item, dict)
+        }
+        archive_manifest = provenance["archive_manifest"]["archives"]
+        for filename, provenance_key in (
+            ("companyfacts.zip", "companyfacts_archive_sha256"),
+            ("submissions.zip", "submissions_archive_sha256"),
+        ):
+            previous = prior_checks.get(filename, {})
+            expected = str(provenance[provenance_key]).lower()
+            declared = archive_manifest[filename]
+            sidecar = archive_provenance["archives"][filename]
+            current_bytes = (source_dir / filename).stat().st_size
+            valid_prior_identity = (
+                previous.get("matches_export_provenance") is True
+                and str(previous.get("actual_sha256", "")).lower() == expected
+                and str(previous.get("expected_sha256", "")).lower() == expected
+                and int(previous.get("bytes", -1)) == current_bytes
+                and expected == str(declared["sha256"]).lower()
+                == str(sidecar["sha256"]).lower()
+                and current_bytes == int(declared["byte_length"])
+                == int(sidecar["byte_length"])
+            )
+            if not valid_prior_identity:
+                raise ValueError(
+                    f"Prior receipt cannot authenticate unchanged {filename}"
+                )
+            reused_archive_hashes[filename] = previous
+        archive_digest_reuse = {
+            "verification_mode": "reused prior receipt digest attestation",
+            "prior_receipt_path": str(prior_path),
+            "prior_receipt_sha256": sha256_file(prior_path),
+            "prior_repository_head": prior_receipt.get("code_identity", {}).get(
+                "repository_head"
+            ),
+            "current_archive_content_rehashed": False,
+            "same_path_and_same_size_assumption": "The current archive bytes are assumed unchanged because source_directory, byte size, prior actual/expected SHA-256, current provenance hash, and archive-sidecar hashes agree. The selected ZIP members are read again for the corrected trace.",
+        }
+
     for filename, key in EXPECTED_EXPORTS.items():
         path = source_dir / filename
         expected = str(provenance[key]).lower()
@@ -195,7 +372,12 @@ def verify_inputs(
             and path.stat().st_size == int(declared["byte_length"])
             == int(archive_sidecar["byte_length"])
         )
-        actual = sha256_file(path)
+        reused = reused_archive_hashes.get(filename)
+        actual = (
+            str(reused["actual_sha256"]).lower()
+            if reused is not None
+            else sha256_file(path)
+        )
         checks.append(
             {
                 "file": filename,
@@ -203,6 +385,12 @@ def verify_inputs(
                 "expected_sha256": expected,
                 "actual_sha256": actual,
                 "matches_export_provenance": actual == expected,
+                "digest_verification_mode": (
+                    "reused_prior_receipt_attestation"
+                    if reused is not None
+                    else "current_sha256_recomputed"
+                ),
+                "current_archive_content_rehashed": reused is None,
                 "archive_sidecars_agree": consistent_metadata,
                 "zip_entry_count_declared": declared["zip_entry_count"],
                 "zip_uncompressed_bytes_declared": declared[
@@ -386,6 +574,7 @@ def verify_inputs(
             "source_membership_sha256": provenance.get("membership_csv_sha256"),
             "fundamentals_provenance_sha256": actual_provenance_hash,
             "verified_inputs": checks,
+            "archive_digest_reuse": archive_digest_reuse,
             "publication_marker": publication_marker,
             "public_date_rule": provenance.get("public_date_rule"),
             "annual_duration_days": provenance.get("annual_duration_days"),
@@ -1354,16 +1543,22 @@ def analyze_bounded_archives(
                     trace_by_metric[metric]["origin_key_companyfacts_candidates"] += len(
                         candidates
                     )
-                    matching_values = [
-                        item
-                        for item in candidates
-                        if item["value"] is not None
-                        and math.isclose(item["value"], csv_value, rel_tol=1e-12, abs_tol=1e-12)
+                    match = qualify_companyfacts_match(
+                        candidates,
+                        csv_value=csv_value,
+                        metric=metric,
+                        statement_type=key[1],
+                        export_period_end=key[2],
+                    )
+                    disposition = match["disposition"]
+                    trace_by_metric[metric][f"disposition_{disposition}"] += 1
+                    trace_by_metric[metric]["qualifying_candidate_count"] += match[
+                        "qualifying_candidate_count"
                     ]
-                    if matching_values:
+                    matched_candidate = match["matched_candidate"]
+                    if matched_candidate is not None:
                         trace_by_metric[metric]["csv_value_found_in_origin_facts"] += 1
-                        for item in matching_values:
-                            matched_units[metric][item["unit"]] += 1
+                        matched_units[metric][matched_candidate["unit"]] += 1
                     else:
                         trace_by_metric[metric]["csv_value_not_found_in_origin_facts"] += 1
                     if len(trace_examples) < 12:
@@ -1379,10 +1574,22 @@ def analyze_bounded_archives(
                                 "source_accession_present": bool(origin_key[0]),
                                 "inherited_metric": metric in inherited,
                                 "companyfacts_origin_candidate_count": len(candidates),
-                                "csv_value_found_in_origin_facts": bool(matching_values),
-                                "matched_unit_names": sorted({item["unit"] for item in matching_values}),
-                                "matched_source_period_ends": sorted(
-                                    {item["period_end"] for item in matching_values}
+                                "qualifying_candidate_count": match[
+                                    "qualifying_candidate_count"
+                                ],
+                                "match_disposition": disposition,
+                                "csv_value_found_in_origin_facts": (
+                                    matched_candidate is not None
+                                ),
+                                "matched_unit_names": (
+                                    [matched_candidate["unit"]]
+                                    if matched_candidate is not None
+                                    else []
+                                ),
+                                "matched_source_period_ends": (
+                                    [matched_candidate["period_end"]]
+                                    if matched_candidate is not None
+                                    else []
                                 ),
                             }
                         )
@@ -1459,7 +1666,11 @@ def make_receipt(args: argparse.Namespace) -> dict[str, Any]:
         else None
     )
     identity, provenance, generation_comparison = verify_inputs(
-        source_dir, membership_path, trading_days_path, comparison_path
+        source_dir,
+        membership_path,
+        trading_days_path,
+        comparison_path,
+        args.reuse_archive_digests_from,
     )
     master = {row["ticker"]: row for row in read_csv_rows(source_dir / "security_master.csv")}
     analysis, sample_export_rows, audit_samples = analyze_export(
@@ -1559,6 +1770,11 @@ def main() -> int:
     parser.add_argument("--membership-csv", type=Path, required=True)
     parser.add_argument("--trading-days-csv", type=Path, required=True)
     parser.add_argument("--comparison-import-provenance", type=Path)
+    parser.add_argument(
+        "--reuse-archive-digests-from",
+        type=Path,
+        help="Reuse authenticated SEC archive SHA-256 values from a prior receipt after identity and byte-size checks.",
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     output_path = args.output.resolve()
