@@ -1,6 +1,6 @@
 # Lead C completion record
 
-Status: ACTIVE / INCOMPLETE. Implementations and scoped reviews exist, and source is integrated locally for correction and validation. No C remote publication, principal acceptance or normal remote merge has occurred. Canonical ongoing state: `docs/next-phase-paper-policy-ledger.md`.
+Status: ACTIVE / INCOMPLETE. Local implementation,107case validation and independent integrated specification/quality review are complete for all nine bounded offline criteria. One minor report hash correction is being appended. GitHub export and outbound handoff remain gated; no C remote publication, required remote checks, principal acceptance or normal remote merge has occurred. Canonical ongoing state: `docs/next-phase-paper-policy-ledger.md`.
 
 Completion requires all nine original #98/#99/#100 criteria, independent specification and quality review, combined offline boundary/restart evidence at exact integrated source, schema compatibility constraints for D, and actual accepted normal merges. This file is not a completion receipt.
 
@@ -8,21 +8,21 @@ Completion requires all nine original #98/#99/#100 criteria, independent specifi
 
 | Issue and criterion | Retained evidence | Current disposition |
 | --- | --- | --- |
-| #98 equivalent facts give equivalent features, breadth and benchmark context | 88 focused cases, reviewed source51053ad/report8190c15; controlled V2/V3 comparisons; unchanged accepted #71 calculator | Scoped spec/quality approved; final integrated and principal acceptance pending |
-| #98 legacy scanner filters do not silently remove candidates | Complete eligible-universe fixture includes legacy-filtered candidates; rejects unexplained omissions | Scoped review approved |
-| #98 unavailable fields remain explicit and historical evidence stays historical | Missingness reason checks, availability/date boundaries, recorded completion and full supplied-input manifest | Scoped review approved; no production/provider admission claimed |
-| #99 residual cash, pending orders and partial fills | Consumerd2a0677 supports terminal or provably-unissued resolution; canonical restart/replay/alias/reservation and negative controls pass | Corrected source passes107case combined checkpoint; final independent review pending |
-| #99 exposures, risk and classifications reconcile at declared valuation | Current valuation/original clocks coexist; flat history and later same-security episode retain explicit protection boundaries | Corrected source passes107case combined checkpoint; final independent review pending |
-| #99 missing facts never become zero risk | Named durable reconciliation flag now blocks V3 readiness until evidenced clear; unrelated flags stay visible without invented blocking semantics | Lead set/restart/unready/clear/ready case passes; final independent review pending |
-| #100 decision/action identity survives restart | Source43a0820/reportbfcaa5a approved; durable identities, provider-scoped aliases, receipts and canonical read tested | All original producer findings resolved; final consumer/integrated and principal gates remain |
-| #100 additions, exit tiers, stops, peaks and pending intentions persist | 43 focused producer cases plus lead checkpoint evidence; recovery retains other pending actions and actual position quantities | Producer spec/quality approved; three later consumer findings remain separately open |
-| #100 timing, missed sessions, conflicts, migrations and rollback recover safely | Temporary-store transactional migration, rollback, caller-version CAS, mixed-generation and late-reference recovery evidence | Producer spec/quality approved; deployment and actual-store migration excluded |
+| #98 equivalent facts give equivalent features, breadth and benchmark context | 88 focused owner cases; controlled V2/V3 comparisons; unchanged accepted #71 calculator | Scoped and integrated spec/quality approved; principal acceptance pending |
+| #98 legacy scanner filters do not silently remove candidates | Complete eligible-universe fixture includes legacy-filtered candidates; rejects unexplained omissions | Scoped and integrated review approved |
+| #98 unavailable fields remain explicit and historical evidence stays historical | Missingness reason checks, availability/date boundaries, recorded completion and full supplied-input manifest | Scoped and integrated review approved; no production/provider admission claimed |
+| #99 residual cash, pending orders and partial fills | Consumerd2a0677 supports terminal or provably-unissued resolution; canonical restart/replay/alias/reservation and negative controls pass |107case combined checkpoint and independent integrated review approved |
+| #99 exposures, risk and classifications reconcile at declared valuation | Current valuation/original clocks coexist; flat history and later same-security episode retain explicit protection boundaries |107case combined checkpoint and independent integrated review approved |
+| #99 missing facts never become zero risk | Named durable reconciliation flag blocks V3 readiness until evidenced clear; unrelated flags stay visible without invented blocking semantics | Lead set/restart/unready/clear/ready case passes; independent review approved |
+| #100 decision/action identity survives restart | Source43a0820/reportbfcaa5a approved; durable identities, provider-scoped aliases, receipts and canonical read tested | All producer and integrated findings resolved; principal gates remain |
+| #100 additions, exit tiers, stops, peaks and pending intentions persist |43focused producer cases plus lead checkpoint evidence; recovery retains other pending actions and actual position quantities | Producer and integrated spec/quality approved |
+| #100 timing, missed sessions, conflicts, migrations and rollback recover safely | Temporary-store migration, rollback, caller-version CAS, mixed-generation and late-reference recovery evidence | Producer and integrated spec/quality approved; deployment and actual-store migration excluded |
 
 ## Latest combined checkpoint
 
 Integrated application candidate `d2c4082746017dd4ecb14d709d71a7c12b1fc2d5`, tree `1e511574341e425f6ec2c326991a8dfaa6f49f38`, includes producer43a0820/reportbfcaa5a and consumerd2a0677. The three new lead regressions pass, including previously unreached flag-clear and active-protection negative assertions. Six specifically vetted offline modules passed107cases (final chunkdc89cb,2warnings,13.95s), including the complete8case chain and2feature-identity cases. Ruff passed. The compileall traversal reported an inaccessible ignored cache directory; a separate read-only compile of all312committed Python files passed. Python3.11 and required remote CI remain pending. Receipt `.artifacts/lead-c/integration-validation-d2c4082.md` retains commands, warnings, exact inventories and historical failure boundaries.
 
-Independent integrated review of the three corrected consumer findings and final candidate is active. Producer scoped approval remains valid; passing tests do not substitute for this final review, principal acceptance, publication or normal merges. No full completion is claimed.
+Independent integrated review approves the final candidate and all nine criteria; the three consumer findings and two inherited blockers are closed with no new Critical/Important application finding. The unchanged full review is published locally in `docs/next-phase-paper-policy-independent-review.md`. One nonblocking source-hash correction to the owner report is assigned; application/test bytes remain frozen. Principal acceptance, publication, required remote CI and normal merges remain outstanding, so full completion is not claimed.
 
 ## Historical combined checkpoints
 
