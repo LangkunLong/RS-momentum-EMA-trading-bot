@@ -30,6 +30,7 @@ _BROKER_TERMINAL_STATES = frozenset({"filled", "cancelled", "rejected", "expired
 _BUY_ROLES = frozenset({"entry", "addition", "replacement"})
 _SELL_ROLES = frozenset({"scale_out", "close"})
 _ACTION_ROLES = _BUY_ROLES | _SELL_ROLES
+_HOLDING_SPECIFIC_ROLES = frozenset({"addition", "scale_out", "close"})
 _CLASSIFICATION_STATES = frozenset(
     {
         "observed",
@@ -340,6 +341,21 @@ class SecuritySymbolMapping:
 
 
 @dataclass(frozen=True, slots=True)
+class CanonicalPortfolioFacts:
+    """Optional monetary facts retained from the canonical portfolio snapshot."""
+
+    equity: float | None
+    cash: float | None
+    gross_exposure: float | None
+    open_risk: float | None
+    peak_equity: float | None
+
+    def __post_init__(self) -> None:
+        for name in ("equity", "cash", "gross_exposure", "open_risk", "peak_equity"):
+            _amount(getattr(self, name), f"canonical portfolio {name}", minimum=0.0, nullable=True)
+
+
+@dataclass(frozen=True, slots=True)
 class PolicyStateProjection:
     """Pure input shape for the #100 read-only holding/action projection."""
 
@@ -358,6 +374,7 @@ class PolicyStateProjection:
     security_symbol_mappings: tuple[SecuritySymbolMapping, ...] | None
     source_namespace: str | None = None
     account_snapshot_id: str | None = None
+    canonical_portfolio_facts: CanonicalPortfolioFacts | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -381,6 +398,10 @@ class PolicyStateProjection:
         _aware(self.input_cutoff_at, "projection input_cutoff_at")
         _identifier(self.source_namespace, "projection source_namespace", nullable=True)
         _identifier(self.account_snapshot_id, "projection account_snapshot_id", nullable=True)
+        if self.canonical_portfolio_facts is not None and type(
+            self.canonical_portfolio_facts
+        ) is not CanonicalPortfolioFacts:
+            raise ValueError("canonical_portfolio_facts must be CanonicalPortfolioFacts or None")
         if self.holdings is not None and (
             type(self.holdings) is not tuple
             or any(type(item) is not HoldingProjection for item in self.holdings)
@@ -559,6 +580,29 @@ def policy_execution_state_to_projection(
     store_identity = _source_member(deployment, "store_identity")
     source_namespace = _source_member(portfolio_snapshot, "source_namespace")
     account_snapshot_id = _source_member(portfolio_snapshot, "account_snapshot_id")
+    canonical_portfolio_facts = CanonicalPortfolioFacts(
+        equity=_source_number(
+            _source_member(portfolio_snapshot, "equity"), "portfolio snapshot equity", nullable=True
+        ),
+        cash=_source_number(
+            _source_member(portfolio_snapshot, "cash"), "portfolio snapshot cash", nullable=True
+        ),
+        gross_exposure=_source_number(
+            _source_member(portfolio_snapshot, "gross_exposure"),
+            "portfolio snapshot gross_exposure",
+            nullable=True,
+        ),
+        open_risk=_source_number(
+            _source_member(portfolio_snapshot, "open_risk"),
+            "portfolio snapshot open_risk",
+            nullable=True,
+        ),
+        peak_equity=_source_number(
+            _source_member(portfolio_snapshot, "portfolio_peak_equity"),
+            "portfolio snapshot portfolio_peak_equity",
+            nullable=True,
+        ),
+    )
     clock_id = _source_member(source_clock, "clock_id")
     completed_session = _source_member(source_clock, "decision_session")
     cutoff = _source_member(source_clock, "as_of_cutoff_at")
@@ -759,6 +803,7 @@ def policy_execution_state_to_projection(
         security_symbol_mappings=tuple(mapping_facts.values()),
         source_namespace=source_namespace,
         account_snapshot_id=account_snapshot_id,
+        canonical_portfolio_facts=canonical_portfolio_facts,
     )
 
 
@@ -962,8 +1007,27 @@ def _merge_duplicate_broker_orders(
             continue
         if len(matches) != 1:
             _finding(findings, "open_orders", "conflicting", "broker order references overlap multiple records")
+            orders.append(record)
             continue
         existing = matches[0]
+        aliases_conflict = (
+            record.broker_order_id is not None
+            and existing.broker_order_id is not None
+            and record.broker_order_id != existing.broker_order_id
+        ) or (
+            record.client_order_id is not None
+            and existing.client_order_id is not None
+            and record.client_order_id != existing.client_order_id
+        )
+        if aliases_conflict:
+            _finding(
+                findings,
+                f"open_orders.{record.broker_order_id or record.client_order_id}",
+                "conflicting",
+                "duplicate reference has inconsistent broker/client order aliases",
+            )
+            orders.append(record)
+            continue
         same_fact = (
             record.symbol == existing.symbol
             and record.side == existing.side
@@ -985,6 +1049,7 @@ def _merge_duplicate_broker_orders(
                 "conflicting",
                 "duplicate reference has inconsistent broker facts",
             )
+            orders.append(record)
             continue
         merged = BrokerOrderFact(
             broker_order_id=existing.broker_order_id or record.broker_order_id,
@@ -1029,6 +1094,46 @@ def _reconcile_projected_actions(
     actions = {
         key: item for key, item in action_rows.items() if isinstance(item, PolicyActionProjection)
     }
+    holdings_by_id: dict[str, list[HoldingProjection]] = defaultdict(list)
+    for holding in projection.holdings:
+        holdings_by_id[holding.holding_episode_id].append(holding)
+    for action_id, action in actions.items():
+        if action.role not in _HOLDING_SPECIFIC_ROLES:
+            continue
+        path = f"pending_actions.{action_id}"
+        holding_id = action.holding_episode_id
+        matching_holdings = holdings_by_id.get(holding_id, []) if holding_id is not None else []
+        distinct_holdings = set(matching_holdings)
+        if not distinct_holdings:
+            _finding(
+                findings,
+                path + ".holding_episode_id",
+                "absent",
+                "holding-specific action has no matching projected holding episode",
+            )
+        elif len(distinct_holdings) != 1:
+            _finding(
+                findings,
+                path + ".holding_episode_id",
+                "conflicting",
+                "holding-specific action maps to conflicting projected holding episodes",
+            )
+        else:
+            holding = next(iter(distinct_holdings))
+            if action.security_id != holding.security_id:
+                _finding(
+                    findings,
+                    path + ".security_id",
+                    "conflicting",
+                    "action security differs from its projected holding episode",
+                )
+            if action.deployment_generation_id != holding.deployment_generation_id:
+                _finding(
+                    findings,
+                    path + ".deployment_generation_id",
+                    "conflicting",
+                    "action deployment generation differs from its projected holding episode",
+                )
     orders = _merge_duplicate_broker_orders(account.open_orders, findings)
     fully_mapped = symbols is not None and len(findings) == start_findings
 
@@ -1065,6 +1170,19 @@ def _reconcile_projected_actions(
         actions_for_order = set().union(*(action_owner.get(ref, set()) for ref in refs))
         holdings_for_order = set().union(*(holding_owner.get(ref, set()) for ref in refs))
         owners = actions_for_order | holdings_for_order
+        reference_owners = [
+            (action_owner.get(reference, set()), holding_owner.get(reference, set()))
+            for reference in refs
+        ]
+        if reference_owners and any(item != reference_owners[0] for item in reference_owners[1:]):
+            _finding(
+                findings,
+                f"open_orders.{name}",
+                "conflicting",
+                "broker/client order aliases do not resolve to the same local owner",
+            )
+            coverage_valid = False
+            continue
         if order.purpose == "strategy":
             if len(actions_for_order) != 1 or holdings_for_order:
                 _finding(findings, f"open_orders.{name}", "conflicting" if owners else "absent", "strategy order does not map to exactly one logical action")
@@ -1129,17 +1247,17 @@ def _reconcile_projected_actions(
                 matching_attempts = [
                     attempt
                     for attempt in attempts
-                    if (
-                        row.client_order_id is not None
-                        and row.client_order_id == attempt.client_order_id
-                    )
-                    or (
-                        row.broker_order_id is not None
-                        and row.broker_order_id == attempt.broker_order_id
-                    )
+                    if (row.client_order_id is None or row.client_order_id == attempt.client_order_id)
+                    and (row.broker_order_id is None or row.broker_order_id == attempt.broker_order_id)
+                    and (row.client_order_id is not None or row.broker_order_id is not None)
                 ]
                 if len(matching_attempts) != 1:
-                    _finding(findings, path + ".order_attempts", "conflicting" if matching_attempts else "absent", "broker order does not map to exactly one local attempt")
+                    partial_match = any(
+                        (row.client_order_id is not None and row.client_order_id == attempt.client_order_id)
+                        or (row.broker_order_id is not None and row.broker_order_id == attempt.broker_order_id)
+                        for attempt in attempts
+                    )
+                    _finding(findings, path + ".order_attempts", "conflicting" if partial_match else "absent", "broker order does not map to exactly one local attempt with all supplied aliases")
                     coverage_valid = False
                     continue
                 attempt = matching_attempts[0]
@@ -1213,8 +1331,9 @@ def _reconcile_projected_actions(
             _finding(findings, path + ".status", "conflicting", "terminal local action still has an active broker order")
             coverage_valid = False
         if rows:
+            expected_symbol = symbols.get(action.security_id) if symbols is not None else None
             if any(
-                row.symbol != symbols.get(action.security_id) or row.side != action.side
+                row.symbol != expected_symbol or row.side != action.side
                 for row in rows
             ):
                 _finding(findings, path + ".order_refs", "conflicting", "broker order symbol or side differs from the logical action")
@@ -1316,6 +1435,26 @@ def _reconcile_projected_actions(
         pending_buys,
         pending_sells,
     )
+
+
+def _compare_canonical_portfolio_facts(
+    *,
+    canonical: CanonicalPortfolioFacts | None,
+    reconciled: dict[str, float | None],
+    findings: list[ReconciliationFinding],
+) -> None:
+    if canonical is None:
+        return
+    for name in ("equity", "cash", "gross_exposure", "open_risk", "peak_equity"):
+        path = f"portfolio_snapshot.{name}"
+        expected = getattr(canonical, name)
+        actual = reconciled[name]
+        if expected is None:
+            _finding(findings, path, "absent", "canonical portfolio fact is unavailable")
+        elif actual is None:
+            _finding(findings, path, "absent", "same-snapshot broker or recomputed fact is unavailable")
+        elif not _close(expected, actual):
+            _finding(findings, path, "conflicting", "canonical portfolio fact differs from broker or recomputed state")
 
 
 def reconcile_account_snapshot(
@@ -1505,6 +1644,17 @@ def reconcile_account_snapshot(
 
     gross = math.fsum(notionals) if valuation_valid else None
     open_risk = math.fsum(risks) if risk_valid and valuation_valid else None
+    _compare_canonical_portfolio_facts(
+        canonical=projection.canonical_portfolio_facts,
+        reconciled={
+            "equity": equity,
+            "cash": cash,
+            "gross_exposure": gross,
+            "open_risk": open_risk,
+            "peak_equity": peak_equity,
+        },
+        findings=findings,
+    )
     sectors = (
         tuple(sorted((key, amount / equity) for key, amount in sector_dollars.items()))
         if classification_valid and equity is not None
@@ -1578,6 +1728,7 @@ def reconcile_account_snapshot(
 __all__ = [
     "AccountReconciliation",
     "AccountValuationClock",
+    "CanonicalPortfolioFacts",
     "BrokerAccountSnapshot",
     "BrokerOrderFact",
     "BrokerPositionFact",

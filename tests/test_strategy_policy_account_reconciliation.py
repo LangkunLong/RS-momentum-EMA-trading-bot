@@ -333,6 +333,66 @@ def test_policy_execution_state_conversion_preserves_decimal_residual_attempts_a
     assert result.reserved_buy_risk == 72
     assert result.total_committed_risk == 312
 
+    inconsistent_snapshot = replace(
+        portfolio_snapshot,
+        equity=Decimal("10100"),
+        cash=Decimal("7500"),
+        gross_exposure=Decimal("2600"),
+        open_risk=Decimal("999"),
+        portfolio_peak_equity=Decimal("13000"),
+    )
+    inconsistent_projection = policy_execution_state_to_projection(
+        account=account,
+        portfolio_snapshot=inconsistent_snapshot,
+        action_projections=(action_projection,),
+        holding_episodes=(holding,),
+    )
+    inconsistent_result = reconcile_account_snapshot(
+        account=account,
+        projection=inconsistent_projection,
+        maximum_balance_age=timedelta(minutes=15),
+        maximum_mark_age=timedelta(minutes=15),
+    )
+    assert inconsistent_result.ready is False
+    assert {
+        finding.path
+        for finding in inconsistent_result.findings
+        if finding.state == "conflicting"
+    } >= {
+        "portfolio_snapshot.equity",
+        "portfolio_snapshot.cash",
+        "portfolio_snapshot.gross_exposure",
+        "portfolio_snapshot.open_risk",
+        "portfolio_snapshot.peak_equity",
+    }
+
+    for source_name, finding_name in (
+        ("equity", "equity"),
+        ("cash", "cash"),
+        ("gross_exposure", "gross_exposure"),
+        ("open_risk", "open_risk"),
+        ("portfolio_peak_equity", "peak_equity"),
+    ):
+        unknown_snapshot = replace(portfolio_snapshot, **{source_name: None})
+        unknown_fact_projection = policy_execution_state_to_projection(
+            account=account,
+            portfolio_snapshot=unknown_snapshot,
+            action_projections=(action_projection,),
+            holding_episodes=(holding,),
+        )
+        unknown_fact_result = reconcile_account_snapshot(
+            account=account,
+            projection=unknown_fact_projection,
+            maximum_balance_age=timedelta(minutes=15),
+            maximum_mark_age=timedelta(minutes=15),
+        )
+        assert unknown_fact_result.ready is False
+        assert any(
+            finding.path == f"portfolio_snapshot.{finding_name}"
+            and finding.state == "absent"
+            for finding in unknown_fact_result.findings
+        )
+
     unknown_risk = replace(intent, risk_per_unit=None, risk_basis=None)
     unknown_risk_projection = policy_execution_state_to_projection(
         account=account,
@@ -397,6 +457,27 @@ def test_policy_execution_state_conversion_preserves_decimal_residual_attempts_a
         finding.path == f"pending_actions.{intent.logical_action_id}.resolution_reason"
         for finding in resolved_result.findings
     )
+
+    for field, wrong_reference in (
+        ("client_order_id", "wrong-client"),
+        ("broker_order_id", "wrong-broker"),
+    ):
+        inconsistent_reference_account = replace(
+            account,
+            open_orders=(
+                replace(account.open_orders[0], **{field: wrong_reference}),  # type: ignore[index]
+                account.open_orders[1],  # type: ignore[index]
+            ),
+        )
+        inconsistent_reference_result = reconcile_account_snapshot(
+            account=inconsistent_reference_account,
+            projection=projection,
+            maximum_balance_age=timedelta(minutes=15),
+            maximum_mark_age=timedelta(minutes=15),
+        )
+        assert inconsistent_reference_result.ready is False
+        assert inconsistent_reference_result.reserved_buy_cash is None
+        assert any(finding.state == "conflicting" for finding in inconsistent_reference_result.findings)
 
 
 def test_policy_execution_state_conversion_keeps_order_references_per_attempt() -> None:
@@ -660,6 +741,33 @@ def test_duplicate_local_and_broker_references_do_not_double_reserve() -> None:
     assert result.ready is True
     assert result.reserved_buy_cash == 600
     assert result.pending_entry_count == 1
+
+
+@pytest.mark.parametrize(
+    ("broker_order_id", "client_order_id"),
+    (("broker-1", "wrong-client"), ("wrong-broker", "client-1")),
+)
+def test_duplicate_broker_rows_with_conflicting_alias_pairs_block_reservations(
+    broker_order_id: str,
+    client_order_id: str,
+) -> None:
+    original = _account().open_orders[0]  # type: ignore[index]
+    conflicting_alias = replace(
+        original,
+        broker_order_id=broker_order_id,
+        client_order_id=client_order_id,
+    )
+    result = reconcile_account_snapshot(
+        account=replace(_account(), open_orders=(original, conflicting_alias)),
+        projection=_projection(),
+        maximum_balance_age=timedelta(minutes=15),
+        maximum_mark_age=timedelta(minutes=15),
+    )
+
+    assert result.ready is False
+    assert result.reserved_buy_cash is None
+    assert result.pending_entry_count is None
+    assert any(finding.state == "conflicting" for finding in result.findings)
 
 
 def test_missing_classification_is_unready_and_never_becomes_zero_exposure() -> None:
@@ -935,6 +1043,161 @@ def test_missing_security_mapping_never_assumes_security_id_is_a_ticker() -> Non
     assert result.reserved_buy_cash is None
     assert result.pending_entry_count is None
     assert any(finding.path == "pending_actions.action-1.security_id" for finding in result.findings)
+
+
+@pytest.mark.parametrize("side", ("buy", "sell"))
+def test_unavailable_security_mapping_with_matched_order_returns_unready(side: str) -> None:
+    if side == "buy":
+        action = _projection().pending_actions[0]  # type: ignore[index]
+        account = _account()
+    else:
+        action = PolicyActionProjection(
+            logical_action_id="scale-out-1",
+            deployment_generation_id="generation-1",
+            holding_episode_id="holding-1",
+            security_id="sec:xyz",
+            role="scale_out",
+            side="sell",
+            status="partially_filled",
+            requested_quantity=10,
+            confirmed_quantity=4,
+            residual_quantity=6,
+            reservation_amount=None,
+            reservation_price=None,
+            reservation_price_basis=None,
+            reservation_stop_price=None,
+            client_order_refs=("sell-client-1",),
+            broker_order_refs=("sell-broker-1",),
+            resolution_reason=None,
+        )
+        account = replace(
+            _account(),
+            open_orders=(BrokerOrderFact("sell-broker-1", "sell-client-1", "XYZ", "sell", "partially_filled", 10, 4),),
+        )
+    projection = replace(
+        _projection(),
+        pending_actions=(action,),
+        security_symbol_mappings=None,
+    )
+
+    result = reconcile_account_snapshot(
+        account=account,
+        projection=projection,
+        maximum_balance_age=timedelta(minutes=15),
+        maximum_mark_age=timedelta(minutes=15),
+    )
+
+    assert result.ready is False
+    assert result.reserved_buy_cash is None
+    assert result.pending_entry_count is None
+    assert result.pending_sell_count is None
+    assert any(finding.path == "security_symbol_mappings" for finding in result.findings)
+
+
+def test_holding_specific_action_requires_a_matching_holding_episode() -> None:
+    action = replace(
+        _projection().pending_actions[0],  # type: ignore[index]
+        role="addition",
+        holding_episode_id="missing-holding",
+    )
+    result = reconcile_account_snapshot(
+        account=_account(),
+        projection=replace(_projection(), pending_actions=(action,)),
+        maximum_balance_age=timedelta(minutes=15),
+        maximum_mark_age=timedelta(minutes=15),
+    )
+
+    assert result.ready is False
+    assert any(
+        finding.path == "pending_actions.action-1.holding_episode_id"
+        and finding.state == "absent"
+        for finding in result.findings
+    )
+
+
+def test_holding_specific_action_security_must_match_its_episode() -> None:
+    action = replace(
+        _projection().pending_actions[0],  # type: ignore[index]
+        role="addition",
+        holding_episode_id="holding-1",
+        security_id="sec:other",
+    )
+    projection = replace(
+        _projection(),
+        pending_actions=(action,),
+        security_symbol_mappings=_projection().security_symbol_mappings
+        + (
+            SecuritySymbolMapping(
+                security_id="sec:other",
+                broker_symbol="ABC",
+                mapping_contract_id="synthetic-other-identity",
+                effective_from=date(2026, 1, 1),
+                effective_through=None,
+                validated_at=VALUATION_TIME,
+            ),
+        ),  # type: ignore[operator]
+    )
+    account = replace(
+        _account(),
+        open_orders=(replace(_account().open_orders[0], symbol="ABC"),),  # type: ignore[index]
+    )
+
+    result = reconcile_account_snapshot(
+        account=account,
+        projection=projection,
+        maximum_balance_age=timedelta(minutes=15),
+        maximum_mark_age=timedelta(minutes=15),
+    )
+
+    assert result.ready is False
+    assert any(
+        finding.path == "pending_actions.action-1.security_id"
+        and finding.state == "conflicting"
+        for finding in result.findings
+    )
+
+
+def test_holding_specific_action_generation_must_match_its_episode() -> None:
+    action = replace(
+        _projection().pending_actions[0],  # type: ignore[index]
+        role="addition",
+        holding_episode_id="holding-1",
+        deployment_generation_id="generation-2",
+    )
+    result = reconcile_account_snapshot(
+        account=_account(),
+        projection=replace(_projection(), pending_actions=(action,)),
+        maximum_balance_age=timedelta(minutes=15),
+        maximum_mark_age=timedelta(minutes=15),
+    )
+
+    assert result.ready is False
+    assert any(
+        finding.path == "pending_actions.action-1.deployment_generation_id"
+        and finding.state == "conflicting"
+        for finding in result.findings
+    )
+
+
+def test_matching_old_generation_holding_action_is_valid_under_new_active_generation() -> None:
+    action = replace(
+        _projection().pending_actions[0],  # type: ignore[index]
+        role="addition",
+        holding_episode_id="holding-1",
+    )
+    result = reconcile_account_snapshot(
+        account=_account(),
+        projection=replace(
+            _projection(),
+            pending_actions=(action,),
+            active_deployment_generation_id="generation-2",
+        ),
+        maximum_balance_age=timedelta(minutes=15),
+        maximum_mark_age=timedelta(minutes=15),
+    )
+
+    assert result.ready is True, result.findings
+    assert result.pending_entry_count == 1
 
 
 def test_partial_sell_restart_reconciles_position_and_keeps_sell_pending_visible() -> None:
