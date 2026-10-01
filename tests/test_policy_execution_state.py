@@ -406,6 +406,92 @@ def test_stop_update_can_protect_partial_entry_fills_without_clearing_entry_iden
         propose_stop_update(exit_pending_holding, decision=stop_decision, stop_price=Decimal("45"))
 
 
+def test_replacement_fill_continues_opening_holding_without_becoming_an_addition() -> None:
+    opening = build_action_intent(
+        decision=_decision(),
+        security_id="FIGI-BB1234",
+        role=ActionRole.REPLACEMENT,
+        side=OrderSide.BUY,
+        requested_quantity=Decimal("10"),
+        reservation_price=Decimal("50"),
+        reservation_price_basis="limit_price",
+        risk_per_unit=Decimal("5"),
+        risk_basis="entry_to_protective_stop",
+    )
+    holding = HoldingEpisode.open(
+        deployment_generation_id=opening.deployment_generation_id,
+        security_id=opening.security_id,
+        symbol="ACME",
+        broker_symbol="ACME",
+        opening_action_id=opening.logical_action_id,
+        initial_filled_quantity=Decimal("4"),
+        entry_price=Decimal("50"),
+    )
+    partial = apply_attempt_cumulative_fill(opening, 1, Decimal("7"))
+    linked = replace(partial, holding_episode_id=holding.holding_episode_id)
+
+    assert linked.logical_action_id == opening.logical_action_id
+    assert linked.immutable_payload() == opening.immutable_payload()
+    updated = apply_action_fill_to_holding(
+        holding,
+        linked,
+        incremental_fill_notional=Decimal("150"),
+        incremental_fees=Decimal("0"),
+    )
+
+    assert updated.initial_filled_quantity == Decimal("4")
+    assert updated.opening_later_fills_quantity == Decimal("3")
+    assert updated.remaining_quantity == Decimal("7")
+    assert updated.completed_additions_quantity == Decimal("0")
+    assert updated.addition_count == 0
+    assert updated.cost_basis == Decimal("50")
+    with pytest.raises(ValueError, match="identity does not match"):
+        apply_action_fill_to_holding(
+            holding,
+            replace(linked, holding_episode_id="holding:unrelated"),
+            incremental_fill_notional=Decimal("150"),
+            incremental_fees=Decimal("0"),
+        )
+
+
+def test_stop_update_can_protect_partial_replacement_fill() -> None:
+    opening = build_action_intent(
+        decision=_decision(),
+        security_id="FIGI-BB1234",
+        role=ActionRole.REPLACEMENT,
+        side=OrderSide.BUY,
+        requested_quantity=Decimal("10"),
+    )
+    holding = HoldingEpisode.open(
+        deployment_generation_id=opening.deployment_generation_id,
+        security_id=opening.security_id,
+        symbol="ACME",
+        broker_symbol="ACME",
+        opening_action_id=opening.logical_action_id,
+        initial_filled_quantity=Decimal("4"),
+        entry_price=Decimal("50"),
+    )
+    partial = replace(
+        apply_attempt_cumulative_fill(opening, 1, Decimal("4")),
+        holding_episode_id=holding.holding_episode_id,
+    )
+    holding = replace(holding, pending_action_ids=(partial.logical_action_id,))
+    decision = _decision(
+        category=DecisionCategory.EXIT,
+        subject_type=DecisionSubjectType.HOLDING,
+        subject_id=holding.holding_episode_id,
+    )
+
+    proposed, stop = propose_stop_update(
+        holding,
+        decision=decision,
+        stop_price=Decimal("45"),
+        coexisting_entry_intents=(partial,),
+    )
+
+    assert set(proposed.pending_action_ids) == {partial.logical_action_id, stop.logical_action_id}
+
+
 def test_projection_reserves_only_unfilled_buy_quantity_and_preserves_unknown_price() -> None:
     intent = build_action_intent(
         decision=_decision(),

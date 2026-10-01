@@ -24,7 +24,11 @@ from core.policy_execution_state import (
     PortfolioStateSnapshot,
     build_action_intent,
 )
-from core.policy_execution_store import ConcurrentStateUpdateError, PolicyExecutionStateStore
+from core.policy_execution_store import (
+    ConcurrentStateUpdateError,
+    FillReceiptConflictError,
+    PolicyExecutionStateStore,
+)
 
 
 UTC = timezone.utc
@@ -1102,6 +1106,250 @@ def test_protective_stop_can_confirm_partial_entry_exposure_while_residual_stays
     assert reloaded_entry.status is ActionStatus.PARTIALLY_FILLED
     assert reloaded_entry.confirmed_quantity == Decimal("4")
     assert reloaded_entry.residual_quantity == Decimal("6")
+
+
+@pytest.mark.parametrize(
+    ("first_quantity", "first_notional", "first_status", "first_residual"),
+    [
+        ("4", "200", ActionStatus.PARTIALLY_FILLED, Decimal("6")),
+        ("10", "500", ActionStatus.FILLED, Decimal("0")),
+    ],
+)
+def test_replacement_opening_fill_is_stable_and_canonical_after_restart(
+    tmp_path: Path,
+    first_quantity: str,
+    first_notional: str,
+    first_status: ActionStatus,
+    first_residual: Decimal,
+) -> None:
+    store = _open_store(tmp_path)
+    store.migrate()
+    deployment = _deployment()
+    store.register_deployment_identity(deployment, lifecycle="prepared", handler_identity="fixture-handler", guard_id="guard-v1")
+    decision = _decision(deployment)
+    replacement = build_action_intent(
+        decision=decision,
+        security_id="FIGI-BB1234",
+        broker_symbol="ACME",
+        role=ActionRole.REPLACEMENT,
+        side=OrderSide.BUY,
+        requested_quantity=Decimal("10"),
+        reservation_price=Decimal("50"),
+        reservation_price_basis="limit_price",
+        reservation_stop_price=Decimal("45"),
+        risk_per_unit=Decimal("5"),
+        risk_basis="entry_to_protective_stop",
+    )
+    _record_decision(store, replacement)
+    store.record_action_intent(replacement, expected_version=None)
+
+    first = _record_fill(
+        store,
+        replacement,
+        event_id="replacement-first-fill",
+        cumulative_quantity=first_quantity,
+        cumulative_notional=first_notional,
+        expected_action_version=0,
+        expected_holding_version=None,
+    )
+    holding = store.load_holding_episode_for_action(replacement.logical_action_id)
+    assert first.status is first_status
+    assert first.holding_episode_id == holding.holding_episode_id
+    assert first.logical_action_id == replacement.logical_action_id
+    assert first.residual_quantity == first_residual
+    assert holding.opening_action_id == replacement.logical_action_id
+    assert holding.initial_filled_quantity == Decimal(first_quantity)
+    assert holding.remaining_quantity == Decimal(first_quantity)
+    assert holding.committed_risk == Decimal(first_quantity) * Decimal("5")
+    assert holding.committed_risk_basis == "entry_to_protective_stop"
+    if first_status is ActionStatus.PARTIALLY_FILLED:
+        assert holding.pending_action_ids == (replacement.logical_action_id,)
+        assert first.reservation_amount == Decimal("300")
+        assert first.residual_committed_risk == Decimal("30")
+    else:
+        assert holding.pending_action_ids == ()
+        assert first.reservation_amount == Decimal("0")
+        assert first.residual_committed_risk == Decimal("0")
+
+    if first_status is ActionStatus.PARTIALLY_FILLED:
+        stop_decision = _decision(
+            deployment,
+            category=DecisionCategory.EXIT,
+            subject_type=DecisionSubjectType.HOLDING,
+            subject_id=holding.holding_episode_id,
+        )
+        store.record_decision(stop_decision, policy_payload={}, guard_payload={}, effective_action_payload={})
+        with pytest.raises(ConcurrentStateUpdateError, match="holding changed"):
+            store.propose_stop_update(
+                holding.holding_episode_id,
+                decision=stop_decision,
+                stop_price=Decimal("45"),
+                expected_holding_version=holding.state_version - 1,
+                observed_at=datetime(2026, 10, 1, 13, 32, tzinfo=UTC),
+            )
+        stop_intent = store.propose_stop_update(
+            holding.holding_episode_id,
+            decision=stop_decision,
+            stop_price=Decimal("45"),
+            expected_holding_version=holding.state_version,
+            observed_at=datetime(2026, 10, 1, 13, 33, tzinfo=UTC),
+        )
+        with_stop = store.load_holding_episode(holding.holding_episode_id)
+        assert replacement.logical_action_id in with_stop.pending_action_ids
+
+        with pytest.raises(ConcurrentStateUpdateError, match="action changed"):
+            _record_fill(
+                store,
+                replacement,
+                event_id="replacement-final-fill",
+                cumulative_quantity="10",
+                cumulative_notional="500",
+                expected_action_version=first.state_version - 1,
+                expected_holding_version=with_stop.state_version,
+            )
+        with pytest.raises(ConcurrentStateUpdateError, match="holding changed"):
+            _record_fill(
+                store,
+                replacement,
+                event_id="replacement-final-fill",
+                cumulative_quantity="10",
+                cumulative_notional="500",
+                expected_action_version=first.state_version,
+                expected_holding_version=holding.state_version,
+            )
+        completed = _record_fill(
+            store,
+            replacement,
+            event_id="replacement-final-fill",
+            cumulative_quantity="10",
+            cumulative_notional="500",
+            expected_action_version=first.state_version,
+            expected_holding_version=with_stop.state_version,
+        )
+        full_holding = store.load_holding_episode(holding.holding_episode_id)
+        assert completed.status is ActionStatus.FILLED
+        assert completed.logical_action_id == replacement.logical_action_id
+        assert completed.holding_episode_id == holding.holding_episode_id
+        assert completed.confirmed_quantity == Decimal("10")
+        assert completed.reservation_amount == Decimal("0")
+        assert completed.residual_committed_risk == Decimal("0")
+        assert full_holding.initial_filled_quantity == Decimal("4")
+        assert full_holding.opening_later_fills_quantity == Decimal("6")
+        assert full_holding.remaining_quantity == Decimal("10")
+        assert full_holding.completed_additions_quantity == Decimal("0")
+        assert full_holding.addition_count == 0
+        assert full_holding.cost_basis == Decimal("50")
+        assert full_holding.committed_risk == Decimal("50")
+        assert full_holding.pending_action_ids == (stop_intent.logical_action_id,)
+
+        restarted = PolicyExecutionStateStore(store.db_path, store_identity=deployment.store_identity)
+        replayed = _record_fill(
+            restarted,
+            replacement,
+            event_id="replacement-final-fill",
+            cumulative_quantity="10",
+            cumulative_notional="500",
+            expected_action_version=first.state_version,
+            expected_holding_version=with_stop.state_version,
+        )
+        assert replayed == completed
+        assert restarted.load_holding_episode(holding.holding_episode_id) == full_holding
+        with pytest.raises(FillReceiptConflictError, match="reused"):
+            _record_fill(
+                restarted,
+                replacement,
+                event_id="replacement-final-fill",
+                cumulative_quantity="9",
+                cumulative_notional="450",
+                expected_action_version=first.state_version,
+                expected_holding_version=with_stop.state_version,
+            )
+        with pytest.raises(ConcurrentStateUpdateError, match="holding changed"):
+            restarted.confirm_protective_stop(
+                stop_intent,
+                stop_price=Decimal("45"),
+                client_order_id="replacement-stop-client",
+                broker_order_id="replacement-stop-broker",
+                observed_at=datetime(2026, 10, 1, 13, 34, tzinfo=UTC),
+                expected_holding_version=with_stop.state_version,
+            )
+        protected = restarted.confirm_protective_stop(
+            stop_intent,
+            stop_price=Decimal("45"),
+            client_order_id="replacement-stop-client",
+            broker_order_id="replacement-stop-broker",
+            observed_at=datetime(2026, 10, 1, 13, 35, tzinfo=UTC),
+            expected_holding_version=full_holding.state_version,
+        )
+        assert protected.remaining_quantity == Decimal("10")
+        assert protected.confirmed_protective_stop_price == Decimal("45")
+        assert protected.pending_action_ids == ()
+
+    portfolio = PortfolioStateSnapshot(
+        deployment_identity=deployment,
+        clock=_clock(),
+        source_namespace="synthetic-account-source",
+        account_snapshot_id=f"replacement-{first_quantity}",
+        equity=Decimal("1000"),
+        cash=Decimal("1000"),
+        gross_exposure=Decimal("0"),
+        open_risk=Decimal("0"),
+        portfolio_peak_equity=Decimal("1000"),
+        last_accepted_session=date(2026, 10, 1),
+    )
+    store.record_portfolio_snapshot(portfolio)
+    restarted = PolicyExecutionStateStore(store.db_path, store_identity=deployment.store_identity)
+    snapshot = restarted.load_policy_execution_snapshot(
+        deployment_generation_id=deployment.deployment_generation_id,
+        portfolio_snapshot_id=portfolio.portfolio_snapshot_id,
+    )
+    actions = {item.logical_action_id: item for item in snapshot.action_projections}
+    assert replacement.logical_action_id in actions
+    assert actions[replacement.logical_action_id].holding_episode_id == holding.holding_episode_id
+    assert actions[replacement.logical_action_id].status is ActionStatus.FILLED
+    assert tuple(item.holding_episode_id for item in snapshot.holding_episodes) == (holding.holding_episode_id,)
+
+
+def test_replacement_cannot_attach_an_unrelated_existing_holding(tmp_path: Path) -> None:
+    store = _open_store(tmp_path)
+    store.migrate()
+    deployment = _deployment()
+    store.register_deployment_identity(deployment, lifecycle="prepared", handler_identity="fixture-handler", guard_id="guard-v1")
+    entry = _entry_intent(deployment)
+    _record_decision(store, entry)
+    store.record_action_intent(entry, expected_version=None)
+    _record_fill(
+        store,
+        entry,
+        event_id="unrelated-opening-fill",
+        cumulative_quantity="10",
+        cumulative_notional="500",
+        expected_action_version=0,
+        expected_holding_version=None,
+    )
+    unrelated_holding = store.load_holding_episode_for_action(entry.logical_action_id)
+    replacement_decision = _decision(
+        deployment,
+        snapshot="b" * 64,
+        subject_type=DecisionSubjectType.CANDIDATE,
+        subject_id="replacement-candidate",
+    )
+    replacement = build_action_intent(
+        decision=replacement_decision,
+        security_id=entry.security_id,
+        broker_symbol=entry.broker_symbol,
+        role=ActionRole.REPLACEMENT,
+        side=OrderSide.BUY,
+        requested_quantity=Decimal("5"),
+        holding_episode_id=unrelated_holding.holding_episode_id,
+    )
+    _record_decision(store, replacement)
+
+    with pytest.raises(ValueError, match="replacement.*opening holding"):
+        store.record_action_intent(replacement, expected_version=None)
+
+    with pytest.raises(KeyError, match="logical action"):
+        store.load_action_projection(replacement.logical_action_id)
 
 
 def test_stop_proposal_stays_blocked_by_pending_strategy_exit(tmp_path: Path) -> None:
