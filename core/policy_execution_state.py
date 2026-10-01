@@ -1263,6 +1263,7 @@ def propose_stop_update(
     *,
     decision: DecisionIdentity,
     stop_price: Decimal,
+    coexisting_entry_intents: tuple[ActionIntent, ...] = (),
 ) -> tuple[HoldingEpisode, StopUpdateIntent]:
     if decision.deployment_generation_id != holding.deployment_generation_id:
         raise ValueError("stop proposal must use the holding's opening generation")
@@ -1277,8 +1278,24 @@ def propose_stop_update(
         raise ValueError("proposed protective stop must evolve monotonically")
     if holding.proposed_stop_action_id != holding.confirmed_stop_action_id:
         raise PendingActionConflictError("a stop update is already awaiting broker confirmation")
-    if holding.pending_action_ids:
-        raise PendingActionConflictError("holding has another pending action")
+    pending_entry_ids = {intent.logical_action_id for intent in coexisting_entry_intents}
+    if len(pending_entry_ids) > 1 or set(holding.pending_action_ids) != pending_entry_ids:
+        raise PendingActionConflictError("only a verified partially filled entry may coexist with a stop update")
+    for entry in coexisting_entry_intents:
+        if (
+            entry.role is not ActionRole.ENTRY
+            or entry.side is not OrderSide.BUY
+            or entry.holding_episode_id != holding.holding_episode_id
+            or entry.deployment_generation_id != holding.deployment_generation_id
+            or entry.security_id != holding.security_id
+            or entry.status is not ActionStatus.PARTIALLY_FILLED
+            or entry.confirmed_filled_quantity <= 0
+            or entry.residual_quantity <= 0
+            or len(entry.order_attempts) != 1
+            or entry.order_attempts[0].status is not ActionAttemptStatus.PARTIALLY_FILLED
+            or entry.order_attempts[0].terminal_status is not None
+        ):
+            raise PendingActionConflictError("only a verified partially filled entry may coexist with a stop update")
     intent = StopUpdateIntent(
         deployment_generation_id=holding.deployment_generation_id,
         decision_id=decision.decision_id,
@@ -1289,7 +1306,7 @@ def propose_stop_update(
         holding,
         proposed_stop_price=price,
         proposed_stop_action_id=intent.logical_action_id,
-        pending_action_ids=(intent.logical_action_id,),
+        pending_action_ids=(*holding.pending_action_ids, intent.logical_action_id),
     )
     return updated, intent
 

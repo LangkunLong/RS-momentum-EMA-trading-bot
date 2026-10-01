@@ -1911,16 +1911,28 @@ class PolicyExecutionStateStore:
                         incremental_fill_notional=delta_notional,
                         incremental_fees=delta_fees,
                     )
-                    if intent.role in {ActionRole.ENTRY, ActionRole.ADDITION} and updated_intent.risk_per_unit is not None:
-                        if new_holding.committed_risk_basis in {None, updated_intent.risk_basis}:
-                            new_holding = replace(
-                                new_holding,
-                                committed_risk=(current_holding.committed_risk or Decimal("0"))
-                                + delta_quantity * updated_intent.risk_per_unit,
-                                committed_risk_basis=updated_intent.risk_basis,
+                    if intent.role in {ActionRole.ENTRY, ActionRole.ADDITION}:
+                        matching_risk_basis = (
+                            current_holding.committed_risk_basis is not None
+                            and current_holding.committed_risk_basis == updated_intent.risk_basis
+                        )
+                        aggregate_risk = None
+                        if (
+                            matching_risk_basis
+                            and current_holding.committed_risk is not None
+                            and updated_intent.risk_per_unit is not None
+                        ):
+                            aggregate_risk = (
+                                current_holding.committed_risk
+                                + delta_quantity * updated_intent.risk_per_unit
                             )
-                        else:
-                            new_holding = replace(new_holding, committed_risk=None, committed_risk_basis=None)
+                        new_holding = replace(
+                            new_holding,
+                            committed_risk=aggregate_risk,
+                            committed_risk_basis=(
+                                current_holding.committed_risk_basis if matching_risk_basis else None
+                            ),
+                        )
                     if updated_intent.status is ActionStatus.FILLED:
                         if intent.role is ActionRole.SCALE_OUT:
                             new_holding = advance_holding_exit_tier(new_holding, updated_intent)
@@ -2464,7 +2476,16 @@ class PolicyExecutionStateStore:
                 )
             if int(holding_row["state_version"]) != expected_holding_version:
                 raise ConcurrentStateUpdateError("holding changed since the caller read it")
-            updated_holding, proposed = propose_stop_in_state(holding, decision=decision, stop_price=stop_price)
+            pending_intents = tuple(
+                self._load_action(conn, action_id)[0]
+                for action_id in holding.pending_action_ids
+            )
+            updated_holding, proposed = propose_stop_in_state(
+                holding,
+                decision=decision,
+                stop_price=stop_price,
+                coexisting_entry_intents=pending_intents,
+            )
             identity = decision.deployment_identity
             conn.execute(
                 """INSERT INTO policy_state_stop_updates(
