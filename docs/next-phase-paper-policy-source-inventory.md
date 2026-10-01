@@ -1,8 +1,21 @@
 # Lead C source and import inventory
 
-Status: frozen checkpoint inventories only. #98 and the latest #99 consumer fix have scoped independent approval; #100 recovery/persistence and combined integration are still changing. This is not final evaluator-closure or image acceptance.
+Status: frozen integrated application candidate `d2c4082746017dd4ecb14d709d71a7c12b1fc2d5`, tree `1e511574341e425f6ec2c326991a8dfaa6f49f38`. #98 and #100 have scoped independent approvals; the latest #99 corrections pass combined validation and are undergoing independent integrated review. This is not evaluator-closure or image acceptance.
 
-Latest integrated checkpoint evidence: `.artifacts/lead-c/source-inventory-a3ef2b7.json`, SHA256 `6268d967718ed36a0acb67b2c516f2723c061926f2470419c02fc2cf16217196`, for exact lead head `a3ef2b78985c2fc11ab705dc3d044fbdef48bbf4`. This includes approved #98, approved #99 baseline, frozen #100 store1847869 under correction, and lead integration tests. No retained B-manifest path changed; accepted #71 blob71e562ffc00dc4e617f1cd625e3f13ea5fe3f81a remains intact. New store imports its new pure state module plus the standard library; existing execution-store/workflow remain unchanged. API/schema definitions are separately retained in `.artifacts/lead-c/store-api-schema-1847869.json`. Neither inventory is final acceptance while producer and consumer fixes are active.
+Current source/import inventory: `.artifacts/lead-c/source-inventory-d2c4082.json`, SHA256 `bbdf9ab669e8c740a1e48ba347d4e6e02bee7e7af1f062a4a765f9ab88bbbb57`. It records all22changed paths from acceptedab385d7, their committed bytes/hashes and static imports. No retained B-manifest path changed, and calculator blob `71e562ffc00dc4e617f1cd625e3f13ea5fe3f81a` is preserved. The four additive modules and their direct dependencies are:
+
+| Module | Raw committed SHA256 | Direct application dependencies |
+| --- | --- | --- |
+| `core/current_policy_inputs.py` | `a1af15fd7885857535a63d9c7b12b3736fdf0b9179f950c29bc1b5976b41ab6b` | pit_data, accepted pit_feature_snapshot, pit_provenance, strategy_policy contracts and market_context; NumPy/pandas plus standard library |
+| `core/policy_execution_state.py` | `739a8a1b1fcc0000d0db027bcf813dddfed069693160cc66a367bf6fc7913032` | Standard library only |
+| `core/policy_execution_store.py` | `db630ca4d775b0c5ec395251762b7018cd6679e1a553a0121a137e7cb1c122af` | New policy_execution_state plus standard library/SQLite |
+| `core/strategy_policy/account_reconciliation.py` | `a5d28579374cfdbfb3528c53aca0fd217b6b3cc386ce437fe59490f1f7604f7f` | New policy_execution_state, existing adapter_v3 and contracts_v3 plus standard library |
+
+The matching API/schema inventory is `.artifacts/lead-c/store-api-schema-d2c4082.json`, SHA256 `28cd7fc40cbc88f2220aba7d8a34a542d7e2bb6ad0e18aaf511948be7be39d6b`. Existing execution-store/workflow and existing imports are unchanged. Six selected offline modules passed107cases and all312committed Python files compiled under Python3.13 at this exact application head; full evidence and warnings are in `.artifacts/lead-c/integration-validation-d2c4082.md`. These checks do not establish dynamic imported-graph closure or authorize a runtime migration.
+
+## Historical checkpoints
+
+Earlier integrated checkpoint evidence: `.artifacts/lead-c/source-inventory-a3ef2b7.json`, SHA256 `6268d967718ed36a0acb67b2c516f2723c061926f2470419c02fc2cf16217196`, for exact lead head `a3ef2b78985c2fc11ab705dc3d044fbdef48bbf4`. This includes approved #98, approved #99 baseline, frozen #100 store1847869 under correction, and lead integration tests. API/schema definitions are separately retained in `.artifacts/lead-c/store-api-schema-1847869.json`. These records remain historical, superseded by the current application candidate above.
 
 Previous checkpoint evidence: `.artifacts/lead-c/source-inventory-8190c15-f9575a5-446d2e1.json`, SHA256 `aeeeaed50086b0dae97fe4267ab06e592a6edfafa9f3e560ffa21ffc1cde11d3`. It covers approved #98 head8190c15, approved #99 consumer fixf9575a5 (including inherited producer6bbf20a), and #100 pure fix3446d2e1. The repeatable raw-Git/AST inventory helper is `.artifacts/lead-c/build_source_inventory.py`; it imports no application modules and inventories committed source only.
 
@@ -29,4 +42,4 @@ Reference manifest: B commit `a7cb3f44c3cd1156a172cce6e52c0c17c6a88a78`, `docs/l
 
 No evaluator image, runtime, provider or broker operation was performed to build this inventory. Static import listings are not a dynamic graph proof. Principal owns collection of the final C inventory for B's actual imported-graph assessment; rejected peer messaging is not bypassed.
 
-Before final acceptance, regenerate this inventory for the exact integrated source, including #98 corrections, #99 adapter, #100 transition fixes and persistence. Include all changed mapped files, existing import changes, schema/API effects and exact source/test identities. B determines whether any accepted image evidence is invalidated by those final changes.
+The current candidate inventory above includes the corrected #98 adapter, #99 consumer, #100 transitions/store and combined tests. Any subsequent application/test change requires a refreshed source-bound inventory and relevant verification. B determines whether any accepted image evidence is invalidated; no such decision is inferred from an empty mapped-path intersection.

@@ -12,6 +12,8 @@ The corrected pointer API requires both `expected_generation_id` and `expected_p
 
 Producer verification is 43 focused cases (19 pure and 24 store), with one disabled-cache configuration warning. A six-module lead checkpoint passed101cases before three additional consumer regressions were added. Final integrated source inventory, corrected consumer evidence, independent integrated review, required CI and principal acceptance remain due. No operational store was opened or migrated.
 
+Later integrated candidate `d2c4082746017dd4ecb14d709d71a7c12b1fc2d5` includes corrected consumerd2a0677 and passes107cases across the six selected offline modules. Its exact matching interface artifact is `.artifacts/lead-c/store-api-schema-d2c4082.json`, SHA256 `28cd7fc40cbc88f2220aba7d8a34a542d7e2bb6ad0e18aaf511948be7be39d6b`; schema and producer bytes remain unchanged from approved43a0820. Source/import inventory and full warning-aware validation are now frozen at this candidate. Independent integrated review, remote CI/publication, principal acceptance and normal merges remain pending.
+
 ## Historical implemented checkpoint1847869
 
 Source d52fb22deedc74361f6e4ae4a0113dc4f215c3c2/report1847869884103f86c3053579dfb1b82145a93096 implements the additive store. Exact committed method signatures, DTO fields and every migration statement are extracted in `.artifacts/lead-c/store-api-schema-1847869.json`, SHA256 `8e549f6c18c3cf960747ffea44d0ad2099730782e305a66e6ab7ecf3974b2a39`. The repeatable extractor `build_store_interface_inventory.py` reads Git blobs and AST literals without importing application code or opening a database. Store raw Git SHA256 is `d385e0c85e79ded5fcb209a908ba212969fc7e963820aa5c2a931148ee11ddbd`.
