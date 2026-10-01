@@ -94,7 +94,11 @@ terminal fact separately. The initial and attempt-numbered fill APIs share
 these rules. If a remainder was already issued, its requested quantity stays
 fixed when an earlier attempt's cumulative fill is corrected. Aggregate fills
 above the logical target remain visible as reconciliation-required exposure;
-they cannot silently reset the remainder or become ready for another order.
+they cannot silently reset the remainder or become ready for another order. A
+logical action cannot become filled or resolved while any issued attempt remains
+live. After every attempt is terminal and holdings reconcile, an explicit
+resolution may retain an above-target confirmed quantity and reason while the
+original requested target remains unchanged.
 
 Every confirmed cumulative-fill update carries attempt number, stable provider
 event ID and immutable payload digest, cumulative quantity, cumulative notional

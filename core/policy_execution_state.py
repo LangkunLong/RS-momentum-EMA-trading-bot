@@ -422,7 +422,12 @@ class ActionIntent:
 
         requested = _positive_decimal(self.requested_quantity, "requested_quantity")
         confirmed = _nonnegative_decimal(self.confirmed_filled_quantity, "confirmed_filled_quantity")
-        if confirmed > requested and self.status is not ActionStatus.RECONCILIATION_REQUIRED:
+        has_resolution_evidence = (
+            self.status is ActionStatus.RESOLVED
+            and isinstance(self.resolution_reason, str)
+            and bool(self.resolution_reason.strip())
+        )
+        if confirmed > requested and self.status is not ActionStatus.RECONCILIATION_REQUIRED and not has_resolution_evidence:
             raise ValueError("confirmed fill quantity cannot exceed requested quantity")
         object.__setattr__(self, "requested_quantity", requested)
         object.__setattr__(self, "confirmed_filled_quantity", confirmed)
@@ -504,7 +509,7 @@ class ActionIntent:
         aggregate_fills = sum((attempt.confirmed_filled_quantity for attempt in attempts), Decimal("0"))
         if aggregate_fills != confirmed:
             raise ValueError("action cumulative fill must equal the sum of its attempt fills")
-        if aggregate_fills > requested and self.status is not ActionStatus.RECONCILIATION_REQUIRED:
+        if aggregate_fills > requested and self.status is not ActionStatus.RECONCILIATION_REQUIRED and not has_resolution_evidence:
             raise ValueError("aggregate fills above target require reconciliation-required action state")
         object.__setattr__(self, "order_attempts", attempts)
 
@@ -651,10 +656,10 @@ def apply_attempt_cumulative_fill(
         ActionAttemptStatus.REJECTED,
         ActionAttemptStatus.FILLED,
     }
-    preserve_uncertainty = (
-        attempt.status in {ActionAttemptStatus.CANCEL_REQUESTED, ActionAttemptStatus.RECONCILIATION_REQUIRED}
-        or intent.status in {ActionStatus.CANCEL_REQUESTED, ActionStatus.RECONCILIATION_REQUIRED}
-    )
+    preserve_attempt_uncertainty = attempt.status in {
+        ActionAttemptStatus.CANCEL_REQUESTED,
+        ActionAttemptStatus.RECONCILIATION_REQUIRED,
+    }
     requires_reconciliation = (
         terminal_conflict
         or cumulative > attempt.requested_quantity
@@ -662,7 +667,7 @@ def apply_attempt_cumulative_fill(
     )
     if requires_reconciliation:
         attempt_status = ActionAttemptStatus.RECONCILIATION_REQUIRED
-    elif preserve_uncertainty:
+    elif preserve_attempt_uncertainty:
         attempt_status = attempt.status
     else:
         attempt_status = (
@@ -724,7 +729,15 @@ def confirm_attempt_terminal(
     updated_attempt = replace(attempt, status=status, terminal_status=status)
     attempts = _replace_attempt(intent, updated_attempt)
     aggregate = sum((item.confirmed_filled_quantity for item in attempts), Decimal("0"))
+    live_attempts = any(
+        item.status not in {ActionAttemptStatus.CANCELLED, ActionAttemptStatus.REJECTED, ActionAttemptStatus.FILLED}
+        for item in attempts
+    )
     if aggregate > intent.requested_quantity:
+        action_status = ActionStatus.RECONCILIATION_REQUIRED
+    elif live_attempts and intent.status is ActionStatus.RECONCILIATION_REQUIRED:
+        action_status = ActionStatus.RECONCILIATION_REQUIRED
+    elif live_attempts and aggregate == intent.requested_quantity:
         action_status = ActionStatus.RECONCILIATION_REQUIRED
     elif aggregate == intent.requested_quantity:
         action_status = ActionStatus.FILLED
@@ -826,6 +839,11 @@ def resolve_action(
     if intent.status is ActionStatus.FILLED:
         return intent
     reason = _text(resolution_reason, "resolution_reason")
+    if intent.status is ActionStatus.RECONCILIATION_REQUIRED and any(
+        attempt.status not in {ActionAttemptStatus.CANCELLED, ActionAttemptStatus.REJECTED, ActionAttemptStatus.FILLED}
+        for attempt in intent.order_attempts
+    ):
+        raise ValueError("all issued order attempts must be terminal before action reconciliation")
     if intent.status is ActionStatus.RESOLVED:
         if status is ActionStatus.RESOLVED and reason == intent.resolution_reason:
             return intent

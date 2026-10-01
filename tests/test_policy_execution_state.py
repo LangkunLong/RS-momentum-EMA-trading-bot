@@ -600,10 +600,47 @@ def test_late_terminal_fill_requires_reconciliation_before_remainder_and_keeps_i
     assert late_fill_a.order_attempts[0].terminal_status is ActionAttemptStatus.CANCELLED
     assert late_fill_a.order_attempts[1].requested_quantity == Decimal("30")
 
+    holding_after_late_fill = apply_action_fill_to_holding(holding, late_fill_a)
+    first_terminal_again = confirm_attempt_terminal(
+        late_fill_a,
+        1,
+        status=ActionAttemptStatus.CANCELLED,
+    )
+    assert first_terminal_again.status is ActionStatus.RECONCILIATION_REQUIRED
+    assert first_terminal_again.order_attempts[1].status is ActionAttemptStatus.INTENDED
+    with pytest.raises(ValueError, match="order attempts must be terminal"):
+        resolve_action(
+            first_terminal_again,
+            status=ActionStatus.RESOLVED,
+            resolution_reason="Remainder submission was verified and terminal facts are needed",
+        )
+    with pytest.raises(ValueError, match="fully confirmed|explicitly resolved"):
+        advance_holding_exit_tier(holding_after_late_fill, first_terminal_again)
+
     over_target = apply_attempt_cumulative_fill(late_fill_a, 2, Decimal("30"))
     assert over_target.confirmed_filled_quantity == Decimal("55")
     assert over_target.residual_quantity == Decimal("0")
     assert over_target.status is ActionStatus.RECONCILIATION_REQUIRED
+    holding_after_over_target = apply_action_fill_to_holding(holding_after_late_fill, over_target)
+    terminal_over_target = confirm_attempt_terminal(
+        over_target,
+        1,
+        status=ActionAttemptStatus.CANCELLED,
+    )
+    assert terminal_over_target.status is ActionStatus.RECONCILIATION_REQUIRED
+    assert all(
+        attempt.status in {ActionAttemptStatus.CANCELLED, ActionAttemptStatus.REJECTED, ActionAttemptStatus.FILLED}
+        for attempt in terminal_over_target.order_attempts
+    )
+    resolved_over_target = resolve_action(
+        terminal_over_target,
+        status=ActionStatus.RESOLVED,
+        resolution_reason="Synthetic broker terminal facts confirm 55 filled against the 50-share target",
+    )
+    assert resolved_over_target.requested_quantity == Decimal("50")
+    assert resolved_over_target.confirmed_filled_quantity == Decimal("55")
+    assert resolved_over_target.resolution_reason is not None
+    assert advance_holding_exit_tier(holding_after_over_target, resolved_over_target).last_exit_tier == 1
 
 
 def test_stop_and_peak_evolve_monotonically_without_turning_missing_values_into_zero() -> None:
