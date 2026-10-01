@@ -611,6 +611,8 @@ def test_late_terminal_fill_requires_reconciliation_before_remainder_and_keeps_i
         status=ActionAttemptStatus.CANCELLED,
     )
     assert first_terminal_again.status is ActionStatus.RECONCILIATION_REQUIRED
+    assert first_terminal_again.order_attempts[0].status is ActionAttemptStatus.RECONCILIATION_REQUIRED
+    assert first_terminal_again.order_attempts[0].terminal_status is ActionAttemptStatus.CANCELLED
     assert first_terminal_again.order_attempts[1].status is ActionAttemptStatus.INTENDED
     resolved_without_unsent_remainder = resolve_action(
         first_terminal_again,
@@ -642,9 +644,15 @@ def test_late_terminal_fill_requires_reconciliation_before_remainder_and_keeps_i
         1,
         status=ActionAttemptStatus.CANCELLED,
     )
-    assert final_terminal.status is ActionStatus.FILLED
+    assert final_terminal.status is ActionStatus.RECONCILIATION_REQUIRED
+    assert final_terminal.order_attempts[0].status is ActionAttemptStatus.RECONCILIATION_REQUIRED
     holding_at_target = apply_action_fill_to_holding(holding_after_late_fill, exact_target_live)
-    assert advance_holding_exit_tier(holding_at_target, final_terminal).last_exit_tier == 1
+    resolved_at_target = resolve_action(
+        final_terminal,
+        status=ActionStatus.RESOLVED,
+        resolution_reason="Synthetic terminal evidence reconciles the exact aggregate fill after a late observation",
+    )
+    assert advance_holding_exit_tier(holding_at_target, resolved_at_target).last_exit_tier == 1
 
     over_target = apply_attempt_cumulative_fill(late_fill_a, 2, Decimal("30"))
     assert over_target.confirmed_filled_quantity == Decimal("55")
@@ -657,10 +665,9 @@ def test_late_terminal_fill_requires_reconciliation_before_remainder_and_keeps_i
         status=ActionAttemptStatus.CANCELLED,
     )
     assert terminal_over_target.status is ActionStatus.RECONCILIATION_REQUIRED
-    assert all(
-        attempt.status in {ActionAttemptStatus.CANCELLED, ActionAttemptStatus.REJECTED, ActionAttemptStatus.FILLED}
-        for attempt in terminal_over_target.order_attempts
-    )
+    assert terminal_over_target.order_attempts[0].status is ActionAttemptStatus.RECONCILIATION_REQUIRED
+    assert terminal_over_target.order_attempts[0].terminal_status is ActionAttemptStatus.CANCELLED
+    assert terminal_over_target.order_attempts[1].terminal_status is ActionAttemptStatus.FILLED
     resolved_over_target = resolve_action(
         terminal_over_target,
         status=ActionStatus.RESOLVED,
