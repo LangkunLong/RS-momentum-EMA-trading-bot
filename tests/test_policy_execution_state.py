@@ -19,6 +19,7 @@ from core.policy_execution_state import (
     IdentityConflictError,
     MissedExecutionSessionError,
     OrderSide,
+    PendingActionConflictError,
     PolicyDeploymentIdentity,
     PortfolioStateSnapshot,
     advance_holding_exit_tier,
@@ -36,6 +37,7 @@ from core.policy_execution_state import (
     create_single_remainder_attempt,
     project_action_state,
     propose_stop_update,
+    register_pending_action,
     request_attempt_cancel,
     resolve_action,
     update_holding_marks,
@@ -333,6 +335,75 @@ def test_stop_proposal_is_distinct_from_broker_confirmed_protection() -> None:
     assert confirmed.confirmed_protective_stop_price == Decimal("48")
     assert confirmed.confirmed_stop_broker_order_id == "stop-broker-1"
     assert confirmed.confirmed_stop_observed_at == datetime(2026, 10, 1, 13, 31, tzinfo=UTC)
+
+
+def test_stop_update_can_protect_partial_entry_fills_without_clearing_entry_identity() -> None:
+    opening = build_action_intent(
+        decision=_decision(),
+        security_id="FIGI-BB1234",
+        role=ActionRole.ENTRY,
+        side=OrderSide.BUY,
+        requested_quantity=Decimal("10"),
+    )
+    partial_entry = apply_attempt_cumulative_fill(opening, 1, Decimal("4"))
+    holding = HoldingEpisode.open(
+        deployment_generation_id=opening.deployment_generation_id,
+        security_id=opening.security_id,
+        symbol="ACME",
+        broker_symbol="ACME",
+        opening_action_id=opening.logical_action_id,
+        initial_filled_quantity=Decimal("4"),
+        entry_price=Decimal("50"),
+    )
+    partial_entry = replace(partial_entry, holding_episode_id=holding.holding_episode_id)
+    assert partial_entry.logical_action_id == opening.logical_action_id
+    holding = replace(holding, pending_action_ids=(partial_entry.logical_action_id,))
+    stop_decision = _decision(
+        category=DecisionCategory.EXIT,
+        subject_type=DecisionSubjectType.HOLDING,
+        subject_id=holding.holding_episode_id,
+    )
+
+    proposed_holding, stop_intent = propose_stop_update(
+        holding,
+        decision=stop_decision,
+        stop_price=Decimal("45"),
+        coexisting_entry_intents=(partial_entry,),
+    )
+    assert set(proposed_holding.pending_action_ids) == {
+        partial_entry.logical_action_id,
+        stop_intent.logical_action_id,
+    }
+    confirmed = confirm_protective_stop(
+        proposed_holding,
+        intent=stop_intent,
+        stop_price=Decimal("45"),
+        client_order_id="stop-client-4-shares",
+        broker_order_id="stop-broker-4-shares",
+        observed_at=datetime(2026, 10, 1, 14, 0, tzinfo=UTC),
+    )
+    assert confirmed.remaining_quantity == Decimal("4")
+    assert confirmed.confirmed_protective_stop_price == Decimal("45")
+    assert confirmed.pending_action_ids == (partial_entry.logical_action_id,)
+
+    with pytest.raises(PendingActionConflictError, match="partially filled entry"):
+        propose_stop_update(holding, decision=stop_decision, stop_price=Decimal("45"))
+
+    unrelated_exit = build_action_intent(
+        decision=stop_decision,
+        security_id=holding.security_id,
+        role=ActionRole.SCALE_OUT,
+        side=OrderSide.SELL,
+        requested_quantity=Decimal("2"),
+        holding_episode_id=holding.holding_episode_id,
+        exit_tier=1,
+        snapshot_original_quantity=Decimal("4"),
+        fraction_of_original_quantity=Decimal("0.5"),
+        rounding_rule_id="whole_share_floor_v1",
+    )
+    exit_pending_holding = register_pending_action(replace(holding, pending_action_ids=()), unrelated_exit)
+    with pytest.raises(PendingActionConflictError, match="partially filled entry"):
+        propose_stop_update(exit_pending_holding, decision=stop_decision, stop_price=Decimal("45"))
 
 
 def test_projection_reserves_only_unfilled_buy_quantity_and_preserves_unknown_price() -> None:

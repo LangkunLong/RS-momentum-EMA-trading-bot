@@ -115,6 +115,10 @@ update attempt/action residual cash and risk, apply holding quantity/cost/P&L
 or opening-entry continuation, append history, and apply any resulting
 completion/tier transition. Reads composing those rows use one read
 transaction. No projection may expose a partial fill transaction.
+A different event at an unchanged quantity watermark is receipt-only: it does
+not refine previously unknown notional or fees. If both the stored and new
+monetary facts are known, conflicting values are rejected. A later monetary
+refinement requires a separately reviewed reconciliation API.
 
 The store preserves all observed client/broker aliases, attempt ancestry, and
 provider/account namespace. Within a logical action, a client or broker
@@ -122,6 +126,11 @@ reference cannot identify two attempts, including through aliases. A scoped
 external reference already bound to another action/attempt is rejected. Fill
 identity is scoped by provider + paper account environment + store identity +
 external fill-event ID, rather than assuming a broker ID is globally unique.
+Provider order references remain individually available on persisted action
+projections, even when multiple providers report the same external identifier.
+Adding new provider ancestry advances the action version and records the
+complete provider-scoped reference set in action history; flattened attempt
+aliases contain each external value only once.
 
 ## Read-only #99 projection
 
@@ -141,6 +150,9 @@ originating snapshot/tier/attempt numbers, requested and action-wide
 cumulative confirmed quantities, residual target, cash reservation price and
 basis, optional reservation stop price, per-unit and residual committed risk
 with explicit basis, and all client/broker references by attempt.
+Persisted projections also retain each provider-scoped mapping with its
+provider, account/store namespace, reference kind, external identifier,
+attempt number, source digest and first-seen time.
 
 Persisted action projections carry `state_version`; pure projections leave it
 `None` because they have no database row version. Persisted holding rows expose
@@ -184,7 +196,7 @@ use the existing database's `PRAGMA user_version`.
 | `policy_state_order_attempts` | `(action_id, attempt_number)` primary key; attempt 1 or 2; request and cumulative quantities/notional/fees; status and preserved terminal status; primary client/broker IDs; state version. FK uses RESTRICT. |
 | `policy_state_order_reference_aliases` | Provider + account environment + store + reference kind + external ID primary key, action + attempt, first-seen time and source payload digest. An alias cannot identify another attempt within an action; a scoped external ID cannot be rebound to another action/attempt. |
 | `policy_state_fill_receipts` | Provider + account + fill-event ID unique key; action/attempt, immutable payload digest, cumulative quantity/notional/fees, observation time. Same ID/same digest is idempotent; same ID/different digest conflicts. Composite FK to attempt. |
-| `policy_state_holding_history` | Holding + monotonically increasing state version primary key; action/event identity, canonical complete state digest/payload, observed time. FK RESTRICT. |
+| `policy_state_holding_history` | Holding + monotonically increasing state version primary key; action/event identity, canonical complete state digest/payload, optional offline reconciliation evidence reference, observed time. FK RESTRICT. |
 | `policy_state_stop_updates` | Stop action ID, generation/account/store, holding/security/decision, requested stop, proposal/confirmation status, client/broker references, confirmed stop price, observation time and state version. Composite deployment, holding and decision FKs use RESTRICT. |
 | `policy_state_portfolio_snapshots` | Snapshot ID, generation/account/store, completed and valuation sessions/time, source account snapshot identity, equity/cash/gross/open risk, peak equity, last accepted session, flags and digest. Composite generation/account/store FK; `(generation, source namespace, account snapshot ID)` is unique. |
 
@@ -213,8 +225,12 @@ version/checksum or database identity fails closed.
   opening holding on its first confirmed entry fill; later fills increase its
   quantity without changing initial fill quantity or add count. A transaction
   failure rolls back every write.
-- `record_holding_episode(holding, *, expected_version)` is the versioned
-  holding state writer used by offline reconciliation.
+- `record_holding_episode(holding, *, expected_version, evidence_ref)` accepts
+  only an evidence-backed change to the `position_reconciliation_required`
+  policy flag on an existing holding. Opening fills create holdings; confirmed
+  fills, stop observations and holding-mark APIs own their respective state
+  transitions. Immutable opening quantity and protection fields cannot be
+  changed through this offline reconciliation API.
 - `request_order_cancel(...)`, `confirm_order_terminal(...)`,
   `create_single_remainder_attempt(...)`, `record_explicit_action_resolution(...)`,
   and `bind_attempt_order_refs(...)` enforce cancel/remainder/tier gates with
@@ -226,7 +242,8 @@ version/checksum or database identity fails closed.
   records immutable account facts.
 - `load_action_projection(...)`, `load_holding_episode(...)`,
   `load_holding_episode_for_action(...)`, `load_deployment_chain(...)`,
-  `load_active_generation(...)`, `load_order_reference_aliases(...)`,
+  `load_active_generation(...)`, `load_active_generation_pointer(...)`,
+  `load_order_reference_aliases(...)`,
   `load_stop_update_intent(...)`, and `load_portfolio_snapshot(...)` are
   individual read APIs. The combined consumer API below guarantees one SQLite
   read transaction for portfolio, action and holding facts.
@@ -250,14 +267,20 @@ version/checksum or database identity fails closed.
   generation, decision clock, references and `state_version`. Thus a pointer
   switch does not hide prior-generation exposure or rewrite action ancestry.
 - `set_active_generation(account_environment_id, *, expected_generation_id,
-  new_generation_id, readiness_evidence_ref, outgoing_entries_reconciled)`
-  atomically compare-and-sets the pointer, checks scoped identity and no
+  expected_pointer_version, new_generation_id, readiness_evidence_ref,
+  outgoing_entries_reconciled)` atomically compare-and-sets the generation
+  and pointer version, checks scoped identity and no
   uncertain outgoing entry, and records the event/evidence reference. This
   API is limited to synthetic/offline/prepared-state evidence in this issue;
   it does not establish #97 activation eligibility or operational readiness.
   Rolling A → B → A changes only the future-entry pointer; B holdings/actions
   stay B-pinned. Missing compatible B handler yields explicit degraded state;
   default non-flat migration is rejected/deferred.
+  `load_active_generation_pointer(...)` returns the generation, pointer
+  version and readiness state to use for a subsequent write. An absent pointer
+  has `None` for all three values; each successful transition returns the new
+  positive pointer version. Comparing both generation and version rejects an
+  ABA-stale writer after A → B → A.
 
 Schema rollback v1 is allowed only if all dependent policy-state tables are
 empty. No export-and-drop escape hatch is defined. This schema operation is
