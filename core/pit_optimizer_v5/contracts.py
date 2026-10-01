@@ -89,6 +89,7 @@ EVALUATOR_SOURCE_PATHS_V5 = (
     "core/pit_optimizer_v5/probes.py",
     "core/pit_provenance.py",
     "core/pit_universe_v3.py",
+    "core/scheduler_observation.py",
     "core/strategy_policy/__init__.py",
     "core/strategy_policy/adapter_v3.py",
     "core/strategy_policy/contracts.py",
