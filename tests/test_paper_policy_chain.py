@@ -198,6 +198,7 @@ def seed_pending_chain(tmp_path):
     store.set_active_generation(
         deployment.paper_account_environment_id,
         expected_generation_id=None,
+        expected_pointer_version=None,
         new_generation_id=deployment.deployment_generation_id,
         readiness_evidence_ref="synthetic-fixture-only",
         outgoing_entries_reconciled=True,
@@ -546,9 +547,11 @@ def test_new_generation_account_keeps_old_holding_and_pending_exit_ancestry(tmp_
     store.register_deployment_identity(
         deployment_b, lifecycle="prepared", handler_identity="synthetic-handler", guard_id="fixed-offline-guard"
     )
+    pointer = store.load_active_generation_pointer(deployment_a.paper_account_environment_id)
     store.set_active_generation(
         deployment_a.paper_account_environment_id,
         expected_generation_id=deployment_a.deployment_generation_id,
+        expected_pointer_version=pointer.pointer_version,
         new_generation_id=deployment_b.deployment_generation_id,
         readiness_evidence_ref="synthetic-switch-with-pinned-holdings",
         outgoing_entries_reconciled=True,
