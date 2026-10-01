@@ -157,8 +157,50 @@ def test_quarterly_eps_full_window_preserves_an_absent_intervening_fiscal_quarte
     assert window["represented_period_slots"] == 3
     assert window["missing_slot_reason_counts"] == {"missing_fiscal_quarter_period": 1}
     assert window["slots"][1]["reason"] == "missing_fiscal_quarter_period"
+    assert window["slots"][1]["placeholder_type"] == "inferred_missing_fiscal_quarter"
+    assert window["slots"][1]["inferred_missing_quarter_count"] == 1
     assert window["slots"][1]["previous_reported_period_end"] == "2023-06-30"
     assert window["slots"][1]["next_reported_period_end"] == "2023-12-31"
+
+
+def test_quarterly_eps_short_gap_is_an_untrusted_cadence_placeholder() -> None:
+    periods = pd.to_datetime(
+        [
+            "2022-03-31",
+            "2022-06-30",
+            "2022-09-30",
+            "2022-12-31",
+            "2023-03-31",
+            "2023-06-30",
+            "2023-10-09",
+            "2023-12-31",
+        ]
+    )
+    eps = pd.Series([1.0, 1.0, 1.0, 1.0, 1.2, 1.2, 1.2, 1.2], index=periods)
+
+    window = coverage._quarterly_eps_full_window(eps)
+
+    assert window["ready"] is False
+    assert window["required_growth_slots"] == 4
+    assert window["represented_period_slots"] == 3
+    assert window["matched_growth_slots"] == 3
+    assert window["missing_growth_slots"] == 1
+    assert window["missing_slot_reason_counts"] == {
+        "fiscal_quarter_cadence_outside_expected_range": 1
+    }
+    placeholder = window["slots"][1]
+    assert placeholder["period_gap_days"] == 83
+    assert placeholder["reason"] == "fiscal_quarter_cadence_outside_expected_range"
+    assert placeholder["placeholder_type"] == "untrusted_fiscal_quarter_cadence"
+    assert placeholder["inferred_missing_quarter_count"] == 0
+    assert window["untrusted_cadence_placeholder_count"] == 1
+
+    summary = coverage._new_full_window_accumulator()
+    coverage._accumulate_full_window(summary, "ABCD", window)
+    assert summary["missing_slot_reason_counts"] == {
+        "fiscal_quarter_cadence_outside_expected_range": 1
+    }
+    assert summary["untrusted_cadence_placeholder_count"] == 1
 
 
 def test_quarterly_eps_full_window_uses_inclusive_84_to_105_day_cadence() -> None:

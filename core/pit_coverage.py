@@ -580,6 +580,7 @@ def _missing_full_window(
         "matched_growth_slots": 0,
         "missing_growth_slots": required_slots,
         "missing_slot_reason_counts": {reason: required_slots},
+        "untrusted_cadence_placeholder_count": 0,
         "slots": slots,
         "skipped_fiscal_year_gaps": [],
     }
@@ -603,6 +604,10 @@ def _growth_window_payload(
         for slot in slots
         if slot["status"] != "matched" and slot.get("reason") is not None
     )
+    untrusted_cadence_placeholders = sum(
+        slot.get("placeholder_type") == "untrusted_fiscal_quarter_cadence"
+        for slot in slots
+    )
     gaps = skipped_fiscal_year_gaps or []
     ready = matched == required_slots
     result = {
@@ -613,6 +618,7 @@ def _growth_window_payload(
         "matched_growth_slots": matched,
         "missing_growth_slots": required_slots - matched,
         "missing_slot_reason_counts": dict(sorted(missing_reasons.items())),
+        "untrusted_cadence_placeholder_count": untrusted_cadence_placeholders,
         "slots": slots,
         "skipped_fiscal_year_gaps": gaps,
     }
@@ -642,17 +648,25 @@ def _quarterly_eps_full_window(
                 <= period_gap_days
                 <= _MAX_ADJACENT_FISCAL_QUARTER_DAYS
             ):
-                inferred_quarter_steps = max(
-                    2,
-                    int(math.floor(period_gap_days / _TYPICAL_FISCAL_QUARTER_DAYS + 0.5)),
-                )
-                missing_quarters = inferred_quarter_steps - 1
-                gap_reason = (
-                    "missing_fiscal_quarter_period"
-                    if period_gap_days > _MAX_ADJACENT_FISCAL_QUARTER_DAYS
-                    else "fiscal_quarter_cadence_outside_expected_range"
-                )
-                for _ in range(missing_quarters):
+                if period_gap_days < _MIN_ADJACENT_FISCAL_QUARTER_DAYS:
+                    placeholder_count = 1
+                    placeholder_type = "untrusted_fiscal_quarter_cadence"
+                    inferred_missing_quarter_count = 0
+                    gap_reason = "fiscal_quarter_cadence_outside_expected_range"
+                else:
+                    inferred_quarter_steps = max(
+                        2,
+                        int(
+                            math.floor(
+                                period_gap_days / _TYPICAL_FISCAL_QUARTER_DAYS + 0.5
+                            )
+                        ),
+                    )
+                    placeholder_count = inferred_quarter_steps - 1
+                    placeholder_type = "inferred_missing_fiscal_quarter"
+                    inferred_missing_quarter_count = placeholder_count
+                    gap_reason = "missing_fiscal_quarter_period"
+                for _ in range(placeholder_count):
                     if len(slots) >= required_slots:
                         break
                     slots.append(
@@ -663,10 +677,11 @@ def _quarterly_eps_full_window(
                             "comparison_period_matched": False,
                             "status": "missing",
                             "reason": gap_reason,
+                            "placeholder_type": placeholder_type,
                             "previous_reported_period_end": match.current_period.isoformat(),
                             "next_reported_period_end": previous_reported_period.isoformat(),
                             "period_gap_days": period_gap_days,
-                            "inferred_missing_quarter_count": missing_quarters,
+                            "inferred_missing_quarter_count": inferred_missing_quarter_count,
                         }
                     )
         if len(slots) >= required_slots:
@@ -1762,9 +1777,16 @@ def build_coverage_report(
                     "readiness": "all four newest fiscal-quarter slots have a valid same-period prior-year comparison",
                     "period_slot_cadence": (
                         "Reported period ends 84 through 105 days apart are adjacent. "
-                        "Outside that range, intervening quarter slots are preserved as missing; "
-                        "the inferred step count rounds the gap to the nearest 91.3125-day quarter "
-                        "and is at least two."
+                        "A gap shorter than 84 days contributes one untrusted cadence placeholder "
+                        "with placeholder_type=untrusted_fiscal_quarter_cadence and "
+                        "inferred_missing_quarter_count=0; it is included in missing growth slots "
+                        "and reason counts and blocks readiness. A gap longer than 105 days "
+                        "contributes inferred missing fiscal-quarter slots, with step count rounded "
+                        "to the nearest 91.3125-day quarter and at least two."
+                    ),
+                    "untrusted_cadence_placeholder_count": (
+                        "Count of short-gap cadence anomaly placeholders, exposed per full window "
+                        "and summed across security sessions in full_window_coverage."
                     ),
                 },
                 "annual_eps_growth": {
@@ -1922,6 +1944,7 @@ def _new_full_window_accumulator() -> dict[str, Any]:
         "matched_growth_slots": 0,
         "missing_growth_slots": 0,
         "missing_slot_reason_counts": Counter(),
+        "untrusted_cadence_placeholder_count": 0,
         "unique_tickers_with_missing_slots": set(),
         "fiscal_year_gap_slots": 0,
         "skipped_fiscal_years": 0,
@@ -1944,6 +1967,9 @@ def _accumulate_full_window(
     accumulator["matched_growth_slots"] += int(full_window.get("matched_growth_slots", 0))
     missing = int(full_window.get("missing_growth_slots", 0))
     accumulator["missing_growth_slots"] += missing
+    accumulator["untrusted_cadence_placeholder_count"] += int(
+        full_window.get("untrusted_cadence_placeholder_count", 0)
+    )
     if missing:
         accumulator["unique_tickers_with_missing_slots"].add(ticker)
         for reason, count in full_window.get("missing_slot_reason_counts", {}).items():
