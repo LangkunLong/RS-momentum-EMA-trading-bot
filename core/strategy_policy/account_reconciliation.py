@@ -148,6 +148,9 @@ class OrderAttemptProjection:
     status: str
     client_order_id: str | None
     broker_order_id: str | None
+    terminal_status: str | None = None
+    client_order_aliases: tuple[str, ...] = ()
+    broker_order_aliases: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.attempt_number not in {1, 2}:
@@ -156,11 +159,25 @@ class OrderAttemptProjection:
         if self.requested_quantity == 0:
             raise ValueError("attempt requested_quantity must be positive")
         _amount(self.confirmed_quantity, "attempt confirmed_quantity", minimum=0.0)
-        if self.confirmed_quantity > self.requested_quantity:
-            raise ValueError("attempt confirmed_quantity exceeds requested_quantity")
         _identifier(self.status, "attempt status")
+        _identifier(self.terminal_status, "attempt terminal_status", nullable=True)
+        if self.confirmed_quantity > self.requested_quantity and not (
+            self.terminal_status is not None or self.status == "reconciliation_required"
+        ):
+            raise ValueError("attempt confirmed_quantity exceeds requested_quantity")
         _identifier(self.client_order_id, "attempt client_order_id", nullable=True)
         _identifier(self.broker_order_id, "attempt broker_order_id", nullable=True)
+        for name, primary in (
+            ("client_order_aliases", self.client_order_id),
+            ("broker_order_aliases", self.broker_order_id),
+        ):
+            aliases = getattr(self, name)
+            if type(aliases) is not tuple:
+                raise ValueError(f"attempt {name} must be a tuple")
+            for alias in aliases:
+                _identifier(alias, f"attempt {name} item")
+            if len(aliases) != len(set(aliases)) or (primary is not None and primary in aliases):
+                raise ValueError(f"attempt {name} must be unique and distinct from its primary reference")
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +189,7 @@ class HoldingProjection:
     stop_price: float | None
     stop_observed_at: datetime | None
     protective_stop_order_references: tuple[OrderReference, ...]
+    source_state_version: int | None = None
 
     def __post_init__(self) -> None:
         _identifier(self.holding_episode_id, "holding_episode_id")
@@ -185,6 +203,12 @@ class HoldingProjection:
             for reference in self.protective_stop_order_references
         ):
             raise ValueError("protective_stop_order_references must be a tuple of OrderReference")
+        if self.source_state_version is not None and (
+            not isinstance(self.source_state_version, int)
+            or isinstance(self.source_state_version, bool)
+            or self.source_state_version < 0
+        ):
+            raise ValueError("holding source_state_version must be a non-negative integer when available")
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,6 +240,12 @@ class PolicyActionProjection:
     source_clock_id: str | None = None
     source_paper_account_environment_id: str | None = None
     source_store_identity: str | None = None
+    source_decision_session: date | None = None
+    source_as_of_cutoff_at: datetime | None = None
+    source_next_execution_session: date | None = None
+    source_account_valuation_session: date | None = None
+    source_account_valuation_at: datetime | None = None
+    source_state_version: int | None = None
 
     def __post_init__(self) -> None:
         _identifier(self.logical_action_id, "logical_action_id")
@@ -234,8 +264,12 @@ class PolicyActionProjection:
         if self.requested_quantity == 0:
             raise ValueError("action requested_quantity must be positive")
         _amount(self.confirmed_quantity, "action confirmed_quantity", minimum=0.0)
-        if self.confirmed_quantity > self.requested_quantity and not _close(
-            float(self.confirmed_quantity), float(self.requested_quantity)
+        has_explicit_resolution = self.status == "resolved" and bool(self.resolution_reason)
+        if (
+            self.confirmed_quantity > self.requested_quantity
+            and not _close(float(self.confirmed_quantity), float(self.requested_quantity))
+            and self.status != "reconciliation_required"
+            and not has_explicit_resolution
         ):
             raise ValueError("action confirmed_quantity exceeds requested_quantity")
         _amount(self.residual_quantity, "action residual_quantity", minimum=0.0)
@@ -295,6 +329,22 @@ class PolicyActionProjection:
             "source_store_identity",
         ):
             _identifier(getattr(self, name), name, nullable=True)
+        for name in (
+            "source_decision_session",
+            "source_next_execution_session",
+            "source_account_valuation_session",
+        ):
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, date) or isinstance(value, datetime)):
+                raise ValueError(f"{name} must be a date")
+        _aware(self.source_as_of_cutoff_at, "source_as_of_cutoff_at", nullable=True)
+        _aware(self.source_account_valuation_at, "source_account_valuation_at", nullable=True)
+        if self.source_state_version is not None and (
+            not isinstance(self.source_state_version, int)
+            or isinstance(self.source_state_version, bool)
+            or self.source_state_version < 0
+        ):
+            raise ValueError("source_state_version must be a non-negative integer when available")
         for name in ("client_order_refs", "broker_order_refs"):
             references = getattr(self, name)
             if type(references) is not tuple or any(
@@ -656,14 +706,6 @@ def policy_execution_state_to_projection(
         source_store = _source_member(source_deployment, "store_identity")
         if _source_member(source, "deployment_generation_id") != source_identity:
             raise ValueError("ActionStateProjection deployment identity is inconsistent")
-        if (
-            _source_member(source, "decision_session") != completed_session
-            or _source_member(source, "as_of_cutoff_at") != cutoff
-            or _source_member(source, "next_execution_session") != next_execution_session
-            or _source_member(source, "account_valuation_session") != valuation_session
-            or _source_member(source, "account_valuation_at") != valuation_time
-        ):
-            raise ValueError("ActionStateProjection clock fields differ from the portfolio snapshot")
         order_attempts_source = _source_member(source, "order_attempts")
         if type(order_attempts_source) is not tuple:
             raise TypeError("ActionStateProjection.order_attempts must be a tuple")
@@ -679,13 +721,20 @@ def policy_execution_state_to_projection(
                 status=_source_enum(_source_member(attempt, "status"), "attempt status"),
                 client_order_id=_source_member(attempt, "client_order_id"),
                 broker_order_id=_source_member(attempt, "broker_order_id"),
+                terminal_status=(
+                    None
+                    if _source_member(attempt, "terminal_status") is None
+                    else _source_enum(
+                        _source_member(attempt, "terminal_status"), "attempt terminal_status"
+                    )
+                ),
+                client_order_aliases=_source_member(attempt, "client_order_aliases"),
+                broker_order_aliases=_source_member(attempt, "broker_order_aliases"),
             )
             for attempt in order_attempts_source
         )
         role = _source_enum(_source_member(source, "role"), "action role")
         side = _source_enum(_source_member(source, "side"), "action side")
-        # The canonical projection has no resolution-reason field yet. A resolved action
-        # therefore remains unready in reconciliation instead of implying a clean release.
         converted_actions.append(
             PolicyActionProjection(
                 logical_action_id=_source_member(source, "logical_action_id"),
@@ -727,12 +776,26 @@ def policy_execution_state_to_projection(
                     else None
                 ),
                 client_order_refs=tuple(
-                    attempt.client_order_id for attempt in attempts if attempt.client_order_id is not None
+                    dict.fromkeys(
+                        order_id
+                        for attempt in attempts
+                        for order_id in (
+                            (() if attempt.client_order_id is None else (attempt.client_order_id,))
+                            + attempt.client_order_aliases
+                        )
+                    )
                 ),
                 broker_order_refs=tuple(
-                    attempt.broker_order_id for attempt in attempts if attempt.broker_order_id is not None
+                    dict.fromkeys(
+                        order_id
+                        for attempt in attempts
+                        for order_id in (
+                            (() if attempt.broker_order_id is None else (attempt.broker_order_id,))
+                            + attempt.broker_order_aliases
+                        )
+                    )
                 ),
-                resolution_reason=getattr(source, "resolution_reason", None),
+                resolution_reason=_source_member(source, "resolution_reason"),
                 reservation_risk_per_unit=(
                     _source_number(_source_member(source, "risk_per_unit"), "risk_per_unit", nullable=True)
                     if side == "buy"
@@ -757,6 +820,12 @@ def policy_execution_state_to_projection(
                 source_clock_id=_source_member(source, "clock_id"),
                 source_paper_account_environment_id=source_environment,
                 source_store_identity=source_store,
+                source_decision_session=_source_member(source, "decision_session"),
+                source_as_of_cutoff_at=_source_member(source, "as_of_cutoff_at"),
+                source_next_execution_session=_source_member(source, "next_execution_session"),
+                source_account_valuation_session=_source_member(source, "account_valuation_session"),
+                source_account_valuation_at=_source_member(source, "account_valuation_at"),
+                source_state_version=_source_member(source, "state_version"),
             )
         )
         add_mapping(source, identity=_source_member(source, "logical_action_id"))
@@ -783,6 +852,7 @@ def policy_execution_state_to_projection(
                 ),
                 stop_observed_at=_source_member(source, "confirmed_stop_observed_at"),
                 protective_stop_order_references=references,
+                source_state_version=_source_member(source, "state_version"),
             )
         )
         add_mapping(source, identity=_source_member(source, "holding_episode_id"))
@@ -1067,6 +1137,65 @@ def _merge_duplicate_broker_orders(
     return orders
 
 
+def _validate_action_origin_clock(
+    *,
+    action: PolicyActionProjection,
+    projection: PolicyStateProjection,
+    account: BrokerAccountSnapshot,
+    path: str,
+    findings: list[ReconciliationFinding],
+) -> bool:
+    origin_fields = (
+        action.source_clock_id,
+        action.source_decision_slot_id,
+        action.source_decision_id,
+        action.source_snapshot_sha256,
+        action.source_decision_session,
+        action.source_as_of_cutoff_at,
+        action.source_next_execution_session,
+        action.source_account_valuation_session,
+        action.source_account_valuation_at,
+    )
+    if all(value is None for value in origin_fields):
+        return True
+    if any(value is None for value in origin_fields):
+        _finding(findings, path + ".source_clock", "absent", "action origin clock identity or fields are incomplete")
+        return False
+
+    assert action.source_decision_session is not None
+    assert action.source_as_of_cutoff_at is not None
+    assert action.source_next_execution_session is not None
+    assert action.source_account_valuation_session is not None
+    assert action.source_account_valuation_at is not None
+    if (
+        action.source_next_execution_session <= action.source_decision_session
+        or action.source_account_valuation_session != action.source_next_execution_session
+        or action.source_account_valuation_at < action.source_as_of_cutoff_at
+    ):
+        _finding(findings, path + ".source_clock", "invalid", "action origin clock fields do not form a valid decision and execution clock")
+        return False
+    if (
+        action.source_decision_session > projection.decision_session
+        or action.source_as_of_cutoff_at > projection.input_cutoff_at
+        or action.source_next_execution_session > projection.next_execution_session
+        or action.source_account_valuation_at > account.clock.valuation_time
+    ):
+        _finding(findings, path + ".source_clock", "invalid", "action origin clock is later than the current account snapshot")
+        return False
+    if (
+        action.status in {"intended", "remainder_ready"}
+        and action.source_next_execution_session < projection.next_execution_session
+    ):
+        _finding(
+            findings,
+            path + ".execution_session",
+            "stale_by_declared_rule",
+            "unsubmitted action missed its originating execution session and cannot be retargeted",
+        )
+        return False
+    return True
+
+
 def _reconcile_projected_actions(
     *,
     account: BrokerAccountSnapshot,
@@ -1204,11 +1333,13 @@ def _reconcile_projected_actions(
     risk_valid = True
     for action_id, action in actions.items():
         path = f"pending_actions.{action_id}"
-        if (
-            action.source_clock_id is not None
-            and action.source_clock_id != projection.decision_clock_id
+        if not _validate_action_origin_clock(
+            action=action,
+            projection=projection,
+            account=account,
+            path=path,
+            findings=findings,
         ):
-            _finding(findings, path + ".clock_id", "conflicting", "action projection belongs to a different decision clock")
             coverage_valid = False
         if (
             action.source_paper_account_environment_id is not None
@@ -1230,6 +1361,15 @@ def _reconcile_projected_actions(
         if action.status == "resolved" and not action.resolution_reason:
             _finding(findings, path + ".resolution_reason", "absent", "resolved action has no explicit reconciliation reason")
             coverage_valid = False
+        if action.status == "resolved":
+            if not action.order_attempts:
+                _finding(findings, path + ".order_attempts", "absent", "resolved action has no canonical terminal attempt evidence")
+                coverage_valid = False
+            for attempt in action.order_attempts:
+                terminal_status = attempt.terminal_status or attempt.status
+                if terminal_status not in {"filled", "cancelled", "rejected"}:
+                    _finding(findings, path + ".order_attempts", "unresolved", "resolved action retains a non-terminal order attempt")
+                    coverage_valid = False
         rows = by_action.get(action_id, [])
         active_rows = [row for row in rows if row.status in _BROKER_ACTIVE_STATES]
         if action.order_attempts:
@@ -1247,14 +1387,30 @@ def _reconcile_projected_actions(
                 matching_attempts = [
                     attempt
                     for attempt in attempts
-                    if (row.client_order_id is None or row.client_order_id == attempt.client_order_id)
-                    and (row.broker_order_id is None or row.broker_order_id == attempt.broker_order_id)
+                    if (
+                        row.client_order_id is None
+                        or row.client_order_id
+                        in {attempt.client_order_id, *attempt.client_order_aliases}
+                    )
+                    and (
+                        row.broker_order_id is None
+                        or row.broker_order_id
+                        in {attempt.broker_order_id, *attempt.broker_order_aliases}
+                    )
                     and (row.client_order_id is not None or row.broker_order_id is not None)
                 ]
                 if len(matching_attempts) != 1:
                     partial_match = any(
-                        (row.client_order_id is not None and row.client_order_id == attempt.client_order_id)
-                        or (row.broker_order_id is not None and row.broker_order_id == attempt.broker_order_id)
+                        (
+                            row.client_order_id is not None
+                            and row.client_order_id
+                            in {attempt.client_order_id, *attempt.client_order_aliases}
+                        )
+                        or (
+                            row.broker_order_id is not None
+                            and row.broker_order_id
+                            in {attempt.broker_order_id, *attempt.broker_order_aliases}
+                        )
                         for attempt in attempts
                     )
                     _finding(findings, path + ".order_attempts", "conflicting" if partial_match else "absent", "broker order does not map to exactly one local attempt with all supplied aliases")
@@ -1279,7 +1435,8 @@ def _reconcile_projected_actions(
                     "cancelled": "cancelled",
                     "rejected": "rejected",
                 }
-                if row.status in terminal_pair and attempt.status != terminal_pair[row.status]:
+                terminal_attempt_status = attempt.terminal_status or attempt.status
+                if row.status in terminal_pair and terminal_attempt_status != terminal_pair[row.status]:
                     _finding(findings, path + ".order_attempts", "conflicting", "terminal broker order differs from the local attempt state")
                     coverage_valid = False
             if action.status == "intended":
