@@ -128,7 +128,7 @@ Content digests at the source head:
 | `core/policy_execution_store.py` | `1f71dc3d45d1e6b447b2f88c4d1d17df6817ce78d54c6f7d8ec9988dfcd6819d` |
 | `tests/test_policy_execution_state.py` | `7dd06766131ac98cb02aa363da556a8abaa1eaf2abf2f811cbb6d3e29bdeafb4` |
 | `tests/test_policy_execution_store.py` | `cdee3e3a771fde1b1945f35b9977579a3620e320351a02d4b9e264c8b546d449` |
-| `docs/issue-100-state-interface-v1.md` | `79c8244200f25912d0ae179e7f521514f1f846976c90558559a60d991813b3fc` |
+| `docs/issue-100-state-interface-v1.md` | `8b647d16da4097878b5be22dc9cc4798229b0f3526adcf5fc13d57e019f7bf0d` |
 
 ## Verification
 
@@ -191,3 +191,13 @@ and any #97 runtime activation/readiness integration require their own review
 and acceptance. This change does not enable live execution, broker/provider
 calls, scheduler wiring, or an operational database migration. No external
 downstream acceptance is recorded by this report.
+
+## Erratum for source checkpoint `2881118`
+
+The `docs/issue-100-state-interface-v1.md` digest in the original report was
+listed as `79c8244200f25912d0ae179e7f521514f1f846976c90558559a60d991813b3fc`.
+Directly hashing the raw Git blob from `2881118` with `git show` gives
+`8b647d16da4097878b5be22dc9cc4798229b0f3526adcf5fc13d57e019f7bf0d`; the
+content-digest table above is corrected to that value. This erratum changes
+only the report and preserves the source checkpoint and its verification
+record.
