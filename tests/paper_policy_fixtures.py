@@ -6,17 +6,20 @@ from core.current_policy_inputs import build_current_feature_context_snapshot
 from core.pit_data import PITDataBundle
 from core.policy_execution_state import DecisionClock, PolicyDeploymentIdentity
 from tests.test_current_feature_context_adapter import (
-    _decision_clock, _fixture, _market_inputs,
-    _unavailable_active_members, _write_schema_v3_bundle,
+    _decision_clock,
+    _fixture,
+    _market_inputs,
+    _unavailable_active_members,
+    _write_schema_v3_bundle,
 )
 
 
 def build_feature_fixture(tmp_path, *, rs_delta=0):
     fixture = _fixture()
     next_session = date.fromisoformat(fixture["next_eligible_session"])
-    fixture["valuation_time"] = datetime.combine(
-        next_session, datetime.min.time(), tzinfo=timezone.utc
-    ).replace(hour=13, minute=31).isoformat()
+    fixture["valuation_time"] = (
+        datetime.combine(next_session, datetime.min.time(), tzinfo=timezone.utc).replace(hour=13, minute=31).isoformat()
+    )
     path, digest, provenance, availability = _write_schema_v3_bundle(tmp_path)
     with PITDataBundle(path, expected_sha256=digest, prices_provenance=provenance) as bundle:
         histories, closes, active, rs = _market_inputs(bundle, fixture)
@@ -26,7 +29,8 @@ def build_feature_fixture(tmp_path, *, rs_delta=0):
             symbol: {
                 name: (
                     {"state": record["state"], "reason": "controlled V3 fixture has no dated sector taxonomy"}
-                    if name == "sector_rs" else record
+                    if name == "sector_rs"
+                    else record
                 )
                 for name, record in records.items()
                 if name != "industry_group_rs"
