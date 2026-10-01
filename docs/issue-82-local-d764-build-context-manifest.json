@@ -1,0 +1,366 @@
+{
+  "build_context_file_count": 59,
+  "build_context_total_bytes": 1429625,
+  "evaluator_source_map_sha256": "3d57003a79ae5cc85cb3e4320568217e8b793a642363cca2c504caaba0aa82cf",
+  "evaluator_source_path_count": 56,
+  "files": [
+    {
+      "bytes": 25188,
+      "git_blob": "3c0b1f6a926a505b77ae020221f918f5e57f44e8",
+      "path": "backtest.py",
+      "sha256": "12187672b377a51da5929f17396b4aa9cd37bf04c341dbe0dd173184726b7679"
+    },
+    {
+      "bytes": 53,
+      "git_blob": "b53b33366cff5db72cd730da04a5c73555a4ebb3",
+      "path": "config/__init__.py",
+      "sha256": "695d80107ae1368f133de8c7335efb35f59b4cf646191decdd7d9aff47a505c6"
+    },
+    {
+      "bytes": 17410,
+      "git_blob": "b9415d52d2983e56f031809e99edad248e4101af",
+      "path": "config/settings.py",
+      "sha256": "0674862ec6f7c23f7ddb9c42f15e1b93becf4f0919c2fc5e37c05178572851c0"
+    },
+    {
+      "bytes": 279088,
+      "git_blob": "89fecca34430fabcb9714bfad8534872bb77a9e4",
+      "path": "core/backtest_engine.py",
+      "sha256": "b61ef7de77f462512c4f3da5124d1d7f8e9c8d9f4e320695ddb0e1ba4618c929"
+    },
+    {
+      "bytes": 8730,
+      "git_blob": "12dcc72fa1bb64edd009ff6226d7a4fec33a09d6",
+      "path": "core/backtest_fills.py",
+      "sha256": "cd8cb77c8b15e3e734af4d1dc64f817392109276441228afd7ae734ccc0deff7"
+    },
+    {
+      "bytes": 1425,
+      "git_blob": "79b8e088b4a31cebc90551532b25a5d11e34835d",
+      "path": "core/canslim/__init__.py",
+      "sha256": "ad2d870e325d41e1dc20e6e6239cbf938a22ee3de0aa554b9f650acfc4cfbf00"
+    },
+    {
+      "bytes": 15658,
+      "git_blob": "0cff46820072902566216c31dafd1e8a0534d854",
+      "path": "core/canslim/a_annual_earnings.py",
+      "sha256": "44798e9cc084c5ee694d7d60b22c7cdd2f72abab34a90ab9849d08788d7f8af1"
+    },
+    {
+      "bytes": 13415,
+      "git_blob": "afe5d276e5cbcea6992dd88781248bd784b4b6be",
+      "path": "core/canslim/c_current_earnings.py",
+      "sha256": "facbc729535869d1323ccc34587852885bd1aa6fdcc8904f99edcf4b474cdc45"
+    },
+    {
+      "bytes": 13433,
+      "git_blob": "5c3a4fd7fea47408a136337e390c7d19f22842f4",
+      "path": "core/canslim/core.py",
+      "sha256": "384a0eec70775128dbfb33b0602852fa6cb2bad73832b0ebd6b6fe077845b320"
+    },
+    {
+      "bytes": 3694,
+      "git_blob": "883464df8c5eac46b135b3478c41940f787f98e5",
+      "path": "core/canslim/earnings_trace.py",
+      "sha256": "2c56b06510079f6b18f803e15d9ca1c58a954c339ca33824448d42d9e6b6dd2d"
+    },
+    {
+      "bytes": 10410,
+      "git_blob": "80f12d4ecce7ee3b192c45a385862348b7ac99eb",
+      "path": "core/canslim/entry_contract.py",
+      "sha256": "319b3a979fd52f0c4979b0598657015dbb3d9c2226a6a4286cb197ee768593bb"
+    },
+    {
+      "bytes": 4703,
+      "git_blob": "14c3c994f70a06f7897288a0d397672dbf897d89",
+      "path": "core/canslim/fiscal_periods.py",
+      "sha256": "b8c4042933407a7d0854d942de34a38718a1005cffd8fd0b36d3c8058c6d1a21"
+    },
+    {
+      "bytes": 5429,
+      "git_blob": "69ef71cfa70750293cc016c69f297c0323d9bfc7",
+      "path": "core/canslim/i_institutional.py",
+      "sha256": "ebb10d3f2594648deea94dc6646683211354b78282084216071a2d4c19d3e6e3"
+    },
+    {
+      "bytes": 3736,
+      "git_blob": "8aec3ceb9ed6e015ff39cff715646bfb0fe374b9",
+      "path": "core/canslim/l_leader_laggard.py",
+      "sha256": "b3658a9b5679c70017b818ae5652fb469b8a86aa5ebb07cc2d7c2809d3db1fe1"
+    },
+    {
+      "bytes": 17016,
+      "git_blob": "a962e0727f204054ff9547b99628e53b14aa05fa",
+      "path": "core/canslim/m_market_direction.py",
+      "sha256": "21a04c9305e6cc3138ffe29be792b7c8a65622d00b131cb60c770dee4df5a0ad"
+    },
+    {
+      "bytes": 5764,
+      "git_blob": "797ead1d0ba34ac92c43dc563d7321cc30ea2f4b",
+      "path": "core/canslim/n_new_products.py",
+      "sha256": "05dfa7c732556a063027fffd675d0903b9507677e046c7061be2727eda1de005"
+    },
+    {
+      "bytes": 12174,
+      "git_blob": "a08327391d93006163f66c3f99d32d2b30628a6e",
+      "path": "core/canslim/s_supply_demand.py",
+      "sha256": "577c4fbc3116b7e7afc7a471baed167e8b51b5b2bdab5a54b034bf2bc9ff6bf9"
+    },
+    {
+      "bytes": 52833,
+      "git_blob": "9be307f4e1549479a5c1c997eb3b7cea8af42514",
+      "path": "core/data_client.py",
+      "sha256": "cff0145702b7a9fc820cdd5c7875dbc9371ec88e1ebe63d9b3301eab71d7c009"
+    },
+    {
+      "bytes": 45648,
+      "git_blob": "4a214d638a92cccb1e960ff3ea1f94807430ba9c",
+      "path": "core/engine_policy.py",
+      "sha256": "3abaaa5a421e78248966afcf450548a70b4ef27985f7f0bca72b06068f3665f2"
+    },
+    {
+      "bytes": 21325,
+      "git_blob": "0e803c92143157eb4af6bd076a7f271aae2274be",
+      "path": "core/index_ticker_fetcher.py",
+      "sha256": "d708b54d01a9a95c9a4e547aa68d17a81e1493f91c65701d93ea940b67b14b40"
+    },
+    {
+      "bytes": 7825,
+      "git_blob": "783ab752ce31c0fbaee53690f25f66e9424f6e4c",
+      "path": "core/industry_group.py",
+      "sha256": "4e93670652b8f090eca835cbe5233bc950a56f80f1ee53332fb7de10a0fbb6fd"
+    },
+    {
+      "bytes": 31556,
+      "git_blob": "5c9a33029d5c96ab5f919b9241be83cebae52165",
+      "path": "core/leader_evaluation.py",
+      "sha256": "bccc557a97206cc22b7ccd707d69ed443fb4646bcbea4efe5bc2c83d27827fdf"
+    },
+    {
+      "bytes": 12142,
+      "git_blob": "179ed8f647c5507935e0f322314120a3866610ca",
+      "path": "core/momentum_analysis.py",
+      "sha256": "3904475d98106edf5f445eb63ceda8492c2e548f5670cfc0a7ef69c9df199e54"
+    },
+    {
+      "bytes": 94855,
+      "git_blob": "3eb58a87ad823135dd90000398c172fa6af42b3e",
+      "path": "core/pit_data.py",
+      "sha256": "b4193d39cfc61d9dec913218c798fed4cfb98a66fb0aa96bc266337f56faea94"
+    },
+    {
+      "bytes": 49656,
+      "git_blob": "e0dd775f3014c534908c7c3f3dae90478a4ca587",
+      "path": "core/pit_diagnosis/fact_cache.py",
+      "sha256": "f65e7d261dab198e3fa8e543c2ee4ebfc5dceb5673661e0308fa89091c44d72a"
+    },
+    {
+      "bytes": 13989,
+      "git_blob": "e7ca41e9e6d80cd883ba3c74094c3a29277c447f",
+      "path": "core/pit_diagnosis/models.py",
+      "sha256": "1eae004909dab25f931f530c1d2d177db233df61150820eee5083af6be610a22"
+    },
+    {
+      "bytes": 23995,
+      "git_blob": "3de826fb9b83578bdf073e0d7491e4cc43a3f127",
+      "path": "core/pit_diagnosis/patterns.py",
+      "sha256": "eaa3080b219650f27e1f2c9153186d014617af83701e935a8425ed19bb2c93a3"
+    },
+    {
+      "bytes": 2878,
+      "git_blob": "961753769f1b98812156da9182840c6baa04b575",
+      "path": "core/pit_diagnosis/rs.py",
+      "sha256": "d26d5f1d8dd1b84b633b4f4e58dc0f64ad3ec7ba3a3726219425249f805fca97"
+    },
+    {
+      "bytes": 5754,
+      "git_blob": "c3c6a5030c06fc84d20e1d68752921ae328010cb",
+      "path": "core/pit_diagnosis/rulebook.py",
+      "sha256": "4c1c438057cedc7d08d5a3fa20da8ecad9e492f8315ee28902f92122afa11117"
+    },
+    {
+      "bytes": 19313,
+      "git_blob": "f641539ef6f55aa2ef10e6008c5d180af9e7337c",
+      "path": "core/pit_diagnosis/supplemental.py",
+      "sha256": "3375282c152e3108be8294192013e91baddd65ccf1f7e043483455024a900ba5"
+    },
+    {
+      "bytes": 24355,
+      "git_blob": "71e562ffc00dc4e617f1cd625e3f13ea5fe3f81a",
+      "path": "core/pit_feature_snapshot.py",
+      "sha256": "c11693f07dffbdb5a3d9f9a60d7098759b2d6b9d97d10b0dd47d8dc4c553d905"
+    },
+    {
+      "bytes": 140799,
+      "git_blob": "3cc9f12ea7ea4baf994aa732799a8921107cb268",
+      "path": "core/pit_optimizer_evaluation.py",
+      "sha256": "01e524ec0ac9087af2a5d1233172e50cb2582c0e2951c0f5621cbfe656956cf0"
+    },
+    {
+      "bytes": 64623,
+      "git_blob": "f8fd557c9984d1b7ca7184fd965846d5d5c0700c",
+      "path": "core/pit_optimizer_v5/candidate_ir.py",
+      "sha256": "f6cbb997ce46a9497c12457e7740b86c68f20ed77d66d829e0098de4cdbb3b8b"
+    },
+    {
+      "bytes": 11342,
+      "git_blob": "23e578ef6ccd14172479a8f3da423366df347b42",
+      "path": "core/pit_optimizer_v5/container_entry.py",
+      "sha256": "a9516a0400f9c1a5e80ceccfd102645797a76328d2a2f208a2a1291605ae98a7"
+    },
+    {
+      "bytes": 12091,
+      "git_blob": "296c0ffbde603a404bcc4a6bc257fa3198cc45e8",
+      "path": "core/pit_optimizer_v5/container_protocol.py",
+      "sha256": "caa6d0b19db2afca871c57b1a632a07e87545fdd7061f530e1c45a855aedc5d5"
+    },
+    {
+      "bytes": 87527,
+      "git_blob": "bbaff26c12f35945a8cf968bf40eb985cf4856bf",
+      "path": "core/pit_optimizer_v5/contracts.py",
+      "sha256": "7f84ae286f1b548d2215b5921daf38011fda6f387fe3d45ab18a9ffe1fb7e5af"
+    },
+    {
+      "bytes": 43952,
+      "git_blob": "01ba279bd666c9cd1d97dd0c1d62fe783ac130a3",
+      "path": "core/pit_optimizer_v5/diagnostics.py",
+      "sha256": "f1673faa323d745e402d1a41fce85542422a0cd289d37d130bc7523d1ab08d2e"
+    },
+    {
+      "bytes": 29858,
+      "git_blob": "320e96d3522a243d0b64658272dd0368845194d0",
+      "path": "core/pit_optimizer_v5/evaluator.py",
+      "sha256": "dc2bd97f3e403d25548583f52a4e4800f502cd2c5f0e244256c9da2ce6f4e169"
+    },
+    {
+      "bytes": 1651,
+      "git_blob": "35fc1f0623de1d00821cc90f17f5079b85dc4500",
+      "path": "core/pit_optimizer_v5/image_manifest.py",
+      "sha256": "231b87f9f45a3a655408649dea77a03a6ea972bc93566cb45daa3511dae9557f"
+    },
+    {
+      "bytes": 4791,
+      "git_blob": "9e7591ad4d506ce57c2f52031c12c125624a76f0",
+      "path": "core/pit_optimizer_v5/policy_scope.py",
+      "sha256": "07938995376229561ea8824574adb0a34ad43c729a22b6f04032eb93a8afa3e3"
+    },
+    {
+      "bytes": 13623,
+      "git_blob": "5120324850bab8fcdd8ebb833ab1ebdec5cbc62a",
+      "path": "core/pit_optimizer_v5/probe_entry.py",
+      "sha256": "be962ea2b6f5cb11573c1604d2bd7062288d671e08752815417b5e55c6bc35ac"
+    },
+    {
+      "bytes": 39722,
+      "git_blob": "668e7cf9129d0fb5221f3ba2b53d8bbd92320ce0",
+      "path": "core/pit_optimizer_v5/probes.py",
+      "sha256": "b70c4f9ec26d2c5c8141df499dc27c5191ffc07b0463190ba4832773a4e9962d"
+    },
+    {
+      "bytes": 1041,
+      "git_blob": "e3d3805a2faef59c7fa5065a462e3fc3bc55a5d4",
+      "path": "core/pit_provenance.py",
+      "sha256": "7ac88611c0552ddee938f74093f1e20000bc154752fb7a237141fda5feabf6ee"
+    },
+    {
+      "bytes": 11735,
+      "git_blob": "527b8c962b18388bf78be8632a4979a1534272f6",
+      "path": "core/pit_universe_v3.py",
+      "sha256": "4f1f729070689edefc8265ac6e624a56d14e7a7694b4a70f570083c651e2e5e9"
+    },
+    {
+      "bytes": 4208,
+      "git_blob": "a2ed557830b85c7e0c24820eeac91207563cbc7c",
+      "path": "core/strategy_policy/__init__.py",
+      "sha256": "30e9c39f26fde0eea2bf9ae45d9f4944422588bd86c39f9865602038519b2ea6"
+    },
+    {
+      "bytes": 11782,
+      "git_blob": "c76e84a9b10e2b6407ae358b3e8a95ca5d812241",
+      "path": "core/strategy_policy/adapter_v3.py",
+      "sha256": "0b6a3f855572c8d435273024cb3e95079ebb47fb434fc5c48ddd4fed0a033803"
+    },
+    {
+      "bytes": 24475,
+      "git_blob": "46b1d82ff498a034452602b3d7608c00e0136979",
+      "path": "core/strategy_policy/contracts.py",
+      "sha256": "88765bfcf283ef192467fe9851a286eda7df207b482a52bad69a2c5d85aa6bf5"
+    },
+    {
+      "bytes": 23167,
+      "git_blob": "a945c1aa279dbd99e7473a742d7ea34f0f0aff0a",
+      "path": "core/strategy_policy/contracts_v3.py",
+      "sha256": "7d9886614229568b77a982145da5aacf67d6e8521cfa62a14e2adf2beb605295"
+    },
+    {
+      "bytes": 1694,
+      "git_blob": "3627afe93de83fd970e1d8663689e306f65dd4aa",
+      "path": "core/strategy_policy/entry.py",
+      "sha256": "43b12406106186ad4f36df17e22b6c11a72df7f6e40a2125d5db616bfbe1377e"
+    },
+    {
+      "bytes": 2603,
+      "git_blob": "f5c01a11d11b830ed4145b6d91b3014dcb3e8d9e",
+      "path": "core/strategy_policy/exit.py",
+      "sha256": "c5a729f60c2df62952372d2002f8ef4a6f4696dc3de05dc0fdc87e61f36ebb1a"
+    },
+    {
+      "bytes": 4432,
+      "git_blob": "aa95bfc5876d628cb69ec7feafdabca5eb35a62e",
+      "path": "core/strategy_policy/market_context.py",
+      "sha256": "214c547a781465813f0a5b7e7ab41c4cc38b080264bb0d9d7ccddb56f5400c31"
+    },
+    {
+      "bytes": 1795,
+      "git_blob": "d3150aa209e239b74453afdbee75df3c21f15586",
+      "path": "core/strategy_policy/risk.py",
+      "sha256": "364c16d031d4431ce5c4a9f1ec4faed33eae64a1aaa38f4862c05eae7544ec84"
+    },
+    {
+      "bytes": 10571,
+      "git_blob": "499f0f503f6c7cc8eeb7c8ce81e246d2254ce728",
+      "path": "core/strategy_policy/runtime.py",
+      "sha256": "17ec8f0e423b0dc902ff578adcb01f572fe1523ceb130ae24db3a034a122d053"
+    },
+    {
+      "bytes": 506,
+      "git_blob": "18ad3b245400ccf613cb9802ee68e35d00546cff",
+      "path": "core/strategy_policy/v3/__init__.py",
+      "sha256": "a0dd307076ddd0fd7bd31887708aafa4fbb36df35d1a27671f0f007028012e87"
+    },
+    {
+      "bytes": 28535,
+      "git_blob": "ab58c800c64a54769bbe03e1dd2dff6c06ca2ed1",
+      "path": "core/strategy_policy/worker.py",
+      "sha256": "ebb31f0ee9b24a45546604969be7d622807de378f5b37c7c4b9107e6a2492b6d"
+    },
+    {
+      "bytes": 3286,
+      "git_blob": "30439633ecde4350e07ed3f785f46009248a9be4",
+      "path": "core/trading_sessions.py",
+      "sha256": "43df208119333a19a57e04b562c38de7c5591551516e632712397c4619663be8"
+    },
+    {
+      "bytes": 3002,
+      "git_blob": "10ae5c560bcca9e2294fc7caae05a5b72acfb97d",
+      "path": "Dockerfile.pit-optimizer-v5",
+      "sha256": "9161715e3ba1c964384b9b685848279f24b54c41813395514fed1fbd97129413"
+    },
+    {
+      "bytes": 1969,
+      "git_blob": "a9f5f11a580d702a7cdce0e9fbe176e5bbd9266b",
+      "path": "Dockerfile.pit-optimizer-v5.dockerignore",
+      "sha256": "a05b3e5aa9ca064074e53fc727d8a11f399c046c41744cc6bcd83d5d079b3afd"
+    },
+    {
+      "bytes": 1395,
+      "git_blob": "69df1ab4c04282aec47076c5437d77215f413738",
+      "path": "requirements-lock.txt",
+      "sha256": "dd9801c36f86e4853079ca0a77989ce6e4149cba5401b4a574bb6f3833743efd"
+    }
+  ],
+  "pinned_base_image": "python:3.13.14-slim@sha256:9662417aace5ae7b8e2609cce472b72a8958e134ba372808abe9cc1a0c0125e6",
+  "schema": "issue82-canonical-build-context-manifest-v1",
+  "source_commit": "d764c8791e27c6b0fc42bb21e9c2d74ca040b5ff",
+  "source_tree": "99efa7740ba1c215c5f5992ce6947394b3a3a82b"
+}
