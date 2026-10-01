@@ -42,6 +42,11 @@ EXPECTED_MANIFEST_SHA256 = (
 )
 V2_REFERENCE_REVISION = "3d8a0edbc793b1a435849daead96ffaa9c165d97"
 EXPECTED_CALCULATOR_ID = "pit-financial-features-v3"
+REPRODUCTION_REPORT_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "docs"
+    / "historical-financial-validation-issue71-adjacency-v3.json"
+)
 
 
 def _sha256(path: Path) -> str:
@@ -199,6 +204,59 @@ def _public_metric(metric: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _validate_recorded_counts(
+    reproduced_scan: dict[str, Any], recorded_scan: dict[str, Any]
+) -> None:
+    """Fail closed if this run does not reproduce the committed addendum."""
+
+    expected_scalars = {
+        "quarterly_records": recorded_scan["quarterly_records"],
+        "price_security_sessions_all_symbols": recorded_scan[
+            "price_security_sessions_all_symbols"
+        ],
+    }
+    mismatches: list[str] = []
+    for field, expected in expected_scalars.items():
+        actual = reproduced_scan[field]
+        if actual != expected:
+            mismatches.append(f"{field}: expected {expected}, got {actual}")
+
+    expected_windows = recorded_scan["state_window_denominator_per_metric"]
+    for metric_name in ("earnings_acceleration", "revenue_acceleration"):
+        actual_metric = reproduced_scan[metric_name]
+        if actual_metric["state_windows"] != expected_windows:
+            mismatches.append(
+                f"{metric_name}.state_windows: expected {expected_windows}, "
+                f"got {actual_metric['state_windows']}"
+            )
+        recorded_metric = recorded_scan[metric_name]
+        expected_metric_fields = {
+            "changed_windows": recorded_metric["changed_windows"],
+            "affected_symbols": recorded_metric["affected_symbols"],
+            "changed_priced_security_sessions": recorded_metric[
+                "changed_priced_security_sessions"
+            ],
+            "v2_available_to_v3_unavailable": recorded_metric.get(
+                "changed_v2_available_to_v3_unavailable", 0
+            ),
+            "v2_unavailable_to_v3_available": recorded_metric.get(
+                "changed_v2_unavailable_to_v3_available", 0
+            ),
+        }
+        for field, expected in expected_metric_fields.items():
+            actual = actual_metric[field]
+            if actual != expected:
+                mismatches.append(
+                    f"{metric_name}.{field}: expected {expected}, got {actual}"
+                )
+
+    if mismatches:
+        raise ValueError(
+            "reproduced measurement differs from the committed v3 addendum: "
+            + "; ".join(mismatches)
+        )
+
+
 def reproduce(
     *,
     bundle_path: Path,
@@ -224,6 +282,18 @@ def reproduce(
     if FINANCIAL_FEATURE_CALCULATOR_ID != EXPECTED_CALCULATOR_ID:
         raise ValueError(
             "this reproduction recipe expects the v3 financial calculator identity"
+        )
+    recorded_report = json.loads(
+        REPRODUCTION_REPORT_PATH.read_text(encoding="utf-8")
+    )
+    recorded_input = recorded_report["input_bundle"]
+    if (
+        recorded_report.get("calculator_identity") != EXPECTED_CALCULATOR_ID
+        or recorded_input.get("bundle_sha256") != actual_bundle_sha256
+        or recorded_input.get("manifest_sha256") != actual_manifest_sha256
+    ):
+        raise ValueError(
+            "reproduction inputs or calculator identity differ from the v3 addendum"
         )
 
     v2_metrics = {
@@ -331,8 +401,7 @@ def reproduce(
     ):
         raise AssertionError("v2/v3 state-window denominators diverged")
 
-    return {
-        "scan": {
+    output_scan = {
             "evaluation_start": evaluation_start.isoformat(),
             "evaluation_end": evaluation_end.isoformat(),
             "quarterly_records": quarterly_record_count,
@@ -344,7 +413,12 @@ def reproduce(
             "revenue_acceleration": _public_metric(
                 v3_metrics["revenue_acceleration"]
             ),
-        },
+        }
+    _validate_recorded_counts(output_scan, recorded_report["scan"])
+
+    return {
+        "recorded_counts_check": "passed",
+        "scan": output_scan,
         "identity": {
             "measurement_kind": "development feature-output comparison",
             "calculator_identity": FINANCIAL_FEATURE_CALCULATOR_ID,

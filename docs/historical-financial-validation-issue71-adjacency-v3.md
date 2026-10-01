@@ -85,6 +85,10 @@ contains at least one price row. The old side uses the v2 calendar-quarter
 ordinal guard; both sides share the accepted #66 28-day fiscal matcher and
 growth formula. The JSON result records the bundle hashes, code revision,
 calculator identity, Python, pandas, and SQLite versions.
+Before emitting JSON, the script compares quarterly-row and price-session
+totals, state-window denominators, changed windows, affected symbols, direction
+counts, and affected sessions against this addendum; it exits with an error on
+any mismatch.
 
 The script was added after the original comparison and this follow-up did not
 rerun the full scan. Thus the recipe makes the measurement independently
@@ -94,9 +98,10 @@ runtime identity is unknown. The recipe-creation environment was CPython
 3.13.14, pandas 3.0.1, SQLite 3.50.4; a reproduction run records its own
 runtime instead of assuming those versions.
 
-The recipe CLI import/help path and Ruff check pass. The addendum JSON parsed
-successfully. The bundle comparison itself was not executed in this follow-up,
-so script output has not been compared to the historical counts.
+The recipe CLI import/help path, focused count-check tests, and Ruff check pass.
+The addendum JSON parsed successfully. The bundle comparison itself was not
+executed in this follow-up, so the run-time count check has not yet been
+exercised against the historical bundle.
 
 ## Verification and status
 
