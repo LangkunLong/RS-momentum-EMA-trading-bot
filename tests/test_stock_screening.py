@@ -458,6 +458,140 @@ def test_partial_rs_response_marks_only_missing_symbol_as_input_gap() -> None:
     assert outcomes["MSFT"] == ["rs_score_unavailable"]
 
 
+def test_observation_marks_required_candidate_ohlcv_exception_as_input_gap() -> None:
+    observation = SchedulerObservation("candidate-ohlcv-provider-failure")
+    market = _make_view()["market_trend"]
+    rs_scores = pd.DataFrame([{"Ticker": "AAPL", "RS_Score": 90.0}])
+    with (
+        activate_scheduler_observation(observation),
+        patch("core.stock_screening.evaluate_market_direction", return_value=market),
+        patch("core.stock_screening.calculate_rs_scores_for_tickers", return_value=rs_scores),
+        patch(
+            "core.canslim.core.fetch_ohlcv",
+            side_effect=RuntimeError("simulated provider failure"),
+        ),
+    ):
+        buys, watchlist, _ = screen_stocks_canslim_detailed(
+            symbols=["AAPL"], start_date="2026-01-01"
+        )
+
+    assert buys == []
+    assert watchlist == []
+    receipt = observation.to_receipt()
+    assert receipt["service_health"] == "unverified"
+    assert receipt["required_input_coverage"] == "unverified"
+    assert receipt["input_gaps"] == [
+        {
+            "symbol": "AAPL",
+            "endpoint": "alpaca_ohlcv",
+            "reason": "request_failed",
+            "coverage_status": "unverified",
+        }
+    ]
+    assert any(
+        issue["code"] == "required_candidate_ohlcv_read_failed"
+        and issue["details"]
+        == {
+            "symbol": "AAPL",
+            "provider": "alpaca",
+            "reason": "read_failed",
+            "error_type": "RuntimeError",
+        }
+        for issue in receipt["issues"]
+    )
+    assert any(
+        event["kind"] == "market_data"
+        and event["key"] == "candidate_ohlcv"
+        and event["status"] == "request_failed"
+        and event["details"]["provider"] == "alpaca"
+        and event["details"]["error_type"] == "RuntimeError"
+        for event in receipt["events"]
+    )
+    candidate = receipt["scan_coverage"]["candidate_outcomes"][0]
+    assert candidate["category"] == "unavailable"
+    assert candidate["reasons"] == ["required_ohlcv_read_failed"]
+    assert candidate["endpoint_coverage"]["alpaca_ohlcv"] == {
+        "status": "unverified",
+        "reason": "request_failed",
+    }
+
+
+def test_observation_marks_insufficient_candidate_ohlcv_history_as_degraded_coverage() -> None:
+    observation = SchedulerObservation("candidate-ohlcv-insufficient-history")
+    market = _make_view()["market_trend"]
+    rs_scores = pd.DataFrame([{"Ticker": "AAPL", "RS_Score": 90.0}])
+    dates = pd.bdate_range(end="2026-10-01", periods=20)
+    short_history = pd.DataFrame(
+        {
+            "Open": [100.0] * len(dates),
+            "High": [101.0] * len(dates),
+            "Low": [99.0] * len(dates),
+            "Close": [100.0] * len(dates),
+            "Volume": [1_000_000.0] * len(dates),
+        },
+        index=dates,
+    )
+    with (
+        activate_scheduler_observation(observation),
+        patch("core.stock_screening.evaluate_market_direction", return_value=market),
+        patch("core.stock_screening.calculate_rs_scores_for_tickers", return_value=rs_scores),
+        patch("core.canslim.core.fetch_ohlcv", return_value=short_history),
+    ):
+        buys, watchlist, _ = screen_stocks_canslim_detailed(
+            symbols=["AAPL"], start_date="2026-01-01"
+        )
+
+    assert buys == []
+    assert watchlist == []
+    receipt = observation.to_receipt()
+    assert receipt["service_health"] == "healthy"
+    assert receipt["required_input_coverage"] == "degraded"
+    assert receipt["issues"] == []
+    assert receipt["input_gaps"] == [
+        {
+            "symbol": "AAPL",
+            "endpoint": "alpaca_ohlcv",
+            "reason": "insufficient_history",
+            "coverage_status": "degraded",
+        }
+    ]
+    candidate = receipt["scan_coverage"]["candidate_outcomes"][0]
+    assert candidate["category"] == "unavailable"
+    assert candidate["reasons"] == ["insufficient_ohlcv_history"]
+    assert candidate["endpoint_coverage"]["alpaca_ohlcv"] == {
+        "status": "degraded",
+        "reason": "insufficient_history",
+    }
+
+
+def test_observation_keeps_strategy_rejection_healthy_and_distinct_from_input_gap() -> None:
+    observation = SchedulerObservation("legitimate-candidate-rejection")
+    market = _make_view()["market_trend"]
+    rs_scores = pd.DataFrame([{"Ticker": "AAPL", "RS_Score": 90.0}])
+    rejected = _make_view(total_score=40.0, is_bullish=False, has_fundamentals=False)
+
+    with (
+        activate_scheduler_observation(observation),
+        patch("core.stock_screening.evaluate_market_direction", return_value=market),
+        patch("core.stock_screening.calculate_rs_scores_for_tickers", return_value=rs_scores),
+        patch("core.stock_screening.evaluate_canslim", return_value=rejected),
+    ):
+        buys, watchlist, _ = screen_stocks_canslim_detailed(
+            symbols=["AAPL"], start_date="2026-01-01", watchlist_min_score=45.0
+        )
+
+    assert buys == []
+    assert watchlist == []
+    receipt = observation.to_receipt()
+    assert receipt["service_health"] == "healthy"
+    assert receipt["required_input_coverage"] == "complete"
+    assert receipt["issues"] == []
+    assert receipt["input_gaps"] == []
+    candidate = receipt["scan_coverage"]["candidate_outcomes"][0]
+    assert candidate["category"] == "rejected"
+    assert candidate["reasons"] == ["below_watchlist_score"]
+
+
 def test_canslim_marks_missing_statements_as_quota_deferred() -> None:
     """A request-boundary denial must propagate into the scanner-facing metrics."""
     dates = pd.bdate_range("2026-01-01", periods=60)

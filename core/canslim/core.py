@@ -14,7 +14,7 @@ Composite scoring uses O'Neil-weighted averages, not equal weights.
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 import pandas as pd
 
@@ -78,6 +78,9 @@ def evaluate_canslim(
     s_turnover_cap: Optional[float] = None,
     i_institutional_cap: Optional[float] = None,
     as_of_session: object = None,
+    on_price_history_unavailable: Optional[
+        Callable[[str, Optional[Exception]], None]
+    ] = None,
 ) -> Optional[Dict[str, object]]:
     """Evaluate all CANSLIM components for a given stock.
 
@@ -97,6 +100,9 @@ def evaluate_canslim(
         n_proximity_weight: Weight for price proximity in N score
         s_turnover_cap: Legacy parameter (unused)
         i_institutional_cap: Legacy parameter (unused)
+        on_price_history_unavailable: Optional callback for callers that need to
+            retain why required price history could not be evaluated. The normal
+            return value remains ``None`` for unavailable history.
 
     Returns:
         Dict containing CANSLIM scores and metrics, or None if evaluation fails
@@ -125,9 +131,13 @@ def evaluate_canslim(
 
     try:
         price_history = fetch_ohlcv(symbol, period=period)
-    except Exception:
+    except Exception as exc:
+        if on_price_history_unavailable is not None:
+            on_price_history_unavailable("read_failed", exc)
         return None
     if price_history.empty:
+        if on_price_history_unavailable is not None:
+            on_price_history_unavailable("empty_response", None)
         return None
     price_history = normalize_price_dataframe(price_history)
     if expected_session is not None:
@@ -138,6 +148,8 @@ def evaluate_canslim(
             return None
         price_history = exact_history
     if len(price_history) < 30:
+        if on_price_history_unavailable is not None:
+            on_price_history_unavailable("insufficient_history", None)
         return None
 
     # 2. Fetch Fundamental Data only after price-session freshness is proven.

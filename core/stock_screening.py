@@ -179,17 +179,71 @@ def evaluate_stock_canslim(
     _debug("\n" + "-" * 60)
     _debug(f"[DEBUG] Evaluating {symbol}")
 
+    observation = current_scheduler_observation()
+    price_history_unavailable: dict[str, str] = {}
+
+    def _record_price_history_unavailable(
+        reason: str, error: Optional[Exception]
+    ) -> None:
+        if observation is None:
+            return
+        details = {
+            "symbol": symbol,
+            "provider": "alpaca",
+            "reason": reason,
+        }
+        if error is not None:
+            details["error_type"] = type(error).__name__
+
+        if reason == "read_failed":
+            event_status = "request_failed"
+            gap_reason = "request_failed"
+            coverage_status = "unverified"
+            candidate_reason = "required_ohlcv_read_failed"
+            observation.latch_service_issue(
+                "required_candidate_ohlcv_read_failed", details, unverified=True
+            )
+        elif reason == "insufficient_history":
+            event_status = "coverage_incomplete"
+            gap_reason = "insufficient_history"
+            coverage_status = "degraded"
+            candidate_reason = "insufficient_ohlcv_history"
+        else:
+            event_status = "coverage_incomplete"
+            gap_reason = reason
+            coverage_status = "degraded"
+            candidate_reason = "empty_ohlcv_response"
+
+        observation.record_event(
+            "market_data", "candidate_ohlcv", event_status, details
+        )
+        observation.record_input_gap(
+            symbol,
+            "alpaca_ohlcv",
+            gap_reason,
+            coverage_status=coverage_status,
+        )
+        price_history_unavailable["reason"] = candidate_reason
+
     canslim_view = evaluate_canslim(
         symbol,
         rs_scores_df=rs_scores_df,
         market_trend=market_trend,
         as_of_session=as_of_session,
+        on_price_history_unavailable=(
+            _record_price_history_unavailable if observation is not None else None
+        ),
     )
     if not canslim_view:
+        reasons = (
+            [price_history_unavailable["reason"]]
+            if price_history_unavailable
+            else ["canslim_evaluation_unavailable"]
+        )
         _record_candidate_observation(
             symbol,
             "unavailable",
-            ["canslim_evaluation_unavailable"],
+            reasons,
             {},
             analyzed=False,
         )
