@@ -53,3 +53,5 @@ Protected main `68b5358e55df1d8a93851550f421e594541dc74e` integrated without con
 #72 frozen `df3892234ad4b95408b9354c445e9b3a61985328` is not accepted: mixed segmented/unsegmented identity loss, removed same-issuer alias lookbacks, and foreign synthetic-fixture membership hashes accepted under opt-in were independently reproduced. Same owner is correcting all three. Original 68-test evidence does not cover these counterexamples.
 
 #70 frozen `174faca` requires correction: its 1,946 scalar matches do not yet establish exact period/duration/unit provenance. An independent adversarial probe matched a wrong-period/wrong-unit fact. The owner is tightening matching, preserving the original receipt, and correcting the all-statement count label.
+
+Principal independently accepted bounded #69 at exact owner `d24dc9c` / integrated `0200146`; principal report SHA-256 `94ebe413fcf7ae948c6757b4f96f6fe3c6e95701677dfcf324b004eb67e4f5bc` is retained at the path in the ledger. Published #69 remains OPEN with all three original production criteria unchecked.

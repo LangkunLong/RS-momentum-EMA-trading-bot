@@ -12,9 +12,9 @@ Launch base verified locally: `ab385d792e19ff6db39d87f1123f47f660fc1e1d`, tree `
 
 | Issue | Owner / worktree | Allowed edits | State |
 | --- | --- | --- | --- |
-| #69 bounded assessment | `01a0e67f-b51f-74e2-99c2-da49cd479ec6`, `C:/Users/llong/.codex/worktrees/3d87/RS-momentum-EMA-trading-bot` | Dedicated offline assessment script, report and small summary receipts; no shared product modules | Existing owner reuse; launch dispatch pending |
-| #70 bounded assessment | `01a0e67f-f999-7380-a36e-4438f207b46e`, `C:/Users/llong/.codex/worktrees/f1ba/RS-momentum-EMA-trading-bot` | Dedicated offline assessment script, report and small summary receipts; no shared exporter/calculator edits | Existing owner reuse; launch dispatch pending |
-| #72 bridge | `01a0f857-8241-7730-9067-6b212b1b22a2`, `C:/Users/llong/.codex/worktrees/2c6e/RS-momentum-EMA-trading-bot` | `core/sec_pit_fundamentals.py`, `build_pit_bundle.py`, dedicated bridge module/CLI if justified, targeted tests/docs | Visible owner created at exact base; active |
+| #69 bounded assessment | `01a0e67f-b51f-74e2-99c2-da49cd479ec6`, `C:/Users/llong/.codex/worktrees/3d87/RS-momentum-EMA-trading-bot` | Dedicated offline assessment script, report and small summary receipts; no shared product modules | Preserved owner; frozen delivery received and reviewed |
+| #70 bounded assessment | `01a0e67f-f999-7380-a36e-4438f207b46e`, `C:/Users/llong/.codex/worktrees/f1ba/RS-momentum-EMA-trading-bot` | Dedicated offline assessment script, report and small summary receipts; no shared exporter/calculator edits | Preserved owner; corrected bounded delivery independently accepted |
+| #72 bridge | `01a0f857-8241-7730-9067-6b212b1b22a2`, `C:/Users/llong/.codex/worktrees/2c6e/RS-momentum-EMA-trading-bot` | `core/sec_pit_fundamentals.py`, `build_pit_bundle.py`, dedicated bridge module/CLI if justified, targeted tests/docs | Preserved owner; three review corrections active |
 
 Workers use GPT-6 Luna/xhigh. Lead uses selected Astra/high. Preserve old worker branches/commits; reuse worktrees with ordinary integration or a scoped branch from the exact base. No reset/force and no worker hierarchy. Workers report to this lead `01a0e67f-9969-7230-8a0c-f1c433a84ad8`.
 
@@ -35,14 +35,14 @@ Independent review refines the minimum boundary to deterministic V3 lineage-memb
 
 | Issue/scope | Implementation | Required inputs | Acceptance evidence | Dependencies |
 | --- | --- | --- | --- | --- |
-| #72 | Starting bridge implementation | Synthetic fixtures sufficient; original eligible input bindings required | Not yet delivered/reviewed | #66 accepted; settled #68 interface available |
-| #69 bounded / full | Assessment starting / production incomplete | Retained sample inventory available / complete eligible union and prices missing | New bounded measurement due / full evidence absent | Start #66 met; full acceptance requires #68 |
-| #70 bounded / full | Assessment starting / production incomplete | Retained export available; archive/audit existence to verify / complete eligible histories missing | New bounded measurement due / full evidence absent | Start #66 met; full acceptance requires #68 |
+| #72 | Corrective implementation active after df38922 | Synthetic fixtures sufficient; original eligible input bindings required | Three reproduced review findings unresolved | #66 accepted; settled #68 interface available |
+| #69 bounded / full | Bounded assessment accepted and integrated / production incomplete | Retained sample measured / complete eligible union and prices missing | Independent bounded review accepted / full evidence absent | Start #66 met; full acceptance requires #68 |
+| #70 bounded / full | Corrected bounded assessment independently accepted and integrated / production incomplete | Alternate export and archive identities retained / complete eligible histories missing | Corrected bounded evidence independently accepted / full evidence absent | Start #66 met; full acceptance requires #68 |
 | #68 preserved obligation | Existing identity/admission code retained | Full source-backed union and transitions missing | Partial acquisition only; not ready | Remains open outside this bounded phase |
 
 ## Review, publication and notification
 
-No next-phase test, review, PR, merge, issue closure or achieved-goal notification yet. Store ready PR and exact evidence here for principal inspection; send the single final completion message only after accepted/merged #72 and both reviewed bounded reports are delivered.
+Bounded #69 review is accepted and integrated locally. #70/#72 corrections and final reviews remain pending. No next-phase PR, remote merge, issue closure or achieved-goal notification yet. Store ready PR and exact evidence here for principal inspection; send the single final completion message only after accepted/merged #72 and both reviewed bounded reports are delivered.
 
 ### Launch receipts
 
@@ -75,3 +75,13 @@ No next-phase test, review, PR, merge, issue closure or achieved-goal notificati
 - #72 final frozen review adds a third reproduced finding: synthetic fixture exemption accepts a foreign membership hash under fixture opt-in. All three fixes remain with the same owner; review saved `.artifacts/coordination/issue72-final-review.md` with executable counterexamples.
 - #70 final frozen review requires exact scalar origin period/duration/unit matching and explicit ambiguity handling. Existing matcher can count a same-number fact from a different period/unit as matched; owner asked to preserve old weaker receipt and produce corrected bounded trace plus negative regressions. Report's all-statement nonempty count must be labelled accurately. Earlier annual/missing-quarter/ROE/DEI/timing/Q4 fixes were verified present.
 - Latest main integrated as `255c6bfcbfe2f9bec1530d2eeb8b2feaacde3a6a`. At integrated `0200146`, all 58 evaluator runtime Git blobs equal B's tested source `a8662e85c4c06142183c707926e7c302c75e233d`; none of the frozen owner changes intersects the runtime map. Corrected final source still requires closure inspection. Receipt `.artifacts/coordination/lead-a-runtime-map-preintegration.json`.
+
+- Fresh final-review GitHub reads of #69/#70/#72 confirm all OPEN and exact bodies unchanged from launch captures.
+- Lead recovered original #72 raw 68-pass/Ruff-success output through authorized task reading, retained at `.artifacts/coordination/issue72-retained-original-command-outputs.json`. This validates historical execution reporting, not the three missed behaviors. Corrected owner regression run independently observed four failing tests against original source before fixes.
+
+- Principal independently accepted bounded #69 at exact owner `d24dc9ccc7fe6b08f7e07a1f7f38a3772194849c` / integrated `0200146e5a8511a2a0c235ea8a04564ce514c7ea`. Lead rehashed principal report `C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.artifacts/coordination/principal-reviews/2026-10-01-issue69-d24-bounded-independent-review.md` as `94ebe413fcf7ae948c6757b4f96f6fe3c6e95701677dfcf324b004eb67e4f5bc`. Principal updated published four statuses, leaving #69 OPEN and all three production criteria unchecked. No rerun/relabel occurred; exact report/receipt/script blobs stay unchanged.
+- #70 corrected owner commit `8f389406` delivered clean atop `174faca`; independent corrected review active. Original receipt remains unchanged; corrected receipt is separately versioned. Owner reports 15 focused tests and 1,946 strict unique period/duration/unit/value matches; final independent verdict pending.
+- #72 owner added four failing regressions before correction, then implemented mixed-universe inclusion, full single-CIK alias history, multi-CIK boundary protection, and fixture membership binding. Owner was directed to stop its incidental broad offline run (partial failures informational), retain logs, and finalize scoped evidence. Final commit/review still due.
+
+- #70 corrected `8f389406f1c7339662387d446cbbffd997b810e8` accepted by independent spec/quality review; integrated via `b675399` then `f6d7474`. Script, tests and both receipts retain exact Git contents. Clarified reproduction commands separately label original source and use scratch outputs. Clarification/integration independently accepted; reports `docs/issue-70-bounded-independent-review.md` and `docs/issue-69-70-integration-review.md`.
+- Windows CRLF checkout differences are explicitly separate from raw Git blob/retained execution identity. Mapping retained `.artifacts/coordination/issue69-70-integration-byte-equivalence.json`. No assessment remeasurement or old67/71/82 rerun performed.

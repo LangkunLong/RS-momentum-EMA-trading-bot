@@ -132,7 +132,7 @@ The alternate `fundamentals_audit.csv` contains per-row filing and metric-origin
 
 ## Reproduction
 
-Run from the repository root with Python 3.13.14 and pandas 3.0.1:
+Historical reproduction uses the original script at commit `174faca79cecfa0a710bbc4112fd2c81f225f281`, Python 3.13.14 and pandas 3.0.1. The command below writes a new scratch receipt; it must not be run with the corrected script as a reproduction of the original weaker trace. Preserve both tracked receipts. For current source, use the corrected command further below.
 
 ```powershell
 python tools\assess_issue70_retained_source.py `
@@ -140,14 +140,14 @@ python tools\assess_issue70_retained_source.py `
   --membership-csv 'C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.artifacts\data\acquisition\acquisition\raw\local-cache\prices\membership.csv' `
   --trading-days-csv 'C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.artifacts\data\acquisition\acquisition\raw\local-cache\prices\spy_trading_days.csv' `
   --comparison-import-provenance 'C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.artifacts\data\acquisition\acquisition\raw\local-cache\import-provenance.json' `
-  --output docs\issue-70-bounded-source-assessment-receipt.json
+  --output .artifacts\coordination\issue70-original-reproduction.json
 ```
 
 The original run verified 9 input digests, joined all 145,010 export rows to audit rows, and wrote the 96,043-byte original receipt. Receipt SHA-256: `1fc74971cee7c30430ea8efbecdf615f3d8c113849a41c66ec52445d0e3c5733`. Assessment script SHA-256 at that run: `601527fed1c6b408e3fe1057f141f2c3909c3775561814c3804d7246d1376de0`. That receipt is preserved with its original weaker match definition.
 
 The corrected rerun used the same bounded inputs and wrote a separate 102,952-byte receipt. Its SHA-256 is `7e690f3a6e0dd116f5a0b20267fcf6e8eebdd37ba9271eafbb8675c62819c5a8`; the corrected assessment script SHA-256 is `c26a9de43bcf12c11f9f802df12c273301553dfa3f06f21affcec0beaaae3c46`. The receipt identifies repository head `174faca79cecfa0a710bbc4112fd2c81f225f281` and the reused digest-attestation details.
 
-Reproduce the corrected run with:
+Reproduce the corrected run with current source and a new scratch output (the retained original receipt remains the read-only archive-digest attestation):
 
 ```powershell
 python tools\assess_issue70_retained_source.py `
@@ -156,7 +156,7 @@ python tools\assess_issue70_retained_source.py `
   --trading-days-csv 'C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.artifacts\data\acquisition\acquisition\raw\local-cache\prices\spy_trading_days.csv' `
   --comparison-import-provenance 'C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.artifacts\data\acquisition\acquisition\raw\local-cache\import-provenance.json' `
   --reuse-archive-digests-from docs\issue-70-bounded-source-assessment-receipt.json `
-  --output docs\issue-70-bounded-source-assessment-receipt-corrected.json
+  --output .artifacts\coordination\issue70-corrected-reproduction.json
 ```
 
 Fifteen focused tests passed with `python -m pytest tests/test_assess_issue70_retained_source.py -q -p no:cacheprovider --no-cov`. The full suite was not run. The CLI help and corrected bounded assessment were run; a live GitHub refresh from this worktree was unavailable through the configured proxy, so the report uses the lead-captured OPEN issue body.
