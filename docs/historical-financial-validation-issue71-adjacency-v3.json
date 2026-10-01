@@ -1,0 +1,106 @@
+{
+  "issue": "#71",
+  "addendum": "fiscal-quarter adjacency v3",
+  "accepted_feature_contract": "historical-feature-specification-v1",
+  "implementation_revision": "0ce6561bd478bcd98ec275d28d63753bd812e114",
+  "calculator_identity": "pit-financial-features-v3",
+  "policy_interface_version": 3,
+  "historical_data_format_version": 2,
+  "original_v2_report_preserved": true,
+  "fiscal_yoy_matching": {
+    "rule": "closest prior-calendar-year period within 28 calendar days",
+    "ties_conflicting_duplicates_and_unmatched": "unavailable",
+    "changed": false
+  },
+  "acceleration_adjacency": {
+    "rule": "current fiscal period-end gap from 84 through 105 days inclusive",
+    "basis": "12-15 week endpoint cadence proxy because source periods have no fiscal-quarter number",
+    "period_endpoint_tolerance_days": 7,
+    "fixed_cases": [
+      {
+        "newest_current_period": "2023-09-30",
+        "previous_current_period": "2023-07-01",
+        "gap_days": 91,
+        "case": "adjacent 52-week fiscal quarters that both fall in calendar Q3",
+        "eps_acceleration": -0.3,
+        "revenue_acceleration": -0.3
+      },
+      {
+        "newest_current_period": "2023-09-30",
+        "previous_current_period": "2023-04-01",
+        "gap_days": 182,
+        "case": "skipped fiscal quarter",
+        "eps_acceleration": null,
+        "revenue_acceleration": null
+      }
+    ]
+  },
+  "input_bundle": {
+    "path": "C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.artifacts/data/development-sp500-v2/pit_bundle.sqlite3",
+    "sha256": "cf729b47d762ae86287bb8a87c28a1664e7475c74ef1aca736fbc240111349de",
+    "manifest_sha256": "3c9edd0158dcb93f9de5edbfcf6f281dd8b25bcdd1ded6ad21473af5fd37be7c",
+    "manifest_bundle_hash_matches": true
+  },
+  "scan": {
+    "evaluation_start": "2021-01-01",
+    "evaluation_end": "2025-12-31",
+    "quarterly_records": 39470,
+    "symbols": 565,
+    "price_security_sessions_all_symbols": 720785,
+    "state_window_denominator_per_metric": 8696,
+    "measurement_kind": "development feature-output comparison",
+    "earnings_acceleration": {
+      "changed_windows": 68,
+      "changed_v2_available_to_v3_unavailable": 24,
+      "changed_v2_unavailable_to_v3_available": 44,
+      "affected_symbols": 47,
+      "changed_priced_security_sessions": 6007
+    },
+    "revenue_acceleration": {
+      "changed_windows": 0,
+      "affected_symbols": 0,
+      "changed_priced_security_sessions": 0
+    },
+    "claims_excluded": [
+      "production feature coverage",
+      "policy consumption",
+      "strategy or portfolio impact",
+      "production-universe behavior",
+      "retrospective trading error"
+    ]
+  },
+  "verification": [
+    {
+      "command": "python -m pytest tests/test_historical06_financial_semantics.py tests/test_task11_earnings_provenance_contract.py -q -p no:cacheprovider -o addopts='' --tb=short",
+      "result": "31 passed"
+    },
+    {
+      "command": "python -m pytest tests/test_fundamental_input_parity.py -q -p no:cacheprovider -o addopts='' -k \"sparse_july or missing_same_quarter or fiscal_yoy_calendar_edge or fiscal_matching_preserves or equal_distance_prior or exact_duplicate_periods or latest_nonfinite_period\" --tb=short",
+      "result": "11 passed, 27 deselected"
+    },
+    {
+      "command": "python -m ruff check core/pit_feature_snapshot.py tests/test_historical06_financial_semantics.py",
+      "result": "All checks passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "Passed"
+    }
+  ],
+  "broader_suite_limitations": [
+    {
+      "test": "tests/test_agent_loop.py::test_policy_worker_command_mount_allowlist_and_cleanup_use_only_fakes",
+      "failure": "ValueError: policy interface version is unsupported",
+      "source": "unchanged core/strategy_policy/worker.py"
+    },
+    {
+      "test_file": "tests/test_fundamental_input_parity.py",
+      "result": "35 passed, 3 failed outside the #71 diff",
+      "failure_sources": [
+        "unchanged core/backtest_engine.py: entry market context is invalid",
+        "unchanged core/pit_data.py: KeyError: 'schema_version'"
+      ]
+    }
+  ],
+  "issue_acceptance_asserted": false
+}
