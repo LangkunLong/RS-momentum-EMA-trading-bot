@@ -45,7 +45,10 @@ from core.pit_feature_snapshot import (
 from core.pit_provenance import PIT_PUBLIC_DATES_ATTR
 
 
-REPORT_SCHEMA = "historical_feature_coverage_v2"
+REPORT_SCHEMA = "historical_feature_coverage_v3"
+_MIN_ADJACENT_FISCAL_QUARTER_DAYS = 84
+_MAX_ADJACENT_FISCAL_QUARTER_DAYS = 105
+_TYPICAL_FISCAL_QUARTER_DAYS = 365.25 / 4
 _FULL_WINDOW_REQUIRED_SLOTS = {
     "quarterly_eps_growth": 4,
     "annual_eps_growth": 3,
@@ -626,21 +629,50 @@ def _quarterly_eps_full_window(
 
     matches = match_fiscal_year_over_year_periods(series)
     slots: list[dict[str, Any]] = []
-    for slot_number in range(1, required_slots + 1):
-        if slot_number > len(matches):
-            slots.append(
-                {
-                    "slot": slot_number,
-                    "current_period_end": None,
-                    "comparison_period_end": None,
-                    "comparison_period_matched": False,
-                    "status": "missing",
-                    "reason": "insufficient_reported_periods",
-                }
-            )
-            continue
+    represented_period_slots = 0
+    previous_reported_period: date | None = None
+    for match in matches:
+        if len(slots) >= required_slots:
+            break
 
-        match = matches[slot_number - 1]
+        if previous_reported_period is not None:
+            period_gap_days = (previous_reported_period - match.current_period).days
+            if not (
+                _MIN_ADJACENT_FISCAL_QUARTER_DAYS
+                <= period_gap_days
+                <= _MAX_ADJACENT_FISCAL_QUARTER_DAYS
+            ):
+                inferred_quarter_steps = max(
+                    2,
+                    int(math.floor(period_gap_days / _TYPICAL_FISCAL_QUARTER_DAYS + 0.5)),
+                )
+                missing_quarters = inferred_quarter_steps - 1
+                gap_reason = (
+                    "missing_fiscal_quarter_period"
+                    if period_gap_days > _MAX_ADJACENT_FISCAL_QUARTER_DAYS
+                    else "fiscal_quarter_cadence_outside_expected_range"
+                )
+                for _ in range(missing_quarters):
+                    if len(slots) >= required_slots:
+                        break
+                    slots.append(
+                        {
+                            "slot": len(slots) + 1,
+                            "current_period_end": None,
+                            "comparison_period_end": None,
+                            "comparison_period_matched": False,
+                            "status": "missing",
+                            "reason": gap_reason,
+                            "previous_reported_period_end": match.current_period.isoformat(),
+                            "next_reported_period_end": previous_reported_period.isoformat(),
+                            "period_gap_days": period_gap_days,
+                            "inferred_missing_quarter_count": missing_quarters,
+                        }
+                    )
+        if len(slots) >= required_slots:
+            break
+
+        slot_number = len(slots) + 1
         current_period = match.current_period.isoformat()
         comparison_period = (
             None if match.prior_period is None else match.prior_period.isoformat()
@@ -677,10 +709,24 @@ def _quarterly_eps_full_window(
                 "reason": reason,
             }
         )
+        represented_period_slots += 1
+        previous_reported_period = match.current_period
+
+    while len(slots) < required_slots:
+        slots.append(
+            {
+                "slot": len(slots) + 1,
+                "current_period_end": None,
+                "comparison_period_end": None,
+                "comparison_period_matched": False,
+                "status": "missing",
+                "reason": "insufficient_reported_periods",
+            }
+        )
 
     return _growth_window_payload(
         required_slots=required_slots,
-        represented_period_slots=min(len(matches), required_slots),
+        represented_period_slots=represented_period_slots,
         reported_level_count=int(series.notna().sum()),
         slots=slots,
     )
@@ -1714,6 +1760,12 @@ def build_coverage_report(
                 "quarterly_eps_growth": {
                     "required_growth_slots": 4,
                     "readiness": "all four newest fiscal-quarter slots have a valid same-period prior-year comparison",
+                    "period_slot_cadence": (
+                        "Reported period ends 84 through 105 days apart are adjacent. "
+                        "Outside that range, intervening quarter slots are preserved as missing; "
+                        "the inferred step count rounds the gap to the nearest 91.3125-day quarter "
+                        "and is at least two."
+                    ),
                 },
                 "annual_eps_growth": {
                     "required_growth_slots": 3,

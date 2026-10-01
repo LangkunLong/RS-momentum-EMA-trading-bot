@@ -134,6 +134,55 @@ def test_quarterly_eps_full_window_counts_matched_growth_slots_not_source_rows()
     assert window["slots"][3]["reason"] == "missing_comparable_period"
 
 
+def test_quarterly_eps_full_window_preserves_an_absent_intervening_fiscal_quarter() -> None:
+    periods = pd.to_datetime(
+        [
+            "2021-12-31",
+            "2022-03-31",
+            "2022-06-30",
+            "2022-12-31",
+            "2023-03-31",
+            "2023-06-30",
+            "2023-12-31",
+        ]
+    )
+    eps = pd.Series([1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6], index=periods)
+
+    window = coverage._quarterly_eps_full_window(eps)
+
+    assert window["ready"] is False
+    assert window["required_growth_slots"] == 4
+    assert window["matched_growth_slots"] == 3
+    assert window["missing_growth_slots"] == 1
+    assert window["represented_period_slots"] == 3
+    assert window["missing_slot_reason_counts"] == {"missing_fiscal_quarter_period": 1}
+    assert window["slots"][1]["reason"] == "missing_fiscal_quarter_period"
+    assert window["slots"][1]["previous_reported_period_end"] == "2023-06-30"
+    assert window["slots"][1]["next_reported_period_end"] == "2023-12-31"
+
+
+def test_quarterly_eps_full_window_uses_inclusive_84_to_105_day_cadence() -> None:
+    periods = pd.to_datetime(
+        [
+            "2022-04-02",
+            "2022-06-25",
+            "2022-09-17",
+            "2022-12-31",
+            "2023-04-02",
+            "2023-06-25",
+            "2023-09-17",
+            "2023-12-31",
+        ]
+    )
+    eps = pd.Series([1.0, 1.0, 1.0, 1.0, 1.2, 1.2, 1.2, 1.2], index=periods)
+
+    window = coverage._quarterly_eps_full_window(eps)
+
+    assert window["ready"] is True
+    assert window["represented_period_slots"] == 4
+    assert window["matched_growth_slots"] == 4
+
+
 def test_annual_full_window_flags_skipped_fiscal_year_separately() -> None:
     periods = pd.to_datetime(
         ["2020-12-31", "2021-12-31", "2023-12-31", "2024-12-31"]
@@ -154,35 +203,55 @@ def test_annual_full_window_flags_skipped_fiscal_year_separately() -> None:
             "slot": 2,
         }
     ]
+    overall = _new_accumulator()
+    year = _new_accumulator()
+    _accumulate_cell(
+        overall,
+        year,
+        "ABCD",
+        {
+            "source_stage": "observed",
+            "publication_stage": "observed",
+            "lookback_stage": "observed",
+            "calculation_stage": "observed",
+            "policy_input_stage": "observed",
+            "reason_codes": [],
+            "policy_input_reason": None,
+            "full_window": window,
+        },
+    )
+    coverage_summary = _finalize_accumulator(overall)["full_window_coverage"]
+    assert coverage_summary["fiscal_year_gap_slots"] == 1
+    assert coverage_summary["skipped_fiscal_years"] == 1
+    assert coverage_summary["consecutive_fiscal_years_ready_security_sessions"] == 0
 
 
 def test_full_window_summary_tracks_session_slots_reasons_and_distinct_tickers() -> None:
     periods = pd.to_datetime(
         [
+            "2021-12-31",
             "2022-03-31",
-            "2022-09-30",
+            "2022-06-30",
             "2022-12-31",
             "2023-03-31",
             "2023-06-30",
-            "2023-09-30",
             "2023-12-31",
-            "2024-03-31",
         ]
     )
     window = coverage._quarterly_eps_full_window(
-        pd.Series([1.0, 1.0, 1.0, 1.2, 1.2, 1.2, 1.2, 1.3], index=periods)
+        pd.Series([1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6], index=periods)
     )
     spec = next(spec for spec in FEATURE_SPECS if spec.feature_id == "quarterly_eps_growth")
     cell = _cell(
         spec=spec,
-        raw_count=8,
-        visible_count=8,
+        raw_count=7,
+        visible_count=7,
         future_count=0,
         payload={
             "calculable": True,
             "lookback_ready": True,
             "required_history": 2,
-            "available_history": 8,
+            "available_history": 7,
             "reason": None,
             "selected_period_ends": [],
             "selected_available_from_sessions": [],
@@ -202,7 +271,7 @@ def test_full_window_summary_tracks_session_slots_reasons_and_distinct_tickers()
     assert summary["ready_security_sessions"] == 0
     assert summary["matched_growth_slots"] == 6
     assert summary["missing_growth_slots"] == 2
-    assert summary["missing_slot_reason_counts"] == {"missing_comparable_period": 2}
+    assert summary["missing_slot_reason_counts"] == {"missing_fiscal_quarter_period": 2}
     assert summary["unique_tickers_with_missing_slots"] == 1
 
 
@@ -446,6 +515,7 @@ def test_small_fixed_history_report_keeps_market_rs_and_industry_denominators(
         source_revision="c" * 40,
     )
 
+    assert report["schema"] == "historical_feature_coverage_v3"
     assert report["calculator_identities"]["financial_feature_calculator_id"] == (
         "pit-financial-features-v3"
     )
