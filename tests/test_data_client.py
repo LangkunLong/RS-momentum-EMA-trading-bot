@@ -9,7 +9,7 @@ import pandas as pd
 from alpaca.data.enums import DataFeed
 
 import enhanced_scanner
-from core.data_client import fetch_bulk_ohlcv, fetch_ohlcv, validate_ticker
+from core.data_client import fetch_bulk_close_prices, fetch_bulk_ohlcv, fetch_ohlcv, validate_ticker
 
 # ─── export_results_to_csv ────────────────────────────────────────────────────
 
@@ -211,6 +211,26 @@ def test_bulk_close_prices_isolate_one_invalid_symbol() -> None:
         result = enhanced_scanner.validate_tickers_bulk(["GOOD1", "BAD", "GOOD2"])
 
     assert set(result) == {"GOOD1", "GOOD2"}
+
+
+def test_bulk_close_prices_does_not_split_failed_chunk_when_retries_disabled() -> None:
+    with (
+        patch("core.data_client._get_alpaca_client") as mock_client,
+        patch("core.data_client._cache_get", return_value=None),
+        patch("core.data_client._cache_set"),
+        patch("core.data_client.time.sleep"),
+    ):
+        mock_client.return_value.get_stock_bars.side_effect = RuntimeError("provider unavailable")
+
+        result = fetch_bulk_close_prices(
+            ["AAPL", "MSFT", "NVDA"],
+            period="5d",
+            chunk_size=3,
+            retry_failed_chunks=False,
+        )
+
+    assert result.empty
+    mock_client.return_value.get_stock_bars.assert_called_once()
 
 
 def test_bulk_ohlcv_isolates_one_invalid_symbol() -> None:

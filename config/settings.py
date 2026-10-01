@@ -19,6 +19,14 @@ ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "")
 ALPACA_STOCK_FEED = os.environ.get("ALPACA_STOCK_FEED", "iex").strip().lower()
 FMP_API_KEY = os.environ.get("FMP_API_KEY", "")
+ALPACA_SDK_RETRY_ATTEMPTS = max(0, int(os.environ.get("ALPACA_SDK_RETRY_ATTEMPTS", "3")))
+ALPACA_SDK_RETRY_WAIT_SECONDS = max(0, int(os.environ.get("ALPACA_SDK_RETRY_WAIT_SECONDS", "3")))
+ALPACA_HTTP_TIMEOUT_SECONDS = max(1.0, float(os.environ.get("ALPACA_HTTP_TIMEOUT_SECONDS", "30")))
+FMP_HTTP_TIMEOUT_SECONDS = max(1.0, float(os.environ.get("FMP_HTTP_TIMEOUT_SECONDS", "30")))
+INDEX_TICKER_HTTP_TIMEOUT_SECONDS = max(
+    1.0,
+    float(os.environ.get("INDEX_TICKER_HTTP_TIMEOUT_SECONDS", "30")),
+)
 # ALPACA_PAPER is read directly from os.environ in order_execution.py
 # (default: "true" — paper trading). Any false value is rejected at runtime.
 

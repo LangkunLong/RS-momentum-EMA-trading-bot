@@ -398,16 +398,63 @@ Generated outputs are ignored under `scan_results/`, `backtest_results*`, and `.
 
 ## Paper-mode dry runs and diagnostics
 
-Validate configuration and broker connectivity without submitting an order:
+Get a local readiness report without contacting providers or submitting an
+order:
 
 ```powershell
 python paper_trading_console.py doctor
 python paper_trading_console.py checklist
+```
+
+These commands report configuration presence separately from provider access,
+preserve missing evidence as `UNVERIFIED`, and inspect an existing SQLite store
+read-only. They require an explicit absolute `EXECUTION_STORE_DB_PATH` binding
+before they can attest the selected operational store. They do not initialize a
+missing store. Exit code `2` means required readiness evidence remains
+unverified; it is not a readiness approval.
+
+Provider checks require an explicit opt-in:
+
+```powershell
+python paper_trading_console.py doctor --probe-external
+```
+
+That command makes at most three read-only Alpaca operations (account,
+positions, open orders; open orders are capped at 500) and four logical FMP
+requests (quarterly income, annual income, annual balance sheet, historical
+price). Broker inventory is compared with the explicitly bound existing
+workflow store; disagreements are reported
+without repair. Every returned order must have a unique local owner and a
+compatible workflow state. Any non-protective sell order blocks reconciliation;
+an entry buy must be in a submitted workflow or a protected partial-fill
+workflow. Notification states count as protected only when the latest durable
+successful stop transition matches the current broker stop and its remaining
+quantity matches the position. Reaching the open-order cap, a missing or
+unreadable store, or incomplete broker reads keeps reconciliation
+`UNVERIFIED`. The FMP probes require the existing request ledger and use the
+existing data-client accounting; they can consume request
+allowance. Free-plan transport retries are disabled, so the four logical
+requests produce at most four HTTP attempts. Paid-plan transport retries are
+bounded by `HTTP_RETRY_TOTAL` (five retries plus the initial attempt per
+endpoint). The FMP price entitlement result is separate from the application's
+active market-price source, which is Alpaca. A false `ALPACA_PAPER` setting
+refuses all provider probes.
+
+For a fresh no-order strategy observation:
+
+```powershell
 python paper_trading_console.py run-now
 python auto_trader.py --dry-run
 ```
 
-The dry run still performs provider reads and may take time. It prints intended entries/exits but does not submit them.
+The dry run still performs provider reads and may take time. It prints intended
+entries/exits but does not submit them. Retain the output with the checkout
+revision and runtime identity, data freshness/coverage, and rejection reasons.
+No buy signal is required for a valid dry run.
+
+See [the paper runtime readiness runbook](docs/paper-runtime-readiness.md) for
+canonical checkout/interpreter/store inventory, scheduler and service-health
+evidence, and alignment with #97's deployment identity contract.
 
 Treat FMP `402` responses for income statements or balance sheets as a deployment blocker for strategy entries when `REQUIRE_FUNDAMENTALS_FOR_BUYS=true`. The scan still completes and reports technical/watchlist results, but candidates with unavailable fundamentals intentionally cannot pass the buy gate. Upgrade the FMP plan or select and validate a replacement fundamental-data provider; do not weaken the gate merely to make orders appear.
 
@@ -436,7 +483,7 @@ operator command, or install an order-enabled task as an unattended first step.
 Before the one-share paper lifecycle:
 
 1. Confirm `ALPACA_PAPER=true` and verify the paper account endpoint.
-2. Pass lint and compilation checks, review relevant test results, and pass `paper_trading_console.py doctor`.
+2. Pass the scoped checks and review `paper_trading_console.py doctor`; resolve failures and collect the separate external, scheduler, service, and dry-run evidence. An exit code of `2` means evidence is unverified, not that the deployment passed readiness.
 3. Display the exact symbol, quantity, order type, and cleanup behavior.
 4. Obtain explicit operator approval.
 5. Observe the buy fill, protective stop derived from the actual fill, durable transitions, restart recovery, and cleanup sell/cancel.

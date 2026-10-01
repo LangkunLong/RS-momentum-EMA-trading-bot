@@ -42,6 +42,8 @@ def scan_for_canslim_stocks(
     watchlist_min_score: Optional[float] = None,
     require_bullish_market_for_buys: Optional[bool] = None,
     strict_breakout_for_buys: Optional[bool] = None,
+    include_extra_symbols: bool = True,
+    retry_failed_market_data_chunks: bool = True,
 ) -> tuple[list[dict], list[dict], object]:
     """Run the full CANSLIM scan and return qualifying opportunities.
 
@@ -50,6 +52,8 @@ def scan_for_canslim_stocks(
         min_canslim_score: Deprecated advisory request; ignored for entry qualification.
         sectors: Index/sector name to scan (e.g. 'nasdaq100', 'large_cap').
         custom_list: Explicit list of tickers to evaluate instead of an index.
+        include_extra_symbols: Append the configured manual symbols to the scan.
+        retry_failed_market_data_chunks: Split failed bulk requests into smaller retries.
         start_date: Start date for historical analysis (overrides settings).
         debug: Enable verbose per-stock output (overrides settings).
 
@@ -90,7 +94,11 @@ def scan_for_canslim_stocks(
     print("=" * 60)
 
     # Get stock list
-    extra_symbols: list[str] = list(settings.EXTRA_SYMBOLS) if hasattr(settings, "EXTRA_SYMBOLS") else []
+    extra_symbols: list[str] = (
+        list(settings.EXTRA_SYMBOLS)
+        if include_extra_symbols and hasattr(settings, "EXTRA_SYMBOLS")
+        else []
+    )
 
     if custom_list:
         print("Using custom stock list...")
@@ -125,7 +133,10 @@ def scan_for_canslim_stocks(
 
     # Filter out invalid/delisted tickers before scanning
     print("Validating tickers with Alpaca...")
-    valid_symbols = validate_tickers_bulk(symbols)
+    valid_symbols = validate_tickers_bulk(
+        symbols,
+        retry_failed_chunks=retry_failed_market_data_chunks,
+    )
 
     missing = set(symbols) - set(valid_symbols)
     if missing:
@@ -142,6 +153,7 @@ def scan_for_canslim_stocks(
         watchlist_min_score=watchlist_min_score,
         require_bullish_market=require_bullish_market_for_buys,
         strict_breakout=strict_breakout_for_buys,
+        retry_failed_market_data_chunks=retry_failed_market_data_chunks,
     )
 
     print("\nScan complete!")

@@ -13,6 +13,8 @@ from __future__ import annotations
 import math
 import threading
 import time
+from contextlib import contextmanager
+from collections.abc import Iterator
 from datetime import datetime, time as dtime, timedelta
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
@@ -26,6 +28,7 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
 from config import settings
+from core.alpaca_client_policy import configure_alpaca_rest_client
 
 
 def _fetch_company_profile(symbol: str, fmp_get_fn):
@@ -145,7 +148,7 @@ def _get_alpaca_client() -> StockHistoricalDataClient:
         if not api_key or not secret_key:
             raise EnvironmentError("ALPACA_API_KEY and ALPACA_SECRET_KEY must be set. See .env.example for details.")
         _local.alpaca_client = StockHistoricalDataClient(api_key, secret_key)
-    return _local.alpaca_client
+    return configure_alpaca_rest_client(_local.alpaca_client)
 
 
 def _get_alpaca_stock_feed() -> DataFeed:
@@ -209,6 +212,22 @@ _REGULAR_SESSION_END = dtime(16, 0)
 _fmp_budget_lock = threading.Lock()
 _fmp_request_context = threading.local()
 _fmp_budget_warning_emitted = False
+_fmp_run_budget_remaining: int | None = None
+
+
+@contextmanager
+def fmp_request_budget(max_requests: int) -> Iterator[None]:
+    """Cap logical FMP requests for one doctor or bounded scanner run."""
+    global _fmp_run_budget_remaining
+    with _fmp_budget_lock:
+        if _fmp_run_budget_remaining is not None:
+            raise RuntimeError("An FMP run request budget is already active")
+        _fmp_run_budget_remaining = max(0, int(max_requests))
+    try:
+        yield
+    finally:
+        with _fmp_budget_lock:
+            _fmp_run_budget_remaining = None
 
 
 def _is_fmp_free_plan() -> bool:
@@ -260,16 +279,27 @@ def _write_fmp_usage(path: str, usage: dict[str, Any]) -> bool:
 
 def _reserve_fmp_request() -> bool:
     """Reserve one persisted free-tier request before any network I/O."""
-    global _fmp_budget_warning_emitted
+    global _fmp_budget_warning_emitted, _fmp_run_budget_remaining
 
     if not _is_fmp_free_plan():
-        return True
+        with _fmp_budget_lock:
+            if _fmp_run_budget_remaining is None:
+                return True
+            if _fmp_run_budget_remaining <= 0:
+                _fmp_request_context.quota_deferred = True
+                return False
+            _fmp_run_budget_remaining -= 1
+            return True
 
     path = str(settings.FMP_REQUEST_LEDGER_PATH)
     window_start = _fmp_window_start(_fmp_now_et()).isoformat()
     budget = int(settings.FMP_DAILY_REQUEST_BUDGET)
 
     with _fmp_budget_lock:
+        if _fmp_run_budget_remaining is not None and _fmp_run_budget_remaining <= 0:
+            _fmp_request_context.quota_deferred = True
+            return False
+
         usage: dict[str, Any] = {"window_start": window_start, "count": 0}
         try:
             with open(path, "r", encoding="utf-8") as handle:
@@ -299,6 +329,8 @@ def _reserve_fmp_request() -> bool:
 
         usage["count"] += 1
         if _write_fmp_usage(path, usage):
+            if _fmp_run_budget_remaining is not None:
+                _fmp_run_budget_remaining -= 1
             return True
 
         _fmp_request_context.quota_deferred = True
@@ -409,7 +441,11 @@ def _fmp_get(endpoint: str, params: Optional[dict] = None) -> Any:
         return []
 
     try:
-        resp = _fmp_session.get(url, params=request_params, timeout=30)
+        resp = _fmp_session.get(
+            url,
+            params=request_params,
+            timeout=settings.FMP_HTTP_TIMEOUT_SECONDS,
+        )
     except requests.exceptions.RetryError:
         # Retry adapter exhausted all attempts — treat as a persistent failure.
         _fmp_quota_exhausted = True
@@ -681,11 +717,20 @@ def fetch_bulk_close_prices(
     tickers: List[str],
     period: str = "14mo",
     chunk_size: int = 100,
+    *,
+    retry_failed_chunks: bool = True,
 ) -> pd.DataFrame:
     """Download close prices for many tickers in batches via Alpaca.
 
     Returns:
         DataFrame with DatetimeIndex and one column per ticker (float close prices).
+
+    When ``retry_failed_chunks`` is False, the first failed or empty batch aborts
+    the download and discards partial data so callers cannot rank an incomplete
+    universe or trigger recursive request splitting. A nonempty batch response
+    can still omit individual symbols; callers that require complete universe
+    coverage must compare returned columns with the requested symbols and report
+    missing coverage explicitly.
 
     """
     cache_key = ("bulk_close_prices", tuple(sorted(tickers)), period)
@@ -720,6 +765,9 @@ def fetch_bulk_close_prices(
 
             if df.empty:
                 print(f"  Batch {batch_num} returned empty data, skipping.")
+                if not retry_failed_chunks:
+                    print("  Bulk download aborted because retries are disabled.")
+                    return pd.DataFrame()
                 continue
 
             # Pivot from MultiIndex (symbol, timestamp) to wide: date × ticker
@@ -734,6 +782,9 @@ def fetch_bulk_close_prices(
             time.sleep(0.5)  # respect Alpaca rate limits
         except Exception as e:
             print(f"  Batch {batch_num} failed: {e}")
+            if not retry_failed_chunks:
+                print("  Bulk download aborted because batch retries are disabled.")
+                return pd.DataFrame()
             if len(chunk) > 1:
                 retry_size = max(1, len(chunk) // 2)
                 print(f"  Retrying failed batch in groups of {retry_size}.")
@@ -741,6 +792,7 @@ def fetch_bulk_close_prices(
                     chunk,
                     period=period,
                     chunk_size=retry_size,
+                    retry_failed_chunks=retry_failed_chunks,
                 )
                 if not recovered.empty:
                     all_frames.append(recovered)
@@ -892,9 +944,17 @@ def validate_ticker(symbol: str) -> bool:
         return False
 
 
-def validate_tickers_bulk(symbols: List[str]) -> List[str]:
+def validate_tickers_bulk(
+    symbols: List[str],
+    *,
+    retry_failed_chunks: bool = True,
+) -> List[str]:
     """Check which tickers are valid using a bulk request to minimize API calls."""
-    df = fetch_bulk_close_prices(symbols, period="5d")
+    df = fetch_bulk_close_prices(
+        symbols,
+        period="5d",
+        retry_failed_chunks=retry_failed_chunks,
+    )
     if df.empty:
         return []
     valid = []

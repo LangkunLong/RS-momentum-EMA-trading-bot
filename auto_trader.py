@@ -25,7 +25,13 @@ from typing import Optional
 
 
 from config import settings
-from core.data_client import fetch_hourly_ohlcv, fetch_latest_intraday_price, fetch_ohlcv
+from core.alpaca_client_policy import alpaca_http_request_budget, single_attempt_alpaca_requests
+from core.data_client import (
+    fetch_hourly_ohlcv,
+    fetch_latest_intraday_price,
+    fetch_ohlcv,
+    fmp_request_budget,
+)
 from core.execution_workflow import EntryExecutionPlan
 from core.order_manager import OrderManager
 from core.order_execution import (
@@ -40,6 +46,12 @@ from enhanced_scanner import scan_for_canslim_stocks
 
 
 ExecutionReadinessCheck = Callable[[], bool]
+# 34 pages cover 550 S&P names plus AAPL over 435 calendar days at 50 symbols
+# per batch and 10,000 rows per Alpaca page. Five other data calls (including
+# the entry-price fallback) plus four read-only entry-state checks make 43 the
+# hard cap for the whole run. A larger response aborts the scan fail-closed.
+_ONE_SYMBOL_SCAN_ALPACA_HTTP_REQUEST_LIMIT = 43
+_ONE_SYMBOL_SCAN_FMP_REQUEST_LIMIT = 3
 
 
 class ExecutionReadinessError(RuntimeError):
@@ -572,6 +584,7 @@ def run_auto_trader(
     skip_entries: bool = False,
     skip_exits: bool = False,
     *,
+    symbol: str | None = None,
     execution_ready: ExecutionReadinessCheck | None = None,
 ) -> AutoTraderCycleResult:
     """Full CANSLIM scan → exit monitoring → entry execution cycle.
@@ -580,10 +593,20 @@ def run_auto_trader(
         dry_run: If True, print all intended actions without submitting orders.
         skip_entries: Skip the entry phase (monitor-only mode).
         skip_exits: Skip the exit check (entry-only mode, use with caution).
+        symbol: One explicit dry-run symbol; configured extra symbols are excluded.
         execution_ready: Dynamic live-monitor readiness check. Required for
             order-enabled execution and propagated to every mutation path.
     """
     require_paper_mode()
+    if symbol is not None:
+        symbol = str(symbol).strip().upper()
+        if not symbol:
+            raise ValueError("An explicit symbol scan requires a non-empty symbol")
+        if not dry_run:
+            raise ValueError("Explicit symbol-scoped runs are dry-run only")
+        if not skip_exits:
+            raise ValueError("Explicit symbol-scoped runs require exit monitoring to be skipped")
+
     mode_label = "DRY RUN" if dry_run else "paper"
     print("=" * 60)
     print(f"CANSLIM AUTO TRADER  [{mode_label}]  {datetime.now().strftime('%Y-%m-%d %H:%M')}")
@@ -619,32 +642,51 @@ def run_auto_trader(
     else:
         print("\n--- Phase 1: Exit monitoring (skipped) ---")
 
-    # --- Phase 2: Scanner ---
-    print("\n--- Phase 2: CANSLIM scan ---")
-    actionable_buys, watchlist_candidates, market_trend = scan_for_canslim_stocks()
-    print(f"Actionable buys from scanner: {len(actionable_buys)}")
-    print(f"Watchlist candidates: {len(watchlist_candidates)}")
-
-    # --- Phase 3: Entries ---
-    if not skip_entries:
-        print("\n--- Phase 3: Entry orders ---")
-        if actionable_buys:
-            if execution_ready is None:
-                entered = execute_entries(actionable_buys, dry_run=dry_run)
-            else:
-                entered = execute_entries(
-                    actionable_buys,
-                    dry_run=dry_run,
-                    execution_ready=execution_ready,
-                )
-            if entered:
-                print(f"Submitted entries for: {', '.join(entered)}")
-            else:
-                print("No new entries submitted.")
+    def _scan_and_execute_entries() -> None:
+        nonlocal entered
+        print("\n--- Phase 2: CANSLIM scan ---")
+        if symbol is None:
+            actionable_buys, watchlist_candidates, _market_trend = scan_for_canslim_stocks()
         else:
+            actionable_buys, watchlist_candidates, _market_trend = scan_for_canslim_stocks(
+                custom_list=[symbol],
+                include_extra_symbols=False,
+                retry_failed_market_data_chunks=False,
+            )
+        print(f"Actionable buys from scanner: {len(actionable_buys)}")
+        print(f"Watchlist candidates: {len(watchlist_candidates)}")
+
+        if skip_entries:
+            print("\n--- Phase 3: Entry orders (skipped) ---")
+            return
+
+        print("\n--- Phase 3: Entry orders ---")
+        if not actionable_buys:
             print("No actionable buys — no entries.")
+            return
+
+        if execution_ready is None:
+            entered = execute_entries(actionable_buys, dry_run=dry_run)
+        else:
+            entered = execute_entries(
+                actionable_buys,
+                dry_run=dry_run,
+                execution_ready=execution_ready,
+            )
+        if entered:
+            print(f"Submitted entries for: {', '.join(entered)}")
+        else:
+            print("No new entries submitted.")
+
+    if symbol is None:
+        _scan_and_execute_entries()
     else:
-        print("\n--- Phase 3: Entry orders (skipped) ---")
+        with (
+            alpaca_http_request_budget(_ONE_SYMBOL_SCAN_ALPACA_HTTP_REQUEST_LIMIT),
+            single_attempt_alpaca_requests(),
+            fmp_request_budget(_ONE_SYMBOL_SCAN_FMP_REQUEST_LIMIT),
+        ):
+            _scan_and_execute_entries()
 
     print("\nAuto-trader cycle complete.")
     return AutoTraderCycleResult(entered=tuple(entered), exited=tuple(exited))
