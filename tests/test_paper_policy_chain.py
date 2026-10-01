@@ -359,7 +359,7 @@ def test_replacement_partial_full_fills_keep_identity_risk_and_protection_after_
         account = replace(
             account,
             account_snapshot_id=f"replacement-valuation:{quantity}",
-            cash=9600 - quantity * 100,
+            cash=9400 - quantity * 100,
             positions=tuple(
                 replace(position, quantity=quantity) if position.symbol == "AAA" else position
                 for position in account.positions
@@ -403,7 +403,7 @@ def test_replacement_partial_full_fills_keep_identity_risk_and_protection_after_
         )
         result = reconcile_chain_snapshot(account, snapshot)
         assert result.ready, result.findings
-        assert result.settled_cash == 9600 - quantity * 100
+        assert result.settled_cash == 9400 - quantity * 100
         assert result.gross_exposure == (quantity + 6) * 100
         assert result.open_position_risk == (quantity + 6) * 10
         assert result.reserved_buy_cash == 1000 + (10 - quantity) * 100
