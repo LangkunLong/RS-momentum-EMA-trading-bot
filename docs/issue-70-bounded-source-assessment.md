@@ -18,7 +18,19 @@ The corrected trace still keys facts by the recorded accession, concept, form, f
 
 The corrected bounded run used the same three issuers (`A`, `AMZN`, `MSFT`) and reopened only their named CompanyFacts and submissions members. All **1,946/1,946** nonempty source-linked sample values had exactly one qualifying match; no period, family, unit, value, or ambiguity disposition remained in this sample. The corrected receipt reused archive SHA-256 attestations from the committed original receipt, checked current paths, byte sizes, expected hashes, and sidecars, and records that the ZIP bytes were not rehashed. It read the six selected members again. The assumption is that the current archives at the same paths and sizes are unchanged.
 
-Fifteen focused tests pass. They exercise both the qualification helper and the bounded archive trace with wrong-period, wrong-duration, wrong-statement-family, wrong-unit, ambiguous, mismatched-value, and missing-origin cases. Each public-trace negative case remains counted as a nonempty exported value without being called a source match.
+Fifteen source-trace tests pass. They exercise both the qualification helper and the bounded archive trace with wrong-period, wrong-duration, wrong-statement-family, wrong-unit, ambiguous, mismatched-value, and missing-origin cases. Each public-trace negative case remains counted as a nonempty exported value without being called a source match.
+
+## Quarterly full-lookback correction
+
+The `8f389406` receipt corrected source-origin matching but still treated the latest four or two *observed* quarterly matches as a complete full-lookback window. That skips wholly absent fiscal quarters and misses a terminal Q4 when an annual filing is visible but has no quarterly Q4 row. The `quarterly-lookback-v2` addendum now measures expected calendar slots through the existing accepted `core.pit_coverage._quarterly_eps_full_window` helper. It anchors only to the latest as-of-visible annual fiscal end with any exported financial value, preserves 84–105-day cadence gaps and unavailable terminal quarters, and never uses an annual amount as a quarterly value. Annual adjacent-available measurements and the pure financial calculator remain unchanged.
+
+The addendum preserves the prior observed-match counts under an explicit observed-period label and separately reports full-window matched slots/readiness. It rehashes the non-ZIP source inputs, requires their hashes and sizes to match the committed corrected receipt, and reuses that receipt's archive digest attestation and source trace. It reopens no ZIP member and emits only quarterly EPS (four slots) and revenue (two slots) profile corrections for the two existing snapshots. The CSV/audit rows are read to recompute those profiles; the CompanyFacts scalar trace is not repeated.
+
+The focused `analyze_export` controls cover an intervening missing quarter, an annual-visible terminal quarter absent from quarterly rows, and a coherent positive history. The first two cases preserve the expected missing slot and report EPS 3/4 plus revenue 1/2; the coherent case reports EPS 4/4 and revenue 2/2. The terminal case includes a later-published annual period to prove the 2021 anchor uses only the visible 2019 annual row.
+
+For retained issuer A, the 2021-01-04 snapshot has annual period end 2020-10-31 visible from 2020-12-21. Its correct EPS slots are missing 2020-10-31, then 2020-07-31, 2020-04-30 and 2020-01-31: three matched of four. Revenue has the missing annual-anchored terminal quarter and one matched July slot. At 2025-12-31, the same pattern is anchored by 2025-10-31, visible from 2025-12-22: three EPS slots matched and one missing, one revenue slot matched and one missing. The previous receipt marked all of A's quarterly profiles ready at both dates; the addendum records these corrected states and periods without changing the earlier receipts.
+
+The versioned evidence is [issue-70-bounded-source-assessment-quarterly-lookback-v2.json](issue-70-bounded-source-assessment-quarterly-lookback-v2.json), 34,505 bytes, SHA-256 `86b6f4c152b2ebbaf090e6dee9a75abc231751b3b402cbf44f99614b64f3ba71`. It binds script SHA-256 `290155b6ea16c330ad00785501610a637d151cd2c1637e2fe7a80960484b165d` and reused the bounded source-trace section with canonical JSON SHA-256 `2f961a64067cf290bfaf36319c496be4941fdafc9441d025a43e760e323170e6`. #70 remains partial/open; this correction does not address its production-universe, identity-lineage, foreign-form, earliest-announcement or universe-wide Q4 requirements.
 
 ## Four project assessment fields
 
@@ -26,14 +38,14 @@ Fifteen focused tests pass. They exercise both the qualification helper and the 
 |---|---|---|
 | **Implementation** | Partial | Added a dedicated offline assessment script and this report/receipt. The shared SEC exporter, bundle builder, financial calculator, and #71 implementation were not edited. |
 | **Required inputs** | Partial | Nine selected files, including both SEC ZIPs, match the alternate export’s declared digests. The alternate export is a separate generation from the acquisition-cache CSV used by the earlier material-only packet; the bridge between generations is not retained. The declared identity-manifest CSV is absent beside this export. |
-| **Acceptance evidence** | Partial | Field/lookback coverage is measured for two dates, source-to-audit alignment is exact, and the corrected three-issuer trace requires exact period, compatible family, and expected unit. Foreign coverage and universe-wide Q4 unit/currency/accounting-basis reconciliation remain unmeasured. |
+| **Acceptance evidence** | Partial | Field/lookback coverage is measured for two dates using expected quarterly slots, source-to-audit alignment is exact, and the corrected three-issuer trace requires exact period, compatible family, and expected unit. Foreign coverage and universe-wide Q4 unit/currency/accounting-basis reconciliation remain unmeasured. |
 | **Dependencies** | Start condition met; acceptance still gated | The accepted #66 scope supplies the start contract. Production acceptance still needs the eligible #68 membership/security identities and data lineage; the old S&P-only seed used here does not satisfy that gate. |
 
 ## Acceptance criteria status
 
 | #70 criterion | Status | Evidence and remaining limit |
 |---|---|---|
-| Actual field and historical lookback coverage by security/date | **Partial** | Two historical member dates are measured below, including each requested field’s lookback readiness. The universe is the retained S&P seed, not the production three-universe set, and this is not a daily all-session matrix. |
+| Actual field and historical lookback coverage by security/date | **Partial** | Two historical member dates are measured below using complete quarterly calendar slots. The universe is the retained S&P seed, not the production three-universe set, and this is not a daily all-session matrix. |
 | Supported forms, Q4 treatment, concepts, and unavailable inputs explicit | **Partial** | Exported forms and observed concepts are counted; two quarterly rows carry an explicit `Q4` tag. Most rows tagged `Q4` are annual/balance statement rows, and same-concept FY/Q1–Q3 groups are only candidates. Foreign forms and currency/unit reconciliation are unavailable at universe scale. No Q4 values were derived. |
 | Public availability separate from period end; retain necessary lookback | **Partial** | All 145,010 rows have separate `period_end` and `public_date`; all 145,010 dates reproduce the supplied-calendar rule and all satisfy `public_date > period_end`. Periods reach 2006 while availability begins at the first supplied session in 2020. These are filing-availability dates, not earliest earnings-release dates. |
 | Filing/fiscal policy implemented and measured, including Q4/foreign treatment | **Partial** | The accepted quarterly matcher and #71 cadence are measured without changing them. Filing-time evidence and Q4 tags are explicit. This export emits no 20-F/6-K, carries no country field, and does not establish foreign treatment. It cannot be called complete policy coverage. |
@@ -65,7 +77,7 @@ The alternate provenance declares identity-manifest SHA-256 `2dbf5357a98d2deca9a
 ## Method and pinned meanings
 
 - The snapshots are `2021-01-04` and `2025-12-31`, using the retained 606-ticker membership-event seed. The script takes the latest member state on or before each date and the latest `public_date` vintage per ticker/statement/period, as of that date.
-- Quarterly EPS uses four latest YoY slots; quarterly revenue uses two. The exact shared #66 matcher is used with its 28-day prior-calendar-year tolerance. A blank latest quarterly field stays as an unmatched slot; it cannot silently expose an older value.
+- Quarterly EPS full lookback uses four expected YoY calendar slots; quarterly revenue uses two. The accepted `_quarterly_eps_full_window` helper anchors an unavailable terminal quarter at the latest visible annual fiscal end and retains missing/intervening/short-cadence slots. The exact shared #66 fiscal matcher supplies YoY comparisons with its 28-day prior-calendar-year tolerance. Observed-pair diagnostics are labeled separately from full-window readiness.
 - Annual EPS, revenue, and net-income profiles use adjacent available annual observations, with missing values dropped as in the accepted annual growth helper. Three growth slots require four available observations. A prior value must be positive for a slot to count. These are input/readiness counts, not CANSLIM scores.
 - The quarterly acceleration candidate counts require the latest two matched growth pairs and the pinned #71 84–105-day quarter-end gap. They do not calculate an acceleration magnitude or claim strategy readiness.
 - ROE input availability combines the latest nonmissing annual net income with the latest nonmissing balance-sheet equity by period end, as of the date. It reports availability only; it does not calculate ROE.
@@ -81,9 +93,9 @@ The alternate export contains 145,010 rows for 566 tickers: 42,000 quarterly, 15
 
 | Export scalar presence (all statement types) | Nonempty rows / tickers | 2021-01-04 full lookback | 2025-12-31 full lookback |
 |---|---:|---:|---:|
-| Quarterly basic EPS, 4 YoY slots | 54,423 / 557 | 366 / 505 | 394 / 503 |
-| Quarterly diluted EPS, 4 YoY slots | 54,519 / 557 | 366 / 505 | 394 / 503 |
-| Quarterly revenue, 2 YoY slots | 46,453 / 553 | 426 / 505 | 463 / 503 |
+| Quarterly basic EPS, 4 YoY slots | 54,423 / 557 | 0 / 505 | 0 / 503 |
+| Quarterly diluted EPS, 4 YoY slots | 54,519 / 557 | 0 / 505 | 0 / 503 |
+| Quarterly revenue, 2 YoY slots | 46,453 / 553 | 364 / 505 | 395 / 503 |
 | Annual basic EPS, 3 adjacent growth slots | 54,423 / 557 | 382 / 505 | 411 / 503 |
 | Annual diluted EPS, 3 adjacent growth slots | 54,519 / 557 | 383 / 505 | 411 / 503 |
 | Annual revenue, 3 adjacent growth slots | 46,453 / 553 | 421 / 505 | 475 / 503 |
@@ -159,4 +171,16 @@ python tools\assess_issue70_retained_source.py `
   --output .artifacts\coordination\issue70-corrected-reproduction.json
 ```
 
-Fifteen focused tests passed with `python -m pytest tests/test_assess_issue70_retained_source.py -q -p no:cacheprovider --no-cov`. The full suite was not run. The CLI help and corrected bounded assessment were run; a live GitHub refresh from this worktree was unavailable through the configured proxy, so the report uses the lead-captured OPEN issue body.
+Regenerate only the quarterly lookback revision, reusing the committed corrected receipt's source/archive attestations and source trace:
+
+```powershell
+python tools\assess_issue70_retained_source.py `
+  --input-dir 'C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.artifacts\data\sec-fundamentals' `
+  --membership-csv 'C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.artifacts\data\acquisition\acquisition\raw\local-cache\prices\membership.csv' `
+  --trading-days-csv 'C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.artifacts\data\acquisition\acquisition\raw\local-cache\prices\spy_trading_days.csv' `
+  --comparison-import-provenance 'C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.artifacts\data\acquisition\acquisition\raw\local-cache\import-provenance.json' `
+  --quarterly-lookback-revision-from docs\issue-70-bounded-source-assessment-receipt-corrected.json `
+  --output docs\issue-70-bounded-source-assessment-quarterly-lookback-v2.json
+```
+
+Eighteen focused tests passed with `python -m pytest tests/test_assess_issue70_retained_source.py -q -p no:cacheprovider --no-cov`. This includes the 15 source-trace controls and three real `analyze_export` calendar-slot controls. The full suite was not run. The CLI help and bounded assessments were run; a live GitHub refresh from this worktree was unavailable through the configured proxy, so the report uses the lead-captured OPEN issue body.

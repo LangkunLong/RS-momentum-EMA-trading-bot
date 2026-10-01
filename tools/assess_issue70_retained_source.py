@@ -29,6 +29,7 @@ import pandas as pd
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
+from core.pit_coverage import _quarterly_eps_full_window  # noqa: E402
 from core.canslim.fiscal_periods import (  # noqa: E402
     FISCAL_YOY_TOLERANCE_DAYS,
     match_fiscal_year_over_year_periods,
@@ -277,21 +278,30 @@ def verify_inputs(
     archive_digest_reuse: dict[str, Any] | None = None
     if reuse_archive_digests_from is not None:
         prior_path = reuse_archive_digests_from.resolve()
-        required_prior_path = (
-            REPO_ROOT / "docs/issue-70-bounded-source-assessment-receipt.json"
-        ).resolve()
-        if os.path.normcase(str(prior_path)) != os.path.normcase(
-            str(required_prior_path)
-        ):
-            raise ValueError("Archive digest reuse is limited to the committed original receipt")
+        allowed_prior_paths = {
+            "docs/issue-70-bounded-source-assessment-receipt.json",
+            "docs/issue-70-bounded-source-assessment-receipt-corrected.json",
+        }
+        try:
+            prior_relative_path = prior_path.relative_to(REPO_ROOT).as_posix()
+        except ValueError as exc:
+            raise ValueError(
+                "Archive digest reuse is limited to a committed issue #70 receipt"
+            ) from exc
+        if prior_relative_path not in allowed_prior_paths:
+            raise ValueError(
+                "Archive digest reuse is limited to a committed issue #70 receipt"
+            )
         try:
             committed_prior_bytes = subprocess.check_output(
-                ["git", "show", "HEAD:docs/issue-70-bounded-source-assessment-receipt.json"],
+                ["git", "show", f"HEAD:{prior_relative_path}"],
                 cwd=REPO_ROOT,
                 stderr=subprocess.DEVNULL,
             )
         except (OSError, subprocess.CalledProcessError) as exc:
-            raise ValueError("Cannot verify the prior receipt against the current commit") from exc
+            raise ValueError(
+                "Cannot verify the prior receipt against the current commit"
+            ) from exc
         prior_bytes_for_commit_check = prior_path.read_bytes().replace(b"\r\n", b"\n")
         if prior_bytes_for_commit_check != committed_prior_bytes.replace(b"\r\n", b"\n"):
             raise ValueError("Prior receipt content differs from the committed original receipt")
@@ -670,6 +680,7 @@ def analyze_export(
     membership_path: Path,
     trading_days_path: Path,
     security_master: dict[str, dict[str, str]],
+    growth_profile_filter: set[str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]], dict[str, list[dict[str, Any]]]]:
     field_rows = Counter()
     field_tickers: dict[str, set[str]] = defaultdict(set)
@@ -806,13 +817,45 @@ def analyze_export(
             for ticker in SAMPLE_TICKERS
             if ticker in members
         }
+        latest_visible_annual_period_end: dict[str, date | None] = {}
+        latest_visible_annual_public_date: dict[str, date | None] = {}
+        for ticker in members:
+            visible_annual_periods = [
+                period
+                for (row_statement, period), tied_rows in snapshot_data[ticker].items()
+                if row_statement == "annual"
+                and any(
+                    any(value is not None for value in row["values"].values())
+                    for row in tied_rows
+                )
+            ]
+            latest_visible_annual_period_end[ticker] = max(
+                visible_annual_periods, default=None
+            )
+            anchor_period = latest_visible_annual_period_end[ticker]
+            anchor_rows = (
+                snapshot_data[ticker].get(("annual", anchor_period), [])
+                if anchor_period is not None
+                else []
+            )
+            latest_visible_annual_public_date[ticker] = max(
+                (row["public_date"] for row in anchor_rows if row["public_date"] is not None),
+                default=None,
+            )
+
         for statement, field, required_slots in GROWTH_PROFILES:
-            slot_histogram = Counter()
+            profile_key = f"{statement}.{field}"
+            if growth_profile_filter is not None and profile_key not in growth_profile_filter:
+                continue
+            observed_slot_histogram = Counter()
+            full_window_slot_histogram = Counter()
             ready_tickers = 0
-            matched_pair_total = 0
+            observed_pair_total = 0
+            full_window_pair_total = 0
             nonempty_tickers = 0
             available_observations = 0
             for ticker in sorted(members):
+                annual_anchor = latest_visible_annual_period_end[ticker]
                 period_values: list[tuple[date, list[float | None]]] = []
                 for (row_statement, period), tied_rows in snapshot_data[ticker].items():
                     if row_statement != statement:
@@ -821,17 +864,60 @@ def analyze_export(
                         (period, [row["values"].get(field) for row in tied_rows])
                     )
                 if not period_values:
-                    slot_histogram[0] += 1
+                    observed_slot_histogram[0] += 1
+                    full_window = (
+                        _quarterly_eps_full_window(
+                            None,
+                            required_slots,
+                            latest_visible_fiscal_period_end=annual_anchor,
+                        )
+                        if statement == "quarterly"
+                        else None
+                    )
+                    full_eligible_slots = 0
+                    if full_window is not None:
+                        full_eligible_slots = sum(
+                            slot["status"] == "matched"
+                            for slot in full_window["slots"]
+                        )
+                    full_window_slot_histogram[full_eligible_slots] += 1
                     if ticker in per_security_sample:
-                        per_security_sample[ticker]["profile_coverage"][
-                            f"{statement}.{field}"
-                        ] = {
+                        profile_coverage = {
                             "current_value_observation_count": 0,
                             "period_observation_count": 0,
-                            "eligible_yoy_pair_count_in_recent_slots": 0,
+                            "eligible_yoy_pair_count_in_recent_observations": 0,
+                            "eligible_yoy_pair_count_in_full_lookback_slots": full_eligible_slots,
                             "required_yoy_slots": required_slots,
-                            "ready_for_full_lookback": False,
+                            "ready_for_full_lookback": bool(
+                                full_window and full_window["ready"]
+                            ),
                         }
+                        if full_window is not None:
+                            profile_coverage.update(
+                                {
+                                    "latest_visible_annual_fiscal_period_end": (
+                                        annual_anchor.isoformat()
+                                        if annual_anchor is not None
+                                        else None
+                                    ),
+                                    "latest_visible_annual_public_date": (
+                                        latest_visible_annual_public_date[ticker].isoformat()
+                                        if latest_visible_annual_public_date[ticker]
+                                        is not None
+                                        else None
+                                    ),
+                                    "full_lookback_slot_current_period_ends": [
+                                        slot["current_period_end"]
+                                        for slot in full_window["slots"]
+                                    ],
+                                    "full_lookback_missing_slot_reason_counts": full_window[
+                                        "missing_slot_reason_counts"
+                                    ],
+                                }
+                            )
+                        per_security_sample[ticker]["profile_coverage"][
+                            f"{statement}.{field}"
+                        ] = profile_coverage
                     continue
                 current_values = [
                     value for _, values in period_values for value in values if value is not None
@@ -853,15 +939,25 @@ def analyze_export(
                         pd.Series(series_values, index=series_dates),
                         tolerance_days=FISCAL_YOY_TOLERANCE_DAYS,
                     )
-                    recent_slots = matches[:required_slots]
-                    eligible_slots = sum(
+                    observed_slots = matches[:required_slots]
+                    observed_eligible_slots = sum(
                         1
-                        for item in recent_slots
+                        for item in observed_slots
                         if item.matched
                         and parse_number(str(item.current_value)) is not None
                         and parse_number(str(item.prior_value)) is not None
                         and float(item.prior_value) > 0
                     )
+                    full_window = _quarterly_eps_full_window(
+                        pd.Series(series_values, index=series_dates),
+                        required_slots,
+                        latest_visible_fiscal_period_end=annual_anchor,
+                    )
+                    full_window_slots = full_window["slots"]
+                    full_eligible_slots = sum(
+                        slot["status"] == "matched" for slot in full_window_slots
+                    )
+                    full_window_ready = full_window["ready"]
                 else:
                     # The accepted annual policy uses adjacent available annual
                     # observations (after missing values are dropped), not the
@@ -872,42 +968,77 @@ def analyze_export(
                         if present_values and all(value == present_values[0] for value in present_values):
                             annual_values.append((period, present_values[0]))
                     annual_values.sort(key=lambda item: item[0], reverse=True)
-                    recent_slots = list(
+                    observed_slots = list(
                         zip(annual_values, annual_values[1:], strict=False)
                     )[:required_slots]
-                    eligible_slots = sum(
+                    observed_eligible_slots = sum(
                         1
-                        for (current_period, current), (prior_period, prior) in recent_slots
+                        for (current_period, current), (prior_period, prior) in observed_slots
                         if current_period > prior_period
                         and math.isfinite(current)
                         and math.isfinite(prior)
                         and prior > 0
                     )
-                slot_histogram[eligible_slots] += 1
-                matched_pair_total += eligible_slots
-                if len(recent_slots) == required_slots and eligible_slots == required_slots:
+                    full_window = None
+                    full_eligible_slots = observed_eligible_slots
+                    full_window_ready = (
+                        len(observed_slots) == required_slots
+                        and full_eligible_slots == required_slots
+                    )
+                observed_slot_histogram[observed_eligible_slots] += 1
+                full_window_slot_histogram[full_eligible_slots] += 1
+                observed_pair_total += observed_eligible_slots
+                full_window_pair_total += full_eligible_slots
+                if full_window_ready:
                     ready_tickers += 1
                 if ticker in per_security_sample:
-                    per_security_sample[ticker]["profile_coverage"][
-                        f"{statement}.{field}"
-                        ] = {
+                    profile_coverage = {
                         "current_value_observation_count": len(current_values),
                         "period_observation_count": len(period_values),
-                        "eligible_yoy_pair_count_in_recent_slots": eligible_slots,
+                        "eligible_yoy_pair_count_in_recent_observations": observed_eligible_slots,
+                        "eligible_yoy_pair_count_in_full_lookback_slots": full_eligible_slots,
                         "required_yoy_slots": required_slots,
-                        "ready_for_full_lookback": (
-                            len(recent_slots) == required_slots
-                            and eligible_slots == required_slots
-                        ),
                     }
-            profile_key = f"{statement}.{field}"
+                    if full_window is not None:
+                        profile_coverage.update(
+                            {
+                                "latest_visible_annual_fiscal_period_end": (
+                                    annual_anchor.isoformat()
+                                    if annual_anchor is not None
+                                    else None
+                                ),
+                                "latest_visible_annual_public_date": (
+                                    latest_visible_annual_public_date[ticker].isoformat()
+                                    if latest_visible_annual_public_date[ticker]
+                                    is not None
+                                    else None
+                                ),
+                                "full_lookback_slot_current_period_ends": [
+                                    slot["current_period_end"]
+                                    for slot in full_window_slots
+                                ],
+                                "full_lookback_missing_slot_reason_counts": full_window[
+                                    "missing_slot_reason_counts"
+                                ],
+                            }
+                        )
+                    profile_coverage["ready_for_full_lookback"] = full_window_ready
+                    per_security_sample[ticker]["profile_coverage"][
+                        f"{statement}.{field}"
+                    ] = profile_coverage
             profile_results[profile_key] = {
                 "required_yoy_slots": required_slots,
                 "members_with_any_current_value": nonempty_tickers,
                 "current_observation_count_within_member_asof_rows": available_observations,
-                "eligible_yoy_pair_count_in_recent_slots": matched_pair_total,
-                "members_by_eligible_slot_count": {
-                    str(key): slot_histogram[key] for key in range(required_slots + 1)
+                "eligible_yoy_pair_count_in_recent_observations": observed_pair_total,
+                "members_by_observed_eligible_slot_count": {
+                    str(key): observed_slot_histogram[key]
+                    for key in range(required_slots + 1)
+                },
+                "eligible_yoy_pair_count_in_full_lookback_slots": full_window_pair_total,
+                "members_by_full_lookback_matched_slot_count": {
+                    str(key): full_window_slot_histogram[key]
+                    for key in range(required_slots + 1)
                 },
                 "members_ready_for_full_lookback": ready_tickers,
             }
@@ -1764,6 +1895,206 @@ def make_receipt(args: argparse.Namespace) -> dict[str, Any]:
     return receipt
 
 
+def make_quarterly_lookback_revision(args: argparse.Namespace) -> dict[str, Any]:
+    prior_path = args.quarterly_lookback_revision_from.resolve()
+    required_prior_path = (
+        REPO_ROOT / "docs/issue-70-bounded-source-assessment-receipt-corrected.json"
+    ).resolve()
+    if os.path.normcase(str(prior_path)) != os.path.normcase(
+        str(required_prior_path)
+    ):
+        raise ValueError(
+            "Quarterly lookback revision must reference the committed corrected receipt"
+        )
+    prior_receipt = read_json(prior_path)
+    source_dir = args.input_dir.resolve()
+    membership_path = args.membership_csv.resolve()
+    trading_days_path = args.trading_days_csv.resolve()
+    comparison_path = (
+        args.comparison_import_provenance.resolve()
+        if args.comparison_import_provenance
+        else None
+    )
+    identity, _provenance, _generation_comparison = verify_inputs(
+        source_dir,
+        membership_path,
+        trading_days_path,
+        comparison_path,
+        prior_path,
+    )
+
+    prior_source = prior_receipt.get("source_identity", {})
+    if (
+        identity.get("fundamentals_provenance_sha256")
+        != prior_source.get("fundamentals_provenance_sha256")
+    ):
+        raise ValueError("Current fundamentals provenance differs from the prior receipt")
+    if (
+        identity.get("publication_marker", {}).get("actual_sha256")
+        != prior_source.get("publication_marker", {}).get("actual_sha256")
+    ):
+        raise ValueError("Current publication marker differs from the prior receipt")
+
+    prior_checks = {
+        item.get("file"): item
+        for item in prior_source.get("verified_inputs", [])
+        if isinstance(item, dict)
+    }
+    for current in identity["verified_inputs"]:
+        previous = prior_checks.get(current["file"])
+        if (
+            previous is None
+            or current["bytes"] != previous.get("bytes")
+            or current["expected_sha256"] != previous.get("expected_sha256")
+            or current["actual_sha256"] != previous.get("actual_sha256")
+            or current["matches_export_provenance"] is not True
+        ):
+            raise ValueError(
+                f"Current input differs from the prior receipt: {current['file']}"
+            )
+
+    master = {
+        row["ticker"]: row
+        for row in read_csv_rows(source_dir / "security_master.csv")
+    }
+    quarterly_profile_keys = {
+        f"quarterly.{field}"
+        for statement, field, _required_slots in GROWTH_PROFILES
+        if statement == "quarterly"
+    }
+    analysis, _sample_export_rows, _audit_samples = analyze_export(
+        source_dir,
+        membership_path,
+        trading_days_path,
+        master,
+        growth_profile_filter=quarterly_profile_keys,
+    )
+
+    revised_snapshots: dict[str, Any] = {}
+    for snapshot_date, snapshot in analysis["snapshot_coverage"].items():
+        prior_snapshot = prior_receipt["measurement"]["snapshots"][snapshot_date]
+        revised_profiles: dict[str, Any] = {}
+        for profile_key in sorted(quarterly_profile_keys):
+            previous = prior_snapshot["profile_coverage"][profile_key]
+            current = snapshot["profile_coverage"][profile_key]
+            sample_coverage = {
+                ticker: profile_rows["profile_coverage"].get(profile_key)
+                for ticker, profile_rows in snapshot[
+                    "sample_security_asof_coverage"
+                ].items()
+                if profile_key in profile_rows["profile_coverage"]
+            }
+            revised_profiles[profile_key] = {
+                "required_yoy_slots": current["required_yoy_slots"],
+                "prior_observed_period_assessment": {
+                    "eligible_yoy_pair_count_in_recent_slots": previous[
+                        "eligible_yoy_pair_count_in_recent_slots"
+                    ],
+                    "members_by_eligible_slot_count": previous[
+                        "members_by_eligible_slot_count"
+                    ],
+                    "members_marked_ready_for_full_lookback": previous[
+                        "members_ready_for_full_lookback"
+                    ],
+                },
+                "revised_observed_period_diagnostic": {
+                    "eligible_yoy_pair_count_in_recent_observations": current[
+                        "eligible_yoy_pair_count_in_recent_observations"
+                    ],
+                    "members_by_observed_eligible_slot_count": current[
+                        "members_by_observed_eligible_slot_count"
+                    ],
+                },
+                "revised_full_lookback_measure": {
+                    "eligible_yoy_pair_count_in_full_lookback_slots": current[
+                        "eligible_yoy_pair_count_in_full_lookback_slots"
+                    ],
+                    "members_by_full_lookback_matched_slot_count": current[
+                        "members_by_full_lookback_matched_slot_count"
+                    ],
+                    "members_ready_for_full_lookback": current[
+                        "members_ready_for_full_lookback"
+                    ],
+                },
+                "sample_security_asof_coverage": sample_coverage,
+            }
+        revised_snapshots[snapshot_date] = {
+            "membership_count": snapshot["membership_count"],
+            "quarterly_profiles": revised_profiles,
+        }
+
+    prior_trace = prior_receipt["measurement"]["bounded_archive_sample"]
+    trace_digest = sha256_bytes(
+        json.dumps(prior_trace, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    )
+    return {
+        "schema_version": 1,
+        "assessment_id": "historical-05-issue-70-quarterly-lookback-revision",
+        "revision_id": "2026-10-01-quarterly-calendar-window-v2",
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "revision_scope": {
+            "profiles": sorted(quarterly_profile_keys),
+            "quarterly_eps_required_slots": 4,
+            "quarterly_revenue_required_slots": 2,
+            "annual_profiles_changed": False,
+            "production_calculator_changed": False,
+            "selection_rule": "Latest as-of-visible annual period end with any observed exported financial scalar anchors an unavailable terminal fiscal-quarter slot when it is later than the newest quarterly row. The annual scalar is never used as a quarterly value.",
+            "slot_semantics": "Uses core.pit_coverage._quarterly_eps_full_window, preserving accepted 84–105-day adjacent-quarter cadence, missing intervening periods, unavailable terminal Q4, and short-cadence placeholders; fiscal YoY values use the accepted 28-day matcher.",
+        },
+        "code_identity": {
+            "repository_head": git_output("rev-parse", "HEAD"),
+            "assessment_script_sha256": sha256_file(Path(__file__).resolve()),
+            "quarterly_full_window_helper": "core.pit_coverage._quarterly_eps_full_window",
+            "quarterly_full_window_helper_git_blob": git_output(
+                "rev-parse", "HEAD:core/pit_coverage.py"
+            ),
+            "fiscal_matcher_git_blob": git_output(
+                "rev-parse", "HEAD:core/canslim/fiscal_periods.py"
+            ),
+            "financial_calculator_identity": "pit-financial-features-v3",
+            "financial_calculator_git_blob": git_output(
+                "rev-parse", "HEAD:core/pit_feature_snapshot.py"
+            ),
+        },
+        "prior_receipt": {
+            "path": str(prior_path),
+            "sha256": sha256_file(prior_path),
+            "assessment_script_sha256": prior_receipt["code_identity"][
+                "script_sha256"
+            ],
+            "repository_head_at_prior_measurement": prior_receipt["code_identity"][
+                "repository_head"
+            ],
+        },
+        "source_identity": identity,
+        "source_trace_reuse": {
+            "reused_from_prior_receipt": True,
+            "bounded_archive_sample_sha256_canonical_json": trace_digest,
+            "bounded_archive_sample_company_count": prior_trace[
+                "bounded_company_count"
+            ],
+            "archive_members_reopened": 0,
+            "origin_trace_recomputed": False,
+            "archive_sha256_mode": identity["archive_digest_reuse"][
+                "verification_mode"
+            ],
+            "archive_content_rehashed_for_this_revision": False,
+        },
+        "recalculated_measurements": {
+            "export_rows_read": analysis["export"]["row_count"],
+            "audit_rows_read": analysis["audit"]["row_count"],
+            "snapshots": revised_snapshots,
+        },
+        "interpretation_limits": [
+            "This revision updates only quarterly EPS four-slot and revenue two-slot full-lookback measurements for the two existing snapshots; non-quarterly fields and source-origin trace are reused by receipt identity.",
+            "Source CSV, audit, membership, calendar, security-master, and coverage inputs are rehashed and required to match the prior receipt. The two SEC archive whole-file digest attestations are reused from the committed corrected receipt under its same-path/same-size assumption; ZIP members and scalar source-origin trace are not reopened.",
+            "The bounded S&P seed remains partial #70 evidence. This correction does not establish production three-universe identity, foreign forms, earliest earnings announcements, universe-wide Q4 reconciliation, or strategy scores.",
+        ],
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-dir", type=Path, required=True)
@@ -1773,15 +2104,35 @@ def main() -> int:
     parser.add_argument(
         "--reuse-archive-digests-from",
         type=Path,
-        help="Reuse authenticated SEC archive SHA-256 values from a prior receipt after identity and byte-size checks.",
+        help=(
+            "Reuse authenticated SEC archive SHA-256 values from a committed "
+            "issue #70 receipt after identity and byte-size checks."
+        ),
+    )
+    parser.add_argument(
+        "--quarterly-lookback-revision-from",
+        type=Path,
+        help=(
+            "Write a quarterly full-lookback addendum from the committed corrected "
+            "receipt without repeating its SEC archive trace."
+        ),
     )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.reuse_archive_digests_from and args.quarterly_lookback_revision_from:
+        parser.error(
+            "--reuse-archive-digests-from and --quarterly-lookback-revision-from "
+            "cannot be used together"
+        )
     output_path = args.output.resolve()
     if not output_path.is_relative_to(REPO_ROOT):
         parser.error("--output must be inside the repository workspace")
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    receipt = make_receipt(args)
+    receipt = (
+        make_quarterly_lookback_revision(args)
+        if args.quarterly_lookback_revision_from
+        else make_receipt(args)
+    )
     output_path.write_text(
         json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -1790,14 +2141,25 @@ def main() -> int:
         "Verified source inputs: "
         + str(len(receipt["source_identity"]["verified_inputs"]))
     )
-    print(
-        "Export rows / audit rows / snapshots: "
-        + str(receipt["measurement"]["export"]["row_count"])
-        + " / "
-        + str(receipt["measurement"]["audit"]["row_count"])
-        + " / "
-        + ", ".join(receipt["measurement"]["snapshots"].keys())
-    )
+    if "recalculated_measurements" in receipt:
+        measurement = receipt["recalculated_measurements"]
+        print(
+            "Lookback revision rows / snapshots: "
+            + str(measurement["export_rows_read"])
+            + " / "
+            + str(measurement["audit_rows_read"])
+            + " / "
+            + ", ".join(measurement["snapshots"].keys())
+        )
+    else:
+        print(
+            "Export rows / audit rows / snapshots: "
+            + str(receipt["measurement"]["export"]["row_count"])
+            + " / "
+            + str(receipt["measurement"]["audit"]["row_count"])
+            + " / "
+            + ", ".join(receipt["measurement"]["snapshots"].keys())
+        )
     return 0
 
 

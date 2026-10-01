@@ -1,0 +1,756 @@
+{
+  "assessment_id": "historical-05-issue-70-quarterly-lookback-revision",
+  "code_identity": {
+    "assessment_script_sha256": "290155b6ea16c330ad00785501610a637d151cd2c1637e2fe7a80960484b165d",
+    "financial_calculator_git_blob": "71e562ffc00dc4e617f1cd625e3f13ea5fe3f81a",
+    "financial_calculator_identity": "pit-financial-features-v3",
+    "fiscal_matcher_git_blob": "14c3c994f70a06f7897288a0d397672dbf897d89",
+    "quarterly_full_window_helper": "core.pit_coverage._quarterly_eps_full_window",
+    "quarterly_full_window_helper_git_blob": "431f95230ca18438cfce3e442e83ecc7c87c2d56",
+    "repository_head": "8f389406f1c7339662387d446cbbffd997b810e8"
+  },
+  "generated_at_utc": "2026-10-01T20:01:29.028817+00:00",
+  "interpretation_limits": [
+    "This revision updates only quarterly EPS four-slot and revenue two-slot full-lookback measurements for the two existing snapshots; non-quarterly fields and source-origin trace are reused by receipt identity.",
+    "Source CSV, audit, membership, calendar, security-master, and coverage inputs are rehashed and required to match the prior receipt. The two SEC archive whole-file digest attestations are reused from the committed corrected receipt under its same-path/same-size assumption; ZIP members and scalar source-origin trace are not reopened.",
+    "The bounded S&P seed remains partial #70 evidence. This correction does not establish production three-universe identity, foreign forms, earliest earnings announcements, universe-wide Q4 reconciliation, or strategy scores."
+  ],
+  "prior_receipt": {
+    "assessment_script_sha256": "c26a9de43bcf12c11f9f802df12c273301553dfa3f06f21affcec0beaaae3c46",
+    "path": "C:\\Users\\llong\\.codex\\worktrees\\f1ba\\RS-momentum-EMA-trading-bot\\docs\\issue-70-bounded-source-assessment-receipt-corrected.json",
+    "repository_head_at_prior_measurement": "174faca79cecfa0a710bbc4112fd2c81f225f281",
+    "sha256": "7e690f3a6e0dd116f5a0b20267fcf6e8eebdd37ba9271eafbb8675c62819c5a8"
+  },
+  "recalculated_measurements": {
+    "audit_rows_read": 145010,
+    "export_rows_read": 145010,
+    "snapshots": {
+      "2021-01-04": {
+        "membership_count": 505,
+        "quarterly_profiles": {
+          "quarterly.basic_eps": {
+            "prior_observed_period_assessment": {
+              "eligible_yoy_pair_count_in_recent_slots": 1654,
+              "members_by_eligible_slot_count": {
+                "0": 63,
+                "1": 9,
+                "2": 20,
+                "3": 47,
+                "4": 366
+              },
+              "members_marked_ready_for_full_lookback": 366
+            },
+            "required_yoy_slots": 4,
+            "revised_full_lookback_measure": {
+              "eligible_yoy_pair_count_in_full_lookback_slots": 1238,
+              "members_by_full_lookback_matched_slot_count": {
+                "0": 67,
+                "1": 17,
+                "2": 42,
+                "3": 379,
+                "4": 0
+              },
+              "members_ready_for_full_lookback": 0
+            },
+            "revised_observed_period_diagnostic": {
+              "eligible_yoy_pair_count_in_recent_observations": 1654,
+              "members_by_observed_eligible_slot_count": {
+                "0": 63,
+                "1": 9,
+                "2": 20,
+                "3": 47,
+                "4": 366
+              }
+            },
+            "sample_security_asof_coverage": {
+              "A": {
+                "current_value_observation_count": 37,
+                "eligible_yoy_pair_count_in_full_lookback_slots": 3,
+                "eligible_yoy_pair_count_in_recent_observations": 4,
+                "full_lookback_missing_slot_reason_counts": {
+                  "missing_fiscal_quarter_period": 1
+                },
+                "full_lookback_slot_current_period_ends": [
+                  "2020-10-31",
+                  "2020-07-31",
+                  "2020-04-30",
+                  "2020-01-31"
+                ],
+                "latest_visible_annual_fiscal_period_end": "2020-10-31",
+                "latest_visible_annual_public_date": "2020-12-21",
+                "period_observation_count": 37,
+                "ready_for_full_lookback": false,
+                "required_yoy_slots": 4
+              },
+              "AMZN": {
+                "current_value_observation_count": 38,
+                "eligible_yoy_pair_count_in_full_lookback_slots": 3,
+                "eligible_yoy_pair_count_in_recent_observations": 4,
+                "full_lookback_missing_slot_reason_counts": {
+                  "missing_fiscal_quarter_period": 1
+                },
+                "full_lookback_slot_current_period_ends": [
+                  "2020-09-30",
+                  "2020-06-30",
+                  "2020-03-31",
+                  null
+                ],
+                "latest_visible_annual_fiscal_period_end": "2019-12-31",
+                "latest_visible_annual_public_date": "2020-02-03",
+                "period_observation_count": 38,
+                "ready_for_full_lookback": false,
+                "required_yoy_slots": 4
+              },
+              "MSFT": {
+                "current_value_observation_count": 37,
+                "eligible_yoy_pair_count_in_full_lookback_slots": 3,
+                "eligible_yoy_pair_count_in_recent_observations": 4,
+                "full_lookback_missing_slot_reason_counts": {
+                  "missing_fiscal_quarter_period": 1
+                },
+                "full_lookback_slot_current_period_ends": [
+                  "2020-09-30",
+                  null,
+                  "2020-03-31",
+                  "2019-12-31"
+                ],
+                "latest_visible_annual_fiscal_period_end": "2020-06-30",
+                "latest_visible_annual_public_date": "2020-08-03",
+                "period_observation_count": 37,
+                "ready_for_full_lookback": false,
+                "required_yoy_slots": 4
+              }
+            }
+          },
+          "quarterly.diluted_eps": {
+            "prior_observed_period_assessment": {
+              "eligible_yoy_pair_count_in_recent_slots": 1653,
+              "members_by_eligible_slot_count": {
+                "0": 63,
+                "1": 10,
+                "2": 19,
+                "3": 47,
+                "4": 366
+              },
+              "members_marked_ready_for_full_lookback": 366
+            },
+            "required_yoy_slots": 4,
+            "revised_full_lookback_measure": {
+              "eligible_yoy_pair_count_in_full_lookback_slots": 1237,
+              "members_by_full_lookback_matched_slot_count": {
+                "0": 68,
+                "1": 16,
+                "2": 42,
+                "3": 379,
+                "4": 0
+              },
+              "members_ready_for_full_lookback": 0
+            },
+            "revised_observed_period_diagnostic": {
+              "eligible_yoy_pair_count_in_recent_observations": 1653,
+              "members_by_observed_eligible_slot_count": {
+                "0": 63,
+                "1": 10,
+                "2": 19,
+                "3": 47,
+                "4": 366
+              }
+            },
+            "sample_security_asof_coverage": {
+              "A": {
+                "current_value_observation_count": 37,
+                "eligible_yoy_pair_count_in_full_lookback_slots": 3,
+                "eligible_yoy_pair_count_in_recent_observations": 4,
+                "full_lookback_missing_slot_reason_counts": {
+                  "missing_fiscal_quarter_period": 1
+                },
+                "full_lookback_slot_current_period_ends": [
+                  "2020-10-31",
+                  "2020-07-31",
+                  "2020-04-30",
+                  "2020-01-31"
+                ],
+                "latest_visible_annual_fiscal_period_end": "2020-10-31",
+                "latest_visible_annual_public_date": "2020-12-21",
+                "period_observation_count": 37,
+                "ready_for_full_lookback": false,
+                "required_yoy_slots": 4
+              },
+              "AMZN": {
+                "current_value_observation_count": 38,
+                "eligible_yoy_pair_count_in_full_lookback_slots": 3,
+                "eligible_yoy_pair_count_in_recent_observations": 4,
+                "full_lookback_missing_slot_reason_counts": {
+                  "missing_fiscal_quarter_period": 1
+                },
+                "full_lookback_slot_current_period_ends": [
+                  "2020-09-30",
+                  "2020-06-30",
+                  "2020-03-31",
+                  null
+                ],
+                "latest_visible_annual_fiscal_period_end": "2019-12-31",
+                "latest_visible_annual_public_date": "2020-02-03",
+                "period_observation_count": 38,
+                "ready_for_full_lookback": false,
+                "required_yoy_slots": 4
+              },
+              "MSFT": {
+                "current_value_observation_count": 37,
+                "eligible_yoy_pair_count_in_full_lookback_slots": 3,
+                "eligible_yoy_pair_count_in_recent_observations": 4,
+                "full_lookback_missing_slot_reason_counts": {
+                  "missing_fiscal_quarter_period": 1
+                },
+                "full_lookback_slot_current_period_ends": [
+                  "2020-09-30",
+                  null,
+                  "2020-03-31",
+                  "2019-12-31"
+                ],
+                "latest_visible_annual_fiscal_period_end": "2020-06-30",
+                "latest_visible_annual_public_date": "2020-08-03",
+                "period_observation_count": 37,
+                "ready_for_full_lookback": false,
+                "required_yoy_slots": 4
+              }
+            }
+          },
+          "quarterly.total_revenue": {
+            "prior_observed_period_assessment": {
+              "eligible_yoy_pair_count_in_recent_slots": 854,
+              "members_by_eligible_slot_count": {
+                "0": 77,
+                "1": 2,
+                "2": 426
+              },
+              "members_marked_ready_for_full_lookback": 426
+            },
+            "required_yoy_slots": 2,
+            "revised_full_lookback_measure": {
+              "eligible_yoy_pair_count_in_full_lookback_slots": 792,
+              "members_by_full_lookback_matched_slot_count": {
+                "0": 77,
+                "1": 64,
+                "2": 364
+              },
+              "members_ready_for_full_lookback": 364
+            },
+            "revised_observed_period_diagnostic": {
+              "eligible_yoy_pair_count_in_recent_observations": 854,
+              "members_by_observed_eligible_slot_count": {
+                "0": 77,
+                "1": 2,
+                "2": 426
+              }
+            },
+            "sample_security_asof_coverage": {
+              "A": {
+                "current_value_observation_count": 10,
+                "eligible_yoy_pair_count_in_full_lookback_slots": 1,
+                "eligible_yoy_pair_count_in_recent_observations": 2,
+                "full_lookback_missing_slot_reason_counts": {
+                  "missing_fiscal_quarter_period": 1
+                },
+                "full_lookback_slot_current_period_ends": [
+                  "2020-10-31",
+                  "2020-07-31"
+                ],
+                "latest_visible_annual_fiscal_period_end": "2020-10-31",
+                "latest_visible_annual_public_date": "2020-12-21",
+                "period_observation_count": 37,
+                "ready_for_full_lookback": false,
+                "required_yoy_slots": 2
+              },
+              "AMZN": {
+                "current_value_observation_count": 10,
+                "eligible_yoy_pair_count_in_full_lookback_slots": 2,
+                "eligible_yoy_pair_count_in_recent_observations": 2,
+                "full_lookback_missing_slot_reason_counts": {},
+                "full_lookback_slot_current_period_ends": [
+                  "2020-09-30",
+                  "2020-06-30"
+                ],
+                "latest_visible_annual_fiscal_period_end": "2019-12-31",
+                "latest_visible_annual_public_date": "2020-02-03",
+                "period_observation_count": 38,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 2
+              },
+              "MSFT": {
+                "current_value_observation_count": 18,
+                "eligible_yoy_pair_count_in_full_lookback_slots": 1,
+                "eligible_yoy_pair_count_in_recent_observations": 2,
+                "full_lookback_missing_slot_reason_counts": {
+                  "missing_fiscal_quarter_period": 1
+                },
+                "full_lookback_slot_current_period_ends": [
+                  "2020-09-30",
+                  null
+                ],
+                "latest_visible_annual_fiscal_period_end": "2020-06-30",
+                "latest_visible_annual_public_date": "2020-08-03",
+                "period_observation_count": 37,
+                "ready_for_full_lookback": false,
+                "required_yoy_slots": 2
+              }
+            }
+          }
+        }
+      },
+      "2025-12-31": {
+        "membership_count": 503,
+        "quarterly_profiles": {
+          "quarterly.basic_eps": {
+            "prior_observed_period_assessment": {
+              "eligible_yoy_pair_count_in_recent_slots": 1799,
+              "members_by_eligible_slot_count": {
+                "0": 25,
+                "1": 9,
+                "2": 11,
+                "3": 64,
+                "4": 394
+              },
+              "members_marked_ready_for_full_lookback": 394
+            },
+            "required_yoy_slots": 4,
+            "revised_full_lookback_measure": {
+              "eligible_yoy_pair_count_in_full_lookback_slots": 1358,
+              "members_by_full_lookback_matched_slot_count": {
+                "0": 27,
+                "1": 8,
+                "2": 54,
+                "3": 414,
+                "4": 0
+              },
+              "members_ready_for_full_lookback": 0
+            },
+            "revised_observed_period_diagnostic": {
+              "eligible_yoy_pair_count_in_recent_observations": 1799,
+              "members_by_observed_eligible_slot_count": {
+                "0": 25,
+                "1": 9,
+                "2": 11,
+                "3": 64,
+                "4": 394
+              }
+            },
+            "sample_security_asof_coverage": {
+              "A": {
+                "current_value_observation_count": 52,
+                "eligible_yoy_pair_count_in_full_lookback_slots": 3,
+                "eligible_yoy_pair_count_in_recent_observations": 4,
+                "full_lookback_missing_slot_reason_counts": {
+                  "missing_fiscal_quarter_period": 1
+                },
+                "full_lookback_slot_current_period_ends": [
+                  "2025-10-31",
+                  "2025-07-31",
+                  "2025-04-30",
+                  "2025-01-31"
+                ],
+                "latest_visible_annual_fiscal_period_end": "2025-10-31",
+                "latest_visible_annual_public_date": "2025-12-22",
+                "period_observation_count": 52,
+                "ready_for_full_lookback": false,
+                "required_yoy_slots": 4
+              },
+              "AMZN": {
+                "current_value_observation_count": 53,
+                "eligible_yoy_pair_count_in_full_lookback_slots": 3,
+                "eligible_yoy_pair_count_in_recent_observations": 4,
+                "full_lookback_missing_slot_reason_counts": {
+                  "missing_fiscal_quarter_period": 1
+                },
+                "full_lookback_slot_current_period_ends": [
+                  "2025-09-30",
+                  "2025-06-30",
+                  "2025-03-31",
+                  null
+                ],
+                "latest_visible_annual_fiscal_period_end": "2024-12-31",
+                "latest_visible_annual_public_date": "2025-02-07",
+                "period_observation_count": 53,
+                "ready_for_full_lookback": false,
+                "required_yoy_slots": 4
+              },
+              "MSFT": {
+                "current_value_observation_count": 52,
+                "eligible_yoy_pair_count_in_full_lookback_slots": 3,
+                "eligible_yoy_pair_count_in_recent_observations": 4,
+                "full_lookback_missing_slot_reason_counts": {
+                  "missing_fiscal_quarter_period": 1
+                },
+                "full_lookback_slot_current_period_ends": [
+                  "2025-09-30",
+                  null,
+                  "2025-03-31",
+                  "2024-12-31"
+                ],
+                "latest_visible_annual_fiscal_period_end": "2025-06-30",
+                "latest_visible_annual_public_date": "2025-07-31",
+                "period_observation_count": 52,
+                "ready_for_full_lookback": false,
+                "required_yoy_slots": 4
+              }
+            }
+          },
+          "quarterly.diluted_eps": {
+            "prior_observed_period_assessment": {
+              "eligible_yoy_pair_count_in_recent_slots": 1802,
+              "members_by_eligible_slot_count": {
+                "0": 24,
+                "1": 9,
+                "2": 11,
+                "3": 65,
+                "4": 394
+              },
+              "members_marked_ready_for_full_lookback": 394
+            },
+            "required_yoy_slots": 4,
+            "revised_full_lookback_measure": {
+              "eligible_yoy_pair_count_in_full_lookback_slots": 1361,
+              "members_by_full_lookback_matched_slot_count": {
+                "0": 26,
+                "1": 8,
+                "2": 54,
+                "3": 415,
+                "4": 0
+              },
+              "members_ready_for_full_lookback": 0
+            },
+            "revised_observed_period_diagnostic": {
+              "eligible_yoy_pair_count_in_recent_observations": 1802,
+              "members_by_observed_eligible_slot_count": {
+                "0": 24,
+                "1": 9,
+                "2": 11,
+                "3": 65,
+                "4": 394
+              }
+            },
+            "sample_security_asof_coverage": {
+              "A": {
+                "current_value_observation_count": 52,
+                "eligible_yoy_pair_count_in_full_lookback_slots": 3,
+                "eligible_yoy_pair_count_in_recent_observations": 4,
+                "full_lookback_missing_slot_reason_counts": {
+                  "missing_fiscal_quarter_period": 1
+                },
+                "full_lookback_slot_current_period_ends": [
+                  "2025-10-31",
+                  "2025-07-31",
+                  "2025-04-30",
+                  "2025-01-31"
+                ],
+                "latest_visible_annual_fiscal_period_end": "2025-10-31",
+                "latest_visible_annual_public_date": "2025-12-22",
+                "period_observation_count": 52,
+                "ready_for_full_lookback": false,
+                "required_yoy_slots": 4
+              },
+              "AMZN": {
+                "current_value_observation_count": 53,
+                "eligible_yoy_pair_count_in_full_lookback_slots": 3,
+                "eligible_yoy_pair_count_in_recent_observations": 4,
+                "full_lookback_missing_slot_reason_counts": {
+                  "missing_fiscal_quarter_period": 1
+                },
+                "full_lookback_slot_current_period_ends": [
+                  "2025-09-30",
+                  "2025-06-30",
+                  "2025-03-31",
+                  null
+                ],
+                "latest_visible_annual_fiscal_period_end": "2024-12-31",
+                "latest_visible_annual_public_date": "2025-02-07",
+                "period_observation_count": 53,
+                "ready_for_full_lookback": false,
+                "required_yoy_slots": 4
+              },
+              "MSFT": {
+                "current_value_observation_count": 52,
+                "eligible_yoy_pair_count_in_full_lookback_slots": 3,
+                "eligible_yoy_pair_count_in_recent_observations": 4,
+                "full_lookback_missing_slot_reason_counts": {
+                  "missing_fiscal_quarter_period": 1
+                },
+                "full_lookback_slot_current_period_ends": [
+                  "2025-09-30",
+                  null,
+                  "2025-03-31",
+                  "2024-12-31"
+                ],
+                "latest_visible_annual_fiscal_period_end": "2025-06-30",
+                "latest_visible_annual_public_date": "2025-07-31",
+                "period_observation_count": 52,
+                "ready_for_full_lookback": false,
+                "required_yoy_slots": 4
+              }
+            }
+          },
+          "quarterly.total_revenue": {
+            "prior_observed_period_assessment": {
+              "eligible_yoy_pair_count_in_recent_slots": 927,
+              "members_by_eligible_slot_count": {
+                "0": 39,
+                "1": 1,
+                "2": 463
+              },
+              "members_marked_ready_for_full_lookback": 463
+            },
+            "required_yoy_slots": 2,
+            "revised_full_lookback_measure": {
+              "eligible_yoy_pair_count_in_full_lookback_slots": 859,
+              "members_by_full_lookback_matched_slot_count": {
+                "0": 39,
+                "1": 69,
+                "2": 395
+              },
+              "members_ready_for_full_lookback": 395
+            },
+            "revised_observed_period_diagnostic": {
+              "eligible_yoy_pair_count_in_recent_observations": 927,
+              "members_by_observed_eligible_slot_count": {
+                "0": 39,
+                "1": 1,
+                "2": 463
+              }
+            },
+            "sample_security_asof_coverage": {
+              "A": {
+                "current_value_observation_count": 25,
+                "eligible_yoy_pair_count_in_full_lookback_slots": 1,
+                "eligible_yoy_pair_count_in_recent_observations": 2,
+                "full_lookback_missing_slot_reason_counts": {
+                  "missing_fiscal_quarter_period": 1
+                },
+                "full_lookback_slot_current_period_ends": [
+                  "2025-10-31",
+                  "2025-07-31"
+                ],
+                "latest_visible_annual_fiscal_period_end": "2025-10-31",
+                "latest_visible_annual_public_date": "2025-12-22",
+                "period_observation_count": 52,
+                "ready_for_full_lookback": false,
+                "required_yoy_slots": 2
+              },
+              "AMZN": {
+                "current_value_observation_count": 25,
+                "eligible_yoy_pair_count_in_full_lookback_slots": 2,
+                "eligible_yoy_pair_count_in_recent_observations": 2,
+                "full_lookback_missing_slot_reason_counts": {},
+                "full_lookback_slot_current_period_ends": [
+                  "2025-09-30",
+                  "2025-06-30"
+                ],
+                "latest_visible_annual_fiscal_period_end": "2024-12-31",
+                "latest_visible_annual_public_date": "2025-02-07",
+                "period_observation_count": 53,
+                "ready_for_full_lookback": true,
+                "required_yoy_slots": 2
+              },
+              "MSFT": {
+                "current_value_observation_count": 33,
+                "eligible_yoy_pair_count_in_full_lookback_slots": 1,
+                "eligible_yoy_pair_count_in_recent_observations": 2,
+                "full_lookback_missing_slot_reason_counts": {
+                  "missing_fiscal_quarter_period": 1
+                },
+                "full_lookback_slot_current_period_ends": [
+                  "2025-09-30",
+                  null
+                ],
+                "latest_visible_annual_fiscal_period_end": "2025-06-30",
+                "latest_visible_annual_public_date": "2025-07-31",
+                "period_observation_count": 52,
+                "ready_for_full_lookback": false,
+                "required_yoy_slots": 2
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "revision_id": "2026-10-01-quarterly-calendar-window-v2",
+  "revision_scope": {
+    "annual_profiles_changed": false,
+    "production_calculator_changed": false,
+    "profiles": [
+      "quarterly.basic_eps",
+      "quarterly.diluted_eps",
+      "quarterly.total_revenue"
+    ],
+    "quarterly_eps_required_slots": 4,
+    "quarterly_revenue_required_slots": 2,
+    "selection_rule": "Latest as-of-visible annual period end with any observed exported financial scalar anchors an unavailable terminal fiscal-quarter slot when it is later than the newest quarterly row. The annual scalar is never used as a quarterly value.",
+    "slot_semantics": "Uses core.pit_coverage._quarterly_eps_full_window, preserving accepted 84\u2013105-day adjacent-quarter cadence, missing intervening periods, unavailable terminal Q4, and short-cadence placeholders; fiscal YoY values use the accepted 28-day matcher."
+  },
+  "schema_version": 1,
+  "source_identity": {
+    "annual_duration_days": [
+      300,
+      430
+    ],
+    "archive_digest_reuse": {
+      "current_archive_content_rehashed": false,
+      "prior_receipt_path": "C:\\Users\\llong\\.codex\\worktrees\\f1ba\\RS-momentum-EMA-trading-bot\\docs\\issue-70-bounded-source-assessment-receipt-corrected.json",
+      "prior_receipt_sha256": "7e690f3a6e0dd116f5a0b20267fcf6e8eebdd37ba9271eafbb8675c62819c5a8",
+      "prior_repository_head": "174faca79cecfa0a710bbc4112fd2c81f225f281",
+      "same_path_and_same_size_assumption": "The current archive bytes are assumed unchanged because source_directory, byte size, prior actual/expected SHA-256, current provenance hash, and archive-sidecar hashes agree. The selected ZIP members are read again for the corrected trace.",
+      "verification_mode": "reused prior receipt digest attestation"
+    },
+    "declared_fundamental_row_count": 145010,
+    "declared_security_master_exclusion_row_count": 39,
+    "declared_security_master_row_count": 568,
+    "filed_date_fallback_count_declared": 13,
+    "fundamentals_provenance_sha256": "79a4ff05e9ee18422200a9b1ebdbf28573b1e7d11f7b9c6268b69e710d7873d0",
+    "identity_manifest_csv_present_in_source_directory": false,
+    "identity_manifest_expected_sha256": "2dbf5357a98d2deca9a08b27fbbb7de01f4294d987e19065d7660266e1aeada3",
+    "institutional_fields_policy": "omitted_blank",
+    "public_date_rule": "first supplied SPY trading day strictly after SEC acceptance calendar date; filed date fallback only",
+    "publication_marker": {
+      "actual_provenance_sha256": "79a4ff05e9ee18422200a9b1ebdbf28573b1e7d11f7b9c6268b69e710d7873d0",
+      "actual_publication_marker_file_hash": "14be96843407c0a2f2bee40274929b99e08b1e5f2384ba5df47a4aaa273606d7",
+      "actual_sha256": "14be96843407c0a2f2bee40274929b99e08b1e5f2384ba5df47a4aaa273606d7",
+      "declared_provenance_sha256": "529ed088a5558c777ed935e6dda0951998d038993110a4974b98352d2f99a6d1",
+      "file": "fundamentals_publication.json",
+      "marker_bound_provenance_reconstruction": {
+        "excluded_current_metadata_field": "net_income_concept_priority",
+        "interpretation": "byte reconstruction only; it does not establish when, by whom, or why the current provenance field was added",
+        "reconstructed_hash_matches_publication_marker": true,
+        "reconstructed_sha256": "529ed088a5558c777ed935e6dda0951998d038993110a4974b98352d2f99a6d1"
+      },
+      "provenance_hash_matches_publication_marker": false,
+      "publication_marker_file_hash": null,
+      "referenced_file_hash_checks": {
+        "fundamentals.csv": {
+          "actual_sha256": "3cb2ecfcaa75cf9195d2ca91e159e62a283092f223fa2d3ed73d2e139456aab2",
+          "matches_publication_marker": true,
+          "publication_marker_sha256": "3cb2ecfcaa75cf9195d2ca91e159e62a283092f223fa2d3ed73d2e139456aab2"
+        },
+        "fundamentals_audit.csv": {
+          "actual_sha256": "bfcde58871671bcd77317a868c460c5a410de0fb3aff6fba25868939002f5424",
+          "matches_publication_marker": true,
+          "publication_marker_sha256": "bfcde58871671bcd77317a868c460c5a410de0fb3aff6fba25868939002f5424"
+        },
+        "fundamentals_coverage.json": {
+          "actual_sha256": "3532f0fbd2d76729f3131cfdac600693051b0316fbbc1fc18e08246555f5d52b",
+          "matches_publication_marker": true,
+          "publication_marker_sha256": "3532f0fbd2d76729f3131cfdac600693051b0316fbbc1fc18e08246555f5d52b"
+        },
+        "fundamentals_provenance.json": {
+          "actual_sha256": "79a4ff05e9ee18422200a9b1ebdbf28573b1e7d11f7b9c6268b69e710d7873d0",
+          "matches_publication_marker": false,
+          "publication_marker_sha256": "529ed088a5558c777ed935e6dda0951998d038993110a4974b98352d2f99a6d1"
+        },
+        "security_master.csv": {
+          "actual_sha256": "6f2a632b43a6dca4cdd046d6c3ae06815f9f1e000fb828b53dca25e6eeed5c42",
+          "matches_publication_marker": true,
+          "publication_marker_sha256": "6f2a632b43a6dca4cdd046d6c3ae06815f9f1e000fb828b53dca25e6eeed5c42"
+        },
+        "security_master_exclusions.csv": {
+          "actual_sha256": "a0862ae2f259651c5627ccb34d40ee420175ab048dab5eb7da7cb655c1d90529",
+          "matches_publication_marker": true,
+          "publication_marker_sha256": "a0862ae2f259651c5627ccb34d40ee420175ab048dab5eb7da7cb655c1d90529"
+        }
+      }
+    },
+    "quarterly_duration_days": [
+      70,
+      115
+    ],
+    "source": "SEC EDGAR official bulk archives",
+    "source_directory": "C:\\Projects\\trading_bot\\RS-momentum-EMA-trading-bot\\.artifacts\\data\\sec-fundamentals",
+    "source_membership_sha256": "a12413a9134623b51350ad4671d4a678eeed8edf2241a9985d0d7d51957f5389",
+    "source_window": {
+      "end_date": "2025-12-31",
+      "start_date": "2020-01-01"
+    },
+    "verified_inputs": [
+      {
+        "actual_sha256": "3cb2ecfcaa75cf9195d2ca91e159e62a283092f223fa2d3ed73d2e139456aab2",
+        "bytes": 10319164,
+        "expected_sha256": "3cb2ecfcaa75cf9195d2ca91e159e62a283092f223fa2d3ed73d2e139456aab2",
+        "file": "fundamentals.csv",
+        "matches_export_provenance": true
+      },
+      {
+        "actual_sha256": "bfcde58871671bcd77317a868c460c5a410de0fb3aff6fba25868939002f5424",
+        "bytes": 147626063,
+        "expected_sha256": "bfcde58871671bcd77317a868c460c5a410de0fb3aff6fba25868939002f5424",
+        "file": "fundamentals_audit.csv",
+        "matches_export_provenance": true
+      },
+      {
+        "actual_sha256": "3532f0fbd2d76729f3131cfdac600693051b0316fbbc1fc18e08246555f5d52b",
+        "bytes": 1757,
+        "expected_sha256": "3532f0fbd2d76729f3131cfdac600693051b0316fbbc1fc18e08246555f5d52b",
+        "file": "fundamentals_coverage.json",
+        "matches_export_provenance": true
+      },
+      {
+        "actual_sha256": "6f2a632b43a6dca4cdd046d6c3ae06815f9f1e000fb828b53dca25e6eeed5c42",
+        "bytes": 41914,
+        "expected_sha256": "6f2a632b43a6dca4cdd046d6c3ae06815f9f1e000fb828b53dca25e6eeed5c42",
+        "file": "security_master.csv",
+        "matches_export_provenance": true
+      },
+      {
+        "actual_sha256": "a0862ae2f259651c5627ccb34d40ee420175ab048dab5eb7da7cb655c1d90529",
+        "bytes": 4370,
+        "expected_sha256": "a0862ae2f259651c5627ccb34d40ee420175ab048dab5eb7da7cb655c1d90529",
+        "file": "security_master_exclusions.csv",
+        "matches_export_provenance": true
+      },
+      {
+        "actual_sha256": "d7b4b3c5f2fe014a203bdaef2197d2cba5683f434e965fc9bced1023a43c82ca",
+        "archive_sidecars_agree": true,
+        "bytes": 1407131132,
+        "current_archive_content_rehashed": false,
+        "digest_verification_mode": "reused_prior_receipt_attestation",
+        "expected_sha256": "d7b4b3c5f2fe014a203bdaef2197d2cba5683f434e965fc9bced1023a43c82ca",
+        "file": "companyfacts.zip",
+        "matches_export_provenance": true,
+        "zip_entry_count_declared": 20266,
+        "zip_uncompressed_bytes_declared": 19277465283
+      },
+      {
+        "actual_sha256": "928d67221c6e6183bc343e7234c1391448c15cd1dd644d36b425db2f99ba4350",
+        "archive_sidecars_agree": true,
+        "bytes": 1559612838,
+        "current_archive_content_rehashed": false,
+        "digest_verification_mode": "reused_prior_receipt_attestation",
+        "expected_sha256": "928d67221c6e6183bc343e7234c1391448c15cd1dd644d36b425db2f99ba4350",
+        "file": "submissions.zip",
+        "matches_export_provenance": true,
+        "zip_entry_count_declared": 987520,
+        "zip_uncompressed_bytes_declared": 5721893028
+      },
+      {
+        "actual_sha256": "a12413a9134623b51350ad4671d4a678eeed8edf2241a9985d0d7d51957f5389",
+        "bytes": 12284,
+        "expected_sha256": "a12413a9134623b51350ad4671d4a678eeed8edf2241a9985d0d7d51957f5389",
+        "file": "membership.csv",
+        "matches_export_provenance": true
+      },
+      {
+        "actual_sha256": "93d8ef415bd6be516fb32ebfa5986ad45cbc2077e5beaa9615943db8890be5b9",
+        "bytes": 16599,
+        "expected_sha256": "93d8ef415bd6be516fb32ebfa5986ad45cbc2077e5beaa9615943db8890be5b9",
+        "file": "spy_trading_days.csv",
+        "matches_export_provenance": true
+      }
+    ]
+  },
+  "source_trace_reuse": {
+    "archive_content_rehashed_for_this_revision": false,
+    "archive_members_reopened": 0,
+    "archive_sha256_mode": "reused prior receipt digest attestation",
+    "bounded_archive_sample_company_count": 3,
+    "bounded_archive_sample_sha256_canonical_json": "2f961a64067cf290bfaf36319c496be4941fdafc9441d025a43e760e323170e6",
+    "origin_trace_recomputed": false,
+    "reused_from_prior_receipt": true
+  }
+}

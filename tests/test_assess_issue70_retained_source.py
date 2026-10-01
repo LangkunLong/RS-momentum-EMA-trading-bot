@@ -1,12 +1,14 @@
 """Negative controls for the bounded #70 CompanyFacts source trace."""
 
 import json
+import csv
 import zipfile
 
 import pytest
 
 from tools.assess_issue70_retained_source import (
     analyze_bounded_archives,
+    analyze_export,
     qualify_companyfacts_match,
 )
 
@@ -233,3 +235,202 @@ def test_missing_origin_link_remains_in_nonempty_value_denominator(tmp_path):
 
     assert counts["exported_nonempty_values"] == 1
     assert counts["no_metric_source_link"] == 1
+
+
+def analyze_quarterly_fixture(tmp_path, quarter_periods, annual_rows):
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    exports = []
+    audits = []
+    input_rows = [
+        ("quarterly", period, "2020-01-02") for period in quarter_periods
+    ] + [("annual", period, public_date) for period, public_date in annual_rows]
+    for index, (statement, period, public_date) in enumerate(input_rows):
+        year, month, _day = (int(part) for part in period.split("-"))
+        quarter = (month - 1) // 3 + 1
+        metric_values = {
+            "basic_eps": str(index + 1),
+            "diluted_eps": str(index + 2),
+            "total_revenue": str((index + 1) * 100),
+            "net_income": "",
+            "common_stock": "",
+            "total_stockholders_equity": "",
+            "shares_outstanding": "",
+        }
+        fiscal_period = f"Q{quarter}" if statement == "quarterly" else "FY"
+        form = "10-Q" if statement == "quarterly" else "10-K"
+        exports.append(
+            {
+                "ticker": "A",
+                "statement_type": statement,
+                "period_end": period,
+                "public_date": public_date,
+                **metric_values,
+            }
+        )
+        audits.append(
+            {
+                "ticker": "A",
+                "statement_type": statement,
+                "period_end": period,
+                "public_date": public_date,
+                "accession_number": f"sample-{index}",
+                "form": form,
+                "filed_date": "2020-01-01",
+                "fiscal_year": str(year),
+                "fiscal_period": fiscal_period,
+                "acceptance_datetime": "",
+                "public_date_basis": "filed_date_fallback",
+                "source_concepts": json.dumps(
+                    {
+                        "basic_eps": "us-gaap:EarningsPerShareBasic",
+                        "diluted_eps": "us-gaap:EarningsPerShareDiluted",
+                        "total_revenue": "us-gaap:Revenues",
+                    }
+                ),
+                "inherited_metrics": "[]",
+                "metric_sources": "{}",
+            }
+        )
+
+    def write_rows(path, rows):
+        with path.open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+
+    write_rows(source_dir / "fundamentals.csv", exports)
+    write_rows(source_dir / "fundamentals_audit.csv", audits)
+    write_rows(
+        source_dir / "security_master.csv",
+        [
+            {
+                "ticker": "A",
+                "cik": "0000000001",
+                "company_name": "Example",
+                "first_membership_date": "2020-01-01",
+                "last_membership_date": "",
+                "mapping_basis": "test",
+            }
+        ],
+    )
+    write_rows(source_dir / "security_master_exclusions.csv", [{"ticker": "", "reason": ""}])
+    (source_dir / "fundamentals_coverage.json").write_text(
+        json.dumps(
+            {
+                "resolved_symbol_count": 1,
+                "explicitly_excluded_symbol_count": 0,
+                "membership_union_symbol_count": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    membership_path = tmp_path / "membership.csv"
+    write_rows(
+        membership_path,
+        [{"ticker": "A", "effective_date": "2020-01-01", "member": "true"}],
+    )
+    trading_days_path = tmp_path / "trading-days.csv"
+    write_rows(trading_days_path, [{"trade_date": "2020-01-02"}])
+    analysis, _sample_exports, _sample_audits = analyze_export(
+        source_dir,
+        membership_path,
+        trading_days_path,
+        {"A": {"cik": "0000000001", "company_name": "Example"}},
+    )
+    return analysis["snapshot_coverage"]["2021-01-04"]
+
+
+def test_analyze_export_full_window_rejects_intervening_missing_quarter(tmp_path):
+    snapshot = analyze_quarterly_fixture(
+        tmp_path,
+        [
+            "2017-03-31",
+            "2017-06-30",
+            "2017-12-31",
+            "2018-03-31",
+            "2018-06-30",
+            "2018-12-31",
+            "2019-03-31",
+            "2019-06-30",
+            "2019-12-31",
+        ],
+        [("2019-12-31", "2020-01-02")],
+    )
+
+    eps = snapshot["profile_coverage"]["quarterly.basic_eps"]
+    diluted = snapshot["profile_coverage"]["quarterly.diluted_eps"]
+    revenue = snapshot["profile_coverage"]["quarterly.total_revenue"]
+    assert eps["members_ready_for_full_lookback"] == 0
+    assert diluted["members_ready_for_full_lookback"] == 0
+    assert revenue["members_ready_for_full_lookback"] == 0
+    assert eps["eligible_yoy_pair_count_in_recent_observations"] == 4
+    assert eps["eligible_yoy_pair_count_in_full_lookback_slots"] == 3
+    assert revenue["eligible_yoy_pair_count_in_recent_observations"] == 2
+    assert revenue["eligible_yoy_pair_count_in_full_lookback_slots"] == 1
+
+
+def test_analyze_export_full_window_anchors_missing_terminal_quarter_asof(tmp_path):
+    snapshot = analyze_quarterly_fixture(
+        tmp_path,
+        [
+            "2017-12-31",
+            "2018-03-31",
+            "2018-06-30",
+            "2018-09-30",
+            "2018-12-31",
+            "2019-03-31",
+            "2019-06-30",
+            "2019-09-30",
+        ],
+        [
+            ("2019-12-31", "2020-01-02"),
+            ("2020-12-31", "2022-02-01"),
+        ],
+    )
+
+    eps = snapshot["profile_coverage"]["quarterly.basic_eps"]
+    diluted = snapshot["profile_coverage"]["quarterly.diluted_eps"]
+    revenue = snapshot["profile_coverage"]["quarterly.total_revenue"]
+    sample = snapshot["sample_security_asof_coverage"]["A"]["profile_coverage"]
+    assert eps["members_ready_for_full_lookback"] == 0
+    assert diluted["members_ready_for_full_lookback"] == 0
+    assert revenue["members_ready_for_full_lookback"] == 0
+    assert eps["eligible_yoy_pair_count_in_recent_observations"] == 4
+    assert eps["eligible_yoy_pair_count_in_full_lookback_slots"] == 3
+    assert revenue["eligible_yoy_pair_count_in_recent_observations"] == 2
+    assert revenue["eligible_yoy_pair_count_in_full_lookback_slots"] == 1
+    assert (
+        sample["quarterly.basic_eps"]["latest_visible_annual_fiscal_period_end"]
+        == "2019-12-31"
+    )
+    assert (
+        sample["quarterly.basic_eps"]["latest_visible_annual_public_date"]
+        == "2020-01-02"
+    )
+
+
+def test_analyze_export_full_window_accepts_coherent_adjacent_quarters(tmp_path):
+    snapshot = analyze_quarterly_fixture(
+        tmp_path,
+        [
+            "2018-03-31",
+            "2018-06-30",
+            "2018-09-30",
+            "2018-12-31",
+            "2019-03-31",
+            "2019-06-30",
+            "2019-09-30",
+            "2019-12-31",
+        ],
+        [("2019-12-31", "2020-01-02")],
+    )
+
+    eps = snapshot["profile_coverage"]["quarterly.basic_eps"]
+    diluted = snapshot["profile_coverage"]["quarterly.diluted_eps"]
+    revenue = snapshot["profile_coverage"]["quarterly.total_revenue"]
+    assert eps["members_ready_for_full_lookback"] == 1
+    assert diluted["members_ready_for_full_lookback"] == 1
+    assert revenue["members_ready_for_full_lookback"] == 1
+    assert eps["eligible_yoy_pair_count_in_full_lookback_slots"] == 4
+    assert revenue["eligible_yoy_pair_count_in_full_lookback_slots"] == 2
