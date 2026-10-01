@@ -2,7 +2,17 @@
 
 Status: frozen implementation checkpoint and earlier proposal retained for principal-owned overlap review; not implementation acceptance or deployment authority. Starting application source `ab385d792e19ff6db39d87f1123f47f660fc1e1d`.
 
-## Implemented checkpoint1847869, pending corrections
+## Approved producer checkpoint43a0820
+
+Current producer source is `43a0820dea9688fd8583f45ccb9704f172553954`, with report-only head `bfcaa5a8cfdcfc5e32edfd78e4dfd5bb65e5b2d5`. Independent producer specification and quality review approves all seven original findings; `.artifacts/lead-c/issue-100-store-fix3-review-43a0820.md` retains the final disposition. This producer approval does not close the three later integrated consumer findings or grant migration/runtime authority.
+
+The complete committed interface is frozen in `.artifacts/lead-c/store-api-schema-43a0820.json`, SHA256 `f8c6a06bdd3fb17a853e750b3cf2847d503da291c671323c8958bd15b2f94c14`. The static extractor reads Git blobs without importing application code or opening a database. It records 28 public constructor/method signatures, all three read DTOs, and every statement for 15 tables plus one unique index. Schema version1 now has checksum `b1eead321b213c54e3eca905b603cf00d7237d9b2d84f74085dda909b91b7190`. Existing `core/execution_store.py` and `core/execution_workflow.py` remain unchanged from the accepted base. This supersedes the earlier development definition below; an old development database checksum mismatch fails closed and is not an approved upgrade path.
+
+The corrected pointer API requires both `expected_generation_id` and `expected_pointer_version`; callers obtain the observed generation/version/readiness through `load_active_generation_pointer(account)`. The general holding writer requires a version and evidence reference and permits only the named reconciliation-flag transition on an existing holding. Quantity, protection and action transitions retain their named versioned APIs. Canonical reads retain same-account/store holdings, including flat history, and relevant actions across their original generations. The consumer must preserve those origin identities while reconciling the current valuation.
+
+Producer verification is 43 focused cases (19 pure and 24 store), with one disabled-cache configuration warning. A six-module lead checkpoint passed101cases before three additional consumer regressions were added. Final integrated source inventory, corrected consumer evidence, independent integrated review, required CI and principal acceptance remain due. No operational store was opened or migrated.
+
+## Historical implemented checkpoint1847869
 
 Source d52fb22deedc74361f6e4ae4a0113dc4f215c3c2/report1847869884103f86c3053579dfb1b82145a93096 implements the additive store. Exact committed method signatures, DTO fields and every migration statement are extracted in `.artifacts/lead-c/store-api-schema-1847869.json`, SHA256 `8e549f6c18c3cf960747ffea44d0ad2099730782e305a66e6ab7ecf3974b2a39`. The repeatable extractor `build_store_interface_inventory.py` reads Git blobs and AST literals without importing application code or opening a database. Store raw Git SHA256 is `d385e0c85e79ded5fcb209a908ba212969fc7e963820aa5c2a931148ee11ddbd`.
 
