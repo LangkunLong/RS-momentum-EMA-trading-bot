@@ -347,23 +347,56 @@ class ActionOrderAttempt:
     status: ActionAttemptStatus = ActionAttemptStatus.INTENDED
     client_order_id: str | None = None
     broker_order_id: str | None = None
+    terminal_status: ActionAttemptStatus | None = None
+    client_order_aliases: tuple[str, ...] = ()
+    broker_order_aliases: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.attempt_number not in {1, 2}:
             raise ValueError("attempt_number must be 1 or the single remainder attempt 2")
         requested = _positive_decimal(self.requested_quantity, "attempt requested_quantity")
         filled = _nonnegative_decimal(self.confirmed_filled_quantity, "attempt confirmed_filled_quantity")
-        if filled > requested:
-            raise ValueError("attempt confirmed fill cannot exceed its requested quantity")
+        status = ActionAttemptStatus(self.status)
+        terminal = None if self.terminal_status is None else ActionAttemptStatus(self.terminal_status)
+        if terminal is not None and terminal not in {
+            ActionAttemptStatus.CANCELLED,
+            ActionAttemptStatus.REJECTED,
+            ActionAttemptStatus.FILLED,
+        }:
+            raise ValueError("terminal_status must preserve a broker-confirmed terminal result")
+        if status in {ActionAttemptStatus.CANCELLED, ActionAttemptStatus.REJECTED, ActionAttemptStatus.FILLED}:
+            if terminal is not None and terminal is not status:
+                raise ValueError("terminal attempt status conflicts with its preserved terminal result")
+            terminal = status
+        if filled > requested and status is not ActionAttemptStatus.RECONCILIATION_REQUIRED and terminal is None:
+            raise ValueError("attempt confirmed fill above its target requires terminal or reconciliation evidence")
         object.__setattr__(self, "requested_quantity", requested)
         object.__setattr__(self, "confirmed_filled_quantity", filled)
-        object.__setattr__(self, "status", ActionAttemptStatus(self.status))
+        object.__setattr__(self, "status", status)
+        object.__setattr__(self, "terminal_status", terminal)
         for name in ("client_order_id", "broker_order_id"):
             value = getattr(self, name)
             if value is not None:
                 object.__setattr__(self, name, _text(value, name))
-        if self.status is ActionAttemptStatus.FILLED and filled != requested:
-            raise ValueError("filled attempt must match its requested quantity")
+        for primary_name, aliases_name in (
+            ("client_order_id", "client_order_aliases"),
+            ("broker_order_id", "broker_order_aliases"),
+        ):
+            primary = getattr(self, primary_name)
+            aliases = tuple(_text(value, aliases_name) for value in getattr(self, aliases_name))
+            if len(aliases) != len(set(aliases)) or (primary is not None and primary in aliases):
+                raise ValueError(f"{aliases_name} must contain unique aliases distinct from the primary reference")
+            object.__setattr__(self, aliases_name, aliases)
+        if status is ActionAttemptStatus.FILLED and filled < requested:
+            raise ValueError("filled attempt must meet or exceed its requested quantity")
+
+    @property
+    def all_client_order_ids(self) -> tuple[str, ...]:
+        return (() if self.client_order_id is None else (self.client_order_id,)) + self.client_order_aliases
+
+    @property
+    def all_broker_order_ids(self) -> tuple[str, ...]:
+        return (() if self.broker_order_id is None else (self.broker_order_id,)) + self.broker_order_aliases
 
 
 @dataclass(frozen=True, slots=True)
@@ -408,7 +441,12 @@ class ActionIntent:
 
         requested = _positive_decimal(self.requested_quantity, "requested_quantity")
         confirmed = _nonnegative_decimal(self.confirmed_filled_quantity, "confirmed_filled_quantity")
-        if confirmed > requested:
+        has_resolution_evidence = (
+            self.status is ActionStatus.RESOLVED
+            and isinstance(self.resolution_reason, str)
+            and bool(self.resolution_reason.strip())
+        )
+        if confirmed > requested and self.status is not ActionStatus.RECONCILIATION_REQUIRED and not has_resolution_evidence:
             raise ValueError("confirmed fill quantity cannot exceed requested quantity")
         object.__setattr__(self, "requested_quantity", requested)
         object.__setattr__(self, "confirmed_filled_quantity", confirmed)
@@ -483,12 +521,15 @@ class ActionIntent:
         if attempts[0].requested_quantity != requested:
             raise ValueError("first attempt target must match the immutable logical action target")
         if len(attempts) == 2:
-            if attempts[1].requested_quantity != requested - attempts[0].confirmed_filled_quantity:
-                raise ValueError("remainder attempt must target the first attempt's residual quantity")
-            if attempts[0].status not in {ActionAttemptStatus.CANCELLED, ActionAttemptStatus.REJECTED}:
+            if attempts[1].requested_quantity > requested:
+                raise ValueError("remainder attempt cannot exceed the immutable logical action target")
+            if attempts[0].terminal_status not in {ActionAttemptStatus.CANCELLED, ActionAttemptStatus.REJECTED}:
                 raise ValueError("remainder attempt requires a broker-confirmed terminal first attempt")
-        if sum((attempt.confirmed_filled_quantity for attempt in attempts), Decimal("0")) != confirmed:
+        aggregate_fills = sum((attempt.confirmed_filled_quantity for attempt in attempts), Decimal("0"))
+        if aggregate_fills != confirmed:
             raise ValueError("action cumulative fill must equal the sum of its attempt fills")
+        if aggregate_fills > requested and self.status is not ActionStatus.RECONCILIATION_REQUIRED and not has_resolution_evidence:
+            raise ValueError("aggregate fills above target require reconciliation-required action state")
         object.__setattr__(self, "order_attempts", attempts)
 
         if self.status is ActionStatus.FILLED and confirmed != requested:
@@ -502,12 +543,14 @@ class ActionIntent:
             "deployment_generation_id": self.deployment_generation_id,
             "security_id": self.security_id,
             "broker_symbol": self.broker_symbol,
-            "holding_episode_id": self.holding_episode_id,
             "role": self.role.value,
         }
         if self.role is ActionRole.SCALE_OUT:
+            identity["holding_episode_id"] = self.holding_episode_id
             identity["exit_tier"] = self.exit_tier
         else:
+            if self.role is not ActionRole.ENTRY:
+                identity["holding_episode_id"] = self.holding_episode_id
             identity["decision_id"] = self.decision.decision_id
         object.__setattr__(self, "logical_action_id", f"action:sha256:{_canonical_digest(identity)}")
 
@@ -524,7 +567,7 @@ class ActionIntent:
             "deployment_generation_id": self.deployment_generation_id,
             "decision_id": self.decision.decision_id,
             "security_id": self.security_id,
-            "holding_episode_id": self.holding_episode_id,
+            "holding_episode_id": None if self.role is ActionRole.ENTRY else self.holding_episode_id,
             "role": self.role.value,
             "side": self.side.value,
             "requested_quantity": str(self.requested_quantity),
@@ -614,40 +657,8 @@ def assert_same_logical_action(existing: ActionIntent, proposed: ActionIntent) -
 
 
 def apply_cumulative_fill(intent: ActionIntent, cumulative_filled_quantity: Decimal) -> ActionIntent:
-    """Apply one attempt's cumulative watermark when only the initial attempt exists."""
-    cumulative = _nonnegative_decimal(cumulative_filled_quantity, "cumulative_filled_quantity")
-    if len(intent.order_attempts) != 1:
-        raise ValueError("use apply_attempt_cumulative_fill after creating a remainder attempt")
-    attempt = intent.order_attempts[0]
-    if cumulative < attempt.confirmed_filled_quantity:
-        raise ValueError("cumulative filled quantity cannot decrease")
-    if cumulative > attempt.requested_quantity:
-        raise ValueError("cumulative filled quantity cannot exceed attempt quantity")
-    if cumulative == attempt.confirmed_filled_quantity:
-        return intent
-    if intent.status is ActionStatus.RESOLVED:
-        raise ValueError("resolved action cannot accept later fill facts")
-    attempt_status = (
-        ActionAttemptStatus.FILLED
-        if cumulative == attempt.requested_quantity
-        else ActionAttemptStatus.PARTIALLY_FILLED
-    )
-    updated_attempt = replace(
-        attempt,
-        confirmed_filled_quantity=cumulative,
-        status=attempt_status,
-    )
-    action_status = (
-        ActionStatus.FILLED
-        if cumulative == intent.requested_quantity
-        else ActionStatus.PARTIALLY_FILLED
-    )
-    return replace(
-        intent,
-        confirmed_filled_quantity=cumulative,
-        status=action_status,
-        order_attempts=(updated_attempt,),
-    )
+    """Apply an attempt-1 watermark through the numbered API's uncertainty rules."""
+    return apply_attempt_cumulative_fill(intent, 1, cumulative_filled_quantity)
 
 
 def apply_attempt_cumulative_fill(
@@ -659,20 +670,32 @@ def apply_attempt_cumulative_fill(
     attempt = _get_attempt(intent, attempt_number)
     if cumulative < attempt.confirmed_filled_quantity:
         raise ValueError("attempt cumulative fill cannot decrease")
-    if cumulative > attempt.requested_quantity:
-        raise ValueError("attempt cumulative fill cannot exceed its requested quantity")
     if cumulative == attempt.confirmed_filled_quantity:
         return intent
-    if intent.status is ActionStatus.RESOLVED:
-        raise ValueError("resolved action cannot accept later fill facts")
-    if attempt.status in {ActionAttemptStatus.CANCELLED, ActionAttemptStatus.REJECTED}:
-        raise IdentityConflictError("terminal order attempt cannot receive a new fill")
-
-    attempt_status = (
-        ActionAttemptStatus.FILLED
-        if cumulative == attempt.requested_quantity
-        else ActionAttemptStatus.PARTIALLY_FILLED
+    terminal_conflict = attempt.status in {
+        ActionAttemptStatus.CANCELLED,
+        ActionAttemptStatus.REJECTED,
+        ActionAttemptStatus.FILLED,
+    }
+    preserve_attempt_uncertainty = attempt.status in {
+        ActionAttemptStatus.CANCEL_REQUESTED,
+        ActionAttemptStatus.RECONCILIATION_REQUIRED,
+    }
+    requires_reconciliation = (
+        terminal_conflict
+        or cumulative > attempt.requested_quantity
+        or intent.status is ActionStatus.RESOLVED
     )
+    if requires_reconciliation:
+        attempt_status = ActionAttemptStatus.RECONCILIATION_REQUIRED
+    elif preserve_attempt_uncertainty:
+        attempt_status = attempt.status
+    else:
+        attempt_status = (
+            ActionAttemptStatus.FILLED
+            if cumulative == attempt.requested_quantity
+            else ActionAttemptStatus.PARTIALLY_FILLED
+        )
     updated_attempt = replace(
         attempt,
         confirmed_filled_quantity=cumulative,
@@ -680,7 +703,12 @@ def apply_attempt_cumulative_fill(
     )
     attempts = _replace_attempt(intent, updated_attempt)
     aggregate = sum((item.confirmed_filled_quantity for item in attempts), Decimal("0"))
-    action_status = ActionStatus.FILLED if aggregate == intent.requested_quantity else ActionStatus.PARTIALLY_FILLED
+    if requires_reconciliation or aggregate > intent.requested_quantity:
+        action_status = ActionStatus.RECONCILIATION_REQUIRED
+    elif intent.status in {ActionStatus.CANCEL_REQUESTED, ActionStatus.RECONCILIATION_REQUIRED}:
+        action_status = intent.status
+    else:
+        action_status = ActionStatus.FILLED if aggregate == intent.requested_quantity else ActionStatus.PARTIALLY_FILLED
     return replace(
         intent,
         confirmed_filled_quantity=aggregate,
@@ -717,13 +745,25 @@ def confirm_attempt_terminal(
         if attempt.status is status:
             return intent
         raise IdentityConflictError("order attempt already has a different terminal status")
-    if status is ActionAttemptStatus.FILLED and attempt.confirmed_filled_quantity != attempt.requested_quantity:
+    if status is ActionAttemptStatus.FILLED and attempt.confirmed_filled_quantity < attempt.requested_quantity:
         raise ValueError("broker cannot confirm filled before the requested attempt quantity is confirmed")
-    updated_attempt = replace(attempt, status=status)
+    updated_attempt = replace(attempt, status=status, terminal_status=status)
     attempts = _replace_attempt(intent, updated_attempt)
     aggregate = sum((item.confirmed_filled_quantity for item in attempts), Decimal("0"))
-    if aggregate == intent.requested_quantity:
+    live_attempts = any(
+        item.status not in {ActionAttemptStatus.CANCELLED, ActionAttemptStatus.REJECTED, ActionAttemptStatus.FILLED}
+        for item in attempts
+    )
+    if aggregate > intent.requested_quantity:
+        action_status = ActionStatus.RECONCILIATION_REQUIRED
+    elif live_attempts and intent.status is ActionStatus.RECONCILIATION_REQUIRED:
+        action_status = ActionStatus.RECONCILIATION_REQUIRED
+    elif live_attempts and aggregate == intent.requested_quantity:
+        action_status = ActionStatus.RECONCILIATION_REQUIRED
+    elif aggregate == intent.requested_quantity:
         action_status = ActionStatus.FILLED
+    elif len(attempts) == 2 and intent.status is ActionStatus.RECONCILIATION_REQUIRED:
+        action_status = ActionStatus.RECONCILIATION_REQUIRED
     elif attempt_number == 1:
         action_status = ActionStatus.REMAINDER_READY
     else:
@@ -777,15 +817,49 @@ def bind_attempt_order_refs(
     for other in intent.order_attempts:
         if other.attempt_number == attempt_number:
             continue
-        if client is not None and client == other.client_order_id:
+        if client is not None and client in other.all_client_order_ids:
             raise IdentityConflictError("client order identity already belongs to another attempt")
-        if broker is not None and broker == other.broker_order_id:
+        if broker is not None and broker in other.all_broker_order_ids:
             raise IdentityConflictError("broker order identity already belongs to another attempt")
     return replace(
         intent,
         order_attempts=_replace_attempt(
             intent,
             replace(attempt, client_order_id=client, broker_order_id=broker),
+        ),
+    )
+
+
+def add_attempt_order_aliases(
+    intent: ActionIntent,
+    *,
+    attempt_number: int,
+    client_order_id: str | None = None,
+    broker_order_id: str | None = None,
+) -> ActionIntent:
+    """Retain additional provider-scoped aliases without replacing attempt identity."""
+    attempt = _get_attempt(intent, attempt_number)
+    client_aliases = list(attempt.client_order_aliases)
+    broker_aliases = list(attempt.broker_order_aliases)
+    if client_order_id is not None:
+        client = _text(client_order_id, "client_order_id")
+        if client != attempt.client_order_id and client not in client_aliases:
+            client_aliases.append(client)
+    if broker_order_id is not None:
+        broker = _text(broker_order_id, "broker_order_id")
+        if broker != attempt.broker_order_id and broker not in broker_aliases:
+            broker_aliases.append(broker)
+    if tuple(client_aliases) == attempt.client_order_aliases and tuple(broker_aliases) == attempt.broker_order_aliases:
+        return intent
+    return replace(
+        intent,
+        order_attempts=_replace_attempt(
+            intent,
+            replace(
+                attempt,
+                client_order_aliases=tuple(client_aliases),
+                broker_order_aliases=tuple(broker_aliases),
+            ),
         ),
     )
 
@@ -820,6 +894,11 @@ def resolve_action(
     if intent.status is ActionStatus.FILLED:
         return intent
     reason = _text(resolution_reason, "resolution_reason")
+    if any(
+        attempt.status not in {ActionAttemptStatus.CANCELLED, ActionAttemptStatus.REJECTED, ActionAttemptStatus.FILLED}
+        for attempt in intent.order_attempts
+    ):
+        raise ValueError("all issued order attempts must be terminal before action reconciliation")
     if intent.status is ActionStatus.RESOLVED:
         if status is ActionStatus.RESOLVED and reason == intent.resolution_reason:
             return intent
@@ -1155,7 +1234,12 @@ def propose_stop_update(
     if decision.deployment_generation_id != holding.deployment_generation_id:
         raise ValueError("stop proposal must use the holding's opening generation")
     price = _positive_decimal(stop_price, "stop_price")
-    prior_stop = holding.proposed_stop_price or holding.confirmed_protective_stop_price
+    known_stops = tuple(
+        value
+        for value in (holding.proposed_stop_price, holding.confirmed_protective_stop_price)
+        if value is not None
+    )
+    prior_stop = max(known_stops) if known_stops else None
     if prior_stop is not None and price < prior_stop:
         raise ValueError("proposed protective stop must evolve monotonically")
     if holding.proposed_stop_action_id != holding.confirmed_stop_action_id:
@@ -1272,6 +1356,7 @@ class ActionStateProjection:
     role: ActionRole
     side: OrderSide
     status: ActionStatus
+    resolution_reason: str | None
     requested_quantity: Decimal
     confirmed_quantity: Decimal
     residual_quantity: Decimal
@@ -1386,6 +1471,7 @@ def project_action_state(intent: ActionIntent) -> ActionStateProjection:
         role=intent.role,
         side=intent.side,
         status=intent.status,
+        resolution_reason=intent.resolution_reason,
         requested_quantity=intent.requested_quantity,
         confirmed_quantity=intent.confirmed_filled_quantity,
         residual_quantity=residual,
