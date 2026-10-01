@@ -628,15 +628,43 @@ def _growth_window_payload(
 
 
 def _quarterly_eps_full_window(
-    series: pd.Series | None, required_slots: int = 4
+    series: pd.Series | None,
+    required_slots: int = 4,
+    *,
+    latest_visible_fiscal_period_end: date | None = None,
 ) -> dict[str, Any]:
-    if series is None:
+    if series is None and latest_visible_fiscal_period_end is None:
         return _missing_full_window(required_slots, "absent_source_observation")
 
-    matches = match_fiscal_year_over_year_periods(series)
+    matches = (
+        () if series is None else match_fiscal_year_over_year_periods(series)
+    )
     slots: list[dict[str, Any]] = []
     represented_period_slots = 0
     previous_reported_period: date | None = None
+
+    quarterly_periods = {match.current_period for match in matches}
+    if (
+        latest_visible_fiscal_period_end is not None
+        and latest_visible_fiscal_period_end not in quarterly_periods
+        and (
+            not quarterly_periods
+            or latest_visible_fiscal_period_end > max(quarterly_periods)
+        )
+    ):
+        slots.append(
+            {
+                "slot": 1,
+                "current_period_end": latest_visible_fiscal_period_end.isoformat(),
+                "comparison_period_end": None,
+                "comparison_period_matched": False,
+                "status": "missing",
+                "reason": "missing_fiscal_quarter_period",
+                "placeholder_type": "unreported_terminal_fiscal_quarter",
+            }
+        )
+        previous_reported_period = latest_visible_fiscal_period_end
+
     for match in matches:
         if len(slots) >= required_slots:
             break
@@ -742,7 +770,7 @@ def _quarterly_eps_full_window(
     return _growth_window_payload(
         required_slots=required_slots,
         represented_period_slots=represented_period_slots,
-        reported_level_count=int(series.notna().sum()),
+        reported_level_count=0 if series is None else int(series.notna().sum()),
         slots=slots,
     )
 
@@ -1003,6 +1031,14 @@ def _financial_states(
         raw_records = source_rows.get(ticker, ())
 
         c_trace = evaluate_c_with_trace(quarterly)
+        latest_visible_fiscal_period_end = None
+        # The visible annual statement establishes fiscal-year timing, but its
+        # values never enter the quarterly EPS growth calculation.
+        visible_annual_columns = annual.columns[annual.notna().any(axis=0)]
+        if len(visible_annual_columns):
+            latest_visible_fiscal_period_end = max(
+                pd.Timestamp(period_end).date() for period_end in visible_annual_columns
+            )
         q_eps = _feature_state(
             calculated=c_trace.current_growth,
             reason=str(c_trace.terminal_reason),
@@ -1018,7 +1054,8 @@ def _financial_states(
             ),
         )
         q_eps["full_window"] = _quarterly_eps_full_window(
-            _eps_series_for_family(quarterly, c_trace.metric_family)
+            _eps_series_for_family(quarterly, c_trace.metric_family),
+            latest_visible_fiscal_period_end=latest_visible_fiscal_period_end,
         )
 
         q_revenue = _quarterly_revenue_state(quarterly)

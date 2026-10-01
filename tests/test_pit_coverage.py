@@ -163,6 +163,195 @@ def test_quarterly_eps_full_window_preserves_an_absent_intervening_fiscal_quarte
     assert window["slots"][1]["next_reported_period_end"] == "2023-12-31"
 
 
+def test_quarterly_eps_full_window_anchors_unreported_terminal_fiscal_quarter() -> None:
+    periods = pd.to_datetime(
+        [
+            "2018-07-31",
+            "2018-10-31",
+            "2019-01-31",
+            "2019-04-30",
+            "2019-07-31",
+            "2019-10-31",
+            "2020-01-31",
+            "2020-04-30",
+            "2020-07-31",
+        ]
+    )
+    eps = pd.Series([1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8], index=periods)
+
+    window = coverage._quarterly_eps_full_window(
+        eps, latest_visible_fiscal_period_end=date(2020, 10, 31)
+    )
+
+    assert window["ready"] is False
+    assert window["represented_period_slots"] == 3
+    assert window["matched_growth_slots"] == 3
+    assert window["missing_growth_slots"] == 1
+    assert window["missing_slot_reason_counts"] == {
+        "missing_fiscal_quarter_period": 1
+    }
+    terminal = window["slots"][0]
+    assert terminal["current_period_end"] == "2020-10-31"
+    assert terminal["comparison_period_end"] is None
+    assert terminal["reason"] == "missing_fiscal_quarter_period"
+    assert terminal["placeholder_type"] == "unreported_terminal_fiscal_quarter"
+    assert [slot["current_period_end"] for slot in window["slots"][1:]] == [
+        "2020-07-31",
+        "2020-04-30",
+        "2020-01-31",
+    ]
+
+
+def test_quarterly_eps_full_window_does_not_duplicate_reported_terminal_quarter() -> None:
+    periods = pd.to_datetime(
+        [
+            "2017-10-31",
+            "2018-01-31",
+            "2018-04-30",
+            "2018-07-31",
+            "2018-10-31",
+            "2019-01-31",
+            "2019-04-30",
+            "2019-07-31",
+            "2019-10-31",
+            "2020-01-31",
+            "2020-04-30",
+            "2020-07-31",
+            "2020-10-31",
+        ]
+    )
+    eps = pd.Series([float(index + 1) for index in range(len(periods))], index=periods)
+
+    window = coverage._quarterly_eps_full_window(
+        eps, latest_visible_fiscal_period_end=date(2020, 10, 31)
+    )
+
+    current_period_ends = [slot["current_period_end"] for slot in window["slots"]]
+    assert current_period_ends.count("2020-10-31") == 1
+    assert window["represented_period_slots"] == 4
+    assert window["missing_growth_slots"] == 0
+
+
+def test_terminal_quarter_anchor_keeps_intervening_cadence_gap() -> None:
+    periods = pd.to_datetime(
+        [
+            "2018-04-30",
+            "2018-07-31",
+            "2018-10-31",
+            "2019-01-31",
+            "2019-04-30",
+            "2019-07-31",
+            "2019-10-31",
+            "2020-01-31",
+            "2020-04-30",
+        ]
+    )
+    eps = pd.Series([float(index + 1) for index in range(len(periods))], index=periods)
+
+    window = coverage._quarterly_eps_full_window(
+        eps, latest_visible_fiscal_period_end=date(2020, 10, 31)
+    )
+
+    assert window["slots"][0]["current_period_end"] == "2020-10-31"
+    assert window["slots"][0]["placeholder_type"] == "unreported_terminal_fiscal_quarter"
+    assert window["slots"][1]["reason"] == "missing_fiscal_quarter_period"
+    assert window["slots"][1]["placeholder_type"] == "inferred_missing_fiscal_quarter"
+    assert window["slots"][1]["period_gap_days"] == 184
+    assert window["slots"][1]["inferred_missing_quarter_count"] == 1
+    assert window["slots"][2]["current_period_end"] == "2020-04-30"
+
+
+def test_financial_state_uses_only_asof_visible_annual_terminal_period(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    periods = pd.to_datetime(
+        [
+            "2018-07-31",
+            "2018-10-31",
+            "2019-01-31",
+            "2019-04-30",
+            "2019-07-31",
+            "2019-10-31",
+            "2020-01-31",
+            "2020-04-30",
+            "2020-07-31",
+        ]
+    )
+    quarterly = pd.DataFrame(
+        [[1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8]],
+        index=["Diluted EPS"],
+        columns=periods,
+    )
+    annual_visible = pd.DataFrame(
+        [[float("nan")], [700.0]],
+        index=["Diluted EPS", "Total Revenue"],
+        columns=pd.to_datetime(["2020-10-31"]),
+    )
+    empty = pd.DataFrame()
+
+    class SnapshotBundle:
+        def iter_fundamental_state_boundaries(self, _bounds, *, include_provenance):
+            assert include_provenance is True
+            yield "A", date(2020, 12, 18), {
+                "quarterly_income": quarterly,
+                "annual_income": empty,
+                "balance_sheet": empty,
+                "company_info": {},
+            }
+            yield "A", date(2020, 12, 21), {
+                "quarterly_income": quarterly,
+                "annual_income": annual_visible,
+                "balance_sheet": empty,
+                "company_info": {},
+            }
+            yield "A", date(2021, 1, 4), {
+                "quarterly_income": quarterly,
+                "annual_income": annual_visible,
+                "balance_sheet": empty,
+                "company_info": {},
+            }
+
+    class Trace:
+        current_growth = None
+        terminal_reason = "no_comparable_prior_period"
+        metric_family = "diluted_eps"
+        current_period_end = None
+        prior_period_end = None
+        current_public_date = None
+        prior_public_date = None
+        annual_growth = None
+
+    monkeypatch.setattr(coverage, "evaluate_c_with_trace", lambda _frame: Trace())
+    monkeypatch.setattr(coverage, "evaluate_a_with_trace", lambda *_args, **_kwargs: Trace())
+    monkeypatch.setattr(coverage, "_selected_public_dates", lambda *_args: ())
+    monkeypatch.setattr(coverage, "_quarterly_revenue_state", lambda _frame: {})
+    monkeypatch.setattr(coverage, "_annual_revenue_state", lambda _frame: {})
+    monkeypatch.setattr(coverage, "_earnings_acceleration", lambda _frame: None)
+    monkeypatch.setattr(coverage, "_growth_acceleration_for_label", lambda *_args: None)
+    monkeypatch.setattr(coverage, "_fundamental_age_state", lambda *_args: {})
+    states = coverage._financial_states(
+        SnapshotBundle(), ("A",), date(2020, 12, 18), date(2021, 1, 4), {}
+    )["A"]
+
+    by_boundary = {boundary: state for boundary, state in states}
+    before_annual_visibility = by_boundary[date(2020, 12, 18)][
+        "quarterly_eps_growth"
+    ]["full_window"]
+    after_annual_visibility = by_boundary[date(2020, 12, 21)][
+        "quarterly_eps_growth"
+    ]["full_window"]
+    at_a_example_session = by_boundary[date(2021, 1, 4)][
+        "quarterly_eps_growth"
+    ]["full_window"]
+
+    assert before_annual_visibility["slots"][0]["current_period_end"] == "2020-07-31"
+    assert before_annual_visibility["missing_growth_slots"] == 0
+    assert after_annual_visibility["slots"][0]["current_period_end"] == "2020-10-31"
+    assert after_annual_visibility["slots"][0]["reason"] == "missing_fiscal_quarter_period"
+    assert at_a_example_session["slots"][0]["current_period_end"] == "2020-10-31"
+    assert at_a_example_session["matched_growth_slots"] == 3
+
+
 def test_quarterly_eps_short_gap_is_an_untrusted_cadence_placeholder() -> None:
     periods = pd.to_datetime(
         [
