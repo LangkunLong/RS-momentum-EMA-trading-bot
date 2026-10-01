@@ -42,6 +42,7 @@ from core.order_execution import (
     get_open_positions,
     require_paper_mode,
 )
+from core.scheduler_observation import current_scheduler_observation
 from enhanced_scanner import scan_for_canslim_stocks
 
 
@@ -56,6 +57,78 @@ _ONE_SYMBOL_SCAN_FMP_REQUEST_LIMIT = 3
 
 class ExecutionReadinessError(RuntimeError):
     """Raised when a live order cannot prove execution monitoring is healthy."""
+
+
+def _read_exit_positions(interval: str):
+    """Read inventory strictly during observation and record its outcome."""
+    observation = current_scheduler_observation()
+    try:
+        positions = (
+            get_open_positions(raise_on_error=True)
+            if observation is not None
+            else get_open_positions()
+        )
+    except Exception as exc:
+        if observation is not None:
+            observation.record_event(
+                "exit_inventory", interval, "unavailable", {"error_type": type(exc).__name__}
+            )
+            observation.latch_service_issue(
+                "exit_inventory_failed", {"interval": interval, "error_type": type(exc).__name__}
+            )
+        raise
+    if observation is not None:
+        observation.record_event(
+            "exit_inventory",
+            interval,
+            "completed_empty" if not positions else "completed",
+            {"position_count": len(positions)},
+        )
+    return positions
+
+
+def _record_exit_bars_unavailable(
+    interval: str, symbol: str, reason: str, *, error_type: str | None = None
+) -> None:
+    observation = current_scheduler_observation()
+    if observation is None:
+        return
+    details = {"reason": reason}
+    if error_type is not None:
+        details["error_type"] = error_type
+    observation.record_event("exit_bar_read", f"{interval}:{symbol}", "unavailable", details)
+    observation.record_input_gap(
+        symbol,
+        f"{interval}-bars",
+        reason,
+        coverage_status="unverified",
+    )
+    observation.latch_service_issue("exit_bar_unavailable", details, unverified=True)
+
+
+def _record_exit_check(interval: str, symbol: str, outcome: str) -> None:
+    observation = current_scheduler_observation()
+    if observation is not None:
+        observation.record_event("exit_check", f"{interval}:{symbol}", outcome, {})
+
+
+def _run_scan_phase_exit_check(callback):
+    """Include the cycle's initial exit pass in bounded scheduler evidence."""
+    observation = current_scheduler_observation()
+    if observation is None:
+        return callback()
+    key = "exit_check:scan_phase"
+    observation.record_event("scheduler_work", key, "due", {"phase": "scan_phase"})
+    observation.record_event("scheduler_work", key, "started", {})
+    try:
+        result = callback()
+    except Exception as exc:
+        details = {"phase": "scan_phase", "error_type": type(exc).__name__}
+        observation.record_event("scheduler_work", key, "failed", details)
+        observation.latch_service_issue("exit_check_work_failed", details)
+        raise
+    observation.record_event("scheduler_work", key, "completed", {})
+    return result
 
 
 def _validate_execution_readiness_callback(
@@ -299,7 +372,7 @@ def monitor_and_exit_positions(
     if stop_loss_pct is None:
         stop_loss_pct = settings.STOP_LOSS_PCT
 
-    positions = get_open_positions()
+    positions = _read_exit_positions("daily")
     if not positions:
         print("No open positions to monitor.")
         return []
@@ -310,6 +383,7 @@ def monitor_and_exit_positions(
     # 1. Hard stop check
     stop_breaches = check_exit_signals(positions, stop_loss_pct)
     for pos in stop_breaches:
+        _record_exit_check("daily", pos.symbol, "hard_stop_triggered")
         pct = pos.unrealized_pl_pct * 100
         print(
             f"[EXIT] Hard stop triggered for {pos.symbol}: "
@@ -329,13 +403,25 @@ def monitor_and_exit_positions(
     for pos in remaining:
         try:
             bars = fetch_ohlcv(pos.symbol, period="3mo")
-            if bars is None or len(bars) < ema_exit_period + 2:
+            if bars is None:
+                _record_exit_bars_unavailable("daily", pos.symbol, "bar_read_failed")
                 continue
+            if len(bars) < ema_exit_period + 2:
+                _record_exit_bars_unavailable(
+                    "daily", pos.symbol, "insufficient_bars"
+                )
+                continue
+            observation = current_scheduler_observation()
+            if observation is not None:
+                observation.record_event(
+                    "exit_bar_read", f"daily:{pos.symbol}", "available", {"bar_count": len(bars)}
+                )
             ema = bars["Close"].ewm(span=ema_exit_period, adjust=False).mean()
             # Two consecutive closes below EMA = violation
             last_two_closes = bars["Close"].iloc[-2:]
             last_two_ema = ema.iloc[-2:]
             if (last_two_closes.values < last_two_ema.values).all():
+                _record_exit_check("daily", pos.symbol, "ma_violation")
                 print(
                     f"[EXIT] MA violation for {pos.symbol}: "
                     f"2 consecutive closes below {ema_exit_period}-day EMA"
@@ -351,9 +437,17 @@ def monitor_and_exit_positions(
                 )
                 if result.success:
                     exited.append(pos.symbol)
+            else:
+                _record_exit_check("daily", pos.symbol, "no_exit")
         except ExecutionReadinessError:
             raise
         except Exception as exc:  # noqa: BLE001
+            _record_exit_bars_unavailable(
+                "daily",
+                pos.symbol,
+                "bar_read_failed",
+                error_type=getattr(exc, "provider_error_type", type(exc).__name__),
+            )
             print(f"[WARN] MA check failed for {pos.symbol}: {exc}")
 
     return exited
@@ -393,7 +487,7 @@ def monitor_exits_hourly(
     Returns:
         List of symbols for which an exit order was submitted.
     """
-    positions = get_open_positions()
+    positions = _read_exit_positions("hourly")
     if not positions:
         return []
 
@@ -403,6 +497,7 @@ def monitor_exits_hourly(
     # 1. Hard stop — uses Alpaca's real-time unrealised P&L (same as daily check)
     stop_breaches = check_exit_signals(positions, settings.STOP_LOSS_PCT)
     for pos in stop_breaches:
+        _record_exit_check("hourly", pos.symbol, "hard_stop_triggered")
         pct = pos.unrealized_pl_pct * 100
         print(
             f"[HOURLY EXIT] Hard stop for {pos.symbol}: {pct:.1f}% loss"
@@ -421,12 +516,24 @@ def monitor_exits_hourly(
     for pos in remaining:
         try:
             bars = fetch_hourly_ohlcv(pos.symbol, days=history_days)
-            if bars is None or len(bars) < ema_period + consecutive:
+            if bars is None:
+                _record_exit_bars_unavailable("hourly", pos.symbol, "bar_read_failed")
                 continue
+            if len(bars) < ema_period + consecutive:
+                _record_exit_bars_unavailable(
+                    "hourly", pos.symbol, "insufficient_bars"
+                )
+                continue
+            observation = current_scheduler_observation()
+            if observation is not None:
+                observation.record_event(
+                    "exit_bar_read", f"hourly:{pos.symbol}", "available", {"bar_count": len(bars)}
+                )
             ema = bars["Close"].ewm(span=ema_period, adjust=False).mean()
             last_closes = bars["Close"].iloc[-consecutive:]
             last_ema = ema.iloc[-consecutive:]
             if (last_closes.values < last_ema.values).all():
+                _record_exit_check("hourly", pos.symbol, "ma_violation")
                 print(
                     f"[HOURLY EXIT] MA violation for {pos.symbol}: "
                     f"{consecutive} consecutive hourly closes below {ema_period}-period hourly EMA"
@@ -442,9 +549,17 @@ def monitor_exits_hourly(
                 )
                 if result.success:
                     exited.append(pos.symbol)
+            else:
+                _record_exit_check("hourly", pos.symbol, "no_exit")
         except ExecutionReadinessError:
             raise
         except Exception as exc:  # noqa: BLE001
+            _record_exit_bars_unavailable(
+                "hourly",
+                pos.symbol,
+                "bar_read_failed",
+                error_type=getattr(exc, "provider_error_type", type(exc).__name__),
+            )
             print(f"[WARN] Hourly MA check failed for {pos.symbol}: {exc}")
 
     return exited
@@ -629,11 +744,15 @@ def run_auto_trader(
     if not skip_exits:
         print("\n--- Phase 1: Exit monitoring ---")
         if execution_ready is None:
-            exited = monitor_and_exit_positions(dry_run=dry_run)
+            exited = _run_scan_phase_exit_check(
+                lambda: monitor_and_exit_positions(dry_run=dry_run)
+            )
         else:
-            exited = monitor_and_exit_positions(
-                dry_run=dry_run,
-                execution_ready=execution_ready,
+            exited = _run_scan_phase_exit_check(
+                lambda: monitor_and_exit_positions(
+                    dry_run=dry_run,
+                    execution_ready=execution_ready,
+                )
             )
         if exited:
             print(f"Exited {len(exited)} position(s): {', '.join(exited)}")

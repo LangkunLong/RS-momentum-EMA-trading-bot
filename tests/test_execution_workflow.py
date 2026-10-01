@@ -33,6 +33,7 @@ from core.execution_workflow import (
     reset_workflow_state,
     resolve_workflow,
 )
+from core.scheduler_observation import SchedulerObservation, activate_scheduler_observation
 
 
 def _plan(symbol: str = "NVDA") -> EntryExecutionPlan:
@@ -51,6 +52,101 @@ def _plan(symbol: str = "NVDA") -> EntryExecutionPlan:
         is_breakout=True,
         has_volume_surge=True,
     )
+
+
+def test_observation_write_cap_limits_transitions_without_changing_workflow_ids(
+    tmp_path: Path,
+) -> None:
+    store = ExecutionStore(str(tmp_path / "execution.sqlite3"))
+    observation = SchedulerObservation("transition-cap")
+
+    with activate_scheduler_observation(observation):
+        for index in range(6):
+            store.append_transition(
+                timestamp_utc=f"2026-10-01T00:00:{index:02d}Z",
+                workflow_id=f"wf-{index}",
+                symbol="NVDA",
+                from_state=None,
+                to_state="created",
+                event="created",
+                details={},
+            )
+        with pytest.raises(RuntimeError, match="workflow.*cap"):
+            store.append_transition(
+                timestamp_utc="2026-10-01T00:00:06Z",
+                workflow_id="wf-denied",
+                symbol="NVDA",
+                from_state=None,
+                to_state="created",
+                event="created",
+                details={},
+            )
+
+    with sqlite3.connect(store.db_path) as conn:
+        workflow_ids = [row[0] for row in conn.execute(
+            "SELECT workflow_id FROM workflow_transitions ORDER BY id"
+        )]
+        tables = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ) if row[0] != "sqlite_sequence"}
+
+    assert workflow_ids == [f"wf-{index}" for index in range(6)]
+    assert observation.to_receipt()["resource_counters"]["workflow_transition_writes"] == 6
+    assert observation.to_receipt()["resource_denials"] == {"workflow_write_cap_denied": 1}
+    assert tables == {
+        "workflow_snapshots",
+        "workflow_transitions",
+        "workflow_order_refs",
+        "active_positions",
+        "workflow_notification_claims",
+    }
+
+
+def test_observation_write_cap_limits_snapshots_and_pair_reservation_is_atomic(
+    tmp_path: Path,
+) -> None:
+    store = ExecutionStore(str(tmp_path / "execution.sqlite3"))
+    observation = SchedulerObservation("snapshot-cap")
+
+    with activate_scheduler_observation(observation):
+        for index in range(2):
+            store.upsert_workflow_snapshot(
+                workflow_id=f"wf-{index}",
+                symbol="NVDA",
+                state="created",
+                broker_order_id="",
+                entry_plan=None,
+                created_at_utc="2026-10-01T00:00:00Z",
+                updated_at_utc="2026-10-01T00:00:00Z",
+            )
+        with pytest.raises(RuntimeError, match="workflow.*cap"):
+            store.persist_transition_and_snapshot(
+                timestamp_utc="2026-10-01T00:00:01Z",
+                workflow_id="wf-denied",
+                symbol="NVDA",
+                from_state=None,
+                to_state="created",
+                event="created",
+                details={},
+                broker_order_id="",
+                entry_plan=None,
+                created_at_utc="2026-10-01T00:00:00Z",
+                expected_transition_count=0,
+            )
+
+    with sqlite3.connect(store.db_path) as conn:
+        snapshot_count = conn.execute(
+            "SELECT COUNT(*) FROM workflow_snapshots"
+        ).fetchone()[0]
+        transition_count = conn.execute(
+            "SELECT COUNT(*) FROM workflow_transitions"
+        ).fetchone()[0]
+
+    counters = observation.to_receipt()["resource_counters"]
+    assert snapshot_count == 2
+    assert transition_count == 0
+    assert counters["workflow_snapshot_writes"] == 2
+    assert counters["workflow_transition_writes"] == 0
 
 
 class TestExecutionWorkflow:

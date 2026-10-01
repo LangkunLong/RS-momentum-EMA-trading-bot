@@ -1,5 +1,6 @@
 """Tests for scanner classification between actionable buys and watchlist names."""
 
+from datetime import date
 from unittest.mock import patch
 
 import pandas as pd
@@ -12,6 +13,7 @@ from core.stock_screening import (
     evaluate_stock_canslim,
     screen_stocks_canslim_detailed,
 )
+from core.scheduler_observation import SchedulerObservation, activate_scheduler_observation
 
 
 def _make_view(
@@ -319,6 +321,369 @@ def test_scanner_reports_and_excludes_quota_deferred_names(capsys) -> None:
     assert buys == []
     assert watchlist == []
     assert "1 candidate(s) quota_deferred" in capsys.readouterr().out
+
+
+def test_observation_records_scan_coverage_and_exact_deferred_endpoint_reason() -> None:
+    observation = SchedulerObservation("candidate-coverage")
+    observation.record_input_gap(
+        "AAPL", "income-statement", "local_ledger_exhausted", coverage_status="degraded"
+    )
+    rs_scores = pd.DataFrame(
+        [
+            {"Ticker": "AAPL", "RS_Score": 95.0},
+            {"Ticker": "MSFT", "RS_Score": 90.0},
+        ]
+    )
+    market = _make_view()["market_trend"]
+    deferred = _make_view(fmp_quota_deferred=True, has_fundamentals=False)
+    deferred.update(
+        {
+            "symbol": "AAPL",
+            "scanner_category": "quota_deferred",
+            "scanner_notes": ["quota_deferred"],
+        }
+    )
+    deferred["metrics"].update(
+        {
+            "quarterly_income_available": False,
+            "annual_income_available": False,
+            "fmp_deferral_reason": "local_ledger",
+        }
+    )
+    covered = _make_view(has_fundamentals=True)
+    covered.update(
+        {
+            "symbol": "MSFT",
+            "scanner_category": "watchlist_candidate",
+            "scanner_notes": ["market_not_bullish"],
+        }
+    )
+    covered["metrics"].update(
+        {"quarterly_income_available": True, "annual_income_available": True}
+    )
+
+    def evaluate(symbol: str, **_kwargs):
+        return {"AAPL": deferred, "MSFT": covered}[symbol]
+
+    with (
+        activate_scheduler_observation(observation),
+        patch("core.stock_screening.evaluate_market_direction", return_value=market),
+        patch("core.stock_screening.calculate_rs_scores_for_tickers", return_value=rs_scores),
+        patch("core.stock_screening.evaluate_stock_canslim", side_effect=evaluate),
+    ):
+        buys, watchlist, _ = screen_stocks_canslim_detailed(
+            symbols=["AAPL", "MSFT"], start_date="2026-01-01"
+        )
+
+    assert buys == []
+    assert [candidate["symbol"] for candidate in watchlist] == ["MSFT"]
+    receipt = observation.to_receipt()
+    coverage = receipt["scan_coverage"]
+    assert coverage["analyzed"] == 2
+    assert coverage["rs_covered"] == 2
+    assert coverage["fundamental_covered"] == 1
+    aapl = next(
+        item for item in coverage["candidate_outcomes"] if item["symbol"] == "AAPL"
+    )
+    assert aapl["category"] == "quota_deferred"
+    assert aapl["reasons"] == ["quota_deferred"]
+    assert aapl["fmp_deferral_reason"] == "local_ledger"
+    assert aapl["endpoint_coverage"]["income-statement"] == {
+        "status": "degraded",
+        "reason": "local_ledger_exhausted",
+    }
+
+
+def test_observation_reports_unavailable_rs_for_malformed_comparison_frame() -> None:
+    observation = SchedulerObservation("malformed-rs")
+    market = _make_view()["market_trend"]
+    with (
+        activate_scheduler_observation(observation),
+        patch("core.stock_screening.evaluate_market_direction", return_value=market),
+        patch(
+            "core.stock_screening.calculate_rs_scores_for_tickers",
+            return_value=pd.DataFrame(),
+        ),
+    ):
+        result = screen_stocks_canslim_detailed(
+            symbols=["AAPL"], start_date="2026-01-01"
+        )
+
+    assert result[:2] == ([], [])
+    candidate = observation.to_receipt()["scan_coverage"]["candidate_outcomes"][0]
+    assert candidate["symbol"] == "AAPL"
+    assert candidate["reasons"] == ["rs_score_unavailable"]
+    assert observation.to_receipt()["required_input_coverage"] == "unverified"
+    assert observation.to_receipt()["input_gaps"] == [
+        {
+            "symbol": "AAPL",
+            "endpoint": "relative_strength",
+            "reason": "rs_score_unavailable",
+            "coverage_status": "unverified",
+        }
+    ]
+
+
+def test_partial_rs_response_marks_only_missing_symbol_as_input_gap() -> None:
+    observation = SchedulerObservation("partial-rs-response")
+    market = _make_view()["market_trend"]
+    partial_scores = pd.DataFrame([{"Ticker": "AAPL", "RS_Score": 10.0}])
+    with (
+        activate_scheduler_observation(observation),
+        patch("core.stock_screening.evaluate_market_direction", return_value=market),
+        patch(
+            "core.stock_screening.calculate_rs_scores_for_tickers",
+            return_value=partial_scores,
+        ),
+    ):
+        result = screen_stocks_canslim_detailed(
+            symbols=["AAPL", "MSFT"], start_date="2026-01-01"
+        )
+
+    assert result[:2] == ([], [])
+    receipt = observation.to_receipt()
+    assert receipt["required_input_coverage"] == "unverified"
+    assert receipt["input_gaps"] == [
+        {
+            "symbol": "MSFT",
+            "endpoint": "relative_strength",
+            "reason": "rs_score_unavailable",
+            "coverage_status": "unverified",
+        }
+    ]
+    outcomes = {
+        row["symbol"]: row["reasons"]
+        for row in receipt["scan_coverage"]["candidate_outcomes"]
+    }
+    assert outcomes["AAPL"] == ["below_canonical_rs_floor"]
+    assert outcomes["MSFT"] == ["rs_score_unavailable"]
+
+
+def test_observation_marks_required_candidate_ohlcv_exception_as_input_gap() -> None:
+    observation = SchedulerObservation("candidate-ohlcv-provider-failure")
+    market = _make_view()["market_trend"]
+    rs_scores = pd.DataFrame([{"Ticker": "AAPL", "RS_Score": 90.0}])
+    with (
+        activate_scheduler_observation(observation),
+        patch("core.stock_screening.evaluate_market_direction", return_value=market),
+        patch("core.stock_screening.calculate_rs_scores_for_tickers", return_value=rs_scores),
+        patch(
+            "core.canslim.core.fetch_ohlcv",
+            side_effect=RuntimeError("simulated provider failure"),
+        ),
+    ):
+        buys, watchlist, _ = screen_stocks_canslim_detailed(
+            symbols=["AAPL"], start_date="2026-01-01"
+        )
+
+    assert buys == []
+    assert watchlist == []
+    receipt = observation.to_receipt()
+    assert receipt["service_health"] == "unverified"
+    assert receipt["required_input_coverage"] == "unverified"
+    assert receipt["input_gaps"] == [
+        {
+            "symbol": "AAPL",
+            "endpoint": "alpaca_ohlcv",
+            "reason": "request_failed",
+            "coverage_status": "unverified",
+        }
+    ]
+    assert any(
+        issue["code"] == "required_candidate_ohlcv_read_failed"
+        and issue["details"]
+        == {
+            "symbol": "AAPL",
+            "provider": "alpaca",
+            "reason": "read_failed",
+            "error_type": "RuntimeError",
+        }
+        for issue in receipt["issues"]
+    )
+    assert any(
+        event["kind"] == "market_data"
+        and event["key"] == "candidate_ohlcv"
+        and event["status"] == "request_failed"
+        and event["details"]["provider"] == "alpaca"
+        and event["details"]["error_type"] == "RuntimeError"
+        for event in receipt["events"]
+    )
+    candidate = receipt["scan_coverage"]["candidate_outcomes"][0]
+    assert candidate["category"] == "unavailable"
+    assert candidate["reasons"] == ["required_ohlcv_read_failed"]
+    assert candidate["endpoint_coverage"]["alpaca_ohlcv"] == {
+        "status": "unverified",
+        "reason": "request_failed",
+    }
+
+
+def test_observation_marks_insufficient_candidate_ohlcv_history_as_degraded_coverage() -> None:
+    observation = SchedulerObservation("candidate-ohlcv-insufficient-history")
+    market = _make_view()["market_trend"]
+    rs_scores = pd.DataFrame([{"Ticker": "AAPL", "RS_Score": 90.0}])
+    dates = pd.bdate_range(end="2026-10-01", periods=20)
+    short_history = pd.DataFrame(
+        {
+            "Open": [100.0] * len(dates),
+            "High": [101.0] * len(dates),
+            "Low": [99.0] * len(dates),
+            "Close": [100.0] * len(dates),
+            "Volume": [1_000_000.0] * len(dates),
+        },
+        index=dates,
+    )
+    with (
+        activate_scheduler_observation(observation),
+        patch("core.stock_screening.evaluate_market_direction", return_value=market),
+        patch("core.stock_screening.calculate_rs_scores_for_tickers", return_value=rs_scores),
+        patch("core.canslim.core.fetch_ohlcv", return_value=short_history),
+    ):
+        buys, watchlist, _ = screen_stocks_canslim_detailed(
+            symbols=["AAPL"], start_date="2026-01-01"
+        )
+
+    assert buys == []
+    assert watchlist == []
+    receipt = observation.to_receipt()
+    assert receipt["service_health"] == "healthy"
+    assert receipt["required_input_coverage"] == "degraded"
+    assert receipt["issues"] == []
+    assert receipt["input_gaps"] == [
+        {
+            "symbol": "AAPL",
+            "endpoint": "alpaca_ohlcv",
+            "reason": "insufficient_history",
+            "coverage_status": "degraded",
+        }
+    ]
+    candidate = receipt["scan_coverage"]["candidate_outcomes"][0]
+    assert candidate["category"] == "unavailable"
+    assert candidate["reasons"] == ["insufficient_ohlcv_history"]
+    assert candidate["endpoint_coverage"]["alpaca_ohlcv"] == {
+        "status": "degraded",
+        "reason": "insufficient_history",
+    }
+
+
+def test_observation_marks_empty_candidate_ohlcv_response_as_degraded_coverage() -> None:
+    observation = SchedulerObservation("candidate-ohlcv-empty-response")
+    market = _make_view()["market_trend"]
+    rs_scores = pd.DataFrame([{"Ticker": "AAPL", "RS_Score": 90.0}])
+    with (
+        activate_scheduler_observation(observation),
+        patch("core.stock_screening.evaluate_market_direction", return_value=market),
+        patch("core.stock_screening.calculate_rs_scores_for_tickers", return_value=rs_scores),
+        patch("core.canslim.core.fetch_ohlcv", return_value=pd.DataFrame()),
+    ):
+        buys, watchlist, _ = screen_stocks_canslim_detailed(
+            symbols=["AAPL"], start_date="2026-01-01"
+        )
+
+    assert buys == []
+    assert watchlist == []
+    receipt = observation.to_receipt()
+    assert receipt["service_health"] == "healthy"
+    assert receipt["required_input_coverage"] == "degraded"
+    assert receipt["issues"] == []
+    assert receipt["input_gaps"] == [
+        {
+            "symbol": "AAPL",
+            "endpoint": "alpaca_ohlcv",
+            "reason": "empty_response",
+            "coverage_status": "degraded",
+        }
+    ]
+    candidate = receipt["scan_coverage"]["candidate_outcomes"][0]
+    assert candidate["category"] == "unavailable"
+    assert candidate["reasons"] == ["empty_ohlcv_response"]
+    assert candidate["endpoint_coverage"]["alpaca_ohlcv"] == {
+        "status": "degraded",
+        "reason": "empty_response",
+    }
+
+
+def test_observation_marks_stale_candidate_ohlcv_session_as_degraded_coverage() -> None:
+    observation = SchedulerObservation("candidate-ohlcv-stale-session")
+    market = _make_view()["market_trend"]
+    market.as_of_session = date(2026, 10, 1)
+    rs_scores = pd.DataFrame([{"Ticker": "AAPL", "RS_Score": 90.0}])
+    dates = pd.bdate_range(end="2026-09-30", periods=60)
+    stale_history = pd.DataFrame(
+        {
+            "Open": [100.0] * len(dates),
+            "High": [101.0] * len(dates),
+            "Low": [99.0] * len(dates),
+            "Close": [100.0] * len(dates),
+            "Volume": [1_000_000.0] * len(dates),
+        },
+        index=dates,
+    )
+    with (
+        activate_scheduler_observation(observation),
+        patch("core.stock_screening.evaluate_market_direction", return_value=market),
+        patch("core.stock_screening.calculate_rs_scores_for_tickers", return_value=rs_scores),
+        patch("core.canslim.core.fetch_ohlcv", return_value=stale_history),
+    ):
+        buys, watchlist, _ = screen_stocks_canslim_detailed(
+            symbols=["AAPL"], start_date="2026-01-01"
+        )
+
+    assert buys == []
+    assert watchlist == []
+    receipt = observation.to_receipt()
+    assert receipt["service_health"] == "healthy"
+    assert receipt["required_input_coverage"] == "degraded"
+    assert receipt["issues"] == []
+    assert receipt["input_gaps"] == [
+        {
+            "symbol": "AAPL",
+            "endpoint": "alpaca_ohlcv",
+            "reason": "stale_session",
+            "coverage_status": "degraded",
+        }
+    ]
+    assert any(
+        event["kind"] == "market_data"
+        and event["key"] == "candidate_ohlcv"
+        and event["status"] == "coverage_incomplete"
+        and event["details"]["reason"] == "stale_session"
+        for event in receipt["events"]
+    )
+    candidate = receipt["scan_coverage"]["candidate_outcomes"][0]
+    assert candidate["category"] == "unavailable"
+    assert candidate["reasons"] == ["stale_candidate_ohlcv_session"]
+    assert candidate["endpoint_coverage"]["alpaca_ohlcv"] == {
+        "status": "degraded",
+        "reason": "stale_session",
+    }
+
+
+def test_observation_keeps_strategy_rejection_healthy_and_distinct_from_input_gap() -> None:
+    observation = SchedulerObservation("legitimate-candidate-rejection")
+    market = _make_view()["market_trend"]
+    rs_scores = pd.DataFrame([{"Ticker": "AAPL", "RS_Score": 90.0}])
+    rejected = _make_view(total_score=40.0, is_bullish=False, has_fundamentals=False)
+
+    with (
+        activate_scheduler_observation(observation),
+        patch("core.stock_screening.evaluate_market_direction", return_value=market),
+        patch("core.stock_screening.calculate_rs_scores_for_tickers", return_value=rs_scores),
+        patch("core.stock_screening.evaluate_canslim", return_value=rejected),
+    ):
+        buys, watchlist, _ = screen_stocks_canslim_detailed(
+            symbols=["AAPL"], start_date="2026-01-01", watchlist_min_score=45.0
+        )
+
+    assert buys == []
+    assert watchlist == []
+    receipt = observation.to_receipt()
+    assert receipt["service_health"] == "healthy"
+    assert receipt["required_input_coverage"] == "complete"
+    assert receipt["issues"] == []
+    assert receipt["input_gaps"] == []
+    candidate = receipt["scan_coverage"]["candidate_outcomes"][0]
+    assert candidate["category"] == "rejected"
+    assert candidate["reasons"] == ["below_watchlist_score"]
 
 
 def test_canslim_marks_missing_statements_as_quota_deferred() -> None:

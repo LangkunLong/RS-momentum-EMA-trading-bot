@@ -423,3 +423,24 @@ class TestNotifyCycleSummary:
         assert "NVDA" in body
         assert "CRWD" in body
         assert "AAPL" in body
+
+    def test_observed_scheduler_cycle_suppresses_all_delivery_backends(self):
+        from types import SimpleNamespace
+
+        import scheduler
+        from core.scheduler_observation import SchedulerObservation, activate_scheduler_observation
+
+        observation = SchedulerObservation("notification-suppression")
+        with (
+            _patch_settings(),
+            activate_scheduler_observation(observation),
+            patch("scheduler.run_auto_trader", return_value=SimpleNamespace(entered=["NVDA"], exited=[])),
+            patch("scheduler.notify_cycle_summary") as scheduler_summary,
+            patch("core.notifier.send_email") as smtp_delivery,
+            patch("core.notifier.send_gmail_email") as gmail_delivery,
+        ):
+            scheduler._run_cycle(dry_run=True)
+
+        scheduler_summary.assert_not_called()
+        smtp_delivery.assert_not_called()
+        gmail_delivery.assert_not_called()

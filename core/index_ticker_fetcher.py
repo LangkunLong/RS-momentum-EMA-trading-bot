@@ -18,6 +18,10 @@ import re
 from bs4 import BeautifulSoup
 
 from config import settings
+from core.scheduler_observation import (
+    IndexRequestBudgetExceeded,
+    current_scheduler_observation,
+)
 
 # Cache configuration
 CACHE_DIR = Path(settings.TICKER_CACHE_DIR)
@@ -51,6 +55,44 @@ _MIN_TICKERS_PER_INDEX: dict[str, int] = {
 # a broader universe than strictly the Nasdaq-100 index).
 _WIKIPEDIA_NASDAQ100_URL = "https://en.wikipedia.org/wiki/List_of_NASDAQ-100_companies"
 _WIKIPEDIA_SP500_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+
+
+def _index_get(source: str, url: str, **kwargs: object) -> requests.Response:
+    """Perform one index request after reserving its observation-wide slot."""
+    observation = current_scheduler_observation()
+    if observation is not None:
+        observation.reserve_index_attempt(source)
+    try:
+        response = requests.get(url, **kwargs)
+    except Exception as exc:
+        if observation is not None:
+            observation.record_event(
+                "index_request",
+                source,
+                "transport_error",
+                {"error_type": type(exc).__name__},
+            )
+        raise
+    if observation is not None:
+        observation.record_event(
+            "index_request",
+            source,
+            "response_received",
+            {"http_status": response.status_code},
+        )
+    return response
+
+
+def _record_index_universe(index_key: str, source: str, tickers: List[str]) -> None:
+    """Record that one source supplied a complete index universe."""
+    observation = current_scheduler_observation()
+    if observation is not None:
+        observation.record_event(
+            "index_universe",
+            index_key,
+            "validated",
+            {"source": source, "ticker_count": len(tickers)},
+        )
 
 
 def _parse_wikipedia_tickers(response_text: str) -> List[str]:
@@ -93,7 +135,8 @@ def _fetch_index_from_wikipedia(index_key: str, display_name: str) -> List[str]:
         return []
 
     try:
-        response = requests.get(
+        response = _index_get(
+            "wikipedia",
             url,
             timeout=settings.INDEX_TICKER_HTTP_TIMEOUT_SECONDS,
             headers={"User-Agent": "Mozilla/5.0 (compatible; trading-bot/1.0)"},
@@ -109,6 +152,8 @@ def _fetch_index_from_wikipedia(index_key: str, display_name: str) -> List[str]:
             f"Wikipedia {display_name} fallback returned {len(tickers)} tickers; "
             f"expected {minimum}-{maximum}."
         )
+    except IndexRequestBudgetExceeded:
+        raise
     except Exception as exc:
         print(f"Wikipedia {display_name} fallback failed: {exc}")
     return []
@@ -219,6 +264,7 @@ class IndexTickerFetcher:
         """Initialise the fetcher with an optional custom cache directory."""
         self.cache_dir = cache_dir or CACHE_DIR
         self.cache_file = self.cache_dir / "index_tickers_cache.json"
+        self._last_fetch_incomplete_indices: set[str] = set()
         self._ensure_cache_dir()
 
     def _ensure_cache_dir(self) -> None:
@@ -267,7 +313,8 @@ class IndexTickerFetcher:
             fund_url = self.ISHARES_URL[index_key]
 
             # 1. Fetch the main fund page
-            page_resp = requests.get(
+            page_resp = _index_get(
+                "ishares_page",
                 fund_url,
                 timeout=settings.INDEX_TICKER_HTTP_TIMEOUT_SECONDS,
                 headers={
@@ -297,7 +344,8 @@ class IndexTickerFetcher:
                 raise ValueError(f"Could not locate CSV download link on {fund_url}")
 
             # 3. Fetch the CSV
-            response = requests.get(
+            response = _index_get(
+                "ishares_csv",
                 csv_url,
                 timeout=settings.INDEX_TICKER_HTTP_TIMEOUT_SECONDS,
                 headers={
@@ -315,7 +363,12 @@ class IndexTickerFetcher:
                         f"[WARN] {display_name}: iShares returned only {len(tickers)} tickers "
                         f"(expected >={minimum}). Attempting alternative source."
                     )
-                    return self._fetch_index_tickers_fallback(index_key, display_name) or tickers
+                    return self._fallback_or_partial(
+                        index_key,
+                        display_name,
+                        "ishares_too_few_tickers",
+                        tickers,
+                    )
                 # Sanity-check: if iShares returns far more tickers than the index
                 # has members, the product URL may have drifted to a broader fund.
                 max_expected = _MAX_TICKERS_PER_INDEX.get(index_key)
@@ -325,18 +378,77 @@ class IndexTickerFetcher:
                         f"(expected <={max_expected}). The product URL may point to a broader "
                         f"fund. Attempting alternative source."
                     )
-                    return self._fetch_index_tickers_fallback(index_key, display_name) or tickers[:max_expected]
+                    return self._fallback_or_partial(
+                        index_key,
+                        display_name,
+                        "ishares_too_many_tickers",
+                        tickers[:max_expected],
+                    )
+                _record_index_universe(index_key, "ishares", tickers)
                 return tickers
             else:
                 print(
                     f"Error: iShares returned status {response.status_code} for {display_name}. "
                     "Attempting alternative source."
                 )
-                return self._fetch_index_tickers_fallback(index_key, display_name) or list(_FALLBACK_TICKERS)
+                return self._fallback_or_partial(
+                    index_key,
+                    display_name,
+                    "ishares_http_refusal",
+                    list(_FALLBACK_TICKERS),
+                )
 
+        except IndexRequestBudgetExceeded:
+            raise
         except Exception as e:
             print(f"Error fetching {display_name} from iShares: {e}. Attempting alternative source.")
-            return self._fetch_index_tickers_fallback(index_key, display_name) or list(_FALLBACK_TICKERS)
+            return self._fallback_or_partial(
+                index_key,
+                display_name,
+                "ishares_request_failed",
+                list(_FALLBACK_TICKERS),
+            )
+
+    def _fallback_or_partial(
+        self,
+        index_key: str,
+        display_name: str,
+        failure_reason: str,
+        fallback_if_empty: list[str],
+    ) -> List[str]:
+        fallback = self._fetch_index_tickers_fallback(index_key, display_name)
+        minimum = _MIN_TICKERS_PER_INDEX.get(index_key, 1)
+        maximum = _MAX_TICKERS_PER_INDEX.get(index_key)
+        fallback_is_complete = bool(fallback) and len(fallback) >= minimum
+        if maximum is not None:
+            fallback_is_complete = fallback_is_complete and len(fallback) <= maximum
+        observation = current_scheduler_observation()
+        if fallback_is_complete:
+            if observation is not None:
+                observation.record_event(
+                    "index_universe",
+                    index_key,
+                    "fallback_selected",
+                    {"source": "wikipedia", "ticker_count": len(fallback)},
+                )
+            return fallback
+        if observation is not None:
+            self._last_fetch_incomplete_indices.add(index_key)
+            details = {
+                "reason": failure_reason,
+                "fallback_ticker_count": len(fallback),
+            }
+            observation.record_event("index_universe", index_key, "unavailable", details)
+            observation.record_input_gap(
+                index_key,
+                "index-universe",
+                "no_complete_index_source",
+                coverage_status="failed",
+            )
+            observation.latch_service_issue(
+                "index_universe_unavailable", {"index_key": index_key, **details}
+            )
+        return fallback or fallback_if_empty
 
     def _fetch_index_tickers_fallback(self, index_key: str, display_name: str) -> List[str]:
         """Attempt an alternative data source when the iShares URL misbehaves.
@@ -430,20 +542,39 @@ class IndexTickerFetcher:
 
         # Fetch fresh data
         print("Fetching fresh ticker data from indices...")
+        self._last_fetch_incomplete_indices = set()
         index_tickers = self.fetch_all_index_tickers(indices)
 
-        cached_tickers = dict(cache_data.get("tickers", {})) if cache_data else {}
-        retained_cached_indices = set(cached_tickers) - set(index_tickers)
-        combined_tickers = dict(cached_tickers)
-        combined_tickers.update(index_tickers)
+        observation = current_scheduler_observation()
+        incomplete_indices = sorted(self._last_fetch_incomplete_indices | {
+            index_key
+            for index_key, tickers in index_tickers.items()
+            if len(tickers) < _MIN_TICKERS_PER_INDEX.get(index_key, 1)
+            or (
+                index_key in _MAX_TICKERS_PER_INDEX
+                and len(tickers) > _MAX_TICKERS_PER_INDEX[index_key]
+            )
+        })
+        if observation is not None and incomplete_indices:
+            observation.record_event(
+                "index_cache",
+                "ticker_universe",
+                "write_skipped",
+                {"reason": "incomplete_index_universe", "indices": incomplete_indices},
+            )
+        else:
+            cached_tickers = dict(cache_data.get("tickers", {})) if cache_data else {}
+            retained_cached_indices = set(cached_tickers) - set(index_tickers)
+            combined_tickers = dict(cached_tickers)
+            combined_tickers.update(index_tickers)
 
-        combined_cache = {
-            "indices": list(combined_tickers.keys()),
-            "tickers": combined_tickers,
-        }
-        if cache_data and retained_cached_indices:
-            combined_cache["timestamp"] = cache_data["timestamp"]
-        self._save_cache(combined_cache)
+            combined_cache = {
+                "indices": list(combined_tickers.keys()),
+                "tickers": combined_tickers,
+            }
+            if cache_data and retained_cached_indices:
+                combined_cache["timestamp"] = cache_data["timestamp"]
+            self._save_cache(combined_cache)
 
         all_tickers = []
         for tickers in index_tickers.values():

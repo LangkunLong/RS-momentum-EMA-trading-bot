@@ -2,13 +2,19 @@
 
 import json
 from datetime import datetime, timedelta
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import requests
 
+from core.scheduler_observation import (
+    IndexRequestBudgetExceeded,
+    SchedulerObservation,
+    activate_scheduler_observation,
+)
 from core.index_ticker_fetcher import (
     IndexTickerFetcher,
+    _fetch_index_from_wikipedia,
     _parse_wikipedia_tickers,
 )
 
@@ -44,6 +50,216 @@ def test_ishares_403_uses_index_specific_fallback(tmp_path) -> None:
 
     assert result == expected
     fallback.assert_called_once_with("sp500", "S&P 500")
+
+
+def test_valid_wikipedia_fallback_is_recorded_after_ishares_refusal(tmp_path) -> None:
+    response = requests.Response()
+    response.status_code = 403
+    response.url = "https://example.invalid/index"
+    expected = [f"T{i}" for i in range(100)]
+    fetcher = IndexTickerFetcher(cache_dir=tmp_path)
+    observation = SchedulerObservation("index-alternate-source")
+
+    with (
+        patch("core.index_ticker_fetcher.requests.get", return_value=response),
+        patch.object(fetcher, "_fetch_index_tickers_fallback", return_value=expected),
+        activate_scheduler_observation(observation),
+    ):
+        result = fetcher._fetch_index_tickers("nasdaq100", "Nasdaq 100")
+
+    assert result == expected
+    receipt = observation.to_receipt()
+    assert receipt["service_health"] == "healthy"
+    assert any(
+        event["kind"] == "index_request"
+        and event["key"] == "ishares_page"
+        and event["details"]["http_status"] == 403
+        for event in receipt["events"]
+    )
+    assert any(
+        event["kind"] == "index_universe"
+        and event["status"] == "fallback_selected"
+        and event["details"]["source"] == "wikipedia"
+        for event in receipt["events"]
+    )
+
+
+def test_total_index_source_failure_marks_full_universe_unavailable(tmp_path) -> None:
+    fetcher = IndexTickerFetcher(cache_dir=tmp_path)
+    observation = SchedulerObservation("index-no-source")
+
+    with (
+        patch(
+            "core.index_ticker_fetcher.requests.get",
+            side_effect=requests.Timeout("offline"),
+        ) as get,
+        activate_scheduler_observation(observation),
+    ):
+        result = fetcher._fetch_index_tickers("russell2000", "Russell 2000")
+
+    receipt = observation.to_receipt()
+    assert result == ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL"]
+    get.assert_called_once()
+    assert receipt["service_health"] == "failed"
+    assert receipt["required_input_coverage"] == "failed"
+    assert any(
+        event["kind"] == "index_universe" and event["status"] == "unavailable"
+        for event in receipt["events"]
+    )
+    assert receipt["input_gaps"] == [
+        {
+            "symbol": "russell2000",
+            "endpoint": "index-universe",
+            "reason": "no_complete_index_source",
+            "coverage_status": "failed",
+        }
+    ]
+
+
+def test_observation_source_failure_does_not_overwrite_complete_index_cache(tmp_path) -> None:
+    fetcher = IndexTickerFetcher(cache_dir=tmp_path)
+    original = {
+        "timestamp": datetime.now().isoformat(),
+        "indices": ["russell2000"],
+        "tickers": {"russell2000": [f"R{i}" for i in range(2000)]},
+    }
+    fetcher.cache_file.write_text(json.dumps(original), encoding="utf-8")
+    before = fetcher.cache_file.read_bytes()
+    observation = SchedulerObservation("preserve-index-cache")
+
+    with (
+        patch(
+            "core.index_ticker_fetcher.requests.get",
+            side_effect=requests.Timeout("offline"),
+        ),
+        activate_scheduler_observation(observation),
+    ):
+        fetcher.get_all_tickers(indices=["russell2000"], force_refresh=True)
+
+    receipt = observation.to_receipt()
+    assert observation.to_receipt()["service_health"] == "failed"
+    assert fetcher.cache_file.read_bytes() == before
+    assert any(
+        event["kind"] == "index_cache"
+        and event["status"] == "write_skipped"
+        and event["details"]["indices"] == ["russell2000"]
+        for event in receipt["events"]
+    )
+
+
+def test_observation_preserves_cache_for_rejected_max_sized_ishares_slice(tmp_path) -> None:
+    fetcher = IndexTickerFetcher(cache_dir=tmp_path)
+    original = {
+        "timestamp": datetime.now().isoformat(),
+        "indices": ["nasdaq100"],
+        "tickers": {"nasdaq100": [f"OLD{i}" for i in range(100)]},
+    }
+    fetcher.cache_file.write_text(json.dumps(original), encoding="utf-8")
+    before = fetcher.cache_file.read_bytes()
+    page = Mock(status_code=200)
+    page.text = '<a href="/us/products/239696/etf.ajax?fileType=csv&fileName=fund_holdings.csv">CSV</a>'
+    page.raise_for_status.return_value = None
+    csv = Mock(status_code=200, text="unused")
+    csv.raise_for_status.return_value = None
+    observation = SchedulerObservation("oversized-index-slice")
+
+    with (
+        patch("core.index_ticker_fetcher.requests.get", side_effect=[page, csv]),
+        patch(
+            "core.index_ticker_fetcher._parse_ishares_csv",
+            return_value=[f"NEW{i}" for i in range(116)],
+        ),
+        patch.object(fetcher, "_fetch_index_tickers_fallback", return_value=[]),
+        patch.object(fetcher, "_save_cache") as save_cache,
+        activate_scheduler_observation(observation),
+    ):
+        result = fetcher.get_all_tickers(indices=["nasdaq100"], force_refresh=True)
+
+    assert len(result) == 115
+    save_cache.assert_not_called()
+    assert fetcher.cache_file.read_bytes() == before
+    receipt = observation.to_receipt()
+    assert receipt["required_input_coverage"] == "failed"
+    assert any(
+        event["kind"] == "index_cache"
+        and event["status"] == "write_skipped"
+        and event["details"]["indices"] == ["nasdaq100"]
+        for event in receipt["events"]
+    )
+
+
+def test_ishares_page_and_csv_attempts_are_counted(tmp_path) -> None:
+    tickers = [f"T{chr(65 + index // 26)}{chr(65 + index % 26)}" for index in range(100)]
+    page = Mock(status_code=200)
+    page.text = '<a href="/us/products/239696/etf.ajax?fileType=csv&fileName=fund_holdings.csv">CSV</a>'
+    page.raise_for_status.return_value = None
+    csv = Mock(status_code=200, text="Ticker\n" + "\n".join(tickers))
+    get = Mock(side_effect=[page, csv])
+    fetcher = IndexTickerFetcher(cache_dir=tmp_path)
+    observation = SchedulerObservation("index-pages")
+
+    with patch("core.index_ticker_fetcher.requests.get", get), activate_scheduler_observation(observation):
+        result = fetcher._fetch_index_tickers("nasdaq100", "Nasdaq 100")
+
+    assert result == tickers
+    assert get.call_count == 2
+    assert get.call_args_list[1].args[0].endswith("fund_holdings.csv")
+    assert observation.to_receipt()["resource_counters"]["index_attempts"] == 2
+
+
+def test_wikipedia_fallback_attempt_is_counted_after_ishares_refusal(tmp_path) -> None:
+    tickers = [f"T{chr(65 + index // 26)}{chr(65 + index % 26)}" for index in range(100)]
+    html = (
+        '<table class="wikitable"><tr><th>Symbol</th><th>Security</th></tr>'
+        + "".join(f"<tr><td>{ticker}</td><td>Company</td></tr>" for ticker in tickers)
+        + "</table>"
+    )
+    refused = Mock(status_code=403)
+    refused.raise_for_status.side_effect = requests.HTTPError("forbidden")
+    wikipedia = Mock(status_code=200, text=html)
+    wikipedia.raise_for_status.return_value = None
+    get = Mock(side_effect=[refused, wikipedia])
+    fetcher = IndexTickerFetcher(cache_dir=tmp_path)
+    observation = SchedulerObservation("index-fallback")
+
+    with patch("core.index_ticker_fetcher.requests.get", get), activate_scheduler_observation(observation):
+        result = fetcher._fetch_index_tickers("nasdaq100", "Nasdaq 100")
+
+    assert result == tickers
+    assert get.call_count == 2
+    assert observation.to_receipt()["resource_counters"]["index_attempts"] == 2
+
+
+def test_failed_index_request_consumes_one_attempt(tmp_path) -> None:
+    get = Mock(side_effect=requests.Timeout("offline"))
+    fetcher = IndexTickerFetcher(cache_dir=tmp_path)
+    observation = SchedulerObservation("index-failed")
+
+    with patch("core.index_ticker_fetcher.requests.get", get), activate_scheduler_observation(observation):
+        result = fetcher._fetch_index_tickers("russell2000", "Russell 2000")
+
+    assert result == ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL"]
+    get.assert_called_once()
+    assert observation.to_receipt()["resource_counters"]["index_attempts"] == 1
+
+
+def test_seventh_index_request_is_denied_before_io() -> None:
+    response = Mock(status_code=500)
+    response.raise_for_status.side_effect = requests.HTTPError("unavailable")
+    get = Mock(return_value=response)
+    observation = SchedulerObservation("index-cap")
+
+    with patch("core.index_ticker_fetcher.requests.get", get), activate_scheduler_observation(observation):
+        for _ in range(6):
+            _fetch_index_from_wikipedia("sp500", "S&P 500")
+        with pytest.raises(IndexRequestBudgetExceeded):
+            _fetch_index_from_wikipedia("sp500", "S&P 500")
+
+    receipt = observation.to_receipt()
+    assert get.call_count == 6
+    assert receipt["resource_counters"]["index_attempts"] == 6
+    assert receipt["resource_denials"] == {"index_cap_denied": 1}
+    assert receipt["service_health"] == "failed"
 
 
 def test_degraded_cached_universe_is_refetched(tmp_path) -> None:

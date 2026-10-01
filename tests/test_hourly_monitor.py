@@ -8,6 +8,8 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
+from core.scheduler_observation import SchedulerObservation, activate_scheduler_observation
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -112,6 +114,24 @@ class TestFetchHourlyOhlcv:
             result = fetch_hourly_ohlcv("FAIL", days=5)
 
         assert result.empty
+
+    def test_observation_propagates_typed_hourly_provider_error(self):
+        from core.data_client import ObservedHourlyBarReadError, fetch_hourly_ohlcv
+        from core.scheduler_observation import SchedulerObservation, activate_scheduler_observation
+
+        mock_client = MagicMock()
+        mock_client.get_stock_bars.side_effect = RuntimeError("API down")
+        observation = SchedulerObservation("hourly-provider-failure")
+
+        with (
+            activate_scheduler_observation(observation),
+            patch("core.data_client._get_alpaca_client", return_value=mock_client),
+            patch("core.data_client._cache_get", return_value=None),
+            pytest.raises(ObservedHourlyBarReadError) as exc_info,
+        ):
+            fetch_hourly_ohlcv("FAIL", days=5)
+
+        assert exc_info.value.provider_error_type == "RuntimeError"
 
     def test_returns_cached_result_without_api_call(self):
         from core.data_client import fetch_hourly_ohlcv
@@ -348,6 +368,108 @@ class TestMonitorExitsHourly:
 
         assert manager.submit_exit.call_count == 1
         assert result == ["NVDA"]
+
+
+def test_observation_records_successful_empty_exit_inventories() -> None:
+    from auto_trader import monitor_and_exit_positions, monitor_exits_hourly
+
+    observation = SchedulerObservation("empty-exits")
+    with (
+        activate_scheduler_observation(observation),
+        patch("auto_trader.get_open_positions", return_value=[]) as get_positions,
+    ):
+        assert monitor_exits_hourly(dry_run=True) == []
+        assert monitor_and_exit_positions(dry_run=True) == []
+
+    assert get_positions.call_args_list == [
+        ((), {"raise_on_error": True}),
+        ((), {"raise_on_error": True}),
+    ]
+    inventory_events = [
+        event for event in observation.to_receipt()["events"]
+        if event["kind"] == "exit_inventory"
+    ]
+    assert [event["status"] for event in inventory_events] == [
+        "completed_empty",
+        "completed_empty",
+    ]
+
+
+def test_observation_does_not_turn_failed_inventory_into_zero_positions() -> None:
+    from auto_trader import monitor_exits_hourly
+
+    observation = SchedulerObservation("failed-inventory")
+    with (
+        activate_scheduler_observation(observation),
+        patch("auto_trader.get_open_positions", side_effect=RuntimeError("offline")) as get_positions,
+        pytest.raises(RuntimeError, match="offline"),
+    ):
+        monitor_exits_hourly(dry_run=True)
+
+    get_positions.assert_called_once_with(raise_on_error=True)
+    assert observation.to_receipt()["service_health"] == "failed"
+    assert observation.to_receipt()["events"][-1]["status"] == "unavailable"
+
+
+def test_observation_records_failed_daily_bars_as_unavailable() -> None:
+    from auto_trader import monitor_and_exit_positions
+
+    observation = SchedulerObservation("failed-daily-bars")
+    position = _make_position("NVDA")
+    with (
+        activate_scheduler_observation(observation),
+        patch("auto_trader.get_open_positions", return_value=[position]),
+        patch("auto_trader.check_exit_signals", return_value=[]),
+        patch("auto_trader.fetch_ohlcv", return_value=None),
+    ):
+        assert monitor_and_exit_positions(dry_run=True) == []
+
+    receipt = observation.to_receipt()
+    assert receipt["service_health"] == "unverified"
+    assert receipt["required_input_coverage"] == "unverified"
+    assert receipt["events"][-1]["status"] == "unavailable"
+
+
+def test_observation_records_insufficient_hourly_bars_as_unavailable() -> None:
+    from auto_trader import monitor_exits_hourly
+
+    observation = SchedulerObservation("short-hourly-bars")
+    position = _make_position("NVDA")
+    with (
+        activate_scheduler_observation(observation),
+        patch("auto_trader.get_open_positions", return_value=[position]),
+        patch("auto_trader.check_exit_signals", return_value=[]),
+        patch("auto_trader.fetch_hourly_ohlcv", return_value=_make_hourly_bars(5)),
+    ):
+        assert monitor_exits_hourly(dry_run=True) == []
+
+    receipt = observation.to_receipt()
+    assert receipt["service_health"] == "unverified"
+    assert receipt["required_input_coverage"] == "unverified"
+    assert receipt["events"][-1]["status"] == "unavailable"
+
+
+def test_hourly_provider_error_is_not_reported_as_insufficient_bars() -> None:
+    from auto_trader import monitor_exits_hourly
+    from core.data_client import ObservedHourlyBarReadError
+
+    observation = SchedulerObservation("hourly-error-outcome")
+    position = _make_position("NVDA")
+    provider_error = ObservedHourlyBarReadError("NVDA", RuntimeError("offline"))
+    with (
+        activate_scheduler_observation(observation),
+        patch("auto_trader.get_open_positions", return_value=[position]),
+        patch("auto_trader.check_exit_signals", return_value=[]),
+        patch("auto_trader.fetch_hourly_ohlcv", side_effect=provider_error),
+    ):
+        assert monitor_exits_hourly(dry_run=True) == []
+
+    unavailable = [
+        event for event in observation.to_receipt()["events"]
+        if event["kind"] == "exit_bar_read" and event["status"] == "unavailable"
+    ]
+    assert unavailable[-1]["details"]["reason"] == "bar_read_failed"
+    assert unavailable[-1]["details"]["error_type"] == "RuntimeError"
 
 
 # ---------------------------------------------------------------------------

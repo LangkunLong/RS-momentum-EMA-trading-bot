@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 
 from config import settings
+from core.scheduler_observation import current_scheduler_observation
 
 
 _NOTIFICATION_LEGACY_EVENTS = {
@@ -98,6 +99,9 @@ class ExecutionStore:
     ) -> None:
         """Persist one immutable workflow transition."""
         payload = json.dumps(details, sort_keys=True)
+        observation = current_scheduler_observation()
+        if observation is not None:
+            observation.reserve_workflow_writes(transitions=1)
         with self._lock, self._connect() as conn:
             conn.execute(
                 """
@@ -136,6 +140,9 @@ class ExecutionStore:
         entry_plan_json = (
             json.dumps(entry_plan, sort_keys=True) if entry_plan is not None else None
         )
+        observation = current_scheduler_observation()
+        if observation is not None:
+            observation.reserve_workflow_writes(transitions=1, snapshots=1)
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             durable_transition_count = int(
@@ -227,6 +234,9 @@ class ExecutionStore:
     ) -> None:
         """Upsert the latest workflow snapshot for fast recovery."""
         entry_plan_json = json.dumps(entry_plan, sort_keys=True) if entry_plan is not None else None
+        observation = current_scheduler_observation()
+        if observation is not None:
+            observation.reserve_workflow_writes(snapshots=1)
         with self._lock, self._connect() as conn:
             conn.execute(
                 """

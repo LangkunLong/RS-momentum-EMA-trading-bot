@@ -26,7 +26,49 @@ from core.canslim.entry_contract import (
     MIN_RS_SCORE as CANONICAL_MIN_RS_SCORE,
     CanslimEntryDecision,
 )
+from core.data_client import fmp_request_deferral_reason
 from core.momentum_analysis import calculate_rs_scores_for_tickers
+from core.scheduler_observation import current_scheduler_observation
+
+
+def _record_candidate_observation(
+    symbol: str,
+    category: str,
+    reasons: list[str],
+    metrics: dict[str, object],
+    *,
+    analyzed: bool,
+) -> None:
+    observation = current_scheduler_observation()
+    if observation is None:
+        return
+    coverage_keys = {
+        "quarterly_income": "quarterly_income_available",
+        "annual_income": "annual_income_available",
+        "balance_sheet": "balance_sheet_available",
+    }
+    fundamental_coverage = {
+        endpoint: (
+            "available" if bool(metrics[key]) else "unavailable"
+        )
+        for endpoint, key in coverage_keys.items()
+        if key in metrics
+    }
+    deferral_reason = metrics.get("fmp_deferral_reason")
+    if metrics.get("fmp_quota_deferred") and not deferral_reason:
+        deferral_reason = fmp_request_deferral_reason()
+    observation.record_scan_coverage(
+        candidate_outcomes=[
+            {
+                "symbol": symbol,
+                "category": category,
+                "reasons": reasons,
+                "analyzed": analyzed,
+                "fundamental_coverage": fundamental_coverage,
+                "fmp_deferral_reason": deferral_reason,
+            }
+        ]
+    )
 
 
 def _classify_canslim_candidate(
@@ -137,13 +179,82 @@ def evaluate_stock_canslim(
     _debug("\n" + "-" * 60)
     _debug(f"[DEBUG] Evaluating {symbol}")
 
+    observation = current_scheduler_observation()
+    price_history_unavailable: dict[str, str] = {}
+
+    def _record_price_history_unavailable(
+        reason: str, error: Optional[Exception]
+    ) -> None:
+        if observation is None:
+            return
+        details = {
+            "symbol": symbol,
+            "provider": "alpaca",
+            "reason": reason,
+        }
+        if error is not None:
+            details["error_type"] = type(error).__name__
+
+        if reason == "read_failed":
+            event_status = "request_failed"
+            gap_reason = "request_failed"
+            coverage_status = "unverified"
+            candidate_reason = "required_ohlcv_read_failed"
+            observation.latch_service_issue(
+                "required_candidate_ohlcv_read_failed", details, unverified=True
+            )
+        elif reason == "insufficient_history":
+            event_status = "coverage_incomplete"
+            gap_reason = "insufficient_history"
+            coverage_status = "degraded"
+            candidate_reason = "insufficient_ohlcv_history"
+        elif reason in {"empty_response", "stale_session"}:
+            event_status = "coverage_incomplete"
+            gap_reason = reason
+            coverage_status = "degraded"
+            candidate_reason = {
+                "empty_response": "empty_ohlcv_response",
+                "stale_session": "stale_candidate_ohlcv_session",
+            }[reason]
+        else:
+            event_status = "coverage_incomplete"
+            gap_reason = reason
+            coverage_status = "degraded"
+            candidate_reason = f"ohlcv_{reason}"
+
+        observation.record_event(
+            "market_data", "candidate_ohlcv", event_status, details
+        )
+        observation.record_input_gap(
+            symbol,
+            "alpaca_ohlcv",
+            gap_reason,
+            coverage_status=coverage_status,
+        )
+        price_history_unavailable["reason"] = candidate_reason
+
     canslim_view = evaluate_canslim(
         symbol,
         rs_scores_df=rs_scores_df,
         market_trend=market_trend,
         as_of_session=as_of_session,
+        on_price_history_unavailable=(
+            _record_price_history_unavailable if observation is not None else None
+        ),
     )
     if not canslim_view:
+        reasons = (
+            [price_history_unavailable["reason"]]
+            if price_history_unavailable
+            else ["canslim_evaluation_unavailable"]
+        )
+        _record_candidate_observation(
+            symbol,
+            "unavailable",
+            reasons,
+            {},
+            analyzed=False,
+        )
         _debug("[DEBUG] CANSLIM evaluation unavailable.")
         _flush_logs()
         return None
@@ -213,6 +324,14 @@ def evaluate_stock_canslim(
         require_fundamentals=require_fundamentals,
         strict_breakout=strict_breakout,
     )
+    if category == "rejected":
+        _record_candidate_observation(
+            symbol,
+            category,
+            notes,
+            metrics,
+            analyzed=True,
+        )
     canslim_view["scanner_category"] = category
     canslim_view["scanner_notes"] = notes
 
@@ -309,13 +428,22 @@ def screen_stocks_canslim_detailed(
     rs_score_by_symbol: Dict[str, float] = {}
     rs_below_threshold = 0
     rs_not_found = 0
+    rs_covered = 0
+    observation = current_scheduler_observation()
     for symbol in symbols_list:
+        rs_available = False
+        rs_val = 0.0
         try:
             match = rs_scores_df[rs_scores_df["Ticker"] == symbol]
             if not match.empty:
-                rs_val = float(match.iloc[0]["RS_Score"])
+                raw_rs_score = match.iloc[0]["RS_Score"]
+                if pd.notna(raw_rs_score):
+                    rs_val = float(raw_rs_score)
+                    rs_available = True
+                    rs_covered += 1
+                else:
+                    rs_not_found += 1
             else:
-                rs_val = 0
                 rs_not_found += 1
         except Exception:
             rs_val = 0
@@ -326,11 +454,34 @@ def screen_stocks_canslim_detailed(
             rs_score_by_symbol[symbol] = rs_val
         else:
             rs_below_threshold += 1
+            if observation is not None:
+                reason = "below_canonical_rs_floor" if rs_available else "rs_score_unavailable"
+                if not rs_available:
+                    observation.record_input_gap(
+                        symbol,
+                        "relative_strength",
+                        "rs_score_unavailable",
+                        coverage_status="unverified",
+                    )
+                observation.record_scan_coverage(
+                    candidate_outcomes=[
+                        {
+                            "symbol": symbol,
+                            "category": "rejected",
+                            "reasons": [reason],
+                            "analyzed": False,
+                            "fundamental_coverage": {},
+                        }
+                    ]
+                )
             if debug:
                 print(
                     f"[DEBUG] Pre-filter: {symbol} RS={rs_val:.1f} < "
                     f"{effective_rs_floor:.1f}, skipped"
                 )
+
+    if observation is not None:
+        observation.record_scan_coverage(rs_covered=rs_covered)
 
     if debug:
         print(
@@ -345,7 +496,7 @@ def screen_stocks_canslim_detailed(
     # Evaluate remaining symbols in parallel
     def _evaluate(sym: str) -> Optional[Dict[str, object]]:
         try:
-            return evaluate_stock_canslim(
+            evaluation = evaluate_stock_canslim(
                 symbol=sym,
                 min_rs_score=min_rs_score,
                 min_canslim_score=min_canslim_score,
@@ -360,7 +511,52 @@ def screen_stocks_canslim_detailed(
             )
         except Exception as exc:
             print(f"Error analyzing {sym}: {exc}")
+            if observation is not None:
+                observation.record_scan_coverage(
+                    candidate_outcomes=[
+                        {
+                            "symbol": sym,
+                            "category": "analysis_failed",
+                            "reasons": [type(exc).__name__],
+                            "analyzed": False,
+                            "fundamental_coverage": {},
+                        }
+                    ]
+                )
+                observation.latch_service_issue(
+                    "candidate_analysis_failed",
+                    {"symbol": sym, "error_type": type(exc).__name__},
+                )
             return None
+        if observation is not None:
+            if evaluation is None:
+                observation.record_scan_coverage(
+                    candidate_outcomes=[
+                        {
+                            "symbol": sym,
+                            "category": "not_emitted",
+                            "reasons": ["evaluation_did_not_emit_candidate"],
+                            "analyzed": False,
+                            "fundamental_coverage": {},
+                        }
+                    ]
+                )
+            else:
+                metrics = evaluation.get("metrics", {})
+                _record_candidate_observation(
+                    sym,
+                    str(evaluation.get("scanner_category", "unclassified")),
+                    list(evaluation.get("scanner_notes", [])),
+                    metrics if isinstance(metrics, dict) else {},
+                    analyzed=True,
+                )
+                observation.record_event(
+                    "candidate_analysis",
+                    sym,
+                    str(evaluation.get("scanner_category", "unclassified")),
+                    {"reasons": evaluation.get("scanner_notes", [])},
+                )
+        return evaluation
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(_evaluate, sym): sym for sym in filtered_symbols}
