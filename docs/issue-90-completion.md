@@ -5,7 +5,7 @@
 - **Source base:** `a7cb3f44c3cd1156a172cce6e52c0c17c6a88a78`.
 - **Original evidence delivery:** `7617ad173d97087809480157930306ba045f9385`.
 - **Current disposition:** the original controlled acceptance slice is evidenced; two P2 delivery corrections are implemented and locally verified. Principal re-review, normal integration/merge, and final acceptance remain pending.
-- **Delivery boundary:** local commits only. No publication, merge, issue closure, provider/model/broker call, or new Docker/runtime operation was performed for this correction.
+- **Delivery boundary:** local commits only. No publication, merge, issue closure, external provider/model/broker call, or Docker/container execution was performed. Verification used local pytest with scripted roles and a synthetic evaluator.
 
 ## Implementation
 
