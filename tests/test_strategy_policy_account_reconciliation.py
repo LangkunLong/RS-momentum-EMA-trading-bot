@@ -1939,9 +1939,13 @@ def test_canonical_store_read_reconciles_old_generation_state_with_current_portf
         subject_type=DecisionSubjectType.SECURITY,
         subject_id="FIGI-BB1234",
     )
+    active_pointer = store.load_active_generation_pointer(generation_b.paper_account_environment_id)
+    assert active_pointer.active_generation_id is None
+    assert active_pointer.pointer_version is None
     store.set_active_generation(
         generation_b.paper_account_environment_id,
-        expected_generation_id=None,
+        expected_generation_id=active_pointer.active_generation_id,
+        expected_pointer_version=active_pointer.pointer_version,
         new_generation_id=generation_b.deployment_generation_id,
         readiness_evidence_ref="synthetic-generation-b-ready",
         outgoing_entries_reconciled=True,

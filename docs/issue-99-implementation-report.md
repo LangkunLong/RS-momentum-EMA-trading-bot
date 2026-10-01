@@ -5,13 +5,15 @@
 **Original review baseline:** `ab385d792e19ff6db39d87f1123f47f660fc1e1d`
 **Pure producer checkpoints:** `446d2e1ac906db9b09db8311aa207ddae4d861db` and approved descendant `aef51d0d4893db1049401bc37ea40f434ea60b56`
 **Persistence construction dependency:** `d52fb22deedc74361f6e4ae4a0113dc4f215c3c2`
+**Durable-state construction correction:** `963a61f1dbc0641d50a4272e845447bf4e40abfa`
+**Producer report-only disposition:** `d8e383ecf5cdae37f0a3828a056ff2d1b1e202af`
 
 ## Statuses
 
 - **Implementation:** The consumer adapter preserves action origin clocks, attempt terminal states and aliases, resolution reasons, and action/holding versions. Reconciliation accepts older issued actions when they match current account facts, rejects future or stale unsent actions, and coalesces equivalent broker rows only after their references resolve to one canonical attempt and their material facts agree. No producer-owned files were changed by #99.
-- **Required inputs:** A focused integration test writes real #100 DTOs into a temporary SQLite store, then obtains generation-A actions and holdings together with generation-B portfolio facts through `load_policy_execution_snapshot`.
-- **Acceptance evidence:** Focused consumer regressions pass, including canonical temp-store and registered-alias coalescing cases. The alias follow-up awaits independent re-review. The old broad non-integration run was interrupted at about 14% after reporting failures and is not acceptance evidence. Persistence producer acceptance remains open.
-- **Dependencies:** The pure producer checkpoint is approved and integrated as a construction dependency. Persistence commit `d52fb22deedc74361f6e4ae4a0113dc4f215c3c2` is also integrated as a construction dependency, but is not independently accepted; its lead has seven Important review fixes underway.
+- **Required inputs:** A focused integration test writes real #100 DTOs into a temporary SQLite store, reads the active pointer version, then obtains generation-A actions and holdings together with generation-B portfolio facts through `load_policy_execution_snapshot`.
+- **Acceptance evidence:** Focused consumer regressions pass, including canonical temp-store and registered-alias coalescing cases. Independent consumer review approved the alias coalescing in `2cf4bdf`; the subsequent pointer-version test adaptation is recorded separately. The old broad non-integration run was interrupted at about 14% after reporting failures and is not acceptance evidence. Persistence producer acceptance remains open.
+- **Dependencies:** The pure producer checkpoint is approved and integrated as a construction dependency. Persistence commit `d52fb22deedc74361f6e4ae4a0113dc4f215c3c2` and correction source `963a61f1dbc0641d50a4272e845447bf4e40abfa` are integrated as construction dependencies only. The producer remains under review; lead-reported scoped review has cleared findings 3, 4, 5, and 7, while one Important gap remains in finding 2. No producer acceptance is inferred.
 
 ## Changed paths owned by #99
 
@@ -25,6 +27,7 @@ The following are inherited from the #100 dependency commit and are not #99-owne
 - `core/policy_execution_state.py`
 - `tests/test_policy_execution_state.py`
 - `docs/issue-100-state-interface-v1.md`
+- `docs/issue-100-implementation-report.md`
 
 ## Acceptance mapping
 
@@ -51,15 +54,15 @@ classes directly.
 
 The branch inherits pure producer commit `446d2e1ac906db9b09db8311aa207ddae4d861db` and its approved descendant `aef51d0d4893db1049401bc37ea40f434ea60b56`. The approved pure checkpoint is a construction dependency only; it is not an acceptance decision for persistence or this consumer integration.
 
-The branch also includes persistence commit `d52fb22deedc74361f6e4ae4a0113dc4f215c3c2` for construction. That commit has not passed independent review; seven Important fixes remain with the producer lead. The consumer change does not modify producer store/state files.
+The branch includes persistence commit `d52fb22deedc74361f6e4ae4a0113dc4f215c3c2` and durable-state correction source `963a61f1dbc0641d50a4272e845447bf4e40abfa` for construction only. The correction adds active-pointer version compare-and-set and associated state/store fixes. Companion producer report-only commit `d8e383ecf5cdae37f0a3828a056ff2d1b1e202af` records review disposition. The lead reports that scoped review cleared findings 3, 4, 5, and 7 and retains one Important issue in finding 2: late references can reopen a resolved addition without restoring its holding pending conflict. Producer acceptance remains pending. The consumer correction does not edit producer state/store files.
 
-The focused temporary-store test uses `PolicyExecutionStateStore.load_policy_execution_snapshot` as the source of both generations' records. It confirms that a generation-A holding and partially filled scale-out action, with provider-scoped aliases and its original action clock, are returned in one read alongside generation-B's current portfolio snapshot. Current synthetic broker positions, balances, and protective-stop facts then reconcile successfully against that returned data.
+The focused temporary-store test reads the absent active pointer (`active_generation_id=None`, `pointer_version=None`) and supplies both observed values to the versioned setter. It then uses `PolicyExecutionStateStore.load_policy_execution_snapshot` as the source of both generations' records. A generation-A holding and partially filled scale-out action, with provider-scoped aliases and its original action clock, are returned in one read alongside generation-B's current portfolio snapshot. Current synthetic broker positions, balances, and protective-stop facts reconcile against that returned data.
 
 The consumer conversion tests cover preservation of explicit resolution reasons, per-attempt aliases and terminal status, and state versions; readiness after a resolved terminal action; release of its reservations; acceptance of a matching older submitted action; and fail-closed outcomes for future/inconsistent provenance and expired unsent actions. The historical 35-test receipt above remains evidence from `e12a8a7` only.
 
 The alias-deduplication follow-up resolves the remaining consumer review finding. For strategy orders with canonical attempts, each supplied broker/client ID must map uniquely to the same `(logical_action_id, attempt_number)` before rows are considered equivalent. Rows are coalesced only when symbol, side, status, purpose, holding ID, requested and filled quantities, and stop price agree. Unregistered or cross-attempt references are not eligible; conflicting material facts remain separate and block reservations. The consumer guide now describes resolved-action readiness and the limited temporary-store test correctly.
 
-This correction is submitted for the requested independent consumer re-review. It does not close the separate persistence review or combined restart acceptance gates.
+The independent consumer review approved the alias correction in `2cf4bdf` as spec-compliant with no remaining Important or Minor findings. That review preceded the producer `963a61f` merge and did not cover the pointer-version test adaptation below. This narrow adaptation is submitted separately; neither result closes the producer persistence review or combined restart acceptance gates.
 
 Focused verification after the persistence integration:
 
@@ -79,17 +82,25 @@ Focused regression command:
 python -m pytest -p no:cacheprovider -o addopts='' -W ignore::pytest.PytestConfigWarning --tb=short tests/test_strategy_policy_account_reconciliation.py::test_policy_execution_state_conversion_preserves_decimal_residual_attempts_and_identity tests/test_strategy_policy_account_reconciliation.py::test_policy_execution_state_conversion_keeps_order_references_per_attempt tests/test_strategy_policy_account_reconciliation.py::test_duplicate_broker_rows_with_conflicting_alias_pairs_block_reservations tests/test_strategy_policy_account_reconciliation.py::test_conflicting_duplicate_broker_order_reference_blocks_reservations tests/test_strategy_policy_account_reconciliation.py::test_duplicate_local_and_broker_references_do_not_double_reserve tests/test_strategy_policy_account_reconciliation.py::test_unavailable_security_mapping_with_matched_order_returns_unready tests/test_strategy_policy_account_reconciliation.py::test_matching_old_generation_holding_action_is_valid_under_new_active_generation tests/test_strategy_policy_account_reconciliation.py::test_canonical_store_read_reconciles_old_generation_state_with_current_portfolio tests/test_strategy_policy_account_reconciliation.py::test_registered_attempt_alias_rows_reserve_once tests/test_strategy_policy_account_reconciliation.py::test_registered_attempt_alias_rows_with_conflicting_facts_block_reservations -q
 ```
 
-Result: **17 passed**. Ruff passed on the reconciliation module and focused test file; `compileall` passed for the reconciliation module; `git diff --check` found no whitespace errors. No broad suite was run.
+Result: **17 passed** after integrating producer source `963a61f` and adapting the consumer test to its pointer-version API. Ruff passed on the reconciliation module and focused test file; `compileall` passed for the reconciliation module; `git diff --check` found no whitespace errors. No broad suite was run.
 
-The separate lead-provided `tests/test_paper_policy_chain.py` receipt was **3 passed, 2 warnings**; it includes a later-session mixed-generation case and does not cover these equivalent-alias rows. The warning details were not supplied, so the receipt remains attributed to the lead and is not classified as warning-free.
+After the producer merge, the canonical-store API adaptation was also run by itself:
+
+```text
+python -m pytest -p no:cacheprovider -o addopts='' -W ignore::pytest.PytestConfigWarning --tb=short tests/test_strategy_policy_account_reconciliation.py::test_canonical_store_read_reconciles_old_generation_state_with_current_portfolio -q
+```
+
+Result: **1 passed**. The test reads `ActiveGenerationPointer`, then supplies both its observed generation ID and pointer version to `set_active_generation`.
+
+Lead-provided chain evidence is separate from the local consumer run. The earlier expanded `tests/test_paper_policy_chain.py` run reported **5 passed, 2 warnings**, including both store alias/restart duplicate cases and the later-session mixed-generation case. Warning details were not supplied, so the receipt remains attributed to the lead and is not classified as warning-free. The producer issue report at `d8e383e` and later lead status keep full producer review open.
 
 SHA-256 evidence hashes (the synthetic records are inline in the test source):
 
 | Artifact | SHA-256 |
 | --- | --- |
 | `core/strategy_policy/account_reconciliation.py` | `a7121eb1512b0422e7607491e43ec53b4a16cc21d7c510d715c74ca05861175f` |
-| `tests/test_strategy_policy_account_reconciliation.py` | `7ec96292ee566225b76e51145748e2b9b4269a1516a82e29ce18435aaa564b16` |
-| `docs/strategy-policy-account-reconciliation-issue99.md` | `8a0b80faa9b03eaa449e835591d8e524e2af23ba47934a315cdab98b256abcce` |
+| `tests/test_strategy_policy_account_reconciliation.py` | `c0976172f916b9ba0c8e190c0bec01d50a577cade6b730159a16c14d9bff436e` |
+| `docs/strategy-policy-account-reconciliation-issue99.md` | `20d00cf9fd874265f397050194aecb2008eeb0a13724ba83f0a1c7b85ef47721` |
 
 ## Prior verification record (`e12a8a7`, report `f89172d`)
 
@@ -143,7 +154,7 @@ Three adjacent offline regression controls also passed (**3 passed**): `test_pol
 
 ## Known dependency and precision limits
 
-- Persistence checkpoint acceptance remains open until the producer lead's seven Important review findings are fixed and independently re-reviewed.
+- Producer source `963a61f` remains construction-only. One Important producer finding remains open in scoped review; the full persistence implementation has not been accepted.
 - Combined restart acceptance with the durable store, live account facts, and deployment workflow remains a separate gate; the current temporary-store test is synthetic and consumer-focused.
 - This work does not establish real provider/broker behavior or runtime deployment acceptance.
 - Decimal source values are normalized to finite floats at the existing V3 feature boundary;

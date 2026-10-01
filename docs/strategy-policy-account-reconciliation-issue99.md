@@ -54,10 +54,11 @@ order. Missing reasons or nonterminal attempts keep readiness blocked.
 
 The conversion is tested against real immutable DTOs from approved pure producer checkpoint
 `aef51d0d4893db1049401bc37ea40f434ea60b56`. A focused consumer test also uses a temporary
-SQLite store from persistence construction dependency
-`d52fb22deedc74361f6e4ae4a0113dc4f215c3c2`, then calls
-`load_policy_execution_snapshot` to reconcile pinned older-generation records with current
-portfolio and broker facts. That checkpoint remains unaccepted pending producer review; the
-test is synthetic consumer evidence, not durable-store or runtime acceptance. The module
-itself remains pure and does not open the store. All account and broker facts in #99 tests
-are deterministic synthetic fixtures.
+SQLite store from persistence checkpoint `d52fb22deedc74361f6e4ae4a0113dc4f215c3c2` and
+construction correction `963a61f1dbc0641d50a4272e845447bf4e40abfa`. It reads the active
+pointer version, then calls `load_policy_execution_snapshot` to reconcile pinned
+older-generation records with current portfolio and broker facts. These producer commits are
+construction dependencies only; independent persistence review and full acceptance remain
+open. The test is synthetic consumer evidence, not durable-store or runtime acceptance. The
+module itself remains pure and does not open the store. All account and broker facts in #99
+tests are deterministic synthetic fixtures.
