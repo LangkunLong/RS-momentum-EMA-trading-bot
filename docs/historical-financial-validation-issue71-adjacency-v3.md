@@ -65,6 +65,39 @@ they do not establish feature coverage, policy consumption, strategy or
 portfolio impact, production-universe behavior, or retrospective trading
 error.
 
+## Reproduction recipe
+
+The one-off scan used for the counts above was not retained with its exact
+command or runtime versions. The read-only recipe is now retained at
+`tools/reproduce_issue71_adjacency_comparison.py`. From the repository root,
+run:
+
+```powershell
+python -m tools.reproduce_issue71_adjacency_comparison --bundle "C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.artifacts/data/development-sp500-v2/pit_bundle.sqlite3" --manifest "C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.artifacts/data/development-sp500-v2/bundle_manifest.json" --evaluation-start 2021-01-01 --evaluation-end 2025-12-31
+```
+
+The script defaults to the recorded bundle and manifest SHA-256 values. It
+validates both digests and the manifest-to-bundle binding, opens the V2 bundle
+read-only, evaluates quarterly snapshots at each distinct quarterly
+`public_date`, and counts ticker price rows in each half-open state window up
+to the next quarterly `public_date`. A window is included for a metric when it
+contains at least one price row. The old side uses the v2 calendar-quarter
+ordinal guard; both sides share the accepted #66 28-day fiscal matcher and
+growth formula. The JSON result records the bundle hashes, code revision,
+calculator identity, Python, pandas, and SQLite versions.
+
+The script was added after the original comparison and this follow-up did not
+rerun the full scan. Thus the recipe makes the measurement independently
+reproducible, but the reported 68-window and 6,007-session EPS counts have not
+yet been revalidated by executing this retained script. The original scan's
+runtime identity is unknown. The recipe-creation environment was CPython
+3.13.14, pandas 3.0.1, SQLite 3.50.4; a reproduction run records its own
+runtime instead of assuming those versions.
+
+The recipe CLI import/help path and Ruff check pass. The addendum JSON parsed
+successfully. The bundle comparison itself was not executed in this follow-up,
+so script output has not been compared to the historical counts.
+
 ## Verification and status
 
 - `tests/test_historical06_financial_semantics.py` and

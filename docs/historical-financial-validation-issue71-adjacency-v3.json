@@ -69,6 +69,38 @@
       "retrospective trading error"
     ]
   },
+  "reproduction_recipe": {
+    "script": "tools/reproduce_issue71_adjacency_comparison.py",
+    "command": "python -m tools.reproduce_issue71_adjacency_comparison --bundle \"C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.artifacts/data/development-sp500-v2/pit_bundle.sqlite3\" --manifest \"C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.artifacts/data/development-sp500-v2/bundle_manifest.json\" --evaluation-start 2021-01-01 --evaluation-end 2025-12-31",
+    "read_only": true,
+    "validates_bundle_sha256": true,
+    "validates_manifest_sha256_and_bundle_binding": true,
+    "state_window_algorithm": "For each symbol, take distinct quarterly public_date boundaries; clip each interval [boundary, next boundary) to the evaluation dates; query the PITDataBundle snapshot as of the clipped interval start; include the window if it contains at least one price row; add all price rows in changed windows to changed priced security-sessions.",
+    "v2_algorithm": "Apply the same #66 fiscal matcher and growth formula, requiring the two newest matched current periods to differ by one pandas calendar-quarter ordinal.",
+    "v3_algorithm": "Apply current pit-financial-features-v3 using the same #66 matcher and growth formula, requiring an inclusive 84-105 day current-period endpoint gap.",
+    "original_scan_runtime_identity_retained": false,
+    "followup_full_scan_rerun": false,
+    "recipe_creation_runtime": {
+      "python_implementation": "CPython",
+      "python_version": "3.13.14",
+      "pandas_version": "3.0.1",
+      "sqlite_version": "3.50.4"
+    },
+    "reproduction_output_captures": [
+      "source revision",
+      "calculator identity",
+      "bundle and manifest digests",
+      "Python implementation and version",
+      "pandas version",
+      "SQLite version"
+    ],
+    "verification": {
+      "cli_help_import_smoke": "passed; scan not executed",
+      "ruff": "passed",
+      "json_parse": "passed",
+      "full_comparison_executed": false
+    }
+  },
   "verification": [
     {
       "command": "python -m pytest tests/test_historical06_financial_semantics.py tests/test_task11_earnings_provenance_contract.py -q -p no:cacheprovider -o addopts='' --tb=short",
