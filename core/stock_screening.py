@@ -208,11 +208,19 @@ def evaluate_stock_canslim(
             gap_reason = "insufficient_history"
             coverage_status = "degraded"
             candidate_reason = "insufficient_ohlcv_history"
+        elif reason in {"empty_response", "stale_session"}:
+            event_status = "coverage_incomplete"
+            gap_reason = reason
+            coverage_status = "degraded"
+            candidate_reason = {
+                "empty_response": "empty_ohlcv_response",
+                "stale_session": "stale_candidate_ohlcv_session",
+            }[reason]
         else:
             event_status = "coverage_incomplete"
             gap_reason = reason
             coverage_status = "degraded"
-            candidate_reason = "empty_ohlcv_response"
+            candidate_reason = f"ohlcv_{reason}"
 
         observation.record_event(
             "market_data", "candidate_ohlcv", event_status, details

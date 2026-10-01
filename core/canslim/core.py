@@ -142,9 +142,13 @@ def evaluate_canslim(
     price_history = normalize_price_dataframe(price_history)
     if expected_session is not None:
         if latest_us_equity_session(price_history) != normalize_us_equity_session(expected_session).date():
+            if on_price_history_unavailable is not None:
+                on_price_history_unavailable("stale_session", None)
             return None
         exact_history = history_through_exact_session(price_history, expected_session)
         if exact_history is None:
+            if on_price_history_unavailable is not None:
+                on_price_history_unavailable("stale_session", None)
             return None
         price_history = exact_history
     if len(price_history) < 30:

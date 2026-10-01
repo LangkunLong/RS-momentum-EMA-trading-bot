@@ -1,5 +1,6 @@
 """Tests for scanner classification between actionable buys and watchlist names."""
 
+from datetime import date
 from unittest.mock import patch
 
 import pandas as pd
@@ -561,6 +562,99 @@ def test_observation_marks_insufficient_candidate_ohlcv_history_as_degraded_cove
     assert candidate["endpoint_coverage"]["alpaca_ohlcv"] == {
         "status": "degraded",
         "reason": "insufficient_history",
+    }
+
+
+def test_observation_marks_empty_candidate_ohlcv_response_as_degraded_coverage() -> None:
+    observation = SchedulerObservation("candidate-ohlcv-empty-response")
+    market = _make_view()["market_trend"]
+    rs_scores = pd.DataFrame([{"Ticker": "AAPL", "RS_Score": 90.0}])
+    with (
+        activate_scheduler_observation(observation),
+        patch("core.stock_screening.evaluate_market_direction", return_value=market),
+        patch("core.stock_screening.calculate_rs_scores_for_tickers", return_value=rs_scores),
+        patch("core.canslim.core.fetch_ohlcv", return_value=pd.DataFrame()),
+    ):
+        buys, watchlist, _ = screen_stocks_canslim_detailed(
+            symbols=["AAPL"], start_date="2026-01-01"
+        )
+
+    assert buys == []
+    assert watchlist == []
+    receipt = observation.to_receipt()
+    assert receipt["service_health"] == "healthy"
+    assert receipt["required_input_coverage"] == "degraded"
+    assert receipt["issues"] == []
+    assert receipt["input_gaps"] == [
+        {
+            "symbol": "AAPL",
+            "endpoint": "alpaca_ohlcv",
+            "reason": "empty_response",
+            "coverage_status": "degraded",
+        }
+    ]
+    candidate = receipt["scan_coverage"]["candidate_outcomes"][0]
+    assert candidate["category"] == "unavailable"
+    assert candidate["reasons"] == ["empty_ohlcv_response"]
+    assert candidate["endpoint_coverage"]["alpaca_ohlcv"] == {
+        "status": "degraded",
+        "reason": "empty_response",
+    }
+
+
+def test_observation_marks_stale_candidate_ohlcv_session_as_degraded_coverage() -> None:
+    observation = SchedulerObservation("candidate-ohlcv-stale-session")
+    market = _make_view()["market_trend"]
+    market.as_of_session = date(2026, 10, 1)
+    rs_scores = pd.DataFrame([{"Ticker": "AAPL", "RS_Score": 90.0}])
+    dates = pd.bdate_range(end="2026-09-30", periods=60)
+    stale_history = pd.DataFrame(
+        {
+            "Open": [100.0] * len(dates),
+            "High": [101.0] * len(dates),
+            "Low": [99.0] * len(dates),
+            "Close": [100.0] * len(dates),
+            "Volume": [1_000_000.0] * len(dates),
+        },
+        index=dates,
+    )
+    with (
+        activate_scheduler_observation(observation),
+        patch("core.stock_screening.evaluate_market_direction", return_value=market),
+        patch("core.stock_screening.calculate_rs_scores_for_tickers", return_value=rs_scores),
+        patch("core.canslim.core.fetch_ohlcv", return_value=stale_history),
+    ):
+        buys, watchlist, _ = screen_stocks_canslim_detailed(
+            symbols=["AAPL"], start_date="2026-01-01"
+        )
+
+    assert buys == []
+    assert watchlist == []
+    receipt = observation.to_receipt()
+    assert receipt["service_health"] == "healthy"
+    assert receipt["required_input_coverage"] == "degraded"
+    assert receipt["issues"] == []
+    assert receipt["input_gaps"] == [
+        {
+            "symbol": "AAPL",
+            "endpoint": "alpaca_ohlcv",
+            "reason": "stale_session",
+            "coverage_status": "degraded",
+        }
+    ]
+    assert any(
+        event["kind"] == "market_data"
+        and event["key"] == "candidate_ohlcv"
+        and event["status"] == "coverage_incomplete"
+        and event["details"]["reason"] == "stale_session"
+        for event in receipt["events"]
+    )
+    candidate = receipt["scan_coverage"]["candidate_outcomes"][0]
+    assert candidate["category"] == "unavailable"
+    assert candidate["reasons"] == ["stale_candidate_ohlcv_session"]
+    assert candidate["endpoint_coverage"]["alpaca_ohlcv"] == {
+        "status": "degraded",
+        "reason": "stale_session",
     }
 
 
