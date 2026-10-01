@@ -147,14 +147,45 @@ def scan_for_canslim_stocks(
 
     missing = set(symbols) - set(valid_symbols)
     if missing:
-        print(f"Skipped {len(missing)} invalid/delisted tickers.")
+        if observation is not None:
+            print(f"Skipped {len(missing)} symbols without validation confirmation.")
+            gap_reason = (
+                "bulk_validation_returned_no_symbols"
+                if not valid_symbols
+                else "symbol_missing_from_bulk_validation"
+            )
+            for symbol in sorted(missing):
+                observation.record_input_gap(
+                    symbol,
+                    "alpaca_ticker_validation",
+                    gap_reason,
+                    coverage_status="unverified",
+                )
+            if not valid_symbols:
+                observation.record_event(
+                    "market_data",
+                    "alpaca_ticker_validation",
+                    "unavailable",
+                    {"requested_count": len(symbols)},
+                )
+                observation.latch_service_issue(
+                    "ticker_validation_unavailable",
+                    {"requested_count": len(symbols)},
+                    unverified=True,
+                )
+        else:
+            print(f"Skipped {len(missing)} invalid/delisted tickers.")
         if observation is not None:
             observation.record_scan_coverage(
                 candidate_outcomes=[
                     {
                         "symbol": symbol,
                         "category": "rejected",
-                        "reasons": ["invalid_ticker"],
+                        "reasons": [
+                            "ticker_validation_unavailable"
+                            if observation is not None
+                            else "invalid_ticker"
+                        ],
                         "analyzed": False,
                         "fundamental_coverage": {},
                     }

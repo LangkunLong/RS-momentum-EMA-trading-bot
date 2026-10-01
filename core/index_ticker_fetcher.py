@@ -264,6 +264,7 @@ class IndexTickerFetcher:
         """Initialise the fetcher with an optional custom cache directory."""
         self.cache_dir = cache_dir or CACHE_DIR
         self.cache_file = self.cache_dir / "index_tickers_cache.json"
+        self._last_fetch_incomplete_indices: set[str] = set()
         self._ensure_cache_dir()
 
     def _ensure_cache_dir(self) -> None:
@@ -432,6 +433,7 @@ class IndexTickerFetcher:
                 )
             return fallback
         if observation is not None:
+            self._last_fetch_incomplete_indices.add(index_key)
             details = {
                 "reason": failure_reason,
                 "fallback_ticker_count": len(fallback),
@@ -540,10 +542,11 @@ class IndexTickerFetcher:
 
         # Fetch fresh data
         print("Fetching fresh ticker data from indices...")
+        self._last_fetch_incomplete_indices = set()
         index_tickers = self.fetch_all_index_tickers(indices)
 
         observation = current_scheduler_observation()
-        incomplete_indices = [
+        incomplete_indices = sorted(self._last_fetch_incomplete_indices | {
             index_key
             for index_key, tickers in index_tickers.items()
             if len(tickers) < _MIN_TICKERS_PER_INDEX.get(index_key, 1)
@@ -551,7 +554,7 @@ class IndexTickerFetcher:
                 index_key in _MAX_TICKERS_PER_INDEX
                 and len(tickers) > _MAX_TICKERS_PER_INDEX[index_key]
             )
-        ]
+        })
         if observation is not None and incomplete_indices:
             observation.record_event(
                 "index_cache",

@@ -87,3 +87,70 @@ def test_observation_records_full_large_cap_request_and_validation_counts() -> N
     assert coverage["validated"] == 7
     assert record_coverage.call_args_list.count(call(requested=8)) == 1
     assert record_coverage.call_args_list.count(call(validated=7)) == 1
+
+
+def test_observation_does_not_report_empty_validation_as_invalid_tickers() -> None:
+    market = SimpleNamespace(is_bullish=True, score=0.8, distribution_days=0, follow_through=False)
+    observation = SchedulerObservation("empty-ticker-validation")
+    with (
+        activate_scheduler_observation(observation),
+        patch.object(enhanced_scanner, "validate_tickers_bulk", return_value=[]),
+        patch.object(
+            enhanced_scanner,
+            "screen_stocks_canslim_detailed",
+            return_value=([], [], market),
+        ) as screen,
+    ):
+        enhanced_scanner.scan_for_canslim_stocks(
+            custom_list=["AAPL", "MSFT"], include_extra_symbols=False
+        )
+
+    screen.assert_called_once()
+    assert screen.call_args.kwargs["symbols"] == []
+    receipt = observation.to_receipt()
+    assert receipt["service_health"] == "unverified"
+    assert receipt["required_input_coverage"] == "unverified"
+    outcomes = {
+        row["symbol"]: row["reasons"]
+        for row in receipt["scan_coverage"]["candidate_outcomes"]
+    }
+    assert outcomes == {
+        "AAPL": ["ticker_validation_unavailable"],
+        "MSFT": ["ticker_validation_unavailable"],
+    }
+    assert all("invalid_ticker" not in reasons for reasons in outcomes.values())
+
+
+def test_observation_marks_partial_ticker_validation_as_unverified_coverage() -> None:
+    market = SimpleNamespace(is_bullish=True, score=0.8, distribution_days=0, follow_through=False)
+    observation = SchedulerObservation("partial-ticker-validation")
+    with (
+        activate_scheduler_observation(observation),
+        patch.object(enhanced_scanner, "validate_tickers_bulk", return_value=["AAPL"]),
+        patch.object(
+            enhanced_scanner,
+            "screen_stocks_canslim_detailed",
+            return_value=([], [], market),
+        ) as screen,
+    ):
+        enhanced_scanner.scan_for_canslim_stocks(
+            custom_list=["AAPL", "MSFT"], include_extra_symbols=False
+        )
+
+    assert screen.call_args.kwargs["symbols"] == ["AAPL"]
+    receipt = observation.to_receipt()
+    assert receipt["service_health"] == "healthy"
+    assert receipt["required_input_coverage"] == "unverified"
+    assert receipt["input_gaps"] == [
+        {
+            "symbol": "MSFT",
+            "endpoint": "alpaca_ticker_validation",
+            "reason": "symbol_missing_from_bulk_validation",
+            "coverage_status": "unverified",
+        }
+    ]
+    msft = next(
+        row for row in receipt["scan_coverage"]["candidate_outcomes"] if row["symbol"] == "MSFT"
+    )
+    assert msft["reasons"] == ["ticker_validation_unavailable"]
+    assert msft["endpoint_coverage"]["alpaca_ticker_validation"]["status"] == "unverified"

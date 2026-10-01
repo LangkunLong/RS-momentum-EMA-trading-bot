@@ -165,6 +165,12 @@ def _record_missed_observed_work(
     )
 
 
+def _observed_hourly_due_at(now: datetime, session_started_at: datetime) -> datetime:
+    """Use session start for a current-hour catch-up whose nominal due predates observation."""
+    due = now.replace(minute=1, second=0, microsecond=0)
+    return max(due, session_started_at)
+
+
 def _reconcile_missed_observed_work(
     observation: SchedulerObservation,
     now: datetime,
@@ -590,8 +596,8 @@ def _run_scheduler_locked(
                             )
 
                         if observe_health:
-                            scheduled_at = now.replace(
-                                minute=1, second=0, microsecond=0
+                            scheduled_at = _observed_hourly_due_at(
+                                now, observation_session_started_at or now
                             )
                             attempted_hourly_due.add(scheduled_at)
                             exited = _run_observed_work(

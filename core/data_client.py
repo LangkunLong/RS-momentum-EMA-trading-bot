@@ -994,6 +994,11 @@ def fetch_bulk_close_prices(
 
             if df.empty:
                 print(f"  Batch {batch_num} returned empty data, skipping.")
+                _record_observed_bulk_close_failure(
+                    tickers if not retry_failed_chunks else chunk,
+                    outcome="empty_response",
+                    error_type=None,
+                )
                 if not retry_failed_chunks:
                     print("  Bulk download aborted because retries are disabled.")
                     return pd.DataFrame()
@@ -1012,6 +1017,11 @@ def fetch_bulk_close_prices(
         except Exception as e:
             print(f"  Batch {batch_num} failed: {e}")
             if not retry_failed_chunks:
+                _record_observed_bulk_close_failure(
+                    tickers,
+                    outcome="request_failed",
+                    error_type=type(e).__name__,
+                )
                 print("  Bulk download aborted because batch retries are disabled.")
                 return pd.DataFrame()
             if len(chunk) > 1:
@@ -1026,6 +1036,9 @@ def fetch_bulk_close_prices(
                 if not recovered.empty:
                     all_frames.append(recovered)
             else:
+                _record_observed_bulk_close_failure(
+                    chunk, outcome="request_failed", error_type=type(e).__name__
+                )
                 print(f"  Skipping invalid/unavailable symbol: {chunk[0]}")
             continue
 
@@ -1036,6 +1049,32 @@ def fetch_bulk_close_prices(
     result = result.dropna(axis=1, how="all")
     _cache_set(cache_key, result)
     return result
+
+
+def _record_observed_bulk_close_failure(
+    symbols: List[str], *, outcome: str, error_type: str | None
+) -> None:
+    """Keep observation health from treating failed bulk reads as valid data."""
+    observation = current_scheduler_observation()
+    if observation is None:
+        return
+    details = {
+        "requested_count": len(symbols),
+        "error_type": error_type,
+    }
+    observation.record_event(
+        "market_data", "alpaca_bulk_close_prices", outcome, details
+    )
+    observation.latch_service_issue(
+        "alpaca_bulk_close_prices_unavailable", details, unverified=True
+    )
+    for symbol in symbols:
+        observation.record_input_gap(
+            str(symbol),
+            "alpaca_bulk_close_prices",
+            outcome,
+            coverage_status="unverified",
+        )
 
 
 def fetch_bulk_ohlcv(

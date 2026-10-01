@@ -74,9 +74,17 @@ The checkout-local ignored helper `.artifacts/issue-107-normal-scheduler/run-nor
 pwsh -NoProfile -File .artifacts/issue-107-normal-scheduler/run-normal-dry-run-once.ps1 -OfflineSelfTest
 ```
 
-That mode launches only dummy Python children with the scheduler-shaped argument list. It checks inherited notification credentials are cleared in the child, all four request/retry settings are exact, stdout/stderr and receipts are retained, the 45-minute watchdog path terminates a child tree, and wrapper/kill failures produce truthful receipts. The self-test reports `provider_calls=0` and does not inspect or touch runtime, provider, scheduler-task, ledger, cache, or database state.
+That mode launches only dummy Python children with the scheduler-shaped argument list. It checks inherited notification credentials are cleared in the child, request/retry settings are bounded, lower FMP ceilings are preserved, stdout/stderr and receipts are retained, the 45-minute watchdog path terminates a child tree, wrapper/kill failures produce truthful receipts, and missing scheduler receipts fail closed. A synthetic reviewed-preflight manifest checks the hash-bound approval gate and rejects a reviewed FMP budget that would raise the currently configured local ceiling. It also uses a scratch SQLite database to verify row-count/content-hash capture for all five execution-store tables, detect an unexpected row mutation, and verify post-run capture failures are persisted. The self-test reports `provider_calls=0` and does not inspect or touch the selected runtime, provider, scheduler task, ledger, cache, or execution-store state.
 
-The helper's normal mode is a separate operational action and was not run as part of this implementation. Before using it, select the intended checkout and interpreter, set `EXECUTION_STORE_DB_PATH` to the existing absolute database, ensure the existing FMP request ledger is present, and obtain the separate authorization for provider reads. It records source/runtime identity plus before/after local captures, hashes the ledger before launch, and refuses to start if the paper setting, five execution-store tables, or ledger are unavailable. It launches only:
+The helper's normal mode is a separate operational action and was not run as part of this implementation. Before using it, select the intended checkout and interpreter, set `EXECUTION_STORE_DB_PATH` to the existing absolute database, ensure the existing FMP request ledger is present, and obtain the separate authorization for provider reads. Normal mode requires both an external reviewed preflight JSON file and its separately approved SHA-256:
+
+```powershell
+pwsh -NoProfile -File .artifacts/issue-107-normal-scheduler/run-normal-dry-run-once.ps1 `
+  -ReviewedPreflightManifest 'C:\path\outside\checkout\preflight.json' `
+  -ReviewedPreflightSha256 '<approved-sha256>'
+```
+
+The manifest must be approved for `normal_dry_run_observation` within the prior 24 hours and bind the clean source revision, exact launcher hash, selected Python 3.13.14 interpreter and 71-package inventory, dependency-file hashes, bounded settings and caps, the exact six configured extra symbols, provider scope, absolute store/ledger/cache paths and hashes, all five execution-store table snapshots, and verified external backups. Immediately before capture, the launcher reads the current FMP daily ceiling without overrides and rejects any reviewed budget above it; a lower approved budget is passed through to the child. The required provider flag is `normal_observation_approved`; a separate additional AAPL allowance is not part of this observation. The helper records source/runtime identity plus before/after local captures, hashes the ledger before launch, and refuses to start if the paper setting, five execution-store tables, or ledger are unavailable. It launches only:
 
 ```text
 scheduler.py --dry-run --now --session --observe-health

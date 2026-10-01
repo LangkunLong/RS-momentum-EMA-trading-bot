@@ -467,6 +467,7 @@ def test_full_large_cap_scan_spanning_exit_slots_records_missed_work(
     universe = [f"S{i:03d}" for i in range(25)]
     extra_symbols = [universe[0], "EXTRA"]
     context_symbols = [f"MKT{i}" for i in range(5)]
+    requested_symbols = universe + ["EXTRA"]
     validations: list[list[str]] = []
     context_tickers_requested: set[str] = set()
     market = SimpleNamespace(
@@ -477,10 +478,11 @@ def test_full_large_cap_scan_spanning_exit_slots_records_missed_work(
         as_of_session=pd.Timestamp("2026-10-01"),
     )
     dates = pd.bdate_range(end="2026-10-01", periods=280)
+    synthetic_symbols = requested_symbols + context_symbols
     synthetic_bars = pd.DataFrame(
         {
             symbol: pd.Series(range(100, 100 + len(dates)), index=dates, dtype=float)
-            for symbol in context_symbols
+            for symbol in synthetic_symbols
         },
         index=dates,
     )
@@ -684,3 +686,82 @@ def test_observed_work_latches_a_caught_expected_work_failure() -> None:
         event["kind"] == "scheduler_work" and event["status"] == "failed"
         for event in receipt["events"]
     )
+
+
+def test_late_join_hourly_catchup_uses_session_start_without_hiding_real_misses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    late_join = datetime(2026, 10, 1, 15, 45, tzinfo=_ET)
+    session_start = late_join
+    observation = SchedulerObservation("late-join-hourly")
+    monkeypatch.setattr(scheduler, "_now_et", lambda: late_join)
+
+    scheduled_at = scheduler._observed_hourly_due_at(late_join, session_start)
+    with activate_scheduler_observation(observation):
+        scheduler._run_observed_work("exit_check", "hourly", scheduled_at, lambda: [])
+
+    assert scheduled_at == late_join
+    assert not any(issue["code"] == "scheduled_work_missed" for issue in observation.to_receipt()["issues"])
+
+    scan_start = datetime(2026, 10, 1, 10, 1, tzinfo=_ET)
+    after_scan = datetime(2026, 10, 1, 15, 5, tzinfo=_ET)
+    monkeypatch.setattr(scheduler, "_now_et", lambda: after_scan)
+    long_scan_due = scheduler._observed_hourly_due_at(after_scan, scan_start)
+    with activate_scheduler_observation(observation):
+        scheduler._run_observed_work("exit_check", "hourly", long_scan_due, lambda: [])
+
+    assert long_scan_due == datetime(2026, 10, 1, 15, 1, tzinfo=_ET)
+    assert any(issue["code"] == "scheduled_work_missed" for issue in observation.to_receipt()["issues"])
+
+
+def test_scheduler_loop_late_join_at_1545_runs_hourly_checks_without_false_miss(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    _set_observation_settings(monkeypatch)
+    session_start = datetime(2026, 10, 1, 15, 45, tzinfo=_ET)
+    clock_state = {"now": session_start}
+    next_ticks = iter(
+        [
+            datetime(2026, 10, 1, 16, 1, tzinfo=_ET),
+            datetime(2026, 10, 1, 16, 6, tzinfo=_ET),
+        ]
+    )
+
+    monkeypatch.setattr(scheduler, "_now_et", lambda: clock_state["now"])
+
+    def advance_clock(_seconds: float) -> None:
+        clock_state["now"] = next(next_ticks)
+
+    with (
+        patch(
+            "scheduler.SchedulerInstanceLock",
+            return_value=MagicMock(__enter__=lambda self: self, __exit__=lambda *args: None),
+        ),
+        patch("scheduler.require_paper_mode"),
+        patch("scheduler._market_clock_is_open", return_value=True),
+        patch("scheduler._run_cycle"),
+        patch("scheduler.monitor_exits_hourly", return_value=[]),
+        patch("scheduler.monitor_and_exit_positions", return_value=[]),
+        patch("scheduler.fmp_observation_request_limit", return_value=12),
+        patch("scheduler.time.sleep", side_effect=advance_clock),
+    ):
+        scheduler.main(_observation_args())
+
+    receipt = _receipt_from_output(capsys.readouterr().out)
+    hourly_events = [
+        event
+        for event in receipt["events"]
+        if event["kind"] == "scheduler_work" and event["key"] == "exit_check:hourly"
+    ]
+    hourly_due_times = [
+        event["details"]["scheduled_at"]
+        for event in hourly_events
+        if event["status"] == "due"
+    ]
+    assert hourly_due_times == [
+        "2026-10-01T15:45:00-04:00",
+        "2026-10-01T16:01:00-04:00",
+    ]
+    assert sum(event["status"] == "completed" for event in hourly_events) == 2
+    assert not any(issue["code"] == "scheduled_work_missed" for issue in receipt["issues"])

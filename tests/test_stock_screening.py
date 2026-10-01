@@ -412,6 +412,50 @@ def test_observation_reports_unavailable_rs_for_malformed_comparison_frame() -> 
     candidate = observation.to_receipt()["scan_coverage"]["candidate_outcomes"][0]
     assert candidate["symbol"] == "AAPL"
     assert candidate["reasons"] == ["rs_score_unavailable"]
+    assert observation.to_receipt()["required_input_coverage"] == "unverified"
+    assert observation.to_receipt()["input_gaps"] == [
+        {
+            "symbol": "AAPL",
+            "endpoint": "relative_strength",
+            "reason": "rs_score_unavailable",
+            "coverage_status": "unverified",
+        }
+    ]
+
+
+def test_partial_rs_response_marks_only_missing_symbol_as_input_gap() -> None:
+    observation = SchedulerObservation("partial-rs-response")
+    market = _make_view()["market_trend"]
+    partial_scores = pd.DataFrame([{"Ticker": "AAPL", "RS_Score": 10.0}])
+    with (
+        activate_scheduler_observation(observation),
+        patch("core.stock_screening.evaluate_market_direction", return_value=market),
+        patch(
+            "core.stock_screening.calculate_rs_scores_for_tickers",
+            return_value=partial_scores,
+        ),
+    ):
+        result = screen_stocks_canslim_detailed(
+            symbols=["AAPL", "MSFT"], start_date="2026-01-01"
+        )
+
+    assert result[:2] == ([], [])
+    receipt = observation.to_receipt()
+    assert receipt["required_input_coverage"] == "unverified"
+    assert receipt["input_gaps"] == [
+        {
+            "symbol": "MSFT",
+            "endpoint": "relative_strength",
+            "reason": "rs_score_unavailable",
+            "coverage_status": "unverified",
+        }
+    ]
+    outcomes = {
+        row["symbol"]: row["reasons"]
+        for row in receipt["scan_coverage"]["candidate_outcomes"]
+    }
+    assert outcomes["AAPL"] == ["below_canonical_rs_floor"]
+    assert outcomes["MSFT"] == ["rs_score_unavailable"]
 
 
 def test_canslim_marks_missing_statements_as_quota_deferred() -> None:

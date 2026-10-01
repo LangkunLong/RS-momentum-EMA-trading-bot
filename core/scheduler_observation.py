@@ -312,6 +312,16 @@ class SchedulerObservation:
                 or self._required_input_coverage == "failed"
                 else "unverified"
             )
+            scan_coverage = {
+                key: value
+                for key, value in self._scan_coverage.items()
+                if key != "candidate_outcomes"
+            }
+            safe_scan_coverage = _safe_value(scan_coverage)
+            safe_scan_coverage["candidate_outcomes"] = [
+                _safe_value(candidate)
+                for candidate in self._scan_coverage["candidate_outcomes"]
+            ]
             return {
                 "run_id": self.run_id,
                 "service_health": self._service_health,
@@ -329,7 +339,7 @@ class SchedulerObservation:
                     }
                     for provider, counter in self._provider_counters.items()
                 },
-                "scan_coverage": _safe_value(self._scan_coverage),
+                "scan_coverage": safe_scan_coverage,
             }
 
 

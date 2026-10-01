@@ -241,6 +241,37 @@ def test_bulk_close_prices_does_not_split_failed_chunk_when_retries_disabled() -
     mock_client.return_value.get_stock_bars.assert_called_once()
 
 
+def test_observation_marks_failed_bulk_close_read_unverified() -> None:
+    observation = SchedulerObservation("bulk-close-provider-failure")
+    with (
+        activate_scheduler_observation(observation),
+        patch("core.data_client._get_alpaca_client") as mock_client,
+        patch("core.data_client._cache_get", return_value=None),
+        patch("core.data_client._cache_set"),
+        patch("core.data_client.time.sleep"),
+    ):
+        mock_client.return_value.get_stock_bars.side_effect = RuntimeError("provider unavailable")
+        result = fetch_bulk_close_prices(
+            ["AAPL", "MSFT"],
+            period="5d",
+            chunk_size=2,
+            retry_failed_chunks=False,
+        )
+
+    assert result.empty
+    receipt = observation.to_receipt()
+    assert receipt["service_health"] == "unverified"
+    assert receipt["required_input_coverage"] == "unverified"
+    assert {gap["symbol"] for gap in receipt["input_gaps"]} == {"AAPL", "MSFT"}
+    assert any(
+        event["kind"] == "market_data"
+        and event["key"] == "alpaca_bulk_close_prices"
+        and event["status"] == "request_failed"
+        and event["details"]["error_type"] == "RuntimeError"
+        for event in receipt["events"]
+    )
+
+
 def test_bulk_ohlcv_isolates_one_invalid_symbol() -> None:
     with (
         patch("core.data_client._get_alpaca_client") as mock_client,

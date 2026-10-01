@@ -147,6 +147,47 @@ def test_observation_source_failure_does_not_overwrite_complete_index_cache(tmp_
     )
 
 
+def test_observation_preserves_cache_for_rejected_max_sized_ishares_slice(tmp_path) -> None:
+    fetcher = IndexTickerFetcher(cache_dir=tmp_path)
+    original = {
+        "timestamp": datetime.now().isoformat(),
+        "indices": ["nasdaq100"],
+        "tickers": {"nasdaq100": [f"OLD{i}" for i in range(100)]},
+    }
+    fetcher.cache_file.write_text(json.dumps(original), encoding="utf-8")
+    before = fetcher.cache_file.read_bytes()
+    page = Mock(status_code=200)
+    page.text = '<a href="/us/products/239696/etf.ajax?fileType=csv&fileName=fund_holdings.csv">CSV</a>'
+    page.raise_for_status.return_value = None
+    csv = Mock(status_code=200, text="unused")
+    csv.raise_for_status.return_value = None
+    observation = SchedulerObservation("oversized-index-slice")
+
+    with (
+        patch("core.index_ticker_fetcher.requests.get", side_effect=[page, csv]),
+        patch(
+            "core.index_ticker_fetcher._parse_ishares_csv",
+            return_value=[f"NEW{i}" for i in range(116)],
+        ),
+        patch.object(fetcher, "_fetch_index_tickers_fallback", return_value=[]),
+        patch.object(fetcher, "_save_cache") as save_cache,
+        activate_scheduler_observation(observation),
+    ):
+        result = fetcher.get_all_tickers(indices=["nasdaq100"], force_refresh=True)
+
+    assert len(result) == 115
+    save_cache.assert_not_called()
+    assert fetcher.cache_file.read_bytes() == before
+    receipt = observation.to_receipt()
+    assert receipt["required_input_coverage"] == "failed"
+    assert any(
+        event["kind"] == "index_cache"
+        and event["status"] == "write_skipped"
+        and event["details"]["indices"] == ["nasdaq100"]
+        for event in receipt["events"]
+    )
+
+
 def test_ishares_page_and_csv_attempts_are_counted(tmp_path) -> None:
     tickers = [f"T{chr(65 + index // 26)}{chr(65 + index % 26)}" for index in range(100)]
     page = Mock(status_code=200)

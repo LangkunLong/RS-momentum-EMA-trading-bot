@@ -394,6 +394,13 @@ def screen_stocks_canslim_detailed(
             rs_below_threshold += 1
             if observation is not None:
                 reason = "below_canonical_rs_floor" if rs_available else "rs_score_unavailable"
+                if not rs_available:
+                    observation.record_input_gap(
+                        symbol,
+                        "relative_strength",
+                        "rs_score_unavailable",
+                        coverage_status="unverified",
+                    )
                 observation.record_scan_coverage(
                     candidate_outcomes=[
                         {

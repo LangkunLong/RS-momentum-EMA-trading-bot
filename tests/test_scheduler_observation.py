@@ -37,6 +37,31 @@ def test_healthy_observation_cannot_claim_issue_readiness_pass():
     assert receipt["overall_readiness"] == "unverified"
 
 
+def test_receipt_preserves_every_large_cap_candidate_identity_and_reason():
+    observation = SchedulerObservation(run_id="large-candidate-receipt")
+    observation.record_scan_coverage(
+        requested=51,
+        validated=51,
+        candidate_outcomes=[
+            {
+                "symbol": f"T{index:03d}",
+                "category": "rejected",
+                "reasons": [f"reason_{index:03d}"],
+                "analyzed": False,
+                "fundamental_coverage": {},
+            }
+            for index in range(51)
+        ],
+    )
+
+    candidates = observation.to_receipt()["scan_coverage"]["candidate_outcomes"]
+
+    assert len(candidates) == 51
+    assert candidates[0]["symbol"] == "T000"
+    assert candidates[-1]["symbol"] == "T050"
+    assert candidates[-1]["reasons"] == ["reason_050"]
+
+
 def test_general_service_issue_is_not_a_resource_denial():
     observation = SchedulerObservation(run_id="test")
     observation.latch_service_issue("clock_unknown", {"source": "alpaca"})
