@@ -115,6 +115,9 @@ def test_decision_and_action_identity_survive_reconstruction_and_conflicts_are_e
     )
     assert action_a.logical_action_id == action_b.logical_action_id
     assert_same_logical_action(action_a, action_b)
+    linked_opening_action = replace(action_a, holding_episode_id="holding-created-after-first-fill")
+    assert linked_opening_action.logical_action_id == action_a.logical_action_id
+    assert linked_opening_action.immutable_payload() == action_a.immutable_payload()
 
     conflicting_snapshot = _decision("b" * 64)
     with pytest.raises(DecisionConflictError, match="decision slot"):

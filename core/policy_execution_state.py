@@ -524,12 +524,14 @@ class ActionIntent:
             "deployment_generation_id": self.deployment_generation_id,
             "security_id": self.security_id,
             "broker_symbol": self.broker_symbol,
-            "holding_episode_id": self.holding_episode_id,
             "role": self.role.value,
         }
         if self.role is ActionRole.SCALE_OUT:
+            identity["holding_episode_id"] = self.holding_episode_id
             identity["exit_tier"] = self.exit_tier
         else:
+            if self.role is not ActionRole.ENTRY:
+                identity["holding_episode_id"] = self.holding_episode_id
             identity["decision_id"] = self.decision.decision_id
         object.__setattr__(self, "logical_action_id", f"action:sha256:{_canonical_digest(identity)}")
 
@@ -546,7 +548,7 @@ class ActionIntent:
             "deployment_generation_id": self.deployment_generation_id,
             "decision_id": self.decision.decision_id,
             "security_id": self.security_id,
-            "holding_episode_id": self.holding_episode_id,
+            "holding_episode_id": None if self.role is ActionRole.ENTRY else self.holding_episode_id,
             "role": self.role.value,
             "side": self.side.value,
             "requested_quantity": str(self.requested_quantity),
