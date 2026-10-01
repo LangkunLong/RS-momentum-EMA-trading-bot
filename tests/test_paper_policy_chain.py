@@ -34,12 +34,12 @@ from core.strategy_policy.account_reconciliation import (
 )
 
 
-def build_entry(features, deployment, clock, symbol, quantity, price):
+def build_entry(features, deployment, clock, symbol, quantity, price, *, role=ActionRole.ENTRY):
     decision = DecisionIdentity.build(
         deployment=deployment,
         clock=clock,
         snapshot_sha256=features.recorded_input_manifest_sha256,
-        category=DecisionCategory.ENTRY,
+        category=DecisionCategory.REPLACEMENT if role is ActionRole.REPLACEMENT else DecisionCategory.ENTRY,
         subject_type=DecisionSubjectType.SECURITY,
         subject_id=f"fixture:{symbol}",
     )
@@ -47,7 +47,7 @@ def build_entry(features, deployment, clock, symbol, quantity, price):
         decision=decision,
         security_id=f"fixture:{symbol}",
         broker_symbol=symbol,
-        role=ActionRole.ENTRY,
+        role=role,
         side=OrderSide.BUY,
         requested_quantity=Decimal(quantity),
         status=ActionStatus.SUBMITTED,
@@ -186,7 +186,7 @@ def protect_holding(store, action):
     )
 
 
-def seed_pending_chain(tmp_path):
+def seed_pending_chain(tmp_path, *, opening_role=ActionRole.ENTRY):
     features = build_feature_fixture(tmp_path)
     deployment, clock = build_chain_identity(features)
     path = tmp_path / "combined-policy.sqlite3"
@@ -237,11 +237,12 @@ def seed_pending_chain(tmp_path):
     holding_c = store.load_holding_episode(holding_c.holding_episode_id)
     record_fill(store, addition, "2", holding=holding_c)
     protect_holding(store, entry_c)
-    entry_a = build_entry(features, deployment, clock, "AAA", "10", "100")
+    entry_a = build_entry(features, deployment, clock, "AAA", "10", "100", role=opening_role)
     entry_b = build_entry(features, deployment, clock, "BBB", "5", "200")
     record_action(store, entry_a)
     record_action(store, entry_b)
     record_fill(store, entry_a, "4", event_id="fill:A:4")
+    assert store.load_holding_episode_for_action(entry_a.logical_action_id) is not None
     protect_holding(store, entry_a)
     account = build_account(deployment, clock, entry_a.decision)
     protected_holdings = tuple(
@@ -304,6 +305,114 @@ def reconcile_chain_snapshot(account, snapshot):
         maximum_balance_age=timedelta(minutes=15),
         maximum_mark_age=timedelta(minutes=15),
     )
+
+
+def test_replacement_partial_full_fills_keep_identity_risk_and_protection_after_restart(tmp_path):
+    features, path, deployment, account, portfolio, replacement, _ = seed_pending_chain(
+        tmp_path, opening_role=ActionRole.REPLACEMENT
+    )
+    action_id = replacement.logical_action_id
+    assert replacement.role is ActionRole.REPLACEMENT
+    assert replacement.decision.category is DecisionCategory.REPLACEMENT
+    assert replacement.decision.snapshot_sha256 == features.recorded_input_manifest_sha256
+    store = PolicyExecutionStateStore(path, store_identity=deployment.store_identity)
+    holding = store.load_holding_episode_for_action(action_id)
+    holding_id = holding.holding_episode_id
+    assert holding.opening_action_id == action_id
+    assert holding.initial_filled_quantity == Decimal("4")
+    assert holding.remaining_quantity == Decimal("4")
+    assert holding.committed_risk == Decimal("40")
+    assert holding.completed_additions_quantity == 0
+    assert holding.addition_count == 0
+    snapshot = read_chain(store, deployment, portfolio)
+    assert_pending_reconciliation(
+        account, snapshot.portfolio_snapshot, snapshot.action_projections, snapshot.holding_episodes
+    )
+    record_fill(store, replacement, "4", holding=holding, event_id="fill:A:4")
+    assert read_chain(store, deployment, portfolio) == snapshot
+
+    for quantity in (6, 10):
+        current = store.load_holding_episode(holding_id)
+        record_fill(store, replacement, str(quantity), holding=current, event_id=f"replacement:A:{quantity}")
+        store = PolicyExecutionStateStore(path, store_identity=deployment.store_identity)
+        persisted = store.load_action_projection(action_id)
+        holding = store.load_holding_episode_for_action(action_id)
+        assert persisted.logical_action_id == action_id
+        assert persisted.holding_episode_id == holding_id
+        assert persisted.confirmed_quantity == Decimal(quantity)
+        assert persisted.reservation_amount == Decimal((10 - quantity) * 100)
+        assert persisted.residual_committed_risk == Decimal((10 - quantity) * 10)
+        assert holding.holding_episode_id == holding_id
+        assert holding.opening_action_id == action_id
+        assert holding.deployment_generation_id == deployment.deployment_generation_id
+        assert holding.initial_filled_quantity == Decimal("4")
+        assert holding.opening_later_fills_quantity == Decimal(quantity - 4)
+        assert holding.remaining_quantity == Decimal(quantity)
+        assert holding.cost_basis == Decimal("100")
+        assert holding.committed_risk == Decimal(quantity * 10)
+        assert holding.completed_additions_quantity == 0
+        assert holding.addition_count == 0
+        assert dict(holding.applied_action_fill_watermarks)[action_id] == Decimal(quantity)
+        assert (action_id in holding.pending_action_ids) is (quantity < 10)
+        assert holding.confirmed_stop_broker_order_id is not None
+
+        account = replace(
+            account,
+            account_snapshot_id=f"replacement-valuation:{quantity}",
+            cash=9600 - quantity * 100,
+            positions=tuple(
+                replace(position, quantity=quantity) if position.symbol == "AAA" else position
+                for position in account.positions
+            ),
+            open_orders=tuple(
+                replace(
+                    row,
+                    cumulative_filled_quantity=quantity,
+                    status="filled" if quantity == 10 else "partially_filled",
+                )
+                if row.broker_order_id == "broker:AAA"
+                else row
+                for row in account.open_orders
+            ),
+        )
+        portfolio = replace(
+            portfolio,
+            account_snapshot_id=account.account_snapshot_id,
+            cash=Decimal(account.cash),
+            gross_exposure=Decimal((quantity + 6) * 100),
+            open_risk=Decimal((quantity + 6) * 10),
+        )
+        store.record_portfolio_snapshot(portfolio)
+        snapshot = read_chain(store, deployment, portfolio)
+        uncovered = reconcile_chain_snapshot(account, snapshot)
+        assert not uncovered.ready
+        assert uncovered.portfolio_features is None
+        assert any("protective" in finding.detail for finding in uncovered.findings)
+
+        account = replace(
+            account,
+            open_orders=tuple(
+                replace(row, requested_quantity=quantity)
+                if row.broker_order_id == holding.confirmed_stop_broker_order_id
+                else row
+                for row in account.open_orders
+            ),
+        )
+        result = reconcile_chain_snapshot(account, snapshot)
+        assert result.ready, result.findings
+        assert result.settled_cash == 9600 - quantity * 100
+        assert result.gross_exposure == (quantity + 6) * 100
+        assert result.open_position_risk == (quantity + 6) * 10
+        assert result.reserved_buy_cash == 1000 + (10 - quantity) * 100
+        assert result.reserved_buy_risk == 50 + (10 - quantity) * 10
+        assert result.total_committed_risk == 210
+        assert result.available_cash == 7400
+        assert result.pending_entry_count == (2 if quantity < 10 else 1)
+        assert result.portfolio_features is not None
+        record_fill(store, replacement, str(quantity), holding=holding, event_id=f"replacement:A:{quantity}")
+        restarted = PolicyExecutionStateStore(path, store_identity=deployment.store_identity)
+        assert read_chain(restarted, deployment, portfolio) == snapshot
+        store = restarted
 
 
 def test_durable_position_reconciliation_flag_blocks_until_evidenced_clear(tmp_path):

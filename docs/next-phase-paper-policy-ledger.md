@@ -1,6 +1,14 @@
 # Lead C paper-policy integration ledger
 
-Goal active; not achieved. Lead chat `01a0f851-dfb4-7081-90c1-81131013fee2`, host local. Principal `01a0f613-6fa9-71d0-ada5-743cfa159a31` owns final independent acceptance and normal eligible merges. No completion notification sent.
+Goal not achieved; principal finding C-R1 is under correction. Lead chat `01a0f851-dfb4-7081-90c1-81131013fee2`, host local. Principal `01a0f613-6fa9-71d0-ada5-743cfa159a31` owns final independent acceptance and normal eligible merges. No completion notification sent.
+
+## Current principal hold: P2 C-R1 replacement fills
+
+Principal review of frozenea2e145/applicationd2c4082 identified an admitted REPLACEMENT lifecycle gap: first fills persist an action/receipt without opening a holding, attaching a holding changes logical action identity, and subsequent attached fills are rejected by the pure holding helper. Lead read the exact source and principal ENTRY-control/REPLACEMENT counterexample and confirmed the branches. The source-bound107-pass receipt and local independent review remain valid historical evidence but did not cover this path; they no longer establish full current acceptance.
+
+The SAME #100 owner now owns the bounded identity/state/store/protection correction; the SAME #99 owner owns canonical replacement-consumption regressions. Lead will add a combined actual-feature/temporary-store regression, integrate frozen corrections, run necessary changed-source checks, and obtain independent correction/integration review before principal delta review. Partial/full fills, subsequent receipts, restart/replay, stable action/holding identities, actual quantities/notional/risk, residual commitments and protection must work without deferring the admitted role. All original nine criteria remain required. No runtime/provider/operational database or existing execution-store/workflow edits are authorized.
+
+The prepared ea2e145 publication payload is HELD and remains immutable as historical evidence. Do not publish it even if the older authorization question is answered. A corrected source/API/evidence package and principal delta review are required. Principal states it will independently assess its own publication authority after review; C does not retry or relay denied exports/messages. Principal proof is in the original checkout under `.artifacts/coordination/principal-reviews/lead-c-ea2e145-independent-proof/`; its pure counterexample imports no store/provider and is distinct from the new canonical temporary-store evidence now required.
 
 ## Source and authority
 
@@ -34,8 +42,8 @@ Ruling: use approved visible isolated implementation chats with Luna/xhigh and d
 | Issue | Implementation | Required inputs | Acceptance evidence | Dependencies |
 | --- | --- | --- | --- | --- |
 | #98 | Source51053ad/report8190c15 scoped and final integrated spec/quality approved | Synthetic V2 and controlled three-universe V3 fixtures available; real provider acceptance excluded | 88focused owner cases and107case integrated checkpoint are separate overlapping evidence; required remote CI/principal acceptance pending | Accepted #66/#80/#97/#71 eligible; publication authorization and normal merge pending |
-| #99 | Consumerd2a0677 scoped corrections and final integrated spec/quality approved; report49ecbf4 appends verified hash correction | Synthetic account/order records and canonical temporary-store lifecycle fixtures complete | Lead107six-module cases pass, including all8chain cases; owner15selected cases overlap; all3integrated findings and minor report correction closed | Accepted #80/#97 and approved producer eligible; remote CI/publication/principal/merge gates remain |
-| #100 | Source43a0820/reportbfcaa5a producer and final integrated spec/quality approved; all7producer findings resolved | Fixed outputs and explicit temporary databases available | 43focused owner cases and107case integrated checkpoint retained without adding overlapping counts | Accepted #80/#97 eligible; existing execution entry points unchanged; principal/remote acceptance remains separate |
+| #99 | Prior consumer corrections approved; canonical REPLACEMENT fill regression work active with same owner for C-R1 | Synthetic account/order records and explicit temporary-store fixture inputs available | Historical107case checkpoint preserved; replacement partial/full/restart/protection consumption evidence still required | Await corrected #100 source; independent and principal delta review/publication remain held |
+| #100 | C-R1 admitted replacement opening/identity/subsequent-fill correction active with same owner | Fixed outputs and explicit temporary databases available | Original7producer findings remain resolved; principal replacement counterexample exposes a new uncovered path | Accepted #80/#97 eligible; existing execution entry points unchanged; revised source review required |
 
 ## Remaining steps
 

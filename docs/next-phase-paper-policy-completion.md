@@ -1,6 +1,6 @@
 # Lead C completion record
 
-Status: ACTIVE / INCOMPLETE. Local implementation,107case validation and independent integrated specification/quality review are complete for all nine bounded offline criteria. The minor report hash correction is appended in owner49ecbf4. GitHub export and outbound handoff remain gated; no C remote publication, required remote checks, principal acceptance or normal remote merge has occurred. Canonical ongoing state: `docs/next-phase-paper-policy-ledger.md`.
+Status: CORRECTION IN PROGRESS / INCOMPLETE. Principal P2 C-R1 exposes missing admitted REPLACEMENT fill/holding/identity behavior in frozenea2e145. Same #100 and #99 owners are correcting and testing the canonical lifecycle; a lead combined regression and independent/principal delta review remain required. The earlier107pass and local independent approval are preserved historical checkpoints that did not cover this path. The old publication payload is held. Canonical ongoing state: `docs/next-phase-paper-policy-ledger.md`.
 
 Completion requires all nine original #98/#99/#100 criteria, independent specification and quality review, combined offline boundary/restart evidence at exact integrated source, schema compatibility constraints for D, and actual accepted normal merges. This file is not a completion receipt.
 
