@@ -745,8 +745,8 @@ def confirm_attempt_terminal(
     attempt = _get_attempt(intent, attempt_number)
     if _attempt_is_unissued(attempt):
         raise ValueError("an unissued order intent cannot receive broker terminal evidence")
-    if attempt.status in {ActionAttemptStatus.CANCELLED, ActionAttemptStatus.REJECTED, ActionAttemptStatus.FILLED}:
-        if attempt.status is status:
+    if attempt.terminal_status is not None:
+        if attempt.terminal_status is status:
             return intent
         raise IdentityConflictError("order attempt already has a different terminal status")
     if status is ActionAttemptStatus.FILLED and attempt.confirmed_filled_quantity < attempt.requested_quantity:
