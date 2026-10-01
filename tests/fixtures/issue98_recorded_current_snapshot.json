@@ -1,0 +1,62 @@
+{
+  "fixture_id": "issue98-recorded-current-snapshot-v1",
+  "session": "2026-03-31",
+  "next_eligible_session": "2026-04-01",
+  "as_of_cutoff": "2026-03-31T16:00:00-04:00",
+  "valuation_time": "2026-04-01T09:35:00-04:00",
+  "active_symbols": ["AAA", "BBB", "CCC"],
+  "candidate_symbols": ["AAA", "BBB", "CCC"],
+  "rs_snapshot": {
+    "AAA": 35.0,
+    "BBB": 91.0,
+    "CCC": 65.0
+  },
+  "market": {
+    "oneil_regime": "confirmed_uptrend",
+    "distribution_days": 2,
+    "follow_through": true
+  },
+  "price_series": {
+    "SPY": {"bars": 252, "start_close": 100.0, "daily_increment": 0.20, "volume": 1000000},
+    "QQQ": {"bars": 252, "start_close": 200.0, "daily_increment": 0.35, "volume": 800000},
+    "IWM": {"bars": 252, "start_close": 150.0, "daily_increment": 0.12, "volume": 600000},
+    "AAA": {"bars": 252, "start_close": 25.0, "daily_increment": 0.04, "volume": 50000},
+    "BBB": {"bars": 252, "start_close": 75.0, "daily_increment": 0.15, "volume": 80000},
+    "CCC": {"bars": 100, "start_close": 40.0, "daily_increment": -0.02, "volume": 60000}
+  },
+  "fundamentals": [
+    {"ticker": "AAA", "statement_type": "quarterly", "period_end": "2023-06-30", "source_public_date": "2023-07-31", "source_public_at": "2023-07-31T10:00:00-04:00", "diluted_eps": 0.8, "total_revenue": 80.0},
+    {"ticker": "AAA", "statement_type": "quarterly", "period_end": "2023-09-30", "source_public_date": "2023-10-31", "source_public_at": "2023-10-31T10:00:00-04:00", "diluted_eps": 0.9, "total_revenue": 90.0},
+    {"ticker": "AAA", "statement_type": "quarterly", "period_end": "2024-06-30", "source_public_date": "2024-07-31", "source_public_at": "2024-07-31T10:00:00-04:00", "diluted_eps": 1.0, "total_revenue": 100.0},
+    {"ticker": "AAA", "statement_type": "quarterly", "period_end": "2024-09-30", "source_public_date": "2024-10-31", "source_public_at": "2024-10-31T10:00:00-04:00", "diluted_eps": 1.2, "total_revenue": 120.0},
+    {"ticker": "AAA", "statement_type": "quarterly", "period_end": "2025-06-30", "source_public_date": "2025-07-31", "source_public_at": "2025-07-31T10:00:00-04:00", "diluted_eps": 1.5, "total_revenue": 150.0},
+    {"ticker": "AAA", "statement_type": "quarterly", "period_end": "2025-09-30", "source_public_date": "2025-10-31", "source_public_at": "2025-10-31T10:00:00-04:00", "diluted_eps": 1.8, "total_revenue": 180.0},
+    {"ticker": "AAA", "statement_type": "quarterly", "period_end": "2025-12-31", "source_public_date": "2026-04-01", "source_public_at": "2026-04-01T10:00:00-04:00", "diluted_eps": 9.9, "total_revenue": 990.0}
+  ],
+  "missingness": {
+    "AAA": {
+      "industry_group_rs": {"state": "unsupported_scope", "reason": "schema-v2 development fixture has no dated industry assignments"},
+      "sector_rs": {"state": "unsupported_scope", "reason": "schema-v2 development fixture has no dated sector taxonomy"}
+    },
+    "BBB": {
+      "earnings_growth_acceleration": {"state": "absent", "reason": "no recorded quarterly earnings observations for BBB"},
+      "sales_growth_acceleration": {"state": "absent", "reason": "no recorded quarterly sales observations for BBB"},
+      "fundamental_age_days": {"state": "absent", "reason": "no recorded quarterly observations for BBB"},
+      "industry_group_rs": {"state": "unsupported_scope", "reason": "schema-v2 development fixture has no dated industry assignments"},
+      "sector_rs": {"state": "unsupported_scope", "reason": "schema-v2 development fixture has no dated sector taxonomy"}
+    },
+    "CCC": {
+      "earnings_growth_acceleration": {"state": "absent", "reason": "no recorded quarterly earnings observations for CCC"},
+      "sales_growth_acceleration": {"state": "absent", "reason": "no recorded quarterly sales observations for CCC"},
+      "fundamental_age_days": {"state": "absent", "reason": "no recorded quarterly observations for CCC"},
+      "industry_group_rs": {"state": "unsupported_scope", "reason": "schema-v2 development fixture has no dated industry assignments"},
+      "sector_rs": {"state": "unsupported_scope", "reason": "schema-v2 development fixture has no dated sector taxonomy"},
+      "distance_from_52_week_high_fraction": {"state": "insufficient_history", "reason": "CCC has 100 completed bars; the feature requires 252"}
+    }
+  },
+  "unavailable_member_disposition": {
+    "state": "absent",
+    "reason": "No recorded current market input for this active member in the synthetic fixture",
+    "source_identity": "issue98-recorded-current-snapshot-v1"
+  }
+}
