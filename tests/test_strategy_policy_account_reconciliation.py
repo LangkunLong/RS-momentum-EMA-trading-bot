@@ -446,7 +446,7 @@ def _portfolio_for(
     account_snapshot_id: str,
     cash: str,
     gross_exposure: str,
-    open_risk: str,
+    open_risk: str | None,
 ) -> PortfolioStateSnapshot:
     return PortfolioStateSnapshot(
         deployment_identity=deployment,
@@ -456,9 +456,458 @@ def _portfolio_for(
         equity=Decimal("10000"),
         cash=Decimal(cash),
         gross_exposure=Decimal(gross_exposure),
-        open_risk=Decimal(open_risk),
+        open_risk=None if open_risk is None else Decimal(open_risk),
         portfolio_peak_equity=Decimal("12500"),
         last_accepted_session=clock.decision_session,
+    )
+
+
+def test_canonical_replacement_partial_full_fill_restart_and_protection_lifecycle(tmp_path: Path) -> None:
+    fixture = _canonical_store_fixture(tmp_path, name="replacement-fill-lifecycle")
+    store = PolicyExecutionStateStore(fixture.database_path, store_identity=fixture.store_identity)
+    store.migrate()
+    replacement_security = "FIGI-CC5678"
+    replacement_decision = DecisionIdentity.build(
+        deployment=fixture.generation_b,
+        clock=fixture.current_clock,
+        snapshot_sha256="f" * 64,
+        category=DecisionCategory.REPLACEMENT,
+        subject_type=DecisionSubjectType.SECURITY,
+        subject_id=replacement_security,
+    )
+    replacement = build_action_intent(
+        decision=replacement_decision,
+        security_id=replacement_security,
+        broker_symbol="ABC",
+        role=ActionRole.REPLACEMENT,
+        side=OrderSide.BUY,
+        requested_quantity=Decimal("5"),
+        reservation_price=Decimal("100"),
+        reservation_price_basis="limit_price",
+        reservation_stop_price=Decimal("90"),
+        risk_per_unit=Decimal("10"),
+        risk_basis="entry_to_protective_stop",
+    )
+    store.record_decision(
+        replacement_decision,
+        policy_payload={},
+        guard_payload={},
+        effective_action_payload={},
+    )
+    store.record_action_intent(replacement, expected_version=None)
+    submitted = store.bind_attempt_order_refs(
+        replacement.logical_action_id,
+        1,
+        provider_id="provider-replacement",
+        client_order_id="replacement-buy-client",
+        broker_order_id="replacement-buy-broker",
+        expected_action_version=0,
+        observed_at=datetime(2026, 10, 2, 13, 10, tzinfo=UTC),
+    )
+    partial_fill = store.record_cumulative_fill(
+        replacement.logical_action_id,
+        1,
+        provider_id="provider-replacement",
+        fill_event_id="replacement-fill-partial",
+        cumulative_quantity=Decimal("3"),
+        cumulative_notional=Decimal("300"),
+        cumulative_fees=Decimal("0"),
+        payload_sha256=None,
+        observed_at=datetime(2026, 10, 2, 13, 15, tzinfo=UTC),
+        expected_action_version=submitted.state_version,
+        expected_holding_version=None,
+    )
+    assert partial_fill.logical_action_id == replacement.logical_action_id
+    assert partial_fill.status is ActionStatus.PARTIALLY_FILLED
+
+    def replacement_account(
+        portfolio: PortfolioStateSnapshot,
+        *,
+        acquired_quantity: int,
+        order_status: str,
+        cumulative_fill: int,
+        protective_stop: BrokerOrderFact | None = None,
+    ) -> BrokerAccountSnapshot:
+        assert fixture.account.positions is not None
+        assert fixture.account.open_orders is not None
+        orders = [*fixture.account.open_orders]
+        orders.append(
+            BrokerOrderFact(
+                broker_order_id="replacement-buy-broker",
+                client_order_id="replacement-buy-client",
+                symbol="ABC",
+                side="buy",
+                status=order_status,
+                requested_quantity=5,
+                cumulative_filled_quantity=cumulative_fill,
+            )
+        )
+        if protective_stop is not None:
+            orders.append(protective_stop)
+        replacement_position = BrokerPositionFact(
+            symbol="ABC",
+            quantity=acquired_quantity,
+            mark_price=100,
+            mark_observed_at=fixture.current_clock.account_valuation_at,
+            sector=_classification(),
+            industry=_classification(code="Software"),
+        )
+        return replace(
+            fixture.account,
+            cash=float(portfolio.cash),
+            positions=(*fixture.account.positions, replacement_position),
+            open_orders=tuple(orders),
+            account_snapshot_id=portfolio.account_snapshot_id,
+        )
+
+    partial_portfolio = _portfolio_for(
+        fixture.generation_b,
+        fixture.current_clock,
+        account_snapshot_id="replacement-partial-account",
+        cash="8700",
+        gross_exposure="1300",
+        open_risk=None,
+    )
+    store.record_portfolio_snapshot(partial_portfolio)
+    partial_account = replacement_account(
+        partial_portfolio,
+        acquired_quantity=3,
+        order_status="partially_filled",
+        cumulative_fill=3,
+    )
+    partial_snapshot, partial_projection, before_protection = _canonical_consumer_read(
+        fixture,
+        portfolio=partial_portfolio,
+        account=partial_account,
+    )
+    replacement_holding_rows = [
+        item for item in partial_snapshot.holding_episodes if item.security_id == replacement_security
+    ]
+    assert len(replacement_holding_rows) == 1, "a confirmed partial replacement fill must create one durable holding"
+    partial_holding = replacement_holding_rows[0]
+    partial_source_action = next(
+        item for item in partial_snapshot.action_projections if item.logical_action_id == replacement.logical_action_id
+    )
+    assert partial_source_action.logical_action_id == replacement.logical_action_id
+    assert partial_source_action.holding_episode_id == partial_holding.holding_episode_id
+    assert partial_holding.opening_action_id == replacement.logical_action_id
+    assert partial_holding.remaining_quantity == Decimal("3")
+    assert partial_holding.entry_price == Decimal("100")
+    assert partial_holding.cost_basis == Decimal("100")
+    assert partial_holding.committed_risk == Decimal("30")
+    assert before_protection.ready is False
+    assert before_protection.portfolio_features is None
+    assert before_protection.gross_exposure == 1300
+    assert before_protection.settled_cash == 8700
+    assert before_protection.reserved_buy_cash == 200
+    assert before_protection.reserved_buy_risk == 20
+    assert before_protection.open_position_risk is None
+    assert partial_projection.pending_actions is not None
+    partial_policy_action = next(
+        item for item in partial_projection.pending_actions if item.logical_action_id == replacement.logical_action_id
+    )
+    assert partial_policy_action.residual_quantity == 2
+    assert partial_account.positions is not None
+    assert next(item for item in partial_account.positions if item.symbol == "ABC").quantity == 3
+
+    stop_decision = DecisionIdentity.build(
+        deployment=fixture.generation_b,
+        clock=fixture.current_clock,
+        snapshot_sha256="9" * 64,
+        category=DecisionCategory.EXIT,
+        subject_type=DecisionSubjectType.HOLDING,
+        subject_id=partial_holding.holding_episode_id,
+        sequence=1,
+    )
+    store.record_decision(stop_decision, policy_payload={}, guard_payload={}, effective_action_payload={})
+    live_holding = store.load_holding_episode(partial_holding.holding_episode_id)
+    stop_intent = store.propose_stop_update(
+        live_holding.holding_episode_id,
+        decision=stop_decision,
+        stop_price=Decimal("90"),
+        expected_holding_version=live_holding.state_version,
+        observed_at=datetime(2026, 10, 2, 13, 20, tzinfo=UTC),
+    )
+    live_holding = store.load_holding_episode(live_holding.holding_episode_id)
+    store.confirm_protective_stop(
+        stop_intent,
+        stop_price=Decimal("90"),
+        client_order_id="replacement-stop-partial-client",
+        broker_order_id="replacement-stop-partial-broker",
+        observed_at=datetime(2026, 10, 2, 13, 22, tzinfo=UTC),
+        expected_holding_version=live_holding.state_version,
+    )
+    live_holding = store.load_holding_episode(live_holding.holding_episode_id)
+    store.update_holding_marks(
+        live_holding.holding_episode_id,
+        valuation_at=fixture.current_clock.account_valuation_at,
+        peak_price=Decimal("100"),
+        expected_holding_version=live_holding.state_version,
+    )
+    protected_partial_portfolio = _portfolio_for(
+        fixture.generation_b,
+        fixture.current_clock,
+        account_snapshot_id="replacement-partial-protected-account",
+        cash="8700",
+        gross_exposure="1300",
+        open_risk="130",
+    )
+    store.record_portfolio_snapshot(protected_partial_portfolio)
+    partial_stop = BrokerOrderFact(
+        broker_order_id="replacement-stop-partial-broker",
+        client_order_id="replacement-stop-partial-client",
+        symbol="ABC",
+        side="sell",
+        status="submitted",
+        requested_quantity=3,
+        cumulative_filled_quantity=0,
+        purpose="protective_stop",
+        holding_episode_id=partial_holding.holding_episode_id,
+        stop_price=90,
+    )
+    protected_partial_account = replacement_account(
+        protected_partial_portfolio,
+        acquired_quantity=3,
+        order_status="partially_filled",
+        cumulative_fill=3,
+        protective_stop=partial_stop,
+    )
+    protected_partial_snapshot, _, after_partial_protection = _canonical_consumer_read(
+        fixture,
+        portfolio=protected_partial_portfolio,
+        account=protected_partial_account,
+    )
+    protected_partial_holding = next(
+        item for item in protected_partial_snapshot.holding_episodes if item.security_id == replacement_security
+    )
+    assert protected_partial_holding.holding_episode_id == partial_holding.holding_episode_id
+    assert after_partial_protection.ready is True, after_partial_protection.findings
+    assert after_partial_protection.open_position_risk == 130
+    assert after_partial_protection.reserved_buy_cash == 200
+    assert after_partial_protection.reserved_buy_risk == 20
+    assert after_partial_protection.total_committed_risk == 150
+    assert after_partial_protection.pending_entry_count == 1
+
+    live_action = store.load_action_projection(replacement.logical_action_id)
+    live_holding = store.load_holding_episode(partial_holding.holding_episode_id)
+    full_fill = store.record_cumulative_fill(
+        replacement.logical_action_id,
+        1,
+        provider_id="provider-replacement",
+        fill_event_id="replacement-fill-full",
+        cumulative_quantity=Decimal("5"),
+        cumulative_notional=Decimal("500"),
+        cumulative_fees=Decimal("0"),
+        payload_sha256=None,
+        observed_at=datetime(2026, 10, 2, 13, 25, tzinfo=UTC),
+        expected_action_version=live_action.state_version,
+        expected_holding_version=live_holding.state_version,
+    )
+    assert full_fill.logical_action_id == replacement.logical_action_id
+    assert full_fill.status is ActionStatus.FILLED
+    full_holding = store.load_holding_episode(partial_holding.holding_episode_id)
+    assert full_holding.remaining_quantity == Decimal("5")
+    assert full_holding.cost_basis == Decimal("100")
+    assert full_holding.committed_risk == Decimal("50")
+
+    full_portfolio = _portfolio_for(
+        fixture.generation_b,
+        fixture.current_clock,
+        account_snapshot_id="replacement-full-account",
+        cash="8500",
+        gross_exposure="1500",
+        open_risk=None,
+    )
+    store.record_portfolio_snapshot(full_portfolio)
+    old_quantity_stop = replace(partial_stop, requested_quantity=3)
+    full_account = replacement_account(
+        full_portfolio,
+        acquired_quantity=5,
+        order_status="filled",
+        cumulative_fill=5,
+        protective_stop=old_quantity_stop,
+    )
+    full_snapshot, _, before_updated_protection = _canonical_consumer_read(
+        fixture,
+        portfolio=full_portfolio,
+        account=full_account,
+    )
+    assert len([item for item in full_snapshot.holding_episodes if item.security_id == replacement_security]) == 1
+    assert before_updated_protection.ready is False
+    assert before_updated_protection.portfolio_features is None
+    assert before_updated_protection.settled_cash == 8500
+    assert before_updated_protection.gross_exposure == 1500
+    assert any("protective_stop" in finding.path for finding in before_updated_protection.findings)
+
+    resize_decision = DecisionIdentity.build(
+        deployment=fixture.generation_b,
+        clock=fixture.current_clock,
+        snapshot_sha256="8" * 64,
+        category=DecisionCategory.EXIT,
+        subject_type=DecisionSubjectType.HOLDING,
+        subject_id=full_holding.holding_episode_id,
+        sequence=2,
+    )
+    store.record_decision(resize_decision, policy_payload={}, guard_payload={}, effective_action_payload={})
+    full_holding = store.load_holding_episode(full_holding.holding_episode_id)
+    resize_intent = store.propose_stop_update(
+        full_holding.holding_episode_id,
+        decision=resize_decision,
+        stop_price=Decimal("90"),
+        expected_holding_version=full_holding.state_version,
+        observed_at=datetime(2026, 10, 2, 13, 26, tzinfo=UTC),
+    )
+    full_holding = store.load_holding_episode(full_holding.holding_episode_id)
+    store.confirm_protective_stop(
+        resize_intent,
+        stop_price=Decimal("90"),
+        client_order_id="replacement-stop-full-client",
+        broker_order_id="replacement-stop-full-broker",
+        observed_at=datetime(2026, 10, 2, 13, 27, tzinfo=UTC),
+        expected_holding_version=full_holding.state_version,
+    )
+    final_portfolio = _portfolio_for(
+        fixture.generation_b,
+        fixture.current_clock,
+        account_snapshot_id="replacement-full-protected-account",
+        cash="8500",
+        gross_exposure="1500",
+        open_risk="150",
+    )
+    store.record_portfolio_snapshot(final_portfolio)
+    full_stop = BrokerOrderFact(
+        broker_order_id="replacement-stop-full-broker",
+        client_order_id="replacement-stop-full-client",
+        symbol="ABC",
+        side="sell",
+        status="submitted",
+        requested_quantity=5,
+        cumulative_filled_quantity=0,
+        purpose="protective_stop",
+        holding_episode_id=full_holding.holding_episode_id,
+        stop_price=90,
+    )
+    final_account = replacement_account(
+        final_portfolio,
+        acquired_quantity=5,
+        order_status="filled",
+        cumulative_fill=5,
+        protective_stop=full_stop,
+    )
+
+    restarted_store = PolicyExecutionStateStore(fixture.database_path, store_identity=fixture.store_identity)
+    restarted_store.migrate()
+    action_before_replay = restarted_store.load_action_projection(replacement.logical_action_id)
+    holding_before_replay = restarted_store.load_holding_episode(full_holding.holding_episode_id)
+    replayed_fill = restarted_store.record_cumulative_fill(
+        replacement.logical_action_id,
+        1,
+        provider_id="provider-replacement",
+        fill_event_id="replacement-fill-full",
+        cumulative_quantity=Decimal("5"),
+        cumulative_notional=Decimal("500"),
+        cumulative_fees=Decimal("0"),
+        payload_sha256=None,
+        observed_at=datetime(2026, 10, 2, 13, 25, tzinfo=UTC),
+        expected_action_version=action_before_replay.state_version,
+        expected_holding_version=holding_before_replay.state_version,
+    )
+    assert replayed_fill == action_before_replay
+    assert restarted_store.load_holding_episode(full_holding.holding_episode_id) == holding_before_replay
+
+    final_snapshot, _, ready_result = _canonical_consumer_read(
+        fixture,
+        portfolio=final_portfolio,
+        account=final_account,
+    )
+    replacement_holdings = [
+        item for item in final_snapshot.holding_episodes if item.security_id == replacement_security
+    ]
+    final_source_action = next(
+        item for item in final_snapshot.action_projections if item.logical_action_id == replacement.logical_action_id
+    )
+    assert len(replacement_holdings) == 1
+    final_holding = replacement_holdings[0]
+    assert final_source_action.logical_action_id == replacement.logical_action_id
+    assert final_source_action.status is ActionStatus.FILLED
+    assert final_source_action.holding_episode_id == final_holding.holding_episode_id
+    assert final_holding.holding_episode_id == partial_holding.holding_episode_id
+    assert final_holding.opening_action_id == replacement.logical_action_id
+    assert final_holding.remaining_quantity == Decimal("5")
+    assert final_holding.initial_filled_quantity == Decimal("3")
+    assert final_holding.opening_later_fills_quantity == Decimal("2")
+    assert final_holding.entry_price * final_holding.remaining_quantity == Decimal("500")
+    assert final_holding.cost_basis * final_holding.remaining_quantity == Decimal("500")
+    assert dict(final_holding.applied_action_fill_watermarks)[replacement.logical_action_id] == Decimal("5")
+    assert ready_result.ready is True, ready_result.findings
+    assert ready_result.portfolio_features is not None
+    assert ready_result.settled_cash == 8500
+    assert ready_result.gross_exposure == 1500
+    assert ready_result.open_position_risk == 150
+    assert ready_result.reserved_buy_cash == 0
+    assert ready_result.reserved_buy_risk == 0
+    assert ready_result.pending_entry_count == 0
+    assert ready_result.total_committed_risk == 150
+
+    no_replacement_stop_account = replace(
+        final_account,
+        open_orders=tuple(
+            order
+            for order in final_account.open_orders
+            if order.broker_order_id != "replacement-stop-full-broker"
+        ),
+    )
+    missing_holding_projection = policy_execution_state_to_projection(
+        account=no_replacement_stop_account,
+        portfolio_snapshot=final_snapshot.portfolio_snapshot,
+        action_projections=final_snapshot.action_projections,
+        holding_episodes=tuple(
+            holding
+            for holding in final_snapshot.holding_episodes
+            if holding.security_id != replacement_security
+        ),
+    )
+    missing_holding_result = reconcile_account_snapshot(
+        account=no_replacement_stop_account,
+        projection=missing_holding_projection,
+        maximum_balance_age=timedelta(minutes=15),
+        maximum_mark_age=timedelta(minutes=15),
+    )
+    assert missing_holding_result.ready is False
+    assert missing_holding_result.portfolio_features is None
+    assert any(finding.path == "holdings.ABC.quantity" for finding in missing_holding_result.findings)
+
+    unknown_risk_holding = replace(
+        final_holding,
+        proposed_stop_price=None,
+        proposed_stop_action_id=None,
+        confirmed_protective_stop_price=None,
+        confirmed_stop_action_id=None,
+        confirmed_stop_client_order_id=None,
+        confirmed_stop_broker_order_id=None,
+        confirmed_stop_observed_at=None,
+    )
+    unknown_risk_projection = policy_execution_state_to_projection(
+        account=no_replacement_stop_account,
+        portfolio_snapshot=final_snapshot.portfolio_snapshot,
+        action_projections=final_snapshot.action_projections,
+        holding_episodes=tuple(
+            unknown_risk_holding if holding.holding_episode_id == final_holding.holding_episode_id else holding
+            for holding in final_snapshot.holding_episodes
+        ),
+    )
+    unknown_risk_result = reconcile_account_snapshot(
+        account=no_replacement_stop_account,
+        projection=unknown_risk_projection,
+        maximum_balance_age=timedelta(minutes=15),
+        maximum_mark_age=timedelta(minutes=15),
+    )
+    assert unknown_risk_result.ready is False
+    assert unknown_risk_result.portfolio_features is None
+    assert unknown_risk_result.open_position_risk is None
+    assert any(
+        finding.path == f"holdings.{final_holding.holding_episode_id}.stop_price"
+        for finding in unknown_risk_result.findings
     )
 
 
