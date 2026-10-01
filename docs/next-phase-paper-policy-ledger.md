@@ -33,9 +33,9 @@ Ruling: use approved visible isolated implementation chats with Luna/xhigh and d
 
 | Issue | Implementation | Required inputs | Acceptance evidence | Dependencies |
 | --- | --- | --- | --- | --- |
-| #98 | Dispatch preparation | Recorded/synthetic non-account fixtures available; provider acceptance excluded | None for new implementation | Accepted #66/#80/#97 and final #71 eligible |
-| #99 | Dispatch preparation | Synthetic account/order records available | None for new implementation | Accepted #80/#97; #100 projection agreed semantically, implementation due |
-| #100 | Dispatch preparation | Fixed outputs and temporary databases available | None for new implementation | Accepted #80/#97 eligible; D collision coordination due |
+| #98 | In progress in registered owner worktree | Recorded/synthetic non-account fixtures available; provider acceptance excluded | Focused tests being implemented; no frozen receipt or independent code acceptance | Accepted #66/#80/#97 and final #71 eligible |
+| #99 | In progress in registered owner worktree | Synthetic account/order records available | Focused tests being implemented; concrete producer integration and independent code acceptance due | Accepted #80/#97; #100 concrete projection still evolving |
+| #100 | Pure state and additive persistence implementation in progress | Fixed outputs and temporary databases available | Design preflight complete with rulings; durability tests and independent code acceptance due | Accepted #80/#97 eligible; new explicit-path module authorized, existing entry-point edits remain gated |
 
 ## Remaining steps
 
@@ -100,3 +100,5 @@ Source-backed #98 draft finding routed to existing owner: `_canonical_candidate_
 Exact #100 API/schema/migration proposal now retained in `docs/next-phase-paper-policy-store-interface.md`, frozen source proposal SHA256 b96ea4012d18fb7fa2353bc64d7b84b053233eea39bfc246bffd1aeac62f8a17. New policy_execution_state/store modules only; no existing entry-point edits. D's current local ledger confirms consumption-only of shared methods, no D edit proposed. Principal can inspect this record directly under its own 17:00 decision; no peer relay or authorization bypass. Independent design review pending; actual durability implementation/evidence still due.
 
 Independent schema preflight now completed: `.artifacts/lead-c/issue-100-schema-preflight-review.md`, six findings, specification/design changes requested. Rulings in store-interface document and successful owner follow-up require per-category/subject decision slots, one atomic fill/accounting transition, relational/store identity enforcement, no nonempty schema rollback escape hatch, explicit order ancestry and complete mutation/lifecycle boundary. No source acceptance. Latest owner cursors9/12/11 remain active; no completed implementation handoff yet.
+
+Revised #100 proposal retained as `.artifacts/lead-c/issue-100-schema-proposal-d4c32c84.md`, SHA256 d4c32c84fce585b9a08349dd4d3f2e920663b2e3904736c678a926a7a8bfc857. It now records all six design dispositions, explicit database identity and order-reference alias tables, and versioned accounting/stop/portfolio writes. This supersedes b96ea401 as the proposed interface; neither is implementation evidence. Latest compact owner cursors13/14/14 remain active. #98 is adding full-universe coverage tests, #99 explicit security-symbol mapping, #100 categorical decision slots and atomic-fill design. No committed owner handoff yet; no source tests were run by the lead against changing drafts.

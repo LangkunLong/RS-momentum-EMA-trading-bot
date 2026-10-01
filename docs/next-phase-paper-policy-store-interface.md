@@ -2,26 +2,26 @@
 
 Status: exact additive proposal retained for principal-owned overlap review; not implementation acceptance or deployment authority. Starting application source `ab385d792e19ff6db39d87f1123f47f660fc1e1d`.
 
-Owner #100: chat `01a0f861-76d9-7b11-9722-724643c52221`, worktree2286. Its mutable proposal is `docs/issue-100-state-interface-v1.md`; frozen lead copy `.artifacts/lead-c/issue-100-schema-proposal-b96ea401.md`, SHA256 `b96ea4012d18fb7fa2353bc64d7b84b053233eea39bfc246bffd1aeac62f8a17`.
+Owner #100: chat `01a0f861-76d9-7b11-9722-724643c52221`, worktree2286. Its mutable proposal is `docs/issue-100-state-interface-v1.md`. The revised frozen lead copy is `.artifacts/lead-c/issue-100-schema-proposal-d4c32c84.md`, SHA256 `d4c32c84fce585b9a08349dd4d3f2e920663b2e3904736c678a926a7a8bfc857`. It incorporates the design-review rulings below. The earlier b96ea401 proposal remains retained as review input; it is superseded.
 
 ## Paths and ownership
 
 - New `core/policy_execution_state.py`: immutable identity/state types and pure transitions; no providers or settings.
-- New `core/policy_execution_store.py`: `PolicyExecutionStateStore(db_path: str | Path)`, explicit caller-supplied path; no default singleton or operational sidecar path.
+- New `core/policy_execution_store.py`: `PolicyExecutionStateStore(db_path, *, store_identity)`, both required and the identity durably bound to the database; no default singleton or operational sidecar path.
 - New dedicated tests and interface/evidence documentation.
 - Existing `core/execution_store.py`, `core/execution_workflow.py`, scheduler, order manager and actual store remain unchanged. Any later entry-point edit requires a separate exact overlap record and principal resolution.
 
 ## Proposed schema and transaction effects
 
-Only `policy_state_*` tables/indexes: schema_migrations, deployments, active_pointers, deployment_events, decisions, holdings, actions, order_attempts, fill_receipts, holding_history and portfolio_snapshots. Independent migration version1; no PRAGMA user_version change. Foreign keys enabled; transactional DDL and ledger insertion in BEGIN IMMEDIATE. Legacy workflow tables/rows must remain equivalent on representative temporary databases.
+Only `policy_state_*` tables/indexes: database_identity, schema_migrations, deployments, active_pointers, deployment_events, decisions, holdings, actions, order_attempts, order_reference_aliases, fill_receipts, holding_history and portfolio_snapshots. Independent migration version1; no PRAGMA user_version change. Foreign keys enabled on each connection before the transaction; statement-by-statement transactional DDL and ledger insertion in BEGIN IMMEDIATE. Legacy workflow schemas/rows must remain equivalent on representative temporary databases.
 
 Uniqueness covers decision slots and immutable payloads, generation/holding/tier across sessions, broker/client attempt references, external fill event identities and holding episodes. Attempt watermarks are cumulative/monotonic; expected-version updates use transaction-scoped compare-and-set. Logical action IDs persist across at most one remainder attempt.
 
 ## Proposed API
 
-`migrate`, `rollback_schema_v1`, `put_deployment_identity`, `set_active_generation`, `load_active_generation`, `record_decision`, `create_holding_episode`, `record_action_intent`, `record_attempt_transition`, `record_cumulative_fill`, `create_single_remainder_attempt`, `record_explicit_action_resolution`, `advance_exit_tier`, `load_holding_episode`, `load_action_projection`, `load_deployment_chain`, `load_portfolio_snapshot`.
+The revised proposal explicitly names `migrate`, `rollback_schema_v1`, `put_deployment_identity`, `record_decision`, `open_holding_from_entry_fill`, `record_cumulative_fill`, `request_order_cancel`, `confirm_order_terminal`, `create_single_remainder_attempt`, `record_explicit_action_resolution`, `advance_exit_tier`, `update_holding_state`, `propose_stop_update`, `confirm_protective_stop`, `update_portfolio_snapshot`, `load_action_projection`, `load_holding_episode`, `load_deployment_chain`, `load_portfolio_snapshot`, and `set_active_generation`. Exact implemented signatures and the creation/read paths for intents, attempts and active pointers remain to be frozen and reviewed with source.
 
-Rollback of schema is distinct from rollback of the active generation. The former must reject unsafe loss of dependent state; the latter changes future-entry selection without reassigning existing holdings/actions. Proposed export-receipt recovery needs independent review before any implementation reliance. Failed migration and restart/concurrent-update behavior require actual tests; prose is not evidence.
+Rollback of schema is distinct from rollback of the active generation. The former rejects any dependent policy-state data with no export-and-drop escape hatch; the latter changes future-entry selection without reassigning existing holdings/actions. Failed migration and restart/concurrent-update behavior require actual tests; prose is not evidence.
 
 ## Consumers and overlap disposition
 
@@ -31,7 +31,7 @@ D's currently inspected `docs/next-phase-runtime-operations-ledger.md` lists exi
 
 B's final import/map/image owner will receive principal-collected final changed-path/import inventory. New modules and imports require exact source review before image acceptance; old image proof remains dated.
 
-The independent schema review and actual owner implementation/source-bound test receipts are pending. Only temporary database fixtures are authorized. No provider/broker/runtime operations or policy promotion follows.
+The initial independent schema review is complete; actual owner implementation/source-bound test receipts and independent code review are pending. Only temporary database fixtures are authorized. No provider/broker/runtime operations or policy promotion follows.
 
 ## Independent design review disposition
 
