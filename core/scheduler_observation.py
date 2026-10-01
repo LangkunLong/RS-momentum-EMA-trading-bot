@@ -26,10 +26,16 @@ _SECRET_ASSIGNMENT = re.compile(
 _EMAIL = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
 _COVERAGE_RANK = {"complete": 0, "degraded": 1, "unverified": 2, "failed": 3}
 _INDEX_REQUEST_LIMIT = 6
+_WORKFLOW_TRANSITION_WRITE_LIMIT = 6
+_WORKFLOW_SNAPSHOT_WRITE_LIMIT = 2
 
 
 class IndexRequestBudgetExceeded(RuntimeError):
     """Raised before an index-source request would exceed the observation cap."""
+
+
+class WorkflowWriteBudgetExceeded(RuntimeError):
+    """Raised before a workflow write would exceed the observation cap."""
 
 
 def _safe_string(value: str) -> str:
@@ -68,7 +74,11 @@ class SchedulerObservation:
         self._input_gaps: list[dict[str, Any]] = []
         self._issues: list[dict[str, Any]] = []
         self._resource_denials: dict[str, int] = {}
-        self._resource_counters: dict[str, int] = {"index_attempts": 0}
+        self._resource_counters: dict[str, int] = {
+            "index_attempts": 0,
+            "workflow_transition_writes": 0,
+            "workflow_snapshot_writes": 0,
+        }
         self._provider_counters: dict[str, dict[str, Any]] = {}
         self._service_health = "healthy"
         self._required_input_coverage = "complete"
@@ -138,6 +148,41 @@ class SchedulerObservation:
             self._resource_counters["index_attempts"] = attempts + 1
             self.record_event(
                 "provider_request", "index_source", "reserved", {"source": source}
+            )
+
+    def reserve_workflow_writes(
+        self, *, transitions: int = 0, snapshots: int = 0
+    ) -> None:
+        """Atomically reserve observation write slots before a store transaction."""
+        if transitions < 0 or snapshots < 0 or (transitions == 0 and snapshots == 0):
+            raise ValueError("workflow write reservation must request positive counts")
+        with self._lock:
+            transition_attempt = self._resource_counters["workflow_transition_writes"] + transitions
+            snapshot_attempt = self._resource_counters["workflow_snapshot_writes"] + snapshots
+            denied_resource: str | None = None
+            attempted = 0
+            cap = 0
+            if transition_attempt > _WORKFLOW_TRANSITION_WRITE_LIMIT:
+                denied_resource = "workflow_transition_writes"
+                attempted = transition_attempt
+                cap = _WORKFLOW_TRANSITION_WRITE_LIMIT
+            elif snapshot_attempt > _WORKFLOW_SNAPSHOT_WRITE_LIMIT:
+                denied_resource = "workflow_snapshot_writes"
+                attempted = snapshot_attempt
+                cap = _WORKFLOW_SNAPSHOT_WRITE_LIMIT
+            if denied_resource is not None:
+                self.record_resource_denial(
+                    "workflow_write_cap_denied",
+                    {"resource": denied_resource, "attempt": attempted, "cap": cap},
+                )
+                raise WorkflowWriteBudgetExceeded(
+                    f"Workflow {denied_resource} cap ({cap}) has been reached"
+                )
+            self._resource_counters["workflow_transition_writes"] = transition_attempt
+            self._resource_counters["workflow_snapshot_writes"] = snapshot_attempt
+            self.record_event(
+                "workflow_write", "execution_store", "reserved",
+                {"transitions": transitions, "snapshots": snapshots},
             )
 
     def record_provider_event(
