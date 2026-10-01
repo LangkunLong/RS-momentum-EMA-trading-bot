@@ -8,9 +8,9 @@
 
 ## Statuses
 
-- **Implementation:** The consumer adapter preserves action origin clocks, attempt terminal states and aliases, resolution reasons, and action/holding versions. Reconciliation accepts older issued actions when they match current account facts, and rejects future or stale unsent actions. No producer-owned files were changed by #99.
+- **Implementation:** The consumer adapter preserves action origin clocks, attempt terminal states and aliases, resolution reasons, and action/holding versions. Reconciliation accepts older issued actions when they match current account facts, rejects future or stale unsent actions, and coalesces equivalent broker rows only after their references resolve to one canonical attempt and their material facts agree. No producer-owned files were changed by #99.
 - **Required inputs:** A focused integration test writes real #100 DTOs into a temporary SQLite store, then obtains generation-A actions and holdings together with generation-B portfolio facts through `load_policy_execution_snapshot`.
-- **Acceptance evidence:** Focused consumer regressions pass, including the canonical temp-store case. The old broad non-integration run was interrupted at about 14% after reporting failures and is not acceptance evidence. Persistence producer acceptance and independent review remain open.
+- **Acceptance evidence:** Focused consumer regressions pass, including canonical temp-store and registered-alias coalescing cases. The alias follow-up awaits independent re-review. The old broad non-integration run was interrupted at about 14% after reporting failures and is not acceptance evidence. Persistence producer acceptance remains open.
 - **Dependencies:** The pure producer checkpoint is approved and integrated as a construction dependency. Persistence commit `d52fb22deedc74361f6e4ae4a0113dc4f215c3c2` is also integrated as a construction dependency, but is not independently accepted; its lead has seven Important review fixes underway.
 
 ## Changed paths owned by #99
@@ -36,6 +36,7 @@ The following are inherited from the #100 dependency commit and are not #99-owne
 - Reserves residual buy cash and canonical residual committed risk once; confirmed fills
   remain represented in broker cash/positions and are not subtracted a second time.
 - Reports pending strategy sells separately from protective sells and current position risk.
+- Coalesces broker rows using registered primary/alias references only when all references map to the same canonical attempt and quantity, status, symbol, side, and other material facts agree.
 - Blocks readiness for unresolved or conflicting actions/orders, missing mappings, stale
   marks, unknown risk bases, missing classifications, or incomplete account snapshots.
 - Builds `PortfolioFeaturesV3` only after complete reconciliation.
@@ -56,6 +57,10 @@ The focused temporary-store test uses `PolicyExecutionStateStore.load_policy_exe
 
 The consumer conversion tests cover preservation of explicit resolution reasons, per-attempt aliases and terminal status, and state versions; readiness after a resolved terminal action; release of its reservations; acceptance of a matching older submitted action; and fail-closed outcomes for future/inconsistent provenance and expired unsent actions. The historical 35-test receipt above remains evidence from `e12a8a7` only.
 
+The alias-deduplication follow-up resolves the remaining consumer review finding. For strategy orders with canonical attempts, each supplied broker/client ID must map uniquely to the same `(logical_action_id, attempt_number)` before rows are considered equivalent. Rows are coalesced only when symbol, side, status, purpose, holding ID, requested and filled quantities, and stop price agree. Unregistered or cross-attempt references are not eligible; conflicting material facts remain separate and block reservations. The consumer guide now describes resolved-action readiness and the limited temporary-store test correctly.
+
+This correction is submitted for the requested independent consumer re-review. It does not close the separate persistence review or combined restart acceptance gates.
+
 Focused verification after the persistence integration:
 
 ```text
@@ -64,12 +69,27 @@ python -m pytest -p no:cacheprovider -o addopts='' -W ignore::pytest.PytestConfi
 
 Result: **6 passed**. Ruff passed for the reconciliation module and its focused test file; `compileall` passed for the reconciliation module; `git diff --check` reported no whitespace errors. No broad suite was run for this continuation.
 
+## Registered-alias review follow-up
+
+Focused tests cover three equivalent-row shapes: a primary pair plus a registered alias pair, a shared primary broker ID with an alias client ID, and a shared primary client ID with an alias broker ID. Each positive case confirms one residual cash reservation, one residual risk reservation, and one pending entry. Negative controls vary quantity, status, symbol, or side and confirm readiness and reservations remain unavailable. Existing wrong-reference and contradictory-pair controls remain in place; the per-attempt regression also verifies that an order combining references from separate attempts is rejected.
+
+Focused regression command:
+
+```text
+python -m pytest -p no:cacheprovider -o addopts='' -W ignore::pytest.PytestConfigWarning --tb=short tests/test_strategy_policy_account_reconciliation.py::test_policy_execution_state_conversion_preserves_decimal_residual_attempts_and_identity tests/test_strategy_policy_account_reconciliation.py::test_policy_execution_state_conversion_keeps_order_references_per_attempt tests/test_strategy_policy_account_reconciliation.py::test_duplicate_broker_rows_with_conflicting_alias_pairs_block_reservations tests/test_strategy_policy_account_reconciliation.py::test_conflicting_duplicate_broker_order_reference_blocks_reservations tests/test_strategy_policy_account_reconciliation.py::test_duplicate_local_and_broker_references_do_not_double_reserve tests/test_strategy_policy_account_reconciliation.py::test_unavailable_security_mapping_with_matched_order_returns_unready tests/test_strategy_policy_account_reconciliation.py::test_matching_old_generation_holding_action_is_valid_under_new_active_generation tests/test_strategy_policy_account_reconciliation.py::test_canonical_store_read_reconciles_old_generation_state_with_current_portfolio tests/test_strategy_policy_account_reconciliation.py::test_registered_attempt_alias_rows_reserve_once tests/test_strategy_policy_account_reconciliation.py::test_registered_attempt_alias_rows_with_conflicting_facts_block_reservations -q
+```
+
+Result: **17 passed**. Ruff passed on the reconciliation module and focused test file; `compileall` passed for the reconciliation module; `git diff --check` found no whitespace errors. No broad suite was run.
+
+The separate lead-provided `tests/test_paper_policy_chain.py` receipt was **3 passed, 2 warnings**; it includes a later-session mixed-generation case and does not cover these equivalent-alias rows. The warning details were not supplied, so the receipt remains attributed to the lead and is not classified as warning-free.
+
 SHA-256 evidence hashes (the synthetic records are inline in the test source):
 
 | Artifact | SHA-256 |
 | --- | --- |
-| `core/strategy_policy/account_reconciliation.py` | `7b1530fe0aea8f5a030675d5c59515f0734388a7d87ccc0c6d4987fa5b416ea6` |
-| `tests/test_strategy_policy_account_reconciliation.py` | `503ee5d7718268014b2f078f98576be1592ceee3d826455759f51914d5505e14` |
+| `core/strategy_policy/account_reconciliation.py` | `a7121eb1512b0422e7607491e43ec53b4a16cc21d7c510d715c74ca05861175f` |
+| `tests/test_strategy_policy_account_reconciliation.py` | `7ec96292ee566225b76e51145748e2b9b4269a1516a82e29ce18435aaa564b16` |
+| `docs/strategy-policy-account-reconciliation-issue99.md` | `8a0b80faa9b03eaa449e835591d8e524e2af23ba47934a315cdab98b256abcce` |
 
 ## Prior verification record (`e12a8a7`, report `f89172d`)
 

@@ -13,9 +13,11 @@ and clock identities. Action projections retain their own decision identity, Dec
 quantities, risk basis, and attempt-scoped client and broker references. Holding episodes
 supply confirmed quantity, current broker symbol, and only broker-confirmed stop facts.
 
-The account cutoff and valuation time stay separate. The action/portfolio decision clock
-must match the declared valuation session, while the account observation may be later than
-the feature cutoff when it belongs to the next execution opportunity.
+The account cutoff and valuation time stay separate. The current portfolio and broker
+snapshot must share the declared valuation clock. Each action retains its original decision
+and execution clocks; a coherent older clock can remain valid for an already-issued action
+when the current order, attempt, and account facts match. Future or inconsistent action
+clocks fail closed, and expired unsent actions are never retargeted to a newer session.
 
 The adapter builds an explicit `security_id` to `broker_symbol` mapping from the canonical
 action and holding facts for that valuation session. Conflicting symbols for one stable
@@ -33,7 +35,9 @@ adapter does not consult an external security master.
   strategy sells remain separate output values. Protective sells map to holding episodes
   and do not count as strategy sells.
 - Attempt references and per-attempt fill watermarks remain associated with their attempt.
-  Conflicting or ambiguous broker aliases block reservations.
+  Equivalent rows using registered IDs for one canonical action attempt coalesce only after
+  every supplied ID resolves to that same attempt and material broker facts agree. Unknown,
+  cross-attempt, or contradictory aliases and facts block reservations.
 - `remainder_ready` continues to reserve its residual. `reconciliation_required` and
   `partial_incomplete` block readiness. Unknown action/order states do not release
   reservations. Broker `expired` state also blocks because the current producer has no
@@ -42,15 +46,18 @@ adapter does not consult an external security master.
   findings remain. Missing cash, equity, position/order snapshots, valuation marks,
   classifications, mappings, or stop-risk facts remain `None` and block readiness.
 
-The current `ActionStateProjection` does not expose `resolution_reason`, even though its
-source `ActionIntent` does. The adapter therefore retains `resolved` as unresolved and
-blocks readiness. The producer-side field and preservation test are a required integration
-fix; this fail-closed behavior is not final acceptance for resolved actions.
+An explicitly resolved action can release its reservation only when its resolution reason
+is present, each attempt has terminal evidence, and current broker facts show no active
+order. Missing reasons or nonterminal attempts keep readiness blocked.
 
 ## Scope boundary
 
-The conversion is tested against the real immutable DTOs in the #100 pure producer
-checkpoint `6bbf20ab2de0f177628bf623c8fa3c138679d868`. That checkpoint does not include the
-planned persistence store. Store loading, durable restart reconciliation, combined
-#99/#100 acceptance, and independent review remain pending. All account and broker facts
-used by #99 tests are deterministic synthetic fixtures.
+The conversion is tested against real immutable DTOs from approved pure producer checkpoint
+`aef51d0d4893db1049401bc37ea40f434ea60b56`. A focused consumer test also uses a temporary
+SQLite store from persistence construction dependency
+`d52fb22deedc74361f6e4ae4a0113dc4f215c3c2`, then calls
+`load_policy_execution_snapshot` to reconcile pinned older-generation records with current
+portfolio and broker facts. That checkpoint remains unaccepted pending producer review; the
+test is synthetic consumer evidence, not durable-store or runtime acceptance. The module
+itself remains pure and does not open the store. All account and broker facts in #99 tests
+are deterministic synthetic fixtures.

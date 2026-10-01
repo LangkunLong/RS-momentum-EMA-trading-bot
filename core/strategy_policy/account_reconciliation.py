@@ -1057,9 +1057,75 @@ def _build_security_symbol_map(
 def _merge_duplicate_broker_orders(
     records: tuple[BrokerOrderFact, ...],
     findings: list[ReconciliationFinding],
+    *,
+    attempt_reference_owners: dict[tuple[str, str], set[tuple[str, int]]],
+    action_reference_owners: dict[tuple[str, str], set[str]],
+    holding_reference_owners: dict[tuple[str, str], set[str]],
 ) -> list[BrokerOrderFact]:
-    orders: list[BrokerOrderFact] = []
+    canonical_orders: list[BrokerOrderFact] = []
+    canonical_attempt_rows: dict[tuple[str, int], int] = {}
     for record in records:
+        supplied_refs = tuple(
+            reference
+            for reference in (
+                ("broker", record.broker_order_id),
+                ("client", record.client_order_id),
+            )
+            if reference[1] is not None
+        )
+        owners_by_ref = [
+            attempt_reference_owners.get((kind, reference), set())
+            for kind, reference in supplied_refs
+        ]
+        canonical_owner: tuple[str, int] | None = None
+        if record.purpose == "strategy" and owners_by_ref and all(len(owners) == 1 for owners in owners_by_ref):
+            resolved_owners = {next(iter(owners)) for owners in owners_by_ref}
+            if len(resolved_owners) == 1:
+                candidate_owner = next(iter(resolved_owners))
+                owner_action_id = candidate_owner[0]
+                if all(
+                    action_reference_owners.get(reference) == {owner_action_id}
+                    and not holding_reference_owners.get(reference)
+                    for reference in supplied_refs
+                ):
+                    canonical_owner = candidate_owner
+
+        if canonical_owner is None or canonical_owner not in canonical_attempt_rows:
+            if canonical_owner is not None:
+                canonical_attempt_rows[canonical_owner] = len(canonical_orders)
+            canonical_orders.append(record)
+            continue
+
+        existing_index = canonical_attempt_rows[canonical_owner]
+        existing = canonical_orders[existing_index]
+        same_facts = (
+            record.symbol == existing.symbol
+            and record.side == existing.side
+            and record.status == existing.status
+            and record.purpose == existing.purpose
+            and record.holding_episode_id == existing.holding_episode_id
+            and _close(record.requested_quantity, existing.requested_quantity)
+            and _close(record.cumulative_filled_quantity, existing.cumulative_filled_quantity)
+            and (
+                record.stop_price is None
+                and existing.stop_price is None
+                or record.stop_price is not None
+                and existing.stop_price is not None
+                and _close(record.stop_price, existing.stop_price)
+            )
+        )
+        if same_facts:
+            continue
+        _finding(
+            findings,
+            f"open_orders.{record.broker_order_id or record.client_order_id}",
+            "conflicting",
+            "one canonical action attempt has inconsistent broker observations",
+        )
+        canonical_orders.append(record)
+
+    orders: list[BrokerOrderFact] = []
+    for record in canonical_orders:
         matches = [
             existing
             for existing in orders
@@ -1263,15 +1329,25 @@ def _reconcile_projected_actions(
                     "conflicting",
                     "action deployment generation differs from its projected holding episode",
                 )
-    orders = _merge_duplicate_broker_orders(account.open_orders, findings)
-    fully_mapped = symbols is not None and len(findings) == start_findings
-
     action_owner: dict[tuple[str, str], set[str]] = defaultdict(set)
+    attempt_reference_owners: dict[tuple[str, str], set[tuple[str, int]]] = defaultdict(set)
     for action_id, action in actions.items():
         for reference in action.client_order_refs:
             action_owner[("client", reference)].add(action_id)
         for reference in action.broker_order_refs:
             action_owner[("broker", reference)].add(action_id)
+        for attempt in action.order_attempts:
+            attempt_owner = (action_id, attempt.attempt_number)
+            for reference in (
+                (() if attempt.client_order_id is None else (attempt.client_order_id,))
+                + attempt.client_order_aliases
+            ):
+                attempt_reference_owners[("client", reference)].add(attempt_owner)
+            for reference in (
+                (() if attempt.broker_order_id is None else (attempt.broker_order_id,))
+                + attempt.broker_order_aliases
+            ):
+                attempt_reference_owners[("broker", reference)].add(attempt_owner)
     holding_owner: dict[tuple[str, str], set[str]] = defaultdict(set)
     for holding in projection.holdings:
         for reference in holding.protective_stop_order_references:
@@ -1279,6 +1355,15 @@ def _reconcile_projected_actions(
                 holding_owner[("client", reference.client_order_id)].add(holding.holding_episode_id)
             if reference.broker_order_id is not None:
                 holding_owner[("broker", reference.broker_order_id)].add(holding.holding_episode_id)
+
+    orders = _merge_duplicate_broker_orders(
+        account.open_orders,
+        findings,
+        attempt_reference_owners=attempt_reference_owners,
+        action_reference_owners=action_owner,
+        holding_reference_owners=holding_owner,
+    )
+    fully_mapped = symbols is not None and len(findings) == start_findings
 
     by_action: dict[str, list[BrokerOrderFact]] = defaultdict(list)
     by_holding: dict[str, list[BrokerOrderFact]] = defaultdict(list)
