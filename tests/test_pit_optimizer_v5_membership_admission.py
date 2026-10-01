@@ -192,8 +192,22 @@ def test_admission_helper_is_in_closed_container_source_map() -> None:
     source_map = evaluator_source_map_v5(source_root)
     source_identity = evaluator_source_sha256(source_map)
 
-    assert len(EVALUATOR_SOURCE_PATHS_V5) == 56
+    assert len(EVALUATOR_SOURCE_PATHS_V5) == 57
     assert "core/pit_data.py" in source_map
+    assert "core/alpaca_client_policy.py" in source_map
+    dockerignore = (
+        source_root / "Dockerfile.pit-optimizer-v5.dockerignore"
+    ).read_text(encoding="utf-8").splitlines()
+    allowed_files = {
+        line[1:]
+        for line in dockerignore
+        if line.startswith("!") and not line.endswith("/")
+    }
+    assert allowed_files == set(EVALUATOR_SOURCE_PATHS_V5) | {
+        "Dockerfile.pit-optimizer-v5",
+        "Dockerfile.pit-optimizer-v5.dockerignore",
+        "requirements-lock.txt",
+    }
     assert "core/pit_optimizer_v5/evaluator.py" in source_map
     assert "core/pit_optimizer_v5/pit_admission.py" not in source_map
     assert container_entry.PitPanelEvaluatorV5 is PitPanelEvaluatorV5
