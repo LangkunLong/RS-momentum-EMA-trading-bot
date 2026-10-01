@@ -20,6 +20,8 @@ Completion requires all nine original #98/#99/#100 criteria, independent specifi
 
 ## Latest combined checkpoint
 
+Producer43a0820/reportbfcaa5a and consumercf3310f now have independent scoped approvals. Six specifically vetted offline modules passed101cases at lead6581650 (receipt872322,2warnings,41.51s). Independent integration review then found3additional consumer gaps: loss of a durable reconciliation flag, rejection of valid never-issued resolutions, and live-protection requirements for flat history. All3have actual failing lead regressions and are assigned to #99. The expanded8case chain is not passing. These new findings supersede earlier statements below about the last known blocker; full acceptance remains unproven.
+
 Expanded five-case chain passes at `549f8d3dc3e12534cb4141ca6aafc52b6ccd268c` with producer963a61f and consumer2cf4bdf: chunk7109f0, 5passed, 2warnings in2.60s. This resolves the two registered-alias regression failures described below. Consumer correction re-review is active. Store re-review clears findings1/3/4/5/6/7 but retains one finding2 variant: late references reopen a resolved holding-backed action without restoring the holding's pending conflict. That remaining correction, final independent integration review and final-source validation/publication/principal gates still prevent completion.
 
 Consumer compatibility6f225eec1c9434f0ae035383cabba43797f33ba2 is locally integrated at lead `c6ee7ceae26e2f6825a1635c874007ee59f156b8`. The original three tests in `tests/test_paper_policy_chain.py` pass at this checkpoint (chunkeb2707: 3passed, 2warnings in4.26s), including the unchanged later-session/mixed-generation case. Receipt `.artifacts/lead-c/combined-chain-c6ee7ce.md`.

@@ -291,6 +291,177 @@ def read_chain(store, deployment, portfolio):
     )
 
 
+def reconcile_chain_snapshot(account, snapshot):
+    projection = policy_execution_state_to_projection(
+        account=account,
+        portfolio_snapshot=snapshot.portfolio_snapshot,
+        action_projections=snapshot.action_projections,
+        holding_episodes=snapshot.holding_episodes,
+    )
+    return reconcile_account_snapshot(
+        account=account,
+        projection=projection,
+        maximum_balance_age=timedelta(minutes=15),
+        maximum_mark_age=timedelta(minutes=15),
+    )
+
+
+def test_durable_position_reconciliation_flag_blocks_until_evidenced_clear(tmp_path):
+    _, path, deployment, account, portfolio, _, _ = seed_pending_chain(tmp_path)
+    store = PolicyExecutionStateStore(path, store_identity=deployment.store_identity)
+    before = read_chain(store, deployment, portfolio)
+    holding = next(item for item in before.holding_episodes if item.broker_symbol == "CCC")
+    reason = "recorded account position requires reconciliation"
+    store.record_holding_episode(
+        replace(holding, policy_flags=(("position_reconciliation_required", reason),)),
+        expected_version=holding.state_version,
+        evidence_ref="synthetic-position-discrepancy",
+    )
+    restarted = PolicyExecutionStateStore(path, store_identity=deployment.store_identity)
+    flagged = read_chain(restarted, deployment, portfolio)
+    flagged_holding = next(
+        item for item in flagged.holding_episodes if item.holding_episode_id == holding.holding_episode_id
+    )
+    assert dict(flagged_holding.policy_flags)["position_reconciliation_required"] == reason
+    result = reconcile_chain_snapshot(account, flagged)
+    assert not result.ready, "durable reconciliation-required state must block risk-increasing readiness"
+    assert result.findings
+    assert result.portfolio_features is None
+    restarted.record_holding_episode(
+        replace(flagged_holding, policy_flags=()),
+        expected_version=flagged_holding.state_version,
+        evidence_ref="synthetic-position-reconciliation-complete",
+    )
+    cleared = read_chain(
+        PolicyExecutionStateStore(path, store_identity=deployment.store_identity), deployment, portfolio
+    )
+    assert cleared.portfolio_snapshot == before.portfolio_snapshot
+    assert_pending_reconciliation(account, portfolio, cleared.action_projections, cleared.holding_episodes)
+
+
+def test_never_issued_addition_resolution_is_ready_after_canonical_restart(tmp_path):
+    features, path, deployment, account, portfolio, _, _ = seed_pending_chain(tmp_path)
+    store = PolicyExecutionStateStore(path, store_identity=deployment.store_identity)
+    before = read_chain(store, deployment, portfolio)
+    holding = next(item for item in before.holding_episodes if item.broker_symbol == "CCC")
+    decision = DecisionIdentity.build(
+        deployment=deployment,
+        clock=portfolio.clock,
+        snapshot_sha256=features.recorded_input_manifest_sha256,
+        category=DecisionCategory.ADDITION,
+        subject_type=DecisionSubjectType.HOLDING,
+        subject_id=holding.holding_episode_id,
+        sequence=1,
+    )
+    addition = build_action_intent(
+        decision=decision,
+        security_id=holding.security_id,
+        broker_symbol=holding.broker_symbol,
+        holding_episode_id=holding.holding_episode_id,
+        role=ActionRole.ADDITION,
+        side=OrderSide.BUY,
+        requested_quantity=Decimal("2"),
+        status=ActionStatus.INTENDED,
+        reservation_price=Decimal("100"),
+        reservation_price_basis="recorded_limit",
+        risk_per_unit=Decimal("10"),
+        risk_basis="recorded_limit_minus_stop",
+    )
+    record_action(store, addition)
+    pending = store.load_action_projection(addition.logical_action_id)
+    holding = store.load_holding_episode(holding.holding_episode_id)
+    resolved = store.record_explicit_action_resolution(
+        addition.logical_action_id,
+        resolution_reason="recorded intention abandoned before any order was issued",
+        expected_action_version=pending.state_version,
+        expected_holding_version=holding.state_version,
+        observed_at=account.clock.valuation_time,
+    )
+    assert resolved.status is ActionStatus.RESOLVED
+    attempt = resolved.order_attempts[0]
+    assert attempt.status is ActionAttemptStatus.INTENDED
+    assert attempt.terminal_status is None
+    assert attempt.client_order_id is None and attempt.broker_order_id is None
+    assert attempt.confirmed_filled_quantity == 0
+    restarted = PolicyExecutionStateStore(path, store_identity=deployment.store_identity)
+    snapshot = read_chain(restarted, deployment, portfolio)
+    assert (
+        addition.logical_action_id not in restarted.load_holding_episode(holding.holding_episode_id).pending_action_ids
+    )
+    assert_pending_reconciliation(account, portfolio, snapshot.action_projections, snapshot.holding_episodes)
+
+
+def test_flat_holding_retains_history_without_requiring_live_protection(tmp_path):
+    features, path, deployment, account, portfolio, _, _ = seed_pending_chain(tmp_path)
+    store = PolicyExecutionStateStore(path, store_identity=deployment.store_identity)
+    before = read_chain(store, deployment, portfolio)
+    holding = next(item for item in before.holding_episodes if item.broker_symbol == "CCC")
+    historical_protection = next(
+        order for order in account.open_orders if order.purpose == "protective_stop" and order.symbol == "CCC"
+    )
+    decision = DecisionIdentity.build(
+        deployment=deployment,
+        clock=portfolio.clock,
+        snapshot_sha256=features.recorded_input_manifest_sha256,
+        category=DecisionCategory.EXIT,
+        subject_type=DecisionSubjectType.HOLDING,
+        subject_id=holding.holding_episode_id,
+    )
+    close = build_action_intent(
+        decision=decision,
+        security_id=holding.security_id,
+        broker_symbol=holding.broker_symbol,
+        holding_episode_id=holding.holding_episode_id,
+        role=ActionRole.CLOSE,
+        side=OrderSide.SELL,
+        requested_quantity=Decimal("6"),
+        status=ActionStatus.SUBMITTED,
+    )
+    close = bind_attempt_order_refs(
+        close, attempt_number=1, client_order_id="client:close:CCC", broker_order_id="broker:close:CCC"
+    )
+    record_action(store, close)
+    holding = store.load_holding_episode(holding.holding_episode_id)
+    record_fill(store, close, "6", holding=holding, event_id="fill:close:CCC:6")
+    account = replace(
+        account,
+        account_snapshot_id="combined-account-after-full-close",
+        cash=9600,
+        positions=tuple(position for position in account.positions if position.symbol != "CCC"),
+        open_orders=(
+            *(order for order in account.open_orders if order != historical_protection),
+            BrokerOrderFact("broker:close:CCC", "client:close:CCC", "CCC", "sell", "filled", 6, 6),
+        ),
+    )
+    portfolio = replace(
+        portfolio,
+        account_snapshot_id=account.account_snapshot_id,
+        cash=Decimal("9600"),
+        gross_exposure=Decimal("400"),
+        open_risk=Decimal("40"),
+    )
+    store.record_portfolio_snapshot(portfolio)
+    restarted = PolicyExecutionStateStore(path, store_identity=deployment.store_identity)
+    snapshot = read_chain(restarted, deployment, portfolio)
+    flat = next(item for item in snapshot.holding_episodes if item.holding_episode_id == holding.holding_episode_id)
+    assert flat.remaining_quantity == 0
+    assert flat.initial_filled_quantity == 4
+    assert flat.completed_additions_quantity == 2
+    assert flat.confirmed_stop_broker_order_id == historical_protection.broker_order_id
+    result = reconcile_chain_snapshot(account, snapshot)
+    assert result.ready, result.findings
+    assert result.gross_exposure == 400
+    assert result.open_position_risk == 40
+    assert result.reserved_buy_cash == 1600
+    assert result.reserved_buy_risk == 110
+    with_active_protection = replace(account, open_orders=(*account.open_orders, historical_protection))
+    blocked = reconcile_chain_snapshot(with_active_protection, snapshot)
+    assert not blocked.ready
+    assert blocked.findings
+    assert blocked.portfolio_features is None
+    assert read_chain(restarted, deployment, portfolio) == snapshot
+
+
 def test_feature_identity_pending_cash_risk_restart_and_resolution(tmp_path):
     features, path, deployment, account, portfolio, action_a, action_b = seed_pending_chain(tmp_path)
     store = PolicyExecutionStateStore(path, store_identity=deployment.store_identity)
