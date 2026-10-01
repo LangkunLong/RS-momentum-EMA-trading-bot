@@ -225,21 +225,59 @@ _fmp_budget_lock = threading.Lock()
 _fmp_request_context = threading.local()
 _fmp_budget_warning_emitted = False
 _fmp_run_budget_remaining: int | None = None
+_fmp_run_budget_cap: int | None = None
 
 
 @contextmanager
 def fmp_request_budget(max_requests: int) -> Iterator[None]:
     """Cap logical FMP requests for one doctor or bounded scanner run."""
-    global _fmp_run_budget_remaining
+    global _fmp_run_budget_remaining, _fmp_run_budget_cap
     with _fmp_budget_lock:
         if _fmp_run_budget_remaining is not None:
             raise RuntimeError("An FMP run request budget is already active")
         _fmp_run_budget_remaining = max(0, int(max_requests))
+        _fmp_run_budget_cap = _fmp_run_budget_remaining
     try:
         yield
     finally:
         with _fmp_budget_lock:
             _fmp_run_budget_remaining = None
+            _fmp_run_budget_cap = None
+
+
+def fmp_observation_request_limit(max_additional_requests: int = 198) -> int:
+    """Return the run cap bounded by remaining ledger allowance, without writes."""
+    path = str(settings.FMP_REQUEST_LEDGER_PATH)
+    expected_window = _fmp_window_start(_fmp_now_et())
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            saved = json.load(handle)
+        if not isinstance(saved, dict):
+            raise ValueError("FMP usage ledger must contain a JSON object")
+        saved_window = datetime.fromisoformat(str(saved["window_start"]))
+        if saved_window.tzinfo is None:
+            raise ValueError("FMP usage ledger window must include a timezone")
+        saved_window = saved_window.astimezone(expected_window.tzinfo)
+        count = max(int(saved.get("count", 0)), 0)
+        if saved_window == expected_window:
+            local_remaining = max(0, int(settings.FMP_DAILY_REQUEST_BUDGET) - count)
+        elif saved_window < expected_window:
+            local_remaining = max(0, int(settings.FMP_DAILY_REQUEST_BUDGET))
+        else:
+            raise ValueError("FMP usage ledger window is in the future")
+    except FileNotFoundError:
+        latch_service_issue("fmp_ledger_missing", {"ledger_state": "missing"})
+        return 0
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        latch_service_issue("fmp_ledger_unreadable", {"ledger_state": "unreadable"})
+        return 0
+    return min(max(0, int(max_additional_requests)), local_remaining)
+
+
+def fmp_request_budget_snapshot() -> dict[str, int | None]:
+    """Return the active process cap and its remaining logical requests."""
+    with _fmp_budget_lock:
+        return {"cap": _fmp_run_budget_cap, "remaining": _fmp_run_budget_remaining}
 
 
 def _is_fmp_free_plan() -> bool:

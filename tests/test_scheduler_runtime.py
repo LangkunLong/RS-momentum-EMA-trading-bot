@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date, datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -10,6 +11,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 import scheduler
+from core.scheduler_observation import SchedulerObservation, activate_scheduler_observation
 from config import settings
 
 
@@ -256,3 +258,192 @@ def test_task_cli_applies_zero_budget_and_writes_its_log(
     assert rc == 0
     assert settings.FMP_DAILY_REQUEST_BUDGET == 0
     assert "task dry_run=True" in log_path.read_text(encoding="utf-8")
+
+
+def _observation_args() -> list[str]:
+    return ["--dry-run", "--now", "--session", "--observe-health"]
+
+
+def _receipt_from_output(output: str) -> dict:
+    prefix = "SCHEDULER_OBSERVATION_RECEIPT="
+    line = next(line for line in output.splitlines() if line.startswith(prefix))
+    return json.loads(line[len(prefix) :])
+
+
+def _set_observation_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "ALPACA_HTTP_TIMEOUT_SECONDS", 15)
+    monkeypatch.setattr(settings, "FMP_HTTP_TIMEOUT_SECONDS", 15)
+    monkeypatch.setattr(settings, "INDEX_TICKER_HTTP_TIMEOUT_SECONDS", 15)
+    monkeypatch.setattr(settings, "ALPACA_SDK_RETRY_ATTEMPTS", 0)
+    monkeypatch.setattr(settings, "NOTIFY_EMAIL_FROM", "")
+    monkeypatch.setattr(settings, "NOTIFY_EMAIL_TO", "")
+    monkeypatch.setattr(settings, "NOTIFY_EMAIL_PASSWORD", "")
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--observe-health"],
+        ["--observe-health", "--now", "--session"],
+        ["--enable-orders", "--now", "--session", "--observe-health"],
+    ],
+)
+def test_observation_cli_requires_explicit_bounded_dry_run(argv: list[str]) -> None:
+    with patch("scheduler._market_clock_is_open") as clock:
+        assert scheduler.main(argv) == 2
+
+    clock.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("setting_name", "bad_value"),
+    [
+        ("ALPACA_HTTP_TIMEOUT_SECONDS", 14),
+        ("FMP_HTTP_TIMEOUT_SECONDS", 14),
+        ("INDEX_TICKER_HTTP_TIMEOUT_SECONDS", 14),
+        ("ALPACA_SDK_RETRY_ATTEMPTS", 1),
+    ],
+)
+def test_observation_cli_rejects_noncanonical_request_settings(
+    setting_name: str,
+    bad_value: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, setting_name, bad_value)
+    with patch("scheduler.run_scheduler") as run:
+        assert scheduler.main(_observation_args()) == 2
+
+    run.assert_not_called()
+
+
+def test_observation_clock_preflight_runs_inside_budget_before_scan(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    _set_observation_settings(monkeypatch)
+    events: list[str] = []
+    cycle_done = False
+    session_start = datetime(2026, 10, 1, 10, 1, tzinfo=_ET)
+    session_end = datetime(2026, 10, 1, 16, 6, tzinfo=_ET)
+
+    def fake_now() -> datetime:
+        return session_end if cycle_done else session_start
+
+    def clock() -> bool:
+        events.append("clock")
+        assert scheduler.alpaca_http_request_snapshot()["cap"] == 256
+        return True
+
+    def cycle(*_args, **_kwargs) -> None:
+        nonlocal cycle_done
+        events.append("cycle")
+        cycle_done = True
+
+    monkeypatch.setattr(scheduler, "_now_et", fake_now)
+    with (
+        patch("scheduler.SchedulerInstanceLock", return_value=MagicMock(__enter__=lambda self: self, __exit__=lambda *args: None)),
+        patch("scheduler.require_paper_mode"),
+        patch("scheduler._market_clock_is_open", side_effect=clock),
+        patch("scheduler._run_cycle", side_effect=cycle),
+        patch("scheduler.fmp_observation_request_limit", return_value=12),
+    ):
+        result = scheduler.main(_observation_args())
+
+    assert result == 0
+    assert events[:2] == ["clock", "cycle"]
+    receipt = _receipt_from_output(capsys.readouterr().out)
+    assert receipt["service_health"] == "healthy"
+    assert receipt["overall_readiness"] == "unverified"
+
+
+def test_unknown_observation_clock_prevents_immediate_scan(capsys, monkeypatch) -> None:
+    _set_observation_settings(monkeypatch)
+    now = datetime(2026, 10, 1, 10, 1, tzinfo=_ET)
+    monkeypatch.setattr(scheduler, "_now_et", lambda: now)
+    with (
+        patch("scheduler.SchedulerInstanceLock", return_value=MagicMock(__enter__=lambda self: self, __exit__=lambda *args: None)),
+        patch("scheduler.require_paper_mode"),
+        patch("scheduler._market_clock_is_open", return_value=None),
+        patch("scheduler._run_cycle") as cycle,
+        patch("scheduler.fmp_observation_request_limit", return_value=12),
+    ):
+        result = scheduler.main(_observation_args())
+
+    assert result == 1
+    cycle.assert_not_called()
+    receipt = _receipt_from_output(capsys.readouterr().out)
+    assert receipt["service_health"] == "unverified"
+    assert receipt["issues"][-1]["code"] == "market_clock_unknown"
+
+
+def test_observed_scheduler_suppresses_hourly_exit_notification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_observation_settings(monkeypatch)
+    times = iter(
+        [
+            datetime(2026, 10, 1, 10, 1, tzinfo=_ET),
+            datetime(2026, 10, 1, 10, 1, tzinfo=_ET),
+            datetime(2026, 10, 1, 10, 1, tzinfo=_ET),
+            datetime(2026, 10, 1, 10, 1, tzinfo=_ET),
+            datetime(2026, 10, 1, 10, 1, tzinfo=_ET),
+            datetime(2026, 10, 1, 15, 1, tzinfo=_ET),
+            datetime(2026, 10, 1, 15, 1, tzinfo=_ET),
+            datetime(2026, 10, 1, 15, 1, tzinfo=_ET),
+            datetime(2026, 10, 1, 16, 6, tzinfo=_ET),
+        ]
+    )
+    monkeypatch.setattr(scheduler, "_now_et", lambda: next(times))
+    with (
+        patch("scheduler.SchedulerInstanceLock", return_value=MagicMock(__enter__=lambda self: self, __exit__=lambda *args: None)),
+        patch("scheduler.require_paper_mode"),
+        patch("scheduler._market_clock_is_open", return_value=True),
+        patch("scheduler._run_cycle"),
+        patch("scheduler.monitor_exits_hourly", return_value=["AAPL"]),
+        patch("scheduler.monitor_and_exit_positions", return_value=[]),
+        patch("scheduler.notify_cycle_summary") as notify,
+        patch("scheduler.fmp_observation_request_limit", return_value=12),
+        patch("scheduler.time.sleep"),
+    ):
+        assert scheduler.main(_observation_args()) == 0
+
+    notify.assert_not_called()
+
+
+def test_run_cycle_suppresses_summary_even_with_parent_notification_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "NOTIFY_EMAIL_FROM", "sender@example.com")
+    monkeypatch.setattr(settings, "NOTIFY_EMAIL_TO", "recipient@example.com")
+    monkeypatch.setattr(settings, "NOTIFY_EMAIL_PASSWORD", "parent-secret")
+    observation = SchedulerObservation("notification-suppression")
+    result = SimpleNamespace(entered=[], exited=[])
+
+    with (
+        activate_scheduler_observation(observation),
+        patch("scheduler.run_auto_trader", return_value=result),
+        patch("scheduler.notify_cycle_summary") as notify,
+    ):
+        scheduler._run_cycle(dry_run=True)
+
+    notify.assert_not_called()
+    assert observation.to_receipt()["events"][-1]["status"] == "suppressed_observation"
+
+
+def test_observed_work_latches_a_caught_expected_work_failure() -> None:
+    observation = SchedulerObservation("work-failure")
+    scheduled_at = datetime(2026, 10, 1, 9, 31, tzinfo=_ET)
+    with activate_scheduler_observation(observation), pytest.raises(RuntimeError, match="scan failed"):
+        scheduler._run_observed_work(
+            "scan",
+            "startup",
+            scheduled_at,
+            lambda: (_ for _ in ()).throw(RuntimeError("scan failed")),
+        )
+
+    receipt = observation.to_receipt()
+    assert receipt["service_health"] == "failed"
+    assert any(
+        event["kind"] == "scheduler_work" and event["status"] == "failed"
+        for event in receipt["events"]
+    )

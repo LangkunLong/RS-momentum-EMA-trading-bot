@@ -308,6 +308,66 @@ def test_fmp_process_cap_is_not_reported_as_local_ledger_deferral(
     assert observation.to_receipt()["service_health"] == "failed"
 
 
+def test_fmp_observation_process_limit_uses_existing_reset_window_allowance(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    ledger = _prepare_observed_fmp_ledger(
+        monkeypatch, tmp_path, count=3, allowance=10
+    )
+    before = ledger.read_text(encoding="utf-8")
+
+    with activate_scheduler_observation(SchedulerObservation("fmp-preflight")):
+        limit = data_client.fmp_observation_request_limit(198)
+
+    assert limit == 7
+    assert ledger.read_text(encoding="utf-8") == before
+
+
+def test_fmp_observation_process_limit_allows_prior_window_rollover_without_write(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    ledger = _prepare_observed_fmp_ledger(
+        monkeypatch,
+        tmp_path,
+        count=5,
+        allowance=10,
+        window_start="2026-09-30T15:00:00-04:00",
+    )
+    before = ledger.read_text(encoding="utf-8")
+
+    with activate_scheduler_observation(SchedulerObservation("fmp-prior-window")):
+        limit = data_client.fmp_observation_request_limit(198)
+
+    assert limit == 10
+    assert ledger.read_text(encoding="utf-8") == before
+
+
+@pytest.mark.parametrize("exists", [True, False])
+def test_fmp_observation_process_limit_fails_closed_for_unreadable_ledger(
+    exists: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    ledger = _prepare_observed_fmp_ledger(
+        monkeypatch, tmp_path, exists=exists
+    )
+    if exists:
+        ledger.write_text("not-json", encoding="utf-8")
+    observation = SchedulerObservation("fmp-invalid-ledger")
+
+    with activate_scheduler_observation(observation):
+        limit = data_client.fmp_observation_request_limit(198)
+
+    assert limit == 0
+    assert observation.to_receipt()["service_health"] == "failed"
+    assert observation.to_receipt()["issues"][0]["code"] in {
+        "fmp_ledger_missing",
+        "fmp_ledger_unreadable",
+    }
+
+
 def test_fmp_local_ledger_exhaustion_degrades_coverage_only(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
