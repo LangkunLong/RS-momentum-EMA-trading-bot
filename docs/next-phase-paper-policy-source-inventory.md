@@ -1,8 +1,10 @@
 # Lead C source and import inventory
 
-Status: frozen checkpoint inventory only. Both checkpoints below remain under correction; #99 and persistence implementation are still changing. This is not final evaluator-closure or image acceptance.
+Status: frozen checkpoint inventories only. #98 and the latest #99 consumer fix have scoped independent approval; #100 recovery/persistence and combined integration are still changing. This is not final evaluator-closure or image acceptance.
 
-Raw evidence: `.artifacts/lead-c/source-inventory-checkpoints-43b4cd9-6bbf20a.json`, SHA256 `59cea2b9a4c7e9695b88be8075662d0a7ad65e5dd01feda9be69d62504dfe32c`. The inventory reads exact Git blobs and parses Python imports without importing application code. It records every changed path, raw Git SHA256, Git blob identity, byte count and static import locations.
+Latest evidence: `.artifacts/lead-c/source-inventory-8190c15-f9575a5-446d2e1.json`, SHA256 `aeeeaed50086b0dae97fe4267ab06e592a6edfafa9f3e560ffa21ffc1cde11d3`. It covers approved #98 head8190c15, approved #99 consumer fixf9575a5 (including inherited producer6bbf20a), and #100 pure fix3446d2e1 still under correction. All three have no changed paths in the retained B manifest and preserve accepted #71 blob71e562ffc00dc4e617f1cd625e3f13ea5fe3f81a. The repeatable raw-Git/AST inventory helper is `.artifacts/lead-c/build_source_inventory.py`; it imports no application modules and excludes uncommitted persistence drafts.
+
+Initial historical evidence: `.artifacts/lead-c/source-inventory-checkpoints-43b4cd9-6bbf20a.json`, SHA256 `59cea2b9a4c7e9695b88be8075662d0a7ad65e5dd01feda9be69d62504dfe32c`. The inventory reads exact Git blobs and parses Python imports without importing application code. It records every changed path, raw Git SHA256, Git blob identity, byte count and static import locations. The following initial-checkpoint hashes remain historical; use the latest evidence above for corrected source.
 
 ## Checkpoints
 
