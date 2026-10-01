@@ -553,12 +553,22 @@ def load_bundle_panel_authority_v5(
         raise ValueError("panel data authorities must be regular non-link files")
     if hashlib.sha256(provenance_path.read_bytes()).hexdigest() != prices_provenance_ref.sha256:
         raise ValueError("prices provenance differs from its authenticated reference")
-    from core.pit_data import PITDataBundle
+    from core.pit_data import (
+        PITDataBundle,
+        require_v5_production_membership_admission,
+    )
     import pandas as pd
 
-    with PITDataBundle(bundle_path, expected_sha256=pit_bundle_ref.sha256) as bundle:
+    with PITDataBundle(
+        bundle_path,
+        expected_sha256=pit_bundle_ref.sha256,
+        prices_provenance=provenance_path,
+    ) as bundle:
         if bundle.metadata.get("schema_version") != "3":
             raise ValueError("V5 panels require the authenticated schema-V3 three-universe bundle")
+        require_v5_production_membership_admission(
+            bundle.metadata, consumer="V5 panel authority"
+        )
         transition = bundle.load_price_identity_transition_contract(provenance_path)
         if transition.prices_provenance_sha256 != prices_provenance_ref.sha256:
             raise ValueError("bundle transition authority differs from prices provenance")

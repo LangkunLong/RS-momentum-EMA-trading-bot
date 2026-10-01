@@ -135,6 +135,45 @@ _SAME_ISSUER_CONTINUITIES = {
     "legacy_survivor_rename",
     "accounting_acquirer_rename",
 }
+_APPROVED_V5_PRODUCTION_MEMBERSHIP_EVIDENCE_PAIRS: frozenset[
+    tuple[str, str]
+] = frozenset()
+
+
+def require_v5_production_membership_admission(
+    metadata: object,
+    *,
+    consumer: str,
+) -> None:
+    """Require an explicitly approved membership evidence pair for V5 production.
+
+    The approved set is currently empty because no provider-native extraction
+    adapter and source-use rights gate have been reviewed for this contract.
+    """
+
+    if not isinstance(metadata, Mapping):
+        raise ValueError(
+            f"{consumer} production membership admission requires bundle metadata"
+        )
+    admission_status = metadata.get("membership_admission_status")
+    evidence_mode = metadata.get("membership_source_evidence_mode")
+    if (
+        not isinstance(admission_status, str)
+        or not admission_status
+        or not isinstance(evidence_mode, str)
+        or not evidence_mode
+    ):
+        raise ValueError(
+            f"{consumer} production membership admission requires an explicit "
+            "membership admission status and evidence mode"
+        )
+    if (admission_status, evidence_mode) not in (
+        _APPROVED_V5_PRODUCTION_MEMBERSHIP_EVIDENCE_PAIRS
+    ):
+        raise ValueError(
+            f"{consumer} production membership admission rejects this "
+            "unknown or nonproduction evidence classification"
+        )
 
 
 @dataclass(frozen=True)
