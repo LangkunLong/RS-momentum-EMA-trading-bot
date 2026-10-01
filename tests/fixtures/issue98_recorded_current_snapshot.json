@@ -4,6 +4,13 @@
   "next_eligible_session": "2026-04-01",
   "as_of_cutoff": "2026-03-31T16:00:00-04:00",
   "valuation_time": "2026-04-01T09:35:00-04:00",
+  "exchange_session_completion": {
+    "session_date": "2026-03-31",
+    "exchange_timezone": "America/New_York",
+    "session_close_at": "2026-03-31T16:00:00-04:00",
+    "source_identity": "issue98-recorded-exchange-calendar-v1",
+    "evidence_sha256": "001f5f7b7e1063e81e8a2fdc1b3f5d80b6b03c63b877659bf67320fd3eb2c573"
+  },
   "active_symbols": ["AAA", "BBB", "CCC"],
   "candidate_symbols": ["AAA", "BBB", "CCC"],
   "rs_snapshot": {

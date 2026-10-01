@@ -7,13 +7,16 @@ change the historical feature and market-context calculators.
 
 from __future__ import annotations
 
+import hashlib
 import math
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, fields
 from datetime import date, datetime
 from numbers import Real
 from types import MappingProxyType
 from typing import Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import numpy as np
 import pandas as pd
@@ -24,7 +27,7 @@ from core.pit_feature_snapshot import (
     EntryFeaturesV3,
     build_entry_features_v3,
 )
-from core.pit_provenance import PIT_PUBLIC_DATES_ATTR
+from core.pit_provenance import PIT_PUBLIC_DATES_ATTR, pit_canonical_json_sha256
 from core.strategy_policy.contracts import MarketContextV1
 from core.strategy_policy.market_context import build_market_context
 
@@ -50,6 +53,7 @@ _POLICY_STATES = {
     "observed": "present",
 }
 _REFERENCE_SYMBOLS = frozenset({"SPY", "QQQ", "IWM"})
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 FEATURE_CONTRACT_ID = "historical-feature-specification-v1+strategy-policy-contract-v1"
 FEATURE_CALCULATOR_IDENTITY = (
     "core.pit_feature_snapshot:build_entry_features_v3"
@@ -61,6 +65,50 @@ FEATURE_CALCULATOR_IDENTITY = (
 def _require_exchange_local_aware(value: object, *, name: str) -> None:
     if type(value) is not datetime or value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{name} must be a timezone-aware datetime")
+
+
+def _exchange_zone(name: str) -> ZoneInfo:
+    if type(name) is not str or not name.strip():
+        raise ValueError("exchange_timezone must be a non-empty IANA timezone name")
+    try:
+        return ZoneInfo(name)
+    except ZoneInfoNotFoundError as exc:
+        raise ValueError("exchange_timezone must identify an installed IANA timezone") from exc
+
+
+def _require_exchange_timezone_aware(
+    value: object,
+    *,
+    name: str,
+    exchange_timezone: str,
+) -> None:
+    _require_exchange_local_aware(value, name=name)
+    zone = _exchange_zone(exchange_timezone)
+    if not isinstance(value.tzinfo, ZoneInfo) or value.tzinfo.key != exchange_timezone:
+        raise ValueError(f"{name} must use the exchange-local timezone {exchange_timezone}")
+    assert isinstance(value, datetime)
+    converted = value.astimezone(zone)
+    if (
+        converted.replace(tzinfo=None) != value.replace(tzinfo=None)
+        or converted.utcoffset() != value.utcoffset()
+        or converted.fold != value.fold
+    ):
+        raise ValueError(f"{name} is not a valid wall time in exchange-local timezone {exchange_timezone}")
+
+
+def _exchange_completion_payload(
+    *,
+    session_date: date,
+    exchange_timezone: str,
+    session_close_at: datetime,
+    source_identity: str,
+) -> dict[str, str]:
+    return {
+        "session_date": session_date.isoformat(),
+        "exchange_timezone": exchange_timezone,
+        "session_close_at": session_close_at.isoformat(),
+        "source_identity": source_identity,
+    }
 
 
 def _exchange_sessions(value: Sequence[date]) -> tuple[date, ...]:
@@ -195,6 +243,40 @@ def validate_normalized_availability(
 
 
 @dataclass(frozen=True, slots=True)
+class RecordedExchangeSessionCompletionV1:
+    """Hash-verified recorded exchange timezone and official session close."""
+
+    session_date: date
+    exchange_timezone: str
+    session_close_at: datetime
+    source_identity: str
+    evidence_sha256: str
+
+    def __post_init__(self) -> None:
+        if type(self.session_date) is not date:
+            raise ValueError("exchange completion session_date must be a date")
+        _require_exchange_timezone_aware(
+            self.session_close_at,
+            name="session_close_at",
+            exchange_timezone=self.exchange_timezone,
+        )
+        if self.session_close_at.date() != self.session_date:
+            raise ValueError("recorded exchange close must use the session's exchange-local date")
+        if type(self.source_identity) is not str or not self.source_identity.strip():
+            raise ValueError("exchange completion source_identity is required")
+        if type(self.evidence_sha256) is not str or _SHA256_RE.fullmatch(self.evidence_sha256) is None:
+            raise ValueError("exchange completion evidence_sha256 must be a lowercase SHA-256")
+        payload = _exchange_completion_payload(
+            session_date=self.session_date,
+            exchange_timezone=self.exchange_timezone,
+            session_close_at=self.session_close_at,
+            source_identity=self.source_identity,
+        )
+        if pit_canonical_json_sha256(payload) != self.evidence_sha256:
+            raise ValueError("exchange completion evidence digest does not match its record")
+
+
+@dataclass(frozen=True, slots=True)
 class CurrentDecisionClockV1:
     """Completed feature cutoff and later valuation observation as separate times."""
 
@@ -202,14 +284,25 @@ class CurrentDecisionClockV1:
     as_of_cutoff: datetime
     next_eligible_session: date
     valuation_time: datetime
+    completion_evidence: RecordedExchangeSessionCompletionV1
 
     def __post_init__(self) -> None:
         if type(self.completed_session) is not date or type(self.next_eligible_session) is not date:
             raise ValueError("decision clock sessions must be dates")
-        _require_exchange_local_aware(self.as_of_cutoff, name="as_of_cutoff")
+        if type(self.completion_evidence) is not RecordedExchangeSessionCompletionV1:
+            raise ValueError("decision clock requires recorded exchange completion evidence")
+        if self.completion_evidence.session_date != self.completed_session:
+            raise ValueError("exchange completion evidence session does not match completed_session")
+        _require_exchange_timezone_aware(
+            self.as_of_cutoff,
+            name="as_of_cutoff",
+            exchange_timezone=self.completion_evidence.exchange_timezone,
+        )
         _require_exchange_local_aware(self.valuation_time, name="valuation_time")
         if self.as_of_cutoff.date() != self.completed_session:
-            raise ValueError("as-of cutoff must be on the completed feature session")
+            raise ValueError("as-of cutoff must use the exchange-local completed feature date")
+        if self.as_of_cutoff < self.completion_evidence.session_close_at:
+            raise ValueError("as-of cutoff precedes recorded exchange close")
         if self.next_eligible_session <= self.completed_session:
             raise ValueError("next eligible session must follow the completed feature session")
         if self.valuation_time < self.as_of_cutoff:
@@ -266,6 +359,7 @@ class CurrentFeatureContextSnapshotV1:
     unavailable_members: Mapping[str, UnavailableUniverseMemberV1]
     source_revision: str
     data_bundle_sha256: str
+    recorded_input_manifest_sha256: str
     feature_contract_id: str
     feature_calculator_identity: str
     universe_ids: tuple[str, ...]
@@ -302,6 +396,11 @@ class CurrentFeatureContextSnapshotV1:
             "unavailable_members",
             MappingProxyType(dict(self.unavailable_members)),
         )
+        if (
+            type(self.recorded_input_manifest_sha256) is not str
+            or _SHA256_RE.fullmatch(self.recorded_input_manifest_sha256) is None
+        ):
+            raise ValueError("recorded_input_manifest_sha256 must be a lowercase SHA-256")
 
 
 def _canonical_candidate_symbols(
@@ -535,6 +634,161 @@ def _availability_records(
     return MappingProxyType(result)
 
 
+def _frame_manifest(frame: pd.DataFrame) -> dict[str, object]:
+    if not isinstance(frame, pd.DataFrame):
+        raise ValueError("recorded input manifest requires DataFrame market inputs")
+    if all(pd.api.types.is_numeric_dtype(dtype) for dtype in frame.dtypes):
+        numeric_values = frame.to_numpy(dtype=np.float64, na_value=np.nan)
+        canonical_float_bytes = np.asarray(numeric_values, dtype=">f8").tobytes(order="C")
+        exact_values_sha256 = hashlib.sha256(canonical_float_bytes).hexdigest()
+    else:
+        exact_values = [
+            [_manifest_cell(value) for value in row]
+            for row in frame.itertuples(index=False, name=None)
+        ]
+        exact_values_sha256 = pit_canonical_json_sha256(exact_values)
+    return {
+        "columns": [str(column) for column in frame.columns],
+        "column_dtypes": [str(dtype) for dtype in frame.dtypes],
+        "index_name": frame.index.name,
+        "columns_name": frame.columns.name,
+        "index_dtype": str(frame.index.dtype),
+        "exact_values_sha256": exact_values_sha256,
+        "split_json": frame.to_json(
+            orient="split",
+            date_format="iso",
+            date_unit="ns",
+            double_precision=15,
+        ),
+    }
+
+
+def _manifest_cell(value: object) -> object:
+    if value is None:
+        return {"kind": "none"}
+    if value is pd.NA:
+        return {"kind": "pandas_na"}
+    if value is pd.NaT:
+        return {"kind": "pandas_nat"}
+    if isinstance(value, pd.Timestamp):
+        return {"kind": "timestamp", "value": value.isoformat()}
+    if isinstance(value, np.datetime64):
+        return {"kind": "timestamp", "value": pd.Timestamp(value).isoformat()}
+    if isinstance(value, datetime):
+        return {"kind": "datetime", "value": value.isoformat()}
+    if isinstance(value, date):
+        return {"kind": "date", "value": value.isoformat()}
+    if isinstance(value, np.generic):
+        value = value.item()
+    if type(value) is bool:
+        return {"kind": "bool", "value": value}
+    if type(value) is int:
+        return {"kind": "int", "value": str(value)}
+    if type(value) is float:
+        return {"kind": "float64_hex", "value": value.hex()}
+    if type(value) is str:
+        return {"kind": "str", "value": value}
+    raise ValueError("recorded input manifest contains an unsupported DataFrame scalar")
+
+
+def _recorded_input_manifest_sha256(
+    *,
+    bundle: PITDataBundle,
+    decision_clock: CurrentDecisionClockV1,
+    candidate_symbols: tuple[str, ...],
+    price_history_by_symbol: Mapping[str, pd.DataFrame],
+    rs_snapshot: Mapping[str, float],
+    market_closes: pd.DataFrame,
+    oneil_regime: str,
+    distribution_days: int,
+    follow_through: bool,
+    missingness: Mapping[str, Mapping[str, FeatureMissingnessV1]],
+    fundamental_availability: Mapping[str, tuple[FundamentalAvailabilityV1, ...]],
+    unavailable_members: Mapping[str, UnavailableUniverseMemberV1],
+    source_revision: str,
+    allow_schema_v2_development: bool,
+) -> str:
+    """Hash every recorded fact and cutoff used to produce one snapshot."""
+
+    if any(type(symbol) is not str for symbol in price_history_by_symbol):
+        raise ValueError("recorded price history keys must be symbols")
+    if any(type(symbol) is not str for symbol in rs_snapshot):
+        raise ValueError("recorded RS snapshot keys must be symbols")
+    histories: dict[str, object] = {}
+    for symbol in sorted(price_history_by_symbol):
+        histories[symbol] = _frame_manifest(price_history_by_symbol[symbol])
+    missingness_payload = {
+        symbol: {
+            name: {"state": record.state, "reason": record.reason}
+            for name, record in sorted(records.items())
+        }
+        for symbol, records in sorted(missingness.items())
+    }
+    availability_payload = {
+        symbol: [
+            {
+                "period_end": record.period_end.isoformat(),
+                "source_public_date": record.source_public_date.isoformat(),
+                "source_public_at": (
+                    record.source_public_at.isoformat()
+                    if record.source_public_at is not None
+                    else None
+                ),
+                "available_from_session": record.available_from_session.isoformat(),
+                "date_basis": record.date_basis,
+            }
+            for record in records
+        ]
+        for symbol, records in sorted(fundamental_availability.items())
+    }
+    unavailable_payload = {
+        symbol: {
+            "state": record.state,
+            "reason": record.reason,
+            "source_identity": record.source_identity,
+        }
+        for symbol, record in sorted(unavailable_members.items())
+    }
+    evidence = decision_clock.completion_evidence
+    manifest: dict[str, object] = {
+        "manifest_version": "current-recorded-inputs-v1",
+        "data_bundle_sha256": bundle.sha256,
+        "source_revision": source_revision,
+        "declared_cutoff": decision_clock.as_of_cutoff.isoformat(),
+        "decision_clock": {
+            "completed_session": decision_clock.completed_session.isoformat(),
+            "next_eligible_session": decision_clock.next_eligible_session.isoformat(),
+            "valuation_time": decision_clock.valuation_time.isoformat(),
+            "exchange_session_completion": {
+                **_exchange_completion_payload(
+                    session_date=evidence.session_date,
+                    exchange_timezone=evidence.exchange_timezone,
+                    session_close_at=evidence.session_close_at,
+                    source_identity=evidence.source_identity,
+                ),
+                "evidence_sha256": evidence.evidence_sha256,
+            },
+        },
+        "candidate_symbols": list(candidate_symbols),
+        "price_history_by_symbol": histories,
+        "rs_snapshot": {
+            symbol: float(value)
+            for symbol, value in sorted(rs_snapshot.items())
+        },
+        "market_closes": _frame_manifest(market_closes),
+        "market_regime": {
+            "oneil_regime": oneil_regime,
+            "distribution_days": distribution_days,
+            "follow_through": follow_through,
+        },
+        "missingness": missingness_payload,
+        "fundamental_availability": availability_payload,
+        "unavailable_members": unavailable_payload,
+        "allow_schema_v2_development": allow_schema_v2_development,
+    }
+    return pit_canonical_json_sha256(manifest)
+
+
 def build_current_feature_context_snapshot(
     *,
     bundle: PITDataBundle,
@@ -637,6 +891,22 @@ def build_current_feature_context_snapshot(
         active_constituents=tuple(sorted(active_symbols)),
         rs_scores=rs_snapshot,
     )
+    input_manifest_sha256 = _recorded_input_manifest_sha256(
+        bundle=bundle,
+        decision_clock=decision_clock,
+        candidate_symbols=candidates,
+        price_history_by_symbol=price_history_by_symbol,
+        rs_snapshot=rs_snapshot,
+        market_closes=closes,
+        oneil_regime=oneil_regime,
+        distribution_days=distribution_days,
+        follow_through=follow_through,
+        missingness=missingness_by_symbol,
+        fundamental_availability=availability,
+        unavailable_members=unavailable,
+        source_revision=source_revision,
+        allow_schema_v2_development=allow_schema_v2_development,
+    )
     source_universes = (
         ("sp500",)
         if schema_version == "2"
@@ -652,6 +922,7 @@ def build_current_feature_context_snapshot(
         unavailable_members=unavailable,
         source_revision=source_revision,
         data_bundle_sha256=bundle.sha256,
+        recorded_input_manifest_sha256=input_manifest_sha256,
         feature_contract_id=FEATURE_CONTRACT_ID,
         feature_calculator_identity=FEATURE_CALCULATOR_IDENTITY,
         universe_ids=source_universes,
@@ -666,6 +937,7 @@ __all__ = [
     "FEATURE_CONTRACT_ID",
     "FeatureMissingnessV1",
     "FundamentalAvailabilityV1",
+    "RecordedExchangeSessionCompletionV1",
     "UnavailableUniverseMemberV1",
     "build_current_feature_context_snapshot",
     "derive_available_from_source_date",

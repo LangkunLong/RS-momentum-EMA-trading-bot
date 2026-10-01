@@ -20,16 +20,20 @@ Market context always uses the bundle's complete dated active membership. Member
 
 `validate_normalized_availability` verifies an existing normalized session against the same rule and returns that session unchanged. This avoids a second next-session shift for bundles that already store first-eligible dates.
 
-`CurrentDecisionClockV1` separately stores the completed feature session/cutoff, next eligible session, and timezone-aware valuation time. The valuation time may be on the next session; it is not used to move the feature cutoff.
+`RecordedExchangeSessionCompletionV1` carries the session date, IANA exchange timezone, recorded official close instant, source identity, and a SHA-256 digest over those record fields. The caller must provide the authenticated recorded calendar evidence; the adapter verifies the record digest and requires the close timestamp to use the declared exchange timezone and local session date. The supplied close instant supports shortened sessions without assuming a standard close time or consulting a live calendar.
+
+`CurrentDecisionClockV1` binds that completion record to the completed feature session. Its declared `as_of_cutoff` must use the same exchange-local IANA timezone and fall at or after the recorded close. Thus a local morning timestamp or a UTC timestamp whose UTC date differs from its exchange-local date cannot accompany completed daily bars. The timezone-aware valuation time remains a later, separate observation; it does not move the feature cutoff.
 
 ## Missingness and identities
 
 Every `None` feature needs a #66 state and reason. The adapter keeps the numeric value as `None` and derives the linked #80 boundary state (`unavailable`, `stale`, or `not_yet_public`). Whole-member input gaps remain in `unavailable_members` and are not represented as policy rejections.
 
-The result carries the exact source revision, authenticated bundle SHA-256, accepted feature-contract identifier, feature calculator identity, and universe scope. Schema V2 is accepted only with the explicit development flag and is labeled `development_only`; the synthetic test fixture is S&P-only. Schema V3 retains the S&P 500, Nasdaq-100, and Russell 2000 universe IDs.
+The result carries the exact source revision, authenticated bundle SHA-256, `recorded_input_manifest_sha256`, accepted feature-contract identifier, feature calculator identity, and universe scope. The input manifest digest covers the exact declared cutoff and completion record, candidate set, all supplied OHLCV histories, dated market closes, RS values, regime/breadth inputs, missingness, availability records, member dispositions, source revision, and development flag. Snapshot input identity is the bundle SHA plus this manifest digest, so changed same-session values do not reuse an earlier complete input identity. The content digest does not replace the caller's responsibility to authenticate each recorded source.
+
+Schema V2 is accepted only with the explicit development flag and is labeled `development_only`; the synthetic test fixture is S&P-only. Schema V3 retains the S&P 500, Nasdaq-100, and Russell 2000 universe IDs.
 
 Schema V3 does not by itself establish production readiness or provider acceptance. The unchanged V3 feature builder requires an RS observation for every active member; if that cross-section is incomplete, feature construction fails closed. This adapter preserves that requirement instead of changing the shared calculator.
 
 ## Local evidence
 
-`tests/test_current_feature_context_adapter.py` builds synthetic SQLite bundles at explicit pytest temporary paths. It compares adapter outputs with direct calls to the unchanged historical feature/context builders, exercises a below-floor candidate at the pre-policy boundary, retains absent active members in coverage, checks strict publication timing and missingness, and rejects incomplete universe handoffs. This evidence is offline and does not establish real-provider acceptance or production readiness.
+`tests/test_current_feature_context_adapter.py` builds synthetic SQLite bundles at explicit pytest temporary paths. It compares adapter outputs with direct calls to the unchanged historical feature/context builders for both the S&P-only V2 development fixture and a controlled V3 fixture whose members span and overlap all three source universes. It also exercises a below-floor candidate at the pre-policy boundary, retains absent active members in coverage, checks strict publication timing, exchange-close evidence, input-manifest identity, and missingness, and rejects incomplete universe handoffs. This evidence is offline and does not establish real-provider acceptance or production readiness.
