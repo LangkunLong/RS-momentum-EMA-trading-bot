@@ -67,8 +67,8 @@ Each SHA-256 below is over the exact working-file bytes read at verification tim
 | Input | `docs/superpowers/specs/2026-09-18-v5-mechanism-evidence-design.md` | `e33be18187f57cc181baf7543ef565a036e3503361bd5fe42bd5321f919c2c38` |
 | Input | Supplied `docs/issue-85-implementation-brief.md` | `e94eee0a3340a349cdc6b15fc35c630344e9caa5fd930ef353a64bcf6211d91a` |
 | Input | Published Research-06 issue-body snapshot `Research-06.md` | `3be6a02bc40d6251c809bfda0b90f189119a1836af3cc001c01b87b1b6854fef` |
-| New evidence document | `docs/issue-85-mechanism-feedback.md` | `8461022273ca1d626728b51fd4cd6fa0d9bcdf837695250373fa9a93b041f8a8` |
-| Local-only verification record | `.artifacts/issue-85/verification.json` | `7d9217293faa8ba86d98a7ab8dd17bd28dbcd44618559462f21a03ecbc7aed5b` |
+| New evidence document | `docs/issue-85-mechanism-feedback.md` | `dbb60c813c3b20bba61b1db05df75298141f2073357dc44756c0ff80cd71fbc1` |
+| Local-only verification record | `.artifacts/issue-85/verification.json` | `b3e5e28a91449a80dda8dc2c9600cd390656c47956f082916f13c9872b0e9965` |
 
 The completion report itself is the second new tracked document and is covered by the delivery commit. Its hash is intentionally not embedded in itself.
 
