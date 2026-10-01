@@ -348,6 +348,8 @@ class ActionOrderAttempt:
     client_order_id: str | None = None
     broker_order_id: str | None = None
     terminal_status: ActionAttemptStatus | None = None
+    client_order_aliases: tuple[str, ...] = ()
+    broker_order_aliases: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.attempt_number not in {1, 2}:
@@ -356,8 +358,6 @@ class ActionOrderAttempt:
         filled = _nonnegative_decimal(self.confirmed_filled_quantity, "attempt confirmed_filled_quantity")
         status = ActionAttemptStatus(self.status)
         terminal = None if self.terminal_status is None else ActionAttemptStatus(self.terminal_status)
-        if filled > requested and status is not ActionAttemptStatus.RECONCILIATION_REQUIRED:
-            raise ValueError("attempt confirmed fill cannot exceed its requested quantity")
         if terminal is not None and terminal not in {
             ActionAttemptStatus.CANCELLED,
             ActionAttemptStatus.REJECTED,
@@ -368,6 +368,8 @@ class ActionOrderAttempt:
             if terminal is not None and terminal is not status:
                 raise ValueError("terminal attempt status conflicts with its preserved terminal result")
             terminal = status
+        if filled > requested and status is not ActionAttemptStatus.RECONCILIATION_REQUIRED and terminal is None:
+            raise ValueError("attempt confirmed fill above its target requires terminal or reconciliation evidence")
         object.__setattr__(self, "requested_quantity", requested)
         object.__setattr__(self, "confirmed_filled_quantity", filled)
         object.__setattr__(self, "status", status)
@@ -376,8 +378,25 @@ class ActionOrderAttempt:
             value = getattr(self, name)
             if value is not None:
                 object.__setattr__(self, name, _text(value, name))
-        if status is ActionAttemptStatus.FILLED and filled != requested:
-            raise ValueError("filled attempt must match its requested quantity")
+        for primary_name, aliases_name in (
+            ("client_order_id", "client_order_aliases"),
+            ("broker_order_id", "broker_order_aliases"),
+        ):
+            primary = getattr(self, primary_name)
+            aliases = tuple(_text(value, aliases_name) for value in getattr(self, aliases_name))
+            if len(aliases) != len(set(aliases)) or (primary is not None and primary in aliases):
+                raise ValueError(f"{aliases_name} must contain unique aliases distinct from the primary reference")
+            object.__setattr__(self, aliases_name, aliases)
+        if status is ActionAttemptStatus.FILLED and filled < requested:
+            raise ValueError("filled attempt must meet or exceed its requested quantity")
+
+    @property
+    def all_client_order_ids(self) -> tuple[str, ...]:
+        return (() if self.client_order_id is None else (self.client_order_id,)) + self.client_order_aliases
+
+    @property
+    def all_broker_order_ids(self) -> tuple[str, ...]:
+        return (() if self.broker_order_id is None else (self.broker_order_id,)) + self.broker_order_aliases
 
 
 @dataclass(frozen=True, slots=True)
@@ -726,7 +745,7 @@ def confirm_attempt_terminal(
         if attempt.status is status:
             return intent
         raise IdentityConflictError("order attempt already has a different terminal status")
-    if status is ActionAttemptStatus.FILLED and attempt.confirmed_filled_quantity != attempt.requested_quantity:
+    if status is ActionAttemptStatus.FILLED and attempt.confirmed_filled_quantity < attempt.requested_quantity:
         raise ValueError("broker cannot confirm filled before the requested attempt quantity is confirmed")
     updated_attempt = replace(attempt, status=status, terminal_status=status)
     attempts = _replace_attempt(intent, updated_attempt)
@@ -798,15 +817,49 @@ def bind_attempt_order_refs(
     for other in intent.order_attempts:
         if other.attempt_number == attempt_number:
             continue
-        if client is not None and client == other.client_order_id:
+        if client is not None and client in other.all_client_order_ids:
             raise IdentityConflictError("client order identity already belongs to another attempt")
-        if broker is not None and broker == other.broker_order_id:
+        if broker is not None and broker in other.all_broker_order_ids:
             raise IdentityConflictError("broker order identity already belongs to another attempt")
     return replace(
         intent,
         order_attempts=_replace_attempt(
             intent,
             replace(attempt, client_order_id=client, broker_order_id=broker),
+        ),
+    )
+
+
+def add_attempt_order_aliases(
+    intent: ActionIntent,
+    *,
+    attempt_number: int,
+    client_order_id: str | None = None,
+    broker_order_id: str | None = None,
+) -> ActionIntent:
+    """Retain additional provider-scoped aliases without replacing attempt identity."""
+    attempt = _get_attempt(intent, attempt_number)
+    client_aliases = list(attempt.client_order_aliases)
+    broker_aliases = list(attempt.broker_order_aliases)
+    if client_order_id is not None:
+        client = _text(client_order_id, "client_order_id")
+        if client != attempt.client_order_id and client not in client_aliases:
+            client_aliases.append(client)
+    if broker_order_id is not None:
+        broker = _text(broker_order_id, "broker_order_id")
+        if broker != attempt.broker_order_id and broker not in broker_aliases:
+            broker_aliases.append(broker)
+    if tuple(client_aliases) == attempt.client_order_aliases and tuple(broker_aliases) == attempt.broker_order_aliases:
+        return intent
+    return replace(
+        intent,
+        order_attempts=_replace_attempt(
+            intent,
+            replace(
+                attempt,
+                client_order_aliases=tuple(client_aliases),
+                broker_order_aliases=tuple(broker_aliases),
+            ),
         ),
     )
 
@@ -841,7 +894,7 @@ def resolve_action(
     if intent.status is ActionStatus.FILLED:
         return intent
     reason = _text(resolution_reason, "resolution_reason")
-    if intent.status is ActionStatus.RECONCILIATION_REQUIRED and any(
+    if any(
         attempt.status not in {ActionAttemptStatus.CANCELLED, ActionAttemptStatus.REJECTED, ActionAttemptStatus.FILLED}
         for attempt in intent.order_attempts
     ):

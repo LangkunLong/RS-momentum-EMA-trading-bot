@@ -620,6 +620,32 @@ def test_late_terminal_fill_requires_reconciliation_before_remainder_and_keeps_i
     with pytest.raises(ValueError, match="fully confirmed|explicitly resolved"):
         advance_holding_exit_tier(holding_after_late_fill, first_terminal_again)
 
+    exact_target_live = apply_attempt_cumulative_fill(late_fill_a, 2, Decimal("25"))
+    assert exact_target_live.confirmed_filled_quantity == Decimal("50")
+    assert exact_target_live.status is ActionStatus.RECONCILIATION_REQUIRED
+    assert exact_target_live.order_attempts[1].requested_quantity == Decimal("30")
+    assert exact_target_live.order_attempts[1].status is ActionAttemptStatus.PARTIALLY_FILLED
+    with pytest.raises(ValueError, match="order attempts must be terminal"):
+        resolve_action(
+            request_attempt_cancel(exact_target_live, 2),
+            status=ActionStatus.RESOLVED,
+            resolution_reason="A cancel request is not terminal evidence",
+        )
+    second_terminal = confirm_attempt_terminal(
+        request_attempt_cancel(exact_target_live, 2),
+        2,
+        status=ActionAttemptStatus.CANCELLED,
+    )
+    assert second_terminal.status is ActionStatus.RECONCILIATION_REQUIRED
+    final_terminal = confirm_attempt_terminal(
+        second_terminal,
+        1,
+        status=ActionAttemptStatus.CANCELLED,
+    )
+    assert final_terminal.status is ActionStatus.FILLED
+    holding_at_target = apply_action_fill_to_holding(holding_after_late_fill, exact_target_live)
+    assert advance_holding_exit_tier(holding_at_target, final_terminal).last_exit_tier == 1
+
     over_target = apply_attempt_cumulative_fill(late_fill_a, 2, Decimal("30"))
     assert over_target.confirmed_filled_quantity == Decimal("55")
     assert over_target.residual_quantity == Decimal("0")
@@ -644,6 +670,35 @@ def test_late_terminal_fill_requires_reconciliation_before_remainder_and_keeps_i
     assert resolved_over_target.confirmed_filled_quantity == Decimal("55")
     assert resolved_over_target.resolution_reason is not None
     assert advance_holding_exit_tier(holding_after_over_target, resolved_over_target).last_exit_tier == 1
+
+
+def test_single_attempt_over_target_fill_can_resolve_without_changing_the_target() -> None:
+    action = build_action_intent(
+        decision=_decision(),
+        security_id="FIGI-BB1234",
+        role=ActionRole.ENTRY,
+        side=OrderSide.BUY,
+        requested_quantity=Decimal("10"),
+    )
+    observed = apply_cumulative_fill(action, Decimal("11"))
+    assert observed.requested_quantity == Decimal("10")
+    assert observed.confirmed_filled_quantity == Decimal("11")
+    assert observed.status is ActionStatus.RECONCILIATION_REQUIRED
+
+    terminal = confirm_attempt_terminal(
+        observed,
+        1,
+        status=ActionAttemptStatus.FILLED,
+    )
+    assert terminal.status is ActionStatus.RECONCILIATION_REQUIRED
+    resolved = resolve_action(
+        terminal,
+        status=ActionStatus.RESOLVED,
+        resolution_reason="Synthetic terminal evidence retains 11 actual shares against a 10-share target",
+    )
+    assert resolved.requested_quantity == Decimal("10")
+    assert resolved.confirmed_filled_quantity == Decimal("11")
+    assert resolved.status is ActionStatus.RESOLVED
 
 
 def test_stop_and_peak_evolve_monotonically_without_turning_missing_values_into_zero() -> None:
