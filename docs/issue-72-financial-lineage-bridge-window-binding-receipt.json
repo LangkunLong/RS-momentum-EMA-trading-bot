@@ -24,7 +24,7 @@
     "baseline_result_sha256": "2e2465d20a852aa0f2d17f292ced115f6f6f1373ee7d33258aa9b2f0e8bd16e7",
     "baseline_finding": "The frozen validator accepted both the coherent control and a self-consistently rehashed projection ending 2024-12-31 while prices, exporter, and bridge ended 2025-12-31; financial rows were unchanged.",
     "correction_result": ".artifacts/coordination/principal-reviews/issue72-window-binding-correction-32a529/window-binding-correction-result.json",
-    "correction_result_sha256": "a25424c2f24ae16d4f51bb0eece0ec516200bbe979f198e178a13aa5e51af7f6",
+    "correction_result_sha256": "a7d48d1904b19f66c19ace7f971c2de4d08c593473f8035d1b9e278bf39c6337",
     "frozen_script_execution": "Not rerun; the original script and result were preserved byte-for-byte."
   },
   "corrected_window_contract": {
@@ -75,7 +75,7 @@
   "source_sha256": {
     "core/financial_lineage_bridge.py": "2faae533894381490b266cd676c1d7e8a9e64aa5a5bd55cab8b0fca9ac0e8abd",
     "fetch_sec_pit_fundamentals.py": "ae1189388a401baa8d4d5f73ee34fd3986f083d5fd5beed11601e2502eda7a8f",
-    "tests/test_financial_lineage_bridge.py": "65427048f04dab8667553e970e953888dddfee7b5aa4e929bc15347a6056437"
+    "tests/test_financial_lineage_bridge.py": "65427048f04dab8667553e970e953888dddefee7b5aa4e929bc15347a6056437"
   },
   "runtime": {
     "platform": "Windows",
