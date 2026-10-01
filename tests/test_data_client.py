@@ -280,6 +280,8 @@ def _prepare_observed_fmp_ledger(
     monkeypatch.setattr(data_client.settings, "FMP_SUPPRESS_REPEATED_ENDPOINT_ERRORS", True)
     monkeypatch.setattr(data_client, "_fmp_now_et", lambda: _FMP_TEST_NOW)
     monkeypatch.setattr(data_client, "_fmp_quota_exhausted", False)
+    monkeypatch.setattr(data_client, "_fmp_session_failure", None)
+    monkeypatch.setattr(data_client, "_fmp_unavailable_outcomes", {})
     data_client._fmp_unavailable_endpoints.clear()
     data_client._fmp_reported_endpoint_failures.clear()
     reset_fmp_request_context()
@@ -338,6 +340,27 @@ def test_fmp_local_ledger_exhaustion_degrades_coverage_only(
     ]
 
 
+def test_fmp_local_exhaustion_wins_when_both_budgets_are_zero(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _prepare_observed_fmp_ledger(monkeypatch, tmp_path, count=5, allowance=5)
+    get = Mock()
+    monkeypatch.setattr(data_client._fmp_session, "get", get)
+    observation = SchedulerObservation("test")
+
+    with fmp_request_budget(0), activate_scheduler_observation(observation):
+        result = data_client._fmp_get("income-statement", {"symbol": "AAPL"})
+        reason = data_client.fmp_request_deferral_reason()
+
+    receipt = observation.to_receipt()
+    assert result == []
+    assert reason == "local_ledger"
+    get.assert_not_called()
+    assert receipt["service_health"] == "healthy"
+    assert receipt["required_input_coverage"] == "degraded"
+
+
 @pytest.mark.parametrize("ledger_state", ["missing_at_start", "deleted_after_preflight", "unreadable"])
 def test_fmp_observation_fails_closed_when_ledger_is_missing_or_unreadable(
     ledger_state: str,
@@ -391,6 +414,7 @@ def test_existing_prior_window_fmp_ledger_rolls_over(
         "count": 1,
     }
     assert observation.to_receipt()["service_health"] == "healthy"
+    assert observation.to_receipt()["provider_counters"]["fmp"]["logical_requests"] == 1
 
 
 @pytest.mark.parametrize("status_code", [402, 403, 404, 429])
@@ -416,6 +440,9 @@ def test_fmp_provider_refusal_statuses_are_distinct_failures(
     assert json.loads(ledger_path.read_text(encoding="utf-8"))["count"] == 1
     assert receipt["service_health"] == "failed"
     assert receipt["issues"][-1]["details"]["http_status"] == status_code
+    assert receipt["provider_counters"]["fmp"]["logical_requests"] == 1
+    assert receipt["provider_counters"]["fmp"]["provider_refusals"] == 1
+    assert receipt["provider_counters"]["fmp"]["refusal_statuses"] == {str(status_code): 1}
 
 
 def test_fmp_transport_error_is_not_reported_as_quota_deferral(
@@ -436,3 +463,108 @@ def test_fmp_transport_error_is_not_reported_as_quota_deferral(
     get.assert_called_once()
     assert json.loads(ledger_path.read_text(encoding="utf-8"))["count"] == 1
     assert observation.to_receipt()["service_health"] == "failed"
+
+
+def test_fmp_suppresses_followup_after_provider_refusal_with_candidate_gap(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _prepare_observed_fmp_ledger(monkeypatch, tmp_path)
+    response = Mock(status_code=429)
+    get = Mock(return_value=response)
+    monkeypatch.setattr(data_client._fmp_session, "get", get)
+    observation = SchedulerObservation("test")
+
+    with fmp_request_budget(5), activate_scheduler_observation(observation):
+        data_client._fmp_get("income-statement", {"symbol": "AAPL"})
+        data_client._fmp_get("balance-sheet", {"symbol": "MSFT"})
+        reason = data_client.fmp_request_deferral_reason()
+
+    receipt = observation.to_receipt()
+    get.assert_called_once()
+    assert reason == "provider_refusal"
+    assert receipt["provider_counters"]["fmp"]["logical_requests"] == 1
+    assert receipt["input_gaps"][-1] == {
+        "symbol": "MSFT",
+        "endpoint": "balance-sheet",
+        "reason": "provider_refusal_suppressed",
+        "coverage_status": "failed",
+    }
+
+
+def test_fmp_suppresses_repeated_unavailable_endpoint_with_candidate_gap(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _prepare_observed_fmp_ledger(monkeypatch, tmp_path)
+    response = Mock(status_code=403)
+    get = Mock(return_value=response)
+    monkeypatch.setattr(data_client._fmp_session, "get", get)
+    observation = SchedulerObservation("test")
+
+    with fmp_request_budget(5), activate_scheduler_observation(observation):
+        data_client._fmp_get("income-statement", {"symbol": "AAPL"})
+        data_client._fmp_get("income-statement", {"symbol": "MSFT"})
+
+    receipt = observation.to_receipt()
+    get.assert_called_once()
+    assert receipt["provider_counters"]["fmp"]["logical_requests"] == 1
+    assert receipt["provider_counters"]["fmp"]["suppressed_followups"] == 1
+    assert receipt["input_gaps"][-1] == {
+        "symbol": "MSFT",
+        "endpoint": "income-statement",
+        "reason": "provider_refusal_suppressed",
+        "coverage_status": "failed",
+    }
+
+
+def test_fmp_suppresses_followup_after_transport_error_with_candidate_gap(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _prepare_observed_fmp_ledger(monkeypatch, tmp_path)
+    get = Mock(side_effect=requests.exceptions.RetryError("offline"))
+    monkeypatch.setattr(data_client._fmp_session, "get", get)
+    observation = SchedulerObservation("test")
+
+    with fmp_request_budget(5), activate_scheduler_observation(observation):
+        data_client._fmp_get("income-statement", {"symbol": "AAPL"})
+        data_client._fmp_get("balance-sheet", {"symbol": "MSFT"})
+        reason = data_client.fmp_request_deferral_reason()
+
+    receipt = observation.to_receipt()
+    get.assert_called_once()
+    assert reason == "transport_error"
+    assert receipt["provider_counters"]["fmp"]["logical_requests"] == 1
+    assert receipt["provider_counters"]["fmp"]["transport_errors"] == 1
+    assert receipt["input_gaps"][-1] == {
+        "symbol": "MSFT",
+        "endpoint": "balance-sheet",
+        "reason": "transport_error_suppressed",
+        "coverage_status": "failed",
+    }
+
+
+def test_fmp_json_error_response_is_latched_and_counted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _prepare_observed_fmp_ledger(monkeypatch, tmp_path)
+    response = Mock(status_code=200)
+    response.json.return_value = {"Error Message": "invalid request"}
+    response.raise_for_status.return_value = None
+    get = Mock(return_value=response)
+    monkeypatch.setattr(data_client._fmp_session, "get", get)
+    observation = SchedulerObservation("test")
+
+    with fmp_request_budget(1), activate_scheduler_observation(observation):
+        result = data_client._fmp_get("income-statement", {"symbol": "AAPL"})
+        reason = data_client.fmp_request_deferral_reason()
+
+    receipt = observation.to_receipt()
+    assert result == []
+    assert reason == "provider_refusal"
+    assert receipt["service_health"] == "failed"
+    assert receipt["provider_counters"]["fmp"]["logical_requests"] == 1
+    assert receipt["provider_counters"]["fmp"]["provider_refusals"] == 1
+    assert receipt["input_gaps"][-1]["reason"] == "provider_error_response"

@@ -63,6 +63,7 @@ class SchedulerObservation:
         self._input_gaps: list[dict[str, Any]] = []
         self._issues: list[dict[str, Any]] = []
         self._resource_denials: dict[str, int] = {}
+        self._provider_counters: dict[str, dict[str, Any]] = {}
         self._service_health = "healthy"
         self._required_input_coverage = "complete"
 
@@ -116,6 +117,39 @@ class SchedulerObservation:
             self._resource_denials[safe_code] = self._resource_denials.get(safe_code, 0) + 1
             self.latch_service_issue(safe_code, details)
 
+    def record_provider_event(
+        self,
+        provider: str,
+        outcome: str,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        safe_provider = _safe_string(str(provider))
+        safe_details = _safe_value(details or {})
+        with self._lock:
+            counter = self._provider_counters.setdefault(
+                safe_provider,
+                {
+                    "logical_requests": 0,
+                    "provider_refusals": 0,
+                    "transport_errors": 0,
+                    "suppressed_followups": 0,
+                    "refusal_statuses": {},
+                },
+            )
+            if outcome == "attempted":
+                counter["logical_requests"] += 1
+            elif outcome == "provider_refusal":
+                counter["provider_refusals"] += 1
+                status = safe_details.get("http_status")
+                if status is not None:
+                    statuses = counter["refusal_statuses"]
+                    key = str(status)
+                    statuses[key] = statuses.get(key, 0) + 1
+            elif outcome == "transport_error":
+                counter["transport_errors"] += 1
+            elif outcome == "suppressed_followup":
+                counter["suppressed_followups"] += 1
+
     def record_input_gap(
         self,
         symbol: str,
@@ -155,6 +189,13 @@ class SchedulerObservation:
                 "input_gaps": [dict(gap) for gap in self._input_gaps],
                 "issues": [dict(issue) for issue in self._issues],
                 "resource_denials": dict(self._resource_denials),
+                "provider_counters": {
+                    provider: {
+                        **{key: value for key, value in counter.items() if key != "refusal_statuses"},
+                        "refusal_statuses": dict(counter["refusal_statuses"]),
+                    }
+                    for provider, counter in self._provider_counters.items()
+                },
             }
 
 
@@ -208,6 +249,16 @@ def record_resource_denial(
     observation = current_scheduler_observation()
     if observation is not None:
         observation.record_resource_denial(code, details)
+
+
+def record_provider_event(
+    provider: str,
+    outcome: str,
+    details: Mapping[str, Any] | None = None,
+) -> None:
+    observation = current_scheduler_observation()
+    if observation is not None:
+        observation.record_provider_event(provider, outcome, details)
 
 
 def record_input_gap(

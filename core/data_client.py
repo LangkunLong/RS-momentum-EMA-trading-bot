@@ -34,6 +34,7 @@ from core.scheduler_observation import (
     latch_service_issue,
     record_event,
     record_input_gap,
+    record_provider_event,
     record_resource_denial,
 )
 
@@ -76,17 +77,21 @@ from cachetools import LRUCache
 _session_cache = LRUCache(maxsize=500)
 _cache_lock = threading.Lock()
 _fmp_unavailable_endpoints: dict[str, str] = {}
+_fmp_unavailable_outcomes: dict[str, dict[str, Any]] = {}
 _fmp_reported_endpoint_failures: set[str] = set()
+_fmp_session_failure: dict[str, Any] | None = None
 
 
 def clear_session_cache() -> None:
     """Reset the in-memory session cache between scan runs."""
-    global _fmp_budget_warning_emitted, _fmp_quota_exhausted
+    global _fmp_budget_warning_emitted, _fmp_quota_exhausted, _fmp_session_failure
     with _cache_lock:
         _session_cache.clear()
     _fmp_unavailable_endpoints.clear()
+    _fmp_unavailable_outcomes.clear()
     _fmp_reported_endpoint_failures.clear()
     _fmp_quota_exhausted = False
+    _fmp_session_failure = None
     _fmp_budget_warning_emitted = False
     reset_fmp_request_context()
 
@@ -349,12 +354,6 @@ def _reserve_fmp_request() -> bool:
                 _fmp_budget_warning_emitted = True
             return False
 
-        if _fmp_run_budget_remaining is not None and _fmp_run_budget_remaining <= 0:
-            _set_fmp_deferral_reason("process_cap")
-            if not observation_active:
-                _fmp_request_context.quota_deferred = True
-            return False
-
         if usage["count"] >= budget:
             _set_fmp_deferral_reason("local_ledger")
             _fmp_request_context.quota_deferred = True
@@ -364,6 +363,12 @@ def _reserve_fmp_request() -> bool:
                     "remaining uncached candidates will be quota_deferred."
                 )
                 _fmp_budget_warning_emitted = True
+            return False
+
+        if _fmp_run_budget_remaining is not None and _fmp_run_budget_remaining <= 0:
+            _set_fmp_deferral_reason("process_cap")
+            if not observation_active:
+                _fmp_request_context.quota_deferred = True
             return False
 
         usage["count"] += 1
@@ -453,6 +458,48 @@ _fmp_session = _get_fmp_session()
 _fmp_quota_exhausted: bool = False
 
 
+def _record_suppressed_fmp_outcome(
+    endpoint: str,
+    params: Optional[dict],
+    failure: dict[str, Any] | None,
+) -> None:
+    if current_scheduler_observation() is None:
+        return
+    details = dict(failure or {})
+    reason = str(details.get("reason", "provider_refusal"))
+    symbol = str((params or {}).get("symbol", "unknown"))
+    _set_fmp_deferral_reason(reason)
+    details.update({"endpoint": endpoint, "symbol": symbol})
+    record_provider_event("fmp", "suppressed_followup", details)
+    record_event("fmp_request", endpoint, "suppressed_after_failure", details)
+    record_input_gap(
+        symbol,
+        endpoint,
+        f"{reason}_suppressed",
+        coverage_status="failed",
+    )
+    latch_service_issue(f"fmp_{reason}_suppressed", details)
+
+
+def _record_fmp_transport_error(
+    endpoint: str,
+    symbol: str,
+    error_type: str,
+    *,
+    suppress_followups: bool,
+) -> None:
+    global _fmp_quota_exhausted, _fmp_session_failure
+    details = {"endpoint": endpoint, "error_type": error_type}
+    _set_fmp_deferral_reason("transport_error")
+    record_provider_event("fmp", "transport_error", details)
+    record_event("fmp_request", endpoint, "transport_error", details)
+    latch_service_issue("fmp_transport_error", details)
+    record_input_gap(symbol, endpoint, "transport_error", coverage_status="failed")
+    if suppress_followups and current_scheduler_observation() is not None:
+        _fmp_quota_exhausted = True
+        _fmp_session_failure = {"reason": "transport_error", **details}
+
+
 def _fmp_get(endpoint: str, params: Optional[dict] = None) -> Any:
     """Execute a GET request against the FMP API with retries.
 
@@ -462,11 +509,21 @@ def _fmp_get(endpoint: str, params: Optional[dict] = None) -> Any:
     Material failures (auth errors, plan restrictions) are printed so they
     are visible in logs rather than silently degrading data quality.
     """
-    global _fmp_quota_exhausted
+    global _fmp_quota_exhausted, _fmp_session_failure
+    symbol = str((params or {}).get("symbol", "unknown"))
 
     if _fmp_quota_exhausted:
+        _record_suppressed_fmp_outcome(endpoint, params, _fmp_session_failure)
         return []
     if settings.FMP_SUPPRESS_REPEATED_ENDPOINT_ERRORS and endpoint in _fmp_unavailable_endpoints:
+        _record_suppressed_fmp_outcome(
+            endpoint,
+            params,
+            _fmp_unavailable_outcomes.get(
+                endpoint,
+                {"reason": "provider_refusal", "endpoint": endpoint},
+            ),
+        )
         return []
 
     url = f"{settings.FMP_BASE_URL}/{endpoint}"
@@ -481,7 +538,6 @@ def _fmp_get(endpoint: str, params: Optional[dict] = None) -> Any:
             request_params["limit"] = int(settings.FMP_FREE_MAX_RECORDS)
     request_params["apikey"] = _fmp_api_key()
     if not _reserve_fmp_request():
-        symbol = str((params or {}).get("symbol", "unknown"))
         reason = fmp_request_deferral_reason()
         if reason == "local_ledger":
             record_input_gap(
@@ -494,11 +550,12 @@ def _fmp_get(endpoint: str, params: Optional[dict] = None) -> Any:
             record_resource_denial("fmp_cap_denied", {"endpoint": endpoint})
         return []
 
+    record_provider_event("fmp", "attempted", {"endpoint": endpoint})
     record_event(
         "fmp_request",
         endpoint,
         "reserved",
-        {"symbol": str((params or {}).get("symbol", "unknown"))},
+        {"symbol": symbol},
     )
 
     try:
@@ -510,30 +567,49 @@ def _fmp_get(endpoint: str, params: Optional[dict] = None) -> Any:
     except requests.exceptions.RetryError:
         # Retry adapter exhausted all attempts — treat as a persistent failure.
         _fmp_quota_exhausted = True
-        _set_fmp_deferral_reason("transport_error")
-        record_event("fmp_request", endpoint, "transport_error", {"error_type": "RetryError"})
-        latch_service_issue("fmp_transport_error", {"endpoint": endpoint, "error_type": "RetryError"})
+        _fmp_session_failure = {
+            "reason": "transport_error",
+            "endpoint": endpoint,
+            "error_type": "RetryError",
+        }
+        _record_fmp_transport_error(
+            endpoint,
+            symbol,
+            "RetryError",
+            suppress_followups=True,
+        )
         print("[FMP] All retries exhausted. Skipping FMP for remainder of session.")
         return []
     except requests.exceptions.RequestException as exc:
-        _set_fmp_deferral_reason("transport_error")
-        record_event(
-            "fmp_request",
+        _record_fmp_transport_error(
             endpoint,
-            "transport_error",
-            {"error_type": type(exc).__name__},
-        )
-        latch_service_issue(
-            "fmp_transport_error",
-            {"endpoint": endpoint, "error_type": type(exc).__name__},
+            symbol,
+            type(exc).__name__,
+            suppress_followups=True,
         )
         return []
 
     def record_provider_refusal() -> None:
+        global _fmp_quota_exhausted, _fmp_session_failure
         _set_fmp_deferral_reason("provider_refusal")
-        details = {"endpoint": endpoint, "http_status": int(resp.status_code)}
+        status_code = int(resp.status_code)
+        details = {"endpoint": endpoint, "http_status": status_code}
+        record_provider_event("fmp", "provider_refusal", details)
         record_event("fmp_request", endpoint, "provider_refusal", details)
         latch_service_issue("fmp_provider_refusal", details)
+        record_input_gap(symbol, endpoint, "provider_refusal", coverage_status="failed")
+        if status_code in {402, 403, 404}:
+            _fmp_unavailable_outcomes[endpoint] = {
+                "reason": "provider_refusal",
+                "http_status": status_code,
+            }
+        if status_code == 429:
+            _fmp_quota_exhausted = True
+            _fmp_session_failure = {
+                "reason": "provider_refusal",
+                "endpoint": endpoint,
+                "http_status": status_code,
+            }
 
     # 402: endpoint not included in the current plan.
     if resp.status_code == 402:
@@ -578,9 +654,26 @@ def _fmp_get(endpoint: str, params: Optional[dict] = None) -> Any:
         error_msg = data.get("Error Message") or data.get("error") or data.get("message")
         if error_msg:
             quota_keywords = ("limit reached", "too many request", "quota", "upgrade", "subscribe")
-            if any(kw in str(error_msg).lower() for kw in quota_keywords):
+            quota_error = any(kw in str(error_msg).lower() for kw in quota_keywords)
+            _set_fmp_deferral_reason("provider_refusal")
+            details = {
+                "endpoint": endpoint,
+                "http_status": int(resp.status_code),
+                "error_type": "api_error",
+                "quota_error": quota_error,
+            }
+            record_provider_event("fmp", "provider_refusal", details)
+            record_event("fmp_request", endpoint, "provider_error", details)
+            latch_service_issue("fmp_provider_error", details)
+            record_input_gap(
+                symbol,
+                endpoint,
+                "provider_error_response",
+                coverage_status="failed",
+            )
+            if quota_error:
                 _fmp_quota_exhausted = True
-                record_provider_refusal()
+                _fmp_session_failure = {"reason": "provider_refusal", **details}
                 print(f"[FMP] Quota/limit error: {error_msg}. Skipping FMP for remainder of session.")
             else:
                 print(f"[FMP] Error on '{endpoint}': {error_msg}")
