@@ -20,7 +20,9 @@ Completion requires all nine original #98/#99/#100 criteria, independent specifi
 
 ## Latest combined checkpoint
 
-Consumer compatibility6f225eec1c9434f0ae035383cabba43797f33ba2 is locally integrated at lead `c6ee7ceae26e2f6825a1635c874007ee59f156b8`. All three tests in `tests/test_paper_policy_chain.py` pass at this checkpoint (chunkeb2707: 3passed, 2warnings in4.26s), including the unchanged later-session/mixed-generation case. Receipt `.artifacts/lead-c/combined-chain-c6ee7ce.md`. Independent consumer re-review is active; remaining #100 findings2–5/7, final combined review and updated-source verification still prevent full acceptance. The earlier failures below are preserved history, not current results for this checkpoint.
+Consumer compatibility6f225eec1c9434f0ae035383cabba43797f33ba2 is locally integrated at lead `c6ee7ceae26e2f6825a1635c874007ee59f156b8`. The original three tests in `tests/test_paper_policy_chain.py` pass at this checkpoint (chunkeb2707: 3passed, 2warnings in4.26s), including the unchanged later-session/mixed-generation case. Receipt `.artifacts/lead-c/combined-chain-c6ee7ce.md`.
+
+Consumer re-review found one Important registered-alias deduplication gap. Two new parametrized combined cases reproduce it through actual store alias registration and restart: chunk583ad9 reports2failed, 2warnings in1.59s at the same application source. The expanded five-case chain is therefore not all passing. Consumer correction/re-review, remaining #100 findings2–5/7, final combined review and updated-source verification still prevent full acceptance. Earlier protection/clock failures below are retained history; alias failures are current.
 
 ## Completion gates and retained earlier evidence
 

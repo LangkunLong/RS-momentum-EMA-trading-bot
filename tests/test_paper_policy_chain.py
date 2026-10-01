@@ -455,6 +455,34 @@ def test_canonical_store_chain_rejects_unknown_and_conflicting_account_facts(tmp
     assert read_chain(store, deployment, portfolio) == snapshot
 
 
+@pytest.mark.parametrize("keep_primary_broker_id", [False, True])
+def test_registered_attempt_alias_rows_reserve_once_after_restart(tmp_path, keep_primary_broker_id):
+    _, path, deployment, account, portfolio, entry_a, _ = seed_pending_chain(tmp_path)
+    store = PolicyExecutionStateStore(path, store_identity=deployment.store_identity)
+    current = store.load_action_projection(entry_a.logical_action_id)
+    store.bind_attempt_order_refs(
+        entry_a.logical_action_id,
+        1,
+        provider_id="synthetic-recorded-account",
+        client_order_id="client:AAA:alias",
+        broker_order_id="broker:AAA:alias",
+        expected_action_version=current.state_version,
+        observed_at=account.clock.valuation_time,
+    )
+    alias_row = replace(
+        account.open_orders[0],
+        client_order_id="client:AAA:alias",
+        broker_order_id="broker:AAA" if keep_primary_broker_id else "broker:AAA:alias",
+    )
+    duplicated = replace(account, open_orders=(*account.open_orders, alias_row))
+    restarted = PolicyExecutionStateStore(path, store_identity=deployment.store_identity)
+    snapshot = read_chain(restarted, deployment, portfolio)
+    assert_pending_reconciliation(
+        duplicated, snapshot.portfolio_snapshot, snapshot.action_projections, snapshot.holding_episodes
+    )
+    assert read_chain(restarted, deployment, portfolio) == snapshot
+
+
 def test_new_generation_account_keeps_old_holding_and_pending_exit_ancestry(tmp_path):
     _, path, deployment_a, account, portfolio, entry_a, entry_b = seed_pending_chain(tmp_path)
     store = PolicyExecutionStateStore(path, store_identity=deployment_a.store_identity)
