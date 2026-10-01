@@ -213,6 +213,10 @@ class PointInTimeUniverseV3:
         if lineage not in self.all_lineage_ids():
             raise ValueError("security lineage is not in membership")
         when = _as_of_date(as_of)
+        if self.identity_transition_contract.has_segmented_chain(lineage):
+            return self.identity_transition_contract.resolve_ticker_for_lineage(
+                lineage, when
+            )
         identities = self.identity_transition_contract.identities
         successors = {
             item.successor: item.effective_date

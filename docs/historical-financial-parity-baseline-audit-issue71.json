@@ -1,0 +1,69 @@
+{
+  "issue": "#71",
+  "purpose": "Establish whether three broad parity-test failures predate issue #71.",
+  "revisions": {
+    "accepted_starting_main": "2c01e76a878a338ab2b743c38c4f1310aab3f75b",
+    "lead_integrated_source": "4bf32a3a327421b62d8977b4f4109b0341955e29"
+  },
+  "test_command": "python -m pytest tests/test_fundamental_input_parity.py::test_live_simple_and_pit_use_the_same_n_and_i_inputs tests/test_fundamental_input_parity.py::test_technical_only_remains_price_only_and_never_calls_fundamentals tests/test_fundamental_input_parity.py::test_pit_n_uses_revenue_only_on_and_after_its_public_date -q -p no:cacheprovider -o addopts='' --tb=short",
+  "runtime": {
+    "python_executable": "C:\\Users\\llong\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\python.exe",
+    "python": "3.13.14",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "pytest": "9.0.2",
+    "pandas": "3.0.1",
+    "numpy": "2.4.2"
+  },
+  "baseline_result": "3 failed, 2 warnings in 2.17s",
+  "integrated_result": "3 failed, 2 warnings in 2.17s",
+  "failures": [
+    {
+      "test": "test_live_simple_and_pit_use_the_same_n_and_i_inputs",
+      "exception": "ValueError: entry market context is invalid",
+      "origin_path": "core/backtest_engine.py",
+      "origin_line": 1365
+    },
+    {
+      "test": "test_technical_only_remains_price_only_and_never_calls_fundamentals",
+      "exception": "ValueError: entry market context is invalid",
+      "origin_path": "core/backtest_engine.py",
+      "origin_line": 1365
+    },
+    {
+      "test": "test_pit_n_uses_revenue_only_on_and_after_its_public_date",
+      "exception": "KeyError: 'schema_version'",
+      "origin_path": "core/pit_data.py",
+      "origin_line": 612
+    }
+  ],
+  "unchanged_failure_files": [
+    {
+      "path": "tests/test_fundamental_input_parity.py",
+      "git_blob_oid": "1abf583a85e935c7633bded94f340e993e84564c",
+      "git_blob_sha256": "3166af8f35d08046854f838a86d978c3a52a76b5c1a421bb31ca30644066973e"
+    },
+    {
+      "path": "core/backtest_engine.py",
+      "git_blob_oid": "89fecca34430fabcb9714bfad8534872bb77a9e4",
+      "git_blob_sha256": "b61ef7de77f462512c4f3da5124d1d7f8e9c8d9f4e320695ddb0e1ba4618c929"
+    },
+    {
+      "path": "core/pit_data.py",
+      "git_blob_oid": "e602ae9b5e2d68d66169c1b1088ace715cf9ed3e",
+      "git_blob_sha256": "5a57be532f0fd66f8eedceff4d730ba68891513391019976271ddaac7aa40a89"
+    }
+  ],
+  "changed_issue71_path": {
+    "path": "core/pit_feature_snapshot.py",
+    "baseline_git_blob_oid": "6a0264d08f7a3eeac84ddf3666d459cc4af857c4",
+    "integrated_git_blob_oid": "8e4020316d13c3de36dac8995fe4743bf888e70c",
+    "present_in_failure_traces": false
+  },
+  "conclusion": "All three failures reproduce at the accepted starting revision and the integrated revision. The test file and failure-origin code files are byte-identical Git blobs across those revisions; no changed #71 production path is involved.",
+  "issue_statuses": {
+    "implementation": "#71 implementation remains integrated; this audit changed documentation only.",
+    "required_inputs": "Both source revisions and the identical runtime/test environment were available.",
+    "acceptance_evidence": "The three failures were directly reproduced at both revisions and identified as predating #71.",
+    "dependencies": "Satisfied: accepted #66 prerequisite is present."
+  }
+}

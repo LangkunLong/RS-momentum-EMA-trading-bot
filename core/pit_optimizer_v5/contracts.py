@@ -47,6 +47,7 @@ EVALUATOR_SOURCE_PATHS_V5 = (
     "backtest.py",
     "config/__init__.py",
     "config/settings.py",
+    "core/alpaca_client_policy.py",
     "core/backtest_engine.py",
     "core/backtest_fills.py",
     "core/canslim/__init__.py",
