@@ -32,3 +32,16 @@ D's currently inspected `docs/next-phase-runtime-operations-ledger.md` lists exi
 B's final import/map/image owner will receive principal-collected final changed-path/import inventory. New modules and imports require exact source review before image acceptance; old image proof remains dated.
 
 The independent schema review and actual owner implementation/source-bound test receipts are pending. Only temporary database fixtures are authorized. No provider/broker/runtime operations or policy promotion follows.
+
+## Independent design review disposition
+
+Reviewer retained `.artifacts/lead-c/issue-100-schema-preflight-review.md`: changes requested, no implementation acceptance. All six findings returned to #100. Lead rulings supersede the frozen proposal where they differ:
+
+- Decision slots include category and stable candidate/holding/portfolio subject, plus explicit sequence if needed, not one global record per session. Refreshable account valuation is not slot uniqueness material; immutable payload preserves original clocks and snapshot for conflict detection.
+- A fill's receipt, attempt watermark, action residuals, holding quantity/cost/add state, history and resulting terminal/tier state change in one transaction. Opening-entry partial fills are not additions. Missing notional/fees never become invented P&L.
+- Transactions enforce relational generation/security/account/store identity; the DB binds its durable identity and history retention. File location is not the store identity.
+- Version1 schema rollback rejects any dependent state. The unspecified export-receipt deletion escape hatch is removed; deployment-pointer rollback remains separately supported.
+- Order/fill references have explicit account/provider namespace, immutable ancestry and conflicting-replay rejection; per-attempt cumulative quantities remain distinct from action aggregates.
+- Portfolio/holding/proposed-versus-confirmed-stop writes require named versioned APIs/history. Active-pointer CAS and pending-entry/readiness checks are atomic. Scope is offline state evidence, not operational activation.
+
+The report also requires actual migration failure-injection, consistent read projections, concurrency, stale-version, oversell and late-fact handling tests. No pass is inferred from the design. Updated owner source/proposal and final full-range independent review remain due.
