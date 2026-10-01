@@ -14,12 +14,17 @@ The corrected reporter was measured from clean integration source
 `af77c86ce00de0b8b89fd94900139360a7adb0e3` on
 `codex/four-issue-integration`. It has calculator ID
 `pit-financial-features-v3` at Git blob
-`71e562ffc00dc4e617f1cd625e3f13ea5fe3f81a` and a canonical raw-Git
-56-path V5 evaluator map SHA-256
-`3d57003a79ae5cc85cb3e4320568217e8b793a642363cca2c504caaba0aa82cf`.
-The selected cross-issue suite passed **138 tests** at this source; Ruff and
-`git diff --check` passed. The broader offline suite is informational. Its
-three selected parity cases still fail exactly as described below.
+`71e562ffc00dc4e617f1cd625e3f13ea5fe3f81a`. The earlier #82 local
+Docker image binds the 56-path map
+`3d57003a79ae5cc85cb3e4320568217e8b793a642363cca2c504caaba0aa82cf`
+at `d764c87`; current main integration changes that source closure and needs a
+new mapped image receipt.
+The selected cross-issue suite passed **138 tests** at the measured source;
+after the current-main merge (`cc034abf40ba5671f5bfe5e711ba707a54a253c8`),
+the cross-issue suite plus tests for the newly merged data-client policy passed
+**152 tests**. Ruff and `git diff --check` passed. The broader offline suite
+is informational. Its three selected parity cases still fail exactly as
+described below.
 An independent #67 review identified a terminal-Q4 slot-placement case under
 the accepted #66 contract. The complete `d764c87` report is retained under
 its original definition; the `af77c86` correction and newly measured report
@@ -46,20 +51,21 @@ the portable Git blob is named above.
 
 | Exact published criterion | Current evidence and disposition |
 | --- | --- |
-| Explicit denominator and exclusions for every feature and calculation | The [corrected development report](historical-feature-coverage-report-v3.md) links the exact-source local `.artifacts/evidence/issue-67-v5-af77c86/coverage_report.json`: JSON SHA-256 `2a5a5394ae2d29c22d84a4cb63eea16339efd0bb40c03a790df49ad84788064d`; 631,965-row gzip SHA-256 `1a329025fdff9db156f6d2049ce3a6318712049cb12504bd937ae4e5dcce7019`. All 20 fields have member-session and year denominators, source/publication/lookback/calculation/policy-input stages and reasons, ticker counts, and nonmember/benchmark exclusions. Independent row-stream reconciliation is pending. Earlier v1 and `d764c87` evidence retain their original definitions. |
+| Explicit denominator and exclusions for every feature and calculation | The [corrected development report](historical-feature-coverage-report-v3.md) links the exact-source local `.artifacts/evidence/issue-67-v5-af77c86/coverage_report.json`: JSON SHA-256 `2a5a5394ae2d29c22d84a4cb63eea16339efd0bb40c03a790df49ad84788064d`; 631,965-row gzip SHA-256 `1a329025fdff9db156f6d2049ce3a6318712049cb12504bd937ae4e5dcce7019`. All 20 fields have member-session and year denominators, source/publication/lookback/calculation/policy-input stages and reasons, ticker counts, and nonmember/benchmark exclusions. Independent row-stream reconciliation found zero mismatches across 120 overall/year feature summaries and 1,895,895 full-window row partitions. Earlier v1 and `d764c87` evidence retain their original definitions. |
 | Missing periods, late classifications, restatements, early warm-up | Fixed cases cover late publication, restatement, absent prior-year comparisons, warm-up, missing dated classification, and the absent newest fiscal quarter. The 84–105-day fiscal cadence rule reports an omitted long-gap quarter separately from an untrusted short-gap placeholder; an 83-day case confirms three matched plus one unavailable slot without falsely inferring a missing quarter. The C scorer is unchanged. |
 | Newly measured development denominator | The corrected reporter schema v3 run exited zero at clean source `af77c86` and measured 1,255 SPY decision sessions, 631,965 member security-sessions, and 606 ticker symbols for 2021-01-04–2025-12-31 on bundle SHA-256 `cf729b47d762ae86287bb8a87c28a1664e7475c74ef1aca736fbc240111349de`. The original v2-calculator report and complete pre-Q4-correction `d764c87` report remain under their own definitions. The stopped `issue-67-v2-cb13f00` and `issue-67-v3-503ecdd` attempts are `INCOMPLETE` and excluded. |
-| Fixed-history breadth, price RS, industry and missing market input denominators | The reporter's fixture covers 50/200-session breadth, price relative strength, SPY/QQQ/IWM benchmark sessions, missing price/benchmark history, and absent dated industry classification. The corrected report has 631,215 valid 50-session breadth cells, 629,600 valid 200-session breadth cells, 631,104 price-RS-ready cells, and 3,765/3,765 ready benchmark sessions; row-stream reconciliation is pending. The development bundle has no industry snapshots, so all 631,965 member sessions lack dated industry assignment. |
+| Fixed-history breadth, price RS, industry and missing market input denominators | The reporter's fixture covers 50/200-session breadth, price relative strength, SPY/QQQ/IWM benchmark sessions, missing price/benchmark history, and absent dated industry classification. The corrected report has 631,215 valid 50-session breadth cells, 629,600 valid 200-session breadth cells, 631,104 price-RS-ready cells, and 3,765/3,765 ready benchmark sessions; the independent reviewer recomputed these from raw bundle rows with zero mismatches. The development bundle has no industry snapshots, so all 631,965 member sessions lack dated industry assignment. |
 
 | Status | Assessment |
 | --- | --- |
-| Implementation | Terminal-Q4 correction integrated at `af77c86`; selected tests pass. |
+| Implementation | Terminal-Q4 correction integrated at `af77c86`; the report/calculator blobs and offline calculation helpers remain unchanged after current-main merge `cc034ab`; 152 selected integrated tests pass. |
 | Required inputs | Fixed histories and the retained development bundle, manifest and price provenance exist; a production three-index bundle is not needed for the bounded reporter measurement. |
-| Acceptance evidence | The new `af77c86` exact-source development report and hashes are retained; independent row/stage reconciliation is pending. Its quarterly EPS four-growth-slot window is ready for **0/631,965** member sessions, with 604,048 `missing_fiscal_quarter_period` slots and 253 untrusted short-cadence placeholders across sessions. Ticker A on 2021-01-04 has an unavailable terminal 2020-10-31 Q4 slot followed by three matched slots. A read-only source sweep of distinct 2021–2025 EPS quarterly period ends found 2,192 gaps over 105 days among 7,982 period rows, including 1,452 exact 182-day gaps; 548/549 tickers with EPS period rows have at least one long gap. Source gaps differ from repeated security-session slot missingness. Static consumer mappings and policy-input availability are **not** actual consumption. |
+| Acceptance evidence | The new `af77c86` exact-source development report and hashes are retained and independently reconciled: 631,965 included rows, all 20 fields on every row, zero duplicate security/session pairs, zero mismatches across 120 feature summaries and 1,895,895 full-window partitions, and zero market/benchmark mismatches. A separate post-merge review found unchanged reporter/calculator Git blobs and offline calculation helpers at `cc034ab`; the report remains comparable, while its actual execution identity remains `af77c86`. Its quarterly EPS four-growth-slot window is ready for **0/631,965** member sessions, with 604,048 `missing_fiscal_quarter_period` slots and 253 untrusted short-cadence placeholders across sessions. Ticker A on 2021-01-04 has an unavailable terminal 2020-10-31 Q4 slot followed by three matched slots. A read-only source sweep of distinct 2021–2025 EPS quarterly period ends found 2,192 gaps over 105 days among 7,982 period rows, including 1,452 exact 182-day gaps; 548/549 tickers with EPS period rows have at least one long gap. Source gaps differ from repeated security-session slot missingness. Static consumer mappings and policy-input availability are **not** actual consumption. |
 | Dependencies | Accepted #66 and corrected #71 calculator identity; production-universe claims separately depend on #68. |
 
-**Recommendation:** bounded reporter measurement ready pending independent
-row-stream reconciliation. No production
+**Recommendation:** ready for bounded #67 reporter acceptance at the named
+development source, with unchanged calculation semantics at the integrated
+source. No production
 coverage or replayed policy-consumption claim follows from that measurement.
 
 ## #71 — financial calculation validation
@@ -82,8 +88,8 @@ documented modeling decisions rather than inferred observations.
 The [baseline parity audit](historical-financial-parity-baseline-audit-issue71.md)
 directly ran the same three broader cases at accepted main
 `2c01e76a878a338ab2b743c38c4f1310aab3f75b` and an earlier integration
-revision. At integrated source `d764c87`, the same three failures persist;
-the later `af77c86` delta changes only the #67 coverage reporter and its tests:
+revision. At both earlier integration source `d764c87` and current-main
+integration `cc034ab`, the same three failures persist:
 two `ValueError: entry market context is invalid` at
 `core/backtest_engine.py:1365` and one `KeyError: 'schema_version'` at
 `core/pit_data.py:1264`. They predate #71, are unresolved, and do not turn the
@@ -109,14 +115,14 @@ At that earlier map, actual V5 parent and comment-only candidate containers
 exited zero, each returned 11 fixed probes, shared fingerprint
 `671a50c126b412b90fcaa466a034cade8d151686a90a8c1c1103c4f621ab4fc1`,
 and had bounded output and owned cleanup. That image **does not** verify the
-current evaluator map `3d5700…`. The [new final-source receipt](issue-82-local-d764-final-source-receipt-2026-10-01.md)
-does: its 59-file canonical Docker build context matched raw Git blobs at
+later `d764c87` evaluator map `3d5700…`. The [later local receipt](issue-82-local-d764-final-source-receipt-2026-10-01.md)
+does verify that map: its 59-file canonical Docker build context matched raw Git blobs at
 `d764c87`; image OCI index digest
 `sha256:5a63234fc2b3e4771b0fccce6cd87fafb663cf343dc8d5efc2f61433c0276ea6`
 and separate config digest
 `sha256:e275320f8637e90d0a60ef3fc563f5596d29c4a11d59f1e0edcb381471cc33ad`
 are bound to map `3d57003a79ae5cc85cb3e4320568217e8b793a642363cca2c504caaba0aa82cf`.
-The local Docker Engine was 29.7.2, Linux/amd64. The retained local
+The local Docker Engine was 29.7.2, Linux/amd64. The retained `d764c87` local
 `evidence.json` SHA-256 is
 `33f331ece8a7b1e2b562860a0edf8a90ae9a0f1eb4cdecdaa6f7d80c35cbad56`,
 and `probe.log` SHA-256 is
@@ -125,19 +131,21 @@ and `probe.log` SHA-256 is
 | Exact published criterion | Current evidence and disposition |
 | --- | --- |
 | Distinguish simulation, fixed probes and supplemental observations | [Simulation receipt](research-03-simulation-verification-2026-09-28.md) separates synthetic next-open/gap-stop portfolio simulation, fixed 11-probe worker results, and supplemental mechanism checks. No historical PIT panel or empirical strategy campaign was run. |
-| Match parent/candidate assumptions; identify enabled/skipped stages | The final-source Windows-host `DockerPanelEvaluatorV5 → LocalContainerExecutorV5` run mounted the same four-policy-file scope into separate parent and comment-only candidate containers from one immutable image. Policy revisions `76f67d16…` and `6d3008e8…`, source bundles `109a6199…` and `7c033b64…`, separate request/command/output hashes, and one matching 11-probe fingerprint `671a50c126b412b90fcaa466a034cade8d151686a90a8c1c1103c4f621ab4fc1` are in the receipt. Historical PIT panel and strategy campaign stages were skipped; no scenario data was mounted. |
-| Bounded failures, cleanup, existing passing path | Focused failure/timeout/cleanup mechanisms and synthetic next-open/gap-stop simulator paths pass in selected tests. The final-source actual parent/candidate containers each exited zero, emitted 3,584 bytes below the 64 MiB bound, used `network=none`, `--pull never`, read-only root and policy mounts, and completed owned evaluator/workspace cleanup. Targeted checks found neither owned run container after cleanup; an independent daemon query found no container with the `pit-v5-` name prefix. The failed full-checkout and offline build setup attempts are retained as setup failures, not candidate results. |
+| Match parent/candidate assumptions; identify enabled/skipped stages | The `d764c87` Windows-host `DockerPanelEvaluatorV5 → LocalContainerExecutorV5` run mounted the same four-policy-file scope into separate parent and comment-only candidate containers from one immutable image. Policy revisions `76f67d16…` and `6d3008e8…`, source bundles `109a6199…` and `7c033b64…`, separate request/command/output hashes, and one matching 11-probe fingerprint `671a50c126b412b90fcaa466a034cade8d151686a90a8c1c1103c4f621ab4fc1` are in the receipt. Historical PIT panel and strategy campaign stages were skipped; no scenario data was mounted. The new integrated image map and import closure remain to be verified. |
+| Bounded failures, cleanup, existing passing path | Focused failure/timeout/cleanup mechanisms and synthetic next-open/gap-stop simulator paths pass in selected tests. The `d764c87` actual parent/candidate containers each exited zero, emitted 3,584 bytes below the 64 MiB bound, used `network=none`, `--pull never`, read-only root and policy mounts, and completed owned evaluator/workspace cleanup. Targeted checks found neither owned run container after cleanup; an independent daemon query found no container with the `pit-v5-` name prefix. The failed full-checkout and offline build setup attempts are retained as setup failures, not candidate results. |
 
 | Status | Assessment |
 | --- | --- |
-| Implementation | Existing simulator, evaluator, worker and focused mechanisms integrated; actual final-map Windows-host container path executed. |
+| Implementation | Existing simulator, evaluator, worker and focused mechanisms integrated; `main` added an imported helper absent from the current image allowlist, and the closure correction is pending. |
 | Required inputs | Synthetic bars/policies, canonical 59-file source context, pinned base/lockfile, and local Docker Engine were available. No production PIT data or provider input was needed for the bounded probe. |
-| Acceptance evidence | Earlier-map receipt remains under its original identity. Final-map local image, actual parent/candidate probe outputs, isolation, runtime and cleanup are retained and independently checked. The unpushed manual-only Actions package was blocked by automatic publication review and was not dispatched. The completed run is local; no hosted run is claimed or required for this bounded local acceptance. |
+| Acceptance evidence | The earlier and `d764c87` local image/run receipts remain valid under their original source maps. A new integrated-map image, importability smoke, matched parent/candidate probes, and cleanup receipt are pending. The unpushed manual-only Actions package was blocked by automatic publication review and was not dispatched. No hosted run is claimed. |
 | Dependencies | Accepted #80/#81; historical production PIT data and empirical costs are outside the bounded synthetic verification. |
 
-**Recommendation:** ready for bounded #82 synthetic evaluator/container
-acceptance at the mapped source identity. This does not accept a production PIT
-evaluation, historical strategy result, or global policy equivalence.
+**Recommendation:** not ready for final integrated-source #82 acceptance until
+the changed image closure and bounded actual local container path are verified.
+The `d764c87` run remains a valid dated synthetic result and does not accept a
+production PIT evaluation, historical strategy result, or global policy
+equivalence.
 
 ## #68 — historical membership and security lineage
 

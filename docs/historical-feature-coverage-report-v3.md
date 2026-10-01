@@ -106,9 +106,39 @@ member denominator. The V2 bundle has no dated industry snapshots: all
 authenticated stable lineage IDs, so none of these counts is a three-index
 production-union denominator.
 
-## Acceptance boundary
+## Independent reconciliation and acceptance boundary
+
+The independent #67 reviewer rehashed the JSON, gzip stream, bundle and
+manifest, then scanned the complete gzip without rerunning the reporter. It
+found 631,965 included rows, 606 tickers, 1,255 sessions, all 20 features on
+every row, and no duplicate security/session pairs. All 120 feature summary
+blocks (overall plus five years) reconciled with zero differences in stage,
+denominator, reason, policy-input, or full-window counts. All 1,895,895
+full-window row partitions had consistent slot statuses and reasons and no
+duplicate period dates. The reviewer counted 121,383 terminal-Q4 anchors;
+the ticker A example above matched its as-of-visible annual period without
+using an annual value as quarterly EPS.
+
+The reviewer also recomputed market context from the raw bundle: 631,215
+valid/344,461 above the 50-session breadth threshold; 629,600 valid/374,967
+above the 200-session threshold; 631,104 RS-eligible; and 3,765/3,765 ready
+benchmark sessions. There were zero market or benchmark mismatches. All
+12,639,300 feature cells mark actual consumption as
+`not_measured_no_policy_replay`; that is an unmeasured quantity, not zero
+consumption.
 
 The report supports the staged reporter and this named development input. It
 does not measure production-universe coverage or actual policy consumption.
-Independent row-stream reconciliation against the retained gzip file is in
-progress; the four-issue packet records the final review disposition.
+After the current-main merge at `cc034abf40ba5671f5bfe5e711ba707a54a253c8`,
+the independent reviewer compared the measured revision to that integrated
+source. `core/pit_coverage.py` remains Git blob
+`431f95230ca18438cfce3e442e83ecc7c87c2d56`; the calculator remains
+Git blob `71e562ffc00dc4e617f1cd625e3f13ea5fe3f81a`. PIT readers and
+CANSLIM helpers are unchanged. The merged `core/momentum_analysis.py` delta
+affects `calculate_rs_scores_for_tickers` network retry behavior; the
+report's offline `calculate_rs_snapshot` and
+`calculate_weighted_performance` functions are unchanged. Added settings
+control HTTP timeout/retry behavior only. Thus the `af77c86` report remains
+comparable to the integrated source, while its recorded execution revision
+remains `af77c86`; no new execution revision is implied. The four-issue
+packet records the integrated-source review disposition.
