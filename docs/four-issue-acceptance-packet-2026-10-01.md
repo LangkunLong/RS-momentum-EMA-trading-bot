@@ -1,0 +1,170 @@
+# Four-issue acceptance packet (working, 2026-10-01)
+
+This packet reviews #67, #71, #82, and #68 against the issue bodies rechecked
+on 2026-10-01. All four GitHub issues remain open. The accepted #66, #80,
+#81, and #97 contracts remain unchanged at Git blobs `9ab5efcd9e5ac94d1cb301bc43d20dc9edc41026`,
+`7eefe196f4de1a93ebaa84eff33684aba209edf9`,
+`532a20fd25f01c9783db215418f7b744497dfd32`, and
+`0c9eb19a118cf5bb1ad882c42374c6fc3a7cabe1`, respectively. #97's
+qualified-policy-to-paper boundary and #107's separate review are outside
+these four issues. No operational database, scheduler, broker, or paper runtime
+was changed.
+
+The tested integration source is
+`d764c8791e27c6b0fc42bb21e9c2d74ca040b5ff` on
+`codex/four-issue-integration`. It has calculator ID
+`pit-financial-features-v3` at Git blob
+`71e562ffc00dc4e617f1cd625e3f13ea5fe3f81a` and a canonical raw-Git
+56-path V5 evaluator map SHA-256
+`3d57003a79ae5cc85cb3e4320568217e8b793a642363cca2c504caaba0aa82cf`.
+The selected cross-issue suite passed **134 tests** at this source; Ruff and
+`git diff --check` passed. The broader offline suite is informational. Its
+three selected parity cases still fail exactly as described below.
+An independent #67 review subsequently identified a terminal-Q4 slot-placement
+case under the accepted #66 contract. The complete `d764c87` report below is
+retained under its original definition, but is **provisional** for #67
+acceptance until that case is corrected and a new report is measured.
+
+## #67 — historical feature availability
+
+The implementation is a staged, 20-field point-in-time coverage reporter.
+Each field has explicit source, publication, lookback, calculation, and
+declared policy-input stages. `consumer_paths` are static interface mappings;
+`actual_policy_consumption=not_measured_no_policy_replay` means there was no
+decision-by-decision policy read or strategy replay. The development bundle is
+S&P-only schema V2, not the three-index production universe.
+The full report command used the local `python` executable at
+`C:/Users/llong/AppData/Local/Microsoft/WindowsApps/PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0/python.exe`;
+an immediate post-run environment snapshot reports CPython 3.13.14,
+pandas 3.0.1, NumPy 2.4.2, SQLite 3.50.4, and Windows
+`11-10.0.26200-SP0`. Its pinned manifest and price-provenance SHA-256 values
+are `3c9edd0158dcb93f9de5edbfcf6f281dd8b25bcdd1ded6ad21473af5fd37be7c`
+and `97dad8197d1fcc0d7a8cedb1a0bc13b76d7169b56a8b9c0a0e836c0a25c4f8a2`.
+The checked-out #66 feature-specification bytes hash to
+`21fa9c9826d1ade7bebb3ccd17f8c40bfaea3136e4bab53dbd7065fa12b46c8a2`;
+the portable Git blob is named above.
+
+| Exact published criterion | Current evidence and disposition |
+| --- | --- |
+| Explicit denominator and exclusions for every feature and calculation | The locally retained exact-source report at `.artifacts/evidence/issue-67-v4-d764c87/coverage_report.json` includes per-field and per-year member security-session denominators, stage/reason counts, ticker counts, nonmember/benchmark exclusions, and the separate policy-input stage. Its JSON SHA-256 is `548d71e20406b27977ee56bbf16604307b5884594cb8db3c49c693892d729716`; its 631,965-row gzip SHA-256 is `eb49de23f03c4506a80a0adb7fc78d7b6dc14b28cc6ce2367dca8c57ccd84477`. All 20 feature denominators and calculation/policy partitions reconcile to 631,965; independent row-stream reconciliation is pending. Earlier v1 evidence retains its original v2-calculator definition. |
+| Missing periods, late classifications, restatements, early warm-up | Fixed cases cover late publication, restatement, absent prior-year comparisons, warm-up, missing dated classification, and the absent newest fiscal quarter. The 84–105-day fiscal cadence rule reports an omitted long-gap quarter separately from an untrusted short-gap placeholder; an 83-day case confirms three matched plus one unavailable slot without falsely inferring a missing quarter. The C scorer is unchanged. |
+| Newly measured development denominator | The final reporter schema v3 run exited zero at clean source `d764c87` and measured 1,255 SPY decision sessions, 631,965 member security-sessions, and 606 ticker symbols for 2021-01-04–2025-12-31 on bundle SHA-256 `cf729b47d762ae86287bb8a87c28a1664e7475c74ef1aca736fbc240111349de`. Earlier v1 evidence used calculator v2 and remains under that definition. The stopped attempts under `issue-67-v2-cb13f00` and `issue-67-v3-503ecdd` are marked `INCOMPLETE` and excluded. |
+| Fixed-history breadth, price RS, industry and missing market input denominators | The reporter's fixture covers 50/200-session breadth, price relative strength, SPY/QQQ/IWM benchmark sessions, missing price/benchmark history, and absent dated industry classification. The final report has 631,215 valid 50-session breadth cells, 629,600 valid 200-session breadth cells, 631,104 price-RS-ready cells, and 3,765/3,765 ready benchmark sessions; row-stream reconciliation is pending. The development bundle has no industry snapshots, so all 631,965 member sessions lack dated industry assignment. |
+
+| Status | Assessment |
+| --- | --- |
+| Implementation | Integrated at `d764c87`; selected tests pass. |
+| Required inputs | Fixed histories and the retained development bundle, manifest and price provenance exist; a production three-index bundle is not needed for the bounded reporter measurement. |
+| Acceptance evidence | The `d764c87` exact-source development report and hashes are retained as provisional evidence; its terminal-Q4 window placement is under correction, and independent row/stage reconciliation is pending. Under that definition, the quarterly EPS four-growth-slot window is ready for **0/631,965** member sessions, with 602,240 `missing_fiscal_quarter_period` slots and 253 untrusted short-cadence placeholders across sessions. A read-only source sweep of distinct 2021–2025 EPS quarterly period ends found 2,192 gaps over 105 days among 7,982 period rows, including 1,452 exact 182-day gaps; 548/549 tickers with EPS period rows have at least one long gap. These are distinct source gaps, while the report's 602,240 figure is repeated security-session slot missingness. Static consumer mappings and policy-input availability are **not** actual consumption. |
+| Dependencies | Accepted #66 and corrected #71 calculator identity; production-universe claims separately depend on #68. |
+
+**Recommendation:** not ready to accept #67 until the terminal-Q4 slot
+correction, new exact-source measurement, and independent reconciliation are
+retained. No production
+coverage or replayed policy-consumption claim follows from that measurement.
+
+## #71 — financial calculation validation
+
+The versioned calculator applies the accepted #66 nearest prior-calendar-year
+fiscal matcher within 28 days. V2 corrected observed-period freshness and
+calendar-adjacent acceleration; V3 corrected fiscal quarter adjacency to an
+inclusive 84–105-day endpoint gap. The input has period-end dates, not fiscal
+quarter sequence IDs, so this is an explicit cadence proxy. Annual growth
+across missing years and income/equity alignment for return on equity remain
+documented modeling decisions rather than inferred observations.
+
+| Exact published criterion | Current evidence and disposition |
+| --- | --- |
+| Skipped periods, adjacent acceleration, income/equity alignment, older restatements | Fixed cases in `tests/test_historical06_financial_semantics.py` and the [v2 validation](historical-financial-validation-issue71.md) cover these paths. The [v3 addendum](historical-financial-validation-issue71-adjacency-v3.md) adds a 91-day adjacent pair accepted for both EPS/revenue acceleration and a 182-day skipped pair rejected. |
+| Reproducible mismatch and bounded correction or explicit modeling decision | The [v3 reproduction script](../tools/reproduce_issue71_adjacency_comparison.py) and [receipt](historical-financial-validation-issue71-adjacency-v3-reproduction.json) hash-check the unchanged development bundle and manifest, read V2 data without mutation, and compare V2/V3 on 2021-01-01–2025-12-31. Annual growth and ROE limits are recorded in the v2 validation. |
+| Old output measured before error claims; changed definitions versioned | The earlier V2 comparison recorded 138,038 EPS and 158,883 revenue priced sessions becoming unavailable under the first correction; it remains under its original definition. The V3 pinned reproduction measured 8,696 priced quarterly-state windows per metric: EPS changed in 68 windows, 47 symbols, 6,007 priced sessions (24 available→unavailable, 44 unavailable→available); revenue changed in 77 windows, 54 symbols, 6,876 priced sessions (27 and 50). The original V3 zero-revenue statement was wrong and is explicitly superseded; its one-off scan was not retained, so the specific cause is unknown. These are feature-output differences, not trade errors. |
+| Explicit source/input identity, comparable results, old reports preserved | Input bundle SHA-256 `cf729b47d762ae86287bb8a87c28a1664e7475c74ef1aca736fbc240111349de`; manifest SHA-256 `3c9edd0158dcb93f9de5edbfcf6f281dd8b25bcdd1ded6ad21473af5fd37be7c`. The successful reproduction's script SHA-256 is `bfec250376d6e03208ee83664513911f45adda271cb1522da918efc0166a5d50`; runtime CPython 3.13.14, pandas 3.0.1, SQLite 3.50.4, 799.531 seconds. Calculator V3 Git blob is named above. Original V2 reports are unchanged. |
+
+The [baseline parity audit](historical-financial-parity-baseline-audit-issue71.md)
+directly ran the same three broader cases at accepted main
+`2c01e76a878a338ab2b743c38c4f1310aab3f75b` and an earlier integration
+revision. At final tested source `d764c87`, the same three failures persist:
+two `ValueError: entry market context is invalid` at
+`core/backtest_engine.py:1365` and one `KeyError: 'schema_version'` at
+`core/pit_data.py:1264`. They predate #71, are unresolved, and do not turn the
+versioned #71 correction into a passing broad parity suite.
+
+| Status | Assessment |
+| --- | --- |
+| Implementation | V3 acceleration/freshness semantics and modeled annual-growth/ROE decisions integrated; no correction is pending. |
+| Required inputs | Fixed histories and authenticated retained development bundle/manifest available. |
+| Acceptance evidence | Fixed cases, corrected pinned before/after counts and runtime receipt, and baseline-versus-integrated parity disposition available. The final #67 report must still bind this calculator. |
+| Dependencies | Accepted #66 matcher; #67 uses calculator V3. Broader parity failures are separately unresolved. |
+
+**Recommendation:** ready for bounded #71 review, with the superseded V3
+revenue claim and unresolved pre-existing broad parity failures stated plainly.
+
+## #82 — historical evaluator and candidate execution
+
+The [earlier actual container receipt](research-03-candidate-container-evidence-2026-09-28.json)
+records a Linux/amd64 Docker Engine 29.7.2 image with immutable config ID
+`sha256:bf842ff5e0dc741f95e96129d224c24d7834feef23c4c20fdfe1d5297d54b527`
+and raw-Git V5 map `a55875a2ea021ec27a9fd18d8e09b180ce9186fcaf1b3bbb14036db871e11fb4`.
+At that earlier map, actual V5 parent and comment-only candidate containers
+exited zero, each returned 11 fixed probes, shared fingerprint
+`671a50c126b412b90fcaa466a034cade8d151686a90a8c1c1103c4f621ab4fc1`,
+and had bounded output and owned cleanup. That image **does not** verify the
+current evaluator map `3d5700…`.
+
+| Exact published criterion | Current evidence and disposition |
+| --- | --- |
+| Distinguish simulation, fixed probes and supplemental observations | [Simulation receipt](research-03-simulation-verification-2026-09-28.md) separates synthetic next-open/gap-stop portfolio simulation, fixed 11-probe worker results, and supplemental mechanism checks. No historical PIT panel or empirical strategy campaign was run. |
+| Match parent/candidate assumptions; identify enabled/skipped stages | The earlier receipt binds separate policy/source/request hashes to one image/map and identical fixed suite. A one-time manual GitHub Actions package is being prepared to run parent/comment-only worker containers at the final map. The Linux runner will use the image-owned `probe_entry` with an explicit Docker lifecycle; `LocalContainerExecutorV5` itself is Windows-only and must not be claimed as Linux-host verified. |
+| Bounded failures, cleanup, existing passing path | Focused failure/timeout/cleanup cases and the earlier actual zero-exit containers are retained. A final-source image/config ID, real parent/candidate exit/output receipt and targeted cleanup evidence are **pending**. |
+
+| Status | Assessment |
+| --- | --- |
+| Implementation | Existing simulator, evaluator, worker and focused mechanisms integrated; one-time runner package under review. |
+| Required inputs | Synthetic bars/policies available; Docker Engine was locally verified and an Actions runner is the user's preferred execution host. A final-source image and run are not yet available. |
+| Acceptance evidence | Earlier-map actual container receipt is preserved. Final integrated-map actual execution is **unverified**. |
+| Dependencies | Accepted #80/#81; historical production PIT data and empirical costs are outside the bounded synthetic verification. |
+
+**Recommendation:** not ready until the final-map actual container run and its
+source/image/input/runtime/cleanup receipt are retained and independently
+reviewed.
+
+## #68 — historical membership and security lineage
+
+The [source receipt](historical-membership-source-receipt-v1.md),
+[acquisition and transition plan](historical-membership-acquisition-plan-v1.md),
+[partial identity ledger](price-identity-transition-evidence-ledger-v1.json),
+and [segment decision](price-identity-segment-contract-decision-v1.md) define
+the exact gap. Integrated code has an opt-in, hash-bound V3 segment contract,
+normalizer and builder/verifier forwarding, plus a V5 production-admission
+guard with an **empty approved evidence-pair set**. Synthetic FISV→FI→FISV
+fixtures exercise representation and rejection. They do not authenticate
+production source bytes or add union membership rows.
+
+| Exact published criterion | Current evidence and disposition |
+| --- | --- |
+| Effective date and retained source evidence for every event | **Missing production input.** The retained S&P stream has 711 secondary-source events/606 tickers and five official spot checks, without a verified opening/ending state or complete primary ledger. Nasdaq has selected notices and a nonadmitted secondary extraction, without an admitted seed/event pair. Russell 2000 has no retained historical membership file. |
+| Overlaps, renames and short-lived events reconcile by security lineage | Synthetic normalizer and integrity fixtures pass; production overlap/short-lived counts and authenticated transition replay are missing. FISV→FI (2023-06-07)→FISV (2025-11-11) needs the three segments tied to original issuer/SEC source bytes, source locators, final price request-contract hash, and complete member events. Thirteen other one-way leads remain evidence-only. |
+| Coverage/exclusions explicit; fund holdings are not membership | Inventory/exclusions are explicit; current constituents and fund holdings are excluded as historical evidence. A source-backed three-index union and per-index/pooled coverage report do not exist. |
+
+| Status | Assessment |
+| --- | --- |
+| Implementation | V3/V5 representation and fail-closed integration complete for synthetic inputs; provider-native production adapter/artifact remains pending exact source files. |
+| Required inputs | Rights-cleared 2020-12-31 (or earlier complete) seeds and every effective 2021–2025 change/correction for all three indices; stable security/share-class IDs; retained provider bytes and permitted use/derivation/retention; authenticated price transitions/segments. |
+| Acceptance evidence | Only inventory, spot checks, partial ledger and synthetic tests; **no production three-index artifact or accepted coverage**. |
+| Dependencies | Accepted #66; provider/source rights and data owner decision. V5 production membership admission remains closed. |
+
+**Recommendation:** keep #68 open. Prefer an already licensed package meeting
+the exact [handoff checklist](historical-membership-acquisition-plan-v1.md#licensed-input-handoff-packet-not-executed).
+If none exists, request product/file/rights/price quotes for S&P DJI,
+Nasdaq GIW/GIFFD or equivalent historical NDX composition, and FTSE Russell
+DDS/historical RUT. Incremental cost, depth and derivation rights are unknown
+until checked. No purchase, provider contact, or license commitment has been
+made.
+
+## Publication and closure
+
+Draft [PR #112](https://github.com/LangkunLong/RS-momentum-EMA-trading-bot/pull/112)
+holds the integration. Issues #67/#71/#82/#68 stay open until their own
+criteria and evidence are reviewed and closure is authorized. A clean branch,
+passing focused tests, fixture coverage, or worker completion alone does not
+establish issue acceptance.
