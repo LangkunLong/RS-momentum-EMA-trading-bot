@@ -24,6 +24,7 @@ The existing explicit-symbol AAPL scan has bounded request contexts. The ordinar
 - This change does not prove health of the installed disabled task, an order-enabled fill stream, startup stop reconciliation, or the deployment as a whole.
 - It does not resolve the pending AAPL run at `f15d3db`, change a quota ledger, prewarm caches, replace the full universe with a smaller sample, or change strategy policy.
 - It does not submit orders, activate or edit the installed task, send email, or grant authority for a provider-backed session.
+- It does not introduce a second durable schema or action-identity policy. Workflow observations and write ceilings use the existing `core/execution_store.py` schema and preserve the C/#100 durable-schema and action-identity contracts.
 
 ## Observation behavior
 
@@ -41,12 +42,16 @@ The proposed run limits are:
 | FMP | At most 198 additional logical requests, further limited to the remaining allowance in the existing reset window. Free-plan transport retries are zero. The ledger is required, retained, and never reset or replaced. |
 | Index sources | 6 actual attempts covering page, CSV, fallback, and failed attempts for the two `large_cap` indices. |
 | Request inactivity | 15 seconds for Alpaca, FMP, and index-source requests. This is not the outer process deadline. |
-| Workflow store writes | At most 6 added transitions and 2 added snapshots, subject to preflight confirmation of the existing maximum of 2 new entries and 5 open positions. |
+| Workflow store writes | At most 6 added transitions and 2 added snapshots, subject to preflight confirmation of the existing maximum of 2 new entries and 5 open positions. Enforce and measure these against the existing C/#100 schema and action identities; add no competing persistence schema or identity policy. |
 | Process | One launch with a separate 45-minute watchdog, bounded termination observation, and no automatic retry. |
 
 Counters reserve an attempt before network I/O so failed requests count. A hard-cap refusal latches an unhealthy observation even if strategy or scheduler code catches the error. Reaching a cap exactly is conservatively unverified unless the receipt proves no further request was refused. The FMP increment is `min(198, existing local remaining allowance)`; provider-side remaining quota is not available locally and is not probed. A provider refusal is captured and does not authorize a retry.
 
+The Python observation context activates the Alpaca budget before making any provider request. Its one authoritative clock preflight then runs inside that context and consumes one of the 256 attempts. The launcher performs no clock, account, position, order, or other provider read outside the child. The clock must report open before the immediate scan starts; a confirmed closed or unknown result ends the attempt as failed/unverified without scanning.
+
 FMP outcomes remain distinct. A candidate deferred before network I/O because the existing local ledger has no remaining allowance is recorded as unavailable/degraded input, with candidate identity, endpoint coverage, and its rejection reason. It is not represented as a provider entitlement pass or as a service crash. A provider denial and a process-wide cap refusal have their own outcomes and latch unhealthy evidence. Any such gap prevents an overall readiness PASS because coverage is incomplete.
+
+The receipt carries three separate outcome fields: `service_health` (`healthy`, `failed`, or `unverified`), `required_input_coverage` (`complete`, `degraded`, `failed`, or `unverified`), and `overall_readiness` (`pass`, `fail`, or `unverified`). A locally quota-deferred candidate, by itself, is not a service crash: it sets input coverage to `degraded`. An observed provider refusal, hard-cap denial, failed required read/work, unknown required clock, or missed due work sets service health to `failed` where failure is observed and `unverified` where evidence is incomplete. This scheduler observation alone never emits `overall_readiness=pass` for #107: that field defaults to `unverified` unless a separately reviewed evidence aggregator receives all eligible receipts at the exact compatible source, including the AAPL dry-run, account/FMP entitlement, runtime identity, and other required criteria. This scope adds no such aggregator. A readiness `fail` may be emitted when this observation establishes a failed required criterion; otherwise issue-level readiness remains `unverified`.
 
 ### Work outcomes and timing
 
@@ -67,9 +72,12 @@ The observer emits structured, sanitized evidence for:
 - requested, validated, and analyzed universe counts; RS/fundamental coverage; and candidate-specific unavailability/rejection reasons;
 - every expected scan, clock check, and due exit check with start and outcome;
 - workflow/snapshot counts and unexpected store mutations;
+- before/after SQLite integrity, file hash, and relevant table row counts; before/after hashes for the existing FMP ledger, ticker cache, RS cache, and fundamentals-cache files;
 - stdout/stderr references, process ID, exit status, watchdog state, and whether child termination was observed.
 
 The launcher retains raw output in files explicitly labeled raw until the child is observed stopped and redaction succeeds. Only then may sanitized output be written. If termination is not observed, the receipt says the child may still be running, leaves the files labeled raw, and does not claim sanitization or take a post-run store snapshot. The launcher does not retry or start a second scheduler.
+
+The before snapshot is read-only and records SQLite `quick_check`, SHA-256, and relevant row counts plus hashes of the existing ledger and caches. The after snapshot records the same values only after child termination has been observed; it reports integrity, hash, and row-count deltas. A surviving child means all post-run store, ledger, and cache reads are skipped because writes or cache updates may still be in flight.
 
 ## Offline verification
 
@@ -85,6 +93,8 @@ Focused tests use synthetic provider responses, a fake clock, a fake notifier, a
 - workflow/snapshot limits and unexpected writes in temporary stores;
 - no notification transmission through SMTP or Gmail and no fill-stream/order path in dry-run;
 - captured output, timeout, wrapper failure, kill failure, final receipt, and truthful surviving-child status.
+
+At least one integration test runs the ordinary scheduler control path through its full scan and exit loop with a synthetic clock and provider clients. It uses the normal `large_cap` symbol selection and unchanged scan/exit functions, with fake responses instead of network access; it verifies the immediate scan, 15:xx and 16:01 hourly checks, and due fallback checks. A receipt-only test or a test that replaces the full scan with an explicit symbol is insufficient.
 
 No test contacts a real provider, uses the selected runtime/store, launches the scheduler/task, or sends a notification.
 
