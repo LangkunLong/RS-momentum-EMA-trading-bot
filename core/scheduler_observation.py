@@ -25,6 +25,11 @@ _SECRET_ASSIGNMENT = re.compile(
 )
 _EMAIL = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
 _COVERAGE_RANK = {"complete": 0, "degraded": 1, "unverified": 2, "failed": 3}
+_INDEX_REQUEST_LIMIT = 6
+
+
+class IndexRequestBudgetExceeded(RuntimeError):
+    """Raised before an index-source request would exceed the observation cap."""
 
 
 def _safe_string(value: str) -> str:
@@ -63,6 +68,7 @@ class SchedulerObservation:
         self._input_gaps: list[dict[str, Any]] = []
         self._issues: list[dict[str, Any]] = []
         self._resource_denials: dict[str, int] = {}
+        self._resource_counters: dict[str, int] = {"index_attempts": 0}
         self._provider_counters: dict[str, dict[str, Any]] = {}
         self._service_health = "healthy"
         self._required_input_coverage = "complete"
@@ -116,6 +122,23 @@ class SchedulerObservation:
         with self._lock:
             self._resource_denials[safe_code] = self._resource_denials.get(safe_code, 0) + 1
             self.latch_service_issue(safe_code, details)
+
+    def reserve_index_attempt(self, source: str) -> None:
+        """Reserve one of six index requests before the caller performs I/O."""
+        with self._lock:
+            attempts = self._resource_counters["index_attempts"]
+            if attempts >= _INDEX_REQUEST_LIMIT:
+                self.record_resource_denial(
+                    "index_cap_denied",
+                    {"attempt": attempts + 1, "cap": _INDEX_REQUEST_LIMIT},
+                )
+                raise IndexRequestBudgetExceeded(
+                    f"Index request cap ({_INDEX_REQUEST_LIMIT}) has been reached"
+                )
+            self._resource_counters["index_attempts"] = attempts + 1
+            self.record_event(
+                "provider_request", "index_source", "reserved", {"source": source}
+            )
 
     def record_provider_event(
         self,
@@ -189,6 +212,7 @@ class SchedulerObservation:
                 "input_gaps": [dict(gap) for gap in self._input_gaps],
                 "issues": [dict(issue) for issue in self._issues],
                 "resource_denials": dict(self._resource_denials),
+                "resource_counters": dict(self._resource_counters),
                 "provider_counters": {
                     provider: {
                         **{key: value for key, value in counter.items() if key != "refusal_statuses"},

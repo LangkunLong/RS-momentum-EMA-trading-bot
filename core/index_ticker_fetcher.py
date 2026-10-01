@@ -18,6 +18,10 @@ import re
 from bs4 import BeautifulSoup
 
 from config import settings
+from core.scheduler_observation import (
+    IndexRequestBudgetExceeded,
+    current_scheduler_observation,
+)
 
 # Cache configuration
 CACHE_DIR = Path(settings.TICKER_CACHE_DIR)
@@ -51,6 +55,14 @@ _MIN_TICKERS_PER_INDEX: dict[str, int] = {
 # a broader universe than strictly the Nasdaq-100 index).
 _WIKIPEDIA_NASDAQ100_URL = "https://en.wikipedia.org/wiki/List_of_NASDAQ-100_companies"
 _WIKIPEDIA_SP500_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+
+
+def _index_get(source: str, url: str, **kwargs: object) -> requests.Response:
+    """Perform one index request after reserving its observation-wide slot."""
+    observation = current_scheduler_observation()
+    if observation is not None:
+        observation.reserve_index_attempt(source)
+    return requests.get(url, **kwargs)
 
 
 def _parse_wikipedia_tickers(response_text: str) -> List[str]:
@@ -93,7 +105,8 @@ def _fetch_index_from_wikipedia(index_key: str, display_name: str) -> List[str]:
         return []
 
     try:
-        response = requests.get(
+        response = _index_get(
+            "wikipedia",
             url,
             timeout=settings.INDEX_TICKER_HTTP_TIMEOUT_SECONDS,
             headers={"User-Agent": "Mozilla/5.0 (compatible; trading-bot/1.0)"},
@@ -109,6 +122,8 @@ def _fetch_index_from_wikipedia(index_key: str, display_name: str) -> List[str]:
             f"Wikipedia {display_name} fallback returned {len(tickers)} tickers; "
             f"expected {minimum}-{maximum}."
         )
+    except IndexRequestBudgetExceeded:
+        raise
     except Exception as exc:
         print(f"Wikipedia {display_name} fallback failed: {exc}")
     return []
@@ -267,7 +282,8 @@ class IndexTickerFetcher:
             fund_url = self.ISHARES_URL[index_key]
 
             # 1. Fetch the main fund page
-            page_resp = requests.get(
+            page_resp = _index_get(
+                "ishares_page",
                 fund_url,
                 timeout=settings.INDEX_TICKER_HTTP_TIMEOUT_SECONDS,
                 headers={
@@ -297,7 +313,8 @@ class IndexTickerFetcher:
                 raise ValueError(f"Could not locate CSV download link on {fund_url}")
 
             # 3. Fetch the CSV
-            response = requests.get(
+            response = _index_get(
+                "ishares_csv",
                 csv_url,
                 timeout=settings.INDEX_TICKER_HTTP_TIMEOUT_SECONDS,
                 headers={
@@ -334,6 +351,8 @@ class IndexTickerFetcher:
                 )
                 return self._fetch_index_tickers_fallback(index_key, display_name) or list(_FALLBACK_TICKERS)
 
+        except IndexRequestBudgetExceeded:
+            raise
         except Exception as e:
             print(f"Error fetching {display_name} from iShares: {e}. Attempting alternative source.")
             return self._fetch_index_tickers_fallback(index_key, display_name) or list(_FALLBACK_TICKERS)
