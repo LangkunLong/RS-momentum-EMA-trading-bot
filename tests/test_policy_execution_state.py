@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date, datetime, timezone
 from decimal import Decimal
 
@@ -524,6 +525,85 @@ def test_cancelled_underfill_needs_explicit_resolution_before_tier_advances() ->
     assert advanced.remaining_quantity == Decimal("90")
 
 
+@pytest.mark.parametrize("fill_api", [apply_cumulative_fill, lambda action, quantity: apply_attempt_cumulative_fill(action, 1, quantity)])
+def test_partial_fill_preserves_cancel_and_reconciliation_uncertainty(fill_api) -> None:
+    action = build_action_intent(
+        decision=_decision(),
+        security_id="FIGI-BB1234",
+        role=ActionRole.ENTRY,
+        side=OrderSide.BUY,
+        requested_quantity=Decimal("10"),
+    )
+    partial = fill_api(action, Decimal("4"))
+    cancel_pending = request_attempt_cancel(partial, 1)
+    still_cancel_pending = fill_api(cancel_pending, Decimal("6"))
+    assert still_cancel_pending.confirmed_filled_quantity == Decimal("6")
+    assert still_cancel_pending.status is ActionStatus.CANCEL_REQUESTED
+    assert still_cancel_pending.order_attempts[0].status is ActionAttemptStatus.CANCEL_REQUESTED
+
+    attempt = still_cancel_pending.order_attempts[0]
+    explicitly_reconciling = replace(
+        still_cancel_pending,
+        status=ActionStatus.RECONCILIATION_REQUIRED,
+        order_attempts=(replace(attempt, status=ActionAttemptStatus.RECONCILIATION_REQUIRED),),
+    )
+    still_reconciling = fill_api(explicitly_reconciling, Decimal("7"))
+    assert still_reconciling.confirmed_filled_quantity == Decimal("7")
+    assert still_reconciling.status is ActionStatus.RECONCILIATION_REQUIRED
+    assert still_reconciling.order_attempts[0].status is ActionAttemptStatus.RECONCILIATION_REQUIRED
+
+
+def test_late_terminal_fill_requires_reconciliation_before_remainder_and_keeps_issued_target() -> None:
+    holding = HoldingEpisode.open(
+        deployment_generation_id=_deployment().deployment_generation_id,
+        security_id="FIGI-BB1234",
+        symbol="ACME",
+        opening_action_id="entry-logical-action",
+        initial_filled_quantity=Decimal("100"),
+        entry_price=Decimal("50"),
+    )
+    action = build_action_intent(
+        decision=_decision(),
+        security_id="FIGI-BB1234",
+        holding_episode_id=holding.holding_episode_id,
+        role=ActionRole.SCALE_OUT,
+        side=OrderSide.SELL,
+        requested_quantity=Decimal("50"),
+        exit_tier=1,
+        snapshot_original_quantity=Decimal("100"),
+        fraction_of_original_quantity=Decimal("0.5"),
+        rounding_rule_id="whole_share_floor_v1",
+    )
+    underfilled = apply_cumulative_fill(action, Decimal("20"))
+    terminal = confirm_attempt_terminal(
+        request_attempt_cancel(underfilled, 1),
+        1,
+        status=ActionAttemptStatus.CANCELLED,
+    )
+
+    before_remainder = apply_cumulative_fill(terminal, Decimal("25"))
+    assert before_remainder.status is ActionStatus.RECONCILIATION_REQUIRED
+    assert before_remainder.confirmed_filled_quantity == Decimal("25")
+    assert before_remainder.order_attempts[0].terminal_status is ActionAttemptStatus.CANCELLED
+    with pytest.raises(ValueError, match="broker-confirmed terminal"):
+        create_single_remainder_attempt(before_remainder)
+
+    already_issued = create_single_remainder_attempt(terminal)
+    assert already_issued.order_attempts[1].requested_quantity == Decimal("30")
+    late_fill_a = apply_cumulative_fill(already_issued, Decimal("25"))
+    late_fill_b = apply_attempt_cumulative_fill(already_issued, 1, Decimal("25"))
+    assert late_fill_a == late_fill_b
+    assert late_fill_a.confirmed_filled_quantity == Decimal("25")
+    assert late_fill_a.status is ActionStatus.RECONCILIATION_REQUIRED
+    assert late_fill_a.order_attempts[0].terminal_status is ActionAttemptStatus.CANCELLED
+    assert late_fill_a.order_attempts[1].requested_quantity == Decimal("30")
+
+    over_target = apply_attempt_cumulative_fill(late_fill_a, 2, Decimal("30"))
+    assert over_target.confirmed_filled_quantity == Decimal("55")
+    assert over_target.residual_quantity == Decimal("0")
+    assert over_target.status is ActionStatus.RECONCILIATION_REQUIRED
+
+
 def test_stop_and_peak_evolve_monotonically_without_turning_missing_values_into_zero() -> None:
     holding = HoldingEpisode.open(
         deployment_generation_id=_deployment().deployment_generation_id,
@@ -556,17 +636,24 @@ def test_stop_and_peak_evolve_monotonically_without_turning_missing_values_into_
     confirmed = confirm_protective_stop(
         improved,
         intent=stop_intent,
-        stop_price=Decimal("45"),
+        stop_price=Decimal("50"),
         client_order_id="stop-client-1",
         broker_order_id="stop-broker-1",
         observed_at=datetime(2026, 10, 1, 13, 31, tzinfo=UTC),
     )
+    assert confirmed.confirmed_protective_stop_price == Decimal("50")
+    with pytest.raises(ValueError, match="monotonic"):
+        propose_stop_update(
+            confirmed,
+            decision=_decision("c" * 64, category=DecisionCategory.EXIT, subject_type=DecisionSubjectType.HOLDING),
+            stop_price=Decimal("48"),
+        )
     next_proposal, _ = propose_stop_update(
         confirmed,
         decision=_decision("b" * 64, category=DecisionCategory.EXIT, subject_type=DecisionSubjectType.HOLDING),
-        stop_price=Decimal("48"),
+        stop_price=Decimal("51"),
     )
-    assert next_proposal.proposed_stop_price == Decimal("48")
+    assert next_proposal.proposed_stop_price == Decimal("51")
     with pytest.raises(ValueError, match="monotonic"):
         update_holding_marks(
             improved,

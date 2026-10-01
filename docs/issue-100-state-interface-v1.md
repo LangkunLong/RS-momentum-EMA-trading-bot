@@ -64,8 +64,10 @@ broker-confirmed protective stop with client/broker order references and
 observation time, holding peak, last accepted policy session, persistent
 policy flags, policy tier, and pending action identities. A stop proposal is
 not represented as broker protection until the matching confirmation arrives.
-Unavailable prices/risk remain `None`. Peaks and confirmed stops are
-monotonic under this contract.
+Each new proposal is checked against both the latest proposal and the strongest
+broker-confirmed stop, so a broker confirmation better than requested cannot
+enable a weaker subsequent proposal. Unavailable prices/risk remain `None`.
+Peaks and confirmed stops are monotonic under this contract.
 
 `ActionIntent` has a stable logical identity separate from attempt identities.
 Entry/add-on/replacement IDs include generation, decision, security, role and
@@ -83,6 +85,16 @@ allows the one remainder attempt. A second terminal underfill becomes
 tier advancement. A proposal, cancel request, timeout, or underfill does not
 advance a tier. A close cannot supersede an unresolved tier or unreconciled
 position fact.
+
+A fill watermark update does not clear `cancel_requested` or
+`reconciliation_required`; only explicit terminal/reconciliation evidence may
+clear those states. A late fill observation after broker-terminal evidence is
+retained and marks the attempt/action `reconciliation_required`, preserving the
+terminal fact separately. The initial and attempt-numbered fill APIs share
+these rules. If a remainder was already issued, its requested quantity stays
+fixed when an earlier attempt's cumulative fill is corrected. Aggregate fills
+above the logical target remain visible as reconciliation-required exposure;
+they cannot silently reset the remainder or become ready for another order.
 
 Every confirmed cumulative-fill update carries attempt number, stable provider
 event ID and immutable payload digest, cumulative quantity, cumulative notional
