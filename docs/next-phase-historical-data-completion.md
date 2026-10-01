@@ -1,6 +1,6 @@
 # Lead A acceptance packet — historical integration
 
-Prepared 2026-10-01. **Implementation and bounded assessments are ready for final principal acceptance and normal merge, subject to required CI. Publication/merge are pending. No achieved-goal notification has been sent.** Full #68/#69/#70 production data delivery remains incomplete.
+Prepared 2026-10-01. **Implementation and bounded assessments are ready for final principal acceptance and normal merge, subject to required CI. Published as PR #117; merge is pending. No achieved-goal notification has been sent.** Full #68/#69/#70 production data delivery remains incomplete.
 
 ## Exact source and integration
 
@@ -85,4 +85,4 @@ No operational database, scheduler, broker or paper state changed. No provider/m
 
 ## Publication and final acceptance
 
-No issue is closed by this package. Ready for principal final review and normal eligible merge after required CI. The principal owns final acceptance/merge and may then accept #72's implementation criteria; full #68/#69/#70 remain open. Record PR/head, hosted checks, actual merge and the single completion-message receipt in the ledger when they occur. Until then this is a reviewed acceptance-ready package, not a claim that the phase has been merged or its goal achieved.
+Published [PR #117](https://github.com/LangkunLong/RS-momentum-EMA-trading-bot/pull/117), initially at packet commit `9e80525`. No issue is closed by this package. Ready for principal final review and normal eligible merge after required CI. The principal owns final acceptance/merge and may then accept #72's implementation criteria; full #68/#69/#70 remain open. Record PR/head, hosted checks, actual merge and the single completion-message receipt in the ledger when they occur. Until then this is a reviewed acceptance-ready package, not a claim that the phase has been merged or its goal achieved.

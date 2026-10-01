@@ -42,7 +42,7 @@ Independent review refines the minimum boundary to deterministic V3 lineage-memb
 
 ## Review, publication and notification
 
-Bounded #69/#70 and corrected #72 reviews are accepted and integrated locally. Final integration and documentation reviews passed. Required hosted CI/publication and principal acceptance/merge remain ahead. No next-phase PR, remote merge, issue closure or achieved-goal notification yet. Store ready PR and exact evidence here for principal inspection; send the single final completion message only after accepted/merged #72 and both reviewed bounded reports are delivered.
+Bounded #69/#70 and corrected #72 reviews are accepted and integrated locally. Final integration and documentation reviews passed. PR #117 is published. Required hosted CI and principal acceptance/merge remain ahead. PR #117 published; no remote merge, issue closure or achieved-goal notification yet. Store ready PR and exact evidence here for principal inspection; send the single final completion message only after accepted/merged #72 and both reviewed bounded reports are delivered.
 
 ### Launch receipts
 
@@ -92,3 +92,5 @@ Bounded #69/#70 and corrected #72 reviews are accepted and integrated locally. F
 
 - Final independent integration and documentation reviews PASS; public copies `docs/lead-a-historical-final-integration-review.md` and `docs/lead-a-historical-final-documentation-review.md`. Publication ready under existing authority; requiredCI and principal final acceptance/normal merge remain gates.
 - Authorized final interface disclosures successfully delivered to peer B `01a0f851-c7ac-7b81-87ab-3de389d47510` and peer C `01a0f851-dfb4-7081-90c1-81131013fee2`: exact final implementation40f6, unchanged61/58context map and71calculator, no production admission or new image execution. No principal progress/completion message sent.
+
+- Published reviewed PR **#117**: https://github.com/LangkunLong/RS-momentum-EMA-trading-bot/pull/117, initial packet head `9e80525`, using normal fast-forward push of preserved `codex/four-issue-integration`; attached to this chat. Required hosted checks and principal final acceptance/normal merge pending. No principal achieved-goal message sent; no issue auto-closure requested.
