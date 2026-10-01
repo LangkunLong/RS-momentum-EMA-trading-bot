@@ -26,7 +26,49 @@ from core.canslim.entry_contract import (
     MIN_RS_SCORE as CANONICAL_MIN_RS_SCORE,
     CanslimEntryDecision,
 )
+from core.data_client import fmp_request_deferral_reason
 from core.momentum_analysis import calculate_rs_scores_for_tickers
+from core.scheduler_observation import current_scheduler_observation
+
+
+def _record_candidate_observation(
+    symbol: str,
+    category: str,
+    reasons: list[str],
+    metrics: dict[str, object],
+    *,
+    analyzed: bool,
+) -> None:
+    observation = current_scheduler_observation()
+    if observation is None:
+        return
+    coverage_keys = {
+        "quarterly_income": "quarterly_income_available",
+        "annual_income": "annual_income_available",
+        "balance_sheet": "balance_sheet_available",
+    }
+    fundamental_coverage = {
+        endpoint: (
+            "available" if bool(metrics[key]) else "unavailable"
+        )
+        for endpoint, key in coverage_keys.items()
+        if key in metrics
+    }
+    deferral_reason = metrics.get("fmp_deferral_reason")
+    if metrics.get("fmp_quota_deferred") and not deferral_reason:
+        deferral_reason = fmp_request_deferral_reason()
+    observation.record_scan_coverage(
+        candidate_outcomes=[
+            {
+                "symbol": symbol,
+                "category": category,
+                "reasons": reasons,
+                "analyzed": analyzed,
+                "fundamental_coverage": fundamental_coverage,
+                "fmp_deferral_reason": deferral_reason,
+            }
+        ]
+    )
 
 
 def _classify_canslim_candidate(
@@ -144,6 +186,13 @@ def evaluate_stock_canslim(
         as_of_session=as_of_session,
     )
     if not canslim_view:
+        _record_candidate_observation(
+            symbol,
+            "unavailable",
+            ["canslim_evaluation_unavailable"],
+            {},
+            analyzed=False,
+        )
         _debug("[DEBUG] CANSLIM evaluation unavailable.")
         _flush_logs()
         return None
@@ -213,6 +262,14 @@ def evaluate_stock_canslim(
         require_fundamentals=require_fundamentals,
         strict_breakout=strict_breakout,
     )
+    if category == "rejected":
+        _record_candidate_observation(
+            symbol,
+            category,
+            notes,
+            metrics,
+            analyzed=True,
+        )
     canslim_view["scanner_category"] = category
     canslim_view["scanner_notes"] = notes
 
@@ -309,11 +366,15 @@ def screen_stocks_canslim_detailed(
     rs_score_by_symbol: Dict[str, float] = {}
     rs_below_threshold = 0
     rs_not_found = 0
+    rs_covered = 0
+    observation = current_scheduler_observation()
     for symbol in symbols_list:
         try:
             match = rs_scores_df[rs_scores_df["Ticker"] == symbol]
             if not match.empty:
                 rs_val = float(match.iloc[0]["RS_Score"])
+                if pd.notna(match.iloc[0]["RS_Score"]):
+                    rs_covered += 1
             else:
                 rs_val = 0
                 rs_not_found += 1
@@ -326,11 +387,31 @@ def screen_stocks_canslim_detailed(
             rs_score_by_symbol[symbol] = rs_val
         else:
             rs_below_threshold += 1
+            if observation is not None:
+                reason = (
+                    "rs_score_unavailable"
+                    if match.empty or pd.isna(match.iloc[0]["RS_Score"])
+                    else "below_canonical_rs_floor"
+                )
+                observation.record_scan_coverage(
+                    candidate_outcomes=[
+                        {
+                            "symbol": symbol,
+                            "category": "rejected",
+                            "reasons": [reason],
+                            "analyzed": False,
+                            "fundamental_coverage": {},
+                        }
+                    ]
+                )
             if debug:
                 print(
                     f"[DEBUG] Pre-filter: {symbol} RS={rs_val:.1f} < "
                     f"{effective_rs_floor:.1f}, skipped"
                 )
+
+    if observation is not None:
+        observation.record_scan_coverage(rs_covered=rs_covered)
 
     if debug:
         print(
@@ -345,7 +426,7 @@ def screen_stocks_canslim_detailed(
     # Evaluate remaining symbols in parallel
     def _evaluate(sym: str) -> Optional[Dict[str, object]]:
         try:
-            return evaluate_stock_canslim(
+            evaluation = evaluate_stock_canslim(
                 symbol=sym,
                 min_rs_score=min_rs_score,
                 min_canslim_score=min_canslim_score,
@@ -360,7 +441,52 @@ def screen_stocks_canslim_detailed(
             )
         except Exception as exc:
             print(f"Error analyzing {sym}: {exc}")
+            if observation is not None:
+                observation.record_scan_coverage(
+                    candidate_outcomes=[
+                        {
+                            "symbol": sym,
+                            "category": "analysis_failed",
+                            "reasons": [type(exc).__name__],
+                            "analyzed": False,
+                            "fundamental_coverage": {},
+                        }
+                    ]
+                )
+                observation.latch_service_issue(
+                    "candidate_analysis_failed",
+                    {"symbol": sym, "error_type": type(exc).__name__},
+                )
             return None
+        if observation is not None:
+            if evaluation is None:
+                observation.record_scan_coverage(
+                    candidate_outcomes=[
+                        {
+                            "symbol": sym,
+                            "category": "not_emitted",
+                            "reasons": ["evaluation_did_not_emit_candidate"],
+                            "analyzed": False,
+                            "fundamental_coverage": {},
+                        }
+                    ]
+                )
+            else:
+                metrics = evaluation.get("metrics", {})
+                _record_candidate_observation(
+                    sym,
+                    str(evaluation.get("scanner_category", "unclassified")),
+                    list(evaluation.get("scanner_notes", [])),
+                    metrics if isinstance(metrics, dict) else {},
+                    analyzed=True,
+                )
+                observation.record_event(
+                    "candidate_analysis",
+                    sym,
+                    str(evaluation.get("scanner_category", "unclassified")),
+                    {"reasons": evaluation.get("scanner_notes", [])},
+                )
+        return evaluation
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(_evaluate, sym): sym for sym in filtered_symbols}

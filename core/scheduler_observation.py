@@ -45,7 +45,7 @@ def _safe_string(value: str) -> str:
 
 
 def _safe_value(value: Any, *, depth: int = 0) -> Any:
-    if depth > 3:
+    if depth > 6:
         return "[TRUNCATED]"
     if value is None or isinstance(value, (bool, int, float)):
         return value
@@ -80,6 +80,15 @@ class SchedulerObservation:
             "workflow_snapshot_writes": 0,
         }
         self._provider_counters: dict[str, dict[str, Any]] = {}
+        self._scan_candidates: dict[str, dict[str, Any]] = {}
+        self._scan_coverage: dict[str, Any] = {
+            "requested": 0,
+            "validated": 0,
+            "analyzed": 0,
+            "rs_covered": 0,
+            "fundamental_covered": 0,
+            "candidate_outcomes": [],
+        }
         self._service_health = "healthy"
         self._required_input_coverage = "complete"
 
@@ -185,6 +194,61 @@ class SchedulerObservation:
                 {"transitions": transitions, "snapshots": snapshots},
             )
 
+    def record_scan_coverage(
+        self,
+        *,
+        requested: int | None = None,
+        validated: int | None = None,
+        rs_covered: int | None = None,
+        candidate_outcomes: list[Mapping[str, Any]] | None = None,
+    ) -> None:
+        """Record full-universe scan counts and per-symbol outcomes."""
+        with self._lock:
+            if requested is not None:
+                self._scan_coverage["requested"] = max(0, int(requested))
+            if validated is not None:
+                self._scan_coverage["validated"] = max(0, int(validated))
+            if rs_covered is not None:
+                self._scan_coverage["rs_covered"] = max(0, int(rs_covered))
+            for candidate in candidate_outcomes or []:
+                safe = _safe_value(candidate)
+                symbol = str(safe.get("symbol", ""))
+                if not symbol:
+                    continue
+                endpoint_coverage = dict(safe.get("endpoint_coverage", {}))
+                for gap in self._input_gaps:
+                    if gap["symbol"] == symbol:
+                        endpoint_coverage[gap["endpoint"]] = {
+                            "status": gap["coverage_status"],
+                            "reason": gap["reason"],
+                        }
+                safe["endpoint_coverage"] = endpoint_coverage
+                prior = self._scan_candidates.get(symbol, {})
+                if prior and safe.get("category") == "not_emitted":
+                    prior["endpoint_coverage"] = {
+                        **prior.get("endpoint_coverage", {}),
+                        **endpoint_coverage,
+                    }
+                    continue
+                self._scan_candidates[symbol] = safe
+            self._scan_coverage["candidate_outcomes"] = [
+                self._scan_candidates[symbol]
+                for symbol in sorted(self._scan_candidates)
+            ]
+            self._scan_coverage["analyzed"] = sum(
+                1
+                for candidate in self._scan_candidates.values()
+                if candidate.get("analyzed") is True
+            )
+            self._scan_coverage["fundamental_covered"] = sum(
+                1
+                for candidate in self._scan_candidates.values()
+                if candidate.get("fundamental_coverage", {}).get("quarterly_income")
+                == "available"
+                and candidate.get("fundamental_coverage", {}).get("annual_income")
+                == "available"
+            )
+
     def record_provider_event(
         self,
         provider: str,
@@ -265,6 +329,7 @@ class SchedulerObservation:
                     }
                     for provider, counter in self._provider_counters.items()
                 },
+                "scan_coverage": _safe_value(self._scan_coverage),
             }
 
 
@@ -341,4 +406,21 @@ def record_input_gap(
     if observation is not None:
         observation.record_input_gap(
             symbol, endpoint, reason, coverage_status=coverage_status
+        )
+
+
+def record_scan_coverage(
+    *,
+    requested: int | None = None,
+    validated: int | None = None,
+    rs_covered: int | None = None,
+    candidate_outcomes: list[Mapping[str, Any]] | None = None,
+) -> None:
+    observation = current_scheduler_observation()
+    if observation is not None:
+        observation.record_scan_coverage(
+            requested=requested,
+            validated=validated,
+            rs_covered=rs_covered,
+            candidate_outcomes=candidate_outcomes,
         )
