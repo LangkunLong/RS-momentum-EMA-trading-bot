@@ -1550,6 +1550,40 @@ def _issue90_artifact_path(root: Path, stem: str) -> Path:
         index += 1
 
 
+def _issue90_evidence_root(tmp_path: Path) -> Path:
+    """Keep ordinary test artifacts under conftest's per-test cleanup root."""
+
+    evidence_directory = os.environ.get("ISSUE_90_EVIDENCE_DIR")
+    return Path(evidence_directory).absolute() if evidence_directory else tmp_path
+
+
+def test_issue90_evidence_root_selection_and_run_uniqueness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("ISSUE_90_EVIDENCE_DIR", raising=False)
+    assert _issue90_evidence_root(tmp_path) == tmp_path
+
+    first_default_run = _issue90_artifact_path(tmp_path, "run")
+    first_default_run.mkdir()
+    second_default_run = _issue90_artifact_path(tmp_path, "run")
+    assert first_default_run == tmp_path / "run-01"
+    assert second_default_run == tmp_path / "run-02"
+
+    explicit_root = tmp_path / "retained-evidence"
+    monkeypatch.setenv("ISSUE_90_EVIDENCE_DIR", str(explicit_root))
+    selected_root = _issue90_evidence_root(tmp_path)
+    assert selected_root == explicit_root.absolute()
+    selected_root.mkdir(parents=True)
+    marker = selected_root / "preserve.json"
+    marker.write_text("{}", encoding="utf-8")
+    first_retained_run = _issue90_artifact_path(selected_root, "run")
+    first_retained_run.mkdir()
+    second_retained_run = _issue90_artifact_path(selected_root, "run")
+    assert second_retained_run == selected_root / "run-02"
+    assert marker.exists()
+
+
 def _issue90_persist_recovery_record(name: str, evidence: dict[str, object]) -> None:
     evidence_directory = os.environ.get("ISSUE_90_EVIDENCE_DIR")
     if not evidence_directory:
@@ -2575,28 +2609,27 @@ def _assert_synthetic_role_admission(request, manifest) -> tuple[int, Decimal]:
 
 
 def test_full_runtime_run_supplied_ports_publishes_after_current_critic_evidence(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The supplied-port runtime runs the real role/checkpoint chronology once."""
 
     evidence_directory = os.environ.get("ISSUE_90_EVIDENCE_DIR")
-    evidence_root = (
-        Path(evidence_directory).absolute()
-        if evidence_directory
-        else Path(__file__).resolve().parents[1] / ".artifacts" / "issue-90"
-    )
+    evidence_root = _issue90_evidence_root(tmp_path)
     evidence_root.mkdir(parents=True, exist_ok=True)
     fixture_root = _issue90_artifact_path(evidence_root, "run")
     calibration_root = fixture_root / "c"
     acceptance_root = fixture_root / "a"
+    diagnostic_base = _issue90_artifact_path(evidence_root, "diag")
+    controller_store = _issue90_artifact_path(evidence_root, "ctl")
     longest_fixture_filename = Path("adapter-state-authority") / "mechanism-v5" / ("f" * 64 + "-binding.json")
     planned_roots = tuple(
         root.absolute()
         for root in (
             calibration_root,
             acceptance_root,
-            evidence_root / "diag-01",
-            evidence_root / "ctl-01",
+            diagnostic_base,
+            controller_store,
         )
     )
     preflight_paths = tuple((root / longest_fixture_filename).absolute() for root in planned_roots)
@@ -2792,6 +2825,7 @@ def test_full_runtime_run_supplied_ports_publishes_after_current_critic_evidence
     first_reopen = reopened_next_request()
     second_reopen = reopened_next_request()
     next_request = first_reopen[-1]
+    assert next_request.sha256 == "e05e0c901d01238de4b7353d27bdc8d36e11352ebe4f42bc28b74523ab5a0432"
     assert second_reopen[-1].sha256 == next_request.sha256
     assert second_reopen[-1].messages == next_request.messages
     assert canonical_json_bytes_v5(second_reopen[-1].to_primitive()) == canonical_json_bytes_v5(
@@ -2847,7 +2881,6 @@ def test_full_runtime_run_supplied_ports_publishes_after_current_critic_evidence
     # reconstructed above from the reopened store.
     longest_store_path = max(len(str(path.absolute())) for path in acceptance_root.rglob("*"))
     assert longest_store_path < 260, f"fixture store path exceeds the Windows path limit: {longest_store_path}"
-    diagnostic_base = _issue90_artifact_path(evidence_root, "diag")
     shutil.copytree(acceptance_root, diagnostic_base)
 
     controller_requests = []
@@ -2983,7 +3016,6 @@ def test_full_runtime_run_supplied_ports_publishes_after_current_critic_evidence
     )
     assert diagnostic_candidate_observations == {"quick": 3, "discovery": 12}
 
-    controller_store = _issue90_artifact_path(evidence_root, "ctl")
     shutil.copytree(acceptance_root, controller_store)
     if evidence_directory:
         diagnostic_evidence = {
