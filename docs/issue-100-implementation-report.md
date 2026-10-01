@@ -3,10 +3,10 @@
 ## Source checkpoint
 
 - Base: `ab385d792e19ff6db39d87f1123f47f660fc1e1d`
-- Policy-state source head: `43a0820dea9688fd8583f45ccb9704f172553954`
-- Review range: `ab385d792e19ff6db39d87f1123f47f660fc1e1d..43a0820dea9688fd8583f45ccb9704f172553954`
-- Full binary patch SHA-256 for that range: `4a4cfc9fbaf8e541a54c14453e1ec719efbd7ad8b570cadde859d49b23ce4734`
-- Commits in the Issue #100 range: `6bbf20a`, `cd16eca`, `65472df`, `243cf59`, `2557184`, `446d2e1`, `aef51d0`, `704cdb8`, `d52fb22`, `67ad856`, `c2b6111`, `b786a08`, `963a61f`, `43a0820`.
+- Policy-state source head: `2881118393ab99bf02037230cfe76d4160f69bae`
+- Review range: `ab385d792e19ff6db39d87f1123f47f660fc1e1d..2881118393ab99bf02037230cfe76d4160f69bae`
+- Full binary patch SHA-256 for that range: `c4fc129e8de89da10d3c50e8a78147c7dd551ab77075e6a6eb3276accb27ec2f`
+- Commits in the Issue #100 range: `6bbf20a`, `cd16eca`, `65472df`, `243cf59`, `2557184`, `446d2e1`, `aef51d0`, `704cdb8`, `d52fb22`, `1847869`, `67ad856`, `c2b6111`, `b786a08`, `963a61f`, `d8e383e`, `43a0820`, `bfcaa5a`, `2881118`.
 
 This report is a docs-only follow-up to the source head above. It does not
 change the source range or the source checksums below.
@@ -30,6 +30,14 @@ Binding late order references to a formerly finalized holding action reopens
 the action and restores its pending conflict on the holding in the same
 transaction, recording a new holding version and history event while retaining
 any other pending action IDs.
+
+`REPLACEMENT` is an opening buy role. Its logical action identity stays fixed
+when the first confirmed fill creates and attaches its holding. First partial
+and full fills create a generation/security/action-pinned holding; later
+cumulative fills continue that opening quantity, cost basis and committed risk
+without counting as an addition. Residual cash/risk and pending state remain
+on the action, partial replacement exposure can receive protective-stop
+updates, and unrelated existing holdings cannot be attached to the action.
 
 `core/policy_execution_store.py` is an independent SQLite store. Callers must
 provide both `db_path` and `store_identity`; it reads no configured/default
@@ -73,9 +81,9 @@ limitation is explicit in the interface contract.
 | --- | --- |
 | Identity, decision clocks, decision-slot conflict handling and stable action identity | Pure state suite; explicit deployment/account/store identity and clock values; durable decision and tier uniqueness tests. |
 | Additive schema, exact-path isolation, rollback and legacy preservation | Temporary database tests compare representative legacy table schemas and rows before/after migration and rollback; injected intermediate DDL failure leaves no policy tables; rollback refuses nonempty policy state. Holding flag reconciliation evidence is included in history. |
-| Fill receipts, cumulative quantities, accounting, history and idempotency | Temporary database tests verify atomic rollback on injected action-write failure, opening holding creation/continuation, same-event replay, conflicting payload rejection and same-watermark zero-delta behavior. An explicit test confirms known monetary facts at an unchanged quantity watermark remain receipt-only. |
+| Fill receipts, cumulative quantities, accounting, history and idempotency | Temporary database tests verify atomic rollback on injected action-write failure, opening holding creation/continuation, same-event replay, conflicting payload rejection and same-watermark zero-delta behavior. Replacement tests cover first partial/full fills, a later cumulative fill, residual cash/risk, stable action/holding IDs, cost basis, committed risk, canonical restart reads, exact receipt replay/conflict, stale action/holding CAS, and unrelated-holding rejection. An explicit test confirms known monetary facts at an unchanged quantity watermark remain receipt-only. |
 | Issued-order uncertainty, remainders, late fills, aliases and explicit resolution | Pure transition tests cover cancel/terminal/remainder gates, live remainder fills, late terminal fills, above-target reconciliation, unissued resolution and cross-attempt alias rejection. Store tests cover late references retaining uncertainty, completed-tier late-fill resolution, provider-scoped alias ancestry/version/history, and issued versus unissued resolution. |
-| Versioned stop proposal and broker confirmation | Temporary database test replays a proposal using its old holding version, rejects changed proposal facts, persists a better confirmed stop price, and replays confirmation idempotently. A partially filled entry can coexist with stop protection under the constrained helper path; lead's scoped review of finding 6 approved it. |
+| Versioned stop proposal and broker confirmation | Temporary database test replays a proposal using its old holding version, rejects changed proposal facts, persists a better confirmed stop price, and replays confirmation idempotently. Partially filled entries and replacements can coexist with stop protection under the constrained helper path. The replacement lifecycle also rejects stale holding versions before accepting protection against the reloaded quantity; lead's scoped review of finding 6 covered entry protection only. |
 | Combined snapshot with generation-pinned ancestry | Temporary database test loads a generation B portfolio alongside generation A's holding/action, checks both row versions and the original action clock, omits an unrelated terminal action, then updates the holding through a fresh store instance using the returned version. The snapshot API docstrings now describe the account/store scope. |
 | Runtime containment | Tests create databases only under pytest `tmp_path`; the fixture seeds a synthetic legacy workflow row. No broker/provider, scheduler, runtime, configured database, or operational migration is invoked. `core/execution_store.py` and `core/execution_workflow.py` are unchanged. |
 
@@ -84,12 +92,13 @@ limitation is explicit in the interface contract.
 | Finding | Current disposition |
 | --- | --- |
 | Addition fills must preserve unknown aggregate risk | Corrected in `c2b6111`; lead's scoped independent re-review approved finding 1 with no new Critical/Important regression. |
-| Late reference binding must preserve action uncertainty and holding conflicts | Corrected in `b786a08` and `43a0820`; finalized holding actions reopen with the reconciliation action restored to the holding in one transaction. The new resolved-addition test preserves another pending ID, blocks a competing action, records terminal evidence and explicit resolution, then checks restart state. Re-review of the final correction is pending. |
+| Late reference binding must preserve action uncertainty and holding conflicts | Corrected in `b786a08` and `43a0820`; finalized holding actions reopen with the reconciliation action restored to the holding in one transaction. The new resolved-addition test preserves another pending ID, blocks a competing action, records terminal evidence and explicit resolution, then checks restart state. An earlier report left re-review pending; the principal's later full review lists C-R1 below as the sole remaining source finding. |
 | Public holding writer must not change confirmed quantity or protection state | Corrected in `963a61f`; the independent review approved this finding. The writer accepts only evidence-backed reconciliation-flag changes and compares immutable opening quantity; focused store tests cover bypass rejection and history evidence. |
 | Late fill after a completed scale-out must remain explicitly resolvable | Corrected in `963a61f`; the independent review approved this finding. Extra fills register a pending reconciliation action, explicit resolution clears it without advancing the tier, and restart reads preserve the result. |
 | Provider-scoped aliases must remain readable, auditable and versioned | Corrected in `963a61f`; the independent review approved this finding. Duplicate external IDs across providers appear once in flattened aliases, retain each scoped record in projections/history, and increment state version. |
 | Partial-entry stop protection must coexist with the pending entry | Corrected in `67ad856`; the independent review approved finding 6. Lead reports all five expanded combined-chain cases passed at source map `549f8d3` (`963a61f` plus consumer `2cf4bdf`), including alias restart. This run predates the final `43a0820` correction. |
 | Active pointer CAS must reject an A → B → A stale writer | Corrected in `963a61f`; the independent review approved this finding. Pointer load exposes version, writes compare generation and version, and the ABA test rejects A/version-1 against A/version-3. |
+| C-R1: replacement opening fills were not persisted or linked to a holding | Corrected in `2881118`. Replacement keeps its pre-fill action ID as the holding attaches, creates a holding on the first positive partial or full fill, applies later opening quantity/cost/risk, retains residual reservations and pending protection, and appears in canonical restart reads. Pure and temporary-store tests cover these cases and reject unrelated holding attachment. The principal classified this finding Important/P2 in the frozen review `2026-10-01-lead-c-ea2e145-independent-review.md` (SHA-256 `a301f76a217f8ff970513d6ea7429c4386c14656bf0450a464a1ef3f287d6c49`); re-review of this correction and the combined chain remain pending. |
 
 ## Synthetic fixture identities and digests
 
@@ -115,19 +124,30 @@ Content digests at the source head:
 
 | File | SHA-256 |
 | --- | --- |
-| `core/policy_execution_state.py` | `739a8a1b1fcc0000d0db027bcf813dddfed069693160cc66a367bf6fc7913032` |
-| `core/policy_execution_store.py` | `db630ca4d775b0c5ec395251762b7018cd6679e1a553a0121a137e7cb1c122af` |
-| `tests/test_policy_execution_state.py` | `1f3129eb146a4419eea9fb6393d05a817361b034ce5a820763d5d944d1a74d16` |
-| `tests/test_policy_execution_store.py` | `ab912504c0b665838b3506677d3d267a54ec8a876849a173a3d4b52b4b8451b8` |
-| `docs/issue-100-state-interface-v1.md` | `e8ba0892d275dfaa9a80a037d936217e0956c496525b4c82d09207fb4eadd1b7` |
+| `core/policy_execution_state.py` | `0aab4b15cd5418dbefab4892d941ac8317afe00abcac6e846c8bf853dff90f4c` |
+| `core/policy_execution_store.py` | `1f71dc3d45d1e6b447b2f88c4d1d17df6817ce78d54c6f7d8ec9988dfcd6819d` |
+| `tests/test_policy_execution_state.py` | `7dd06766131ac98cb02aa363da556a8abaa1eaf2abf2f811cbb6d3e29bdeafb4` |
+| `tests/test_policy_execution_store.py` | `cdee3e3a771fde1b1945f35b9977579a3620e320351a02d4b9e264c8b546d449` |
+| `docs/issue-100-state-interface-v1.md` | `79c8244200f25912d0ae179e7f521514f1f846976c90558559a60d991813b3fc` |
 
 ## Verification
 
-Commands run at the source head `43a0820dea9688fd8583f45ccb9704f172553954`:
+The earlier source checkpoint `43a0820dea9688fd8583f45ccb9704f172553954`
+had 43 focused tests passing and a reported patch SHA-256 of
+`4a4cfc9fbaf8e541a54c14453e1ec719efbd7ad8b570cadde859d49b23ce4734`. That
+checkpoint predates replacement-fill coverage and is retained as historical
+evidence only. The replacement TDD baseline failed on all five selected cases
+before the correction: identity changed after attachment, partial replacement
+protection was rejected, and both first partial/full replacement fills failed
+to create holdings. The unrelated-holding fixture first hit a conflicting
+decision slot before reaching the store guard; its corrected fixture passes
+in the final focused run.
+
+Commands run at source head `2881118393ab99bf02037230cfe76d4160f69bae`:
 
 ```text
 py -3.13 -m pytest -p no:cacheprovider -o addopts='' tests/test_policy_execution_state.py tests/test_policy_execution_store.py
-43 passed
+48 passed
 
 py -3.13 -m ruff check core/policy_execution_state.py core/policy_execution_store.py tests/test_policy_execution_state.py tests/test_policy_execution_store.py
 All checks passed
@@ -135,31 +155,34 @@ All checks passed
 git diff --check
 Passed
 
-Commit hooks at `43a0820`
+Commit hooks at `2881118`
 ruff, trailing whitespace, end-of-file and merge-conflict checks passed
 ```
 
 Pytest emits one configuration warning because disabling the cache plugin also
 disables the repository's configured `cache_dir` option. Git also warns that
-the four changed source/test/docs files use LF in the worktree and will be
-converted to CRLF on a future Git touch. No broader test suite was run.
+the five changed source/test/interface files use LF in the worktree and will
+be converted to CRLF on a future Git touch. No broader test suite or combined
+#99/#100 chain was run.
 
 ## Issue assessment
 
-- **Implementation:** All seven producer-side review findings have code fixes
-  at `43a0820`. Findings 1, 3–7 have scoped review approval. Finding 2's
-  holding-backed late-reference correction was added after the latest review
-  and awaits re-review.
+- **Implementation:** The seven earlier producer-side findings have code
+  fixes through `43a0820`. The principal's later full review names C-R1 below
+  as the sole remaining producer-side source finding. Its replacement
+  correction is at `2881118` and awaits principal re-review.
 - **Required inputs:** Synthetic identities, fixed decisions, and explicit
   temporary SQLite databases were available. Lead reports the five-case
   combined chain passed at the earlier `963a61f` producer / `2cf4bdf` consumer
   source map, including alias restart.
-- **Acceptance evidence:** The 43 focused pure-state/store tests, Ruff, diff
-  check, and commit hooks pass. The combined-chain receipt predates
-  `43a0820`, so rerunning it against the final source remains pending.
-- **Dependencies:** Re-review of the final finding 2 correction and a combined
-  #99/#100 rerun at `43a0820` remain outstanding. No overall issue acceptance
-  or #97 runtime activation/readiness acceptance is claimed.
+- **Acceptance evidence:** The two focused producer modules pass 48 tests,
+  including replacement first partial/full fills, cumulative continuation,
+  residual cash/risk, protection, receipt replay/conflict and canonical
+  restart selection. Ruff, diff check, and source commit hooks pass. The new
+  combined #99/#100 chain has not been rerun at `2881118`.
+- **Dependencies:** Principal review of the C-R1 correction and a combined
+  #99/#100 rerun at `2881118` remain outstanding. No overall issue acceptance or #97 runtime
+  activation/readiness acceptance is claimed.
 
 ## Remaining integration boundary
 
