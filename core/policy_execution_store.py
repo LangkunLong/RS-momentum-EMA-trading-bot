@@ -33,6 +33,7 @@ from core.policy_execution_state import (
     OrderSide,
     PolicyDeploymentIdentity,
     PortfolioStateSnapshot,
+    ProviderOrderReference,
     StopUpdateIntent,
     add_attempt_order_aliases,
     advance_holding_exit_tier,
@@ -46,6 +47,7 @@ from core.policy_execution_state import (
     project_action_state,
     propose_stop_update as propose_stop_in_state,
     register_pending_action,
+    register_reconciliation_action,
     request_attempt_cancel,
     resolve_action,
     update_holding_marks,
@@ -77,7 +79,7 @@ class SchemaRollbackBlockedError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class PolicyExecutionReadSnapshot:
-    """One transactionally consistent generation-scoped consumer read."""
+    """One consistent account/store read selected by a portfolio generation."""
 
     deployment_identity: PolicyDeploymentIdentity
     portfolio_snapshot: PortfolioStateSnapshot
@@ -97,6 +99,15 @@ class PolicyDeploymentChain:
     pointer_version: int | None
     readiness_state: str | None
     events: tuple[Mapping[str, object], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveGenerationPointer:
+    """Active generation and the version a caller must include in its next write."""
+
+    active_generation_id: str | None
+    pointer_version: int | None
+    readiness_state: str | None
 
 
 SCHEMA_V1_STATEMENTS: tuple[str, ...] = (
@@ -350,6 +361,7 @@ SCHEMA_V1_STATEMENTS: tuple[str, ...] = (
         event_kind TEXT NOT NULL,
         state_sha256 TEXT NOT NULL,
         state_json TEXT NOT NULL,
+        evidence_ref TEXT,
         observed_at_utc TEXT NOT NULL,
         PRIMARY KEY (holding_episode_id, state_version),
         FOREIGN KEY (holding_episode_id) REFERENCES policy_state_holdings(holding_episode_id) ON DELETE RESTRICT,
@@ -648,7 +660,7 @@ def _action_from_row(conn: sqlite3.Connection, row: sqlite3.Row) -> ActionIntent
     alias_rows = conn.execute(
         """SELECT attempt_number, reference_kind, external_order_id
            FROM policy_state_order_reference_aliases
-           WHERE logical_action_id=? ORDER BY first_seen_at_utc, external_order_id""",
+           WHERE logical_action_id=? ORDER BY first_seen_at_utc, provider_id, external_order_id""",
         (row["logical_action_id"],),
     ).fetchall()
     aliases_by_attempt: dict[int, dict[str, list[str]]] = {}
@@ -657,7 +669,9 @@ def _action_from_row(conn: sqlite3.Connection, row: sqlite3.Row) -> ActionIntent
             int(alias["attempt_number"]),
             {"client_order_id": [], "broker_order_id": []},
         )
-        refs[str(alias["reference_kind"])].append(str(alias["external_order_id"]))
+        external_id = str(alias["external_order_id"])
+        if external_id not in refs[str(alias["reference_kind"])]:
+            refs[str(alias["reference_kind"])].append(external_id)
     attempts = tuple(
         ActionOrderAttempt(
             attempt_number=int(attempt["attempt_number"]),
@@ -701,6 +715,45 @@ def _action_from_row(conn: sqlite3.Connection, row: sqlite3.Row) -> ActionIntent
         rounding_rule_id=row["rounding_rule_id"],
         order_attempts=attempts,
         resolution_reason=row["resolution_reason"],
+    )
+
+
+def _provider_order_references(
+    conn: sqlite3.Connection,
+    logical_action_id: str,
+) -> tuple[ProviderOrderReference, ...]:
+    rows = conn.execute(
+        """SELECT provider_id, paper_account_environment_id, store_identity, reference_kind,
+                  external_order_id, attempt_number, source_payload_sha256, first_seen_at_utc
+           FROM policy_state_order_reference_aliases
+           WHERE logical_action_id=?
+           ORDER BY provider_id, reference_kind, external_order_id, first_seen_at_utc""",
+        (logical_action_id,),
+    ).fetchall()
+    return tuple(
+        ProviderOrderReference(
+            provider_id=str(row["provider_id"]),
+            paper_account_environment_id=str(row["paper_account_environment_id"]),
+            store_identity=str(row["store_identity"]),
+            reference_kind=str(row["reference_kind"]),
+            external_order_id=str(row["external_order_id"]),
+            attempt_number=int(row["attempt_number"]),
+            source_payload_sha256=str(row["source_payload_sha256"]),
+            first_seen_at_utc=datetime.fromisoformat(str(row["first_seen_at_utc"]).replace("Z", "+00:00")),
+        )
+        for row in rows
+    )
+
+
+def _action_projection_from_row(
+    conn: sqlite3.Connection,
+    intent: ActionIntent,
+    row: sqlite3.Row,
+) -> ActionStateProjection:
+    return replace(
+        project_action_state(intent),
+        state_version=int(row["state_version"]),
+        provider_order_references=_provider_order_references(conn, intent.logical_action_id),
     )
 
 
@@ -909,6 +962,7 @@ class PolicyExecutionStateStore:
         paper_account_environment_id: str,
         *,
         expected_generation_id: str | None,
+        expected_pointer_version: int | None,
         new_generation_id: str,
         readiness_evidence_ref: str,
         outgoing_entries_reconciled: bool,
@@ -935,7 +989,8 @@ class PolicyExecutionStateStore:
             ).fetchone()
             current_id = None if current is None else str(current[0])
             current_version = 0 if current is None else int(current[1])
-            if current_id != expected_generation_id:
+            observed_pointer_version = None if current is None else current_version
+            if current_id != expected_generation_id or observed_pointer_version != expected_pointer_version:
                 raise ConcurrentStateUpdateError("active deployment pointer changed since it was read")
             if current_id == target_id:
                 return current_version
@@ -986,7 +1041,7 @@ class PolicyExecutionStateStore:
                         account,
                         self.store_identity,
                         current_id,
-                        current_version,
+                        expected_pointer_version,
                     ),
                 ).rowcount
                 if changed != 1:
@@ -1039,6 +1094,20 @@ class PolicyExecutionStateStore:
                 (account, self.store_identity),
             ).fetchone()
             return None if row is None else str(row[0])
+
+    def load_active_generation_pointer(self, paper_account_environment_id: str) -> ActiveGenerationPointer:
+        account = _required_text(paper_account_environment_id, "paper_account_environment_id")
+        with self._transaction(write=False) as conn:
+            self._require_ready(conn)
+            row = conn.execute(
+                """SELECT active_generation_id, pointer_version, readiness_state
+                   FROM policy_state_active_pointers
+                   WHERE paper_account_environment_id=? AND store_identity=?""",
+                (account, self.store_identity),
+            ).fetchone()
+            if row is None:
+                return ActiveGenerationPointer(None, None, None)
+            return ActiveGenerationPointer(str(row[0]), int(row[1]), str(row[2]))
 
     def load_deployment_chain(self, deployment_generation_id: str) -> PolicyDeploymentChain:
         generation = _required_text(deployment_generation_id, "deployment_generation_id")
@@ -1195,8 +1264,11 @@ class PolicyExecutionStateStore:
         event_kind: str,
         logical_action_id: str | None,
         observed_at: datetime,
+        evidence_ref: str | None = None,
     ) -> None:
         state = {**_holding_payload(holding), "state_version": version}
+        if evidence_ref is not None:
+            state["evidence_ref"] = evidence_ref
         state_json = _canonical_json(state)
         state_sha = _sha256_text(state_json)
         event_id = "holding-event:sha256:" + _sha256_text(
@@ -1212,8 +1284,8 @@ class PolicyExecutionStateStore:
         conn.execute(
             """INSERT INTO policy_state_holding_history(
                 holding_episode_id, state_version, event_id, logical_action_id,
-                event_kind, state_sha256, state_json, observed_at_utc
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                event_kind, state_sha256, state_json, evidence_ref, observed_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 holding.holding_episode_id,
                 version,
@@ -1222,6 +1294,7 @@ class PolicyExecutionStateStore:
                 event_kind,
                 state_sha,
                 state_json,
+                evidence_ref,
                 _aware_iso(observed_at),
             ),
         )
@@ -1236,6 +1309,7 @@ class PolicyExecutionStateStore:
         logical_action_id: str | None = None,
         observed_at: datetime | None = None,
         initial_version: int = 0,
+        evidence_ref: str | None = None,
     ) -> int:
         identity = self._require_deployment(conn, holding.deployment_generation_id)
         if identity["store_identity"] != self.store_identity:
@@ -1315,16 +1389,24 @@ class PolicyExecutionStateStore:
                 existing["paper_account_environment_id"],
                 existing["store_identity"],
                 existing["security_id"],
+                existing["symbol"],
+                existing["broker_symbol"],
                 existing["opening_decision_id"],
                 existing["opening_action_id"],
+                existing["initial_filled_quantity"],
+                existing["entry_price"],
             )
             expected_immutable = (
                 holding.deployment_generation_id,
                 account,
                 self.store_identity,
                 holding.security_id,
+                holding.symbol,
+                holding.broker_symbol,
                 opening["decision_id"],
                 holding.opening_action_id,
+                str(holding.initial_filled_quantity),
+                _decimal_text(holding.entry_price),
             )
             if immutable != expected_immutable:
                 raise IdentityConflictError("holding generation, account, security, or opening identity cannot change")
@@ -1380,17 +1462,42 @@ class PolicyExecutionStateStore:
             event_kind=event_kind,
             logical_action_id=logical_action_id,
             observed_at=now,
+            evidence_ref=evidence_ref,
         )
         return version
 
-    def record_holding_episode(self, holding: HoldingEpisode, *, expected_version: int | None) -> int:
+    def record_holding_episode(
+        self,
+        holding: HoldingEpisode,
+        *,
+        expected_version: int,
+        evidence_ref: str,
+    ) -> int:
+        """Record only an evidence-backed position-reconciliation flag change."""
+        evidence = _required_text(evidence_ref, "evidence_ref")
         with self._transaction(write=True) as conn:
             self._require_ready(conn)
+            row = self._holding_row(conn, _required_text(holding.holding_episode_id, "holding_episode_id"))
+            if row is None:
+                raise ValueError("holdings must be created by a confirmed entry fill")
+            current = _holding_from_row(row)
+            if int(row["state_version"]) != expected_version:
+                raise ConcurrentStateUpdateError("holding changed since the caller read it")
+            candidate_with_current_flags = replace(holding, policy_flags=current.policy_flags, state_version=current.state_version)
+            if candidate_with_current_flags != current:
+                raise ValueError("offline holding reconciliation may change only policy flags")
+            current_flags = dict(current.policy_flags)
+            proposed_flags = dict(holding.policy_flags)
+            if current.policy_flags == holding.policy_flags:
+                return expected_version
+            if set(current_flags) | set(proposed_flags) != {"position_reconciliation_required"}:
+                raise ValueError("offline holding reconciliation supports only the position reconciliation flag")
             return self._save_holding(
                 conn,
                 holding,
                 expected_version=expected_version,
-                event_kind="holding_state_recorded",
+                event_kind="position_reconciliation_flag_recorded",
+                evidence_ref=evidence,
             )
 
     def load_holding_episode(self, holding_episode_id: str) -> HoldingEpisode:
@@ -1455,7 +1562,26 @@ class PolicyExecutionStateStore:
         event_kind: str,
         observed_at: datetime,
     ) -> None:
-        state_json = _canonical_json({**_action_payload(intent), "state_version": version})
+        provider_references = [
+            {
+                "provider_id": item.provider_id,
+                "paper_account_environment_id": item.paper_account_environment_id,
+                "store_identity": item.store_identity,
+                "reference_kind": item.reference_kind,
+                "external_order_id": item.external_order_id,
+                "attempt_number": item.attempt_number,
+                "source_payload_sha256": item.source_payload_sha256,
+                "first_seen_at_utc": _aware_iso(item.first_seen_at_utc),
+            }
+            for item in _provider_order_references(conn, intent.logical_action_id)
+        ]
+        state_json = _canonical_json(
+            {
+                **_action_payload(intent),
+                "provider_order_references": provider_references,
+                "state_version": version,
+            }
+        )
         state_sha = _sha256_text(state_json)
         event_id = "action-event:sha256:" + _sha256_text(
             _canonical_json(
@@ -1700,7 +1826,7 @@ class PolicyExecutionStateStore:
         with self._transaction(write=False) as conn:
             self._require_ready(conn)
             intent, row = self._load_action(conn, logical_action_id)
-            return replace(project_action_state(intent), state_version=int(row["state_version"]))
+            return _action_projection_from_row(conn, intent, row)
 
     def record_cumulative_fill(
         self,
@@ -1772,7 +1898,7 @@ class PolicyExecutionStateStore:
                 )
                 if not same:
                     raise FillReceiptConflictError("fill event ID was reused with different immutable payload facts")
-                return replace(project_action_state(intent), state_version=int(action_row["state_version"]))
+                return _action_projection_from_row(conn, intent, action_row)
             if int(action_row["state_version"]) != expected_action_version:
                 raise ConcurrentStateUpdateError("action changed since the caller read it")
 
@@ -1822,7 +1948,7 @@ class PolicyExecutionStateStore:
                 ),
             )
             if cumulative_quantity == previous_quantity:
-                return replace(project_action_state(intent), state_version=int(action_row["state_version"]))
+                return _action_projection_from_row(conn, intent, action_row)
 
             next_notional = previous_notional if cumulative_notional is None else cumulative_notional
             next_fees = previous_fees if cumulative_fees is None else cumulative_fees
@@ -1904,6 +2030,7 @@ class PolicyExecutionStateStore:
                         realized_pnl=None,
                     )
                     updated_intent = replace(updated_intent, status=ActionStatus.RECONCILIATION_REQUIRED)
+                    new_holding = register_reconciliation_action(new_holding, updated_intent)
                 else:
                     new_holding = apply_action_fill_to_holding(
                         current_holding,
@@ -1938,6 +2065,8 @@ class PolicyExecutionStateStore:
                             new_holding = advance_holding_exit_tier(new_holding, updated_intent)
                         else:
                             new_holding = clear_terminal_pending_action(new_holding, updated_intent)
+                    elif updated_intent.status is ActionStatus.RECONCILIATION_REQUIRED:
+                        new_holding = register_reconciliation_action(new_holding, updated_intent)
                 current_holding_version = int(holding_row["state_version"])
 
             if new_holding is not None and current_holding_version is None:
@@ -1968,7 +2097,7 @@ class PolicyExecutionStateStore:
                     initial_version=0,
                 )
             return replace(
-                project_action_state(updated_intent),
+                _action_projection_from_row(conn, updated_intent, action_row),
                 state_version=int(action_row["state_version"]) + 1,
             )
 
@@ -1997,7 +2126,10 @@ class PolicyExecutionStateStore:
             raise ValueError("holding position reconciliation must clear before action completion")
         if intent.status is ActionStatus.FILLED or intent.status is ActionStatus.RESOLVED:
             if intent.role is ActionRole.SCALE_OUT:
-                holding = advance_holding_exit_tier(holding, intent)
+                if intent.exit_tier is not None and intent.exit_tier <= holding.last_exit_tier:
+                    holding = clear_terminal_pending_action(holding, intent)
+                else:
+                    holding = advance_holding_exit_tier(holding, intent)
             else:
                 holding = clear_terminal_pending_action(holding, intent)
             self._save_holding(
@@ -2019,17 +2151,23 @@ class PolicyExecutionStateStore:
         event_kind: str,
         observed_at: datetime,
         expected_holding_version: int | None = None,
+        force_event: bool = False,
     ) -> ActionStateProjection:
-        if updated == current:
-            return replace(project_action_state(current), state_version=int(action_row["state_version"]))
+        if updated == current and not force_event:
+            return _action_projection_from_row(conn, current, action_row)
+        new_version = int(action_row["state_version"]) + 1
         self._store_action(
             conn,
             updated,
-            version=int(action_row["state_version"]) + 1,
+            version=new_version,
             event_kind=event_kind,
             observed_at=observed_at,
         )
-        if updated.status in {ActionStatus.FILLED, ActionStatus.RESOLVED}:
+        if (
+            updated != current
+            and updated.status in {ActionStatus.FILLED, ActionStatus.RESOLVED}
+            and current.status not in {ActionStatus.FILLED, ActionStatus.RESOLVED}
+        ):
             self._finish_holding_action(
                 conn,
                 updated,
@@ -2037,7 +2175,7 @@ class PolicyExecutionStateStore:
                 event_kind=event_kind,
                 observed_at=observed_at,
             )
-        return replace(project_action_state(updated), state_version=int(action_row["state_version"]) + 1)
+        return replace(_action_projection_from_row(conn, updated, action_row), state_version=new_version)
 
     def request_order_cancel(
         self,
@@ -2189,6 +2327,7 @@ class PolicyExecutionStateStore:
             )
             if attempt is None:
                 raise ValueError(f"action has no order attempt {attempt_number}")
+            alias_rows_added = False
             for kind, external_id in refs:
                 for other in intent.order_attempts:
                     if other.attempt_number == attempt_number:
@@ -2210,6 +2349,7 @@ class PolicyExecutionStateStore:
                 ):
                     raise OrderReferenceConflictError("external order reference already belongs to another attempt")
                 if existing is None:
+                    alias_rows_added = True
                     conn.execute(
                         """INSERT INTO policy_state_order_reference_aliases(
                             provider_id, paper_account_environment_id, store_identity, reference_kind,
@@ -2262,6 +2402,7 @@ class PolicyExecutionStateStore:
                 updated,
                 event_kind="order_references_bound",
                 observed_at=observed_at,
+                force_event=alias_rows_added,
             )
 
     def load_order_reference_aliases(self, logical_action_id: str) -> tuple[Mapping[str, object], ...]:
@@ -2362,7 +2503,7 @@ class PolicyExecutionStateStore:
         deployment_generation_id: str,
         portfolio_snapshot_id: str,
     ) -> PolicyExecutionReadSnapshot:
-        """Read one portfolio snapshot, its generation's actions and holdings in one SQLite snapshot."""
+        """Read one portfolio plus account/store actions and holdings in one SQLite snapshot."""
         generation = _required_text(deployment_generation_id, "deployment_generation_id")
         snapshot_id = _required_text(portfolio_snapshot_id, "portfolio_snapshot_id")
         with self._transaction(write=False) as conn:
@@ -2413,7 +2554,7 @@ class PolicyExecutionStateStore:
                 intent = _action_from_row(conn, row)
                 if intent.is_open or intent.logical_action_id in holding_action_ids or intent.holding_episode_id in holding_ids:
                     projections_list.append(
-                        replace(project_action_state(intent), state_version=int(row["state_version"]))
+                        _action_projection_from_row(conn, intent, row)
                     )
             projections = tuple(projections_list)
             return PolicyExecutionReadSnapshot(identity, portfolio, projections, holdings)
