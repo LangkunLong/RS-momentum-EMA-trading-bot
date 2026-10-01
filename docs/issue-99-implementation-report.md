@@ -7,13 +7,15 @@
 **Persistence construction dependency:** `d52fb22deedc74361f6e4ae4a0113dc4f215c3c2`
 **Durable-state construction correction:** `963a61f1dbc0641d50a4272e845447bf4e40abfa`
 **Producer report-only disposition:** `d8e383ecf5cdae37f0a3828a056ff2d1b1e202af`
+**Latest producer source correction:** `43a0820dea9688fd8583f45ccb9704f172553954`
+**Latest producer review report:** `bfcaa5a8cfdcfc5e32edfd78e4dfd5bb65e5b2d5`
 
 ## Statuses
 
-- **Implementation:** The consumer adapter preserves action origin clocks, attempt terminal states and aliases, resolution reasons, and action/holding versions. Reconciliation accepts older issued actions when they match current account facts, rejects future or stale unsent actions, and coalesces equivalent broker rows only after their references resolve to one canonical attempt and their material facts agree. No producer-owned files were changed by #99.
+- **Implementation:** The consumer adapter preserves action origin clocks, attempt terminal states and aliases, resolution reasons, action/holding versions, and holding policy flags. Explicitly resolved attempts may be terminal or provably unissued under the producer predicate. Flat historical holdings retain confirmed stop history without requiring a live stop, and a later episode for the same security remains independently reconcilable. No producer-owned files were changed by #99.
 - **Required inputs:** A focused integration test writes real #100 DTOs into a temporary SQLite store, reads the active pointer version, then obtains generation-A actions and holdings together with generation-B portfolio facts through `load_policy_execution_snapshot`.
-- **Acceptance evidence:** Focused consumer regressions pass, including canonical temp-store and registered-alias coalescing cases. Independent consumer review approved the alias coalescing in `2cf4bdf`; the subsequent pointer-version test adaptation is recorded separately. The old broad non-integration run was interrupted at about 14% after reporting failures and is not acceptance evidence. Persistence producer acceptance remains open.
-- **Dependencies:** The pure producer checkpoint is approved and integrated as a construction dependency. Persistence commit `d52fb22deedc74361f6e4ae4a0113dc4f215c3c2` and correction source `963a61f1dbc0641d50a4272e845447bf4e40abfa` are integrated as construction dependencies only. The producer remains under review; lead-reported scoped review has cleared findings 3, 4, 5, and 7, while one Important gap remains in finding 2. No producer acceptance is inferred.
+- **Acceptance evidence:** Focused consumer regressions pass, including canonical temporary-store checks for holding flags, resolved unissued attempts, and flat-history/later-episode behavior. Earlier independent consumer approval of alias coalescing in `2cf4bdf` and origin-clock work in `6f225ee` remains scoped to those changes. The old broad non-integration run was interrupted at about 14% after reporting failures and is not acceptance evidence. Lead integrated-boundary review of this consumer continuation remains pending; full integration acceptance is not claimed.
+- **Dependencies:** The pure producer checkpoint is approved and integrated as a construction dependency. Persistence source `d52fb22`, correction `963a61f`, and late-reference correction `43a0820` are integrated as producer construction dependencies. The latest producer review report `bfcaa5a` approves that producer source/report pair. Producer approval does not approve this integrated consumer boundary or replace the pending lead delta review.
 
 ## Changed paths owned by #99
 
@@ -54,7 +56,7 @@ classes directly.
 
 The branch inherits pure producer commit `446d2e1ac906db9b09db8311aa207ddae4d861db` and its approved descendant `aef51d0d4893db1049401bc37ea40f434ea60b56`. The approved pure checkpoint is a construction dependency only; it is not an acceptance decision for persistence or this consumer integration.
 
-The branch includes persistence commit `d52fb22deedc74361f6e4ae4a0113dc4f215c3c2` and durable-state correction source `963a61f1dbc0641d50a4272e845447bf4e40abfa` for construction only. The correction adds active-pointer version compare-and-set and associated state/store fixes. Companion producer report-only commit `d8e383ecf5cdae37f0a3828a056ff2d1b1e202af` records review disposition. The lead reports that scoped review cleared findings 3, 4, 5, and 7 and retains one Important issue in finding 2: late references can reopen a resolved addition without restoring its holding pending conflict. Producer acceptance remains pending. The consumer correction does not edit producer state/store files.
+The branch includes persistence commit `d52fb22deedc74361f6e4ae4a0113dc4f215c3c2`, durable-state correction source `963a61f1dbc0641d50a4272e845447bf4e40abfa`, and latest source correction `43a0820dea9688fd8583f45ccb9704f172553954` for construction. Producer report-only history progressed from `d8e383ecf5cdae37f0a3828a056ff2d1b1e202af` to `bfcaa5a8cfdcfc5e32edfd78e4dfd5bb65e5b2d5`. The latest producer source/report pair is independently approved; the earlier finding about late references restoring the holding reconciliation conflict is cleared by `43a0820`. This does not approve the integrated consumer boundary. The #99 correction does not edit producer state/store files.
 
 The focused temporary-store test reads the absent active pointer (`active_generation_id=None`, `pointer_version=None`) and supplies both observed values to the versioned setter. It then uses `PolicyExecutionStateStore.load_policy_execution_snapshot` as the source of both generations' records. A generation-A holding and partially filled scale-out action, with provider-scoped aliases and its original action clock, are returned in one read alongside generation-B's current portfolio snapshot. Current synthetic broker positions, balances, and protective-stop facts reconcile against that returned data.
 
@@ -92,15 +94,29 @@ python -m pytest -p no:cacheprovider -o addopts='' -W ignore::pytest.PytestConfi
 
 Result: **1 passed**. The test reads `ActiveGenerationPointer`, then supplies both its observed generation ID and pointer version to `set_active_generation`.
 
-Lead-provided chain evidence is separate from the local consumer run. The earlier expanded `tests/test_paper_policy_chain.py` run reported **5 passed, 2 warnings**, including both store alias/restart duplicate cases and the later-session mixed-generation case. Warning details were not supplied, so the receipt remains attributed to the lead and is not classified as warning-free. The producer issue report at `d8e383e` and later lead status keep full producer review open.
+Lead-provided chain evidence is separate from the local consumer run. The earlier expanded `tests/test_paper_policy_chain.py` run reported **5 passed, 2 warnings**, including both store alias/restart duplicate cases and the later-session mixed-generation case. Warning details were not supplied, so the receipt remains attributed to the lead and is not classified as warning-free. At that time, report `d8e383e` and lead status kept producer review open; that status was superseded by the independently approved producer source/report pair `43a0820`/`bfcaa5a`.
 
-SHA-256 evidence hashes (the synthetic records are inline in the test source):
+## Latest integrated-boundary consumer corrections (2026-10-01)
+
+The lead's boundary review against producer source `43a0820` reproduced three consumer gaps. The #99 changes now preserve holding `policy_flags` and make only `position_reconciliation_required` block readiness with its reason; accept explicitly resolved attempts only when terminal or matching the producer's exact unissued predicate; and preserve flat holding stop history without demanding a live stop. An active protective sell against a flat episode remains a conflict, while a later same-security episode is reconciled by its own quantity and stop.
+
+The unissued-attempt test writes a never-issued addition and a scale-out whose first issued attempt is cancelled and whose remainder attempt remains unissued. Both are resolved with explicit reasons and no active matching order, then read through a reopened SQLite store and the canonical converter. Its negative controls add a primary reference, an alias reference, a nonzero fill, or an active matching broker order and confirm readiness stays blocked. The flag lifecycle similarly persists the evidence-backed flag and its evidence-backed clear across separate canonical reads; account balances and position quantity remain unchanged. The flat-history case closes the original episode, reads it with no active stop, blocks an unexpected active old stop, then opens a later episode for the same stable security and reconciles both records.
+
+Focused regression command:
+
+```text
+python -m pytest -p no:cacheprovider -o addopts='' -W ignore::pytest.PytestConfigWarning --tb=short tests/test_strategy_policy_account_reconciliation.py::test_canonical_holding_reconciliation_flag_survives_restart_until_evidenced_clear tests/test_strategy_policy_account_reconciliation.py::test_canonical_resolved_unissued_addition_and_remainder_release_reservations_after_restart tests/test_strategy_policy_account_reconciliation.py::test_flat_holding_history_needs_no_live_stop_and_allows_a_later_same_security_episode tests/test_strategy_policy_account_reconciliation.py::test_policy_execution_state_conversion_preserves_decimal_residual_attempts_and_identity tests/test_strategy_policy_account_reconciliation.py::test_policy_execution_state_conversion_keeps_order_references_per_attempt tests/test_strategy_policy_account_reconciliation.py::test_canonical_store_read_reconciles_old_generation_state_with_current_portfolio tests/test_strategy_policy_account_reconciliation.py::test_partial_sell_restart_reconciles_position_and_keeps_sell_pending_visible tests/test_strategy_policy_account_reconciliation.py::test_protective_sell_is_matched_to_holding_and_not_counted_as_strategy_sell tests/test_strategy_policy_account_reconciliation.py::test_registered_attempt_alias_rows_reserve_once tests/test_strategy_policy_account_reconciliation.py::test_registered_attempt_alias_rows_with_conflicting_facts_block_reservations -q
+```
+
+Result: **15 passed**. Ruff passed for the consumer module and its focused tests; `compileall` passed for the consumer module; `git diff --check` reported no whitespace errors. This was a selected offline consumer run only. No broad suite, runtime, provider, broker, or real-store test was run. Producer source/report approval at `43a0820`/`bfcaa5a` is separate; lead delta review of these consumer changes remains outstanding, so integrated acceptance is not claimed.
+
+Latest consumer artifact SHA-256 hashes (the synthetic records are inline in the test source):
 
 | Artifact | SHA-256 |
 | --- | --- |
-| `core/strategy_policy/account_reconciliation.py` | `a7121eb1512b0422e7607491e43ec53b4a16cc21d7c510d715c74ca05861175f` |
-| `tests/test_strategy_policy_account_reconciliation.py` | `c0976172f916b9ba0c8e190c0bec01d50a577cade6b730159a16c14d9bff436e` |
-| `docs/strategy-policy-account-reconciliation-issue99.md` | `20d00cf9fd874265f397050194aecb2008eeb0a13724ba83f0a1c7b85ef47721` |
+| `core/strategy_policy/account_reconciliation.py` | `595dc4e4742780667dab536d14c71ae8c8c27ec4e5cdb7901585881c806a84e1` |
+| `tests/test_strategy_policy_account_reconciliation.py` | `d7a5d0850db4b3b9d9eb62b4bd1d87b2440c07833e544cf16967d932473e6887` |
+| `docs/strategy-policy-account-reconciliation-issue99.md` | `f3b52d3c935b371b75a3f4c8c7d8a9b0c86f4d3c214e50b6114f0ca4478b4ae1` |
 
 ## Prior verification record (`e12a8a7`, report `f89172d`)
 
@@ -154,7 +170,7 @@ Three adjacent offline regression controls also passed (**3 passed**): `test_pol
 
 ## Known dependency and precision limits
 
-- Producer source `963a61f` remains construction-only. One Important producer finding remains open in scoped review; the full persistence implementation has not been accepted.
+- Producer source/report `43a0820`/`bfcaa5a` are approved construction dependencies. The integrated consumer delta review remains pending.
 - Combined restart acceptance with the durable store, live account facts, and deployment workflow remains a separate gate; the current temporary-store test is synthetic and consumer-focused.
 - This work does not establish real provider/broker behavior or runtime deployment acceptance.
 - Decimal source values are normalized to finite floats at the existing V3 feature boundary;

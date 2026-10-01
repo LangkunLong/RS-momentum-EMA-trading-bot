@@ -42,23 +42,35 @@ adapter does not consult an external security master.
   `partial_incomplete` block readiness. Unknown action/order states do not release
   reservations. Broker `expired` state also blocks because the current producer has no
   corresponding local attempt status.
+- A holding's `position_reconciliation_required` policy flag blocks readiness and is
+  reported with its evidence reason. Other persisted policy flags remain visible to the
+  projection but do not block this consumer.
+- A flat historical holding retains its confirmed stop price and order references without
+  requiring a live protective order. Any active protective sell still mapped to that flat
+  episode blocks readiness. A later episode for the same stable security reconciles against
+  its own active stop and quantity.
 - `PortfolioFeaturesV3` is produced only when all required account facts reconcile and no
   findings remain. Missing cash, equity, position/order snapshots, valuation marks,
   classifications, mappings, or stop-risk facts remain `None` and block readiness.
 
 An explicitly resolved action can release its reservation only when its resolution reason
-is present, each attempt has terminal evidence, and current broker facts show no active
-order. Missing reasons or nonterminal attempts keep readiness blocked.
+is present, each attempt is either in a supported terminal state (`filled`, `cancelled`, or
+`rejected`) or is provably unissued (`intended`, zero confirmed fill, no primary or alias
+order references, and no terminal status), and current broker facts show no active matching
+order. Missing reasons, references or fills on an intended attempt, or an active order keep
+readiness blocked.
 
 ## Scope boundary
 
 The conversion is tested against real immutable DTOs from approved pure producer checkpoint
 `aef51d0d4893db1049401bc37ea40f434ea60b56`. A focused consumer test also uses a temporary
 SQLite store from persistence checkpoint `d52fb22deedc74361f6e4ae4a0113dc4f215c3c2` and
-construction correction `963a61f1dbc0641d50a4272e845447bf4e40abfa`. It reads the active
-pointer version, then calls `load_policy_execution_snapshot` to reconcile pinned
-older-generation records with current portfolio and broker facts. These producer commits are
-construction dependencies only; independent persistence review and full acceptance remain
-open. The test is synthetic consumer evidence, not durable-store or runtime acceptance. The
-module itself remains pure and does not open the store. All account and broker facts in #99
-tests are deterministic synthetic fixtures.
+construction corrections `963a61f1dbc0641d50a4272e845447bf4e40abfa` and
+`43a0820dea9688fd8583f45ccb9704f172553954`. The latest focused regressions reopen the
+temporary SQLite store, then call `load_policy_execution_snapshot` to reconcile pinned
+older-generation records with current portfolio and broker facts. Source `43a0820` and its
+report-only companion `bfcaa5a8cfdcfc5e32edfd78e4dfd5bb65e5b2d5` are reviewed producer
+construction dependencies; this does not establish full integrated acceptance. The tests
+are synthetic consumer evidence, not live durable-store or runtime acceptance. The module
+itself remains pure and does not open the store. All account and broker facts in #99 tests
+are deterministic synthetic fixtures.

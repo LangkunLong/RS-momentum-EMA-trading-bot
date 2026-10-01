@@ -190,6 +190,7 @@ class HoldingProjection:
     stop_observed_at: datetime | None
     protective_stop_order_references: tuple[OrderReference, ...]
     source_state_version: int | None = None
+    policy_flags: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         _identifier(self.holding_episode_id, "holding_episode_id")
@@ -203,6 +204,15 @@ class HoldingProjection:
             for reference in self.protective_stop_order_references
         ):
             raise ValueError("protective_stop_order_references must be a tuple of OrderReference")
+        if type(self.policy_flags) is not tuple:
+            raise ValueError("holding policy_flags must be a tuple")
+        for flag in self.policy_flags:
+            if type(flag) is not tuple or len(flag) != 2:
+                raise ValueError("holding policy_flags items must be name/value pairs")
+            _identifier(flag[0], "holding policy flag name")
+            _identifier(flag[1], "holding policy flag value")
+        if len({name for name, _ in self.policy_flags}) != len(self.policy_flags):
+            raise ValueError("holding policy flag names must be unique")
         if self.source_state_version is not None and (
             not isinstance(self.source_state_version, int)
             or isinstance(self.source_state_version, bool)
@@ -853,6 +863,7 @@ def policy_execution_state_to_projection(
                 stop_observed_at=_source_member(source, "confirmed_stop_observed_at"),
                 protective_stop_order_references=references,
                 source_state_version=_source_member(source, "state_version"),
+                policy_flags=_source_member(source, "policy_flags"),
             )
         )
         add_mapping(source, identity=_source_member(source, "holding_episode_id"))
@@ -1262,6 +1273,23 @@ def _validate_action_origin_clock(
     return True
 
 
+def _resolved_attempt_has_terminal_or_unissued_evidence(
+    attempt: OrderAttemptProjection,
+) -> bool:
+    terminal_status = attempt.terminal_status or attempt.status
+    if terminal_status in {"filled", "cancelled", "rejected"}:
+        return True
+    return (
+        attempt.status == "intended"
+        and attempt.terminal_status is None
+        and attempt.confirmed_quantity == 0
+        and attempt.client_order_id is None
+        and attempt.broker_order_id is None
+        and not attempt.client_order_aliases
+        and not attempt.broker_order_aliases
+    )
+
+
 def _reconcile_projected_actions(
     *,
     account: BrokerAccountSnapshot,
@@ -1448,12 +1476,16 @@ def _reconcile_projected_actions(
             coverage_valid = False
         if action.status == "resolved":
             if not action.order_attempts:
-                _finding(findings, path + ".order_attempts", "absent", "resolved action has no canonical terminal attempt evidence")
+                _finding(findings, path + ".order_attempts", "absent", "resolved action has no canonical order attempt evidence")
                 coverage_valid = False
             for attempt in action.order_attempts:
-                terminal_status = attempt.terminal_status or attempt.status
-                if terminal_status not in {"filled", "cancelled", "rejected"}:
-                    _finding(findings, path + ".order_attempts", "unresolved", "resolved action retains a non-terminal order attempt")
+                if not _resolved_attempt_has_terminal_or_unissued_evidence(attempt):
+                    _finding(
+                        findings,
+                        path + ".order_attempts",
+                        "unresolved",
+                        "resolved action retains an attempt without terminal or provably unissued evidence",
+                    )
                     coverage_valid = False
         rows = by_action.get(action_id, [])
         active_rows = [row for row in rows if row.status in _BROKER_ACTIVE_STATES]
@@ -1646,9 +1678,17 @@ def _reconcile_projected_actions(
     for holding in projection.holdings:
         path = f"holdings.{holding.holding_episode_id}"
         rows = by_holding.get(holding.holding_episode_id, [])
-        if holding.protective_stop_order_references and len(
-            [row for row in rows if row.status in _BROKER_ACTIVE_STATES]
-        ) != 1:
+        active_rows = [row for row in rows if row.status in _BROKER_ACTIVE_STATES]
+        if holding.remaining_quantity == 0:
+            if active_rows:
+                _finding(
+                    findings,
+                    path + ".protective_stop",
+                    "conflicting",
+                    "active protective sell remains for a flat holding episode",
+                )
+                coverage_valid = False
+        elif holding.protective_stop_order_references and len(active_rows) != 1:
             _finding(findings, path + ".protective_stop", "absent", "recorded protective stop has no unique active broker order")
             coverage_valid = False
         for row in rows:
@@ -1658,7 +1698,7 @@ def _reconcile_projected_actions(
                 row.side != "sell"
                 or row.holding_episode_id != holding.holding_episode_id
                 or row.symbol != expected_symbol
-                or not _close(residual, holding.remaining_quantity)
+                or (holding.remaining_quantity > 0 and not _close(residual, holding.remaining_quantity))
             ):
                 _finding(findings, path + ".protective_stop", "conflicting", "protective sell identity or quantity differs from the holding")
                 coverage_valid = False
@@ -1795,16 +1835,27 @@ def reconcile_account_snapshot(
     projected_holdings: dict[str, list[HoldingProjection]] | None = None
     if projection.holdings is None:
         _finding(findings, "holdings", "absent", "policy holding projection is unavailable")
-    elif symbols is not None:
+    else:
         holding_rows = _deduplicate(
             projection.holdings,
             key_of=lambda item: item.holding_episode_id,  # type: ignore[attr-defined]
             path="holdings",
             findings=findings,
         )
-        projected_holdings = defaultdict(list)
+        if symbols is not None:
+            projected_holdings = defaultdict(list)
         for holding in (holding_rows or {}).values():
             if not isinstance(holding, HoldingProjection):
+                continue
+            reconciliation_reason = dict(holding.policy_flags).get("position_reconciliation_required")
+            if reconciliation_reason is not None:
+                _finding(
+                    findings,
+                    f"holdings.{holding.holding_episode_id}.policy_flags.position_reconciliation_required",
+                    "unresolved",
+                    f"holding position reconciliation is required: {reconciliation_reason}",
+                )
+            if symbols is None:
                 continue
             symbol = symbols.get(holding.security_id)
             if symbol is None:

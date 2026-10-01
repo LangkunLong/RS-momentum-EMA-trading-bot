@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
 from core.policy_execution_state import (
+    ActionIntent,
     ActionAttemptStatus,
     ActionRole,
     ActionStatus,
@@ -188,6 +190,816 @@ def _account(
         source_namespace="synthetic-broker",
         account_snapshot_id="account-snapshot-1",
     )
+
+
+@dataclass(frozen=True, slots=True)
+class _CanonicalStoreFixture:
+    database_path: Path
+    store_identity: str
+    generation_a: PolicyDeploymentIdentity
+    generation_b: PolicyDeploymentIdentity
+    old_clock: DecisionClock
+    current_clock: DecisionClock
+    current_decision: DecisionIdentity
+    holding: HoldingEpisode
+    portfolio: PortfolioStateSnapshot
+    account: BrokerAccountSnapshot
+
+
+def _canonical_store_fixture(tmp_path: Path, *, name: str = "canonical-consumer") -> _CanonicalStoreFixture:
+    database_path = tmp_path / f"{name}.sqlite3"
+    store_identity = "synthetic-policy-store"
+    store = PolicyExecutionStateStore(database_path, store_identity=store_identity)
+    store.migrate()
+    generation_a = PolicyDeploymentIdentity(
+        policy_artifact_id="policy:canonical-consumer",
+        capability_manifest_id="manifest:canonical-consumer",
+        policy_interface_version="3",
+        feature_contract_id="features-v3",
+        feature_calculator_id="calculator-v3",
+        source_revision="a" * 40,
+        runtime_identity="runtime:canonical-a",
+        execution_profile_id="paper-profile-v1",
+        paper_account_environment_id="synthetic-paper-account",
+        store_identity=store_identity,
+    )
+    generation_b = replace(
+        generation_a,
+        source_revision="b" * 40,
+        runtime_identity="runtime:canonical-b",
+    )
+    for deployment in (generation_a, generation_b):
+        store.register_deployment_identity(
+            deployment,
+            lifecycle="prepared",
+            handler_identity="fixture-handler",
+            guard_id="guard-v1",
+        )
+
+    old_clock = DecisionClock(
+        exchange_id="XNYS",
+        decision_session=date(2026, 9, 30),
+        as_of_cutoff_at=datetime(2026, 9, 30, 20, 0, tzinfo=UTC),
+        next_execution_session=date(2026, 10, 1),
+        account_valuation_session=date(2026, 10, 1),
+        account_valuation_at=datetime(2026, 10, 1, 13, 30, tzinfo=UTC),
+    )
+    opening_decision = DecisionIdentity.build(
+        deployment=generation_a,
+        clock=old_clock,
+        snapshot_sha256="a" * 64,
+        category=DecisionCategory.ENTRY,
+        subject_type=DecisionSubjectType.SECURITY,
+        subject_id="FIGI-BB1234",
+    )
+    opening = build_action_intent(
+        decision=opening_decision,
+        security_id="FIGI-BB1234",
+        broker_symbol="XYZ",
+        role=ActionRole.ENTRY,
+        side=OrderSide.BUY,
+        requested_quantity=Decimal("10"),
+        reservation_price=Decimal("100"),
+        reservation_price_basis="limit_price",
+        reservation_stop_price=Decimal("90"),
+        risk_per_unit=Decimal("10"),
+        risk_basis="entry_to_protective_stop",
+    )
+    store.record_decision(opening_decision, policy_payload={}, guard_payload={}, effective_action_payload={})
+    store.record_action_intent(opening, expected_version=None)
+    store.record_cumulative_fill(
+        opening.logical_action_id,
+        1,
+        provider_id="provider-a",
+        fill_event_id=f"{name}-opening-fill",
+        cumulative_quantity=Decimal("10"),
+        cumulative_notional=Decimal("1000"),
+        cumulative_fees=Decimal("0"),
+        payload_sha256=None,
+        observed_at=datetime(2026, 10, 1, 13, 31, tzinfo=UTC),
+        expected_action_version=0,
+        expected_holding_version=None,
+    )
+    holding = store.load_holding_episode_for_action(opening.logical_action_id)
+
+    stop_decision = DecisionIdentity.build(
+        deployment=generation_a,
+        clock=old_clock,
+        snapshot_sha256="c" * 64,
+        category=DecisionCategory.EXIT,
+        subject_type=DecisionSubjectType.HOLDING,
+        subject_id=holding.holding_episode_id,
+        sequence=1,
+    )
+    store.record_decision(stop_decision, policy_payload={}, guard_payload={}, effective_action_payload={})
+    stop_intent = store.propose_stop_update(
+        holding.holding_episode_id,
+        decision=stop_decision,
+        stop_price=Decimal("90"),
+        expected_holding_version=holding.state_version,
+        observed_at=datetime(2026, 10, 1, 13, 40, tzinfo=UTC),
+    )
+    holding = store.load_holding_episode(holding.holding_episode_id)
+    store.confirm_protective_stop(
+        stop_intent,
+        stop_price=Decimal("90"),
+        client_order_id=f"{name}-stop-client",
+        broker_order_id=f"{name}-stop-broker",
+        observed_at=datetime(2026, 10, 1, 13, 41, tzinfo=UTC),
+        expected_holding_version=holding.state_version,
+    )
+
+    pointer = store.load_active_generation_pointer(generation_b.paper_account_environment_id)
+    store.set_active_generation(
+        generation_b.paper_account_environment_id,
+        expected_generation_id=pointer.active_generation_id,
+        expected_pointer_version=pointer.pointer_version,
+        new_generation_id=generation_b.deployment_generation_id,
+        readiness_evidence_ref="synthetic-canonical-consumer-ready",
+        outgoing_entries_reconciled=True,
+    )
+    current_clock = DecisionClock(
+        exchange_id="XNYS",
+        decision_session=date(2026, 10, 1),
+        as_of_cutoff_at=datetime(2026, 10, 1, 20, 0, tzinfo=UTC),
+        next_execution_session=date(2026, 10, 2),
+        account_valuation_session=date(2026, 10, 2),
+        account_valuation_at=datetime(2026, 10, 2, 13, 30, tzinfo=UTC),
+    )
+    current_decision = DecisionIdentity.build(
+        deployment=generation_b,
+        clock=current_clock,
+        snapshot_sha256="e" * 64,
+        category=DecisionCategory.ENTRY,
+        subject_type=DecisionSubjectType.SECURITY,
+        subject_id="FIGI-BB1234",
+    )
+    portfolio = PortfolioStateSnapshot(
+        deployment_identity=generation_b,
+        clock=current_clock,
+        source_namespace="synthetic-broker",
+        account_snapshot_id=f"{name}-current-account",
+        equity=Decimal("10000"),
+        cash=Decimal("9000"),
+        gross_exposure=Decimal("1000"),
+        open_risk=Decimal("100"),
+        portfolio_peak_equity=Decimal("12500"),
+        last_accepted_session=date(2026, 10, 1),
+    )
+    store.record_portfolio_snapshot(portfolio)
+    holding = store.load_holding_episode(holding.holding_episode_id)
+    store.update_holding_marks(
+        holding.holding_episode_id,
+        valuation_at=current_clock.account_valuation_at,
+        peak_price=Decimal("105"),
+        expected_holding_version=holding.state_version,
+    )
+    account_clock = AccountValuationClock(
+        completed_session=current_clock.decision_session,
+        as_of_cutoff=current_clock.as_of_cutoff_at,
+        next_execution_session=current_clock.next_execution_session,
+        valuation_time=current_clock.account_valuation_at,
+    )
+    account = BrokerAccountSnapshot(
+        paper_account_environment_id=generation_b.paper_account_environment_id,
+        decision_slot_id=current_decision.decision_slot_id,
+        decision_id=current_decision.decision_id,
+        clock=account_clock,
+        equity=10000,
+        cash=9000,
+        peak_equity=12500,
+        balance_observed_at=current_clock.account_valuation_at,
+        peak_observed_at=current_clock.account_valuation_at,
+        positions=(BrokerPositionFact(
+            symbol="XYZ",
+            quantity=10,
+            mark_price=100,
+            mark_observed_at=current_clock.account_valuation_at,
+            sector=_classification(),
+            industry=_classification(code="Software"),
+        ),),
+        open_orders=(BrokerOrderFact(
+            broker_order_id=f"{name}-stop-broker",
+            client_order_id=f"{name}-stop-client",
+            symbol="XYZ",
+            side="sell",
+            status="submitted",
+            requested_quantity=10,
+            cumulative_filled_quantity=0,
+            purpose="protective_stop",
+            holding_episode_id=holding.holding_episode_id,
+            stop_price=90,
+        ),),
+        source_namespace="synthetic-broker",
+        account_snapshot_id=portfolio.account_snapshot_id,
+    )
+    return _CanonicalStoreFixture(
+        database_path=database_path,
+        store_identity=store_identity,
+        generation_a=generation_a,
+        generation_b=generation_b,
+        old_clock=old_clock,
+        current_clock=current_clock,
+        current_decision=current_decision,
+        holding=holding,
+        portfolio=portfolio,
+        account=account,
+    )
+
+
+def _canonical_consumer_read(
+    fixture: _CanonicalStoreFixture,
+    *,
+    portfolio: PortfolioStateSnapshot | None = None,
+    account: BrokerAccountSnapshot | None = None,
+):
+    portfolio = portfolio or fixture.portfolio
+    restarted_store = PolicyExecutionStateStore(
+        fixture.database_path,
+        store_identity=fixture.store_identity,
+    )
+    restarted_store.migrate()
+    canonical = restarted_store.load_policy_execution_snapshot(
+        deployment_generation_id=fixture.generation_b.deployment_generation_id,
+        portfolio_snapshot_id=portfolio.portfolio_snapshot_id,
+    )
+    account = account or fixture.account
+    projection = policy_execution_state_to_projection(
+        account=account,
+        portfolio_snapshot=canonical.portfolio_snapshot,
+        action_projections=canonical.action_projections,
+        holding_episodes=canonical.holding_episodes,
+    )
+    result = reconcile_account_snapshot(
+        account=account,
+        projection=projection,
+        maximum_balance_age=timedelta(minutes=15),
+        maximum_mark_age=timedelta(minutes=15),
+    )
+    return canonical, projection, result
+
+
+def _portfolio_for(
+    deployment: PolicyDeploymentIdentity,
+    clock: DecisionClock,
+    *,
+    account_snapshot_id: str,
+    cash: str,
+    gross_exposure: str,
+    open_risk: str,
+) -> PortfolioStateSnapshot:
+    return PortfolioStateSnapshot(
+        deployment_identity=deployment,
+        clock=clock,
+        source_namespace="synthetic-broker",
+        account_snapshot_id=account_snapshot_id,
+        equity=Decimal("10000"),
+        cash=Decimal(cash),
+        gross_exposure=Decimal(gross_exposure),
+        open_risk=Decimal(open_risk),
+        portfolio_peak_equity=Decimal("12500"),
+        last_accepted_session=clock.decision_session,
+    )
+
+
+def test_canonical_holding_reconciliation_flag_survives_restart_until_evidenced_clear(tmp_path: Path) -> None:
+    fixture = _canonical_store_fixture(tmp_path, name="holding-policy-flag")
+    writer = PolicyExecutionStateStore(fixture.database_path, store_identity=fixture.store_identity)
+    writer.migrate()
+    holding = writer.load_holding_episode(fixture.holding.holding_episode_id)
+    original_quantity = holding.remaining_quantity
+    writer.record_holding_episode(
+        replace(
+            holding,
+            policy_flags=(("position_reconciliation_required", "broker position differs from recorded fills"),),
+        ),
+        expected_version=holding.state_version,
+        evidence_ref="synthetic-position-mismatch-observation",
+    )
+
+    flagged_snapshot, flagged_projection, flagged_result = _canonical_consumer_read(fixture)
+    flagged_holding = next(
+        item for item in flagged_snapshot.holding_episodes if item.holding_episode_id == holding.holding_episode_id
+    )
+    projected_holding = next(
+        item for item in flagged_projection.holdings if item.holding_episode_id == holding.holding_episode_id
+    )
+    assert flagged_holding.policy_flags == (
+        ("position_reconciliation_required", "broker position differs from recorded fills"),
+    )
+    assert projected_holding.policy_flags == flagged_holding.policy_flags
+    assert flagged_holding.remaining_quantity == original_quantity
+    assert flagged_snapshot.portfolio_snapshot == fixture.portfolio
+    assert fixture.account.positions[0].quantity == 10
+    assert fixture.account.equity == 10000
+    assert fixture.account.cash == 9000
+    assert flagged_result.equity == fixture.account.equity
+    assert flagged_result.settled_cash == fixture.account.cash
+    assert flagged_result.ready is False
+    assert flagged_result.portfolio_features is None
+    assert any(
+        finding.path.endswith("policy_flags.position_reconciliation_required")
+        and "broker position differs from recorded fills" in finding.detail
+        for finding in flagged_result.findings
+    )
+
+    holding = writer.load_holding_episode(holding.holding_episode_id)
+    writer.record_holding_episode(
+        replace(holding, policy_flags=()),
+        expected_version=holding.state_version,
+        evidence_ref="synthetic-position-match-confirmed",
+    )
+    cleared_snapshot, cleared_projection, cleared_result = _canonical_consumer_read(fixture)
+    assert next(
+        item for item in cleared_snapshot.holding_episodes if item.holding_episode_id == holding.holding_episode_id
+    ).policy_flags == ()
+    assert next(
+        item for item in cleared_projection.holdings if item.holding_episode_id == holding.holding_episode_id
+    ).policy_flags == ()
+    assert cleared_result.ready is True, cleared_result.findings
+    assert cleared_result.portfolio_features is not None
+
+    unrelated = replace(
+        cleared_snapshot.holding_episodes[0],
+        policy_flags=(("unrelated_annotation", "retain without blocking"),),
+    )
+    unrelated_projection = policy_execution_state_to_projection(
+        account=fixture.account,
+        portfolio_snapshot=cleared_snapshot.portfolio_snapshot,
+        action_projections=cleared_snapshot.action_projections,
+        holding_episodes=(unrelated,),
+    )
+    unrelated_result = reconcile_account_snapshot(
+        account=fixture.account,
+        projection=unrelated_projection,
+        maximum_balance_age=timedelta(minutes=15),
+        maximum_mark_age=timedelta(minutes=15),
+    )
+    assert unrelated_projection.holdings[0].policy_flags == unrelated.policy_flags
+    assert unrelated_result.ready is True, unrelated_result.findings
+
+
+def test_canonical_resolved_unissued_addition_and_remainder_release_reservations_after_restart(
+    tmp_path: Path,
+) -> None:
+    fixture = _canonical_store_fixture(tmp_path, name="resolved-unissued-additions")
+    writer = PolicyExecutionStateStore(fixture.database_path, store_identity=fixture.store_identity)
+    writer.migrate()
+
+    def addition(sequence: int, quantity: str) -> ActionIntent:
+        decision = DecisionIdentity.build(
+            deployment=fixture.generation_a,
+            clock=fixture.old_clock,
+            snapshot_sha256=str(sequence) * 64,
+            category=DecisionCategory.ADDITION,
+            subject_type=DecisionSubjectType.HOLDING,
+            subject_id=fixture.holding.holding_episode_id,
+            sequence=sequence,
+        )
+        intent = build_action_intent(
+            decision=decision,
+            security_id=fixture.holding.security_id,
+            broker_symbol=fixture.holding.broker_symbol,
+            holding_episode_id=fixture.holding.holding_episode_id,
+            role=ActionRole.ADDITION,
+            side=OrderSide.BUY,
+            requested_quantity=Decimal(quantity),
+            reservation_price=Decimal("100"),
+            reservation_price_basis="limit_price",
+            reservation_stop_price=Decimal("90"),
+            risk_per_unit=Decimal("10"),
+            risk_basis="entry_to_protective_stop",
+        )
+        writer.record_decision(decision, policy_payload={}, guard_payload={}, effective_action_payload={})
+        writer.record_action_intent(intent, expected_version=None)
+        return intent
+
+    never_issued = addition(1, "2")
+    holding = writer.load_holding_episode(fixture.holding.holding_episode_id)
+    resolved_addition = writer.record_explicit_action_resolution(
+        never_issued.logical_action_id,
+        resolution_reason="Synthetic dispatch ledger confirms no addition order was issued",
+        expected_action_version=0,
+        expected_holding_version=holding.state_version,
+        observed_at=datetime(2026, 10, 1, 14, 0, tzinfo=UTC),
+    )
+
+    remainder_decision = DecisionIdentity.build(
+        deployment=fixture.generation_a,
+        clock=fixture.old_clock,
+        snapshot_sha256="2" * 64,
+        category=DecisionCategory.EXIT,
+        subject_type=DecisionSubjectType.HOLDING,
+        subject_id=fixture.holding.holding_episode_id,
+        sequence=2,
+    )
+    remainder = build_action_intent(
+        decision=remainder_decision,
+        security_id=fixture.holding.security_id,
+        broker_symbol=fixture.holding.broker_symbol,
+        holding_episode_id=fixture.holding.holding_episode_id,
+        role=ActionRole.SCALE_OUT,
+        side=OrderSide.SELL,
+        requested_quantity=Decimal("5"),
+        exit_tier=1,
+        snapshot_original_quantity=Decimal("10"),
+        fraction_of_original_quantity=Decimal("0.5"),
+        rounding_rule_id="whole_share_floor_v1",
+    )
+    writer.record_decision(
+        remainder_decision,
+        policy_payload={},
+        guard_payload={},
+        effective_action_payload={},
+    )
+    writer.record_action_intent(remainder, expected_version=None)
+    submitted = writer.bind_attempt_order_refs(
+        remainder.logical_action_id,
+        1,
+        provider_id="provider-a",
+        client_order_id="cancelled-addition-client",
+        broker_order_id="cancelled-addition-broker",
+        expected_action_version=0,
+        observed_at=datetime(2026, 10, 1, 14, 1, tzinfo=UTC),
+    )
+    cancelled = writer.confirm_order_terminal(
+        remainder.logical_action_id,
+        1,
+        terminal_status=ActionAttemptStatus.CANCELLED,
+        expected_action_version=submitted.state_version,
+        observed_at=datetime(2026, 10, 1, 14, 2, tzinfo=UTC),
+    )
+    second_attempt = writer.create_single_remainder_attempt(
+        remainder.logical_action_id,
+        expected_action_version=cancelled.state_version,
+        observed_at=datetime(2026, 10, 1, 14, 3, tzinfo=UTC),
+    )
+    holding = writer.load_holding_episode(fixture.holding.holding_episode_id)
+    resolved_remainder = writer.record_explicit_action_resolution(
+        remainder.logical_action_id,
+        resolution_reason="Synthetic dispatch ledger confirms the remainder attempt was never issued",
+        expected_action_version=second_attempt.state_version,
+        expected_holding_version=holding.state_version,
+        observed_at=datetime(2026, 10, 1, 14, 4, tzinfo=UTC),
+    )
+
+    canonical, projection, result = _canonical_consumer_read(fixture)
+    source_actions = {item.logical_action_id: item for item in canonical.action_projections}
+    assert source_actions[never_issued.logical_action_id].resolution_reason
+    assert source_actions[resolved_addition.logical_action_id].status is ActionStatus.RESOLVED
+    assert source_actions[remainder.logical_action_id].status is ActionStatus.RESOLVED
+    never_issued_attempt = source_actions[resolved_addition.logical_action_id].order_attempts[0]
+    assert never_issued_attempt.status is ActionAttemptStatus.INTENDED
+    assert never_issued_attempt.confirmed_filled_quantity == 0
+    assert never_issued_attempt.terminal_status is None
+    assert never_issued_attempt.client_order_id is None
+    assert never_issued_attempt.broker_order_id is None
+    assert source_actions[resolved_remainder.logical_action_id].order_attempts[0].status is ActionAttemptStatus.CANCELLED
+    never_issued_remainder_attempt = source_actions[resolved_remainder.logical_action_id].order_attempts[1]
+    assert never_issued_remainder_attempt.status is ActionAttemptStatus.INTENDED
+    assert never_issued_remainder_attempt.confirmed_filled_quantity == 0
+    assert never_issued_remainder_attempt.terminal_status is None
+    assert never_issued_remainder_attempt.client_order_id is None
+    assert never_issued_remainder_attempt.broker_order_id is None
+    projected_actions = {item.logical_action_id: item for item in projection.pending_actions}
+    assert projected_actions[resolved_addition.logical_action_id].status == "resolved"
+    assert projected_actions[resolved_remainder.logical_action_id].status == "resolved"
+    assert result.ready is True, result.findings
+    assert result.portfolio_features is not None
+    assert result.reserved_buy_cash == 0
+    assert result.reserved_buy_risk == 0
+    assert result.pending_entry_count == 0
+
+    unissued_action = projected_actions[resolved_addition.logical_action_id]
+    original_attempt = unissued_action.order_attempts[0]
+    assert original_attempt.status == "intended"
+    malformed_cases = (
+        (
+            "referenced attempt",
+            replace(original_attempt, client_order_id="unexpected-late-client"),
+            fixture.account,
+            ("unexpected-late-client",),
+            (),
+        ),
+        (
+            "aliased attempt",
+            replace(original_attempt, broker_order_aliases=("unexpected-late-broker-alias",)),
+            fixture.account,
+            (),
+            ("unexpected-late-broker-alias",),
+        ),
+        (
+            "nonzero fill",
+            replace(original_attempt, confirmed_quantity=1),
+            fixture.account,
+            (),
+            (),
+        ),
+        (
+            "active broker order",
+            replace(
+                original_attempt,
+                client_order_id="active-addition-client",
+                broker_order_id="active-addition-broker",
+            ),
+            replace(
+                fixture.account,
+                open_orders=fixture.account.open_orders + (
+                    BrokerOrderFact(
+                        broker_order_id="active-addition-broker",
+                        client_order_id="active-addition-client",
+                        symbol="XYZ",
+                        side="buy",
+                        status="submitted",
+                        requested_quantity=original_attempt.requested_quantity,
+                        cumulative_filled_quantity=0,
+                    ),
+                ),
+            ),
+            ("active-addition-client",),
+            ("active-addition-broker",),
+        ),
+    )
+    for label, attempt, account, client_refs, broker_refs in malformed_cases:
+        malformed_action = replace(
+            unissued_action,
+            order_attempts=(attempt,),
+            client_order_refs=client_refs,
+            broker_order_refs=broker_refs,
+        )
+        malformed_projection = replace(
+            projection,
+            pending_actions=tuple(
+                malformed_action if item.logical_action_id == malformed_action.logical_action_id else item
+                for item in projection.pending_actions
+            ),
+        )
+        malformed_result = reconcile_account_snapshot(
+            account=account,
+            projection=malformed_projection,
+            maximum_balance_age=timedelta(minutes=15),
+            maximum_mark_age=timedelta(minutes=15),
+        )
+        assert malformed_result.ready is False, label
+        assert malformed_result.portfolio_features is None, label
+
+
+def test_flat_holding_history_needs_no_live_stop_and_allows_a_later_same_security_episode(
+    tmp_path: Path,
+) -> None:
+    fixture = _canonical_store_fixture(tmp_path, name="flat-holding-history")
+    writer = PolicyExecutionStateStore(fixture.database_path, store_identity=fixture.store_identity)
+    writer.migrate()
+    close_decision = DecisionIdentity.build(
+        deployment=fixture.generation_a,
+        clock=fixture.old_clock,
+        snapshot_sha256="d" * 64,
+        category=DecisionCategory.EXIT,
+        subject_type=DecisionSubjectType.HOLDING,
+        subject_id=fixture.holding.holding_episode_id,
+        sequence=2,
+    )
+    close = build_action_intent(
+        decision=close_decision,
+        security_id=fixture.holding.security_id,
+        broker_symbol=fixture.holding.broker_symbol,
+        holding_episode_id=fixture.holding.holding_episode_id,
+        role=ActionRole.CLOSE,
+        side=OrderSide.SELL,
+        requested_quantity=Decimal("10"),
+    )
+    writer.record_decision(close_decision, policy_payload={}, guard_payload={}, effective_action_payload={})
+    writer.record_action_intent(close, expected_version=None)
+    submitted = writer.bind_attempt_order_refs(
+        close.logical_action_id,
+        1,
+        provider_id="provider-a",
+        client_order_id="historical-close-client",
+        broker_order_id="historical-close-broker",
+        expected_action_version=0,
+        observed_at=datetime(2026, 10, 1, 14, 0, tzinfo=UTC),
+    )
+    holding = writer.load_holding_episode(fixture.holding.holding_episode_id)
+    closed = writer.record_cumulative_fill(
+        close.logical_action_id,
+        1,
+        provider_id="provider-a",
+        fill_event_id="historical-close-fill",
+        cumulative_quantity=Decimal("10"),
+        cumulative_notional=Decimal("1000"),
+        cumulative_fees=Decimal("0"),
+        payload_sha256=None,
+        observed_at=datetime(2026, 10, 1, 14, 5, tzinfo=UTC),
+        expected_action_version=submitted.state_version,
+        expected_holding_version=holding.state_version,
+    )
+    assert closed.status is ActionStatus.FILLED
+    flat_holding = writer.load_holding_episode(fixture.holding.holding_episode_id)
+    assert flat_holding.remaining_quantity == 0
+    assert flat_holding.confirmed_stop_broker_order_id == "flat-holding-history-stop-broker"
+
+    flat_portfolio = _portfolio_for(
+        fixture.generation_b,
+        fixture.current_clock,
+        account_snapshot_id="flat-holding-account",
+        cash="10000",
+        gross_exposure="0",
+        open_risk="0",
+    )
+    writer.record_portfolio_snapshot(flat_portfolio)
+    flat_account = replace(
+        fixture.account,
+        equity=10000,
+        cash=10000,
+        positions=(),
+        open_orders=(),
+        account_snapshot_id=flat_portfolio.account_snapshot_id,
+    )
+    flat_snapshot, flat_projection, flat_result = _canonical_consumer_read(
+        fixture,
+        portfolio=flat_portfolio,
+        account=flat_account,
+    )
+    flat_source = next(
+        item for item in flat_snapshot.holding_episodes if item.holding_episode_id == flat_holding.holding_episode_id
+    )
+    flat_projected = next(
+        item for item in flat_projection.holdings if item.holding_episode_id == flat_holding.holding_episode_id
+    )
+    assert flat_source.remaining_quantity == 0
+    assert flat_source.confirmed_stop_broker_order_id == "flat-holding-history-stop-broker"
+    assert flat_projected.protective_stop_order_references == (
+        OrderReference(broker_order_id="flat-holding-history-stop-broker", client_order_id="flat-holding-history-stop-client"),
+    )
+    assert flat_result.ready is True, flat_result.findings
+    assert flat_result.gross_exposure == 0
+    assert flat_result.open_position_risk == 0
+
+    active_old_stop = BrokerOrderFact(
+        broker_order_id="flat-holding-history-stop-broker",
+        client_order_id="flat-holding-history-stop-client",
+        symbol="XYZ",
+        side="sell",
+        status="submitted",
+        requested_quantity=10,
+        cumulative_filled_quantity=0,
+        purpose="protective_stop",
+        holding_episode_id=flat_holding.holding_episode_id,
+        stop_price=90,
+    )
+    unexpected_active_stop = replace(flat_account, open_orders=(active_old_stop,))
+    active_result = reconcile_account_snapshot(
+        account=unexpected_active_stop,
+        projection=flat_projection,
+        maximum_balance_age=timedelta(minutes=15),
+        maximum_mark_age=timedelta(minutes=15),
+    )
+    assert active_result.ready is False
+    assert active_result.portfolio_features is None
+    assert any("flat holding" in finding.detail for finding in active_result.findings)
+
+    later_clock = DecisionClock(
+        exchange_id="XNYS",
+        decision_session=date(2026, 10, 2),
+        as_of_cutoff_at=datetime(2026, 10, 2, 20, 0, tzinfo=UTC),
+        next_execution_session=date(2026, 10, 3),
+        account_valuation_session=date(2026, 10, 3),
+        account_valuation_at=datetime(2026, 10, 3, 13, 30, tzinfo=UTC),
+    )
+    later_entry_decision = DecisionIdentity.build(
+        deployment=fixture.generation_b,
+        clock=later_clock,
+        snapshot_sha256="f" * 64,
+        category=DecisionCategory.ENTRY,
+        subject_type=DecisionSubjectType.SECURITY,
+        subject_id=fixture.holding.security_id,
+    )
+    later_entry = build_action_intent(
+        decision=later_entry_decision,
+        security_id=fixture.holding.security_id,
+        broker_symbol=fixture.holding.broker_symbol,
+        role=ActionRole.ENTRY,
+        side=OrderSide.BUY,
+        requested_quantity=Decimal("5"),
+        reservation_price=Decimal("100"),
+        reservation_price_basis="limit_price",
+        reservation_stop_price=Decimal("90"),
+        risk_per_unit=Decimal("10"),
+        risk_basis="entry_to_protective_stop",
+    )
+    writer.record_decision(later_entry_decision, policy_payload={}, guard_payload={}, effective_action_payload={})
+    writer.record_action_intent(later_entry, expected_version=None)
+    writer.record_cumulative_fill(
+        later_entry.logical_action_id,
+        1,
+        provider_id="provider-b",
+        fill_event_id="later-same-security-entry-fill",
+        cumulative_quantity=Decimal("5"),
+        cumulative_notional=Decimal("500"),
+        cumulative_fees=Decimal("0"),
+        payload_sha256=None,
+        observed_at=datetime(2026, 10, 3, 13, 20, tzinfo=UTC),
+        expected_action_version=0,
+        expected_holding_version=None,
+    )
+    later_holding = writer.load_holding_episode_for_action(later_entry.logical_action_id)
+    later_stop_decision = DecisionIdentity.build(
+        deployment=fixture.generation_b,
+        clock=later_clock,
+        snapshot_sha256="9" * 64,
+        category=DecisionCategory.EXIT,
+        subject_type=DecisionSubjectType.HOLDING,
+        subject_id=later_holding.holding_episode_id,
+        sequence=1,
+    )
+    writer.record_decision(later_stop_decision, policy_payload={}, guard_payload={}, effective_action_payload={})
+    later_stop_intent = writer.propose_stop_update(
+        later_holding.holding_episode_id,
+        decision=later_stop_decision,
+        stop_price=Decimal("90"),
+        expected_holding_version=later_holding.state_version,
+        observed_at=datetime(2026, 10, 3, 13, 22, tzinfo=UTC),
+    )
+    later_holding = writer.load_holding_episode(later_holding.holding_episode_id)
+    writer.confirm_protective_stop(
+        later_stop_intent,
+        stop_price=Decimal("90"),
+        client_order_id="later-episode-stop-client",
+        broker_order_id="later-episode-stop-broker",
+        observed_at=datetime(2026, 10, 3, 13, 23, tzinfo=UTC),
+        expected_holding_version=later_holding.state_version,
+    )
+    later_holding = writer.load_holding_episode(later_holding.holding_episode_id)
+    writer.update_holding_marks(
+        later_holding.holding_episode_id,
+        valuation_at=later_clock.account_valuation_at,
+        peak_price=Decimal("101"),
+        expected_holding_version=later_holding.state_version,
+    )
+    later_portfolio = _portfolio_for(
+        fixture.generation_b,
+        later_clock,
+        account_snapshot_id="later-same-security-account",
+        cash="9500",
+        gross_exposure="500",
+        open_risk="50",
+    )
+    writer.record_portfolio_snapshot(later_portfolio)
+    later_account_clock = AccountValuationClock(
+        completed_session=later_clock.decision_session,
+        as_of_cutoff=later_clock.as_of_cutoff_at,
+        next_execution_session=later_clock.next_execution_session,
+        valuation_time=later_clock.account_valuation_at,
+    )
+    later_account = BrokerAccountSnapshot(
+        paper_account_environment_id=fixture.generation_b.paper_account_environment_id,
+        decision_slot_id=later_entry_decision.decision_slot_id,
+        decision_id=later_entry_decision.decision_id,
+        clock=later_account_clock,
+        equity=10000,
+        cash=9500,
+        peak_equity=12500,
+        balance_observed_at=later_clock.account_valuation_at,
+        peak_observed_at=later_clock.account_valuation_at,
+        positions=(BrokerPositionFact(
+            symbol="XYZ",
+            quantity=5,
+            mark_price=100,
+            mark_observed_at=later_clock.account_valuation_at,
+            sector=_classification(),
+            industry=_classification(code="Software"),
+        ),),
+        open_orders=(BrokerOrderFact(
+            broker_order_id="later-episode-stop-broker",
+            client_order_id="later-episode-stop-client",
+            symbol="XYZ",
+            side="sell",
+            status="submitted",
+            requested_quantity=5,
+            cumulative_filled_quantity=0,
+            purpose="protective_stop",
+            holding_episode_id=later_holding.holding_episode_id,
+            stop_price=90,
+        ),),
+        source_namespace="synthetic-broker",
+        account_snapshot_id=later_portfolio.account_snapshot_id,
+    )
+    later_snapshot, _, later_result = _canonical_consumer_read(
+        fixture,
+        portfolio=later_portfolio,
+        account=later_account,
+    )
+    same_security_episodes = [
+        item for item in later_snapshot.holding_episodes if item.security_id == fixture.holding.security_id
+    ]
+    assert {item.holding_episode_id for item in same_security_episodes} == {
+        flat_holding.holding_episode_id,
+        later_holding.holding_episode_id,
+    }
+    assert sum(item.remaining_quantity for item in same_security_episodes) == Decimal("5")
+    assert later_result.ready is True, later_result.findings
+    assert later_result.open_position_risk == 50
+    assert later_result.total_committed_risk == 50
 
 
 def _registered_alias_case(
