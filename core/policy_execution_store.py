@@ -2245,9 +2245,14 @@ class PolicyExecutionStateStore:
             attempt = next(item for item in updated.order_attempts if item.attempt_number == attempt_number)
             if attempt.status is ActionAttemptStatus.INTENDED:
                 submitted = replace(attempt, status=ActionAttemptStatus.SUBMITTED)
+                next_action_status = intent.status
+                if intent.status is ActionStatus.INTENDED:
+                    next_action_status = ActionStatus.SUBMITTED
+                elif intent.status in {ActionStatus.FILLED, ActionStatus.RESOLVED}:
+                    next_action_status = ActionStatus.RECONCILIATION_REQUIRED
                 updated = replace(
                     updated,
-                    status=ActionStatus.SUBMITTED,
+                    status=next_action_status,
                     order_attempts=tuple(submitted if item.attempt_number == attempt_number else item for item in updated.order_attempts),
                 )
             return self._versioned_action_transition(

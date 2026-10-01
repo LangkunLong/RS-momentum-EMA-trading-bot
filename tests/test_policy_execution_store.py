@@ -561,6 +561,17 @@ def test_unissued_action_can_be_resolved_but_issued_action_waits_for_terminal_ev
     assert resolved.status is ActionStatus.RESOLVED
     assert resolved.resolution_reason == "Synthetic missed-session reconciliation confirms no order was submitted"
     assert resolved.state_version == 1
+    late_reference = store.bind_attempt_order_refs(
+        intent.logical_action_id,
+        1,
+        provider_id="recorded-fixture-provider",
+        client_order_id="late-discovered-client",
+        expected_action_version=resolved.state_version,
+        observed_at=datetime(2026, 10, 1, 13, 32, tzinfo=UTC),
+    )
+    assert late_reference.status is ActionStatus.RECONCILIATION_REQUIRED
+    assert late_reference.resolution_reason == resolved.resolution_reason
+    assert late_reference.order_attempts[0].status is ActionAttemptStatus.SUBMITTED
 
     issued = build_action_intent(
         decision=_decision(deployment, subject_id="FIGI-ISSUED"),
@@ -1033,3 +1044,140 @@ def test_provider_scoped_order_aliases_survive_action_projection_reload(tmp_path
         "client-alias",
         "broker-alias",
     }
+
+
+def test_binding_remainder_refs_preserves_late_fill_reconciliation_across_restart(tmp_path: Path) -> None:
+    store = _open_store(tmp_path)
+    store.migrate()
+    deployment = _deployment()
+    store.register_deployment_identity(deployment, lifecycle="prepared", handler_identity="fixture-handler", guard_id="guard-v1")
+    entry = _entry_intent(deployment)
+    _record_decision(store, entry)
+    store.record_action_intent(entry, expected_version=None)
+    _record_fill(
+        store,
+        entry,
+        event_id="remainder-recovery-opening-fill",
+        cumulative_quantity="100",
+        cumulative_notional="5000",
+        expected_action_version=0,
+        expected_holding_version=None,
+    )
+    holding = store.load_holding_episode_for_action(entry.logical_action_id)
+    exit_decision = _decision(
+        deployment,
+        category=DecisionCategory.EXIT,
+        subject_type=DecisionSubjectType.HOLDING,
+        subject_id=holding.holding_episode_id,
+    )
+    store.record_decision(exit_decision, policy_payload={}, guard_payload={}, effective_action_payload={})
+    action = build_action_intent(
+        decision=exit_decision,
+        security_id=holding.security_id,
+        broker_symbol=holding.broker_symbol,
+        holding_episode_id=holding.holding_episode_id,
+        role=ActionRole.SCALE_OUT,
+        side=OrderSide.SELL,
+        requested_quantity=Decimal("50"),
+        exit_tier=1,
+        snapshot_original_quantity=Decimal("100"),
+        fraction_of_original_quantity=Decimal("0.5"),
+        rounding_rule_id="whole_share_floor_v1",
+    )
+    store.record_action_intent(action, expected_version=None)
+    submitted = store.bind_attempt_order_refs(
+        action.logical_action_id,
+        1,
+        provider_id="recorded-remainder-provider",
+        client_order_id="first-client",
+        broker_order_id="first-broker",
+        expected_action_version=0,
+        observed_at=datetime(2026, 10, 1, 13, 31, tzinfo=UTC),
+    )
+    after_first_fill = store.load_holding_episode(holding.holding_episode_id)
+    underfilled = _record_fill(
+        store,
+        action,
+        event_id="first-attempt-fill-20",
+        cumulative_quantity="20",
+        cumulative_notional="1000",
+        expected_action_version=submitted.state_version,
+        expected_holding_version=after_first_fill.state_version,
+    )
+    cancel = store.request_order_cancel(
+        action.logical_action_id,
+        1,
+        expected_action_version=underfilled.state_version,
+        observed_at=datetime(2026, 10, 1, 13, 32, tzinfo=UTC),
+    )
+    terminal = store.confirm_order_terminal(
+        action.logical_action_id,
+        1,
+        terminal_status=ActionAttemptStatus.CANCELLED,
+        expected_action_version=cancel.state_version,
+        observed_at=datetime(2026, 10, 1, 13, 33, tzinfo=UTC),
+    )
+    remainder = store.create_single_remainder_attempt(
+        action.logical_action_id,
+        expected_action_version=terminal.state_version,
+        observed_at=datetime(2026, 10, 1, 13, 34, tzinfo=UTC),
+    )
+    after_late_fill = store.load_holding_episode(holding.holding_episode_id)
+    late_fill = store.record_cumulative_fill(
+        action.logical_action_id,
+        1,
+        provider_id="recorded-remainder-provider",
+        fill_event_id="first-attempt-late-fill-25",
+        cumulative_quantity=Decimal("25"),
+        cumulative_notional=Decimal("1250"),
+        cumulative_fees=Decimal("0"),
+        payload_sha256=None,
+        observed_at=datetime(2026, 10, 1, 13, 35, tzinfo=UTC),
+        expected_action_version=remainder.state_version,
+        expected_holding_version=after_late_fill.state_version,
+    )
+    assert late_fill.status is ActionStatus.RECONCILIATION_REQUIRED
+    assert late_fill.state_version == remainder.state_version + 1
+
+    bound_remainder = store.bind_attempt_order_refs(
+        action.logical_action_id,
+        2,
+        provider_id="recorded-remainder-provider",
+        client_order_id="remainder-client",
+        broker_order_id="remainder-broker",
+        expected_action_version=late_fill.state_version,
+        observed_at=datetime(2026, 10, 1, 13, 36, tzinfo=UTC),
+    )
+    assert bound_remainder.status is ActionStatus.RECONCILIATION_REQUIRED
+    assert bound_remainder.order_attempts[0].terminal_status is ActionAttemptStatus.CANCELLED
+    assert bound_remainder.order_attempts[1].status is ActionAttemptStatus.SUBMITTED
+
+    before_remainder_fill = store.load_holding_episode(holding.holding_episode_id)
+    filled_while_live = store.record_cumulative_fill(
+        action.logical_action_id,
+        2,
+        provider_id="recorded-remainder-provider",
+        fill_event_id="remainder-attempt-fill-25",
+        cumulative_quantity=Decimal("25"),
+        cumulative_notional=Decimal("1250"),
+        cumulative_fees=Decimal("0"),
+        payload_sha256=None,
+        observed_at=datetime(2026, 10, 1, 13, 37, tzinfo=UTC),
+        expected_action_version=bound_remainder.state_version,
+        expected_holding_version=before_remainder_fill.state_version,
+    )
+    assert filled_while_live.status is ActionStatus.RECONCILIATION_REQUIRED
+    assert filled_while_live.confirmed_quantity == Decimal("50")
+    assert filled_while_live.residual_quantity == Decimal("0")
+    assert filled_while_live.order_attempts[1].requested_quantity == Decimal("30")
+    assert filled_while_live.order_attempts[1].confirmed_filled_quantity == Decimal("25")
+    still_pending = store.load_holding_episode(holding.holding_episode_id)
+    assert still_pending.last_exit_tier == 0
+    assert still_pending.pending_action_ids == (action.logical_action_id,)
+
+    restarted = PolicyExecutionStateStore(store.db_path, store_identity=deployment.store_identity)
+    projection = restarted.load_action_projection(action.logical_action_id)
+    assert projection.status is ActionStatus.RECONCILIATION_REQUIRED
+    assert projection.confirmed_quantity == Decimal("50")
+    assert projection.order_attempts[1].requested_quantity == Decimal("30")
+    assert restarted.load_holding_episode(holding.holding_episode_id).last_exit_tier == 0
