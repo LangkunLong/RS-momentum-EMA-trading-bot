@@ -1,5 +1,7 @@
 # Lead C source and import inventory
 
+Current hold: principal C-R1 supersedes whole-package acceptance of the candidate below. Its exact inventories remain immutable historical evidence. Replacement fill/holding/identity corrections are active with the original owners; regenerate source/API inventories for the corrected integrated application after relevant validation and independent review. Principal authenticated the inherited application closure against accepted main and found no separate dependency blocker.
+
 Status: frozen integrated application candidate `d2c4082746017dd4ecb14d709d71a7c12b1fc2d5`, tree `1e511574341e425f6ec2c326991a8dfaa6f49f38`. Final independent integrated specification and quality review approve all nine bounded offline criteria. This is not principal acceptance, evaluator-closure or image acceptance. Later documentation-only publication commits retain this validated application/test target and require their own exact changed-path payload inventory.
 
 Current source/import inventory: `.artifacts/lead-c/source-inventory-d2c4082.json`, SHA256 `bbdf9ab669e8c740a1e48ba347d4e6e02bee7e7af1f062a4a765f9ab88bbbb57`. It records all22changed paths from acceptedab385d7, their committed bytes/hashes and static imports. No retained B-manifest path changed, and calculator blob `71e562ffc00dc4e617f1cd625e3f13ea5fe3f81a` is preserved. The four additive modules and their direct dependencies are:

@@ -1,5 +1,7 @@
 # Lead C store/workflow interface record
 
+Current hold: principal P2 C-R1 requires admitted REPLACEMENT buy fills to create and update durable holdings while preserving logical identity, residual reservations and protection. The signatures/schema and approvals below describe the historical frozen candidate; they do not close this newly demonstrated semantic gap. Same #100 owner holds the correction; no operational store migration, runtime or legacy execution-entry-point change is authorized. Corrected source-bound API/schema inventory and independent/principal delta reviews remain required.
+
 Status: frozen implementation checkpoint and earlier proposal retained for principal-owned overlap review; not implementation acceptance or deployment authority. Starting application source `ab385d792e19ff6db39d87f1123f47f660fc1e1d`.
 
 ## Approved producer checkpoint43a0820
