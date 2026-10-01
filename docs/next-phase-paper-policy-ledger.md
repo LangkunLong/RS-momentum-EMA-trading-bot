@@ -41,6 +41,10 @@ Ruling: use approved visible isolated implementation chats with Luna/xhigh and d
 
 Complete #99/#100 corrections and persistence; retain per-criterion source/input-bound receipts; independent full base-to-head spec/quality review and scoped fix reviews; integrate #100 before #99; combined #98/#99/#100 pending/partial-fill/restart test and final independent review; publish eligible PR/evidence when export authorization is established; await actual normal merges and accurate issue disposition; then send one achieved-goal report only when messaging is permitted.
 
+Approved producer interface is now frozen at43a0820 in `.artifacts/lead-c/store-api-schema-43a0820.json` (SHA256 `f8c6a06bdd3fb17a853e750b3cf2847d503da291c671323c8958bd15b2f94c14`):28public methods,15tables+1index, schemaV1 checksum `b1eead321b213c54e3eca905b603cf00d7237d9b2d84f74085dda909b91b7190`, no existing execution entry-point edits. Companion interface/completion records were refreshed in leadab46098. Final integrated inventory and approval still await consumer corrections.
+
+Local #100 publication preparation is retained as `.artifacts/lead-c/issue-100-pr-body-bfcaa5a.md` (SHA256 `ca287a24c9a9d5fd7a6e2f195505231588b31ce5d56bf7f9a2c78b8400d795ca`) and `issue-100-publication-payload-bfcaa5a.json` (SHA256 `5c5d4893d1a6feb009c08777a5fb16fdd98c9cf9ecc370266b8dddb256ebaee1`). The six exact paths were read from the accepted-base diff. No #100 export was attempted; the prepared body explicitly retains the three consumer findings and final acceptance gates. Existing #98 export and peer-message restrictions remain unchanged.
+
 ## Dispatch register and current gate
 
 All three missing visible issue chats were requested with `gpt-6-luna` / `xhigh`, isolated worktrees starting at exact `ab385d792e19ff6db39d87f1123f47f660fc1e1d`. Creation returned queued client IDs; permanent IDs below were resolved from actual session metadata and verified with the app status tool. No duplicate creation.
