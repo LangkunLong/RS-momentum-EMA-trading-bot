@@ -1,6 +1,6 @@
 # Lead C completion record
 
-Status: ACTIVE / INCOMPLETE. Local implementation,107case validation and independent integrated specification/quality review are complete for all nine bounded offline criteria. One minor report hash correction is being appended. GitHub export and outbound handoff remain gated; no C remote publication, required remote checks, principal acceptance or normal remote merge has occurred. Canonical ongoing state: `docs/next-phase-paper-policy-ledger.md`.
+Status: ACTIVE / INCOMPLETE. Local implementation,107case validation and independent integrated specification/quality review are complete for all nine bounded offline criteria. The minor report hash correction is appended in owner49ecbf4. GitHub export and outbound handoff remain gated; no C remote publication, required remote checks, principal acceptance or normal remote merge has occurred. Canonical ongoing state: `docs/next-phase-paper-policy-ledger.md`.
 
 Completion requires all nine original #98/#99/#100 criteria, independent specification and quality review, combined offline boundary/restart evidence at exact integrated source, schema compatibility constraints for D, and actual accepted normal merges. This file is not a completion receipt.
 
@@ -22,7 +22,7 @@ Completion requires all nine original #98/#99/#100 criteria, independent specifi
 
 Integrated application candidate `d2c4082746017dd4ecb14d709d71a7c12b1fc2d5`, tree `1e511574341e425f6ec2c326991a8dfaa6f49f38`, includes producer43a0820/reportbfcaa5a and consumerd2a0677. The three new lead regressions pass, including previously unreached flag-clear and active-protection negative assertions. Six specifically vetted offline modules passed107cases (final chunkdc89cb,2warnings,13.95s), including the complete8case chain and2feature-identity cases. Ruff passed. The compileall traversal reported an inaccessible ignored cache directory; a separate read-only compile of all312committed Python files passed. Python3.11 and required remote CI remain pending. Receipt `.artifacts/lead-c/integration-validation-d2c4082.md` retains commands, warnings, exact inventories and historical failure boundaries.
 
-Independent integrated review approves the final candidate and all nine criteria; the three consumer findings and two inherited blockers are closed with no new Critical/Important application finding. The unchanged full review is published locally in `docs/next-phase-paper-policy-independent-review.md`. One nonblocking source-hash correction to the owner report is assigned; application/test bytes remain frozen. Principal acceptance, publication, required remote CI and normal merges remain outstanding, so full completion is not claimed.
+Independent integrated review approves the final candidate and all nine criteria; the three consumer findings and two inherited blockers are closed with no new Critical/Important application finding. The unchanged full review is published locally in `docs/next-phase-paper-policy-independent-review.md`. The nonblocking source-hash correction is appended by owner49ecbf4 and verified by the lead; application/test bytes remain frozen. Principal acceptance, publication, required remote CI and normal merges remain outstanding, so full completion is not claimed.
 
 ## Historical combined checkpoints
 
