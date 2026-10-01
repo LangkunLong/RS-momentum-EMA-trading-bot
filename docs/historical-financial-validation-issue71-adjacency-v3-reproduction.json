@@ -1,0 +1,125 @@
+{
+  "issue": "#71",
+  "artifact": "fiscal adjacency v3 reproduction receipt",
+  "input_identity": {
+    "bundle_sha256": "cf729b47d762ae86287bb8a87c28a1664e7475c74ef1aca736fbc240111349de",
+    "manifest_sha256": "3c9edd0158dcb93f9de5edbfcf6f281dd8b25bcdd1ded6ad21473af5fd37be7c",
+    "manifest_bundle_hash_matches": true
+  },
+  "superseded_v3_addendum_revision": {
+    "commit": "675df31e4facaa260f78a579524a713f1a38971f",
+    "report_json_sha256": "7324a21f4004c1f9e824179b6e5c2416b72dca52b9815a7048950bfe4109c8e1",
+    "superseded_claim": "Revenue acceleration had zero changed outputs.",
+    "reason": "The hash-pinned reproduction measured 77 revenue windows with changed outputs. The original one-off scan code and runtime receipt were not retained, so the specific cause of its zero result cannot be reconstructed."
+  },
+  "first_failed_reproduction": {
+    "result": "count check failed",
+    "failure": "ValueError: reproduced measurement differs from the committed v3 addendum: price_security_sessions_all_symbols: expected 720785, got 869041; revenue_acceleration.changed_windows: expected 0, got 77; revenue_acceleration.affected_symbols: expected 0, got 54; revenue_acceleration.changed_priced_security_sessions: expected 0, got 6876; revenue_acceleration.v2_available_to_v3_unavailable: expected 0, got 27; revenue_acceleration.v2_unavailable_to_v3_available: expected 0, got 50",
+    "runtime_identity": {
+      "source_revision": "675df31e4facaa260f78a579524a713f1a38971f",
+      "calculator_identity": "pit-financial-features-v3",
+      "python_implementation": "CPython",
+      "python_version": "3.13.14",
+      "pandas_version": "3.0.1",
+      "sqlite_version": "3.50.4",
+      "script_sha256": null,
+      "script_sha256_note": "The first failed run raised before emitting its JSON identity; the script was modified in the working tree, so its exact bytes were not captured."
+    },
+    "recorded_counts": {
+      "state_window_denominator_per_metric": 8696,
+      "earnings_acceleration": {
+        "changed_windows": 68,
+        "affected_symbols": 47,
+        "changed_priced_security_sessions": 6007,
+        "v2_available_to_v3_unavailable": 24,
+        "v2_unavailable_to_v3_available": 44
+      },
+      "revenue_acceleration": {
+        "changed_windows": 0,
+        "affected_symbols": 0,
+        "changed_priced_security_sessions": 0,
+        "v2_available_to_v3_unavailable": 0,
+        "v2_unavailable_to_v3_available": 0
+      }
+    },
+    "reproduced_counts_before_check": {
+      "quarterly_records": 39470,
+      "quarterly_symbols": 565,
+      "price_security_sessions_all_bundle_dates": 869041,
+      "state_window_denominator_per_metric": 8696,
+      "earnings_acceleration": {
+        "changed_windows": 68,
+        "affected_symbols": 47,
+        "changed_priced_security_sessions": 6007,
+        "v2_available_to_v3_unavailable": 24,
+        "v2_unavailable_to_v3_available": 44
+      },
+      "revenue_acceleration": {
+        "changed_windows": 77,
+        "affected_symbols": 54,
+        "changed_priced_security_sessions": 6876,
+        "v2_available_to_v3_unavailable": 27,
+        "v2_unavailable_to_v3_available": 50
+      }
+    },
+    "diagnosis": {
+      "price_session_total": "This script-method discrepancy counted every price row in the bundle, including dates outside 2021-01-01 through 2025-12-31. The corrected query bounds trade_date to the evaluation interval; the verified total is 720785.",
+      "revenue_acceleration": "This is a v2-versus-v3 feature-output difference under the retained comparison method and hash-pinned input, not a consequence of the all-dates price total. The earlier zero is superseded; because the original scan code was not retained, its exact calculation or transcription error is unknown.",
+      "calculator_semantics_changed_by_followup": false
+    }
+  },
+  "verified_reproduction": {
+    "result": "passed recorded-count check",
+    "command": "python -m tools.reproduce_issue71_adjacency_comparison --bundle \"C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.artifacts/data/development-sp500-v2/pit_bundle.sqlite3\" --manifest \"C:/Projects/trading_bot/RS-momentum-EMA-trading-bot/.artifacts/data/development-sp500-v2/bundle_manifest.json\" --evaluation-start 2021-01-01 --evaluation-end 2025-12-31",
+    "runtime_seconds": 799.531,
+    "identity": {
+      "bundle_sha256": "cf729b47d762ae86287bb8a87c28a1664e7475c74ef1aca736fbc240111349de",
+      "manifest_sha256": "3c9edd0158dcb93f9de5edbfcf6f281dd8b25bcdd1ded6ad21473af5fd37be7c",
+      "calculator_identity": "pit-financial-features-v3",
+      "v2_reference_revision": "3d8a0edbc793b1a435849daead96ffaa9c165d97",
+      "source_revision_at_runtime": "675df31e4facaa260f78a579524a713f1a38971f",
+      "source_worktree_dirty": true,
+      "reproduction_script_sha256": "bfec250376d6e03208ee83664513911f45adda271cb1522da918efc0166a5d50",
+      "v3_calculator_source_sha256": "2d76ece95830386831d2bc4e21c688d894efea4d70872a9591a98ab0c3b2b703",
+      "python_implementation": "CPython",
+      "python_version": "3.13.14",
+      "pandas_version": "3.0.1",
+      "sqlite_version": "3.50.4"
+    },
+    "recorded_counts_check": "passed",
+    "method": {
+      "changed_sessions": "count all ticker price rows in each changed state window",
+      "fiscal_matcher": "shared #66 matcher with 28-day prior-calendar-year tolerance",
+      "quarterly_state_boundary": "distinct quarterly fundamental public_date",
+      "read_only": true,
+      "snapshot_date": "state boundary clipped to evaluation start",
+      "state_window": "[snapshot_date, next quarterly public_date), clipped to evaluation period",
+      "v2_adjacency": "newest two matched current periods differ by one pandas calendar-quarter ordinal",
+      "v3_adjacency": "newest two matched current period ends are 84 through 105 days apart inclusive",
+      "window_counting": "one state window when the ticker has at least one price row in the interval"
+    },
+    "scan": {
+      "evaluation_start": "2021-01-01",
+      "evaluation_end": "2025-12-31",
+      "quarterly_records": 39470,
+      "quarterly_symbols": 565,
+      "price_security_sessions_all_symbols": 720785,
+      "earnings_acceleration": {
+        "state_windows": 8696,
+        "changed_windows": 68,
+        "affected_symbols": 47,
+        "changed_priced_security_sessions": 6007,
+        "v2_available_to_v3_unavailable": 24,
+        "v2_unavailable_to_v3_available": 44
+      },
+      "revenue_acceleration": {
+        "state_windows": 8696,
+        "changed_windows": 77,
+        "affected_symbols": 54,
+        "changed_priced_security_sessions": 6876,
+        "v2_available_to_v3_unavailable": 27,
+        "v2_unavailable_to_v3_available": 50
+      }
+    }
+  }
+}

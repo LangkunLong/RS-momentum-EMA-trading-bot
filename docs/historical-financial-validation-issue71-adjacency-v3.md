@@ -55,15 +55,18 @@ windows. The bundle contains 39,470 quarterly records, 565 symbols, and
 | Feature | Windows changed | Symbols affected | Priced security-sessions changed |
 | --- | ---: | ---: | ---: |
 | Earnings acceleration | 68 | 47 | 6,007 |
-| Revenue acceleration | 0 | 0 | 0 |
+| Revenue acceleration | 77 | 54 | 6,876 |
 
 For EPS, 24 windows changed from available under v2 to unavailable under v3;
 44 changed from unavailable under v2 to available under v3. The 68-window
-total counts output changes in either direction. Revenue acceleration had no
-changed outputs in this bundle. These are feature-output comparisons only;
-they do not establish feature coverage, policy consumption, strategy or
-portfolio impact, production-universe behavior, or retrospective trading
-error.
+total counts output changes in either direction. For revenue, 27 windows
+changed from available to unavailable and 50 changed from unavailable to
+available. A later hash-pinned reproduction found that the initial v3 addendum
+had incorrectly recorded zero revenue changes; the table and machine-readable
+counts here reflect the reproduced 77-window result. These are feature-output
+comparisons only; they do not establish feature coverage, policy consumption,
+strategy or portfolio impact, production-universe behavior, or retrospective
+trading error.
 
 ## Reproduction recipe
 
@@ -91,17 +94,32 @@ counts, and affected sessions against this addendum; it exits with an error on
 any mismatch.
 
 The script was added after the original comparison and this follow-up did not
-rerun the full scan. Thus the recipe makes the measurement independently
-reproducible, but the reported 68-window and 6,007-session EPS counts have not
-yet been revalidated by executing this retained script. The original scan's
-runtime identity is unknown. The recipe-creation environment was CPython
-3.13.14, pandas 3.0.1, SQLite 3.50.4; a reproduction run records its own
-runtime instead of assuming those versions.
+retain the original scan's runtime identity. The reproduction run below
+captures its own Python, pandas, and SQLite versions, exact script and
+calculator source hashes, source revision, and worktree state.
 
-The recipe CLI import/help path, focused count-check tests, and Ruff check pass.
-The addendum JSON parsed successfully. The bundle comparison itself was not
-executed in this follow-up, so the run-time count check has not yet been
-exercised against the historical bundle.
+The first full attempt exposed two different issues. Its all-bundle-date price
+count was a script-method error; the query now clips price rows to the
+evaluation interval. Revenue's 77 changed windows are an actual difference
+between the v2 and v3 calculator outputs under the shared matcher. The initial
+addendum's zero cannot be traced to a specific mistake because its one-off scan
+code was not retained. The earlier v3 addendum at commit
+`675df31e4facaa260f78a579524a713f1a38971f` (JSON SHA-256
+`7324a21f4004c1f9e824179b6e5c2416b72dca52b9815a7048950bfe4109c8e1`) is
+superseded for that revenue result. The original v2 report remains unchanged.
+
+The corrected pinned run passed the report-count check in **799.531 seconds**.
+It reported CPython 3.13.14, pandas 3.0.1, SQLite 3.50.4, bundle SHA-256
+`cf729b47d762ae86287bb8a87c28a1664e7475c74ef1aca736fbc240111349de`, manifest
+SHA-256 `3c9edd0158dcb93f9de5edbfcf6f281dd8b25bcdd1ded6ad21473af5fd37be7c`,
+and reproduction-script SHA-256
+`bfec250376d6e03208ee83664513911f45adda271cb1522da918efc0166a5d50`. The
+complete failed-attempt receipt and successful output are retained in
+[`historical-financial-validation-issue71-adjacency-v3-reproduction.json`](/C:/Users/llong/.codex/worktrees/f1ba/RS-momentum-EMA-trading-bot/docs/historical-financial-validation-issue71-adjacency-v3-reproduction.json).
+
+The recipe CLI import/help path, four focused count and identity tests, and
+Ruff check pass. No calculator implementation or semantics changed in this
+reproduction correction.
 
 ## Verification and status
 

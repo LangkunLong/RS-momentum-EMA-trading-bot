@@ -16,6 +16,7 @@ import platform
 import sqlite3
 import subprocess
 import sys
+import time
 from collections import defaultdict
 from datetime import date, timedelta
 from pathlib import Path
@@ -67,6 +68,19 @@ def _git_revision() -> str:
         ).strip()
     except (OSError, subprocess.CalledProcessError):
         return "unavailable"
+
+
+def _git_worktree_dirty() -> bool | None:
+    try:
+        changes = subprocess.check_output(
+            ["git", "status", "--porcelain"],
+            cwd=Path(__file__).resolve().parents[1],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        return bool(changes.strip())
+    except (OSError, subprocess.CalledProcessError):
+        return None
 
 
 def _readonly_connection(path: Path) -> sqlite3.Connection:
@@ -257,6 +271,25 @@ def _validate_recorded_counts(
         )
 
 
+def _validate_recorded_identity(
+    recorded_report: dict[str, Any],
+    *,
+    bundle_sha256: str,
+    manifest_sha256: str,
+) -> None:
+    """Bind this run to the input hashes recorded in the committed addendum."""
+
+    recorded_input = recorded_report["input_bundle"]
+    if (
+        recorded_report.get("calculator_identity") != EXPECTED_CALCULATOR_ID
+        or recorded_input.get("sha256") != bundle_sha256
+        or recorded_input.get("manifest_sha256") != manifest_sha256
+    ):
+        raise ValueError(
+            "reproduction inputs or calculator identity differ from the v3 addendum"
+        )
+
+
 def reproduce(
     *,
     bundle_path: Path,
@@ -286,15 +319,11 @@ def reproduce(
     recorded_report = json.loads(
         REPRODUCTION_REPORT_PATH.read_text(encoding="utf-8")
     )
-    recorded_input = recorded_report["input_bundle"]
-    if (
-        recorded_report.get("calculator_identity") != EXPECTED_CALCULATOR_ID
-        or recorded_input.get("bundle_sha256") != actual_bundle_sha256
-        or recorded_input.get("manifest_sha256") != actual_manifest_sha256
-    ):
-        raise ValueError(
-            "reproduction inputs or calculator identity differ from the v3 addendum"
-        )
+    _validate_recorded_identity(
+        recorded_report,
+        bundle_sha256=actual_bundle_sha256,
+        manifest_sha256=actual_manifest_sha256,
+    )
 
     v2_metrics = {
         "earnings_acceleration": _empty_metric(),
@@ -328,7 +357,13 @@ def reproduce(
                 ).fetchone()[0]
             )
             all_price_row_count = int(
-                connection.execute("SELECT COUNT(*) FROM price").fetchone()[0]
+                connection.execute(
+                    "SELECT COUNT(*) FROM price WHERE trade_date >= ? AND trade_date <= ?",
+                    (
+                        evaluation_start.isoformat(),
+                        evaluation_end.isoformat(),
+                    ),
+                ).fetchone()[0]
             )
             boundaries_by_symbol = _quarterly_boundaries(
                 connection, evaluation_end
@@ -424,6 +459,13 @@ def reproduce(
             "calculator_identity": FINANCIAL_FEATURE_CALCULATOR_ID,
             "v2_reference_revision": V2_REFERENCE_REVISION,
             "source_revision_at_runtime": _git_revision(),
+            "source_worktree_dirty": _git_worktree_dirty(),
+            "reproduction_script_sha256": _sha256(Path(__file__).resolve()),
+            "v3_calculator_source_sha256": _sha256(
+                Path(__file__).resolve().parents[1]
+                / "core"
+                / "pit_feature_snapshot.py"
+            ),
             "bundle_sha256": actual_bundle_sha256,
             "manifest_sha256": actual_manifest_sha256,
             "python_implementation": platform.python_implementation(),
@@ -462,6 +504,7 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = _parse_args()
+    started = time.perf_counter()
     result = reproduce(
         bundle_path=args.bundle,
         manifest_path=args.manifest,
@@ -470,6 +513,7 @@ def main() -> int:
         evaluation_start=args.evaluation_start,
         evaluation_end=args.evaluation_end,
     )
+    result["runtime_seconds"] = round(time.perf_counter() - started, 3)
     json.dump(result, sys.stdout, indent=2, sort_keys=True)
     sys.stdout.write("\n")
     return 0

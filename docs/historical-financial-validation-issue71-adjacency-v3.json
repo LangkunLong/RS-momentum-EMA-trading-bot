@@ -57,9 +57,11 @@
       "changed_priced_security_sessions": 6007
     },
     "revenue_acceleration": {
-      "changed_windows": 0,
-      "affected_symbols": 0,
-      "changed_priced_security_sessions": 0
+      "changed_windows": 77,
+      "changed_v2_available_to_v3_unavailable": 27,
+      "changed_v2_unavailable_to_v3_available": 50,
+      "affected_symbols": 54,
+      "changed_priced_security_sessions": 6876
     },
     "claims_excluded": [
       "production feature coverage",
@@ -81,7 +83,12 @@
     "v2_algorithm": "Apply the same #66 fiscal matcher and growth formula, requiring the two newest matched current periods to differ by one pandas calendar-quarter ordinal.",
     "v3_algorithm": "Apply current pit-financial-features-v3 using the same #66 matcher and growth formula, requiring an inclusive 84-105 day current-period endpoint gap.",
     "original_scan_runtime_identity_retained": false,
-    "followup_full_scan_rerun": false,
+    "followup_full_scan_rerun": true,
+    "verified_reproduction_receipt": "docs/historical-financial-validation-issue71-adjacency-v3-reproduction.json",
+    "superseded_zero_revenue_revision": {
+      "commit": "675df31e4facaa260f78a579524a713f1a38971f",
+      "report_json_sha256": "7324a21f4004c1f9e824179b6e5c2416b72dca52b9815a7048950bfe4109c8e1"
+    },
     "recipe_creation_runtime": {
       "python_implementation": "CPython",
       "python_version": "3.13.14",
@@ -90,19 +97,23 @@
     },
     "reproduction_output_captures": [
       "source revision",
+      "worktree dirty state",
+      "reproduction script and calculator source hashes",
       "calculator identity",
       "bundle and manifest digests",
+      "elapsed seconds",
       "Python implementation and version",
       "pandas version",
       "SQLite version",
       "recorded-count validation result"
     ],
     "verification": {
-      "cli_help_import_smoke": "passed; scan not executed",
-      "focused_count_check_tests": "2 passed",
+      "cli_help_import_smoke": "passed",
+      "focused_count_check_tests": "4 passed",
       "ruff": "passed",
       "json_parse": "passed",
-      "full_comparison_executed": false
+      "full_comparison_executed": true,
+      "full_comparison_count_check": "passed"
     }
   },
   "verification": [

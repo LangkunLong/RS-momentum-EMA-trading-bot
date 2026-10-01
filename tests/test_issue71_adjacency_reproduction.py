@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from tools.reproduce_issue71_adjacency_comparison import _validate_recorded_counts
+from tools.reproduce_issue71_adjacency_comparison import (
+    EXPECTED_CALCULATOR_ID,
+    REPRODUCTION_REPORT_PATH,
+    _validate_recorded_counts,
+    _validate_recorded_identity,
+)
 
 
 def _recorded_scan() -> dict[str, object]:
@@ -58,3 +65,33 @@ def test_recorded_counts_check_reports_any_measurement_drift() -> None:
 
     with pytest.raises(ValueError, match="expected 6007, got 6006"):
         _validate_recorded_counts(reproduced, _recorded_scan())
+
+
+def test_recorded_identity_matches_the_addendum_input_bundle_schema() -> None:
+    report = json.loads(REPRODUCTION_REPORT_PATH.read_text(encoding="utf-8"))
+    input_bundle = report["input_bundle"]
+
+    assert "sha256" in input_bundle
+    assert "bundle_sha256" not in input_bundle
+    _validate_recorded_identity(
+        report,
+        bundle_sha256=input_bundle["sha256"],
+        manifest_sha256=input_bundle["manifest_sha256"],
+    )
+
+
+def test_recorded_identity_rejects_input_hash_drift() -> None:
+    report = {
+        "calculator_identity": EXPECTED_CALCULATOR_ID,
+        "input_bundle": {
+            "sha256": "a" * 64,
+            "manifest_sha256": "b" * 64,
+        },
+    }
+
+    with pytest.raises(ValueError, match="inputs or calculator identity differ"):
+        _validate_recorded_identity(
+            report,
+            bundle_sha256="c" * 64,
+            manifest_sha256="b" * 64,
+        )
