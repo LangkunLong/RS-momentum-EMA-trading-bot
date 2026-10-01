@@ -35,4 +35,12 @@ The one-way predecessor-date and normalizer removal-bypass cases are covered in 
 5. Represent FISV→FI→FISV as three unique segment IDs with non-overlapping date ranges; verify both effective-date edges and verify that ticker-symbol reuse does not create a graph cycle or ambiguous holding resolution. Pending coordinated schema work.
 6. Reject a two-row FISV/FI representation that truncates the first FISV interval and therefore loses the 2025-11-11 FISV segment. Pending coordinated schema work.
 
-Acceptance remains blocked for the Fiserv transition chain until the identity-segment schema, the retained request-contract mapping, and resolver semantics are jointly reviewed and the existing price export is reconciled against the dated episodes. No historical index membership rows were acquired or added in this review.
+At the time of this review, acceptance remained blocked pending segment schema, request-contract mapping, and resolver review. No historical index membership rows were acquired or added in this review.
+
+## Follow-up — 2026-10-01
+
+The implementation gap recorded above is resolved at the code level: the integrated `price_identity_segments_v1` parser/resolver and bundle-integrity forwarding are present, and the relevant source files match lead commit `503ecdd`. This does not admit Fiserv evidence or change the production gate. The V3 builder still requires explicit nonproduction fixture opt-in and rejects production membership pending a reviewed provider-native adapter; the V5 approved evidence-pair set remains empty.
+
+The [Fiserv source receipt](price-identity-fiserv-source-receipt-v1.md) records the current source-byte status. The 2025 Fiserv IR release and Fiserv Terms of Use were retained privately with SHA-256 receipts under the terms' internal informational-use permission. The 2023 Fiserv IR release was browser-verified but a raw-byte capture did not complete. A direct raw-byte request for the 2023 SEC exhibit returned HTTP 403; raw bytes were not captured for the 2025 SEC filing. The first edge has no byte-backed primary assertion, and completed effective-date corroboration remains unreviewed, so no segment contract is complete.
+
+The retained parent request contract still has 607 keys and digest `273727c248f57b7376b6cf269312325cdd059287e1f4ed16ab5ce63617ceabc7`. Its FISV interval spans 2020-01-01–2025-12-31 and its FI interval spans 2023-06-07–2025-11-10, overlapping in the parent representation. The source-supported three episode bounds remain FISV through 2023-06-06, FI through 2025-11-10, then FISV from 2025-11-11. Keep both edges and any segment rows out of the retained prices provenance until the complete byte-backed assertions and resolver review are available.

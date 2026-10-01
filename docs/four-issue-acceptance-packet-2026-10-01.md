@@ -20,8 +20,9 @@ Docker image binds the 56-path map
 at `d764c87`; current main integration changed that source closure. The
 corrected 57-path map at `8a0896a` is
 `f6dee0745545308088887a924b9839efedd8f1beff1dfbfac82fd889935819f0`.
-A canonical local build and import smoke exist for this map; matched probes
-remain pending.
+A canonical local build, import smoke, and matched parent/comment-only candidate
+probes now exist for this map. The probe execution identity remains `8a0896a`;
+later integration commits changed only evidence/docs.
 The selected cross-issue suite passed **138 tests** at the measured source;
 after the current-main merge and 57-path image closure fix
 (`8a0896ac55dce180a14f3e06b08a1baaa1fd64e1`), the cross-issue suite
@@ -135,35 +136,39 @@ The [new integrated-image build/import receipt](issue-82-local-8a-build-import-r
 binds a 60-file raw-Git context, the corrected map, Docker backend image ID
 `sha256:1e0e6327f48e96d4f9754c6bae47969f0d8cf57f3c2b6cb8a10ab2ece28af0df`,
 and a successful no-network/no-mount panel import smoke with owned cleanup.
-It retains a failed config-digest reference attempt separately. It is partial
-evidence, not a matched parent/candidate run at `8a0896a`.
+It retains a failed config-digest reference attempt separately. The
+[integrated-source candidate receipt](issue-82-local-8a-final-source-candidate-receipt-2026-10-01.md)
+adds the actual matched run at that same map. Its final parsed JSON SHA-256 is
+`859c65a7e413118ff71f4001857233ae25d0a65273aaa7f5b806f520f7357c7c`;
+the executed local harness SHA-256 is
+`6cf0404ac7dd32b969232879cde8b2c8d3ed3d9d05dd5df5dc50e2e673472104`.
 
 | Exact published criterion | Current evidence and disposition |
 | --- | --- |
 | Distinguish simulation, fixed probes and supplemental observations | [Simulation receipt](research-03-simulation-verification-2026-09-28.md) separates synthetic next-open/gap-stop portfolio simulation, fixed 11-probe worker results, and supplemental mechanism checks. No historical PIT panel or empirical strategy campaign was run. |
-| Match parent/candidate assumptions; identify enabled/skipped stages | The `d764c87` Windows-host `DockerPanelEvaluatorV5 → LocalContainerExecutorV5` run mounted the same four-policy-file scope into separate parent and comment-only candidate containers from one immutable image. Policy revisions `76f67d16…` and `6d3008e8…`, source bundles `109a6199…` and `7c033b64…`, separate request/command/output hashes, and one matching 11-probe fingerprint `671a50c126b412b90fcaa466a034cade8d151686a90a8c1c1103c4f621ab4fc1` are in the receipt. Historical PIT panel and strategy campaign stages were skipped; no scenario data was mounted. The new integrated image imports its full panel path but has no matched parent/candidate output yet. |
-| Bounded failures, cleanup, existing passing path | Focused failure/timeout/cleanup mechanisms and synthetic next-open/gap-stop simulator paths pass in selected tests. The `d764c87` actual parent/candidate containers each exited zero, emitted 3,584 bytes below the 64 MiB bound, used `network=none`, `--pull never`, read-only root and policy mounts, and completed owned evaluator/workspace cleanup. Targeted checks found neither owned run container after cleanup; an independent daemon query found no container with the `pit-v5-` name prefix. The failed full-checkout and offline build setup attempts are retained as setup failures, not candidate results. |
+| Match parent/candidate assumptions; identify enabled/skipped stages | The `8a0896a` Windows-host `DockerPanelEvaluatorV5 → LocalContainerExecutorV5` run mounted the same four-policy-file scope into separate parent and comment-only candidate containers from one immutable image. Policy revisions `76f67d16…` and `6d3008e8…`, source bundles `109a6199…` and `7c033b64…`, separate request/command/output hashes, and one matching 11-probe fingerprint `671a50c126b412b90fcaa466a034cade8d151686a90a8c1c1103c4f621ab4fc1` are in the new receipt. The executor checked each created container's actual `.Image` against the pre-inspected Docker backend image ID before start. Historical PIT panel and strategy campaign stages were skipped; no scenario data was mounted. |
+| Bounded failures, cleanup, existing passing path | Focused failure/timeout/cleanup mechanisms and synthetic next-open/gap-stop simulator paths pass in selected tests. The actual `8a0896a` parent/candidate containers each exited zero, emitted 3,584 bytes below the 64 MiB bound, used `network=none`, `--pull never`, read-only root and policy mounts, and completed owned evaluator/workspace cleanup. Targeted checks found neither owned run container after cleanup; an independent daemon query found no container with the `pit-v5-` name prefix. Earlier full-checkout/offline build and config-digest-reference attempts remain setup failures, not candidate results. |
 
 | Status | Assessment |
 | --- | --- |
-| Implementation | Existing simulator, evaluator, worker and focused mechanisms integrated; the new Alpaca helper is in the 57-path source and Docker allowlists. The corrected image built and imported the full panel path. |
-| Required inputs | Synthetic bars/policies, canonical 60-file source context, pinned base/lockfile, and local Docker Engine were available. The requested hosted route also needs temporary manual-workflow publication on GitHub's default branch; that publication is held. No production PIT data or provider input is needed for the bounded probe. |
-| Acceptance evidence | The earlier and `d764c87` local image/run receipts remain valid under their original source maps. The `8a0896a` local image and import-smoke receipt are retained; actual matched parent/candidate probe outputs and cleanup at this map remain missing. The unpushed manual-only Actions package was blocked by automatic publication review and was not dispatched. No hosted run is claimed. |
+| Implementation | Existing simulator, evaluator, worker and focused mechanisms integrated; the new Alpaca helper is in the 57-path source and Docker allowlists. The corrected image built, imported the full panel path, and executed matched fixed probes. |
+| Required inputs | Synthetic bars/policies, canonical 60-file source context, pinned base/lockfile, and local Docker Engine 29.7.2 were available and used. No production PIT data or provider input was needed for this bounded probe. The prepared hosted route is optional and remains unpublished. |
+| Acceptance evidence | The earlier and `d764c87` local image/run receipts remain valid under their original source maps. At `8a0896a`, the image/build/import and actual parent/candidate JSON/log receipts are retained. Both 11-probe semantic fingerprints matched; policy, request, and output identities differed as expected. Both containers exited zero with a passing pre-start actual-image guard, bounded output, and complete owned cleanup. The receipt discloses shared trace presentation and the absence of literal observed `.Image` fields in the JSON. No hosted run is claimed. |
 | Dependencies | Accepted #80/#81; historical production PIT data and empirical costs are outside the bounded synthetic verification. |
 
-**Recommendation:** not ready for final integrated-source #82 acceptance until
-matched parent/candidate containers execute at the corrected map and their
-output/cleanup evidence is reviewed. The user prefers the hosted runner;
-workflow publication and dispatch remain an explicit approval gate here.
-The `d764c87` run remains a valid dated synthetic result and does not accept a
+**Recommendation:** ready for bounded #82 actual container acceptance at the
+named integrated source and fixed synthetic probe scope. The `d764c87` run
+remains a valid dated result under its original image. Neither run accepts a
 production PIT evaluation, historical strategy result, or global policy
-equivalence.
+equivalence. The held GitHub Actions package was not needed for this local
+completion and has not been published or dispatched.
 
 ## #68 — historical membership and security lineage
 
 The [source receipt](historical-membership-source-receipt-v1.md),
 [acquisition and transition plan](historical-membership-acquisition-plan-v1.md),
 [partial identity ledger](price-identity-transition-evidence-ledger-v1.json),
+[Fiserv source-byte receipt](price-identity-fiserv-source-receipt-v1.md),
 and [segment decision](price-identity-segment-contract-decision-v1.md) define
 the exact gap. Integrated code has an opt-in, hash-bound V3 segment contract,
 normalizer and builder/verifier forwarding, plus a V5 production-admission
@@ -174,14 +179,14 @@ production source bytes or add union membership rows.
 | Exact published criterion | Current evidence and disposition |
 | --- | --- |
 | Effective date and retained source evidence for every event | **Missing production input.** The retained S&P stream has 711 secondary-source events/606 tickers and five official spot checks, without a verified opening/ending state or complete primary ledger. Nasdaq has selected notices and a nonadmitted secondary extraction, without an admitted seed/event pair. Russell 2000 has no retained historical membership file. |
-| Overlaps, renames and short-lived events reconcile by security lineage | Synthetic normalizer and integrity fixtures pass; production overlap/short-lived counts and authenticated transition replay are missing. FISV→FI (2023-06-07)→FISV (2025-11-11) needs the three segments tied to original issuer/SEC source bytes, source locators, final price request-contract hash, and complete member events. Thirteen other one-way leads remain evidence-only. |
+| Overlaps, renames and short-lived events reconcile by security lineage | Synthetic normalizer and integrity fixtures pass; production overlap/short-lived counts and authenticated transition replay are missing. FISV→FI (2023-06-07)→FISV (2025-11-11) needs the three segments tied to original primary-source bytes, source locators, final price request-contract hash, and complete member events. A 2025 Fiserv IR page and its terms are privately retained for internal audit with SHA-256 receipts; the 2023 issuer page was browser-verified but has no raw-byte receipt, the 2023 SEC raw request returned HTTP 403, and the 2025 SEC filing has no raw-byte copy. No segment was emitted. Thirteen other one-way leads remain evidence-only. |
 | Coverage/exclusions explicit; fund holdings are not membership | Inventory/exclusions are explicit; current constituents and fund holdings are excluded as historical evidence. A source-backed three-index union and per-index/pooled coverage report do not exist. |
 
 | Status | Assessment |
 | --- | --- |
 | Implementation | V3/V5 representation and fail-closed integration complete for synthetic inputs; provider-native production adapter/artifact remains pending exact source files. |
-| Required inputs | Rights-cleared 2020-12-31 (or earlier complete) seeds and every effective 2021–2025 change/correction for all three indices; stable security/share-class IDs; retained provider bytes and permitted use/derivation/retention; authenticated price transitions/segments. |
-| Acceptance evidence | Only inventory, spot checks, partial ledger and synthetic tests; **no production three-index artifact or accepted coverage**. |
+| Required inputs | Rights-cleared 2020-12-31 (or earlier complete) seeds and every effective 2021–2025 change/correction for all three indices; stable security/share-class IDs; retained provider bytes and permitted use/derivation/retention; authenticated price transitions/segments. The first Fiserv edge still lacks primary source bytes, and completed effective-date corroboration for the chain remains to be reviewed. |
+| Acceptance evidence | Inventory, spot checks, partial ledger, one rights-scoped 2025 issuer source-byte receipt and synthetic tests exist; **no production three-index artifact, admitted Fiserv segment, or accepted coverage**. |
 | Dependencies | Accepted #66; provider/source rights and data owner decision. V5 production membership admission remains closed. |
 
 **Recommendation:** keep #68 open. Prefer an already licensed package meeting
