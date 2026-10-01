@@ -447,7 +447,7 @@ def test_small_fixed_history_report_keeps_market_rs_and_industry_denominators(
     )
 
     assert report["calculator_identities"]["financial_feature_calculator_id"] == (
-        "pit-financial-features-v2"
+        "pit-financial-features-v3"
     )
     assert report["calculator_identities"]["financial_feature_calculator_source_revision"] == (
         "c" * 40
