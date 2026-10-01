@@ -2164,6 +2164,25 @@ class PolicyExecutionStateStore:
             observed_at=observed_at,
         )
         if (
+            current.status in {ActionStatus.FILLED, ActionStatus.RESOLVED}
+            and updated.status is ActionStatus.RECONCILIATION_REQUIRED
+            and updated.holding_episode_id is not None
+        ):
+            holding_row = self._holding_row(conn, updated.holding_episode_id)
+            if holding_row is None:
+                raise ValueError("reopened holding action has no durable holding episode")
+            holding = _holding_from_row(holding_row)
+            reconciled_holding = register_reconciliation_action(holding, updated)
+            if reconciled_holding != holding:
+                self._save_holding(
+                    conn,
+                    reconciled_holding,
+                    expected_version=int(holding_row["state_version"]),
+                    event_kind="holding_action_reopened_for_reconciliation",
+                    logical_action_id=updated.logical_action_id,
+                    observed_at=observed_at,
+                )
+        if (
             updated != current
             and updated.status in {ActionStatus.FILLED, ActionStatus.RESOLVED}
             and current.status not in {ActionStatus.FILLED, ActionStatus.RESOLVED}

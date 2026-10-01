@@ -702,6 +702,161 @@ def test_unissued_action_can_be_resolved_but_issued_action_waits_for_terminal_ev
         )
 
 
+def test_late_references_reopen_resolved_addition_and_restore_holding_conflict(tmp_path: Path) -> None:
+    store = _open_store(tmp_path)
+    store.migrate()
+    deployment = _deployment()
+    store.register_deployment_identity(deployment, lifecycle="prepared", handler_identity="fixture-handler", guard_id="guard-v1")
+    opening = _entry_intent(deployment)
+    _record_decision(store, opening)
+    store.record_action_intent(opening, expected_version=None)
+    _record_fill(
+        store,
+        opening,
+        event_id="resolved-addition-opening-fill",
+        cumulative_quantity="100",
+        cumulative_notional="5000",
+        expected_action_version=0,
+        expected_holding_version=None,
+    )
+    holding = store.load_holding_episode_for_action(opening.logical_action_id)
+    addition_decision = _decision(
+        deployment,
+        session=date(2026, 10, 1),
+        category=DecisionCategory.ADDITION,
+        subject_type=DecisionSubjectType.HOLDING,
+        subject_id=holding.holding_episode_id,
+    )
+    addition = build_action_intent(
+        decision=addition_decision,
+        security_id=holding.security_id,
+        broker_symbol=holding.broker_symbol,
+        holding_episode_id=holding.holding_episode_id,
+        role=ActionRole.ADDITION,
+        side=OrderSide.BUY,
+        requested_quantity=Decimal("2"),
+    )
+    _record_decision(store, addition)
+    store.record_action_intent(addition, expected_version=None)
+    pending = store.load_holding_episode(holding.holding_episode_id)
+    resolved = store.record_explicit_action_resolution(
+        addition.logical_action_id,
+        resolution_reason="Synthetic position check confirms no addition order was issued",
+        expected_action_version=0,
+        expected_holding_version=pending.state_version,
+        observed_at=datetime(2026, 10, 1, 13, 31, tzinfo=UTC),
+    )
+    assert resolved.status is ActionStatus.RESOLVED
+    cleared = store.load_holding_episode(holding.holding_episode_id)
+    assert cleared.pending_action_ids == ()
+
+    other_decision = _decision(
+        deployment,
+        session=date(2026, 10, 2),
+        category=DecisionCategory.EXIT,
+        subject_type=DecisionSubjectType.HOLDING,
+        subject_id=holding.holding_episode_id,
+    )
+    other_action = build_action_intent(
+        decision=other_decision,
+        security_id=holding.security_id,
+        broker_symbol=holding.broker_symbol,
+        holding_episode_id=holding.holding_episode_id,
+        role=ActionRole.SCALE_OUT,
+        side=OrderSide.SELL,
+        requested_quantity=Decimal("50"),
+        exit_tier=1,
+        snapshot_original_quantity=Decimal("100"),
+        fraction_of_original_quantity=Decimal("0.5"),
+        rounding_rule_id="whole_share_floor_v1",
+    )
+    _record_decision(store, other_action)
+    store.record_action_intent(other_action, expected_version=None)
+    with_other_action = store.load_holding_episode(holding.holding_episode_id)
+    assert with_other_action.pending_action_ids == (other_action.logical_action_id,)
+
+    reopened = store.bind_attempt_order_refs(
+        addition.logical_action_id,
+        1,
+        provider_id="recorded-late-addition-provider",
+        client_order_id="late-addition-client",
+        broker_order_id="late-addition-broker",
+        expected_action_version=resolved.state_version,
+        observed_at=datetime(2026, 10, 1, 13, 32, tzinfo=UTC),
+    )
+    assert reopened.status is ActionStatus.RECONCILIATION_REQUIRED
+    assert reopened.order_attempts[0].status is ActionAttemptStatus.SUBMITTED
+    reopened_holding = store.load_holding_episode(holding.holding_episode_id)
+    assert reopened_holding.pending_action_ids == tuple(sorted((other_action.logical_action_id, addition.logical_action_id)))
+    assert reopened_holding.state_version == with_other_action.state_version + 1
+    assert reopened_holding.remaining_quantity == holding.remaining_quantity
+    with sqlite3.connect(store.db_path) as conn:
+        history = conn.execute(
+            "SELECT event_kind, logical_action_id FROM policy_state_holding_history "
+            "WHERE holding_episode_id=? ORDER BY state_version DESC LIMIT 1",
+            (holding.holding_episode_id,),
+        ).fetchone()
+    assert tuple(history) == ("holding_action_reopened_for_reconciliation", addition.logical_action_id)
+
+    competing_decision = _decision(
+        deployment,
+        session=date(2026, 10, 3),
+        category=DecisionCategory.ADDITION,
+        subject_type=DecisionSubjectType.HOLDING,
+        subject_id=holding.holding_episode_id,
+    )
+    competing = build_action_intent(
+        decision=competing_decision,
+        security_id=holding.security_id,
+        broker_symbol=holding.broker_symbol,
+        holding_episode_id=holding.holding_episode_id,
+        role=ActionRole.ADDITION,
+        side=OrderSide.BUY,
+        requested_quantity=Decimal("1"),
+    )
+    _record_decision(store, competing)
+    with pytest.raises(ValueError, match="pending logical action"):
+        store.record_action_intent(competing, expected_version=None)
+
+    terminal = store.confirm_order_terminal(
+        addition.logical_action_id,
+        1,
+        terminal_status=ActionAttemptStatus.CANCELLED,
+        expected_action_version=reopened.state_version,
+        observed_at=datetime(2026, 10, 1, 13, 33, tzinfo=UTC),
+    )
+    assert terminal.status is ActionStatus.REMAINDER_READY
+    resolved_again = store.record_explicit_action_resolution(
+        addition.logical_action_id,
+        resolution_reason="Synthetic terminal evidence confirms the discovered order was cancelled without fills",
+        expected_action_version=terminal.state_version,
+        expected_holding_version=reopened_holding.state_version,
+        observed_at=datetime(2026, 10, 1, 13, 34, tzinfo=UTC),
+    )
+    assert resolved_again.status is ActionStatus.RESOLVED
+    after_reopened_resolution = store.load_holding_episode(holding.holding_episode_id)
+    assert after_reopened_resolution.pending_action_ids == (other_action.logical_action_id,)
+    assert after_reopened_resolution.remaining_quantity == holding.remaining_quantity
+    other_resolved = store.record_explicit_action_resolution(
+        other_action.logical_action_id,
+        resolution_reason="Synthetic session review confirms the separate exit intent was not issued",
+        expected_action_version=0,
+        expected_holding_version=after_reopened_resolution.state_version,
+        observed_at=datetime(2026, 10, 1, 13, 35, tzinfo=UTC),
+    )
+    assert other_resolved.status is ActionStatus.RESOLVED
+    final_holding = store.load_holding_episode(holding.holding_episode_id)
+    assert final_holding.pending_action_ids == ()
+    assert final_holding.remaining_quantity == holding.remaining_quantity
+
+    restarted = PolicyExecutionStateStore(store.db_path, store_identity=deployment.store_identity)
+    assert restarted.load_action_projection(addition.logical_action_id).status is ActionStatus.RESOLVED
+    assert restarted.load_action_projection(other_action.logical_action_id).status is ActionStatus.RESOLVED
+    restarted_holding = restarted.load_holding_episode(holding.holding_episode_id)
+    assert restarted_holding == final_holding
+    assert addition.logical_action_id not in restarted_holding.pending_action_ids
+
+
 def test_mixed_generation_consistent_read_exposes_action_and_holding_versions(tmp_path: Path) -> None:
     store = _open_store(tmp_path)
     store.migrate()
