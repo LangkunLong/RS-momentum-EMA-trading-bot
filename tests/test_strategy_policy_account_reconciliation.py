@@ -190,6 +190,108 @@ def _account(
     )
 
 
+def _registered_alias_case(
+    open_orders: tuple[BrokerOrderFact, ...],
+) -> tuple[BrokerAccountSnapshot, PolicyStateProjection]:
+    cutoff = datetime(2026, 9, 30, 20, 0, tzinfo=UTC)
+    valuation = datetime(2026, 10, 1, 13, 30, tzinfo=UTC)
+    policy_clock = DecisionClock(
+        exchange_id="XNYS",
+        decision_session=date(2026, 9, 30),
+        as_of_cutoff_at=cutoff,
+        next_execution_session=date(2026, 10, 1),
+        account_valuation_session=date(2026, 10, 1),
+        account_valuation_at=valuation,
+    )
+    account_clock = AccountValuationClock(
+        completed_session=date(2026, 9, 30),
+        as_of_cutoff=cutoff,
+        next_execution_session=date(2026, 10, 1),
+        valuation_time=valuation,
+    )
+    deployment = PolicyDeploymentIdentity(
+        policy_artifact_id="policy:registered-alias-test",
+        capability_manifest_id="manifest:registered-alias-test",
+        policy_interface_version="3",
+        feature_contract_id="features-v3",
+        feature_calculator_id="calculator-v3",
+        source_revision="registered-alias-test",
+        runtime_identity="synthetic-runtime",
+        execution_profile_id="synthetic-paper-profile",
+        paper_account_environment_id="synthetic-paper-account",
+        store_identity="synthetic-policy-store",
+    )
+    decision = DecisionIdentity.build(
+        deployment=deployment,
+        clock=policy_clock,
+        snapshot_sha256="f" * 64,
+        category=DecisionCategory.ENTRY,
+        subject_type=DecisionSubjectType.SECURITY,
+        subject_id="sec:xyz",
+    )
+    intent = build_action_intent(
+        decision=decision,
+        security_id="sec:xyz",
+        broker_symbol="XYZ",
+        role=ActionRole.ENTRY,
+        side=OrderSide.BUY,
+        requested_quantity=Decimal("10"),
+        status=ActionStatus.SUBMITTED,
+        reservation_price=Decimal("100"),
+        reservation_price_basis="limit_price",
+        reservation_stop_price=Decimal("90"),
+        risk_per_unit=Decimal("12"),
+        risk_basis="strategy_risk",
+    )
+    intent = bind_attempt_order_refs(
+        intent,
+        attempt_number=1,
+        client_order_id="client-1",
+        broker_order_id="broker-1",
+    )
+    intent = add_attempt_order_aliases(
+        intent,
+        attempt_number=1,
+        client_order_id="client-alias-1",
+        broker_order_id="broker-alias-1",
+    )
+    action_projection = replace(project_action_state(intent), state_version=3)
+    portfolio = PortfolioStateSnapshot(
+        deployment_identity=deployment,
+        clock=policy_clock,
+        source_namespace="synthetic-broker",
+        account_snapshot_id="registered-alias-account",
+        equity=Decimal("10000"),
+        cash=Decimal("10000"),
+        gross_exposure=Decimal("0"),
+        open_risk=Decimal("0"),
+        portfolio_peak_equity=Decimal("12500"),
+        last_accepted_session=date(2026, 9, 29),
+    )
+    account = BrokerAccountSnapshot(
+        paper_account_environment_id=deployment.paper_account_environment_id,
+        decision_slot_id=action_projection.decision_slot_id,
+        decision_id=action_projection.decision_id,
+        clock=account_clock,
+        equity=10000,
+        cash=10000,
+        peak_equity=12500,
+        balance_observed_at=valuation,
+        peak_observed_at=valuation,
+        positions=(),
+        open_orders=open_orders,
+        source_namespace="synthetic-broker",
+        account_snapshot_id="registered-alias-account",
+    )
+    projection = policy_execution_state_to_projection(
+        account=account,
+        portfolio_snapshot=portfolio,
+        action_projections=(action_projection,),
+        holding_episodes=(),
+    )
+    return account, projection
+
+
 def test_policy_execution_state_conversion_preserves_decimal_residual_attempts_and_identity() -> None:
     feature_cutoff = datetime(2026, 9, 30, 20, 0, tzinfo=UTC)
     valuation_time = datetime(2026, 10, 1, 13, 30, tzinfo=UTC)
@@ -911,6 +1013,22 @@ def test_policy_execution_state_conversion_keeps_order_references_per_attempt() 
     assert remainder_ready_result.ready is True, remainder_ready_result.findings
     assert remainder_ready_result.pending_sell_count == 1
 
+    cross_attempt_order = replace(
+        account.open_orders[1],  # type: ignore[index]
+        broker_order_id="scale-broker-alias-1",
+        client_order_id="scale-client-alias-2",
+    )
+    cross_attempt_account = replace(account, open_orders=(protective_order, cross_attempt_order))
+    cross_attempt_result = reconcile_account_snapshot(
+        account=cross_attempt_account,
+        projection=projection,
+        maximum_balance_age=timedelta(minutes=15),
+        maximum_mark_age=timedelta(minutes=15),
+    )
+    assert cross_attempt_result.ready is False
+    assert cross_attempt_result.pending_sell_count is None
+    assert any(finding.state == "conflicting" for finding in cross_attempt_result.findings)
+
 
 def test_partial_fill_reserves_only_residual_buy_once_and_builds_v3_portfolio() -> None:
     result = reconcile_account_snapshot(
@@ -1005,6 +1123,76 @@ def test_duplicate_broker_rows_with_conflicting_alias_pairs_block_reservations(
 
     assert result.ready is False
     assert result.reserved_buy_cash is None
+    assert result.pending_entry_count is None
+    assert any(finding.state == "conflicting" for finding in result.findings)
+
+
+@pytest.mark.parametrize(
+    ("broker_order_id", "client_order_id"),
+    (
+        ("broker-alias-1", "client-alias-1"),
+        ("broker-1", "client-alias-1"),
+        ("broker-alias-1", "client-1"),
+    ),
+    ids=("primary-and-alias-pairs", "shared-primary-broker-id", "shared-primary-client-id"),
+)
+def test_registered_attempt_alias_rows_reserve_once(
+    broker_order_id: str,
+    client_order_id: str,
+) -> None:
+    primary = BrokerOrderFact("broker-1", "client-1", "XYZ", "buy", "submitted", 10, 0)
+    registered_alias = BrokerOrderFact(
+        broker_order_id, client_order_id, "XYZ", "buy", "submitted", 10, 0
+    )
+    account, projection = _registered_alias_case((primary, registered_alias))
+
+    result = reconcile_account_snapshot(
+        account=account,
+        projection=projection,
+        maximum_balance_age=timedelta(minutes=15),
+        maximum_mark_age=timedelta(minutes=15),
+    )
+
+    assert result.ready is True, result.findings
+    assert result.reserved_buy_cash == 1_000
+    assert result.reserved_buy_risk == 120
+    assert result.pending_entry_count == 1
+    assert result.total_committed_risk == 120
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("requested_quantity", 11),
+        ("status", "cancelled"),
+        ("symbol", "ABC"),
+        ("side", "sell"),
+    ),
+    ids=("quantity", "status", "symbol", "side"),
+)
+def test_registered_attempt_alias_rows_with_conflicting_facts_block_reservations(
+    field: str,
+    value: object,
+) -> None:
+    primary = BrokerOrderFact("broker-1", "client-1", "XYZ", "buy", "submitted", 10, 0)
+    registered_alias = replace(
+        primary,
+        broker_order_id="broker-alias-1",
+        client_order_id="client-alias-1",
+        **{field: value},
+    )
+    account, projection = _registered_alias_case((primary, registered_alias))
+
+    result = reconcile_account_snapshot(
+        account=account,
+        projection=projection,
+        maximum_balance_age=timedelta(minutes=15),
+        maximum_mark_age=timedelta(minutes=15),
+    )
+
+    assert result.ready is False
+    assert result.reserved_buy_cash is None
+    assert result.reserved_buy_risk is None
     assert result.pending_entry_count is None
     assert any(finding.state == "conflicting" for finding in result.findings)
 
