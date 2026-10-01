@@ -749,8 +749,30 @@ def _v3_provenance_metadata(
         allow_blank=False,
     ) != len(fundamentals):
         raise ValueError("fundamentals provenance row count is inconsistent")
-    if fundamentals_provenance.get("membership_csv_sha256") != membership_sha:
-        raise ValueError("fundamentals provenance does not bind schema-V3 membership")
+    synthetic_fundamentals_fixture = (
+        allow_nonproduction_fixture
+        and fundamentals_provenance.get("source") == "synthetic fixture"
+    )
+    if synthetic_fundamentals_fixture:
+        # Fixture-only test bundles do not claim to be SEC exports. Production
+        # SEC provenance always requires the complete lineage and source bridge.
+        lineage_bridge_metadata = {}
+    else:
+        from core.financial_lineage_bridge import validate_export_bridge
+
+        lineage_bridge_metadata = validate_export_bridge(
+            output_provenance_path=fundamentals_provenance_path,
+            output_provenance=fundamentals_provenance,
+            fundamentals_csv=fundamentals_path,
+            destination_membership_csv=membership_path,
+            destination_membership_provenance=membership_provenance_path,
+            prices_provenance=prices_provenance_path,
+            membership=membership,
+            identities=identities,
+            transitions=transitions,
+            segment_contract=segment_contract,
+            fundamentals_row_count=len(fundamentals),
+        )
     if fundamentals_provenance.get("start_date") != warmup_start:
         raise ValueError("fundamentals provenance start_date does not match warmup_start")
     if fundamentals_provenance.get("end_date") != cutoff:
@@ -898,6 +920,7 @@ def _v3_provenance_metadata(
         "non_tradable_reference_symbols_sha256": pit_canonical_json_sha256(reference_values),
         "source_universes_json": pit_canonical_json(list(_V3_SOURCE_UNIVERSES)),
     }
+    metadata.update(lineage_bridge_metadata)
     for key in (
         "submissions_archive_sha256",
         "companyfacts_archive_sha256",

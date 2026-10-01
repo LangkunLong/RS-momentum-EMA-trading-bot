@@ -21,6 +21,7 @@ import requests
 from core.sec_pit_fundamentals import (
     FUNDAMENTAL_AUDIT_COLUMNS,
     FUNDAMENTAL_COLUMNS,
+    IDENTITY_EXTRACTION_RESULT_COLUMNS,
     SECURITY_MASTER_COLUMNS,
     SECURITY_MASTER_EXCLUSION_COLUMNS,
     FundamentalAuditRow,
@@ -31,6 +32,10 @@ from core.sec_pit_fundamentals import (
     extract_fundamentals,
     sha256_file,
     validate_sec_archive,
+)
+from core.financial_lineage_bridge import (
+    make_export_bridge_record,
+    sha256_file as lineage_sha256_file,
 )
 
 
@@ -44,6 +49,7 @@ _ARCHIVE_MANIFEST = "sec_archives_provenance.json"
 _NORMALIZED_OUTPUTS = (
     "security_master.csv",
     "security_master_exclusions.csv",
+    "financial_lineage_extraction_history.csv",
     "fundamentals.csv",
     "fundamentals_audit.csv",
     "fundamentals_provenance.json",
@@ -311,6 +317,19 @@ def _security_master_values(row: SecurityMasterRow) -> tuple[str, ...]:
     )
 
 
+def _identity_extraction_values(row: Any) -> tuple[str, ...]:
+    return (
+        row.ticker,
+        row.first_extraction_date.isoformat(),
+        row.last_extraction_date.isoformat(),
+        row.security_lineage_id,
+        row.identity_segment_id,
+        row.cik,
+        row.company_name,
+        row.mapping_basis,
+    )
+
+
 def _exclusion_values(row: SecurityMasterExclusion) -> tuple[str, ...]:
     return (
         row.ticker,
@@ -383,8 +402,9 @@ def _consumed_hashes(
     spy_trading_days_csv: Path,
     identity_manifest_csv: Path,
     output_dir: Path,
+    identity_extraction_history_csv: Path | None = None,
 ) -> dict[str, str]:
-    return {
+    result = {
         "membership_csv_sha256": sha256_file(membership_csv),
         "security_names_csv_sha256": sha256_file(security_names_csv),
         "spy_trading_days_csv_sha256": sha256_file(spy_trading_days_csv),
@@ -392,6 +412,11 @@ def _consumed_hashes(
         "submissions_archive_sha256": sha256_file(output_dir / "submissions.zip"),
         "companyfacts_archive_sha256": sha256_file(output_dir / "companyfacts.zip"),
     }
+    if identity_extraction_history_csv is not None:
+        result["identity_extraction_history_csv_sha256"] = sha256_file(
+            identity_extraction_history_csv
+        )
+    return result
 
 
 def _unlink_same_file(source: Path, target: Path) -> None:
@@ -428,8 +453,11 @@ def publish_normalized_outputs(
     consumed_hashes: Mapping[str, str],
     start_date: date,
     end_date: date,
+    membership_start_date: date = _MEMBERSHIP_START,
+    membership_lineage_projection_provenance: Path | None = None,
+    identity_extraction_history_csv: Path | None = None,
 ) -> Mapping[str, Any]:
-    """Publish the six normalized outputs as one no-clobber transaction."""
+    """Publish the normalized outputs as one no-clobber transaction."""
     _assert_normalized_targets_absent(output_dir)
     current_hashes = _consumed_hashes(
         membership_csv=membership_csv,
@@ -437,6 +465,7 @@ def publish_normalized_outputs(
         spy_trading_days_csv=spy_trading_days_csv,
         identity_manifest_csv=identity_manifest_csv,
         output_dir=output_dir,
+        identity_extraction_history_csv=identity_extraction_history_csv,
     )
     if current_hashes != dict(consumed_hashes):
         raise ValueError("consumed Task 2 input changed before publication")
@@ -446,6 +475,30 @@ def publish_normalized_outputs(
         raise ValueError("security master is not bound to the consumed identity overlay")
     if fundamentals.companyfacts_archive_sha256 != consumed_hashes["companyfacts_archive_sha256"]:
         raise ValueError("fundamentals are not bound to the consumed companyfacts archive")
+    lineage_projection_sha256: str | None = None
+    export_bridge: Mapping[str, object] | None = None
+    if membership_lineage_projection_provenance is not None:
+        if identity_extraction_history_csv is None:
+            raise ValueError("lineage bridge export requires its identity extraction history CSV")
+        lineage_projection_sha256 = lineage_sha256_file(
+            membership_lineage_projection_provenance
+        )
+        export_bridge = make_export_bridge_record(
+            output_dir=output_dir,
+            membership_csv=membership_csv,
+            projection_provenance_path=membership_lineage_projection_provenance,
+        )
+        if (
+            export_bridge["identity_extraction_history_csv_sha256"]
+            != lineage_sha256_file(identity_extraction_history_csv)
+        ):
+            raise ValueError("SEC exporter identity history differs from its lineage projection")
+        if (
+            export_bridge["extraction_start_date"] != start_date.isoformat()
+            or export_bridge["extraction_end_date"] != end_date.isoformat()
+            or export_bridge["membership_start_date"] != membership_start_date.isoformat()
+        ):
+            raise ValueError("SEC export dates differ from the authenticated lineage projection")
     staging = output_dir / f".sec-pit-publish-{uuid.uuid4().hex}"
     staging.mkdir()
     published: list[tuple[Path, Path]] = []
@@ -459,6 +512,14 @@ def publish_normalized_outputs(
             staging / "security_master_exclusions.csv",
             SECURITY_MASTER_EXCLUSION_COLUMNS,
             (_exclusion_values(row) for row in security_master.exclusions),
+        )
+        _write_csv(
+            staging / "financial_lineage_extraction_history.csv",
+            IDENTITY_EXTRACTION_RESULT_COLUMNS,
+            (
+                _identity_extraction_values(row)
+                for row in security_master.identity_extraction_rows
+            ),
         )
         _write_csv(
             staging / "fundamentals.csv",
@@ -478,6 +539,7 @@ def publish_normalized_outputs(
             for name in (
                 "security_master.csv",
                 "security_master_exclusions.csv",
+                "financial_lineage_extraction_history.csv",
                 "fundamentals.csv",
                 "fundamentals_audit.csv",
             )
@@ -491,6 +553,7 @@ def publish_normalized_outputs(
             "archive_manifest": archive_manifest,
             "start_date": start_date.isoformat(),
             "end_date": end_date.isoformat(),
+            "membership_start_date": membership_start_date.isoformat(),
             "public_date_rule": "first supplied SPY trading day strictly after SEC acceptance calendar date; filed date fallback only",
             "quarterly_duration_days": [70, 115],
             "annual_duration_days": [300, 430],
@@ -506,11 +569,16 @@ def publish_normalized_outputs(
             "institutional_fields": "omitted_blank",
             "security_master_row_count": len(security_master.rows),
             "security_master_exclusion_row_count": len(security_master.exclusions),
+            "financial_lineage_extraction_history_row_count": len(
+                security_master.identity_extraction_rows
+            ),
             "fundamental_row_count": len(fundamentals.rows),
             "filed_date_fallback_count": coverage.get("filed_date_fallback_count", 0),
             **source_hashes,
             **normalized_hashes,
         }
+        if export_bridge is not None:
+            provenance["financial_lineage_bridge_v1"] = dict(export_bridge)
         _write_bytes_exclusive(staging / "fundamentals_provenance.json", _json_bytes(provenance))
         publication_hashes = {
             name: sha256_file(staging / name)
@@ -528,9 +596,19 @@ def publish_normalized_outputs(
             spy_trading_days_csv=spy_trading_days_csv,
             identity_manifest_csv=identity_manifest_csv,
             output_dir=output_dir,
+            identity_extraction_history_csv=identity_extraction_history_csv,
         )
         if final_hashes != dict(consumed_hashes):
             raise ValueError("consumed Task 2 input changed during normalization")
+        if membership_lineage_projection_provenance is not None and (
+            lineage_sha256_file(membership_lineage_projection_provenance)
+            != lineage_projection_sha256
+            or lineage_sha256_file(membership_csv)
+            != export_bridge.get("ticker_membership_csv_sha256")
+            or lineage_sha256_file(identity_extraction_history_csv)
+            != export_bridge.get("identity_extraction_history_csv_sha256")
+        ):
+            raise ValueError("lineage membership projection changed during SEC export")
         _assert_normalized_targets_absent(output_dir)
         for name in _NORMALIZED_OUTPUTS:
             source = staging / name
@@ -566,10 +644,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--sec-user-agent", required=True)
     parser.add_argument("--max-archive-bytes", type=_positive_bytes, required=True)
     parser.add_argument("--identity-manifest-csv", default="config/pit_price_identity_map.csv")
+    parser.add_argument(
+        "--membership-lineage-projection-provenance",
+        help=(
+            "retained V3 lineage-to-ticker projection provenance for the membership CSV; "
+            "required to bind this export to schema-V3 membership"
+        ),
+    )
     parser.add_argument("--output-dir", required=True)
     args = parser.parse_args(argv)
 
     output_dir: Path | None = None
+    identity_extraction_history_csv: Path | None = None
     archives_created = False
     owned_archive_identities: dict[str, tuple[int, int]] = {}
     try:
@@ -581,6 +667,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         security_names_csv = _regular_file(Path(args.security_names_csv), "security names CSV")
         spy_days_csv = _regular_file(Path(args.spy_trading_days_csv), "SPY trading-days CSV")
         identity_manifest_csv = _regular_file(Path(args.identity_manifest_csv), "reviewed identity manifest")
+        lineage_projection_provenance = (
+            _regular_file(
+                Path(args.membership_lineage_projection_provenance),
+                "financial lineage projection provenance",
+            )
+            if args.membership_lineage_projection_provenance
+            else None
+        )
+        if lineage_projection_provenance is not None:
+            bridge_record = make_export_bridge_record(
+                output_dir=output_dir,
+                membership_csv=membership_csv,
+                projection_provenance_path=lineage_projection_provenance,
+            )
+            if (
+                bridge_record["extraction_start_date"] != args.start_date.isoformat()
+                or bridge_record["extraction_end_date"] != args.end_date.isoformat()
+                or bridge_record["membership_start_date"]
+                != _MEMBERSHIP_START.isoformat()
+            ):
+                raise ValueError("SEC CLI date bounds differ from the authenticated lineage projection")
+            identity_extraction_history_csv = _regular_file(
+                output_dir / str(bridge_record["identity_extraction_history_csv_path"]),
+                "financial identity extraction history CSV",
+            )
         _assert_normalized_targets_absent(output_dir)
         max_json_member_bytes = min(args.max_archive_bytes, 512 * 1024 * 1024)
         archives_preexisting = all(
@@ -605,6 +716,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             spy_trading_days_csv=spy_days_csv,
             identity_manifest_csv=identity_manifest_csv,
             output_dir=output_dir,
+            identity_extraction_history_csv=identity_extraction_history_csv,
         )
         archive_metadata = archive_manifest["archives"]
         if input_hashes["submissions_archive_sha256"] != archive_metadata["submissions.zip"]["sha256"]:
@@ -618,6 +730,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             identity_manifest_csv,
             start_date=_MEMBERSHIP_START,
             end_date=args.end_date,
+            extraction_start_date=args.start_date,
+            identity_extraction_history_csv=identity_extraction_history_csv,
             max_json_member_bytes=max_json_member_bytes,
         )
         fundamentals = extract_fundamentals(
@@ -634,6 +748,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             spy_trading_days_csv=spy_days_csv,
             identity_manifest_csv=identity_manifest_csv,
             output_dir=output_dir,
+            identity_extraction_history_csv=identity_extraction_history_csv,
         ) != input_hashes:
             raise ValueError("Task 2 input changed while it was being consumed")
         provenance = publish_normalized_outputs(
@@ -648,6 +763,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             consumed_hashes=input_hashes,
             start_date=args.start_date,
             end_date=args.end_date,
+            membership_start_date=_MEMBERSHIP_START,
+            membership_lineage_projection_provenance=lineage_projection_provenance,
+            identity_extraction_history_csv=identity_extraction_history_csv,
         )
     except (OSError, ValueError, RuntimeError, requests.RequestException) as exc:
         if archives_created and output_dir is not None:

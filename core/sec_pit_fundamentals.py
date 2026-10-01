@@ -77,6 +77,19 @@ FUNDAMENTAL_AUDIT_COLUMNS = (
 )
 
 _MEMBERSHIP_COLUMNS = ("effective_date", "ticker", "member")
+IDENTITY_EXTRACTION_COLUMNS = (
+    "ticker",
+    "first_extraction_date",
+    "last_extraction_date",
+    "security_lineage_id",
+    "identity_segment_id",
+)
+IDENTITY_EXTRACTION_RESULT_COLUMNS = (
+    *IDENTITY_EXTRACTION_COLUMNS,
+    "cik",
+    "company_name",
+    "mapping_basis",
+)
 _SECURITY_NAME_COLUMNS = ("ticker", "company_name")
 _IDENTITY_COLUMNS = (
     "canonical_ticker",
@@ -175,6 +188,7 @@ class SecurityMasterResult:
     identity_manifest_sha256: str
     submissions_archive_sha256: str
     missing_submission_fragments: int
+    identity_extraction_rows: tuple[IdentityExtractionRow, ...] = ()
 
     def __post_init__(self) -> None:
         frozen = {
@@ -226,6 +240,18 @@ class FundamentalExportResult:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "coverage", MappingProxyType(dict(self.coverage)))
+
+
+@dataclass(frozen=True)
+class IdentityExtractionRow:
+    ticker: str
+    cik: str
+    company_name: str
+    first_extraction_date: date
+    last_extraction_date: date
+    security_lineage_id: str
+    identity_segment_id: str
+    mapping_basis: str
 
 
 @dataclass(frozen=True)
@@ -442,6 +468,42 @@ def _membership_intervals(
     if not ordered:
         raise ValueError("membership export is empty")
     return ordered, tuple(sorted(union))
+
+
+def _identity_extraction_history(
+    path: Path | None,
+    *,
+    start_date: date,
+    end_date: date,
+) -> tuple[tuple[str, date, date, str, str], ...]:
+    if path is None:
+        return ()
+    rows: list[tuple[str, date, date, str, str]] = []
+    previous: tuple[str, date] | None = None
+    last_by_ticker: dict[str, date] = {}
+    for row in _csv_rows(path, IDENTITY_EXTRACTION_COLUMNS):
+        ticker = _canonical_ticker(row["ticker"])
+        first = _iso_date(row["first_extraction_date"], "first_extraction_date")
+        last = _iso_date(row["last_extraction_date"], "last_extraction_date")
+        lineage = row["security_lineage_id"].strip()
+        segment = row["identity_segment_id"].strip()
+        key = (ticker, first)
+        if (
+            row["ticker"] != ticker
+            or first < start_date
+            or last > end_date
+            or last < first
+            or not lineage
+            or (previous is not None and key <= previous)
+            or (ticker in last_by_ticker and first <= last_by_ticker[ticker])
+        ):
+            raise ValueError("identity extraction history is not canonical or is out of range")
+        previous = key
+        last_by_ticker[ticker] = last
+        rows.append((ticker, first, last, lineage, segment))
+    if not rows:
+        raise ValueError("identity extraction history is empty")
+    return tuple(rows)
 
 
 def _security_names(path: Path, union: Sequence[str]) -> Mapping[str, str]:
@@ -828,32 +890,54 @@ def build_security_master(
     *,
     start_date: date = date(2021, 1, 1),
     end_date: date = date(2025, 12, 31),
+    extraction_start_date: date | None = None,
+    identity_extraction_history_csv: Path | None = None,
     max_json_member_bytes: int = 512 * 1024 * 1024,
 ) -> SecurityMasterResult:
     """Resolve membership intervals to exact CIKs without fuzzy name matching."""
     intervals, union = _membership_intervals(membership_csv, start_date=start_date, end_date=end_date)
-    names = _security_names(security_names_csv, union)
-    identities, identity_hash = _identity_manifest(identity_manifest_csv, union, intervals)
+    extraction_start = extraction_start_date or start_date
+    identity_history = _identity_extraction_history(
+        identity_extraction_history_csv,
+        start_date=extraction_start,
+        end_date=end_date,
+    )
+    history_intervals = tuple(
+        _MembershipInterval(ticker, first, last)
+        for ticker, first, last, _lineage, _segment in identity_history
+    )
+    all_intervals = (*intervals, *history_intervals)
+    extraction_union = tuple(sorted(set(union).union(row[0] for row in identity_history)))
+    names = _security_names(security_names_csv, extraction_union)
+    identities, identity_hash = _identity_manifest(
+        identity_manifest_csv, extraction_union, all_intervals
+    )
     for interval in intervals:
         identity = identities[interval.ticker]
         if interval.first < identity.admitted_start or interval.last > identity.admitted_end:
             raise ValueError(f"reviewed identity does not cover membership interval for {interval.ticker}")
+    for interval in history_intervals:
+        identity = identities[interval.ticker]
+        if interval.first < identity.admitted_start or interval.last > identity.admitted_end:
+            raise ValueError(
+                f"reviewed identity does not cover extraction history for {interval.ticker}"
+            )
     issuers = _scan_candidate_issuers(
         submissions_archive,
-        union=union,
+        union=extraction_union,
         names=names,
         max_json_member_bytes=max_json_member_bytes,
     )
     resolved, unresolved = _resolve_ciks(
-        intervals=intervals,
-        union=union,
+        intervals=all_intervals,
+        union=extraction_union,
         names=names,
         identities=identities,
         issuers=issuers,
     )
     for ticker, expected_cik in _REVIEWED_BASELINE_CIKS.items():
-        ticker_mappings = {resolved[item][0] for item in intervals if item.ticker == ticker and item in resolved}
-        if ticker in union and ticker_mappings != {expected_cik}:
+        ticker_mappings = {resolved[item][0] for item in all_intervals if item.ticker == ticker and item in resolved}
+        if ticker in extraction_union and ticker_mappings != {expected_cik}:
             actual = ",".join(sorted(ticker_mappings)) or "unresolved"
             raise ValueError(f"reviewed baseline CIK boundary failed for {ticker}: {actual} != {expected_cik}")
 
@@ -885,6 +969,31 @@ def build_security_master(
                 basis,
             )
         )
+    identity_rows: list[IdentityExtractionRow] = []
+    for ticker, first, last, lineage, segment_id in identity_history:
+        interval = _MembershipInterval(ticker, first, last)
+        mapping = resolved.get(interval)
+        if mapping is None:
+            reason, details = unresolved.get(
+                interval, ("identity_history_unresolved", "no exact SEC identity")
+            )
+            raise ValueError(
+                f"financial identity extraction history did not resolve for {ticker}: "
+                f"{reason}:{details}"
+            )
+        cik, basis = mapping
+        identity_rows.append(
+            IdentityExtractionRow(
+                ticker,
+                cik,
+                names[ticker],
+                first,
+                last,
+                lineage,
+                segment_id,
+                basis,
+            )
+        )
     row_keys = [(row.ticker, row.cik, row.first_membership_date, row.last_membership_date) for row in rows]
     if len(row_keys) != len(set(row_keys)):
         raise ValueError("security master contains duplicate membership intervals")
@@ -899,7 +1008,7 @@ def build_security_master(
 
     acceptance_by_cik, missing_fragments = _acceptances_for_ciks(
         submissions_archive,
-        (row.cik for row in rows),
+        (*[row.cik for row in rows], *[row.cik for row in identity_rows]),
         max_json_member_bytes=max_json_member_bytes,
     )
     return SecurityMasterResult(
@@ -910,6 +1019,12 @@ def build_security_master(
         identity_manifest_sha256=identity_hash,
         submissions_archive_sha256=sha256_file(submissions_archive),
         missing_submission_fragments=missing_fragments,
+        identity_extraction_rows=tuple(
+            sorted(
+                identity_rows,
+                key=lambda row: (row.ticker, row.first_extraction_date, row.cik),
+            )
+        ),
     )
 
 
@@ -1355,7 +1470,11 @@ def extract_fundamentals(
     counters: Counter[str] = Counter()
     handle, members = _zip_members(companyfacts_archive, max_member_bytes=max_json_member_bytes)
     cik_members = _companyfacts_members(members)
-    resolved_ciks = sorted({row.cik for row in security_master.rows})
+    resolved_ciks = sorted(
+        {row.cik for row in security_master.rows}.union(
+            row.cik for row in security_master.identity_extraction_rows
+        )
+    )
     by_cik: dict[str, tuple[_Candidate, ...]] = {}
     missing_ciks: set[str] = set()
     try:
@@ -1377,19 +1496,33 @@ def extract_fundamentals(
         handle.close()
 
     windows = _cik_windows(security_master.rows)
+    history_by_ticker: dict[str, list[IdentityExtractionRow]] = defaultdict(list)
+    for row in security_master.identity_extraction_rows:
+        history_by_ticker[row.ticker].append(row)
     all_rows: list[FundamentalRow] = []
     all_audit: list[FundamentalAuditRow] = []
     statement_symbols: dict[str, set[str]] = defaultdict(set)
     no_facts: set[str] = set()
-    for ticker, cik_values in sorted(windows.items()):
+    for ticker in sorted(set(windows).union(history_by_ticker)):
         selected: list[_Candidate] = []
-        for cik, (lower, upper) in cik_values.items():
-            for candidate in by_cik.get(cik, ()):
-                if lower is not None and candidate.public_date < lower:
-                    continue
-                if upper is not None and candidate.public_date > upper:
-                    continue
-                selected.append(candidate)
+        if ticker in history_by_ticker:
+            for history in history_by_ticker[ticker]:
+                for candidate in by_cik.get(history.cik, ()):
+                    if not (
+                        history.first_extraction_date
+                        <= candidate.public_date
+                        <= history.last_extraction_date
+                    ):
+                        continue
+                    selected.append(candidate)
+        else:
+            for cik, (lower, upper) in windows[ticker].items():
+                for candidate in by_cik.get(cik, ()):
+                    if lower is not None and candidate.public_date < lower:
+                        continue
+                    if upper is not None and candidate.public_date > upper:
+                        continue
+                    selected.append(candidate)
         ticker_rows, ticker_audit = _materialize_ticker(ticker, selected, counters)
         if not ticker_rows:
             no_facts.add(ticker)
