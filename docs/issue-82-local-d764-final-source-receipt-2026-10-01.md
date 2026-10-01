@@ -33,11 +33,14 @@ it does not relabel or replace their evaluator map
 
 ## Build and execution stages
 
-1. A first build from the full checkout stopped at the Dockerfile guard requiring
-   editable V3 policy files to be absent from the installed image. It produced
-   no candidate image and was a context setup failure.
-2. The canonical context's offline build stopped because the local package cache
-   did not contain `alpaca-py==0.44.0`. It produced no candidate image.
+1. A first build from the full checkout stopped at the Dockerfile's composite
+   required-source and editable-policy exclusion guard. The log does not
+   isolate which conjunct failed. It produced no candidate image and was a
+   context setup failure.
+2. The canonical context's offline build stopped during installation of
+   `alpaca-py==0.44.0`: the log records PyPI DNS retries and resolution failure.
+   This build used `--no-cache-dir`, so cache contents do not establish the
+   failure's cause. It produced no candidate image.
 3. The canonical context then built successfully with dependency network access.
    Only the resulting image was used for the two probes below. The Docker daemon
    used for this run was version `29.7.2`, Linux/amd64. The two candidate
@@ -71,8 +74,8 @@ The verified runtime profile was network disabled, pull never, read-only root,
 all Linux capabilities dropped, no-new-privileges, UID/GID `65532:65532`, one
 CPU, 1024 MiB memory and swap, and 32 PIDs. Each run had four read-only policy
 source mounts, a bounded 64 MiB output mount, and no scenario-data mount.
-Both evaluator cleanups completed; targeted container-absence checks returned
-0, and both workspace-cleanup flags are true.
+Both evaluator cleanups completed; targeted absence checks found neither of
+the two owned run containers, and both workspace-cleanup flags are true.
 
 ## Retained local artifacts and limits
 
