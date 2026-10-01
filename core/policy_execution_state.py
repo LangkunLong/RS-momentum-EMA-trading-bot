@@ -1128,6 +1128,17 @@ def clear_terminal_pending_action(holding: HoldingEpisode, intent: ActionIntent)
     )
 
 
+def register_reconciliation_action(holding: HoldingEpisode, intent: ActionIntent) -> HoldingEpisode:
+    """Keep an action with unresolved execution facts visible on its holding."""
+    if intent.holding_episode_id != holding.holding_episode_id:
+        raise ValueError("action does not belong to this holding episode")
+    if intent.status is not ActionStatus.RECONCILIATION_REQUIRED:
+        raise ValueError("only an action requiring reconciliation can be registered this way")
+    if intent.logical_action_id in holding.pending_action_ids:
+        return holding
+    return replace(holding, pending_action_ids=(*holding.pending_action_ids, intent.logical_action_id))
+
+
 def _apply_action_fill_to_holding(
     holding: HoldingEpisode,
     intent: ActionIntent,
@@ -1382,6 +1393,35 @@ def advance_holding_exit_tier(holding: HoldingEpisode, intent: ActionIntent) -> 
 
 
 @dataclass(frozen=True, slots=True)
+class ProviderOrderReference:
+    """Provider-scoped ancestry for an external order reference."""
+
+    provider_id: str
+    paper_account_environment_id: str
+    store_identity: str
+    reference_kind: str
+    external_order_id: str
+    attempt_number: int
+    source_payload_sha256: str
+    first_seen_at_utc: datetime
+
+    def __post_init__(self) -> None:
+        for name in (
+            "provider_id",
+            "paper_account_environment_id",
+            "store_identity",
+            "external_order_id",
+            "source_payload_sha256",
+        ):
+            object.__setattr__(self, name, _text(getattr(self, name), name))
+        if self.reference_kind not in {"client_order_id", "broker_order_id"}:
+            raise ValueError("reference_kind must be client_order_id or broker_order_id")
+        if not isinstance(self.attempt_number, int) or isinstance(self.attempt_number, bool) or self.attempt_number not in {1, 2}:
+            raise ValueError("attempt_number must be 1 or 2")
+        _aware_datetime(self.first_seen_at_utc, "first_seen_at_utc")
+
+
+@dataclass(frozen=True, slots=True)
 class ActionStateProjection:
     """Read-only action and residual reservation view for account adapters."""
 
@@ -1423,6 +1463,7 @@ class ActionStateProjection:
     rounding_rule_id: str | None
     order_attempts: tuple[ActionOrderAttempt, ...]
     state_version: int | None = None
+    provider_order_references: tuple[ProviderOrderReference, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

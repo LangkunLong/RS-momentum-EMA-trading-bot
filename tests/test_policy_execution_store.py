@@ -24,7 +24,7 @@ from core.policy_execution_state import (
     PortfolioStateSnapshot,
     build_action_intent,
 )
-from core.policy_execution_store import PolicyExecutionStateStore
+from core.policy_execution_store import ConcurrentStateUpdateError, PolicyExecutionStateStore
 
 
 UTC = timezone.utc
@@ -225,16 +225,18 @@ def test_deployment_pointer_rollback_keeps_open_holding_and_action_generation_pi
     generation_b = _deployment(revision="b" * 40)
     store.register_deployment_identity(generation_a, lifecycle="prepared", handler_identity="handler-a", guard_id="guard-v1")
     store.register_deployment_identity(generation_b, lifecycle="prepared", handler_identity="handler-b", guard_id="guard-v1")
-    store.set_active_generation(
+    first_pointer_version = store.set_active_generation(
         generation_a.paper_account_environment_id,
         expected_generation_id=None,
+        expected_pointer_version=None,
         new_generation_id=generation_a.deployment_generation_id,
         readiness_evidence_ref="synthetic-ready-a",
         outgoing_entries_reconciled=True,
     )
-    store.set_active_generation(
+    second_pointer_version = store.set_active_generation(
         generation_a.paper_account_environment_id,
         expected_generation_id=generation_a.deployment_generation_id,
+        expected_pointer_version=first_pointer_version,
         new_generation_id=generation_b.deployment_generation_id,
         readiness_evidence_ref="synthetic-ready-b",
         outgoing_entries_reconciled=True,
@@ -280,6 +282,7 @@ def test_deployment_pointer_rollback_keeps_open_holding_and_action_generation_pi
     store.set_active_generation(
         generation_a.paper_account_environment_id,
         expected_generation_id=generation_b.deployment_generation_id,
+        expected_pointer_version=second_pointer_version,
         new_generation_id=generation_a.deployment_generation_id,
         readiness_evidence_ref="synthetic-rollback-a",
         outgoing_entries_reconciled=True,
@@ -485,6 +488,51 @@ def test_duplicate_fill_ids_compare_payload_and_cumulative_replays_apply_zero_de
     assert store.load_holding_episode_for_action(intent.logical_action_id).remaining_quantity == Decimal("40")
 
 
+def test_same_watermark_monetary_refinement_is_receipt_only(tmp_path: Path) -> None:
+    store = _open_store(tmp_path)
+    store.migrate()
+    deployment = _deployment()
+    store.register_deployment_identity(deployment, lifecycle="prepared", handler_identity="fixture-handler", guard_id="guard-v1")
+    intent = _entry_intent(deployment)
+    _record_decision(store, intent)
+    store.record_action_intent(intent, expected_version=None)
+    first = store.record_cumulative_fill(
+        intent.logical_action_id,
+        1,
+        provider_id="recorded-fixture-provider",
+        fill_event_id="unknown-value-fill",
+        cumulative_quantity=Decimal("40"),
+        cumulative_notional=None,
+        cumulative_fees=None,
+        payload_sha256=None,
+        observed_at=datetime(2026, 10, 1, 13, 31, tzinfo=UTC),
+        expected_action_version=0,
+        expected_holding_version=None,
+    )
+    refined = store.record_cumulative_fill(
+        intent.logical_action_id,
+        1,
+        provider_id="recorded-fixture-provider",
+        fill_event_id="known-value-same-watermark",
+        cumulative_quantity=Decimal("40"),
+        cumulative_notional=Decimal("2000"),
+        cumulative_fees=Decimal("0"),
+        payload_sha256=None,
+        observed_at=datetime(2026, 10, 1, 13, 32, tzinfo=UTC),
+        expected_action_version=first.state_version,
+        expected_holding_version=1,
+    )
+    assert refined.state_version == first.state_version
+    assert store.load_holding_episode_for_action(intent.logical_action_id).cost_basis is None
+    with sqlite3.connect(store.db_path) as conn:
+        notional, fees = conn.execute(
+            "SELECT cumulative_notional, cumulative_fees FROM policy_state_order_attempts WHERE logical_action_id=? AND attempt_number=1",
+            (intent.logical_action_id,),
+        ).fetchone()
+    assert notional is None
+    assert fees is None
+
+
 def test_active_pointer_compare_and_set_serializes_competing_writers(tmp_path: Path) -> None:
     store = _open_store(tmp_path)
     store.migrate()
@@ -493,14 +541,17 @@ def test_active_pointer_compare_and_set_serializes_competing_writers(tmp_path: P
     third = _deployment(revision="c" * 40)
     for deployment in (base, second, third):
         store.register_deployment_identity(deployment, lifecycle="prepared", handler_identity="fixture-handler", guard_id="guard-v1")
-    store.set_active_generation(
+    initial_pointer_version = store.set_active_generation(
         base.paper_account_environment_id,
         expected_generation_id=None,
+        expected_pointer_version=None,
         new_generation_id=base.deployment_generation_id,
-            readiness_evidence_ref="synthetic-initial-pointer",
+        readiness_evidence_ref="synthetic-initial-pointer",
         outgoing_entries_reconciled=True,
     )
     barrier = Barrier(2)
+    expected_pointer = store.load_active_generation_pointer(base.paper_account_environment_id)
+    assert expected_pointer.pointer_version == initial_pointer_version
 
     def contender(target: PolicyDeploymentIdentity) -> bool:
         writer = PolicyExecutionStateStore(store.db_path, store_identity=base.store_identity)
@@ -508,7 +559,8 @@ def test_active_pointer_compare_and_set_serializes_competing_writers(tmp_path: P
         try:
             writer.set_active_generation(
                 base.paper_account_environment_id,
-                expected_generation_id=base.deployment_generation_id,
+                expected_generation_id=expected_pointer.active_generation_id,
+                expected_pointer_version=expected_pointer.pointer_version,
                 new_generation_id=target.deployment_generation_id,
                 readiness_evidence_ref=f"synthetic-{target.source_revision[:4]}",
                 outgoing_entries_reconciled=True,
@@ -524,6 +576,54 @@ def test_active_pointer_compare_and_set_serializes_competing_writers(tmp_path: P
         second.deployment_generation_id,
         third.deployment_generation_id,
     }
+
+
+def test_active_pointer_compare_and_set_rejects_aba_stale_version(tmp_path: Path) -> None:
+    store = _open_store(tmp_path)
+    store.migrate()
+    generation_a = _deployment()
+    generation_b = _deployment(revision="b" * 40)
+    generation_c = _deployment(revision="c" * 40)
+    for deployment in (generation_a, generation_b, generation_c):
+        store.register_deployment_identity(deployment, lifecycle="prepared", handler_identity="fixture-handler", guard_id="guard-v1")
+
+    version_a1 = store.set_active_generation(
+        generation_a.paper_account_environment_id,
+        expected_generation_id=None,
+        expected_pointer_version=None,
+        new_generation_id=generation_a.deployment_generation_id,
+        readiness_evidence_ref="synthetic-a1",
+        outgoing_entries_reconciled=True,
+    )
+    version_b2 = store.set_active_generation(
+        generation_a.paper_account_environment_id,
+        expected_generation_id=generation_a.deployment_generation_id,
+        expected_pointer_version=version_a1,
+        new_generation_id=generation_b.deployment_generation_id,
+        readiness_evidence_ref="synthetic-b2",
+        outgoing_entries_reconciled=True,
+    )
+    version_a3 = store.set_active_generation(
+        generation_a.paper_account_environment_id,
+        expected_generation_id=generation_b.deployment_generation_id,
+        expected_pointer_version=version_b2,
+        new_generation_id=generation_a.deployment_generation_id,
+        readiness_evidence_ref="synthetic-a3",
+        outgoing_entries_reconciled=True,
+    )
+    assert version_a3 == version_a1 + 2
+    with pytest.raises(ConcurrentStateUpdateError, match="changed since it was read"):
+        store.set_active_generation(
+            generation_a.paper_account_environment_id,
+            expected_generation_id=generation_a.deployment_generation_id,
+            expected_pointer_version=version_a1,
+            new_generation_id=generation_c.deployment_generation_id,
+            readiness_evidence_ref="synthetic-stale-a1",
+            outgoing_entries_reconciled=True,
+        )
+    pointer = store.load_active_generation_pointer(generation_a.paper_account_environment_id)
+    assert pointer.active_generation_id == generation_a.deployment_generation_id
+    assert pointer.pointer_version == version_a3
 
 
 def test_schema_rollback_refuses_any_durable_policy_state(tmp_path: Path) -> None:
@@ -561,6 +661,17 @@ def test_unissued_action_can_be_resolved_but_issued_action_waits_for_terminal_ev
     assert resolved.status is ActionStatus.RESOLVED
     assert resolved.resolution_reason == "Synthetic missed-session reconciliation confirms no order was submitted"
     assert resolved.state_version == 1
+    late_reference = store.bind_attempt_order_refs(
+        intent.logical_action_id,
+        1,
+        provider_id="recorded-fixture-provider",
+        client_order_id="late-discovered-client",
+        expected_action_version=resolved.state_version,
+        observed_at=datetime(2026, 10, 1, 13, 32, tzinfo=UTC),
+    )
+    assert late_reference.status is ActionStatus.RECONCILIATION_REQUIRED
+    assert late_reference.resolution_reason == resolved.resolution_reason
+    assert late_reference.order_attempts[0].status is ActionAttemptStatus.SUBMITTED
 
     issued = build_action_intent(
         decision=_decision(deployment, subject_id="FIGI-ISSUED"),
@@ -632,9 +743,10 @@ def test_mixed_generation_consistent_read_exposes_action_and_holding_versions(tm
         observed_at=datetime(2026, 10, 1, 13, 35, tzinfo=UTC),
     )
 
-    store.set_active_generation(
+    generation_a_pointer_version = store.set_active_generation(
         generation_a.paper_account_environment_id,
         expected_generation_id=None,
+        expected_pointer_version=None,
         new_generation_id=generation_a.deployment_generation_id,
         readiness_evidence_ref="synthetic-generation-a",
         outgoing_entries_reconciled=True,
@@ -642,6 +754,7 @@ def test_mixed_generation_consistent_read_exposes_action_and_holding_versions(tm
     store.set_active_generation(
         generation_a.paper_account_environment_id,
         expected_generation_id=generation_a.deployment_generation_id,
+        expected_pointer_version=generation_a_pointer_version,
         new_generation_id=generation_b.deployment_generation_id,
         readiness_evidence_ref="synthetic-generation-b",
         outgoing_entries_reconciled=True,
@@ -993,6 +1106,112 @@ def test_addition_never_turns_unknown_aggregate_holding_risk_into_known_risk(
     assert updated_holding.committed_risk_basis is None
 
 
+def test_public_holding_reconciliation_rejects_quantity_and_protection_bypasses(tmp_path: Path) -> None:
+    store = _open_store(tmp_path)
+    store.migrate()
+    deployment = _deployment()
+    store.register_deployment_identity(deployment, lifecycle="prepared", handler_identity="fixture-handler", guard_id="guard-v1")
+    entry = _entry_intent(deployment)
+    _record_decision(store, entry)
+    store.record_action_intent(entry, expected_version=None)
+    _record_fill(
+        store,
+        entry,
+        event_id="holding-reconciliation-opening-fill",
+        cumulative_quantity="100",
+        cumulative_notional="5000",
+        expected_action_version=0,
+        expected_holding_version=None,
+    )
+    holding = store.load_holding_episode_for_action(entry.logical_action_id)
+
+    changed_initial_quantity = replace(
+        holding,
+        initial_filled_quantity=Decimal("200"),
+        remaining_quantity=Decimal("200"),
+    )
+    with pytest.raises(ValueError, match="only policy flags"):
+        store.record_holding_episode(
+            changed_initial_quantity,
+            expected_version=holding.state_version,
+            evidence_ref="synthetic-position-check-1",
+        )
+    changed_peak = replace(holding, peak_price=Decimal("60"))
+    with pytest.raises(ValueError, match="only policy flags"):
+        store.record_holding_episode(
+            changed_peak,
+            expected_version=holding.state_version,
+            evidence_ref="synthetic-position-check-2",
+        )
+    fabricated_stop = replace(
+        holding,
+        confirmed_protective_stop_price=Decimal("45"),
+        confirmed_stop_action_id="unrecorded-stop-action",
+        confirmed_stop_client_order_id="unrecorded-client",
+        confirmed_stop_broker_order_id="unrecorded-broker",
+        confirmed_stop_observed_at=datetime(2026, 10, 1, 14, 0, tzinfo=UTC),
+    )
+    with pytest.raises(ValueError, match="only policy flags"):
+        store.record_holding_episode(
+            fabricated_stop,
+            expected_version=holding.state_version,
+            evidence_ref="synthetic-position-check-3",
+        )
+    unchanged = store.load_holding_episode(holding.holding_episode_id)
+    assert unchanged.initial_filled_quantity == Decimal("100")
+    assert unchanged.remaining_quantity == Decimal("100")
+    assert unchanged.state_version == holding.state_version
+
+
+def test_public_holding_reconciliation_retains_flag_evidence_in_history(tmp_path: Path) -> None:
+    store = _open_store(tmp_path)
+    store.migrate()
+    deployment = _deployment()
+    store.register_deployment_identity(deployment, lifecycle="prepared", handler_identity="fixture-handler", guard_id="guard-v1")
+    entry = _entry_intent(deployment)
+    _record_decision(store, entry)
+    store.record_action_intent(entry, expected_version=None)
+    _record_fill(
+        store,
+        entry,
+        event_id="holding-flag-opening-fill",
+        cumulative_quantity="100",
+        cumulative_notional="5000",
+        expected_action_version=0,
+        expected_holding_version=None,
+    )
+    holding = store.load_holding_episode_for_action(entry.logical_action_id)
+    flagged = replace(
+        holding,
+        policy_flags=(("position_reconciliation_required", "offline account comparison pending"),),
+    )
+    version = store.record_holding_episode(
+        flagged,
+        expected_version=holding.state_version,
+        evidence_ref="offline-account-snapshot-2026-10-01",
+    )
+    flagged = store.load_holding_episode(holding.holding_episode_id)
+    assert version == flagged.state_version == holding.state_version + 1
+    cleared = replace(flagged, policy_flags=())
+    version = store.record_holding_episode(
+        cleared,
+        expected_version=flagged.state_version,
+        evidence_ref="offline-account-reconciliation-2026-10-01",
+    )
+    assert version == flagged.state_version + 1
+    with sqlite3.connect(store.db_path) as conn:
+        rows = conn.execute(
+            "SELECT evidence_ref, state_json FROM policy_state_holding_history "
+            "WHERE holding_episode_id=? ORDER BY state_version DESC LIMIT 2",
+            (holding.holding_episode_id,),
+        ).fetchall()
+    assert [row[0] for row in rows] == [
+        "offline-account-reconciliation-2026-10-01",
+        "offline-account-snapshot-2026-10-01",
+    ]
+    assert all(row[0] in row[1] for row in rows)
+
+
 def test_provider_scoped_order_aliases_survive_action_projection_reload(tmp_path: Path) -> None:
     store = _open_store(tmp_path)
     store.migrate()
@@ -1019,13 +1238,33 @@ def test_provider_scoped_order_aliases_survive_action_projection_reload(tmp_path
         expected_action_version=first.state_version,
         observed_at=datetime(2026, 10, 1, 13, 32, tzinfo=UTC),
     )
+    third = store.bind_attempt_order_refs(
+        intent.logical_action_id,
+        1,
+        provider_id="recorded-provider-c",
+        client_order_id="client-alias",
+        broker_order_id="broker-alias",
+        expected_action_version=second.state_version,
+        observed_at=datetime(2026, 10, 1, 13, 33, tzinfo=UTC),
+    )
     projection = store.load_action_projection(intent.logical_action_id)
     attempt = projection.order_attempts[0]
-    assert second.state_version == projection.state_version == 2
+    assert third.state_version == projection.state_version == 3
     assert attempt.client_order_id == "client-primary"
     assert attempt.broker_order_id == "broker-primary"
     assert attempt.client_order_aliases == ("client-alias",)
     assert attempt.broker_order_aliases == ("broker-alias",)
+    assert {
+        (reference.provider_id, reference.reference_kind, reference.external_order_id)
+        for reference in projection.provider_order_references
+    } == {
+        ("recorded-provider-a", "client_order_id", "client-primary"),
+        ("recorded-provider-a", "broker_order_id", "broker-primary"),
+        ("recorded-provider-b", "client_order_id", "client-alias"),
+        ("recorded-provider-b", "broker_order_id", "broker-alias"),
+        ("recorded-provider-c", "client_order_id", "client-alias"),
+        ("recorded-provider-c", "broker_order_id", "broker-alias"),
+    }
     aliases = store.load_order_reference_aliases(intent.logical_action_id)
     assert {row["external_order_id"] for row in aliases} == {
         "client-primary",
@@ -1033,3 +1272,276 @@ def test_provider_scoped_order_aliases_survive_action_projection_reload(tmp_path
         "client-alias",
         "broker-alias",
     }
+    with sqlite3.connect(store.db_path) as conn:
+        history = conn.execute(
+            "SELECT state_json FROM policy_state_action_history WHERE logical_action_id=? AND state_version=3",
+            (intent.logical_action_id,),
+        ).fetchone()[0]
+    assert "recorded-provider-c" in history
+
+    restarted = PolicyExecutionStateStore(store.db_path, store_identity=deployment.store_identity)
+    reopened = restarted.load_action_projection(intent.logical_action_id)
+    assert reopened.provider_order_references == projection.provider_order_references
+    assert reopened.order_attempts[0].client_order_aliases == ("client-alias",)
+
+
+def test_binding_remainder_refs_preserves_late_fill_reconciliation_across_restart(tmp_path: Path) -> None:
+    store = _open_store(tmp_path)
+    store.migrate()
+    deployment = _deployment()
+    store.register_deployment_identity(deployment, lifecycle="prepared", handler_identity="fixture-handler", guard_id="guard-v1")
+    entry = _entry_intent(deployment)
+    _record_decision(store, entry)
+    store.record_action_intent(entry, expected_version=None)
+    _record_fill(
+        store,
+        entry,
+        event_id="remainder-recovery-opening-fill",
+        cumulative_quantity="100",
+        cumulative_notional="5000",
+        expected_action_version=0,
+        expected_holding_version=None,
+    )
+    holding = store.load_holding_episode_for_action(entry.logical_action_id)
+    exit_decision = _decision(
+        deployment,
+        category=DecisionCategory.EXIT,
+        subject_type=DecisionSubjectType.HOLDING,
+        subject_id=holding.holding_episode_id,
+    )
+    store.record_decision(exit_decision, policy_payload={}, guard_payload={}, effective_action_payload={})
+    action = build_action_intent(
+        decision=exit_decision,
+        security_id=holding.security_id,
+        broker_symbol=holding.broker_symbol,
+        holding_episode_id=holding.holding_episode_id,
+        role=ActionRole.SCALE_OUT,
+        side=OrderSide.SELL,
+        requested_quantity=Decimal("50"),
+        exit_tier=1,
+        snapshot_original_quantity=Decimal("100"),
+        fraction_of_original_quantity=Decimal("0.5"),
+        rounding_rule_id="whole_share_floor_v1",
+    )
+    store.record_action_intent(action, expected_version=None)
+    submitted = store.bind_attempt_order_refs(
+        action.logical_action_id,
+        1,
+        provider_id="recorded-remainder-provider",
+        client_order_id="first-client",
+        broker_order_id="first-broker",
+        expected_action_version=0,
+        observed_at=datetime(2026, 10, 1, 13, 31, tzinfo=UTC),
+    )
+    after_first_fill = store.load_holding_episode(holding.holding_episode_id)
+    underfilled = _record_fill(
+        store,
+        action,
+        event_id="first-attempt-fill-20",
+        cumulative_quantity="20",
+        cumulative_notional="1000",
+        expected_action_version=submitted.state_version,
+        expected_holding_version=after_first_fill.state_version,
+    )
+    cancel = store.request_order_cancel(
+        action.logical_action_id,
+        1,
+        expected_action_version=underfilled.state_version,
+        observed_at=datetime(2026, 10, 1, 13, 32, tzinfo=UTC),
+    )
+    terminal = store.confirm_order_terminal(
+        action.logical_action_id,
+        1,
+        terminal_status=ActionAttemptStatus.CANCELLED,
+        expected_action_version=cancel.state_version,
+        observed_at=datetime(2026, 10, 1, 13, 33, tzinfo=UTC),
+    )
+    remainder = store.create_single_remainder_attempt(
+        action.logical_action_id,
+        expected_action_version=terminal.state_version,
+        observed_at=datetime(2026, 10, 1, 13, 34, tzinfo=UTC),
+    )
+    after_late_fill = store.load_holding_episode(holding.holding_episode_id)
+    late_fill = store.record_cumulative_fill(
+        action.logical_action_id,
+        1,
+        provider_id="recorded-remainder-provider",
+        fill_event_id="first-attempt-late-fill-25",
+        cumulative_quantity=Decimal("25"),
+        cumulative_notional=Decimal("1250"),
+        cumulative_fees=Decimal("0"),
+        payload_sha256=None,
+        observed_at=datetime(2026, 10, 1, 13, 35, tzinfo=UTC),
+        expected_action_version=remainder.state_version,
+        expected_holding_version=after_late_fill.state_version,
+    )
+    assert late_fill.status is ActionStatus.RECONCILIATION_REQUIRED
+    assert late_fill.state_version == remainder.state_version + 1
+
+    bound_remainder = store.bind_attempt_order_refs(
+        action.logical_action_id,
+        2,
+        provider_id="recorded-remainder-provider",
+        client_order_id="remainder-client",
+        broker_order_id="remainder-broker",
+        expected_action_version=late_fill.state_version,
+        observed_at=datetime(2026, 10, 1, 13, 36, tzinfo=UTC),
+    )
+    assert bound_remainder.status is ActionStatus.RECONCILIATION_REQUIRED
+    assert bound_remainder.order_attempts[0].terminal_status is ActionAttemptStatus.CANCELLED
+    assert bound_remainder.order_attempts[1].status is ActionAttemptStatus.SUBMITTED
+
+    before_remainder_fill = store.load_holding_episode(holding.holding_episode_id)
+    filled_while_live = store.record_cumulative_fill(
+        action.logical_action_id,
+        2,
+        provider_id="recorded-remainder-provider",
+        fill_event_id="remainder-attempt-fill-25",
+        cumulative_quantity=Decimal("25"),
+        cumulative_notional=Decimal("1250"),
+        cumulative_fees=Decimal("0"),
+        payload_sha256=None,
+        observed_at=datetime(2026, 10, 1, 13, 37, tzinfo=UTC),
+        expected_action_version=bound_remainder.state_version,
+        expected_holding_version=before_remainder_fill.state_version,
+    )
+    assert filled_while_live.status is ActionStatus.RECONCILIATION_REQUIRED
+    assert filled_while_live.confirmed_quantity == Decimal("50")
+    assert filled_while_live.residual_quantity == Decimal("0")
+    assert filled_while_live.order_attempts[1].requested_quantity == Decimal("30")
+    assert filled_while_live.order_attempts[1].confirmed_filled_quantity == Decimal("25")
+    still_pending = store.load_holding_episode(holding.holding_episode_id)
+    assert still_pending.last_exit_tier == 0
+    assert still_pending.pending_action_ids == (action.logical_action_id,)
+
+    restarted = PolicyExecutionStateStore(store.db_path, store_identity=deployment.store_identity)
+    projection = restarted.load_action_projection(action.logical_action_id)
+    assert projection.status is ActionStatus.RECONCILIATION_REQUIRED
+    assert projection.confirmed_quantity == Decimal("50")
+    assert projection.order_attempts[1].requested_quantity == Decimal("30")
+    assert restarted.load_holding_episode(holding.holding_episode_id).last_exit_tier == 0
+
+
+def test_late_fill_after_completed_scale_out_requires_explicit_resolution(tmp_path: Path) -> None:
+    store = _open_store(tmp_path)
+    store.migrate()
+    deployment = _deployment()
+    store.register_deployment_identity(deployment, lifecycle="prepared", handler_identity="fixture-handler", guard_id="guard-v1")
+    opening = build_action_intent(
+        decision=_decision(deployment),
+        security_id="FIGI-BB1234",
+        broker_symbol="ACME",
+        role=ActionRole.ENTRY,
+        side=OrderSide.BUY,
+        requested_quantity=Decimal("10"),
+    )
+    _record_decision(store, opening)
+    store.record_action_intent(opening, expected_version=None)
+    _record_fill(
+        store,
+        opening,
+        event_id="late-scale-opening-fill",
+        cumulative_quantity="10",
+        cumulative_notional="500",
+        expected_action_version=0,
+        expected_holding_version=None,
+    )
+    holding = store.load_holding_episode_for_action(opening.logical_action_id)
+    decision = _decision(
+        deployment,
+        session=date(2026, 10, 1),
+        category=DecisionCategory.EXIT,
+        subject_type=DecisionSubjectType.HOLDING,
+        subject_id=holding.holding_episode_id,
+    )
+    scale_out = build_action_intent(
+        decision=decision,
+        security_id=holding.security_id,
+        broker_symbol=holding.broker_symbol,
+        holding_episode_id=holding.holding_episode_id,
+        role=ActionRole.SCALE_OUT,
+        side=OrderSide.SELL,
+        requested_quantity=Decimal("5"),
+        exit_tier=1,
+        snapshot_original_quantity=Decimal("10"),
+        fraction_of_original_quantity=Decimal("0.5"),
+        rounding_rule_id="whole_share_floor_v1",
+    )
+    _record_decision(store, scale_out)
+    store.record_action_intent(scale_out, expected_version=None)
+    after_intent = store.load_holding_episode(holding.holding_episode_id)
+    filled = _record_fill(
+        store,
+        scale_out,
+        event_id="late-scale-target-fill",
+        cumulative_quantity="5",
+        cumulative_notional="250",
+        expected_action_version=0,
+        expected_holding_version=after_intent.state_version,
+    )
+    completed = store.load_holding_episode(holding.holding_episode_id)
+    assert filled.status is ActionStatus.FILLED
+    assert completed.remaining_quantity == Decimal("5")
+    assert completed.last_exit_tier == 1
+    assert completed.pending_action_ids == ()
+
+    late_fill = store.record_cumulative_fill(
+        scale_out.logical_action_id,
+        1,
+        provider_id="recorded-fixture-provider",
+        fill_event_id="late-scale-extra-fill",
+        cumulative_quantity=Decimal("6"),
+        cumulative_notional=Decimal("300"),
+        cumulative_fees=Decimal("0"),
+        payload_sha256=None,
+        observed_at=datetime(2026, 10, 1, 13, 32, tzinfo=UTC),
+        expected_action_version=filled.state_version,
+        expected_holding_version=completed.state_version,
+    )
+    conflicted = store.load_holding_episode(holding.holding_episode_id)
+    assert late_fill.status is ActionStatus.RECONCILIATION_REQUIRED
+    assert conflicted.remaining_quantity == Decimal("4")
+    assert conflicted.last_exit_tier == 1
+    assert conflicted.pending_action_ids == (scale_out.logical_action_id,)
+
+    conflicting_decision = _decision(
+        deployment,
+        session=date(2026, 10, 2),
+        snapshot="e" * 64,
+        category=DecisionCategory.EXIT,
+        subject_type=DecisionSubjectType.HOLDING,
+        subject_id=holding.holding_episode_id,
+    )
+    conflicting_action = build_action_intent(
+        decision=conflicting_decision,
+        security_id=holding.security_id,
+        broker_symbol=holding.broker_symbol,
+        holding_episode_id=holding.holding_episode_id,
+        role=ActionRole.SCALE_OUT,
+        side=OrderSide.SELL,
+        requested_quantity=Decimal("2"),
+        exit_tier=2,
+        snapshot_original_quantity=Decimal("10"),
+        fraction_of_original_quantity=Decimal("0.2"),
+        rounding_rule_id="whole_share_floor_v1",
+    )
+    _record_decision(store, conflicting_action)
+    with pytest.raises(ValueError, match="pending logical action"):
+        store.record_action_intent(conflicting_action, expected_version=None)
+
+    resolved = store.record_explicit_action_resolution(
+        scale_out.logical_action_id,
+        resolution_reason="Synthetic reconciliation confirms the extra share was sold",
+        expected_action_version=late_fill.state_version,
+        expected_holding_version=conflicted.state_version,
+        observed_at=datetime(2026, 10, 1, 13, 33, tzinfo=UTC),
+    )
+    assert resolved.status is ActionStatus.RESOLVED
+    resolved_holding = store.load_holding_episode(holding.holding_episode_id)
+    assert resolved_holding.remaining_quantity == Decimal("4")
+    assert resolved_holding.last_exit_tier == 1
+    assert resolved_holding.pending_action_ids == ()
+
+    restarted = PolicyExecutionStateStore(store.db_path, store_identity=deployment.store_identity)
+    assert restarted.load_action_projection(scale_out.logical_action_id).status is ActionStatus.RESOLVED
+    assert restarted.load_holding_episode(holding.holding_episode_id) == resolved_holding
