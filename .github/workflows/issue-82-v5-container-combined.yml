@@ -1,0 +1,127 @@
+name: Issue 82 one-time V5 container check (combined source)
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_container_run:
+        description: Build and run the fixed probes against the exact PR124 source after principal review of this workflow
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue-82-v5-container-combined-check
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: inputs.confirm_container_run == true && github.ref == 'refs/heads/codex/issue-82-combined-verification'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out this one-time combined runner package
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          path: package
+          persist-credentials: false
+
+      - name: Check out the exact PR124 evaluator source
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: 99fa44902fc3621338a5a1e19ea5b4a643c88187
+          path: evaluator
+          persist-credentials: false
+
+      - name: Verify the 58-path source, build once, import once, and run the two matched probes
+        timeout-minutes: 17
+        run: >-
+          python3 package/scripts/issue82_github_runner_probe_combined.py
+          --source-root evaluator
+          --evidence-path "$RUNNER_TEMP/issue-82-combined-container-evidence.json"
+
+      - name: Retain the last valid evidence checkpoint
+        if: always()
+        timeout-minutes: 1
+        env:
+          EVIDENCE_PATH: ${{ runner.temp }}/issue-82-combined-container-evidence.json
+        run: |
+          python3 - "$EVIDENCE_PATH" "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          evidence_path = pathlib.Path(sys.argv[1])
+          summary_path = pathlib.Path(sys.argv[2])
+          receipt_limit = 480_000
+          combined_log_summary_limit = 1_048_576
+          title = "## Issue 82 exact-source PR124 99fa4490 container verification"
+          incomplete = False
+          lines = [title, ""]
+
+          try:
+              evidence_size = evidence_path.stat().st_size
+          except FileNotFoundError:
+              lines.append(
+                  "**INCOMPLETE:** no evidence checkpoint was available to export. "
+                  "A hard cancellation or job timeout may have stopped the helper "
+                  "before its first checkpoint."
+              )
+              incomplete = True
+          except OSError as error:
+              lines.append(f"**INCOMPLETE:** evidence checkpoint stat failed: {error}")
+              incomplete = True
+          else:
+              if evidence_size <= 0 or evidence_size > receipt_limit:
+                  lines.append(
+                      "**INCOMPLETE:** checkpoint size is empty or exceeds the "
+                      "480,000-byte receipt bound; it was not read."
+                  )
+                  incomplete = True
+              else:
+                  try:
+                      raw = evidence_path.read_bytes()
+                  except OSError as error:
+                      lines.append(f"**INCOMPLETE:** evidence checkpoint read failed: {error}")
+                      incomplete = True
+                  else:
+                      if len(raw) != evidence_size or len(raw) > receipt_limit:
+                          lines.append("**INCOMPLETE:** checkpoint changed size while being read.")
+                          incomplete = True
+                      else:
+                          try:
+                              report = json.loads(raw.decode("utf-8", errors="strict"))
+                          except (UnicodeError, json.JSONDecodeError):
+                              lines.append("**INCOMPLETE:** the available checkpoint is not valid UTF-8 JSON.")
+                              incomplete = True
+                          else:
+                              status = report.get("status") if isinstance(report, dict) else None
+                              if status == "verified":
+                                  lines.append("**VERIFIED:** final helper receipt retained below.")
+                              elif status == "failed":
+                                  lines.append("**FAILED:** final helper report retained below.")
+                              else:
+                                  lines.append(
+                                      "**INCOMPLETE:** the latest checkpoint is nonterminal. "
+                                      "The helper may have been interrupted by cancellation or timeout; "
+                                      "no final receipt was produced."
+                                  )
+                                  incomplete = True
+                              lines.extend(["", "```json", raw.decode("utf-8").rstrip(), "```"])
+
+          rendered = "\n".join(lines) + "\n"
+          if len(rendered.encode("utf-8")) * 2 > combined_log_summary_limit:
+              incomplete = True
+              rendered = (
+                  title + "\n\n**INCOMPLETE:** rendered receipt exceeded the combined "
+                  "stdout and summary bound; inspect the helper checkpoint status.\n"
+              )
+          print(rendered, end="")
+          summary_path.parent.mkdir(parents=True, exist_ok=True)
+          with summary_path.open("a", encoding="utf-8") as stream:
+              stream.write(rendered)
+          if incomplete:
+              raise SystemExit(1)
+          PY
