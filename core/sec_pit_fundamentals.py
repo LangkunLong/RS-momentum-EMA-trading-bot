@@ -1177,8 +1177,13 @@ def _candidate_metadata(
         counters["pre_window_filing_omissions"] += 1
         return None
     public_date = _next_trading_day(spy_days, source_date)
-    if public_date is None or public_date > end_date:
+    if public_date is None:
+        counters["no_next_session_fact_omissions"] += 1
         counters["post_cutoff_fact_omissions"] += 1
+        return None
+    if public_date > end_date:
+        counters["post_cutoff_fact_omissions"] += 1
+        counters["mapped_after_cutoff_fact_omissions"] += 1
         return None
     if public_date < start_date:
         counters["pre_window_fact_omissions"] += 1
