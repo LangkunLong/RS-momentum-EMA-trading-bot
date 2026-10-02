@@ -1270,9 +1270,8 @@ def _normalize_cache_to_cutoff_basis(
                 if identities is not None and identity is None:
                     raise ValueError(f"cache row lacks a canonical price-identity contract for {ticker}")
                 if identity is not None and (
-                    trade_date > identity.admitted_end
-                    or identity.continuity_kind == "successor_reset"
-                    and trade_date < identity.admitted_start
+                    trade_date < identity.admitted_start
+                    or trade_date > identity.admitted_end
                 ):
                     continue
                 factor = cache_factors.get(ticker)
@@ -1374,6 +1373,78 @@ def _merge_price_sources(cache_path: Path, sip_path: Path, output_path: Path) ->
         "alpaca_sip_fill_row_count": sip_fill_count,
         "merged_row_count": merged_count,
         "overlap_audit": audit.finish(),
+    }
+
+
+def _validate_published_price_identity_continuity(
+    prices_path: Path,
+    identities: dict[str, PriceIdentity],
+) -> dict[str, object]:
+    """Fail closed when merged cache/provider rows disagree across an identity link."""
+    successors = {
+        ticker: identity.warmup_predecessor
+        for ticker, identity in identities.items()
+        if identity.warmup_predecessor is not None
+    }
+    linked_tickers = set(successors)
+    linked_tickers.update(predecessor for predecessor in successors.values() if predecessor)
+    rows: dict[str, dict[date, tuple[float, ...]]] = {
+        ticker: {} for ticker in linked_tickers
+    }
+    with prices_path.open("r", encoding="utf-8", newline="") as stream:
+        reader = csv.DictReader(stream)
+        if tuple(reader.fieldnames or ()) != _PRICE_COLUMNS:
+            raise ValueError("published price CSV has an unexpected identity-audit header")
+        for row_number, row in enumerate(reader, start=2):
+            ticker = row["ticker"]
+            if ticker not in linked_tickers:
+                continue
+            try:
+                trade_date = date.fromisoformat(row["trade_date"])
+                values = tuple(float(row[name]) for name in _PRICE_COLUMNS[2:])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"published price row {row_number} is malformed during identity audit"
+                ) from exc
+            if trade_date in rows[ticker]:
+                raise ValueError(
+                    f"published price CSV duplicates {ticker} on {trade_date.isoformat()}"
+                )
+            rows[ticker][trade_date] = values
+
+    audits: dict[str, object] = {}
+    for ticker, predecessor in sorted(successors.items()):
+        assert predecessor is not None
+        predecessor_identity = identities.get(predecessor)
+        if (
+            predecessor_identity is None
+            or predecessor_identity.chain_id != identities[ticker].chain_id
+        ):
+            raise ValueError(
+                f"published identity predecessor {predecessor} for {ticker} is outside its chain"
+            )
+        shared = sorted(set(rows[ticker]).intersection(rows[predecessor]))
+        mismatches = [
+            trade_date
+            for trade_date in shared
+            if rows[ticker][trade_date] != rows[predecessor][trade_date]
+        ]
+        if mismatches:
+            raise ValueError(
+                "published price identity continuity mismatch for "
+                f"{predecessor}/{ticker}: {len(mismatches)}/{len(shared)} shared rows differ; "
+                f"first mismatch {mismatches[0].isoformat()}"
+            )
+        audits[ticker] = {
+            "predecessor": predecessor,
+            "exact_overlap_row_count": len(shared),
+            "overlap_first_date": shared[0].isoformat() if shared else None,
+            "overlap_last_date": shared[-1].isoformat() if shared else None,
+        }
+    return {
+        "scope": "published_merged_price_csv",
+        "validated_successor_count": len(audits),
+        "successor_audits": audits,
     }
 
 
@@ -1662,6 +1733,10 @@ def export(args: argparse.Namespace) -> dict[str, object]:
                 alpaca_snapshot_path,
                 publication_prices,
             )
+            published_identity_validation = _validate_published_price_identity_continuity(
+                publication_prices,
+                price_identities,
+            )
             metrics, spy_days = _validate_prices(
                 publication_prices,
                 membership,
@@ -1727,6 +1802,7 @@ def export(args: argparse.Namespace) -> dict[str, object]:
                 "cutoff_factors": cutoff_factors,
                 "cutoff_factors_sha256": hashlib.sha256(factor_bytes).hexdigest(),
                 "price_identity_warmup_validation": warmup_continuity,
+                "published_price_identity_validation": published_identity_validation,
                 "cache_identity_clipping": cache_identity_clipping,
                 "cache_basis_by_symbol": cache_basis["cache_basis_by_symbol"],
                 "cache_basis_counts": cache_basis["cache_basis_counts"],

@@ -1,0 +1,2459 @@
+{
+  "coverage_and_quality": {
+    "covered_evaluation_pairs_with_zero_volume_row": 23,
+    "covered_pairs": 631782,
+    "evaluation_sessions": 1255,
+    "expected_member_security_sessions": 631965,
+    "missing_pair_count": 183,
+    "missing_pair_observations": [
+      {
+        "canonical_ticker": "ANSS",
+        "source_membership_tickers": "ANSS",
+        "trade_date": "2025-07-17"
+      },
+      {
+        "canonical_ticker": "ATVI",
+        "source_membership_tickers": "ATVI",
+        "trade_date": "2023-10-16"
+      },
+      {
+        "canonical_ticker": "ATVI",
+        "source_membership_tickers": "ATVI",
+        "trade_date": "2023-10-17"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-04"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-05"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-06"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-07"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-08"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-11"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-12"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-13"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-14"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-15"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-19"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-20"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-21"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-22"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-25"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-26"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-27"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-28"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-29"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-01"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-02"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-03"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-04"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-05"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-08"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-09"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-10"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-11"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-12"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-16"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-17"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-18"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-19"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-22"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-23"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-24"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-25"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-26"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-01"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-02"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-03"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-04"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-05"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-08"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-09"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-10"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-11"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-12"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-15"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-16"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-17"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-18"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-19"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-22"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-23"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-24"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-25"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-26"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-29"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-30"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-31"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-01"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-05"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-06"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-07"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-08"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-09"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-12"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-13"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-14"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-15"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-16"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-19"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-20"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-21"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-22"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-23"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-26"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-27"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-28"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-29"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-30"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-03"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-04"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-05"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-06"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-07"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-10"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-11"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-12"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-13"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-14"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-17"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-18"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-19"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-20"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-21"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-24"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-25"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-26"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-27"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-28"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-01"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-02"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-03"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-04"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-07"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-08"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-09"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-10"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-11"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-14"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-15"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-16"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-17"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-18"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-21"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-22"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-23"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-24"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-25"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-28"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-29"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-30"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-01"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-02"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-06"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-07"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-08"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-09"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-12"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-13"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-14"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-15"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-16"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-19"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-20"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-21"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-22"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-23"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-26"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-27"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-28"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-29"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-30"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-08-02"
+      },
+      {
+        "canonical_ticker": "CTLT",
+        "source_membership_tickers": "CTLT",
+        "trade_date": "2024-12-18"
+      },
+      {
+        "canonical_ticker": "CTLT",
+        "source_membership_tickers": "CTLT",
+        "trade_date": "2024-12-19"
+      },
+      {
+        "canonical_ticker": "CTLT",
+        "source_membership_tickers": "CTLT",
+        "trade_date": "2024-12-20"
+      },
+      {
+        "canonical_ticker": "CTXS",
+        "source_membership_tickers": "CTXS",
+        "trade_date": "2022-09-30"
+      },
+      {
+        "canonical_ticker": "CXO",
+        "source_membership_tickers": "CXO",
+        "trade_date": "2021-01-19"
+      },
+      {
+        "canonical_ticker": "CXO",
+        "source_membership_tickers": "CXO",
+        "trade_date": "2021-01-20"
+      },
+      {
+        "canonical_ticker": "FBHS",
+        "source_membership_tickers": "FBHS",
+        "trade_date": "2022-12-15"
+      },
+      {
+        "canonical_ticker": "FBHS",
+        "source_membership_tickers": "FBHS",
+        "trade_date": "2022-12-16"
+      },
+      {
+        "canonical_ticker": "FRC",
+        "source_membership_tickers": "FRC",
+        "trade_date": "2023-05-01"
+      },
+      {
+        "canonical_ticker": "FRC",
+        "source_membership_tickers": "FRC",
+        "trade_date": "2023-05-02"
+      },
+      {
+        "canonical_ticker": "FRC",
+        "source_membership_tickers": "FRC",
+        "trade_date": "2023-05-03"
+      },
+      {
+        "canonical_ticker": "HES",
+        "source_membership_tickers": "HES",
+        "trade_date": "2025-07-18"
+      },
+      {
+        "canonical_ticker": "HES",
+        "source_membership_tickers": "HES",
+        "trade_date": "2025-07-21"
+      },
+      {
+        "canonical_ticker": "HES",
+        "source_membership_tickers": "HES",
+        "trade_date": "2025-07-22"
+      },
+      {
+        "canonical_ticker": "JNPR",
+        "source_membership_tickers": "JNPR",
+        "trade_date": "2025-07-02"
+      },
+      {
+        "canonical_ticker": "JNPR",
+        "source_membership_tickers": "JNPR",
+        "trade_date": "2025-07-03"
+      },
+      {
+        "canonical_ticker": "JNPR",
+        "source_membership_tickers": "JNPR",
+        "trade_date": "2025-07-07"
+      },
+      {
+        "canonical_ticker": "JNPR",
+        "source_membership_tickers": "JNPR",
+        "trade_date": "2025-07-08"
+      },
+      {
+        "canonical_ticker": "MRO",
+        "source_membership_tickers": "MRO",
+        "trade_date": "2024-11-22"
+      },
+      {
+        "canonical_ticker": "MRO",
+        "source_membership_tickers": "MRO",
+        "trade_date": "2024-11-25"
+      },
+      {
+        "canonical_ticker": "MXIM",
+        "source_membership_tickers": "MXIM",
+        "trade_date": "2021-08-26"
+      },
+      {
+        "canonical_ticker": "MXIM",
+        "source_membership_tickers": "MXIM",
+        "trade_date": "2021-08-27"
+      },
+      {
+        "canonical_ticker": "PXD",
+        "source_membership_tickers": "PXD",
+        "trade_date": "2024-05-03"
+      },
+      {
+        "canonical_ticker": "PXD",
+        "source_membership_tickers": "PXD",
+        "trade_date": "2024-05-06"
+      },
+      {
+        "canonical_ticker": "PXD",
+        "source_membership_tickers": "PXD",
+        "trade_date": "2024-05-07"
+      },
+      {
+        "canonical_ticker": "SIVB",
+        "source_membership_tickers": "SIVB",
+        "trade_date": "2023-03-10"
+      },
+      {
+        "canonical_ticker": "SIVB",
+        "source_membership_tickers": "SIVB",
+        "trade_date": "2023-03-13"
+      },
+      {
+        "canonical_ticker": "SIVB",
+        "source_membership_tickers": "SIVB",
+        "trade_date": "2023-03-14"
+      },
+      {
+        "canonical_ticker": "TWTR",
+        "source_membership_tickers": "TWTR",
+        "trade_date": "2022-10-28"
+      },
+      {
+        "canonical_ticker": "TWTR",
+        "source_membership_tickers": "TWTR",
+        "trade_date": "2022-10-31"
+      },
+      {
+        "canonical_ticker": "VAR",
+        "source_membership_tickers": "VAR",
+        "trade_date": "2021-04-15"
+      },
+      {
+        "canonical_ticker": "VAR",
+        "source_membership_tickers": "VAR",
+        "trade_date": "2021-04-16"
+      },
+      {
+        "canonical_ticker": "VAR",
+        "source_membership_tickers": "VAR",
+        "trade_date": "2021-04-19"
+      },
+      {
+        "canonical_ticker": "XLNX",
+        "source_membership_tickers": "XLNX",
+        "trade_date": "2022-02-14"
+      }
+    ],
+    "missing_pairs": [
+      {
+        "canonical_ticker": "ANSS",
+        "source_membership_tickers": "ANSS",
+        "trade_date": "2025-07-17"
+      },
+      {
+        "canonical_ticker": "ATVI",
+        "source_membership_tickers": "ATVI",
+        "trade_date": "2023-10-16"
+      },
+      {
+        "canonical_ticker": "ATVI",
+        "source_membership_tickers": "ATVI",
+        "trade_date": "2023-10-17"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-04"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-05"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-06"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-07"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-08"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-11"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-12"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-13"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-14"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-15"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-19"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-20"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-21"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-22"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-25"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-26"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-27"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-28"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-01-29"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-01"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-02"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-03"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-04"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-05"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-08"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-09"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-10"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-11"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-12"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-16"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-17"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-18"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-19"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-22"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-23"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-24"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-25"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-02-26"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-01"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-02"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-03"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-04"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-05"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-08"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-09"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-10"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-11"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-12"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-15"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-16"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-17"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-18"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-19"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-22"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-23"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-24"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-25"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-26"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-29"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-30"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-03-31"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-01"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-05"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-06"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-07"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-08"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-09"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-12"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-13"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-14"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-15"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-16"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-19"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-20"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-21"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-22"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-23"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-26"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-27"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-28"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-29"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-04-30"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-03"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-04"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-05"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-06"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-07"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-10"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-11"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-12"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-13"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-14"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-17"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-18"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-19"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-20"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-21"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-24"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-25"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-26"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-27"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-05-28"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-01"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-02"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-03"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-04"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-07"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-08"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-09"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-10"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-11"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-14"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-15"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-16"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-17"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-18"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-21"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-22"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-23"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-24"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-25"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-28"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-29"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-06-30"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-01"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-02"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-06"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-07"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-08"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-09"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-12"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-13"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-14"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-15"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-16"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-19"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-20"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-21"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-22"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-23"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-26"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-27"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-28"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-29"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-07-30"
+      },
+      {
+        "canonical_ticker": "BBWI",
+        "source_membership_tickers": "BBWI",
+        "trade_date": "2021-08-02"
+      },
+      {
+        "canonical_ticker": "CTLT",
+        "source_membership_tickers": "CTLT",
+        "trade_date": "2024-12-18"
+      },
+      {
+        "canonical_ticker": "CTLT",
+        "source_membership_tickers": "CTLT",
+        "trade_date": "2024-12-19"
+      },
+      {
+        "canonical_ticker": "CTLT",
+        "source_membership_tickers": "CTLT",
+        "trade_date": "2024-12-20"
+      },
+      {
+        "canonical_ticker": "CTXS",
+        "source_membership_tickers": "CTXS",
+        "trade_date": "2022-09-30"
+      },
+      {
+        "canonical_ticker": "CXO",
+        "source_membership_tickers": "CXO",
+        "trade_date": "2021-01-19"
+      },
+      {
+        "canonical_ticker": "CXO",
+        "source_membership_tickers": "CXO",
+        "trade_date": "2021-01-20"
+      },
+      {
+        "canonical_ticker": "FBHS",
+        "source_membership_tickers": "FBHS",
+        "trade_date": "2022-12-15"
+      },
+      {
+        "canonical_ticker": "FBHS",
+        "source_membership_tickers": "FBHS",
+        "trade_date": "2022-12-16"
+      },
+      {
+        "canonical_ticker": "FRC",
+        "source_membership_tickers": "FRC",
+        "trade_date": "2023-05-01"
+      },
+      {
+        "canonical_ticker": "FRC",
+        "source_membership_tickers": "FRC",
+        "trade_date": "2023-05-02"
+      },
+      {
+        "canonical_ticker": "FRC",
+        "source_membership_tickers": "FRC",
+        "trade_date": "2023-05-03"
+      },
+      {
+        "canonical_ticker": "HES",
+        "source_membership_tickers": "HES",
+        "trade_date": "2025-07-18"
+      },
+      {
+        "canonical_ticker": "HES",
+        "source_membership_tickers": "HES",
+        "trade_date": "2025-07-21"
+      },
+      {
+        "canonical_ticker": "HES",
+        "source_membership_tickers": "HES",
+        "trade_date": "2025-07-22"
+      },
+      {
+        "canonical_ticker": "JNPR",
+        "source_membership_tickers": "JNPR",
+        "trade_date": "2025-07-02"
+      },
+      {
+        "canonical_ticker": "JNPR",
+        "source_membership_tickers": "JNPR",
+        "trade_date": "2025-07-03"
+      },
+      {
+        "canonical_ticker": "JNPR",
+        "source_membership_tickers": "JNPR",
+        "trade_date": "2025-07-07"
+      },
+      {
+        "canonical_ticker": "JNPR",
+        "source_membership_tickers": "JNPR",
+        "trade_date": "2025-07-08"
+      },
+      {
+        "canonical_ticker": "MRO",
+        "source_membership_tickers": "MRO",
+        "trade_date": "2024-11-22"
+      },
+      {
+        "canonical_ticker": "MRO",
+        "source_membership_tickers": "MRO",
+        "trade_date": "2024-11-25"
+      },
+      {
+        "canonical_ticker": "MXIM",
+        "source_membership_tickers": "MXIM",
+        "trade_date": "2021-08-26"
+      },
+      {
+        "canonical_ticker": "MXIM",
+        "source_membership_tickers": "MXIM",
+        "trade_date": "2021-08-27"
+      },
+      {
+        "canonical_ticker": "PXD",
+        "source_membership_tickers": "PXD",
+        "trade_date": "2024-05-03"
+      },
+      {
+        "canonical_ticker": "PXD",
+        "source_membership_tickers": "PXD",
+        "trade_date": "2024-05-06"
+      },
+      {
+        "canonical_ticker": "PXD",
+        "source_membership_tickers": "PXD",
+        "trade_date": "2024-05-07"
+      },
+      {
+        "canonical_ticker": "SIVB",
+        "source_membership_tickers": "SIVB",
+        "trade_date": "2023-03-10"
+      },
+      {
+        "canonical_ticker": "SIVB",
+        "source_membership_tickers": "SIVB",
+        "trade_date": "2023-03-13"
+      },
+      {
+        "canonical_ticker": "SIVB",
+        "source_membership_tickers": "SIVB",
+        "trade_date": "2023-03-14"
+      },
+      {
+        "canonical_ticker": "TWTR",
+        "source_membership_tickers": "TWTR",
+        "trade_date": "2022-10-28"
+      },
+      {
+        "canonical_ticker": "TWTR",
+        "source_membership_tickers": "TWTR",
+        "trade_date": "2022-10-31"
+      },
+      {
+        "canonical_ticker": "VAR",
+        "source_membership_tickers": "VAR",
+        "trade_date": "2021-04-15"
+      },
+      {
+        "canonical_ticker": "VAR",
+        "source_membership_tickers": "VAR",
+        "trade_date": "2021-04-16"
+      },
+      {
+        "canonical_ticker": "VAR",
+        "source_membership_tickers": "VAR",
+        "trade_date": "2021-04-19"
+      },
+      {
+        "canonical_ticker": "XLNX",
+        "source_membership_tickers": "XLNX",
+        "trade_date": "2022-02-14"
+      }
+    ],
+    "missing_security_breakdown": [
+      {
+        "missing_sessions": 1,
+        "ranges": [
+          {
+            "end": "2025-07-17",
+            "start": "2025-07-17"
+          }
+        ],
+        "ticker": "ANSS"
+      },
+      {
+        "missing_sessions": 2,
+        "ranges": [
+          {
+            "end": "2023-10-17",
+            "start": "2023-10-16"
+          }
+        ],
+        "ticker": "ATVI"
+      },
+      {
+        "missing_sessions": 146,
+        "ranges": [
+          {
+            "end": "2021-08-02",
+            "start": "2021-01-04"
+          }
+        ],
+        "ticker": "BBWI"
+      },
+      {
+        "missing_sessions": 3,
+        "ranges": [
+          {
+            "end": "2024-12-20",
+            "start": "2024-12-18"
+          }
+        ],
+        "ticker": "CTLT"
+      },
+      {
+        "missing_sessions": 1,
+        "ranges": [
+          {
+            "end": "2022-09-30",
+            "start": "2022-09-30"
+          }
+        ],
+        "ticker": "CTXS"
+      },
+      {
+        "missing_sessions": 2,
+        "ranges": [
+          {
+            "end": "2021-01-20",
+            "start": "2021-01-19"
+          }
+        ],
+        "ticker": "CXO"
+      },
+      {
+        "missing_sessions": 2,
+        "ranges": [
+          {
+            "end": "2022-12-16",
+            "start": "2022-12-15"
+          }
+        ],
+        "ticker": "FBHS"
+      },
+      {
+        "missing_sessions": 3,
+        "ranges": [
+          {
+            "end": "2023-05-03",
+            "start": "2023-05-01"
+          }
+        ],
+        "ticker": "FRC"
+      },
+      {
+        "missing_sessions": 3,
+        "ranges": [
+          {
+            "end": "2025-07-22",
+            "start": "2025-07-18"
+          }
+        ],
+        "ticker": "HES"
+      },
+      {
+        "missing_sessions": 4,
+        "ranges": [
+          {
+            "end": "2025-07-08",
+            "start": "2025-07-02"
+          }
+        ],
+        "ticker": "JNPR"
+      },
+      {
+        "missing_sessions": 2,
+        "ranges": [
+          {
+            "end": "2024-11-25",
+            "start": "2024-11-22"
+          }
+        ],
+        "ticker": "MRO"
+      },
+      {
+        "missing_sessions": 2,
+        "ranges": [
+          {
+            "end": "2021-08-27",
+            "start": "2021-08-26"
+          }
+        ],
+        "ticker": "MXIM"
+      },
+      {
+        "missing_sessions": 3,
+        "ranges": [
+          {
+            "end": "2024-05-07",
+            "start": "2024-05-03"
+          }
+        ],
+        "ticker": "PXD"
+      },
+      {
+        "missing_sessions": 3,
+        "ranges": [
+          {
+            "end": "2023-03-14",
+            "start": "2023-03-10"
+          }
+        ],
+        "ticker": "SIVB"
+      },
+      {
+        "missing_sessions": 2,
+        "ranges": [
+          {
+            "end": "2022-10-31",
+            "start": "2022-10-28"
+          }
+        ],
+        "ticker": "TWTR"
+      },
+      {
+        "missing_sessions": 3,
+        "ranges": [
+          {
+            "end": "2021-04-19",
+            "start": "2021-04-15"
+          }
+        ],
+        "ticker": "VAR"
+      },
+      {
+        "missing_sessions": 1,
+        "ranges": [
+          {
+            "end": "2022-02-14",
+            "start": "2022-02-14"
+          }
+        ],
+        "ticker": "XLNX"
+      }
+    ],
+    "row_presence_policy": "Retained zero-volume rows count as present; positive-volume figures remain a sensitivity only.",
+    "warmup_pairs_with_zero_volume_row": 1,
+    "zero_volume_flat_ohlc_rows": 1430,
+    "zero_volume_rows": 1430,
+    "zero_volume_tickers": [
+      {
+        "rows": 662,
+        "ticker": "INFO"
+      },
+      {
+        "rows": 509,
+        "ticker": "SBNY"
+      },
+      {
+        "rows": 156,
+        "ticker": "EXE"
+      },
+      {
+        "rows": 74,
+        "ticker": "TPL"
+      },
+      {
+        "rows": 8,
+        "ticker": "SMCI"
+      },
+      {
+        "rows": 7,
+        "ticker": "ERIE"
+      },
+      {
+        "rows": 2,
+        "ticker": "BIIB"
+      },
+      {
+        "rows": 1,
+        "ticker": "ATVI"
+      },
+      {
+        "rows": 1,
+        "ticker": "DOC"
+      },
+      {
+        "rows": 1,
+        "ticker": "FICO"
+      },
+      {
+        "rows": 1,
+        "ticker": "GEHC"
+      },
+      {
+        "rows": 1,
+        "ticker": "MLM"
+      },
+      {
+        "rows": 1,
+        "ticker": "MTD"
+      },
+      {
+        "rows": 1,
+        "ticker": "NDSN"
+      },
+      {
+        "rows": 1,
+        "ticker": "PSA"
+      },
+      {
+        "rows": 1,
+        "ticker": "RVTY"
+      },
+      {
+        "rows": 1,
+        "ticker": "TDG"
+      },
+      {
+        "rows": 1,
+        "ticker": "WST"
+      },
+      {
+        "rows": 1,
+        "ticker": "ZBRA"
+      }
+    ]
+  },
+  "created_at_utc": "2026-10-02T05:35:18Z",
+  "git": {
+    "accepted_main_merged": "c5295851081ddd85cbff260554ec75baeff75b83",
+    "base_before_fix": "fe27678fb8472c8d031bcca25f24a611b91cfbdb",
+    "base_tree": "94d4b79d2d980d72f3d153ea43a264ae03d37b4b",
+    "bounded_assessment_commit": "d24dc9ccc7fe6b08f7e07a1f7f38a3772194849c",
+    "branch": "codex/issue-69-bounded-source-assessment",
+    "implementation_commit": "d1662b80ddf541e70b1794f153ab0cf5d1caa6e6",
+    "implementation_tree": "4b227c2b7d35a1c4e2fefe54dc03257fae2e1dc5",
+    "receipt_parent": "013250b73032ba808874e737007d12aa73d60fb7",
+    "report_correction_commit": "013250b73032ba808874e737007d12aa73d60fb7",
+    "source_tree_clean_before_receipt_write": true
+  },
+  "identity_map_bytes": {
+    "committed_blob_equals_retained_input": true,
+    "committed_config_sha256": "6a9ec69bc0fe05decea1b832cac8e26a611d706cce831d5687fa5424f9544955",
+    "retained_input_sha256": "6a9ec69bc0fe05decea1b832cac8e26a611d706cce831d5687fa5424f9544955",
+    "windows_line_ending_note": "The worktree has CRLF checkout conversion; receipt uses the committed LF blob and hash-pinned retained input bytes.",
+    "windows_worktree_raw_sha256": "2dbf5357a98d2deca9a08b27fbbb7de01f4294d987e19065d7660266e1aeada3"
+  },
+  "missing_intermediate_sources": {
+    "declared_snapshot_sha256": "8d0ab3c8f72538ee0167d999b754ed5e4bb6594da2d9d169cb84e5bc705a536d",
+    "expected_prior_archive_roots": [
+      {
+        "exists": false,
+        "path": "C:\\Projects\\trading_bot\\RS-momentum-EMA-trading-bot\\.worktrees\\pit-optimizer-v5-architecture\\.artifacts\\pit-optimizer-v5"
+      },
+      {
+        "exists": false,
+        "path": "C:\\Projects\\trading_bot\\RS-momentum-EMA-trading-bot\\.artifacts\\pit-optimizer-v5"
+      }
+    ],
+    "original_cache_source_sha256": "1ac1a08341e103d594a14f8ba53f628925a45c3e2362864da710a22d7d2ae850",
+    "scope_note": "The receipt proves absence from the 13-file pinned set and the listed expected roots only; it does not claim a whole-machine search.",
+    "snapshot_file_present_in_pinned_price_bundle": false
+  },
+  "objective": "Trace and block publication of inconsistent merged price identity rows while preserving retained source artifacts and documenting the authenticated-input boundary.",
+  "official_primary_sources_reviewed": [
+    {
+      "supports": "Fiserv listed as FI on NYSE after June 7, 2023 transfer from Nasdaq symbol FISV.",
+      "url": "https://www.sec.gov/Archives/edgar/data/798354/000079835424000037/fi-20231231.htm"
+    },
+    {
+      "supports": "Fiserv expected FI-to-FISV listing change effective November 11, 2025.",
+      "url": "https://investors.fiserv.com/news-releases/news-release-details/fiserv-announces-transfer-stock-exchange-listing-nasdaq"
+    },
+    {
+      "supports": "Coterra merger/ticker timeline: COG until October 4, 2021 open; CTRA thereafter.",
+      "url": "https://www.sec.gov/Archives/edgar/data/858470/000110465921122041/tm2129019d1_ex99-1.htm"
+    },
+    {
+      "supports": "March 1, 2024 PEAK/DOC merger and Healthpeak as accounting acquirer.",
+      "url": "https://www.sec.gov/Archives/edgar/data/765880/000162828024033154/peak-20240630.htm"
+    },
+    {
+      "supports": "August 7, 2025 Paramount/Skydance merger close and PSKY trading start.",
+      "url": "https://ir.paramount.com/news-releases/news-release-details/skydance-media-and-paramount-global-complete-merger-creating"
+    }
+  ],
+  "publication_authority": {
+    "corrected_price_bundle_published": false,
+    "new_credentialed_provider_calls": "not performed; separately review before any call",
+    "reason_no_price_bundle": "Required staged/provider source and original cache bytes are absent from the pinned inputs; source identity remains unresolved.",
+    "versioned_no_clobber_offline_artifacts_from_authenticated_retained_inputs": "authorized"
+  },
+  "reference_reconciliation": {
+    "admission_status": "reference_material_only_pending_complete_tradable_union_and_price_provenance_composition",
+    "all_three_csv_hashes_equal": true,
+    "cutoff_factors": {
+      "IWM": 1.0,
+      "QQQ": 1.0,
+      "SPY": 1.0
+    },
+    "generator_sources": {
+      "core/alpaca_pit_backfill.py": "03f183977322bb25eee42cb404fad6cc4a9206432f361e608c3e37dbdc1f709b",
+      "export_pit_prices.py": "ad049f0b8f1d16cdc22f05ac9503b43f6d6329a58846d5365dd628ae8c7da1bb"
+    },
+    "raw_retrieved_at_utc": "2026-09-07T03:38:43.812152Z",
+    "raw_row_count": 4524,
+    "rows_per_reference": 1508,
+    "sha256_by_file": {
+      "references-cutoff.csv": "4991b8f524986a8e7d5e956c04920b06a63a9d1d5dffe3a942a170c798a33f9f",
+      "sip-raw.csv": "4991b8f524986a8e7d5e956c04920b06a63a9d1d5dffe3a942a170c798a33f9f",
+      "sip-split.csv": "4991b8f524986a8e7d5e956c04920b06a63a9d1d5dffe3a942a170c798a33f9f"
+    },
+    "source_kind": "Alpaca_SIP_daily_split_snapshot_with_RAW_cutoff_factor_calibration",
+    "split_retrieved_at_utc": "2026-09-07T03:38:42.011019Z",
+    "split_row_count": 4524
+  },
+  "retained_data_reproduction": {
+    "baseline_provenance_claim": {
+      "declared_intermediate_sha256": "8d0ab3c8f72538ee0167d999b754ed5e4bb6594da2d9d169cb84e5bc705a536d",
+      "exact_overlap_row_count": 610,
+      "field": "price_identity_warmup_validation.successor_audits.FI",
+      "first_date": "2023-06-07",
+      "last_date": "2025-11-10",
+      "scope": "staged cutoff-adjusted SIP snapshot before cache merge; not the final merged output",
+      "staged_snapshot_in_pinned_raw_bundle": false
+    },
+    "fixed_guard_on_retained_published_csv": {
+      "error": "published price identity continuity mismatch for FISV/FI: 1145/1473 shared rows differ; first mismatch 2021-04-22",
+      "result": "rejected"
+    },
+    "interpretation": "The new guard rejects the retained merged CSV. No corrected price data is emitted because the staged SIP snapshot and original cache source are unavailable in the pinned set and the admitted identity segments are not authenticated.",
+    "price_csv_sha256": "dd18e38d14356df2be9aea79bc777407d40750305dcf327a2f3552815c39c376",
+    "price_provenance_sha256": "7fca2de6d408e232bca560f1df10aeae88433f3a58e1bb64f7bef20944f95ca5",
+    "retained_published_rows": {
+      "after_admission_end": {
+        "exact_matches": 0,
+        "shared_dates": 0
+      },
+      "all_shared_date_exact_ohlcv_matches": 328,
+      "all_shared_date_mismatches": 1145,
+      "all_shared_dates": 1473,
+      "declared_admission_window_2023_06_07_to_2025_11_10": {
+        "exact_matches": 0,
+        "mismatches": 610,
+        "shared_dates": 610
+      },
+      "first_mismatch": "2021-04-22",
+      "pre_admission_before_2023_06_07": {
+        "exact_matches": 328,
+        "mismatches": 535,
+        "shared_dates": 863
+      }
+    }
+  },
+  "retained_inputs": {
+    "all_hashes_and_sizes_reverified": true,
+    "count": 13,
+    "files": [
+      {
+        "bytes": 43650461,
+        "path": "local-cache/prices/prices.csv",
+        "sha256": "dd18e38d14356df2be9aea79bc777407d40750305dcf327a2f3552815c39c376",
+        "verified": true
+      },
+      {
+        "bytes": 265269,
+        "path": "local-cache/prices/prices_provenance.json",
+        "sha256": "7fca2de6d408e232bca560f1df10aeae88433f3a58e1bb64f7bef20944f95ca5",
+        "verified": true
+      },
+      {
+        "bytes": 16599,
+        "path": "local-cache/prices/spy_trading_days.csv",
+        "sha256": "93d8ef415bd6be516fb32ebfa5986ad45cbc2077e5beaa9615943db8890be5b9",
+        "verified": true
+      },
+      {
+        "bytes": 5383,
+        "path": "local-cache/prices/pit_price_identity_map.csv",
+        "sha256": "6a9ec69bc0fe05decea1b832cac8e26a611d706cce831d5687fa5424f9544955",
+        "verified": true
+      },
+      {
+        "bytes": 12284,
+        "path": "local-cache/prices/membership.csv",
+        "sha256": "a12413a9134623b51350ad4671d4a678eeed8edf2241a9985d0d7d51957f5389",
+        "verified": true
+      },
+      {
+        "bytes": 12284,
+        "path": "local-sp500/membership.csv",
+        "sha256": "a12413a9134623b51350ad4671d4a678eeed8edf2241a9985d0d7d51957f5389",
+        "verified": true
+      },
+      {
+        "bytes": 14755,
+        "path": "local-sp500/membership_provenance.json",
+        "sha256": "16fdda33dc102c3e8bfbcd2f683812666a892a0fb28bdc5347ba90c1e9206518",
+        "verified": true
+      },
+      {
+        "bytes": 9645,
+        "path": "local-sp500/pit_membership_symbol_map.csv",
+        "sha256": "6284214a6a4cefd766b3c52e84be57ac7e087cbf76d642d22abad131d61d8fa4",
+        "verified": true
+      },
+      {
+        "bytes": 4737,
+        "path": "local-cache/import-provenance.json",
+        "sha256": "357fd624fb7087b0c97bc180cc1f4bc3c70aeba5c644d8d5ebaff12e246a6bd7",
+        "verified": true
+      },
+      {
+        "bytes": 2367,
+        "path": "alpaca-references/acquisition.json",
+        "sha256": "e9397323b511e91200509013ba54f1fca537c5d3bed9fb7b266b7d3602026f50",
+        "verified": true
+      },
+      {
+        "bytes": 244771,
+        "path": "alpaca-references/sip-raw.csv",
+        "sha256": "4991b8f524986a8e7d5e956c04920b06a63a9d1d5dffe3a942a170c798a33f9f",
+        "verified": true
+      },
+      {
+        "bytes": 244771,
+        "path": "alpaca-references/sip-split.csv",
+        "sha256": "4991b8f524986a8e7d5e956c04920b06a63a9d1d5dffe3a942a170c798a33f9f",
+        "verified": true
+      },
+      {
+        "bytes": 244771,
+        "path": "alpaca-references/references-cutoff.csv",
+        "sha256": "4991b8f524986a8e7d5e956c04920b06a63a9d1d5dffe3a942a170c798a33f9f",
+        "verified": true
+      }
+    ],
+    "root": "C:\\Projects\\trading_bot\\RS-momentum-EMA-trading-bot\\.artifacts\\data\\acquisition\\acquisition\\raw"
+  },
+  "runtime": {
+    "host_os": "Windows 11",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "python_executable": "C:\\Users\\llong\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\python.exe",
+    "python_version": "3.13.14 (tags/v3.13.14:fd17997, Jun 10 2026, 13:03:48) [MSC v.1944 64 bit (AMD64)]"
+  },
+  "schema": "issue-69-source-reconciliation-followup-receipt/v1",
+  "segment_interface_gap": {
+    "accepted_representation": "V3 dated segments preserve request keys and can represent FISV/FI/FISV episodes; no authenticated Fiserv segment object is present in retained price provenance.",
+    "exporter_model": "One legacy PriceIdentity interval per canonical ticker; does not load price_identity_segments_v1 or the V3 segment resolver.",
+    "guard_behavior": "An observed mismatching overlap fails closed; zero overlap is recorded without demanding overlap or claiming continuity.",
+    "owner": "#68 owns segment meanings and source assertions; #69 needs a separate segment-aware admission/normalization increment once those inputs arrive.",
+    "unchanged_parent_request_contract_sha256": "273727c248f57b7376b6cf269312325cdd059287e1f4ed16ab5ce63617ceabc7"
+  },
+  "source_and_action_classification": {
+    "COG_CTRA": "Bounded continuity support only; exact pre-admission row copy is not production action authentication.",
+    "FISV_FI": "Unresolved; official symbol windows are documented, but the retained map and merged price values conflict. No legacy row was truncated or relabeled.",
+    "PEAK_DOC": "Accounting-acquirer identity supported by filing; effective-date zero-volume price path unresolved.",
+    "VIAC_PARA_PSKY": "Predecessor price continuity excluded; PSKY is a successor-reset chain.",
+    "other_delistings_spinoffs": "Unresolved; membership-removal events lack a complete action-reason ledger.",
+    "source_use_rights": "Not evidenced for production use."
+  },
+  "source_files": [
+    {
+      "bytes": 83050,
+      "path": "export_pit_prices.py",
+      "revision": "d1662b80ddf541e70b1794f153ab0cf5d1caa6e6",
+      "sha256": "a9ca3156b64704aac9bd72605feb89571cadac51b8d982e8ba65c1dcf969b560"
+    },
+    {
+      "bytes": 25448,
+      "path": "core/alpaca_pit_backfill.py",
+      "revision": "d1662b80ddf541e70b1794f153ab0cf5d1caa6e6",
+      "sha256": "8943d9b3ebe7ffff6b78b8172491cc3dcacbac2a919388683d3039bde2b0507f"
+    },
+    {
+      "bytes": 94855,
+      "path": "core/pit_data.py",
+      "revision": "d1662b80ddf541e70b1794f153ab0cf5d1caa6e6",
+      "sha256": "b4193d39cfc61d9dec913218c798fed4cfb98a66fb0aa96bc266337f56faea94"
+    },
+    {
+      "bytes": 5383,
+      "path": "config/pit_price_identity_map.csv",
+      "revision": "d1662b80ddf541e70b1794f153ab0cf5d1caa6e6",
+      "sha256": "6a9ec69bc0fe05decea1b832cac8e26a611d706cce831d5687fa5424f9544955"
+    },
+    {
+      "bytes": 32258,
+      "path": "tests/test_export_pit_prices.py",
+      "revision": "d1662b80ddf541e70b1794f153ab0cf5d1caa6e6",
+      "sha256": "e50c2797514c3d1373d36766a3b40ae6443f5d4c78bb9314354a79ee53e247b0"
+    },
+    {
+      "bytes": 17332,
+      "path": "tests/test_pit_identity_segments.py",
+      "revision": "d1662b80ddf541e70b1794f153ab0cf5d1caa6e6",
+      "sha256": "d9ca9ec875b9f3152f0fe6e1cb98538ee6f14bf4020bfab831f2974a0c2163e1"
+    },
+    {
+      "bytes": 60461,
+      "path": "scripts/assess_issue_69_retained_prices.py",
+      "revision": "d1662b80ddf541e70b1794f153ab0cf5d1caa6e6",
+      "sha256": "70746f8d683b21c453b7bccbc16e4c5ba2616182013e3d49476e2b9bcfd4d903"
+    },
+    {
+      "bytes": 18894,
+      "path": "docs/issue-69-bounded-source-assessment.md",
+      "revision": "d1662b80ddf541e70b1794f153ab0cf5d1caa6e6",
+      "sha256": "3f43188f8071e93fef9be88e2c7bbf11484d79675dbed5aa4d3cc1829a45af2e"
+    },
+    {
+      "bytes": 1422931,
+      "path": "docs/issue-69-bounded-source-assessment-receipt.json",
+      "revision": "d1662b80ddf541e70b1794f153ab0cf5d1caa6e6",
+      "sha256": "efe5cbe05902a655d8511889537bb167af3f9b0da607e0b4e9d14587d3e1612c"
+    },
+    {
+      "bytes": 11484,
+      "path": "docs/issue-69-source-reconciliation-followup-2026-10-02.md",
+      "revision": "013250b73032ba808874e737007d12aa73d60fb7",
+      "sha256": "1cdf12857bc88e898115d56c889da39ce9dad825b845257525fe6855806daada"
+    },
+    {
+      "bytes": 33378,
+      "path": "docs/historical-membership-acquisition-plan-v1.md",
+      "revision": "d1662b80ddf541e70b1794f153ab0cf5d1caa6e6",
+      "sha256": "ba44ca746d72181bb14f3285147609342434fe37e5e3a5990eb353e36fe9fadb"
+    },
+    {
+      "bytes": 7678,
+      "path": "docs/price-identity-fiserv-source-receipt-v1.md",
+      "revision": "d1662b80ddf541e70b1794f153ab0cf5d1caa6e6",
+      "sha256": "053ab5b35b17415e4ab614cf587ae15b4975fe43cc788bcf4149b605f616d5e4"
+    }
+  ],
+  "status": {
+    "acceptance_evidence": "Bounded source reconciliation complete; full #69 criteria remain partial/unresolved.",
+    "dependency": "#68 authenticated production identity segments and complete eligible membership remain open.",
+    "implementation": "Fix and focused tests committed.",
+    "required_inputs": "Insufficient for a corrected production price bundle."
+  },
+  "successor_overlap_audit": {
+    "declared_successor_count": 14,
+    "meaning": "Zero same-date overlap is no overlap observed; it is not proof of price continuity or security identity.",
+    "no_overlap_observed_count": 13,
+    "no_overlap_observed_tickers": [
+      "BALL",
+      "COR",
+      "CPAY",
+      "CTRA",
+      "DAY",
+      "DOC",
+      "EG",
+      "ELV",
+      "GEN",
+      "META",
+      "PARA",
+      "RVTY",
+      "WTW"
+    ],
+    "positive_overlap_tickers": [
+      "FI"
+    ]
+  },
+  "verification": {
+    "commit_hooks": {
+      "fix_end_of_files": "passed",
+      "merge_conflict_check": "passed",
+      "ruff_legacy_alias": "passed",
+      "trim_trailing_whitespace": "passed"
+    },
+    "not_run": [
+      "full test suite",
+      "full exporter/provider workflow",
+      "provider or broker calls",
+      "corrected price CSV publication"
+    ],
+    "ruff_check_command": "python -m ruff check export_pit_prices.py tests/test_export_pit_prices.py",
+    "ruff_check_result": "passed",
+    "targeted_test_command": "python -m pytest tests/test_export_pit_prices.py -q -k \"cache_basis_normalization or cache_normalization_discards or published_identity_audit or ticker_reuse_warmup\"",
+    "targeted_tests_deselected": 22,
+    "targeted_tests_exit_code": 0,
+    "targeted_tests_passed": 6,
+    "test_execution_based_on_commit": "fe27678fb8472c8d031bcca25f24a611b91cfbdb plus staged code/test changes later committed as d1662b80ddf541e70b1794f153ab0cf5d1caa6e6",
+    "warnings": [
+      "pytest could not write its ignored .artifacts/pytest cache directory (Access denied); selected tests still passed.",
+      "websockets.legacy emitted a deprecation warning."
+    ]
+  }
+}
