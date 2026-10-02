@@ -8,7 +8,7 @@ from dataclasses import replace
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 import shutil
 import traceback
 
@@ -1557,6 +1557,18 @@ def _issue90_evidence_root(tmp_path: Path) -> Path:
     return Path(evidence_directory).absolute() if evidence_directory else tmp_path
 
 
+def _issue90_path_length_exceeds_windows_limit(path_length: int, *, windows: bool | None = None) -> bool:
+    """Apply the legacy MAX_PATH guard only when checking Windows path lengths."""
+
+    if windows is None:
+        windows = os.name == "nt"
+    return windows and path_length >= 260
+
+
+def _issue90_path_exceeds_windows_limit(path: PurePath, *, windows: bool | None = None) -> bool:
+    return _issue90_path_length_exceeds_windows_limit(len(str(path)), windows=windows)
+
+
 def test_issue90_evidence_root_selection_and_run_uniqueness(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1582,6 +1594,20 @@ def test_issue90_evidence_root_selection_and_run_uniqueness(
     second_retained_run = _issue90_artifact_path(selected_root, "run")
     assert second_retained_run == selected_root / "run-02"
     assert marker.exists()
+
+
+def test_issue90_fixture_path_length_guard_is_windows_specific() -> None:
+    for length, should_exceed in ((259, False), (260, True), (268, True)):
+        windows_path = PureWindowsPath("C:\\" + "x" * (length - 3))
+        assert len(str(windows_path)) == length
+        assert _issue90_path_exceeds_windows_limit(windows_path, windows=True) is should_exceed
+        assert _issue90_path_length_exceeds_windows_limit(length, windows=True) is should_exceed
+
+    long_posix_path = PurePosixPath("/" + "x" * 267)
+    assert len(str(long_posix_path)) == 268
+    assert not _issue90_path_exceeds_windows_limit(long_posix_path, windows=False)
+    assert not _issue90_path_length_exceeds_windows_limit(len(str(long_posix_path)), windows=False)
+    assert _issue90_path_exceeds_windows_limit(long_posix_path) is (os.name == "nt")
 
 
 def _issue90_persist_recovery_record(name: str, evidence: dict[str, object]) -> None:
@@ -2639,7 +2665,9 @@ def test_full_runtime_run_supplied_ports_publishes_after_current_critic_evidence
         for index, left in enumerate(planned_roots)
         for right in planned_roots[index + 1 :]
     )
-    assert max(len(str(path)) for path in preflight_paths) < 260, "fixture paths exceed the Windows path limit"
+    assert not any(_issue90_path_exceeds_windows_limit(path) for path in preflight_paths), (
+        "fixture paths exceed the Windows path limit"
+    )
 
     calibration = _run_issue90_mechanism_round(
         calibration_root,
@@ -2880,7 +2908,9 @@ def test_full_runtime_run_supplied_ports_publishes_after_current_critic_evidence
     # controller's own request factory must produce and persist the request
     # reconstructed above from the reopened store.
     longest_store_path = max(len(str(path.absolute())) for path in acceptance_root.rglob("*"))
-    assert longest_store_path < 260, f"fixture store path exceeds the Windows path limit: {longest_store_path}"
+    assert not _issue90_path_length_exceeds_windows_limit(longest_store_path), (
+        f"fixture store path exceeds the Windows path limit: {longest_store_path}"
+    )
     shutil.copytree(acceptance_root, diagnostic_base)
 
     controller_requests = []
