@@ -274,6 +274,155 @@ def test_cache_basis_normalization_removes_amcr_lookahead_but_preserves_crwd_cut
     assert (float(crwd["close"]), float(crwd["volume"])) == (100.0, 100.0)
 
 
+def test_cache_normalization_discards_rows_before_price_identity_admission(
+    tmp_path: Path,
+) -> None:
+    cache_path = tmp_path / "cache.csv"
+    split_path = tmp_path / "split.csv"
+    cutoff_path = tmp_path / "cutoff.csv"
+    normalized_path = tmp_path / "normalized.csv"
+    with cache_path.open("x", encoding="utf-8", newline="") as stream:
+        writer = exporter.csv.writer(stream, lineterminator="\n")
+        writer.writerow(PRICE_COLUMNS)
+        writer.writerow(("2023-06-06", "FI", 50, 51, 49, 50, 800))
+        writer.writerow(("2023-06-07", "FI", 100, 101, 99, 100, 1_000))
+    for path in (split_path, cutoff_path):
+        with path.open("x", encoding="utf-8", newline="") as stream:
+            writer = exporter.csv.writer(stream, lineterminator="\n")
+            writer.writerow(PRICE_COLUMNS)
+            writer.writerow(("2023-06-07", "FI", 100, 101, 99, 100, 1_000))
+    identities = {
+        "FI": exporter.PriceIdentity(
+            "FI", "FI", date(2025, 11, 10), date(2023, 6, 7),
+            date(2025, 11, 10), "fiserv", "same_issuer_ticker_reuse", "FISV", False,
+            "https://example.test/fi",
+        ),
+    }
+
+    exporter._normalize_cache_to_cutoff_basis(
+        cache_path, split_path, cutoff_path, {"FI": 1.0}, normalized_path, identities
+    )
+
+    with normalized_path.open("r", encoding="utf-8", newline="") as stream:
+        rows = list(exporter.csv.DictReader(stream))
+    assert [(row["trade_date"], row["ticker"]) for row in rows] == [
+        ("2023-06-07", "FI"),
+    ]
+
+
+def test_published_identity_audit_catches_cache_rows_overriding_matching_provider_rows(
+    tmp_path: Path,
+) -> None:
+    cache_path = tmp_path / "cache.csv"
+    sip_path = tmp_path / "sip.csv"
+    merged_path = tmp_path / "merged.csv"
+    provider_values = (115.89, 116.0, 113.57, 115.89, 102_643)
+    cache_values = {
+        "FI": (115.78, 116.0, 113.57, 115.78, 3_075_854),
+        "FISV": provider_values,
+    }
+    with cache_path.open("x", encoding="utf-8", newline="") as stream:
+        writer = exporter.csv.writer(stream, lineterminator="\n")
+        writer.writerow(PRICE_COLUMNS)
+        for ticker, values in sorted(cache_values.items()):
+            writer.writerow(("2023-06-07", ticker, *values))
+    with sip_path.open("x", encoding="utf-8", newline="") as stream:
+        writer = exporter.csv.writer(stream, lineterminator="\n")
+        writer.writerow(PRICE_COLUMNS)
+        for ticker in ("FI", "FISV"):
+            writer.writerow(("2023-06-07", ticker, *provider_values))
+    identities = {
+        "FISV": exporter.PriceIdentity(
+            "FISV", "FISV", date(2025, 12, 31), date(2020, 1, 1),
+            date(2025, 12, 31), "fiserv", "same_issuer_ticker_reuse", None, True,
+            "https://example.test/fisv",
+        ),
+        "FI": exporter.PriceIdentity(
+            "FI", "FI", date(2025, 11, 10), date(2023, 6, 7),
+            date(2025, 11, 10), "fiserv", "same_issuer_ticker_reuse", "FISV", False,
+            "https://example.test/fi",
+        ),
+    }
+
+    exporter._merge_price_sources(cache_path, sip_path, merged_path)
+
+    with pytest.raises(
+        ValueError,
+        match=r"published price identity continuity mismatch for FISV/FI: 1/1 shared rows differ",
+    ):
+        exporter._validate_published_price_identity_continuity(merged_path, identities)
+
+
+def test_published_identity_audit_records_exact_merged_overlap(tmp_path: Path) -> None:
+    prices_path = tmp_path / "prices.csv"
+    values = (115.89, 116.0, 113.57, 115.89, 102_643)
+    with prices_path.open("x", encoding="utf-8", newline="") as stream:
+        writer = exporter.csv.writer(stream, lineterminator="\n")
+        writer.writerow(PRICE_COLUMNS)
+        for ticker in ("FI", "FISV"):
+            writer.writerow(("2023-06-07", ticker, *values))
+    identities = {
+        "FISV": exporter.PriceIdentity(
+            "FISV", "FISV", date(2025, 12, 31), date(2020, 1, 1),
+            date(2025, 12, 31), "fiserv", "same_issuer_ticker_reuse", None, True,
+            "https://example.test/fisv",
+        ),
+        "FI": exporter.PriceIdentity(
+            "FI", "FI", date(2025, 11, 10), date(2023, 6, 7),
+            date(2025, 11, 10), "fiserv", "same_issuer_ticker_reuse", "FISV", False,
+            "https://example.test/fi",
+        ),
+    }
+
+    result = exporter._validate_published_price_identity_continuity(prices_path, identities)
+
+    assert result == {
+        "scope": "published_merged_price_csv",
+        "validated_successor_count": 1,
+        "successor_audits": {
+            "FI": {
+                "predecessor": "FISV",
+                "exact_overlap_row_count": 1,
+                "overlap_first_date": "2023-06-07",
+                "overlap_last_date": "2023-06-07",
+            },
+        },
+    }
+
+
+def test_published_identity_audit_allows_no_overlap_without_claiming_continuity(
+    tmp_path: Path,
+) -> None:
+    prices_path = tmp_path / "prices.csv"
+    values = (100.0, 101.0, 99.0, 100.0, 1_000)
+    with prices_path.open("x", encoding="utf-8", newline="") as stream:
+        writer = exporter.csv.writer(stream, lineterminator="\n")
+        writer.writerow(PRICE_COLUMNS)
+        writer.writerow(("2023-06-06", "FISV", *values))
+        writer.writerow(("2023-06-07", "FI", *values))
+    identities = {
+        "FISV": exporter.PriceIdentity(
+            "FISV", "FISV", date(2025, 12, 31), date(2020, 1, 1),
+            date(2025, 12, 31), "fiserv", "same_issuer_ticker_reuse", None, True,
+            "https://example.test/fisv",
+        ),
+        "FI": exporter.PriceIdentity(
+            "FI", "FI", date(2025, 11, 10), date(2023, 6, 7),
+            date(2025, 11, 10), "fiserv", "same_issuer_ticker_reuse", "FISV", False,
+            "https://example.test/fi",
+        ),
+    }
+
+    result = exporter._validate_published_price_identity_continuity(prices_path, identities)
+
+    assert result["successor_audits"]["FI"] == {
+        "predecessor": "FISV",
+        "exact_overlap_row_count": 0,
+        "overlap_first_date": None,
+        "overlap_last_date": None,
+    }
+
+
 def test_provider_identity_rows_outside_admitted_interval_are_not_output() -> None:
     """Break caught: FI's reused pre-entry symbol history leaked into Fiserv output."""
     index = pd.MultiIndex.from_tuples(
