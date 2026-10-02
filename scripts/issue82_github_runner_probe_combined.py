@@ -25,14 +25,14 @@ import time
 from typing import Any
 
 
-SOURCE_COMMIT = "99fa44902fc3621338a5a1e19ea5b4a643c88187"
-SOURCE_TREE = "bd8f83c2763cb811e562fcfacda180bdd058c193"
+SOURCE_COMMIT = "b33d4fe1d5c88a6face2815fb3fdceaeb199b275"
+SOURCE_TREE = "36676250cfc4f3703e42750eb2c0e56bdabe9102"
 RUNTIME_SOURCE_SHA256 = "117fabb267ffc4294c3075e6965621d14c7bb6c901ae3e593950f334fd234ee0"
 SOURCE_PIN_STATUS = "final-public"
 RUNNER_PACKAGE_BRANCH = "codex/issue-82-combined-verification"
 CALCULATOR_GIT_BLOB = "71e562ffc00dc4e617f1cd625e3f13ea5fe3f81a"
 DOCKERFILE_GIT_BLOB = "10ae5c560bcca9e2294fc7caae05a5b72acfb97d"
-DOCKERIGNORE_GIT_BLOB = "7a7972722cc458212b6f9a81bbd889a8c9c39f60"
+DOCKERIGNORE_GIT_BLOB = "c10d0adaeb062eefd3a5e3424442b2190c60f4e4"
 LOCK_GIT_BLOB = "69df1ab4c04282aec47076c5437d77215f413738"
 POLICY_SCOPE_GIT_BLOB = "9e7591ad4d506ce57c2f52031c12c125624a76f0"
 BASE_IMAGE = "python:3.13.14-slim@sha256:9662417aace5ae7b8e2609cce472b72a8958e134ba372808abe9cc1a0c0125e6"
@@ -1059,8 +1059,10 @@ def execute(source_root: Path, evidence_path: Path) -> dict[str, Any]:
             "probe_mechanics_timeout_seconds": MECHANICS_TIMEOUT_SECONDS,
         },
         "synthetic_authority_note": (
-            "Only the fixed semantic-probe suite ran. Synthetic policy/runtime/constraint identities; "
-            "no production evaluator authority, PIT data, provider, model, broker, or paper state."
+            "Synthetic authority is limited to the fixed semantic-probe suite. Import and probe stages "
+            "are conditional on preceding source/build gates; a failure before those stages means they "
+            "did not run. No production evaluator authority, PIT data, provider, model, broker, or paper "
+            "state is used."
         ),
         "probes": [],
     }

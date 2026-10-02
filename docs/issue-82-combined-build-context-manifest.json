@@ -7,8 +7,8 @@
       "size": 3002
     },
     "Dockerfile.pit-optimizer-v5.dockerignore": {
-      "sha256": "7af3857c12a2c3ef860329e40cfd78f178e0c99a8f51baa92a568eb349338da6",
-      "size": 2030
+      "sha256": "920631033029c9204e2269067077d701f60ed6e4641cb19b2b2f42edbc41e10a",
+      "size": 2155
     },
     "backtest.py": {
       "sha256": "12187672b377a51da5929f17396b4aa9cd37bf04c341dbe0dd173184726b7679",
@@ -248,6 +248,6 @@
     }
   },
   "runtime_path_count": 58,
-  "source_commit": "99fa44902fc3621338a5a1e19ea5b4a643c88187",
-  "source_tree": "bd8f83c2763cb811e562fcfacda180bdd058c193"
+  "source_commit": "b33d4fe1d5c88a6face2815fb3fdceaeb199b275",
+  "source_tree": "36676250cfc4f3703e42750eb2c0e56bdabe9102"
 }

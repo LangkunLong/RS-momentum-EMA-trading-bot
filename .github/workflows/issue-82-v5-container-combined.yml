@@ -31,7 +31,7 @@ jobs:
       - name: Check out the exact PR124 evaluator source
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
-          ref: 99fa44902fc3621338a5a1e19ea5b4a643c88187
+          ref: b33d4fe1d5c88a6face2815fb3fdceaeb199b275
           path: evaluator
           persist-credentials: false
 
@@ -57,7 +57,7 @@ jobs:
           summary_path = pathlib.Path(sys.argv[2])
           receipt_limit = 480_000
           combined_log_summary_limit = 1_048_576
-          title = "## Issue 82 exact-source PR124 99fa4490 container verification"
+          title = "## Issue 82 exact-source PR124 b33d4fe1 container verification"
           incomplete = False
           lines = [title, ""]
 

@@ -161,6 +161,8 @@ class CombinedRunnerPreflightTests(unittest.TestCase):
                 report, docker_calls, builds, checkpoints, evidence = self.run_preflight(result)
                 receipt = report["prebuild_image_inspection"]
                 self.assertEqual(report["status"], "failed")
+                self.assertIn("a failure before those stages means they did not run",
+                              report["synthetic_authority_note"])
                 self.assertEqual(receipt["status"], expected_status)
                 self.assertEqual(receipt["exit_code"], result.returncode)
                 self.assertFalse(receipt["absence_verified"])
