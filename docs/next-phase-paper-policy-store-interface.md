@@ -1,5 +1,11 @@
 # Lead C store/workflow interface record
 
+Post-merge disposition (2026-10-01): principal accepted all nine bounded offline criteria at09dc456; PR119 normally merged asdc2ead68. Required quality checks passed and issues98/99/100 are closed. Exact merge/source validation and separately failed/cancelled informational jobs are recorded in `docs/next-phase-paper-policy-completion.md`. Source/API/schema inventories below remain unchanged checkpoint evidence; their earlier pending statuses are historical. No runtime or operational migration authority follows.
+
+Current cross-team disposition: [principal delivery status](principal-reviewed-delivery-status-2026-10-02.md).
+
+## Historical pre-merge checkpoint records
+
 Corrected application/test candidate: `c48d95ca12ea792fcaf7b18004ad90f62d9aabaa`, tree `0e32d17c66156b7d700c69df9d7c43da81b513bc`. Producer source `2881118`, producer report/erratum `f14562a`, consumer test/report `b207822`, unchanged consumer implementation `d2a0677`, and lead chain `0ad64e9` are integrated. Producer and final integrated independent C-R1 reviews approve specification and quality for all nine bounded offline criteria, with no new Critical or Important findings. The integrated review is retained unchanged in `docs/next-phase-paper-policy-c-r1-independent-review.md`. Principal delta acceptance, required remote CI and normal merge remain pending. The earlier ea2e145 publication payload stays held and immutable.
 
 Actual source-bound evidence is 48 producer cases, 7 selected consumer cases and 11 combined/identity cases. The historical 107-pass checkpoint belongs to d2c4082. Raw Git equality binds executed source/test files to the corrected candidate; six changed Python blobs also compile under Python 3.13. No provider, broker, operational store, runtime or legacy execution entry point was used or modified by this correction.

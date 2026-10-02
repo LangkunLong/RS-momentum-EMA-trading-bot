@@ -1,5 +1,29 @@
 # Lead C completion record
 
+Status: COMPLETE for Lead C's bounded offline #98/#99/#100 delivery, verified 2026-10-01. Principal independent specification, quality and combined-boundary acceptance covers all nine original criteria. [PR119](https://github.com/LangkunLong/RS-momentum-EMA-trading-bot/pull/119) normally merged reviewed head `09dc456665d814d15f5dab7f9530b839585f61b0` at **2026-10-01 19:18:45 America/Toronto** (23:18:45 UTC), merge `dc2ead68b10c366f09507d8a4046bf24ac7244f5`, tree `633637bcd2f63cceb75e719ab581a46aaa858630`, normal parents `d618562bcdf41d27af4652202417759f112cffbf` and `09dc456665d814d15f5dab7f9530b839585f61b0`. Lead independently checked local merge metadata and exact byte equality for all 24 delivered paths.
+
+October 1 GitHub connector reads confirmed PR119 merged and issues [98](https://github.com/LangkunLong/RS-momentum-EMA-trading-bot/issues/98), [99](https://github.com/LangkunLong/RS-momentum-EMA-trading-bot/issues/99), and [100](https://github.com/LangkunLong/RS-momentum-EMA-trading-bot/issues/100) closed as completed. Their full bodies retain all original clauses checked and separate implementation, required-input, acceptance-evidence and dependency assessments. Principal report SHA256 `dabc45fe043b29ea9fc4fe746d62dae02ce0353e7cb8bf275a269aa8d4718689` is verified and retained locally as `.artifacts/lead-c/principal-final-09dc456-acceptance.md`.
+
+All four required quality jobs succeeded: push Python3.11 `110626586948`, push Python3.13 `110626587055`, PR Python3.11 `110627242679`, PR Python3.13 `110627242688`. [Push run](https://github.com/LangkunLong/RS-momentum-EMA-trading-bot/actions/runs/36939230550) and [PR run](https://github.com/LangkunLong/RS-momentum-EMA-trading-bot/actions/runs/36939439785). Fresh job reads supersede the principal's earlier in-progress informational observation: push informational Python3.11 failed, and the other three informational jobs were cancelled. The failed broad run reports 233 failed, 2646 passed, 5 skipped, 2 deselected, 1 warning and 152 errors; it is not a passing receipt. Its failure/error summary names none of C's six scoped modules, which does not prove those modules ran in that job. No broad-suite diagnosis, rerun or claim of whole-repository health is made. Original controlled 48/7/11 results and historical107 retain their exact source bindings.
+
+Public responses and job details are frozen in `.artifacts/lead-c/pr119-public-completion-verification.json`; the failed informational summary is `pr119-informational-job-110626587157-summary.txt`. The initial local gh read failed through its unavailable proxy; verification succeeded through the read-only GitHub connector. No export or previously denied peer-message action was retried or relayed.
+
+This completion covers controlled offline adapters, reconciliation, durable state and accepted integration. Provider/data acceptance, operational migration, #101–106 execution wiring, #107 readiness/#108 lifecycle, runtime sessions and policy qualification/promotion remain separately owned. No wider-phase completion is claimed. The original completion supplement at `201081749a3e7131ed2ccd253a8934b96d117c50` was local and was not part of PR119. This follow-up integrates its reviewed documentation. Earlier denied private export and peer-message actions remain held; the principal's separately authorized reviewed publication does not retry or relay them. See the [principal delivery status](principal-reviewed-delivery-status-2026-10-02.md) for the current cross-team disposition.
+
+| Issue | Original criterion | Final disposition |
+| --- | --- | --- |
+| #98 | Equivalent feature, breadth and benchmark snapshots | Principal accepted; normally merged |
+| #98 | No silent legacy prefilter removal | Principal accepted at adapter boundary; runtime wiring separate |
+| #98 | Explicit unavailable fields; no historical substitution | Principal accepted for recorded/controlled facts |
+| #99 | Explicit reservations, pending orders and partial fills | Principal accepted including corrected replacement lifecycle |
+| #99 | Valuation-time exposure, risk and classifications | Principal accepted including partial/full protection and actual/residual accounting |
+| #99 | Missing facts never silently become zero risk | Principal accepted with meaningful fail-closed controls |
+| #100 | Stable decision/action identity across restart | Principal accepted including replacement attachment/replay and CAS |
+| #100 | Additions, tiers, stops, peaks and pending state | Principal accepted with first/later opening fills kept distinct |
+| #100 | Explicit recoverable timing, conflicts, migrations and rollback | Principal accepted in temporary stores; operational migration separate |
+
+## Historical pre-merge record (superseded status, retained evidence)
+
 Status: LOCAL CORRECTION IMPLEMENTED / INCOMPLETE.
 
 Corrected application/test candidate: `c48d95ca12ea792fcaf7b18004ad90f62d9aabaa`, tree `0e32d17c66156b7d700c69df9d7c43da81b513bc`. Producer source `2881118`, producer report/erratum `f14562a`, consumer test/report `b207822`, unchanged consumer implementation `d2a0677`, and lead chain `0ad64e9` are integrated. Producer and final integrated independent C-R1 reviews approve specification and quality for all nine bounded offline criteria, with no new Critical or Important findings. The integrated review is retained unchanged in `docs/next-phase-paper-policy-c-r1-independent-review.md`. Principal delta acceptance, required remote CI and normal merge remain pending. The earlier ea2e145 publication payload stays held and immutable.
