@@ -105,12 +105,7 @@ def _run_observed_work(
         {"scheduled_at": scheduled_at.isoformat()},
     )
     started_at = _now_et()
-    observation.record_event(
-        "scheduler_work",
-        f"{kind}:{key}",
-        "started",
-        {"started_at": started_at.isoformat()},
-    )
+    observation.begin_work(kind, key, scheduled_at)
     if (started_at - scheduled_at).total_seconds() > _LOOP_SLEEP_SECS:
         _record_missed_observed_work(
             observation,
@@ -120,15 +115,19 @@ def _run_observed_work(
             started_at,
             missed_due_keys,
         )
+    if not observation.try_admit_work(kind, key, _now_et):
+        return None
     try:
         result = callback()
     except Exception as exc:
+        observation.finish_work(kind, key)
         details = {"error_type": type(exc).__name__}
         observation.record_event(
             "scheduler_work", f"{kind}:{key}", "failed", details
         )
         observation.latch_service_issue(f"{kind}_work_failed", details)
         raise
+    observation.finish_work(kind, key)
     observation.record_event(
         "scheduler_work",
         f"{kind}:{key}",
@@ -178,9 +177,12 @@ def _reconcile_missed_observed_work(
     attempted_hourly_due: set[datetime],
     last_daily_exit: datetime,
     missed_due_keys: set[tuple[str, str, str]],
+    observation_end_at: datetime | None = None,
 ) -> None:
     """Record hourly and daily slots that elapsed during long scheduler work."""
     cutoff = now - timedelta(seconds=_LOOP_SLEEP_SECS)
+    if observation_end_at is not None:
+        cutoff = min(cutoff, observation_end_at)
     if now.date() == session_started_at.date():
         for hour in sorted(_HOURLY_CHECK_HOURS):
             due = now.replace(hour=hour, minute=1, second=0, microsecond=0)
@@ -194,20 +196,11 @@ def _reconcile_missed_observed_work(
                     missed_due_keys,
                 )
 
-    if last_daily_exit.year == 1:
-        due = session_started_at
-        if due <= cutoff:
-            _record_missed_observed_work(
-                observation,
-                "exit_check",
-                "daily_fallback",
-                due,
-                now,
-                missed_due_keys,
-            )
-        return
-
-    due = last_daily_exit + timedelta(seconds=_DAILY_EXIT_INTERVAL_SECS)
+    due = (
+        session_started_at
+        if last_daily_exit.year == 1
+        else last_daily_exit + timedelta(seconds=_DAILY_EXIT_INTERVAL_SECS)
+    )
     while due <= cutoff:
         _record_missed_observed_work(
             observation,
@@ -339,6 +332,8 @@ def run_scheduler(
     run_now: bool = False,
     stop_after_session: bool = False,
     observe_health: bool = False,
+    observation_stop_at: datetime | None = None,
+    observation_hard_deadline_at: datetime | None = None,
 ) -> None:
     """Start the daily trading loop.
 
@@ -354,12 +349,24 @@ def run_scheduler(
         raise ValueError(
             "Health observation requires dry-run, --now, and --session"
         )
+    if observe_health and (
+        observation_stop_at is None or observation_hard_deadline_at is None
+    ):
+        raise ValueError(
+            "Health observation requires an explicit stop time and hard deadline"
+        )
+    if not observe_health and (
+        observation_stop_at is not None or observation_hard_deadline_at is not None
+    ):
+        raise ValueError("Observation deadlines are only valid with --observe-health")
     with SchedulerInstanceLock():
         _run_scheduler_locked(
             dry_run=dry_run,
             run_now=run_now,
             stop_after_session=stop_after_session,
             observe_health=observe_health,
+            observation_stop_at=observation_stop_at,
+            observation_hard_deadline_at=observation_hard_deadline_at,
         )
 
 
@@ -369,6 +376,8 @@ def _run_scheduler_locked(
     run_now: bool,
     stop_after_session: bool,
     observe_health: bool = False,
+    observation_stop_at: datetime | None = None,
+    observation_hard_deadline_at: datetime | None = None,
 ) -> None:
     """Run one scheduler process after the singleton has been acquired."""
     mode = "DRY RUN" if dry_run else "paper"
@@ -389,7 +398,26 @@ def _run_scheduler_locked(
             session_date = started_at.date()
             if observe_health:
                 observation_session_started_at = started_at
-            if _session_is_complete(started_at, session_date):
+                observation = current_scheduler_observation()
+                if observation is None:
+                    raise RuntimeError("Health observation context is not active")
+                assert observation_stop_at is not None
+                assert observation_hard_deadline_at is not None
+                observation.configure_execution_window(
+                    requested_stop_at=observation_stop_at,
+                    hard_deadline_at=observation_hard_deadline_at,
+                )
+            unavailable = (
+                _session_is_complete(started_at, session_date)
+                if not observe_health
+                else (
+                    not _is_weekday(started_at)
+                    or started_at.date() != observation_stop_at.date()
+                    or started_at >= observation_stop_at
+                    or started_at >= observation_hard_deadline_at
+                )
+            )
+            if unavailable:
                 print(
                     f"[SCHEDULER] {started_at.strftime('%Y-%m-%d %H:%M ET')} — "
                     "no bounded weekday session remains to run."
@@ -414,6 +442,7 @@ def _run_scheduler_locked(
             observation = current_scheduler_observation()
             if observation is None:
                 raise RuntimeError("Health observation context is not active")
+            observation.record_scheduler_started(_now_et())
             clock_open = _market_clock_is_open()
             status = "open" if clock_open is True else "closed" if clock_open is False else "unknown"
             observation.record_event("market_clock", "startup_preflight", status, {})
@@ -440,6 +469,21 @@ def _run_scheduler_locked(
 
         # Optional immediate scan at startup.
         if run_now:
+            immediate_scan_at = _now_et()
+            if (
+                observe_health
+                and observation_stop_at is not None
+                and immediate_scan_at >= observation_stop_at
+            ):
+                observation = current_scheduler_observation()
+                if observation is not None:
+                    observation.request_stop(immediate_scan_at)
+                    observation.latch_service_issue(
+                        "observation_window_closed_before_scan",
+                        {"actual_at": immediate_scan_at.isoformat()},
+                        unverified=True,
+                    )
+                return
             if not dry_run and _market_clock_is_open() is not True:
                 raise RuntimeError(
                     "Order-enabled --now requires an authoritative open Alpaca clock"
@@ -489,7 +533,16 @@ def _run_scheduler_locked(
                     attempted_hourly_due,
                     last_daily_exit,
                     missed_due_keys,
+                    observation_stop_at,
                 )
+
+            if (
+                observation is not None
+                and observation_stop_at is not None
+                and now >= observation_stop_at
+            ):
+                observation.request_stop(now)
+                break
 
             if session_date is not None and _session_is_complete(now, session_date):
                 print(
@@ -547,13 +600,22 @@ def _run_scheduler_locked(
                     exit_session_live = session_seen_open_date == today or last_scan_date == today
 
             if market_session_live:
+                if observe_health:
+                    now = _now_et()
+                    today = now.date()
+                    if observation_stop_at is not None and now >= observation_stop_at:
+                        observation = current_scheduler_observation()
+                        if observation is not None:
+                            observation.request_stop(now)
+                        continue
+                    market_session_live = _is_market_hours(now) and market_clock_open is True
                 current_hour = now.hour
 
                 # ── Daily scan at 09:31 ────────────────────────────────────────
                 # Always update last_scan_date after the attempt (success or
                 # early-return) so the scheduler does not retry every 30s when
                 # run_auto_trader exits early due to the Alpaca market clock.
-                if now.time() >= _SCAN_TIME and last_scan_date != today:
+                if market_session_live and now.time() >= _SCAN_TIME and last_scan_date != today:
                     print(f"\n[SCHEDULER] {now.strftime('%H:%M ET')} — Running daily scan + entries")
                     last_scan_date = today   # set BEFORE the call to prevent retry loops
                     try:
@@ -579,6 +641,15 @@ def _run_scheduler_locked(
             # Runs once per clock hour at :01 past.  The extended window to
             # 16:05 ensures the 15:00–16:00 bar is always evaluated at 16:01.
             if exit_session_live:
+                if observe_health:
+                    now = _now_et()
+                    today = now.date()
+                    if observation_stop_at is not None and now >= observation_stop_at:
+                        observation = current_scheduler_observation()
+                        if observation is not None:
+                            observation.request_stop(now)
+                        continue
+                    current_hour = now.hour
                 current_hour = now.hour
                 if (
                     current_hour in _HOURLY_CHECK_HOURS
@@ -586,6 +657,10 @@ def _run_scheduler_locked(
                     and current_hour != last_hourly_exit_hour
                 ):
                     print(f"\n[SCHEDULER] {now.strftime('%H:%M ET')} — Hourly exit check")
+                    if observe_health:
+                        # Claim the due slot before work starts so a failed
+                        # callback is reported once instead of retried every tick.
+                        last_hourly_exit_hour = current_hour
                     try:
                         def run_hourly_check():
                             if dry_run:
@@ -627,6 +702,26 @@ def _run_scheduler_locked(
                 # ── 30-min daily fallback exit check ──────────────────────────
                 elapsed = (now - last_daily_exit).total_seconds()
                 if elapsed >= _DAILY_EXIT_INTERVAL_SECS:
+                    if observe_health:
+                        now = _now_et()
+                        if observation_stop_at is not None and now >= observation_stop_at:
+                            observation = current_scheduler_observation()
+                            if observation is not None:
+                                observation.request_stop(now)
+                            continue
+                        elapsed = (now - last_daily_exit).total_seconds()
+                    if elapsed < _DAILY_EXIT_INTERVAL_SECS:
+                        continue
+                    if observe_health:
+                        due_at = (
+                            observation_session_started_at or now
+                            if last_daily_exit.year == 1
+                            else last_daily_exit
+                            + timedelta(seconds=_DAILY_EXIT_INTERVAL_SECS)
+                        )
+                        # Claim the fallback slot before work starts. A failed
+                        # observation must not retry its broker reads next tick.
+                        last_daily_exit = now
                     try:
                         def run_daily_check():
                             if dry_run:
@@ -637,11 +732,6 @@ def _run_scheduler_locked(
                             )
 
                         if observe_health:
-                            due_at = (
-                                observation_session_started_at or now
-                                if last_daily_exit.year == 1
-                                else last_daily_exit + timedelta(seconds=_DAILY_EXIT_INTERVAL_SECS)
-                            )
                             exited = _run_observed_work(
                                 "exit_check",
                                 "daily_fallback",
@@ -653,7 +743,8 @@ def _run_scheduler_locked(
                             exited = run_daily_check()
                         if exited:
                             print(f"[SCHEDULER] Daily fallback exits: {', '.join(exited)}")
-                        last_daily_exit = now
+                        if not observe_health:
+                            last_daily_exit = now
                     except Exception as exc:  # noqa: BLE001
                         print(f"[SCHEDULER ERROR] Daily fallback exit failed: {exc}")
 
@@ -671,9 +762,19 @@ def _run_scheduler_locked(
                 if now.time() > _EXIT_MONITOR_CLOSE:
                     last_hourly_exit_hour = -1
 
-            time.sleep(_LOOP_SLEEP_SECS)
+            if observe_health and observation_stop_at is not None:
+                seconds_to_stop = (observation_stop_at - _now_et()).total_seconds()
+                if seconds_to_stop <= 0:
+                    continue
+                time.sleep(min(_LOOP_SLEEP_SECS, seconds_to_stop))
+            else:
+                time.sleep(_LOOP_SLEEP_SECS)
 
     except KeyboardInterrupt:
+        if observe_health:
+            observation = current_scheduler_observation()
+            if observation is not None:
+                observation.mark_interrupted(_now_et())
         print("\n[SCHEDULER] Shutdown requested.")
     finally:
         if monitor is not None:
@@ -844,6 +945,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Record bounded, offline-reviewable outcomes for one dry-run session",
     )
     parser.add_argument(
+        "--observe-stop-at",
+        type=_observation_datetime_argument,
+        default=None,
+        metavar="ISO_DATETIME",
+        help="Stop admitting observation work at this timezone-aware timestamp",
+    )
+    parser.add_argument(
+        "--observe-hard-deadline-at",
+        type=_observation_datetime_argument,
+        default=None,
+        metavar="ISO_DATETIME",
+        help="Fixed process deadline enforced by the one-shot launcher",
+    )
+    parser.add_argument(
         "--fmp-daily-budget",
         type=_fmp_budget_argument,
         default=None,
@@ -874,12 +989,41 @@ def _fmp_budget_argument(value: str) -> int:
     return budget
 
 
+def _observation_datetime_argument(value: str) -> datetime:
+    """Parse an explicit ISO-8601 deadline and normalize it to Eastern time."""
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("deadline must be an ISO-8601 datetime") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise argparse.ArgumentTypeError("deadline must include a UTC offset")
+    return parsed.astimezone(_ET)
+
+
 def _run_cli_args(args: argparse.Namespace) -> int:
     """Apply process-local controls and invoke the scheduler."""
     if args.observe_health:
         if not args.dry_run or args.enable_orders or not args.now or not args.session:
             print(
                 "[SCHEDULER] --observe-health requires explicit --dry-run, --now, and --session."
+            )
+            return 2
+        stop_at = args.observe_stop_at
+        hard_deadline_at = args.observe_hard_deadline_at
+        if stop_at is None or hard_deadline_at is None:
+            print(
+                "[SCHEDULER] --observe-health requires --observe-stop-at and "
+                "--observe-hard-deadline-at."
+            )
+            return 2
+        if (
+            stop_at.date() != hard_deadline_at.date()
+            or hard_deadline_at <= stop_at
+            or hard_deadline_at - stop_at > timedelta(minutes=5)
+        ):
+            print(
+                "[SCHEDULER] Observation hard deadline must be later than the "
+                "stop time by no more than five minutes on the same ET date."
             )
             return 2
         required_settings = {
@@ -922,7 +1066,8 @@ def _run_cli_args(args: argparse.Namespace) -> int:
             settings.FMP_DAILY_REQUEST_BUDGET = args.fmp_daily_budget
     if args.observe_health:
         observation = SchedulerObservation(
-            run_id=f"scheduler-{uuid4().hex}"
+            run_id=f"scheduler-{uuid4().hex}",
+            snapshot_path=os.environ.get("SCHEDULER_OBSERVATION_SNAPSHOT_PATH") or None,
         )
         with activate_scheduler_observation(observation):
             fmp_limit = fmp_observation_request_limit(198)
@@ -945,6 +1090,8 @@ def _run_cli_args(args: argparse.Namespace) -> int:
                                 run_now=True,
                                 stop_after_session=True,
                                 observe_health=True,
+                                observation_stop_at=stop_at,
+                                observation_hard_deadline_at=hard_deadline_at,
                             )
                         except SchedulerAlreadyRunningError as exc:
                             print(f"[SCHEDULER] {exc}; observation did not start.")
@@ -970,6 +1117,18 @@ def _run_cli_args(args: argparse.Namespace) -> int:
                         "observation_budget_activation_failed",
                         {"error_type": type(exc).__name__},
                     )
+        actual_stop_at = _now_et()
+        window = observation.to_receipt()["execution_window"]
+        admitted_at = window.get("scheduler_started_at")
+        deadline_exceeded = bool(
+            admitted_at
+            and datetime.fromisoformat(admitted_at) < hard_deadline_at
+            and actual_stop_at >= hard_deadline_at
+        )
+        observation.mark_stopped(
+            actual_stop_at,
+            deadline_exceeded=deadline_exceeded,
+        )
         receipt = observation.to_receipt()
         print("SCHEDULER_OBSERVATION_RECEIPT=" + json.dumps(receipt, sort_keys=True))
         return (
