@@ -1,0 +1,253 @@
+{
+  "context_file_count": 61,
+  "evaluator_source_sha256": "117fabb267ffc4294c3075e6965621d14c7bb6c901ae3e593950f334fd234ee0",
+  "files": {
+    "Dockerfile.pit-optimizer-v5": {
+      "sha256": "9161715e3ba1c964384b9b685848279f24b54c41813395514fed1fbd97129413",
+      "size": 3002
+    },
+    "Dockerfile.pit-optimizer-v5.dockerignore": {
+      "sha256": "7af3857c12a2c3ef860329e40cfd78f178e0c99a8f51baa92a568eb349338da6",
+      "size": 2030
+    },
+    "backtest.py": {
+      "sha256": "12187672b377a51da5929f17396b4aa9cd37bf04c341dbe0dd173184726b7679",
+      "size": 25188
+    },
+    "config/__init__.py": {
+      "sha256": "695d80107ae1368f133de8c7335efb35f59b4cf646191decdd7d9aff47a505c6",
+      "size": 53
+    },
+    "config/settings.py": {
+      "sha256": "6a18c8453195c822cb2a254a5a0685a422840a783f134042aed6eb1c994bd08e",
+      "size": 17912
+    },
+    "core/alpaca_client_policy.py": {
+      "sha256": "b699f9cb7b4e692ffe2cad9069d83884b8afe043fb8e1ee44c2a487c079826ea",
+      "size": 3546
+    },
+    "core/backtest_engine.py": {
+      "sha256": "b61ef7de77f462512c4f3da5124d1d7f8e9c8d9f4e320695ddb0e1ba4618c929",
+      "size": 279088
+    },
+    "core/backtest_fills.py": {
+      "sha256": "cd8cb77c8b15e3e734af4d1dc64f817392109276441228afd7ae734ccc0deff7",
+      "size": 8730
+    },
+    "core/canslim/__init__.py": {
+      "sha256": "ad2d870e325d41e1dc20e6e6239cbf938a22ee3de0aa554b9f650acfc4cfbf00",
+      "size": 1425
+    },
+    "core/canslim/a_annual_earnings.py": {
+      "sha256": "44798e9cc084c5ee694d7d60b22c7cdd2f72abab34a90ab9849d08788d7f8af1",
+      "size": 15658
+    },
+    "core/canslim/c_current_earnings.py": {
+      "sha256": "facbc729535869d1323ccc34587852885bd1aa6fdcc8904f99edcf4b474cdc45",
+      "size": 13415
+    },
+    "core/canslim/core.py": {
+      "sha256": "d70031c556943b9af8c9a945d27b436979158cec9ae3e6ab79ea296678e30666",
+      "size": 14394
+    },
+    "core/canslim/earnings_trace.py": {
+      "sha256": "2c56b06510079f6b18f803e15d9ca1c58a954c339ca33824448d42d9e6b6dd2d",
+      "size": 3694
+    },
+    "core/canslim/entry_contract.py": {
+      "sha256": "319b3a979fd52f0c4979b0598657015dbb3d9c2226a6a4286cb197ee768593bb",
+      "size": 10410
+    },
+    "core/canslim/fiscal_periods.py": {
+      "sha256": "b8c4042933407a7d0854d942de34a38718a1005cffd8fd0b36d3c8058c6d1a21",
+      "size": 4703
+    },
+    "core/canslim/i_institutional.py": {
+      "sha256": "ebb10d3f2594648deea94dc6646683211354b78282084216071a2d4c19d3e6e3",
+      "size": 5429
+    },
+    "core/canslim/l_leader_laggard.py": {
+      "sha256": "b3658a9b5679c70017b818ae5652fb469b8a86aa5ebb07cc2d7c2809d3db1fe1",
+      "size": 3736
+    },
+    "core/canslim/m_market_direction.py": {
+      "sha256": "21a04c9305e6cc3138ffe29be792b7c8a65622d00b131cb60c770dee4df5a0ad",
+      "size": 17016
+    },
+    "core/canslim/n_new_products.py": {
+      "sha256": "05dfa7c732556a063027fffd675d0903b9507677e046c7061be2727eda1de005",
+      "size": 5764
+    },
+    "core/canslim/s_supply_demand.py": {
+      "sha256": "577c4fbc3116b7e7afc7a471baed167e8b51b5b2bdab5a54b034bf2bc9ff6bf9",
+      "size": 12174
+    },
+    "core/data_client.py": {
+      "sha256": "5a2939497bf3dcb5962ff6513f8b06f46435a75b6e74d6a6d8370d9b56675dd8",
+      "size": 65901
+    },
+    "core/engine_policy.py": {
+      "sha256": "3abaaa5a421e78248966afcf450548a70b4ef27985f7f0bca72b06068f3665f2",
+      "size": 45648
+    },
+    "core/index_ticker_fetcher.py": {
+      "sha256": "64af27605bf739bf4bc7448b15288c6877c40aa8818e75d95de3665a75cf8e73",
+      "size": 26171
+    },
+    "core/industry_group.py": {
+      "sha256": "4e93670652b8f090eca835cbe5233bc950a56f80f1ee53332fb7de10a0fbb6fd",
+      "size": 7825
+    },
+    "core/leader_evaluation.py": {
+      "sha256": "bccc557a97206cc22b7ccd707d69ed443fb4646bcbea4efe5bc2c83d27827fdf",
+      "size": 31556
+    },
+    "core/momentum_analysis.py": {
+      "sha256": "1d9e85fba4a20f03df432f004e852ba71276601e26115f26c531c4e4b93111c9",
+      "size": 12260
+    },
+    "core/pit_data.py": {
+      "sha256": "3242d237dcc85258ffd95dbc2e5cd5f4fe769a5bdbec49fb1cb0a8c5322d9034",
+      "size": 99943
+    },
+    "core/pit_diagnosis/fact_cache.py": {
+      "sha256": "f65e7d261dab198e3fa8e543c2ee4ebfc5dceb5673661e0308fa89091c44d72a",
+      "size": 49656
+    },
+    "core/pit_diagnosis/models.py": {
+      "sha256": "1eae004909dab25f931f530c1d2d177db233df61150820eee5083af6be610a22",
+      "size": 13989
+    },
+    "core/pit_diagnosis/patterns.py": {
+      "sha256": "eaa3080b219650f27e1f2c9153186d014617af83701e935a8425ed19bb2c93a3",
+      "size": 23995
+    },
+    "core/pit_diagnosis/rs.py": {
+      "sha256": "d26d5f1d8dd1b84b633b4f4e58dc0f64ad3ec7ba3a3726219425249f805fca97",
+      "size": 2878
+    },
+    "core/pit_diagnosis/rulebook.py": {
+      "sha256": "4c1c438057cedc7d08d5a3fa20da8ecad9e492f8315ee28902f92122afa11117",
+      "size": 5754
+    },
+    "core/pit_diagnosis/supplemental.py": {
+      "sha256": "3375282c152e3108be8294192013e91baddd65ccf1f7e043483455024a900ba5",
+      "size": 19313
+    },
+    "core/pit_feature_snapshot.py": {
+      "sha256": "c11693f07dffbdb5a3d9f9a60d7098759b2d6b9d97d10b0dd47d8dc4c553d905",
+      "size": 24355
+    },
+    "core/pit_optimizer_evaluation.py": {
+      "sha256": "01e524ec0ac9087af2a5d1233172e50cb2582c0e2951c0f5621cbfe656956cf0",
+      "size": 140799
+    },
+    "core/pit_optimizer_v5/candidate_ir.py": {
+      "sha256": "f6cbb997ce46a9497c12457e7740b86c68f20ed77d66d829e0098de4cdbb3b8b",
+      "size": 64623
+    },
+    "core/pit_optimizer_v5/container_entry.py": {
+      "sha256": "a9516a0400f9c1a5e80ceccfd102645797a76328d2a2f208a2a1291605ae98a7",
+      "size": 11342
+    },
+    "core/pit_optimizer_v5/container_protocol.py": {
+      "sha256": "caa6d0b19db2afca871c57b1a632a07e87545fdd7061f530e1c45a855aedc5d5",
+      "size": 12091
+    },
+    "core/pit_optimizer_v5/contracts.py": {
+      "sha256": "0420220eb5ea9ad51c2d5b02ef8be2ba641f97ead0ce7182b017a20281b1b605",
+      "size": 87600
+    },
+    "core/pit_optimizer_v5/diagnostics.py": {
+      "sha256": "f1673faa323d745e402d1a41fce85542422a0cd289d37d130bc7523d1ab08d2e",
+      "size": 43952
+    },
+    "core/pit_optimizer_v5/evaluator.py": {
+      "sha256": "dc2bd97f3e403d25548583f52a4e4800f502cd2c5f0e244256c9da2ce6f4e169",
+      "size": 29858
+    },
+    "core/pit_optimizer_v5/image_manifest.py": {
+      "sha256": "231b87f9f45a3a655408649dea77a03a6ea972bc93566cb45daa3511dae9557f",
+      "size": 1651
+    },
+    "core/pit_optimizer_v5/policy_scope.py": {
+      "sha256": "07938995376229561ea8824574adb0a34ad43c729a22b6f04032eb93a8afa3e3",
+      "size": 4791
+    },
+    "core/pit_optimizer_v5/probe_entry.py": {
+      "sha256": "be962ea2b6f5cb11573c1604d2bd7062288d671e08752815417b5e55c6bc35ac",
+      "size": 13623
+    },
+    "core/pit_optimizer_v5/probes.py": {
+      "sha256": "b70c4f9ec26d2c5c8141df499dc27c5191ffc07b0463190ba4832773a4e9962d",
+      "size": 39722
+    },
+    "core/pit_provenance.py": {
+      "sha256": "7ac88611c0552ddee938f74093f1e20000bc154752fb7a237141fda5feabf6ee",
+      "size": 1041
+    },
+    "core/pit_universe_v3.py": {
+      "sha256": "4f1f729070689edefc8265ac6e624a56d14e7a7694b4a70f570083c651e2e5e9",
+      "size": 11735
+    },
+    "core/scheduler_observation.py": {
+      "sha256": "03421ef976d9925754597d26440284d90700928d4dc143ca77838eea115327a8",
+      "size": 26093
+    },
+    "core/strategy_policy/__init__.py": {
+      "sha256": "30e9c39f26fde0eea2bf9ae45d9f4944422588bd86c39f9865602038519b2ea6",
+      "size": 4208
+    },
+    "core/strategy_policy/adapter_v3.py": {
+      "sha256": "0b6a3f855572c8d435273024cb3e95079ebb47fb434fc5c48ddd4fed0a033803",
+      "size": 11782
+    },
+    "core/strategy_policy/contracts.py": {
+      "sha256": "88765bfcf283ef192467fe9851a286eda7df207b482a52bad69a2c5d85aa6bf5",
+      "size": 24475
+    },
+    "core/strategy_policy/contracts_v3.py": {
+      "sha256": "7d9886614229568b77a982145da5aacf67d6e8521cfa62a14e2adf2beb605295",
+      "size": 23167
+    },
+    "core/strategy_policy/entry.py": {
+      "sha256": "43b12406106186ad4f36df17e22b6c11a72df7f6e40a2125d5db616bfbe1377e",
+      "size": 1694
+    },
+    "core/strategy_policy/exit.py": {
+      "sha256": "c5a729f60c2df62952372d2002f8ef4a6f4696dc3de05dc0fdc87e61f36ebb1a",
+      "size": 2603
+    },
+    "core/strategy_policy/market_context.py": {
+      "sha256": "214c547a781465813f0a5b7e7ab41c4cc38b080264bb0d9d7ccddb56f5400c31",
+      "size": 4432
+    },
+    "core/strategy_policy/risk.py": {
+      "sha256": "364c16d031d4431ce5c4a9f1ec4faed33eae64a1aaa38f4862c05eae7544ec84",
+      "size": 1795
+    },
+    "core/strategy_policy/runtime.py": {
+      "sha256": "17ec8f0e423b0dc902ff578adcb01f572fe1523ceb130ae24db3a034a122d053",
+      "size": 10571
+    },
+    "core/strategy_policy/v3/__init__.py": {
+      "sha256": "a0dd307076ddd0fd7bd31887708aafa4fbb36df35d1a27671f0f007028012e87",
+      "size": 506
+    },
+    "core/strategy_policy/worker.py": {
+      "sha256": "ebb31f0ee9b24a45546604969be7d622807de378f5b37c7c4b9107e6a2492b6d",
+      "size": 28535
+    },
+    "core/trading_sessions.py": {
+      "sha256": "43df208119333a19a57e04b562c38de7c5591551516e632712397c4619663be8",
+      "size": 3286
+    },
+    "requirements-lock.txt": {
+      "sha256": "dd9801c36f86e4853079ca0a77989ce6e4149cba5401b4a574bb6f3833743efd",
+      "size": 1395
+    }
+  },
+  "runtime_path_count": 58,
+  "source_commit": "99fa44902fc3621338a5a1e19ea5b4a643c88187",
+  "source_tree": "bd8f83c2763cb811e562fcfacda180bdd058c193"
+}
