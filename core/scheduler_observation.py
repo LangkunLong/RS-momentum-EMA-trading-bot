@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Iterator, Mapping
+from pathlib import Path
+from typing import Any, Callable, Iterator, Mapping
 
 
 _active_lock = threading.Lock()
@@ -67,9 +70,11 @@ def _safe_value(value: Any, *, depth: int = 0) -> Any:
 class SchedulerObservation:
     """Accumulate sanitized work outcomes and latched health signals."""
 
-    def __init__(self, run_id: str):
+    def __init__(self, run_id: str, *, snapshot_path: str | Path | None = None):
         self.run_id = _safe_string(str(run_id))
         self._lock = threading.RLock()
+        self._snapshot_path = Path(snapshot_path) if snapshot_path else None
+        self._snapshot_error: str | None = None
         self._events: list[dict[str, Any]] = []
         self._input_gaps: list[dict[str, Any]] = []
         self._issues: list[dict[str, Any]] = []
@@ -91,6 +96,217 @@ class SchedulerObservation:
         }
         self._service_health = "healthy"
         self._required_input_coverage = "complete"
+        self._in_flight_work: list[dict[str, str]] = []
+        self._execution_window: dict[str, Any] = {
+            "requested_stop_at": None,
+            "hard_deadline_at": None,
+            "scheduler_started_at": None,
+            "stop_requested_at": None,
+            "interrupted_at": None,
+            "actual_stop_at": None,
+            "deadline_exceeded": False,
+        }
+
+    def configure_execution_window(
+        self, *, requested_stop_at: datetime, hard_deadline_at: datetime
+    ) -> None:
+        with self._lock:
+            self._execution_window["requested_stop_at"] = requested_stop_at.isoformat()
+            self._execution_window["hard_deadline_at"] = hard_deadline_at.isoformat()
+            self._persist_partial_snapshot_locked()
+
+    def record_scheduler_started(self, at: datetime) -> None:
+        with self._lock:
+            self._execution_window["scheduler_started_at"] = at.isoformat()
+            self.record_event(
+                "scheduler", "bounded_session", "started", {"at": at.isoformat()}
+            )
+
+    def begin_work(self, kind: str, key: str, scheduled_at: datetime) -> None:
+        with self._lock:
+            self._in_flight_work.append(
+                {
+                    "kind": _safe_string(str(kind)),
+                    "key": _safe_string(str(key)),
+                    "scheduled_at": scheduled_at.isoformat(),
+                    "started_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            self._persist_partial_snapshot_locked()
+
+    def finish_work(self, kind: str, key: str) -> None:
+        with self._lock:
+            for index in range(len(self._in_flight_work) - 1, -1, -1):
+                work = self._in_flight_work[index]
+                if work["kind"] == kind and work["key"] == key:
+                    del self._in_flight_work[index]
+                    break
+            self._persist_partial_snapshot_locked()
+
+    def try_admit_work(
+        self, kind: str, key: str, now: Callable[[], datetime]
+    ) -> bool:
+        """Admit work only while before the bounded observation stop."""
+        with self._lock:
+            at = now()
+            requested_stop_at = self._execution_window["requested_stop_at"]
+            if requested_stop_at is None or at < datetime.fromisoformat(requested_stop_at):
+                # This is the final admission transition: keep it in memory so
+                # no synchronous evidence write can move callback start past
+                # the cutoff after the clock check. The persisted in-flight
+                # marker remains the crash-safe evidence if execution stops.
+                self._events.append(
+                    {
+                        "at": datetime.now(timezone.utc).isoformat(),
+                        "kind": "scheduler_work",
+                        "key": _safe_string(f"{kind}:{key}"),
+                        "status": "started",
+                        "details": _safe_value({"started_at": at.isoformat()}),
+                    }
+                )
+                return True
+
+            self.finish_work(kind, key)
+            details = {
+                "reason": "requested_stop_cutoff",
+                "not_started": True,
+                "checked_at": at.isoformat(),
+                "requested_stop_at": requested_stop_at,
+            }
+            self.request_stop(at)
+            self.record_event(
+                "scheduler_work", f"{kind}:{key}", "denied", details
+            )
+            self.latch_service_issue(
+                "observation_work_denied_at_stop", details, unverified=True
+            )
+            return False
+
+    def request_stop(self, at: datetime) -> None:
+        with self._lock:
+            if self._execution_window["stop_requested_at"] is None:
+                self._execution_window["stop_requested_at"] = at.isoformat()
+                self.record_event(
+                    "scheduler", "bounded_stop", "requested", {"at": at.isoformat()}
+                )
+            self._persist_partial_snapshot_locked()
+
+    def mark_interrupted(self, at: datetime) -> None:
+        """Latch an early Ctrl-C as incomplete for a bounded observation."""
+        with self._lock:
+            self._execution_window["interrupted_at"] = at.isoformat()
+            details = {"interrupted_at": at.isoformat()}
+            self.latch_service_issue(
+                "observation_interrupted", details, unverified=True
+            )
+            self.record_event(
+                "scheduler", "bounded_session", "interrupted", details
+            )
+
+    def mark_stopped(self, at: datetime, *, deadline_exceeded: bool = False) -> None:
+        with self._lock:
+            self._execution_window["actual_stop_at"] = at.isoformat()
+            self._execution_window["deadline_exceeded"] = bool(deadline_exceeded)
+            if self._in_flight_work:
+                self.latch_service_issue(
+                    "observation_stopped_with_work_in_flight",
+                    {"in_flight_work": self._in_flight_work},
+                )
+            if deadline_exceeded:
+                self.latch_service_issue(
+                    "observation_hard_deadline_exceeded",
+                    {"actual_stop_at": at.isoformat()},
+                )
+            self.record_event(
+                "scheduler",
+                "bounded_stop",
+                (
+                    "deadline_exceeded"
+                    if deadline_exceeded
+                    else "interrupted"
+                    if self._execution_window["interrupted_at"] is not None
+                    else "completed"
+                ),
+                {
+                    "actual_stop_at": at.isoformat(),
+                    "work_in_flight": bool(self._in_flight_work),
+                },
+            )
+            self._persist_partial_snapshot_locked()
+
+    def _partial_receipt_locked(self) -> dict[str, Any]:
+        candidates = list(self._scan_candidates.values())
+        readiness = (
+            "fail"
+            if self._service_health == "failed"
+            or self._required_input_coverage == "failed"
+            else "unverified"
+        )
+        provider_counters = {
+            provider: {
+                **{key: value for key, value in counter.items() if key != "refusal_statuses"},
+                "refusal_statuses": dict(counter["refusal_statuses"]),
+            }
+            for provider, counter in self._provider_counters.items()
+        }
+        return {
+            "schema": "scheduler-observation-partial/v1",
+            "captured_at_utc": datetime.now(timezone.utc).isoformat(),
+            "run_id": self.run_id,
+            "service_health": self._service_health,
+            "required_input_coverage": self._required_input_coverage,
+            "overall_readiness": readiness,
+            "execution_window": dict(self._execution_window),
+            "in_flight_work": [dict(work) for work in self._in_flight_work],
+            "event_count": len(self._events),
+            "recent_events": [dict(event) for event in self._events[-20:]],
+            "issues": [dict(issue) for issue in self._issues[-50:]],
+            "resource_denials": dict(self._resource_denials),
+            "resource_counters": dict(self._resource_counters),
+            "provider_counters": provider_counters,
+            "input_gap_count": len(self._input_gaps),
+            "input_gap_sample": [dict(gap) for gap in self._input_gaps[:50]],
+            "scan_coverage": {
+                **{
+                    key: value
+                    for key, value in self._scan_coverage.items()
+                    if key != "candidate_outcomes"
+                },
+                "candidate_outcome_count": len(candidates),
+                "candidate_outcome_sample": [
+                    _safe_value(candidate) for candidate in candidates[-20:]
+                ],
+            },
+            "snapshot_error": self._snapshot_error,
+        }
+
+    def _persist_partial_snapshot_locked(self) -> None:
+        if self._snapshot_path is None or self._snapshot_error is not None:
+            return
+        temporary_path = self._snapshot_path.with_name(
+            f".{self._snapshot_path.name}.{os.getpid()}.tmp"
+        )
+        try:
+            self._snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path.write_text(
+                json.dumps(self._partial_receipt_locked(), sort_keys=True),
+                encoding="utf-8",
+            )
+            os.replace(temporary_path, self._snapshot_path)
+        except Exception as exc:  # noqa: BLE001
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._snapshot_error = type(exc).__name__
+            self._service_health = "failed"
+            self._issues.append(
+                {
+                    "code": "observation_snapshot_write_failed",
+                    "details": {"error_type": self._snapshot_error},
+                    "unverified": False,
+                }
+            )
 
     def record_event(
         self,
@@ -109,6 +325,7 @@ class SchedulerObservation:
                     "details": _safe_value(details or {}),
                 }
             )
+            self._persist_partial_snapshot_locked()
 
     def latch_service_issue(
         self,
@@ -131,6 +348,7 @@ class SchedulerObservation:
                     self._service_health = "unverified"
             else:
                 self._service_health = "failed"
+            self._persist_partial_snapshot_locked()
 
     def record_resource_denial(
         self,
@@ -248,6 +466,7 @@ class SchedulerObservation:
                 and candidate.get("fundamental_coverage", {}).get("annual_income")
                 == "available"
             )
+            self._persist_partial_snapshot_locked()
 
     def record_provider_event(
         self,
@@ -281,6 +500,7 @@ class SchedulerObservation:
                 counter["transport_errors"] += 1
             elif outcome == "suppressed_followup":
                 counter["suppressed_followups"] += 1
+            self._persist_partial_snapshot_locked()
 
     def record_input_gap(
         self,
@@ -303,6 +523,7 @@ class SchedulerObservation:
                     "coverage_status": coverage_status,
                 }
             )
+            self._persist_partial_snapshot_locked()
 
     def to_receipt(self) -> dict[str, Any]:
         with self._lock:
@@ -340,6 +561,9 @@ class SchedulerObservation:
                     for provider, counter in self._provider_counters.items()
                 },
                 "scan_coverage": safe_scan_coverage,
+                "execution_window": dict(self._execution_window),
+                "in_flight_work": [dict(work) for work in self._in_flight_work],
+                "snapshot_error": self._snapshot_error,
             }
 
 

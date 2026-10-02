@@ -264,7 +264,16 @@ def test_task_cli_applies_zero_budget_and_writes_its_log(
 
 
 def _observation_args() -> list[str]:
-    return ["--dry-run", "--now", "--session", "--observe-health"]
+    return [
+        "--dry-run",
+        "--now",
+        "--session",
+        "--observe-health",
+        "--observe-stop-at",
+        "2026-10-01T16:06:00-04:00",
+        "--observe-hard-deadline-at",
+        "2026-10-01T16:11:00-04:00",
+    ]
 
 
 def _receipt_from_output(output: str) -> dict:
@@ -281,6 +290,281 @@ def _set_observation_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "NOTIFY_EMAIL_FROM", "")
     monkeypatch.setattr(settings, "NOTIFY_EMAIL_TO", "")
     monkeypatch.setattr(settings, "NOTIFY_EMAIL_PASSWORD", "")
+
+
+def test_observation_cli_requires_bounded_stop_and_hard_deadline() -> None:
+    parser = scheduler.build_parser()
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(
+            [
+                "--observe-health",
+                "--dry-run",
+                "--now",
+                "--session",
+                "--observe-stop-at",
+                "2026-10-02T10:05:00",
+            ]
+        )
+    assert exc_info.value.code == 2
+
+
+def test_observation_cli_rejects_naive_deadline() -> None:
+    parser = scheduler.build_parser()
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["--observe-stop-at", "2026-10-02T10:05:00"])
+    assert exc_info.value.code == 2
+
+
+def test_observation_cli_rejects_hard_deadline_over_five_minute_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_observation_settings(monkeypatch)
+    args = scheduler.build_parser().parse_args(
+        [
+            "--observe-health",
+            "--dry-run",
+            "--now",
+            "--session",
+            "--observe-stop-at",
+            "2026-10-02T10:05:00-04:00",
+            "--observe-hard-deadline-at",
+            "2026-10-02T10:11:00-04:00",
+        ]
+    )
+
+    assert scheduler._run_cli_args(args) == 2
+
+
+def test_idle_observation_keyboard_interrupt_is_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _set_observation_settings(monkeypatch)
+    actual_stop = datetime(2026, 10, 2, 10, 0, tzinfo=_ET)
+    monkeypatch.setattr(scheduler, "_now_et", lambda: actual_stop)
+    with (
+        patch(
+            "scheduler.SchedulerInstanceLock",
+            return_value=MagicMock(__enter__=lambda self: self, __exit__=lambda *args: None),
+        ),
+        patch("scheduler.require_paper_mode"),
+        patch("scheduler._market_clock_is_open", return_value=True),
+        patch("scheduler._run_cycle"),
+        patch("scheduler.monitor_exits_hourly", return_value=[]),
+        patch("scheduler.monitor_and_exit_positions", return_value=[]),
+        patch("scheduler.fmp_observation_request_limit", return_value=0),
+        patch("scheduler.time.sleep", side_effect=KeyboardInterrupt),
+    ):
+        result = scheduler.main(
+            [
+                "--dry-run",
+                "--now",
+                "--session",
+                "--observe-health",
+                "--observe-stop-at",
+                "2026-10-02T10:05:00-04:00",
+                "--observe-hard-deadline-at",
+                "2026-10-02T10:10:00-04:00",
+            ]
+        )
+
+    assert result == 1
+    receipt = _receipt_from_output(capsys.readouterr().out)
+    assert receipt["service_health"] == "unverified"
+    assert receipt["execution_window"]["actual_stop_at"] == actual_stop.isoformat()
+    assert receipt["execution_window"]["interrupted_at"] == actual_stop.isoformat()
+    assert receipt["in_flight_work"] == []
+    assert any(
+        issue["code"] == "observation_interrupted" and issue["unverified"]
+        for issue in receipt["issues"]
+    )
+    assert any(
+        event["kind"] == "scheduler"
+        and event["key"] == "bounded_session"
+        and event["status"] == "interrupted"
+        for event in receipt["events"]
+    )
+
+
+def test_observed_scheduler_stops_at_morning_cutoff_after_hourly_and_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_observation_settings(monkeypatch)
+    clock_state = {"now": datetime(2026, 10, 2, 9, 30, tzinfo=_ET)}
+    stop_at = datetime(2026, 10, 2, 10, 5, tzinfo=_ET)
+    hard_deadline = datetime(2026, 10, 2, 10, 10, tzinfo=_ET)
+    ticks = iter(
+        [
+            datetime(2026, 10, 2, 10, 0, tzinfo=_ET),
+            datetime(2026, 10, 2, 10, 1, tzinfo=_ET),
+            stop_at,
+        ]
+    )
+    observation = SchedulerObservation("morning-cutoff")
+    monkeypatch.setattr(scheduler, "_now_et", lambda: clock_state["now"])
+
+    def advance_clock(_seconds: float) -> None:
+        clock_state["now"] = next(ticks)
+
+    with (
+        activate_scheduler_observation(observation),
+        patch("scheduler.SchedulerInstanceLock", return_value=MagicMock(__enter__=lambda self: self, __exit__=lambda *args: None)),
+        patch("scheduler.require_paper_mode"),
+        patch("scheduler._market_clock_is_open", return_value=True),
+        patch("scheduler._run_cycle") as scan,
+        patch("scheduler.monitor_exits_hourly", return_value=[]) as hourly,
+        patch("scheduler.monitor_and_exit_positions", return_value=[]) as fallback,
+        patch("scheduler.time.sleep", side_effect=advance_clock),
+    ):
+        scheduler.run_scheduler(
+            dry_run=True,
+            run_now=True,
+            stop_after_session=True,
+            observe_health=True,
+            observation_stop_at=stop_at,
+            observation_hard_deadline_at=hard_deadline,
+        )
+        observation.mark_stopped(clock_state["now"])
+
+    scan.assert_called_once_with(True)
+    assert hourly.call_count == 1
+    assert fallback.call_count == 2
+    receipt = observation.to_receipt()
+    work = [event for event in receipt["events"] if event["kind"] == "scheduler_work"]
+    hourly_due = [
+        event["details"]["scheduled_at"]
+        for event in work
+        if event["key"] == "exit_check:hourly" and event["status"] == "due"
+    ]
+    daily_due = [
+        event["details"]["scheduled_at"]
+        for event in work
+        if event["key"] == "exit_check:daily_fallback" and event["status"] == "due"
+    ]
+    assert hourly_due == ["2026-10-02T10:01:00-04:00"]
+    assert daily_due == [
+        "2026-10-02T09:30:00-04:00",
+        "2026-10-02T10:00:00-04:00",
+    ]
+    assert any(
+        event["key"] == "exit_check:hourly" and event["status"] == "completed"
+        for event in work
+    )
+    assert any(
+        event["key"] == "exit_check:daily_fallback" and event["status"] == "completed"
+        for event in work
+    )
+    assert not any(issue["code"] == "scheduled_work_missed" for issue in receipt["issues"])
+    assert receipt["execution_window"]["stop_requested_at"].startswith(
+        "2026-10-02T10:05:00"
+    )
+
+
+def test_long_morning_scan_records_only_missed_slots_through_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_observation_settings(monkeypatch)
+    start = datetime(2026, 10, 2, 9, 30, tzinfo=_ET)
+    scan_finished = datetime(2026, 10, 2, 10, 7, tzinfo=_ET)
+    clock_state = {"now": start}
+    stop_at = datetime(2026, 10, 2, 10, 5, tzinfo=_ET)
+    hard_deadline = datetime(2026, 10, 2, 10, 10, tzinfo=_ET)
+    observation = SchedulerObservation("long-morning-scan")
+
+    def run_scan(*_args, **_kwargs) -> None:
+        clock_state["now"] = scan_finished
+
+    monkeypatch.setattr(scheduler, "_now_et", lambda: clock_state["now"])
+    with (
+        activate_scheduler_observation(observation),
+        patch("scheduler.SchedulerInstanceLock", return_value=MagicMock(__enter__=lambda self: self, __exit__=lambda *args: None)),
+        patch("scheduler.require_paper_mode"),
+        patch("scheduler._market_clock_is_open", return_value=True),
+        patch("scheduler._run_cycle", side_effect=run_scan),
+        patch("scheduler.monitor_exits_hourly") as hourly,
+        patch("scheduler.monitor_and_exit_positions") as fallback,
+        patch("scheduler.time.sleep") as sleep,
+    ):
+        scheduler.run_scheduler(
+            dry_run=True,
+            run_now=True,
+            stop_after_session=True,
+            observe_health=True,
+            observation_stop_at=stop_at,
+            observation_hard_deadline_at=hard_deadline,
+        )
+        observation.mark_stopped(scan_finished)
+
+    hourly.assert_not_called()
+    fallback.assert_not_called()
+    sleep.assert_not_called()
+    receipt = observation.to_receipt()
+    missed_due = [
+        event["details"]["scheduled_at"]
+        for event in receipt["events"]
+        if event["kind"] == "scheduler_work" and event["status"] == "missed"
+    ]
+    assert missed_due == [
+        "2026-10-02T10:01:00-04:00",
+        "2026-10-02T09:30:00-04:00",
+        "2026-10-02T10:00:00-04:00",
+    ]
+    assert receipt["service_health"] == "unverified"
+
+
+def test_observation_does_not_retry_failed_exit_work_on_next_scheduler_tick(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_observation_settings(monkeypatch)
+    start = datetime(2026, 10, 2, 10, 1, tzinfo=_ET)
+    stop_at = datetime(2026, 10, 2, 10, 2, tzinfo=_ET)
+    hard_deadline = datetime(2026, 10, 2, 10, 7, tzinfo=_ET)
+    clock_state = {"now": start}
+    ticks = iter(
+        [
+            datetime(2026, 10, 2, 10, 1, 30, tzinfo=_ET),
+            stop_at,
+        ]
+    )
+    observation = SchedulerObservation("failed-exit-work-no-retry")
+
+    def advance_clock(_seconds: float) -> None:
+        clock_state["now"] = next(ticks)
+
+    monkeypatch.setattr(scheduler, "_now_et", lambda: clock_state["now"])
+    with (
+        activate_scheduler_observation(observation),
+        patch("scheduler.SchedulerInstanceLock", return_value=MagicMock(__enter__=lambda self: self, __exit__=lambda *args: None)),
+        patch("scheduler.require_paper_mode"),
+        patch("scheduler._market_clock_is_open", return_value=True),
+        patch("scheduler._run_cycle"),
+        patch("scheduler.monitor_exits_hourly", side_effect=RuntimeError("hourly read failed")) as hourly,
+        patch("scheduler.monitor_and_exit_positions", side_effect=RuntimeError("fallback read failed")) as fallback,
+        patch("scheduler.time.sleep", side_effect=advance_clock),
+    ):
+        scheduler.run_scheduler(
+            dry_run=True,
+            run_now=True,
+            stop_after_session=True,
+            observe_health=True,
+            observation_stop_at=stop_at,
+            observation_hard_deadline_at=hard_deadline,
+        )
+        observation.mark_stopped(clock_state["now"])
+
+    hourly.assert_called_once_with(dry_run=True)
+    fallback.assert_called_once_with(dry_run=True)
+    receipt = observation.to_receipt()
+    failed = [
+        event
+        for event in receipt["events"]
+        if event["kind"] == "scheduler_work" and event["status"] == "failed"
+    ]
+    assert [(event["key"], event["details"]["error_type"]) for event in failed] == [
+        ("exit_check:hourly", "RuntimeError"),
+        ("exit_check:daily_fallback", "RuntimeError"),
+    ]
+    assert receipt["service_health"] == "failed"
 
 
 @pytest.mark.parametrize(
@@ -597,7 +881,17 @@ def test_full_large_cap_scan_spanning_exit_slots_records_missed_work(
         if event["key"] == "exit_check:daily_fallback" and event["status"] == "missed"
     ]
     assert [event["details"].get("scheduled_at") for event in daily_missed] == [
-        "2026-10-01T10:01:00-04:00"
+        "2026-10-01T10:01:00-04:00",
+        "2026-10-01T10:31:00-04:00",
+        "2026-10-01T11:01:00-04:00",
+        "2026-10-01T11:31:00-04:00",
+        "2026-10-01T12:01:00-04:00",
+        "2026-10-01T12:31:00-04:00",
+        "2026-10-01T13:01:00-04:00",
+        "2026-10-01T13:31:00-04:00",
+        "2026-10-01T14:01:00-04:00",
+        "2026-10-01T14:31:00-04:00",
+        "2026-10-01T15:01:00-04:00",
     ]
     assert sum(event["key"] == "exit_check:daily_fallback" and event["status"] == "completed" for event in work) == 3
     due_at = {
@@ -619,20 +913,17 @@ def test_observed_scheduler_suppresses_hourly_exit_notification(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _set_observation_settings(monkeypatch)
-    times = iter(
+    clock_state = {"now": datetime(2026, 10, 1, 10, 1, tzinfo=_ET)}
+    ticks = iter(
         [
-            datetime(2026, 10, 1, 10, 1, tzinfo=_ET),
-            datetime(2026, 10, 1, 10, 1, tzinfo=_ET),
-            datetime(2026, 10, 1, 10, 1, tzinfo=_ET),
-            datetime(2026, 10, 1, 10, 1, tzinfo=_ET),
-            datetime(2026, 10, 1, 10, 1, tzinfo=_ET),
-            datetime(2026, 10, 1, 15, 1, tzinfo=_ET),
-            datetime(2026, 10, 1, 15, 1, tzinfo=_ET),
             datetime(2026, 10, 1, 15, 1, tzinfo=_ET),
             datetime(2026, 10, 1, 16, 6, tzinfo=_ET),
         ]
     )
-    monkeypatch.setattr(scheduler, "_now_et", lambda: next(times))
+    monkeypatch.setattr(scheduler, "_now_et", lambda: clock_state["now"])
+
+    def advance_clock(_seconds: float) -> None:
+        clock_state["now"] = next(ticks)
     with (
         patch("scheduler.SchedulerInstanceLock", return_value=MagicMock(__enter__=lambda self: self, __exit__=lambda *args: None)),
         patch("scheduler.require_paper_mode"),
@@ -642,7 +933,7 @@ def test_observed_scheduler_suppresses_hourly_exit_notification(
         patch("scheduler.monitor_and_exit_positions", return_value=[]),
         patch("scheduler.notify_cycle_summary") as notify,
         patch("scheduler.fmp_observation_request_limit", return_value=12),
-        patch("scheduler.time.sleep"),
+            patch("scheduler.time.sleep", side_effect=advance_clock),
     ):
         assert scheduler.main(_observation_args()) == 1
 
@@ -686,6 +977,56 @@ def test_observed_work_latches_a_caught_expected_work_failure() -> None:
         event["kind"] == "scheduler_work" and event["status"] == "failed"
         for event in receipt["events"]
     )
+
+
+def test_observed_work_denies_callback_if_evidence_write_crosses_stop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    start = datetime(2026, 10, 2, 10, 4, 59, tzinfo=_ET)
+    stop_at = datetime(2026, 10, 2, 10, 5, tzinfo=_ET)
+    hard_deadline = datetime(2026, 10, 2, 10, 10, tzinfo=_ET)
+    clock_state = {"now": start}
+    observation = SchedulerObservation(
+        "snapshot-crosses-stop", snapshot_path=tmp_path / "partial.json"
+    )
+    observation.configure_execution_window(
+        requested_stop_at=stop_at, hard_deadline_at=hard_deadline
+    )
+    original_begin_work = observation.begin_work
+
+    def begin_work(kind, key, scheduled_at) -> None:
+        original_begin_work(kind, key, scheduled_at)
+        clock_state["now"] = stop_at
+
+    monkeypatch.setattr(observation, "begin_work", begin_work)
+    monkeypatch.setattr(scheduler, "_now_et", lambda: clock_state["now"])
+    callback = MagicMock(return_value=[])
+
+    with activate_scheduler_observation(observation):
+        result = scheduler._run_observed_work(
+            "scan", "scheduled", start, callback
+        )
+
+    callback.assert_not_called()
+    assert result is None
+    receipt = observation.to_receipt()
+    assert receipt["in_flight_work"] == []
+    assert any(
+        event["kind"] == "scheduler_work"
+        and event["key"] == "scan:scheduled"
+        and event["status"] == "denied"
+        and event["details"].get("not_started") is True
+        for event in receipt["events"]
+    )
+    assert not any(
+        event["kind"] == "scheduler_work"
+        and event["key"] == "scan:scheduled"
+        and event["status"] == "started"
+        for event in receipt["events"]
+    )
+    assert receipt["execution_window"]["stop_requested_at"] == stop_at.isoformat()
+    assert receipt["service_health"] == "unverified"
 
 
 def test_late_join_hourly_catchup_uses_session_start_without_hiding_real_misses(

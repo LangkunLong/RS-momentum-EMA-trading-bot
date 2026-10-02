@@ -1,7 +1,10 @@
 """Tests for the scheduler observation outcome contract."""
 
 from types import SimpleNamespace
+import json
+from datetime import datetime
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 from auto_trader import run_auto_trader
 from core.scheduler_observation import SchedulerObservation, activate_scheduler_observation
@@ -120,3 +123,34 @@ def test_scan_phase_exit_work_is_recorded_with_no_open_positions():
         ("started", "exit_check:scan_phase"),
         ("completed", "exit_check:scan_phase"),
     ]
+
+
+def test_partial_snapshot_tracks_provider_usage_and_in_flight_work(tmp_path):
+    snapshot_path = tmp_path / "partial.json"
+    observation = SchedulerObservation("partial-state", snapshot_path=snapshot_path)
+    eastern = ZoneInfo("America/New_York")
+    observation.configure_execution_window(
+        requested_stop_at=datetime(2026, 10, 2, 10, 5, tzinfo=eastern),
+        hard_deadline_at=datetime(2026, 10, 2, 10, 10, tzinfo=eastern),
+    )
+    observation.begin_work(
+        "scan", "startup", datetime(2026, 10, 2, 9, 30, tzinfo=eastern)
+    )
+    observation.record_provider_event("alpaca", "attempted", {"endpoint": "clock"})
+    observation.record_input_gap("AAPL", "income-quarterly", "local_ledger_exhausted")
+
+    partial = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    assert partial["schema"] == "scheduler-observation-partial/v1"
+    assert partial["in_flight_work"][0]["key"] == "startup"
+    assert partial["provider_counters"]["alpaca"]["logical_requests"] == 1
+    assert partial["input_gap_count"] == 1
+
+    observation.finish_work("scan", "startup")
+    observation.request_stop(datetime(2026, 10, 2, 10, 5, tzinfo=eastern))
+    observation.mark_stopped(datetime(2026, 10, 2, 10, 5, 1, tzinfo=eastern))
+    final_partial = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    assert final_partial["in_flight_work"] == []
+    assert final_partial["execution_window"]["deadline_exceeded"] is False
+    assert final_partial["execution_window"]["actual_stop_at"].startswith(
+        "2026-10-02T10:05:01"
+    )
