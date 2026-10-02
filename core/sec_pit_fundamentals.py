@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 
 FUNDAMENTAL_COLUMNS = (
@@ -281,6 +281,7 @@ class _Issuer:
 
 @dataclass(frozen=True)
 class _Candidate:
+    cik: str
     accession: str
     form: str
     statement_type: str
@@ -293,6 +294,9 @@ class _Candidate:
     public_date_basis: str
     values: Mapping[str, float]
     concepts: Mapping[str, str]
+    units: Mapping[str, str]
+    metric_details: Mapping[str, Mapping[str, Any]]
+    q4_kind: str | None = None
 
 
 def _regular_file(path: Path, label: str) -> Path:
@@ -412,10 +416,26 @@ def validate_sec_archive(path: Path, *, max_member_bytes: int = 512 * 1024 * 102
         handle.close()
 
 
-def _json_member(handle: zipfile.ZipFile, info: zipfile.ZipInfo) -> Mapping[str, Any]:
+def _json_member(
+    handle: zipfile.ZipFile,
+    info: zipfile.ZipInfo,
+    *,
+    member_use_callback: Callable[[str, int, str], None] | None = None,
+) -> Mapping[str, Any]:
     try:
         with handle.open(info, "r") as stream:
-            value = json.load(stream)
+            if member_use_callback is None:
+                value = json.load(stream)
+            else:
+                digest = hashlib.sha256()
+                expanded_bytes = 0
+                chunks: list[bytes] = []
+                while chunk := stream.read(1024 * 1024):
+                    expanded_bytes += len(chunk)
+                    digest.update(chunk)
+                    chunks.append(chunk)
+                member_use_callback(info.filename, expanded_bytes, digest.hexdigest())
+                value = json.loads(b"".join(chunks))
     except (OSError, UnicodeError, json.JSONDecodeError, RuntimeError) as exc:
         raise ValueError(f"invalid SEC JSON member: {info.filename}") from exc
     if not isinstance(value, dict):
@@ -836,6 +856,7 @@ def _acceptances_for_ciks(
     ciks: Iterable[str],
     *,
     max_json_member_bytes: int,
+    member_use_callback: Callable[[str, int, str], None] | None = None,
 ) -> tuple[Mapping[str, Mapping[str, FilingAcceptance]], int]:
     handle, members = _zip_members(submissions_archive, max_member_bytes=max_json_member_bytes)
     result: dict[str, Mapping[str, FilingAcceptance]] = {}
@@ -855,7 +876,7 @@ def _acceptances_for_ciks(
             main = main_by_cik.get(cik)
             if main is None:
                 raise ValueError(f"SEC submissions archive lacks a main record for CIK {cik}")
-            payload = _json_member(handle, main)
+            payload = _json_member(handle, main, member_use_callback=member_use_callback)
             acceptances: dict[str, FilingAcceptance] = {}
             _parse_acceptances(payload, cik=cik, target=acceptances)
             filings = payload.get("filings", {})
@@ -875,7 +896,11 @@ def _acceptances_for_ciks(
                 if info is None:
                     missing_fragments += 1
                     continue
-                _parse_acceptances(_json_member(handle, info), cik=cik, target=acceptances)
+                _parse_acceptances(
+                    _json_member(handle, info, member_use_callback=member_use_callback),
+                    cik=cik,
+                    target=acceptances,
+                )
             result[cik] = MappingProxyType(acceptances)
     finally:
         handle.close()
@@ -1145,6 +1170,12 @@ def _candidate_metadata(
         basis = "filed_date_fallback"
         source_date = filed
         counters["filed_date_fallback_fact_count"] += 1
+    if source_date < start_date:
+        # A calendar that starts at the extraction window cannot map older
+        # filing events to their actual first public session. Do not clamp
+        # them to the first supplied trading day.
+        counters["pre_window_filing_omissions"] += 1
+        return None
     public_date = _next_trading_day(spy_days, source_date)
     if public_date is None or public_date > end_date:
         counters["post_cutoff_fact_omissions"] += 1
@@ -1213,13 +1244,6 @@ def _candidates_for_cik(
     if payload_cik != cik or not isinstance(payload.get("facts"), dict):
         raise ValueError(f"companyfacts filename/payload mismatch for CIK {cik}")
     facts: Mapping[str, Any] = payload["facts"]
-    # One fact can appear twice in companyfacts (for example with and without a frame).
-    # Exact repeats are removed before context selection.
-    seen_facts: set[tuple[Any, ...]] = set()
-    groups: dict[tuple[Any, ...], dict[str, list[tuple[tuple[int, ...], float, str]]]] = defaultdict(
-        lambda: defaultdict(list)
-    )
-
     definitions: list[tuple[str, str, str, str, int, bool]] = []
     definitions.extend(
         (metric, ns, concept, unit, rank, False)
@@ -1231,6 +1255,46 @@ def _candidates_for_cik(
         for rank, (ns, concept, unit) in enumerate(_REVENUE_PRIORITY)
     )
     definitions.extend((metric, ns, concept, unit, 0, True) for metric, (ns, concept, unit) in _BALANCE_CONCEPTS.items())
+
+    # A short-duration fact in a 10-K is a direct Q4 fact only when its period
+    # end is also an annual period end in that same filing (or the filing
+    # explicitly labels it Q4). This keeps comparative-year quarters from
+    # being mistaken for the current fiscal Q4.
+    annual_periods: set[tuple[str, date]] = set()
+    annual_fiscal_years: set[tuple[str, str]] = set()
+    annual_fiscal_intervals: dict[tuple[str, str], set[tuple[date, date]]] = defaultdict(set)
+    for _metric, namespace, concept, unit, _rank, balance_metric in definitions:
+        if balance_metric:
+            continue
+        for raw in _fact_list(facts, namespace, concept, unit):
+            form_info = _fact_form(raw.get("form"))
+            if form_info is None or form_info[1] != "annual":
+                continue
+            try:
+                start = _iso_date(raw.get("start"), "companyfacts start")
+                period_end = _iso_date(raw.get("end"), "companyfacts end")
+                filing_fy = int(str(raw.get("fy", "")).strip())
+                accession = _accession(raw.get("accn"))
+            except (TypeError, ValueError):
+                continue
+            if (
+                (period_end.year == filing_fy or str(raw.get("fp", "")).upper() == "Q4")
+                and 300 <= (period_end - start).days + 1 <= 430
+            ):
+                annual_periods.add((accession, period_end))
+                if period_end.year == filing_fy:
+                    fiscal_year_key = (accession, str(filing_fy))
+                    annual_fiscal_years.add(fiscal_year_key)
+                    annual_fiscal_intervals[fiscal_year_key].add((start, period_end))
+
+    # One fact can appear twice in companyfacts (for example with and without a frame).
+    # Exact repeats are removed before context selection.
+    seen_facts: set[tuple[Any, ...]] = set()
+    groups: dict[
+        tuple[Any, ...],
+        dict[str, list[tuple[tuple[int, ...], float, str, str, Mapping[str, Any]]]],
+    ] = defaultdict(lambda: defaultdict(list))
+    q4_kinds: dict[tuple[Any, ...], str] = {}
 
     for metric, namespace, concept, unit, concept_rank, balance_metric in definitions:
         for raw in _fact_list(facts, namespace, concept, unit):
@@ -1247,14 +1311,101 @@ def _candidates_for_cik(
                 continue
             accession, form, income_type, period_end, filed, fy, fp, acceptance, public_date, basis = metadata
             statement_type = "balance" if balance_metric else income_type
+            q4_kind: str | None = None
+            duration_days: int | None = None
+            fact_start: date | None = None
+            same_filing_quarter = False
+            fy_labeled_quarter_interval = False
             if balance_metric:
                 context_score = (0, 0)
             else:
-                duration_score = _duration_score(raw, statement_type=statement_type, counters=counters)
-                if duration_score is None:
-                    continue
-                context_score = duration_score
+                duration_days: int | None = None
+                if raw.get("start"):
+                    fact_start = _iso_date(raw["start"], "companyfacts start")
+                    duration_days = (period_end - fact_start).days + 1
+                direct_q4 = (
+                    income_type == "annual"
+                    and duration_days is not None
+                    and 70 <= duration_days <= 115
+                    and (str(fp).upper() == "Q4" or (accession, period_end) in annual_periods)
+                )
+                same_filing_fiscal_year = (accession, fy) in annual_fiscal_years
+                fy_labeled_quarter_interval = (
+                    str(fp).upper() == "FY"
+                    and fact_start is not None
+                    and any(
+                        annual_start <= fact_start and period_end < annual_end
+                        for annual_start, annual_end in annual_fiscal_intervals.get(
+                            (accession, fy), ()
+                        )
+                    )
+                )
+                same_filing_quarter = (
+                    income_type == "annual"
+                    and duration_days is not None
+                    and 70 <= duration_days <= 115
+                    and same_filing_fiscal_year
+                    and (
+                        str(fp).upper() in {"Q1", "Q2", "Q3"}
+                        or fy_labeled_quarter_interval
+                    )
+                )
+                if direct_q4:
+                    statement_type = "quarterly"
+                    q4_kind = "direct"
+                    context_score = (
+                        int(str(fp).upper() == "Q4"),
+                        -abs(duration_days - 91),
+                    )
+                elif same_filing_quarter:
+                    # Some 10-Ks include their fiscal Q1-Q3 fact contexts. Keep
+                    # them available as a basis-reconciled set, while still
+                    # requiring the derivation path below to prove a complete
+                    # interval partition and a shared accession.
+                    statement_type = "quarterly"
+                    context_score = (
+                        int(str(fp).upper() in {"Q1", "Q2", "Q3"}),
+                        -abs(duration_days - 91),
+                    )
+                else:
+                    duration_score = _duration_score(raw, statement_type=statement_type, counters=counters)
+                    if duration_score is None:
+                        continue
+                    context_score = duration_score
             number = _fact_number(raw["val"], concept=concept)
+            concept_id = f"{namespace}:{concept}"
+            candidate_fp = "Q4" if q4_kind == "direct" else fp
+            raw_acceptance = (
+                acceptance.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+                if acceptance is not None
+                else ""
+            )
+            metric_detail: dict[str, Any] = {
+                "accession_number": _display_accession(accession),
+                "form": form,
+                "filed_date": filed.isoformat(),
+                "fiscal_year": fy,
+                "fiscal_period": fp,
+                "acceptance_datetime": raw_acceptance,
+                "public_date_basis": basis,
+                "public_date": public_date.isoformat(),
+                "source_concept": concept_id,
+                "source_value": number,
+                "unit": unit,
+                "currency": unit if unit in {"USD", "CAD", "EUR", "GBP"} else "",
+                "value_scale_multiplier": 1,
+                "value_scale_basis": "SEC CompanyFacts numeric value in base unit",
+                "decimals": str(raw.get("decimals", "") or ""),
+                "period_start": str(raw.get("start", "") or ""),
+                "period_end": period_end.isoformat(),
+                "duration_days": duration_days,
+            }
+            if same_filing_quarter and fy_labeled_quarter_interval:
+                metric_detail["fiscal_period_interpretation"] = (
+                    "quarter_duration_within_same_accession_fiscal_year"
+                )
+            if q4_kind == "direct":
+                metric_detail["q4_attribution"] = "direct_10k_quarter_duration"
             duplicate_key = (
                 metric,
                 namespace,
@@ -1267,7 +1418,7 @@ def _candidates_for_cik(
                 str(raw.get("frame", "")),
                 filed,
                 fy,
-                fp,
+                candidate_fp,
                 number,
             )
             if duplicate_key in seen_facts:
@@ -1281,18 +1432,22 @@ def _candidates_for_cik(
                 period_end,
                 filed,
                 fy,
-                fp,
+                candidate_fp,
                 acceptance,
                 public_date,
                 basis,
             )
             score = (-concept_rank, *context_score)
-            groups[key][metric].append((score, number, f"{namespace}:{concept}"))
+            groups[key][metric].append((score, number, concept_id, unit, metric_detail))
+            if q4_kind is not None:
+                q4_kinds[key] = q4_kind
 
     candidates: list[_Candidate] = []
     for key, metric_entries in groups.items():
         values: dict[str, float] = {}
         concepts: dict[str, str] = {}
+        units: dict[str, str] = {}
+        metric_details: dict[str, Mapping[str, Any]] = {}
         for metric, entries in metric_entries.items():
             best_score = max(item[0] for item in entries)
             best = [item for item in entries if item[0] == best_score]
@@ -1308,10 +1463,13 @@ def _candidates_for_cik(
                     counters["revenue_concept_conflict_count"] += 1
             values[metric] = chosen[1]
             concepts[metric] = chosen[2]
+            units[metric] = chosen[3]
+            metric_details[metric] = MappingProxyType(dict(chosen[4]))
             counters[f"selected_{chosen[2].replace(':', '_')}"] += 1
         accession, form, statement_type, period_end, filed, fy, fp, acceptance, public_date, basis = key
         candidates.append(
             _Candidate(
+                cik=cik,
                 accession=accession,
                 form=form,
                 statement_type=statement_type,
@@ -1324,9 +1482,410 @@ def _candidates_for_cik(
                 public_date_basis=basis,
                 values=MappingProxyType(values),
                 concepts=MappingProxyType(concepts),
+                units=MappingProxyType(units),
+                metric_details=MappingProxyType(metric_details),
+                q4_kind=q4_kinds.get(key),
             )
         )
+        if q4_kinds.get(key) == "direct":
+            counters["q4_direct_fact_metric_count"] += len(values)
     return tuple(candidates)
+
+
+def _derive_q4_revenue_candidates(
+    candidates: Sequence[_Candidate], counters: Counter[str]
+) -> tuple[_Candidate, ...]:
+    """Derive Q4 revenue from a compatible FY and a unique interval partition."""
+    annual_groups: dict[tuple[str, str, date], list[_Candidate]] = defaultdict(list)
+    direct_q4 = [
+        candidate
+        for candidate in candidates
+        if candidate.statement_type == "quarterly"
+        and candidate.q4_kind == "direct"
+        and "total_revenue" in candidate.values
+    ]
+    for candidate in candidates:
+        if candidate.statement_type == "annual" and candidate.fiscal_period == "FY":
+            if "total_revenue" in candidate.values:
+                annual_groups[
+                    (candidate.cik, candidate.fiscal_year, candidate.period_end)
+                ].append(candidate)
+
+    derived: list[_Candidate] = []
+    for (cik, fiscal_year, annual_end), annual_versions in annual_groups.items():
+        try:
+            fiscal_year_number = int(fiscal_year)
+        except ValueError:
+            counters["q4_revenue_unparseable_fiscal_year_count"] += 1
+            continue
+        if annual_end.year != fiscal_year_number:
+            counters["q4_revenue_fiscal_year_end_mismatch_count"] += 1
+            continue
+        emitted_signatures: set[tuple[Any, ...]] = set()
+        any_sequence = False
+        for annual_seed in annual_versions:
+            annual_concept = annual_seed.concepts["total_revenue"]
+            annual_unit = annual_seed.units["total_revenue"]
+            if annual_unit != "USD" or not annual_concept.startswith("us-gaap:"):
+                counters["q4_revenue_incompatible_basis_count"] += 1
+                continue
+            try:
+                annual_detail = annual_seed.metric_details["total_revenue"]
+                annual_start = _iso_date(
+                    annual_detail.get("period_start"), "annual revenue period start"
+                )
+                annual_duration = int(annual_detail.get("duration_days", 0))
+            except (TypeError, ValueError):
+                counters["q4_revenue_incompatible_basis_count"] += 1
+                continue
+            if not 300 <= annual_duration <= 430:
+                counters["q4_revenue_incompatible_basis_count"] += 1
+                continue
+
+            interval_groups: dict[tuple[date, date], list[_Candidate]] = defaultdict(list)
+            for candidate in candidates:
+                if (
+                    candidate.statement_type != "quarterly"
+                    or candidate.q4_kind is not None
+                    or "total_revenue" not in candidate.values
+                    or candidate.cik != cik
+                    or candidate.fiscal_year != fiscal_year
+                    or candidate.accession != annual_seed.accession
+                    or _form_family(candidate.form) != _form_family(annual_seed.form)
+                    or candidate.concepts.get("total_revenue") != annual_concept
+                    or candidate.units.get("total_revenue") != annual_unit
+                    or candidate.metric_details["total_revenue"].get("value_scale_multiplier") != 1
+                    or candidate.fiscal_period.upper() not in {"Q1", "Q2", "Q3", "FY"}
+                ):
+                    continue
+                try:
+                    source_detail = candidate.metric_details["total_revenue"]
+                    quarter_start = _iso_date(
+                        source_detail.get("period_start"), "quarter revenue period start"
+                    )
+                    quarter_end = _iso_date(
+                        source_detail.get("period_end"), "quarter revenue period end"
+                    )
+                    quarter_duration = int(source_detail.get("duration_days", 0))
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    quarter_end != candidate.period_end
+                    or not 70 <= quarter_duration <= 115
+                    or quarter_start < annual_start
+                    or quarter_end >= annual_end
+                ):
+                    continue
+                interval_groups[(quarter_start, quarter_end)].append(candidate)
+
+            # Different raw fp contexts can repeat one period interval. Keep a
+            # single interval only when every context supplies the same value.
+            unique_interval_groups: dict[tuple[date, date], list[_Candidate]] = {}
+            for interval, versions in interval_groups.items():
+                if len({item.values["total_revenue"] for item in versions}) != 1:
+                    counters["q4_revenue_ambiguous_interval_value_count"] += 1
+                    continue
+                unique_interval_groups[interval] = versions
+
+            intervals = sorted(unique_interval_groups)
+            sequences: set[tuple[tuple[date, date], tuple[date, date], tuple[date, date]]] = set()
+            for q1_interval in intervals:
+                q1_start, q1_end = q1_interval
+                if q1_start != annual_start:
+                    continue
+                q1_duration = (q1_end - q1_start).days + 1
+                if not 70 <= q1_duration <= 115:
+                    continue
+                q1_labels = {
+                    item.fiscal_period.upper()
+                    for item in unique_interval_groups[q1_interval]
+                    if item.fiscal_period.upper() in {"Q1", "Q2", "Q3"}
+                }
+                if q1_labels and q1_labels != {"Q1"}:
+                    continue
+                for q2_interval in intervals:
+                    q2_start, q2_end = q2_interval
+                    if q2_start != q1_end + timedelta(days=1):
+                        continue
+                    q2_duration = (q2_end - q2_start).days + 1
+                    if not 70 <= q2_duration <= 115:
+                        continue
+                    q2_labels = {
+                        item.fiscal_period.upper()
+                        for item in unique_interval_groups[q2_interval]
+                        if item.fiscal_period.upper() in {"Q1", "Q2", "Q3"}
+                    }
+                    if q2_labels and q2_labels != {"Q2"}:
+                        continue
+                    for q3_interval in intervals:
+                        q3_start, q3_end = q3_interval
+                        if q3_start != q2_end + timedelta(days=1):
+                            continue
+                        q3_duration = (q3_end - q3_start).days + 1
+                        q4_start = q3_end + timedelta(days=1)
+                        q4_duration = (annual_end - q4_start).days + 1
+                        q3_labels = {
+                            item.fiscal_period.upper()
+                            for item in unique_interval_groups[q3_interval]
+                            if item.fiscal_period.upper() in {"Q1", "Q2", "Q3"}
+                        }
+                        if (
+                            q3_labels
+                            and q3_labels != {"Q3"}
+                            or not 70 <= q3_duration <= 115
+                            or not 70 <= q4_duration <= 115
+                            or q3_end >= annual_end
+                            or sum((q1_duration, q2_duration, q3_duration, q4_duration))
+                            != annual_duration
+                        ):
+                            continue
+                        sequences.add((q1_interval, q2_interval, q3_interval))
+
+            if not sequences:
+                continue
+            if len(sequences) != 1:
+                counters["q4_revenue_ambiguous_quarter_sequence_count"] += 1
+                continue
+            any_sequence = True
+            quarter_intervals = next(iter(sequences))
+            quarter_versions = tuple(
+                unique_interval_groups[interval] for interval in quarter_intervals
+            )
+            event_dates = sorted(
+                {
+                    candidate.public_date
+                    for candidate in (
+                        *annual_versions,
+                        *quarter_versions[0],
+                        *quarter_versions[1],
+                        *quarter_versions[2],
+                    )
+                }
+            )
+            for event_date in event_dates:
+                annual_visible = [
+                    candidate
+                    for candidate in annual_versions
+                    if candidate.public_date <= event_date
+                ]
+                if not annual_visible:
+                    continue
+                annual = max(
+                    annual_visible,
+                    key=lambda item: (
+                        item.public_date,
+                        _candidate_timestamp(item),
+                        item.accession,
+                    ),
+                )
+                if (
+                    annual.accession != annual_seed.accession
+                    or annual.concepts.get("total_revenue") != annual_concept
+                    or annual.units.get("total_revenue") != annual_unit
+                ):
+                    continue
+                selected_quarters: list[_Candidate] = []
+                for versions in quarter_versions:
+                    visible = [item for item in versions if item.public_date <= event_date]
+                    if not visible:
+                        break
+                    selected_quarters.append(
+                        max(
+                            visible,
+                            key=lambda item: (
+                                item.fiscal_period.upper() not in {"Q1", "Q2", "Q3"},
+                                item.public_date,
+                                _candidate_timestamp(item),
+                                item.accession,
+                            ),
+                        )
+                    )
+                if len(selected_quarters) != 3:
+                    continue
+
+                input_candidates = (annual, *selected_quarters)
+                compatible = all(
+                    item.cik == cik
+                    and item.fiscal_year == fiscal_year
+                    and item.accession == annual.accession
+                    and _form_family(item.form) == _form_family(annual.form)
+                    and item.concepts.get("total_revenue") == annual_concept
+                    and item.units.get("total_revenue") == annual_unit
+                    and item.metric_details["total_revenue"].get("value_scale_multiplier") == 1
+                    for item in input_candidates
+                )
+                if not compatible:
+                    counters["q4_revenue_incompatible_basis_count"] += 1
+                    continue
+
+                available_from = max(item.public_date for item in input_candidates)
+                if any(
+                    item.cik == cik
+                    and item.period_end == annual_end
+                    and item.accession == annual.accession
+                    and _form_family(item.form) == _form_family(annual.form)
+                    and item.concepts.get("total_revenue") == annual_concept
+                    and item.units.get("total_revenue") == annual_unit
+                    and item.public_date <= available_from
+                    for item in direct_q4
+                ):
+                    counters["q4_revenue_direct_fact_preferred_count"] += 1
+                    continue
+
+                input_values = [item.values["total_revenue"] for item in input_candidates]
+                value = input_values[0] - input_values[1] - input_values[2] - input_values[3]
+                signature = (
+                    available_from,
+                    annual.accession,
+                    *quarter_intervals,
+                    *input_values,
+                )
+                if signature in emitted_signatures:
+                    continue
+                emitted_signatures.add(signature)
+                trigger = max(
+                    input_candidates,
+                    key=lambda item: (
+                        item.public_date,
+                        _candidate_timestamp(item),
+                        item.accession,
+                    ),
+                )
+                source_inputs = [dict(annual.metric_details["total_revenue"])]
+                for quarter_number, (interval, item) in enumerate(
+                    zip(quarter_intervals, selected_quarters, strict=True),
+                    start=1,
+                ):
+                    detail = dict(item.metric_details["total_revenue"])
+                    detail["normalized_fiscal_quarter"] = f"Q{quarter_number}"
+                    detail["fiscal_period_inference_method"] = (
+                        "contiguous_interval_partition_within_fy"
+                    )
+                    detail["source_context_fiscal_periods"] = sorted(
+                        {version.fiscal_period for version in unique_interval_groups[interval]}
+                    )
+                    source_inputs.append(detail)
+                q4_start = quarter_intervals[2][1] + timedelta(days=1)
+                q4_duration = (annual_end - q4_start).days + 1
+                detail = {
+                    "q4_attribution": "derived",
+                    "derivation": "annual_minus_q1_q2_q3",
+                    "formula": "FY - Q1 - Q2 - Q3",
+                    "input_values": input_values,
+                    "inputs": source_inputs,
+                    "available_from": available_from.isoformat(),
+                    "unit": annual_unit,
+                    "currency": "USD",
+                    "value_scale_multiplier": 1,
+                    "value_scale_basis": "SEC CompanyFacts numeric value in base unit",
+                    "accounting_basis_reconciliation": (
+                        "same filing accession, exact US-GAAP concept, unit, and base-value scale; "
+                        "Q1-Q3 fact intervals are contiguous from FY start and the Q4 residual "
+                        "completes the FY interval"
+                    ),
+                    "q4_residual_period_start": q4_start.isoformat(),
+                    "q4_residual_period_end": annual_end.isoformat(),
+                    "q4_residual_duration_days": q4_duration,
+                    "source_concept": f"derived:{annual_concept}",
+                    "source_value": value,
+                }
+                derived.append(
+                    _Candidate(
+                        cik=trigger.cik,
+                        accession=trigger.accession,
+                        form=trigger.form,
+                        statement_type="quarterly",
+                        period_end=annual_end,
+                        filed=trigger.filed,
+                        fiscal_year=fiscal_year,
+                        fiscal_period="Q4",
+                        acceptance=trigger.acceptance,
+                        public_date=available_from,
+                        public_date_basis=trigger.public_date_basis,
+                        values=MappingProxyType({"total_revenue": value}),
+                        concepts=MappingProxyType(
+                            {"total_revenue": f"derived:{annual_concept}"}
+                        ),
+                        units=MappingProxyType({"total_revenue": annual_unit}),
+                        metric_details=MappingProxyType(
+                            {"total_revenue": MappingProxyType(detail)}
+                        ),
+                        q4_kind="derived",
+                    )
+                )
+                counters["q4_revenue_derived_candidate_count"] += 1
+        if not any_sequence:
+            counters["q4_revenue_missing_quarter_sequence_count"] += 1
+
+    return tuple(derived)
+
+
+def _merge_q4_candidates(candidates: Sequence[_Candidate]) -> tuple[_Candidate, ...]:
+    """Merge same-session Q4 metrics by vintage, preferring direct facts on ties."""
+    ordinary = [candidate for candidate in candidates if candidate.q4_kind is None]
+    q4_groups: dict[tuple[str, date, date], list[_Candidate]] = defaultdict(list)
+    for candidate in candidates:
+        if candidate.q4_kind is not None:
+            q4_groups[(candidate.cik, candidate.period_end, candidate.public_date)].append(candidate)
+
+    merged: list[_Candidate] = []
+    for versions in q4_groups.values():
+        primary = max(
+            versions,
+            key=lambda item: (
+                _candidate_timestamp(item),
+                item.accession,
+                item.q4_kind == "direct",
+            ),
+        )
+        values: dict[str, float] = {}
+        concepts: dict[str, str] = {}
+        units: dict[str, str] = {}
+        details: dict[str, Mapping[str, Any]] = {}
+        for metric in sorted({name for item in versions for name in item.values}):
+            sources = [
+                item
+                for item in versions
+                if metric in item.values
+            ]
+            selected = max(
+                sources,
+                key=lambda item: (
+                    _candidate_timestamp(item),
+                    item.accession,
+                    item.q4_kind == "direct",
+                ),
+            )
+            values[metric] = selected.values[metric]
+            concepts[metric] = selected.concepts[metric]
+            units[metric] = selected.units[metric]
+            details[metric] = selected.metric_details[metric]
+        merged.append(
+            _Candidate(
+                cik=primary.cik,
+                accession=primary.accession,
+                form=primary.form,
+                statement_type="quarterly",
+                period_end=primary.period_end,
+                filed=primary.filed,
+                fiscal_year=primary.fiscal_year,
+                fiscal_period="Q4",
+                acceptance=primary.acceptance,
+                public_date=primary.public_date,
+                public_date_basis=primary.public_date_basis,
+                values=MappingProxyType(values),
+                concepts=MappingProxyType(concepts),
+                units=MappingProxyType(units),
+                metric_details=MappingProxyType(details),
+                q4_kind=(
+                    "mixed"
+                    if any(item.q4_kind == "direct" for item in versions)
+                    and any(item.q4_kind == "derived" for item in versions)
+                    else primary.q4_kind
+                ),
+            )
+        )
+    return tuple((*ordinary, *merged))
 
 
 def _candidate_timestamp(candidate: _Candidate) -> datetime:
@@ -1362,27 +1921,14 @@ def _materialize_ticker(
     for (statement_type, period_end), period_candidates in by_period.items():
         state: dict[str, float] = {}
         state_concepts: dict[str, str] = {}
-        state_origins: dict[str, Mapping[str, str]] = {}
+        state_origins: dict[str, Mapping[str, Any]] = {}
         previous_public: date | None = None
         for candidate in period_candidates:
             inherited = sorted(metric for metric in state if metric not in candidate.values)
             state.update(candidate.values)
             state_concepts.update(candidate.concepts)
             for metric in candidate.values:
-                state_origins[metric] = {
-                    "accession_number": _display_accession(candidate.accession),
-                    "form": candidate.form,
-                    "filed_date": candidate.filed.isoformat(),
-                    "fiscal_year": candidate.fiscal_year,
-                    "fiscal_period": candidate.fiscal_period,
-                    "acceptance_datetime": (
-                        candidate.acceptance.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-                        if candidate.acceptance is not None
-                        else ""
-                    ),
-                    "public_date_basis": candidate.public_date_basis,
-                    "source_concept": candidate.concepts[metric],
-                }
+                state_origins[metric] = dict(candidate.metric_details[metric])
             if not state:
                 continue
             if previous_public is not None and candidate.public_date > previous_public:
@@ -1460,6 +2006,8 @@ def extract_fundamentals(
     start_date: date = date(2020, 1, 1),
     end_date: date = date(2025, 12, 31),
     max_json_member_bytes: int = 512 * 1024 * 1024,
+    attested_companyfacts_archive_sha256: str | None = None,
+    companyfacts_member_use_callback: Callable[[str, int, str], None] | None = None,
 ) -> FundamentalExportResult:
     """Extract accession-aware, coherent PIT snapshots from SEC companyfacts."""
     if end_date < start_date:
@@ -1484,7 +2032,11 @@ def extract_fundamentals(
                 missing_ciks.add(cik)
                 continue
             by_cik[cik] = _candidates_for_cik(
-                _json_member(handle, info),
+                _json_member(
+                    handle,
+                    info,
+                    member_use_callback=companyfacts_member_use_callback,
+                ),
                 cik=cik,
                 acceptances=security_master.acceptance_by_cik.get(cik, {}),
                 spy_days=spy_days,
@@ -1575,6 +2127,8 @@ def extract_fundamentals(
                     if upper is not None and candidate.public_date > upper:
                         continue
                     selected.append(candidate)
+        selected.extend(_derive_q4_revenue_candidates(selected, counters))
+        selected = list(_merge_q4_candidates(selected))
         ticker_rows, ticker_audit = _materialize_ticker(ticker, selected, counters)
         if not ticker_rows:
             no_facts.add(ticker)
@@ -1639,9 +2193,15 @@ def extract_fundamentals(
         "missing_submission_fragment_count": security_master.missing_submission_fragments,
         **dict(sorted(counters.items())),
     }
+    if attested_companyfacts_archive_sha256 is None:
+        companyfacts_archive_sha256 = sha256_file(companyfacts_archive)
+    else:
+        companyfacts_archive_sha256 = attested_companyfacts_archive_sha256.strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", companyfacts_archive_sha256):
+            raise ValueError("attested companyfacts archive SHA-256 is invalid")
     return FundamentalExportResult(
         rows=rows,
         audit_rows=audit_rows,
         coverage=coverage,
-        companyfacts_archive_sha256=sha256_file(companyfacts_archive),
+        companyfacts_archive_sha256=companyfacts_archive_sha256,
     )

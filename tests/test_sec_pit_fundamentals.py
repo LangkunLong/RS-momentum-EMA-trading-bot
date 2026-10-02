@@ -2,12 +2,46 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from datetime import date
 import json
 from pathlib import Path
 import zipfile
 
 import core.sec_pit_fundamentals as sec
+
+
+def test_balance_only_payload_does_not_use_income_quarter_context_locals() -> None:
+    accession = "0000000001-24-000001"
+    fact = {
+        "accn": accession,
+        "form": "10-K",
+        "filed": "2024-04-30",
+        "end": "2024-03-31",
+        "fy": "2024",
+        "fp": "Q1",
+        "val": 100.0,
+    }
+    payload = {
+        "cik": "1",
+        "facts": {
+            "us-gaap": {"CommonStockValue": {"units": {"USD": [fact]}}},
+        },
+    }
+
+    candidates = sec._candidates_for_cik(
+        payload,
+        cik="0000000001",
+        acceptances={},
+        spy_days=(date(2024, 5, 1),),
+        start_date=date(2024, 1, 1),
+        end_date=date(2024, 12, 31),
+        counters=Counter(),
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].statement_type == "balance"
+    assert "fiscal_period_interpretation" not in candidates[0].metric_details["common_stock"]
 
 
 def _quarterly_fact(accession: str, form: str, filed: str, value: float) -> dict[str, object]:

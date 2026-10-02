@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 from copy import deepcopy
 from dataclasses import replace
+from datetime import date
 import json
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from core.pit_data import (
     PITDataBundle,
     PriceIdentityTransitionContract,
     _segment_contract_object,
+    validate_price_identity_segments_v1,
 )
 from core.pit_provenance import pit_canonical_json_bytes, pit_canonical_json_sha256
 from core.pit_universe_v3 import PointInTimeUniverseV3
@@ -283,6 +285,136 @@ def test_fiserv_segments_resolve_both_effective_dated_handoffs_and_v3_ticker(
     assert membership.ticker_for_lineage_at("fiserv", "2023-06-07") == "FI"
     assert membership.ticker_for_lineage_at("fiserv", "2025-11-10") == "FI"
     assert membership.ticker_for_lineage_at("fiserv", "2025-11-11") == "FISV"
+
+
+def test_prebundle_segment_input_uses_exact_parent_and_has_no_provenance_placeholder(
+    tmp_path: Path,
+) -> None:
+    _, provenance_path = _bundle_with_segments(tmp_path)
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    parent = provenance["price_identity_request_contracts"]
+
+    validated = validate_price_identity_segments_v1(
+        provenance["price_identity_segments_v1"],
+        declared_sha256=provenance["price_identity_segments_v1_sha256"],
+        parent_request_contracts=parent,
+        identities=parent,
+        source_evidence_root=tmp_path,
+        data_cutoff=date(2025, 12, 31),
+    )
+
+    assert validated.parent_request_contracts_sha256 == pit_canonical_json_sha256(parent)
+    assert validated.segment_contract_sha256 == provenance["price_identity_segments_v1_sha256"]
+    assert pit_canonical_json_sha256(validated.to_provenance_object()) == validated.segment_contract_sha256
+    assert len(validated.source_assertions) == 3
+    assert not hasattr(validated, "prices_provenance_sha256")
+
+
+def test_prebundle_segment_input_rejects_parent_identity_mismatch(tmp_path: Path) -> None:
+    _, provenance_path = _bundle_with_segments(tmp_path)
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    parent = provenance["price_identity_request_contracts"]
+    wrong_identities = deepcopy(parent)
+    wrong_identities["FI"]["provider_symbol"] = "FISV"
+
+    with pytest.raises(ValueError, match="do not match validated identities"):
+        validate_price_identity_segments_v1(
+            provenance["price_identity_segments_v1"],
+            declared_sha256=provenance["price_identity_segments_v1_sha256"],
+            parent_request_contracts=parent,
+            identities=wrong_identities,
+            source_evidence_root=tmp_path,
+            data_cutoff=date(2025, 12, 31),
+        )
+
+
+@pytest.mark.parametrize(
+    ("edit", "message"),
+    [
+        ("bad_date", "parent request contract row is invalid"),
+        ("noncanonical_ticker", "parent request contract row is invalid"),
+        ("bad_factor_anchor_type", "parent request contract row is invalid"),
+        ("extra_field", "parent request contract row is invalid"),
+    ],
+)
+def test_prebundle_segment_input_validates_parent_row_shape_and_identity(
+    tmp_path: Path,
+    edit: str,
+    message: str,
+) -> None:
+    _, provenance_path = _bundle_with_segments(tmp_path)
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    parent = deepcopy(provenance["price_identity_request_contracts"])
+    if edit == "bad_date":
+        parent["FI"]["admitted_start"] = "2023-99-07"
+    elif edit == "noncanonical_ticker":
+        parent["fi"] = parent.pop("FI")
+    elif edit == "bad_factor_anchor_type":
+        parent["FISV"]["factor_anchor"] = "true"
+    elif edit == "extra_field":
+        parent["FISV"]["unexpected"] = "extra"
+
+    with pytest.raises(ValueError, match=message):
+        validate_price_identity_segments_v1(
+            provenance["price_identity_segments_v1"],
+            declared_sha256=provenance["price_identity_segments_v1_sha256"],
+            parent_request_contracts=parent,
+            identities=parent,
+            source_evidence_root=tmp_path,
+            data_cutoff=date(2025, 12, 31),
+        )
+
+
+@pytest.mark.parametrize(
+    ("edit", "message"),
+    [
+        ("wrong_parent_digest", "parent digest does not match request contracts"),
+        ("overlap_predecessor", "invalid segment transition"),
+        ("gap_before_successor", "invalid segment transition"),
+        ("cycle", "invalid segment transition"),
+        ("wrong_source_effective_date", "source assertion is missing or misdated"),
+        ("source_hash_mismatch", "source document hash does not match assertion"),
+        ("source_path_traversal", "source document path is invalid"),
+    ],
+)
+def test_prebundle_segment_input_reuses_existing_source_graph_and_date_gates(
+    tmp_path: Path,
+    edit: str,
+    message: str,
+) -> None:
+    _, provenance_path = _bundle_with_segments(tmp_path, edit=edit)
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    parent = provenance["price_identity_request_contracts"]
+
+    with pytest.raises(ValueError, match=message):
+        validate_price_identity_segments_v1(
+            provenance["price_identity_segments_v1"],
+            declared_sha256=provenance["price_identity_segments_v1_sha256"],
+            parent_request_contracts=parent,
+            identities=parent,
+            source_evidence_root=tmp_path,
+            data_cutoff=date(2025, 12, 31),
+        )
+
+
+def test_prebundle_segment_input_confines_source_bytes_to_evidence_root(
+    tmp_path: Path,
+) -> None:
+    _, provenance_path = _bundle_with_segments(tmp_path)
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    other_root = tmp_path / "other-evidence-root"
+    other_root.mkdir()
+    parent = provenance["price_identity_request_contracts"]
+
+    with pytest.raises(ValueError, match="source document is unavailable"):
+        validate_price_identity_segments_v1(
+            provenance["price_identity_segments_v1"],
+            declared_sha256=provenance["price_identity_segments_v1_sha256"],
+            parent_request_contracts=parent,
+            identities=parent,
+            source_evidence_root=other_root,
+            data_cutoff=date(2025, 12, 31),
+        )
 
 
 def test_existing_transition_contract_constructor_keeps_legacy_behavior() -> None:
