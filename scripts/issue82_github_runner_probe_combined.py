@@ -51,6 +51,7 @@ TRUSTED_RUNTIME_SHA256 = "1" * 64
 IMMUTABLE_CONSTRAINTS_SHA256 = "2" * 64
 MAX_OUTPUT_BYTES = 67_108_864
 MAX_BUILD_METADATA_BYTES = 1_048_576
+MAX_BUILD_METADATA_PREVIEW_BYTES = 2_048
 MAX_BUILD_SECONDS = 10 * 60
 MECHANICS_TIMEOUT_SECONDS = 60
 CONTAINER_UID_GID = "65532:65532"
@@ -396,6 +397,38 @@ def _image_identity(image_tag: str) -> dict[str, Any]:
     }
 
 
+def _build_metadata_evidence(raw: bytes) -> dict[str, Any]:
+    """Capture bounded Buildx metadata context before strict admission parsing."""
+    preview = raw[:MAX_BUILD_METADATA_PREVIEW_BYTES]
+    evidence: dict[str, Any] = {
+        "metadata_file_sha256": _sha256(raw),
+        "metadata_file_size_bytes": len(raw),
+        "raw_metadata_preview_utf8": preview.decode("utf-8", errors="replace"),
+        "raw_metadata_preview_truncated": len(raw) > len(preview),
+    }
+    try:
+        metadata = json.loads(raw.decode("utf-8", errors="strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        evidence["json_status"] = "invalid"
+        evidence["json_error_type"] = type(exc).__name__
+        return evidence
+
+    evidence["json_status"] = "valid"
+    evidence["json_root_type"] = type(metadata).__name__
+    if isinstance(metadata, dict):
+        fields = (
+            "containerimage.config.digest",
+            "containerimage.digest",
+            "containerimage.descriptor",
+        )
+        evidence["field_presence"] = {name: name in metadata for name in fields}
+        evidence["field_types"] = {
+            name: type(metadata[name]).__name__ if name in metadata else None
+            for name in fields
+        }
+    return evidence
+
+
 def _parse_build_metadata(raw: bytes) -> dict[str, Any]:
     if not raw or len(raw) > MAX_BUILD_METADATA_BYTES:
         raise VerificationError("Buildx metadata file is empty or exceeds the size limit")
@@ -412,23 +445,30 @@ def _parse_build_metadata(raw: bytes) -> dict[str, Any]:
     image_digest = metadata.get("containerimage.digest")
     if not isinstance(image_digest, str) or not _SHA256_DIGEST.fullmatch(image_digest):
         raise VerificationError("Buildx metadata image digest is missing or noncanonical")
-    descriptor = metadata.get("containerimage.descriptor")
-    if not isinstance(descriptor, dict):
-        raise VerificationError("Buildx metadata image descriptor is missing")
-    descriptor_digest = descriptor.get("digest")
-    if not isinstance(descriptor_digest, str) or not _SHA256_DIGEST.fullmatch(descriptor_digest):
-        raise VerificationError("Buildx metadata descriptor digest is missing or noncanonical")
-    if descriptor_digest != image_digest:
-        raise VerificationError("Buildx metadata image and descriptor digests differ")
-    media_type = descriptor.get("mediaType")
-    if not isinstance(media_type, str) or not media_type:
-        raise VerificationError("Buildx metadata descriptor media type is missing")
+    descriptor_status = "provided"
+    descriptor_digest: str | None = None
+    media_type: str | None = None
+    if "containerimage.descriptor" not in metadata:
+        descriptor_status = "not_provided"
+    else:
+        descriptor = metadata["containerimage.descriptor"]
+        if not isinstance(descriptor, dict):
+            raise VerificationError("Buildx metadata image descriptor must be an object when present")
+        descriptor_digest = descriptor.get("digest")
+        if not isinstance(descriptor_digest, str) or not _SHA256_DIGEST.fullmatch(descriptor_digest):
+            raise VerificationError("Buildx metadata descriptor digest is missing or noncanonical")
+        if descriptor_digest != image_digest:
+            raise VerificationError("Buildx metadata image and descriptor digests differ")
+        media_type = descriptor.get("mediaType")
+        if not isinstance(media_type, str) or not media_type:
+            raise VerificationError("Buildx metadata descriptor media type is missing")
 
     return {
         "metadata_file_sha256": _sha256(raw),
         "metadata_file_size_bytes": len(raw),
         "buildx_image_digest": image_digest,
         "buildx_config_digest": config_digest,
+        "buildx_descriptor_status": descriptor_status,
         "buildx_descriptor_digest": descriptor_digest,
         "buildx_descriptor_media_type": media_type,
     }
@@ -1208,10 +1248,12 @@ def execute(source_root: Path, evidence_path: Path) -> dict[str, Any]:
         if build_exit_code != 0:
             raise VerificationError(f"Buildx image build exited with code {build_exit_code}")
         metadata_raw = build_metadata_path.read_bytes()
+        report["build"]["metadata_evidence"] = _build_metadata_evidence(metadata_raw)
         report["build"].update({
             "metadata_file_sha256": _sha256(metadata_raw),
             "metadata_file_size_bytes": len(metadata_raw),
         })
+        _write_evidence_checkpoint(evidence_path, report)
         build_metadata = _parse_build_metadata(metadata_raw)
         report["build"].update(build_metadata)
         image = _image_identity(image_tag)
@@ -1230,6 +1272,7 @@ def execute(source_root: Path, evidence_path: Path) -> dict[str, Any]:
             **image,
             "buildx_image_digest": build_metadata["buildx_image_digest"],
             "buildx_config_digest": build_metadata["buildx_config_digest"],
+            "buildx_descriptor_status": build_metadata["buildx_descriptor_status"],
             "buildx_descriptor_digest": build_metadata["buildx_descriptor_digest"],
             "buildx_descriptor_media_type": build_metadata["buildx_descriptor_media_type"],
             "buildx_metadata_file_sha256": build_metadata["metadata_file_sha256"],

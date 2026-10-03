@@ -22,6 +22,7 @@ from scripts import issue82_github_runner_probe_combined as runner_probe
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_PATH = ROOT / ".github" / "workflows" / "issue-82-v5-container-combined.yml"
+DEFAULT_DESCRIPTOR = object()
 
 
 def completed(returncode: int, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess[str]:
@@ -235,7 +236,9 @@ class CombinedRunnerPreflightTests(unittest.TestCase):
 
 
 class CombinedRunnerBuildIdentityTests(unittest.TestCase):
-    def run_identity(self, config_digest: str, backend_image_id: str) -> tuple[dict[str, object], list[list[str]], list[dict[str, object]], Path]:
+    def run_identity(self, config_digest: str, backend_image_id: str, *,
+                     descriptor: object = DEFAULT_DESCRIPTOR,
+                     descriptor_present: bool = True) -> tuple[dict[str, object], list[list[str]], list[dict[str, object]], Path]:
         runner_temp = ROOT
         evidence_path = ROOT / f".issue82-identity-{uuid.uuid4().hex}.json"
         self.addCleanup(lambda: evidence_path.unlink(missing_ok=True))
@@ -248,14 +251,16 @@ class CombinedRunnerBuildIdentityTests(unittest.TestCase):
             "RUNNER_OS": "Linux", "RUNNER_ARCH": "X64", "RUNNER_TEMP": str(runner_temp),
         }
         manifest_digest = f"sha256:{'c' * 64}"
-        metadata_raw = json.dumps({
+        metadata: dict[str, object] = {
             "containerimage.config.digest": config_digest,
             "containerimage.digest": manifest_digest,
-            "containerimage.descriptor": {
+        }
+        if descriptor_present:
+            metadata["containerimage.descriptor"] = ({
                 "digest": manifest_digest,
                 "mediaType": "application/vnd.oci.image.manifest.v1+json",
-            },
-        }, sort_keys=True).encode()
+            } if descriptor is DEFAULT_DESCRIPTOR else descriptor)
+        metadata_raw = json.dumps(metadata, sort_keys=True).encode()
         inspect_raw = json.dumps({
             "Id": backend_image_id, "Os": "linux", "Architecture": "amd64",
             "Config": {"Labels": {
@@ -326,6 +331,78 @@ class CombinedRunnerBuildIdentityTests(unittest.TestCase):
              patch.object(runner_probe, "_write_evidence_checkpoint", side_effect=capture_checkpoint):
             report = runner_probe.execute(ROOT, evidence_path)
         return report, calls, imports, evidence_path
+
+    def test_absent_build_descriptor_is_explicit_and_keeps_image_id_gate_fail_closed(self) -> None:
+        config = f"sha256:{'a' * 64}"
+        backend = f"sha256:{'b' * 64}"
+        report, _calls, imports, evidence = self.run_identity(
+            config, backend, descriptor_present=False
+        )
+
+        self.assertEqual(report["status"], "failed")
+        runtime = report["runtime"]
+        self.assertEqual(runtime["buildx_descriptor_status"], "not_provided")
+        self.assertIsNone(runtime["buildx_descriptor_digest"])
+        self.assertIsNone(runtime["buildx_descriptor_media_type"])
+        self.assertIs(runtime["buildx_config_matches_docker_backend_image_id"], False)
+        self.assertEqual(imports, [])
+        self.assertIn("Buildx config digest differs", report["failure"])
+        self.assertEqual(json.loads(evidence.read_text(encoding="utf-8")), report)
+
+    def test_present_malformed_descriptor_fails_with_bounded_preparse_metadata_evidence(self) -> None:
+        config = f"sha256:{'a' * 64}"
+        report, _calls, imports, evidence = self.run_identity(config, config, descriptor=None)
+
+        self.assertEqual(report["status"], "failed")
+        self.assertIsNone(report["runtime"])
+        self.assertIn("Buildx metadata image descriptor", report["failure"])
+        self.assertEqual(imports, [])
+        metadata = {
+            "containerimage.config.digest": config,
+            "containerimage.digest": f"sha256:{'c' * 64}",
+            "containerimage.descriptor": None,
+        }
+        raw = json.dumps(metadata, sort_keys=True).encode()
+        receipt = json.loads(evidence.read_text(encoding="utf-8"))
+        diagnostics = receipt["build"]["metadata_evidence"]
+        self.assertEqual(diagnostics["metadata_file_sha256"], hashlib.sha256(raw).hexdigest())
+        self.assertEqual(diagnostics["metadata_file_size_bytes"], len(raw))
+        self.assertEqual(diagnostics["field_presence"]["containerimage.descriptor"], True)
+        self.assertEqual(diagnostics["field_types"]["containerimage.descriptor"], "NoneType")
+        self.assertIn('"containerimage.descriptor": null', diagnostics["raw_metadata_preview_utf8"])
+        self.assertLess(evidence.stat().st_size, 480_000)
+
+    def test_build_metadata_rejects_present_malformed_or_conflicting_descriptors(self) -> None:
+        image_digest = f"sha256:{'c' * 64}"
+        base = {
+            "containerimage.config.digest": f"sha256:{'a' * 64}",
+            "containerimage.digest": image_digest,
+        }
+        invalid = [
+            ("null", None),
+            ("wrong_type", "descriptor"),
+            ("missing_digest", {"mediaType": "application/vnd.oci.image.manifest.v1+json"}),
+            ("digest_conflict", {
+                "digest": f"sha256:{'d' * 64}",
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            }),
+        ]
+        for name, descriptor in invalid:
+            with self.subTest(case=name):
+                metadata = dict(base)
+                metadata["containerimage.descriptor"] = descriptor
+                with self.assertRaises(runner_probe.VerificationError):
+                    runner_probe._parse_build_metadata(json.dumps(metadata).encode())
+
+    def test_build_metadata_evidence_caps_raw_preview_and_keeps_full_hash(self) -> None:
+        raw = b'{"padding":"' + (b"x" * 20_000) + b'"}'
+
+        evidence = runner_probe._build_metadata_evidence(raw)
+
+        self.assertEqual(len(evidence["raw_metadata_preview_utf8"].encode("utf-8")), 2_048)
+        self.assertTrue(evidence["raw_metadata_preview_truncated"])
+        self.assertEqual(evidence["metadata_file_size_bytes"], len(raw))
+        self.assertEqual(evidence["metadata_file_sha256"], hashlib.sha256(raw).hexdigest())
 
     def test_config_match_gate_compares_config_identity_and_blocks_mismatch_before_import(self) -> None:
         for matches in (False, True):
