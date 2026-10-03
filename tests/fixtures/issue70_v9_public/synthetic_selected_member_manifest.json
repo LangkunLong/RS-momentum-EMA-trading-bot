@@ -1,0 +1,26 @@
+{
+  "fixture_id": "issue70-v9-public-synthetic-members-v1",
+  "fixture_scope": "TEST_ONLY_NOT_REAL_SEC_MEMBER_IDENTITIES",
+  "source_budgets": {
+    "selected_member_hashes": {
+      "submissions": [
+        {"member_name": "CIK9999900000.json", "sha256": "1111111111111111111111111111111111111111111111111111111111111111", "expanded_bytes": 101},
+        {"member_name": "CIK9999900001.json", "sha256": "2222222222222222222222222222222222222222222222222222222222222222", "expanded_bytes": 102},
+        {"member_name": "CIK9999900002.json", "sha256": "3333333333333333333333333333333333333333333333333333333333333333", "expanded_bytes": 103},
+        {"member_name": "CIK9999900003.json", "sha256": "4444444444444444444444444444444444444444444444444444444444444444", "expanded_bytes": 104},
+        {"member_name": "CIK9999900004.json", "sha256": "5555555555555555555555555555555555555555555555555555555555555555", "expanded_bytes": 105},
+        {"member_name": "CIK9999900005.json", "sha256": "6666666666666666666666666666666666666666666666666666666666666666", "expanded_bytes": 106},
+        {"member_name": "CIK9999900006.json", "sha256": "7777777777777777777777777777777777777777777777777777777777777777", "expanded_bytes": 107},
+        {"member_name": "CIK9999900007.json", "sha256": "8888888888888888888888888888888888888888888888888888888888888888", "expanded_bytes": 108},
+        {"member_name": "CIK9999900008.json", "sha256": "9999999999999999999999999999999999999999999999999999999999999999", "expanded_bytes": 109},
+        {"member_name": "CIK9999900000-submissions-001.json", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "expanded_bytes": 110}
+      ],
+      "companyfacts": [
+        {"member_name": "CIK9999900000.json", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "expanded_bytes": 201},
+        {"member_name": "CIK9999900001.json", "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "expanded_bytes": 202},
+        {"member_name": "CIK9999900002.json", "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "expanded_bytes": 203},
+        {"member_name": "CIK9999900003.json", "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "expanded_bytes": 204}
+      ]
+    }
+  }
+}

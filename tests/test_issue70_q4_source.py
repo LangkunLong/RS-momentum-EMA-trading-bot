@@ -8,7 +8,10 @@ import json
 from pathlib import Path
 import zipfile
 
+import pytest
+
 import core.sec_pit_fundamentals as sec
+from tools import generate_issue70_q4_source_sample as issue70_v9
 
 
 CIK = "0000000001"
@@ -539,6 +542,139 @@ def test_direct_q4_and_additive_revenue_require_same_accession_basis(tmp_path: P
     )
     assert annual.basic_eps == 4.2
     assert all(row.period_end >= date(2020, 1, 1) for row in result.rows)
+
+
+def test_derived_q4_basis_inputs_retain_raw_public_dates_and_intervals(tmp_path: Path) -> None:
+    result = _extract(tmp_path)
+    q4_audit = next(
+        audit
+        for audit in result.audit_rows
+        if audit.statement_type == "quarterly"
+        and audit.period_end == date.fromisoformat(ANNUAL_END)
+        and json.loads(audit.metric_sources)["total_revenue"].get("q4_attribution") == "derived"
+    )
+
+    revenue = json.loads(q4_audit.metric_sources)["total_revenue"]
+    assert all("source_public_date" not in item for item in revenue["inputs"])
+    assert [
+        (
+            item["source_value"],
+            item["period_start"],
+            item["period_end"],
+            (
+                item["acceptance_datetime"][:10]
+                if item["acceptance_datetime"]
+                else item["filed_date"]
+            ),
+            item["public_date_basis"],
+            item["public_date"],
+        )
+        for item in revenue["inputs"]
+    ] == [
+        (100.0, "2024-01-01", "2024-12-31", "2025-02-14", "acceptance_datetime", "2025-02-18"),
+        (10.0, "2024-01-01", "2024-03-31", "2025-02-14", "acceptance_datetime", "2025-02-18"),
+        (20.0, "2024-04-01", "2024-06-30", "2025-02-14", "acceptance_datetime", "2025-02-18"),
+        (30.0, "2024-07-01", "2024-09-30", "2025-02-14", "acceptance_datetime", "2025-02-18"),
+    ]
+
+
+def test_v9_coverage_keeps_all_field_denominators_and_q4_basis_origins(tmp_path: Path) -> None:
+    result = _extract(tmp_path)
+    synthetic_calendar_sessions = (
+        date(2024, 5, 1),
+        date(2024, 8, 2),
+        date(2024, 11, 4),
+        date(2025, 2, 18),
+        date(2025, 3, 4),
+        date(2025, 3, 11),
+        date(2025, 3, 12),
+        date(2025, 12, 31),
+    )
+    security = sec.SecurityMasterRow(
+        TICKER,
+        CIK,
+        "Example Issuer",
+        date(2025, 3, 12),
+        date(2025, 12, 31),
+        "exact_current_ticker",
+    )
+    records, summary = issue70_v9._build_v9_coverage_records(
+        fundamentals=result,
+        security_rows=(security,),
+        evaluation_sessions=(date(2025, 3, 11), date(2025, 3, 12)),
+        calendar_sessions=synthetic_calendar_sessions,
+    )
+
+    field_rows = [row for row in records if row["record_kind"] == "field_session"]
+    assert {row["slot_metric"] for row in field_rows} == {
+        "basic_eps",
+        "diluted_eps",
+        "total_revenue",
+        "net_income",
+        "common_stock",
+        "total_stockholders_equity",
+        "shares_outstanding",
+    }
+    common_stock = next(row for row in field_rows if row["slot_metric"] == "common_stock")
+    assert common_stock["consumer_status"] == "intentionally_not_exposed"
+    assert common_stock["actual_policy_consumption"] == "not_measured_no_policy_replay"
+    assert summary["eligible_security_session_count"] == 1
+    assert summary["field_session_denominator_count"] == 7
+    assert sum(row["membership_status"] == "pre_membership_or_outside_sample" for row in field_rows) == 7
+    assert summary["pre_membership_rows_are_excluded_from_denominators"] is True
+    assert summary["by_evaluation_year"]["2025"]["field:total_revenue:raw_fact_candidate_count"] >= 1
+    assert summary["by_evaluation_year"]["2025"]["field:total_revenue:visible_origin_count"] >= 1
+    assert summary["unique_eligible_tickers_by_evaluation_year_and_field"]["2025:total_revenue"] == 1
+
+    revenue_slot = next(
+        row
+        for row in records
+        if row["record_kind"] == "expected_slot"
+        and row["slot_metric"] == "q4_total_revenue"
+        and row["expected_period_end"] == ANNUAL_END
+    )
+    assert revenue_slot["status"] == "derived"
+    basis = [
+        row
+        for row in records
+        if row["record_kind"] == "source_origin"
+        and row["slot_id"] == revenue_slot["slot_id"]
+    ]
+    assert [row["origin_role"] for row in basis] == [
+        "q4_fy_basis",
+        "q4_q1_basis",
+        "q4_q2_basis",
+        "q4_q3_basis",
+    ]
+    assert [row["source_value"] for row in basis] == ["100", "10", "20", "30"]
+    assert [(row["source_period_start"], row["source_period_end"]) for row in basis] == [
+        ("2024-01-01", "2024-12-31"),
+        ("2024-01-01", "2024-03-31"),
+        ("2024-04-01", "2024-06-30"),
+        ("2024-07-01", "2024-09-30"),
+    ]
+    assert {row["source_public_date"] for row in basis} == {"2025-02-14"}
+    assert {row["available_from_session"] for row in basis} == {"2025-02-18"}
+    assert all(row["public_date_basis"] == "acceptance_datetime" for row in basis)
+    assert all(row["origin_id"] for row in basis)
+
+    quarterly_eps = [
+        row
+        for row in records
+        if row["record_kind"] == "expected_slot"
+        and row["slot_metric"] == "quarterly_eps_growth"
+    ]
+    assert [row["slot_number"] for row in quarterly_eps] == ["1", "2", "3", "4"]
+    assert any(row["status"] == "missing" for row in quarterly_eps)
+
+    with pytest.raises(ValueError, match="250,000-row cap"):
+        issue70_v9._build_v9_coverage_records(
+            fundamentals=result,
+            security_rows=(security,),
+            evaluation_sessions=(date(2025, 3, 11),),
+            calendar_sessions=synthetic_calendar_sessions,
+            max_records=1,
+        )
 
 
 def test_q4_revenue_rejects_noncontiguous_quarter_starts(tmp_path: Path) -> None:

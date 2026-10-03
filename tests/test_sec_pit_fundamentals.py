@@ -44,6 +44,31 @@ def test_balance_only_payload_does_not_use_income_quarter_context_locals() -> No
     assert "fiscal_period_interpretation" not in candidates[0].metric_details["common_stock"]
 
 
+def test_fact_without_a_strict_next_session_gets_a_distinct_omission_counter() -> None:
+    counters: Counter[str] = Counter()
+
+    candidate = sec._candidate_metadata(
+        {
+            "accn": "0000000001-25-000001",
+            "form": "10-K",
+            "filed": "2025-12-31",
+            "end": "2025-11-30",
+            "val": 10.0,
+        },
+        cik="0000000001",
+        acceptances={},
+        spy_days=(date(2025, 12, 31),),
+        start_date=date(2010, 1, 1),
+        end_date=date(2025, 12, 31),
+        counters=counters,
+    )
+
+    assert candidate is None
+    assert counters["no_next_session_fact_omissions"] == 1
+    assert counters["post_cutoff_fact_omissions"] == 1
+    assert counters["mapped_after_cutoff_fact_omissions"] == 0
+
+
 def _quarterly_fact(accession: str, form: str, filed: str, value: float) -> dict[str, object]:
     return {
         "accn": accession,

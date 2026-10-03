@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import time
 import uuid
 import zipfile
@@ -30,17 +31,47 @@ from fetch_sec_pit_fundamentals import (
     _json_bytes,
     _write_csv,
 )
+from tools.issue70_v9_coverage import (
+    build_v8_source_window_comparison,
+    build_v9_coverage_records,
+    serialize_v9_coverage_records,
+)
 
 
 TICKERS = ("A", "AMZN", "MSFT", "KDP")
 START_DATE = date(2020, 1, 1)
 END_DATE = date(2025, 12, 31)
+V9_HISTORY_START = date(2010, 1, 1)
+V9_EVALUATION_START = date(2020, 1, 1)
+V9_EVALUATION_END = date(2025, 12, 31)
+V9_CALENDAR_SHA256 = "f658bbfff04b623a3e20afa0ed2909e15e33470da4ef8305bd811f811a3c8cb5"
+V9_CALENDAR_PROVENANCE_SHA256 = "666e76d9a926b7c0dca602461cfb218c19a77f44a1b2657a8e5f8a93e54221b7"
+V9_CALENDAR_MARKER_SHA256 = "8143e95025914ad40d2eba1de669128adb69926cc94152b92d0b7790f7966bbf"
+V9_CALENDAR_DECISION_SHA256 = "5e50cfa5a8184c2646cfbdfa44f9487ff87497e53a459fee8e2c15a07790243e"
+V9_CALENDAR_REVIEW_SHA256 = "6d1060e23a005030aeec3b0f5243a9e476f1a28de418797af3cc91b319afe6ee"
+V9_REFERENCE_CALENDAR_SHA256 = "93d8ef415bd6be516fb32ebfa5986ad45cbc2077e5beaa9615943db8890be5b9"
+V9_REVIEWED_COMMIT = "52b7c35d465bb0874161c751dccc590445695fee"
+V9_REVIEWED_TREE = "11409278dd40f48083ea6324352dc7fb264c8157"
+V9_WHEEL_SHA256 = "fc5a2ad0d61b5c3a6539a3061cd4cbb55c59f4a903455cec7926e4b798919996"
+V9_V8_SOURCE_MANIFEST_SHA256 = "c5ecb3a97639861d6c79e5ab18aed49798b38eb4c9dcd9206f6bdabe08d3073f"
+V9_EXPECTED_CIKS = {
+    "A": "0001090872",
+    "AMZN": "0001018724",
+    "KDP": "0001418135",
+    "MSFT": "0000789019",
+}
+V9_EXPECTED_CALENDAR_SESSIONS = 4024
+V9_EXPECTED_RETAINED_OVERLAP = 1508
 MAX_SELECTED_MEMBER_BYTES = 64 * 1024 * 1024
 MAX_SELECTED_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
 MAX_LEGACY_FUNDAMENTALS_BYTES = 11_000_000
 MAX_ALTERNATE_AUDIT_BYTES = 148_000_000
 MAX_OUTPUT_BYTES = 20 * 1024 * 1024
 MAX_RUNTIME_SECONDS = 10 * 60
+MAX_FINANCIAL_AUDIT_ROWS = 10_000
+MAX_ISSUER_SESSION_GRID = 6_032
+MAX_COVERAGE_RECORDS = 250_000
+MAX_COVERAGE_UNCOMPRESSED_BYTES = 128 * 1024 * 1024
 CIK_MEMBER = re.compile(r"(?:^|/)CIK(?P<cik>\d{10})\.json$")
 
 
@@ -103,11 +134,408 @@ def _validate_bound_file(path: Path, expected_sha256: str, *, expected_bytes: in
     return digest
 
 
+def _read_bound_json(path: Path, expected_sha256: str) -> tuple[str, Mapping[str, Any]]:
+    """Parse the exact small JSON bytes whose digest is part of the v9 contract."""
+    try:
+        checked_path = sec._regular_file(path, path.name)
+        if checked_path.stat().st_size > 4 * 1024 * 1024:
+            raise ValueError(f"bound JSON input exceeds the 4 MiB manifest cap: {path.name}")
+        raw = checked_path.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"bound JSON input is unavailable: {path.name}") from exc
+    digest = hashlib.sha256(raw).hexdigest()
+    if digest != expected_sha256:
+        raise ValueError(f"retained input digest differs from its receipt: {path.name}")
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid JSON input: {path}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"JSON input must be an object: {path}")
+    return digest, value
+
+
+def _validate_v8_selected_member_hashes(
+    manifest: Mapping[str, Any], actual_selected: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> Mapping[str, Any]:
+    """Bind measured `(archive, member, raw SHA, expanded bytes)` tuples to v8."""
+    source_budgets = manifest.get("source_budgets")
+    expected_selected = (
+        source_budgets.get("selected_member_hashes")
+        if isinstance(source_budgets, Mapping)
+        else None
+    )
+    if not isinstance(expected_selected, Mapping):
+        raise ValueError("hash-bound v8 source manifest lacks selected SEC member identities")
+    if set(expected_selected) != {"submissions", "companyfacts"}:
+        raise ValueError("hash-bound v8 source manifest has an unexpected selected-member group")
+    if set(actual_selected) != {"submissions", "companyfacts"}:
+        raise ValueError("measured SEC member identities have an unexpected group")
+
+    matched_counts: dict[str, int] = {}
+    expected_identities: dict[tuple[str, str], tuple[str, int]] = {}
+    actual_identities: dict[tuple[str, str], tuple[str, int]] = {}
+
+    def add_rows(
+        target: dict[tuple[str, str], tuple[str, int]], rows: Sequence[Any], *,
+        archive: str, source: str,
+    ) -> None:
+        member_pattern = (
+            re.compile(r"^CIK\d{10}\.json$")
+            if archive == "companyfacts"
+            else re.compile(r"^CIK\d{10}(?:-submissions-\d{3})?\.json$")
+        )
+        for row in rows:
+            if not isinstance(row, Mapping):
+                raise ValueError(f"{source} selected SEC member record is malformed: {archive}")
+            name = row.get("member_name")
+            digest = row.get("sha256")
+            expanded_bytes = row.get("expanded_bytes")
+            if (
+                not isinstance(name, str)
+                or not member_pattern.fullmatch(name)
+                or "\\" in name
+                or not isinstance(digest, str)
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+                or not isinstance(expanded_bytes, int)
+                or isinstance(expanded_bytes, bool)
+                or expanded_bytes <= 0
+            ):
+                raise ValueError(f"{source} selected SEC member identity is malformed: {archive}")
+            key = (archive, name)
+            if key in target:
+                raise ValueError(f"{source} selected SEC member identity is duplicated: {archive}/{name}")
+            target[key] = (digest, expanded_bytes)
+
+    for group in ("submissions", "companyfacts"):
+        expected_rows = expected_selected[group]
+        actual_rows = actual_selected[group]
+        if not isinstance(expected_rows, list) or not isinstance(actual_rows, Sequence):
+            raise ValueError(f"selected SEC member identities are invalid: {group}")
+        add_rows(expected_identities, expected_rows, archive=group, source="v8 manifest")
+        add_rows(actual_identities, actual_rows, archive=group, source="measured")
+        matched_counts[group] = len(expected_rows)
+    if len(expected_identities) != 14:
+        raise ValueError("hash-bound v8 source contract must contain exactly 14 selected SEC members")
+    if set(expected_identities) != set(actual_identities):
+        raise ValueError("measured archive/member namespaces differ from the hash-bound v8 manifest")
+    for archive, name in sorted(expected_identities):
+        if actual_identities[(archive, name)] != expected_identities[(archive, name)]:
+            raise ValueError(
+                "measured archive/member digest or expanded length differs from the "
+                f"hash-bound v8 manifest: {archive}/{name}"
+            )
+    return {
+        "status": "matched",
+        "selected_member_count": len(expected_identities),
+        "selected_members_by_archive": matched_counts,
+        "compared_fields": ["archive", "member_name", "sha256", "expanded_bytes"],
+        "selected_members": [
+            {
+                "archive": archive,
+                "member_name": name,
+                "sha256": actual_identities[(archive, name)][0],
+                "expanded_bytes": actual_identities[(archive, name)][1],
+            }
+            for archive, name in sorted(actual_identities)
+        ],
+    }
+
+
+def _validate_combined_v9_evidence_caps(
+    coverage_artifact: Mapping[str, Any], financial_summary: Mapping[str, Any], *,
+    max_records: int = MAX_COVERAGE_RECORDS,
+    max_uncompressed_bytes: int = MAX_COVERAGE_UNCOMPRESSED_BYTES,
+) -> Mapping[str, int]:
+    comparison = financial_summary.get("v8_source_window_comparison")
+    if not isinstance(comparison, Mapping):
+        raise ValueError("complete v9 financial summary lacks its source-window comparison")
+    by_slot_id = comparison.get("by_slot_id")
+    if not isinstance(by_slot_id, Mapping) or int(comparison.get("expected_slot_count", -1)) != len(by_slot_id):
+        raise ValueError("v9 comparison slot count differs from its complete by-slot structure")
+    annual_gap_slots = financial_summary.get("annual_fiscal_year_gap_slots")
+    if (
+        not isinstance(annual_gap_slots, list)
+        or int(financial_summary.get("annual_fiscal_year_gap_slot_count", -1)) != len(annual_gap_slots)
+    ):
+        raise ValueError("v9 annual-gap diagnostic count differs from its complete summary structure")
+
+    origin_decision_count = 0
+    for slot_id, slot_detail in by_slot_id.items():
+        if not isinstance(slot_id, str) or not isinstance(slot_detail, Mapping):
+            raise ValueError("v9 comparison contains a malformed slot detail")
+        origin_evidence = slot_detail.get("origin_evidence")
+        if not isinstance(origin_evidence, Mapping):
+            raise ValueError("v9 comparison slot lacks linked origin evidence")
+        decisions = origin_evidence.get("window_candidates_by_origin_id")
+        if not isinstance(decisions, Mapping):
+            raise ValueError("v9 comparison slot lacks its origin window decisions")
+        origin_decision_count += len(decisions)
+
+    comparison_entry_count = len(by_slot_id)
+    annual_gap_count = len(annual_gap_slots)
+    total_records = (
+        int(coverage_artifact["record_count"])
+        + comparison_entry_count
+        + origin_decision_count
+        + annual_gap_count
+    )
+    if total_records > max_records:
+        raise ValueError(
+            "combined v9 coverage, comparison-slot, origin-decision, and annual-gap evidence "
+            f"exceeds the configured {max_records:,}-record cap"
+        )
+    summary_bytes = len(_json_bytes(financial_summary))
+    total_uncompressed = (
+        int(coverage_artifact["uncompressed_byte_length"])
+        + summary_bytes
+    )
+    if total_uncompressed > max_uncompressed_bytes:
+        raise ValueError(
+            "combined v9 coverage CSV and complete financial summary exceed the configured "
+            f"{max_uncompressed_bytes:,}-byte canonical evidence cap"
+        )
+    return {
+        "coverage_csv_record_count": int(coverage_artifact["record_count"]),
+        "comparison_slot_count": comparison_entry_count,
+        "origin_window_decision_count": origin_decision_count,
+        "annual_gap_diagnostic_count": annual_gap_count,
+        "combined_record_count": total_records,
+        "coverage_csv_uncompressed_bytes": int(coverage_artifact["uncompressed_byte_length"]),
+        "financial_summary_bytes": summary_bytes,
+        "combined_canonical_uncompressed_bytes": total_uncompressed,
+    }
+
+
+def _complete_v9_coverage_summary(
+    coverage_summary: Mapping[str, Any], coverage_artifact: Mapping[str, Any],
+    comparison: Mapping[str, Any], fundamentals_coverage: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        **coverage_summary,
+        "compressed_evidence": dict(coverage_artifact),
+        "v8_source_window_comparison": comparison,
+        "prehistory_and_no_next_session_omissions": {
+            "pre_window_filing_fact_candidates": int(
+                fundamentals_coverage.get("pre_window_filing_omissions", 0)
+            ),
+            "no_next_session_fact_candidates": int(
+                fundamentals_coverage.get("no_next_session_fact_omissions", 0)
+            ),
+            "post_cutoff_or_no_next_session_fact_candidates": int(
+                fundamentals_coverage.get("post_cutoff_fact_omissions", 0)
+            ),
+            "mapped_after_cutoff_fact_candidates": int(
+                fundamentals_coverage.get("mapped_after_cutoff_fact_omissions", 0)
+            ),
+            "unique_cik_accession_filing_event_counts": "unmeasured_from_retained_candidate_counters",
+            "distinct_cik_period_metric_vintage_counts": "unmeasured_from_retained_candidate_counters",
+        },
+    }
+
+
+def _calendar_dates(path: Path, *, expected_header: tuple[str, ...]) -> tuple[date, ...]:
+    values: list[date] = []
+    with sec._regular_file(path, path.name).open("r", encoding="utf-8", newline="") as stream:
+        reader = csv.DictReader(stream)
+        if tuple(reader.fieldnames or ()) != expected_header:
+            raise ValueError(f"calendar CSV header is invalid: {path.name}")
+        for row in reader:
+            try:
+                values.append(date.fromisoformat(row[expected_header[0]]))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"calendar CSV contains an invalid date: {path.name}") from exc
+    if not values or values != sorted(set(values)):
+        raise ValueError(f"calendar CSV dates must be nonempty, unique, and sorted: {path.name}")
+    return tuple(values)
+
+
+def _validate_v9_calendar_inputs(
+    *,
+    session_calendar_path: Path,
+    adoption_decision_path: Path,
+    calendar_provenance_path: Path,
+    candidate_marker_path: Path,
+    retained_calendar_path: Path,
+) -> Mapping[str, Any]:
+    """Bind the exact principal-adopted calendar before any SEC archive access."""
+    decision_path = sec._regular_file(adoption_decision_path, "calendar adoption decision")
+    decision_sha256 = _validate_bound_file(decision_path, V9_CALENDAR_DECISION_SHA256)
+    decision = _json_file(decision_path)
+    if (
+        decision.get("decision") != "ADOPT_EXACT_WHEEL_BOUND_DERIVED_DAILY_XNYS_SESSIONS_INPUT"
+        or decision.get("reviewed_commit") != V9_REVIEWED_COMMIT
+        or decision.get("reviewed_tree") != V9_REVIEWED_TREE
+        or decision.get("calendar_path") != "docs/issue-70-calendar-candidate-v1/exchange_sessions.csv"
+        or decision.get("calendar_bytes") != 44_275
+        or decision.get("calendar_sha256") != V9_CALENDAR_SHA256
+        or decision.get("provenance_sha256") != V9_CALENDAR_PROVENANCE_SHA256
+        or decision.get("rows") != V9_EXPECTED_CALENDAR_SESSIONS
+        or decision.get("requested_range") != ["2010-01-01", "2025-12-31"]
+        or decision.get("actual_session_bounds") != ["2010-01-04", "2025-12-31"]
+        or decision.get("source_label") != "derived_exchange_schedule"
+        or decision.get("not_observed_price_history") is not True
+        or decision.get("reference_overlap")
+        != {"dates": V9_EXPECTED_RETAINED_OVERLAP, "derived_only": 0, "retained_only": 0, "full_interval": "2020–2025"}
+        or decision.get("boundary_checks") != 14
+        or decision.get("report_sha256") != V9_CALENDAR_REVIEW_SHA256
+        or decision.get("root_full_read_and_report_hash_verified") is not True
+        or V9_WHEEL_SHA256 not in str(decision.get("package_identity", ""))
+    ):
+        raise ValueError("calendar adoption decision does not match the accepted exact-input record")
+
+    calendar_path = sec._regular_file(session_calendar_path, "adopted session calendar")
+    try:
+        calendar_sha256 = _validate_bound_file(
+            calendar_path, V9_CALENDAR_SHA256, expected_bytes=44_275
+        )
+    except ValueError as exc:
+        raise ValueError(f"calendar CSV digest or byte length differs from the adopted input: {exc}") from exc
+    provenance_path = sec._regular_file(calendar_provenance_path, "calendar provenance")
+    provenance_sha256 = _validate_bound_file(
+        provenance_path, V9_CALENDAR_PROVENANCE_SHA256
+    )
+    provenance = _json_file(provenance_path)
+    if (
+        provenance.get("schema_version") != 1
+        or provenance.get("status") != "research_validation_passed"
+        or provenance.get("origin") != "derived_exchange_schedule"
+        or provenance.get("not_observed_price_history") is not True
+        or provenance.get("calendar") != "XNYS"
+        or provenance.get("requested_start") != "2010-01-01"
+        or provenance.get("requested_end") != "2025-12-31"
+        or provenance.get("first_session") != "2010-01-04"
+        or provenance.get("last_session") != "2025-12-31"
+        or provenance.get("rows") != V9_EXPECTED_CALENDAR_SESSIONS
+        or provenance.get("calendar_sha256") != calendar_sha256
+        or provenance.get("retained_reference_sha256") != V9_REFERENCE_CALENDAR_SHA256
+        or provenance.get("retained_rows") != V9_EXPECTED_RETAINED_OVERLAP
+        or provenance.get("overlap_differences") != {"derived_only": [], "retained_only": []}
+    ):
+        raise ValueError("calendar provenance does not match the adopted derived schedule")
+    strict_checks = provenance.get("strict_next_session_checks")
+    if (
+        not isinstance(strict_checks, dict)
+        or len(strict_checks) != 14
+        or any(
+            not isinstance(check, dict) or check.get("expected") != check.get("actual")
+            for check in strict_checks.values()
+        )
+    ):
+        raise ValueError("calendar provenance strict-next-session checks are incomplete")
+    packages = provenance.get("packages")
+    if not isinstance(packages, list) or not any(
+        isinstance(package, dict)
+        and package.get("name") == "exchange_calendars"
+        and package.get("version") == "4.13.2"
+        and package.get("sha256") == V9_WHEEL_SHA256
+        for package in packages
+    ):
+        raise ValueError("calendar provenance does not bind the inspected exchange_calendars wheel")
+
+    marker_path = sec._regular_file(candidate_marker_path, "historical calendar publication marker")
+    marker_sha256 = _validate_bound_file(marker_path, V9_CALENDAR_MARKER_SHA256)
+    marker = _json_file(marker_path)
+    marker_files = marker.get("files")
+    if (
+        marker.get("status") != "candidate_pending_independent_adoption"
+        or not isinstance(marker_files, dict)
+        or marker_files.get("exchange_sessions.csv") != calendar_sha256
+        or marker_files.get("calendar_provenance.json") != provenance_sha256
+    ):
+        raise ValueError("historical calendar candidate marker changed or lost its original status")
+
+    sessions = _calendar_dates(calendar_path, expected_header=("trade_date",))
+    if (
+        len(sessions) != V9_EXPECTED_CALENDAR_SESSIONS
+        or (sessions[0].isoformat(), sessions[-1].isoformat()) != ("2010-01-04", "2025-12-31")
+    ):
+        raise ValueError("adopted calendar session count or bounds differ from the adoption decision")
+    retained_path = sec._regular_file(retained_calendar_path, "retained comparison session calendar")
+    retained_sha256 = _validate_bound_file(retained_path, V9_REFERENCE_CALENDAR_SHA256)
+    retained_sessions = _calendar_dates(retained_path, expected_header=("trade_date",))
+    if len(retained_sessions) != V9_EXPECTED_RETAINED_OVERLAP:
+        raise ValueError("retained comparison calendar row count differs from its receipt")
+    derived_window = tuple(
+        session for session in sessions
+        if V9_EVALUATION_START <= session <= V9_EVALUATION_END
+    )
+    derived_only = sorted(set(derived_window) - set(retained_sessions))
+    retained_only = sorted(set(retained_sessions) - set(derived_window))
+    if derived_only or retained_only or len(derived_window) != V9_EXPECTED_RETAINED_OVERLAP:
+        raise ValueError("adopted calendar does not match the full retained 2020–2025 session set")
+    return {
+        "sessions": sessions,
+        "calendar_sha256": calendar_sha256,
+        "calendar_provenance_sha256": provenance_sha256,
+        "adoption_decision_sha256": decision_sha256,
+        "candidate_marker_sha256": marker_sha256,
+        "independent_review_sha256": V9_CALENDAR_REVIEW_SHA256,
+        "reviewed_commit": V9_REVIEWED_COMMIT,
+        "reviewed_tree": V9_REVIEWED_TREE,
+        "source_label": "derived_exchange_schedule",
+        "wheel_sha256": V9_WHEEL_SHA256,
+        "retained_reference_sha256": retained_sha256,
+        "retained_window_overlap": {
+            "dates": len(derived_window),
+            "derived_only": 0,
+            "retained_only": 0,
+        },
+    }
+
+
 def _write_json(path: Path, value: Mapping[str, Any]) -> None:
     with path.open("xb") as stream:
         stream.write(_json_bytes(value))
         stream.flush()
         os.fsync(stream.fileno())
+
+
+def _source_revision(repo_root: Path) -> Mapping[str, str]:
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo_root, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+        status = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=repo_root, check=True,
+            capture_output=True, text=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ValueError("unable to bind a clean source revision for v9 provenance") from exc
+    if not re.fullmatch(r"[0-9a-f]{40}", commit) or status.strip():
+        raise ValueError("v9 financial generation requires a clean committed source revision")
+    return {"commit": commit, "worktree_status": "clean"}
+
+
+def _build_v9_coverage_records(
+    *,
+    fundamentals: sec.FundamentalExportResult,
+    security_rows: Sequence[sec.SecurityMasterRow],
+    evaluation_sessions: Sequence[date],
+    calendar_sessions: Sequence[date] | None = None,
+    max_records: int = MAX_COVERAGE_RECORDS,
+    normalized_origins_out: list[dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    if calendar_sessions is None:
+        calendar_path = (
+            Path(__file__).resolve().parents[1]
+            / "docs"
+            / "issue-70-calendar-candidate-v1"
+            / "exchange_sessions.csv"
+        )
+        calendar_sessions = _calendar_dates(
+            calendar_path, expected_header=("trade_date",)
+        )
+    return build_v9_coverage_records(
+        fundamentals=fundamentals,
+        security_rows=security_rows,
+        evaluation_sessions=evaluation_sessions,
+        calendar_sessions=calendar_sessions,
+        max_records=max_records,
+        normalized_origins_out=normalized_origins_out,
+    )
 
 
 def _submission_workset(
@@ -431,6 +859,11 @@ def generate(
     legacy_root: Path,
     alternate_dir: Path,
     output_dir: Path,
+    session_calendar_path: Path | None = None,
+    calendar_adoption_decision_path: Path | None = None,
+    history_start_date: date | None = None,
+    evaluation_start_date: date | None = None,
+    evaluation_end_date: date | None = None,
 ) -> Mapping[str, Any]:
     started = time.monotonic()
     repo_root = Path(__file__).resolve().parents[1]
@@ -439,11 +872,61 @@ def generate(
         raise ValueError("sample output directory must stay inside the current repository")
     if output_dir.exists() or output_dir.is_symlink():
         raise ValueError(f"refusing to overwrite existing sample directory: {output_dir}")
-    output_dir.parent.mkdir(parents=True, exist_ok=True)
-
     archive_dir = Path(os.path.abspath(archive_dir))
     legacy_root = Path(os.path.abspath(legacy_root))
     alternate_dir = Path(os.path.abspath(alternate_dir))
+    v9_values = (
+        session_calendar_path,
+        calendar_adoption_decision_path,
+        history_start_date,
+        evaluation_start_date,
+        evaluation_end_date,
+    )
+    v9_mode = any(value is not None for value in v9_values)
+    calendar_input: Mapping[str, Any] | None = None
+    v8_manifest_sha256: str | None = None
+    v8_source_manifest: Mapping[str, Any] | None = None
+    v8_member_binding: Mapping[str, Any] | None = None
+    source_revision: Mapping[str, str] | None = None
+    v9_comparison: Mapping[str, Any] | None = None
+    v9_coverage_totals: Mapping[str, int] | None = None
+    v9_coverage_records: list[dict[str, str]] | None = None
+    v9_coverage_summary: dict[str, Any] | None = None
+    v9_coverage_gzip: bytes | None = None
+    v9_coverage_artifact: Mapping[str, Any] | None = None
+    if v9_mode:
+        if any(value is None for value in v9_values):
+            raise ValueError("v9 calendar and date inputs must be supplied together")
+        if (
+            history_start_date != V9_HISTORY_START
+            or evaluation_start_date != V9_EVALUATION_START
+            or evaluation_end_date != V9_EVALUATION_END
+        ):
+            raise ValueError("v9 history and evaluation windows must match the adjudicated plan")
+        expected_output = repo_root / "docs" / "issue-70-q4-source-sample-v9"
+        if output_dir != expected_output:
+            raise ValueError(f"v9 output must use its owned no-clobber destination: {expected_output}")
+        assert session_calendar_path is not None and calendar_adoption_decision_path is not None
+        calendar_input = _validate_v9_calendar_inputs(
+            session_calendar_path=Path(session_calendar_path),
+            adoption_decision_path=Path(calendar_adoption_decision_path),
+            calendar_provenance_path=Path(session_calendar_path).parent / "calendar_provenance.json",
+            candidate_marker_path=Path(session_calendar_path).parent / "candidate-publication.json",
+            retained_calendar_path=legacy_root / "prices" / "spy_trading_days.csv",
+        )
+        v8_manifest_path = repo_root / "docs" / "issue-70-q4-source-sample-v8" / "fundamentals_provenance.json"
+        v8_manifest_sha256, v8_source_manifest = _read_bound_json(
+            v8_manifest_path, V9_V8_SOURCE_MANIFEST_SHA256
+        )
+        source_revision = _source_revision(repo_root)
+    else:
+        history_start_date = START_DATE
+        evaluation_start_date = START_DATE
+        evaluation_end_date = END_DATE
+    assert history_start_date is not None
+    assert evaluation_start_date is not None
+    assert evaluation_end_date is not None
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
     legacy_fundamentals_dir = legacy_root / "fundamentals"
     prices_dir = legacy_root / "prices"
     import_provenance_path = legacy_root / "import-provenance.json"
@@ -517,6 +1000,10 @@ def generate(
             raise ValueError(f"retained SEC archive size differs from attestation: {name}")
 
     security_rows = _load_security_rows(input_paths["security_master_csv"])
+    if v9_mode:
+        actual_sample_ciks = {row.ticker: row.cik for row in security_rows}
+        if actual_sample_ciks != V9_EXPECTED_CIKS:
+            raise ValueError("v9 retained security master differs from the adjudicated four CIK sample")
     ciks = tuple(sorted({row.cik for row in security_rows}))
     if len(ciks) != len(TICKERS):
         raise ValueError("four-ticker sample unexpectedly resolves to a non-unique CIK count")
@@ -564,17 +1051,21 @@ def generate(
         submissions_archive_sha256=str(archive_metadata["submissions.zip"]["sha256"]),
         missing_submission_fragments=missing_fragments,
     )
+    parser_calendar_path = (
+        Path(session_calendar_path)
+        if v9_mode and session_calendar_path is not None
+        else input_paths["spy_trading_days_csv"]
+    )
     fundamentals = sec.extract_fundamentals(
         archive_paths["companyfacts.zip"],
         security_master,
-        input_paths["spy_trading_days_csv"],
-        start_date=START_DATE,
-        end_date=END_DATE,
+        parser_calendar_path,
+        start_date=history_start_date,
+        end_date=evaluation_end_date,
         max_json_member_bytes=512 * 1024 * 1024,
         attested_companyfacts_archive_sha256=str(archive_metadata["companyfacts.zip"]["sha256"]),
         companyfacts_member_use_callback=record_companyfacts_read,
     )
-
     submission_preflight = submissions_budget["main_preflight_reads"]
     for member_name, preflight in submission_preflight.items():
         actual_reads = submissions_member_usage.get(member_name, [])
@@ -634,6 +1125,62 @@ def generate(
             for member_name in sorted(companyfacts_member_usage)
         ],
     }
+    if v9_mode:
+        assert v8_source_manifest is not None
+        v8_member_binding = _validate_v8_selected_member_hashes(
+            v8_source_manifest, selected_member_hashes
+        )
+
+        assert calendar_input is not None
+        assert v8_manifest_sha256 is not None
+        assert source_revision is not None
+        evaluation_sessions = tuple(
+            session for session in calendar_input["sessions"]
+            if evaluation_start_date <= session <= evaluation_end_date
+        )
+        if len(security_rows) * len(evaluation_sessions) > MAX_ISSUER_SESSION_GRID:
+            raise ValueError("v9 issuer-session grid exceeds the 6,032-cell ceiling")
+        if len(fundamentals.rows) != len(fundamentals.audit_rows):
+            raise ValueError("v9 financial snapshot and audit rows must be one-to-one")
+        if len(fundamentals.rows) > MAX_FINANCIAL_AUDIT_ROWS:
+            raise ValueError("v9 paired financial and audit rows exceed the 10,000-row ceiling")
+
+        normalized_origins: list[dict[str, Any]] = []
+        v9_coverage_records, v9_coverage_summary = _build_v9_coverage_records(
+            fundamentals=fundamentals,
+            security_rows=security_rows,
+            evaluation_sessions=evaluation_sessions,
+            calendar_sessions=calendar_input["sessions"],
+            normalized_origins_out=normalized_origins,
+        )
+        v9_coverage_gzip, v9_coverage_artifact = serialize_v9_coverage_records(
+            v9_coverage_records,
+            max_records=MAX_COVERAGE_RECORDS,
+            max_uncompressed_bytes=MAX_COVERAGE_UNCOMPRESSED_BYTES,
+        )
+        v9_comparison = build_v8_source_window_comparison(
+            v9_records=v9_coverage_records,
+            normalized_origins=normalized_origins,
+            evaluation_sessions=evaluation_sessions,
+            calendar_sessions=calendar_input["sessions"],
+            source_window_start=START_DATE,
+            source_window_end=END_DATE,
+            v8_manifest_sha256=v8_manifest_sha256,
+            adopted_calendar_sha256=str(calendar_input["calendar_sha256"]),
+            source_revision=source_revision,
+            measured_member_binding=v8_member_binding,
+        )
+        v9_coverage_summary = _complete_v9_coverage_summary(
+            v9_coverage_summary,
+            v9_coverage_artifact,
+            v9_comparison,
+            fundamentals.coverage,
+        )
+        v9_coverage_totals = _validate_combined_v9_evidence_caps(
+            v9_coverage_artifact, v9_coverage_summary,
+            max_records=MAX_COVERAGE_RECORDS,
+            max_uncompressed_bytes=MAX_COVERAGE_UNCOMPRESSED_BYTES,
+        )
 
     def verify_archive_stability() -> Mapping[str, Any]:
         stability: dict[str, Any] = {}
@@ -739,7 +1286,7 @@ def generate(
         if (
             audit.statement_type != "quarterly"
             or audit.fiscal_period.upper() != "Q4"
-            or not START_DATE <= audit.public_date <= END_DATE
+            or not evaluation_start_date <= audit.public_date <= evaluation_end_date
         ):
             continue
         values = rows_by_key[(audit.ticker, audit.statement_type, audit.period_end, audit.public_date)]
@@ -775,8 +1322,8 @@ def generate(
             audit.statement_type == "annual"
             and audit.fiscal_period.upper() == "FY"
             and audit.period_end.year == fiscal_year_number
-            and 2019 <= fiscal_year_number <= END_DATE.year
-            and START_DATE <= audit.public_date <= END_DATE
+            and 2019 <= fiscal_year_number <= evaluation_end_date.year
+            and evaluation_start_date <= audit.public_date <= evaluation_end_date
         ):
             annual_filing_by_year[(audit.ticker, audit.fiscal_year, audit.period_end)].append(audit)
     q4_by_year: dict[tuple[str, str, date, date], list[Any]] = defaultdict(list)
@@ -784,7 +1331,7 @@ def generate(
         if (
             audit.statement_type == "quarterly"
             and audit.fiscal_period.upper() == "Q4"
-            and START_DATE <= audit.public_date <= END_DATE
+            and evaluation_start_date <= audit.public_date <= evaluation_end_date
         ):
             q4_by_year[(audit.ticker, audit.fiscal_year, audit.period_end, audit.public_date)].append(audit)
     annual_release_q4_status: dict[str, list[Mapping[str, Any]]] = {
@@ -832,7 +1379,7 @@ def generate(
             }
         )
     q4_summary = {
-        "window": [START_DATE.isoformat(), END_DATE.isoformat()],
+        "window": [evaluation_start_date.isoformat(), evaluation_end_date.isoformat()],
         "sample_tickers": list(TICKERS),
         "q4_rows_by_ticker": {ticker: q4_by_ticker.get(ticker, []) for ticker in TICKERS},
         "annual_release_q4_status_by_ticker": annual_release_q4_status,
@@ -874,12 +1421,16 @@ def generate(
         },
     }
     provenance = {
-        "schema_version": 1,
-        "source": "SEC EDGAR official bulk archives; bounded retained-source Q4 sample",
+        "schema_version": 2 if v9_mode else 1,
+        "source": (
+            "SEC EDGAR official bulk archives; bounded retained-source Q4 sample"
+            if not v9_mode
+            else "SEC EDGAR official bulk archives; bounded retained-source v9 Q4 and historical-coverage sample"
+        ),
         "generated_at_utc": generated_at_utc,
         "sample_tickers": list(TICKERS),
-        "start_date": START_DATE.isoformat(),
-        "end_date": END_DATE.isoformat(),
+        "start_date": history_start_date.isoformat(),
+        "end_date": evaluation_end_date.isoformat(),
         "membership_source_generation": "authenticated previous S&P 500 material; not complete V5 input set",
         "source_archive_attestation_reuse": archive_attestation_reuse,
         "input_hashes": input_hashes,
@@ -887,6 +1438,7 @@ def generate(
             "companyfacts_selected_members": dict(companyfacts_budget),
             "submissions_selected_members": dict(submissions_budget),
             "selected_member_hashes": selected_member_hashes,
+            **({"v8_selected_member_binding": dict(v8_member_binding)} if v9_mode else {}),
             "decompressed_bytes": {
                 "submissions_preflight_main_members": submission_preflight_bytes,
                 "submissions_acceptance_parse": submission_parse_bytes,
@@ -898,6 +1450,12 @@ def generate(
             "alternate_audit_max_bytes": MAX_ALTERNATE_AUDIT_BYTES,
             "sample_output_max_bytes": MAX_OUTPUT_BYTES,
             "runtime_max_seconds": MAX_RUNTIME_SECONDS,
+            **({
+                "financial_audit_row_pairs_max": MAX_FINANCIAL_AUDIT_ROWS,
+                "issuer_session_grid_max": MAX_ISSUER_SESSION_GRID,
+                "coverage_records_max": MAX_COVERAGE_RECORDS,
+                "coverage_uncompressed_bytes_max": MAX_COVERAGE_UNCOMPRESSED_BYTES,
+            } if v9_mode else {}),
         },
         "q4_policy": {
             "direct_fact": "Accept source-duration Q4 reported in a 10-K when its endpoint is the annual period end in the same accession, or the source explicitly labels Q4.",
@@ -918,6 +1476,48 @@ def generate(
             "The v4 sample directory is preserved but superseded because it did not bind exact selected SEC JSON member bytes.",
         ],
     }
+    if v9_mode:
+        assert calendar_input is not None
+        assert v8_manifest_sha256 is not None
+        assert source_revision is not None
+        assert v8_member_binding is not None
+        assert v9_comparison is not None
+        assert v9_coverage_summary is not None
+        assert v9_coverage_totals is not None
+        provenance.update({
+            "history_window": [history_start_date.isoformat(), evaluation_end_date.isoformat()],
+            "evaluation_window": [evaluation_start_date.isoformat(), evaluation_end_date.isoformat()],
+            "source_revision": dict(source_revision),
+            "v9_adopted_calendar": {
+                "calendar_sha256": calendar_input["calendar_sha256"],
+                "calendar_provenance_sha256": calendar_input["calendar_provenance_sha256"],
+                "candidate_marker_sha256": calendar_input["candidate_marker_sha256"],
+                "adoption_decision_sha256": calendar_input["adoption_decision_sha256"],
+                "independent_review_sha256": calendar_input["independent_review_sha256"],
+                "reviewed_commit": calendar_input["reviewed_commit"],
+                "reviewed_tree": calendar_input["reviewed_tree"],
+                "source_label": calendar_input["source_label"],
+                "not_observed_price_history": True,
+                "wheel_sha256": calendar_input["wheel_sha256"],
+                "retained_reference_sha256": calendar_input["retained_reference_sha256"],
+                "retained_window_overlap": dict(calendar_input["retained_window_overlap"]),
+            },
+            "v8_source_manifest_sha256": v8_manifest_sha256,
+            "financial_coverage_evidence": dict(v9_coverage_artifact),
+            "financial_coverage_evidence_totals": dict(v9_coverage_totals),
+            "v8_selected_member_binding": dict(v8_member_binding),
+            "financial_coverage_comparison": {
+                "schema_version": v9_comparison["schema_version"],
+                "label": v9_comparison["label"],
+                "protocol_sha256": v9_comparison["protocol_sha256"],
+                "complete_comparison_sha256": v9_comparison["complete_comparison_sha256"],
+                "canonical_detail_byte_length": v9_comparison["canonical_detail_byte_length"],
+                "summary_sha256": hashlib.sha256(_json_bytes(v9_coverage_summary)).hexdigest(),
+                "source_identity": dict(v9_comparison["source_identity"]),
+                "source_window": dict(v9_comparison["source_window"]),
+            },
+            "full_issue_70_acceptance": "open",
+        })
 
     staging = output_dir.parent / f".{output_dir.name}.{uuid.uuid4().hex}.tmp"
     staging.mkdir()
@@ -951,6 +1551,36 @@ def generate(
         _write_json(staging / "sample_q4_findings.json", q4_summary)
         _write_json(staging / "generation_reconciliation.json", generation_reconciliation)
         _write_json(staging / "fundamentals_provenance.json", provenance)
+        if v9_mode:
+            assert v9_coverage_summary is not None
+            assert v9_coverage_gzip is not None
+            assert session_calendar_path is not None
+            assert calendar_adoption_decision_path is not None
+            _write_json(staging / "financial_coverage_summary.json", v9_coverage_summary)
+            with (staging / "financial_coverage_slots.csv.gz").open("xb") as stream:
+                stream.write(v9_coverage_gzip)
+                stream.flush()
+                os.fsync(stream.fileno())
+            calendar_source_dir = Path(session_calendar_path).parent
+            for source_path, output_name in (
+                (Path(session_calendar_path), "exchange_sessions.csv"),
+                (calendar_source_dir / "calendar_provenance.json", "calendar_provenance.json"),
+                (calendar_source_dir / "candidate-publication.json", "candidate-publication.json"),
+                (Path(calendar_adoption_decision_path), "principal-adoption-decision.json"),
+            ):
+                with sec._regular_file(source_path, source_path.name).open("rb") as source, (
+                    staging / output_name
+                ).open("xb") as target:
+                    shutil.copyfileobj(source, target)
+                    target.flush()
+                    os.fsync(target.fileno())
+            if (
+                _digest(staging / "exchange_sessions.csv") != calendar_input["calendar_sha256"]
+                or _digest(staging / "calendar_provenance.json") != calendar_input["calendar_provenance_sha256"]
+                or _digest(staging / "candidate-publication.json") != calendar_input["candidate_marker_sha256"]
+                or _digest(staging / "principal-adoption-decision.json") != calendar_input["adoption_decision_sha256"]
+            ):
+                raise ValueError("copied v9 calendar evidence differs from its adopted input hashes")
         for source_key, output_name in (
             ("membership_csv", "membership.csv"),
             ("security_names_csv", "security_names.csv"),
@@ -1001,6 +1631,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     retained_root = Path(
         r"C:\Projects\trading_bot\RS-momentum-EMA-trading-bot\.artifacts\data"
     )
+
+    def parse_date(value: str) -> date:
+        try:
+            return date.fromisoformat(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("date must be YYYY-MM-DD") from exc
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--archive-dir",
@@ -1017,18 +1654,42 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=Path,
         default=retained_root / "sec-fundamentals",
     )
+    parser.add_argument("--session-calendar", type=Path)
+    parser.add_argument("--calendar-adoption-decision", type=Path)
+    parser.add_argument("--history-start-date", type=parse_date)
+    parser.add_argument("--evaluation-start-date", type=parse_date)
+    parser.add_argument("--evaluation-end-date", type=parse_date)
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=repo_root / "docs" / "issue-70-q4-source-sample-v8",
     )
     args = parser.parse_args(argv)
+    v9_requested = any(
+        value is not None
+        for value in (
+            args.session_calendar,
+            args.calendar_adoption_decision,
+            args.history_start_date,
+            args.evaluation_start_date,
+            args.evaluation_end_date,
+        )
+    )
+    output_dir = args.output_dir or (
+        repo_root / "docs" / (
+            "issue-70-q4-source-sample-v9" if v9_requested else "issue-70-q4-source-sample-v8"
+        )
+    )
     try:
         result = generate(
             archive_dir=args.archive_dir,
             legacy_root=args.legacy_root,
             alternate_dir=args.alternate_dir,
-            output_dir=args.output_dir,
+            output_dir=output_dir,
+            session_calendar_path=args.session_calendar,
+            calendar_adoption_decision_path=args.calendar_adoption_decision,
+            history_start_date=args.history_start_date,
+            evaluation_start_date=args.evaluation_start_date,
+            evaluation_end_date=args.evaluation_end_date,
         )
     except (OSError, ValueError, TimeoutError, zipfile.BadZipFile) as exc:
         parser.error(str(exc))
