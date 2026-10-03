@@ -107,6 +107,7 @@ from core.pit_optimizer_v5.provider import (
     RoleRequestV5,
     ScenarioAggregateV5,
     SemanticDecisionTraceV5,
+    _validate_safe_text,
     build_role_request_v5,
     role_schema_authority_from_manifest_v5,
 )
@@ -171,19 +172,55 @@ class _EvidenceBuilderV5:
         self._role = role
         self._items: list[RoleEvidenceItemV5] = []
 
-    def add(self, metric_id: str, value: object) -> str:
+    def add(
+        self,
+        metric_id: str,
+        value: object,
+        *,
+        description: str | None = None,
+    ) -> str:
         if type(metric_id) is not str:
             raise ValueError("role evidence metric ID is invalid")
         ordinal = len(self._items) + 1
         slug = re.sub(r"[^a-z0-9_.-]+", "-", metric_id.lower()).strip(".-")
         suffix = hashlib.sha256(f"{self._role}:{ordinal}:{metric_id}".encode()).hexdigest()[:12]
         evidence_id = f"v5.{self._role}.{ordinal}.{slug[:72]}.{suffix}"
-        item = RoleEvidenceItemV5(evidence_id, metric_id, value)  # type: ignore[arg-type]
+        item = RoleEvidenceItemV5(
+            evidence_id,
+            metric_id,
+            value,  # type: ignore[arg-type]
+            description,
+        )
         self._items.append(item)
         return evidence_id
 
     def build(self) -> RoleEvidenceV5:
         return RoleEvidenceV5(5, tuple(self._items))
+
+
+def _add_on_reason_description(reason_code: str) -> str:
+    digest = hashlib.sha256(reason_code.encode("utf-8")).hexdigest()
+    prefix = "Candidate-authored reason code for a declined AddOnDecisionV3"
+    exact = f"{prefix}: {reason_code}; SHA-256 {digest}."
+    try:
+        _validate_safe_text(exact, "candidate add-on reason description")
+    except ValueError:
+        return (
+            f"{prefix} withheld from provider prose by the existing text safety "
+            f"checks; SHA-256 {digest} binds the code. The exact code remains in "
+            "the persisted evaluator report."
+        )
+    return exact
+
+
+def _bounded_add_on_reason_projection(metrics):
+    ordered = tuple(sorted(metrics, key=lambda item: item.metric_id))
+    retained = ordered[:64]
+    omitted = ordered[64:]
+    digest = hashlib.sha256(
+        "\n".join(f"{item.metric_id}:{item.count}" for item in omitted).encode("utf-8")
+    ).hexdigest()
+    return retained, len(omitted), digest
 
 
 def _parent_campaign(
@@ -1066,6 +1103,10 @@ class LocalRoleRequestFactoryV5:
         for episode in campaign.episodes:
             report = selected_scenario(episode.evaluation).report
             prefix = f"episode.{episode.episode_ordinal}"
+            metric_definitions = {
+                item.metric_id: item.definition
+                for item in report.metric_definitions
+            }
             evaluator_ids.extend(
                 (
                     evidence.add(
@@ -1077,6 +1118,127 @@ class LocalRoleRequestFactoryV5:
                     evidence.add(f"{prefix}.average_exposure_pct", report.average_exposure_pct),
                 )
             )
+            if report.report_semantics_version >= 2:
+                for name in (
+                    "gross_annualized_return_pct",
+                    "estimated_idle_cash_drag_pct",
+                    "scale_out_opportunity_cost_pct",
+                ):
+                    evaluator_ids.append(
+                        evidence.add(
+                            f"{prefix}.{name}",
+                            getattr(report, name),
+                            description=metric_definitions.get(name),
+                        )
+                    )
+                evaluator_ids.append(
+                    evidence.add(
+                        f"{prefix}.report_semantics_version",
+                        report.report_semantics_version,
+                    )
+                )
+                evaluator_ids.append(
+                    evidence.add(
+                        f"{prefix}.add_on_rejection_telemetry_status",
+                        None,
+                        description=(
+                            f"Add-on rejection telemetry status: "
+                            f"{report.add_on_rejection_telemetry_status}. A legacy "
+                            "checkpoint can only provide partial reason counts; "
+                            "unavailable telemetry is not a zero count."
+                        ),
+                    )
+                )
+                for metric in report.add_on_outcomes:
+                    evaluator_ids.append(
+                        evidence.add(
+                            f"{prefix}.add_on.outcome.{('invalid_mark' if metric.metric_id == 'invalid_price' else metric.metric_id)}",
+                            metric.count,
+                            description=f"Observed V5 add-on outcome count for {metric.metric_id}.",
+                        )
+                    )
+                retained_reasons, omitted_reasons, omitted_digest = (
+                    _bounded_add_on_reason_projection(
+                        report.add_on_rejection_reason_counts
+                    )
+                )
+                for metric in retained_reasons:
+                    reason_digest = hashlib.sha256(metric.metric_id.encode("utf-8")).hexdigest()
+                    evaluator_ids.append(
+                        evidence.add(
+                            f"{prefix}.add_on.rejection_reason_count.{reason_digest}",
+                            metric.count,
+                            description=_add_on_reason_description(metric.metric_id),
+                        )
+                    )
+                if omitted_reasons:
+                    evaluator_ids.append(
+                        evidence.add(
+                            f"{prefix}.add_on.rejection_reason_unrepresented_count",
+                            omitted_reasons,
+                            description=(
+                                "Additional reason categories are omitted from this "
+                                f"bounded projection; SHA-256 {omitted_digest} binds "
+                                "their ordered IDs and counts in the persisted report."
+                            ),
+                        )
+                    )
+                retained_unregistered, omitted_unregistered, omitted_unregistered_digest = (
+                    _bounded_add_on_reason_projection(
+                        report.unregistered_add_on_rejection_reason_counts
+                    )
+                )
+                for metric in retained_unregistered:
+                    reason_digest = hashlib.sha256(metric.metric_id.encode("utf-8")).hexdigest()
+                    evaluator_ids.append(
+                        evidence.add(
+                            f"{prefix}.add_on.unregistered_rejection_reason_count.{reason_digest}",
+                            metric.count,
+                            description=(
+                                "Unregistered "
+                                + _add_on_reason_description(metric.metric_id)
+                            ),
+                        )
+                    )
+                if omitted_unregistered:
+                    evaluator_ids.append(
+                        evidence.add(
+                            f"{prefix}.add_on.unregistered_reason_unrepresented_count",
+                            omitted_unregistered,
+                            description=(
+                                "Additional unregistered reason categories are omitted "
+                                f"from this bounded projection; SHA-256 {omitted_unregistered_digest} "
+                                "binds their ordered IDs and counts in the persisted report."
+                            ),
+                        )
+                    )
+                if report.friction_scenario is not None:
+                    friction_description = (
+                        f"Configured friction scenario {report.friction_scenario.scenario_id}. "
+                        f"{report.friction_calibration_limitation}"
+                    )
+                    for metric_id, value in (
+                        ("half_spread_bps", report.friction_scenario.half_spread_bps),
+                        ("market_impact_bps", report.friction_scenario.market_impact_bps),
+                        ("commission_bps", report.friction_scenario.commission_bps),
+                    ):
+                        evaluator_ids.append(
+                            evidence.add(
+                                f"{prefix}.friction_scenario.{metric_id}",
+                                value,
+                                description=friction_description,
+                            )
+                        )
+                    evaluator_ids.append(
+                        evidence.add(
+                            f"{prefix}.friction_calibration_status",
+                            None,
+                            description=(
+                                f"{report.friction_calibration_status}: "
+                                f"{report.friction_calibration_limitation}"
+                            ),
+                        )
+                    )
             counts = {item.metric_id: item.count for item in report.entry_funnel}
             for metric_id in _INVESTIGATOR_ENTRY_COUNTS_V5:
                 if metric_id in counts:
@@ -1435,7 +1597,133 @@ class LocalRoleRequestFactoryV5:
             if detailed
             else ("portfolio_annualized_return_pct", "friction_drag_pct")
         )
-        ids = [evidence.add(f"{prefix}.{name}", getattr(report, name)) for name in names]
+        metric_definitions = {
+            item.metric_id: item.definition
+            for item in report.metric_definitions
+        }
+        ids = [
+            evidence.add(
+                f"{prefix}.{name}",
+                getattr(report, name),
+                description=metric_definitions.get(name),
+            )
+            for name in names
+        ]
+        if detailed and report.report_semantics_version >= 2:
+            ids.append(
+                evidence.add(
+                    f"{prefix}.gross_annualized_return_pct",
+                    report.gross_annualized_return_pct,
+                    description=metric_definitions.get("gross_annualized_return_pct"),
+                )
+            )
+            ids.append(
+                evidence.add(
+                    f"{prefix}.report_semantics_version",
+                    report.report_semantics_version,
+                )
+            )
+            ids.append(
+                evidence.add(
+                    f"{prefix}.add_on_rejection_telemetry_status",
+                    None,
+                    description=(
+                        f"Add-on rejection telemetry status: "
+                        f"{report.add_on_rejection_telemetry_status}; missing telemetry "
+                        "is unavailable, not a zero count."
+                    ),
+                )
+            )
+            for metric in report.add_on_outcomes:
+                ids.append(
+                    evidence.add(
+                        f"{prefix}.add_on.outcome.{('invalid_mark' if metric.metric_id == 'invalid_price' else metric.metric_id)}",
+                        metric.count,
+                        description=f"Observed V5 add-on outcome count for {metric.metric_id}.",
+                    )
+                )
+            retained_reasons, omitted_reasons, omitted_digest = (
+                _bounded_add_on_reason_projection(
+                    report.add_on_rejection_reason_counts
+                )
+            )
+            for metric in retained_reasons:
+                reason_digest = hashlib.sha256(metric.metric_id.encode("utf-8")).hexdigest()
+                ids.append(
+                    evidence.add(
+                        f"{prefix}.add_on.rejection_reason_count.{reason_digest}",
+                        metric.count,
+                        description=_add_on_reason_description(metric.metric_id),
+                    )
+                )
+            if omitted_reasons:
+                ids.append(
+                    evidence.add(
+                        f"{prefix}.add_on.rejection_reason_unrepresented_count",
+                        omitted_reasons,
+                        description=(
+                            "Additional reason categories are omitted from this "
+                            f"bounded projection; SHA-256 {omitted_digest} binds "
+                            "their ordered IDs and counts in the persisted report."
+                        ),
+                    )
+                )
+            retained_unregistered, omitted_unregistered, omitted_unregistered_digest = (
+                _bounded_add_on_reason_projection(
+                    report.unregistered_add_on_rejection_reason_counts
+                )
+            )
+            for metric in retained_unregistered:
+                reason_digest = hashlib.sha256(metric.metric_id.encode("utf-8")).hexdigest()
+                ids.append(
+                    evidence.add(
+                        f"{prefix}.add_on.unregistered_rejection_reason_count.{reason_digest}",
+                        metric.count,
+                        description=(
+                            "Unregistered "
+                            + _add_on_reason_description(metric.metric_id)
+                        ),
+                    )
+                )
+            if omitted_unregistered:
+                ids.append(
+                    evidence.add(
+                        f"{prefix}.add_on.unregistered_reason_unrepresented_count",
+                        omitted_unregistered,
+                        description=(
+                            "Additional unregistered reason categories are omitted "
+                            f"from this bounded projection; SHA-256 {omitted_unregistered_digest} "
+                            "binds their ordered IDs and counts in the persisted report."
+                        ),
+                    )
+                )
+            if report.friction_scenario is not None:
+                friction_description = (
+                    f"Configured friction scenario {report.friction_scenario.scenario_id}. "
+                    f"{report.friction_calibration_limitation}"
+                )
+                for metric_id, value in (
+                    ("half_spread_bps", report.friction_scenario.half_spread_bps),
+                    ("market_impact_bps", report.friction_scenario.market_impact_bps),
+                    ("commission_bps", report.friction_scenario.commission_bps),
+                ):
+                    ids.append(
+                        evidence.add(
+                            f"{prefix}.friction_scenario.{metric_id}",
+                            value,
+                            description=friction_description,
+                        )
+                    )
+                ids.append(
+                    evidence.add(
+                        f"{prefix}.friction_calibration_status",
+                        None,
+                        description=(
+                            f"{report.friction_calibration_status}: "
+                            f"{report.friction_calibration_limitation}"
+                        ),
+                    )
+                )
         if parent_report is not None:
             delta_names = (
                 (

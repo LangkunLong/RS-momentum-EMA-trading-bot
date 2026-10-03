@@ -193,6 +193,27 @@ def _primitive(value: object) -> object:
             "market_impact_bps": value.market_impact_bps,
             "commission_bps": value.commission_bps,
         }
+    if type(value).__name__ == "RoleEvidenceItemV5":
+        return value.to_primitive()  # type: ignore[attr-defined]
+    if type(value).__name__ == "EvaluationReportV5":
+        semantics_version = getattr(value, "report_semantics_version", 1)
+        if semantics_version == 1:
+            v2_fields = {
+                "report_semantics_version",
+                "add_on_outcomes",
+                "add_on_rejection_telemetry_status",
+                "add_on_rejection_reason_counts",
+                "unregistered_add_on_rejection_reason_counts",
+                "friction_scenario",
+                "friction_calibration_status",
+                "friction_calibration_limitation",
+                "metric_definitions",
+            }
+            return {
+                item.name: _primitive(getattr(value, item.name))
+                for item in fields(value)
+                if item.name not in v2_fields
+            }
     if is_dataclass(value) and not isinstance(value, type):
         return {item.name: _primitive(getattr(value, item.name)) for item in fields(value)}
     if isinstance(value, tuple):
@@ -1370,6 +1391,16 @@ class MetricCountV5:
 
 
 @dataclass(frozen=True, slots=True)
+class ReportMetricDefinitionV5:
+    metric_id: str
+    definition: str
+
+    def __post_init__(self) -> None:
+        _text(self.metric_id, "report metric definition ID")
+        _text(self.definition, "report metric definition")
+
+
+@dataclass(frozen=True, slots=True)
 class SliceMetricsV5:
     annualized_return_pct: Decimal
     total_return_pct: Decimal
@@ -1464,6 +1495,17 @@ class EvaluationReportV5:
     episode_slices: tuple[EvaluationSliceV5, ...]
     calendar_year_slices: tuple[EvaluationSliceV5, ...]
     rolling_returns: tuple[RollingReturnV5, ...]
+    report_semantics_version: int = 1
+    add_on_outcomes: tuple[MetricCountV5, ...] = ()
+    add_on_rejection_telemetry_status: Literal[
+        "complete", "unavailable_legacy_checkpoint", "unavailable_unspecified"
+    ] = "unavailable_unspecified"
+    add_on_rejection_reason_counts: tuple[MetricCountV5, ...] = ()
+    unregistered_add_on_rejection_reason_counts: tuple[MetricCountV5, ...] = ()
+    friction_scenario: FrictionScenario | None = None
+    friction_calibration_status: Literal["not_supplied"] | None = None
+    friction_calibration_limitation: str | None = None
+    metric_definitions: tuple[ReportMetricDefinitionV5, ...] = ()
 
     def __post_init__(self) -> None:
         optional_decimals = {
@@ -1496,14 +1538,98 @@ class EvaluationReportV5:
                 "entry_funnel",
                 "exit_attribution",
                 "policy_intent_outcomes",
+                "add_on_outcomes",
+                "add_on_rejection_reason_counts",
+                "unregistered_add_on_rejection_reason_counts",
             }:
                 self._validate_metric_counts(value, name)
+            elif name == "metric_definitions":
+                if type(value) is not tuple or any(
+                    type(definition) is not ReportMetricDefinitionV5
+                    for definition in value
+                ):
+                    raise ValueError("report metric definitions must use the V5 schema")
+                definition_ids = tuple(item.metric_id for item in value)
+                if len(set(definition_ids)) != len(definition_ids):
+                    raise ValueError("report metric definition IDs must be unique")
+            elif name == "report_semantics_version":
+                if type(value) is not int or value not in {1, 2}:
+                    raise ValueError("report semantics version is unsupported")
+            elif name == "add_on_rejection_telemetry_status":
+                if value not in {
+                    "complete",
+                    "unavailable_legacy_checkpoint",
+                    "unavailable_unspecified",
+                }:
+                    raise ValueError("report add-on rejection telemetry status is invalid")
+            elif name == "friction_scenario":
+                if value is not None and type(value) is not FrictionScenario:
+                    raise ValueError("report friction scenario must use the V5 friction contract")
+            elif name == "friction_calibration_status":
+                if value not in {None, "not_supplied"}:
+                    raise ValueError("report friction calibration status is invalid")
+            elif name == "friction_calibration_limitation":
+                if value is not None:
+                    _text(value, "report friction calibration limitation")
             elif name in {"regime_slices", "episode_slices", "calendar_year_slices"}:
                 self._validate_slices(value, name)
             elif name == "rolling_returns":
                 self._validate_rolling_returns(value)
             else:
                 _decimal(value, f"report {name}")
+        if self.report_semantics_version == 1:
+            if (
+                self.add_on_outcomes
+                or self.add_on_rejection_reason_counts
+                or self.unregistered_add_on_rejection_reason_counts
+                or self.friction_scenario is not None
+                or self.friction_calibration_status is not None
+                or self.friction_calibration_limitation is not None
+                or self.metric_definitions
+                or self.add_on_rejection_telemetry_status != "unavailable_unspecified"
+            ):
+                raise ValueError("legacy report semantics cannot carry V2 evidence")
+        else:
+            if (
+                self.friction_scenario is None
+                or self.friction_calibration_status != "not_supplied"
+                or self.friction_calibration_limitation is None
+            ):
+                raise ValueError("V2 report friction semantics are incomplete")
+            definitions = {item.metric_id for item in self.metric_definitions}
+            if not {
+                "gross_annualized_return_pct",
+                "estimated_idle_cash_drag_pct",
+                "scale_out_opportunity_cost_pct",
+            }.issubset(definitions):
+                raise ValueError("V2 report metric definitions are incomplete")
+            if self.add_on_rejection_telemetry_status == "complete":
+                outcome_ids = {item.metric_id for item in self.add_on_outcomes}
+                if "declined" not in outcome_ids:
+                    raise ValueError("complete V2 add-on telemetry lacks declined outcomes")
+            elif (
+                self.add_on_rejection_telemetry_status == "unavailable_unspecified"
+                and (
+                    self.add_on_rejection_reason_counts
+                    or self.unregistered_add_on_rejection_reason_counts
+                )
+            ):
+                raise ValueError("unavailable V2 add-on telemetry cannot carry reason counts")
+            reason_counts = {item.metric_id: item.count for item in self.add_on_rejection_reason_counts}
+            unregistered_counts = {
+                item.metric_id: item.count
+                for item in self.unregistered_add_on_rejection_reason_counts
+            }
+            if self.add_on_rejection_telemetry_status == "complete":
+                declined_counts = {
+                    item.metric_id: item.count
+                    for item in self.add_on_outcomes
+                    if item.metric_id == "declined"
+                }
+                if declined_counts.get("declined") != sum(reason_counts.values()):
+                    raise ValueError("complete V2 declined add-on counts do not reconcile")
+            if any(reason_counts.get(key) != count for key, count in unregistered_counts.items()):
+                raise ValueError("unregistered V2 add-on reasons differ from complete reason counts")
 
     @staticmethod
     def _validate_metric_counts(value: object, label: str) -> None:
@@ -1544,11 +1670,14 @@ class RoleEvidenceItemV5:
     evidence_id: str
     metric_id: str
     value: Decimal | int | None
+    description: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.evidence_id) is not str or _EVIDENCE_ID_RE.fullmatch(self.evidence_id) is None:
             raise ValueError("role evidence ID is invalid")
         _text(self.metric_id, "role evidence metric ID")
+        if self.description is not None:
+            _text(self.description, "role evidence description")
         if self.value is not None:
             if type(self.value) is int:
                 if self.value < 0:
@@ -1560,11 +1689,14 @@ class RoleEvidenceItemV5:
         value: str | int | None = self.value
         if type(value) is Decimal:
             value = _decimal_primitive(value)
-        return {
+        primitive: dict[str, str | int | None] = {
             "evidence_id": self.evidence_id,
             "metric_id": self.metric_id,
             "value": value,
         }
+        if self.description is not None:
+            primitive["description"] = self.description
+        return primitive
 
 
 @dataclass(frozen=True, slots=True)
