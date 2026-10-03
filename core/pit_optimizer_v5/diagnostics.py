@@ -32,6 +32,7 @@ from .contracts import (
     RoleEvidenceV5,
     RollingReturnV5,
     SliceMetricsV5,
+    _ADD_ON_OUTCOME_IDS_V5,
 )
 
 
@@ -65,19 +66,6 @@ _POLICY_OUTCOME_IDS = frozenset(
         "delayed_missing_open_sessions",
         "preempted_by_stop",
         "unexecuted_terminal",
-    }
-)
-_ADD_ON_OUTCOME_IDS = frozenset(
-    {
-        "queued",
-        "executed",
-        "cancelled",
-        "already_pending",
-        "invalid_price",
-        "risk",
-        "cash",
-        "cap",
-        "no_position",
     }
 )
 _REGISTERED_ADD_ON_REJECTION_REASON_IDS = frozenset(
@@ -844,13 +832,6 @@ def summarize_panel_result(
         + policy_outcomes["unexecuted_terminal"]
     ):
         raise ValueError("V5 policy intents do not reconcile to terminal outcomes")
-    add_on_outcomes = result.add_on_outcomes
-    if (
-        not isinstance(add_on_outcomes, Mapping)
-        or set(add_on_outcomes) != _ADD_ON_OUTCOME_IDS
-        or any(type(value) is not int or value < 0 for value in add_on_outcomes.values())
-    ):
-        raise ValueError("V5 add-on outcomes are incomplete")
     rejection_status = result.add_on_rejection_telemetry_status
     if rejection_status not in {
         "complete",
@@ -858,6 +839,17 @@ def summarize_panel_result(
         "unavailable_unspecified",
     }:
         raise ValueError("V5 add-on rejection telemetry status is invalid")
+    add_on_outcomes = result.add_on_outcomes
+    if (
+        not isinstance(add_on_outcomes, Mapping)
+        or any(type(value) is not int or value < 0 for value in add_on_outcomes.values())
+    ):
+        raise ValueError("V5 add-on outcomes are incomplete")
+    if add_on_outcomes:
+        if set(add_on_outcomes) != _ADD_ON_OUTCOME_IDS_V5:
+            raise ValueError("V5 add-on outcomes are incomplete")
+    elif rejection_status != "unavailable_unspecified":
+        raise ValueError("V5 add-on outcomes are incomplete")
     report_rejection_status = {
         "incomplete_legacy_checkpoint": "unavailable_legacy_checkpoint",
     }.get(rejection_status, rejection_status)
@@ -877,10 +869,12 @@ def summarize_panel_result(
         add_on_metric_counts = _metric_counts(
             {**{str(key): int(value) for key, value in add_on_outcomes.items()}, "declined": declined_count}
         )
-    else:
+    elif add_on_outcomes:
         add_on_metric_counts = _metric_counts(
             {str(key): int(value) for key, value in add_on_outcomes.items()}
         )
+    else:
+        add_on_metric_counts = ()
     rejection_metric_counts = _metric_counts(
         {str(key): int(value) for key, value in rejection_reasons.items()}
     )
@@ -1197,9 +1191,9 @@ def to_role_evidence(report: EvaluationReportV5) -> RoleEvidenceV5:
         candidates.append(("report.report_semantics_version", report.report_semantics_version, None))
         status_description = (
             f"Candidate-declined add-on reason telemetry status: "
-            f"{report.add_on_rejection_telemetry_status}. Counts are partial when "
-            "status is unavailable_legacy_checkpoint and unavailable when status "
-            "is unavailable_unspecified."
+            f"{report.add_on_rejection_telemetry_status}. Counts are partial for "
+            "legacy checkpoints and unavailable for unspecified telemetry; "
+            "unavailable telemetry is not a zero count."
         )
         candidates.append(
             (

@@ -353,6 +353,59 @@ def test_actual_engine_observation_reaches_v2_report() -> None:
     assert "sha256" in unrepresented.description.lower()
 
 
+def test_absent_legacy_add_on_outcomes_stay_unavailable_without_zeroes() -> None:
+    from dataclasses import replace
+
+    panel, friction, result = _actual_engine_result()
+    legacy_result = replace(
+        result,
+        add_on_outcomes={},
+        add_on_rejection_reasons={},
+        add_on_rejection_telemetry_status="unavailable_unspecified",
+    )
+
+    report = summarize_panel_result(
+        panel=panel,
+        scenario=friction,
+        result=legacy_result,
+    )
+
+    assert report.add_on_rejection_telemetry_status == "unavailable_unspecified"
+    assert report.add_on_outcomes == ()
+    evidence = to_role_evidence(report)
+    assert not any(item.metric_id.startswith("add_on.outcome.") for item in evidence.items)
+    status = next(
+        item
+        for item in evidence.items
+        if item.metric_id == "report.add_on_rejection_telemetry_status"
+    )
+    assert status.value is None
+    assert "unavailable_unspecified" in status.description
+    assert "not a zero" in status.description
+
+    with pytest.raises(ValueError, match="add-on outcome telemetry is incomplete"):
+        replace(report, add_on_outcomes=(MetricCountV5("queued", 1),))
+
+
+def test_nonempty_partial_add_on_outcome_map_remains_invalid() -> None:
+    from dataclasses import replace
+
+    panel, friction, result = _actual_engine_result()
+    partial_result = replace(
+        result,
+        add_on_outcomes={"queued": 1},
+        add_on_rejection_reasons={},
+        add_on_rejection_telemetry_status="unavailable_unspecified",
+    )
+
+    with pytest.raises(ValueError, match="V5 add-on outcomes are incomplete"):
+        summarize_panel_result(
+            panel=panel,
+            scenario=friction,
+            result=partial_result,
+        )
+
+
 def test_legacy_v1_report_bytes_and_decode_remain_unchanged() -> None:
     from tests.test_pit_optimizer_v5_mechanism_artifacts import _zero_report
 

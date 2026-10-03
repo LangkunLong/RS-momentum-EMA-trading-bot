@@ -33,7 +33,7 @@ Initial implementation bytes in commit `6b1b6b7d2342da896565fce5d0f551b836f10764
 | --- | --- |
 | Additional-purchase outcomes reach reports and role evidence. | `test_actual_engine_observation_reaches_v2_report` calls the actual add-on decision/queue/fill path, then the simulator's result assembly. It verifies queued/executed outcomes in semantics-v2 reporting. `test_persisted_report_reaches_next_investigator_request` serializes a typed evaluation with the report, reloads it, and constructs the actual next `RoleRequestV5` through `LocalRoleRequestFactoryV5.investigator_request`; assertions inspect the constructed `request.messages` payload as well as role evidence. |
 | A candidate-authored rejection reason is retained or explicitly represented, and unknown reasons are not silently counted as zero. | The engine records exact validated reason-code counts on decline. The report preserves exact codes and separates unregistered codes. The investigator request carries the code count with a hash-bound metric identity and a provider-safe description in message schema v2. Unsafe reason prose is withheld and hash-bound. Role evidence projects at most 64 reason categories and carries an explicit omitted-category count with a hash manifest description. The issue test covers an unregistered reason and 66-category truncation. |
-| Missing legacy observation is unavailable rather than a fabricated zero. | A completed fresh simulator checkpoint is serialized, its new telemetry fields are removed to emulate a legacy checkpoint, and the actual result recovery path marks telemetry `incomplete_legacy_checkpoint`. The report maps that internal state to `unavailable_legacy_checkpoint`, omits the declined count, and does not project a declined zero. Explicit `null` status is rejected as malformed rather than treated as an old checkpoint. `unavailable_unspecified` likewise cannot carry reason counts. |
+| Missing legacy observation is unavailable rather than a fabricated zero. | A completed fresh simulator checkpoint is serialized, its new telemetry fields are removed to emulate a legacy checkpoint, and the actual result recovery path marks telemetry `incomplete_legacy_checkpoint`. The report maps that internal state to `unavailable_legacy_checkpoint`, omits the declined count, and does not project a declined zero. Explicit `null` status is rejected as malformed rather than treated as an old checkpoint. `unavailable_unspecified` likewise cannot carry reason counts. Round two also preserves an absent legacy add-on outcome map as an empty report tuple with unavailable status and no projected outcome counts; partial non-empty maps remain invalid. |
 | New semantics are versioned without retroactively changing old reports. | New summaries use report semantics v2 with explicit metric definitions and friction calibration limitations. `test_legacy_v1_report_bytes_and_decode_remain_unchanged` pins the existing v1 canonical SHA-256 to `5cccfb2c87faf7b6ec91ce3cf0b38945ff0cff04af1f5ab082090281604aa706` and covers decoding the old shape. V1 serialization omits v2-only fields. |
 
 ## Metric meanings and limits
@@ -102,3 +102,29 @@ Result: **6 passed, 2 warnings in 3.34s**. It covers all issue-specific tests, e
 TDD checks first failed because the request lacked `evidence_schema_version`; after adding descriptions, the existing provider filter surfaced uppercase `SHA` and `ADV` in explanatory text. Those terms were rendered as lowercase `sha256` and expanded “average daily volume”; the safety filter itself was not relaxed. The parity check then exposed the old paths' different unavailable-status wording; the shared helper now supplies the same bounded projection to both.
 
 The fixture and request construction are local and synthetic. No provider, model, broker, market-data acquisition, campaign, migration, deployment, or issue-status operation was performed. Independent lead review and integrated-branch acceptance remain separate from these scoped results.
+
+## Round-two legacy outcome compatibility
+
+The integrated #87 fixture builds a `SimulationResultV5` with no add-on outcome map and the default `unavailable_unspecified` telemetry status. The report path now preserves that absence as `add_on_outcomes=()` and `unavailable_unspecified`; role evidence emits no outcome count IDs. Its status description states that unavailable telemetry is not a zero count. A non-empty partial map remains invalid at both the result summarizer and report contract boundaries. Complete maps retain their existing validation and reporting behavior.
+
+The new issue regression `test_absent_legacy_add_on_outcomes_stay_unavailable_without_zeroes` covers the empty map, absence of projected counts, explicit unavailable wording, and rejection of a partial constructed report. `test_nonempty_partial_add_on_outcome_map_remains_invalid` checks that a partial input map is still rejected.
+
+Focused verification command:
+
+```text
+py -3.13 -m pytest -q -p no:cacheprovider --no-cov tests/test_issue86_report_evidence.py tests/test_pit_optimizer_v5_mechanism_artifacts.py::test_extension_off_factory_requests_and_messages_match_recorded_baseline tests/test_pit_optimizer_v5_evaluator_assumptions.py
+```
+
+Result: **8 passed, 2 warnings in 4.41s**. The warnings remain the unknown pytest `cache_dir` option and `websockets.legacy` deprecation. `git diff --check` and `py -3.13 -m py_compile core\pit_optimizer_v5\contracts.py core\pit_optimizer_v5\diagnostics.py tests\test_issue86_report_evidence.py` both exited 0.
+
+The exact #87 compatibility test `tests/test_issue87_diagnostic_meanings.py::test_public_diagnostic_values_match_fixed_same_path_arithmetic` was run read-only from the lead's `dd38` worktree while preloading this worktree's `core.pit_optimizer_v5.contracts` and `core.pit_optimizer_v5.diagnostics`. The printed diagnostics source was `C:\Users\llong\.codex\worktrees\210d\RS-momentum-EMA-trading-bot\core\pit_optimizer_v5\diagnostics.py`; result: **1 passed, 1 warning in 0.04s**. The test input file SHA-256 was `4B49C364AB5387A9891804EBA81DB44B96B9132B2AE2D22B50611CD0E63A9CF9`. No files in the `dd38` worktree were changed.
+
+Round-two implementation source bytes before commit:
+
+| File | SHA-256 |
+| --- | --- |
+| `core/pit_optimizer_v5/contracts.py` | `517EC0540C16FF9F1695869A0CE8A328B2B1A901A773184B518758EBF70B9886` |
+| `core/pit_optimizer_v5/diagnostics.py` | `100C76164D9F6F2E9D4760BE564DF3682D988988EAE5E5C6A314126AE0B2FF9E` |
+| `tests/test_issue86_report_evidence.py` | `366766F4AB9B03F4DDCF43E0E671E12656F1853C6EF927CE825F7E6490194211` |
+
+These are round-two working-tree bytes. The commit identity and final tracked status are recorded after committing.

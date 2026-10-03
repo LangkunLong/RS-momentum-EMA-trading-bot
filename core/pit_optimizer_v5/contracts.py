@@ -36,6 +36,19 @@ _TARGET_QUANTUM_V5 = Decimal("0.01")
 ARTIFACT_ROOT_V5 = ".artifacts/pit-optimizer-v5"
 MAX_ROLE_EVIDENCE_ITEMS_V5 = 2048
 MAX_ROLE_EVIDENCE_BYTES_V5 = 384 * 1024
+_ADD_ON_OUTCOME_IDS_V5 = frozenset(
+    {
+        "queued",
+        "executed",
+        "cancelled",
+        "already_pending",
+        "invalid_price",
+        "risk",
+        "cash",
+        "cap",
+        "no_position",
+    }
+)
 
 # This is a closed semantic-runtime set, not a repository hash.  In particular,
 # documentation, orchestration, provider, and CLI files do not affect evaluator
@@ -1603,18 +1616,21 @@ class EvaluationReportV5:
                 "scale_out_opportunity_cost_pct",
             }.issubset(definitions):
                 raise ValueError("V2 report metric definitions are incomplete")
+            outcome_ids = {item.metric_id for item in self.add_on_outcomes}
             if self.add_on_rejection_telemetry_status == "complete":
-                outcome_ids = {item.metric_id for item in self.add_on_outcomes}
-                if "declined" not in outcome_ids:
-                    raise ValueError("complete V2 add-on telemetry lacks declined outcomes")
-            elif (
-                self.add_on_rejection_telemetry_status == "unavailable_unspecified"
-                and (
+                if outcome_ids != _ADD_ON_OUTCOME_IDS_V5 | {"declined"}:
+                    raise ValueError("complete V2 add-on outcome telemetry is incomplete")
+            elif self.add_on_rejection_telemetry_status == "unavailable_legacy_checkpoint":
+                if outcome_ids != _ADD_ON_OUTCOME_IDS_V5:
+                    raise ValueError("legacy V2 add-on outcome telemetry is incomplete")
+            else:
+                if outcome_ids and outcome_ids != _ADD_ON_OUTCOME_IDS_V5:
+                    raise ValueError("V2 add-on outcome telemetry is incomplete")
+                if (
                     self.add_on_rejection_reason_counts
                     or self.unregistered_add_on_rejection_reason_counts
-                )
-            ):
-                raise ValueError("unavailable V2 add-on telemetry cannot carry reason counts")
+                ):
+                    raise ValueError("unavailable V2 add-on telemetry cannot carry reason counts")
             reason_counts = {item.metric_id: item.count for item in self.add_on_rejection_reason_counts}
             unregistered_counts = {
                 item.metric_id: item.count
