@@ -354,7 +354,14 @@ def _inputs(repository, attempt_ref, attempt):
             selection.experiment_ref,
             selection.finalized_campaign_ref,
         ),
-        raw=(attempt.pit_bundle_ref, attempt.prices_provenance_ref),
+        raw=(
+            attempt.pit_bundle_ref,
+            attempt.prices_provenance_ref,
+            confirmation_plan.episode.panel_ref,
+            original.discovery.mechanics.panel_ref,
+            original.discovery.quick.panel_ref,
+            *(item.panel_ref for item in original.discovery.discovery),
+        ),
     )
     values = {item.name: getattr(original, item.name) for item in fields(original)}
     values.update(attempt_ref=attempt_ref, attempt=attempt, confirmation_plan=confirmation_plan)
@@ -367,7 +374,11 @@ def _panel(repository, inputs, snapshot):
     _walk(
         repository,
         (inputs.attempt.qualification_plan_ref,),
-        raw=(inputs.attempt.pit_bundle_ref, inputs.attempt.prices_provenance_ref),
+        raw=(
+            inputs.attempt.pit_bundle_ref,
+            inputs.attempt.prices_provenance_ref,
+            plan.episode.panel_ref,
+        ),
     )
     panel = repository.load_evaluation_panel_spec(plan.episode.panel_ref)
     validate_episode_plan_panel_v5(plan.episode, panel)

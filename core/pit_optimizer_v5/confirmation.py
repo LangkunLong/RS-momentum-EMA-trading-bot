@@ -350,6 +350,7 @@ def build_confirmation_attempt(
     manifest, plan = authorities.manifest, authorities.panel_plan
     if confirmation_plan_ref.sha256 != plan.confirmation_plan_sha256:
         raise ValueError("confirmation plan is not the discovery commitment")
+    confirmation_plan = _load(repository, confirmation_plan_ref, ConfirmationPanelPlanV5)
     adapter = _load(repository, execution_adapter_ref, ConfirmationAdapterConfigV5)
     if (
         adapter.discovery_manifest_ref != discovery_manifest_ref
@@ -368,7 +369,14 @@ def build_confirmation_attempt(
             retirement_ledger.preopen_snapshot_ref,
         ),
         opaque=(confirmation_plan_ref,),
-        raw=(plan.pit_bundle_ref, plan.prices_provenance_ref),
+        raw=(
+            plan.pit_bundle_ref,
+            plan.prices_provenance_ref,
+            confirmation_plan.episode.panel_ref,
+            plan.mechanics.panel_ref,
+            plan.quick.panel_ref,
+            *(item.panel_ref for item in plan.discovery),
+        ),
     )
     champion, experiment = repository.load_confirmation_champion(
         checkpoint_ref=discovery_checkpoint_ref,
@@ -476,6 +484,7 @@ def _inputs(repository, attempt_ref, attempt):
     finalization = _load(repository, selection.finalized_campaign_ref, FinalizedDiscoveryCampaignV5)
     manifest = _load(repository, attempt.discovery_manifest_ref, CampaignManifestV5)
     discovery = _load(repository, manifest.panel_plan_ref, CampaignPanelPlanV5)
+    confirmation_plan = _load(repository, attempt.confirmation_plan_ref, ConfirmationPanelPlanV5)
     _walk(
         repository,
         (attempt_ref,),
@@ -486,7 +495,14 @@ def _inputs(repository, attempt_ref, attempt):
             selection.experiment_ref,
             selection.finalized_campaign_ref,
         ),
-        raw=(attempt.pit_bundle_ref, attempt.prices_provenance_ref),
+        raw=(
+            attempt.pit_bundle_ref,
+            attempt.prices_provenance_ref,
+            confirmation_plan.episode.panel_ref,
+            discovery.mechanics.panel_ref,
+            discovery.quick.panel_ref,
+            *(item.panel_ref for item in discovery.discovery),
+        ),
     )
     evaluator = _load(repository, attempt.evaluator_contract_ref, EvaluatorContractV5)
     execution = _load(repository, attempt.execution_profile_ref, ExecutionProfileV5)

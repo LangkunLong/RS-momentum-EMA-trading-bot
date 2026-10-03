@@ -578,6 +578,7 @@ def _identities(repository, attempt, prior, confirmed_outcome):
         sandbox_profile_ref=attempt.sandbox_profile_ref,
         sandbox_profile=sandbox,
         resources=manifest.resources,
+        pit_data_scope=manifest.pit_data_scope,
     )
     if (
         selection.discovery_manifest_ref != prior.discovery_manifest_ref
