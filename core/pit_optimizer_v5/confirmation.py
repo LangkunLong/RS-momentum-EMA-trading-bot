@@ -350,7 +350,6 @@ def build_confirmation_attempt(
     manifest, plan = authorities.manifest, authorities.panel_plan
     if confirmation_plan_ref.sha256 != plan.confirmation_plan_sha256:
         raise ValueError("confirmation plan is not the discovery commitment")
-    confirmation_plan = _load(repository, confirmation_plan_ref, ConfirmationPanelPlanV5)
     adapter = _load(repository, execution_adapter_ref, ConfirmationAdapterConfigV5)
     if (
         adapter.discovery_manifest_ref != discovery_manifest_ref
@@ -372,7 +371,6 @@ def build_confirmation_attempt(
         raw=(
             plan.pit_bundle_ref,
             plan.prices_provenance_ref,
-            confirmation_plan.episode.panel_ref,
             plan.mechanics.panel_ref,
             plan.quick.panel_ref,
             *(item.panel_ref for item in plan.discovery),
@@ -484,7 +482,6 @@ def _inputs(repository, attempt_ref, attempt):
     finalization = _load(repository, selection.finalized_campaign_ref, FinalizedDiscoveryCampaignV5)
     manifest = _load(repository, attempt.discovery_manifest_ref, CampaignManifestV5)
     discovery = _load(repository, manifest.panel_plan_ref, CampaignPanelPlanV5)
-    confirmation_plan = _load(repository, attempt.confirmation_plan_ref, ConfirmationPanelPlanV5)
     _walk(
         repository,
         (attempt_ref,),
@@ -498,7 +495,6 @@ def _inputs(repository, attempt_ref, attempt):
         raw=(
             attempt.pit_bundle_ref,
             attempt.prices_provenance_ref,
-            confirmation_plan.episode.panel_ref,
             discovery.mechanics.panel_ref,
             discovery.quick.panel_ref,
             *(item.panel_ref for item in discovery.discovery),
@@ -568,6 +564,8 @@ def _inputs(repository, attempt_ref, attempt):
 
 
 def _panel(repository, inputs, snapshot):
+    # The plan and held-out panel are decoded only after run_confirmation has
+    # observed or appended the durable opened ledger record.
     plan = _load(repository, inputs.attempt.confirmation_plan_ref, ConfirmationPanelPlanV5)
     panel = repository.load_evaluation_panel_spec(plan.episode.panel_ref)
     validate_episode_plan_panel_v5(plan.episode, panel)

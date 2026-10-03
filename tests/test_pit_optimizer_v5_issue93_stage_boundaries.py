@@ -33,6 +33,7 @@ from core.pit_optimizer_v5.candidate_ir import (
 from core.pit_optimizer_v5.confirmation import (
     ConfirmationAdapterConfigV5,
     ConfirmationCleanupV5,
+    ConfirmationLedgerV5,
     build_confirmation_attempt,
     run_confirmation,
 )
@@ -115,6 +116,7 @@ class _StageFixture:
     discovery_archive_ref: ArtifactRefV5
     finalized_campaign_ref: ArtifactRefV5
     confirmation_plan_ref: ArtifactRefV5
+    confirmation_panel_ref: ArtifactRefV5
     qualification_plan_ref: ArtifactRefV5
     scenario_grid_ref: ArtifactRefV5
     confirmation_ledger: RetirementLedgerLocatorV5
@@ -597,6 +599,7 @@ def _stage_fixture(tmp_path: Path) -> _StageFixture:
         archive_ref,
         finalized_ref,
         confirmation_plan_ref,
+        confirmation_episode.panel_ref,
         qualification_plan_ref,
         scenario_grid_ref,
         RetirementLedgerLocatorV5(
@@ -625,8 +628,11 @@ def stage_fixture() -> _StageFixture:
 
 
 def _fork_stage_fixture(template: _StageFixture, case_name: str, root: Path) -> _StageFixture:
-    evidence_root_value = os.environ.get("ISSUE93_EVIDENCE_ROOT")
-    persistent = evidence_root_value is not None and case_name == "positive"
+    evidence_root_value = {
+        "positive": os.environ.get("ISSUE93_EVIDENCE_ROOT"),
+        "heldout-decode-interruption": os.environ.get("ISSUE93_DECODE_EVIDENCE_ROOT"),
+    }.get(case_name)
+    persistent = evidence_root_value is not None
     if persistent:
         root = Path(evidence_root_value).resolve()
     artifact_root = root / "r"
@@ -941,6 +947,129 @@ def test_public_stage_chain_binds_policy_panels_and_non_executable_readiness(
             "source_root_path": str(fixture.source_root),
         }
         (evidence_root / "stage-chain-summary.json").write_text(
+            json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+
+def test_confirmation_keeps_heldout_plan_opaque_until_open_and_retires_decode_interruption(
+    stage_fixture: _StageFixture, tmp_path: Path
+) -> None:
+    fixture = _fork_stage_fixture(stage_fixture, "heldout-decode-interruption", tmp_path)
+    repository = fixture.repository
+    phase = "builder"
+    ledger = None
+    raw_plan_auth_phases = []
+    raw_plan_auth_states = []
+    plan_decode_states = []
+    panel_decode_states = []
+    interrupted = False
+    authenticate_raw = repository.authenticate_raw_artifact
+    load_typed = repository.load_typed_artifact
+    load_panel = repository.load_evaluation_panel_spec
+
+    def observe_raw_authentication(reference):
+        if reference == fixture.confirmation_plan_ref:
+            raw_plan_auth_phases.append(phase)
+            if ledger is not None:
+                state = ledger.state()[0]
+                raw_plan_auth_states.append((phase, state))
+                if phase == "runner":
+                    assert state == "unused"
+        return authenticate_raw(reference)
+
+    def observe_typed_load(reference, *, value_type):
+        if value_type is ConfirmationPanelPlanV5:
+            if ledger is None:
+                pytest.fail("attempt construction must keep the held-out plan opaque")
+            state = ledger.state()[0]
+            plan_decode_states.append((phase, state))
+            assert phase == "runner" and state == "opened"
+        return load_typed(reference, value_type=value_type)
+
+    def interrupt_after_panel_decode(reference):
+        nonlocal interrupted
+        if reference == fixture.confirmation_panel_ref and not interrupted:
+            state = ledger.state()[0]
+            panel_decode_states.append(state)
+            assert state == "opened"
+            load_panel(reference)
+            interrupted = True
+            raise KeyboardInterrupt("synthetic interruption after held-out panel decode")
+        return load_panel(reference)
+
+    repository.authenticate_raw_artifact = observe_raw_authentication
+    repository.load_typed_artifact = observe_typed_load
+    repository.load_evaluation_panel_spec = interrupt_after_panel_decode
+
+    attempt_ref = _confirmation_attempt(fixture)
+    assert raw_plan_auth_phases == ["builder"]
+    attempt = load_typed(attempt_ref, value_type=ConfirmationAttemptCommitmentV5)
+    snapshot = load_typed(
+        attempt.retirement_ledger.preopen_snapshot_ref,
+        value_type=StageRetirementSnapshotV5,
+    )
+    ledger = ConfirmationLedgerV5(repository, attempt_ref, attempt, snapshot)
+    assert ledger.state()[0] == "unused"
+
+    workers = []
+
+    def worker_factory(current_repository, inputs):
+        worker = _SyntheticStageWorker(current_repository, inputs)
+        workers.append(worker)
+        return worker
+
+    phase = "runner"
+    outcome_ref = run_confirmation(repository=repository, attempt_ref=attempt_ref, worker_factory=worker_factory)
+    outcome = repository.load_typed_artifact(outcome_ref, value_type=ConfirmationOutcomeV5)
+    assert interrupted and raw_plan_auth_phases == ["builder", "runner"]
+    assert raw_plan_auth_states == [("runner", "unused")]
+    assert plan_decode_states == [("runner", "opened")]
+    assert panel_decode_states == ["opened"]
+    assert outcome.status == "cancelled" and outcome.candidate_evidence_ref is None
+    assert ledger.state()[0] == "retired"
+    assert len(workers) == 1 and workers[0].evaluations == [] and workers[0].closed == [False]
+
+    recovered_ref = run_confirmation(
+        repository=repository,
+        attempt_ref=attempt_ref,
+        worker_factory=lambda *_: pytest.fail("retired decode interruption must not evaluate again"),
+    )
+    assert recovered_ref == outcome_ref and ledger.state()[0] == "retired"
+    assert len(workers[0].evaluations) == 0 and plan_decode_states == [("runner", "opened")]
+
+    evidence_root_value = os.environ.get("ISSUE93_DECODE_EVIDENCE_ROOT")
+    if evidence_root_value is not None:
+        evidence_root = Path(evidence_root_value).resolve()
+        summary = {
+            "schema_version": 1,
+            "source_revision": subprocess.run(
+                ("git", "rev-parse", "HEAD"),
+                cwd=Path(__file__).resolve().parents[1],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip(),
+            "evaluation_mode": "offline_fixture",
+            "provider_calls": 0,
+            "pit_bundle_sha256": fixture.pit_bundle_ref.sha256,
+            "discovery_manifest_sha256": fixture.manifest_ref.sha256,
+            "confirmation_plan_sha256": fixture.confirmation_plan_ref.sha256,
+            "confirmation_panel_sha256": fixture.confirmation_panel_ref.sha256,
+            "confirmation_attempt_sha256": attempt_ref.sha256,
+            "confirmation_outcome_sha256": outcome_ref.sha256,
+            "retirement_terminal_sha256": outcome.retirement_terminal_ref.sha256,
+            "retirement_ledger_sha256": hashlib.sha256(
+                repository.read_stage_ledger(attempt.retirement_ledger.relative_path)
+            ).hexdigest(),
+            "raw_plan_authentication_phases": raw_plan_auth_phases,
+            "raw_plan_authentication_states": raw_plan_auth_states,
+            "typed_plan_decode_phases_and_ledger_states": plan_decode_states,
+            "panel_decode_ledger_states": panel_decode_states,
+            "final_ledger_state": ledger.state()[0],
+            "worker_evaluations": len(workers[0].evaluations),
+            "artifact_root_identity_sha256": repository.root_identity_sha256,
+        }
+        (evidence_root / "heldout-ordering-summary.json").write_text(
             json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
 
