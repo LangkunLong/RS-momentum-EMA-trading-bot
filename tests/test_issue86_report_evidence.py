@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 
 import pandas as pd
 import pytest
@@ -11,6 +12,7 @@ from core.pit_optimizer_v5.artifacts import _decode_dataclass
 from core.pit_optimizer_v5.contracts import (
     EvaluationReportV5,
     MetricCountV5,
+    RoleEvidenceV5,
     canonical_json_bytes_v5,
     canonical_sha256_v5,
     initial_friction_grid_v5,
@@ -286,7 +288,7 @@ def test_actual_engine_observation_reaches_v2_report() -> None:
         if item.metric_id.startswith("add_on.rejection_reason_count.")
     )
     assert reason.value == 1
-    assert "sha-256" in reason.description.lower()
+    assert "sha256" in reason.description.lower()
     assert evidence_by_metric[
         "report.gross_annualized_return_pct"
     ].description is not None
@@ -348,7 +350,7 @@ def test_actual_engine_observation_reaches_v2_report() -> None:
         if item.metric_id == "add_on.rejection_reason_count.unrepresented_reason_category_count"
     )
     assert unrepresented.value == 2
-    assert "sha-256" in unrepresented.description.lower()
+    assert "sha256" in unrepresented.description.lower()
 
 
 def test_legacy_v1_report_bytes_and_decode_remain_unchanged() -> None:
@@ -377,6 +379,10 @@ def test_persisted_report_reaches_next_investigator_request(tmp_path) -> None:
     from tests.test_pit_optimizer_v5_mechanism_artifacts import _capability
 
     panel, friction, result = _actual_engine_result()
+    result = replace(
+        result,
+        add_on_rejection_telemetry_status="incomplete_legacy_checkpoint",
+    )
     report = summarize_panel_result(panel=panel, scenario=friction, result=result)
     mechanism_repository, capability, _candidate_bundle, _candidate_revision = _capability(tmp_path)
     authenticated = capability.authenticated_manifest
@@ -462,6 +468,84 @@ def test_persisted_report_reaches_next_investigator_request(tmp_path) -> None:
     assert "no observed quote" in evidence[
         "episode.1.friction_calibration_status"
     ].description
+
+    message_content = request.messages[0]["content"]
+    assert message_content["evidence_schema_version"] == 2
+    message_payloads = {
+        item["payload"]["metric_id"]: item["payload"]
+        for item in message_content["evidence"]
+    }
+    assert _UNKNOWN_ADD_ON_REASON in message_payloads[reason.metric_id]["description"]
+    assert "sha256" in message_payloads[reason.metric_id]["description"].lower()
+    message_status = message_payloads[
+        "episode.1.add_on_rejection_telemetry_status"
+    ]["description"]
+    assert "unavailable_legacy_checkpoint" in message_status
+    assert "not a zero count" in message_status
+    assert "Same-path gross-of-configured-friction" in message_payloads[
+        "episode.1.gross_annualized_return_pct"
+    ]["description"]
+    assert "arithmetic mean of observed-session gross-long-notional / total-equity" in message_payloads[
+        "episode.1.estimated_idle_cash_drag_pct"
+    ]["description"]
+    assert "chronology relative to a sale is unknown" in message_payloads[
+        "episode.1.scale_out_opportunity_cost_pct"
+    ]["description"]
+    assert "no observed quote" in message_payloads[
+        "episode.1.friction_calibration_status"
+    ]["description"]
+
+    from core.pit_optimizer_v5.production_runtime import (
+        _EvidenceBuilderV5,
+        _add_on_reason_description,
+    )
+
+    unsafe_reason = "ticker: ABC"
+    withheld_description = _add_on_reason_description(unsafe_reason)
+    unsafe_digest = hashlib.sha256(unsafe_reason.encode("utf-8")).hexdigest()
+    from core.pit_optimizer_v5.provider import _validate_safe_text
+
+    assert unsafe_reason not in withheld_description
+    assert unsafe_digest in withheld_description
+    assert "withheld" in withheld_description
+    assert _validate_safe_text(withheld_description, "fixture description") == withheld_description
+
+    unsafe_items = tuple(
+        replace(item, description="ticker: ABC")
+        if item.metric_id == reason.metric_id
+        else item
+        for item in request.role_evidence.items
+    )
+    with pytest.raises(ValueError, match="role evidence description contains"):
+        replace(request, role_evidence=RoleEvidenceV5(5, unsafe_items))
+
+    detailed_builder = _EvidenceBuilderV5("critic")
+    LocalRoleRequestFactoryV5._report_evidence(
+        detailed_builder,
+        report,
+        prefix="candidate.1",
+    )
+    detailed_items = detailed_builder.build().items
+
+    def shared_projection(items, prefix):
+        projected = {}
+        for item in items:
+            if not item.metric_id.startswith(prefix):
+                continue
+            suffix = item.metric_id[len(prefix) :]
+            if (
+                suffix.startswith("add_on.")
+                or suffix == "add_on_rejection_telemetry_status"
+                or suffix.startswith("friction_scenario.")
+                or suffix == "friction_calibration_status"
+            ):
+                projected[suffix] = (item.value, item.description)
+        return projected
+
+    assert shared_projection(
+        request.role_evidence.items,
+        "episode.1.",
+    ) == shared_projection(detailed_items, "candidate.1.")
 
 
 def test_actual_completed_checkpoint_round_trip_marks_legacy_reason_counts_unavailable(

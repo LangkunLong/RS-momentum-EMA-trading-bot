@@ -88,7 +88,8 @@ _MAX_ROLE_ADD_ON_REASON_CATEGORIES = 64
 _FRICTION_CALIBRATION_LIMITATION = (
     "Empirical friction calibration inputs and provenance were not supplied. "
     "The configured bps have no empirical sample or provenance, and no observed "
-    "quote, volume, ADV, order-size, or participation data calibrates this scenario."
+    "quote, volume, average daily volume, order-size, or participation data "
+    "calibrates this scenario."
 )
 _REPORT_METRIC_DEFINITIONS_V2 = (
     ReportMetricDefinitionV5(
@@ -1137,7 +1138,7 @@ def _role_add_on_reason_candidates(
             f"add_on.{category}.{hashlib.sha256(item.metric_id.encode('utf-8')).hexdigest()}",
             item.count,
             f"{description} Full reason code is retained in the persisted report; "
-            "this projection uses its SHA-256 reference.",
+            "this projection uses its sha256 reference.",
         )
         for item in retained
     ]
@@ -1149,7 +1150,7 @@ def _role_add_on_reason_candidates(
                 f"add_on.{category}.unrepresented_reason_category_count",
                 len(omitted),
                 "Some candidate-authored reason categories are omitted from bounded "
-                f"role evidence; SHA-256 {digest} binds their ordered IDs and counts. "
+                f"role evidence; sha256 {digest} binds their ordered IDs and counts. "
                 "Exact codes and counts remain in the persisted report.",
             )
         )
