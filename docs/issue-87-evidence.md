@@ -11,7 +11,7 @@ The report exposes these fields:
 | Public field | Calculation in the inspected source | Supported description |
 | --- | --- | --- |
 | `gross_annualized_return_pct` | Add each date's cumulative configured fill friction back to the observed equity curve, then calculate annualized return on that reconstructed curve. | Same realized path with configured friction restored. A path-derived gross estimate; it does not rerun decisions, orders, quantities, or cash under zero friction. |
-| `estimated_idle_cash_drag_pct` | `net annualized return / mean(daily gross long notional / daily total equity) - net annualized return`. | Exposure-scaled estimate. It does not accrue cash yield or simulate redeployment and changed actions. |
+| `estimated_idle_cash_drag_pct` | `net annualized return / mean(observed-session gross long notional / observed-session total equity) - net annualized return`. | Exposure-scaled estimate. It does not accrue cash yield or simulate redeployment and changed actions. |
 | `scale_out_opportunity_cost_pct` | For scale-out rows, sum `max(episode maximum completed-bar price - scale-out execution price, 0) × shares sold`; divide by scale-out execution notional. | Hindsight price gap to the episode-wide maximum. The maximum has no timestamp in `PositionEpisodeV5`, so it may precede the scale-out. It is not realized loss or a simulated hold-to-maximum counterfactual. |
 
 `portfolio_total_return_pct` and `portfolio_annualized_return_pct` use the first and last observed equity values in the panel. `friction_drag_pct` is the difference between gross and net total-return percentages. The cost-added-back curve preserves the simulated path. None of these metrics separately simulates changed fills or decisions under another friction assumption.
@@ -34,10 +34,10 @@ The observed net equity checkpoints are `$999.75 → $1,049.64 → $1,079.46`. A
 - Net first-to-last return and annualized return: **7.972993%**.
 - Same-path gross annualized return: **8.000000%**.
 - Total configured friction: **$0.54**.
-- Mean daily marked exposure: **27.150618%**. The daily long-notional fractions are `$500 / $999.75`, `$330 / $1,049.64`, and `$0 / $1,079.46`.
+- Mean observed-session marked exposure: **27.150618%**. The three observed-session long-notional fractions are `$500 / $999.75`, `$330 / $1,049.64`, and `$0 / $1,079.46`. This is an equal-weight mean of the supplied checkpoints, not a time-weighted or daily-density measure.
 - Exposure-scaled invested-sleeve annualized return: **29.365788%**.
 - Estimated idle-cash drag: **21.392795 percentage points** (`29.365788 − 7.972993`). This is the formula's scale-up proxy, not the simulated result of investing idle cash.
-- Scale-out gap: the stored episode maximum is **$130**, fixed as occurring before the later scale-out. The maximum has no timestamp field. The formula counts `($130 − $109.945) × 2 = $40.11` over `$109.945 × 2 = $219.89`, producing **18.240939%**. Because the peak preceded the sale, this is not evidence that holding the sold shares would have gained $40.11 after that sale.
+- Scale-out gap: the synthetic scenario assumes the **$130** episode maximum occurred before the later scale-out. `maximum_completed_bar_price` has no timestamp, so the stored metadata cannot establish that ordering. Under the scenario premise, the formula counts `($130 − $109.945) × 2 = $40.11` over `$109.945 × 2 = $219.89`, producing **18.240939%**. The fixture does not establish that holding the sold shares would have gained $40.11 after the sale.
 
 The fixture confirms arithmetic and current public field values. Its `LEAD` lineage, dates, prices, execution events, and account observations are synthetic and do not establish actual trading results, historical coverage, strategy performance, or execution quality.
 
