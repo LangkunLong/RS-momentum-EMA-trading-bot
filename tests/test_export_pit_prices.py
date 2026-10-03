@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import stat
 import subprocess
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import date
 from pathlib import Path
@@ -64,6 +66,321 @@ def _write_minimal_price_identity_manifest(
         membership.tickers,
     )
     return membership, history, exporter._sha256_file(path)
+
+
+def _synthetic_fiserv_segment_sidecar(
+    output_dir: Path,
+    parent_request_contracts: dict[str, dict[str, object]],
+) -> tuple[Path, str]:
+    evidence_dir = output_dir / "identity-evidence"
+    evidence_dir.mkdir(parents=True)
+    assertions: list[dict[str, object]] = []
+    for index, (assertion_id, effective_date) in enumerate(
+        (
+            ("synthetic-fiserv-2023", "2023-06-07"),
+            ("synthetic-fiserv-2025", "2025-11-11"),
+        )
+    ):
+        source_bytes = f"Synthetic test fixture; not source evidence {index}\n".encode()
+        source_path = evidence_dir / f"source-{index}.bin"
+        source_path.write_bytes(source_bytes)
+        assertions.append(
+            {
+                "assertion_id": assertion_id,
+                "authority": "Synthetic test fixture; not source evidence",
+                "url": f"https://example.test/synthetic-identity-{index}",
+                "accession": None,
+                "document_date": "2023-05-25" if index == 0 else "2025-10-29",
+                "locator": "Synthetic shape-only assertion",
+                "effective_date": effective_date,
+                "supports": "Synthetic test data; no real filing or source claim.",
+                "source_byte_sha256": hashlib.sha256(source_bytes).hexdigest(),
+                "source_document_path": f"identity-evidence/{source_path.name}",
+            }
+        )
+    parent_digest = exporter.pit_canonical_json_sha256(parent_request_contracts)
+    contract: dict[str, object] = {
+        "schema_version": 1,
+        "parent_price_identity_request_contracts_sha256": parent_digest,
+        "segments": [
+            {
+                "segment_id": "fiserv-fisv-pre-2023",
+                "provider_symbol": "FISV",
+                "chain_id": "fiserv",
+                "continuity_kind": "same_issuer_ticker_reuse",
+                "admitted_start": "2020-01-01",
+                "admitted_end": "2023-06-06",
+                "factor_anchor": False,
+            },
+            {
+                "segment_id": "fiserv-fi-2023-2025",
+                "provider_symbol": "FI",
+                "chain_id": "fiserv",
+                "continuity_kind": "same_issuer_ticker_reuse",
+                "admitted_start": "2023-06-07",
+                "admitted_end": "2025-11-10",
+                "factor_anchor": False,
+            },
+            {
+                "segment_id": "fiserv-fisv-post-2025",
+                "provider_symbol": "FISV",
+                "chain_id": "fiserv",
+                "continuity_kind": "same_issuer_ticker_reuse",
+                "admitted_start": "2025-11-11",
+                "admitted_end": "2025-12-31",
+                "factor_anchor": True,
+            },
+        ],
+        "transitions": [
+            {
+                "effective_date": "2023-06-07",
+                "predecessor_segment_id": "fiserv-fisv-pre-2023",
+                "successor_segment_id": "fiserv-fi-2023-2025",
+                "chain_id": "fiserv",
+                "continuity_kind": "same_issuer_ticker_reuse",
+                "source_assertion_ids": ["synthetic-fiserv-2023"],
+            },
+            {
+                "effective_date": "2025-11-11",
+                "predecessor_segment_id": "fiserv-fi-2023-2025",
+                "successor_segment_id": "fiserv-fisv-post-2025",
+                "chain_id": "fiserv",
+                "continuity_kind": "same_issuer_ticker_reuse",
+                "source_assertion_ids": ["synthetic-fiserv-2025"],
+            },
+        ],
+        "source_assertions": assertions,
+    }
+    contract_path = output_dir.parent / "synthetic-segment-contract.json"
+    contract_path.write_text(
+        exporter.json.dumps(contract, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    return contract_path, exporter.pit_canonical_json_sha256(contract)
+
+
+def _composed_export_args(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    output_name: str,
+    include_segments: bool,
+    cache_close: float = 100,
+) -> SimpleNamespace:
+    output_dir = tmp_path / output_name
+    output_dir.mkdir()
+    membership_path = tmp_path / f"{output_name}-membership.csv"
+    membership_path.write_text(
+        "effective_date,ticker,member\n"
+        "2020-01-02,FISV,1\n"
+        "2023-06-07,FI,1\n"
+        "2023-06-07,FISV,0\n"
+        "2025-11-11,FI,0\n"
+        "2025-11-11,FISV,1\n",
+        encoding="utf-8",
+    )
+    membership = exporter._load_membership(membership_path)
+    history_path = tmp_path / "synthetic-symbol-history.csv"
+    history_path.write_text("synthetic nonproduction symbol history\n", encoding="utf-8")
+    identity_map_path = tmp_path / "synthetic-price-identity.csv"
+    identity_map_path.write_text("synthetic nonproduction price identity\n", encoding="utf-8")
+    fi = exporter.PriceIdentity(
+        "FI",
+        "FI",
+        date(2025, 11, 10),
+        date(2023, 6, 7),
+        date(2025, 11, 10),
+        "fiserv",
+        "same_issuer_ticker_reuse",
+        "FISV",
+        False,
+        "https://example.test/synthetic-fi",
+    )
+    fisv = exporter.PriceIdentity(
+        "FISV",
+        "FISV",
+        date(2025, 12, 31),
+        date(2020, 1, 1),
+        date(2025, 12, 31),
+        "fiserv",
+        "same_issuer_ticker_reuse",
+        None,
+        True,
+        "https://example.test/synthetic-fisv",
+    )
+    manifest = exporter.PriceIdentityManifest(
+        identity_map_path,
+        exporter._sha256_file(identity_map_path),
+        {"FI": fi, "FISV": fisv},
+        1,
+    )
+    history = exporter.IdentityBounds(
+        history_path,
+        exporter._sha256_file(history_path),
+        {"FI": date(2025, 11, 10), "FISV": date(2025, 12, 31)},
+        2,
+        ("FI", "FISV"),
+    )
+    monkeypatch.setattr(exporter, "_load_identity_bounds", lambda *_args: history)
+    monkeypatch.setattr(exporter, "_load_price_identity_manifest", lambda *_args: manifest)
+
+    cache_path = tmp_path / f"{output_name}-cache.sqlite3"
+    cache_path.write_bytes(b"synthetic cache input\n")
+    cache_sha256 = exporter._sha256_file(cache_path)
+    worker_script = tmp_path / "synthetic-worker.py"
+    worker_script.write_text("# synthetic confined worker fixture\n", encoding="utf-8")
+
+    def copy_cache(_source: Path, expected_sha256: str, root: Path) -> exporter.CacheSnapshot:
+        return exporter.CacheSnapshot(
+            root / "synthetic-cache-snapshot.sqlite3",
+            expected_sha256,
+            0,
+            hashlib.sha256(b"").hexdigest(),
+        )
+
+    def run_worker(*_args: object) -> Path:
+        worker_output = _args[-1]
+        assert isinstance(worker_output, Path)
+        prices_path = worker_output / "prices.csv"
+        with prices_path.open("x", encoding="utf-8", newline="") as stream:
+            writer = exporter.csv.writer(stream, lineterminator="\n")
+            writer.writerow(PRICE_COLUMNS)
+            writer.writerow(
+                ("2023-06-06", "FISV", cache_close, cache_close + 1, cache_close - 1, cache_close, 1_000)
+            )
+        return prices_path
+
+    def write_snapshot(output_path: Path) -> SimpleNamespace:
+        fixture_rows = (
+            ("2023-06-06", "FISV"),
+            ("2023-06-07", "FI"),
+            ("2023-06-07", "FISV"),
+            ("2025-11-10", "FI"),
+            ("2025-11-10", "FISV"),
+            ("2025-11-11", "FISV"),
+            ("2023-06-06", "IWM"),
+            ("2023-06-06", "QQQ"),
+            ("2023-06-06", "SPY"),
+        )
+        with output_path.open("x", encoding="utf-8", newline="") as stream:
+            writer = exporter.csv.writer(stream, lineterminator="\n")
+            writer.writerow(PRICE_COLUMNS)
+            for trade_date, ticker in sorted(fixture_rows):
+                writer.writerow((trade_date, ticker, 100, 101, 99, 100, 1_000))
+        return SimpleNamespace(
+            path=output_path,
+            retrieved_at_utc="2026-10-02T00:00:00Z",
+            requested_symbol_count=5,
+            requested_membership_symbol_count=2,
+            returned_symbol_count=5,
+            returned_membership_symbol_count=2,
+            chunk_count=1,
+            row_count=len(fixture_rows),
+            adjustment="SPLIT",
+            identity_group_count=2,
+        )
+
+    def write_raw_snapshot(output_path: Path) -> SimpleNamespace:
+        output_path.write_text(",".join(PRICE_COLUMNS) + "\n", encoding="utf-8")
+        return SimpleNamespace(
+            path=output_path,
+            retrieved_at_utc="2026-10-02T00:00:00Z",
+            chunk_count=1,
+            row_count=0,
+            identity_group_count=2,
+        )
+
+    def fake_validate(
+        path: Path,
+        _membership: exporter.Membership,
+        _start: date,
+        _end: date,
+        *,
+        enforce_gates: bool = True,
+    ) -> tuple[dict[str, object], tuple[date, ...]]:
+        with path.open("r", encoding="utf-8", newline="") as stream:
+            rows = list(exporter.csv.DictReader(stream))
+        return (
+            {
+                "member_trading_day_pairs": 10,
+                "covered_member_trading_day_pairs": min(len(rows), 10),
+                "coverage_pct": 100.0,
+                "symbols_with_no_prices": [],
+                "symbols_with_partial_prices": [],
+                "reference_symbol_coverage": {},
+                "spy_first_date": "2025-11-11",
+                "spy_last_date": "2025-11-11",
+                "price_row_count": len(rows),
+                "synthetic_fixture_enforce_gates": enforce_gates,
+            },
+            (date(2025, 11, 11),),
+        )
+
+    monkeypatch.setattr(exporter, "_copy_and_validate_cache", copy_cache)
+    monkeypatch.setattr(exporter, "_prepare_container_access", lambda *_args: object())
+    monkeypatch.setattr(exporter, "_run_worker", run_worker)
+    monkeypatch.setattr(exporter, "load_alpaca_credentials", lambda *_args: ("fixture", "fixture"))
+    monkeypatch.setattr(
+        exporter,
+        "fetch_alpaca_sip_snapshot",
+        lambda *args, **kwargs: write_snapshot(kwargs["output_path"]),
+    )
+    monkeypatch.setattr(
+        exporter,
+        "fetch_alpaca_sip_raw_calibration",
+        lambda *args, **kwargs: write_raw_snapshot(kwargs["output_path"]),
+    )
+    monkeypatch.setattr(
+        exporter,
+        "_derive_cutoff_split_factors",
+        lambda _split, _raw, symbols: {symbol: 1.0 for symbol in symbols},
+    )
+    monkeypatch.setattr(exporter, "_validate_prices", fake_validate)
+
+    args = SimpleNamespace(
+        start_date=date(2020, 1, 1),
+        end_date=date(2025, 12, 31),
+        membership_csv=membership_path,
+        symbol_history_map=history_path,
+        symbol_history_map_sha256=history.sha256,
+        price_identity_map=identity_map_path,
+        price_identity_map_sha256=manifest.sha256,
+        cache=cache_path,
+        cache_sha256=cache_sha256,
+        worker_script=worker_script,
+        output_dir=output_dir,
+        docker_executable="docker",
+        sandbox_image="synthetic-fixture-image",
+        alpaca_sip_backfill=True,
+        alpaca_env_file=None,
+        price_identity_segments_json=None,
+        price_identity_segments_sha256=None,
+        allow_nonproduction_price_identity_segment_fixture=False,
+    )
+    if include_segments:
+        price_identities = exporter._complete_price_identities(
+            membership, manifest, args.end_date
+        )
+        parent = {
+            ticker: {
+                "provider_symbol": identity.provider_symbol,
+                "identity_asof": identity.identity_asof.isoformat(),
+                "admitted_start": identity.admitted_start.isoformat(),
+                "admitted_end": identity.admitted_end.isoformat(),
+                "chain_id": identity.chain_id,
+                "continuity_kind": identity.continuity_kind,
+                "warmup_predecessor": identity.warmup_predecessor,
+                "factor_anchor": identity.factor_anchor,
+            }
+            for ticker, identity in sorted(price_identities.items())
+        }
+        contract_path, contract_digest = _synthetic_fiserv_segment_sidecar(
+            output_dir, parent
+        )
+        args.price_identity_segments_json = contract_path
+        args.price_identity_segments_sha256 = contract_digest
+        args.allow_nonproduction_price_identity_segment_fixture = True
+    return args
 
 
 def test_price_identity_manifest_accepts_only_reviewed_class_share_provider_formatting(
@@ -156,6 +473,161 @@ def test_cache_only_path_does_not_load_backfill_identity_manifests(
 
     with pytest.raises(FileNotFoundError):
         exporter.export(args)
+
+
+def test_segment_export_composes_projection_warmup_provenance_and_legacy_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    temporary_index = 0
+
+    @contextmanager
+    def workspace_temporary_directory(*, prefix: str):
+        nonlocal temporary_index
+        path = tmp_path / f"{prefix}{temporary_index}"
+        temporary_index += 1
+        path.mkdir()
+        yield str(path)
+
+    monkeypatch.setattr(
+        exporter.tempfile, "TemporaryDirectory", workspace_temporary_directory
+    )
+    segment_args = _composed_export_args(
+        tmp_path, monkeypatch, output_name="segment-output", include_segments=True
+    )
+    segment_provenance = exporter.export(segment_args)
+    legacy_args = _composed_export_args(
+        tmp_path, monkeypatch, output_name="legacy-output", include_segments=False
+    )
+    legacy_provenance = exporter.export(legacy_args)
+
+    assert segment_provenance["price_identity_request_contracts"] == (
+        legacy_provenance["price_identity_request_contracts"]
+    )
+    assert segment_provenance["price_identity_request_contracts_sha256"] == (
+        legacy_provenance["price_identity_request_contracts_sha256"]
+    )
+    assert len(segment_provenance["price_identity_request_contracts"]) == 5
+    assert "price_identity_segments_v1" not in legacy_provenance
+    assert segment_provenance["price_identity_segment_sip_projection"] == {
+        "scope": "active_price_identity_segments",
+        "source_row_count": 9,
+        "active_segment_row_count": 4,
+        "active_rows_by_segment": {
+            "fiserv-fisv-pre-2023": 1,
+            "fiserv-fi-2023-2025": 2,
+            "fiserv-fisv-post-2025": 1,
+        },
+        "unsegmented_row_count": 3,
+        "discarded_inactive_symbol_row_count": 2,
+        "discarded_outside_segment_window_row_count": 0,
+    }
+    warmup = segment_provenance["price_identity_segment_warmup_validation"]
+    assert warmup["copied_warmup_rows_by_segment"] == {
+        "fiserv-fi-2023-2025": 1,
+        "fiserv-fisv-post-2025": 3,
+    }
+    assert warmup["transition_audits"]["fiserv-fisv-post-2025"][
+        "effective_date"
+    ] == "2025-11-11"
+    assert segment_provenance["price_identity_segment_parent_request_contracts_sha256"] == (
+        segment_provenance["price_identity_request_contracts_sha256"]
+    )
+    assert segment_provenance["price_identity_segments_admission_status"] == (
+        "nonproduction_fixture"
+    )
+    assert segment_provenance["price_identity_segments_source_use_status"] == (
+        "source_bytes_hash_verified_rights_not_adjudicated"
+    )
+    assert exporter.pit_canonical_json_sha256(
+        segment_provenance["price_identity_segments_v1"]
+    ) == segment_provenance["price_identity_segments_v1_sha256"]
+    staged_segment_input = exporter.validate_price_identity_segments_v1(
+        segment_provenance["price_identity_segments_v1"],
+        declared_sha256=segment_provenance["price_identity_segments_v1_sha256"],
+        parent_request_contracts=segment_provenance["price_identity_request_contracts"],
+        identities=segment_provenance["price_identity_request_contracts"],
+        source_evidence_root=segment_args.output_dir,
+        data_cutoff=date(2025, 12, 31),
+    )
+    assert staged_segment_input.segment_contract_sha256 == (
+        segment_provenance["price_identity_segments_v1_sha256"]
+    )
+
+    with (segment_args.output_dir / "prices.csv").open(
+        "r", encoding="utf-8", newline=""
+    ) as stream:
+        prices = list(exporter.csv.DictReader(stream))
+    assert [(row["trade_date"], row["ticker"]) for row in prices] == sorted(
+        (row["trade_date"], row["ticker"]) for row in prices
+    )
+    assert ("2023-06-07", "FISV") in {
+        (row["trade_date"], row["ticker"]) for row in prices
+    }  # explicitly retained as FI-segment warm-up
+    assert ("2025-11-10", "FISV") in {
+        (row["trade_date"], row["ticker"]) for row in prices
+    }  # explicitly retained as post-2025 FISV-segment warm-up
+
+    conflicting_args = _composed_export_args(
+        tmp_path,
+        monkeypatch,
+        output_name="segment-conflicting-cache",
+        include_segments=True,
+        cache_close=101,
+    )
+    with pytest.raises(ValueError, match="published price identity continuity mismatch"):
+        exporter.export(conflicting_args)
+    assert not (conflicting_args.output_dir / "prices.csv").exists()
+
+    unopted_args = _composed_export_args(
+        tmp_path,
+        monkeypatch,
+        output_name="segment-without-fixture-opt-in",
+        include_segments=True,
+    )
+    unopted_args.allow_nonproduction_price_identity_segment_fixture = False
+    with pytest.raises(ValueError, match="fixture-only until price-identity source-use admission"):
+        exporter.export(unopted_args)
+
+
+def test_segment_export_revalidates_source_evidence_before_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @contextmanager
+    def workspace_temporary_directory(*, prefix: str):
+        path = tmp_path / f"{prefix}revalidation"
+        path.mkdir()
+        yield str(path)
+
+    monkeypatch.setattr(
+        exporter.tempfile, "TemporaryDirectory", workspace_temporary_directory
+    )
+    args = _composed_export_args(
+        tmp_path, monkeypatch, output_name="segment-evidence-mutated", include_segments=True
+    )
+    source_path = args.output_dir / "identity-evidence" / "source-0.bin"
+    original_csv_text = exporter._csv_text
+    mutated = False
+
+    def mutate_before_final_validation(
+        rows: object,
+        header: object,
+    ) -> str:
+        nonlocal mutated
+        result = original_csv_text(rows, header)
+        if header == ("trade_date",) and not mutated:
+            source_path.write_bytes(b"changed after segment validation\n")
+            mutated = True
+        return result
+
+    monkeypatch.setattr(exporter, "_csv_text", mutate_before_final_validation)
+
+    with pytest.raises(ValueError, match="price identity source document hash does not match assertion"):
+        exporter.export(args)
+
+    assert mutated
+    assert not (args.output_dir / "prices.csv").exists()
 
 
 def test_alpaca_class_share_aliases_use_provider_dots_and_restore_canonical_hyphens() -> None:

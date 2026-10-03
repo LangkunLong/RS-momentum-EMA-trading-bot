@@ -16,7 +16,7 @@ import stat
 import subprocess
 import tempfile
 import uuid
-from contextlib import closing
+from contextlib import ExitStack, closing
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
@@ -36,6 +36,11 @@ from core.pit_provenance import (
     PIT_NON_TRADABLE_REFERENCE_SYMBOLS,
     pit_canonical_json,
     pit_canonical_json_sha256,
+)
+from core.pit_data import (
+    PriceIdentitySegment,
+    ValidatedPriceIdentitySegmentInput,
+    validate_price_identity_segments_v1,
 )
 
 _BASELINE_START = date(2020, 1, 1)
@@ -170,6 +175,71 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("price identity segment JSON contains a duplicate key")
+        result[key] = value
+    return result
+
+
+def _load_price_identity_segment_input(
+    path: Path,
+    expected_sha256: str,
+    parent_request_contracts: dict[str, dict[str, object]],
+    *,
+    source_evidence_root: Path,
+    data_cutoff: date,
+) -> tuple[ValidatedPriceIdentitySegmentInput, str]:
+    path = _regular_file(path, "price identity segment contract")
+    try:
+        raw_bytes = path.read_bytes()
+        raw_contract = json.loads(
+            raw_bytes.decode("utf-8"), object_pairs_hook=_unique_json_object
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("price identity segment contract is not valid UTF-8 JSON") from exc
+    if not isinstance(raw_contract, dict):
+        raise ValueError("price identity segment contract must be a JSON object")
+    source_root = Path(os.path.abspath(source_evidence_root))
+    if source_root.is_symlink() or not source_root.is_dir():
+        raise ValueError("price identity segment source-evidence root must be a directory")
+    validated = validate_price_identity_segments_v1(
+        raw_contract,
+        declared_sha256=expected_sha256,
+        parent_request_contracts=parent_request_contracts,
+        identities=parent_request_contracts,
+        source_evidence_root=source_root,
+        data_cutoff=data_cutoff,
+    )
+    return validated, hashlib.sha256(raw_bytes).hexdigest()
+
+
+def _revalidate_price_identity_segment_input(
+    contract_path: Path,
+    expected_file_sha256: str,
+    expected_contract: ValidatedPriceIdentitySegmentInput,
+    parent_request_contracts: dict[str, dict[str, object]],
+    *,
+    source_evidence_root: Path,
+    data_cutoff: date,
+) -> None:
+    contract_path = _regular_file(contract_path, "price identity segment contract")
+    if _sha256_file(contract_path) != expected_file_sha256:
+        raise ValueError("price identity segment input file changed during export")
+    refreshed = validate_price_identity_segments_v1(
+        expected_contract.to_provenance_object(),
+        declared_sha256=expected_contract.segment_contract_sha256,
+        parent_request_contracts=parent_request_contracts,
+        identities=parent_request_contracts,
+        source_evidence_root=source_evidence_root,
+        data_cutoff=data_cutoff,
+    )
+    if refreshed != expected_contract:
+        raise ValueError("price identity segment evidence changed during export")
 
 
 def _load_membership(path: Path) -> Membership:
@@ -1220,6 +1290,308 @@ def _clip_cache_to_admitted_identities(
     return {"kept_row_count": kept, "discarded_row_count": discarded}
 
 
+def _partition_prices_by_active_segments(
+    source_path: Path,
+    segment_input: ValidatedPriceIdentitySegmentInput,
+    projected_path: Path,
+    segmented_path: Path,
+    unsegmented_path: Path,
+) -> dict[str, object]:
+    """Keep active segment observations and partition legacy rows for warm-up."""
+    segments_by_chain: dict[str, list[PriceIdentitySegment]] = {}
+    chains_by_symbol: dict[str, set[str]] = {}
+    for segment in segment_input.segments.values():
+        segments_by_chain.setdefault(segment.chain_id, []).append(segment)
+        chains_by_symbol.setdefault(segment.provider_symbol, set()).add(segment.chain_id)
+    ambiguous = sorted(symbol for symbol, chains in chains_by_symbol.items() if len(chains) != 1)
+    if ambiguous:
+        raise ValueError(
+            "segmented provider symbol maps to multiple lineages: " + ", ".join(ambiguous)
+        )
+    chain_by_symbol = {symbol: next(iter(chains)) for symbol, chains in chains_by_symbol.items()}
+
+    created: list[Path] = []
+    active_by_segment = {segment_id: 0 for segment_id in segment_input.segments}
+    unsegmented_count = 0
+    inactive_symbol_count = 0
+    outside_segment_window_count = 0
+    source_count = 0
+    previous_key: tuple[str, str] | None = None
+    try:
+        with source_path.open("r", encoding="utf-8", newline="") as source, ExitStack() as stack:
+            output_streams = []
+            for output_path in (projected_path, segmented_path, unsegmented_path):
+                output_streams.append(
+                    stack.enter_context(output_path.open("x", encoding="utf-8", newline=""))
+                )
+                created.append(output_path)
+            readers = csv.DictReader(source)
+            if tuple(readers.fieldnames or ()) != _PRICE_COLUMNS:
+                raise ValueError("segment projection source has an unexpected header")
+            writers = [
+                csv.DictWriter(stream, fieldnames=_PRICE_COLUMNS, lineterminator="\n")
+                for stream in output_streams
+            ]
+            for writer in writers:
+                writer.writeheader()
+            for row_number, row in enumerate(readers, start=2):
+                source_count += 1
+                ticker = row.get("ticker", "")
+                try:
+                    trade_date = date.fromisoformat(row["trade_date"])
+                except (KeyError, ValueError) as exc:
+                    raise ValueError(
+                        f"segment projection row {row_number} has an invalid trade date"
+                    ) from exc
+                if _TICKER_RE.fullmatch(ticker) is None:
+                    raise ValueError(f"segment projection row {row_number} has an invalid ticker")
+                key = (trade_date.isoformat(), ticker)
+                if previous_key is not None and key <= previous_key:
+                    raise ValueError("segment projection source is not strictly sorted by identity/date")
+                previous_key = key
+                chain_id = chain_by_symbol.get(ticker)
+                if chain_id is None:
+                    writers[0].writerow(row)
+                    writers[2].writerow(row)
+                    unsegmented_count += 1
+                    continue
+                active = [
+                    item
+                    for item in segments_by_chain[chain_id]
+                    if item.admitted_start <= trade_date <= item.admitted_end
+                ]
+                if not active:
+                    outside_segment_window_count += 1
+                    continue
+                if len(active) != 1:
+                    raise ValueError(
+                        f"segmented lineage has ambiguous active rows on {trade_date.isoformat()}"
+                    )
+                if ticker != active[0].provider_symbol:
+                    inactive_symbol_count += 1
+                    continue
+                writers[0].writerow(row)
+                writers[1].writerow(row)
+                active_by_segment[active[0].segment_id] += 1
+    except Exception:
+        for path in reversed(created):
+            path.unlink(missing_ok=True)
+        raise
+    return {
+        "scope": "active_price_identity_segments",
+        "source_row_count": source_count,
+        "active_segment_row_count": sum(active_by_segment.values()),
+        "active_rows_by_segment": active_by_segment,
+        "unsegmented_row_count": unsegmented_count,
+        "discarded_inactive_symbol_row_count": inactive_symbol_count,
+        "discarded_outside_segment_window_row_count": outside_segment_window_count,
+    }
+
+
+def _build_segment_price_identity_warmup(
+    active_path: Path,
+    segment_input: ValidatedPriceIdentitySegmentInput,
+    output_path: Path,
+) -> dict[str, object]:
+    """Warm successor series by segment edges without conflating reused tickers."""
+    active_rows: dict[str, dict[date, tuple[float, ...]]] = {
+        segment_id: {} for segment_id in segment_input.segments
+    }
+    chains_by_symbol: dict[str, set[str]] = {}
+    segments_by_chain: dict[str, list[PriceIdentitySegment]] = {}
+    for segment in segment_input.segments.values():
+        chains_by_symbol.setdefault(segment.provider_symbol, set()).add(segment.chain_id)
+        segments_by_chain.setdefault(segment.chain_id, []).append(segment)
+    if any(len(chains) != 1 for chains in chains_by_symbol.values()):
+        raise ValueError("segmented provider symbol maps to multiple lineages")
+
+    previous_key: tuple[str, str] | None = None
+    with active_path.open("r", encoding="utf-8", newline="") as stream:
+        reader = csv.DictReader(stream)
+        if tuple(reader.fieldnames or ()) != _PRICE_COLUMNS:
+            raise ValueError("segment warm-up source has an unexpected header")
+        for row_number, row in enumerate(reader, start=2):
+            ticker = row.get("ticker", "")
+            try:
+                trade_date = date.fromisoformat(row["trade_date"])
+                values = tuple(float(row[name]) for name in _PRICE_COLUMNS[2:])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"segment warm-up row {row_number} is malformed") from exc
+            chain_ids = chains_by_symbol.get(ticker)
+            if chain_ids is None or len(chain_ids) != 1:
+                raise ValueError("segment warm-up input contains an unsegmented price row")
+            chain_id = next(iter(chain_ids))
+            active = [
+                item
+                for item in segments_by_chain[chain_id]
+                if item.admitted_start <= trade_date <= item.admitted_end
+            ]
+            if len(active) != 1 or ticker != active[0].provider_symbol:
+                raise ValueError("segment warm-up input contains an inactive identity/date row")
+            key = (trade_date.isoformat(), ticker)
+            if previous_key is not None and key <= previous_key:
+                raise ValueError("segment warm-up source is not strictly sorted by identity/date")
+            previous_key = key
+            segment_rows = active_rows[active[0].segment_id]
+            if trade_date in segment_rows:
+                raise ValueError(
+                    f"segment warm-up source duplicates {ticker} on {trade_date.isoformat()}"
+                )
+            segment_rows[trade_date] = values
+
+    incoming = {
+        transition.successor_segment_id: transition
+        for transition in segment_input.transitions
+    }
+    augmented: dict[str, dict[date, tuple[float, ...]]] = {}
+    copied_by_segment: dict[str, int] = {}
+    transition_audits: dict[str, object] = {}
+    ordered_segments = sorted(
+        segment_input.segments.values(),
+        key=lambda item: (item.admitted_start, item.segment_id),
+    )
+    for segment in ordered_segments:
+        rows = dict(active_rows[segment.segment_id])
+        transition = incoming.get(segment.segment_id)
+        if transition is not None:
+            predecessor_rows = augmented.get(transition.predecessor_segment_id)
+            if predecessor_rows is None:
+                raise ValueError("segment warm-up predecessor has not been resolved")
+            predecessor_active = active_rows[transition.predecessor_segment_id]
+            shared = sorted(set(predecessor_active).intersection(active_rows[segment.segment_id]))
+            mismatches = [
+                trade_date
+                for trade_date in shared
+                if predecessor_active[trade_date] != active_rows[segment.segment_id][trade_date]
+            ]
+            if mismatches:
+                raise ValueError(
+                    "price identity segment observations disagree on an admitted overlap"
+                )
+            copied = 0
+            for trade_date, values in sorted(predecessor_rows.items()):
+                if trade_date >= segment.admitted_start:
+                    continue
+                existing = rows.get(trade_date)
+                if existing is not None and existing != values:
+                    raise ValueError(
+                        "segment predecessor warm-up conflicts with successor history"
+                    )
+                if existing is None:
+                    rows[trade_date] = values
+                    copied += 1
+            if copied == 0:
+                raise ValueError(
+                    f"segment predecessor {transition.predecessor_segment_id} "
+                    f"supplies no warm-up for {segment.segment_id}"
+                )
+            copied_by_segment[segment.segment_id] = copied
+            transition_audits[segment.segment_id] = {
+                "predecessor_segment_id": transition.predecessor_segment_id,
+                "effective_date": transition.effective_date.isoformat(),
+                "exact_active_overlap_row_count": len(shared),
+                "copied_warmup_row_count": copied,
+            }
+        augmented[segment.segment_id] = rows
+
+    by_ticker: dict[str, dict[date, tuple[float, ...]]] = {}
+    for segment in ordered_segments:
+        ticker_rows = by_ticker.setdefault(segment.provider_symbol, {})
+        for trade_date, values in augmented[segment.segment_id].items():
+            existing = ticker_rows.get(trade_date)
+            if existing is not None and existing != values:
+                raise ValueError(
+                    "segment episodes produce conflicting rows under a reused ticker"
+                )
+            ticker_rows[trade_date] = values
+
+    created = False
+    try:
+        with output_path.open("x", encoding="utf-8", newline="") as output:
+            created = True
+            writer = csv.writer(output, lineterminator="\n")
+            writer.writerow(_PRICE_COLUMNS)
+            for trade_date, ticker, values in sorted(
+                (
+                    (trade_date, ticker, values)
+                    for ticker, ticker_rows in by_ticker.items()
+                    for trade_date, values in ticker_rows.items()
+                ),
+                key=lambda item: (item[0], item[1]),
+            ):
+                writer.writerow(
+                    (trade_date.isoformat(), ticker, *(repr(value) for value in values))
+                )
+    except Exception:
+        if created:
+            output_path.unlink(missing_ok=True)
+        raise
+    return {
+        "scope": "price_identity_segment_warmup",
+        "active_segment_row_count": sum(len(rows) for rows in active_rows.values()),
+        "active_rows_by_segment": {
+            segment_id: len(rows) for segment_id, rows in sorted(active_rows.items())
+        },
+        "copied_warmup_row_count": sum(copied_by_segment.values()),
+        "copied_warmup_rows_by_segment": dict(sorted(copied_by_segment.items())),
+        "transition_audits": dict(sorted(transition_audits.items())),
+    }
+
+
+def _merge_partitioned_price_rows(
+    left_path: Path,
+    right_path: Path,
+    output_path: Path,
+) -> dict[str, int]:
+    """Merge disjoint sorted identity partitions, rejecting duplicate row keys."""
+    output_created = False
+    left_count = 0
+    right_count = 0
+    try:
+        with (
+            left_path.open("r", encoding="utf-8", newline="") as left_stream,
+            right_path.open("r", encoding="utf-8", newline="") as right_stream,
+            output_path.open("x", encoding="utf-8", newline="") as output_stream,
+        ):
+            output_created = True
+            left_reader = csv.DictReader(left_stream)
+            right_reader = csv.DictReader(right_stream)
+            if tuple(left_reader.fieldnames or ()) != _PRICE_COLUMNS:
+                raise ValueError("left partition has an unexpected price header")
+            if tuple(right_reader.fieldnames or ()) != _PRICE_COLUMNS:
+                raise ValueError("right partition has an unexpected price header")
+            writer = csv.DictWriter(output_stream, fieldnames=_PRICE_COLUMNS, lineterminator="\n")
+            writer.writeheader()
+            left_row = next(left_reader, None)
+            right_row = next(right_reader, None)
+            while left_row is not None or right_row is not None:
+                left_key = (
+                    (left_row["trade_date"], left_row["ticker"])
+                    if left_row is not None
+                    else None
+                )
+                right_key = (
+                    (right_row["trade_date"], right_row["ticker"])
+                    if right_row is not None
+                    else None
+                )
+                if right_key is None or left_key is not None and left_key < right_key:
+                    writer.writerow(left_row)
+                    left_count += 1
+                    left_row = next(left_reader, None)
+                elif left_key is None or right_key < left_key:
+                    writer.writerow(right_row)
+                    right_count += 1
+                    right_row = next(right_reader, None)
+                else:
+                    raise ValueError("partitioned price rows contain a duplicate identity/date key")
+    except Exception:
+        if output_created:
+            output_path.unlink(missing_ok=True)
+        raise
+    return {"left_row_count": left_count, "right_row_count": right_count}
+
+
 def _normalize_cache_to_cutoff_basis(
     cache_path: Path,
     split_path: Path,
@@ -1564,8 +1936,28 @@ def export(args: argparse.Namespace) -> dict[str, object]:
     membership = _load_membership(membership_path)
     alpaca_sip_backfill = bool(getattr(args, "alpaca_sip_backfill", False))
     alpaca_env_file_value = getattr(args, "alpaca_env_file", None)
+    segment_contract_path_value = getattr(args, "price_identity_segments_json", None)
+    segment_contract_sha256 = getattr(args, "price_identity_segments_sha256", None)
+    segment_fixture_opt_in = getattr(
+        args, "allow_nonproduction_price_identity_segment_fixture", False
+    )
+    if (segment_contract_path_value is None) != (segment_contract_sha256 is None):
+        raise ValueError(
+            "price identity segment JSON input and declared SHA-256 must be supplied together"
+        )
+    if segment_contract_path_value is not None and segment_fixture_opt_in is not True:
+        raise ValueError(
+            "segment exporter inputs are fixture-only until price-identity source-use admission is reviewed"
+        )
+    if segment_fixture_opt_in is True and segment_contract_path_value is None:
+        raise ValueError("nonproduction segment fixture opt-in requires a segment contract")
+    if segment_contract_path_value is not None and not alpaca_sip_backfill:
+        raise ValueError("price identity segments require explicit --alpaca-sip-backfill")
     if not alpaca_sip_backfill and alpaca_env_file_value is not None:
         raise ValueError("--alpaca-env-file requires explicit --alpaca-sip-backfill")
+    output_dir = Path(args.output_dir).resolve()
+    segment_input: ValidatedPriceIdentitySegmentInput | None = None
+    segment_input_file_sha256: str | None = None
     if alpaca_sip_backfill:
         identity_bounds = _load_identity_bounds(
             Path(args.symbol_history_map),
@@ -1609,10 +2001,22 @@ def export(args: argparse.Namespace) -> dict[str, object]:
         identity_request_bytes = (
             json.dumps(identity_request_values, sort_keys=True, separators=(",", ":")) + "\n"
         ).encode()
+        if segment_contract_path_value is not None:
+            segment_input, segment_input_file_sha256 = _load_price_identity_segment_input(
+                Path(segment_contract_path_value),
+                segment_contract_sha256,
+                identity_request_values,
+                source_evidence_root=output_dir,
+                data_cutoff=args.end_date,
+            )
+            expected_parent_sha256 = hashlib.sha256(identity_request_bytes).hexdigest()
+            if segment_input.parent_request_contracts_sha256 != expected_parent_sha256:
+                raise ValueError(
+                    "validated price identity segments do not match the exporter request contracts"
+                )
     source = _regular_file(Path(args.cache), "cache")
     source_before = source.stat()
     worker_script = _regular_file(Path(args.worker_script), "worker script")
-    output_dir = Path(args.output_dir).resolve()
     with tempfile.TemporaryDirectory(prefix="pit-price-export-") as temporary:
         root = Path(temporary)
         worker_output = root / "output"
@@ -1700,20 +2104,73 @@ def export(args: argparse.Namespace) -> dict[str, object]:
                 admitted_snapshot_path,
             )
             alpaca_snapshot_path = root / "alpaca_sip_snapshot.csv"
-            warmup_continuity = _build_price_identity_warmup(
-                admitted_snapshot_path,
-                price_identities,
-                alpaca_snapshot_path,
-            )
+            segment_cache_projection: dict[str, object] | None = None
+            segment_sip_projection: dict[str, object] | None = None
+            segment_warmup_validation: dict[str, object] | None = None
+            if segment_input is None:
+                warmup_continuity = _build_price_identity_warmup(
+                    admitted_snapshot_path,
+                    price_identities,
+                    alpaca_snapshot_path,
+                )
+            else:
+                segmented_chains = {
+                    segment.chain_id for segment in segment_input.segments.values()
+                }
+                unsegmented_identities = {
+                    ticker: identity
+                    for ticker, identity in price_identities.items()
+                    if identity.chain_id not in segmented_chains
+                }
+                sip_projected_path = root / "alpaca_sip_segment_projected.csv"
+                sip_segmented_path = root / "alpaca_sip_segment_active.csv"
+                sip_unsegmented_path = root / "alpaca_sip_unsegmented.csv"
+                segment_sip_projection = _partition_prices_by_active_segments(
+                    admitted_snapshot_path,
+                    segment_input,
+                    sip_projected_path,
+                    sip_segmented_path,
+                    sip_unsegmented_path,
+                )
+                segment_warmup_path = root / "alpaca_sip_segment_warmup.csv"
+                segment_warmup_validation = _build_segment_price_identity_warmup(
+                    sip_segmented_path,
+                    segment_input,
+                    segment_warmup_path,
+                )
+                unsegmented_warmup_path = root / "alpaca_sip_unsegmented_warmup.csv"
+                warmup_continuity = _build_price_identity_warmup(
+                    sip_unsegmented_path,
+                    unsegmented_identities,
+                    unsegmented_warmup_path,
+                )
+                segment_snapshot_merge = _merge_partitioned_price_rows(
+                    segment_warmup_path,
+                    unsegmented_warmup_path,
+                    alpaca_snapshot_path,
+                )
             admitted_cache_path = root / "admitted_cache.csv"
             cache_identity_clipping = _clip_cache_to_admitted_identities(
                 prices_path,
                 price_identities,
                 admitted_cache_path,
             )
+            cache_for_basis_path = admitted_cache_path
+            if segment_input is not None:
+                cache_projected_path = root / "cache_segment_projected.csv"
+                cache_segmented_path = root / "cache_segment_active.csv"
+                cache_unsegmented_path = root / "cache_unsegmented.csv"
+                segment_cache_projection = _partition_prices_by_active_segments(
+                    admitted_cache_path,
+                    segment_input,
+                    cache_projected_path,
+                    cache_segmented_path,
+                    cache_unsegmented_path,
+                )
+                cache_for_basis_path = cache_projected_path
             normalized_cache_path = root / "cutoff_normalized_cache.csv"
             cache_basis = _normalize_cache_to_cutoff_basis(
-                admitted_cache_path,
+                cache_for_basis_path,
                 split_snapshot.path,
                 alpaca_snapshot_path,
                 cutoff_factors,
@@ -1823,6 +2280,34 @@ def export(args: argparse.Namespace) -> dict[str, object]:
                 - int(metrics["covered_member_trading_day_pairs"]),
                 **merge_metrics,
             }
+            if segment_input is not None:
+                if (
+                    segment_cache_projection is None
+                    or segment_sip_projection is None
+                    or segment_warmup_validation is None
+                    or segment_input_file_sha256 is None
+                ):
+                    raise RuntimeError("validated price identity segment audit state is incomplete")
+                provider_provenance.update(
+                    {
+                        "price_identity_segments_v1": segment_input.to_provenance_object(),
+                        "price_identity_segments_v1_sha256": (
+                            segment_input.segment_contract_sha256
+                        ),
+                        "price_identity_segments_admission_status": "nonproduction_fixture",
+                        "price_identity_segments_source_use_status": (
+                            "source_bytes_hash_verified_rights_not_adjudicated"
+                        ),
+                        "price_identity_segment_input_file_sha256": segment_input_file_sha256,
+                        "price_identity_segment_parent_request_contracts_sha256": (
+                            segment_input.parent_request_contracts_sha256
+                        ),
+                        "price_identity_segment_cache_projection": segment_cache_projection,
+                        "price_identity_segment_sip_projection": segment_sip_projection,
+                        "price_identity_segment_warmup_validation": segment_warmup_validation,
+                        "price_identity_segment_partition_merge": segment_snapshot_merge,
+                    }
+                )
         else:
             metrics, spy_days = cache_metrics, _cache_spy_days
         source_after = source.stat()
@@ -1857,6 +2342,17 @@ def export(args: argparse.Namespace) -> dict[str, object]:
         }
         spy_text = _csv_text([(value.isoformat(),) for value in spy_days], ("trade_date",))
         provenance["spy_trading_days_sha256"] = hashlib.sha256(spy_text.encode()).hexdigest()
+        if segment_input is not None:
+            if segment_contract_path_value is None or segment_input_file_sha256 is None:
+                raise RuntimeError("validated price identity segment input state is incomplete")
+            _revalidate_price_identity_segment_input(
+                Path(segment_contract_path_value),
+                segment_input_file_sha256,
+                segment_input,
+                identity_request_values,
+                source_evidence_root=output_dir,
+                data_cutoff=args.end_date,
+            )
         _publish(
             output_dir,
             publication_prices,

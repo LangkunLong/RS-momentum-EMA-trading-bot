@@ -221,6 +221,31 @@ class PriceIdentitySourceAssertion:
 
 
 @dataclass(frozen=True)
+class ValidatedPriceIdentitySegmentInput:
+    """Validated segment input before a final prices-provenance file exists."""
+
+    parent_request_contracts_sha256: str
+    segment_contract_sha256: str
+    segments: Mapping[str, PriceIdentitySegment]
+    transitions: tuple[PriceIdentitySegmentTransition, ...]
+    source_assertions: Mapping[str, PriceIdentitySourceAssertion]
+    source_evidence_root: Path
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "segments", MappingProxyType(dict(self.segments)))
+        object.__setattr__(self, "source_assertions", MappingProxyType(dict(self.source_assertions)))
+
+    def to_provenance_object(self) -> dict[str, object]:
+        """Return the canonical v1 object validated by this ingestion result."""
+        return _segment_contract_object(
+            self.parent_request_contracts_sha256,
+            self.segments,
+            self.transitions,
+            self.source_assertions,
+        )
+
+
+@dataclass(frozen=True)
 class PriceIdentityTransitionContract:
     """Hash-bound rules for carrying an open holding across ticker identities."""
 
@@ -877,6 +902,102 @@ def _parse_price_identity_segments_v1(
         MappingProxyType(segments),
         tuple(segment_transitions),
         MappingProxyType(assertions),
+    )
+
+
+def validate_price_identity_segments_v1(
+    raw_contract: object,
+    *,
+    declared_sha256: object,
+    parent_request_contracts: Mapping[str, Mapping[str, object]],
+    identities: Mapping[str, Mapping[str, object]],
+    source_evidence_root: Path,
+    data_cutoff: date,
+    ticker_transitions: tuple[IdentityTransition, ...] = (),
+) -> ValidatedPriceIdentitySegmentInput:
+    """Validate a segment sidecar against its exact pre-bundle parent input.
+
+    Unlike :class:`PriceIdentityTransitionContract`, this result is not bound
+    to a final prices-provenance file and carries no placeholder provenance
+    digest. The existing segment parser remains the authority for segment,
+    source-byte, graph, and admission-date checks.
+    """
+    expected_identity_fields = {
+        "provider_symbol",
+        "identity_asof",
+        "admitted_start",
+        "admitted_end",
+        "chain_id",
+        "continuity_kind",
+        "warmup_predecessor",
+        "factor_anchor",
+    }
+    try:
+        parent_payload = {
+            ticker: dict(values) for ticker, values in parent_request_contracts.items()
+        }
+        identity_payload = {ticker: dict(values) for ticker, values in identities.items()}
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError("price identity parent request contracts are invalid") from exc
+    if not parent_payload or parent_payload != identity_payload:
+        raise ValueError("price identity parent request contracts do not match validated identities")
+
+    for ticker, identity in parent_payload.items():
+        try:
+            canonical_ticker = _canonical_ticker_v3(ticker)
+            provider_symbol = _canonical_ticker_v3(identity["provider_symbol"])
+            identity_asof = date.fromisoformat(str(identity["identity_asof"]))
+            admitted_start = date.fromisoformat(str(identity["admitted_start"]))
+            admitted_end = date.fromisoformat(str(identity["admitted_end"]))
+            chain_id = identity["chain_id"]
+            continuity_kind = identity["continuity_kind"]
+            predecessor = identity["warmup_predecessor"]
+            factor_anchor = identity["factor_anchor"]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("price identity parent request contract row is invalid") from exc
+        if (
+            canonical_ticker != ticker
+            or provider_symbol != identity["provider_symbol"]
+            or set(identity) != expected_identity_fields
+            or admitted_end < admitted_start
+            or not isinstance(chain_id, str)
+            or _SECURITY_LINEAGE_ID_RE.fullmatch(chain_id) is None
+            or not isinstance(continuity_kind, str)
+            or type(factor_anchor) is not bool
+            or (
+                predecessor is not None
+                and (
+                    not isinstance(predecessor, str)
+                    or _canonical_ticker_v3(predecessor) != predecessor
+                )
+            )
+        ):
+            raise ValueError("price identity parent request contract row is invalid")
+        # Match the existing bundle loader's date parsing semantics exactly.
+        _ = identity_asof
+
+    try:
+        parent_digest = pit_canonical_json_sha256(parent_payload)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("price identity parent request contracts are not canonical JSON") from exc
+    segments, transitions, assertions = _parse_price_identity_segments_v1(
+        raw_contract,
+        declared_sha256=declared_sha256,
+        parent_contract_sha256=parent_digest,
+        evidence_root=source_evidence_root,
+        identities=identity_payload,
+        ticker_transitions=tuple(ticker_transitions),
+        data_cutoff=data_cutoff,
+    )
+    if not isinstance(declared_sha256, str):
+        raise ValueError("price identity segment digest is invalid")
+    return ValidatedPriceIdentitySegmentInput(
+        parent_digest,
+        declared_sha256,
+        segments,
+        transitions,
+        assertions,
+        source_evidence_root.resolve(strict=True),
     )
 
 
