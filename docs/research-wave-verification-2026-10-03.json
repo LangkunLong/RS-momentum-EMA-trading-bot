@@ -1,0 +1,2963 @@
+{
+  "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+  "source_tree": "5b0801f2366bded96507a8da7919859767d8c407",
+  "dirty_tracked_before": "",
+  "runtime_identity": {
+    "python": "3.13.14 (tags/v3.13.14:fd17997, Jun 10 2026, 13:03:48) [MSC v.1944 64 bit (AMD64)]",
+    "executable": "C:\\Users\\llong\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\python.exe",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "requirements_sha256": "9fa4779734bcf2550e335f178b175731f807ddb5d3dbdeba8c0d2a6528358ec5",
+    "environment_inventory": {
+      "path": ".artifacts/research-wave/integrated-2/environment.json",
+      "sha256": "46c52ddcc3fc00e5303dc9ca14fd16ce4ffa50ffc38f0b0de5e5618d7bcf9728",
+      "visibility": "local-only"
+    }
+  },
+  "evaluator_image_digest": null,
+  "evaluator_image_status": "not applicable: in-process controlled fixtures; no container evaluation",
+  "evaluation_mode": "bounded offline synthetic report and stage acceptance",
+  "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+  "input_bundle_scope": "Controlled fixture/test sources and shared fixture support; other repository dependencies bound by source_revision",
+  "input_bundle_manifest": {
+    "tests/conftest.py": "edef3f58726e54e123f9cfaf43d8c52dae8b4a8be5d7dce26c0da94daf519898",
+    "tests/task4_legacy_fixture.py": "02b93b0f00b75a418cbd9989a30d81bdd298f032329989f97c9d9fdc48035fad",
+    "tests/test_issue86_report_evidence.py": "92d7581871318dd9db7a8fe3cb305c3c983fca7aa9f586d3990d3e4ef1c01cb4",
+    "tests/test_issue87_diagnostic_meanings.py": "4b49c364ab5387a9891804eba81db44b96b9132b2ae2d22b50611cd0e63a9cf9",
+    "tests/test_pit_optimizer_v5_evaluator_assumptions.py": "fa9bfb7736d3830f4445636fa95d8f3086da5ccb641d09755ed83c738513df43",
+    "tests/test_pit_optimizer_v5_issue93_stage_boundaries.py": "e9dc8fd02095113cd968313715357d8870552d50ee5f20732117fa8e4487f27f",
+    "tests/test_pit_optimizer_v5_mechanism_artifacts.py": "8ccb785d8dbc72fbb40fd1973733a2aa2cd43cd8d195e4dd60a199b6ee502c16",
+    "tests/test_pit_optimizer_v5_mechanism_evidence.py": "3afddb6488e24831ed035609e36563b1ca1762d4999958687d844b3306d744c6"
+  },
+  "evidence_root_id": "research-wave-integrated-ed820aff0f86d82778927f7935ef8f5be177414b",
+  "verification_runner_sha256": "40d52643d0dffe1d42ac95097db88969d15afb3444f1d29dad6a91112da8feb2",
+  "source_and_fixture_sha256": {
+    ".artifacts/issue-87/integration-label-check.md": "c8555862b075cb5835d3e13ba65d14a94e51ecda0986f415fd479933aaf621d0",
+    ".artifacts/issue-87/source-corrections.md": "a0481911c40316d8c9debbd184d6b745574e23e99c6d5ee94f8afbc4b4c8beb0",
+    "core/backtest_engine.py": "c898106f9cce62b173ac720c4b7eebd0713316a78b6bb1e09e30a31bb1079df1",
+    "core/pit_optimizer_v5/artifacts.py": "204409cc4a1b2fd8a696e7564cb537d835e89886fd385c0aaf2f2ac86859015e",
+    "core/pit_optimizer_v5/confirmation.py": "009355b1dea4f2431293d11b04a808655cc8ff9a5a661668b1b480ef481a06e4",
+    "core/pit_optimizer_v5/contracts.py": "ded6e1b0c9fc7f9e74e497b71030ce1832779b84a23b34316279d59ba0268c5e",
+    "core/pit_optimizer_v5/diagnostics.py": "5daf0230a1caf35dcc2fc1c0e284a9d298998e797a4a0bbc87c91a75dab37e42",
+    "core/pit_optimizer_v5/production_runtime.py": "816a52eb31a9a78c3cfcfa4f888b4aaa0af5a1ec73752958345ddeb1e0ca7c8d",
+    "core/pit_optimizer_v5/provider.py": "5a0fd02326c392585dee21735fd20e78799bea25d6bc39e3124abf0e76f61783",
+    "core/pit_optimizer_v5/qualification.py": "78cc788c6c62d3b83e6bac7627ff84021188cf01306bcf8c33dfcc4cc5b8307a",
+    "core/pit_optimizer_v5/readiness.py": "3d1fd0c5bdadbbf19dd1a2c35fce5779d015a70b88a3eeab0f5c79390c9dcb76",
+    "docs/issue-86-evidence.md": "33f37cda4b0617c46b31cdf3150b04d60fb39affb3d2dccbca3eb61e1afc12db",
+    "docs/issue-87-evidence.md": "b551024d9a3a82a418337311eb66a44558e7da65ac54d40233b1357b810e8f45",
+    "docs/issue-93-evidence.md": "ca3ec3235a8b383d7373f3529bc7504e91414e5047d5b543329b07a4515e98bf",
+    "docs/research-reproducibility-index.md": "5365f7533154bddc7cbd5e10d424cd16f152bfd151c4f67462cbfe7eee8933af",
+    "docs/strategy-policy-contract-v1.md": "5a31bdd9015776f4b782097cfb07f0142202b90fad9c3c7a1784e54fda45c2a9",
+    "pyproject.toml": "55209286a4eaa10a44e5be2d96c48ae0820609b7a5aed50ca0038351fc8626fd",
+    "requirements-lock.txt": "9f1f1f14f18c86a2471a3d81bb5d103b3a26bb37da7f753daf90bfd9b5b312b6",
+    "requirements.txt": "9fa4779734bcf2550e335f178b175731f807ddb5d3dbdeba8c0d2a6528358ec5",
+    "tests/conftest.py": "edef3f58726e54e123f9cfaf43d8c52dae8b4a8be5d7dce26c0da94daf519898",
+    "tests/task4_legacy_fixture.py": "02b93b0f00b75a418cbd9989a30d81bdd298f032329989f97c9d9fdc48035fad",
+    "tests/test_issue86_report_evidence.py": "92d7581871318dd9db7a8fe3cb305c3c983fca7aa9f586d3990d3e4ef1c01cb4",
+    "tests/test_issue87_diagnostic_meanings.py": "4b49c364ab5387a9891804eba81db44b96b9132b2ae2d22b50611cd0e63a9cf9",
+    "tests/test_pit_optimizer_v5_evaluator_assumptions.py": "fa9bfb7736d3830f4445636fa95d8f3086da5ccb641d09755ed83c738513df43",
+    "tests/test_pit_optimizer_v5_issue93_stage_boundaries.py": "e9dc8fd02095113cd968313715357d8870552d50ee5f20732117fa8e4487f27f",
+    "tests/test_pit_optimizer_v5_mechanism_artifacts.py": "8ccb785d8dbc72fbb40fd1973733a2aa2cd43cd8d195e4dd60a199b6ee502c16",
+    "tests/test_pit_optimizer_v5_mechanism_evidence.py": "3afddb6488e24831ed035609e36563b1ca1762d4999958687d844b3306d744c6"
+  },
+  "checks": [
+    {
+      "name": "focused",
+      "argv": [
+        "C:\\Users\\llong\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\python.exe",
+        "-m",
+        "pytest",
+        "-q",
+        "--no-cov",
+        "-o",
+        "addopts=",
+        "-p",
+        "no:cacheprovider",
+        "--tb=short",
+        "tests/test_issue86_report_evidence.py",
+        "tests/test_issue87_diagnostic_meanings.py",
+        "tests/test_pit_optimizer_v5_issue93_stage_boundaries.py",
+        "tests/test_pit_optimizer_v5_evaluator_assumptions.py",
+        "tests/test_pit_optimizer_v5_mechanism_evidence.py",
+        "tests/test_pit_optimizer_v5_mechanism_artifacts.py::test_extension_off_factory_requests_and_messages_match_recorded_baseline",
+        "tests/test_pit_optimizer_v5_mechanism_artifacts.py::test_full_runtime_run_supplied_ports_publishes_after_current_critic_evidence"
+      ],
+      "exit_code": 0,
+      "seconds": 183.34,
+      "path": ".artifacts/research-wave/integrated-2/focused.log",
+      "sha256": "85f51ecb28be42e808b6a028a2830c3f1ad71dfd1ca483f821561c2a51e855d8",
+      "visibility": "local-only",
+      "evidence_kind": "command-output",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-check",
+      "acceptance_status": "pass"
+    },
+    {
+      "name": "ruff",
+      "argv": [
+        "C:\\Users\\llong\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\python.exe",
+        "-m",
+        "ruff",
+        "check",
+        "."
+      ],
+      "exit_code": 0,
+      "seconds": 3.41,
+      "path": ".artifacts/research-wave/integrated-2/ruff.log",
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18",
+      "visibility": "local-only",
+      "evidence_kind": "command-output",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-check",
+      "acceptance_status": "pass"
+    },
+    {
+      "name": "compile",
+      "argv": [
+        "C:\\Users\\llong\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\python.exe",
+        "-m",
+        "compileall",
+        "-q",
+        "-x",
+        "[/\\\\](\\.git|\\.worktrees|\\.artifacts|\\.venv)[/\\\\]",
+        "."
+      ],
+      "exit_code": 0,
+      "seconds": 0.35,
+      "path": ".artifacts/research-wave/integrated-2/compile.log",
+      "sha256": "325b9fca1430b255ee574081a7bff3e6141ca400f3d17052aebaeb05d0173a04",
+      "visibility": "local-only",
+      "evidence_kind": "command-output",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-check",
+      "acceptance_status": "pass"
+    }
+  ],
+  "fixture_environment": {
+    "ISSUE93_EVIDENCE_ROOT": "C:\\Users\\llong\\.codex\\worktrees\\dd38\\RS-momentum-EMA-trading-bot\\.artifacts\\research-wave\\integrated-2\\chain",
+    "ISSUE_90_EVIDENCE_DIR": "C:\\Users\\llong\\.codex\\worktrees\\dd38\\RS-momentum-EMA-trading-bot\\.artifacts\\rw90-2"
+  },
+  "source_revision_after": "ed820aff0f86d82778927f7935ef8f5be177414b",
+  "dirty_tracked_after": "",
+  "source_and_fixture_unchanged": true,
+  "record_kind": "source-bound verification receipt and retained evidence index",
+  "visibility": "repository-visible receipt; referenced raw evidence is local-only",
+  "scope_limit": "Bounded offline fixtures only; no empirical calibration, production policy qualification, replay execution or deployment",
+  "raw_evidence": [
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/adapter-blobs/issue93-synthetic/pit-bundle.bin",
+      "sha256": "90370219a8db350e80e8ea0a8956e4a3360ec2ab472a0fcca043205aba776a39",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/adapter-blobs/issue93-synthetic/prices.bin",
+      "sha256": "d3b3ef14a8dd1f57b522e9211e5ab9438ec25d591e9d6910b1fa3e80db8e0966",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/adapter-blobs/issue93-synthetic/runtime-source.bin",
+      "sha256": "66fa38dac6ff545362d503503b5f34eb1f3ce6f578f315d6eb4336afa4411457",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/adapter-blobs/issue93-synthetic/transition.bin",
+      "sha256": "49812853ef9c2b92c58255b2759eaf572aa4f199028faa2fc85e9f39cb16b603",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/adapter-state/policy-source/4d644e03af75e3cf2ad9b696e4cff61c2ce78c6c70404c9e1e4b28c5f1ecd30a.json",
+      "sha256": "034284abdc0dfbd830edb0e859acd8b0bb7f7cf6a2ba79f678766a0529f54661",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/adapter-state/policy-source/adc01a32d553d375b526ce0d9d014d683a7c4e2cbca50271e2162ec7d1385e0a.json",
+      "sha256": "16ee6d28643b73773c2c9bcf7fa906f41a4d79a13fff3d50830fc304bcbd6564",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/adapter-state/policy-source/e952c5516d56b23cdda4840e66563df7428f6656662db0b4d618d9f57b0c525d.json",
+      "sha256": "f287b76e46d4d8f061d515d97aea26036caf1f38ada59408f801303a7c3998f9",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/adapter-state/policy-source/f0e916a3500078c86c6a38ae7060f1d3fea53193c63c841a65ae7b7121372cd1.json",
+      "sha256": "cb65863da759eed792e16f32b48dc42f21602f6d5e9ff2258a5f75b30063cf74",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/adapter-state/policy-source/f74df11b915ea74061ac5e16d546c8476a5db82397685ab5d400d197fc0ee15f.json",
+      "sha256": "df90643252379651a7ff7abc381c27163ecd4ad707de3e40608f5021c3e4fd1c",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/adapter-state-authority/policy-source/4d644e03af75e3cf2ad9b696e4cff61c2ce78c6c70404c9e1e4b28c5f1ecd30a.json",
+      "sha256": "b9ab68691b88d90631f28f4cb220d4043178f58d002412f1e74dab799f80e1a8",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/adapter-state-authority/policy-source/adc01a32d553d375b526ce0d9d014d683a7c4e2cbca50271e2162ec7d1385e0a.json",
+      "sha256": "38f200971df8ebf333c88a82be99d8f1d0e12e601699b0612f81c32b53e45bb7",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/adapter-state-authority/policy-source/e952c5516d56b23cdda4840e66563df7428f6656662db0b4d618d9f57b0c525d.json",
+      "sha256": "be6efa0f74d8153d5b162d93a7215e77d972128160f9676488524e042fa2175a",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/adapter-state-authority/policy-source/f0e916a3500078c86c6a38ae7060f1d3fea53193c63c841a65ae7b7121372cd1.json",
+      "sha256": "cb44d9a40c7228395d209df98149581a67cdc8a5d715e6c7d9ac1a0677c0606f",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/adapter-state-authority/policy-source/f74df11b915ea74061ac5e16d546c8476a5db82397685ab5d400d197fc0ee15f.json",
+      "sha256": "d7d61cbb464a12a8f2f6b423e22cafd86178ac2716621eaf224fd8518be4c0cf",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/adapter-state-locks/confirmation/4e0a7c868acb10703863005f35dc19dad02d5eee031ea8e0f7c4b364aceb9a90.lock",
+      "sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/adapter-state-locks/qualification/62c107608cc931200d696ba8888d063e88b26af65edc21c105e365ad50ba3151.lock",
+      "sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/archive.json",
+      "sha256": "b22ccda97fcd63dedfa7590290b58641101b8eb3f0900fb39d3911973c6b2a6e",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/baseline/authority.json",
+      "sha256": "a387c0a1cb29579b07e8f1dd83b41cbf82d92397d9a395ab81a577ae86859f55",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/baseline/policy.json",
+      "sha256": "d5d85ab58e673b4e5dbb09d0fa3791fe1cdca49510c32eb04300c54077b53ee7",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/baseline/source.json",
+      "sha256": "a5b8c9b1d29bfde6a40a2014b1ef52bcfc0ecaae9a3fc6e083be4153ea523357",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/campaign/manifest.json",
+      "sha256": "0098e7bf605d0cd0006ea7d546a0bd3f0940db68b1fc3626c14ee3dd5790e349",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/campaign/policy-scope.json",
+      "sha256": "5151351c352738ed29bf7c5ac80bea05ddbd912599ca04fa622ddc5f4e929b27",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/checkpoint.json",
+      "sha256": "eb4b4078ac00a90155ca0ad7b69e54d1acfb792d448cbc1f4bcc2fca5f728a47",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/confirmation/bcfd91a0cd4320a4ee19ebd1a828dfef9b74198386233397dbc5ed37285fb50a/baseline.json",
+      "sha256": "778840b4ffd171722afbcb4a498c7ba55c6035ce4b967699dd00b5b9f6bf4107",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/confirmation/bcfd91a0cd4320a4ee19ebd1a828dfef9b74198386233397dbc5ed37285fb50a/candidate.json",
+      "sha256": "eed4835810e2bdc92f3f56f8ac4d41f460300fb596fd235413aa6eb7930824b8",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/confirmation/bcfd91a0cd4320a4ee19ebd1a828dfef9b74198386233397dbc5ed37285fb50a/cleanup.json",
+      "sha256": "bbf5f71ed3f2447b6efd5eaeee22954f9c94bafee849e946ec527fc89327035c",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/confirmation/bcfd91a0cd4320a4ee19ebd1a828dfef9b74198386233397dbc5ed37285fb50a/outcome.json",
+      "sha256": "c16a15096623c3b95c46b93e12db8aa4d6eca5267628d5f1831778f8f17e2915",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/confirmation/bcfd91a0cd4320a4ee19ebd1a828dfef9b74198386233397dbc5ed37285fb50a/terminal.json",
+      "sha256": "02490c70033f2262bd39112999c4eed8c9cdc56291a3253609066dd71763edef",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/critics/8c79bffe44b9820fcce96d2979b62c315b5fb4adb278a61950bda2d25f3a42e5.json",
+      "sha256": "8c79bffe44b9820fcce96d2979b62c315b5fb4adb278a61950bda2d25f3a42e5",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/critics/cf6e28143d037ef1204cc99941e9ad86f11e1fe818fbf8133c90fbe64b046b78.json",
+      "sha256": "cf6e28143d037ef1204cc99941e9ad86f11e1fe818fbf8133c90fbe64b046b78",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/discovery/finalized-campaign.json",
+      "sha256": "94f60fef1f387052acf3fcf154744405f841425c92ec7f2d8c0516f3782dfc04",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/evaluator/contract.json",
+      "sha256": "c0a681715eeab6c4d543ef7343390f9202dbadd78e4811d2d84237e9095da9bb",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/evaluator/execution.json",
+      "sha256": "93ced32086727384e67f36c5bdfa8ebfd3211a7fe47e25e7356b170a3bacb3af",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/evaluator/sandbox.json",
+      "sha256": "8ae84b189acaf3d028212dfe0a417c6ec026b915b77d937612fca96a9d7b80dc",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/evaluator/scenario-grid.json",
+      "sha256": "912deebab1fd2da39a8cea740f8252b68f16ff2edbf5c46cb8b3c08e488e417d",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0001/000000.json",
+      "sha256": "9689adde293c4f5ccd35d27c375de9c7441e7b63d05ab1faae510186398c20ad",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0001/000001.json",
+      "sha256": "90990fdee1aa01cb012c37898f742872c5c10022bce27a705366b0c3646facd0",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0001/000002.json",
+      "sha256": "f51b4969e84015bd0b11455f26a5c8cf01551483485c431bcd570de572af82ae",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0001/000003.json",
+      "sha256": "9f383912b6b534e04f11ef0ffeb3e5ce02d0aa9dfd9d6da2bded86438752141e",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0001/000004.json",
+      "sha256": "c20bab2c08dd276fa7ec7caf52a88ddca893952179418c382dda0b7b3838fc1d",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0001/000005.json",
+      "sha256": "27dae0637904545b04e455c75a6a4eab97f2a3cccbe00932b2b8e5dbc52d6d67",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0001/000006.json",
+      "sha256": "24ebd21369f4710c638576d44caf3cf9d56124d4737903fef8009af0dc39aa0e",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0001/000007.json",
+      "sha256": "a38c1991af7d60c238b2418698fd62773a0b7752787acee8ac51e389b2e6a9cc",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0001/000008.json",
+      "sha256": "3e268476171e13d7ba849d92cd7f1621bbcffa0310e3597abcb3eaf3e357c5e7",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0001/000009.json",
+      "sha256": "25318cdfa65ed8d05b957193ffec9d287c773bbb678a1ca2692b293b3d260cb1",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0001/000010.json",
+      "sha256": "1765fb6be45d98ea55844c480c750dd32eae3ed1bf16254cf0427e8c770a5594",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0001/000011.json",
+      "sha256": "e62625f25516b5e46594f8c19dacdf13aa6d0043245c38eeb90ddef26830fb95",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0001/000012.json",
+      "sha256": "60f4d337a4ff31d70d1c1f0b1b6389b279918bf12a19a860190c6171f1bd859b",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0001/000013.json",
+      "sha256": "3ab89085a75e44d87aac216f381d38e3fa616d64e1561c46f50d6459f5b360e5",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0001/000014.json",
+      "sha256": "0d0d3ac96947310ab905e5ae5e88852af593aba03ecc10335e40c55126c674e4",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0001/000015.json",
+      "sha256": "5578bf2cb90ae1717261aa7cf8a41323f94880297bf8f0ee94666ad239c9b696",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0001/000016.json",
+      "sha256": "c95e867a946b258b948673e11fa2e78e2cf74e47ecb63f3cbf9cfa0f6251da2b",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0001/000017.json",
+      "sha256": "befd76b25d81631bd87801ebe2d01290e3684e9cab751e06c04805f26f9055fe",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0001/000018.json",
+      "sha256": "c1e7953119341e60415b7ed08c59a758b7ea34e7e3f1fb657571e14311145e8c",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0001/000019.json",
+      "sha256": "0d5c6eb441691afbe22539bf6cd510df3395c810ab251426ed32f470351dd5e7",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0001/000020.json",
+      "sha256": "d4adb975549189ba404533b22222f0cbdde88e61d82461583f3bc1d1e2187e3e",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0001/000021.json",
+      "sha256": "c3ff559e958e7ac0d240646a23c77a0fbec72a783d4f286202874903e4f0a94f",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0001/000022.json",
+      "sha256": "f7136adb219c73646d294d20d4e1325e249296f22d5ca1ca53d3ccebcf724354",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0001/000023.json",
+      "sha256": "547d2ed20887ded9381e4d03f1df96eae439528a63c123d5262a4a748c0094ea",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0001/000024.json",
+      "sha256": "375f7a2f3c243e0a64dbe0e75af85a86a7801b50d25c7974b8c969e0a6f3a9a2",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0001/000025.json",
+      "sha256": "1d51e1ebcfb402bf1af5195c0d5cb38c3eac978547cb46fff7c4daa6a98917ba",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0001/000026.json",
+      "sha256": "9b5f36b95246b1a0330aaaa8ad3381a7e8ed6d1cf2fa0f30cda7a7a3dc8913b0",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0001/000027.json",
+      "sha256": "b06e2ed95ce36238eb0292a14c23693e4ea405b389f32da4d41b9f97cf3e6084",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0001/000028.json",
+      "sha256": "2e9321e2ece9b6044d2acb44f05c57fce446bb9b65b5b6e1b545a2979815d12b",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0001/000029.json",
+      "sha256": "f5f7f50a46b61d191dfc53f51ea01b5b40f948054c93509dd9d6b0a8518bbfe7",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0001/000030.json",
+      "sha256": "4e69abcdcbfec9542ed408dfec4d734c42c78081b819449d666ff8d2ede75b0b",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0001/000031.json",
+      "sha256": "185e81e346cdb9e00c9fde97d4dded9b33880e91366169104ec4497fdf1ad4b7",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0002/000000.json",
+      "sha256": "2bd50aa5a9b0075e7349b8f277d4e0781f05e5769d32c420eaf39e9478706ffe",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0002/000001.json",
+      "sha256": "1cf72b166317a5e37be70e720793353e29062e74f61d4b2ba8ed07ad3ddbe687",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0002/000002.json",
+      "sha256": "d85486bb7ab8b86cd5212fa9e8b6cd18b613f3881e2bbd7b4cb3268234467eab",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0002/000003.json",
+      "sha256": "dfde1d37446373402a3d2d0e61def1582fcced7707c723ac9247813db9cda915",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0002/000004.json",
+      "sha256": "5878d43929dc2ce850d67499dc4cb027a50c7d39ac5191949b506f85804697b3",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0002/000005.json",
+      "sha256": "e201eacff30be11ea82d3419cfd35486afe06a2acf8cfe6951b00f1d898538a3",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0002/000006.json",
+      "sha256": "62136aa4ada50dec62951fa921bd2d6344f41e4ea5815a7cfaa674ef3948f835",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0002/000007.json",
+      "sha256": "743bbc5115cc0d4549b0b7bdf0c04ef17f73fb32db44a3988e3fe89168f8b3c0",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0002/000008.json",
+      "sha256": "e12316711e6e47e34c1396987b5aef3fba43fd224bc1fd2cdd452b90cd0e7fa0",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0002/000009.json",
+      "sha256": "707f237aa0d1dab61f783f5b8d3909ea73bf1f8f935488f792195a57f733ec1e",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0002/000010.json",
+      "sha256": "db4bd6d432fcfc51baf994ff83b3392b051b2a5d9b6d106a8b5c95361b431b4f",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0002/000011.json",
+      "sha256": "ee38e1d3f01070f46d49503da56b0fa16c8bb7d45f0f78b3924f6fdd751252eb",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0002/000012.json",
+      "sha256": "b8d55f7eaff5915f5412fa1793049bca989709d2d6ba225e4242f106db694d75",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0002/000013.json",
+      "sha256": "f87aae07edda3580ad657854406ac26366a1f8b742b157437470e0a75ad6ff99",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0002/000014.json",
+      "sha256": "332b279c1058fa89d71a80ae11485f1f55f6bb31bcfa00a40d7a50c995b9cdf2",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0002/000015.json",
+      "sha256": "6207fb142bd3d2a40fa40b9248d208846e9de16c9bc11f79411d7bbf0083e850",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0002/000016.json",
+      "sha256": "f06dfa2d9075e724da59d3f4d902aed19b4de8c6e040dc5e9e3435b473055e73",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0002/000017.json",
+      "sha256": "3b2c272b002d03b80ff293f3ccb4c9140d62a7cfafee7ca233bd9558f805c7da",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0002/000018.json",
+      "sha256": "027c107432f5b89db357398f588ad9109dc8eec956b1c6e5cf66dca438b92b22",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0002/000019.json",
+      "sha256": "8e12b5f2ddfabdee95497dbe8301447d9822ea788bc6ffa42710efcfe47b4d48",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0002/000020.json",
+      "sha256": "27666f9d7b2e50ac7a466b48a463c91a210fad60ee12d17e55db2c52957ffb43",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0002/000021.json",
+      "sha256": "11365e17078a9c4b9eabe451232678e0563f166a069c10357908692453e2d5c2",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0002/000022.json",
+      "sha256": "ffc7e3e710b6d1caf874f30a870374dc9850f64bbb9b6bea6dfe3ef502788fa2",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0002/000023.json",
+      "sha256": "31f851761b9006d32ec578f8d703b1a0ae2320938216d7671d322ad25e949b82",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0002/000024.json",
+      "sha256": "98e7199946bcb42111e4be9c11c2de0d09d17d08667e9db91cc5ec7ef2b58b71",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0002/000025.json",
+      "sha256": "52a23926916d0e2fddfeb398851153f6633639a111dab15b70690196643ef42d",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0002/000026.json",
+      "sha256": "dc3048dd7b5a20e2f1b257deea10a129b8edd1cac115ce616079f782761d0706",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0002/000027.json",
+      "sha256": "d92cea6c1b9d63443c73cc530ef9cfb65de3ee5d5c74f40133f3fec6c29c127f",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0002/000028.json",
+      "sha256": "4aa1619e7ba1c63d8b1686369715abd5557f77b624553a6db5d62c8225b98508",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0002/000029.json",
+      "sha256": "2762543829c3e22979025128a6a4edeabe80068edf3eb03d3bed24381a40e2ac",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0002/000030.json",
+      "sha256": "865b11640a84ae0593c7318f0fa0e4aef725317b2a8d6fe8d06337f5284a2503",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/events/issue93-synthetic-campaign/0002/000031.json",
+      "sha256": "0163e636975caea8a910ad1e027858324d58e25002c69d22e068031cd9297186",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/full-replay-readiness.json",
+      "sha256": "1d97847e7e01fbdca48a1bd4aff4c067bd2030ce68c4288c88172a6c0a915d8e",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/panels/confirmation-owner.json",
+      "sha256": "4419b9a4c682c2a2b780aa87a239cb87eca7a251405940f062969d0d1e1100e4",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/panels/confirmation-retirement.json",
+      "sha256": "935315bb1345def6c4a904a7542898532fd3c96805b4c4dd026e35e12acbb58d",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/panels/confirmation-retirement.json.lock",
+      "sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/panels/discovery-owner.json",
+      "sha256": "82aff7fd3b67c5d30cddda24f196c01478c092bfb6c40b101c51bb6f29d0b20b",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/panels/qualification-owner.json",
+      "sha256": "c6a55632dc79984769510fe76de23ab2835ad144593c85ccdc558bb25eef1527",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/panels/qualification-retirement.json",
+      "sha256": "870cfab013fd118129fdaf6db4237c5d8cc87758f6bd1292070e410aeecce4d2",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/panels/qualification-retirement.json.lock",
+      "sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/panels/retirement-snapshots/confirmation-4e0a7c868acb10703863005f35dc19dad02d5eee031ea8e0f7c4b364aceb9a90.json",
+      "sha256": "2607abad52bbdbd149777ea0c49e5ceb336fc69dd00fc85bb84736367d601062",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/panels/retirement-snapshots/qualification-62c107608cc931200d696ba8888d063e88b26af65edc21c105e365ad50ba3151.json",
+      "sha256": "6bb78b1d7e9ad094659a5cdca53ea6464c2a7857914e47952e8fd746cabb50b1",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/panels/specs/confirmation.json",
+      "sha256": "68f3baa73cc994e06d3f2274d1899e34810d7829289ddc4018ea0d71d64932f0",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/panels/specs/discovery-1.json",
+      "sha256": "d186b739ee3018392ba399ffa98c0246a5b2dd08b74e6371e0759c6614ebd346",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/panels/specs/discovery-2.json",
+      "sha256": "1916933b0b8b83c3097c3903c4780e3b1e5450664eb4c508453b6f21757e594d",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/panels/specs/discovery-3.json",
+      "sha256": "8da37dbb6345f994862169b45aa1045c5d4b8bf41329c40eed5747af9517a4c2",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/panels/specs/discovery-4.json",
+      "sha256": "6d5142cca67f40b2b0e321ebe3b3c362fbf5909d9a685824db808a196f8b9daf",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/panels/specs/mechanics.json",
+      "sha256": "c0c5735e7c54eb0ddacc948b15b8ac46ed8ba68564a68f6b77d54d4c1b43ced2",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/panels/specs/qualification.json",
+      "sha256": "6ecef66da71994ef7b20f40f56cf11880071cff411db2da7b7f3577d02a6ff58",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/panels/specs/quick.json",
+      "sha256": "1d2af48d1f80ceac1611081e3619262b26689288f85ccdfc3abfdf99300f8e77",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/candidate_stage_result/0e157a4247b6ea5ade8e148c2888a8d3007a9d3f8043ad2c096e058ccc0271b1.json",
+      "sha256": "0e157a4247b6ea5ade8e148c2888a8d3007a9d3f8043ad2c096e058ccc0271b1",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/candidate_stage_result/31fde411750a3da021081c88f633f8bd8ec7a1eab518ad024f2b53d0122255c2.json",
+      "sha256": "31fde411750a3da021081c88f633f8bd8ec7a1eab518ad024f2b53d0122255c2",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/candidate_stage_result/3cd7269486f464cc0366fdf31294f48afde237299fa5e89318b85601c949fb31.json",
+      "sha256": "3cd7269486f464cc0366fdf31294f48afde237299fa5e89318b85601c949fb31",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/candidate_stage_result/6164726548e9dc90f1a534136cb79ad58afc98b72b786bcb3f6b02a97cadf6f1.json",
+      "sha256": "6164726548e9dc90f1a534136cb79ad58afc98b72b786bcb3f6b02a97cadf6f1",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/candidate_stage_result/7f555b17c7d1e41108854a8aa14e4527ede7110782424dc7e05bb2e56508bfb0.json",
+      "sha256": "7f555b17c7d1e41108854a8aa14e4527ede7110782424dc7e05bb2e56508bfb0",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/candidate_stage_result/8de259d2837865ccb5987b60115dbadcdccbee2ff48b8eee610427c0e319dbc7.json",
+      "sha256": "8de259d2837865ccb5987b60115dbadcdccbee2ff48b8eee610427c0e319dbc7",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/candidate_stage_result/9801fa435536ff62207f77f3f9d65e1ace29f1a8ff450868eee77f93b6953d08.json",
+      "sha256": "9801fa435536ff62207f77f3f9d65e1ace29f1a8ff450868eee77f93b6953d08",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/candidate_stage_result/a3963ed457954c2d28a3112bad1bebb845dd9976e096062ccb279554eeb30ec8.json",
+      "sha256": "a3963ed457954c2d28a3112bad1bebb845dd9976e096062ccb279554eeb30ec8",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/candidate_stage_result/b9a1e606fce64f6c916092af9893ae82bd5574480006ae485b96d42fc290622d.json",
+      "sha256": "b9a1e606fce64f6c916092af9893ae82bd5574480006ae485b96d42fc290622d",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/candidate_stage_result/c904491310a7cd9b68656daf1c8dd9de6ab53fee3872bfe00a0b09f78ffc54e2.json",
+      "sha256": "c904491310a7cd9b68656daf1c8dd9de6ab53fee3872bfe00a0b09f78ffc54e2",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/candidate_stage_result/cb0b94a480d086aedeeb909f23b14168866b00662fd047e340cd67f97cccc94f.json",
+      "sha256": "cb0b94a480d086aedeeb909f23b14168866b00662fd047e340cd67f97cccc94f",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/candidate_stage_result/f7b0c830f6cfb4fad51ef07dc642704e31b273c9e408aa2774b0d8c577a24b3d.json",
+      "sha256": "f7b0c830f6cfb4fad51ef07dc642704e31b273c9e408aa2774b0d8c577a24b3d",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/cleanup_result/27447d1e88e9807bb10ffdd22df0e83716818a63eb417c5ee5f58b6ad733a904.json",
+      "sha256": "27447d1e88e9807bb10ffdd22df0e83716818a63eb417c5ee5f58b6ad733a904",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/episode_evidence/038b722a0e296fbaf621422ef0ebc11e971e2052b439de3a0c31c12d0eb0311d.json",
+      "sha256": "038b722a0e296fbaf621422ef0ebc11e971e2052b439de3a0c31c12d0eb0311d",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/episode_evidence/0d64bd00dd7d2aba1eddaf7d9c035c3fae41c25fce78b98ecf1e27beaf693d9d.json",
+      "sha256": "0d64bd00dd7d2aba1eddaf7d9c035c3fae41c25fce78b98ecf1e27beaf693d9d",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/episode_evidence/10560b1f35590c1ff208a2c546679361150741206fced20c61ec14c2ac49ef5b.json",
+      "sha256": "10560b1f35590c1ff208a2c546679361150741206fced20c61ec14c2ac49ef5b",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/episode_evidence/242df738ccaf82ebb2743d130df7d3baf025b6a643311a648285c270dce8fc22.json",
+      "sha256": "242df738ccaf82ebb2743d130df7d3baf025b6a643311a648285c270dce8fc22",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/episode_evidence/31ff96f1d403da51743be3fe9ba34c09d1e0a5c09bfe10e7d2f04ffb0d435c02.json",
+      "sha256": "31ff96f1d403da51743be3fe9ba34c09d1e0a5c09bfe10e7d2f04ffb0d435c02",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/episode_evidence/38b48a4b3950cd9c8f8da72aa5eee25046f51e9cad2244e36acfbc3eed2f2292.json",
+      "sha256": "38b48a4b3950cd9c8f8da72aa5eee25046f51e9cad2244e36acfbc3eed2f2292",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/episode_evidence/3c9a1f64a0f1856614e62fc521448ef68880a343c07256563dbd76399714badf.json",
+      "sha256": "3c9a1f64a0f1856614e62fc521448ef68880a343c07256563dbd76399714badf",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/episode_evidence/4325d9c6e155967f6f7b8c79a58fa82b56fed7ccbbd9aea939c5c15d73b216ad.json",
+      "sha256": "4325d9c6e155967f6f7b8c79a58fa82b56fed7ccbbd9aea939c5c15d73b216ad",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/episode_evidence/50ebb61e0c908ff69e9da41a9de8b56ab4e585065224d6c0ec10d9f6f84adf74.json",
+      "sha256": "50ebb61e0c908ff69e9da41a9de8b56ab4e585065224d6c0ec10d9f6f84adf74",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/episode_evidence/575e53e35d532cccc87b4e90d0c3b91bf07f7c6510e8bf19ae72166ebbf1c5cd.json",
+      "sha256": "575e53e35d532cccc87b4e90d0c3b91bf07f7c6510e8bf19ae72166ebbf1c5cd",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/episode_evidence/5916477bf00096d3c49191f9128c828c4c538f07472113773aedd3aca9e86cbc.json",
+      "sha256": "5916477bf00096d3c49191f9128c828c4c538f07472113773aedd3aca9e86cbc",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/episode_evidence/7151224f3ca06c5196c56147ea780074b39523dce6da3070aa2d354603c67c1a.json",
+      "sha256": "7151224f3ca06c5196c56147ea780074b39523dce6da3070aa2d354603c67c1a",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/episode_evidence/8d38e377718979e81e6559f8130ee2933411ede5e24d1ffba9ce2ab0c76dc096.json",
+      "sha256": "8d38e377718979e81e6559f8130ee2933411ede5e24d1ffba9ce2ab0c76dc096",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/episode_evidence/972e330e1c8d48228db0054ff9bbc95d5d97ae5a2cce38405172828ca495dea3.json",
+      "sha256": "972e330e1c8d48228db0054ff9bbc95d5d97ae5a2cce38405172828ca495dea3",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/episode_evidence/9943db9a1cdca3e4106ef13522edfecd397f320ac3322439f0b402e28c73b110.json",
+      "sha256": "9943db9a1cdca3e4106ef13522edfecd397f320ac3322439f0b402e28c73b110",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/episode_evidence/a83786bd680c8f6774f3d233750ef30e5cc1f9e7d4ecf492f22db159ca14f7f5.json",
+      "sha256": "a83786bd680c8f6774f3d233750ef30e5cc1f9e7d4ecf492f22db159ca14f7f5",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/episode_evidence/be946c79c814abf1d150b4a019453606af4f3c76835c7aad2146764b4a19328e.json",
+      "sha256": "be946c79c814abf1d150b4a019453606af4f3c76835c7aad2146764b4a19328e",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/episode_evidence/c31d6490d2a5c9b66e68d43c9371bd5724f2078ebbac8ec31a34a303655df5bf.json",
+      "sha256": "c31d6490d2a5c9b66e68d43c9371bd5724f2078ebbac8ec31a34a303655df5bf",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/episode_evidence/cd808e8f4cad805db939075e5e90f29f7e61ad32b68c2fb7800dfdac5b15f1a1.json",
+      "sha256": "cd808e8f4cad805db939075e5e90f29f7e61ad32b68c2fb7800dfdac5b15f1a1",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/episode_evidence/cf53809969ed8e74340541cab674a3afdb680683b91851346ee57535d49e27c8.json",
+      "sha256": "cf53809969ed8e74340541cab674a3afdb680683b91851346ee57535d49e27c8",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/episode_evidence/ddcde1afb941320e0458d5448a1df1156e84d9dbaa7c4e18dd9c449e4b44a7eb.json",
+      "sha256": "ddcde1afb941320e0458d5448a1df1156e84d9dbaa7c4e18dd9c449e4b44a7eb",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/episode_evidence/e1558f11f7ce90453e56f5c7f16f0c4aee1d2c1adee7ea5ccdf8719cf2e29016.json",
+      "sha256": "e1558f11f7ce90453e56f5c7f16f0c4aee1d2c1adee7ea5ccdf8719cf2e29016",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/episode_evidence/e97bf89d599a69833b9ab4e6c8e6bcb552a712957aa014b2e202ff0a54fb29af.json",
+      "sha256": "e97bf89d599a69833b9ab4e6c8e6bcb552a712957aa014b2e202ff0a54fb29af",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/episode_evidence/f92bdfd3536fc04e7b0aefcb077a312ee1e9e643e2fee737405244dd1f3c38c8.json",
+      "sha256": "f92bdfd3536fc04e7b0aefcb077a312ee1e9e643e2fee737405244dd1f3c38c8",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/quick_evidence/92a5fd226c152367853234cf3210178d37c276c90e05a4ebe46285e9bafc9f27.json",
+      "sha256": "92a5fd226c152367853234cf3210178d37c276c90e05a4ebe46285e9bafc9f27",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/quick_evidence/b319112722506149356ac11dd1d30945260ef8caa96ab666c7963815923d330c.json",
+      "sha256": "b319112722506149356ac11dd1d30945260ef8caa96ab666c7963815923d330c",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/quick_evidence/c5f73004d098c93f6fdcd5adb9f49d8c82968617d1fbc7cc1ef27d18b3ab4397.json",
+      "sha256": "c5f73004d098c93f6fdcd5adb9f49d8c82968617d1fbc7cc1ef27d18b3ab4397",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/quick_evidence/f0bc6cfc94e96f1aa45c4e396921c5213a0744c67a20100ee5c232f06d8ba3e6.json",
+      "sha256": "f0bc6cfc94e96f1aa45c4e396921c5213a0744c67a20100ee5c232f06d8ba3e6",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/quick_evidence/f8263771d64144375202ae99e63c711e9ecc2c15a5cf20d3502bd5d3c612184b.json",
+      "sha256": "f8263771d64144375202ae99e63c711e9ecc2c15a5cf20d3502bd5d3c612184b",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/quick_evidence/f99700a3372ebff01d79588785e4f1fe5ce6063bd8ab8f17d9a978d2a9331175.json",
+      "sha256": "f99700a3372ebff01d79588785e4f1fe5ce6063bd8ab8f17d9a978d2a9331175",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/rendered_variant/0bb1c2dd8f9e090aaba5e0fbf5c09e7610b5aa56909836c14437d6a82e0963ca.json",
+      "sha256": "0bb1c2dd8f9e090aaba5e0fbf5c09e7610b5aa56909836c14437d6a82e0963ca",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/rendered_variant/2c83d59b39a533bc9226ed13cea237f286ec9cbbab4cad3dcc9dbab6b2fa003f.json",
+      "sha256": "2c83d59b39a533bc9226ed13cea237f286ec9cbbab4cad3dcc9dbab6b2fa003f",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/rendered_variant/8fb82847b4dcfab352ac8ffdd39b63a0d01581fc678b75987825a224f73153ae.json",
+      "sha256": "8fb82847b4dcfab352ac8ffdd39b63a0d01581fc678b75987825a224f73153ae",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/rendered_variant/aa8f2701649aebe96316a4ed998707a80ca2b4f8a85a60deb958659ecba3f353.json",
+      "sha256": "aa8f2701649aebe96316a4ed998707a80ca2b4f8a85a60deb958659ecba3f353",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/rendered_variant/b6e2b610c83eac431e1a89deb8d8325cae3795667568cabae0d2a0b7b4b5d617.json",
+      "sha256": "b6e2b610c83eac431e1a89deb8d8325cae3795667568cabae0d2a0b7b4b5d617",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/resource_lease/204d75009f3466d00582f1ff8d7794015034445a40e3250434439611e7721fcf.json",
+      "sha256": "204d75009f3466d00582f1ff8d7794015034445a40e3250434439611e7721fcf",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/resource_lease/2eedc59309104c37e0e0f514b7ff46c0e98dc7e9f5dd00bbb161b9abab38c6a3.json",
+      "sha256": "2eedc59309104c37e0e0f514b7ff46c0e98dc7e9f5dd00bbb161b9abab38c6a3",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/resource_lease/6dd861937ed64f88b32b41c222dbee0eb00cbf7fe22cd8217710ace877078621.json",
+      "sha256": "6dd861937ed64f88b32b41c222dbee0eb00cbf7fe22cd8217710ace877078621",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/resource_lease/6e75a1066d78ac1e2a9da3ea49ad4734665c80af0dc0967b66ce21c993e0b028.json",
+      "sha256": "6e75a1066d78ac1e2a9da3ea49ad4734665c80af0dc0967b66ce21c993e0b028",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/resource_lease/b47815fee9c769b50fe9018911bced41b6cbabe424048a0d575bb75c37bdd8f6.json",
+      "sha256": "b47815fee9c769b50fe9018911bced41b6cbabe424048a0d575bb75c37bdd8f6",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/resource_lease/c85f6eecdcd4d52241b1ae9ac1508af5e3fbfa334b57a96ae82db2cc1b837612.json",
+      "sha256": "c85f6eecdcd4d52241b1ae9ac1508af5e3fbfa334b57a96ae82db2cc1b837612",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/role_completion/1c08065d8a68c9ccf5c38d0cb981e8241533b5a0a8cc13075ceb094e0b7bc4bc.json",
+      "sha256": "1c08065d8a68c9ccf5c38d0cb981e8241533b5a0a8cc13075ceb094e0b7bc4bc",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/role_completion/65a247a4344a41047cc976484626d3dc96e7bf569e2cd75cbb46e3b98778268a.json",
+      "sha256": "65a247a4344a41047cc976484626d3dc96e7bf569e2cd75cbb46e3b98778268a",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/role_completion/ba76630c221a5cb7e2654b39b23631a19febf2231b8b60c192a0483182d93bdc.json",
+      "sha256": "ba76630c221a5cb7e2654b39b23631a19febf2231b8b60c192a0483182d93bdc",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/role_completion/d3faca618334b8496a569a57424c9c23ea69e1a6f3c4378450d8a1775a01f8c2.json",
+      "sha256": "d3faca618334b8496a569a57424c9c23ea69e1a6f3c4378450d8a1775a01f8c2",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/role_completion/e813143c058ec3428f22591afff854201ed58d6130f7e95d00b179de4505896b.json",
+      "sha256": "e813143c058ec3428f22591afff854201ed58d6130f7e95d00b179de4505896b",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/role_completion/fdbe49dad8981124868c1eb4a1ed7675df51b9dd2f3ebdaaebca81c4f016aa11.json",
+      "sha256": "fdbe49dad8981124868c1eb4a1ed7675df51b9dd2f3ebdaaebca81c4f016aa11",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/round_intent/00c4ae56a2931ffba455afd746273aa14486b89badcce99be67278296c63fce6.json",
+      "sha256": "00c4ae56a2931ffba455afd746273aa14486b89badcce99be67278296c63fce6",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/payloads/round_intent/85b5494b7993ac49812cf05fc8de73eb382c6edc31443aedff3de164b6ec948b.json",
+      "sha256": "85b5494b7993ac49812cf05fc8de73eb382c6edc31443aedff3de164b6ec948b",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/qualification/e08c7257cc2484d49230c9de98101bdb5b572f76a4e4b40a18b8aa7bded09a98/baseline.json",
+      "sha256": "75fa1ea9cf8da0e790416a5bf74203a12a035dbc218d6f838a593e7fd1b97da0",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/qualification/e08c7257cc2484d49230c9de98101bdb5b572f76a4e4b40a18b8aa7bded09a98/candidate.json",
+      "sha256": "eec46f381fcb382b0d56598dcc323aa1344c7b206e9f0c4c54f1db6b03d3033c",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/qualification/e08c7257cc2484d49230c9de98101bdb5b572f76a4e4b40a18b8aa7bded09a98/cleanup.json",
+      "sha256": "9e543a907da77c3f151e381efa0db48e90e911f415982da4d42c7bb2eb69141a",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/qualification/e08c7257cc2484d49230c9de98101bdb5b572f76a4e4b40a18b8aa7bded09a98/outcome.json",
+      "sha256": "ea544af82ce271a0324f3a306bd908920326409b221fb0577444ca3bcf341f33",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/qualification/e08c7257cc2484d49230c9de98101bdb5b572f76a4e4b40a18b8aa7bded09a98/terminal.json",
+      "sha256": "0ba005a947eca512eaa305762bd2ab718bc8161d23d5a80b4892c3f3983e5361",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/records/38107219ddeb4e239b3686983dffa6be4db55fe5d64f334f6e0474780ecfef7d.json",
+      "sha256": "07dd5c3908481a43bedba2c64285c02605c8a9fb4e0f62da3cd982e614134376",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/records/71ef2997a13ac997eac2ed6cca9e377391fc293c7735679b2cb6f8970182dd53.json",
+      "sha256": "56c6dcd5b062f0592ba6cba2e57e599703f5b5a485c494765185a869e3d97d62",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/records/79e03ec0f7eb74a29131bad40d2895147d6e20fce0cb89c2349d3ef208c4b3bf.json",
+      "sha256": "97424773cde46560725aee8a87a8e879a2c2ac2e6d1445e3eb35358d8fc4b675",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/records/85d2b1c38e96e395ca77da68856d78519d4298e3efe39c2ef46899e088524d09.json",
+      "sha256": "efc70d48170b4ec50a4e9a8e2c425734350e81bd215bd71cfd745f9ba180ed10",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/records/c09ad48c2fd7013e7dd8ff0fc7eb90b6b90582fd0dedd2c8ebd364349b0d21e1.json",
+      "sha256": "8928e06e3ad81221f5bbad44ab91db201cada92c874d2c63d39de2a1fc64c104",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/records/e5a365e7492465be757fcb7bf399e333b740401962f1d025a9824088de92f861.json",
+      "sha256": "fa8c6d99cc33f60347849b263d7b886b82f5eb266c56417eb65b457bdcae3340",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/roles/artifacts/author/2082c6daa543ea3220b089c1cd9857182c3a02ebe43bafe4307e3cee5aa27436.json",
+      "sha256": "0fbf72aa6f7fee365ba04cfdeaa77a865291b6743703c38f43396fe73c0914cd",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/roles/artifacts/author/451c5be02fe7ebcd248e29f6b95edad02b023dfaf34dcb2e11283754d9a33c8f.json",
+      "sha256": "f692f653ccc491d010fd327eb870cb2527b407df544011ab03771a0742a69ebc",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/roles/artifacts/critic/8c79bffe44b9820fcce96d2979b62c315b5fb4adb278a61950bda2d25f3a42e5.json",
+      "sha256": "eca7b2d4422426b802546a9e99947e35307f9b9f53dd591367d4241f3b546e50",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/roles/artifacts/critic/cf6e28143d037ef1204cc99941e9ad86f11e1fe818fbf8133c90fbe64b046b78.json",
+      "sha256": "6fcab7536e7a3eed6172c5f832c96012b035fb8d6b4ffd349f5ef0f7b4c6a4a4",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/roles/artifacts/investigator/8d10e1ef983a83d230b974e8b27ccc43db613c7950aba980caab7e561488cdac.json",
+      "sha256": "d3f678c6a019ceddb9aca5e953dfe41069108debd43dde9c66704ba092701c5f",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/roles/attempts/author/7c3b9aa0032a0d6a36ca5c84718619911e6f98aa94e1731ca956a8a8c0c3c8d4.json",
+      "sha256": "1c8615eae14ae15c3a741952642e9b5423cda3690ad8b01afbcb491972ae98f8",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/roles/attempts/author/b863391dae582c60ac4904a2f9b020f332fc3b7dd7dd141c47b64199f93b8817.json",
+      "sha256": "a22997fbe3bca0a04eb6455041f9d4f28c629430d5a79af84c1124dbd366f8ee",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/roles/attempts/critic/d92222a19a74544867002f4fbb353f7749f94c7d125743b09ad8ce6879635238.json",
+      "sha256": "7540530c3ab50087112d8d31a359d47e8375bf54e7be52d73c0c1d056f4f3a67",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/roles/attempts/critic/ecaf998d35210d27f998884d115abb534658b7ee647303e820e29482130592b2.json",
+      "sha256": "459a2792af99ea2fa85c96daba72974efdb6ef45bbcb7d5d7faf96fe244ab7b2",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/roles/attempts/investigator/060cc9a1392a8fbf94ef8b80b393702272710042e27056bdd354bab84e5f09f4.json",
+      "sha256": "d50e483abd567a28cac022d64e4ceabe293c7c023e087181374a0a0886aed94d",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/roles/attempts/investigator/4766a54f0376e32d14dfc27766dee77fa93a298a50b5851fbcc82fa62aa6615c.json",
+      "sha256": "5ee4c8ed8e6f1dc80506506e27a70e5595699434570fbf83b728c58978409a34",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/roles/requests/29ae5ab61192995dc20d0c917ceefc0ed78349eb2e348fc77340e2a13d59260f.json",
+      "sha256": "9937e90c8bdfb9eda1e4597bdc19a186490a32f064c4dd099286c1b2e1bdc861",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/roles/requests/2b49bb1f08da38fcdb2ac8d6d4a044d684a0533467ba8e5aabd7bc7d44cc2a43.json",
+      "sha256": "d4728335e81188a38143225d5e636bc50985ff3346001c66b7a7d134f88d995f",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/roles/requests/667332ce605d969f0af710ff7851e2f5d55987710a3f68beccc57fd5c1231cff.json",
+      "sha256": "a03ebb397d2fca46d4ff58af66969d850f3815dbdf60b78a14dd75f5ed47457c",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/roles/requests/82c74e09906c87a3574ce1cd141eea8767ca4067b341ff19527ac5ec2c6513f1.json",
+      "sha256": "1bbae4ef347fb765dcf48f442175ac711da1f3e1a316dd6fc8a6d23cd659ca87",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/roles/requests/c6c931268e76d3cf6c5735db51ac35656cfd66ee3cd79b99ed336977dfdd2802.json",
+      "sha256": "26062bebf5135856f1fbb9a503a486791fa764901faad0cd62d5bb781eb161e5",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/roles/requests/d0b38a92fb675e57e4e247b4091f7d64322932116a83386a091551df8a25d093.json",
+      "sha256": "08b4b6ebd0a0f87da6e4ab8b1ce610220e91aacc356def573bf549d1a7c31f6a",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/roles/terminals/author/119b02887a420bb898c1b014860f4df4097c6b9e5f57fb7da4312635df4fc23f.json",
+      "sha256": "e8458c5fc0f4b13fb19f1868fc3ec1cab392e256dc8cd1b481e88b17eea3e44a",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/roles/terminals/author/90ea8fffa5fcf9d2d4aae2df0529881c4cabcd3dbf1733d2114fc89755d9ebfe.json",
+      "sha256": "4ee3fd6d96fcac4b3769a084dfb2fd23af99eabd06e3f1f5833f449957eb8cc6",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/roles/terminals/critic/8e4999e57547e280e5919b15b41db89b45ab79156e13e0da0bba4b8f715d1532.json",
+      "sha256": "09f4f466331954f8591796f58466394fc9b7b736240fbe4e6fddf9d69faa0266",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/roles/terminals/critic/ecc75aae15ea07fcf49424c8da370e67cd21266bc70c0551fbc31c897f4cc37f.json",
+      "sha256": "af682b3a94c49f1b7eeb2e9ace2d00560b494a6082d1e4d2688af4f8b78e0f36",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/roles/terminals/investigator/7bdd1ba856eb06f8733338eb7edbeeaaa87a9330387b71bed418d3bd0e420195.json",
+      "sha256": "40cc5e42698df266d3001c5ab06296386fef8d94da1c2ebfe4ca0dd6835ede1b",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/roles/terminals/investigator/848d165d740357165d685bdaddf9c66c4fd4c9230d1ccf3b972b7232f8551adb.json",
+      "sha256": "4b5448f4053cb56a0e7d93af6c306a8193ead444e324d992a209059aa718e999",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/stages/adapters/positive.json",
+      "sha256": "0c89c695d551bc7ccbcd12f8bf039bbc041031f8d7ce2f55ba5701209833dfa0",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/stages/confirmation-attempt.json",
+      "sha256": "bcfd91a0cd4320a4ee19ebd1a828dfef9b74198386233397dbc5ed37285fb50a",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/stages/confirmation-attempt.json.policy.json",
+      "sha256": "4d644e03af75e3cf2ad9b696e4cff61c2ce78c6c70404c9e1e4b28c5f1ecd30a",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/stages/confirmation-attempt.json.selection.json",
+      "sha256": "6706d58f4cc258a56a115bedd4b912684fa4ed5deebf89e4f5954a205c41b61f",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/stages/execution-adapter.json",
+      "sha256": "b42fdfc262dbf5141301f423cc3748365e696314c24585cef7c06ce8a967a25a",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/stages/qualification-attempt.json",
+      "sha256": "e08c7257cc2484d49230c9de98101bdb5b572f76a4e4b40a18b8aa7bded09a98",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/r/stages/tampered-policy-attempt.json",
+      "sha256": "50d73bad83c90dec987ef57bb08835dceb5105ecb4fab62c5a64b687a8af5673",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/s/.git/COMMIT_EDITMSG",
+      "sha256": "2c81b54e99e75a288c6d94ed6f8425ba4128ed08e8628c183cfdeedd52b82cbe",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/s/.git/config",
+      "sha256": "88c6c9429d7a2966e625086491b9cd5492774c0defff52c021ca89fb3a929239",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/s/.git/description",
+      "sha256": "85ab6c163d43a17ea9cf7788308bca1466f1b0a8d1cc92e26e9bf63da4062aee",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/s/.git/HEAD",
+      "sha256": "f6f2b945f6c411b02ba3da9c7ace88dcf71b6af65ba2e0d89aa82900042b5a10",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/s/.git/hooks/applypatch-msg.sample",
+      "sha256": "0223497a0b8b033aa58a3a521b8629869386cf7ab0e2f101963d328aa62193f7",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/s/.git/hooks/commit-msg.sample",
+      "sha256": "1f74d5e9292979b573ebd59741d46cb93ff391acdd083d340b94370753d92437",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/s/.git/hooks/fsmonitor-watchman.sample",
+      "sha256": "e0549964e93897b519bd8e333c037e51fff0f88ba13e086a331592bf801fa1d0",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/s/.git/hooks/post-update.sample",
+      "sha256": "81765af2daef323061dcbc5e61fc16481cb74b3bac9ad8a174b186523586f6c5",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/s/.git/hooks/pre-applypatch.sample",
+      "sha256": "e15c5b469ea3e0a695bea6f2c82bcf8e62821074939ddd85b77e0007ff165475",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/s/.git/hooks/pre-commit.sample",
+      "sha256": "57185b7b9f05239d7ab52db045f5b89eb31348d7b2177eab214f5eb872e1971b",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/s/.git/hooks/pre-merge-commit.sample",
+      "sha256": "d3825a70337940ebbd0a5c072984e13245920cdf8898bd225c8d27a6dfc9cb53",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/s/.git/hooks/pre-push.sample",
+      "sha256": "ecce9c7e04d3f5dd9d8ada81753dd1d549a9634b26770042b58dda00217d086a",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/s/.git/hooks/pre-rebase.sample",
+      "sha256": "4febce867790052338076f4e66cc47efb14879d18097d1d61c8261859eaaa7b3",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/s/.git/hooks/pre-receive.sample",
+      "sha256": "a4c3d2b9c7bb3fd8d1441c31bd4ee71a595d66b44fcf49ddb310252320169989",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/s/.git/hooks/prepare-commit-msg.sample",
+      "sha256": "e9ddcaa4189fddd25ed97fc8c789eca7b6ca16390b2392ae3276f0c8e1aa4619",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/s/.git/hooks/push-to-checkout.sample",
+      "sha256": "a53d0741798b287c6dd7afa64aee473f305e65d3f49463bb9d7408ec3b12bf5f",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/s/.git/hooks/sendemail-validate.sample",
+      "sha256": "44ebfc923dc5466bc009602f0ecf067b9c65459abfe8868ddc49b78e6ced7a92",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/s/.git/hooks/update.sample",
+      "sha256": "8d5f2fa83e103cf08b57eaa67521df9194f45cbdbcb37da52ad586097a14d106",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/s/.git/index",
+      "sha256": "aab25358b43c96c1048bf9a2079c91873a27be19c1c11ae6ca67126a48a52fa9",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/s/.git/info/exclude",
+      "sha256": "6671fe83b7a07c8932ee89164d1f2793b2318058eb8b98dc5c06ee0a5a3b0ec1",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/s/.git/logs/HEAD",
+      "sha256": "c9db3d2265843467fd0760ef7e427f8b867fdee3dfd91c8cc5725e0d7ee66995",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/s/.git/logs/refs/heads/master",
+      "sha256": "c9db3d2265843467fd0760ef7e427f8b867fdee3dfd91c8cc5725e0d7ee66995",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/s/.git/objects/16/34ba092c5c6edb2b3272588fe2c3da624c19e6",
+      "sha256": "bd11dacd8ad514dfeda1a94c16e243246f9112e2d297758da52ae176d096c073",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/s/.git/objects/3b/1f39d759164754d880417af22584afef0d918e",
+      "sha256": "f797fe55fcad2be4199eeb3d16188297eeeff17630578519cf1f9ed948d24112",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/s/.git/objects/9f/b49c290e1f8151efe26478293703079cfafa88",
+      "sha256": "34fdd2514e0a19ca26155b902a7639bcf9bf923b4f42cfad474e5d79b25bd5d0",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/s/.git/objects/b3/eaef289389e353219c879dcfc304cede10d381",
+      "sha256": "04145099ebe5640fedb39998a2a6b0f436b69edc64b5dbf1aedfb91fa546b7c4",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/s/.git/objects/ce/d5132135e39b33053a7d5d602c28263265653c",
+      "sha256": "1061071c12a461adf54b3d77e23720745978280cf9ba769ede3745d978c4fd03",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/s/.git/objects/d3/e787736ca521b0468f089836ba3653c4d2ca37",
+      "sha256": "e138c6a3b9861a108ecb65ece13671f50a7f929802817504b8933e3554f47a49",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/s/.git/objects/d4/76d61fae5ecbe3725fa7a70a5c97d5c3e640eb",
+      "sha256": "e981f66cef483a3870e3be7b979fe74044d4671cbe9d6f5ed313a7283fc46511",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/s/.git/objects/e3/9300c294e54e47aab7755f5e00e438ac817f98",
+      "sha256": "e0c2c9cf86e5eee19401b2c35d2a69d4c3158d642f6a5b43771acaaa12e1cb16",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/s/.git/objects/fc/4a126b4aac32b86d69fb5a88af6e43d3b9d2e7",
+      "sha256": "fcf261ec7bc7981de43d2f37ff0562b9523f055d8e418c8093e18b5a10b9cb4d",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/s/.git/refs/heads/master",
+      "sha256": "1e390c0eb77bebb1c7e50a8826b92175530bf6fa53222a34dd71c37decc9b9eb",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/s/core/strategy_policy/v3/entry.py",
+      "sha256": "1879bd1f0cfc7e022cb4b060661f21c50150d0d5deb70fc00e10f9de44050474",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/s/core/strategy_policy/v3/exit.py",
+      "sha256": "61b07c9e42813e5d58a4ce7d669f06466e9bf5b6b4cf2872d624022959d8f837",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/s/core/strategy_policy/v3/position.py",
+      "sha256": "8a9d0b790c0e3b7bc70a45d9e10b06f9b3c0337ebad662d8111f8abc35886cd1",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/s/core/strategy_policy/v3/risk.py",
+      "sha256": "32098cc02d13c2fbede053818bb99686b9659639b976108d9730adbfcf6cfe20",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/chain/stage-chain-summary.json",
+      "sha256": "3a4dcb651975fd9c3aa6c3083aeb5f0db0bca3ce6e330d6e3eec7de91be1f905",
+      "visibility": "local-only",
+      "evidence_kind": "controlled-stage-artifact",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/compile.log",
+      "sha256": "325b9fca1430b255ee574081a7bff3e6141ca400f3d17052aebaeb05d0173a04",
+      "visibility": "local-only",
+      "evidence_kind": "verification-output",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/environment.json",
+      "sha256": "46c52ddcc3fc00e5303dc9ca14fd16ce4ffa50ffc38f0b0de5e5618d7bcf9728",
+      "visibility": "local-only",
+      "evidence_kind": "verification-output",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/focused.log",
+      "sha256": "85f51ecb28be42e808b6a028a2830c3f1ad71dfd1ca483f821561c2a51e855d8",
+      "visibility": "local-only",
+      "evidence_kind": "verification-output",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/ruff.log",
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18",
+      "visibility": "local-only",
+      "evidence_kind": "verification-output",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    },
+    {
+      "path": ".artifacts/research-wave/integrated-2/verification.json",
+      "sha256": "6fbb1d3ba9753bf1705e92e11184ad90e2760c6343832b22e3c5cc56ef191bdd",
+      "visibility": "local-only",
+      "evidence_kind": "verification-output",
+      "source_revision": "ed820aff0f86d82778927f7935ef8f5be177414b",
+      "input_bundle_id": "19b9523fda6fd8fed57640d1e70d1ffc4a421f87caa67b931d52e64d8898ac44",
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "supports the named bounded checks only"
+    }
+  ],
+  "historical_comparisons": [
+    {
+      "receipt": {
+        "path": ".artifacts/research-wave/integrated/verification.json",
+        "sha256": "afcf1afe8d11728fab5eac7750b9d54551caf0b896aa6c77277c893e13a41992",
+        "visibility": "local-only",
+        "evidence_kind": "historical-failed-run",
+        "source_revision": "93e4a3c154ef3d78a908df0f4d14f1078dbfaf9e",
+        "input_bundle_id": "8825351956b4f3ea8c3d180827fa6e9218bda769bb3fb393be34ffde37253d9d",
+        "availability_status": "present-at-packaging",
+        "acceptance_status": "not a passing run"
+      },
+      "result": "85 passed, 14 failed; one new unavailable-add-on-map regression, thirteen pre-existing failures",
+      "checks": [
+        {
+          "name": "focused",
+          "argv": [
+            "C:\\Users\\llong\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\python.exe",
+            "-m",
+            "pytest",
+            "-q",
+            "--no-cov",
+            "-o",
+            "addopts=",
+            "-p",
+            "no:cacheprovider",
+            "--tb=short",
+            "tests/test_issue86_report_evidence.py",
+            "tests/test_issue87_diagnostic_meanings.py",
+            "tests/test_pit_optimizer_v5_issue93_stage_boundaries.py",
+            "tests/test_pit_optimizer_v5_evaluator_assumptions.py",
+            "tests/test_pit_optimizer_v5_mechanism_evidence.py",
+            "tests/test_pit_optimizer_v5_mechanism_artifacts.py::test_extension_off_factory_requests_and_messages_match_recorded_baseline",
+            "tests/test_pit_optimizer_v5_mechanism_artifacts.py::test_full_runtime_run_supplied_ports_publishes_after_current_critic_evidence",
+            "tests/test_backtest_custom_strategy_contract.py",
+            "tests/test_task11_effective_policy_contract.py"
+          ],
+          "exit_code": 1,
+          "seconds": 251.66,
+          "path": ".artifacts/research-wave/integrated/focused.log",
+          "sha256": "d64f4b03392f854a4a5a556af1a65d514318763a358f2d453163ca78a3a8a5e7",
+          "visibility": "local-only",
+          "evidence_kind": "command-output",
+          "source_revision": "93e4a3c154ef3d78a908df0f4d14f1078dbfaf9e",
+          "input_bundle_id": "8825351956b4f3ea8c3d180827fa6e9218bda769bb3fb393be34ffde37253d9d",
+          "availability_status": "present-at-check",
+          "acceptance_status": "failed"
+        },
+        {
+          "name": "ruff",
+          "argv": [
+            "C:\\Users\\llong\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\python.exe",
+            "-m",
+            "ruff",
+            "check",
+            "."
+          ],
+          "exit_code": 0,
+          "seconds": 0.31,
+          "path": ".artifacts/research-wave/integrated/ruff.log",
+          "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18",
+          "visibility": "local-only",
+          "evidence_kind": "command-output",
+          "source_revision": "93e4a3c154ef3d78a908df0f4d14f1078dbfaf9e",
+          "input_bundle_id": "8825351956b4f3ea8c3d180827fa6e9218bda769bb3fb393be34ffde37253d9d",
+          "availability_status": "present-at-check",
+          "acceptance_status": "pass"
+        },
+        {
+          "name": "compile",
+          "argv": [
+            "C:\\Users\\llong\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\python.exe",
+            "-m",
+            "compileall",
+            "-q",
+            "-x",
+            "[/\\\\](\\.git|\\.worktrees|\\.artifacts|\\.venv)[/\\\\]",
+            "."
+          ],
+          "exit_code": 0,
+          "seconds": 2.1,
+          "path": ".artifacts/research-wave/integrated/compile.log",
+          "sha256": "325b9fca1430b255ee574081a7bff3e6141ca400f3d17052aebaeb05d0173a04",
+          "visibility": "local-only",
+          "evidence_kind": "command-output",
+          "source_revision": "93e4a3c154ef3d78a908df0f4d14f1078dbfaf9e",
+          "input_bundle_id": "8825351956b4f3ea8c3d180827fa6e9218bda769bb3fb393be34ffde37253d9d",
+          "availability_status": "present-at-check",
+          "acceptance_status": "pass"
+        }
+      ],
+      "comparison_details": null
+    },
+    {
+      "receipt": {
+        "path": ".artifacts/research-wave/legacy-baseline/verification.json",
+        "sha256": "78d14406cd4af9a89fa10fccf6c715f2c382c07cb2f6e4c9c054f50d1d94404b",
+        "visibility": "local-only",
+        "evidence_kind": "historical-failed-run",
+        "source_revision": "c6c5b715f77a1225ff9f6e456c8cf3d5145654ab",
+        "input_bundle_id": null,
+        "availability_status": "present-at-packaging",
+        "acceptance_status": "not a passing run"
+      },
+      "result": "18 passed, 13 failed; reproduced all thirteen pre-existing failures",
+      "checks": [],
+      "comparison_details": {
+        "source_revision": "c6c5b715f77a1225ff9f6e456c8cf3d5145654ab",
+        "source_archive_sha256": "475c1c9e8a0e1bdf06049b6b2de7513d0b4b2294087cffe39943f40c5769389d",
+        "python": "3.13.14 (tags/v3.13.14:fd17997, Jun 10 2026, 13:03:48) [MSC v.1944 64 bit (AMD64)]",
+        "argv": [
+          "C:\\Users\\llong\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\python.exe",
+          "-m",
+          "pytest",
+          "-q",
+          "--no-cov",
+          "-o",
+          "addopts=",
+          "-p",
+          "no:cacheprovider",
+          "--tb=short",
+          "tests/test_backtest_custom_strategy_contract.py",
+          "tests/test_task11_effective_policy_contract.py"
+        ],
+        "exit_code": 1,
+        "seconds": 2.505537986755371,
+        "log_sha256": "b254f91e38a67e011167b1a037bb536bef9b71573413ee18f189446ae1cd6ff9",
+        "visibility": "local-only",
+        "scope": "Existing custom strategy and policy contract fixtures; static mocked data only"
+      }
+    }
+  ],
+  "independent_task_reviews": [
+    {
+      "path": ".artifacts/research-wave/review-issue86.md",
+      "sha256": "bced5c2c49fefd0c769453140517f1df6b9c10f7cf80fbac54591c7ee14511a4",
+      "visibility": "local-only",
+      "evidence_kind": "independent-review-report",
+      "source_revision": "6b1b6b7d2342da896565fce5d0f551b836f10764",
+      "input_bundle_id": null,
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "historical scoped review; not acceptance of later integrated bytes"
+    },
+    {
+      "path": ".artifacts/research-wave/review-issue86-fix1.md",
+      "sha256": "e40d73c6a96239b0d8f76ead072c09d3efa64ca42e9106a190aada87e5695346",
+      "visibility": "local-only",
+      "evidence_kind": "independent-review-report",
+      "source_revision": "03ea0945bc3d2e510abe7e9ab1fbab6556167378",
+      "input_bundle_id": null,
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "historical scoped review; not acceptance of later integrated bytes"
+    },
+    {
+      "path": ".artifacts/research-wave/review-issue86-fix2.md",
+      "sha256": "ffc399d965fce7cdfb90565bca9f0779ac0ef7dde7a7a78268339054f63bb51f",
+      "visibility": "local-only",
+      "evidence_kind": "independent-review-report",
+      "source_revision": "75b94787307b7ba32abb5cb2910a48fc36eddfe9",
+      "input_bundle_id": null,
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "historical scoped review; not acceptance of later integrated bytes"
+    },
+    {
+      "path": ".artifacts/research-wave/review-issue87.md",
+      "sha256": "33e77864c61c90369eabf02fc611a53e2e7a970b18f650f39b6570a30af78f27",
+      "visibility": "local-only",
+      "evidence_kind": "independent-review-report",
+      "source_revision": "666dd5b925095f25053ae3ab4af613f2ee0a2d8c",
+      "input_bundle_id": null,
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "historical scoped review; not acceptance of later integrated bytes"
+    },
+    {
+      "path": ".artifacts/research-wave/review-issue93.md",
+      "sha256": "7945d40e39cd9d6ccaf061874604568d84b77c5901c0ff2643da5e31efab3e85",
+      "visibility": "local-only",
+      "evidence_kind": "independent-review-report",
+      "source_revision": "ef647ccc920d14dc2d40c8c159f132983ac3acb8",
+      "input_bundle_id": null,
+      "availability_status": "present-at-packaging",
+      "acceptance_status": "historical scoped review; not acceptance of later integrated bytes"
+    }
+  ],
+  "known_test_debt": {
+    "baseline_source": "c6c5b715f77a1225ff9f6e456c8cf3d5145654ab",
+    "failure_count": 13,
+    "files": [
+      "tests/test_backtest_custom_strategy_contract.py",
+      "tests/test_task11_effective_policy_contract.py"
+    ],
+    "classification": "Reproduced unchanged-base failures, outside this activated wave; excluded from final targeted selection, never represented as passing"
+  }
+}
