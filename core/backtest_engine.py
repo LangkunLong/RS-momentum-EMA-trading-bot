@@ -8,6 +8,7 @@ import json
 import math
 import os
 import pickle
+import re
 import sqlite3
 import sys
 from collections.abc import Mapping
@@ -852,6 +853,10 @@ class SimulationResultV5(SimulationResult):
     portfolio_observations: tuple[PortfolioObservationV5, ...] = ()
     policy_intent_outcomes: dict[str, int] = field(default_factory=dict)
     add_on_outcomes: dict[str, int] = field(default_factory=dict)
+    add_on_rejection_reasons: dict[str, int] = field(default_factory=dict)
+    add_on_rejection_telemetry_status: Literal[
+        "complete", "incomplete_legacy_checkpoint", "unavailable_unspecified"
+    ] = "unavailable_unspecified"
 
 
 class PerformanceReport:
@@ -1844,6 +1849,22 @@ def _new_add_on_outcomes_v5() -> dict[str, int]:
     }
 
 
+def _checkpoint_add_on_rejection_reasons(value: object) -> dict[str, int]:
+    if not isinstance(value, Mapping):
+        raise ValueError("portfolio checkpoint V5 add-on rejection reasons are invalid")
+    normalized: dict[str, int] = {}
+    for raw_reason, raw_count in value.items():
+        if (
+            type(raw_reason) is not str
+            or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", raw_reason) is None
+            or type(raw_count) is not int
+            or raw_count < 0
+        ):
+            raise ValueError("portfolio checkpoint V5 add-on rejection reasons are invalid")
+        normalized[raw_reason] = raw_count
+    return normalized
+
+
 def _strategy_checkpoint_identity(
     simulator: "PortfolioSimulator",
     *,
@@ -2310,6 +2331,10 @@ class PortfolioSimulator:
         )
         self._add_on_outcomes = (
             _new_add_on_outcomes_v5() if self._v5_enabled else {}
+        )
+        self._add_on_rejection_reasons: dict[str, int] = {}
+        self._add_on_rejection_telemetry_status = (
+            "complete" if self._v5_enabled else "unavailable_unspecified"
         )
         self._weekly_snapshots: List[dict] = []
         self._signal_rows: List[dict] = []
@@ -2822,6 +2847,33 @@ class PortfolioSimulator:
                 }
                 if any(value < 0 for value in self._add_on_outcomes.values()):
                     raise ValueError("portfolio checkpoint V5 add-on outcomes are invalid")
+                if "add_on_rejection_telemetry_status" not in checkpoint_state:
+                    # Pre-issue-86 checkpoints recorded add-on outcomes but did
+                    # not retain candidate-declined reasons.
+                    if "add_on_rejection_reasons" in checkpoint_state:
+                        raise ValueError(
+                            "portfolio checkpoint V5 add-on rejection status is missing"
+                        )
+                    self._add_on_rejection_reasons = {}
+                    self._add_on_rejection_telemetry_status = (
+                        "incomplete_legacy_checkpoint"
+                    )
+                else:
+                    raw_rejection_status = checkpoint_state[
+                        "add_on_rejection_telemetry_status"
+                    ]
+                    if (
+                        type(raw_rejection_status) is not str
+                        or raw_rejection_status
+                        not in {"complete", "incomplete_legacy_checkpoint"}
+                    ):
+                        raise ValueError(
+                            "portfolio checkpoint V5 add-on rejection telemetry status is invalid"
+                        )
+                    self._add_on_rejection_reasons = _checkpoint_add_on_rejection_reasons(
+                        checkpoint_state.get("add_on_rejection_reasons")
+                    )
+                    self._add_on_rejection_telemetry_status = raw_rejection_status
             equity_series = {
                 str(row["date"]): float(row["equity"])
                 for row in restored_outputs["equity"]
@@ -3232,30 +3284,12 @@ class PortfolioSimulator:
                 origin_requested_min_canslim_score,
             ),
         )
-        result_type = SimulationResultV5 if self._v5_enabled else SimulationResult
-        result_kwargs: dict[str, Any] = {
-            "trades": self._trades,
-            "equity_curve": pd.Series(equity_series),
-            "benchmark_curve": pd.Series(benchmark_series),
-            "initial_capital": self.initial_capital,
-            "config": result_config,
-            "transaction_log": pd.DataFrame(self._transactions),
-            "weekly_holdings": pd.DataFrame(self._weekly_snapshots),
-            "signal_log": pd.DataFrame(self._signal_rows),
-            "execution_diagnostics": dict(self._execution_diagnostics),
-            "entry_outcomes": tuple(self._entry_outcomes),
-            "benchmark_symbol": benchmark,
-        }
-        if self._v5_enabled:
-            result_kwargs.update(
-                fill_log=pd.DataFrame(self._fill_rows),
-                fill_cost_totals=dict(self._fill_cost_totals),
-                position_episodes=tuple(self._position_episodes),
-                portfolio_observations=tuple(self._portfolio_observations),
-                policy_intent_outcomes=dict(self._policy_intent_outcomes),
-                add_on_outcomes=dict(self._add_on_outcomes),
-            )
-        result = result_type(**result_kwargs)
+        result = self._assemble_simulation_result(
+            equity_curve=pd.Series(equity_series),
+            benchmark_curve=pd.Series(benchmark_series),
+            benchmark=benchmark,
+            result_config=result_config,
+        )
         if checkpoint is not None:
             _write_checkpoint_json(
                 checkpoint,
@@ -3294,6 +3328,45 @@ class PortfolioSimulator:
             state_stream.close()
         return result
 
+    def _assemble_simulation_result(
+        self,
+        *,
+        equity_curve: pd.Series,
+        benchmark_curve: pd.Series,
+        benchmark: str,
+        result_config: dict[str, Any],
+    ) -> SimulationResult:
+        """Build the public result envelope from the current simulator state."""
+
+        result_type = SimulationResultV5 if self._v5_enabled else SimulationResult
+        result_kwargs: dict[str, Any] = {
+            "trades": self._trades,
+            "equity_curve": equity_curve,
+            "benchmark_curve": benchmark_curve,
+            "initial_capital": self.initial_capital,
+            "config": result_config,
+            "transaction_log": pd.DataFrame(self._transactions),
+            "weekly_holdings": pd.DataFrame(self._weekly_snapshots),
+            "signal_log": pd.DataFrame(self._signal_rows),
+            "execution_diagnostics": dict(self._execution_diagnostics),
+            "entry_outcomes": tuple(self._entry_outcomes),
+            "benchmark_symbol": benchmark,
+        }
+        if self._v5_enabled:
+            result_kwargs.update(
+                fill_log=pd.DataFrame(self._fill_rows),
+                fill_cost_totals=dict(self._fill_cost_totals),
+                position_episodes=tuple(self._position_episodes),
+                portfolio_observations=tuple(self._portfolio_observations),
+                policy_intent_outcomes=dict(self._policy_intent_outcomes),
+                add_on_outcomes=dict(self._add_on_outcomes),
+                add_on_rejection_reasons=dict(self._add_on_rejection_reasons),
+                add_on_rejection_telemetry_status=(
+                    self._add_on_rejection_telemetry_status
+                ),
+            )
+        return result_type(**result_kwargs)
+
     def _reset_run_state(self) -> None:
         """Restore all mutable per-run state before evaluating an independent fold."""
 
@@ -3313,6 +3386,10 @@ class PortfolioSimulator:
         )
         self._add_on_outcomes = (
             _new_add_on_outcomes_v5() if self._v5_enabled else {}
+        )
+        self._add_on_rejection_reasons = {}
+        self._add_on_rejection_telemetry_status = (
+            "complete" if self._v5_enabled else "unavailable_unspecified"
         )
         self._weekly_snapshots = []
         self._signal_rows = []
@@ -3702,6 +3779,12 @@ class PortfolioSimulator:
                     },
                     "policy_intent_outcomes": dict(self._policy_intent_outcomes),
                     "add_on_outcomes": dict(self._add_on_outcomes),
+                    "add_on_rejection_reasons": dict(
+                        self._add_on_rejection_reasons
+                    ),
+                    "add_on_rejection_telemetry_status": (
+                        self._add_on_rejection_telemetry_status
+                    ),
                 }
             )
         if result_config is not None:
@@ -3776,6 +3859,29 @@ class PortfolioSimulator:
         )
         if checkpoint_outcomes != journal_outcomes:
             raise ValueError("completed checkpoint entry outcomes disagree with state log")
+        if "add_on_rejection_telemetry_status" not in checkpoint:
+            if "add_on_rejection_reasons" in checkpoint:
+                raise ValueError(
+                    "completed checkpoint V5 add-on rejection status is missing"
+                )
+            restored_add_on_rejection_reasons: dict[str, int] = {}
+            restored_add_on_rejection_status = "incomplete_legacy_checkpoint"
+        else:
+            raw_add_on_rejection_status = checkpoint[
+                "add_on_rejection_telemetry_status"
+            ]
+            if (
+                type(raw_add_on_rejection_status) is not str
+                or raw_add_on_rejection_status
+                not in {"complete", "incomplete_legacy_checkpoint"}
+            ):
+                raise ValueError(
+                    "completed checkpoint V5 add-on rejection telemetry status is invalid"
+                )
+            restored_add_on_rejection_reasons = _checkpoint_add_on_rejection_reasons(
+                checkpoint.get("add_on_rejection_reasons")
+            )
+            restored_add_on_rejection_status = raw_add_on_rejection_status
         equity = pd.Series(
             [float(row["equity"]) for row in outputs["equity"]],
             index=pd.to_datetime([row["date"] for row in outputs["equity"]]),
@@ -3828,6 +3934,8 @@ class PortfolioSimulator:
                     str(key): int(value)
                     for key, value in checkpoint.get("add_on_outcomes", {}).items()
                 },
+                add_on_rejection_reasons=restored_add_on_rejection_reasons,
+                add_on_rejection_telemetry_status=restored_add_on_rejection_status,
             )
         return result_type(**result_kwargs)
 
@@ -5612,6 +5720,9 @@ class PortfolioSimulator:
             raise ValueError("add-on policy decision is invalid")
         decision = validate_add_on_decision(snapshot, decision)
         if not decision.add:
+            self._add_on_rejection_reasons[decision.reason_code] = (
+                self._add_on_rejection_reasons.get(decision.reason_code, 0) + 1
+            )
             return None
         pending = PendingAddOn(
             symbol=symbol,

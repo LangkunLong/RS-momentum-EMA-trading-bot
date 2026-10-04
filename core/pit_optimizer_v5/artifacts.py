@@ -383,9 +383,36 @@ def _decode_value(annotation: object, value: object) -> object:
 
 
 def _decode_dataclass(cls: type[T], value: object) -> T:
-    primitive = _exact_keys(value, {item.name for item in fields(cls) if item.init})
+    expected = {item.name for item in fields(cls) if item.init}
+    optional_legacy_fields: set[str] = set()
+    if cls.__name__ == "EvaluationReportV5":
+        optional_legacy_fields = {
+            "report_semantics_version",
+            "add_on_outcomes",
+            "add_on_rejection_telemetry_status",
+            "add_on_rejection_reason_counts",
+            "unregistered_add_on_rejection_reason_counts",
+            "friction_scenario",
+            "friction_calibration_status",
+            "friction_calibration_limitation",
+            "metric_definitions",
+        }
+    elif cls.__name__ == "RoleEvidenceItemV5":
+        optional_legacy_fields = {"description"}
+    if optional_legacy_fields:
+        if type(value) is not dict or not (expected - optional_legacy_fields).issubset(value):
+            raise ValueError
+        if set(value) - expected:
+            raise ValueError
+        primitive = value
+    else:
+        primitive = _exact_keys(value, expected)
     hints = get_type_hints(cls)
-    decoded = {item.name: _decode_value(hints[item.name], primitive[item.name]) for item in fields(cls) if item.init}
+    decoded = {
+        item.name: _decode_value(hints[item.name], primitive[item.name])
+        for item in fields(cls)
+        if item.init and item.name in primitive
+    }
     return cls(**decoded)
 
 

@@ -1851,12 +1851,19 @@ class RoleRequestV5:
             raise ValueError("critic binding requires a hypothesis and complete experiment batch")
         evidence_rows: list[dict[str, object]] = []
         issued: list[IssuedEvidenceV5] = []
+        evidence_has_descriptions = False
         for item in self.role_evidence.items:
             _validate_metric_id(item.metric_id)
             payload = {
                 "metric_id": item.metric_id,
                 "value": canonical_primitive_v5(item.value),
             }
+            if item.description is not None:
+                payload["description"] = _validate_safe_text(
+                    item.description,
+                    "role evidence description",
+                )
+                evidence_has_descriptions = True
             evidence_rows.append({"evidence_id": item.evidence_id, "payload": payload})
             issued.append(
                 IssuedEvidenceV5(
@@ -1872,17 +1879,17 @@ class RoleRequestV5:
             issued_ids=tuple(item.evidence_id for item in self.role_evidence.items),
             issued_evidence=self.role_evidence,
         )
+        message_content: dict[str, object] = {
+            "binding": self.expected_binding.to_primitive(),
+            "evidence": evidence_rows,
+            "role_input": canonical_primitive_v5(self.role_input),
+        }
+        if evidence_has_descriptions:
+            # Schema v2 adds optional, provider-safe explanatory text to each
+            # described evidence payload. V1 requests retain their exact shape.
+            message_content["evidence_schema_version"] = 2
         messages = _freeze_json(
-            (
-                {
-                    "role": "user",
-                    "content": {
-                        "binding": self.expected_binding.to_primitive(),
-                        "evidence": evidence_rows,
-                        "role_input": canonical_primitive_v5(self.role_input),
-                    },
-                },
-            )
+            ({"role": "user", "content": message_content},)
         )
         assert type(messages) is tuple
         object.__setattr__(self, "messages", messages)

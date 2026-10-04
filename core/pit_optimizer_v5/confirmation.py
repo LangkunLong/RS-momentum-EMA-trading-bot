@@ -368,7 +368,13 @@ def build_confirmation_attempt(
             retirement_ledger.preopen_snapshot_ref,
         ),
         opaque=(confirmation_plan_ref,),
-        raw=(plan.pit_bundle_ref, plan.prices_provenance_ref),
+        raw=(
+            plan.pit_bundle_ref,
+            plan.prices_provenance_ref,
+            plan.mechanics.panel_ref,
+            plan.quick.panel_ref,
+            *(item.panel_ref for item in plan.discovery),
+        ),
     )
     champion, experiment = repository.load_confirmation_champion(
         checkpoint_ref=discovery_checkpoint_ref,
@@ -486,7 +492,13 @@ def _inputs(repository, attempt_ref, attempt):
             selection.experiment_ref,
             selection.finalized_campaign_ref,
         ),
-        raw=(attempt.pit_bundle_ref, attempt.prices_provenance_ref),
+        raw=(
+            attempt.pit_bundle_ref,
+            attempt.prices_provenance_ref,
+            discovery.mechanics.panel_ref,
+            discovery.quick.panel_ref,
+            *(item.panel_ref for item in discovery.discovery),
+        ),
     )
     evaluator = _load(repository, attempt.evaluator_contract_ref, EvaluatorContractV5)
     execution = _load(repository, attempt.execution_profile_ref, ExecutionProfileV5)
@@ -552,6 +564,8 @@ def _inputs(repository, attempt_ref, attempt):
 
 
 def _panel(repository, inputs, snapshot):
+    # The plan and held-out panel are decoded only after run_confirmation has
+    # observed or appended the durable opened ledger record.
     plan = _load(repository, inputs.attempt.confirmation_plan_ref, ConfirmationPanelPlanV5)
     panel = repository.load_evaluation_panel_spec(plan.episode.panel_ref)
     validate_episode_plan_panel_v5(plan.episode, panel)

@@ -27,10 +27,12 @@ from .contracts import (
     EvaluationSliceV5,
     MAX_ROLE_EVIDENCE_ITEMS_V5,
     MetricCountV5,
+    ReportMetricDefinitionV5,
     RoleEvidenceItemV5,
     RoleEvidenceV5,
     RollingReturnV5,
     SliceMetricsV5,
+    _ADD_ON_OUTCOME_IDS_V5,
 )
 
 
@@ -65,6 +67,41 @@ _POLICY_OUTCOME_IDS = frozenset(
         "preempted_by_stop",
         "unexecuted_terminal",
     }
+)
+_REGISTERED_ADD_ON_REJECTION_REASON_IDS = frozenset(
+    {"baseline_no_add_on", "registered_no_add_on"}
+)
+_ADD_ON_REASON_RE = re.compile(r"[a-z][a-z0-9_]{0,63}")
+_MAX_ROLE_ADD_ON_REASON_CATEGORIES = 64
+_FRICTION_CALIBRATION_LIMITATION = (
+    "Empirical friction calibration inputs and provenance were not supplied. "
+    "The configured bps have no empirical sample or provenance, and no observed "
+    "quote, volume, average daily volume, order-size, or participation data "
+    "calibrates this scenario."
+)
+_REPORT_METRIC_DEFINITIONS_V2 = (
+    ReportMetricDefinitionV5(
+        "gross_annualized_return_pct",
+        "Same-path gross-of-configured-friction estimate: the observed equity path "
+        "with realized configured fill friction added back, not a zero-cost "
+        "re-simulation or counterfactual.",
+    ),
+    ReportMetricDefinitionV5(
+        "estimated_idle_cash_drag_pct",
+        "Exposure-scaled proxy: net annualized return divided by the arithmetic mean "
+        "of observed-session gross-long-notional / total-equity exposure fractions, "
+        "minus net annualized return. Each observed session is weighted equally, "
+        "not by elapsed time. It includes terminally liquidated sessions and models "
+        "no interest or cash redeployment.",
+    ),
+    ReportMetricDefinitionV5(
+        "scale_out_opportunity_cost_pct",
+        "Hindsight price-gap diagnostic: max(episode maximum completed-bar price "
+        "minus scale-out execution price, 0) times scale-out shares, divided by "
+        "total scale-out execution notional. The episode maximum has no timestamp, "
+        "so its chronology relative to a sale is unknown. This is not realized loss "
+        "or missed future upside.",
+    ),
 )
 _ENTRY_OUTCOME_IDS = frozenset(
     {
@@ -795,6 +832,59 @@ def summarize_panel_result(
         + policy_outcomes["unexecuted_terminal"]
     ):
         raise ValueError("V5 policy intents do not reconcile to terminal outcomes")
+    rejection_status = result.add_on_rejection_telemetry_status
+    if rejection_status not in {
+        "complete",
+        "incomplete_legacy_checkpoint",
+        "unavailable_unspecified",
+    }:
+        raise ValueError("V5 add-on rejection telemetry status is invalid")
+    add_on_outcomes = result.add_on_outcomes
+    if (
+        not isinstance(add_on_outcomes, Mapping)
+        or any(type(value) is not int or value < 0 for value in add_on_outcomes.values())
+    ):
+        raise ValueError("V5 add-on outcomes are incomplete")
+    if add_on_outcomes:
+        if set(add_on_outcomes) != _ADD_ON_OUTCOME_IDS_V5:
+            raise ValueError("V5 add-on outcomes are incomplete")
+    elif rejection_status != "unavailable_unspecified":
+        raise ValueError("V5 add-on outcomes are incomplete")
+    report_rejection_status = {
+        "incomplete_legacy_checkpoint": "unavailable_legacy_checkpoint",
+    }.get(rejection_status, rejection_status)
+    rejection_reasons = result.add_on_rejection_reasons
+    if not isinstance(rejection_reasons, Mapping) or any(
+        type(reason) is not str
+        or _ADD_ON_REASON_RE.fullmatch(reason) is None
+        or type(count) is not int
+        or count < 0
+        for reason, count in rejection_reasons.items()
+    ):
+        raise ValueError("V5 add-on rejection reason evidence is invalid")
+    if rejection_status == "unavailable_unspecified" and rejection_reasons:
+        raise ValueError("unavailable V5 add-on rejection telemetry cannot carry reason counts")
+    if rejection_status == "complete":
+        declined_count = sum(rejection_reasons.values())
+        add_on_metric_counts = _metric_counts(
+            {**{str(key): int(value) for key, value in add_on_outcomes.items()}, "declined": declined_count}
+        )
+    elif add_on_outcomes:
+        add_on_metric_counts = _metric_counts(
+            {str(key): int(value) for key, value in add_on_outcomes.items()}
+        )
+    else:
+        add_on_metric_counts = ()
+    rejection_metric_counts = _metric_counts(
+        {str(key): int(value) for key, value in rejection_reasons.items()}
+    )
+    unregistered_rejection_metric_counts = _metric_counts(
+        {
+            str(key): int(value)
+            for key, value in rejection_reasons.items()
+            if key not in _REGISTERED_ADD_ON_REJECTION_REASON_IDS
+        }
+    )
 
     net_metrics = _return_metrics(equity, panel.sessions)
     benchmark_metrics = _return_metrics(benchmark, panel.sessions)
@@ -1006,6 +1096,15 @@ def summarize_panel_result(
         episode_slices=episode_slices,
         calendar_year_slices=calendar_slices,
         rolling_returns=_rolling_returns(equity, panel.sessions),
+        report_semantics_version=2,
+        add_on_outcomes=add_on_metric_counts,
+        add_on_rejection_telemetry_status=report_rejection_status,
+        add_on_rejection_reason_counts=rejection_metric_counts,
+        unregistered_add_on_rejection_reason_counts=unregistered_rejection_metric_counts,
+        friction_scenario=scenario,
+        friction_calibration_status="not_supplied",
+        friction_calibration_limitation=_FRICTION_CALIBRATION_LIMITATION,
+        metric_definitions=_REPORT_METRIC_DEFINITIONS_V2,
     )
 
 
@@ -1019,12 +1118,46 @@ def _evidence_id(metric_id: str) -> str:
     return f"v5.{fragment}"
 
 
+def _role_add_on_reason_candidates(
+    *,
+    category: str,
+    metrics: tuple[MetricCountV5, ...],
+    description: str,
+) -> list[tuple[str, int, str]]:
+    ordered = tuple(sorted(metrics, key=lambda item: item.metric_id))
+    retained = ordered[:_MAX_ROLE_ADD_ON_REASON_CATEGORIES]
+    omitted = ordered[_MAX_ROLE_ADD_ON_REASON_CATEGORIES:]
+    candidates = [
+        (
+            f"add_on.{category}.{hashlib.sha256(item.metric_id.encode('utf-8')).hexdigest()}",
+            item.count,
+            f"{description} Full reason code is retained in the persisted report; "
+            "this projection uses its sha256 reference.",
+        )
+        for item in retained
+    ]
+    if omitted:
+        manifest = "\n".join(f"{item.metric_id}:{item.count}" for item in omitted)
+        digest = hashlib.sha256(manifest.encode("utf-8")).hexdigest()
+        candidates.append(
+            (
+                f"add_on.{category}.unrepresented_reason_category_count",
+                len(omitted),
+                "Some candidate-authored reason categories are omitted from bounded "
+                f"role evidence; sha256 {digest} binds their ordered IDs and counts. "
+                "Exact codes and counts remain in the persisted report.",
+            )
+        )
+    return candidates
+
+
 def to_role_evidence(report: EvaluationReportV5) -> RoleEvidenceV5:
     """Project a report into stable, bounded, symbol-neutral aggregate evidence."""
 
     if type(report) is not EvaluationReportV5:
         raise ValueError("role evidence requires an EvaluationReportV5")
-    candidates: list[tuple[str, Decimal | int | None]] = []
+    candidates: list[tuple[str, Decimal | int | None, str | None]] = []
+    definitions = {item.metric_id: item.definition for item in report.metric_definitions}
     excluded = {
         "maximum_favorable_excursion_pct",
         "maximum_adverse_excursion_pct",
@@ -1035,27 +1168,96 @@ def to_role_evidence(report: EvaluationReportV5) -> RoleEvidenceV5:
         "episode_slices",
         "calendar_year_slices",
         "rolling_returns",
+        "report_semantics_version",
+        "add_on_outcomes",
+        "add_on_rejection_telemetry_status",
+        "add_on_rejection_reason_counts",
+        "unregistered_add_on_rejection_reason_counts",
+        "friction_scenario",
+        "friction_calibration_status",
+        "friction_calibration_limitation",
+        "metric_definitions",
     }
     for item in fields(report):
         if item.name not in excluded:
-            candidates.append((f"report.{item.name}", getattr(report, item.name)))
+            candidates.append(
+                (
+                    f"report.{item.name}",
+                    getattr(report, item.name),
+                    definitions.get(item.name),
+                )
+            )
+    if report.report_semantics_version >= 2:
+        candidates.append(("report.report_semantics_version", report.report_semantics_version, None))
+        status_description = (
+            f"Candidate-declined add-on reason telemetry status: "
+            f"{report.add_on_rejection_telemetry_status}. Counts are partial for "
+            "legacy checkpoints and unavailable for unspecified telemetry; "
+            "unavailable telemetry is not a zero count."
+        )
+        candidates.append(
+            (
+                "report.add_on_rejection_telemetry_status",
+                None,
+                status_description,
+            )
+        )
+        candidates.extend(
+            (
+                f"add_on.outcome.{('invalid_mark' if item.metric_id == 'invalid_price' else item.metric_id)}",
+                item.count,
+                f"Observed V5 add-on outcome count for {item.metric_id}.",
+            )
+            for item in report.add_on_outcomes
+        )
+        candidates.extend(
+            _role_add_on_reason_candidates(
+                category="rejection_reason_count",
+                metrics=report.add_on_rejection_reason_counts,
+                description="Candidate-authored declined AddOnDecisionV3 reason.",
+            )
+        )
+        candidates.extend(
+            _role_add_on_reason_candidates(
+                category="unregistered_rejection_reason_count",
+                metrics=report.unregistered_add_on_rejection_reason_counts,
+                description="Unregistered candidate-authored declined AddOnDecisionV3 reason.",
+            )
+        )
+        if report.friction_scenario is not None:
+            configured = (
+                f"Configured scenario {report.friction_scenario.scenario_id}; "
+                f"{_FRICTION_CALIBRATION_LIMITATION}"
+            )
+            candidates.extend(
+                (
+                    ("report.friction_scenario.half_spread_bps", report.friction_scenario.half_spread_bps, configured),
+                    ("report.friction_scenario.market_impact_bps", report.friction_scenario.market_impact_bps, configured),
+                    ("report.friction_scenario.commission_bps", report.friction_scenario.commission_bps, configured),
+                    (
+                        "report.friction_calibration_status",
+                        None,
+                        f"{report.friction_calibration_status}: {report.friction_calibration_limitation}",
+                    ),
+                )
+            )
     for prefix, distribution in (
         ("mfe", report.maximum_favorable_excursion_pct),
         ("mae", report.maximum_adverse_excursion_pct),
     ):
         if distribution is None:
-            candidates.append((f"distribution.{prefix}.undefined", None))
+            candidates.append((f"distribution.{prefix}.undefined", None, None))
         else:
             for item in fields(distribution):
                 candidates.append(
-                    (f"distribution.{prefix}.{item.name}", getattr(distribution, item.name))
+                    (f"distribution.{prefix}.{item.name}", getattr(distribution, item.name), None)
                 )
     for category, metrics in (
         ("exit", report.exit_attribution),
         ("policy", report.policy_intent_outcomes),
     ):
         for metric in metrics:
-            candidates.append((f"{category}.{metric.metric_id}", metric.count))
+            candidates.append((f"{category}.{metric.metric_id}", metric.count, None))
     for dimension, slices in (
         ("regime", report.regime_slices),
         ("episode", report.episode_slices),
@@ -1067,6 +1269,7 @@ def to_role_evidence(report: EvaluationReportV5) -> RoleEvidenceV5:
                     (
                         f"slice.{dimension}.{slice_item.label}.{metric.name}",
                         getattr(slice_item.metrics, metric.name),
+                        None,
                     )
                 )
     latest_rolling: dict[int, RollingReturnV5] = {}
@@ -1075,24 +1278,25 @@ def to_role_evidence(report: EvaluationReportV5) -> RoleEvidenceV5:
     for months, row in sorted(latest_rolling.items()):
         candidates.extend(
             (
-                (f"rolling.{months}m.latest.total_return_pct", row.total_return_pct),
+                (f"rolling.{months}m.latest.total_return_pct", row.total_return_pct, None),
                 (
                     f"rolling.{months}m.latest.annualized_return_pct",
                     row.annualized_return_pct,
+                    None,
                 ),
             )
         )
     for metric in report.entry_funnel:
-        candidates.append((f"entry.{metric.metric_id}", metric.count))
+        candidates.append((f"entry.{metric.metric_id}", metric.count, None))
 
     items: list[RoleEvidenceItemV5] = []
     seen: set[str] = set()
-    for metric_id, value in candidates:
+    for metric_id, value, description in candidates:
         evidence_id = _evidence_id(metric_id)
         if evidence_id in seen:
             raise ValueError("role evidence projection produced a duplicate stable ID")
         seen.add(evidence_id)
-        candidate = RoleEvidenceItemV5(evidence_id, metric_id, value)
+        candidate = RoleEvidenceItemV5(evidence_id, metric_id, value, description)
         if len(items) == MAX_ROLE_EVIDENCE_ITEMS_V5:
             break
         tentative = RoleEvidenceV5(schema_version=5, items=tuple([*items, candidate]))
