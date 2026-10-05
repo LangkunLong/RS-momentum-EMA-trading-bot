@@ -869,6 +869,7 @@ def test_v3_builder_resolves_all_fiserv_segment_episodes_end_to_end(
     industry_provenance = {
         "industry_sha256": sha256_file(industry_path),
         "membership_csv_sha256": sha256_file(membership_path),
+        "prices_provenance_sha256": sha256_file(prices_provenance_path),
         "data_cutoff": cutoff,
         "row_count": len(industry_rows),
         "symbol_count": len({row[0] for row in industry_rows}),
@@ -880,6 +881,46 @@ def test_v3_builder_resolves_all_fiserv_segment_episodes_end_to_end(
     industry_provenance_path.write_text(
         pit_canonical_json(industry_provenance) + "\n", encoding="utf-8"
     )
+
+    incomplete_industry_provenance = dict(industry_provenance)
+    incomplete_industry_provenance.pop("prices_provenance_sha256", None)
+    incomplete_industry_provenance_path = (
+        tmp_path / "industry-provenance-incomplete.json"
+    )
+    incomplete_industry_provenance_path.write_text(
+        pit_canonical_json(incomplete_industry_provenance) + "\n", encoding="utf-8"
+    )
+    with pytest.raises(
+        ValueError, match="industry provenance does not bind prices provenance"
+    ):
+        bundle_builder._v3_provenance_metadata(
+            membership_path=membership_path,
+            prices_path=prices_path,
+            fundamentals_path=fundamentals_path,
+            industry_path=industry_path,
+            cutoff=cutoff,
+            evaluation_start=evaluation_start,
+            warmup_start=warmup_start,
+            membership=bundle_builder._load_membership_v3(membership_path, cutoff),
+            prices=bundle_builder._load_prices(
+                prices_path, cutoff, ticker_parser=bundle_builder._ticker_v3
+            ),
+            fundamentals=bundle_builder._load_fundamentals(
+                fundamentals_path, cutoff, ticker_parser=bundle_builder._ticker_v3
+            ),
+            industry=bundle_builder._load_industry(industry_path, cutoff),
+            membership_provenance_path=membership_provenance_path,
+            membership_provenance=json.loads(
+                membership_provenance_path.read_text(encoding="utf-8")
+            ),
+            prices_provenance_path=prices_provenance_path,
+            prices_provenance=prices_provenance,
+            fundamentals_provenance_path=fundamentals_provenance_path,
+            fundamentals_provenance=fundamentals_provenance,
+            industry_provenance_path=incomplete_industry_provenance_path,
+            industry_provenance=incomplete_industry_provenance,
+            allow_nonproduction_fixture=True,
+        )
 
     bundle_path = tmp_path / "fiserv-v3.sqlite3"
     manifest_path = tmp_path / "fiserv-v3-manifest.json"
