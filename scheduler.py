@@ -33,7 +33,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
 from types import TracebackType
-from typing import BinaryIO, Iterable
+from typing import Any, BinaryIO, Iterable
 from zoneinfo import ZoneInfo
 
 from config import settings
@@ -56,6 +56,19 @@ from core.data_client import (
 )
 from core.order_execution import _get_trading_client, _is_paper_mode, require_paper_mode
 from core.order_manager import OrderManager
+from core.bounded_trading_stream import ReadOnlyTradeUpdateObserver
+from core.operation_limits import (
+    OperationBudget,
+    OperationCapExceeded,
+    OperationManifestError,
+    activate_operation_budget,
+    budgeted_standard_output,
+    consume_operation_dimension,
+    current_operation_budget,
+    enforce_manifest_session_window,
+    load_operation_manifest,
+    validate_runtime_binding,
+)
 from core.scheduler_observation import (
     SchedulerObservation,
     activate_scheduler_observation,
@@ -222,6 +235,30 @@ def _record_observation_resource_snapshots(observation: SchedulerObservation) ->
     )
 
 
+def _observer_exit_code(
+    observation: SchedulerObservation,
+    budget: OperationBudget,
+) -> int:
+    """Fail on any incomplete budget, even when the final receipt cannot print."""
+    budget_state = budget.snapshot()
+    if str(budget_state["incomplete_reason"]).startswith("output_bytes:"):
+        existing = observation.to_receipt()["issues"]
+        if not any(issue.get("code") == "operation_output_cap_denied" for issue in existing):
+            observation.latch_service_issue(
+                "operation_output_cap_denied",
+                {"reason": budget_state["incomplete_reason"]},
+            )
+    receipt = observation.to_receipt()
+    budget_state = budget.snapshot()
+    return (
+        1
+        if not budget_state["evidence_complete"]
+        or receipt["service_health"] != "healthy"
+        or receipt["overall_readiness"] == "fail"
+        else 0
+    )
+
+
 class SchedulerAlreadyRunningError(RuntimeError):
     """Raised when another scheduler owns the host-wide paper-trading lock."""
 
@@ -327,6 +364,63 @@ def _market_clock_is_open() -> bool | None:
         return None
 
 
+def _validate_observer_run_admission(
+    observation_stop_at: datetime,
+    observation_hard_deadline_at: datetime,
+) -> None:
+    """Repeat observer admission at the public Python entry before provider I/O."""
+    budget = current_operation_budget()
+    if budget is None:
+        raise OperationManifestError(
+            "observe_health requires an active admitted observer operation budget"
+        )
+    manifest = budget.manifest
+    manifest.require_admitted()
+    if manifest.operation != "observer":
+        raise OperationManifestError("observe_health requires an observer manifest")
+    observation = current_scheduler_observation()
+    if observation is None:
+        raise OperationManifestError(
+            "observe_health requires an active scheduler observation context"
+        )
+    enforce_manifest_session_window(manifest, now=datetime.now(_ET))
+    bound_stop = datetime.fromisoformat(
+        str(manifest.binding["session_stop"])
+    ).astimezone(_ET)
+    bound_start = datetime.fromisoformat(
+        str(manifest.binding["session_start"])
+    ).astimezone(_ET)
+    expected_hard_deadline = bound_stop + timedelta(
+        seconds=manifest.deadlines_seconds["hard_deadline_grace_seconds"]
+    )
+    if (
+        observation_stop_at != bound_stop
+        or observation_hard_deadline_at != expected_hard_deadline
+    ):
+        raise OperationManifestError(
+            "scheduler deadlines do not match the admitted observer manifest"
+        )
+    if (bound_stop - bound_start).total_seconds() > manifest.deadlines_seconds[
+        "session_seconds"
+    ]:
+        raise OperationManifestError(
+            "manifest session_seconds cannot cover the bound session window"
+        )
+    budget.ensure_complete()
+    validate_runtime_binding(manifest, Path(__file__).resolve().parent)
+    settings.load_runtime_credentials()
+
+    account = _get_trading_client().get_account()
+    account_id = str(getattr(account, "id", "") or "").strip()
+    if not account_id or account_id != str(manifest.binding["account_id"]):
+        observation.latch_service_issue(
+            "observer_account_binding_mismatch", {}
+        )
+        raise OperationManifestError(
+            "connected account does not match the admitted observer account"
+        )
+
+
 def run_scheduler(
     dry_run: bool = True,
     run_now: bool = False,
@@ -354,6 +448,13 @@ def run_scheduler(
     ):
         raise ValueError(
             "Health observation requires an explicit stop time and hard deadline"
+        )
+    if observe_health:
+        assert observation_stop_at is not None
+        assert observation_hard_deadline_at is not None
+        _validate_observer_run_admission(
+            observation_stop_at,
+            observation_hard_deadline_at,
         )
     if not observe_health and (
         observation_stop_at is not None or observation_hard_deadline_at is not None
@@ -384,7 +485,7 @@ def _run_scheduler_locked(
     print(f"[SCHEDULER] Starting CANSLIM scheduler [{mode}]")
     print("[SCHEDULER] Press Ctrl-C to stop.")
 
-    monitor: FillMonitor | None = None
+    monitor: FillMonitor | ReadOnlyTradeUpdateObserver | None = None
 
     def live_execution_ready() -> bool:
         """Read monitor health at the instant an order may submit."""
@@ -454,7 +555,24 @@ def _run_scheduler_locked(
                     "Observation requires an authoritative open Alpaca clock"
                 )
 
-        if dry_run:
+        if observe_health:
+            budget = current_operation_budget()
+            if budget is None or budget.manifest.operation != "observer":
+                raise RuntimeError("Observer operation budget is not active")
+            monitor = ReadOnlyTradeUpdateObserver(budget)
+            monitor.start()
+            _wait_for_fill_monitor_connection(
+                monitor,
+                timeout_seconds=budget.manifest.deadlines_seconds[
+                    "stream_connect_seconds"
+                ],
+            )
+            observation = current_scheduler_observation()
+            if observation is not None:
+                observation.record_event(
+                    "trade_update_stream", "observer", "connected", {}
+                )
+        elif dry_run:
             print("[SCHEDULER] Fill monitor disabled in dry-run mode.")
         else:
             monitor = _start_live_monitor()
@@ -496,7 +614,12 @@ def _run_scheduler_locked(
                 if dry_run:
                     if observe_health:
                         _run_observed_work(
-                            "scan", "startup", _now_et(), lambda: _run_cycle(dry_run)
+                            "scan",
+                            "startup",
+                            _now_et(),
+                            lambda: _run_observer_scan(
+                                list(current_operation_budget().manifest.scope["symbols"])
+                            ),
                         )
                     else:
                         _run_cycle(dry_run)
@@ -512,14 +635,31 @@ def _run_scheduler_locked(
                 last_scan_date = _now_et().date()
 
         while True:
+            if observe_health:
+                budget = current_operation_budget()
+                if budget is None:
+                    raise RuntimeError("Observer operation budget is not active")
+                budget.ensure_complete()
+                consume_operation_dimension("scheduler_ticks")
             execution_armed = dry_run
             if monitor is not None:
-                try:
-                    monitor = _ensure_fill_monitor_running(monitor, dry_run=False)
-                    execution_armed = True
-                except Exception as exc:  # noqa: BLE001
-                    execution_armed = False
-                    print(f"[SCHEDULER ERROR] Live execution disarmed: {exc}")
+                if observe_health:
+                    if not monitor.is_connected():
+                        observation = current_scheduler_observation()
+                        if observation is not None:
+                            observation.latch_service_issue(
+                                "observer_trade_update_stream_disconnected",
+                                {},
+                                unverified=True,
+                            )
+                        raise RuntimeError("Read-only trade-update observer disconnected")
+                else:
+                    try:
+                        monitor = _ensure_fill_monitor_running(monitor, dry_run=False)
+                        execution_armed = True
+                    except Exception as exc:  # noqa: BLE001
+                        execution_armed = False
+                        print(f"[SCHEDULER ERROR] Live execution disarmed: {exc}")
 
             now = _now_et()
             today = now.date()
@@ -591,7 +731,7 @@ def _run_scheduler_locked(
                 )
 
             exit_session_live = False
-            if in_exit_window and (dry_run or execution_armed):
+            if not observe_health and in_exit_window and (dry_run or execution_armed):
                 if market_clock_open is None:
                     exit_session_live = dry_run and not observe_health
                 elif in_market_hours:
@@ -625,7 +765,9 @@ def _run_scheduler_locked(
                                     "scan",
                                     "scheduled",
                                     now.replace(hour=9, minute=31, second=0, microsecond=0),
-                                    lambda: _run_cycle(dry_run),
+                                    lambda: _run_observer_scan(
+                                        list(current_operation_budget().manifest.scope["symbols"])
+                                    ),
                                 )
                             else:
                                 _run_cycle(dry_run)
@@ -778,20 +920,35 @@ def _run_scheduler_locked(
         print("\n[SCHEDULER] Shutdown requested.")
     finally:
         if monitor is not None:
-            monitor.stop()
+            stopped = monitor.stop()
+            if not stopped and observe_health:
+                observation = current_scheduler_observation()
+                if observation is not None:
+                    observation.latch_service_issue(
+                        "observer_trade_update_stream_stop_incomplete",
+                        {},
+                        unverified=True,
+                    )
             print("[SCHEDULER] Fill monitor stopped. Goodbye.")
         else:
             print("[SCHEDULER] Dry-run scheduler stopped. Goodbye.")
 
 
 def _wait_for_fill_monitor_connection(
-    monitor: FillMonitor,
+    monitor: FillMonitor | ReadOnlyTradeUpdateObserver,
     *,
-    timeout_seconds: float = _MONITOR_CONNECT_TIMEOUT_SECS,
+    timeout_seconds: float | None = None,
     poll_seconds: float = _MONITOR_CONNECT_POLL_SECS,
 ) -> None:
     """Wait for authenticated stream readiness or fail closed."""
-    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    timeout = _MONITOR_CONNECT_TIMEOUT_SECS if timeout_seconds is None else timeout_seconds
+    budget = current_operation_budget()
+    if budget is not None:
+        timeout = min(
+            timeout,
+            budget.manifest.deadlines_seconds["stream_connect_seconds"],
+        )
+    deadline = time.monotonic() + max(0.0, timeout)
     while True:
         if monitor.is_connected():
             return
@@ -912,6 +1069,18 @@ def _run_cycle(
         pass  # notification failure is non-fatal
 
 
+def _run_observer_scan(symbols: list[str]) -> None:
+    """Scan only the manifest's explicit symbols, with both trade phases off."""
+    for symbol in symbols:
+        consume_operation_dimension("scan_cycles")
+        run_auto_trader(
+            dry_run=True,
+            skip_entries=True,
+            skip_exits=True,
+            symbol=symbol,
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the safe-by-default scheduler CLI."""
     parser = argparse.ArgumentParser(description="CANSLIM Daily Scheduler")
@@ -943,6 +1112,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Record bounded, offline-reviewable outcomes for one dry-run session",
+    )
+    parser.add_argument(
+        "--operation-manifest",
+        default="",
+        help="path to the separately admitted observer limits manifest",
     )
     parser.add_argument(
         "--observe-stop-at",
@@ -1016,27 +1190,41 @@ def _run_cli_args(args: argparse.Namespace) -> int:
                 "--observe-hard-deadline-at."
             )
             return 2
-        if (
-            stop_at.date() != hard_deadline_at.date()
-            or hard_deadline_at <= stop_at
-            or hard_deadline_at - stop_at > timedelta(minutes=5)
-        ):
+        if not args.operation_manifest:
             print(
-                "[SCHEDULER] Observation hard deadline must be later than the "
-                "stop time by no more than five minutes on the same ET date."
+                "[SCHEDULER] --observe-health requires an admitted --operation-manifest."
             )
             return 2
-        required_settings = {
-            "ALPACA_HTTP_TIMEOUT_SECONDS": 15,
-            "FMP_HTTP_TIMEOUT_SECONDS": 15,
-            "INDEX_TICKER_HTTP_TIMEOUT_SECONDS": 15,
-            "ALPACA_SDK_RETRY_ATTEMPTS": 0,
-        }
-        invalid_settings = {
-            name: getattr(settings, name, None)
-            for name, expected in required_settings.items()
-            if getattr(settings, name, None) != expected
-        }
+        try:
+            manifest = load_operation_manifest(
+                args.operation_manifest, expected_operation="observer"
+            )
+            enforce_manifest_session_window(manifest, now=_now_et())
+            validate_runtime_binding(manifest, Path(__file__).resolve().parent)
+            bound_start = datetime.fromisoformat(
+                str(manifest.binding["session_start"])
+            ).astimezone(_ET)
+            bound_stop = datetime.fromisoformat(
+                str(manifest.binding["session_stop"])
+            ).astimezone(_ET)
+            expected_hard_deadline = bound_stop + timedelta(
+                seconds=manifest.deadlines_seconds["hard_deadline_grace_seconds"]
+            )
+            if stop_at != bound_stop or hard_deadline_at != expected_hard_deadline:
+                raise OperationManifestError(
+                    "CLI stop/deadline values do not match the admitted manifest"
+                )
+            if (bound_stop - bound_start).total_seconds() > manifest.deadlines_seconds[
+                "session_seconds"
+            ]:
+                raise OperationManifestError(
+                    "manifest session_seconds cannot cover the bound session window"
+                )
+            budget = OperationBudget(manifest)
+            settings.load_runtime_credentials()
+        except OperationManifestError as exc:
+            print(f"[SCHEDULER] Observer contract rejected before client construction: {exc}")
+            return 2
         notification_settings = (
             "NOTIFY_EMAIL_FROM",
             "NOTIFY_EMAIL_TO",
@@ -1045,17 +1233,11 @@ def _run_cli_args(args: argparse.Namespace) -> int:
         nonblank_notifications = [
             name for name in notification_settings if str(getattr(settings, name, "")).strip()
         ]
-        if invalid_settings or nonblank_notifications:
-            if invalid_settings:
-                print(
-                    "[SCHEDULER] --observe-health requires request settings "
-                    f"{required_settings}; got {invalid_settings}."
-                )
-            if nonblank_notifications:
-                print(
-                    "[SCHEDULER] --observe-health requires blank notification "
-                    f"credentials; got configured values for {nonblank_notifications}."
-                )
+        if nonblank_notifications:
+            print(
+                "[SCHEDULER] --observe-health requires blank notification "
+                f"credentials; got configured values for {nonblank_notifications}."
+            )
             return 2
     if args.fmp_daily_budget is not None:
         if args.observe_health:
@@ -1069,8 +1251,14 @@ def _run_cli_args(args: argparse.Namespace) -> int:
             run_id=f"scheduler-{uuid4().hex}",
             snapshot_path=os.environ.get("SCHEDULER_OBSERVATION_SNAPSHOT_PATH") or None,
         )
-        with activate_scheduler_observation(observation):
-            fmp_limit = fmp_observation_request_limit(198)
+        with (
+            activate_scheduler_observation(observation),
+            activate_operation_budget(budget),
+            budgeted_standard_output(budget),
+        ):
+            fmp_limit = fmp_observation_request_limit(
+                manifest.http_category_limits["fmp_read"]
+            )
             missing_ledger = any(
                 issue["code"] in {"fmp_ledger_missing", "fmp_ledger_unreadable"}
                 for issue in observation.to_receipt()["issues"]
@@ -1079,11 +1267,9 @@ def _run_cli_args(args: argparse.Namespace) -> int:
                 _record_observation_resource_snapshots(observation)
             else:
                 try:
-                    with (
-                        single_attempt_alpaca_requests(),
-                        alpaca_http_request_budget(256),
-                        fmp_request_budget(fmp_limit),
-                    ):
+                    with single_attempt_alpaca_requests(), alpaca_http_request_budget(
+                        manifest.total_http_attempts
+                    ), fmp_request_budget(fmp_limit):
                         try:
                             run_scheduler(
                                 dry_run=True,
@@ -1098,19 +1284,29 @@ def _run_cli_args(args: argparse.Namespace) -> int:
                             observation.latch_service_issue(
                                 "scheduler_already_running", {}, unverified=True
                             )
+                        except OperationCapExceeded as exc:
+                            print(f"[SCHEDULER] Observer contract stopped the run: {exc}")
                         except Exception as exc:  # noqa: BLE001
                             print(f"[SCHEDULER ERROR] Observation failed: {exc}")
-                            observation.record_event(
-                                "scheduler", "observation", "failed",
-                                {"error_type": type(exc).__name__},
-                            )
+                            try:
+                                observation.record_event(
+                                    "scheduler", "observation", "failed",
+                                    {"error_type": type(exc).__name__},
+                                )
+                            except OperationCapExceeded:
+                                pass
                             if observation.to_receipt()["service_health"] == "healthy":
                                 observation.latch_service_issue(
                                     "scheduler_observation_failed",
                                     {"error_type": type(exc).__name__},
                                 )
                         finally:
-                            _record_observation_resource_snapshots(observation)
+                            try:
+                                _record_observation_resource_snapshots(observation)
+                            except OperationCapExceeded:
+                                observation.latch_service_issue(
+                                    "observer_resource_snapshot_cap_denied", {},
+                                )
                 except RuntimeError as exc:
                     print(f"[SCHEDULER ERROR] Could not activate observation budgets: {exc}")
                     observation.latch_service_issue(
@@ -1125,18 +1321,43 @@ def _run_cli_args(args: argparse.Namespace) -> int:
             and datetime.fromisoformat(admitted_at) < hard_deadline_at
             and actual_stop_at >= hard_deadline_at
         )
-        observation.mark_stopped(
-            actual_stop_at,
-            deadline_exceeded=deadline_exceeded,
-        )
-        receipt = observation.to_receipt()
-        print("SCHEDULER_OBSERVATION_RECEIPT=" + json.dumps(receipt, sort_keys=True))
-        return (
-            1
-            if receipt["service_health"] != "healthy"
-            or receipt["overall_readiness"] == "fail"
-            else 0
-        )
+        with activate_scheduler_observation(observation), activate_operation_budget(budget):
+            try:
+                observation.mark_stopped(
+                    actual_stop_at,
+                    deadline_exceeded=deadline_exceeded,
+                )
+            except OperationCapExceeded as exc:
+                observation.latch_service_issue(
+                    "observer_final_event_cap_denied", {"reason": str(exc)}
+                )
+            if str(budget.snapshot()["incomplete_reason"]).startswith("output_bytes:"):
+                _observer_exit_code(observation, budget)
+
+            prefix = "SCHEDULER_OBSERVATION_RECEIPT="
+            line = ""
+            receipt: dict[str, Any] = {}
+            try:
+                charged = 0
+                for _ in range(3):
+                    budget_state = budget.snapshot()
+                    receipt = observation.to_receipt()
+                    receipt["evidence_complete"] = budget_state["evidence_complete"]
+                    receipt["operation_budget"] = budget_state
+                    line = prefix + json.dumps(receipt, sort_keys=True)
+                    required = len((line + "\n").encode("utf-8"))
+                    if required <= charged:
+                        break
+                    budget.consume_output(required - charged)
+                    charged = required
+                else:
+                    raise OperationCapExceeded(
+                        "final observer receipt byte count did not stabilize"
+                    )
+                print(line)
+            except OperationCapExceeded:
+                return _observer_exit_code(observation, budget)
+        return _observer_exit_code(observation, budget)
     try:
         run_scheduler(
             dry_run=not args.enable_orders,

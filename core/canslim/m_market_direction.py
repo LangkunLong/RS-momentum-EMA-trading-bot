@@ -28,6 +28,7 @@ from core.data_client import (
     fetch_ohlcv,
     normalize_price_dataframe,
 )
+from core.operation_limits import current_operation_budget, market_trend_data_request
 from core.trading_sessions import latest_us_equity_session
 
 
@@ -371,7 +372,12 @@ def evaluate_m(
         data = price_data
     else:
         try:
-            data = fetch_ohlcv(benchmark_symbol, period=period)
+            budget = current_operation_budget()
+            if budget is not None and budget.manifest.operation == "observer":
+                with market_trend_data_request():
+                    data = fetch_ohlcv(benchmark_symbol, period=period)
+            else:
+                data = fetch_ohlcv(benchmark_symbol, period=period)
         except Exception:
             data = pd.DataFrame()
 

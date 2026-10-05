@@ -22,6 +22,7 @@ from core.scheduler_observation import (
     IndexRequestBudgetExceeded,
     current_scheduler_observation,
 )
+from core.operation_limits import current_operation_budget
 
 # Cache configuration
 CACHE_DIR = Path(settings.TICKER_CACHE_DIR)
@@ -62,6 +63,19 @@ def _index_get(source: str, url: str, **kwargs: object) -> requests.Response:
     observation = current_scheduler_observation()
     if observation is not None:
         observation.reserve_index_attempt(source)
+    operation_budget = current_operation_budget()
+    if operation_budget is not None:
+        operation_budget.consume("index_requests_per_scan")
+        operation_budget.reserve_http("index_read")
+        requested_timeout = kwargs.get("timeout")
+        bounded_timeout = operation_budget.manifest.deadlines_seconds[
+            "request_timeout_seconds"
+        ]
+        if requested_timeout is None:
+            kwargs["timeout"] = bounded_timeout
+        else:
+            kwargs["timeout"] = min(float(requested_timeout), bounded_timeout)
+        kwargs["allow_redirects"] = False
     try:
         response = requests.get(url, **kwargs)
     except Exception as exc:

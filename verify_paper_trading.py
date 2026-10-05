@@ -7,7 +7,7 @@ from SQLite state, then closes the test position and proves broker and local
 state are flat.
 
 Usage:
-    python verify_paper_trading.py --execute
+    python verify_paper_trading.py --execute --operation-manifest PATH
 
 Requires ALPACA_API_KEY, ALPACA_SECRET_KEY, and ALPACA_PAPER=true in .env.
 The price path is Alpaca-only; the verifier does not call FMP.
@@ -16,14 +16,17 @@ The price path is Alpaca-only; the verifier does not call FMP.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from config import settings
+from core.alpaca_client_policy import single_attempt_alpaca_requests
 from core.execution_store import get_execution_store
 from core.execution_workflow import (
     ClosedSellCheckpoint,
@@ -49,6 +52,16 @@ from core.order_execution import (
     reconcile_symbol_after_exit_failure,
 )
 from core.order_manager import OrderManager
+from core.operation_limits import (
+    OperationBudget,
+    OperationCapExceeded,
+    OperationManifestError,
+    activate_operation_budget,
+    current_operation_budget,
+    enforce_manifest_session_window,
+    load_operation_manifest,
+    validate_runtime_binding,
+)
 from fill_monitor import FillMonitor
 
 _ET = ZoneInfo("America/New_York")
@@ -107,10 +120,39 @@ def _check_market_open() -> bool:
         return False
 
 
-def main(*, execute: bool = False) -> int:
+def main(
+    *, execute: bool = False, operation_manifest_path: str | None = None
+) -> int:
     if not execute:
         print("[REFUSED] Pass --execute to authorize the one-share paper lifecycle.")
         return 2
+    if not operation_manifest_path:
+        print("[REFUSED] --execute requires an admitted lifecycle --operation-manifest.")
+        return 2
+    try:
+        manifest = load_operation_manifest(
+            operation_manifest_path, expected_operation="lifecycle"
+        )
+        enforce_manifest_session_window(manifest)
+        validate_runtime_binding(manifest, Path(__file__).resolve().parent)
+        budget = OperationBudget(manifest)
+        settings.load_runtime_credentials()
+    except OperationManifestError as exc:
+        print(f"[REFUSED] Lifecycle contract rejected before client construction: {exc}")
+        return 2
+
+    try:
+        with activate_operation_budget(budget), single_attempt_alpaca_requests():
+            result = _run_lifecycle(manifest)
+    except (OperationCapExceeded, OperationManifestError) as exc:
+        print(f"[INCOMPLETE] Lifecycle stopped by its operation contract: {exc}")
+        result = 1
+    snapshot = budget.snapshot()
+    print("PAPER_LIFECYCLE_BUDGET=" + json.dumps(snapshot, sort_keys=True))
+    return result if snapshot["evidence_complete"] else 1
+
+
+def _run_lifecycle(manifest) -> int:
 
     print(_SEPARATOR)
     print(
@@ -131,6 +173,10 @@ def main(*, execute: bool = False) -> int:
     try:
         client = _get_trading_client()
         account = client.get_account()
+        account_id = str(getattr(account, "id", "") or "").strip()
+        if not account_id or account_id != str(manifest.binding["account_id"]):
+            print("      ERROR: connected account does not match binding.account_id")
+            return 1
         equity = float(account.equity)
         buying_power = float(account.buying_power)
         print(f"      Equity:        ${equity:,.2f}")
@@ -183,7 +229,7 @@ def main(*, execute: bool = False) -> int:
     try:
         print("\n[5/8] Starting fill monitor and submitting through OrderManager...")
         manager = OrderManager(paper=True)
-        monitor = FillMonitor()
+        monitor = FillMonitor(budget=current_operation_budget())
         monitor.start()
         if not _wait_for_monitor_connection(monitor):
             print("      ERROR: fill monitor did not connect; entry was not submitted")
@@ -289,8 +335,9 @@ def main(*, execute: bool = False) -> int:
                 except Exception as exc:  # noqa: BLE001
                     print(f"[Emergency cleanup] ERROR: {exc}")
             if not cleanup_complete:
-                _hold_until_symbol_safe(_TEST_SYMBOL, manager, workflow_id)
-                cleanup_complete = True
+                cleanup_complete = _hold_until_symbol_safe(
+                    _TEST_SYMBOL, manager, workflow_id
+                )
 
         if monitor is not None:
             _stop_monitor_and_wait(monitor)
@@ -323,8 +370,15 @@ def _wait_for_durable_entry(
     timeout: float,
 ) -> dict[str, Any] | None:
     """Wait for the full persisted entry, fill, stop, and ownership evidence."""
+    budget = current_operation_budget()
+    started = time.monotonic()
+    if budget is not None:
+        timeout = min(timeout, budget.manifest.deadlines_seconds["entry_wait_seconds"])
     deadline = time.monotonic() + max(0.0, timeout)
     while True:
+        if budget is not None:
+            budget.enforce_deadline("entry_wait_seconds", started)
+            budget.consume("durable_entry_polls")
         snapshot = get_execution_store().load_workflow(workflow_id)
         if snapshot is not None:
             transitions = snapshot.get("transitions", [])
@@ -438,8 +492,15 @@ def _wait_for_workflow_events(
     timeout: float,
 ) -> dict[str, Any] | None:
     """Poll the durable store until all required workflow events exist."""
+    budget = current_operation_budget()
+    started = time.monotonic()
+    if budget is not None:
+        timeout = min(timeout, budget.manifest.deadlines_seconds["entry_wait_seconds"])
     deadline = time.monotonic() + max(0.0, timeout)
     while True:
+        if budget is not None:
+            budget.enforce_deadline("entry_wait_seconds", started)
+            budget.consume("durable_entry_polls")
         snapshot = get_execution_store().load_workflow(workflow_id)
         if snapshot is not None:
             events = {
@@ -474,7 +535,7 @@ def _restart_monitor_and_recover(
     recovered = get_active_workflow_for_symbol(symbol)
 
     restarted_manager = OrderManager(paper=True)
-    restarted_monitor = FillMonitor()
+    restarted_monitor = FillMonitor(budget=current_operation_budget())
     restarted_monitor.start()
     if not _wait_for_monitor_connection(restarted_monitor):
         return _RestartRecovery(
@@ -1475,19 +1536,39 @@ def _hold_until_symbol_safe(
     symbol: str,
     manager: OrderManager,
     workflow_id: str,
-) -> None:
-    """Keep recovery and the fill monitor alive until broker safety is proven."""
+) -> bool:
+    """Run the manifest-bounded recovery loop and never claim unproven safety."""
+    budget = current_operation_budget()
+    started = time.monotonic()
     while True:
         try:
+            if budget is not None:
+                budget.enforce_deadline("exit_wait_seconds", started)
+                budget.consume("safety_recovery_passes")
             if _ensure_symbol_safe(symbol, manager, workflow_id):
-                return
+                return True
+        except OperationCapExceeded as exc:
+            print(f"[Emergency cleanup] Bounded recovery stopped incomplete: {exc}")
+            if budget is not None:
+                budget.mark_incomplete(str(exc))
+            return False
         except Exception as exc:  # noqa: BLE001
             print(f"[Emergency cleanup] Safety inspection raised: {exc}")
         print(
             "[Emergency cleanup] CRITICAL: safety is still unproven; "
             "keeping the monitor alive and retrying."
         )
-        time.sleep(_SAFETY_RETRY_INTERVAL)
+        wait_seconds = _SAFETY_RETRY_INTERVAL
+        if budget is not None:
+            remaining = (
+                budget.manifest.deadlines_seconds["exit_wait_seconds"]
+                - (time.monotonic() - started)
+            )
+            if remaining <= 0:
+                budget.mark_incomplete("exit_wait_seconds: safety recovery deadline elapsed")
+                return False
+            wait_seconds = min(wait_seconds, remaining)
+        time.sleep(wait_seconds)
 
 
 def _verified_protective_stop_identity(
@@ -1569,11 +1650,22 @@ def _wait_for_symbol_clear(
     workflow_id: str = "",
 ) -> bool:
     """Require stable broker/local/intent clear state and terminal entry coverage."""
+    budget = current_operation_budget()
+    started = time.monotonic()
+    if budget is not None:
+        budget.consume("final_clear_invocations")
+        timeout = min(
+            timeout,
+            budget.manifest.deadlines_seconds["final_clear_wait_seconds"],
+        )
     deadline = time.monotonic() + max(0.0, timeout)
     last_error = ""
     clear_confirmations = 0
     entry_is_terminal = not workflow_id
     while True:
+        if budget is not None:
+            budget.enforce_deadline("final_clear_wait_seconds", started)
+            budget.consume("final_clear_polls")
         try:
             positions = get_open_positions(raise_on_error=True)
             orders = get_open_orders(symbol, raise_on_error=True)
@@ -1733,7 +1825,11 @@ def _entry_order_is_terminal(symbol: str, workflow_id: str) -> bool:
 def _stop_monitor_and_wait(monitor: FillMonitor) -> bool:
     """Request monitor shutdown and wait for its background thread to exit."""
     monitor.stop()
-    deadline = time.monotonic() + _MONITOR_STOP_TIMEOUT
+    budget = current_operation_budget()
+    timeout = _MONITOR_STOP_TIMEOUT
+    if budget is not None:
+        timeout = min(timeout, budget.manifest.deadlines_seconds["stream_stop_seconds"])
+    deadline = time.monotonic() + timeout
     while monitor.is_running():
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -1744,7 +1840,11 @@ def _stop_monitor_and_wait(monitor: FillMonitor) -> bool:
 
 def _wait_for_monitor_connection(monitor: FillMonitor) -> bool:
     """Wait until the Alpaca stream has authenticated and subscribed."""
-    deadline = time.monotonic() + _MONITOR_CONNECT_TIMEOUT
+    budget = current_operation_budget()
+    timeout = _MONITOR_CONNECT_TIMEOUT
+    if budget is not None:
+        timeout = min(timeout, budget.manifest.deadlines_seconds["stream_connect_seconds"])
+    deadline = time.monotonic() + timeout
     while True:
         if monitor.is_connected():
             return True
@@ -1824,4 +1924,15 @@ if __name__ == "__main__":
         action="store_true",
         help="explicitly authorize one SPY paper entry and verified cleanup",
     )
-    raise SystemExit(main(execute=parser.parse_args().execute))
+    parser.add_argument(
+        "--operation-manifest",
+        default="",
+        help="path to the separately admitted lifecycle limits manifest",
+    )
+    args = parser.parse_args()
+    raise SystemExit(
+        main(
+            execute=args.execute,
+            operation_manifest_path=args.operation_manifest or None,
+        )
+    )

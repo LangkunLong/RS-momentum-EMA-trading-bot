@@ -46,6 +46,7 @@ from core.execution_workflow import (
     normalize_workflow_id,
     recover_active_position_workflow,
 )
+from core.operation_limits import current_operation_budget
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +114,7 @@ def _get_trading_client() -> TradingClient:
     """Return the module-level TradingClient, creating it on first call."""
     global _trading_client
     require_paper_mode()
+    settings.load_runtime_credentials()
     if _trading_client is None:
         api_key = settings.ALPACA_API_KEY
         secret_key = settings.ALPACA_SECRET_KEY
@@ -266,6 +268,9 @@ def submit_bracket_buy(
 
         broker_submission_started = True
         order: Order = client.submit_order(req)
+        budget = current_operation_budget()
+        if budget is not None:
+            budget.admit_order_id(str(getattr(order, "id", "") or ""))
         response_status = _order_status(order)
         if response_status not in _ACCEPTED_SUBMISSION_STATUSES:
             error = (
@@ -361,6 +366,9 @@ def submit_stop_loss(
         )
         broker_submission_started = True
         order: Order = client.submit_order(req)
+        budget = current_operation_budget()
+        if budget is not None:
+            budget.admit_order_id(str(getattr(order, "id", "") or ""))
         identity_error = _stop_order_identity_error(
             order,
             symbol=symbol,
@@ -610,6 +618,12 @@ def _lookup_stop_submission(
     )
     if identity_error:
         return None, False, identity_error
+    budget = current_operation_budget()
+    if budget is not None:
+        budget.link_client_order_identity(
+            client_order_id,
+            str(getattr(order, "id", "") or ""),
+        )
     status = _order_status(order)
     if status in _ACCEPTED_SUBMISSION_STATUSES:
         return order, False, ""
@@ -689,13 +703,23 @@ def _sample_stable_symbol_state(
     timeout: float | None = None,
 ) -> tuple[PositionSummary | None, list[Order]]:
     """Return two identical strict broker observations with working orders only."""
+    budget = current_operation_budget()
     resolved_timeout = _SAFETY_SNAPSHOT_TIMEOUT if timeout is None else max(0.0, timeout)
+    if budget is not None:
+        resolved_timeout = min(
+            resolved_timeout,
+            budget.manifest.deadlines_seconds["stable_sample_seconds"],
+        )
+    started = time.monotonic()
     deadline = time.monotonic() + resolved_timeout
     previous: tuple[object, ...] | None = None
     confirmations = 0
     last_transitioning = False
 
     while True:
+        if budget is not None:
+            budget.enforce_deadline("stable_sample_seconds", started)
+            budget.consume("stable_sample_iterations")
         positions = get_open_positions(raise_on_error=True)
         position = next((item for item in positions if item.symbol == symbol), None)
         orders = get_open_orders(symbol, raise_on_error=True)
@@ -738,12 +762,25 @@ def _cancel_order_ids_verified(
     targets = {str(order_id) for order_id in order_ids if str(order_id)}
     if not targets:
         return 0
+    budget = current_operation_budget()
     client = _get_trading_client()
-    deadline = time.monotonic() + max(0.0, timeout)
+    resolved_timeout = max(0.0, timeout)
+    if budget is not None:
+        resolved_timeout = min(
+            resolved_timeout,
+            budget.manifest.deadlines_seconds["cancel_verify_seconds"],
+        )
+        for order_id in targets:
+            budget.admit_order_id(order_id)
+    started = time.monotonic()
+    deadline = time.monotonic() + resolved_timeout
     absent_confirmations = 0
     errors: dict[str, str] = {}
 
     while True:
+        if budget is not None:
+            budget.enforce_deadline("cancel_verify_seconds", started)
+            budget.consume("cancel_verification_polls")
         open_orders = get_open_orders(symbol, raise_on_error=True)
         remaining_by_id = {
             str(getattr(order, "id", "") or ""): order
@@ -760,6 +797,8 @@ def _cancel_order_ids_verified(
                 if _order_status(order) == "pending_cancel":
                     continue
                 try:
+                    if budget is not None:
+                        budget.consume_order_attempt("cancel", order_id)
                     client.cancel_order_by_id(order_id)
                     errors.pop(order_id, None)
                 except Exception as exc:  # noqa: BLE001
@@ -799,13 +838,26 @@ def _wait_for_terminal_buy_order_chain(
     if workflow is None:
         raise RuntimeError(f"Entry fence workflow {workflow_id} was not found")
 
+    budget = current_operation_budget()
     client = _get_trading_client()
-    deadline = time.monotonic() + max(0.0, timeout)
+    resolved_timeout = max(0.0, timeout)
+    if budget is not None:
+        resolved_timeout = min(
+            resolved_timeout,
+            budget.manifest.deadlines_seconds["terminal_chain_seconds"],
+        )
+        for order_id in known_ids:
+            budget.admit_order_id(order_id)
+    started = time.monotonic()
+    deadline = time.monotonic() + resolved_timeout
     terminal_orders: dict[str, Order] = {}
     last_errors: dict[str, str] = {}
     persisted_ids: set[str] = set()
 
     while True:
+        if budget is not None:
+            budget.enforce_deadline("terminal_chain_seconds", started)
+            budget.consume("exact_lookup_polls")
         all_terminal = True
         for order_id in list(known_ids):
             try:
@@ -836,6 +888,8 @@ def _wait_for_terminal_buy_order_chain(
             for relation in ("replaces", "replaced_by"):
                 related_order_id = str(getattr(order, relation, "") or "")
                 if related_order_id:
+                    if budget is not None:
+                        budget.admit_order_id(related_order_id, replacement=True)
                     known_ids.add(related_order_id)
 
             status = _order_status(order)
@@ -857,6 +911,8 @@ def _wait_for_terminal_buy_order_chain(
                 continue
             if status != "pending_cancel":
                 try:
+                    if budget is not None:
+                        budget.consume_order_attempt("cancel", order_id)
                     client.cancel_order_by_id(order_id)
                     last_errors.pop(order_id, None)
                 except Exception as exc:  # noqa: BLE001
@@ -981,7 +1037,15 @@ def ensure_protective_stop(
         resolved_sell_fill_qty = float(durable_sell_fill_qty)
         if not math.isfinite(resolved_sell_fill_qty) or resolved_sell_fill_qty < 0:
             raise ValueError("Durable sell fill quantity must be finite and non-negative")
-        deadline = time.monotonic() + _POSITION_SYNC_TIMEOUT
+        budget = current_operation_budget()
+        sync_timeout = _POSITION_SYNC_TIMEOUT
+        if budget is not None:
+            sync_timeout = min(
+                sync_timeout,
+                budget.manifest.deadlines_seconds["exit_wait_seconds"],
+            )
+        recovery_started = time.monotonic()
+        deadline = recovery_started + sync_timeout
         attempt = 0
         terminal_filled_qty = 0.0
         durable_entry_ids = {
@@ -993,6 +1057,9 @@ def ensure_protective_stop(
             durable_entry_ids.add(str(entry_order_id))
         fenced_entry_ids: set[str] = set()
         while True:
+            if budget is not None:
+                budget.enforce_deadline("exit_wait_seconds", recovery_started)
+                budget.consume("safety_recovery_passes")
             attempt += 1
             current_orders = get_open_orders(symbol, raise_on_error=True)
             buy_ids = {
@@ -1119,7 +1186,15 @@ def ensure_protective_stop(
                 return protection
             can_retry = (
                 (bool(durable_entry_ids) and time.monotonic() < deadline)
-                or (not durable_entry_ids and attempt < 3)
+                or (
+                    not durable_entry_ids
+                    and attempt
+                    < (
+                        budget.manifest.dimensions["safety_recovery_passes"]
+                        if budget is not None
+                        else 3
+                    )
+                )
             )
             if protection.action in {"pending_buy", "position_sync_pending"} and can_retry:
                 time.sleep(_SAFETY_SNAPSHOT_POLL_INTERVAL)
@@ -1247,6 +1322,9 @@ def submit_market_sell(
         )
         broker_submission_started = True
         order: Order = client.submit_order(req)
+        budget = current_operation_budget()
+        if budget is not None:
+            budget.admit_order_id(str(getattr(order, "id", "") or ""))
         response_status = _order_status(order)
         if response_status not in _ACCEPTED_SUBMISSION_STATUSES:
             error = (
@@ -1382,6 +1460,16 @@ def get_open_orders(
         List of Alpaca Order objects. Empty on error unless
         ``raise_on_error`` is true.
     """
+    budget = current_operation_budget()
+    if budget is not None and budget.manifest.operation == "lifecycle":
+        expected_symbol = str(budget.manifest.scope["symbol"]).strip().upper()
+        if symbol and str(symbol).strip().upper() != expected_symbol:
+            budget.reject_incomplete(
+                "open_order_read", "request symbol is outside the lifecycle scope"
+            )
+        symbol = expected_symbol
+        declared_page_size = budget.manifest.dimensions["order_page_size"]
+        limit = declared_page_size if limit is None else min(int(limit), declared_page_size)
     client = _get_trading_client()
     try:
         request_fields = {
@@ -1406,6 +1494,14 @@ def get_closed_orders(
     raise_on_error: bool = False,
 ) -> list[Order]:
     """Return recent closed orders for a symbol, optionally propagating errors."""
+    budget = current_operation_budget()
+    if budget is not None and budget.manifest.operation == "lifecycle":
+        expected_symbol = str(budget.manifest.scope["symbol"]).strip().upper()
+        if str(symbol).strip().upper() != expected_symbol:
+            budget.reject_incomplete(
+                "closed_order_read", "request symbol is outside the lifecycle scope"
+            )
+        limit = min(int(limit), budget.manifest.dimensions["order_page_size"])
     client = _get_trading_client()
     try:
         request = GetOrdersRequest(
@@ -1428,6 +1524,10 @@ def _cleanup_submitted_stop(symbol: str, order_id: str) -> str:
         return "submitted stop had no broker order id"
     cancel_error = ""
     try:
+        budget = current_operation_budget()
+        if budget is not None:
+            budget.admit_order_id(order_id)
+            budget.consume_order_attempt("cancel", order_id)
         _get_trading_client().cancel_order_by_id(order_id)
     except Exception as exc:  # noqa: BLE001
         cancel_error = f"targeted cancel for unproven stop {order_id} failed: {exc}"
@@ -1959,7 +2059,11 @@ def cancel_open_orders(symbol: str) -> int:
     cancelled = 0
     for order in orders:
         try:
-            client.cancel_order_by_id(str(order.id))
+            order_id = str(getattr(order, "id", "") or "")
+            budget = current_operation_budget()
+            if budget is not None:
+                budget.consume_order_attempt("cancel", order_id)
+            client.cancel_order_by_id(order_id)
             cancelled += 1
         except Exception as exc:  # noqa: BLE001
             print(f"[ORDER ERROR] cancel order {order.id} for {symbol}: {exc}")
@@ -1974,13 +2078,24 @@ def cancel_open_orders_verified(
     poll_interval: float = 0.1,
 ) -> int:
     """Cancel symbol orders in exposure-safe priority and prove stable emptiness."""
+    budget = current_operation_budget()
     client = _get_trading_client()
-    deadline = time.monotonic() + max(0.0, timeout)
+    resolved_timeout = max(0.0, timeout)
+    if budget is not None:
+        resolved_timeout = min(
+            resolved_timeout,
+            budget.manifest.deadlines_seconds["cancel_verify_seconds"],
+        )
+    started = time.monotonic()
+    deadline = time.monotonic() + resolved_timeout
     seen_ids: set[str] = set()
     errors: dict[str, str] = {}
     empty_confirmations = 0
 
     while True:
+        if budget is not None:
+            budget.enforce_deadline("cancel_verify_seconds", started)
+            budget.consume("cancel_verification_polls")
         remaining = get_open_orders(symbol, raise_on_error=True)
         if not remaining:
             empty_confirmations += 1
@@ -2014,9 +2129,13 @@ def cancel_open_orders_verified(
                 if not order_id:
                     continue
                 seen_ids.add(order_id)
+                if budget is not None:
+                    budget.admit_order_id(order_id)
                 if _order_status(order) == "pending_cancel":
                     continue
                 try:
+                    if budget is not None:
+                        budget.consume_order_attempt("cancel", order_id)
                     client.cancel_order_by_id(order_id)
                     errors.pop(order_id, None)
                 except Exception as exc:  # noqa: BLE001

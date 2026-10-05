@@ -15,10 +15,12 @@ from typing import Any
 from alpaca.trading.stream import TradingStream
 
 from config import settings
+from core.bounded_trading_stream import BudgetedTradingStream
 from core.execution_store import get_execution_store
 from core.execution_workflow import build_stop_client_order_id
 from core.order_execution import require_paper_mode
 from core.order_manager import OrderManager, PendingExitSafetyError
+from core.operation_limits import OperationBudget, OperationCapExceeded, current_operation_budget
 
 
 _STOP_JOIN_TIMEOUT_SECS = 5.0
@@ -27,14 +29,22 @@ _STOP_JOIN_TIMEOUT_SECS = 5.0
 class FillMonitor:
     """Wrap Alpaca's TradingStream and forward meaningful events to OrderManager."""
 
-    def __init__(self) -> None:
+    def __init__(self, budget: OperationBudget | None = None) -> None:
         require_paper_mode()
+        settings.load_runtime_credentials()
+        budget = budget or current_operation_budget()
+        self._budget = budget
         self._paper = True
         self._order_manager = OrderManager(paper=self._paper)
-        self._stream = TradingStream(
-            api_key=settings.ALPACA_API_KEY,
-            secret_key=settings.ALPACA_SECRET_KEY,
-            paper=self._paper,
+        stream_kwargs = {
+            "api_key": settings.ALPACA_API_KEY,
+            "secret_key": settings.ALPACA_SECRET_KEY,
+            "paper": self._paper,
+        }
+        self._stream = (
+            BudgetedTradingStream(budget, **stream_kwargs)
+            if budget is not None
+            else TradingStream(**stream_kwargs)
         )
         self._thread: threading.Thread | None = None
         self._running = False
@@ -44,8 +54,18 @@ class FillMonitor:
 
         async def _on_trade_update(data: Any) -> None:  # noqa: ANN401
             try:
+                if self._budget is not None:
+                    self._budget.consume("stream_events")
+                    if _normalize_enum_like(getattr(data, "event", "")) == "partial_fill":
+                        self._budget.consume("partial_fill_events")
                 await asyncio.to_thread(self._dispatch, data)
                 self._clear_converged_exit_fault(data)
+            except OperationCapExceeded as exc:
+                with self._health_lock:
+                    self._handler_fault = True
+                self._running = False
+                self._stream._should_run = False
+                print(f"[FILL MONITOR] Operation stream cap reached: {exc}")
             except PendingExitSafetyError as exc:
                 if self._is_expected_stop_cancel(data, exc):
                     with self._health_lock:
@@ -77,7 +97,10 @@ class FillMonitor:
     def stop(self) -> bool:
         """Stop the stream within one time budget and report full termination."""
         self._running = False
-        deadline = time.monotonic() + _STOP_JOIN_TIMEOUT_SECS
+        timeout = _STOP_JOIN_TIMEOUT_SECS
+        if self._budget is not None:
+            timeout = self._budget.manifest.deadlines_seconds["stream_stop_seconds"]
+        deadline = time.monotonic() + timeout
         stop_errors: list[Exception] = []
 
         def request_stream_stop() -> None:

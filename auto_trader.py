@@ -32,6 +32,7 @@ from core.data_client import (
     fetch_ohlcv,
     fmp_request_budget,
 )
+from core.operation_limits import current_operation_budget
 from core.execution_workflow import EntryExecutionPlan
 from core.order_manager import OrderManager
 from core.order_execution import (
@@ -798,6 +799,11 @@ def run_auto_trader(
             print("No new entries submitted.")
 
     if symbol is None:
+        _scan_and_execute_entries()
+    elif current_operation_budget() is not None:
+        # The admitted observer owns the aggregate limits for every symbol
+        # scan.  A nested legacy context would create a second, disconnected
+        # budget and is therefore skipped.
         _scan_and_execute_entries()
     else:
         with (
