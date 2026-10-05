@@ -88,6 +88,16 @@ class PolicyExecutionReadSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class PolicyDecisionRecord:
+    """Durable immutable decision and its policy, guard, and effective-action facts."""
+
+    decision: DecisionIdentity
+    policy_payload: Mapping[str, object]
+    guard_payload: Mapping[str, object]
+    effective_action_payload: Mapping[str, object]
+
+
+@dataclass(frozen=True, slots=True)
 class PolicyDeploymentChain:
     """Durable deployment identity, handler binding and pointer history."""
 
@@ -1184,6 +1194,42 @@ class PolicyExecutionStateStore:
                 events=events,
             )
 
+    def load_decision_record(self, decision_id: str) -> PolicyDecisionRecord:
+        identity = _required_text(decision_id, "decision_id")
+        with self._transaction(write=False) as conn:
+            self._require_ready(conn)
+            row = conn.execute(
+                """SELECT decision_json, policy_payload_json, guard_payload_json, effective_action_payload_json
+                   FROM policy_state_decisions WHERE decision_id=? AND store_identity=?""",
+                (identity, self.store_identity),
+            ).fetchone()
+            if row is None:
+                raise KeyError("decision was not found")
+            return PolicyDecisionRecord(
+                decision=_decision_from_payload(json.loads(row[0])),
+                policy_payload=json.loads(row[1]),
+                guard_payload=json.loads(row[2]),
+                effective_action_payload=json.loads(row[3]),
+            )
+
+    def load_decision_record_by_slot(self, decision_slot_id: str) -> PolicyDecisionRecord:
+        slot = _required_text(decision_slot_id, "decision_slot_id")
+        with self._transaction(write=False) as conn:
+            self._require_ready(conn)
+            row = conn.execute(
+                """SELECT decision_json, policy_payload_json, guard_payload_json, effective_action_payload_json
+                   FROM policy_state_decisions WHERE decision_slot_id=? AND store_identity=?""",
+                (slot, self.store_identity),
+            ).fetchone()
+            if row is None:
+                raise KeyError("decision slot was not found")
+            return PolicyDecisionRecord(
+                decision=_decision_from_payload(json.loads(row[0])),
+                policy_payload=json.loads(row[1]),
+                guard_payload=json.loads(row[2]),
+                effective_action_payload=json.loads(row[3]),
+            )
+
     def record_decision(
         self,
         decision: DecisionIdentity,
@@ -1803,7 +1849,13 @@ class PolicyExecutionStateStore:
             observed_at=observed_at or datetime.now().astimezone(),
         )
 
-    def record_action_intent(self, intent: ActionIntent, *, expected_version: int | None) -> int:
+    def record_action_intent(
+        self,
+        intent: ActionIntent,
+        *,
+        expected_version: int | None,
+        expected_holding_version: int | None = None,
+    ) -> int:
         with self._transaction(write=True) as conn:
             self._require_ready(conn)
             self._validate_deployment_scope(intent.decision.deployment_identity)
@@ -1831,6 +1883,8 @@ class PolicyExecutionStateStore:
                 holding_row = self._holding_row(conn, intent.holding_episode_id)
                 if holding_row is None:
                     raise ValueError("action holding episode is not recorded")
+                if expected_holding_version is not None and int(holding_row["state_version"]) != expected_holding_version:
+                    raise ConcurrentStateUpdateError("holding changed since the caller read it")
                 holding = _holding_from_row(holding_row)
                 _validate_replacement_holding(intent, holding)
                 updated_holding = register_pending_action(holding, intent)
@@ -1855,6 +1909,12 @@ class PolicyExecutionStateStore:
         if row is None:
             raise KeyError("logical action was not found")
         return _action_from_row(conn, row), row
+
+    def load_action_intent(self, logical_action_id: str) -> ActionIntent:
+        with self._transaction(write=False) as conn:
+            self._require_ready(conn)
+            intent, _ = self._load_action(conn, logical_action_id)
+            return intent
 
     def load_action_projection(self, logical_action_id: str) -> ActionStateProjection:
         with self._transaction(write=False) as conn:
