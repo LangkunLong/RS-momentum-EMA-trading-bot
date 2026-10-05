@@ -154,6 +154,7 @@ _ALPACA_FEED_WARNING_EMITTED = False
 
 
 def _get_alpaca_client() -> StockHistoricalDataClient:
+    settings.load_runtime_credentials()
     if not hasattr(_local, "alpaca_client"):
         api_key = settings.ALPACA_API_KEY
         secret_key = settings.ALPACA_SECRET_KEY
@@ -178,6 +179,7 @@ def _get_alpaca_stock_feed() -> DataFeed:
 
 
 def _fmp_api_key() -> str:
+    settings.load_runtime_credentials()
     key = settings.FMP_API_KEY
     if not key:
         raise EnvironmentError("FMP_API_KEY must be set. See .env.example for details.")
@@ -222,6 +224,7 @@ _US_EASTERN = ZoneInfo("America/New_York")
 _REGULAR_SESSION_START = dtime(9, 30)
 _REGULAR_SESSION_END = dtime(16, 0)
 _fmp_budget_lock = threading.Lock()
+_fmp_operation_request_lock = threading.RLock()
 _fmp_request_context = threading.local()
 _fmp_budget_warning_emitted = False
 _fmp_run_budget_remaining: int | None = None
@@ -577,6 +580,13 @@ def _fmp_get(endpoint: str, params: Optional[dict] = None) -> Any:
     request_params["apikey"] = _fmp_api_key()
     if not _reserve_fmp_request():
         reason = fmp_request_deferral_reason()
+        from core.operation_limits import current_operation_budget
+
+        operation_budget = current_operation_budget()
+        if operation_budget is not None:
+            operation_budget.mark_incomplete(
+                f"fmp_{reason or 'request'}: local allowance refused request"
+            )
         if reason == "local_ledger":
             record_input_gap(
                 symbol,
@@ -597,11 +607,61 @@ def _fmp_get(endpoint: str, params: Optional[dict] = None) -> Any:
     )
 
     try:
-        resp = _fmp_session.get(
-            url,
-            params=request_params,
-            timeout=settings.FMP_HTTP_TIMEOUT_SECONDS,
-        )
+        from urllib3.util.retry import Retry
+
+        from core.operation_limits import current_operation_budget
+
+        operation_budget = current_operation_budget()
+        request_timeout = settings.FMP_HTTP_TIMEOUT_SECONDS
+        if operation_budget is not None:
+            request_timeout = min(
+                request_timeout,
+                operation_budget.manifest.deadlines_seconds["request_timeout_seconds"],
+            )
+        if operation_budget is None:
+            resp = _fmp_session.get(
+                url,
+                params=request_params,
+                timeout=request_timeout,
+            )
+        else:
+            # Reserve this physical send before touching the transport.  The
+            # operation contract counts attempts, so the adapter must not
+            # silently retry a request behind that counter.
+            if operation_budget.manifest.operation == "observer":
+                allowed_symbols = {
+                    str(item).strip().upper()
+                    for item in operation_budget.manifest.scope["symbols"]
+                }
+                if symbol.strip().upper() not in allowed_symbols:
+                    operation_budget.reject_incomplete(
+                        "fmp_read", "request symbol is outside explicit observer scope"
+                    )
+            operation_budget.consume_symbol_dimension(
+                "fmp_requests_per_symbol",
+                symbol,
+                multiplier=operation_budget.manifest.dimensions.get("scan_cycles", 1),
+            )
+            operation_budget.reserve_http("fmp_read")
+            with _fmp_operation_request_lock:
+                adapter = _fmp_session.get_adapter(url)
+                previous_retries = adapter.max_retries
+                adapter.max_retries = Retry(
+                    total=0,
+                    connect=0,
+                    read=0,
+                    redirect=0,
+                    status=0,
+                )
+                try:
+                    resp = _fmp_session.get(
+                        url,
+                        params=request_params,
+                        timeout=request_timeout,
+                        allow_redirects=False,
+                    )
+                finally:
+                    adapter.max_retries = previous_retries
     except requests.exceptions.RetryError:
         # Retry adapter exhausted all attempts — treat as a persistent failure.
         _fmp_quota_exhausted = True

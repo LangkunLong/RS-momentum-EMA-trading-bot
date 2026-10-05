@@ -8,7 +8,7 @@ from datetime import date
 from pathlib import Path
 import sqlite3
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pandas as pd
 import pytest
@@ -50,6 +50,80 @@ def test_default_doctor_does_not_contact_provider_endpoints() -> None:
         console.run_doctor()
 
     external_check.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "args",
+    [["doctor"], ["checklist", "--limit", "1"]],
+    ids=["doctor", "checklist"],
+)
+def test_doctor_and_checklist_report_environment_credentials_without_provider_calls(
+    args: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from config import settings
+
+    monkeypatch.setattr(settings, "_RUNTIME_CREDENTIALS_LOADED", False)
+    monkeypatch.setattr(settings, "ALPACA_API_KEY", "")
+    monkeypatch.setattr(settings, "ALPACA_SECRET_KEY", "")
+    monkeypatch.setattr(settings, "FMP_API_KEY", "")
+    monkeypatch.setenv("ALPACA_API_KEY", "offline-alpaca-key")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "offline-alpaca-secret")
+    monkeypatch.setenv("FMP_API_KEY", "offline-fmp-key")
+    monkeypatch.setattr(console, "_is_paper_mode", lambda: True)
+    monkeypatch.setattr(console, "_runtime_identity_record", lambda **_kwargs: {})
+    monkeypatch.setattr(
+        console,
+        "_check_execution_store_binding",
+        lambda: console.ReadinessCheck(
+            "Execution store binding", console.EvidenceStatus.UNVERIFIED, "offline fixture"
+        ),
+    )
+    monkeypatch.setattr(
+        console,
+        "_check_execution_store_read_only",
+        lambda: console.ReadinessCheck(
+            "Persistence", console.EvidenceStatus.UNVERIFIED, "offline fixture"
+        ),
+    )
+    monkeypatch.setattr(
+        console,
+        "_check_scheduler_installation",
+        lambda: console.ReadinessCheck(
+            "Scheduler installation", console.EvidenceStatus.UNVERIFIED, "offline fixture"
+        ),
+    )
+    monkeypatch.setattr(
+        console,
+        "_check_recent_signal_quality",
+        lambda **_kwargs: console.CheckResult("Signals", True, "offline fixture"),
+    )
+
+    external_probe = Mock(side_effect=AssertionError("provider probe must stay disabled"))
+    account_client = Mock(side_effect=AssertionError("broker access must stay disabled"))
+    positions_reader = Mock(side_effect=AssertionError("broker access must stay disabled"))
+    orders_reader = Mock(side_effect=AssertionError("broker access must stay disabled"))
+    fmp_reader = Mock(side_effect=AssertionError("provider access must stay disabled"))
+    monkeypatch.setattr(console, "_check_external_access", external_probe)
+    monkeypatch.setattr(console, "_get_trading_client", account_client)
+    monkeypatch.setattr(console, "get_open_positions", positions_reader)
+    monkeypatch.setattr(console, "get_open_orders", orders_reader)
+    monkeypatch.setattr(console, "_fmp_get", fmp_reader)
+
+    result = console.main(args)
+
+    assert result == 2
+    assert "[PASS] Configuration: paper mode selected; required key settings are present" in capsys.readouterr().out
+    assert settings.ALPACA_API_KEY == "offline-alpaca-key"
+    assert settings.ALPACA_SECRET_KEY == "offline-alpaca-secret"
+    assert settings.FMP_API_KEY == "offline-fmp-key"
+    assert settings._RUNTIME_CREDENTIALS_LOADED is True
+    external_probe.assert_not_called()
+    account_client.assert_not_called()
+    positions_reader.assert_not_called()
+    orders_reader.assert_not_called()
+    fmp_reader.assert_not_called()
 
 
 def test_external_provider_probes_are_fixed_and_cover_strategy_fmp_inputs(tmp_path: Path) -> None:

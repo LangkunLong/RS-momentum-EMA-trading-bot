@@ -94,6 +94,7 @@ class ReadinessCheck:
 
 def run_doctor(*, probe_external: bool = False) -> int:
     """Report readiness evidence without contacting providers unless explicitly requested."""
+    settings.load_runtime_credentials()
     return _print_readiness_report(
         "PAPER TRADING READINESS",
         _collect_readiness_checks(probe_external=probe_external),
@@ -102,6 +103,7 @@ def run_doctor(*, probe_external: bool = False) -> int:
 
 def run_checklist(limit: int = 10, *, probe_external: bool = False) -> int:
     """Show readiness evidence plus recent scan observations; never imply approval."""
+    settings.load_runtime_credentials()
     checks = _collect_readiness_checks(probe_external=probe_external)
     signal_check = _check_recent_signal_quality(limit=limit)
     checks.append(_readiness_from_legacy_check(signal_check))

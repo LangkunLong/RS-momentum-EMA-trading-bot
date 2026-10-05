@@ -287,11 +287,29 @@ class SchedulerObservation:
             f".{self._snapshot_path.name}.{os.getpid()}.tmp"
         )
         try:
-            self._snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-            temporary_path.write_text(
-                json.dumps(self._partial_receipt_locked(), sort_keys=True),
-                encoding="utf-8",
+            payload = json.dumps(self._partial_receipt_locked(), sort_keys=True)
+            from core.operation_limits import (
+                OperationCapExceeded,
+                current_operation_budget,
             )
+
+            budget = current_operation_budget()
+            if budget is not None and budget.manifest.operation == "observer":
+                try:
+                    budget.consume_output(len(payload.encode("utf-8")))
+                except OperationCapExceeded as exc:
+                    self._snapshot_error = type(exc).__name__
+                    self._service_health = "failed"
+                    self._issues.append(
+                        {
+                            "code": "operation_output_cap_denied",
+                            "details": {"reason": str(exc)},
+                            "unverified": False,
+                        }
+                    )
+                    return
+            self._snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path.write_text(payload, encoding="utf-8")
             os.replace(temporary_path, self._snapshot_path)
         except Exception as exc:  # noqa: BLE001
             try:
@@ -316,15 +334,35 @@ class SchedulerObservation:
         details: Mapping[str, Any] | None = None,
     ) -> None:
         with self._lock:
-            self._events.append(
-                {
-                    "at": datetime.now(timezone.utc).isoformat(),
-                    "kind": _safe_string(str(kind)),
-                    "key": _safe_string(str(key)),
-                    "status": _safe_string(str(status)),
-                    "details": _safe_value(details or {}),
-                }
-            )
+            event = {
+                "at": datetime.now(timezone.utc).isoformat(),
+                "kind": _safe_string(str(kind)),
+                "key": _safe_string(str(key)),
+                "status": _safe_string(str(status)),
+                "details": _safe_value(details or {}),
+            }
+            from core.operation_limits import OperationCapExceeded, current_operation_budget
+
+            budget = current_operation_budget()
+            if budget is not None and budget.manifest.operation == "observer":
+                encoded_size = len(
+                    json.dumps(event, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                )
+                try:
+                    budget.consume("receipt_events")
+                    budget.consume_output(encoded_size)
+                except OperationCapExceeded as exc:
+                    if budget.snapshot()["incomplete_reason"].startswith("output_bytes:"):
+                        self._service_health = "failed"
+                        self._issues.append(
+                            {
+                                "code": "operation_output_cap_denied",
+                                "details": {"reason": str(exc)},
+                                "unverified": False,
+                            }
+                        )
+                    raise
+            self._events.append(event)
             self._persist_partial_snapshot_locked()
 
     def latch_service_issue(

@@ -32,6 +32,7 @@ from core.execution_workflow import (
     resolve_workflow,
 )
 from core.notifier import notify_buy_filled, notify_entry_submitted, notify_sell_filled
+from core.operation_limits import current_operation_budget
 from core.order_execution import (
     OrderResult,
     ProtectiveStopResult,
@@ -1686,6 +1687,7 @@ class OrderManager:
         current = root_order
         expected_parent_id = ""
         store = get_execution_store()
+        budget = current_operation_budget()
 
         while True:
             order_id = str(getattr(current, "id", "") or "").strip()
@@ -1703,6 +1705,8 @@ class OrderManager:
             durable_owners = store.find_workflow_ids_by_broker_order_id(order_id)
             if durable_owners and durable_owners != {workflow.workflow_id}:
                 raise RuntimeError("Submission replacement order has a conflicting owner")
+            if budget is not None:
+                budget.admit_order_id(order_id, replacement=bool(chain))
 
             if chain:
                 client_order_id = str(
@@ -1730,6 +1734,8 @@ class OrderManager:
                 break
             if child_id == order_id or child_id in seen:
                 raise RuntimeError("Submission replacement chain is cyclic")
+            if budget is not None:
+                budget.admit_order_id(child_id, replacement=True)
             try:
                 current = client.get_order_by_id(child_id)
             except Exception as exc:  # noqa: BLE001
@@ -1782,6 +1788,9 @@ class OrderManager:
                 or order_side != "buy"
             ):
                 raise RuntimeError("Broker order does not match pending entry intent")
+            budget = current_operation_budget()
+            if budget is not None:
+                budget.link_client_order_identity(client_order_id, broker_order_id)
 
             workflow.claim_order_reference_from_submission_intent(
                 broker_order_id=broker_order_id,
@@ -1962,6 +1971,9 @@ class OrderManager:
                 or order_type != "market"
             ):
                 raise RuntimeError("Broker order does not match pending exit intent")
+            budget = current_operation_budget()
+            if budget is not None:
+                budget.link_client_order_identity(client_order_id, broker_order_id)
 
             workflow.claim_order_reference_from_submission_intent(
                 broker_order_id=broker_order_id,

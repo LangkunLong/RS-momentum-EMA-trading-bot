@@ -6,19 +6,18 @@ Parameters follow William O'Neil's CANSLIM methodology from
 """
 
 import os
+import threading
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
-
 # ==============================================================================
 # API KEYS (loaded from environment — see .env.example)
 # ==============================================================================
-ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY", "")
-ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "")
+ALPACA_API_KEY = ""
+ALPACA_SECRET_KEY = ""
 ALPACA_STOCK_FEED = os.environ.get("ALPACA_STOCK_FEED", "iex").strip().lower()
-FMP_API_KEY = os.environ.get("FMP_API_KEY", "")
+FMP_API_KEY = ""
 ALPACA_SDK_RETRY_ATTEMPTS = max(0, int(os.environ.get("ALPACA_SDK_RETRY_ATTEMPTS", "3")))
 ALPACA_SDK_RETRY_WAIT_SECONDS = max(0, int(os.environ.get("ALPACA_SDK_RETRY_WAIT_SECONDS", "3")))
 ALPACA_HTTP_TIMEOUT_SECONDS = max(1.0, float(os.environ.get("ALPACA_HTTP_TIMEOUT_SECONDS", "30")))
@@ -36,10 +35,37 @@ INDEX_TICKER_HTTP_TIMEOUT_SECONDS = max(
 # NOTIFY_EMAIL_FROM: your Gmail address (sender)
 # NOTIFY_EMAIL_TO: recipient address (can be the same Gmail)
 # NOTIFY_EMAIL_PASSWORD: legacy SMTP App Password; unused by gmail_oauth.
-NOTIFY_EMAIL_PROVIDER = os.environ.get("NOTIFY_EMAIL_PROVIDER", "auto").strip().lower()
-NOTIFY_EMAIL_FROM = os.environ.get("NOTIFY_EMAIL_FROM", "")
-NOTIFY_EMAIL_TO = os.environ.get("NOTIFY_EMAIL_TO", "")
-NOTIFY_EMAIL_PASSWORD = os.environ.get("NOTIFY_EMAIL_PASSWORD", "")
+NOTIFY_EMAIL_PROVIDER = "auto"
+NOTIFY_EMAIL_FROM = ""
+NOTIFY_EMAIL_TO = ""
+NOTIFY_EMAIL_PASSWORD = ""
+
+_CREDENTIALS_LOCK = threading.Lock()
+_RUNTIME_CREDENTIALS_LOADED = False
+
+
+def load_runtime_credentials() -> None:
+    """Load credentials only after an entry point has passed its admission gate."""
+    global _RUNTIME_CREDENTIALS_LOADED
+    global ALPACA_API_KEY, ALPACA_SECRET_KEY, FMP_API_KEY
+    global NOTIFY_EMAIL_PROVIDER, NOTIFY_EMAIL_FROM, NOTIFY_EMAIL_TO
+    global NOTIFY_EMAIL_PASSWORD
+    if _RUNTIME_CREDENTIALS_LOADED:
+        return
+    with _CREDENTIALS_LOCK:
+        if _RUNTIME_CREDENTIALS_LOADED:
+            return
+        load_dotenv()
+        ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY", "")
+        ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "")
+        FMP_API_KEY = os.environ.get("FMP_API_KEY", "")
+        NOTIFY_EMAIL_PROVIDER = os.environ.get(
+            "NOTIFY_EMAIL_PROVIDER", "auto"
+        ).strip().lower()
+        NOTIFY_EMAIL_FROM = os.environ.get("NOTIFY_EMAIL_FROM", "")
+        NOTIFY_EMAIL_TO = os.environ.get("NOTIFY_EMAIL_TO", "")
+        NOTIFY_EMAIL_PASSWORD = os.environ.get("NOTIFY_EMAIL_PASSWORD", "")
+        _RUNTIME_CREDENTIALS_LOADED = True
 
 
 # ==============================================================================
