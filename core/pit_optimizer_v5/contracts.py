@@ -56,6 +56,8 @@ _ADD_ON_OUTCOME_IDS_V5 = frozenset(
 # their exact bytes are authenticated separately by PolicyRevisionIdentityV5.
 # diagnostics.py is deliberately required before the source identity can be
 # issued, even though it is introduced by the next implementation task.
+# mechanism_contracts.py is included because mechanism_entry imports
+# mechanism_request_allocation_v1 to authenticate per-request resource shares.
 EVALUATOR_SOURCE_PATHS_V5 = (
     "backtest.py",
     "config/__init__.py",
@@ -97,9 +99,14 @@ EVALUATOR_SOURCE_PATHS_V5 = (
     "core/pit_optimizer_v5/diagnostics.py",
     "core/pit_optimizer_v5/evaluator.py",
     "core/pit_optimizer_v5/image_manifest.py",
+    "core/pit_optimizer_v5/mechanism_contracts.py",
+    "core/pit_optimizer_v5/mechanism_entry.py",
+    "core/pit_optimizer_v5/mechanism_probes.py",
+    "core/pit_optimizer_v5/mechanism_worker.py",
     "core/pit_optimizer_v5/policy_scope.py",
     "core/pit_optimizer_v5/probe_entry.py",
     "core/pit_optimizer_v5/probes.py",
+    "core/pit_optimizer_v5/sandbox.py",
     "core/pit_provenance.py",
     "core/pit_universe_v3.py",
     "core/scheduler_observation.py",

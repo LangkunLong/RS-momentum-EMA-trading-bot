@@ -11,7 +11,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal, localcontext
 from types import MappingProxyType
 from typing import Literal
 
@@ -488,6 +488,48 @@ class MechanismResourceBudgetV1(_CanonicalMechanismV1):
             memory_mib=raw["memory_mib"],  # type: ignore[arg-type]
             output_bytes=raw["output_bytes"],  # type: ignore[arg-type]
         )
+
+
+def mechanism_resource_shares_v1(
+    budget: MechanismResourceBudgetV1,
+) -> tuple[int, Decimal, int, int]:
+    """Split run-total CPU, timeout, and output over its maximum role lattice.
+
+    Memory is intentionally absent: its budget is a per-container ceiling,
+    while run-level peak-memory usage is aggregated as a maximum.
+    """
+
+    if type(budget) is not MechanismResourceBudgetV1:
+        raise ValueError("mechanism resource allocation requires a typed run budget")
+    request_count = 2 * budget.max_cases * budget.max_repetitions
+    if request_count <= 0:
+        raise ValueError("mechanism request allocation count is invalid")
+    with localcontext() as context:
+        context.prec = 96
+        context.rounding = ROUND_DOWN
+        cpu_seconds_per_request = budget.cpu_seconds / Decimal(request_count)
+    if cpu_seconds_per_request <= 0:
+        raise ValueError("mechanism per-request CPU share is below numeric resolution")
+    cpu_numerator, cpu_denominator = cpu_seconds_per_request.as_integer_ratio()
+    budget_numerator, budget_denominator = budget.cpu_seconds.as_integer_ratio()
+    if cpu_numerator * request_count * budget_denominator > budget_numerator * cpu_denominator:
+        raise ValueError("mechanism per-request CPU shares exceed the run total")
+    return (
+        request_count,
+        cpu_seconds_per_request,
+        budget.timeout_ms // request_count,
+        budget.output_bytes // request_count,
+    )
+
+
+def mechanism_request_allocation_v1(
+    binding: MechanismObservationBindingV1,
+) -> tuple[int, Decimal, int, int]:
+    """Derive the authenticated per-request share from one bound mechanism run."""
+
+    if type(binding) is not MechanismObservationBindingV1:
+        raise ValueError("mechanism request allocation requires a bound run")
+    return mechanism_resource_shares_v1(binding.resource_budget)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1855,6 +1897,7 @@ __all__ = [
     "aggregate_mechanism_evaluator_predictions_v1",
     "bind_mechanism_observation_v1",
     "mechanism_evaluator_context_key_v1",
+    "mechanism_resource_shares_v1",
     "validate_mechanism_observation_binding_v1",
     "validate_mechanism_report_against_spec_v1",
     "validate_mechanism_spec_hypothesis_v1",

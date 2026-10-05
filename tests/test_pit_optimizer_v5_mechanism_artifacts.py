@@ -81,6 +81,8 @@ from core.pit_optimizer_v5.memory import (
     round_event_payload_primitive_v5,
 )
 from core.pit_optimizer_v5.mechanism_artifacts import (
+    MECHANISM_ARTIFACT_MAX_BYTES_V1,
+    MECHANISM_ARTIFACT_NAMESPACE_V1,
     MechanismArtifactCorrupt,
     MechanismArtifactRepositoryV5,
     MechanismCapabilityError,
@@ -96,6 +98,7 @@ from core.pit_optimizer_v5.mechanism_contracts import (
     MechanismCoverageV1,
     MechanismExecutionV1,
     MechanismExperimentSpecV1,
+    MechanismLearningProjectionV1,
     MechanismMetricSpecV1,
     MechanismPredicateV1,
     MechanismPredictionResultV1,
@@ -105,6 +108,7 @@ from core.pit_optimizer_v5.mechanism_probes import (
     MechanismWorkerRegistrationV1,
     SyntheticFixtureWorkerV1,
     build_mechanism_observation_corpus_v1,
+    collect_mechanism_observations_v1,
 )
 from core.pit_optimizer_v5.fixture_runtime import (
     FixtureRoleInvokerV5,
@@ -1750,6 +1754,340 @@ def test_required_fixture_collects_and_reuses_completed_run(tmp_path: Path) -> N
         deadline_monotonic=None,
     )
     assert second == run
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_reason"),
+    (
+        ("invalid_result", "protocol_failure"),
+        ("crash", "execution_failed"),
+        ("timeout", "timeout"),
+        ("cleanup_failure", "execution_failed"),
+    ),
+)
+def test_failed_worker_outcomes_survive_sidecar_restart_and_report_projection(
+    tmp_path: Path,
+    failure: str,
+    expected_reason: str,
+) -> None:
+    """A failed bounded observation stays unavailable and source-bound after reload."""
+
+    repository, capability, candidate_bundle, candidate_revision = _capability(tmp_path)
+    repository.append_precommitment(capability)
+    experiment_id = "f" * 64
+    bound = capability.bind_candidate(
+        experiment_id=experiment_id,
+        candidate_revision=candidate_revision,
+        candidate_source_bundle=candidate_bundle,
+    )
+    repository.append_binding(bound)
+    parent, candidate = _fixture_workers(bound)
+    first_case_id = capability.corpus.cases[0].input_identity_sha256
+    if failure == "invalid_result":
+        parent.decisions_by_input_identity[first_case_id] = object()
+    elif failure == "crash":
+        parent.failure = RuntimeError("synthetic fixture worker crashed")
+    elif failure == "timeout":
+        parent.failure = TimeoutError("fixture timeout")
+    else:
+        parent.cleanup_failure = RuntimeError("fixture cleanup failure")
+
+    run = collect_mechanism_observations_v1(
+        capability.spec,
+        bound.binding,
+        capability.corpus,
+        parent_worker=parent,
+        candidate_worker=candidate,
+    )
+    assert run.execution.status == "failed"
+    assert run.execution.reason == expected_reason
+    run_ref = repository.append_run(bound, run)
+    report_ref = repository.append_report(bound, run)
+    restarted = MechanismArtifactRepositoryV5(LocalArtifactRepositoryV5(tmp_path))
+    loaded_run = restarted.load_run(bound)
+    loaded_report = restarted.load_report(bound)
+    assert loaded_run == run
+    assert loaded_report is not None
+    assert run_ref.sha256 == hashlib.sha256(
+        restarted.repository.load_binary_state(
+            namespace=MECHANISM_ARTIFACT_NAMESPACE_V1,
+            key=f"{experiment_id}-run",
+            reference=run_ref,
+            maximum_bytes=MECHANISM_ARTIFACT_MAX_BYTES_V1,
+        )
+    ).hexdigest()
+    assert report_ref.sha256 == hashlib.sha256(
+        restarted.repository.load_binary_state(
+            namespace=MECHANISM_ARTIFACT_NAMESPACE_V1,
+            key=f"{experiment_id}-report",
+            reference=report_ref,
+            maximum_bytes=MECHANISM_ARTIFACT_MAX_BYTES_V1,
+        )
+    ).hexdigest()
+    assert loaded_report.execution == run.execution
+    assert loaded_report.coverage == run.coverage
+    assert all(item.availability == "unavailable" for item in loaded_report.predictions)
+    assert all(item.unavailable_reason == "execution_failed" for item in loaded_report.predictions)
+
+    projection = MechanismLearningProjectionV1.from_report(capability.spec, loaded_report)
+    payload = json.loads(projection.to_canonical_json())
+    projected_binding = payload["binding"]
+    assert projected_binding["experiment_id"] == experiment_id
+    assert projected_binding["spec_sha256"] == capability.spec.sha256
+    assert projected_binding["corpus_sha256"] == capability.corpus.sha256
+    assert projected_binding["parent_revision_sha256"] == capability.parent_revision.sha256
+    assert projected_binding["candidate_bytes_sha256"] == candidate_bundle.sha256
+    assert projected_binding["provenance"] == capability.spec.provenance
+    assert projected_binding["resource_budget"] == {
+        "cpu_seconds": str(capability.resource_budget.cpu_seconds),
+        "max_cases": capability.resource_budget.max_cases,
+        "max_repetitions": capability.resource_budget.max_repetitions,
+        "memory_mib": capability.resource_budget.memory_mib,
+        "output_bytes": capability.resource_budget.output_bytes,
+        "timeout_ms": capability.resource_budget.timeout_ms,
+    }
+    assert all(item["unit"] == "count" for item in payload["predictions"])
+    assert {
+        item["metric_id"]: item["denominator_kind"] for item in payload["predictions"]
+    } == {
+        "exit.decision_changed_count": "relevant_cases",
+        "exit.protected_control_unchanged_count": "relevant_cases",
+        "evaluator.exit_attribution_count": "evaluator_cases",
+    }
+    assert all(item["availability"] == "unavailable" for item in payload["predictions"])
+    assert all(item["unavailable_reason"] == "execution_failed" for item in payload["predictions"])
+    assert any("synthetic fixture" in item.lower() for item in payload["limitations"])
+    assert any("CPU and peak memory were not measured or enforced" in item for item in payload["limitations"])
+    assert payload["report_sha256"] == hashlib.sha256(
+        loaded_report.to_canonical_json().encode("utf-8")
+    ).hexdigest()
+    if failure == "cleanup_failure":
+        assert any("cleanup" in item.lower() for item in payload["limitations"])
+    if failure == "crash":
+        assert any("bounded worker execution failed" in item.lower() for item in payload["limitations"])
+    if failure == "timeout":
+        assert any("timed out" in item.lower() for item in payload["limitations"])
+    assert MechanismLearningProjectionV1.from_canonical_json(projection.to_canonical_json()) == projection
+
+
+def test_registered_nonzero_adapter_exit_survives_sidecar_restart_and_projection(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    from core.pit_optimizer_v5.mechanism_docker import MechanismDockerCaseWorkerV1
+    from core.pit_optimizer_v5.production_sandbox import LocalContainerExecutorV5
+    from core.pit_optimizer_v5.sandbox import (
+        BoundedOutputBytesV5,
+        ContainerExecutionResultV5,
+        SandboxMountHandleV5,
+    )
+    from core.pit_optimizer_v5.workspace import WorkspaceOwnerV5
+
+    repository, fixture_capability, candidate_bundle, candidate_revision = _capability(tmp_path)
+    capability = replace(fixture_capability, execution_kind="registered_sandbox")
+    repository.append_precommitment(capability)
+    bound = capability.bind_candidate(
+        experiment_id="b" * 64,
+        candidate_revision=candidate_revision,
+        candidate_source_bundle=candidate_bundle,
+    )
+    repository.append_binding(bound)
+
+    manifest = capability.authenticated_manifest.manifest
+    owner = WorkspaceOwnerV5(
+        campaign_id=manifest.campaign_id,
+        round_index=capability.round_index,
+        owner_token_sha256="a" * 64,
+        controller_lease_id="mechanism-crash-adapter-test",
+    )
+
+    class _MountFactory:
+        def mechanism_case_output_mount(
+            self,
+            *,
+            execution_authority_sha256: str,
+            output_authority_sha256: str,
+            source_bundle_sha256: str,
+            maximum_bytes: int,
+        ) -> SandboxMountHandleV5:
+            return SandboxMountHandleV5(
+                kind="output",
+                mode="bounded_write_only",
+                root_identity_sha256="c" * 64,
+                content_authority_sha256=output_authority_sha256,
+                host_path=str((tmp_path / "mechanism-output").resolve()),
+                container_path="/pit/output",
+                maximum_bytes=maximum_bytes,
+                opaque_handle=object(),
+            )
+
+    mount_factory = _MountFactory()
+    reservation_factory = object.__new__(LocalContainerExecutorV5)
+    reservation_factory._owner = owner
+    reservation_factory._executor_identity_sha256 = "d" * 64
+    crash_requests = []
+
+    class _NonzeroExecutor:
+        def reserve(self, command):
+            crash_requests.append(command.request)
+            return reservation_factory._runtime_reservation(command, "created")
+
+        def start(self, reservation):
+            return None
+
+        def collect(self, reservation, *, remaining_timeout_seconds):
+            command = reservation.command
+            request = command.request
+            return ContainerExecutionResultV5(
+                status="nonzero_exit",
+                exit_code=137,
+                output=BoundedOutputBytesV5(
+                    content=None,
+                    observed_byte_count=0,
+                    request_sha256=request.sha256,
+                    command_sha256=command.sha256,
+                    output_mount_authority_sha256=request.output_mount.content_authority_sha256,
+                ),
+                leases=reservation.leases,
+            )
+
+        def cleanup(self, *, owner, leases):
+            return SimpleNamespace(cleanup_complete=True)
+
+    executor = _NonzeroExecutor()
+    parent_fixture, _candidate_fixture = _fixture_workers(bound)
+
+    def _registered_worker(role: str, *, inject_crash: bool) -> MechanismDockerCaseWorkerV1:
+        worker = object.__new__(MechanismDockerCaseWorkerV1)
+        worker.registration = MechanismWorkerRegistrationV1(
+            experiment_id=bound.binding.experiment_id,
+            spec_sha256=bound.binding.spec_sha256,
+            role=role,
+            parent_revision_sha256=bound.binding.parent_revision_sha256,
+            candidate_bytes_sha256=bound.binding.candidate_bytes_sha256,
+            corpus_sha256=bound.binding.corpus_sha256,
+            resource_budget=bound.binding.resource_budget,
+            execution_kind="registered_sandbox",
+            reset_semantics="reset_per_case",
+            cpu_memory_enforced=True,
+        )
+        worker._bound = bound
+        worker._owner = owner
+        worker._role = role
+        worker._revision = capability.parent_revision if role == "parent" else candidate_revision
+        worker._source = capability.parent_source_bundle if role == "parent" else candidate_bundle
+        worker._executor = executor
+        worker._mount_factory = mount_factory
+        worker._inject_first_candidate_crash = inject_crash
+        worker._identity = object()
+        return worker
+
+    parent_worker = _registered_worker("parent", inject_crash=False)
+    candidate_worker = _registered_worker("candidate", inject_crash=True)
+
+    def _parent_decision(command, *, session, deadline_monotonic):
+        return parent_fixture.decisions_by_input_identity[command.request.case.input_identity_sha256]
+
+    parent_worker._execute_case = _parent_decision
+
+    run = collect_mechanism_observations_v1(
+        capability.spec,
+        bound.binding,
+        capability.corpus,
+        parent_worker=parent_worker,
+        candidate_worker=candidate_worker,
+    )
+
+    assert len(crash_requests) == 1
+    assert crash_requests[0].role == "candidate"
+    assert crash_requests[0].case.order == 0
+    assert crash_requests[0].repetition == 0
+    assert crash_requests[0].failure_mode == "terminate_child_after_ready"
+    assert run.execution.status == "failed"
+    assert run.execution.reason == "execution_failed"
+    run = replace(
+        run,
+        limitations=tuple(
+            item
+            for item in run.limitations
+            if not item.startswith("Registered observations ran in one")
+        )
+        + ("TEST ONLY: a fake executor returned exit 137; no worker process or Docker container ran.",),
+    )
+
+    run_ref = repository.append_run(bound, run)
+    repository.append_report(bound, run)
+    restarted = MechanismArtifactRepositoryV5(LocalArtifactRepositoryV5(tmp_path))
+    loaded_run = restarted.load_run(bound)
+    loaded_report = restarted.load_report(bound)
+    assert run_ref.sha256 == hashlib.sha256(
+        restarted.repository.load_binary_state(
+            namespace=MECHANISM_ARTIFACT_NAMESPACE_V1,
+            key=f"{bound.experiment_id}-run",
+            reference=run_ref,
+            maximum_bytes=MECHANISM_ARTIFACT_MAX_BYTES_V1,
+        )
+    ).hexdigest()
+    assert loaded_run == run
+    assert loaded_report is not None
+    assert loaded_report.execution == run.execution
+    assert all(item.availability == "unavailable" for item in loaded_report.predictions)
+    assert all(item.unavailable_reason == "execution_failed" for item in loaded_report.predictions)
+    projection = MechanismLearningProjectionV1.from_report(capability.spec, loaded_report)
+    payload = json.loads(projection.to_canonical_json())
+    assert any("TEST ONLY" in item for item in payload["limitations"])
+
+
+
+
+def test_missing_evaluator_evidence_survives_report_projection(tmp_path: Path) -> None:
+    """A missing registered evaluator diagnostic stays unavailable, never zero."""
+
+    repository, capability, candidate_bundle, candidate_revision = _capability(tmp_path)
+    repository.append_precommitment(capability)
+    experiment_id = "e" * 64
+    bound = capability.bind_candidate(
+        experiment_id=experiment_id,
+        candidate_revision=candidate_revision,
+        candidate_source_bundle=candidate_bundle,
+    )
+    repository.append_binding(bound)
+    parent, candidate = _fixture_workers(bound)
+    run = collect_mechanism_observations_v1(
+        capability.spec,
+        bound.binding,
+        capability.corpus,
+        parent_worker=parent,
+        candidate_worker=candidate,
+    )
+    assert run.execution.status == "completed"
+    repository.append_run(bound, run)
+    repository.append_report(bound, run, matched_evaluations=())
+
+    restarted = MechanismArtifactRepositoryV5(LocalArtifactRepositoryV5(tmp_path))
+    report = restarted.load_report(bound)
+    assert report is not None
+    missing = next(item for item in report.predictions if item.metric_id == "evaluator.exit_attribution_count")
+    assert missing.availability == "unavailable"
+    assert missing.unavailable_reason == "evaluator_metric_missing"
+    assert missing.parent_value is None
+    assert missing.candidate_value is None
+    assert missing.numerator is None
+    assert missing.paired_delta is None
+
+    projection = MechanismLearningProjectionV1.from_report(capability.spec, report)
+    projected_missing = next(
+        item for item in projection.predictions if item.metric_id == "evaluator.exit_attribution_count"
+    )
+    assert projected_missing == missing
+    assert projected_missing.unit == "count"
+    assert projected_missing.denominator_kind == "evaluator_cases"
+    assert all(
+        item.availability == "measured"
+        for item in projection.predictions
+        if item.metric_id != "evaluator.exit_attribution_count"
+    )
+    assert projection.binding.provenance == capability.spec.provenance
+    assert MechanismLearningProjectionV1.from_canonical_json(projection.to_canonical_json()) == projection
 
 
 def test_selected_nonbaseline_parent_binds_persisted_record_and_source_authority(tmp_path: Path) -> None:
@@ -4556,6 +4894,298 @@ def test_registered_sandbox_rejects_synthetic_factory_before_invocation(tmp_path
     assert calls["factory"] == 0
 
 
+def test_registered_mechanism_mount_reads_bound_history_before_pin(tmp_path: Path) -> None:
+    from core.pit_optimizer_v5.production_sandbox import LocalSandboxMountFactoryV5
+    from core.pit_optimizer_v5.sandbox import (
+        MechanismDockerCaseRequestV1,
+        SandboxMountHandleV5,
+        derive_mechanism_case_mount_authorities_v1,
+        mechanism_request_allocation_v1,
+    )
+    from core.pit_optimizer_v5.workspace import WorkspaceOwnerV5
+
+    _repository, capability, candidate_bundle, candidate_revision = _capability(tmp_path)
+    bound = capability.bind_candidate(
+        experiment_id="c" * 64,
+        candidate_revision=candidate_revision,
+        candidate_source_bundle=candidate_bundle,
+    )
+    manifest = capability.authenticated_manifest.manifest
+    profile = capability.authenticated_manifest.sandbox_profile
+    owner = WorkspaceOwnerV5(
+        campaign_id=manifest.campaign_id,
+        round_index=capability.round_index,
+        owner_token_sha256="a" * 64,
+        controller_lease_id="mechanism-mount-history-test",
+    )
+    case = capability.corpus.cases[0]
+    _execution_authority, output_authority = derive_mechanism_case_mount_authorities_v1(
+        owner=owner,
+        binding=bound.binding,
+        role="candidate",
+        policy_revision=candidate_revision,
+        source_bundle=candidate_bundle,
+        corpus=capability.corpus,
+        case=case,
+        repetition=0,
+        sandbox_profile=profile,
+    )
+    output_limit_bytes = mechanism_request_allocation_v1(bound.binding)[3]
+    request = MechanismDockerCaseRequestV1(
+        owner=owner,
+        manifest=manifest,
+        sandbox_profile=profile,
+        role="candidate",
+        policy_revision=candidate_revision,
+        source_bundle=candidate_bundle,
+        binding=bound.binding,
+        corpus=capability.corpus,
+        case=case,
+        repetition=0,
+        output_mount=SandboxMountHandleV5(
+            kind="output",
+            mode="bounded_write_only",
+            root_identity_sha256="b" * 64,
+            content_authority_sha256=output_authority,
+            host_path=str((tmp_path / "mechanism-output").resolve()),
+            container_path="/pit/output",
+            maximum_bytes=output_limit_bytes,
+            opaque_handle=object(),
+        ),
+    )
+    request_bytes = request.canonical_bytes
+
+    class _EmptyMountHistory:
+        def __init__(self) -> None:
+            self.typed_reads: list[str] = []
+            self.input_read = False
+
+        def load_typed_state(self, *, namespace, key, value_type, repair):
+            self.typed_reads.append(namespace)
+            assert key == output_authority
+            assert repair is False
+            return None
+
+        def load_binary_state(self, *, namespace, key, reference, maximum_bytes):
+            self.input_read = True
+            assert namespace == "container-mechanism-case-input"
+            assert key == request.sha256
+            assert reference.sha256 == hashlib.sha256(request_bytes).hexdigest()
+            assert maximum_bytes >= len(request_bytes)
+            return request_bytes
+
+    history = _EmptyMountHistory()
+    mount_factory = object.__new__(LocalSandboxMountFactoryV5)
+    mount_factory._owner = owner
+    mount_factory._manifest = manifest
+    mount_factory._profile = profile
+    mount_factory._mount_identity_sha256 = "d" * 64
+    mount_factory._repository = history
+
+    with pytest.raises(ValueError, match="mechanism case output history differs from durable authority"):
+        with mount_factory.pinned_mechanism_case_request(request):
+            pytest.fail("an unreserved mechanism output mount was pinned")
+
+    assert history.typed_reads == [
+        "sandbox-mount-reservation",
+        "sandbox-mount-created",
+        "sandbox-mount-ready",
+    ]
+    assert history.input_read is True
+
+
+def test_registered_mechanism_case_builds_separate_bounded_docker_command(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+    import time
+
+    from core.pit_optimizer_v5.sandbox import (
+        MechanismDockerCaseRequestV1,
+        ContainerCommandV5,
+        SandboxMountHandleV5,
+        build_docker_argv_v5,
+        derive_mechanism_case_mount_authorities_v1,
+        mechanism_request_allocation_v1,
+        mechanism_memory_limit_mib_v1,
+    )
+    from core.pit_optimizer_v5.mechanism_entry import decode_mechanism_case_request_v1
+    from core.pit_optimizer_v5.contracts import canonical_primitive_v5
+    from core.pit_optimizer_v5.production_sandbox import LocalContainerExecutorV5
+    from core.pit_optimizer_v5.workspace import WorkspaceOwnerV5
+
+    _repository, capability, candidate_bundle, candidate_revision = _capability(tmp_path)
+    bound = capability.bind_candidate(
+        experiment_id="9" * 64,
+        candidate_revision=candidate_revision,
+        candidate_source_bundle=candidate_bundle,
+    )
+    case = capability.corpus.cases[0]
+    manifest = capability.authenticated_manifest.manifest
+    profile = capability.authenticated_manifest.sandbox_profile
+    owner = WorkspaceOwnerV5(
+        campaign_id=manifest.campaign_id,
+        round_index=capability.round_index,
+        owner_token_sha256="a" * 64,
+        controller_lease_id="mechanism-case-test",
+    )
+    _request_authority, output_authority = derive_mechanism_case_mount_authorities_v1(
+        owner=owner,
+        binding=bound.binding,
+        role="candidate",
+        policy_revision=candidate_revision,
+        source_bundle=candidate_bundle,
+        corpus=capability.corpus,
+        case=case,
+        repetition=0,
+        sandbox_profile=profile,
+    )
+    request_count, cpu_share, timeout_share_ms, output_share_bytes = mechanism_request_allocation_v1(bound.binding)
+    output_mount = SandboxMountHandleV5(
+        kind="output",
+        mode="bounded_write_only",
+        root_identity_sha256="b" * 64,
+        content_authority_sha256=output_authority,
+        host_path=str((tmp_path / "mechanism-output").resolve()),
+        container_path="/pit/output",
+        maximum_bytes=output_share_bytes,
+        opaque_handle=object(),
+    )
+    request = MechanismDockerCaseRequestV1(
+        owner=owner,
+        manifest=manifest,
+        sandbox_profile=profile,
+        role="candidate",
+        policy_revision=candidate_revision,
+        source_bundle=candidate_bundle,
+        binding=bound.binding,
+        corpus=capability.corpus,
+        case=case,
+        repetition=0,
+        output_mount=output_mount,
+    )
+
+    decoded = decode_mechanism_case_request_v1(
+        request.canonical_bytes,
+        expected_request_sha256=request.sha256,
+        expected_role="candidate",
+        expected_policy_sha256=candidate_revision.sha256,
+        expected_source_bundle_sha256=candidate_bundle.sha256,
+        expected_snapshot_sha256=case.snapshot_sha256,
+    )
+    assert decoded.role == "candidate"
+    assert decoded.case == case
+    assert decoded.source_bundle == candidate_bundle
+    assert request.allocation_request_count == request_count
+    assert request.cpu_seconds_per_request == cpu_share
+    assert request.timeout_ms_per_request == timeout_share_ms
+    assert request.output_limit_bytes == output_share_bytes
+    assert (
+        cpu_share * request_count <= bound.binding.resource_budget.cpu_seconds
+        and timeout_share_ms * request_count <= bound.binding.resource_budget.timeout_ms
+        and output_share_bytes * request_count <= bound.binding.resource_budget.output_bytes
+    )
+
+    argv = build_docker_argv_v5(request)
+
+    assert argv[:3] == ("docker", "run", "--rm")
+    assert ("--network", "none") == tuple(argv[index : index + 2] for index, value in enumerate(argv) if value == "--network")[0]
+    assert "--read-only" in argv
+    assert ("--cap-drop", "ALL") == tuple(argv[index : index + 2] for index, value in enumerate(argv) if value == "--cap-drop")[0]
+    assert ("--security-opt", "no-new-privileges") == tuple(argv[index : index + 2] for index, value in enumerate(argv) if value == "--security-opt")[0]
+    assert "core.pit_optimizer_v5.mechanism_entry" in argv
+    assert "core.pit_optimizer_v5.probe_entry" not in argv
+    assert ("--request-sha256", request.sha256) == tuple(argv[index : index + 2] for index, value in enumerate(argv) if value == "--request-sha256")[0]
+    assert ("--policy-sha256", candidate_revision.sha256) == tuple(argv[index : index + 2] for index, value in enumerate(argv) if value == "--policy-sha256")[0]
+    assert ("--source-bundle-sha256", candidate_bundle.sha256) == tuple(argv[index : index + 2] for index, value in enumerate(argv) if value == "--source-bundle-sha256")[0]
+    assert ("--snapshot-sha256", case.snapshot_sha256) == tuple(argv[index : index + 2] for index, value in enumerate(argv) if value == "--snapshot-sha256")[0]
+    assert ("--cpu-seconds", canonical_primitive_v5(cpu_share)) == tuple(
+        argv[index : index + 2] for index, value in enumerate(argv) if value == "--cpu-seconds"
+    )[0]
+    assert ("--timeout-ms", str(request.effective_timeout_ms)) == tuple(
+        argv[index : index + 2] for index, value in enumerate(argv) if value == "--timeout-ms"
+    )[0]
+    assert ("--output-limit-bytes", str(output_share_bytes)) == tuple(
+        argv[index : index + 2] for index, value in enumerate(argv) if value == "--output-limit-bytes"
+    )[0]
+    effective_memory_mib = min(
+        bound.binding.resource_budget.memory_mib,
+        manifest.resources.evaluation_memory_mib,
+        profile.memory_limit_mib,
+    )
+    assert mechanism_memory_limit_mib_v1(request) == effective_memory_mib
+    assert ("--memory", f"{effective_memory_mib}m") == tuple(
+        argv[index : index + 2] for index, value in enumerate(argv) if value == "--memory"
+    )[0]
+
+    command = ContainerCommandV5(request, argv, request.timeout_seconds)
+    local_executor = object.__new__(LocalContainerExecutorV5)
+    local_executor._docker_executable = tmp_path / "docker.exe"
+    local_executor._profile = profile
+    local_executor._owner = owner
+    local_executor._repository = _repository.repository
+    local_executor._executor_identity_sha256 = "c" * 64
+    runtime_argv = local_executor._runtime_argv(command)
+    assert ("--memory-swap", f"{effective_memory_mib}m") == tuple(
+        runtime_argv[index : index + 2]
+        for index, value in enumerate(runtime_argv)
+        if value == "--memory-swap"
+    )[0]
+
+    from core.pit_optimizer_v5.mechanism_docker import MechanismDockerCaseWorkerV1
+
+    class _Collected(RuntimeError):
+        pass
+
+    class _DeadlineExecutor:
+        def __init__(self):
+            self.remaining_timeout_seconds = None
+            self.reservation = SimpleNamespace(
+                command=command,
+                disposition="created",
+                leases=tuple(
+                    SimpleNamespace(
+                        role_kind=role,
+                        request_sha256=request.sha256,
+                        command_sha256=command.sha256,
+                        output_mount_authority_sha256=request.output_mount.content_authority_sha256,
+                        owned_lease=object(),
+                    )
+                    for role in ("container", "evaluator_process")
+                ),
+            )
+
+        def reserve(self, received_command):
+            assert received_command == command
+            return self.reservation
+
+        def start(self, reservation):
+            assert reservation is self.reservation
+            time.sleep(0.002)
+
+        def collect(self, reservation, *, remaining_timeout_seconds):
+            assert reservation is self.reservation
+            self.remaining_timeout_seconds = remaining_timeout_seconds
+            raise _Collected("capture the exact Docker-wait timeout")
+
+        def cleanup(self, *, owner, leases):
+            assert owner == request.owner
+            assert len(leases) == 2
+            return SimpleNamespace(cleanup_complete=True)
+
+    worker = object.__new__(MechanismDockerCaseWorkerV1)
+    worker._owner = owner
+    fake_executor = _DeadlineExecutor()
+    worker._executor = fake_executor
+    caller_deadline = time.monotonic() + 0.020
+    with pytest.raises(_Collected, match="exact Docker-wait timeout"):
+        worker._execute_case(
+            command,
+            session=object(),
+            deadline_monotonic=caller_deadline,
+        )
+    assert fake_executor.remaining_timeout_seconds is not None
+    assert 0 < fake_executor.remaining_timeout_seconds < 0.025
+
+
 def test_orphan_run_blob_fails_before_worker_factory(tmp_path: Path) -> None:
     repository, capability, candidate_bundle, candidate_revision = _capability(tmp_path)
     repository.append_precommitment(capability)
@@ -4600,3 +5230,196 @@ def test_finalization_has_no_caller_supplied_match_override(tmp_path: Path) -> N
             candidate_evidence=None,
             matched_evaluations=(),
         )
+
+
+def test_container_collection_deadline_expiry_persists_timed_out_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from core.pit_optimizer_v5.production_sandbox import LocalContainerExecutorV5
+
+    command = SimpleNamespace(
+        sha256="a" * 64,
+        request=SimpleNamespace(
+            sha256="b" * 64,
+            output_mount=SimpleNamespace(content_authority_sha256="c" * 64),
+        ),
+        deadline_monotonic=1.0,
+    )
+    reservation = SimpleNamespace(command=command)
+    record = object()
+
+    class Repository:
+        @contextmanager
+        def adapter_state_transition(self, *, namespace: str, key: str):
+            assert namespace == "container-execution"
+            assert key == command.sha256
+            yield
+
+    executor = object.__new__(LocalContainerExecutorV5)
+    executor._repository = Repository()
+    monkeypatch.setattr(executor, "_authorize_reservation", lambda value: record)
+    monkeypatch.setattr(executor, "_terminal_record", lambda value: None)
+    monkeypatch.setattr(
+        executor,
+        "_phase",
+        lambda value, phase: SimpleNamespace(container_identity_sha256="d" * 64),
+    )
+    monkeypatch.setattr(executor, "_container_identity", lambda value: SimpleNamespace(sha256="d" * 64))
+    monkeypatch.setattr(executor, "_ensure_control", lambda value: None)
+
+    @contextmanager
+    def transaction(value: object, *, deadline_monotonic: float | None):
+        assert value is record
+        assert deadline_monotonic == command.deadline_monotonic
+        yield object()
+
+    monkeypatch.setattr(executor, "_pinned_control_transaction", transaction)
+
+    def inspect_image(value: object) -> object:
+        raise TimeoutError("Docker control operation exceeded its mechanism deadline")
+
+    monkeypatch.setattr(executor, "_inspect_image", inspect_image)
+    monkeypatch.setattr(
+        executor,
+        "_persist_terminal",
+        lambda value, *, status, exit_code, output: SimpleNamespace(status=status),
+    )
+    monkeypatch.setattr(executor, "_result_from_terminal", lambda value, terminal: terminal)
+
+    result = executor.collect(reservation, remaining_timeout_seconds=10.0)
+
+    assert result.status == "timed_out"
+
+
+@pytest.mark.parametrize(
+    "timeout_stage",
+    ("deadline", "create", "create_observed", "start", "start_observed"),
+)
+def test_container_start_timeout_persists_timed_out_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+    timeout_stage: str,
+) -> None:
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from core.pit_optimizer_v5.production_sandbox import LocalContainerExecutorV5
+
+    container_id = "e" * 64
+    command = SimpleNamespace(
+        sha256="a" * 64,
+        request=SimpleNamespace(sha256="b" * 64),
+        deadline_monotonic=1.0,
+    )
+    reservation = SimpleNamespace(command=command)
+    record = object()
+
+    class Repository:
+        @contextmanager
+        def adapter_state_transition(self, *, namespace: str, key: str):
+            assert namespace == "container-execution"
+            assert key == command.sha256
+            yield
+
+    executor = object.__new__(LocalContainerExecutorV5)
+    executor._repository = Repository()
+    executor._manifest = SimpleNamespace(resources=SimpleNamespace(worker_startup_timeout_seconds=10))
+    monkeypatch.setattr(executor, "_authorize_reservation", lambda value: record)
+    monkeypatch.setattr(executor, "_terminal_record", lambda value: None)
+    monkeypatch.setattr(executor, "_phase", lambda value, phase: None)
+    monkeypatch.setattr(executor, "_append_phase", lambda value, phase: None)
+    monkeypatch.setattr(executor, "_ensure_control", lambda value: None)
+
+    @contextmanager
+    def transaction(value: object, *, deadline_monotonic: float | None):
+        assert value is record
+        assert deadline_monotonic == command.deadline_monotonic
+        yield object()
+
+    @contextmanager
+    def pinned_request(request: object):
+        assert request is command.request
+        yield
+
+    monkeypatch.setattr(executor, "_pinned_control_transaction", transaction)
+    executor._mount_factory = SimpleNamespace(pinned_request=pinned_request)
+
+    def inspect_image(value: object) -> object:
+        if timeout_stage == "deadline":
+            raise TimeoutError("Docker control operation exceeded its mechanism deadline")
+        return object()
+
+    monkeypatch.setattr(executor, "_inspect_image", inspect_image)
+    inspection_sequences = {
+        "create_observed": (
+            None,
+            SimpleNamespace(container_id=container_id, state_authority={"Status": "created"}),
+        ),
+        "start": (
+            None,
+            SimpleNamespace(container_id=container_id, state_authority={"Status": "created"}),
+            None,
+        ),
+        "start_observed": (
+            None,
+            SimpleNamespace(container_id=container_id, state_authority={"Status": "created"}),
+            SimpleNamespace(container_id=container_id, state_authority={"Status": "running"}),
+        ),
+    }
+    inspections = iter(inspection_sequences.get(timeout_stage, ()))
+
+    def inspect_container(**kwargs: object) -> object | None:
+        if timeout_stage in {"create", "create_observed"} and not inspection_sequences.get(timeout_stage):
+            return None
+        return next(inspections)
+
+    monkeypatch.setattr(executor, "_inspect_container", inspect_container)
+    identity = SimpleNamespace(sha256="f" * 64, container_id=container_id)
+    monkeypatch.setattr(executor, "_container_identity", lambda value: None)
+    monkeypatch.setattr(executor, "_persist_container_identity", lambda value, inspection: identity)
+    observed_phases: list[str] = []
+
+    def append_observed(**kwargs: object) -> object:
+        observed_phases.append(kwargs["phase"])
+        return SimpleNamespace(container_identity_sha256=identity.sha256)
+
+    monkeypatch.setattr(executor, "_append_observed_phase", append_observed)
+    monkeypatch.setattr(executor, "_require_stable_container_identity", lambda *args: None)
+    monkeypatch.setattr(executor, "_require_phase_transition", lambda *args, **kwargs: None)
+    monkeypatch.setattr(executor, "_runtime_argv", lambda value: ("docker", "create"))
+    success = SimpleNamespace(returncode=0, timed_out=False, stdout=container_id)
+    timeout = SimpleNamespace(returncode=124, timed_out=True, stdout="")
+    control_results = iter((success, timeout))
+    control_calls: list[object] = []
+
+    def control(*args: object, **kwargs: object) -> object:
+        result = timeout if timeout_stage in {"create", "create_observed"} else next(control_results)
+        control_calls.append(result)
+        return result
+
+    monkeypatch.setattr(executor, "_control", control)
+    persisted: list[str] = []
+
+    def persist_terminal(value: object, *, status: str, exit_code: object, output: object) -> object:
+        persisted.append(status)
+        return SimpleNamespace(status=status)
+
+    monkeypatch.setattr(executor, "_persist_terminal", persist_terminal)
+
+    executor.start(reservation)
+
+    assert control_calls == (
+        []
+        if timeout_stage == "deadline"
+        else [timeout]
+        if timeout_stage in {"create", "create_observed"}
+        else [success, timeout]
+    )
+    assert observed_phases == {
+        "deadline": [],
+        "create": [],
+        "create_observed": ["created"],
+        "start": ["created"],
+        "start_observed": ["created", "started"],
+    }[timeout_stage]
+    assert persisted == ["timed_out"]

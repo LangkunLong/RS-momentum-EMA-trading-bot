@@ -536,17 +536,23 @@ def test_assessment_keeps_zero_and_too_small_denominators_insufficient() -> None
         )
 
 
-def test_unavailable_measurements_preserve_declared_rows_without_fabricated_zeroes() -> None:
-    metric = _spec().metrics[2]
+@pytest.mark.parametrize("reason", ("evaluator_metric_missing", "unsupported_case"))
+def test_unavailable_measurements_preserve_declared_rows_without_fabricated_zeroes(reason: str) -> None:
+    metric_id = (
+        "evaluator.exit_attribution_count"
+        if reason == "evaluator_metric_missing"
+        else "exit.decision_changed_count"
+    )
+    metric = next(item for item in _spec().metrics if item.metric_id == metric_id)
 
     unavailable = MechanismPredictionResultV1.unavailable(
         metric,
         minimum_relevant_cases=2,
-        reason="evaluator_metric_missing",
+        reason=reason,
     )
 
     assert unavailable.availability == "unavailable"
-    assert unavailable.unavailable_reason == "evaluator_metric_missing"
+    assert unavailable.unavailable_reason == reason
     assert unavailable.parent_value is None
     assert unavailable.candidate_value is None
     assert unavailable.numerator is None
@@ -772,6 +778,18 @@ def test_report_separates_execution_coverage_and_assessment_and_projection_label
     unavailable_report = replace(report, predictions=(*predictions[:2], unavailable))
     unavailable_projection = MechanismLearningProjectionV1.from_report(spec, unavailable_report)
     assert unavailable_projection.predictions[-1].unavailable_reason == "evaluator_metric_missing"
+
+    unsupported_case = MechanismPredictionResultV1.unavailable(
+        spec.metrics[0],
+        minimum_relevant_cases=2,
+        reason="unsupported_case",
+    )
+    unsupported_report = replace(report, predictions=(unsupported_case, *predictions[1:]))
+    unsupported_projection = MechanismLearningProjectionV1.from_report(spec, unsupported_report)
+    assert unsupported_projection.predictions[0].availability == "unavailable"
+    assert unsupported_projection.predictions[0].unavailable_reason == "unsupported_case"
+    assert unsupported_projection.predictions[0].candidate_value is None
+    assert unsupported_projection.predictions[0].assessment == "insufficient_evidence"
 
 
 def test_failed_execution_preserves_overrun_and_requires_unavailable_predictions() -> None:
@@ -1039,6 +1057,73 @@ def test_nonfixture_worker_fails_closed_without_sandbox_enforcement() -> None:
     assert run.observations == ()
     assert not parent.opened and not candidate.opened
     assert any("sandbox" in limitation.lower() for limitation in run.limitations)
+
+
+def test_registered_sandbox_contract_accepts_only_concrete_docker_adapter(monkeypatch) -> None:
+    from core.pit_optimizer_v5.mechanism_docker import MechanismDockerCaseWorkerV1
+
+    spec = _observation_spec()
+    corpus = build_mechanism_observation_corpus_v1(spec, seed_snapshot=_exit_seed())
+    binding = _observation_binding(spec, corpus)
+    fixture_parent, fixture_candidate = _fixture_workers(
+        binding,
+        corpus,
+        changed_inputs=(corpus.cases[1].input_identity_sha256,),
+    )
+    workers = []
+    for role in ("parent", "candidate"):
+        worker = object.__new__(MechanismDockerCaseWorkerV1)
+        worker.registration = _worker_registration(
+            binding,
+            role=role,
+            execution_kind="registered_sandbox",
+            cpu_memory_enforced=True,
+        )
+        worker._identity = object()
+        worker._test_decisions = (
+            fixture_parent.decisions_by_input_identity
+            if role == "parent"
+            else fixture_candidate.decisions_by_input_identity
+        )
+        workers.append(worker)
+
+    def fake_open(worker):
+        return {"identity": worker._identity, "case": None}
+
+    def fake_reset(worker, session, case, *, deadline_monotonic):
+        assert type(deadline_monotonic) is float
+        session["deadline"] = deadline_monotonic
+        session["case"] = case
+
+    def fake_evaluate(worker, session, case, *, deadline_monotonic):
+        assert session["identity"] is worker._identity
+        assert session["case"] == case
+        assert session["deadline"] == deadline_monotonic
+        session["case"] = None
+        return worker._test_decisions[case.input_identity_sha256]
+
+    def fake_close(worker, session):
+        assert session["identity"] is worker._identity
+        session["case"] = None
+
+    monkeypatch.setattr(MechanismDockerCaseWorkerV1, "open", fake_open)
+    monkeypatch.setattr(MechanismDockerCaseWorkerV1, "reset", fake_reset)
+    monkeypatch.setattr(MechanismDockerCaseWorkerV1, "evaluate", fake_evaluate)
+    monkeypatch.setattr(MechanismDockerCaseWorkerV1, "close", fake_close)
+
+    run = collect_mechanism_observations_v1(
+        spec,
+        binding,
+        corpus,
+        parent_worker=workers[0],
+        candidate_worker=workers[1],
+    )
+
+    assert run.execution.status == "completed"
+    assert run.execution.reason == "completed"
+    assert len(run.observations) == len(corpus.cases)
+    assert run.observations[1].decision_changed is True
+    assert any("Docker container per role and case" in item for item in run.limitations)
 
 
 def test_resource_case_bound_is_execution_failure_before_worker_open() -> None:
