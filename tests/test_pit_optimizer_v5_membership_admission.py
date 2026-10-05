@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -192,7 +195,8 @@ def test_admission_helper_is_in_closed_container_source_map() -> None:
     source_map = evaluator_source_map_v5(source_root)
     source_identity = evaluator_source_sha256(source_map)
 
-    assert len(EVALUATOR_SOURCE_PATHS_V5) == 58
+    assert "core/pit_optimizer_v5/sandbox.py" in source_map
+    assert len(EVALUATOR_SOURCE_PATHS_V5) == 63
     assert "core/pit_data.py" in source_map
     assert "core/alpaca_client_policy.py" in source_map
     assert "core/scheduler_observation.py" in source_map
@@ -215,6 +219,25 @@ def test_admission_helper_is_in_closed_container_source_map() -> None:
     assert verify_installed_evaluator_source_v5(
         source_root=source_root, expected_sha256=source_identity
     ) == source_identity
+
+
+def test_mechanism_entry_imports_from_the_authenticated_image_closure(tmp_path: Path) -> None:
+    source_root = Path(__file__).resolve().parents[1]
+    for relative in EVALUATOR_SOURCE_PATHS_V5:
+        target = tmp_path / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes((source_root / relative).read_bytes())
+
+    completed = subprocess.run(
+        [sys.executable, "-P", "-c", "import core.pit_optimizer_v5.mechanism_entry"],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(tmp_path)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_installed_image_authenticates_observation_dependency(tmp_path: Path) -> None:

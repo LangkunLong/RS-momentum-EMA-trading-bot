@@ -58,6 +58,7 @@ from core.pit_optimizer_v5.mechanism_contracts import (
     MechanismObservationBindingV1,
     MechanismResourceBudgetV1,
     bind_mechanism_observation_v1,
+    mechanism_resource_shares_v1,
     validate_mechanism_report_against_spec_v1,
     validate_mechanism_observation_binding_v1,
     validate_mechanism_spec_hypothesis_v1,
@@ -367,15 +368,21 @@ def _validate_resource_budget(
 ) -> None:
     resources = authenticated.manifest.resources
     sandbox = authenticated.sandbox_profile
-    # cpu_seconds is a duration.  The manifest's evaluation_cpu_limit is a
-    # quota in cores; multiplying it by the admitted mechanics wall duration
-    # yields the only deterministic conversion at this boundary.
+    request_count, cpu_seconds_per_request, timeout_ms_per_request, output_bytes_per_request = (
+        mechanism_resource_shares_v1(budget)
+    )
+    # CPU duration, timeout, and output are run totals. Compare their shares
+    # against per-container manifest/profile caps. Memory is already a
+    # per-container ceiling and is not divided across the request lattice.
     cpu_seconds_ceiling = resources.evaluation_cpu_limit * Decimal(resources.mechanics_timeout_seconds)
     if (
-        budget.timeout_ms > resources.mechanics_timeout_seconds * 1000
-        or budget.cpu_seconds > cpu_seconds_ceiling
+        request_count <= 0
+        or timeout_ms_per_request <= 0
+        or timeout_ms_per_request > resources.mechanics_timeout_seconds * 1000
+        or cpu_seconds_per_request > cpu_seconds_ceiling
         or budget.memory_mib > min(resources.evaluation_memory_mib, sandbox.memory_limit_mib)
-        or budget.output_bytes > min(resources.evaluation_output_limit_bytes, sandbox.output_limit_bytes)
+        or output_bytes_per_request <= 0
+        or output_bytes_per_request > min(resources.evaluation_output_limit_bytes, sandbox.output_limit_bytes)
     ):
         raise MechanismCapabilityError("mechanism resource budget exceeds authenticated manifest limits")
 
@@ -2284,31 +2291,18 @@ class MechanismRuntimeExtensionV1:
             self._bound[experiment_id] = bound
             self._runs[experiment_id] = existing
             return existing
+        registered_factory_available = True
         if self.capability.execution_kind == "registered_sandbox":
-            run = MechanismObservationRunV1(
-                binding=bound.binding,
-                corpus=self.capability.corpus,
-                execution=MechanismExecutionV1(status="not_run", reason="worker_unavailable"),
-                coverage=MechanismCoverageV1(
-                    total_cases=0,
-                    relevant_cases=0,
-                    decision_changed_cases=0,
-                    protected_control_cases=0,
-                    protected_control_unchanged_cases=0,
-                    unsupported_cases=0,
-                ),
-                observations=(),
-                repetitions=1,
-                reset_semantics="reset_per_case",
-                limitations=(
-                    "No registered sandbox executor exists in this adapter slice; observation failed closed.",
-                ),
-            )
-        elif semantic_recovered or self.worker_factory is None:
+            from .mechanism_docker import MechanismDockerCaseWorkerFactoryV1
+
+            registered_factory_available = type(self.worker_factory) is MechanismDockerCaseWorkerFactoryV1
+        if semantic_recovered or self.worker_factory is None or not registered_factory_available:
             reason = "worker_unavailable"
             limitation = (
                 "A recovered fixed-semantic candidate had no matching completed mechanism sidecar; no observation was rerun."
                 if semantic_recovered
+                else "No concrete registered Docker mechanism worker factory was supplied; observation failed closed."
+                if not registered_factory_available
                 else "No concrete registered mechanism executor was supplied; observation failed closed."
             )
             run = MechanismObservationRunV1(

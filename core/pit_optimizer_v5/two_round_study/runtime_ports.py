@@ -53,6 +53,7 @@ from core.pit_optimizer_v5.mechanism_artifacts import (
     MechanismExtensionCapabilityV1,
     MechanismPrecommitmentIndexV1,
     MechanismRuntimeExtensionV1,
+    MechanismWorkerFactoryV1,
     explicit_mechanism_fixture_opt_in_v1,
     mechanism_extension_source_sha256_v1,
     manifest_source_identity_sha256_v1,
@@ -1094,6 +1095,7 @@ class StudyMechanismComposerV1:
         ledger: StudyLedgerV1 | None,
         imported: StudyImportV1 | None,
         scripted: StudyScriptedRoleInvokerV1,
+        registered_worker_factory: MechanismWorkerFactoryV1 | None = None,
     ) -> None:
         if type(fixture) is not StudyFixtureV1 or type(inputs) is not FeedbackRoundInputV5:
             raise ValueError("study mechanism composer authority is invalid")
@@ -1101,6 +1103,13 @@ class StudyMechanismComposerV1:
             raise ValueError("study mechanism composer arm/store is invalid")
         if type(scripted) is not StudyScriptedRoleInvokerV1:
             raise ValueError("study mechanism composer role delegate is invalid")
+        if registered_worker_factory is not None and not callable(registered_worker_factory):
+            raise ValueError("study registered mechanism worker factory is invalid")
+        if registered_worker_factory is not None:
+            from core.pit_optimizer_v5.mechanism_docker import MechanismDockerCaseWorkerFactoryV1
+
+            if type(registered_worker_factory) is not MechanismDockerCaseWorkerFactoryV1:
+                raise ValueError("study registered mechanism factory must be the bounded Docker case factory")
         self.fixture = fixture
         self.inputs = inputs
         self.arm = arm
@@ -1108,6 +1117,7 @@ class StudyMechanismComposerV1:
         self.ledger = ledger
         self.imported = imported
         self.scripted = scripted
+        self.registered_worker_factory = registered_worker_factory
         self.mechanism_repository = MechanismArtifactRepositoryV5(fixture.repository)
         self._extension: MechanismRuntimeExtensionV1 | None = None
         self._capability: MechanismExtensionCapabilityV1 | None = None
@@ -1326,7 +1336,9 @@ class StudyMechanismComposerV1:
                 f"study-runtime:{self.arm}:{self.inputs.campaign_id}:{self.inputs.round_index}:{intent.hypothesis.sha256}"
             ),
             round_index=1,
-            execution_kind="synthetic_fixture",
+            execution_kind=(
+                "registered_sandbox" if self.registered_worker_factory is not None else "synthetic_fixture"
+            ),
             extension_source_sha256=mechanism_extension_source_sha256_v1(),
             parent_campaign_evidence=baseline.campaign,
             parent_quick_evidence=None,
@@ -1882,16 +1894,23 @@ class StudyMechanismComposerV1:
                 f"study-runtime:{self.arm}:{self.inputs.campaign_id}:{self.inputs.round_index}:{round_intent.hypothesis.sha256}"
             ),
             round_index=self.inputs.round_index,
-            execution_kind="synthetic_fixture",
+            execution_kind=(
+                "registered_sandbox" if self.registered_worker_factory is not None else "synthetic_fixture"
+            ),
             extension_source_sha256=mechanism_extension_source_sha256_v1(),
             parent_campaign_evidence=parent_campaign,
             parent_quick_evidence=parent_quick,
             parent_record=parent_record,
         )
+        worker_factory = (
+            self.registered_worker_factory
+            if self.registered_worker_factory is not None
+            else lambda bound: study_workers_v1(bound=bound, registry=self.fixture.registry)
+        )
         extension = MechanismRuntimeExtensionV1(
             self.mechanism_repository,
             capability,
-            worker_factory=lambda bound: study_workers_v1(bound=bound, registry=self.fixture.registry),
+            worker_factory=worker_factory,
         )
         extension.before_authoring(
             round_intent=round_intent,
@@ -1933,6 +1952,7 @@ def compose_study_round_v1(
     store: StudyStoreV1,
     ledger: StudyLedgerV1 | None,
     imported: StudyImportV1 | None,
+    registered_worker_factory: MechanismWorkerFactoryV1 | None = None,
 ) -> tuple[FeedbackRoundInputV5, FeedbackRoundDependenciesV5]:
     if type(fixture) is not StudyFixtureV1 or type(store) is not StudyStoreV1:
         raise ValueError("study round composition authority is invalid")
@@ -1945,6 +1965,8 @@ def compose_study_round_v1(
             raise ValueError("round two requires its import and ledger")
         if imported.arm != arm or imported.study_id != ledger.study_id:
             raise ValueError("round-two import differs from its arm or ledger")
+    if registered_worker_factory is not None and not callable(registered_worker_factory):
+        raise ValueError("study registered mechanism worker factory is invalid")
     authenticated = fixture.manifest
     manifest = authenticated.manifest
     owner_token = canonical_sha256_v5({"fixture": manifest.sha256, "round": round_index})
@@ -2018,6 +2040,7 @@ def compose_study_round_v1(
         ledger=ledger,
         imported=imported,
         scripted=scripted,
+        registered_worker_factory=registered_worker_factory,
     )
     dependencies = FeedbackRoundDependenciesV5(
         persistence=fixture.repository,
