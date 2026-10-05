@@ -201,6 +201,22 @@ def test_recorded_replacement_decision_and_durable_sell_intent_match_after_resta
     }
     assert "decision.snapshot_sha256" in result.matched_fields
     assert "intent.sell_quantity" in result.matched_fields
+    assert {
+        field for field in result.matched_fields if field.startswith("intent.")
+    } == {
+        "intent.sell_role",
+        "intent.sell_side",
+        "intent.sell_security_id",
+        "intent.sell_symbol",
+        "intent.sell_quantity",
+        "intent.buy_candidate_security_id",
+        "intent.buy_candidate_symbol",
+        "intent.buy_quantity_cap",
+        "intent.buy_price_limit",
+        "intent.protective_stop",
+        "intent.risk_per_unit",
+        "intent.risk_basis",
+    }
 
 
 def test_missing_historical_quantity_is_unknown_not_zero():
@@ -366,6 +382,50 @@ def test_timezone_offset_spelling_does_not_change_the_decision_instant():
     assert result.disposition is ParityDisposition.MATCHED
     assert result.mismatches == ()
     assert "decision.as_of_cutoff_at" in result.matched_fields
+
+
+@pytest.mark.parametrize(
+    ("field", "paper_value", "expected_mismatches"),
+    [
+        pytest.param(
+            "sell_quantity",
+            Decimal("5"),
+            ("intent.sell_quantity",),
+            id="sell-quantity",
+        ),
+        pytest.param(
+            "buy_price_limit",
+            Decimal("125.01"),
+            ("intent.buy_price_limit",),
+            id="one-cent-buy-limit-change",
+        ),
+    ],
+)
+def test_fixed_replacement_action_difference_is_a_mismatch(
+    field, paper_value, expected_mismatches
+):
+    history = _comparison_case()
+    paper = _comparison_case()
+    paper["intent"][field] = paper_value
+
+    result = compare_replacement_cases(history, paper)
+
+    assert result.disposition is ParityDisposition.MISMATCH
+    assert result.mismatches == expected_mismatches
+    assert result.execution_variances == ()
+
+
+def test_decimal_scale_does_not_change_replacement_action_parity():
+    history = _comparison_case()
+    paper = _comparison_case()
+    history["intent"]["sell_quantity"] = Decimal("6.0")
+    paper["intent"]["sell_quantity"] = Decimal("6.00")
+
+    result = compare_replacement_cases(history, paper)
+
+    assert result.disposition is ParityDisposition.MATCHED
+    assert result.mismatches == ()
+    assert "intent.sell_quantity" in result.matched_fields
 
 
 
