@@ -66,14 +66,17 @@ def _equal(left: Any, right: Any) -> bool:
 
 
 def _same_value(field: str, left: Any, right: Any) -> bool:
-    if field in _TIMESTAMP_FIELDS and isinstance(left, str) and isinstance(right, str):
+    if field in _TIMESTAMP_FIELDS:
+        if not isinstance(left, str) or not isinstance(right, str):
+            return False
         try:
             left_time = datetime.fromisoformat(left.replace("Z", "+00:00"))
             right_time = datetime.fromisoformat(right.replace("Z", "+00:00"))
         except ValueError:
-            return left == right
-        if left_time.utcoffset() is not None and right_time.utcoffset() is not None:
-            return left_time.astimezone(timezone.utc) == right_time.astimezone(timezone.utc)
+            return False
+        if left_time.utcoffset() is None or right_time.utcoffset() is None:
+            return False
+        return left_time.astimezone(timezone.utc) == right_time.astimezone(timezone.utc)
     return _equal(left, right)
 
 

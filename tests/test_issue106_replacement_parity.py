@@ -384,6 +384,30 @@ def test_timezone_offset_spelling_does_not_change_the_decision_instant():
     assert "decision.as_of_cutoff_at" in result.matched_fields
 
 
+def test_equal_malformed_timestamp_strings_are_not_parity_matches():
+    history = _comparison_case()
+    paper = _comparison_case()
+    history["decision"]["as_of_cutoff_at"] = "not-a-timestamp"
+    paper["decision"]["as_of_cutoff_at"] = "not-a-timestamp"
+
+    result = compare_replacement_cases(history, paper)
+
+    assert result.disposition is ParityDisposition.MISMATCH
+    assert result.mismatches == ("decision.as_of_cutoff_at",)
+
+
+def test_equal_timezone_naive_timestamp_strings_are_not_parity_matches():
+    history = _comparison_case()
+    paper = _comparison_case()
+    history["decision"]["as_of_cutoff_at"] = "2026-03-31T16:00:00"
+    paper["decision"]["as_of_cutoff_at"] = "2026-03-31T16:00:00"
+
+    result = compare_replacement_cases(history, paper)
+
+    assert result.disposition is ParityDisposition.MISMATCH
+    assert result.mismatches == ("decision.as_of_cutoff_at",)
+
+
 @pytest.mark.parametrize(
     ("field", "paper_value", "expected_mismatches"),
     [
