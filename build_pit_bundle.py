@@ -931,7 +931,7 @@ def _v3_provenance_metadata(
         ):
             raise ValueError("industry provenance coverage is inconsistent")
         recorded_prices_provenance = industry_provenance.get("prices_provenance_sha256")
-        if recorded_prices_provenance is not None and recorded_prices_provenance != sha256_file(
+        if recorded_prices_provenance != sha256_file(
             prices_provenance_path
         ):
             raise ValueError("industry provenance does not bind prices provenance")
