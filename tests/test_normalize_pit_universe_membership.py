@@ -7,6 +7,9 @@ import hashlib
 import json
 import sqlite3
 import sys
+
+import numpy as np
+import pandas as pd
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +18,15 @@ import pytest
 
 import build_pit_bundle as bundle_builder
 import normalize_pit_universe_membership as membership_normalizer
+from core.backtest_engine import CanslimStrategy
+from core.canslim.i_institutional import evaluate_i
+from core.strategy_policy.runtime import InProcessPolicyClient
+from core.strategy_policy import (
+    BenchmarkContextV1,
+    EntryDecision,
+    EntrySnapshot,
+    MarketContextV1,
+)
 from build_pit_bundle import (
     _load_v3_identity_contract,
     _require_v3_production_source_evidence,
@@ -35,6 +47,37 @@ from normalize_pit_universe_membership import (
 
 _UNIVERSES = ("nasdaq100", "russell2000", "sp500")
 _RETRIEVED_AT = "2026-09-28T00:00:00Z"
+
+
+class _CapturingInstitutionalPolicy(InProcessPolicyClient):
+    def __init__(self) -> None:
+        self.snapshot: EntrySnapshot | None = None
+
+    def evaluate_entry(self, snapshot: EntrySnapshot) -> EntryDecision:
+        self.snapshot = snapshot
+        return EntryDecision(False, True, (None, None), ())
+
+
+def _institutional_test_market(session: str) -> MarketContextV1:
+    return MarketContextV1(
+        schema_version=1,
+        session=session,
+        oneil_regime="confirmed_uptrend",
+        distribution_days=0,
+        follow_through=False,
+        benchmarks=tuple(
+            BenchmarkContextV1(symbol, 1.0, 1.0, 0.2)
+            for symbol in ("SPY", "QQQ", "IWM")
+        ),
+        active_constituent_count=1,
+        breadth_above_50_fraction=1.0,
+        breadth_50_coverage_fraction=1.0,
+        breadth_above_200_fraction=1.0,
+        breadth_200_coverage_fraction=1.0,
+        median_rs_score=95.0,
+        rs_at_least_80_fraction=1.0,
+        rs_coverage_fraction=1.0,
+    )
 
 
 def _source(
@@ -771,6 +814,23 @@ def test_v3_builder_resolves_all_fiserv_segment_episodes_end_to_end(
             )
             for ticker in ("FI", "FISV")
         )
+    institutional_path = tmp_path / "institutional-v5.csv"
+    with institutional_path.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.writer(stream, lineterminator="\n")
+        writer.writerow(
+            (
+                "ticker", "statement_type", "period_end", "public_date", "basic_eps",
+                "diluted_eps", "total_revenue", "net_income", "common_stock",
+                "total_stockholders_equity", "shares_outstanding",
+                "held_percent_institutions", "institution_count", "prev_institution_count",
+            )
+        )
+        writer.writerows(
+            (
+                ("FISV", "institutional", "2023-03-31", "2023-05-15", "", "", "", "", "", "", "1000000", "0.35", "10", ""),
+                ("FI", "institutional", "2023-09-30", "2024-01-03", "", "", "", "", "", "", "", "", "12", ""),
+            )
+        )
     fundamentals_provenance_path = tmp_path / "fundamentals-provenance.json"
     fundamentals_provenance = {
         "fundamentals_sha256": sha256_file(fundamentals_path),
@@ -833,6 +893,8 @@ def test_v3_builder_resolves_all_fiserv_segment_episodes_end_to_end(
         str(prices_path),
         "--fundamentals-csv",
         str(fundamentals_path),
+        "--institutional-csv",
+        str(institutional_path),
         "--industry-csv",
         str(industry_path),
         "--data-cutoff",
@@ -866,6 +928,48 @@ def test_v3_builder_resolves_all_fiserv_segment_episodes_end_to_end(
         assert bundle.metadata["membership_admission_status"] == "nonproduction_fixture"
         assert bundle.metadata["membership_source_evidence_mode"] == "nonproduction_fixture"
         assert bundle.metadata["fundamentals_source_kind"] == "synthetic fixture"
+        assert bundle.metadata["institutional_observation_count"] == "2"
+        assert bundle.metadata["institutional_null_ownership_count"] == "1"
+        assert bundle.metadata["institutional_null_denominator_count"] == "1"
+        institutional_snapshot = bundle.fundamentals_as_of("FI", "2024-01-03")["company_info"]
+        assert institutional_snapshot["institution_count"] == 12
+        assert institutional_snapshot["prev_institution_count"] == 10
+        assert institutional_snapshot["held_percent_institutions"] is None
+        assert institutional_snapshot["shares_outstanding"] == 1_000_000
+
+        policy = _CapturingInstitutionalPolicy()
+        strategy = CanslimStrategy(fundamental_provider=bundle.fundamentals_provider)
+        strategy._policy_client_provider = lambda: policy
+        close = np.linspace(40.0, 52.0, 70)
+        ticker_prices = pd.DataFrame(
+            {
+                "Open": close * 0.998,
+                "High": close * 1.01,
+                "Low": close * 0.99,
+                "Close": close,
+                "Volume": np.full(len(close), 1_000_000.0),
+            },
+            index=pd.bdate_range(end="2024-01-03", periods=len(close)),
+        )
+        session = ticker_prices.index[-1]
+        signal = strategy.evaluate_symbol(
+            ticker="FI",
+            ticker_ohlcv={"FI": ticker_prices},
+            all_closes=pd.DataFrame({"FI": ticker_prices["Close"]}),
+            eval_date=session,
+            market_state={
+                "market": _institutional_test_market(session.date().isoformat()),
+                "m_score": 1.0,
+                "market_is_bullish": True,
+            },
+            rs_score=95.0,
+        )
+        assert signal is not None
+        assert policy.snapshot is not None
+        assert signal["i_score"] == pytest.approx(evaluate_i(None, 12, 10))
+        assert policy.snapshot.i_score == pytest.approx(evaluate_i(None, 12, 10))
+        assert policy.snapshot.institutional_data_available is True
+
         assert bundle.membership_v3.members_at("2023-06-06") == frozenset({"FISV"})
         assert bundle.membership_v3.members_at(evaluation_start) == frozenset({"FI"})
         assert bundle.membership_v3.members_at("2025-11-11") == frozenset({"FISV"})

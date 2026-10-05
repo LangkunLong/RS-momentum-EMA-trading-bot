@@ -248,6 +248,15 @@ FEATURE_SPECS: tuple[FeatureSpec, ...] = (
         ("core.pit_feature_snapshot.EntryFeaturesV3.industry_group_rs",),
     ),
     FeatureSpec(
+        "sector_rs",
+        "Mean relative-strength score of active members with the same dated explicit sector assignment.",
+        "core.canslim.l_leader_laggard.calculate_group_rs",
+        1,
+        "v3_feature_exposed",
+        "exposed_but_not_consumed_by_v3_parity_baseline",
+        ("core.pit_feature_snapshot.EntryFeaturesV3.sector_rs",),
+    ),
+    FeatureSpec(
         "atr_20_fraction",
         "Mean 20-session true range divided by completed-session close.",
         "core.pit_feature_snapshot._atr_20_fraction",
@@ -1259,19 +1268,38 @@ def _raw_classification_rows(bundle: PITDataBundle) -> dict[str, list[dict[str, 
     }
     if "industry_group_snapshots" not in tables:
         return {}
-    result: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    columns = {
+        str(row[1])
+        for row in bundle._connection.execute(
+            "PRAGMA table_info(industry_group_snapshots)"
+        ).fetchall()
+    }
+    sector_column = "sector_id" if "sector_id" in columns else "NULL"
+    lineage_reader = getattr(bundle, "security_lineage_ids", None)
+    lineage_by_symbol = dict(lineage_reader()) if callable(lineage_reader) else {}
+    rows_by_symbol: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    rows_by_lineage: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in bundle._connection.execute(
-        "SELECT symbol, as_of_date, group_id FROM industry_group_snapshots "
-        "ORDER BY symbol, as_of_date"
+        "SELECT symbol, as_of_date, group_id, " + sector_column +
+        " FROM industry_group_snapshots ORDER BY symbol, as_of_date"
     ):
-        result[str(row["symbol"])].append(
-            {
-                "effective_date": str(row["as_of_date"]),
-                "available_from_session": str(row["as_of_date"]),
-                "group_id": str(row["group_id"]),
-            }
-        )
-    return dict(result)
+        symbol = str(row["symbol"])
+        item = {
+            "effective_date": str(row["as_of_date"]),
+            "available_from_session": str(row["as_of_date"]),
+            "group_id": str(row["group_id"]),
+            "sector_id": row[3],
+        }
+        rows_by_symbol[symbol].append(item)
+        lineage_id = lineage_by_symbol.get(symbol)
+        if lineage_id is not None:
+            rows_by_lineage[str(lineage_id)].append(item)
+    if not lineage_by_symbol:
+        return dict(rows_by_symbol)
+    return {
+        symbol: list(rows_by_lineage.get(str(lineage_id), rows_by_symbol.get(symbol, ())))
+        for symbol, lineage_id in lineage_by_symbol.items()
+    }
 
 
 def _reason_for_unready(
@@ -1592,12 +1620,25 @@ def build_coverage_report(
                     for ticker, assignment in assignments.items()
                 }
                 group_values: dict[str, float | None] = {}
+                sector_by_ticker = {
+                    ticker: assignment.sector_id
+                    for ticker, assignment in assignments.items()
+                    if assignment.sector_id is not None
+                }
+                sector_values: dict[str, float | None] = {}
                 if set(rs_scores).issuperset(members):
                     for group_id in sorted(set(group_by_ticker.values())):
                         group_values[group_id] = calculate_group_rs(
                             group_id,
                             active_symbols=members,
                             symbol_groups=group_by_ticker,
+                            rs_snapshot=rs_scores,
+                        )
+                    for sector_id in sorted(set(sector_by_ticker.values())):
+                        sector_values[sector_id] = calculate_group_rs(
+                            sector_id,
+                            active_symbols=members,
+                            symbol_groups=sector_by_ticker,
                             rs_snapshot=rs_scores,
                         )
                 valid_50 = 0
@@ -1686,7 +1727,12 @@ def build_coverage_report(
                                 else None
                             )
                             if assignment is None:
-                                reason = "classification_absent" if not raw_count else ("not_yet_public" if not visible_count else "no_effective_classification")
+                                if not raw_count:
+                                    reason = "classification_absent"
+                                elif not visible_count:
+                                    reason = "not_yet_public"
+                                else:
+                                    reason = "no_effective_classification"
                             elif not rs_complete:
                                 reason = "incomplete_active_universe_rs"
                             else:
@@ -1702,6 +1748,56 @@ def build_coverage_report(
                             )
                             payload["selected_available_from_sessions"] = (
                                 [str(assignment.as_of_date)] if assignment is not None else []
+                            )
+                        elif feature_id == "sector_rs":
+                            class_rows = classification_rows.get(ticker, ())
+                            raw_count = len(class_rows)
+                            visible_count = sum(
+                                date.fromisoformat(str(item["available_from_session"])) <= session
+                                and date.fromisoformat(str(item["effective_date"])) <= session
+                                for item in class_rows
+                            )
+                            future_count = raw_count - visible_count
+                            assignment = assignments.get(ticker)
+                            sector_value = (
+                                sector_values.get(assignment.sector_id)
+                                if assignment is not None
+                                and assignment.sector_id is not None
+                                and rs_complete
+                                else None
+                            )
+                            if assignment is None:
+                                if not raw_count:
+                                    reason = "classification_absent"
+                                elif not visible_count:
+                                    reason = "not_yet_public"
+                                else:
+                                    reason = "no_effective_classification"
+                            elif assignment.sector_id is None:
+                                reason = "sector_classification_unknown"
+                            elif not rs_complete:
+                                reason = "incomplete_active_universe_rs"
+                            else:
+                                reason = None
+                            payload = _price_payload(
+                                sector_value,
+                                required=1,
+                                available=int(
+                                    assignment is not None
+                                    and assignment.sector_id is not None
+                                    and rs_complete
+                                ),
+                                reason=reason,
+                            )
+                            payload["selected_period_ends"] = (
+                                [str(assignment.as_of_date)]
+                                if assignment is not None
+                                else []
+                            )
+                            payload["selected_available_from_sessions"] = (
+                                [str(assignment.as_of_date)]
+                                if assignment is not None
+                                else []
                             )
                         else:
                             raw_count = price_row_counts.get(ticker, 0)
@@ -1885,7 +1981,7 @@ def build_coverage_report(
             "security_sessions_without_public_dated_industry_assignment": identity_counts["members_without_public_dated_industry_assignment_security_sessions"],
             "industry_data_input_status": "absent_from_schema_v2_development_bundle" if schema_version == "2" else "read_from_schema_v3_industry_group_snapshots",
             "industry_code_status": "implemented_in_current_v3_snapshot_path",
-            "sector_rs": "intentionally_not_supported_by_current_feature_contract",
+            "sector_rs": "implemented_in_current_v3_snapshot_path; missing_sector_id_remains_unknown",
             "foreign_financial_scope": "not_measurable_from_this_bundle_without_domicile_classification; production contract defers foreign financials",
             "annual_revenue_consumer_scope": "in_source/calculation coverage; intentionally not a current baseline score consumer",
             "annual_revenue_basis_limitation": "V2 normalized total_revenue rows do not retain currency/concept/accounting-basis fields per observation; report-only growth is a development diagnostic and not source-metric parity evidence",

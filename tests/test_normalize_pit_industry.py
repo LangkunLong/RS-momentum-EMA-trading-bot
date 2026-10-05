@@ -93,6 +93,7 @@ def test_html_revision_reads_metadata_and_table(tmp_path: Path) -> None:
             "as_of_date": "2024-02-02",
             "group_id": "gics-subindustry:Application Software",
             "evidence_ids": '["wikipedia:revid:456"]',
+            "sector_id": "",
         }
     ]
 
@@ -234,3 +235,37 @@ def test_mediawiki_api_shaped_revision_is_supported(tmp_path: Path) -> None:
     )
     assert result.revid == 987
     assert result.as_of_date == "2024-03-04"
+
+def test_normalizer_emits_explicit_sector_and_keeps_missing_sector_unknown(tmp_path: Path) -> None:
+    revision = tmp_path / "revision-with-sectors.json"
+    revision.write_text(
+        json.dumps(
+            {
+                "revid": 321,
+                "timestamp": "2024-01-02T15:00:00Z",
+                "rows": [
+                    {
+                        "Symbol": "AAA",
+                        "GICS Sub-Industry": "Software",
+                        "GICS Sector": "Information Technology",
+                    },
+                    {"Symbol": "BBB", "GICS Sub-Industry": "Banks"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "classification.csv"
+
+    normalize_revision(
+        revision_export=revision,
+        sessions=("2024-01-03",),
+        output=output,
+    )
+
+    with output.open("r", encoding="utf-8", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    assert [row["sector_id"] for row in rows] == [
+        "gics-sector:information_technology",
+        "",
+    ]

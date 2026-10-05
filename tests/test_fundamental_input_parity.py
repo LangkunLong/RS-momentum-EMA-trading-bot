@@ -28,6 +28,7 @@ from core.data_client import (
     fetch_quarterly_income_statement,
 )
 from core.pit_data import PITDataBundle
+from core.strategy_policy.contracts import BenchmarkContextV1, MarketContextV1
 
 
 def _quarterly_frame(
@@ -473,6 +474,29 @@ def test_live_simple_and_pit_use_the_same_n_and_i_inputs() -> None:
     proximity = float(prices["Close"].iloc[-1] / prices["Close"].max())
     direct_n, direct_growth = evaluate_n(quarterly_income, proximity_to_high=proximity)
     price_only_n, _missing_growth = evaluate_n(pd.DataFrame(), proximity_to_high=proximity)
+    market_state = {
+        "m_score": 1.0,
+        "market_is_bullish": True,
+        "market": MarketContextV1(
+            schema_version=1,
+            session=eval_date.date().isoformat(),
+            oneil_regime="confirmed_uptrend",
+            distribution_days=0,
+            follow_through=False,
+            benchmarks=tuple(
+                BenchmarkContextV1(symbol, 0.05, 0.10, 0.20)
+                for symbol in ("SPY", "QQQ", "IWM")
+            ),
+            active_constituent_count=1,
+            breadth_above_50_fraction=1.0,
+            breadth_50_coverage_fraction=1.0,
+            breadth_above_200_fraction=1.0,
+            breadth_200_coverage_fraction=1.0,
+            median_rs_score=95.0,
+            rs_at_least_80_fraction=1.0,
+            rs_coverage_fraction=1.0,
+        ),
+    }
 
     with patch("backtest.fetch_fundamental_data_as_of", return_value=raw):
         simple_fund = _evaluate_fundamentals_at_date("AAA", eval_date)
@@ -482,7 +506,7 @@ def test_live_simple_and_pit_use_the_same_n_and_i_inputs() -> None:
             ticker_ohlcv={"AAA": prices},
             all_closes=pd.DataFrame({"AAA": prices["Close"]}),
             eval_date=eval_date,
-            market_state={"m_score": 1.0, "market_is_bullish": True},
+            market_state=market_state,
             rs_score=95.0,
         )
     pit = CanslimStrategy(fundamental_provider=lambda _symbol, _date: raw).evaluate_symbol(
@@ -490,7 +514,7 @@ def test_live_simple_and_pit_use_the_same_n_and_i_inputs() -> None:
         ticker_ohlcv={"AAA": prices},
         all_closes=pd.DataFrame({"AAA": prices["Close"]}),
         eval_date=eval_date,
-        market_state={"m_score": 1.0, "market_is_bullish": True},
+        market_state=market_state,
         rs_score=95.0,
     )
     market = MarketTrend("SPY", 1.0, True, 100.0, {})

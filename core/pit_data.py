@@ -1386,6 +1386,29 @@ class PITDataBundle:
             return _canonical_ticker_v3(value)
         return _canonical_ticker(value)
 
+    def _fundamental_lineage_id(self, ticker: str) -> str:
+        """Return the authenticated lineage used to carry facts across a rename."""
+
+        lineage_ids = getattr(self, "_security_lineage_ids", None)
+        if lineage_ids is None:
+            return ticker
+        return str(lineage_ids.get(ticker, ticker))
+
+    def _fundamental_source_tickers(self, ticker: str) -> tuple[str, ...]:
+        """Return every ticker alias whose dated records belong to this lineage."""
+
+        lineage_ids = getattr(self, "_security_lineage_ids", None)
+        if lineage_ids is None or ticker not in lineage_ids:
+            return (ticker,)
+        lineage_id = str(lineage_ids[ticker])
+        return tuple(
+            sorted(
+                symbol
+                for symbol, candidate in lineage_ids.items()
+                if candidate == lineage_id
+            )
+        )
+
     def _validate_integrity(self) -> None:
         if self.metadata["schema_version"] == "3":
             duplicate_membership = self._connection.execute(
@@ -1987,13 +2010,16 @@ class PITDataBundle:
         if pd.Timestamp(as_of_date) > self.data_cutoff:
             raise ValueError("requested fundamental date exceeds point-in-time bundle cutoff")
         cutoff = pd.Timestamp(as_of_date).date().isoformat()
+        source_tickers = self._fundamental_source_tickers(ticker)
+        placeholders = ",".join("?" for _ in source_tickers)
         rows = self._connection.execute(
             "SELECT ticker, statement_type, period_end, public_date, basic_eps, diluted_eps, "
             "total_revenue, net_income, common_stock, total_stockholders_equity, "
             "shares_outstanding, held_percent_institutions, institution_count, "
             "prev_institution_count FROM fundamentals "
-            "WHERE ticker = ? AND public_date <= ? ORDER BY public_date, period_end",
-            (ticker, cutoff),
+            f"WHERE ticker IN ({placeholders}) AND public_date <= ? "
+            "ORDER BY public_date, period_end, ticker",
+            (*source_tickers, cutoff),
         ).fetchall()
         records = [dict(row) for row in rows]
         for record in records:
@@ -2038,28 +2064,35 @@ class PITDataBundle:
         if not symbols:
             return
         cutoff = max(end for _start, end in bounds.values()).isoformat()
-        placeholders = ",".join("?" for _ in symbols)
+        source_tickers = tuple(
+            sorted(
+                {
+                    source_ticker
+                    for ticker in symbols
+                    for source_ticker in self._fundamental_source_tickers(ticker)
+                }
+            )
+        )
+        placeholders = ",".join("?" for _ in source_tickers)
         rows = self._connection.execute(
             "SELECT ticker, statement_type, period_end, public_date, basic_eps, diluted_eps, "
             "total_revenue, net_income, common_stock, total_stockholders_equity, "
             "shares_outstanding, held_percent_institutions, institution_count, "
             "prev_institution_count FROM fundamentals "
             f"WHERE ticker IN ({placeholders}) AND public_date <= ? "
-            "ORDER BY ticker, public_date, period_end",
-            (*symbols, cutoff),
+            "ORDER BY public_date, period_end, ticker",
+            (*source_tickers, cutoff),
         )
-        ticker_groups = iter(groupby(
-            rows,
-            key=lambda row: self._canonical_bundle_ticker(row["ticker"]),
-        ))
-        next_group = next(ticker_groups, None)
+        rows_by_lineage: dict[str, list[sqlite3.Row]] = {}
+        for row in rows:
+            row_ticker = self._canonical_bundle_ticker(row["ticker"])
+            rows_by_lineage.setdefault(
+                self._fundamental_lineage_id(row_ticker), []
+            ).append(row)
         for ticker in symbols:
-            ticker_rows: list[sqlite3.Row] = []
-            if next_group is not None and next_group[0] == ticker:
-                ticker_rows = list(next_group[1])
-                next_group = next(ticker_groups, None)
-            elif next_group is not None and next_group[0] < ticker:
-                raise ValueError("fundamental state stream order is invalid")
+            ticker_rows = rows_by_lineage.get(
+                self._fundamental_lineage_id(ticker), []
+            )
             start, end = bounds[ticker]
             history: list[dict[str, Any]] = []
             baseline_emitted = False
@@ -2166,20 +2199,46 @@ class PITDataBundle:
             "institution_count": None,
             "prev_institution_count": None,
         }
-        institutional_pair_selected = False
+        latest_institutional = next(
+            (
+                record
+                for record in reversed(records)
+                if record.get("statement_type") == "institutional"
+            ),
+            None,
+        )
+        held_percent_selected = latest_institutional is not None
+        institutional_pair_selected = latest_institutional is not None
+        if latest_institutional is not None:
+            # A visible institutional snapshot is atomic for ownership level
+            # and its count pair. In particular, a missing denominator must not
+            # revive an older percentage.
+            result["held_percent_institutions"] = latest_institutional.get(
+                "held_percent_institutions"
+            )
+            result["institution_count"] = latest_institutional.get(
+                "institution_count"
+            )
+            result["prev_institution_count"] = latest_institutional.get(
+                "prev_institution_count"
+            )
+
         for record in reversed(records):
-            for key in ("shares_outstanding", "held_percent_institutions"):
-                value = record.get(key)
-                if result[key] is None and value is not None:
-                    result[key] = value
-            institution_count = record.get("institution_count")
-            prev_institution_count = record.get("prev_institution_count")
-            if not institutional_pair_selected and (
-                institution_count is not None or prev_institution_count is not None
-            ):
-                result["institution_count"] = institution_count
-                result["prev_institution_count"] = prev_institution_count
-                institutional_pair_selected = True
+            value = record.get("shares_outstanding")
+            if result["shares_outstanding"] is None and value is not None:
+                result["shares_outstanding"] = value
+            if not held_percent_selected:
+                value = record.get("held_percent_institutions")
+                if result["held_percent_institutions"] is None and value is not None:
+                    result["held_percent_institutions"] = value
+                    held_percent_selected = True
+            if not institutional_pair_selected:
+                institution_count = record.get("institution_count")
+                prev_institution_count = record.get("prev_institution_count")
+                if institution_count is not None or prev_institution_count is not None:
+                    result["institution_count"] = institution_count
+                    result["prev_institution_count"] = prev_institution_count
+                    institutional_pair_selected = True
         return result
 
     def _fundamentals_provider_state(
@@ -2200,13 +2259,15 @@ class PITDataBundle:
         if state is not None:
             return state
 
+        source_tickers = self._fundamental_source_tickers(ticker)
+        placeholders = ",".join("?" for _ in source_tickers)
         rows = self._connection.execute(
             "SELECT ticker, statement_type, period_end, public_date, basic_eps, diluted_eps, "
             "total_revenue, net_income, common_stock, total_stockholders_equity, "
             "shares_outstanding, held_percent_institutions, institution_count, "
             "prev_institution_count FROM fundamentals "
-            "WHERE ticker = ? ORDER BY public_date, period_end",
-            (ticker,),
+            f"WHERE ticker IN ({placeholders}) ORDER BY public_date, period_end, ticker",
+            source_tickers,
         ).fetchall()
         boundaries = tuple(
             (

@@ -181,3 +181,115 @@ def test_paid_fmp_profile_smoke_returns_nonblank_label(tmp_path, monkeypatch) ->
 
     assert isinstance(result.get("NVDA"), str)
     assert result["NVDA"].strip()
+
+def test_dated_assignments_carry_forward_across_security_lineage_only_as_of_session() -> None:
+    import sqlite3
+    from datetime import date
+
+    from core.industry_group import (
+        PITIndustryAssignment,
+        load_pit_industry_assignments_as_of,
+    )
+
+    connection = sqlite3.connect(":memory:")
+    connection.execute(
+        "CREATE TABLE industry_group_snapshots ("
+        "symbol TEXT, as_of_date TEXT, group_id TEXT, group_rank INTEGER, "
+        "group_members TEXT, evidence_ids TEXT, sector_id TEXT)"
+    )
+    connection.executemany(
+        "INSERT INTO industry_group_snapshots VALUES (?,?,?,?,?,?,?)",
+        [
+            (
+                "OLD", "2024-02-01", "gics-subindustry:semiconductors", 1,
+                '["OLD"]', '["revision:1"]', "gics-sector:information_technology",
+            ),
+            (
+                "NEW", "2025-06-02", "gics-subindustry:hardware", 1,
+                '["NEW"]', '["revision:2"]', "gics-sector:information_technology",
+            ),
+            (
+                "NEW", "2026-02-02", "gics-subindustry:software", 1,
+                '["NEW"]', '["revision:3"]', "gics-sector:communication_services",
+            ),
+        ],
+    )
+
+    class _Bundle:
+        metadata = {"schema_version": "3", "data_cutoff": "2026-12-31"}
+        _connection = connection
+
+        @staticmethod
+        def security_lineage_ids() -> dict[str, str]:
+            return {"OLD": "lineage_a", "NEW": "lineage_a", "OTHER": "lineage_b"}
+
+    result = load_pit_industry_assignments_as_of(
+        _Bundle(), session=date(2025, 12, 31), symbols=("NEW",)
+    )
+
+    assert result == {
+        "NEW": PITIndustryAssignment(
+            date(2025, 6, 2),
+            "gics-subindustry:hardware",
+            "gics-sector:information_technology",
+        )
+    }
+    connection.close()
+
+def test_v3_portfolio_exposure_uses_visible_sector_and_unknown_notional(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import date
+    from types import SimpleNamespace
+
+    import pandas as pd
+
+    from core import backtest_engine
+    from core.industry_group import PITIndustryAssignment
+
+    session = pd.Timestamp("2025-06-03")
+    engine = object.__new__(backtest_engine.PortfolioSimulator)
+    engine.pit_bundle = object()
+    engine.pit_data_scope = "schema_v3"
+    engine._equity = 1000.0
+    engine._v3_peak_equity = 1000.0
+    engine._open_positions = {
+        "AAA": SimpleNamespace(remaining_qty=1.0, entry_price=95.0, stop_price=90.0),
+        "BBB": SimpleNamespace(remaining_qty=1.0, entry_price=195.0, stop_price=190.0),
+        "CCC": SimpleNamespace(remaining_qty=1.0, entry_price=295.0, stop_price=290.0),
+    }
+    assignments = {
+        "AAA": PITIndustryAssignment(
+            date(2025, 5, 1), "gics-subindustry:software", "gics-sector:information_technology"
+        ),
+        "BBB": PITIndustryAssignment(
+            date(2025, 5, 1), "gics-subindustry:banks", "gics-sector:financials"
+        ),
+    }
+    monkeypatch.setattr(
+        backtest_engine,
+        "load_pit_industry_assignments_as_of",
+        lambda *_args, **_kwargs: assignments,
+    )
+    prices = {
+        symbol: pd.DataFrame(
+            {"Open": [price], "Close": [price]}, index=pd.DatetimeIndex([session])
+        )
+        for symbol, price in (("AAA", 100.0), ("BBB", 200.0), ("CCC", 300.0))
+    }
+
+    result = engine._v3_portfolio_features(
+        ticker_ohlcv=prices,
+        session=session,
+        use_open=False,
+        pending_entry_count=0,
+    )
+
+    assert result.sector_exposures == (
+        ("gics-sector:financials", 0.125),
+        ("gics-sector:information_technology", 0.0625),
+        ("unclassified", 0.1875),
+    )
+    assert sum(value for _sector, value in result.sector_exposures) == pytest.approx(
+        result.gross_exposure_fraction
+    )

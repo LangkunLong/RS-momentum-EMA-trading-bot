@@ -1,29 +1,37 @@
 """Build a dated point-in-time industry-group ranking CSV.
 
-This utility is deliberately an offline boundary.  It accepts a validated PIT
-bundle and a dated classification export, then emits the ``industry.csv``
-contract consumed by :mod:`tools.build_pit_supplemental`.  It never resolves
-symbols from a current provider, and it never uses a price after the
+This utility is deliberately an offline boundary. It accepts a hash-pinned
+schema-V3 industry-preparation bundle, authenticated prices provenance, and a
+dated classification export. It emits ranked ``industry.csv`` rows and can
+write a provenance sidecar for final schema-V3 bundle assembly. It never
+resolves symbols from a current provider or uses a price after the
 classification snapshot date.
 
-The classification input has the exact header::
+The classification input accepts the legacy header::
 
     symbol,as_of_date,group_id,evidence_ids
+
+or the sector-aware header::
+
+    symbol,as_of_date,group_id,evidence_ids,sector_id
 
 ``as_of_date`` is the public/available date of the classification observation
 and must be an exact SPY price session in the bundle.  The ranker uses the
 existing PIT RS implementation over the members active on that date.  Group
 scores are the arithmetic mean of member RS ratings; ties are broken by the
-canonical group ID.  The output has the six columns required by
-``build_pit_supplemental``.
+canonical group ID.  The output appends ``sector_id`` to the existing six ranking columns. Blank
+sector IDs mean unknown; nonblank values use the canonical ``gics-sector:<slug>``
+form and come only from an explicit dated source field.
 
 Example::
 
     python -m tools.build_pit_industry \
         --pit-bundle pit.sqlite3 \
         --bundle-sha256 <sha256> \
+        --prices-provenance prices-provenance.json \
         --classification-csv classifications.csv \
-        --output industry.csv
+        --output industry.csv \
+        --output-provenance industry-provenance.json
 """
 
 from __future__ import annotations
@@ -31,7 +39,7 @@ from __future__ import annotations
 import argparse
 import csv
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 import json
 import math
 from pathlib import Path
@@ -40,11 +48,13 @@ from typing import Iterable, Mapping
 
 import pandas as pd
 
-from core.pit_data import PITDataBundle
+from core.pit_data import PITDataBundle, sha256_file
+from core.pit_provenance import pit_canonical_json
 from core.pit_diagnosis.rs import calculate_pit_rs_snapshot
 
 
 _CLASSIFICATION_FIELDS = ("symbol", "as_of_date", "group_id", "evidence_ids")
+_CLASSIFICATION_FIELDS_WITH_SECTOR = (*_CLASSIFICATION_FIELDS, "sector_id")
 _INDUSTRY_FIELDS = (
     "symbol",
     "as_of_date",
@@ -52,6 +62,7 @@ _INDUSTRY_FIELDS = (
     "group_rank",
     "group_members",
     "evidence_ids",
+    "sector_id",
 )
 _MAX_ROWS = 1_000_000
 _INTEGER_SYMBOL = re.compile(r"[A-Z][A-Z0-9.-]{0,7}\Z")
@@ -60,12 +71,13 @@ _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 
 @dataclass(frozen=True)
 class ClassificationRow:
-    """One dated, externally evidenced symbol-to-group classification."""
+    """One dated, externally evidenced group and optional sector classification."""
 
     symbol: str
     as_of_date: str
     group_id: str
     evidence_ids: tuple[str, ...]
+    sector_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -77,6 +89,7 @@ class IndustryBuildResult:
     classification_rows: int
     industry_rows: int
     snapshot_dates: int
+    output_provenance: Path | None = None
 
 
 def _regular_file(path: str | Path, field: str) -> Path:
@@ -112,6 +125,18 @@ def _symbol(value: object, field: str = "symbol") -> str:
     return value
 
 
+def _sector_id(value: object) -> str | None:
+    if value is None or value == "":
+        return None
+    if (
+        not isinstance(value, str)
+        or value != value.strip()
+        or re.fullmatch(r"gics-sector:[a-z0-9]+(?:_[a-z0-9]+)*", value) is None
+    ):
+        raise ValueError("classification sector_id must be canonical GICS sector text or blank")
+    return value
+
+
 def _json_strings(value: object, field: str) -> tuple[str, ...]:
     try:
         parsed = json.loads(
@@ -144,10 +169,12 @@ def _read_classifications(
     try:
         with path.open("r", encoding="utf-8", newline="") as stream:
             reader = csv.DictReader(stream, strict=True)
-            if tuple(reader.fieldnames or ()) != _CLASSIFICATION_FIELDS:
+            fields = tuple(reader.fieldnames or ())
+            if fields not in {_CLASSIFICATION_FIELDS, _CLASSIFICATION_FIELDS_WITH_SECTOR}:
                 raise ValueError(
-                    "classification CSV header must be exactly "
+                    "classification CSV header must be "
                     + ",".join(_CLASSIFICATION_FIELDS)
+                    + " with optional trailing sector_id"
                 )
             for raw in reader:
                 if raw.get(None) is not None or any(value is None for value in raw.values()):
@@ -171,7 +198,10 @@ def _read_classifications(
                 ):
                     raise ValueError("classification group_id must be non-empty and trimmed")
                 evidence_ids = _json_strings(raw["evidence_ids"], "classification evidence_ids")
-                rows.append(ClassificationRow(symbol, as_of, group_id, evidence_ids))
+                sector_id = _sector_id(raw.get("sector_id"))
+                rows.append(
+                    ClassificationRow(symbol, as_of, group_id, evidence_ids, sector_id)
+                )
     except UnicodeDecodeError as exc:
         raise ValueError("classification CSV must be UTF-8") from exc
     except csv.Error as exc:
@@ -295,6 +325,7 @@ def _snapshot_rows(
                     "group_rank": str(ranks[row.group_id]),
                     "group_members": json.dumps(group_members[row.group_id], separators=(",", ":")),
                     "evidence_ids": json.dumps(row.evidence_ids, separators=(",", ":")),
+                    "sector_id": row.sector_id or "",
                 }
             )
     return tuple(sorted(output, key=lambda row: (row["symbol"], row["as_of_date"])))
@@ -320,12 +351,28 @@ def _write_output(path: Path, rows: Iterable[Mapping[str, str]]) -> int:
         raise
 
 
+def _write_provenance(path: Path, payload: Mapping[str, object]) -> None:
+    partial = Path(f"{path}.partial")
+    if path.exists() or path.is_symlink() or partial.exists() or partial.is_symlink():
+        raise ValueError("industry provenance output or partial already exists")
+    try:
+        with partial.open("x", encoding="utf-8", newline="") as stream:
+            stream.write(pit_canonical_json(payload) + "\n")
+        partial.replace(path)
+    except Exception:
+        partial.unlink(missing_ok=True)
+        path.unlink(missing_ok=True)
+        raise
+
+
 def build_industry_csv(
     *,
     pit_bundle: str | Path,
     bundle_sha256: str,
     classification_csv: str | Path,
+    prices_provenance: str | Path,
     output: str | Path,
+    output_provenance: str | Path | None = None,
     max_rows: int = _MAX_ROWS,
 ) -> IndustryBuildResult:
     """Build a strict supplemental ``industry.csv`` from PIT-only inputs."""
@@ -335,10 +382,20 @@ def build_industry_csv(
     bundle_path = _regular_file(pit_bundle, "pit_bundle")
     classification_path = _regular_file(classification_csv, "classification_csv")
     output_path = _new_output(output)
+    prices_provenance_path = _regular_file(prices_provenance, "prices_provenance")
+    provenance_path = (
+        None if output_provenance is None else _new_output(output_provenance)
+    )
+    if provenance_path is not None and provenance_path == output_path:
+        raise ValueError("industry CSV and provenance outputs must differ")
     # A tiny metadata read is not sufficient: PITDataBundle validates the
     # whole hash-bound membership/price/fundamental contract before use.
     try:
-        with PITDataBundle(bundle_path, expected_sha256=bundle_sha256) as bundle:
+        with PITDataBundle(
+            bundle_path,
+            expected_sha256=bundle_sha256,
+            prices_provenance=prices_provenance_path,
+        ) as bundle:
             classifications = _read_classifications(
                 classification_path,
                 data_cutoff=str(bundle.metadata["data_cutoff"]),
@@ -346,15 +403,43 @@ def build_industry_csv(
             )
             rows = _snapshot_rows(bundle, classifications)
             count = _write_output(output_path, rows)
+            if provenance_path is not None:
+                membership_sha256 = bundle.metadata.get("membership_source_sha256")
+                if not isinstance(membership_sha256, str) or _DIGEST.fullmatch(membership_sha256) is None:
+                    raise ValueError("PIT bundle lacks authenticated membership source digest")
+                evidence_ids = sorted(
+                    {evidence for row in classifications for evidence in row.evidence_ids}
+                )
+                provenance = {
+                    "classification_csv_sha256": sha256_file(classification_path),
+                    "classification_evidence_ids": evidence_ids,
+                    "data_cutoff": str(bundle.metadata["data_cutoff"]),
+                    "first_as_of_date": min(row.as_of_date for row in classifications),
+                    "industry_sha256": sha256_file(output_path),
+                    "last_as_of_date": max(row.as_of_date for row in classifications),
+                    "membership_csv_sha256": membership_sha256,
+                    "pit_bundle_sha256": bundle.sha256,
+                    "prices_provenance_sha256": sha256_file(prices_provenance_path),
+                    "retrieved_at_utc": datetime.now(timezone.utc)
+                    .isoformat(timespec="seconds")
+                    .replace("+00:00", "Z"),
+                    "row_count": count,
+                    "source_kind": "dated_classifications_ranked_against_authenticated_pit_prices",
+                    "symbol_count": len({row["symbol"] for row in rows}),
+                }
+                _write_provenance(provenance_path, provenance)
             return IndustryBuildResult(
                 output=output_path,
                 bundle_sha256=bundle.sha256,
                 classification_rows=len(classifications),
                 industry_rows=count,
                 snapshot_dates=len({row.as_of_date for row in classifications}),
+                output_provenance=provenance_path,
             )
     except Exception:
         output_path.unlink(missing_ok=True)
+        if provenance_path is not None:
+            provenance_path.unlink(missing_ok=True)
         raise
 
 
@@ -369,7 +454,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--pit-bundle", type=Path, required=True)
     parser.add_argument("--bundle-sha256", type=_digest, required=True)
     parser.add_argument("--classification-csv", type=Path, required=True)
+    parser.add_argument("--prices-provenance", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--output-provenance", type=Path)
     parser.add_argument("--max-rows", type=int, default=_MAX_ROWS)
     return parser
 
@@ -381,6 +468,8 @@ def main(argv: list[str] | None = None) -> int:
         bundle_sha256=args.bundle_sha256,
         classification_csv=args.classification_csv,
         output=args.output,
+        prices_provenance=args.prices_provenance,
+        output_provenance=args.output_provenance,
         max_rows=args.max_rows,
     )
     print(
@@ -390,6 +479,11 @@ def main(argv: list[str] | None = None) -> int:
                 "classification_rows": result.classification_rows,
                 "industry_rows": result.industry_rows,
                 "output": str(result.output),
+                "output_provenance": (
+                    str(result.output_provenance)
+                    if result.output_provenance is not None
+                    else None
+                ),
                 "snapshot_dates": result.snapshot_dates,
             },
             sort_keys=True,
