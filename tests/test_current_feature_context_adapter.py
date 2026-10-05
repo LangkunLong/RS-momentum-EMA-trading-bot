@@ -889,3 +889,89 @@ def test_source_public_dates_shift_strictly_after_exchange_session_and_normalize
     assert already_normalized.source_public_date == date(2026, 1, 2)
     assert already_normalized.available_from_session == date(2026, 1, 5)
     assert already_normalized.date_basis == "already_normalized"
+
+
+def test_entry_features_compute_sector_rs_from_dated_visible_assignments(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture()
+    bundle_path, _old_digest, provenance_path, _availability = (
+        _write_schema_v3_bundle(tmp_path)
+    )
+    session = date.fromisoformat(fixture["session"])
+    connection = sqlite3.connect(bundle_path)
+    connection.executemany(
+        "UPDATE industry_group_snapshots SET sector_id=? WHERE symbol=?",
+        [
+            ("gics-sector:information_technology", "AAA"),
+            ("gics-sector:financials", "BBB"),
+            ("gics-sector:information_technology", "CCC"),
+        ],
+    )
+    future_date = max(session.replace(day=1), date(2026, 4, 2)).isoformat()
+    connection.execute(
+        "INSERT INTO industry_group_snapshots "
+        "(symbol,as_of_date,group_id,group_rank,group_members,evidence_ids,sector_id) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (
+            "AAA", future_date, "future_group", 1, '["AAA"]',
+            '["revision:future"]', "gics-sector:communication_services",
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    digest = sha256_file(bundle_path)
+    with PITDataBundle(
+        bundle_path, expected_sha256=digest, prices_provenance=provenance_path
+    ) as bundle:
+        history = bundle.fetch_price_data(
+            ("AAA",), pd.Timestamp("2025-01-01"), pd.Timestamp(session)
+        )["AAA"]
+        features = build_entry_features_v3(
+            bundle=bundle,
+            symbol="AAA",
+            session=session,
+            price_history=history,
+            rs_snapshot=fixture["rs_snapshot"],
+        )
+
+    expected = (
+        fixture["rs_snapshot"]["AAA"] + fixture["rs_snapshot"]["CCC"]
+    ) / 2
+    assert features.sector_rs == pytest.approx(expected)
+
+
+def test_industry_preparation_stage_bundle_is_rejected_by_decision_features(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture()
+    bundle_path, _old_digest, provenance_path, _availability = (
+        _write_schema_v3_bundle(tmp_path)
+    )
+    connection = sqlite3.connect(bundle_path)
+    connection.execute(
+        "INSERT INTO dataset_metadata(key,value) VALUES (?,?)",
+        ("bundle_stage", "industry_preparation"),
+    )
+    connection.execute("DELETE FROM industry_group_snapshots")
+    connection.commit()
+    connection.close()
+
+    with PITDataBundle(
+        bundle_path,
+        expected_sha256=sha256_file(bundle_path),
+        prices_provenance=provenance_path,
+    ) as bundle:
+        session = date.fromisoformat(fixture["session"])
+        history = bundle.fetch_price_data(
+            ("AAA",), pd.Timestamp("2025-01-01"), pd.Timestamp(session)
+        )["AAA"]
+        with pytest.raises(ValueError, match="industry-preparation"):
+            build_entry_features_v3(
+                bundle=bundle,
+                symbol="AAA",
+                session=session,
+                price_history=history,
+                rs_snapshot=fixture["rs_snapshot"],
+            )

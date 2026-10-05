@@ -1,10 +1,10 @@
 """Normalize one immutable S&P 500 Wikipedia revision into PIT classifications.
 
 This utility is intentionally offline.  It accepts a local JSON or HTML export
-of one immutable MediaWiki revision and writes the four-column classification
-CSV consumed by :mod:`tools.build_pit_industry`::
+of one immutable MediaWiki revision and writes the dated classification CSV
+consumed by :mod:`tools.build_pit_industry`::
 
-    symbol,as_of_date,group_id,evidence_ids
+    symbol,as_of_date,group_id,evidence_ids,sector_id
 
 The revision must carry a numeric revision ID and a timezone-aware timestamp.
 The output date is the first supplied ``trade_date`` strictly after that
@@ -13,7 +13,9 @@ never guesses a session calendar or falls back to the same/previous session.
 
 JSON exports may use the compact contract ``{"revid": ..., "timestamp":
 ..., "rows": [...]}``, where each row has ``Symbol``, ``GICS Sub-Industry``,
-and optional ``CIK`` fields.  A MediaWiki API-shaped object containing one
+plus optional ``GICS Sector`` and ``CIK`` fields. Missing sectors remain blank;
+the normalizer never infers them from a sub-industry or current profile. A
+MediaWiki API-shaped object containing one
 revision and either ``rows`` or an HTML ``content``/``html`` value is also
 accepted.  HTML exports must carry revision metadata in ``meta`` tags (or a
 canonical ``oldid`` URL) and contain a table with the same symbol and GICS
@@ -39,7 +41,7 @@ import pandas as pd
 from core.public_membership import canonical_ticker
 
 
-_CLASSIFICATION_FIELDS = ("symbol", "as_of_date", "group_id", "evidence_ids")
+_CLASSIFICATION_FIELDS = ("symbol", "as_of_date", "group_id", "evidence_ids", "sector_id")
 _SESSION_FIELDS = ("trade_date",)
 _MEMBERSHIP_FIELDS = ("effective_date", "ticker", "member")
 _MAX_ROWS = 10_000
@@ -59,6 +61,7 @@ class RevisionClassification:
     symbol: str
     group_id: str
     cik: str | None = None
+    sector_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -164,6 +167,27 @@ def _canonical_group(value: object) -> str:
     if _CONTROL.search(cleaned):
         raise ValueError("GICS Sub-Industry contains control characters")
     return f"gics-subindustry:{cleaned}"
+
+
+def _canonical_sector(value: object) -> str | None:
+    """Canonicalize an explicit GICS sector; absent values stay unknown."""
+    if value is None:
+        return None
+    try:
+        if bool(pd.isna(value)):
+            return None
+    except (TypeError, ValueError):
+        if not isinstance(value, str):
+            raise ValueError("GICS Sector must be scalar text") from None
+    raw = str(value).replace("\xa0", " ").strip()
+    if not raw:
+        return None
+    if _CONTROL.search(raw):
+        raise ValueError("GICS Sector contains control characters")
+    slug = re.sub(r"[^a-z0-9]+", "_", raw.casefold()).strip("_")
+    if not slug:
+        raise ValueError("GICS Sector must contain ASCII letters or digits")
+    return f"gics-sector:{slug}"
 
 
 def _canonical_cik(value: object) -> str | None:
@@ -362,6 +386,7 @@ def _normalize_rows(rows: Iterable[Mapping[object, object]]) -> tuple[RevisionCl
         symbol_key = _column(row, "symbol", "ticker")
         group_key = _column(row, "gics sub-industry", "gics sub industry", "sub-industry", "sub industry")
         cik_key = _column(row, "cik")
+        sector_key = _column(row, "gics sector", "sector")
         if symbol_key is None or group_key is None:
             raise ValueError("revision row must contain Symbol and GICS Sub-Industry")
         symbol = _canonical_symbol(row[symbol_key])
@@ -369,7 +394,12 @@ def _normalize_rows(rows: Iterable[Mapping[object, object]]) -> tuple[RevisionCl
             raise ValueError(f"duplicate or ambiguous revision symbol: {symbol}")
         seen.add(symbol)
         cik = _canonical_cik(row[cik_key]) if cik_key is not None else None
-        normalized.append(RevisionClassification(symbol, _canonical_group(row[group_key]), cik))
+        sector = _canonical_sector(row[sector_key]) if sector_key is not None else None
+        normalized.append(
+            RevisionClassification(
+                symbol, _canonical_group(row[group_key]), cik, sector
+            )
+        )
     if not normalized:
         raise ValueError("revision table is empty")
     return tuple(sorted(normalized, key=lambda row: row.symbol))
@@ -507,6 +537,7 @@ def normalize_revision(
             "as_of_date": as_of_date,
             "group_id": row.group_id,
             "evidence_ids": evidence,
+            "sector_id": row.sector_id or "",
         }
         for row in normalized
     )

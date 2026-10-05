@@ -137,6 +137,22 @@ def build_entry_features_v3(
         if target_group is not None
         else None
     )
+    sectors = {
+        ticker: assignment.sector_id
+        for ticker, assignment in assignments.items()
+        if assignment.sector_id is not None
+    }
+    target_sector = sectors.get(symbol)
+    sector_rs = (
+        _resolve_deferred_feature("calculate_group_rs")(
+            target_sector,
+            active_symbols=active_symbols,
+            symbol_groups=sectors,
+            rs_snapshot=validated_rs,
+        )
+        if target_sector is not None
+        else None
+    )
 
     history = _validated_price_history(price_history, session)
     fundamentals = bundle.fundamentals_provider(
@@ -152,9 +168,7 @@ def build_entry_features_v3(
     return EntryFeaturesV3(
         affiliations=affiliations,
         industry_group_rs=group_rs,
-        # Schema V3 seals GICS-like sub-industry IDs but no dated sector
-        # taxonomy.  Inferring a sector from current profiles would be a leak.
-        sector_rs=None,
+        sector_rs=sector_rs,
         earnings_growth_acceleration=_earnings_acceleration(quarterly),
         sales_growth_acceleration=_growth_acceleration_for_label(
             quarterly, "Total Revenue"
@@ -226,6 +240,8 @@ def _validated_context(
     if type(allow_schema_v2_development) is not bool:
         raise ValueError("feature development flag must be a bool")
     schema_version = bundle.metadata.get("schema_version")
+    if schema_version == "3" and bundle.metadata.get("bundle_stage") == "industry_preparation":
+        raise ValueError("industry-preparation bundles cannot build decision features")
     if schema_version != "3" and not (
         allow_schema_v2_development and schema_version == "2"
     ):

@@ -741,7 +741,9 @@ def test_small_fixed_history_report_keeps_market_rs_and_industry_denominators(
         bundle_path=tmp_path / "synthetic.sqlite3",
         bundle_manifest_path=tmp_path / "manifest.json",
         prices_provenance_path=tmp_path / "prices.json",
-        feature_spec_path=Path(__file__).parents[1] / "docs" / "historical-feature-specification-v1.md",
+        feature_spec_path=(
+            Path(__file__).parents[1] / "docs" / "historical-feature-specification-v1.md"
+        ),
         output_dir=tmp_path / "report",
         source_revision="c" * 40,
     )
@@ -818,4 +820,157 @@ def test_small_fixed_history_report_keeps_market_rs_and_industry_denominators(
         ] == 4
         assert first_row["features"]["quarterly_eps_growth"]["full_window"]["ready"] is False
         assert sum(1 for _line in row_file) == 38
+    bundle._connection.close()
+
+
+def test_sector_rs_coverage_uses_dated_explicit_sector_assignments(
+    monkeypatch, tmp_path: Path
+) -> None:
+    sessions = pd.bdate_range("2020-01-02", periods=70)
+    decision_sessions = sessions[-2:]
+    members = ("AAA", "AAB")
+
+    def price_frame(offset: float) -> pd.DataFrame:
+        closes = [
+            100.0 + step * (0.1 + offset / 1000) for step in range(len(sessions))
+        ]
+        return pd.DataFrame(
+            {
+                "Open": closes,
+                "High": [value + 1.0 for value in closes],
+                "Low": [value - 1.0 for value in closes],
+                "Close": closes,
+                "Volume": [1000.0] * len(sessions),
+            },
+            index=sessions,
+        )
+
+    price_data = {
+        ticker: price_frame(float(index + 1))
+        for index, ticker in enumerate(("SPY", "QQQ", "IWM", *members))
+    }
+    older_fact = sessions[-4].date().isoformat()
+    later_fact = decision_sessions[-1].date().isoformat()
+
+    class SyntheticBundle:
+        metadata = {
+            "bundle_kind": "canslim_pit_v3",
+            "schema_version": "3",
+            "data_cutoff": sessions[-1].date().isoformat(),
+            "evaluation_start": decision_sessions[0].date().isoformat(),
+            "warmup_start": sessions[0].date().isoformat(),
+            "membership_source_kind": "fixed_test_history",
+            "membership_source_sha256": "1" * 64,
+            "membership_provenance_sha256": "2" * 64,
+            "prices_source_kind": "fixed_test_history",
+            "prices_source_sha256": "3" * 64,
+            "prices_provenance_sha256": "4" * 64,
+            "fundamentals_source_kind": "fixed_test_history",
+            "fundamentals_source_sha256": "5" * 64,
+            "fundamentals_provenance_sha256": "6" * 64,
+            "membership_revision_id": "fixed-test-v1",
+        }
+
+        def __init__(self) -> None:
+            self.data_cutoff = pd.Timestamp(self.metadata["data_cutoff"])
+            self._connection = sqlite3.connect(":memory:")
+            self._connection.row_factory = sqlite3.Row
+            self._connection.execute(
+                "CREATE TABLE fundamentals "
+                "(ticker TEXT, statement_type TEXT, period_end TEXT, public_date TEXT, "
+                "basic_eps REAL, diluted_eps REAL, total_revenue REAL, net_income REAL, "
+                "total_stockholders_equity REAL, shares_outstanding REAL, "
+                "held_percent_institutions REAL, institution_count INTEGER, "
+                "prev_institution_count INTEGER)"
+            )
+            self._connection.execute(
+                "CREATE TABLE industry_group_snapshots "
+                "(symbol TEXT, as_of_date TEXT, group_id TEXT, sector_id TEXT)"
+            )
+            self._connection.executemany(
+                "INSERT INTO industry_group_snapshots VALUES (?, ?, ?, ?)",
+                (
+                    ("OLD", older_fact, "industry:software", "gics-sector:technology"),
+                    ("AAA", later_fact, "industry:capital-markets", "gics-sector:financials"),
+                    ("AAB", older_fact, "industry:biotechnology", None),
+                ),
+            )
+
+        def price_symbols(self) -> tuple[str, ...]:
+            return tuple(sorted(price_data))
+
+        def fetch_price_data(self, *_args, **_kwargs):
+            return price_data
+
+        def tradable_symbols(self) -> tuple[str, ...]:
+            return members
+
+        def reference_symbols(self) -> tuple[str, ...]:
+            return ("SPY", "QQQ", "IWM")
+
+        def members_at(self, _session: date) -> tuple[str, ...]:
+            return members
+
+        def affiliations_at(self, _session: date):
+            return {}
+
+        def security_lineage_ids(self) -> dict[str, str]:
+            return {
+                "AAA": "lineage-aaa",
+                "OLD": "lineage-aaa",
+                "AAB": "lineage-aab",
+            }
+
+        def security_lineage_id(self, ticker: str) -> str:
+            return self.security_lineage_ids()[ticker]
+
+    bundle = SyntheticBundle()
+    monkeypatch.setattr(coverage, "_verify_committed_source", lambda _sha: "a" * 40)
+    monkeypatch.setattr(
+        coverage,
+        "_load_bundle",
+        lambda *_args: (bundle, {}, {"bundle_sha256": "b" * 64}),
+    )
+    monkeypatch.setattr(coverage, "_financial_states", lambda *_args: {})
+    monkeypatch.setattr(
+        coverage,
+        "calculate_rs_snapshot",
+        lambda *_args, **_kwargs: {"AAA": 55.0, "AAB": 65.0},
+    )
+
+    report = build_coverage_report(
+        bundle_path=tmp_path / "synthetic.sqlite3",
+        bundle_manifest_path=tmp_path / "manifest.json",
+        prices_provenance_path=tmp_path / "prices.json",
+        feature_spec_path=Path(__file__).parents[1] / "docs" / "historical-feature-specification-v1.md",
+        output_dir=tmp_path / "report",
+        source_revision="c" * 40,
+    )
+
+    sector = report["features"]["sector_rs"]["overall"]
+    assert sector["denominator_security_sessions"] == 4
+    assert sector["calculable_security_sessions"] == 2
+    assert sector["reason_counts"] == {"sector_classification_unknown": 2}
+    assert sector["unique_tickers_by_reason"] == {"sector_classification_unknown": 1}
+    assert "not_supported" not in report["exclusions_and_gaps"]["sector_rs"]
+
+    with coverage.gzip.open(
+        tmp_path / "report" / "security_session_coverage.jsonl.gz", "rt", encoding="utf-8"
+    ) as row_file:
+        rows = [json.loads(line) for line in row_file]
+    aaa_rows = [row for row in rows if row["ticker"] == "AAA"]
+    assert len(aaa_rows) == 2
+    assert [
+        row["features"]["sector_rs"]["source_observation_rows"] for row in aaa_rows
+    ] == [2, 2]
+    assert [
+        row["features"]["sector_rs"]["public_observation_rows"] for row in aaa_rows
+    ] == [1, 2]
+    assert aaa_rows[0]["features"]["sector_rs"]["selected_period_ends"] == [older_fact]
+    assert aaa_rows[1]["features"]["sector_rs"]["selected_period_ends"] == [later_fact]
+    aab_rows = [row for row in rows if row["ticker"] == "AAB"]
+    assert all(
+        row["features"]["sector_rs"]["reason_codes"] == ["sector_classification_unknown"]
+        for row in aab_rows
+    )
     bundle._connection.close()

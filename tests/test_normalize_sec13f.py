@@ -167,3 +167,106 @@ def test_missing_trading_day_after_filing_fails_closed(tmp_path: Path) -> None:
     _csv(trading, ("trade_date",), [("2024-04-30",)])
     with pytest.raises(ValueError, match="strictly after filing date"):
         normalize_13f(thirteenf_zip=zip_path, cusip_mapping_csv=mapping, shares_csv=shares, trading_days_csv=trading, output=tmp_path / "out.csv")
+
+
+def test_v5_bundle_export_keeps_missing_denominator_and_both_dates(tmp_path: Path) -> None:
+    zip_path, mapping, shares, trading = _inputs(tmp_path)
+    _csv(
+        shares,
+        ("symbol", "as_of_date", "shares_outstanding", "evidence_ids"),
+        [("AAA", "2024-06-01", "1000", '["future-denominator"]')],
+    )
+    legacy_output = tmp_path / "institutional.csv"
+    bundle_output = tmp_path / "institutional-v5.csv"
+
+    result = normalize_13f(
+        thirteenf_zip=zip_path,
+        cusip_mapping_csv=mapping,
+        shares_csv=shares,
+        trading_days_csv=trading,
+        output=legacy_output,
+        pit_bundle_output=bundle_output,
+    )
+
+    assert result.output_rows == 0
+    assert result.skipped_missing_denominator == 1
+    assert legacy_output.read_text(encoding="utf-8") == (
+        "symbol,as_of_date,ownership_percent,holder_count,previous_holder_count,evidence_ids\n"
+    )
+    with bundle_output.open(encoding="utf-8-sig", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+
+    assert len(rows) == 1
+    assert rows[0]["ticker"] == "AAA"
+    assert rows[0]["statement_type"] == "institutional"
+    assert rows[0]["period_end"] == "2024-03-31"
+    assert rows[0]["public_date"] == "2024-05-13"
+    assert rows[0]["shares_outstanding"] == ""
+    assert rows[0]["held_percent_institutions"] == ""
+    assert rows[0]["institution_count"] == "2"
+    assert rows[0]["prev_institution_count"] == ""
+
+
+
+def test_v5_bundle_export_includes_denominator_when_available(tmp_path: Path) -> None:
+    zip_path, mapping, shares, trading = _inputs(tmp_path)
+    legacy_output = tmp_path / "institutional.csv"
+    bundle_output = tmp_path / "institutional-v5.csv"
+
+    result = normalize_13f(
+        thirteenf_zip=zip_path,
+        cusip_mapping_csv=mapping,
+        shares_csv=shares,
+        trading_days_csv=trading,
+        output=legacy_output,
+        pit_bundle_output=bundle_output,
+    )
+
+    assert result.pit_bundle_output == bundle_output.resolve()
+    assert result.pit_bundle_rows == 1
+    with bundle_output.open(encoding="utf-8-sig", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    assert len(rows) == 1
+    assert rows[0]["ticker"] == "AAA"
+    assert rows[0]["period_end"] == "2024-03-31"
+    assert rows[0]["public_date"] == "2024-05-13"
+    assert rows[0]["shares_outstanding"] == "1000"
+    assert rows[0]["held_percent_institutions"] == "0.4"
+    assert rows[0]["institution_count"] == "2"
+    assert rows[0]["prev_institution_count"] == ""
+
+
+def test_v5_dual_output_rolls_back_first_publish_when_second_link_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import tools.normalize_sec13f as normalizer
+
+    zip_path, mapping, shares, trading = _inputs(tmp_path)
+    legacy_output = tmp_path / "institutional.csv"
+    bundle_output = tmp_path / "institutional-v5.csv"
+    original_link = normalizer.os.link
+    calls = 0
+
+    def fail_second_link(source, target) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected second publication failure")
+        original_link(source, target)
+
+    monkeypatch.setattr(normalizer.os, "link", fail_second_link)
+    with pytest.raises(OSError, match="injected second publication failure"):
+        normalize_13f(
+            thirteenf_zip=zip_path,
+            cusip_mapping_csv=mapping,
+            shares_csv=shares,
+            trading_days_csv=trading,
+            output=legacy_output,
+            pit_bundle_output=bundle_output,
+        )
+
+    assert calls == 2
+    assert not legacy_output.exists()
+    assert not bundle_output.exists()
+    assert not Path(f"{legacy_output}.partial").exists()
+    assert not Path(f"{bundle_output}.partial").exists()

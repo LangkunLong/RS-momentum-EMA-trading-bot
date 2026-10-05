@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -24,6 +25,8 @@ class _AuthenticatedBundle(Protocol):
     metadata: Mapping[str, str]
     _connection: sqlite3.Connection
 
+    def security_lineage_ids(self) -> Mapping[str, str]: ...
+
 
 @dataclass(frozen=True, slots=True)
 class PITIndustryAssignment:
@@ -31,6 +34,7 @@ class PITIndustryAssignment:
 
     as_of_date: date
     group_id: str
+    sector_id: str | None = None
 
 
 def load_pit_industry_assignments_as_of(
@@ -65,6 +69,8 @@ def load_pit_industry_assignments_as_of(
     if type(allow_schema_v2_development) is not bool:
         raise ValueError("PIT industry development flag must be a bool")
     schema_version = bundle.metadata.get("schema_version")
+    if schema_version == "3" and bundle.metadata.get("bundle_stage") == "industry_preparation":
+        raise ValueError("industry-preparation bundles cannot supply policy assignments")
     if schema_version != "3" and not (
         allow_schema_v2_development and schema_version == "2"
     ):
@@ -80,19 +86,39 @@ def load_pit_industry_assignments_as_of(
     if not requested:
         return MappingProxyType({})
 
+    lineage_reader = getattr(bundle, "security_lineage_ids", None)
+    if callable(lineage_reader):
+        lineage_by_symbol = lineage_reader()
+        missing_lineages = requested.difference(lineage_by_symbol)
+        if missing_lineages:
+            raise ValueError("requested PIT industry symbols lack authenticated lineages")
+    else:
+        # Compatibility for narrow unit adapters predating the lineage API.
+        lineage_by_symbol = {symbol: symbol for symbol in requested}
+    requested_lineages = {lineage_by_symbol[symbol] for symbol in requested}
     try:
+        columns = {
+            str(row[1])
+            for row in bundle._connection.execute(
+                "PRAGMA table_info(industry_group_snapshots)"
+            ).fetchall()
+        }
+        sector_column = "sector_id" if "sector_id" in columns else "NULL"
         rows = bundle._connection.execute(
-            "SELECT symbol, as_of_date, group_id FROM industry_group_snapshots "
-            "WHERE as_of_date <= ? ORDER BY symbol, as_of_date",
+            f"SELECT symbol, as_of_date, group_id, {sector_column} "
+            "FROM industry_group_snapshots WHERE as_of_date <= ? "
+            "ORDER BY as_of_date, symbol",
             (session.isoformat(),),
         ).fetchall()
     except sqlite3.DatabaseError as exc:
         raise ValueError("schema-V3 bundle has no readable PIT industry snapshots") from exc
 
-    result: dict[str, PITIndustryAssignment] = {}
+    latest_by_lineage: dict[str, PITIndustryAssignment] = {}
+    seen_symbol_dates: set[tuple[str, date]] = set()
     for row in rows:
         symbol = _pit_symbol(row[0])
-        if symbol not in requested:
+        lineage = lineage_by_symbol.get(symbol)
+        if lineage not in requested_lineages:
             continue
         try:
             as_of_date = date.fromisoformat(str(row[1]))
@@ -100,6 +126,10 @@ def load_pit_industry_assignments_as_of(
             raise ValueError("PIT industry assignment date is invalid") from exc
         if as_of_date > session:
             raise ValueError("PIT industry assignment is after the requested session")
+        key = (symbol, as_of_date)
+        if key in seen_symbol_dates:
+            raise ValueError("PIT industry assignments are not uniquely ordered")
+        seen_symbol_dates.add(key)
         group_id = row[2]
         if (
             not isinstance(group_id, str)
@@ -108,11 +138,36 @@ def load_pit_industry_assignments_as_of(
             or any(ord(character) < 32 for character in group_id)
         ):
             raise ValueError("PIT industry group_id is invalid")
-        previous = result.get(symbol)
-        if previous is not None and as_of_date <= previous.as_of_date:
-            raise ValueError("PIT industry assignments are not uniquely ordered")
-        result[symbol] = PITIndustryAssignment(as_of_date, group_id)
+        raw_sector = row[3]
+        sector_id = _pit_sector(raw_sector)
+        assignment = PITIndustryAssignment(as_of_date, group_id, sector_id)
+        previous = latest_by_lineage.get(str(lineage))
+        if previous is not None and as_of_date < previous.as_of_date:
+            continue
+        if previous is not None and as_of_date == previous.as_of_date:
+            if assignment != previous:
+                raise ValueError("PIT industry lineage has ambiguous same-date assignments")
+            continue
+        latest_by_lineage[str(lineage)] = assignment
+
+    result = {
+        symbol: latest_by_lineage[lineage_by_symbol[symbol]]
+        for symbol in requested
+        if lineage_by_symbol[symbol] in latest_by_lineage
+    }
     return MappingProxyType(result)
+
+
+def _pit_sector(value: object) -> str | None:
+    if value is None or value == "":
+        return None
+    if (
+        not isinstance(value, str)
+        or value != value.strip()
+        or re.fullmatch(r"gics-sector:[a-z0-9]+(?:_[a-z0-9]+)*", value) is None
+    ):
+        raise ValueError("PIT industry sector_id is invalid")
+    return value
 
 
 def _pit_symbol(value: object) -> str:

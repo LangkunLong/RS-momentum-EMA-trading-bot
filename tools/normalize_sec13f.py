@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 import json
+import os
 from pathlib import Path
 import re
 import zipfile
@@ -38,6 +39,12 @@ from collections import defaultdict
 from typing import Iterable, Mapping
 
 
+_PIT_BUNDLE_FUNDAMENTAL_FIELDS = (
+    "ticker", "statement_type", "period_end", "public_date", "basic_eps",
+    "diluted_eps", "total_revenue", "net_income", "common_stock",
+    "total_stockholders_equity", "shares_outstanding",
+    "held_percent_institutions", "institution_count", "prev_institution_count",
+)
 _INSTITUTIONAL_FIELDS = (
     "symbol",
     "as_of_date",
@@ -97,6 +104,8 @@ class NormalizationResult:
     output_rows: int
     ignored_non_target_rows: int
     skipped_missing_denominator: int
+    pit_bundle_output: Path | None = None
+    pit_bundle_rows: int = 0
 
 
 @dataclass(frozen=True)
@@ -369,8 +378,9 @@ def normalize_13f(
     shares_csv: Path,
     trading_days_csv: Path,
     output: Path,
+    pit_bundle_output: Path | None = None,
 ) -> NormalizationResult:
-    """Normalize one quarterly ZIP into the strict institutional CSV contract."""
+    """Normalize one ZIP to the legacy contract and optional V5 fundamentals rows."""
 
     mapping = _read_mapping(cusip_mapping_csv)
     shares = _read_shares(shares_csv)
@@ -431,6 +441,7 @@ def normalize_13f(
         grouped_evidence[(symbol, as_of, report_period)].update(evidence[(symbol, as_of, report_period, cik)])
 
     output_rows: list[tuple[str, str, str, str, str, str]] = []
+    pit_bundle_rows: list[tuple[str, ...]] = []
     emitted_keys: set[tuple[str, date]] = set()
     skipped_missing = 0
     for (symbol, as_of, report_period), manager_positions in sorted(grouped.items(), key=lambda item: (item[0][0], item[0][1], item[0][2])):
@@ -440,35 +451,101 @@ def normalize_13f(
             )
         available = shares.get(symbol, ())
         index = bisect.bisect_right([entry.as_of for entry in available], as_of) - 1
-        if index < 0:
+        denominator = available[index] if index >= 0 else None
+        if denominator is None:
             skipped_missing += 1
+            ownership = None
+        else:
+            ownership = sum(manager_positions.values(), Decimal(0)) / denominator.shares
+            if ownership > 1:
+                raise ValueError(f"derived ownership exceeds 100% for {symbol} at {as_of.isoformat()}")
+
+        if pit_bundle_output is not None:
+            pit_bundle_rows.append((
+                symbol,
+                "institutional",
+                report_period.isoformat(),
+                as_of.isoformat(),
+                "", "", "", "", "", "",
+                _fmt_decimal(denominator.shares) if denominator is not None else "",
+                _fmt_decimal(ownership) if ownership is not None else "",
+                str(len(manager_positions)),
+                "",
+            ))
+
+        if denominator is None:
             continue
-        denominator = available[index]
-        ownership = sum(manager_positions.values(), Decimal(0)) / denominator.shares
-        if ownership > 1:
-            raise ValueError(f"derived ownership exceeds 100% for {symbol} at {as_of.isoformat()}")
         evidence_ids = sorted({*grouped_evidence[(symbol, as_of, report_period)], *denominator.evidence_ids})
         output_rows.append((symbol, as_of.isoformat(), _fmt_decimal(ownership), str(len(manager_positions)), "0", json.dumps(evidence_ids, separators=(",", ":"))))
         emitted_keys.add((symbol, as_of))
 
     output = Path(output).resolve()
-    if output.exists() or output.is_symlink():
-        raise ValueError("output already exists")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    partial = Path(f"{output}.partial")
-    if partial.exists() or partial.is_symlink():
-        raise ValueError("partial output already exists")
-    try:
-        with partial.open("x", encoding="utf-8", newline="") as stream:
-            writer = csv.writer(stream, lineterminator="\n")
-            writer.writerow(_INSTITUTIONAL_FIELDS)
-            writer.writerows(output_rows)
-        partial.replace(output)
-    except Exception:
-        partial.unlink(missing_ok=True)
-        output.unlink(missing_ok=True)
-        raise
-    return NormalizationResult(output, len(selected), len(grouped), len(output_rows), ignored, skipped_missing)
+    if pit_bundle_output is None:
+        if output.exists() or output.is_symlink():
+            raise ValueError("output already exists")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        partial = Path(f"{output}.partial")
+        if partial.exists() or partial.is_symlink():
+            raise ValueError("partial output already exists")
+        try:
+            with partial.open("x", encoding="utf-8", newline="") as stream:
+                writer = csv.writer(stream, lineterminator="\n")
+                writer.writerow(_INSTITUTIONAL_FIELDS)
+                writer.writerows(output_rows)
+            partial.replace(output)
+        except Exception:
+            partial.unlink(missing_ok=True)
+            output.unlink(missing_ok=True)
+            raise
+        bundle_output = None
+    else:
+        bundle_output = Path(pit_bundle_output).resolve()
+        targets = (output, bundle_output)
+        if len(set(targets)) != len(targets):
+            raise ValueError("legacy and PIT-bundle outputs must differ")
+        partials = tuple(Path(f"{target}.partial") for target in targets)
+        for target, partial in zip(targets, partials, strict=True):
+            if target.exists() or target.is_symlink():
+                raise ValueError(f"output already exists: {target}")
+            if partial.exists() or partial.is_symlink():
+                raise ValueError(f"partial output already exists: {partial}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+        published: list[tuple[Path, Path]] = []
+        created_partials: set[Path] = set()
+        try:
+            for partial, fields, rows in (
+                (partials[0], _INSTITUTIONAL_FIELDS, output_rows),
+                (partials[1], _PIT_BUNDLE_FUNDAMENTAL_FIELDS, pit_bundle_rows),
+            ):
+                with partial.open("x", encoding="utf-8", newline="") as stream:
+                    created_partials.add(partial)
+                    writer = csv.writer(stream, lineterminator="\n")
+                    writer.writerow(fields)
+                    writer.writerows(rows)
+            for partial, target in zip(partials, targets, strict=True):
+                os.link(partial, target)
+                published.append((partial, target))
+        except Exception:
+            for partial, target in reversed(published):
+                try:
+                    if target.exists() and os.path.samefile(partial, target):
+                        target.unlink()
+                except OSError:
+                    pass
+            raise
+        finally:
+            for partial in created_partials:
+                partial.unlink(missing_ok=True)
+    return NormalizationResult(
+        output=output,
+        selected_filings=len(selected),
+        position_groups=len(grouped),
+        output_rows=len(output_rows),
+        ignored_non_target_rows=ignored,
+        skipped_missing_denominator=skipped_missing,
+        pit_bundle_output=bundle_output,
+        pit_bundle_rows=len(pit_bundle_rows),
+    )
 
 
 @dataclass(frozen=True)
@@ -749,6 +826,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--trading-days-csv", "--trading-days", dest="trading_days_csv", type=Path)
     parser.add_argument("--data-cutoff")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--pit-bundle-output", type=Path,
+        help="optional V5 fundamentals CSV retaining institutional observations with missing denominators",
+    )
     return parser
 
 
@@ -757,6 +838,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.manifest is not None:
         if any(value is not None for value in (args.cusip_mapping_csv, args.shares_csv, args.trading_days_csv)):
             raise ValueError("quarter-manifest mode does not accept ZIP normalization inputs")
+        if args.pit_bundle_output is not None:
+            raise ValueError("quarter-manifest mode does not accept --pit-bundle-output")
         result = assemble_institutional_csv(manifest=args.manifest, output=args.output, data_cutoff=args.data_cutoff)
         print(json.dumps({
             "input_rows": result.input_rows,
@@ -774,15 +857,20 @@ def main(argv: list[str] | None = None) -> int:
         shares_csv=args.shares_csv,
         trading_days_csv=args.trading_days_csv,
         output=args.output,
+        pit_bundle_output=args.pit_bundle_output,
     )
-    print(json.dumps({
+    payload = {
         "ignored_non_target_rows": result.ignored_non_target_rows,
         "output": str(result.output),
         "output_rows": result.output_rows,
         "position_groups": result.position_groups,
         "selected_filings": result.selected_filings,
         "skipped_missing_denominator": result.skipped_missing_denominator,
-    }, sort_keys=True))
+    }
+    if result.pit_bundle_output is not None:
+        payload["pit_bundle_output"] = str(result.pit_bundle_output)
+        payload["pit_bundle_rows"] = result.pit_bundle_rows
+    print(json.dumps(payload, sort_keys=True))
     return 0
 
 

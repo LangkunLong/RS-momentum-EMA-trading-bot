@@ -242,44 +242,90 @@ explicit proxy/incomplete baseline path.
 
 ## Building the industry CSV from PIT prices
 
-When the classification source contains only dated symbol-to-group observations,
-`tools/build_pit_industry.py` derives the remaining fields without consulting a
-current profile provider. Its input contract is the exact UTF-8 header:
+When the classification source contains dated symbol-to-group observations,
+`tools/build_pit_industry.py` derives the ranking fields without consulting a
+current profile provider. It accepts the legacy UTF-8 header:
 
 ```text
 symbol,as_of_date,group_id,evidence_ids
 ```
 
-`as_of_date` is the public/available date of the classification observation. It
-must be no later than the PIT bundle cutoff and must be an exact completed SPY
-price session; no adjacent-session fallback is permitted. Every symbol must be
-present in the bundle and active in the bundle's historical membership state on
-that date, and every active PIT member must have exactly one classification row
-at each snapshot date. Duplicate `(symbol, as_of_date)` rows, unknown symbols,
-inactive symbols, incomplete snapshots, empty evidence, and future-dated rows
-are rejected.
+or the sector-aware header:
+
+```text
+symbol,as_of_date,group_id,evidence_ids,sector_id
+```
+
+`sector_id` must be a canonical `gics-sector:<slug>` obtained from an explicit
+dated source field. Blank means unknown. A sub-industry or current profile is
+never used to infer a sector.
+
+`as_of_date` is the public/available date of the classification observation.
+It must be no later than the PIT bundle cutoff and must be an exact completed
+SPY price session; no adjacent-session fallback is permitted. Every symbol must
+be present in the bundle and active in the historical membership state on that
+date, and every active PIT member must have exactly one classification row at
+each snapshot date. Duplicate `(symbol, as_of_date)` rows, unknown or inactive
+symbols, incomplete snapshots, empty evidence, and future-dated rows are
+rejected.
 
 For every snapshot date, the utility groups the supplied classifications and
 computes each group's score as the mean of member ratings from the repository's
 causal PIT RS implementation. The input prices passed to each RS calculation
 end at the classification session. Groups are ranked by descending score with
-a canonical `group_id` tie-break, and one output row is emitted for every input
-symbol snapshot. `group_members` is the sorted, dated classified member set
-and `evidence_ids` is carried through from the classification source.
+a canonical `group_id` tie-break. `group_members` and `evidence_ids` are carried
+into the output along with the sector ID.
+
+Build a schema-V3 preparation bundle using the normal membership, price,
+fundamentals, and provenance inputs, omitting industry CSV/provenance. Its
+manifest marks industry coverage `not_built` and it cannot supply decision
+features.
+
+```powershell
+python build_pit_bundle.py `
+  --schema-version 3 `
+  --industry-preparation-stage `
+  --membership-csv membership.csv `
+  --prices-csv prices.csv `
+  --fundamentals-csv fundamentals.csv `
+  --membership-provenance membership-provenance.json `
+  --prices-provenance prices-provenance.json `
+  --fundamentals-provenance fundamentals-provenance.json `
+  --data-cutoff 2025-12-31 `
+  --evaluation-start 2021-01-04 `
+  --warmup-start 2020-01-02 `
+  --output pit-industry-preparation.sqlite3 `
+  --manifest-output pit-industry-preparation.manifest.json
+```
+
+Then rank the dated classifications and emit a final-bundle provenance sidecar:
 
 ```powershell
 python -m tools.build_pit_industry `
-  --pit-bundle pit.sqlite3 `
+  --pit-bundle pit-industry-preparation.sqlite3 `
   --bundle-sha256 <bundle-sha256> `
+  --prices-provenance prices-provenance.json `
   --classification-csv classifications.csv `
-  --output industry.csv
+  --output industry.csv `
+  --output-provenance industry-provenance.json
 ```
 
-The resulting `industry.csv` can be supplied directly as the
-`--industry-csv` input to `tools.build_pit_supplemental.py`. The classification
-export must contain enough historical price for the existing PIT RS calculation
-to produce a rating for every classified group member; the ranker fails closed
-when a group cannot be ranked causally.
+Supply both generated files to `build_pit_bundle.py` as `--industry-csv` and
+`--industry-provenance` for final V3 assembly. The sidecar binds ranked rows to
+the classification file, preparation bundle, membership CSV, and price
+provenance. The ranker fails closed if the SPY session or required causal
+lookback is missing.
+
+The V3 entry snapshot derives `sector_rs` from the mean RS of active members
+with the same visible, explicit sector ID. It requires complete active-universe
+RS; a blank or absent sector ID stays unavailable and is never inferred from an
+industry group. The coverage report emits a separate `sector_rs` row with dated
+selected assignments and an explicit `sector_classification_unknown` reason.
+V3 portfolio features sum held notionals by visible sector ID and retain missing
+assignments or sector IDs in `unclassified`, preserving gross exposure.
+
+These fixture-backed paths verify calculation and causal visibility. They do not
+establish real-source or production-universe sector coverage.
 
 ## Offline normalization of an archived Wikipedia revision
 
@@ -317,14 +363,15 @@ canonical `oldid` URL), one timezone-aware revision timestamp, and a table with
 strictly; duplicate symbols, malformed fields, and unknown punctuation aliases
 are rejected.
 
-The normalizer assigns `as_of_date` to the first supplied `trade_date` strictly
-after the revision timestamp. A same-day session is therefore never used for a
-revision published later that day, and a missing later session is an error.
-Evidence is emitted as the JSON array `["wikipedia:revid:<id>"]` in the
-classification CSV contract. When a PIT membership CSV is supplied, the
-revision symbols must exactly equal the active members on the derived date;
-missing and extra symbols fail closed.
-
+The normalizer assigns `as_of_date` to the first supplied `trade_date`
+strictly after the revision timestamp. This is the shared public-availability
+date for sub-industry and optional sector assignments. A same-day session is
+never used for a revision published later that day, and a missing later session
+is an error. Evidence is emitted as the JSON array `["wikipedia:revid:<id>"]`.
+An explicit `GICS Sector` value becomes `gics-sector:<slug>`; an absent value
+stays blank. When a PIT membership CSV is supplied, revision symbols must
+exactly equal active members on the derived date; missing and extra symbols fail
+closed.
 ```powershell
 python -m tools.normalize_pit_industry `
   --revision-export wikipedia-revision.json `

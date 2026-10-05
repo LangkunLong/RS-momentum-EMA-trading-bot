@@ -49,6 +49,8 @@ _INDUSTRY_COLUMNS = (
     "group_members",
     "evidence_ids",
 )
+_INDUSTRY_COLUMNS_WITH_SECTOR = (*_INDUSTRY_COLUMNS, "sector_id")
+_SECTOR_ID_RE = re.compile(r"gics-sector:[a-z0-9]+(?:_[a-z0-9]+)*\Z")
 _V3_SOURCE_UNIVERSES = ("nasdaq100", "russell2000", "sp500")
 _NONPRODUCTION_EVIDENCE_MODES = {
     "nonproduction_fixture",
@@ -285,6 +287,102 @@ def _load_fundamentals(
     return sorted(result, key=lambda row: (row[0], row[1], row[3], row[2]))
 
 
+def _load_institutional_fundamentals(
+    paths: Iterable[Path],
+    cutoff: str,
+    *,
+    ticker_parser: Any = _ticker,
+    identities: Mapping[str, Mapping[str, object]] | None = None,
+    transitions: tuple[Mapping[str, object], ...] = (),
+    segment_contract: PriceIdentityTransitionContract | None = None,
+) -> list[tuple[Any, ...]]:
+    """Load optional V5-ready institutional snapshots and derive causal trends."""
+
+    observations: dict[tuple[str, str, str, str], tuple[tuple[Any, ...], str]] = {}
+    for raw_path in paths:
+        path = _regular_input(raw_path)
+        for row in _load_fundamentals(
+            path, cutoff, ticker_parser=ticker_parser
+        ):
+            ticker, statement_type, period_end, public_date = row[:4]
+            if statement_type != "institutional":
+                raise ValueError("institutional fundamentals input contains a non-institutional row")
+            shares_outstanding = row[10]
+            held_percent = row[11]
+            institution_count = row[12]
+            if shares_outstanding is not None and shares_outstanding <= 0:
+                raise ValueError("institutional shares_outstanding must be positive")
+            if held_percent is not None and not 0 <= held_percent <= 1:
+                raise ValueError("institutional held_percent_institutions must be between zero and one")
+            if institution_count is None:
+                raise ValueError("institutional institution_count is required")
+
+            if identities is None:
+                lineage_id = str(ticker)
+            else:
+                identity = identities.get(str(ticker))
+                if identity is None:
+                    raise ValueError(f"institutional ticker is not an authenticated price identity: {ticker}")
+                lineage_id = _lineage(identity.get("chain_id"))
+                active_ticker = _v3_ticker_for_lineage(
+                    lineage_id,
+                    str(public_date),
+                    identities,
+                    transitions,
+                    segment_contract,
+                )
+                if active_ticker != ticker:
+                    raise ValueError(
+                        f"institutional ticker {ticker} is not the active price identity "
+                        f"for its lineage on {public_date}"
+                    )
+
+            key = (str(ticker), str(statement_type), str(period_end), str(public_date))
+            # Prior-count values are deliberately ignored: recompute them after
+            # authenticated lineage ordering so ticker renames do not reset trend.
+            comparable = tuple(row[:13])
+            existing = observations.get(key)
+            if existing is not None:
+                if existing[0] != comparable or existing[1] != lineage_id:
+                    raise ValueError("conflicting duplicate institutional snapshot across source CSVs")
+                continue
+            observations[key] = (comparable, lineage_id)
+
+    ordered = sorted(
+        (
+            (lineage_id, key[3], key[2], key[0], comparable)
+            for key, (comparable, lineage_id) in observations.items()
+        ),
+        key=lambda item: item[:4],
+    )
+    previous_count_by_lineage: dict[str, int] = {}
+    result: list[tuple[Any, ...]] = []
+    for lineage_id, _public_date, _period_end, _ticker_value, row in ordered:
+        previous_count = previous_count_by_lineage.get(lineage_id)
+        result.append((*row[:13], previous_count))
+        previous_count_by_lineage[lineage_id] = int(row[12])
+    return result
+
+
+def _merge_institutional_fundamentals(
+    fundamentals: list[tuple[Any, ...]],
+    institutional: list[tuple[Any, ...]],
+) -> list[tuple[Any, ...]]:
+    seen = {
+        (str(row[0]), str(row[1]), str(row[2]), str(row[3]))
+        for row in fundamentals
+    }
+    for row in institutional:
+        key = (str(row[0]), str(row[1]), str(row[2]), str(row[3]))
+        if key in seen:
+            raise ValueError("institutional snapshot duplicates a base fundamentals snapshot")
+        seen.add(key)
+    return sorted(
+        [*fundamentals, *institutional],
+        key=lambda row: (str(row[0]), str(row[1]), str(row[3]), str(row[2])),
+    )
+
+
 def _json_string_array(value: object, *, field: str) -> tuple[str, ...]:
     if not isinstance(value, str):
         raise ValueError(f"{field} must be a canonical JSON string array")
@@ -308,7 +406,15 @@ def _json_string_array(value: object, *, field: str) -> tuple[str, ...]:
 def _load_industry(path: Path, cutoff: str) -> list[tuple[Any, ...]]:
     result: list[tuple[Any, ...]] = []
     previous: tuple[str, str] | None = None
-    for row in _rows(path, _INDUSTRY_COLUMNS):
+    with path.open("r", encoding="utf-8", newline="") as stream:
+        header = tuple(next(csv.reader(stream), ()))
+    if header == _INDUSTRY_COLUMNS:
+        fields = _INDUSTRY_COLUMNS
+    elif header == _INDUSTRY_COLUMNS_WITH_SECTOR:
+        fields = _INDUSTRY_COLUMNS_WITH_SECTOR
+    else:
+        raise ValueError("industry CSV header must match the dated classification contract")
+    for row in _rows(path, fields):
         ticker = _ticker_v3(row["symbol"])
         as_of = _iso_date(row["as_of_date"], field="industry as_of_date")
         if as_of > cutoff:
@@ -324,6 +430,9 @@ def _load_industry(path: Path, cutoff: str) -> list[tuple[Any, ...]]:
         if ticker not in normalized_members:
             raise ValueError("industry group_members must include its symbol")
         evidence = _json_string_array(row["evidence_ids"], field="industry evidence_ids")
+        sector_id = row.get("sector_id") or None
+        if sector_id is not None and _SECTOR_ID_RE.fullmatch(sector_id) is None:
+            raise ValueError("industry sector_id must be canonical GICS sector text or blank")
         key = (ticker, as_of)
         if previous is not None and key <= previous:
             raise ValueError("industry CSV is not canonical-sorted")
@@ -335,6 +444,7 @@ def _load_industry(path: Path, cutoff: str) -> list[tuple[Any, ...]]:
                 rank,
                 json.dumps(normalized_members, ensure_ascii=False, separators=(",", ":")),
                 json.dumps(evidence, ensure_ascii=False, separators=(",", ":")),
+                sector_id,
             )
         )
         previous = key
@@ -639,7 +749,7 @@ def _v3_provenance_metadata(
     membership_path: Path,
     prices_path: Path,
     fundamentals_path: Path,
-    industry_path: Path,
+    industry_path: Path | None,
     cutoff: str,
     evaluation_start: str,
     warmup_start: str,
@@ -653,9 +763,10 @@ def _v3_provenance_metadata(
     prices_provenance: Mapping[str, object],
     fundamentals_provenance_path: Path,
     fundamentals_provenance: Mapping[str, object],
-    industry_provenance_path: Path,
-    industry_provenance: Mapping[str, object],
+    industry_provenance_path: Path | None,
+    industry_provenance: Mapping[str, object] | None,
     allow_nonproduction_fixture: bool = False,
+    industry_preparation_stage: bool = False,
 ) -> tuple[
     dict[str, str],
     set[str],
@@ -666,7 +777,7 @@ def _v3_provenance_metadata(
     membership_sha = sha256_file(membership_path)
     prices_sha = sha256_file(prices_path)
     fundamentals_sha = sha256_file(fundamentals_path)
-    industry_sha = sha256_file(industry_path)
+    industry_sha = sha256_file(industry_path) if industry_path is not None else None
     if membership_provenance_path.read_bytes() != (
         pit_canonical_json(membership_provenance) + "\n"
     ).encode("utf-8"):
@@ -787,39 +898,57 @@ def _v3_provenance_metadata(
         raise ValueError("prices provenance start_date does not match warmup_start")
     if prices_provenance.get("end_date") != cutoff:
         raise ValueError("prices provenance end_date does not match data_cutoff")
-    if industry_provenance.get("industry_sha256") != industry_sha:
-        raise ValueError("industry provenance does not bind the industry CSV")
-    if industry_provenance.get("membership_csv_sha256") != membership_sha:
-        raise ValueError("industry provenance does not bind schema-V3 membership")
-    if industry_provenance.get("data_cutoff") != cutoff:
-        raise ValueError("industry provenance data_cutoff is inconsistent")
-    if _int(
-        industry_provenance.get("row_count"), field="industry row_count", allow_blank=False
-    ) != len(industry):
-        raise ValueError("industry provenance row count is inconsistent")
-    if (
-        industry_provenance.get("symbol_count")
-        != len({str(row[0]) for row in industry})
-        or industry_provenance.get("first_as_of_date")
-        != min(str(row[1]) for row in industry)
-        or industry_provenance.get("last_as_of_date")
-        != max(str(row[1]) for row in industry)
-    ):
-        raise ValueError("industry provenance coverage is inconsistent")
-    industry_source_kind = _required_v3_text(industry_provenance, "source_kind")
-    industry_retrieved_at = _required_v3_text(industry_provenance, "retrieved_at_utc")
-    try:
-        datetime_value = datetime.fromisoformat(
-            industry_retrieved_at[:-1] + "+00:00"
-        )
+    if industry_preparation_stage:
+        if industry or industry_path is not None or industry_provenance_path is not None or industry_provenance is not None:
+            raise ValueError("industry-preparation stage cannot include industry inputs")
+        industry_source_kind = "industry_preparation_pending"
+        industry_retrieved_at = ""
+    else:
         if (
-            not industry_retrieved_at.endswith("Z")
-            or datetime_value.utcoffset() is None
-            or datetime_value.utcoffset().total_seconds() != 0
+            industry_path is None
+            or industry_provenance_path is None
+            or industry_provenance is None
+            or industry_sha is None
         ):
-            raise ValueError
-    except ValueError as exc:
-        raise ValueError("industry provenance retrieval time is invalid") from exc
+            raise ValueError("schema-V3 production bundles require industry inputs")
+        if industry_provenance.get("industry_sha256") != industry_sha:
+            raise ValueError("industry provenance does not bind the industry CSV")
+        if industry_provenance.get("membership_csv_sha256") != membership_sha:
+            raise ValueError("industry provenance does not bind schema-V3 membership")
+        if industry_provenance.get("data_cutoff") != cutoff:
+            raise ValueError("industry provenance data_cutoff is inconsistent")
+        if _int(
+            industry_provenance.get("row_count"), field="industry row_count", allow_blank=False
+        ) != len(industry):
+            raise ValueError("industry provenance row count is inconsistent")
+        if (
+            industry_provenance.get("symbol_count")
+            != len({str(row[0]) for row in industry})
+            or industry_provenance.get("first_as_of_date")
+            != min(str(row[1]) for row in industry)
+            or industry_provenance.get("last_as_of_date")
+            != max(str(row[1]) for row in industry)
+        ):
+            raise ValueError("industry provenance coverage is inconsistent")
+        recorded_prices_provenance = industry_provenance.get("prices_provenance_sha256")
+        if recorded_prices_provenance is not None and recorded_prices_provenance != sha256_file(
+            prices_provenance_path
+        ):
+            raise ValueError("industry provenance does not bind prices provenance")
+        industry_source_kind = _required_v3_text(industry_provenance, "source_kind")
+        industry_retrieved_at = _required_v3_text(industry_provenance, "retrieved_at_utc")
+        try:
+            datetime_value = datetime.fromisoformat(
+                industry_retrieved_at[:-1] + "+00:00"
+            )
+            if (
+                not industry_retrieved_at.endswith("Z")
+                or datetime_value.utcoffset() is None
+                or datetime_value.utcoffset().total_seconds() != 0
+            ):
+                raise ValueError
+        except ValueError as exc:
+            raise ValueError("industry provenance retrieval time is invalid") from exc
 
     reference_values = list(PIT_NON_TRADABLE_REFERENCE_SYMBOLS)
     if (
@@ -891,11 +1020,9 @@ def _v3_provenance_metadata(
         "membership_source_sha256": membership_sha,
         "prices_source_sha256": prices_sha,
         "fundamentals_source_sha256": fundamentals_sha,
-        "industry_source_sha256": industry_sha,
         "membership_provenance_sha256": sha256_file(membership_provenance_path),
         "prices_provenance_sha256": sha256_file(prices_provenance_path),
         "fundamentals_provenance_sha256": sha256_file(fundamentals_provenance_path),
-        "industry_provenance_sha256": sha256_file(industry_provenance_path),
         "membership_source_kind": "normalized_three_universe_membership",
         "membership_revision_id": membership_inputs_sha,
         "membership_raw_sha256": membership_inputs_sha,
@@ -924,6 +1051,10 @@ def _v3_provenance_metadata(
         "non_tradable_reference_symbols_sha256": pit_canonical_json_sha256(reference_values),
         "source_universes_json": pit_canonical_json(list(_V3_SOURCE_UNIVERSES)),
     }
+    if not industry_preparation_stage:
+        assert industry_sha is not None and industry_provenance_path is not None
+        metadata["industry_source_sha256"] = industry_sha
+        metadata["industry_provenance_sha256"] = sha256_file(industry_provenance_path)
     metadata.update(lineage_bridge_metadata)
     for key in (
         "submissions_archive_sha256",
@@ -1111,6 +1242,7 @@ def _integrity_gate_v3(
     identities: Mapping[str, Mapping[str, object]],
     transitions: tuple[Mapping[str, object], ...],
     segment_contract: PriceIdentityTransitionContract | None = None,
+    industry_preparation_stage: bool = False,
 ) -> None:
     cutoff_date = date.fromisoformat(cutoff)
     evaluation_date = date.fromisoformat(evaluation_start)
@@ -1154,36 +1286,42 @@ def _integrity_gate_v3(
             lineage, evaluation_start, identities, transitions, segment_contract
         )
 
-    industry_by_date: dict[str, set[str]] = {}
-    industry_groups: dict[tuple[str, str], set[str]] = {}
-    for ticker, as_of, group_id, _rank, group_members_json, _evidence in industry:
-        if ticker in reference_symbols:
-            raise ValueError("reference symbols must not appear in industry")
-        industry_by_date.setdefault(str(as_of), set()).add(str(ticker))
-        industry_groups.setdefault((str(as_of), str(group_id)), set()).update(
-            json.loads(str(group_members_json))
-        )
-    covered_lineages: set[str] = set()
-    for as_of, observed in sorted(industry_by_date.items()):
-        active = _v3_active_lineages(membership, as_of)
-        union = set().union(*active.values())
-        expected = {
-            _v3_ticker_for_lineage(
-                lineage, as_of, identities, transitions, segment_contract
+    if industry_preparation_stage:
+        if industry:
+            raise ValueError("industry-preparation stage must have no industry rows")
+    else:
+        industry_by_date: dict[str, set[str]] = {}
+        industry_groups: dict[tuple[str, str], set[str]] = {}
+        for row in industry:
+            ticker, as_of, group_id, _rank, group_members_json, _evidence = row[:6]
+            if ticker in reference_symbols:
+                raise ValueError("reference symbols must not appear in industry")
+            industry_by_date.setdefault(str(as_of), set()).add(str(ticker))
+            industry_groups.setdefault((str(as_of), str(group_id)), set()).update(
+                json.loads(str(group_members_json))
             )
-            for lineage in union
-        }
-        if observed != expected:
-            raise ValueError(
-                "industry snapshot does not exactly cover the active membership union"
-            )
-        covered_lineages.update(union)
-        rows_for_date = [row for row in industry if row[1] == as_of]
-        for _ticker_value, _date, group_id, _rank, group_members_json, _evidence in rows_for_date:
-            if set(json.loads(str(group_members_json))) != industry_groups[(as_of, str(group_id))]:
-                raise ValueError("industry group_members disagree within a snapshot")
-    if covered_lineages != lineages:
-        raise ValueError("industry snapshots do not cover every membership lineage")
+        covered_lineages: set[str] = set()
+        for as_of, observed in sorted(industry_by_date.items()):
+            active = _v3_active_lineages(membership, as_of)
+            union = set().union(*active.values())
+            expected = {
+                _v3_ticker_for_lineage(
+                    lineage, as_of, identities, transitions, segment_contract
+                )
+                for lineage in union
+            }
+            if observed != expected:
+                raise ValueError(
+                    "industry snapshot does not exactly cover the active membership union"
+                )
+            covered_lineages.update(union)
+            rows_for_date = [row for row in industry if row[1] == as_of]
+            for row in rows_for_date:
+                _ticker_value, _date, group_id, _rank, group_members_json, _evidence = row[:6]
+                if set(json.loads(str(group_members_json))) != industry_groups[(as_of, str(group_id))]:
+                    raise ValueError("industry group_members disagree within a snapshot")
+        if covered_lineages != lineages:
+            raise ValueError("industry snapshots do not cover every membership lineage")
 
 
 def _create_bundle(output: Path, *, metadata: Mapping[str, str], membership: list[tuple[str, str, int]],
@@ -1247,6 +1385,7 @@ def _create_bundle_v3(
               group_rank INTEGER NOT NULL,
               group_members TEXT NOT NULL,
               evidence_ids TEXT NOT NULL,
+              sector_id TEXT,
               PRIMARY KEY (symbol, as_of_date)
             );
             """
@@ -1260,8 +1399,11 @@ def _create_bundle_v3(
         connection.executemany(
             "INSERT INTO fundamentals VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", fundamentals
         )
+        industry_rows = [
+            tuple(row) if len(row) == 7 else (*row, None) for row in industry
+        ]
         connection.executemany(
-            "INSERT INTO industry_group_snapshots VALUES (?,?,?,?,?,?)", industry
+            "INSERT INTO industry_group_snapshots VALUES (?,?,?,?,?,?,?)", industry_rows
         )
         connection.execute(
             "CREATE INDEX fundamentals_ticker_public_date_period_end_idx "
@@ -1277,18 +1419,29 @@ def _create_bundle_v3(
 
 
 def _manifest_with_v3_industry(
-    manifest: dict[str, object], industry: list[tuple[Any, ...]]
+    manifest: dict[str, object],
+    industry: list[tuple[Any, ...]],
+    *,
+    industry_preparation_stage: bool = False,
 ) -> dict[str, object]:
     if manifest.get("schema_version") != "3":
         return manifest
     result = dict(manifest)
     coverage = dict(result.get("coverage", {}))
-    coverage["industry"] = {
-        "first_date": min(str(row[1]) for row in industry),
-        "last_date": max(str(row[1]) for row in industry),
-        "row_count": len(industry),
-        "symbol_count": len({str(row[0]) for row in industry}),
-    }
+    coverage["industry"] = (
+        {
+            "state": "not_built",
+            "row_count": 0,
+            "symbol_count": 0,
+        }
+        if industry_preparation_stage and not industry
+        else {
+            "first_date": min(str(row[1]) for row in industry),
+            "last_date": max(str(row[1]) for row in industry),
+            "row_count": len(industry),
+            "symbol_count": len({str(row[0]) for row in industry}),
+        }
+    )
     result["coverage"] = coverage
     return result
 
@@ -1324,6 +1477,10 @@ def main() -> int:
     parser.add_argument("--membership-csv", required=True)
     parser.add_argument("--prices-csv", required=True)
     parser.add_argument("--fundamentals-csv", required=True)
+    parser.add_argument(
+        "--institutional-csv", action="append", default=[],
+        help="optional V5-ready institutional fundamentals CSV; may be supplied more than once",
+    )
     parser.add_argument("--industry-csv")
     parser.add_argument("--data-cutoff", required=True, help="inclusive YYYY-MM-DD cutoff")
     parser.add_argument("--evaluation-start", required=True)
@@ -1332,6 +1489,7 @@ def main() -> int:
     parser.add_argument("--prices-provenance", required=True)
     parser.add_argument("--fundamentals-provenance", required=True)
     parser.add_argument("--industry-provenance")
+    parser.add_argument("--industry-preparation-stage", action="store_true")
     parser.add_argument("--output", required=True)
     parser.add_argument("--manifest-output", required=True, help="required manifest-last commit marker")
     parser.add_argument(
@@ -1344,14 +1502,21 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    if args.schema_version == "3" and (
+    if args.industry_preparation_stage and args.schema_version != "3":
+        parser.error("--industry-preparation-stage requires --schema-version 3")
+    if args.schema_version == "3" and args.industry_preparation_stage:
+        if args.industry_csv is not None or args.industry_provenance is not None:
+            parser.error("preparation stage cannot include industry inputs")
+    elif args.schema_version == "3" and (
         args.industry_csv is None or args.industry_provenance is None
     ):
         parser.error(
             "--industry-csv and --industry-provenance are required for --schema-version 3"
         )
     if args.schema_version == "2" and (
-        args.industry_csv is not None or args.industry_provenance is not None
+        args.industry_csv is not None
+        or args.industry_provenance is not None
+        or args.industry_preparation_stage
     ):
         parser.error("industry inputs are schema-version-3-only")
     if args.schema_version != "3" and args.allow_nonproduction_fixture:
@@ -1363,6 +1528,11 @@ def main() -> int:
     membership_path = _regular_input(args.membership_csv)
     prices_path = _regular_input(args.prices_csv)
     fundamentals_path = _regular_input(args.fundamentals_csv)
+    institutional_paths = tuple(
+        _regular_input(path) for path in args.institutional_csv
+    )
+    if len(set(institutional_paths)) != len(institutional_paths):
+        raise ValueError("institutional CSV inputs must be unique")
     provenance_reader = _json_input_v3 if args.schema_version == "3" else _json_input
     if args.schema_version == "3":
         membership_provenance_path, membership_provenance = provenance_reader(
@@ -1386,10 +1556,11 @@ def main() -> int:
         )
     inputs = {membership_path, prices_path, fundamentals_path, membership_provenance_path,
               prices_provenance_path, fundamentals_provenance_path}
+    inputs.update(institutional_paths)
     industry_path: Path | None = None
     industry_provenance_path: Path | None = None
     industry_provenance: Mapping[str, object] | None = None
-    if args.schema_version == "3":
+    if args.schema_version == "3" and not args.industry_preparation_stage:
         industry_path = _regular_input(args.industry_csv)
         industry_provenance_path, industry_provenance = _json_input_v3(
             args.industry_provenance, label="industry provenance"
@@ -1405,16 +1576,22 @@ def main() -> int:
 
     before_hashes = {path: sha256_file(path) for path in inputs}
     industry: list[tuple[Any, ...]] = []
+    institutional: list[tuple[Any, ...]] = []
     if args.schema_version == "3":
-        assert industry_path is not None
-        assert industry_provenance_path is not None
-        assert industry_provenance is not None
+        if not args.industry_preparation_stage:
+            assert industry_path is not None
+            assert industry_provenance_path is not None
+            assert industry_provenance is not None
         membership_v3 = _load_membership_v3(membership_path, cutoff)
         prices = _load_prices(prices_path, cutoff, ticker_parser=_ticker_v3)
         fundamentals = _load_fundamentals(
             fundamentals_path, cutoff, ticker_parser=_ticker_v3
         )
-        industry = _load_industry(industry_path, cutoff)
+        industry = (
+            []
+            if args.industry_preparation_stage
+            else _load_industry(industry_path, cutoff)
+        )
         (
             provenance_metadata,
             price_exclusions,
@@ -1442,7 +1619,20 @@ def main() -> int:
             industry_provenance_path=industry_provenance_path,
             industry_provenance=industry_provenance,
             allow_nonproduction_fixture=args.allow_nonproduction_fixture,
+            industry_preparation_stage=args.industry_preparation_stage,
         )
+        if institutional_paths:
+            institutional = _load_institutional_fundamentals(
+                institutional_paths,
+                cutoff,
+                ticker_parser=_ticker_v3,
+                identities=identities,
+                transitions=transitions,
+                segment_contract=segment_contract,
+            )
+            fundamentals = _merge_institutional_fundamentals(
+                fundamentals, institutional
+            )
         _integrity_gate_v3(
             cutoff=cutoff,
             evaluation_start=evaluation_start,
@@ -1455,6 +1645,7 @@ def main() -> int:
             identities=identities,
             transitions=transitions,
             segment_contract=segment_contract,
+            industry_preparation_stage=args.industry_preparation_stage,
         )
     else:
         membership = _load_membership(membership_path, cutoff)
@@ -1471,6 +1662,13 @@ def main() -> int:
             fundamentals_provenance_path=fundamentals_provenance_path,
             fundamentals_provenance=fundamentals_provenance,
         )
+        if institutional_paths:
+            institutional = _load_institutional_fundamentals(
+                institutional_paths, cutoff, ticker_parser=_ticker
+            )
+            fundamentals = _merge_institutional_fundamentals(
+                fundamentals, institutional
+            )
         _integrity_gate(cutoff=cutoff, evaluation_start=evaluation_start, warmup_start=warmup_start,
                         membership=membership, prices=prices, fundamentals=fundamentals,
                         price_exclusions=price_exclusions,
@@ -1486,6 +1684,17 @@ def main() -> int:
         "evaluation_start": evaluation_start, "warmup_start": warmup_start,
         **provenance_metadata,
     }
+    if args.industry_preparation_stage:
+        metadata["bundle_stage"] = "industry_preparation"
+    if institutional_paths:
+        source_digests = sorted(sha256_file(path) for path in institutional_paths)
+        metadata.update({
+            "institutional_source_csvs_sha256": pit_canonical_json_sha256(source_digests),
+            "institutional_source_count": str(len(institutional_paths)),
+            "institutional_observation_count": str(len(institutional)),
+            "institutional_null_ownership_count": str(sum(row[11] is None for row in institutional)),
+            "institutional_null_denominator_count": str(sum(row[10] is None for row in institutional)),
+        })
     output.parent.mkdir(parents=True, exist_ok=True)
     staged: list[tuple[Path, Path]] = []
     temp_paths: list[Path] = []
@@ -1524,7 +1733,11 @@ def main() -> int:
             bundle.load_price_identity_transition_contract(prices_provenance_path)
             manifest = bundle.manifest()
             manifest["symbols"] = manifest.pop("symbol_count")
-            manifest = _manifest_with_v3_industry(manifest, industry)
+            manifest = _manifest_with_v3_industry(
+                manifest,
+                industry,
+                industry_preparation_stage=args.industry_preparation_stage,
+            )
         staged.append((temp_output, output))
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
         descriptor, temp_name = tempfile.mkstemp(prefix=f".{manifest_path.name}.", suffix=".tmp", dir=manifest_path.parent)

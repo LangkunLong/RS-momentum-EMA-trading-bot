@@ -4011,6 +4011,7 @@ class PortfolioSimulator:
         )
         notionals: list[float] = []
         risks: list[float] = []
+        sectors: dict[str, float] = {}
         industries: dict[str, float] = {}
         gross = 0.0
         for symbol, trade in self._open_positions.items():
@@ -4030,9 +4031,14 @@ class PortfolioSimulator:
             gross += notional
             assignment = assignments.get(symbol)
             group = assignment.group_id if assignment is not None else "unclassified"
+            sector = (
+                assignment.sector_id
+                if assignment is not None and assignment.sector_id is not None
+                else "unclassified"
+            )
             industries[group] = industries.get(group, 0.0) + notional
+            sectors[sector] = sectors.get(sector, 0.0) + notional
         equity = self._equity + gross
-        sectors = {"unclassified": gross} if gross > 0 else {}
         return StrategyPolicyAdapterV3.build_portfolio_features(
             equity=equity,
             cash=self._equity,
