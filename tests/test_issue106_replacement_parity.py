@@ -398,3 +398,19 @@ def test_nested_parity_values_are_rejected_explicitly(history_value, paper_value
 
     with pytest.raises(TypeError, match="nested parity values are unsupported"):
         compare_replacement_cases(history, paper)
+
+
+@pytest.mark.parametrize(
+    "group",
+    ("policy_identity", "facts", "decision", "intent", "execution"),
+)
+def test_empty_evidence_group_is_unknown_instead_of_matched(group):
+    history = _comparison_case()
+    paper = _comparison_case()
+    history[group] = {}
+    paper[group] = {}
+
+    result = compare_replacement_cases(history, paper)
+
+    assert result.disposition is ParityDisposition.INCOMPLETE
+    assert group in result.unknowns

@@ -100,6 +100,9 @@ def compare_replacement_cases(
         if not isinstance(expected_group, Mapping) or not isinstance(observed_group, Mapping):
             unknown.append(group)
             continue
+        if not expected_group and not observed_group:
+            unknown.append(group)
+            continue
         for field, expected_value in expected_group.items():
             label = f"{group}.{field}"
             observed_value = observed_group.get(field, _MISSING)
@@ -118,6 +121,8 @@ def compare_replacement_cases(
     expected_execution = historical.get("execution")
     observed_execution = paper.get("execution")
     if not isinstance(expected_execution, Mapping) or not isinstance(observed_execution, Mapping):
+        unknown.append("execution")
+    elif not expected_execution and not observed_execution:
         unknown.append("execution")
     else:
         for field, expected_value in expected_execution.items():
