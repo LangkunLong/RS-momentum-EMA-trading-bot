@@ -13,6 +13,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import stat
+import time
 from typing import Iterator, Literal
 
 from core.pit_optimizer_evaluation import EvaluationPanelSpec
@@ -63,12 +64,15 @@ from core.pit_optimizer_v5.sandbox import (
     EVALUATOR_RUNTIME_SOURCE_LABEL_V5,
     ExecutionLeaseV5,
     ExecutionReservationV5,
+    MechanismDockerCaseRequestV1,
     SandboxMountFactoryV5,
     SandboxMountHandleV5,
     build_docker_argv_v5,
     derive_execution_lease_id_v5,
+    derive_mechanism_case_mount_authorities_v1,
     derive_sandbox_mount_authorities_v5,
     execution_output_name_v5,
+    mechanism_memory_limit_mib_v1,
     panel_execution_request_for_v5,
 )
 from core.pit_optimizer_v5.workspace import MaterializedWorkspaceV5, WorkspaceOwnerV5
@@ -86,6 +90,9 @@ _DOCKER_CONFIG_CONTENT_V5 = b"{}\n"
 _DOCKER_CONFIG_TEXT_V5 = _DOCKER_CONFIG_CONTENT_V5.decode("ascii")
 _PANEL_INPUT_NAMESPACE_V5 = "container-panel-input"
 _PANEL_INPUT_TARGET_V5 = "/pit/request/panel-request.json"
+_MECHANISM_INPUT_NAMESPACE_V1 = "container-mechanism-case-input"
+_MECHANISM_INPUT_TARGET_V1 = "/pit/request/mechanism-case.json"
+_MECHANISM_INPUT_MAXIMUM_BYTES_V1 = 8 * 1024 * 1024
 
 
 def _windows_key(path: str) -> str:
@@ -115,6 +122,19 @@ def _panel_input_reference_v5(
     if reference.sha256 != panel_input.sha256:
         raise ValueError("panel input canonical identity is inconsistent")
     return panel_input, reference
+
+
+def _mechanism_input_reference_v1(
+    request: MechanismDockerCaseRequestV1,
+) -> tuple[bytes, ArtifactRefV5]:
+    raw = request.canonical_bytes
+    reference = ArtifactRefV5(
+        f"adapter-blobs/{_MECHANISM_INPUT_NAMESPACE_V1}/{request.sha256}.bin",
+        hashlib.sha256(raw).hexdigest(),
+    )
+    if reference.sha256 != request.sha256 or len(raw) > _MECHANISM_INPUT_MAXIMUM_BYTES_V1:
+        raise ValueError("mechanism case input canonical identity is inconsistent")
+    return raw, reference
 
 
 def _is_reparse(info: os.stat_result) -> bool:
@@ -842,6 +862,7 @@ class _PinnedControlTransactionV5:
     transaction_root_identity: tuple[int, int]
     environment: tuple[tuple[str, str], ...]
     opaque_capability: object
+    deadline_monotonic: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1183,7 +1204,7 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
                     source_path=source_access.path,
                     source_identity=source_binding,
                     data_identity=data_identity,
-                    execution_key=execution_key,
+                    execution_key_sha256=canonical_sha256_v5(execution_key),
                     output_authority=authorities[2],
                 )
                 source_info = source_access.path.lstat()
@@ -1223,6 +1244,67 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
                 canonical_sha256_v5(data_file_identities),
             ),
             output_handle,
+        )
+
+    def mechanism_case_output_mount(
+        self,
+        *,
+        execution_authority_sha256: str,
+        output_authority_sha256: str,
+        source_bundle_sha256: str,
+        maximum_bytes: int,
+    ) -> SandboxMountHandleV5:
+        """Issue an output-only root for one source-bound mechanism case."""
+
+        if (
+            type(execution_authority_sha256) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", execution_authority_sha256) is None
+            or type(output_authority_sha256) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", output_authority_sha256) is None
+            or type(source_bundle_sha256) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", source_bundle_sha256) is None
+            or type(maximum_bytes) is not int
+            or maximum_bytes <= 0
+            or maximum_bytes > min(
+                self._manifest.resources.evaluation_output_limit_bytes,
+                self._profile.output_limit_bytes,
+            )
+        ):
+            raise ValueError("mechanism case output mount authority is invalid")
+        source_identity = canonical_sha256_v5(
+            {
+                "domain": "pit-optimizer-v5-mechanism-source-bundle-v1",
+                "source_bundle_sha256": source_bundle_sha256,
+            }
+        )
+        data_identity = canonical_sha256_v5(
+            {
+                "domain": "pit-optimizer-v5-mechanism-case-no-data-v1",
+                "execution_authority_sha256": execution_authority_sha256,
+            }
+        )
+        try:
+            with acquire_absolute_directory_v5(
+                self._output_root,
+                expected_identity=(self._output_info.st_dev, self._output_info.st_ino),
+            ) as output_access:
+                output_path, output_info = self._create_or_load_output(
+                    output_parent=output_access,
+                    source_path=self._repository.root,
+                    source_identity=source_identity,
+                    data_identity=data_identity,
+                    execution_key_sha256=execution_authority_sha256,
+                    output_authority=output_authority_sha256,
+                )
+        except (OSError, ValueError):
+            raise ValueError("mechanism case output mount could not be issued") from None
+        return self._mount_handle(
+            "output",
+            output_path,
+            output_info,
+            output_authority_sha256,
+            _directory_identity(output_path, output_info),
+            maximum_bytes=maximum_bytes,
         )
 
     def _authenticate_data_files(
@@ -1265,7 +1347,7 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
         source_path: Path,
         source_identity: str,
         data_identity: str,
-        execution_key: CandidateExecutionKeyV5,
+        execution_key_sha256: str,
         output_authority: str,
     ) -> tuple[Path, os.stat_result]:
         relative = f"pit-v5-output-{output_authority[:24]}"
@@ -1278,7 +1360,7 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
             5,
             self.mount_identity_sha256,
             self._owner,
-            canonical_sha256_v5(execution_key),
+            execution_key_sha256,
             output_authority,
             relative,
             _directory_identity(self._output_root, self._output_info),
@@ -1434,6 +1516,7 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
         binding: str,
         *,
         container_path: str | None = None,
+        maximum_bytes: int | None = None,
     ) -> SandboxMountHandleV5:
         capability = _MountCapabilityV5(
             self.mount_identity_sha256,
@@ -1451,7 +1534,11 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
             content_authority,
             str(path),
             container_path or {"source": "/pit/candidate", "data": "/pit/data", "output": "/pit/output"}[kind],
-            self._manifest.resources.evaluation_output_limit_bytes if kind == "output" else None,
+            (
+                self._manifest.resources.evaluation_output_limit_bytes
+                if kind == "output" and maximum_bytes is None
+                else maximum_bytes
+            ),
             capability,
         )
 
@@ -1532,10 +1619,14 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
     @contextmanager
     def pinned_request(
         self,
-        request: DockerPanelRequestV5,
+        request: DockerPanelRequestV5 | MechanismDockerCaseRequestV1,
     ) -> Iterator[tuple[Path, ...]]:
         """Hold every mount ancestry stable across one Docker engine boundary."""
 
+        if type(request) is MechanismDockerCaseRequestV1:
+            with self.pinned_mechanism_case_request(request) as paths:
+                yield paths
+            return
         self._authorize_request(request)
         with ExitStack() as stack:
             handles = (
@@ -1652,12 +1743,140 @@ class LocalSandboxMountFactoryV5(SandboxMountFactoryV5):
 
     def authenticate_request(
         self,
-        request: DockerPanelRequestV5,
+        request: DockerPanelRequestV5 | MechanismDockerCaseRequestV1,
     ) -> tuple[Path, ...]:
         """Reauthenticate every mount and its request-bound source/data authority."""
 
         with self.pinned_request(request) as paths:
             return paths
+
+    @contextmanager
+    def pinned_mechanism_case_request(
+        self,
+        request: MechanismDockerCaseRequestV1,
+    ) -> Iterator[tuple[Path, ...]]:
+        """Pin the authenticated request blob and its output-only directory."""
+
+        if (
+            type(request) is not MechanismDockerCaseRequestV1
+            or request.owner != self._owner
+            or request.manifest != self._manifest
+            or request.sandbox_profile != self._profile
+        ):
+            raise ValueError("mechanism case request differs from mount-factory authority")
+        execution_authority, output_authority = derive_mechanism_case_mount_authorities_v1(
+            owner=request.owner,
+            binding=request.binding,
+            role=request.role,
+            policy_revision=request.policy_revision,
+            source_bundle=request.source_bundle,
+            corpus=request.corpus,
+            case=request.case,
+            repetition=request.repetition,
+            sandbox_profile=request.sandbox_profile,
+            failure_mode=request.failure_mode,
+        )
+        source_identity = canonical_sha256_v5(
+            {
+                "domain": "pit-optimizer-v5-mechanism-source-bundle-v1",
+                "source_bundle_sha256": request.source_bundle.sha256,
+            }
+        )
+        data_identity = canonical_sha256_v5(
+            {
+                "domain": "pit-optimizer-v5-mechanism-case-no-data-v1",
+                "execution_authority_sha256": execution_authority,
+            }
+        )
+        relative = f"pit-v5-output-{output_authority[:24]}"
+        reservation = self._repository.load_typed_state(
+            namespace="sandbox-mount-reservation",
+            key=output_authority,
+            value_type=MountReservationRecordV5,
+            repair=False,
+        )
+        created = self._repository.load_typed_state(
+            namespace="sandbox-mount-created",
+            key=output_authority,
+            value_type=MountCreatedRecordV5,
+            repair=False,
+        )
+        ready = self._repository.load_typed_state(
+            namespace="sandbox-mount-ready",
+            key=output_authority,
+            value_type=MountReadyRecordV5,
+            repair=False,
+        )
+        raw, reference = _mechanism_input_reference_v1(request)
+        try:
+            stored = self._repository.load_binary_state(
+                namespace=_MECHANISM_INPUT_NAMESPACE_V1,
+                key=request.sha256,
+                reference=reference,
+                maximum_bytes=_MECHANISM_INPUT_MAXIMUM_BYTES_V1,
+            )
+        except (OSError, ValueError):
+            raise ValueError("mechanism case request bytes are unavailable") from None
+        if stored != raw:
+            raise ValueError("mechanism case request bytes differ from authority")
+        if (
+            reservation is None
+            or created is None
+            or ready is None
+            or reservation.factory_identity_sha256 != self.mount_identity_sha256
+            or reservation.owner != self._owner
+            or reservation.execution_key_sha256 != execution_authority
+            or reservation.output_authority_sha256 != output_authority
+            or reservation.output_relative_path != relative
+            or reservation.output_parent_identity_sha256
+            != _directory_identity(self._output_root, self._output_info)
+            or reservation.source_root_identity_sha256 != source_identity
+            or reservation.data_root_identity_sha256 != data_identity
+            or created.factory_identity_sha256 != self.mount_identity_sha256
+            or created.output_authority_sha256 != output_authority
+            or ready.factory_identity_sha256 != self.mount_identity_sha256
+            or ready.output_authority_sha256 != output_authority
+            or (created.output_device, created.output_inode) != (ready.output_device, ready.output_inode)
+        ):
+            raise ValueError("mechanism case output history differs from durable authority")
+        parts = PurePosixPath(reference.relative_path).parts
+        try:
+            with ExitStack() as stack:
+                output_access = stack.enter_context(self._pin_handle(request.output_mount))
+                repository_root = stack.enter_context(acquire_absolute_directory_v5(self._repository.root))
+                if self._repository.root_identity_sha256 != canonical_sha256_v5(
+                    {"device": repository_root.identity[0], "inode": repository_root.identity[1]}
+                ):
+                    raise ValueError("mechanism request repository root changed")
+                parent = stack.enter_context(
+                    acquire_directory_v5(
+                        self._repository.root,
+                        tuple(parts[:-1]),
+                        create=False,
+                        expected_root_identity=repository_root.identity,
+                    )
+                )
+                stream, info = open_regular_in_directory_v5(parent, parts[-1], writable=False)
+                stack.enter_context(stream)
+                observed = _hash_open_stream(
+                    stream,
+                    info,
+                    maximum_bytes=_MECHANISM_INPUT_MAXIMUM_BYTES_V1,
+                )
+                if observed[3] != reference.sha256 or info.st_size != len(raw):
+                    raise ValueError("mechanism case request mount bytes changed")
+                input_path = parent.path / parts[-1]
+                if _roots_overlap(output_access.path, input_path):
+                    raise ValueError("mechanism request and output roots overlap")
+                if (
+                    output_access.identity != (ready.output_device, ready.output_inode)
+                    or _directory_identity(output_access.path, output_access.path.lstat())
+                    != ready.output_root_identity_sha256
+                ):
+                    raise ValueError("mechanism output root identity changed")
+                yield (output_access.path, input_path)
+        except (OSError, ValueError):
+            raise ValueError("mechanism case request path is unavailable") from None
 
 
 class LocalContainerExecutorV5(ContainerExecutorV5):
@@ -1730,6 +1949,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                     "workdirs": (
                         ("semantic_probe", "/"),
                         ("panel_evaluation", "/"),
+                        ("mechanism_case", "/"),
                     ),
                     "mount_layout": (
                         ("semantic_probe", "four_policy_files_and_output"),
@@ -1737,10 +1957,12 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                             "panel_evaluation",
                             "four_policy_files_two_data_files_request_and_output",
                         ),
+                        ("mechanism_case", "request_with_source_bundle_and_output"),
                     ),
                     "output_names": (
                         ("semantic_probe", "semantic-fingerprint.json"),
                         ("panel_evaluation", "panel-evaluation.json"),
+                        ("mechanism_case", "mechanism-case.json"),
                     ),
                     "shell": False,
                 },
@@ -1814,6 +2036,17 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             raise ValueError("container panel input persistence differs from authority")
         return stored
 
+    def _ensure_mechanism_input(self, request: MechanismDockerCaseRequestV1) -> ArtifactRefV5:
+        raw, expected = _mechanism_input_reference_v1(request)
+        stored = self._repository.append_binary_state(
+            namespace=_MECHANISM_INPUT_NAMESPACE_V1,
+            key=request.sha256,
+            content=raw,
+        )
+        if stored != expected:
+            raise ValueError("container mechanism input persistence differs from authority")
+        return stored
+
     def _authenticate_command(
         self,
         command: ContainerCommandV5,
@@ -1827,10 +2060,15 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             or command.request.manifest != self._manifest
             or command.request.sandbox_profile != self._profile
             or command.argv != build_docker_argv_v5(command.request)
+            or type(command.request) is MechanismDockerCaseRequestV1
+            and command.deadline_monotonic is None
         ):
             raise ValueError("container command differs from executor authority")
         if persist_panel_input:
-            self._ensure_panel_input(command.request)
+            if type(command.request) is MechanismDockerCaseRequestV1:
+                self._ensure_mechanism_input(command.request)
+            else:
+                self._ensure_panel_input(command.request)
         paths = self._mount_factory.authenticate_request(command.request)
         if any(_roots_overlap(self._control_root, path) for path in paths):
             raise ValueError("container control root overlaps a sandbox mount")
@@ -1851,6 +2089,11 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
         generic[0] = str(self._docker_executable)
         generic[1] = "create"
         del generic[2]
+        memory_limit_mib = (
+            mechanism_memory_limit_mib_v1(command.request)
+            if type(command.request) is MechanismDockerCaseRequestV1
+            else self._profile.memory_limit_mib
+        )
         injected = [
             "--name",
             self._container_name(command.sha256),
@@ -1869,7 +2112,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             "--restart",
             "no",
             "--memory-swap",
-            f"{self._profile.memory_limit_mib}m",
+            f"{memory_limit_mib}m",
             "--no-healthcheck",
             "--stop-signal",
             "SIGTERM",
@@ -1895,11 +2138,23 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             "/",
         ]
         generic[2:2] = injected
-        data_mount = command.request.data_mount
-        if command.request.execution_key.stage == "semantic_probe":
+        if type(command.request) is MechanismDockerCaseRequestV1:
+            if any("/pit/data" in item or "/pit/candidate" in item for item in generic):
+                raise ValueError("mechanism case Docker grammar exposes an unbound mount")
+            _raw, reference = _mechanism_input_reference_v1(command.request)
+            input_path = self._repository.root.joinpath(*PurePosixPath(reference.relative_path).parts)
+            input_host_path = _docker_host_path_v5(input_path)
+            separator = generic.index("--")
+            generic[separator:separator] = [
+                "--mount",
+                f"type=bind,src={input_host_path},dst={_MECHANISM_INPUT_TARGET_V1},readonly",
+            ]
+        elif command.request.execution_key.stage == "semantic_probe":
+            data_mount = command.request.data_mount
             if data_mount is not None or any("/pit/data" in item for item in generic):
                 raise ValueError("semantic probe Docker grammar exposes PIT data")
         else:
+            data_mount = command.request.data_mount
             if type(data_mount) is not SandboxMountHandleV5:
                 raise ValueError("panel Docker grammar lacks its data authority")
             data_root_argument = f"type=bind,src={data_mount.host_path},dst={data_mount.container_path},readonly"
@@ -1940,15 +2195,30 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             derive_execution_lease_id_v5(command.sha256, role) for role in ("evaluator_process", "container")
         )
         runtime_argv = self._runtime_argv(command)
-        source_mounts = tuple(
-            (
-                _windows_key(str(Path(command.request.source_mount.host_path).joinpath(*relative.split("/")))),
-                f"{command.request.source_mount.container_path}/{relative.rsplit('/', 1)[-1]}",
-                False,
+        source_mounts = (
+            ()
+            if type(command.request) is MechanismDockerCaseRequestV1
+            else tuple(
+                (
+                    _windows_key(str(Path(command.request.source_mount.host_path).joinpath(*relative.split("/")))),
+                    f"{command.request.source_mount.container_path}/{relative.rsplit('/', 1)[-1]}",
+                    False,
+                )
+                for relative in EDITABLE_POLICY_PATHS_V5
             )
-            for relative in EDITABLE_POLICY_PATHS_V5
         )
-        if command.request.execution_key.stage == "semantic_probe":
+        if type(command.request) is MechanismDockerCaseRequestV1:
+            data_mounts: tuple[tuple[str, str, bool], ...] = ()
+            _raw, input_reference = _mechanism_input_reference_v1(command.request)
+            input_path = self._repository.root.joinpath(*PurePosixPath(input_reference.relative_path).parts)
+            input_mounts = (
+                (
+                    _windows_key(_docker_host_path_v5(input_path)),
+                    _MECHANISM_INPUT_TARGET_V1,
+                    False,
+                ),
+            )
+        elif command.request.execution_key.stage == "semantic_probe":
             if command.request.data_mount is not None:
                 raise ValueError("semantic probe reservation exposes PIT data")
             data_mounts: tuple[tuple[str, str, bool], ...] = ()
@@ -2550,6 +2820,8 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
     def _pinned_control_transaction(
         self,
         reservation: ExecutionReservationRecordV5,
+        *,
+        deadline_monotonic: float | None = None,
     ) -> Iterator[_PinnedControlTransactionV5]:
         """Hold every Docker control capability across a multi-command operation."""
 
@@ -2562,6 +2834,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                     target_identity,
                     environment,
                     self._control_capability,
+                    deadline_monotonic,
                 )
 
     def _control(
@@ -2584,6 +2857,11 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             or timeout <= 0
         ):
             raise ValueError("Docker control invocation is invalid")
+        if transaction.deadline_monotonic is not None:
+            remaining = transaction.deadline_monotonic - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Docker control operation exceeded its mechanism deadline")
+            timeout = min(timeout, remaining)
         from agent_loop import _bounded_process
 
         result = _bounded_process(
@@ -2770,8 +3048,9 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
         host: object,
         *,
         expected_mounts: tuple[tuple[str, str, bool], ...],
+        expected_memory_bytes: int,
     ) -> dict[str, object]:
-        if type(host) is not dict:
+        if type(host) is not dict or type(expected_memory_bytes) is not int or expected_memory_bytes <= 0:
             raise ValueError("container HostConfig is malformed")
         mount_authority = self._closed_host_mount_authority(host.get("Mounts"), expected_mounts)
         masked_paths = [
@@ -2828,7 +3107,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             "Runtime": "runc",
             "Isolation": "",
             "CpuShares": 0,
-            "Memory": self._profile.memory_limit_mib * 1024 * 1024,
+            "Memory": expected_memory_bytes,
             "NanoCpus": int(self._profile.cpu_limit * Decimal(1_000_000_000)),
             "CgroupParent": "",
             "BlkioWeight": 0,
@@ -2847,7 +3126,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             "DeviceCgroupRules": [],
             "DeviceRequests": [],
             "MemoryReservation": 0,
-            "MemorySwap": self._profile.memory_limit_mib * 1024 * 1024,
+            "MemorySwap": expected_memory_bytes,
             "MemorySwappiness": None,
             "OomKillDisable": False,
             "PidsLimit": self._profile.pid_limit,
@@ -3414,6 +3693,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
         host_authority = self._closed_host_authority(
             host,
             expected_mounts=reservation.expected_mounts,
+            expected_memory_bytes=self._command_memory_limit_bytes(reservation.command_argv),
         )
         network_authority = self._closed_network_authority(network)
         state_authority = self._closed_state(state, allowed_statuses=allowed_statuses)
@@ -3442,6 +3722,18 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             state_authority,
             canonical_sha256_v5(state_authority),
         )
+
+    @staticmethod
+    def _command_memory_limit_bytes(command_argv: tuple[str, ...]) -> int:
+        try:
+            index = command_argv.index("--memory")
+            value = command_argv[index + 1]
+        except (ValueError, IndexError):
+            raise ValueError("container command omits its memory limit") from None
+        match = re.fullmatch(r"([1-9][0-9]*)m", value)
+        if match is None:
+            raise ValueError("container command memory limit is malformed")
+        return int(match.group(1)) * 1024 * 1024
 
     @staticmethod
     def _phase_attestation(
@@ -3554,12 +3846,16 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                 self._append_phase(command.sha256, "launch_claim")
             self._ensure_control(record)
             try:
-                with self._pinned_control_transaction(record) as transaction:
+                with self._pinned_control_transaction(
+                    record,
+                    deadline_monotonic=command.deadline_monotonic,
+                ) as transaction:
                     image_authority = self._inspect_image(transaction)
                     with self._mount_factory.pinned_request(command.request):
                         created = self._phase(command.sha256, "created")
                         started = self._phase(command.sha256, "started")
                         identity = self._container_identity(command.sha256)
+                        create_timed_out = False
                         if (created is None) is not (identity is None):
                             if identity is None:
                                 raise ValueError("created phase lacks exact container identity")
@@ -3596,6 +3892,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                                 timeout=float(self._manifest.resources.worker_startup_timeout_seconds),
                                 output_limit=64 * 1024,
                             )
+                            create_timed_out = getattr(result, "timed_out", None) is True
                             created_id = result.stdout.strip() if self._successful(result) else ""
                             if created_id and re.fullmatch(r"[0-9a-f]{64}", created_id) is None:
                                 raise ValueError("Docker create returned a malformed container identity")
@@ -3607,7 +3904,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                                 allowed_statuses=("created",),
                             )
                             if not self._successful(result) and inspection is None:
-                                self._persist_failure(command)
+                                self._persist_control_failure(command, result)
                                 return
                             if inspection is not None and created_id and inspection.container_id != created_id:
                                 raise ValueError("Docker create identity differs from exact inspection")
@@ -3636,6 +3933,9 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                             )
                         else:
                             self._require_stable_container_identity(identity, inspection)
+                        if create_timed_out:
+                            self._persist_terminal(command, status="timed_out", exit_code=None, output=None)
+                            return
                         if started is not None:
                             assert inspection is not None
                             self._require_phase_transition(
@@ -3651,6 +3951,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                             self._append_phase(command.sha256, "start_claim")
                         assert inspection is not None
                         status = inspection.state_authority["Status"]
+                        start_timed_out = False
                         if status == "created" and start_is_new:
                             result = self._control(
                                 transaction,
@@ -3658,6 +3959,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                                 timeout=float(self._manifest.resources.worker_startup_timeout_seconds),
                                 output_limit=64 * 1024,
                             )
+                            start_timed_out = getattr(result, "timed_out", None) is True
                             inspection = self._inspect_container(
                                 transaction=transaction,
                                 reservation=record,
@@ -3666,7 +3968,7 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                                 allowed_statuses=("running", "exited"),
                             )
                             if not self._successful(result) and inspection is None:
-                                self._persist_failure(command)
+                                self._persist_control_failure(command, result)
                                 return
                         elif status == "created":
                             self._persist_failure(command)
@@ -3678,6 +3980,9 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                             return
                         self._require_stable_container_identity(identity, inspection)
                         if inspection.state_authority["Status"] not in {"running", "exited"}:
+                            if start_timed_out and inspection.state_authority["Status"] == "created":
+                                self._persist_terminal(command, status="timed_out", exit_code=None, output=None)
+                                return
                             self._persist_failure(command)
                             return
                         self._append_observed_phase(
@@ -3686,6 +3991,10 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                             identity=identity,
                             inspection=inspection,
                         )
+                        if start_timed_out:
+                            self._persist_terminal(command, status="timed_out", exit_code=None, output=None)
+            except TimeoutError:
+                self._persist_terminal(command, status="timed_out", exit_code=None, output=None)
             except Exception:
                 self._persist_failure(command)
 
@@ -3743,6 +4052,15 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
     def _persist_failure(self, command: ContainerCommandV5) -> ExecutionTerminalRecordV5:
         return self._persist_terminal(command, status="failed", exit_code=None, output=None)
 
+    def _persist_control_failure(
+        self,
+        command: ContainerCommandV5,
+        result: object,
+    ) -> ExecutionTerminalRecordV5:
+        if getattr(result, "timed_out", None) is True:
+            return self._persist_terminal(command, status="timed_out", exit_code=None, output=None)
+        return self._persist_failure(command)
+
     def _result_from_terminal(
         self,
         command: ContainerCommandV5,
@@ -3755,11 +4073,16 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
             raise ValueError("container terminal differs from command authority")
         content = None
         if terminal.output_ref is not None:
+            maximum_bytes = (
+                command.request.output_limit_bytes
+                if type(command.request) is MechanismDockerCaseRequestV1
+                else self._manifest.resources.evaluation_output_limit_bytes
+            )
             content = self._repository.load_binary_state(
                 namespace="container-output",
                 key=command.sha256,
                 reference=terminal.output_ref,
-                maximum_bytes=self._manifest.resources.evaluation_output_limit_bytes + 1,
+                maximum_bytes=maximum_bytes + 1,
             )
         if terminal.observed_byte_count != (0 if content is None else len(content)):
             raise ValueError("container terminal output length is invalid")
@@ -3778,6 +4101,11 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
 
     def _read_output(self, command: ContainerCommandV5) -> bytes | None:
         output_name = execution_output_name_v5(command.request)
+        maximum_bytes = (
+            command.request.output_limit_bytes
+            if type(command.request) is MechanismDockerCaseRequestV1
+            else self._manifest.resources.evaluation_output_limit_bytes
+        )
         with self._mount_factory._pin_handle(command.request.output_mount) as output_root:
             path = output_root.path / output_name
             if _lstat_optional(path) is None:
@@ -3789,12 +4117,12 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                     writable=False,
                 )
                 try:
-                    content = stream.read(self._manifest.resources.evaluation_output_limit_bytes + 1)
+                    content = stream.read(maximum_bytes + 1)
                 finally:
                     stream.close()
             except (OSError, ValueError):
                 raise ValueError("container output could not be read") from None
-            if len(content) <= self._manifest.resources.evaluation_output_limit_bytes and info.st_size != len(content):
+            if len(content) <= maximum_bytes and info.st_size != len(content):
                 raise ValueError("container output changed during bounded read")
             return content
 
@@ -3828,7 +4156,10 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                 return self._result_from_terminal(command, self._persist_failure(command))
             self._ensure_control(record)
             try:
-                with self._pinned_control_transaction(record) as transaction:
+                with self._pinned_control_transaction(
+                    record,
+                    deadline_monotonic=command.deadline_monotonic,
+                ) as transaction:
                     image_authority = self._inspect_image(transaction)
                     inspection = self._inspect_container(
                         transaction=transaction,
@@ -3958,6 +4289,14 @@ class LocalContainerExecutorV5(ContainerExecutorV5):
                         output=output,
                     )
                     return self._result_from_terminal(command, terminal)
+            except TimeoutError:
+                terminal = self._persist_terminal(
+                    command,
+                    status="timed_out",
+                    exit_code=None,
+                    output=None,
+                )
+                return self._result_from_terminal(command, terminal)
             except Exception:
                 return self._result_from_terminal(command, self._persist_failure(command))
 

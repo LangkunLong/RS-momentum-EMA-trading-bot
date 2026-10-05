@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 import json
 import math
 import ntpath
@@ -15,6 +16,15 @@ from core.pit_optimizer_v5.candidate_ir import (
     PolicyRevisionIdentityV5,
     RenderedVariantV5,
     SourceBundleV5,
+)
+from core.pit_optimizer_v5.mechanism_contracts import (
+    MechanismObservationBindingV1,
+    mechanism_request_allocation_v1,
+)
+from core.pit_optimizer_v5.mechanism_probes import (
+    MechanismObservationCorpusV1,
+    MechanismPairedCaseV1,
+    MechanismWorkerRoleV1,
 )
 from core.pit_optimizer_v5.contracts import (
     CampaignManifestV5,
@@ -77,6 +87,7 @@ ExecutionRoleV5 = Literal["evaluator_process", "container"]
 ReservationDispositionV5 = Literal["created", "existing"]
 MountKindV5 = Literal["source", "data", "output"]
 MountModeV5 = Literal["read_only", "bounded_write_only"]
+MechanismWorkerFailureModeV1 = Literal["none", "terminate_child_after_ready"]
 
 _FAILURES = frozenset(get_args(SandboxFailureCodeV5))
 EVALUATOR_RUNTIME_SOURCE_LABEL_V5 = "io.trading-bot.pit-v5.runtime-source-sha256"
@@ -391,14 +402,256 @@ class DockerPanelRequestV5:
         return canonical_sha256_v5(self.to_primitive())
 
 
+def derive_mechanism_case_mount_authorities_v1(
+    *,
+    owner: WorkspaceOwnerV5,
+    binding: MechanismObservationBindingV1,
+    role: MechanismWorkerRoleV1,
+    policy_revision: PolicyRevisionIdentityV5,
+    source_bundle: SourceBundleV5,
+    corpus: MechanismObservationCorpusV1,
+    case: MechanismPairedCaseV1,
+    repetition: int,
+    sandbox_profile: SandboxProfileV5,
+    failure_mode: MechanismWorkerFailureModeV1 = "none",
+) -> tuple[str, str]:
+    """Bind one immutable source/case request and its write-only output root."""
+
+    if (
+        type(owner) is not WorkspaceOwnerV5
+        or type(binding) is not MechanismObservationBindingV1
+        or type(policy_revision) is not PolicyRevisionIdentityV5
+        or type(source_bundle) is not SourceBundleV5
+        or type(corpus) is not MechanismObservationCorpusV1
+        or type(case) is not MechanismPairedCaseV1
+        or type(sandbox_profile) is not SandboxProfileV5
+        or type(failure_mode) is not str
+        or failure_mode not in {"none", "terminate_child_after_ready"}
+        or type(role) is not str
+        or role not in {"parent", "candidate"}
+        or type(repetition) is not int
+        or not 0 <= repetition < binding.resource_budget.max_repetitions
+    ):
+        raise ValueError("mechanism Docker case authority is invalid")
+    if (
+        corpus.sha256 != binding.corpus_sha256
+        or case.order >= len(corpus.cases)
+        or corpus.cases[case.order] != case
+        or policy_revision.editable_source_sha256
+        != tuple((item.path, item.sha256) for item in source_bundle.files)
+        or (role == "parent" and policy_revision.sha256 != binding.parent_revision_sha256)
+        or (role == "candidate" and source_bundle.sha256 != binding.candidate_bytes_sha256)
+    ):
+        raise ValueError("mechanism Docker case source/corpus differs from its binding")
+    authority = canonical_sha256_v5(
+        {
+            "domain": "pit-optimizer-v5-mechanism-case-execution-v1",
+            "owner_sha256": owner.sha256,
+            "binding_sha256": binding.sha256,
+            "role": role,
+            "policy_revision_sha256": policy_revision.sha256,
+            "source_bundle_sha256": source_bundle.sha256,
+            "corpus_sha256": corpus.sha256,
+            "case_order": case.order,
+            "input_identity_sha256": case.input_identity_sha256,
+            "snapshot_sha256": case.snapshot_sha256,
+            "repetition": repetition,
+            "failure_mode": failure_mode,
+            "sandbox_profile_sha256": sandbox_profile.sha256,
+        }
+    )
+    output_authority = canonical_sha256_v5(
+        {
+            "domain": "pit-optimizer-v5-mechanism-case-output-v1",
+            "execution_authority_sha256": authority,
+            "owner_sha256": owner.sha256,
+        }
+    )
+    return authority, output_authority
+
+
 @dataclass(frozen=True, slots=True)
-class ContainerCommandV5:
-    request: DockerPanelRequestV5
-    argv: tuple[str, ...]
-    remaining_timeout_seconds: float
+class MechanismDockerCaseRequestV1:
+    """One exact policy-source decision in the bounded V5 container."""
+
+    owner: WorkspaceOwnerV5
+    manifest: CampaignManifestV5
+    sandbox_profile: SandboxProfileV5
+    role: MechanismWorkerRoleV1
+    policy_revision: PolicyRevisionIdentityV5
+    source_bundle: SourceBundleV5
+    binding: MechanismObservationBindingV1
+    corpus: MechanismObservationCorpusV1
+    case: MechanismPairedCaseV1
+    repetition: int
+    output_mount: SandboxMountHandleV5
+    failure_mode: MechanismWorkerFailureModeV1 = "none"
 
     def __post_init__(self) -> None:
-        if type(self.request) is not DockerPanelRequestV5:
+        if (
+            type(self.owner) is not WorkspaceOwnerV5
+            or type(self.manifest) is not CampaignManifestV5
+            or type(self.sandbox_profile) is not SandboxProfileV5
+            or type(self.policy_revision) is not PolicyRevisionIdentityV5
+            or type(self.source_bundle) is not SourceBundleV5
+            or type(self.binding) is not MechanismObservationBindingV1
+            or type(self.corpus) is not MechanismObservationCorpusV1
+            or type(self.case) is not MechanismPairedCaseV1
+            or type(self.output_mount) is not SandboxMountHandleV5
+        ):
+            raise ValueError("mechanism Docker case request authority is invalid")
+        if (
+            self.owner.campaign_id != self.manifest.campaign_id
+            or self.owner.round_index > self.manifest.search.max_feedback_rounds
+            or self.manifest.sandbox_profile_ref.sha256 != self.sandbox_profile.sha256
+        ):
+            raise ValueError("mechanism Docker case request differs from campaign authority")
+        budget = self.binding.resource_budget
+        resources = self.manifest.resources
+        request_count, cpu_share, timeout_share_ms, output_share_bytes = mechanism_request_allocation_v1(
+            self.binding
+        )
+        if (
+            timeout_share_ms <= 0
+            or timeout_share_ms > resources.mechanics_timeout_seconds * 1000
+            or output_share_bytes <= 0
+            or output_share_bytes > min(
+                resources.evaluation_output_limit_bytes,
+                self.sandbox_profile.output_limit_bytes,
+            )
+            or budget.memory_mib > min(resources.evaluation_memory_mib, self.sandbox_profile.memory_limit_mib)
+            or cpu_share > resources.evaluation_cpu_limit * Decimal(resources.mechanics_timeout_seconds)
+        ):
+            raise ValueError("mechanism Docker request exceeds the authenticated resource budget")
+        if request_count != 2 * budget.max_cases * budget.max_repetitions:
+            raise ValueError("mechanism request allocation count differs from its bound run")
+        if self.effective_timeout_ms <= 0:
+            raise ValueError("mechanism CPU budget is below the supported timeout resolution")
+        if self.failure_mode not in {"none", "terminate_child_after_ready"} or (
+            self.failure_mode == "terminate_child_after_ready"
+            and (self.role != "candidate" or self.case.order != 0 or self.repetition != 0)
+        ):
+            raise ValueError("mechanism worker failure mode is outside the single crash scope")
+        validate_sandbox_profile_resources_v5(self.sandbox_profile, self.manifest.resources)
+        _execution_authority, output_authority = derive_mechanism_case_mount_authorities_v1(
+            owner=self.owner,
+            binding=self.binding,
+            role=self.role,
+            policy_revision=self.policy_revision,
+            source_bundle=self.source_bundle,
+            corpus=self.corpus,
+            case=self.case,
+            repetition=self.repetition,
+            sandbox_profile=self.sandbox_profile,
+            failure_mode=self.failure_mode,
+        )
+        output_limit = self.output_bytes_per_request
+        if (
+            self.output_mount.kind != "output"
+            or self.output_mount.maximum_bytes != output_limit
+            or self.output_mount.content_authority_sha256 != output_authority
+        ):
+            raise ValueError("mechanism Docker case output mount differs from its authority")
+
+    @property
+    def output_limit_bytes(self) -> int:
+        return min(
+            self.output_bytes_per_request,
+            self.manifest.resources.evaluation_output_limit_bytes,
+            self.sandbox_profile.output_limit_bytes,
+        )
+
+    @property
+    def allocation_request_count(self) -> int:
+        return mechanism_request_allocation_v1(self.binding)[0]
+
+    @property
+    def cpu_seconds_per_request(self) -> Decimal:
+        return mechanism_request_allocation_v1(self.binding)[1]
+
+    @property
+    def timeout_ms_per_request(self) -> int:
+        return mechanism_request_allocation_v1(self.binding)[2]
+
+    @property
+    def output_bytes_per_request(self) -> int:
+        return mechanism_request_allocation_v1(self.binding)[3]
+
+    @property
+    def timeout_seconds(self) -> float:
+        return self.effective_timeout_ms / 1000.0
+
+    @property
+    def effective_timeout_ms(self) -> int:
+        budget_numerator, budget_denominator = self.cpu_seconds_per_request.as_integer_ratio()
+        quota_numerator, quota_denominator = self.manifest.resources.evaluation_cpu_limit.as_integer_ratio()
+        cpu_bound_timeout_ms = (budget_numerator * quota_denominator * 1000) // (
+            budget_denominator * quota_numerator
+        )
+        return min(
+            self.timeout_ms_per_request,
+            self.manifest.resources.mechanics_timeout_seconds * 1000,
+            cpu_bound_timeout_ms,
+        )
+
+    def to_primitive(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "owner_sha256": self.owner.sha256,
+            "manifest_sha256": self.manifest.sha256,
+            "sandbox_profile_sha256": self.sandbox_profile.sha256,
+            "role": self.role,
+            "policy_revision": self.policy_revision.to_primitive(),
+            "policy_revision_sha256": self.policy_revision.sha256,
+            "source_bundle": self.source_bundle.to_primitive(),
+            "source_bundle_sha256": self.source_bundle.sha256,
+            "binding": self.binding.to_primitive(),
+            "corpus_sha256": self.corpus.sha256,
+            "case": {
+                "order": self.case.order,
+                "input_value": self.case.input_value,
+                "input_canonical_bytes": self.case.input_canonical_bytes.decode("utf-8"),
+                "input_identity_sha256": self.case.input_identity_sha256,
+                "converted_value": self.case.converted_value,
+                "snapshot_canonical_json": self.case.snapshot_canonical_json.decode("utf-8"),
+                "snapshot_sha256": self.case.snapshot_sha256,
+                "applicable": self.case.applicable,
+            },
+            "repetition": self.repetition,
+            "failure_mode": self.failure_mode,
+            "resource_budget": self.binding.resource_budget.to_primitive(),
+            "output_mount": {
+                "root_identity_sha256": self.output_mount.root_identity_sha256,
+                "content_authority_sha256": self.output_mount.content_authority_sha256,
+                "container_path": self.output_mount.container_path,
+                "maximum_bytes": self.output_mount.maximum_bytes,
+            },
+            "allocation_request_count": self.allocation_request_count,
+            "cpu_seconds_per_request": self.cpu_seconds_per_request,
+            "timeout_ms_per_request": self.timeout_ms_per_request,
+            "output_bytes_per_request": self.output_bytes_per_request,
+            "effective_timeout_ms": self.effective_timeout_ms,
+            "output_limit_bytes": self.output_limit_bytes,
+        }
+
+    @property
+    def canonical_bytes(self) -> bytes:
+        return canonical_json_bytes_v5(self.to_primitive())
+
+    @property
+    def sha256(self) -> str:
+        return canonical_sha256_v5(self.to_primitive())
+
+
+@dataclass(frozen=True, slots=True)
+class ContainerCommandV5:
+    request: DockerPanelRequestV5 | MechanismDockerCaseRequestV1
+    argv: tuple[str, ...]
+    remaining_timeout_seconds: float
+    deadline_monotonic: float | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.request) not in {DockerPanelRequestV5, MechanismDockerCaseRequestV1}:
             raise ValueError("container command request is invalid")
         if (
             type(self.argv) is not tuple
@@ -412,6 +665,10 @@ class ContainerCommandV5:
             or self.remaining_timeout_seconds <= 0
         ):
             raise ValueError("container command timeout is invalid")
+        if self.deadline_monotonic is not None and (
+            type(self.deadline_monotonic) is not float or not math.isfinite(self.deadline_monotonic)
+        ):
+            raise ValueError("container command deadline is invalid")
 
     @property
     def sha256(self) -> str:
@@ -800,13 +1057,27 @@ def _semantic_policy_mount_args_v5(
     return tuple(arguments)
 
 
-def execution_output_name_v5(request: DockerPanelRequestV5) -> str:
+def execution_output_name_v5(request: DockerPanelRequestV5 | MechanismDockerCaseRequestV1) -> str:
+    if type(request) is MechanismDockerCaseRequestV1:
+        return "mechanism-case.json"
     if type(request) is not DockerPanelRequestV5:
         raise ValueError("execution output request is invalid")
     return (
         "semantic-fingerprint.json"
         if request.execution_key.stage == "semantic_probe"
         else "panel-evaluation.json"
+    )
+
+
+def mechanism_memory_limit_mib_v1(request: MechanismDockerCaseRequestV1) -> int:
+    """Return the effective no-swap memory ceiling for one mechanism request."""
+
+    if type(request) is not MechanismDockerCaseRequestV1:
+        raise ValueError("mechanism memory limit requires a V1 case request")
+    return min(
+        request.binding.resource_budget.memory_mib,
+        request.manifest.resources.evaluation_memory_mib,
+        request.sandbox_profile.memory_limit_mib,
     )
 
 
@@ -848,9 +1119,82 @@ def panel_execution_request_for_v5(
     )
 
 
-def build_docker_argv_v5(request: DockerPanelRequestV5) -> tuple[str, ...]:
+def build_mechanism_docker_argv_v1(request: MechanismDockerCaseRequestV1) -> tuple[str, ...]:
+    if type(request) is not MechanismDockerCaseRequestV1:
+        raise ValueError("mechanism Docker argv requires a V1 case request")
+    resources = request.manifest.resources
+    cpu = canonical_primitive_v5(resources.evaluation_cpu_limit)
+    cpu_seconds = canonical_primitive_v5(request.cpu_seconds_per_request)
+    assert type(cpu) is str and type(cpu_seconds) is str
+    memory_mib = mechanism_memory_limit_mib_v1(request)
+    timeout_ms = request.effective_timeout_ms
+    argv = [
+        "docker",
+        "run",
+        "--rm",
+        "--network",
+        "none",
+        "--read-only",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "--pids-limit",
+        str(resources.evaluation_pid_limit),
+        "--cpus",
+        cpu,
+        "--memory",
+        f"{memory_mib}m",
+        "--mount",
+        _mount_arg(request.output_mount),
+        "--tmpfs",
+        "/tmp:rw,noexec,nosuid,nodev,size=16m",
+        "--",
+        request.sandbox_profile.image_reference,
+        "python",
+        "-P",
+        "-B",
+        "-m",
+        "core.pit_optimizer_v5.mechanism_entry",
+        "--request-sha256",
+        request.sha256,
+        "--role",
+        request.role,
+        "--policy-sha256",
+        request.policy_revision.sha256,
+        "--source-bundle-sha256",
+        request.source_bundle.sha256,
+        "--binding-sha256",
+        request.binding.sha256,
+        "--corpus-sha256",
+        request.corpus.sha256,
+        "--case-order",
+        str(request.case.order),
+        "--snapshot-sha256",
+        request.case.snapshot_sha256,
+        "--repetition",
+        str(request.repetition),
+        "--failure-mode",
+        request.failure_mode,
+        "--sandbox-profile-sha256",
+        request.sandbox_profile.sha256,
+        "--runtime-source-sha256",
+        request.sandbox_profile.runtime_source_sha256,
+        "--timeout-ms",
+        str(timeout_ms),
+        "--cpu-seconds",
+        cpu_seconds,
+        "--output-limit-bytes",
+        str(request.output_limit_bytes),
+    ]
+    return tuple(argv)
+
+
+def build_docker_argv_v5(request: DockerPanelRequestV5 | MechanismDockerCaseRequestV1) -> tuple[str, ...]:
+    if type(request) is MechanismDockerCaseRequestV1:
+        return build_mechanism_docker_argv_v1(request)
     if type(request) is not DockerPanelRequestV5:
-        raise ValueError("Docker argv requires a V5 panel request")
+        raise ValueError("Docker argv requires a V5 panel or mechanism case request")
     cpu = canonical_primitive_v5(request.manifest.resources.evaluation_cpu_limit)
     assert type(cpu) is str
     argv = [
@@ -1875,6 +2219,8 @@ __all__ = [
     "DockerPanelEvaluatorV5",
     "DockerPanelOutcomeV5",
     "DockerPanelRequestV5",
+    "MechanismDockerCaseRequestV1",
+    "MechanismWorkerFailureModeV1",
     "ExecutionLeaseV5",
     "ExecutionReservationV5",
     "ExecutionRoleV5",
@@ -1889,6 +2235,7 @@ __all__ = [
     "SandboxMountFactoryV5",
     "SandboxMountHandleV5",
     "build_docker_argv_v5",
+    "build_mechanism_docker_argv_v1",
     "decode_panel_evaluation_v5",
     "decode_semantic_fingerprint_output_v5",
     "derive_trusted_probe_runtime_authority_v5",
@@ -1896,7 +2243,10 @@ __all__ = [
     "EVALUATOR_RUNTIME_KIND_V5",
     "EVALUATOR_RUNTIME_SOURCE_LABEL_V5",
     "derive_sandbox_mount_authorities_v5",
+    "derive_mechanism_case_mount_authorities_v1",
     "derive_execution_lease_id_v5",
     "execution_output_name_v5",
+    "mechanism_memory_limit_mib_v1",
+    "mechanism_request_allocation_v1",
     "panel_execution_request_for_v5",
 ]
