@@ -979,7 +979,6 @@ def test_industry_preparation_stage_bundle_is_rejected_by_decision_features(
 
 def _write_d1_causal_bundle(tmp_path: Path):
     """Extend the accepted V3 fixture with dated ownership/classification changes."""
-    fixture = _fixture()
     bundle_path, _old_digest, provenance_path, base_availability = (
         _write_schema_v3_bundle(tmp_path)
     )
