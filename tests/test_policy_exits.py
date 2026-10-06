@@ -177,6 +177,21 @@ def test_close_action_and_protective_resize_use_the_remaining_quantity(tmp_path)
     assert resize.replaces_broker_order_id == reduced.confirmed_stop_broker_order_id
     assert resize.replaces_client_order_id == reduced.confirmed_stop_client_order_id
     assert resize.stop_intent.requested_stop_price == reduced.confirmed_protective_stop_price
+    assert resize.disposition == "replace"
+    pending_replay = propose_protection_resize(
+        store,
+        decision=decision,
+        holding_episode_id=holding.holding_episode_id,
+        stop_price=reduced.confirmed_protective_stop_price,
+        expected_holding_version=reduced.state_version,
+        policy_payload={"reason": "post_scale_out"},
+        guard_payload={"outcome": "allow_offline_fixture"},
+        observed_at=decision.clock.account_valuation_at,
+    )
+    assert pending_replay.disposition == "reconcile"
+    assert pending_replay.replaces_client_order_id is None
+    assert pending_replay.replaces_broker_order_id is None
+    assert pending_replay.current_confirmed_stop_broker_order_id == reduced.confirmed_stop_broker_order_id
     record = store.load_decision_record(decision.decision_id)
     assert record.effective_action_payload["remaining_quantity"] == "2"
     # The fake broker receives the persisted quantity, then its confirmed order reference is durable.
@@ -210,6 +225,10 @@ def test_close_action_and_protective_resize_use_the_remaining_quantity(tmp_path)
     )
     assert recovered_resize.remaining_quantity == Decimal("2")
     assert recovered_resize.stop_intent == resize.stop_intent
+    assert recovered_resize.disposition == "confirmed"
+    assert recovered_resize.replaces_client_order_id is None
+    assert recovered_resize.replaces_broker_order_id is None
+    assert recovered_resize.current_confirmed_stop_broker_order_id == "resized-stop-broker"
 
     close_decision = _exit_decision(features, deployment, portfolio, confirmed, sequence=2)
     close = start_full_exit(

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime
-from typing import Callable, Mapping
+from typing import Callable, Literal, Mapping
 
 from core.policy_execution_state import (
     ActionIntent,
@@ -24,15 +24,18 @@ _RESIZE_KIND = "policy_protective_resize_v1"
 
 @dataclass(frozen=True, slots=True)
 class ProtectionResizePlan:
-    """Durable request to resize the existing stop to the holding's current shares."""
+    """Durable replacement state; only the initial proposal is dispatchable."""
 
     decision: DecisionIdentity
     holding_episode_id: str
     remaining_quantity: Decimal
     stop_price: Decimal
     stop_intent: StopUpdateIntent
-    replaces_client_order_id: str
-    replaces_broker_order_id: str
+    disposition: Literal["replace", "reconcile", "confirmed"]
+    replaces_client_order_id: str | None
+    replaces_broker_order_id: str | None
+    current_confirmed_stop_client_order_id: str | None
+    current_confirmed_stop_broker_order_id: str | None
 
 
 def _positive_decimal(value: Decimal, name: str) -> Decimal:
@@ -349,6 +352,7 @@ def propose_protection_resize(
         if not isinstance(expected_version, int) or isinstance(expected_version, bool):
             raise ValueError("stored protection resize has no valid holding version")
         stop_intent = _resize_intent(decision, holding_episode_id, price)
+        proposal_created = False
         try:
             persisted_intent = store.load_stop_update_intent(stop_intent.logical_action_id)
         except KeyError:
@@ -363,16 +367,37 @@ def propose_protection_resize(
                 expected_holding_version=expected_version,
                 observed_at=observed_at,
             )
+            proposal_created = True
         current = store.load_holding_episode(holding_episode_id)
         if current.remaining_quantity != quantity:
             raise ConcurrentStateUpdateError("holding quantity changed after the protective resize was prepared")
         if persisted_intent != stop_intent:
             raise ValueError("stored protective resize intent differs from the fixed decision")
+        confirmed = current.confirmed_stop_action_id == stop_intent.logical_action_id
+        if not confirmed and current.proposed_stop_action_id != stop_intent.logical_action_id:
+            raise ValueError("stored protective resize is not pending or confirmed on the holding")
+        if confirmed:
+            disposition = "confirmed"
+        elif proposal_created:
+            disposition = "replace"
+        else:
+            disposition = "reconcile"
         client_id = effective.get("replaces_client_order_id")
         broker_id = effective.get("replaces_broker_order_id")
         if not isinstance(client_id, str) or not isinstance(broker_id, str):
             raise ValueError("stored protective resize has no prior stop order references")
-        return ProtectionResizePlan(decision, holding_episode_id, quantity, price, persisted_intent, client_id, broker_id)
+        return ProtectionResizePlan(
+            decision=decision,
+            holding_episode_id=holding_episode_id,
+            remaining_quantity=quantity,
+            stop_price=price,
+            stop_intent=persisted_intent,
+            disposition=disposition,
+            replaces_client_order_id=client_id if disposition == "replace" else None,
+            replaces_broker_order_id=broker_id if disposition == "replace" else None,
+            current_confirmed_stop_client_order_id=current.confirmed_stop_client_order_id,
+            current_confirmed_stop_broker_order_id=current.confirmed_stop_broker_order_id,
+        )
 
     holding = store.load_holding_episode(holding_episode_id)
     _validate_decision(decision, holding, subject_id=holding_episode_id)
@@ -416,6 +441,9 @@ def propose_protection_resize(
         remaining_quantity=holding.remaining_quantity,
         stop_price=price,
         stop_intent=stop_intent,
+        disposition="replace",
         replaces_client_order_id=holding.confirmed_stop_client_order_id,
         replaces_broker_order_id=holding.confirmed_stop_broker_order_id,
+        current_confirmed_stop_client_order_id=holding.confirmed_stop_client_order_id,
+        current_confirmed_stop_broker_order_id=holding.confirmed_stop_broker_order_id,
     )
