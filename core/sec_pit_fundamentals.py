@@ -1396,6 +1396,7 @@ def _candidates_for_cik(
                 q3_ytd_input = (
                     metric in _Q4_FLOW_METRICS
                     and income_type == "quarterly"
+                    and str(fp).upper() == "Q3"
                     and duration_days is not None
                     and duration_days > 115
                 )

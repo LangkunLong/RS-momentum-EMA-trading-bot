@@ -368,6 +368,21 @@ def test_q4_q3_ytd_incompatible_later_revision_clears_only_affected_metric(tmp_p
     assert "start_mismatch" in invalidation["reason_codes"]
 
 
+def test_q4_late_q2_ytd_amendment_does_not_invalidate_q3_ytd_derivation(tmp_path: Path) -> None:
+    facts = _base_q4_facts()
+    q2_amendment = _q4_fact(
+        "0000000001-25-000003", "10-Q/A", "2025-03-03", _Q4_YEAR, "Q2",
+        "2024-01-01", "2024-06-29", 510.25,
+    )
+    facts.append((_REVENUE_NS, _REVENUE_TAG, _REVENUE_UNIT, q2_amendment))
+
+    q4 = _q4_pairs(_extract_q4_facts(tmp_path, facts))
+
+    assert [(audit.public_date, row.total_revenue) for row, audit in q4] == [
+        (date(2025, 2, 18), pytest.approx(270.15)),
+    ]
+
+
 def test_q4_q3_ytd_direct_fact_wins_and_records_conflicting_derivation(tmp_path: Path) -> None:
     facts = _base_q4_facts()
     direct = _q4_fact(
