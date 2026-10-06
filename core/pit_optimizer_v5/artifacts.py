@@ -44,6 +44,7 @@ from core.pit_optimizer_v5.candidate_ir import (
     derive_experiment_identity_v5,
     derive_pre_validation_invalid_experiment_identity_v5,
 )
+from core.pit_optimizer_v5.development_evaluation import DevelopmentEvaluationReceiptV5
 from core.pit_optimizer_v5.contracts import (
     AnnualizedReturnTargetV5,
     ArtifactGraphFailureV5,
@@ -3562,6 +3563,96 @@ class LocalArtifactRepositoryV5:
             ):
                 raise ArtifactSchemaFailureV5(reference)
         return tuple(indexed[event.payload_ref] for event in events if event.payload_ref in indexed)
+
+    def append_development_evaluation_receipt(
+        self,
+        receipt: DevelopmentEvaluationReceiptV5,
+        *,
+        input_bytes: bytes,
+        output_bytes: bytes,
+    ) -> ArtifactRefV5:
+        """Persist a development evaluator receipt and its retained canonical bytes.
+
+        This is a sibling blob namespace. It never appends a candidate-execution
+        round event and never creates Docker or resource-lease authority.
+        """
+
+        if (
+            type(receipt) is not DevelopmentEvaluationReceiptV5
+            or type(input_bytes) is not bytes
+            or type(output_bytes) is not bytes
+            or len(input_bytes) > 8 * 1024 * 1024
+            or len(output_bytes) > 64 * 1024 * 1024
+            or hashlib.sha256(input_bytes).hexdigest() != receipt.input_sha256
+            or hashlib.sha256(output_bytes).hexdigest() != receipt.output_sha256
+        ):
+            raise ValueError("development evaluation persistence bytes differ from their receipt")
+        request_ref = self.append_binary_state(
+            namespace="candidate-development-evaluation-inputs",
+            key=receipt.input_sha256,
+            content=input_bytes,
+        )
+        output_ref = self.append_binary_state(
+            namespace="candidate-development-evaluation-outputs",
+            key=receipt.output_sha256,
+            content=output_bytes,
+        )
+        if request_ref != receipt.request_ref or output_ref != receipt.output_ref:
+            raise ValueError("development evaluation retained references differ from their receipt")
+        receipt_bytes = receipt.canonical_bytes()
+        receipt_ref = self.append_binary_state(
+            namespace="candidate-development-evaluation-receipts",
+            key=receipt.sha256,
+            content=receipt_bytes,
+        )
+        expected_ref = ArtifactRefV5(
+            f"adapter-blobs/candidate-development-evaluation-receipts/{receipt.sha256}.bin",
+            receipt.sha256,
+        )
+        if receipt_ref != expected_ref:
+            raise ArtifactNonCanonicalV5(receipt_ref)
+        return receipt_ref
+
+    def load_development_evaluation_receipt(
+        self,
+        reference: ArtifactRefV5,
+    ) -> tuple[DevelopmentEvaluationReceiptV5, bytes, bytes]:
+        """Read one separate development receipt and its exact retained payloads."""
+
+        prefix = "adapter-blobs/candidate-development-evaluation-receipts/"
+        if (
+            type(reference) is not ArtifactRefV5
+            or not reference.relative_path.startswith(prefix)
+            or not reference.relative_path.endswith(".bin")
+        ):
+            raise ValueError("development evaluation receipt reference is outside its namespace")
+        key = reference.relative_path[len(prefix):-4]
+        if not re.fullmatch(r"[0-9a-f]{64}", key) or reference.sha256 != key:
+            raise ValueError("development evaluation receipt reference is not deterministic")
+        raw = self.load_binary_state(
+            namespace="candidate-development-evaluation-receipts",
+            key=key,
+            reference=reference,
+            maximum_bytes=1024 * 1024,
+        )
+        receipt = DevelopmentEvaluationReceiptV5.from_canonical_json(raw)
+        if receipt.sha256 != key:
+            raise ArtifactDigestMismatchV5(reference, receipt.sha256)
+        input_key = receipt.input_sha256
+        output_key = receipt.output_sha256
+        input_bytes = self.load_binary_state(
+            namespace="candidate-development-evaluation-inputs",
+            key=input_key,
+            reference=receipt.request_ref,
+            maximum_bytes=8 * 1024 * 1024,
+        )
+        output_bytes = self.load_binary_state(
+            namespace="candidate-development-evaluation-outputs",
+            key=output_key,
+            reference=receipt.output_ref,
+            maximum_bytes=64 * 1024 * 1024,
+        )
+        return receipt, input_bytes, output_bytes
 
     def append_candidate_execution(self, authority: CandidateExecutionAuthorityV5) -> ArtifactRefV5:
         if type(authority) is not CandidateExecutionAuthorityV5:

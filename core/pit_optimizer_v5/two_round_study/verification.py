@@ -64,6 +64,8 @@ from .ledger import (
 from .live_calls import (
     FixturePreflightV1,
     StudyCallRequestV1,
+    StudyDevelopmentRoundCallSlotV1,
+    StudyRoundCallAdmissionV1,
     authenticate_fixture_preflight_v1,
 )
 from core.pit_optimizer_v5.mechanism_reports import build_mechanism_evidence_report_v1
@@ -103,6 +105,7 @@ _STORE_KINDS = (
     "reconciliations",
     "terminals",
     "parsed",
+    "development-round-one-evaluations",
     "admission-rejections",
     "imports",
     "import-translations",
@@ -1700,6 +1703,38 @@ def _validate_human_review(
         )
 
 
+def _reject_development_round_slot_v1(request: StudyCallRequestV1) -> None:
+    """Reject development-only feedback at the production verification boundary."""
+
+    if type(request) is not StudyCallRequestV1:
+        raise StudyAuthorityError("production study verification request is invalid")
+    if type(request.round_slot) is StudyDevelopmentRoundCallSlotV1:
+        raise StudyAuthorityError("production study verification rejects development-only feedback")
+
+
+def _reject_development_feedback_v1(store: StudyStoreV1) -> None:
+    """Reject development feedback or retained development results before qualification."""
+
+    if store.list_refs(kind="development-round-one-evaluations"):
+        raise StudyAuthorityError("production study verification rejects development evaluator results")
+    for kind in ("calls", "requests"):
+        for reference in store.list_refs(kind=kind):
+            if kind == "requests" and reference.relative_path.rsplit("/", 1)[-1].startswith("pending-"):
+                continue
+            try:
+                request = StudyCallRequestV1.from_canonical_json(store.read(reference))
+            except Exception as exc:  # noqa: BLE001 - persisted call graph is an authority boundary
+                raise StudyAuthorityError("production study verification could not decode its call graph") from exc
+            _reject_development_round_slot_v1(request)
+    for reference in store.list_refs(kind="round-call-admissions"):
+        try:
+            admission = StudyRoundCallAdmissionV1.from_canonical_json(store.read(reference))
+        except Exception as exc:  # noqa: BLE001
+            raise StudyAuthorityError("production study verification could not decode round-call admissions") from exc
+        if any(type(slot) is StudyDevelopmentRoundCallSlotV1 for slot in admission.slots):
+            raise StudyAuthorityError("production study verification rejects development-only admitted slots")
+
+
 def verify_study_v1(
     *,
     prepared: PreparedStudyV1,
@@ -1736,6 +1771,8 @@ def verify_study_v1(
             raise StudyAuthorityError("study verifier grant differs from the supplied study store")
         if ledger.grant.manifest_sha256 != prepared.manifest.sha256:
             raise StudyAuthorityError("study verifier grant differs from the prepared manifest")
+
+    _reject_development_feedback_v1(store)
 
     arms: list[StudyArmVerificationV1] = []
     # Keep arm/root provenance in the key.  The two descendant repositories

@@ -15,7 +15,12 @@ import uuid
 from typing import Literal, Mapping
 
 from core.pit_optimizer_v5.artifacts import ArtifactRefV5
-from core.pit_optimizer_v5.contracts import canonical_json_bytes_v5, canonical_primitive_v5
+from core.pit_optimizer_v5.contracts import canonical_json_bytes_v5, canonical_primitive_v5, selected_scenario
+from core.pit_optimizer_v5.development_evaluation import (
+    DevelopmentEvaluationContextV5,
+    DevelopmentEvaluationReceiptV5,
+    authenticate_inprocess_development_evaluation_v5,
+)
 from core.pit_optimizer_v5.provider import (
     CompletionResultV5,
     ProviderFailureDiagnosticV5,
@@ -42,15 +47,20 @@ from .contracts import (
     StudyResponseV1,
 )
 from .live_calls import (
+    AuthenticatedStudyDevelopmentRoundOneEvaluatorResultV1,
     AuthenticatedStudyRoundOneEvaluatorResultV1,
     FixturePreflightV1,
     StudyCallRequestV1,
     StudyExecutionApprovalV1,
     StudyGrantV1,
+    StudyDevelopmentRoundCallSlotV1,
+    StudyDevelopmentRoundOneEvaluatorResultV1,
+    StudyEvaluatorMetricV1,
     StudyRoundCallApprovalV1,
     StudyRoundCallAdmissionV1,
     StudyRoundCallSlotV1,
     StudyRoundOneEvaluatorResultV1,
+    _DEVELOPMENT_ROUND_ONE_EVALUATION_TOKEN,
     _ROUND_ONE_EVALUATION_TOKEN,
     authenticate_fixture_preflight_v1,
     study_parser_authority_bytes_v1,
@@ -1198,8 +1208,11 @@ class StudyLedgerV1:
         ):
             raise StudyAuthorityError("round-call approval does not match the current admission")
 
-    def _ensure_round_call_authorized(self, slot: StudyRoundCallSlotV1) -> None:
-        if type(slot) is not StudyRoundCallSlotV1 or self.round_call_admission is None:
+    def _ensure_round_call_authorized(
+        self,
+        slot: StudyRoundCallSlotV1 | StudyDevelopmentRoundCallSlotV1,
+    ) -> None:
+        if type(slot) not in {StudyRoundCallSlotV1, StudyDevelopmentRoundCallSlotV1} or self.round_call_admission is None:
             raise StudyAuthorityError("round-call admission is missing")
         if self.round_call_approval is None:
             raise StudyAuthorityError("new round-call reservations require current explicit approval")
@@ -1972,6 +1985,207 @@ class StudyLedgerV1:
             _controller_guard=_ROUND_ONE_EVALUATION_TOKEN,
         )
 
+    def _derive_development_round_one_result(
+        self,
+        *,
+        request: StudyCallRequestV1,
+        development_reference: ArtifactRefV5,
+    ) -> StudyDevelopmentRoundOneEvaluatorResultV1:
+        if (
+            type(request) is not StudyCallRequestV1
+            or request.round_slot is None
+            or request.round_slot.round_index != 1
+            or type(development_reference) is not ArtifactRefV5
+            or self.manifest.mode != "offline_fixture"
+            or self.grant.mode != "offline_fixture"
+        ):
+            raise StudyAuthorityError("development evaluation requires an offline round-one study request")
+        self._validate_request(request, require_current=True)
+        terminal_record = self._find_terminal(request)
+        if terminal_record is None:
+            raise StudyAdmissionError("development evaluation requires a successful parsed round one")
+        terminal = terminal_record.terminal
+        if terminal.failure_code is not None or terminal.parsed_ref is None:
+            raise StudyAdmissionError("development evaluation requires a successful parsed round one")
+        parsed_raw = self.store.read(terminal.parsed_ref)
+        if terminal.parsed_ref.sha256 != _sha256(parsed_raw):
+            raise StudyAuthorityError("development evaluation parsed response reference differs from its bytes")
+        try:
+            parsed_response = StudyResponseV1.from_canonical_json(parsed_raw)
+        except (StudyContractError, TypeError, ValueError) as exc:
+            raise StudyAuthorityError("development evaluation parsed response is not canonical") from exc
+        try:
+            stored_receipt, _input_bytes, _output_bytes = self.store.repository.load_development_evaluation_receipt(
+                development_reference
+            )
+        except Exception as exc:  # noqa: BLE001 - convert repository failure to study authority
+            raise StudyAuthorityError("development evaluation receipt could not be loaded") from exc
+        if type(stored_receipt) is not DevelopmentEvaluationReceiptV5:
+            raise StudyAuthorityError("development evaluation receipt has an invalid type")
+        candidate_matches = tuple(
+            draft
+            for draft in parsed_response.drafts
+            if draft.sha256 == stored_receipt.context.candidate_sha256
+        )
+        if len(candidate_matches) != 1:
+            raise StudyAuthorityError("development evaluation candidate is not in the exact parsed response")
+        draft = candidate_matches[0]
+
+        registry_refs = self._refs("registry")
+        if (
+            len(registry_refs) != 1
+            or registry_refs[0].relative_path != "adapter-blobs/study-v1-registry/v1.bin"
+            or registry_refs[0].sha256 != self.manifest.registry_sha256
+        ):
+            raise StudyAuthorityError("development evaluation registry is not exactly pinned")
+        try:
+            from .registry import FrozenBehaviorRegistryV1, verify_registry_v1
+
+            registry = FrozenBehaviorRegistryV1.from_canonical_json(self.store.read(registry_refs[0]))
+            verify_registry_v1(registry)
+            configuration = registry.configuration(draft.configuration_id)
+        except Exception as exc:  # noqa: BLE001 - frozen registry is an authority boundary
+            raise StudyAuthorityError("development evaluation candidate registry identity is invalid") from exc
+
+        claimed_context = stored_receipt.context
+        expected_context = DevelopmentEvaluationContextV5(
+            campaign_id=claimed_context.campaign_id,
+            campaign_round_index=claimed_context.campaign_round_index,
+            study_id=self.study_id,
+            study_arm=request.arm,
+            study_round_one_request_sha256=request.sha256,
+            study_round_one_terminal_sha256=terminal.terminal_sha256,
+            parsed_response_sha256=terminal.parsed_ref.sha256,
+            candidate_sha256=draft.sha256,
+            policy_identity_sha256=configuration.policy_revision.sha256,
+        )
+        authenticated = authenticate_inprocess_development_evaluation_v5(
+            repository=self.store.repository,
+            reference=development_reference,
+            expected_context=expected_context,
+        )
+        evaluation = authenticated.output.evaluation
+        evaluator_request = authenticated.request
+        if (
+            evaluator_request.pit_data_scope != "development_sp500_v2"
+            or evaluator_request.policy_revision.sha256 != configuration.policy_revision.sha256
+            or evaluation.policy_identity_sha256 != configuration.policy_revision.sha256
+            or evaluation.evaluator_contract_sha256 != authenticated.receipt.evaluator_contract_sha256
+            or evaluation.panel_sha256 != authenticated.receipt.panel_sha256
+        ):
+            raise StudyAuthorityError("development panel evaluation differs from the frozen candidate identity")
+        report = selected_scenario(evaluation).report
+        metrics = tuple(
+            sorted(
+                (
+                    StudyEvaluatorMetricV1(
+                        metric_id="max_drawdown_pct",
+                        value=report.max_drawdown_pct,
+                        unit="percent",
+                    ),
+                    StudyEvaluatorMetricV1(
+                        metric_id="portfolio_annualized_return_pct",
+                        value=report.portfolio_annualized_return_pct,
+                        unit="percent",
+                    ),
+                    StudyEvaluatorMetricV1(
+                        metric_id="portfolio_total_return_pct",
+                        value=report.portfolio_total_return_pct,
+                        unit="percent",
+                    ),
+                    StudyEvaluatorMetricV1(
+                        metric_id="sharpe_ratio",
+                        value=report.sharpe_ratio,
+                        unit="ratio",
+                    ),
+                ),
+                key=lambda item: item.metric_id,
+            )
+        )
+        return StudyDevelopmentRoundOneEvaluatorResultV1(
+            study_id=self.study_id,
+            manifest_sha256=self.manifest.sha256,
+            grant_sha256=self.grant.sha256,
+            arm=request.arm,
+            parent_request_sha256=request.base_request_sha256,
+            round_one_request_sha256=request.sha256,
+            round_one_terminal_sha256=terminal.terminal_sha256,
+            parsed_response_sha256=terminal.parsed_ref.sha256,
+            candidate_sha256=draft.sha256,
+            context=expected_context,
+            development_receipt_ref=development_reference,
+            study_rubric_sha256=self.manifest.rubric_sha256,
+            development_evaluator_contract_sha256=authenticated.receipt.evaluator_contract_sha256,
+            panel_sha256=authenticated.receipt.panel_sha256,
+            universe_sha256=authenticated.receipt.universe_sha256,
+            panel_evaluation_sha256=evaluation.sha256,
+            metrics=metrics,
+        )
+
+    def authenticate_round_one_development_evaluation(
+        self,
+        *,
+        request: StudyCallRequestV1,
+        development_reference: ArtifactRefV5,
+    ) -> AuthenticatedStudyDevelopmentRoundOneEvaluatorResultV1:
+        """Derive and persist a separate development feedback result from retained V5 output."""
+
+        result = self._derive_development_round_one_result(
+            request=request,
+            development_reference=development_reference,
+        )
+        reference = self.store.put(
+            kind="development-round-one-evaluations",
+            key=result.sha256,
+            content=result.canonical_bytes(),
+        )
+        return self._authenticate_persisted_development_round_one_evaluation(
+            request=request,
+            reference=reference,
+        )
+
+    def _authenticate_persisted_development_round_one_evaluation(
+        self,
+        *,
+        request: StudyCallRequestV1,
+        reference: ArtifactRefV5,
+    ) -> AuthenticatedStudyDevelopmentRoundOneEvaluatorResultV1:
+        if (
+            type(request) is not StudyCallRequestV1
+            or request.round_slot is None
+            or request.round_slot.round_index != 1
+            or type(reference) is not ArtifactRefV5
+        ):
+            raise StudyAuthorityError("development result authentication requires a round-one request and stored reference")
+        expected_path = (
+            f"adapter-blobs/study-v1-development-round-one-evaluations/"
+            f"{reference.relative_path.rsplit('/', 1)[-1][:-4]}.bin"
+        )
+        if reference.relative_path != expected_path:
+            raise StudyAuthorityError("development evaluator result path is not deterministic")
+        raw = self.store.read(reference)
+        if reference.sha256 != _sha256(raw):
+            raise StudyAuthorityError("development evaluator result reference differs from its bytes")
+        try:
+            stored_result = StudyDevelopmentRoundOneEvaluatorResultV1.from_canonical_json(raw)
+        except (StudyContractError, TypeError, ValueError) as exc:
+            raise StudyAuthorityError("development evaluator result is not a typed canonical record") from exc
+        if reference.relative_path != (
+            f"adapter-blobs/study-v1-development-round-one-evaluations/{stored_result.sha256}.bin"
+        ):
+            raise StudyAuthorityError("development evaluator result key differs from its content")
+        derived_result = self._derive_development_round_one_result(
+            request=request,
+            development_reference=stored_result.development_receipt_ref,
+        )
+        if stored_result != derived_result:
+            raise StudyAuthorityError("persisted development evaluator result differs from retained V5 evidence")
+        return AuthenticatedStudyDevelopmentRoundOneEvaluatorResultV1._issue(
+            result=stored_result,
+            reference=reference,
+            _controller_guard=_DEVELOPMENT_ROUND_ONE_EVALUATION_TOKEN,
+        )
+
     def _find_reservation(self, request: StudyCallRequestV1) -> StudyReservationV1 | None:
         for _ref_value, reservation in self._reservations():
             if reservation.request_sha256 == request.sha256:
@@ -2104,10 +2318,18 @@ class StudyLedgerV1:
                 if evaluation is None or reference is None:
                     raise StudyAdmissionError("round two requires its authenticated evaluator result")
                 round_one_request = self._stored_request(evaluation.round_one_request_sha256)
-                authenticated_evaluation = self.authenticate_round_one_evaluator_result(
-                    request=round_one_request,
-                    reference=reference,
-                )
+                if type(request.round_slot) is StudyRoundCallSlotV1:
+                    authenticated_evaluation = self.authenticate_round_one_evaluator_result(
+                        request=round_one_request,
+                        reference=reference,
+                    )
+                elif type(request.round_slot) is StudyDevelopmentRoundCallSlotV1:
+                    authenticated_evaluation = self._authenticate_persisted_development_round_one_evaluation(
+                        request=round_one_request,
+                        reference=reference,
+                    )
+                else:
+                    raise StudyAuthorityError("round-two evaluator slot type is invalid")
                 if authenticated_evaluation.result != evaluation:
                     raise StudyAuthorityError("round-two evaluator result differs from its persisted authenticated bytes")
         elif self.round_call_admission is not None:
