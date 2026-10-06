@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, fields, is_dataclass
-from datetime import date
-from decimal import Decimal, ROUND_HALF_EVEN
+from datetime import date, datetime, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 from pathlib import Path
 from collections import Counter
 import argparse
@@ -14,6 +14,7 @@ import math
 import re
 import shutil
 import subprocess
+from enum import StrEnum
 from types import MappingProxyType
 from typing import Callable, Iterable, Mapping, Sequence
 
@@ -42,6 +43,162 @@ _DISCOVERY_WINDOWS = (
 )
 _HIDDEN_WINDOW = ("hidden_1", "2021-12-15", "2022-03-11")
 
+
+class ActionParityDisposition(StrEnum):
+    MATCHED = "matched"
+    MATCHED_WITH_EXECUTION_VARIANCE = "matched_with_execution_variance"
+    INCOMPLETE = "incomplete"
+    MISMATCH = "mismatch"
+    INCOMPATIBLE_POLICY = "incompatible_policy"
+
+
+@dataclass(frozen=True, slots=True)
+class ActionParityComparison:
+    disposition: ActionParityDisposition
+    matched_fields: tuple[str, ...] = ()
+    unknowns: tuple[str, ...] = ()
+    mismatches: tuple[str, ...] = ()
+    incompatible_fields: tuple[str, ...] = ()
+    execution_variances: tuple[str, ...] = ()
+
+
+_ACTION_PARITY_EXACT_GROUPS = ("policy_identity", "facts", "decision", "intent")
+_ACTION_PARITY_EXECUTION_VARIANCE_FIELDS = frozenset(
+    {"fill_price", "fees", "valuation_time", "pending_state"}
+)
+_ACTION_PARITY_TIMESTAMP_FIELDS = frozenset(
+    {"as_of_cutoff_at", "account_valuation_at", "valuation_time"}
+)
+_ACTION_PARITY_MISSING = object()
+
+
+def _action_parity_nested(value: object) -> bool:
+    return isinstance(value, Mapping) or (
+        isinstance(value, Sequence) and not isinstance(value, (str, bytes))
+    )
+
+
+def _action_parity_equal(left: object, right: object) -> bool:
+    if _action_parity_nested(left) or _action_parity_nested(right):
+        raise TypeError("nested parity values are unsupported; flatten them into declared fields")
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left == right
+    numeric = (Decimal, int, float)
+    if isinstance(left, numeric) and isinstance(right, numeric):
+        try:
+            left_value = Decimal(str(left))
+            right_value = Decimal(str(right))
+        except (InvalidOperation, ValueError):
+            return False
+        return left_value.is_finite() and right_value.is_finite() and left_value == right_value
+    return left == right
+
+
+def _action_parity_same_value(field: str, left: object, right: object) -> bool:
+    if field in _ACTION_PARITY_TIMESTAMP_FIELDS:
+        if not isinstance(left, str) or not isinstance(right, str):
+            return False
+        try:
+            left_time = datetime.fromisoformat(left.replace("Z", "+00:00"))
+            right_time = datetime.fromisoformat(right.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        if left_time.utcoffset() is None or right_time.utcoffset() is None:
+            return False
+        return left_time.astimezone(timezone.utc) == right_time.astimezone(timezone.utc)
+    return _action_parity_equal(left, right)
+
+
+def compare_action_parity_cases(
+    historical: Mapping[str, object],
+    paper: Mapping[str, object],
+) -> ActionParityComparison:
+    """Compare fixed historical decisions with durable paper action intentions.
+
+    Policy identity, known facts, the decision clock and output, and fixed action
+    intent fields must match exactly. Missing evidence stays unknown. Only the
+    declared execution fields may differ as an execution variance; fills, fees,
+    valuation time, and pending state never excuse a changed decision or order.
+    """
+    matched: list[str] = []
+    unknown: list[str] = []
+    mismatches: list[str] = []
+    incompatible: list[str] = []
+    execution_variances: list[str] = []
+
+    for group in _ACTION_PARITY_EXACT_GROUPS:
+        expected_group = historical.get(group)
+        observed_group = paper.get(group)
+        if not isinstance(expected_group, Mapping) or not isinstance(observed_group, Mapping):
+            unknown.append(group)
+            continue
+        if not expected_group and not observed_group:
+            unknown.append(group)
+            continue
+        for field, expected_value in expected_group.items():
+            label = f"{group}.{field}"
+            observed_value = observed_group.get(field, _ACTION_PARITY_MISSING)
+            if (
+                expected_value is None
+                or observed_value is _ACTION_PARITY_MISSING
+                or observed_value is None
+            ):
+                unknown.append(label)
+            elif _action_parity_same_value(field, expected_value, observed_value):
+                matched.append(label)
+            elif group == "policy_identity":
+                incompatible.append(label)
+            else:
+                mismatches.append(label)
+        for field in observed_group:
+            if field not in expected_group:
+                unknown.append(f"{group}.{field}")
+
+    expected_execution = historical.get("execution")
+    observed_execution = paper.get("execution")
+    if not isinstance(expected_execution, Mapping) or not isinstance(observed_execution, Mapping):
+        unknown.append("execution")
+    elif not expected_execution and not observed_execution:
+        unknown.append("execution")
+    else:
+        for field, expected_value in expected_execution.items():
+            label = f"execution.{field}"
+            observed_value = observed_execution.get(field, _ACTION_PARITY_MISSING)
+            if (
+                expected_value is None
+                or observed_value is _ACTION_PARITY_MISSING
+                or observed_value is None
+            ):
+                unknown.append(label)
+            elif _action_parity_same_value(field, expected_value, observed_value):
+                matched.append(label)
+            elif field in _ACTION_PARITY_EXECUTION_VARIANCE_FIELDS:
+                execution_variances.append(label)
+            else:
+                mismatches.append(label)
+        for field in observed_execution:
+            if field not in expected_execution:
+                unknown.append(f"execution.{field}")
+
+    if incompatible:
+        disposition = ActionParityDisposition.INCOMPATIBLE_POLICY
+    elif mismatches:
+        disposition = ActionParityDisposition.MISMATCH
+    elif unknown:
+        disposition = ActionParityDisposition.INCOMPLETE
+    elif execution_variances:
+        disposition = ActionParityDisposition.MATCHED_WITH_EXECUTION_VARIANCE
+    else:
+        disposition = ActionParityDisposition.MATCHED
+
+    return ActionParityComparison(
+        disposition=disposition,
+        matched_fields=tuple(sorted(matched)),
+        unknowns=tuple(sorted(unknown)),
+        mismatches=tuple(sorted(mismatches)),
+        incompatible_fields=tuple(sorted(incompatible)),
+        execution_variances=tuple(sorted(execution_variances)),
+    )
 
 def _canonical_json_bytes(value: object) -> bytes:
     return (
