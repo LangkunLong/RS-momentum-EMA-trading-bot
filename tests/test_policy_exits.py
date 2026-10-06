@@ -1,8 +1,10 @@
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
+from threading import Barrier
 from decimal import Decimal
 
 from core.policy_execution_state import ActionRole, ActionStatus, DecisionCategory, DecisionIdentity, DecisionSubjectType, OrderSide
-from core.policy_execution_store import PolicyExecutionStateStore
+from core.policy_execution_store import PolicyExecutionStateStore, StopUpdateProposalAlreadyClaimedError
 from core.policy_exits import propose_protection_resize, start_full_exit, start_scale_out
 from tests.test_paper_policy_chain import read_chain, seed_pending_chain
 
@@ -241,3 +243,67 @@ def test_close_action_and_protective_resize_use_the_remaining_quantity(tmp_path)
     )
     assert close.role is ActionRole.CLOSE
     assert close.requested_quantity == Decimal("2")
+
+
+def test_concurrent_protective_resize_claim_returns_one_dispatchable_plan(tmp_path):
+    features, store, deployment, portfolio, holding = _fixture(tmp_path)
+    decision = _exit_decision(features, deployment, portfolio, holding)
+    barrier = Barrier(2)
+    stores = [
+        PolicyExecutionStateStore(store.db_path, store_identity=deployment.store_identity)
+        for _ in range(2)
+    ]
+
+    for candidate in stores:
+        original_load = candidate.load_decision_record
+
+        def wait_for_both_initial_misses(decision_id, *, load=original_load):
+            try:
+                return load(decision_id)
+            except KeyError:
+                barrier.wait(timeout=5)
+                raise
+
+        candidate.load_decision_record = wait_for_both_initial_misses
+
+    def propose(candidate):
+        try:
+            return ("plan", propose_protection_resize(
+                candidate,
+                decision=decision,
+                holding_episode_id=holding.holding_episode_id,
+                stop_price=holding.confirmed_protective_stop_price,
+                expected_holding_version=holding.state_version,
+                policy_payload={"reason": "concurrent_post_scale_out"},
+                guard_payload={"outcome": "allow_offline_fixture"},
+                observed_at=decision.clock.account_valuation_at,
+            ))
+        except Exception as error:
+            return ("error", error)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(propose, stores))
+
+    plans = [value for kind, value in outcomes if kind == "plan"]
+    errors = [value for kind, value in outcomes if kind == "error"]
+    assert len(plans) == 1
+    assert plans[0].disposition == "replace"
+    assert plans[0].remaining_quantity == Decimal("6")
+    assert plans[0].replaces_broker_order_id == holding.confirmed_stop_broker_order_id
+    assert len(errors) == 1
+    assert isinstance(errors[0], StopUpdateProposalAlreadyClaimedError)
+    assert "reconcile" in str(errors[0]).lower()
+
+    replay = propose_protection_resize(
+        stores[0],
+        decision=decision,
+        holding_episode_id=holding.holding_episode_id,
+        stop_price=holding.confirmed_protective_stop_price,
+        expected_holding_version=holding.state_version,
+        policy_payload={"reason": "concurrent_post_scale_out"},
+        guard_payload={"outcome": "allow_offline_fixture"},
+        observed_at=decision.clock.account_valuation_at,
+    )
+    assert replay.disposition == "reconcile"
+    assert replay.replaces_client_order_id is None
+    assert replay.replaces_broker_order_id is None
