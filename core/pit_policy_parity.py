@@ -70,6 +70,64 @@ _ACTION_PARITY_TIMESTAMP_FIELDS = frozenset(
     {"as_of_cutoff_at", "account_valuation_at", "valuation_time"}
 )
 _ACTION_PARITY_MISSING = object()
+_ACTION_PARITY_REQUIRED_INTENT_FIELDS = {
+    "replacement": frozenset(
+        {
+            "sell_role",
+            "sell_side",
+            "sell_security_id",
+            "sell_symbol",
+            "sell_quantity",
+            "buy_candidate_security_id",
+            "buy_candidate_symbol",
+            "buy_quantity_cap",
+            "buy_price_limit",
+            "protective_stop",
+            "risk_per_unit",
+            "risk_basis",
+            "sell_order_type",
+        }
+    ),
+    "addition": frozenset(
+        {
+            "role",
+            "side",
+            "security_id",
+            "broker_symbol",
+            "requested_quantity",
+            "holding_episode_id",
+            "reservation_price",
+            "reservation_price_basis",
+            "reservation_stop_price",
+            "risk_per_unit",
+            "risk_basis",
+        }
+    ),
+    "scale_out": frozenset(
+        {
+            "role",
+            "side",
+            "security_id",
+            "broker_symbol",
+            "requested_quantity",
+            "holding_episode_id",
+            "snapshot_original_quantity",
+            "fraction_of_original_quantity",
+            "exit_tier",
+            "rounding_rule_id",
+        }
+    ),
+    "close": frozenset(
+        {
+            "role",
+            "side",
+            "security_id",
+            "broker_symbol",
+            "requested_quantity",
+            "holding_episode_id",
+        }
+    ),
+}
 
 
 def _action_parity_nested(value: object) -> bool:
@@ -180,6 +238,27 @@ def compare_action_parity_cases(
             if field not in expected_execution:
                 unknown.append(f"execution.{field}")
 
+    expected_decision = historical.get("decision")
+    action_family = (
+        expected_decision.get("action_family")
+        if isinstance(expected_decision, Mapping)
+        else None
+    )
+    required_intent_fields = _ACTION_PARITY_REQUIRED_INTENT_FIELDS.get(action_family)
+    if required_intent_fields is None:
+        unknown.append("decision.action_family")
+    else:
+        expected_intent = historical.get("intent")
+        observed_intent = paper.get("intent")
+        for field in required_intent_fields:
+            if (
+                not isinstance(expected_intent, Mapping)
+                or field not in expected_intent
+                or not isinstance(observed_intent, Mapping)
+                or field not in observed_intent
+            ):
+                unknown.append(f"intent.{field}")
+
     if incompatible:
         disposition = ActionParityDisposition.INCOMPATIBLE_POLICY
     elif mismatches:
@@ -194,7 +273,7 @@ def compare_action_parity_cases(
     return ActionParityComparison(
         disposition=disposition,
         matched_fields=tuple(sorted(matched)),
-        unknowns=tuple(sorted(unknown)),
+        unknowns=tuple(sorted(set(unknown))),
         mismatches=tuple(sorted(mismatches)),
         incompatible_fields=tuple(sorted(incompatible)),
         execution_variances=tuple(sorted(execution_variances)),

@@ -36,13 +36,23 @@ def _comparison_case():
             "candidate_security_id": "fixture:DDD",
         },
         "decision": {
+            "action_family": "replacement",
             "decision_session": "2025-02-04",
             "snapshot_sha256": "a" * 64,
         },
         "intent": {
+            "sell_role": "close",
             "sell_side": "sell",
+            "sell_security_id": "fixture:CCC",
+            "sell_symbol": "CCC",
             "sell_quantity": Decimal("6"),
+            "buy_candidate_security_id": "fixture:DDD",
+            "buy_candidate_symbol": "DDD",
+            "buy_quantity_cap": Decimal("100"),
             "buy_price_limit": Decimal("125"),
+            "protective_stop": Decimal("100"),
+            "risk_per_unit": Decimal("25"),
+            "risk_basis": "fixed_candidate_limit_minus_stop",
             "sell_order_type": "market",
         },
         "execution": {
@@ -76,6 +86,7 @@ def _recorded_history_case(features, clock):
             "candidate_symbol": "DDD",
         },
         "decision": {
+            "action_family": "replacement",
             "exchange_id": "XNYS",
             "decision_session": clock.decision_session.isoformat(),
             "as_of_cutoff_at": clock.as_of_cutoff_at.isoformat(),
@@ -137,6 +148,7 @@ def _paper_replacement_case(execution, pending_state):
             "candidate_symbol": plan.candidate_symbol,
         },
         "decision": {
+            "action_family": "replacement",
             "exchange_id": clock.exchange_id,
             "decision_session": clock.decision_session.isoformat(),
             "as_of_cutoff_at": clock.as_of_cutoff_at.isoformat(),
@@ -217,6 +229,29 @@ def test_recorded_replacement_decision_and_durable_sell_intent_match_after_resta
         "intent.risk_per_unit",
         "intent.risk_basis",
     }
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    (
+        "sell_role",
+        "sell_security_id",
+        "sell_quantity",
+        "buy_candidate_security_id",
+        "buy_quantity_cap",
+    ),
+)
+def test_missing_same_replacement_intent_field_is_incomplete(missing_field):
+    history = _comparison_case()
+    paper = _comparison_case()
+    history["intent"].pop(missing_field)
+    paper["intent"].pop(missing_field)
+
+    result = compare_replacement_cases(history, paper)
+
+    assert result.disposition is ParityDisposition.INCOMPLETE
+    assert result.unknowns == (f"intent.{missing_field}",)
+    assert result.mismatches == ()
 
 
 def test_missing_historical_quantity_is_unknown_not_zero():
