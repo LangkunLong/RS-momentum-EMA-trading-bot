@@ -975,3 +975,468 @@ def test_industry_preparation_stage_bundle_is_rejected_by_decision_features(
                 price_history=history,
                 rs_snapshot=fixture["rs_snapshot"],
             )
+
+
+def _write_d1_causal_bundle(tmp_path: Path):
+    """Extend the accepted V3 fixture with dated ownership/classification changes."""
+    bundle_path, _old_digest, provenance_path, base_availability = (
+        _write_schema_v3_bundle(tmp_path)
+    )
+    quarterly_availability = {
+        "AAA": list(base_availability),
+        "BBB": [],
+        "CCC": [],
+    }
+    exchange_sessions = tuple(
+        timestamp.date()
+        for timestamp in pd.bdate_range("2023-01-01", "2026-04-10")
+    )
+    connection = sqlite3.connect(bundle_path)
+    connection.execute(
+        "DELETE FROM membership_v3 WHERE effective_date=? "
+        "AND security_lineage_id=? AND universe_id=?",
+        ("2020-01-02", "issue98_aaa", "nasdaq100"),
+    )
+    connection.execute(
+        "INSERT INTO membership_v3 VALUES (?,?,?,?)",
+        ("2026-04-02", "issue98_aaa", "nasdaq100", 1),
+    )
+    connection.execute(
+        "UPDATE industry_group_snapshots SET group_id=?,group_rank=?,"
+        "group_members=?,evidence_ids=?,sector_id=? "
+        "WHERE symbol=? AND as_of_date=?",
+        (
+            "industry:legacy",
+            1,
+            pit_canonical_json(["AAA"]),
+            pit_canonical_json(["d1:initial"]),
+            "gics-sector:information_technology",
+            "AAA",
+            "2026-03-31",
+        ),
+    )
+    connection.execute(
+        "UPDATE industry_group_snapshots SET group_id=?,group_rank=?,"
+        "group_members=?,evidence_ids=?,sector_id=? "
+        "WHERE symbol=? AND as_of_date=?",
+        (
+            "industry:other",
+            1,
+            pit_canonical_json(["CCC"]),
+            pit_canonical_json(["d1:initial"]),
+            "gics-sector:consumer_discretionary",
+            "CCC",
+            "2026-03-31",
+        ),
+    )
+    connection.execute(
+        "DELETE FROM industry_group_snapshots WHERE symbol=?", ("BBB",)
+    )
+
+    def add_record(
+        ticker: str,
+        statement_type: str,
+        period_end: str,
+        source_public_date: str,
+        source_public_at: str,
+        *,
+        diluted_eps: float | None = None,
+        total_revenue: float | None = None,
+        shares_outstanding: float | None = None,
+        held_percent: float | None = None,
+        institution_count: int | None = None,
+        previous_institution_count: int | None = None,
+    ) -> None:
+        available = derive_available_from_source_date(
+            period_end=date.fromisoformat(period_end),
+            source_public_date=date.fromisoformat(source_public_date),
+            source_public_at=datetime.fromisoformat(source_public_at),
+            exchange_sessions=exchange_sessions,
+        )
+        connection.execute(
+            "INSERT INTO fundamentals VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                ticker,
+                statement_type,
+                period_end,
+                available.available_from_session.isoformat(),
+                None,
+                diluted_eps,
+                total_revenue,
+                None,
+                None,
+                None,
+                shares_outstanding,
+                held_percent,
+                institution_count,
+                previous_institution_count,
+            ),
+        )
+        if statement_type == "quarterly":
+            quarterly_availability[ticker].append(available)
+
+    # Complete the Q4 comparison around the already-dated future Q4 2025 filing.
+    add_record(
+        "AAA", "quarterly", "2023-12-31", "2024-02-15",
+        "2024-02-15T10:00:00-05:00", diluted_eps=0.9, total_revenue=90.0
+    )
+    add_record(
+        "AAA", "quarterly", "2024-12-31", "2025-02-18",
+        "2025-02-18T10:00:00-05:00", diluted_eps=1.2, total_revenue=120.0
+    )
+    add_record(
+        "AAA", "annual", "2023-12-31", "2024-02-15",
+        "2024-02-15T10:00:00-05:00", diluted_eps=0.9
+    )
+    add_record(
+        "AAA", "annual", "2024-12-31", "2025-02-18",
+        "2025-02-18T10:00:00-05:00", diluted_eps=1.35
+    )
+    add_record(
+        "AAA", "institutional", "2025-09-30", "2025-11-14",
+        "2025-11-14T10:00:00-05:00", shares_outstanding=10_000_000,
+        held_percent=0.40, institution_count=100, previous_institution_count=90
+    )
+    add_record(
+        "AAA", "institutional", "2025-12-31", "2026-04-01",
+        "2026-04-01T10:00:00-04:00", shares_outstanding=10_200_000,
+        held_percent=0.42, institution_count=110, previous_institution_count=100
+    )
+    # BBB has a current fiscal period but no comparable prior-year period.
+    add_record(
+        "BBB", "quarterly", "2025-06-30", "2025-08-15",
+        "2025-08-15T10:00:00-04:00", diluted_eps=5.0, total_revenue=100.0
+    )
+    # CCC has a matched period whose zero EPS denominator must remain unknown.
+    add_record(
+        "CCC", "quarterly", "2024-03-31", "2024-05-15",
+        "2024-05-15T10:00:00-04:00", diluted_eps=0.0, total_revenue=100.0
+    )
+    add_record(
+        "CCC", "quarterly", "2025-03-31", "2025-05-15",
+        "2025-05-15T10:00:00-04:00", diluted_eps=2.0, total_revenue=200.0
+    )
+    add_record(
+        "CCC", "annual", "2023-12-31", "2024-02-15",
+        "2024-02-15T10:00:00-05:00", diluted_eps=0.0
+    )
+    add_record(
+        "CCC", "annual", "2024-12-31", "2025-02-18",
+        "2025-02-18T10:00:00-05:00", diluted_eps=2.0
+    )
+
+    for ticker in ("SPY", "QQQ", "IWM", "AAA", "BBB", "CCC"):
+        last = connection.execute(
+            "SELECT close,volume FROM price WHERE ticker=? "
+            "ORDER BY trade_date DESC LIMIT 1",
+            (ticker,),
+        ).fetchone()
+        previous_close = float(last[0])
+        previous_volume = float(last[1])
+        for trade_date in ("2026-04-01", "2026-04-02"):
+            close = previous_close * 1.005
+            connection.execute(
+                "INSERT INTO price VALUES (?,?,?,?,?,?,?)",
+                (
+                    trade_date,
+                    ticker,
+                    previous_close,
+                    close * 1.01,
+                    previous_close * 0.99,
+                    close,
+                    previous_volume * (2.0 if ticker == "AAA" else 1.0),
+                ),
+            )
+            previous_close = close
+    connection.execute(
+        "UPDATE price SET volume=volume*2 WHERE ticker='AAA' AND trade_date='2026-03-31'"
+    )
+    for ticker, sector in (
+        ("AAA", "gics-sector:information_technology"),
+        ("CCC", "gics-sector:information_technology"),
+    ):
+        connection.execute(
+            "INSERT INTO industry_group_snapshots VALUES (?,?,?,?,?,?,?)",
+            (
+                ticker,
+                "2026-04-02",
+                "industry:reclassified",
+                1,
+                pit_canonical_json(["AAA", "CCC"]),
+                pit_canonical_json(["d1:reclassification"]),
+                sector,
+            ),
+        )
+    connection.commit()
+    connection.close()
+    return (
+        bundle_path,
+        sha256_file(bundle_path),
+        provenance_path,
+        {symbol: tuple(records) for symbol, records in quarterly_availability.items()},
+    )
+
+
+def _d1_fixture_for_session(fixture: dict[str, Any], session: date) -> dict[str, Any]:
+    next_session = {
+        date(2026, 3, 31): date(2026, 4, 1),
+        date(2026, 4, 2): date(2026, 4, 3),
+    }[session]
+    result = dict(fixture)
+    result["session"] = session.isoformat()
+    result["next_eligible_session"] = next_session.isoformat()
+    result["as_of_cutoff"] = f"{session.isoformat()}T16:00:00-04:00"
+    result["valuation_time"] = f"{next_session.isoformat()}T09:35:00-04:00"
+    evidence = dict(fixture["exchange_session_completion"])
+    evidence["session_date"] = session.isoformat()
+    evidence["session_close_at"] = f"{session.isoformat()}T16:00:00-04:00"
+    payload = {
+        "session_date": evidence["session_date"],
+        "exchange_timezone": evidence["exchange_timezone"],
+        "session_close_at": evidence["session_close_at"],
+        "source_identity": evidence["source_identity"],
+    }
+    evidence["evidence_sha256"] = pit_canonical_json_sha256(payload)
+    result["exchange_session_completion"] = evidence
+    return result
+
+
+def _d1_missingness(features: dict[str, Any]) -> dict[str, dict[str, dict[str, str]]]:
+    result: dict[str, dict[str, dict[str, str]]] = {}
+    for symbol, snapshot in features.items():
+        records: dict[str, dict[str, str]] = {}
+        for name in snapshot.__dataclass_fields__:
+            if getattr(snapshot, name) is not None:
+                continue
+            classification = name in {"industry_group_rs", "sector_rs"}
+            records[name] = {
+                "state": "absent" if classification else "insufficient_history",
+                "reason": (
+                    "the dated synthetic fixture has no visible classification"
+                    if classification
+                    else "the dated synthetic fixture lacks a usable comparison"
+                ),
+            }
+        result[symbol] = records
+    return result
+
+
+def test_d1_causal_canslim_inputs_are_shared_and_fail_closed(tmp_path: Path) -> None:
+    """One fixture proves dated financial, ownership, classification and price inputs."""
+    from core.backtest_engine import CanslimStrategy
+    from core.canslim.i_institutional import evaluate_i
+
+    fixture = _fixture()
+    bundle_path, bundle_sha256, provenance_path, availability = (
+        _write_d1_causal_bundle(tmp_path)
+    )
+    before = date(2026, 3, 31)
+    after = date(2026, 4, 2)
+    evidence: dict[date, dict[str, Any]] = {}
+
+    with PITDataBundle(
+        bundle_path,
+        expected_sha256=bundle_sha256,
+        prices_provenance=provenance_path,
+    ) as bundle:
+        for session in (before, after):
+            session_fixture = _d1_fixture_for_session(fixture, session)
+            histories, closes, active, rs_snapshot = _market_inputs(
+                bundle, session_fixture
+            )
+            historical = {
+                symbol: build_entry_features_v3(
+                    bundle=bundle,
+                    symbol=symbol,
+                    session=session,
+                    price_history=histories[symbol],
+                    rs_snapshot=rs_snapshot,
+                )
+                for symbol in fixture["candidate_symbols"]
+            }
+            current = build_current_feature_context_snapshot(
+                bundle=bundle,
+                decision_clock=_decision_clock(session_fixture),
+                candidate_symbols=tuple(fixture["candidate_symbols"]),
+                price_history_by_symbol=histories,
+                rs_snapshot=rs_snapshot,
+                market_closes=closes,
+                oneil_regime=fixture["market"]["oneil_regime"],
+                distribution_days=fixture["market"]["distribution_days"],
+                follow_through=fixture["market"]["follow_through"],
+                missingness=_d1_missingness(historical),
+                fundamental_availability=availability,
+                unavailable_members=_unavailable_active_members(active, session_fixture),
+                source_revision="bc1f33829799f2fd2dfd33f4ab7bbec1645d146e",
+            )
+            market = build_market_context(
+                session=pd.Timestamp(session),
+                oneil_regime=fixture["market"]["oneil_regime"],
+                distribution_days=fixture["market"]["distribution_days"],
+                follow_through=fixture["market"]["follow_through"],
+                closes=closes,
+                active_constituents=active,
+                rs_scores=rs_snapshot,
+            )
+            signals = {}
+            for symbol in fixture["candidate_symbols"]:
+                signal = CanslimStrategy(
+                    fundamental_provider=bundle.fundamentals_provider
+                ).evaluate_symbol(
+                    ticker=symbol,
+                    ticker_ohlcv={symbol: histories[symbol]},
+                    all_closes=closes,
+                    eval_date=pd.Timestamp(session),
+                    market_state={
+                        "m_score": 1.0,
+                        "market_is_bullish": True,
+                        "market": market,
+                    },
+                    rs_score=rs_snapshot[symbol],
+                )
+                assert signal is not None
+                signals[symbol] = signal
+            assert current.entry_features == historical
+            assert current.data_bundle_sha256 == bundle_sha256
+            evidence[session] = {
+                "current": current,
+                "historical": historical,
+                "signals": signals,
+                "histories": histories,
+                "closes": closes,
+                "active": active,
+                "rs_snapshot": rs_snapshot,
+                "session_fixture": session_fixture,
+            }
+
+        early = evidence[before]
+        late = evidence[after]
+        early_fundamentals = bundle.fundamentals_provider(
+            "AAA", pd.Timestamp(before)
+        )
+        late_fundamentals = bundle.fundamentals_provider(
+            "AAA", pd.Timestamp(after)
+        )
+        q4_availability = next(
+            row for row in availability["AAA"]
+            if row.period_end == date(2025, 12, 31)
+        )
+        assert q4_availability.available_from_session == after
+        assert pd.Timestamp("2025-12-31") not in early_fundamentals[
+            "quarterly_income"
+        ].columns
+        assert pd.Timestamp("2025-12-31") in late_fundamentals[
+            "quarterly_income"
+        ].columns
+        assert early["historical"]["AAA"].fundamental_age_days > 0
+        assert late["historical"]["AAA"].fundamental_age_days == 0
+
+        assert bundle.affiliations_at(before)["AAA"] == frozenset({"sp500"})
+        assert bundle.affiliations_at(after)["AAA"] == frozenset(
+            {"nasdaq100", "sp500"}
+        )
+        assert early["historical"]["AAA"].affiliations == ("sp500",)
+        assert late["historical"]["AAA"].affiliations == ("nasdaq100", "sp500")
+        assert early["historical"]["AAA"].industry_group_rs == pytest.approx(35.0)
+        assert late["historical"]["AAA"].industry_group_rs == pytest.approx(50.0)
+        assert early["historical"]["AAA"].sector_rs == pytest.approx(35.0)
+        assert late["historical"]["AAA"].sector_rs == pytest.approx(50.0)
+
+        early_owner = early_fundamentals["company_info"]
+        late_owner = late_fundamentals["company_info"]
+        assert (
+            early_owner["held_percent_institutions"],
+            early_owner["institution_count"],
+            early_owner["prev_institution_count"],
+        ) == (0.40, 100, 90)
+        assert (
+            late_owner["held_percent_institutions"],
+            late_owner["institution_count"],
+            late_owner["prev_institution_count"],
+        ) == (0.42, 110, 100)
+        assert early["signals"]["AAA"]["current_growth"] == pytest.approx(0.50)
+        assert early["signals"]["AAA"]["annual_growth"] == pytest.approx(0.50)
+        assert early["signals"]["AAA"]["i_score"] == pytest.approx(
+            evaluate_i(0.40, 100, 90)
+        )
+        assert "current_growth_unavailable" not in early["signals"]["AAA"][
+            "entry_blocking_reasons"
+        ]
+        assert "annual_growth_unavailable" not in early["signals"]["AAA"][
+            "entry_blocking_reasons"
+        ]
+
+        unknown_period = early["signals"]["BBB"]
+        unknown_denominator = early["signals"]["CCC"]
+        assert unknown_period["current_growth"] is None
+        assert unknown_period["annual_growth"] is None
+        assert "current_growth_unavailable" in unknown_period[
+            "entry_blocking_reasons"
+        ]
+        assert early["historical"]["BBB"].earnings_growth_acceleration is None
+        assert early["historical"]["BBB"].sales_growth_acceleration is None
+        assert early["historical"]["BBB"].industry_group_rs is None
+        assert early["historical"]["BBB"].sector_rs is None
+        assert unknown_denominator["current_growth"] is None
+        assert unknown_denominator["annual_growth"] is None
+        assert "current_growth_unavailable" in unknown_denominator[
+            "entry_blocking_reasons"
+        ]
+        assert "annual_growth_unavailable" in unknown_denominator[
+            "entry_blocking_reasons"
+        ]
+
+        replayed = {
+            symbol: build_entry_features_v3(
+                bundle=bundle,
+                symbol=symbol,
+                session=before,
+                price_history=early["histories"][symbol],
+                rs_snapshot=early["rs_snapshot"],
+            )
+            for symbol in fixture["candidate_symbols"]
+        }
+        assert replayed == early["historical"]
+
+        record_counts = {
+            str(row[0]): int(row[1])
+            for row in bundle._connection.execute(
+                "SELECT statement_type,COUNT(*) FROM fundamentals "
+                "GROUP BY statement_type"
+            ).fetchall()
+        }
+        coverage = {
+            "scope": "synthetic_fixture_only",
+            "production_source_coverage": False,
+            "tradable_symbols": len(bundle.tradable_symbols()),
+            "reference_symbols": len(bundle.reference_symbols()),
+            "decision_sessions": (before.isoformat(), after.isoformat()),
+            "price_history_bars": {
+                symbol: len(early["histories"][symbol])
+                for symbol in fixture["candidate_symbols"]
+            },
+            "fundamental_rows": record_counts,
+            "lookback_sessions": {
+                "atr": 20,
+                "average_dollar_volume": 50,
+                "52_week_high": 252,
+            },
+        }
+        assert coverage == {
+            "scope": "synthetic_fixture_only",
+            "production_source_coverage": False,
+            "tradable_symbols": 3,
+            "reference_symbols": 3,
+            "decision_sessions": ("2026-03-31", "2026-04-02"),
+            "price_history_bars": {"AAA": 252, "BBB": 252, "CCC": 100},
+            "fundamental_rows": {
+                "annual": 4,
+                "institutional": 2,
+                "quarterly": 12,
+            },
+            "lookback_sessions": {
+                "atr": 20,
+                "average_dollar_volume": 50,
+                "52_week_high": 252,
+            },
+        }
