@@ -300,3 +300,141 @@ def test_recorded_full_exit_matches_durable_close_intent_after_restart(tmp_path)
     assert result.disposition is ActionParityDisposition.INCOMPLETE
     assert result.mismatches == ()
     assert result.unknowns == ("execution.fees", "execution.fill_price")
+
+
+def _complete_addition_case():
+    return {
+        "policy_identity": {
+            "policy_artifact_id": "policy:v1",
+            "capability_manifest_id": "capabilities:v1",
+            "policy_interface_version": "3",
+            "feature_contract_id": "features:v1",
+            "feature_calculator_id": "calculator:v1",
+            "source_revision": "a" * 40,
+            "runtime_identity": "offline-test",
+            "execution_profile_id": "paper-profile",
+            "paper_account_environment_id": "paper-account",
+            "store_identity": "store:v1",
+        },
+        "facts": {
+            "holding_episode_id": "holding:1",
+            "security_id": "security:ABC",
+            "broker_symbol": "ABC",
+            "original_quantity": Decimal("4"),
+            "remaining_quantity": Decimal("4"),
+            "holding_state_version": 3,
+            "entry_price": Decimal("100"),
+            "current_price": Decimal("110"),
+            "current_quantity": Decimal("4"),
+            "current_notional_fraction": Decimal("0.1"),
+            "days_held": 4,
+            "add_on_count": 0,
+            "remaining_cash_fraction": Decimal("0.5"),
+            "open_position_risk_fraction": Decimal("0.02"),
+            "current_rs_score": Decimal("80"),
+            "industry_group_rs": Decimal("70"),
+            "atr_20_fraction": Decimal("0.04"),
+            "volume_ratio": Decimal("1.5"),
+        },
+        "decision": {
+            "action_family": "addition",
+            "decision_id": "decision:1",
+            "exchange_id": "XNYS",
+            "decision_session": "2025-02-04",
+            "as_of_cutoff_at": "2025-02-04T20:00:00+00:00",
+            "next_execution_session": "2025-02-05",
+            "account_valuation_session": "2025-02-04",
+            "account_valuation_at": "2025-02-04T20:00:00+00:00",
+            "snapshot_sha256": "b" * 64,
+            "category": "addition",
+            "subject_type": "security",
+            "subject_id": "security:ABC",
+            "add": True,
+            "risk_fraction": Decimal("0.01"),
+            "notional_fraction_cap": Decimal("0.2"),
+            "reason_code": "relative_strength",
+        },
+        "intent": {
+            "action_family": "addition",
+            "role": "addition",
+            "side": "buy",
+            "security_id": "security:ABC",
+            "broker_symbol": "ABC",
+            "requested_quantity": Decimal("2"),
+            "holding_episode_id": "holding:1",
+            "reservation_price": Decimal("110"),
+            "reservation_price_basis": "decision_time_mark:snapshot:1",
+            "reservation_stop_price": Decimal("90"),
+            "risk_per_unit": Decimal("20"),
+            "risk_basis": "confirmed_stop:stop:1",
+        },
+        "execution": {
+            "fill_price": Decimal("110"),
+            "fees": Decimal("0"),
+            "pending_state": "buy_due",
+        },
+    }
+
+
+def test_equal_sparse_action_records_are_incomplete():
+    sparse = {
+        "policy_identity": {"policy_artifact_id": "policy:v1"},
+        "facts": {"snapshot_sha256": "b" * 64},
+        "decision": {"action_family": "addition"},
+        "intent": {
+            "action_family": "addition",
+            "role": "addition",
+            "side": "buy",
+            "security_id": "security:ABC",
+            "broker_symbol": "ABC",
+            "requested_quantity": Decimal("2"),
+            "holding_episode_id": "holding:1",
+            "reservation_price": Decimal("110"),
+            "reservation_price_basis": "decision_time_mark:snapshot:1",
+            "reservation_stop_price": Decimal("90"),
+            "risk_per_unit": Decimal("20"),
+            "risk_basis": "confirmed_stop:stop:1",
+        },
+        "execution": {"pending_state": "buy_due"},
+    }
+
+    result = compare_action_parity_cases(sparse, sparse)
+
+    assert result.disposition is ActionParityDisposition.INCOMPLETE
+    assert "policy_identity.capability_manifest_id" in result.unknowns
+    assert "decision.decision_id" in result.unknowns
+    assert "facts.remaining_quantity" in result.unknowns
+    assert "execution.fill_price" in result.unknowns
+
+
+def test_missing_common_policy_field_on_both_sides_is_incomplete():
+    historical = _complete_addition_case()
+    paper = _complete_addition_case()
+    del historical["policy_identity"]["store_identity"]
+    del paper["policy_identity"]["store_identity"]
+
+    result = compare_action_parity_cases(historical, paper)
+
+    assert result.disposition is ActionParityDisposition.INCOMPLETE
+    assert result.unknowns == ("policy_identity.store_identity",)
+
+
+def test_complete_action_evidence_matches():
+    case = _complete_addition_case()
+
+    result = compare_action_parity_cases(case, case)
+
+    assert result.disposition is ActionParityDisposition.MATCHED
+    assert result.unknowns == ()
+
+
+def test_execution_difference_remains_an_execution_variance():
+    historical = _complete_addition_case()
+    paper = _complete_addition_case()
+    paper["execution"]["fill_price"] = Decimal("111")
+
+    result = compare_action_parity_cases(historical, paper)
+
+    assert result.disposition is ActionParityDisposition.MATCHED_WITH_EXECUTION_VARIANCE
+    assert result.execution_variances == ("execution.fill_price",)
+    assert result.mismatches == ()
