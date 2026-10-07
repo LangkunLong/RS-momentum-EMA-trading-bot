@@ -7,11 +7,29 @@ under a single workflow id.
 
 from __future__ import annotations
 
+from datetime import datetime
+from decimal import Decimal
 from dataclasses import dataclass
 import math
 import threading
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
+
+from core.policy_addition import (
+    AdditionCancelResult,
+    AdditionPlan,
+    AdditionStep,
+    AdditionStepKind,
+    AdditionSubmissionResult,
+    cancel_addition_remainder as cancel_policy_addition_remainder,
+    confirm_addition_cancel as confirm_policy_addition_cancel,
+    confirm_addition_protection as confirm_policy_addition_protection,
+    record_addition_fill as record_policy_addition_fill,
+    replace_addition_protection as replace_policy_addition_protection,
+    resolve_addition_after_terminal as resolve_policy_addition_after_terminal,
+    start_addition as start_policy_addition,
+    submit_addition as submit_policy_addition,
+)
 
 from core.execution_store import (
     ConcurrentWorkflowTransitionError,
@@ -33,6 +51,9 @@ from core.execution_workflow import (
 )
 from core.notifier import notify_buy_filled, notify_entry_submitted, notify_sell_filled
 from core.operation_limits import current_operation_budget
+from core.policy_execution_state import ActionStatus, PortfolioStateSnapshot
+from core.policy_execution_store import PolicyExecutionStateStore
+from core.strategy_policy.account_reconciliation import BrokerAccountSnapshot
 from core.order_execution import (
     OrderResult,
     ProtectiveStopResult,
@@ -86,6 +107,36 @@ class EntrySubmissionOutcome:
     error: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class AdditionExecutionPorts:
+    """Explicit durable state and injected paper operations for one fixed addition."""
+
+    store: PolicyExecutionStateStore
+    provider_id: str
+    get_account_snapshot: Callable[[], BrokerAccountSnapshot]
+    get_portfolio_snapshot: Callable[[AdditionPlan, BrokerAccountSnapshot], PortfolioStateSnapshot]
+    observed_at: Callable[[], datetime]
+    submit_order: Callable[..., AdditionSubmissionResult]
+    cancel_order: Callable[..., AdditionCancelResult]
+    replace_stop: Callable[..., BrokerAccountSnapshot | None]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.store, PolicyExecutionStateStore):
+            raise TypeError("addition execution requires an explicit PolicyExecutionStateStore")
+        if not isinstance(self.provider_id, str) or not self.provider_id.strip():
+            raise ValueError("addition provider_id must be non-empty")
+        for name in (
+            "get_account_snapshot",
+            "get_portfolio_snapshot",
+            "observed_at",
+            "submit_order",
+            "cancel_order",
+            "replace_stop",
+        ):
+            if not callable(getattr(self, name)):
+                raise TypeError(f"addition execution {name} must be callable")
+
+
 class PendingExitSafetyError(RuntimeError):
     """Signal an unresolved exit that must remain unhealthy until convergence."""
 
@@ -102,6 +153,164 @@ class OrderManager:
         resolved_paper = _is_paper_mode() if paper is None else paper
         require_paper_mode(resolved_paper)
         self._paper = True
+
+    @staticmethod
+    def _addition_account_snapshot(ports: AdditionExecutionPorts) -> BrokerAccountSnapshot:
+        account = ports.get_account_snapshot()
+        if type(account) is not BrokerAccountSnapshot:
+            raise TypeError("addition account provider must return BrokerAccountSnapshot")
+        if account.positions is None or account.open_orders is None or not account.account_snapshot_id:
+            raise ValueError("addition account provider must return complete position and open-order facts")
+        return account
+
+    @staticmethod
+    def _addition_observed_at(ports: AdditionExecutionPorts) -> datetime:
+        observed_at = ports.observed_at()
+        if not isinstance(observed_at, datetime) or observed_at.tzinfo is None:
+            raise TypeError("addition observed_at must be an aware datetime")
+        return observed_at
+
+    def _advance_addition_protection(
+        self,
+        decision_id: str,
+        step: AdditionStep,
+        *,
+        ports: AdditionExecutionPorts,
+    ) -> AdditionStep:
+        if step.kind is not AdditionStepKind.PROTECTION_DUE:
+            return step
+        return replace_policy_addition_protection(
+            ports.store,
+            decision_id,
+            account=self._addition_account_snapshot(ports),
+            observed_at=self._addition_observed_at(ports),
+            replace_stop=ports.replace_stop,
+        )
+
+    def submit_addition(
+        self,
+        plan: AdditionPlan,
+        *,
+        ports: AdditionExecutionPorts,
+    ) -> AdditionStep:
+        """Submit one caller-fixed addition through the public paper order owner."""
+        if type(plan) is not AdditionPlan:
+            raise TypeError("OrderManager accepts only a fixed AdditionPlan")
+        if type(ports) is not AdditionExecutionPorts:
+            raise TypeError("OrderManager requires AdditionExecutionPorts")
+        with _FILL_HANDLING_LOCK:
+            account = self._addition_account_snapshot(ports)
+            portfolio = ports.get_portfolio_snapshot(plan, account)
+            if type(portfolio) is not PortfolioStateSnapshot:
+                raise TypeError("addition portfolio provider must return PortfolioStateSnapshot")
+            step = start_policy_addition(
+                ports.store,
+                plan,
+                account=account,
+                portfolio_snapshot=portfolio,
+            )
+            if step.kind is AdditionStepKind.BUY_DUE:
+                step = submit_policy_addition(
+                    ports.store,
+                    plan.decision.decision_id,
+                    provider_id=ports.provider_id,
+                    observed_at=self._addition_observed_at(ports),
+                    submit=ports.submit_order,
+                )
+            return self._advance_addition_protection(
+                plan.decision.decision_id,
+                step,
+                ports=ports,
+            )
+
+    def handle_addition_fill(
+        self,
+        decision_id: str,
+        *,
+        fill_event_id: str,
+        cumulative_quantity: Decimal,
+        cumulative_notional: Decimal,
+        cumulative_fees: Decimal,
+        ports: AdditionExecutionPorts,
+    ) -> AdditionStep:
+        """Record a cumulative fill, cancel an exposed partial remainder, and resize protection."""
+        if type(ports) is not AdditionExecutionPorts:
+            raise TypeError("OrderManager requires AdditionExecutionPorts")
+        with _FILL_HANDLING_LOCK:
+            step = record_policy_addition_fill(
+                ports.store,
+                decision_id,
+                provider_id=ports.provider_id,
+                fill_event_id=fill_event_id,
+                cumulative_quantity=cumulative_quantity,
+                cumulative_notional=cumulative_notional,
+                cumulative_fees=cumulative_fees,
+                observed_at=self._addition_observed_at(ports),
+            )
+            if step.action is not None and step.action.status is ActionStatus.PARTIALLY_FILLED:
+                step = cancel_policy_addition_remainder(
+                    ports.store,
+                    decision_id,
+                    provider_id=ports.provider_id,
+                    observed_at=self._addition_observed_at(ports),
+                    cancel=ports.cancel_order,
+                )
+            return self._advance_addition_protection(decision_id, step, ports=ports)
+
+    def confirm_addition_cancel(
+        self,
+        decision_id: str,
+        *,
+        result: AdditionCancelResult,
+        ports: AdditionExecutionPorts,
+    ) -> AdditionStep:
+        """Apply a later broker cancel/fill observation without repeating cancellation."""
+        if type(ports) is not AdditionExecutionPorts:
+            raise TypeError("OrderManager requires AdditionExecutionPorts")
+        with _FILL_HANDLING_LOCK:
+            step = confirm_policy_addition_cancel(
+                ports.store,
+                decision_id,
+                provider_id=ports.provider_id,
+                result=result,
+                observed_at=self._addition_observed_at(ports),
+            )
+            return self._advance_addition_protection(decision_id, step, ports=ports)
+
+    def reconcile_addition_after_terminal(
+        self,
+        decision_id: str,
+        *,
+        ports: AdditionExecutionPorts,
+    ) -> AdditionStep:
+        """Reconcile a terminal broker order against a new authoritative account snapshot."""
+        if type(ports) is not AdditionExecutionPorts:
+            raise TypeError("OrderManager requires AdditionExecutionPorts")
+        with _FILL_HANDLING_LOCK:
+            step = resolve_policy_addition_after_terminal(
+                ports.store,
+                decision_id,
+                account=self._addition_account_snapshot(ports),
+                observed_at=self._addition_observed_at(ports),
+            )
+            return self._advance_addition_protection(decision_id, step, ports=ports)
+
+    def confirm_addition_protection(
+        self,
+        decision_id: str,
+        *,
+        ports: AdditionExecutionPorts,
+    ) -> AdditionStep:
+        """Confirm a previously uncertain stop exchange from current broker facts."""
+        if type(ports) is not AdditionExecutionPorts:
+            raise TypeError("OrderManager requires AdditionExecutionPorts")
+        with _FILL_HANDLING_LOCK:
+            return confirm_policy_addition_protection(
+                ports.store,
+                decision_id,
+                account=self._addition_account_snapshot(ports),
+                observed_at=self._addition_observed_at(ports),
+            )
 
     def submit_entry(
         self,
