@@ -18,6 +18,7 @@ from core.policy_execution_state import (
     build_action_intent,
 )
 from core.policy_execution_store import PolicyExecutionStateStore
+from core.order_manager import AdditionExecutionPorts, OrderManager
 from core.strategy_policy.account_reconciliation import (
     BrokerOrderFact,
     policy_execution_state_to_projection,
@@ -892,3 +893,195 @@ def test_unavailable_decision_time_price_blocks_without_reserving_an_action(tmp_
     assert step.kind is AdditionStepKind.BLOCKED
     assert step.action is None
     assert store.load_holding_episode(holding.holding_episode_id).pending_action_ids == ()
+
+
+def test_addition_blocks_when_plan_portfolio_snapshot_id_does_not_match(tmp_path):
+    store, plan, _, account, portfolio, _ = _addition_fixture(tmp_path)
+    mismatched_plan = replace(
+        plan,
+        source_portfolio_snapshot_id="portfolio:sha256:" + "0" * 64,
+    )
+
+    step = start_addition(
+        store,
+        mismatched_plan,
+        account=account,
+        portfolio_snapshot=portfolio,
+    )
+
+    assert step.kind is AdditionStepKind.BLOCKED
+    assert step.action is None
+    assert step.reason == "addition account or portfolio facts do not match the fixed decision"
+
+def test_order_manager_addition_route_blocks_a_plan_bound_to_another_portfolio(tmp_path):
+    store, plan, _, account, portfolio, _ = _addition_fixture(tmp_path)
+    mismatched_plan = replace(plan, source_portfolio_snapshot_id="other-portfolio-snapshot")
+    submissions = []
+    ports = AdditionExecutionPorts(
+        store=store,
+        provider_id=_ADD_PROVIDER,
+        get_account_snapshot=lambda: account,
+        get_portfolio_snapshot=lambda _plan, _account: portfolio,
+        observed_at=lambda: account.clock.valuation_time,
+        submit_order=lambda **request: submissions.append(request)
+        or AdditionSubmissionResult(success=True, broker_order_id=_ADD_BROKER_ID),
+        cancel_order=lambda **_request: pytest.fail("blocked plan must not cancel"),
+        replace_stop=lambda **_request: pytest.fail("blocked plan must not replace protection"),
+    )
+
+    step = OrderManager(paper=True).submit_addition(mismatched_plan, ports=ports)
+
+    assert step.kind is AdditionStepKind.BLOCKED
+    assert step.action is None
+    assert submissions == []
+
+
+def test_order_manager_addition_route_does_not_reissue_uncertain_submission(tmp_path):
+    store, plan, _, account, portfolio, _ = _addition_fixture(tmp_path)
+    submissions = []
+
+    def uncertain_submit(**request):
+        submissions.append(request)
+        return AdditionSubmissionResult(
+            success=False,
+            outcome_uncertain=True,
+            error="fake transport lost response",
+        )
+
+    ports = AdditionExecutionPorts(
+        store=store,
+        provider_id=_ADD_PROVIDER,
+        get_account_snapshot=lambda: account,
+        get_portfolio_snapshot=lambda _plan, _account: portfolio,
+        observed_at=lambda: account.clock.valuation_time,
+        submit_order=uncertain_submit,
+        cancel_order=lambda **_request: pytest.fail("uncertain submit has no confirmed fill"),
+        replace_stop=lambda **_request: pytest.fail("uncertain submit has no confirmed fill"),
+    )
+    manager = OrderManager(paper=True)
+
+    first = manager.submit_addition(plan, ports=ports)
+    replay = manager.submit_addition(plan, ports=ports)
+
+    assert first.kind is AdditionStepKind.WAITING_FOR_BUY
+    assert replay.kind is AdditionStepKind.WAITING_FOR_BUY
+    assert first.action is not None
+    assert replay.action is not None
+    assert replay.action.logical_action_id == first.action.logical_action_id
+    assert len(submissions) == 1
+
+
+def test_order_manager_addition_route_reconciles_partial_fill_and_protective_stop(tmp_path):
+    store, plan, _, account, portfolio, original_holding = _addition_fixture(tmp_path)
+    after_fill_account = _addition_account_after_fill(
+        account, plan, quantity=7, cash=8890, order_status="cancelled", cumulative=1
+    )
+    refreshed_account = _account_after_stop_replacement(after_fill_account, plan, holding_quantity=7)
+
+    class FakeBroker:
+        def __init__(self):
+            self.account = account
+            self.submissions = []
+            self.cancellations = []
+            self.stop_replacements = []
+            self.portfolio_reads = []
+
+        def read_account(self):
+            return self.account
+
+        def read_portfolio(self, fixed_plan, account_snapshot):
+            self.portfolio_reads.append((fixed_plan, account_snapshot.account_snapshot_id))
+            return portfolio
+
+        def submit_order(self, **request):
+            self.submissions.append(request)
+            return AdditionSubmissionResult(success=True, broker_order_id=_ADD_BROKER_ID)
+
+        def cancel_order(self, **request):
+            self.cancellations.append(request)
+            self.account = after_fill_account
+            return AdditionCancelResult(outcome_uncertain=True)
+
+        def replace_stop(self, **request):
+            self.stop_replacements.append(request)
+            assert request["old_order"].broker_order_id == original_holding.confirmed_stop_broker_order_id
+            assert request["quantity"] == Decimal("7")
+            assert request["stop_price"] == Decimal("90")
+            # The fake broker accepted the atomic replacement, but its response was lost.
+            self.account = refreshed_account
+            return None
+
+    broker = FakeBroker()
+    ports = AdditionExecutionPorts(
+        store=store,
+        provider_id=_ADD_PROVIDER,
+        get_account_snapshot=broker.read_account,
+        get_portfolio_snapshot=broker.read_portfolio,
+        observed_at=lambda: account.clock.valuation_time,
+        submit_order=broker.submit_order,
+        cancel_order=broker.cancel_order,
+        replace_stop=broker.replace_stop,
+    )
+    manager = OrderManager(paper=True)
+
+    submitted = manager.submit_addition(plan, ports=ports)
+    assert submitted.kind is AdditionStepKind.WAITING_FOR_BUY
+    assert submitted.action is not None
+    assert submitted.action.status is ActionStatus.SUBMITTED
+    assert len(broker.submissions) == 1
+    assert broker.portfolio_reads == [(plan, account.account_snapshot_id)]
+
+    waiting_for_cancel = manager.handle_addition_fill(
+        plan.decision.decision_id,
+        fill_event_id="manager-route-add-fill-one-share",
+        cumulative_quantity=Decimal("1"),
+        cumulative_notional=Decimal("110"),
+        cumulative_fees=Decimal("0"),
+        ports=ports,
+    )
+    duplicate_fill = manager.handle_addition_fill(
+        plan.decision.decision_id,
+        fill_event_id="manager-route-add-fill-one-share",
+        cumulative_quantity=Decimal("1"),
+        cumulative_notional=Decimal("110"),
+        cumulative_fees=Decimal("0"),
+        ports=ports,
+    )
+    assert waiting_for_cancel.kind is AdditionStepKind.WAITING_FOR_BUY
+    assert duplicate_fill.kind is AdditionStepKind.WAITING_FOR_BUY
+    assert len(broker.cancellations) == 1
+
+    protected_pending_confirmation = manager.confirm_addition_cancel(
+        plan.decision.decision_id,
+        result=AdditionCancelResult(
+            outcome_uncertain=False,
+            terminal_status=ActionAttemptStatus.CANCELLED,
+            cumulative_quantity=Decimal("1"),
+            cumulative_notional=Decimal("110"),
+            cumulative_fees=Decimal("0"),
+            fill_event_id="manager-route-add-terminal-watermark",
+            account=after_fill_account,
+        ),
+        ports=ports,
+    )
+    assert protected_pending_confirmation.kind is AdditionStepKind.WAITING_FOR_PROTECTION
+    assert len(broker.stop_replacements) == 1
+
+    protected = manager.confirm_addition_protection(plan.decision.decision_id, ports=ports)
+    duplicate_after_protection = manager.handle_addition_fill(
+        plan.decision.decision_id,
+        fill_event_id="manager-route-add-fill-one-share",
+        cumulative_quantity=Decimal("1"),
+        cumulative_notional=Decimal("110"),
+        cumulative_fees=Decimal("0"),
+        ports=ports,
+    )
+
+    assert protected.kind is AdditionStepKind.PROTECTED
+    assert duplicate_after_protection.kind is AdditionStepKind.PROTECTED
+    assert len(broker.cancellations) == 1
+    assert len(broker.stop_replacements) == 1
+    holding = store.load_holding_episode(original_holding.holding_episode_id)
+    assert holding.remaining_quantity == Decimal("7")
+    assert holding.confirmed_stop_client_order_id == _STOP_CLIENT_ID
+    assert holding.confirmed_stop_broker_order_id == _STOP_BROKER_ID

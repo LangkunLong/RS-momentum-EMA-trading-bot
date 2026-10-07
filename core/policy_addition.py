@@ -423,6 +423,7 @@ def start_addition(
             portfolio_snapshot.deployment_identity != deployment
             or portfolio_snapshot.clock != plan.decision.clock
             or portfolio_snapshot.account_snapshot_id != plan.source_account_snapshot_id
+            or portfolio_snapshot.portfolio_snapshot_id != plan.source_portfolio_snapshot_id
             or account.account_snapshot_id != plan.source_account_snapshot_id
             or account.source_namespace != portfolio_snapshot.source_namespace
             or account.paper_account_environment_id != deployment.paper_account_environment_id
