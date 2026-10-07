@@ -28,6 +28,7 @@ from core.policy_execution_store import (
     ConcurrentStateUpdateError,
     FillReceiptConflictError,
     PolicyExecutionStateStore,
+    StopUpdateProposalAlreadyClaimedError,
 )
 
 
@@ -997,13 +998,15 @@ def test_stop_update_replay_uses_durable_intent_and_confirmed_price(tmp_path: Pa
         expected_holding_version=holding.state_version,
         observed_at=observed_at,
     )
-    replayed = store.propose_stop_update(
-        holding.holding_episode_id,
-        decision=decision,
-        stop_price=Decimal("47"),
-        expected_holding_version=holding.state_version,
-        observed_at=observed_at,
-    )
+    with pytest.raises(StopUpdateProposalAlreadyClaimedError, match="reconcile"):
+        store.propose_stop_update(
+            holding.holding_episode_id,
+            decision=decision,
+            stop_price=Decimal("47"),
+            expected_holding_version=holding.state_version,
+            observed_at=observed_at,
+        )
+    replayed = store.load_stop_update_intent(intent.logical_action_id)
     assert replayed == intent
     with pytest.raises(ValueError, match="requested facts"):
         store.propose_stop_update(

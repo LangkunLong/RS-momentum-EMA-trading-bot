@@ -61,6 +61,10 @@ class ConcurrentStateUpdateError(ValueError):
     """Raised when a caller's expected version or pointer is stale."""
 
 
+class StopUpdateProposalAlreadyClaimedError(ValueError):
+    """A matching durable stop proposal exists; reconcile instead of dispatching again."""
+
+
 class StoreIdentityConflictError(ValueError):
     """Raised when an explicit path is opened under a different store identity."""
 
@@ -2733,11 +2737,8 @@ class PolicyExecutionStateStore:
                 )
                 if immutable != expected:
                     raise IdentityConflictError("stop update action already has different requested facts")
-                return StopUpdateIntent(
-                    deployment_generation_id=str(existing["deployment_generation_id"]),
-                    decision_id=str(existing["decision_id"]),
-                    holding_episode_id=str(existing["holding_episode_id"]),
-                    requested_stop_price=Decimal(existing["requested_stop_price"]),
+                raise StopUpdateProposalAlreadyClaimedError(
+                    "matching stop update proposal already exists; reconcile before dispatching again"
                 )
             if int(holding_row["state_version"]) != expected_holding_version:
                 raise ConcurrentStateUpdateError("holding changed since the caller read it")

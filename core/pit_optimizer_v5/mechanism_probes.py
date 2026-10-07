@@ -340,7 +340,13 @@ class MechanismWorkerPortV1(Protocol):
 
     def open(self) -> object: ...
 
-    def reset(self, session: object, case: MechanismPairedCaseV1) -> None: ...
+    def reset(
+        self,
+        session: object,
+        case: MechanismPairedCaseV1,
+        *,
+        deadline_monotonic: float | None,
+    ) -> None: ...
 
     def evaluate(
         self,
@@ -382,11 +388,21 @@ class SyntheticFixtureWorkerV1:
         self.closed = False
         return self
 
-    def reset(self, session: object, case: MechanismPairedCaseV1) -> None:
+    def reset(
+        self,
+        session: object,
+        case: MechanismPairedCaseV1,
+        *,
+        deadline_monotonic: float | None,
+    ) -> None:
         if session is not self or not self.opened or self.closed:
             raise RuntimeError("synthetic fixture worker session is invalid")
         if type(case) is not MechanismPairedCaseV1:
             raise ValueError("synthetic fixture case is invalid")
+        if deadline_monotonic is not None and (
+            type(deadline_monotonic) is not float or not math.isfinite(deadline_monotonic)
+        ):
+            raise ValueError("synthetic fixture worker deadline is invalid")
         self.reset_count += 1
         if self.failure is not None:
             raise self.failure
@@ -726,19 +742,44 @@ def collect_mechanism_observations_v1(
             repetitions=repetitions,
             limitations=("The bound case or repetition count exceeds the registered resource budget.",),
         )
-    if (
-        parent_worker.registration.execution_kind != "synthetic_fixture"
-        or candidate_worker.registration.execution_kind != "synthetic_fixture"
-    ):
+    execution_kinds = (parent_worker.registration.execution_kind, candidate_worker.registration.execution_kind)
+    if execution_kinds[0] != execution_kinds[1]:
         return _run(
             binding=binding,
             corpus=corpus,
             execution=MechanismExecutionV1(status="not_run", reason="worker_unavailable"),
             observations=(),
             repetitions=repetitions,
-            limitations=("No registered sandbox adapter is available for nonfixture execution.",),
+            limitations=("Parent and candidate worker execution kinds differ.",),
         )
-    if parent_worker.registration.cpu_memory_enforced or candidate_worker.registration.cpu_memory_enforced:
+    registered_sandbox = execution_kinds[0] == "registered_sandbox"
+    if registered_sandbox:
+        from .mechanism_docker import MechanismDockerCaseWorkerV1
+
+        if (
+            type(parent_worker) is not MechanismDockerCaseWorkerV1
+            or type(candidate_worker) is not MechanismDockerCaseWorkerV1
+            or not parent_worker.registration.cpu_memory_enforced
+            or not candidate_worker.registration.cpu_memory_enforced
+        ):
+            return _run(
+                binding=binding,
+                corpus=corpus,
+                execution=MechanismExecutionV1(status="not_run", reason="worker_unavailable"),
+                observations=(),
+                repetitions=repetitions,
+                limitations=("Registered sandbox observations require the concrete bounded Docker case adapter.",),
+            )
+    elif execution_kinds[0] != "synthetic_fixture":
+        return _run(
+            binding=binding,
+            corpus=corpus,
+            execution=MechanismExecutionV1(status="not_run", reason="worker_unavailable"),
+            observations=(),
+            repetitions=repetitions,
+            limitations=("The worker execution kind is unsupported.",),
+        )
+    if not registered_sandbox and (parent_worker.registration.cpu_memory_enforced or candidate_worker.registration.cpu_memory_enforced):
         return _run(
             binding=binding,
             corpus=corpus,
@@ -754,14 +795,26 @@ def collect_mechanism_observations_v1(
     execution_reason: Literal["completed", "resource_limit", "timeout", "protocol_failure", "execution_failed"] = (
         "completed"
     )
-    limitations: list[str] = [
-        "Synthetic fixture execution supplied typed decisions; it does not prove sandbox execution or resource isolation.",
-        "CPU and peak memory were not measured or enforced by the synthetic fixture port.",
-        "Branch coverage is unavailable without an independently instrumented worker.",
-    ]
+    limitations: list[str] = (
+        [
+            "Registered observations ran in one network-disabled, read-only Docker container per role and case.",
+            "Configured CPU and memory limits were enforced by the Docker executor; peak usage was not measured.",
+            "Branch coverage is unavailable without an independently instrumented worker.",
+        ]
+        if registered_sandbox
+        else [
+            "Synthetic fixture execution supplied typed decisions; it does not prove sandbox execution or resource isolation.",
+            "CPU and peak memory were not measured or enforced by the synthetic fixture port.",
+            "Branch coverage is unavailable without an independently instrumented worker.",
+        ]
+    )
+
+    run_deadline_monotonic = time.monotonic() + budget.timeout_ms / 1000.0
+    if deadline_monotonic is not None:
+        run_deadline_monotonic = min(run_deadline_monotonic, deadline_monotonic)
 
     def check_deadline() -> None:
-        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+        if time.monotonic() >= run_deadline_monotonic:
             raise _ObservationFailure("timeout", "caller-owned observation deadline expired")
 
     try:
@@ -778,20 +831,28 @@ def collect_mechanism_observations_v1(
             for case in corpus.cases:
                 check_deadline()
                 try:
-                    parent_worker.reset(parent_session, case)
+                    parent_worker.reset(
+                        parent_session,
+                        case,
+                        deadline_monotonic=run_deadline_monotonic,
+                    )
                     check_deadline()
-                    candidate_worker.reset(candidate_session, case)
+                    candidate_worker.reset(
+                        candidate_session,
+                        case,
+                        deadline_monotonic=run_deadline_monotonic,
+                    )
                     check_deadline()
                     parent_raw = parent_worker.evaluate(
                         parent_session,
                         case,
-                        deadline_monotonic=deadline_monotonic,
+                        deadline_monotonic=run_deadline_monotonic,
                     )
                     check_deadline()
                     candidate_raw = candidate_worker.evaluate(
                         candidate_session,
                         case,
-                        deadline_monotonic=deadline_monotonic,
+                        deadline_monotonic=run_deadline_monotonic,
                     )
                     check_deadline()
                     parent, parent_json, parent_sha256 = _validate_decision(case.snapshot, parent_raw)
