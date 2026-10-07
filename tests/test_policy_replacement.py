@@ -324,3 +324,65 @@ def test_restart_between_full_sale_and_buy_releases_one_cash_bounded_action(tmp_
     assert replay_after_change.kind is ReplacementStepKind.BLOCKED
     assert replay_after_change.action is not None
     assert replay_after_change.action.status.value == "resolved"
+
+
+def test_candidate_price_change_resolves_unsubmitted_buy_and_cannot_reopen(tmp_path):
+    store, plan, deployment, account, portfolio, _ = _replacement_fixture(tmp_path)
+    start_replacement(store, plan)
+    _submit_fake_sell(store, plan, plan.decision.clock.account_valuation_at)
+    _record_fake_sell_fill(
+        store,
+        plan,
+        str(plan.sell_action.requested_quantity),
+        observed_at=plan.decision.clock.account_valuation_at,
+    )
+    refreshed_account, refreshed_portfolio = _refreshed_after_full_sale(
+        store, account, portfolio, plan
+    )
+
+    buy_due = advance_replacement(
+        store,
+        plan.decision.decision_id,
+        account=refreshed_account,
+        portfolio_snapshot=refreshed_portfolio,
+        candidate_price=Decimal("100"),
+    )
+    assert buy_due.kind is ReplacementStepKind.BUY_DUE
+    assert buy_due.action is not None
+    assert buy_due.action.status.value == "intended"
+    buy_action_id = buy_due.action.logical_action_id
+
+    restarted = PolicyExecutionStateStore(store.db_path, store_identity=deployment.store_identity)
+    changed_price = advance_replacement(
+        restarted,
+        plan.decision.decision_id,
+        account=refreshed_account,
+        portfolio_snapshot=refreshed_portfolio,
+        candidate_price=Decimal("101"),
+    )
+    assert changed_price.kind is ReplacementStepKind.BLOCKED
+    assert changed_price.action is not None
+    assert changed_price.action.logical_action_id == buy_action_id
+    assert changed_price.action.status.value == "resolved"
+
+    resolved = load_replacement_intention(restarted, plan.decision.decision_id)
+    assert resolved.buy_action is not None
+    assert resolved.buy_action.logical_action_id == buy_action_id
+    assert resolved.buy_action.status.value == "resolved"
+
+    replayed_old_price = advance_replacement(
+        restarted,
+        plan.decision.decision_id,
+        account=refreshed_account,
+        portfolio_snapshot=refreshed_portfolio,
+        candidate_price=Decimal("100"),
+    )
+    assert replayed_old_price.kind is ReplacementStepKind.BLOCKED
+    assert replayed_old_price.action is not None
+    assert replayed_old_price.action.logical_action_id == buy_action_id
+    assert replayed_old_price.action.status.value == "resolved"
+
+    still_resolved = load_replacement_intention(restarted, plan.decision.decision_id)
+    assert still_resolved.buy_action is not None
+    assert still_resolved.buy_action.logical_action_id == buy_action_id
+    assert still_resolved.buy_action.status.value == "resolved"
