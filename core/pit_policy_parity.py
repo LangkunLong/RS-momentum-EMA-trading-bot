@@ -130,6 +130,98 @@ _ACTION_PARITY_REQUIRED_INTENT_FIELDS = {
 }
 
 
+_ACTION_PARITY_REQUIRED_COMMON_FIELDS = {
+    "policy_identity": frozenset(
+        {
+            "policy_artifact_id",
+            "capability_manifest_id",
+            "policy_interface_version",
+            "feature_contract_id",
+            "feature_calculator_id",
+            "source_revision",
+            "runtime_identity",
+            "execution_profile_id",
+            "paper_account_environment_id",
+            "store_identity",
+        }
+    ),
+    "decision": frozenset(
+        {
+            "action_family",
+            "decision_id",
+            "exchange_id",
+            "decision_session",
+            "as_of_cutoff_at",
+            "next_execution_session",
+            "account_valuation_session",
+            "account_valuation_at",
+            "snapshot_sha256",
+            "category",
+            "subject_type",
+            "subject_id",
+        }
+    ),
+}
+_ACTION_PARITY_REQUIRED_FACT_FIELDS = {
+    "replacement": frozenset(
+        {
+            "evicted_security_id",
+            "evicted_symbol",
+            "evicted_quantity",
+            "candidate_security_id",
+            "candidate_symbol",
+        }
+    ),
+    "addition": frozenset(
+        {
+            "holding_episode_id",
+            "security_id",
+            "broker_symbol",
+            "original_quantity",
+            "remaining_quantity",
+            "holding_state_version",
+            "entry_price",
+            "current_price",
+            "current_quantity",
+            "current_notional_fraction",
+            "days_held",
+            "add_on_count",
+            "remaining_cash_fraction",
+            "open_position_risk_fraction",
+            "current_rs_score",
+            "industry_group_rs",
+            "atr_20_fraction",
+            "volume_ratio",
+        }
+    ),
+    "scale_out": frozenset(
+        {
+            "holding_episode_id",
+            "security_id",
+            "broker_symbol",
+            "original_quantity",
+            "remaining_quantity",
+            "holding_state_version",
+            "confirmed_stop_price",
+        }
+    ),
+    "close": frozenset(
+        {
+            "holding_episode_id",
+            "security_id",
+            "broker_symbol",
+            "original_quantity",
+            "remaining_quantity",
+            "holding_state_version",
+            "confirmed_stop_price",
+        }
+    ),
+}
+_ACTION_PARITY_REQUIRED_EXECUTION_FIELDS = frozenset(
+    {"fill_price", "fees", "pending_state"}
+)
+
+
 def _action_parity_nested(value: object) -> bool:
     return isinstance(value, Mapping) or (
         isinstance(value, Sequence) and not isinstance(value, (str, bytes))
@@ -167,6 +259,10 @@ def _action_parity_same_value(field: str, left: object, right: object) -> bool:
     return _action_parity_equal(left, right)
 
 
+def _action_parity_required_value_missing(value: object) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
 def compare_action_parity_cases(
     historical: Mapping[str, object],
     paper: Mapping[str, object],
@@ -174,7 +270,8 @@ def compare_action_parity_cases(
     """Compare fixed historical decisions with durable paper action intentions.
 
     Policy identity, known facts, the decision clock and output, and fixed action
-    intent fields must match exactly. Missing evidence stays unknown. Only the
+    intent fields must match exactly. Missing or blank required evidence stays
+    unknown. Only the
     declared execution fields may differ as an execution variance; fills, fees,
     valuation time, and pending state never excuse a changed decision or order.
     """
@@ -184,15 +281,38 @@ def compare_action_parity_cases(
     incompatible: list[str] = []
     execution_variances: list[str] = []
 
+    expected_decision = historical.get("decision")
+    action_family = (
+        expected_decision.get("action_family")
+        if isinstance(expected_decision, Mapping)
+        else None
+    )
+    required_fields_by_group = {
+        **_ACTION_PARITY_REQUIRED_COMMON_FIELDS,
+        "facts": _ACTION_PARITY_REQUIRED_FACT_FIELDS.get(action_family, frozenset()),
+        "intent": _ACTION_PARITY_REQUIRED_INTENT_FIELDS.get(action_family, frozenset()),
+    }
+
     for group in _ACTION_PARITY_EXACT_GROUPS:
         expected_group = historical.get(group)
         observed_group = paper.get(group)
+        required_fields = required_fields_by_group.get(group, frozenset())
         if not isinstance(expected_group, Mapping) or not isinstance(observed_group, Mapping):
             unknown.append(group)
+            unknown.extend(f"{group}.{field}" for field in required_fields)
             continue
         if not expected_group and not observed_group:
             unknown.append(group)
+            unknown.extend(f"{group}.{field}" for field in required_fields)
             continue
+        for field in required_fields:
+            if (
+                field not in expected_group
+                or _action_parity_required_value_missing(expected_group.get(field))
+                or field not in observed_group
+                or _action_parity_required_value_missing(observed_group.get(field))
+            ):
+                unknown.append(f"{group}.{field}")
         for field, expected_value in expected_group.items():
             label = f"{group}.{field}"
             observed_value = observed_group.get(field, _ACTION_PARITY_MISSING)
@@ -200,6 +320,13 @@ def compare_action_parity_cases(
                 expected_value is None
                 or observed_value is _ACTION_PARITY_MISSING
                 or observed_value is None
+                or (
+                    field in required_fields
+                    and (
+                        _action_parity_required_value_missing(expected_value)
+                        or _action_parity_required_value_missing(observed_value)
+                    )
+                )
             ):
                 unknown.append(label)
             elif _action_parity_same_value(field, expected_value, observed_value):
@@ -216,9 +343,23 @@ def compare_action_parity_cases(
     observed_execution = paper.get("execution")
     if not isinstance(expected_execution, Mapping) or not isinstance(observed_execution, Mapping):
         unknown.append("execution")
+        unknown.extend(
+            f"execution.{field}" for field in _ACTION_PARITY_REQUIRED_EXECUTION_FIELDS
+        )
     elif not expected_execution and not observed_execution:
         unknown.append("execution")
+        unknown.extend(
+            f"execution.{field}" for field in _ACTION_PARITY_REQUIRED_EXECUTION_FIELDS
+        )
     else:
+        for field in _ACTION_PARITY_REQUIRED_EXECUTION_FIELDS:
+            if (
+                field not in expected_execution
+                or _action_parity_required_value_missing(expected_execution.get(field))
+                or field not in observed_execution
+                or _action_parity_required_value_missing(observed_execution.get(field))
+            ):
+                unknown.append(f"execution.{field}")
         for field, expected_value in expected_execution.items():
             label = f"execution.{field}"
             observed_value = observed_execution.get(field, _ACTION_PARITY_MISSING)
@@ -226,6 +367,13 @@ def compare_action_parity_cases(
                 expected_value is None
                 or observed_value is _ACTION_PARITY_MISSING
                 or observed_value is None
+                or (
+                    field in _ACTION_PARITY_REQUIRED_EXECUTION_FIELDS
+                    and (
+                        _action_parity_required_value_missing(expected_value)
+                        or _action_parity_required_value_missing(observed_value)
+                    )
+                )
             ):
                 unknown.append(label)
             elif _action_parity_same_value(field, expected_value, observed_value):
@@ -238,26 +386,8 @@ def compare_action_parity_cases(
             if field not in expected_execution:
                 unknown.append(f"execution.{field}")
 
-    expected_decision = historical.get("decision")
-    action_family = (
-        expected_decision.get("action_family")
-        if isinstance(expected_decision, Mapping)
-        else None
-    )
-    required_intent_fields = _ACTION_PARITY_REQUIRED_INTENT_FIELDS.get(action_family)
-    if required_intent_fields is None:
+    if action_family not in _ACTION_PARITY_REQUIRED_INTENT_FIELDS:
         unknown.append("decision.action_family")
-    else:
-        expected_intent = historical.get("intent")
-        observed_intent = paper.get("intent")
-        for field in required_intent_fields:
-            if (
-                not isinstance(expected_intent, Mapping)
-                or field not in expected_intent
-                or not isinstance(observed_intent, Mapping)
-                or field not in observed_intent
-            ):
-                unknown.append(f"intent.{field}")
 
     if incompatible:
         disposition = ActionParityDisposition.INCOMPATIBLE_POLICY
