@@ -892,3 +892,22 @@ def test_unavailable_decision_time_price_blocks_without_reserving_an_action(tmp_
     assert step.kind is AdditionStepKind.BLOCKED
     assert step.action is None
     assert store.load_holding_episode(holding.holding_episode_id).pending_action_ids == ()
+
+
+def test_addition_blocks_when_plan_portfolio_snapshot_id_does_not_match(tmp_path):
+    store, plan, _, account, portfolio, _ = _addition_fixture(tmp_path)
+    mismatched_plan = replace(
+        plan,
+        source_portfolio_snapshot_id="portfolio:sha256:" + "0" * 64,
+    )
+
+    step = start_addition(
+        store,
+        mismatched_plan,
+        account=account,
+        portfolio_snapshot=portfolio,
+    )
+
+    assert step.kind is AdditionStepKind.BLOCKED
+    assert step.action is None
+    assert step.reason == "addition account or portfolio facts do not match the fixed decision"
