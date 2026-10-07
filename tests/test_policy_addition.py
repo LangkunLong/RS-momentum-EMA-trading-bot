@@ -663,6 +663,7 @@ def test_partial_and_duplicate_fill_resolves_once_then_resizes_protection_to_exa
     projection_after_first = store.load_action_projection(due.action.logical_action_id)
     holding_after_first = store.load_holding_episode(original_holding.holding_episode_id)
     assert holding_after_first.remaining_quantity == Decimal("7")
+    assert holding_after_first.initial_filled_quantity == original_holding.initial_filled_quantity
     assert holding_after_first.cost_basis == Decimal("710") / Decimal("7")
     assert holding_after_first.confirmed_protective_stop_price == Decimal("90")
     assert holding_after_first.confirmed_stop_broker_order_id == original_holding.confirmed_stop_broker_order_id
