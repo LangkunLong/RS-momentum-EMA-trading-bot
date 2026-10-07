@@ -1,5 +1,6 @@
 from decimal import Decimal
 
+import pytest
 from core.pit_policy_parity import ActionParityDisposition, compare_action_parity_cases
 from core.policy_addition import AdditionStepKind, start_addition
 from core.policy_execution_store import PolicyExecutionStateStore
@@ -417,6 +418,19 @@ def test_missing_common_policy_field_on_both_sides_is_incomplete():
 
     assert result.disposition is ActionParityDisposition.INCOMPLETE
     assert result.unknowns == ("policy_identity.store_identity",)
+
+
+@pytest.mark.parametrize("blank_identity", ["", " \t"])
+def test_equal_blank_required_policy_identity_is_incomplete(blank_identity):
+    historical = _complete_addition_case()
+    paper = _complete_addition_case()
+    historical["policy_identity"]["policy_artifact_id"] = blank_identity
+    paper["policy_identity"]["policy_artifact_id"] = blank_identity
+
+    result = compare_action_parity_cases(historical, paper)
+
+    assert result.disposition is ActionParityDisposition.INCOMPLETE
+    assert result.unknowns == ("policy_identity.policy_artifact_id",)
 
 
 def test_complete_action_evidence_matches():
