@@ -58,6 +58,8 @@ _ADD_ON_OUTCOME_IDS_V5 = frozenset(
 # issued, even though it is introduced by the next implementation task.
 # mechanism_contracts.py is included because mechanism_entry imports
 # mechanism_request_allocation_v1 to authenticate per-request resource shares.
+# operation_limits.py is imported through the panel evaluator's top-level
+# backtest dependencies before container_entry can handle a request.
 EVALUATOR_SOURCE_PATHS_V5 = (
     "backtest.py",
     "config/__init__.py",
@@ -83,6 +85,7 @@ EVALUATOR_SOURCE_PATHS_V5 = (
     "core/index_ticker_fetcher.py",
     "core/leader_evaluation.py",
     "core/momentum_analysis.py",
+    "core/operation_limits.py",
     "core/pit_data.py",
     "core/pit_diagnosis/fact_cache.py",
     "core/pit_diagnosis/models.py",

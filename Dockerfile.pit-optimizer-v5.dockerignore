@@ -40,6 +40,7 @@ core/strategy_policy/v3/*
 !core/index_ticker_fetcher.py
 !core/leader_evaluation.py
 !core/momentum_analysis.py
+!core/operation_limits.py
 !core/pit_data.py
 !core/pit_diagnosis/fact_cache.py
 !core/pit_diagnosis/models.py

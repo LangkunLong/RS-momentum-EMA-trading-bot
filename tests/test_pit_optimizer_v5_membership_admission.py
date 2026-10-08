@@ -196,7 +196,7 @@ def test_admission_helper_is_in_closed_container_source_map() -> None:
     source_identity = evaluator_source_sha256(source_map)
 
     assert "core/pit_optimizer_v5/sandbox.py" in source_map
-    assert len(EVALUATOR_SOURCE_PATHS_V5) == 63
+    assert len(EVALUATOR_SOURCE_PATHS_V5) == 64
     assert "core/pit_data.py" in source_map
     assert "core/alpaca_client_policy.py" in source_map
     assert "core/scheduler_observation.py" in source_map
