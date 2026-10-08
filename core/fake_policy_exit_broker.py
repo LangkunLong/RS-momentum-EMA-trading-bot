@@ -635,10 +635,10 @@ class FakeProtectedExitBroker:
             ):
                 raise ValueError("fake broker stop exchange differs from held shares")
             if any(
-                row.symbol == symbol and row.side == "sell" and row.purpose == "strategy" and row.status in _WORKING
+                row is not current and row.symbol == symbol and row.side == "sell" and row.status in _WORKING
                 for row in self._account.open_orders
             ):
-                raise ValueError("fake broker cannot exchange a stop beside a working strategy sell")
+                raise ValueError("fake broker cannot exchange a stop beside another working sell")
             digest = sha256(new_client_order_id.encode("utf-8")).hexdigest()[:20]
             new_broker_id = "fake-stop-order:" + digest
             new_order = replace(

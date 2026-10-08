@@ -152,7 +152,7 @@ def _observed_stop(broker: FakeProtectedExitBroker, decision: DecisionIdentity, 
     other_sells = tuple(
         row for row in account.open_orders
         if row.symbol == holding.broker_symbol and row.side == "sell"
-        and row.purpose != "protective_stop" and row.status in _WORKING
+        and row.status in _WORKING and (len(stops) != 1 or row is not stops[0])
     )
     if (
         len(positions) != 1 or len(stops) != 1 or other_sells

@@ -216,3 +216,36 @@ def test_selected_stop_requires_fake_broker_swap_and_recovers_after_restart(tmp_
     )
     assert stop_fill.status is ActionStatus.PARTIALLY_FILLED
     assert store.load_holding_episode(holding.holding_episode_id).remaining_quantity == Decimal("4")
+
+
+def test_selected_stop_rejects_second_working_protective_sell_for_symbol(tmp_path):
+    _, store, _, account, _, holding, decision, snapshot = _case(tmp_path)
+    manager = OrderManager(paper=True, policy_store=store)
+    saved = manager.record_policy_exit_management(
+        decision=decision, holding_episode_id=holding.holding_episode_id,
+        snapshot=snapshot, outcome=evaluate_exit(snapshot),
+        expected_holding_version=holding.state_version,
+    )
+    old = next(
+        row for row in account.open_orders
+        if row.broker_order_id == holding.confirmed_stop_broker_order_id
+    )
+    duplicate = replace(
+        old, broker_order_id="fake:other-stop", client_order_id="fake:other-stop-client",
+        holding_episode_id="holding:another-episode",
+    )
+    broker = _broker(store, replace(account, open_orders=account.open_orders + (duplicate,)))
+    broker.observe_for(decision)
+    blocked = manager.apply_policy_exit_selected_stop(
+        decision=decision, broker=broker, provider_id="offline-fake-broker",
+        observed_at=decision.clock.account_valuation_at,
+    )
+    assert blocked.disposition == "blocked"
+    assert store.load_holding_episode(holding.holding_episode_id) == saved
+    assert saved.proposed_stop_action_id == saved.confirmed_stop_action_id
+    with pytest.raises(ValueError, match="another working sell"):
+        broker.replace_stop(
+            old_order=old, symbol=holding.broker_symbol,
+            quantity=holding.remaining_quantity, stop_price=Decimal("106"),
+            new_client_order_id="fake:blocked-replacement",
+        )
