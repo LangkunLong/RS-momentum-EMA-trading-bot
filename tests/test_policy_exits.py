@@ -3,6 +3,8 @@ from datetime import timedelta
 from threading import Barrier
 from decimal import Decimal
 
+import pytest
+
 from core.policy_execution_state import ActionRole, ActionStatus, DecisionCategory, DecisionIdentity, DecisionSubjectType, OrderSide
 from core.policy_execution_store import PolicyExecutionStateStore, StopUpdateProposalAlreadyClaimedError
 from core.policy_exits import propose_protection_resize, start_full_exit, start_scale_out
@@ -107,6 +109,37 @@ def test_scale_out_uses_original_and_remaining_quantities_and_recovers_partial_a
     assert replayed.status is ActionStatus.PARTIALLY_FILLED
     assert replayed.confirmed_filled_quantity == Decimal("2")
     assert restarted.load_holding_episode(holding.holding_episode_id).pending_action_ids == (action.logical_action_id,)
+
+
+@pytest.mark.parametrize("full_exit", [False, True], ids=["scale-out", "close"])
+def test_explicit_exit_order_type_replays_exactly_and_rejects_changed_type(tmp_path, full_exit):
+    features, store, deployment, portfolio, holding = _fixture(tmp_path)
+    decision = _exit_decision(features, deployment, portfolio, holding)
+    common = {
+        "decision": decision,
+        "holding_episode_id": holding.holding_episode_id,
+        "expected_holding_version": holding.state_version,
+        "policy_payload": {"reason": "typed_exit_fixture"},
+        "guard_payload": {"outcome": "allow_offline_fixture"},
+    }
+    if full_exit:
+        start = start_full_exit
+    else:
+        start = start_scale_out
+        common.update(
+            fraction_of_original_quantity=Decimal("0.5"),
+            quantity_increment=Decimal("1"),
+            rounding_rule_id="whole_share_floor_v1",
+        )
+    action = start(store, order_type="market", **common)
+    assert store.load_decision_record(decision.decision_id).effective_action_payload["order_type"] == "market"
+
+    restarted = PolicyExecutionStateStore(store.db_path, store_identity=deployment.store_identity)
+    replay = start(restarted, order_type="market", **common)
+    assert replay.logical_action_id == action.logical_action_id
+    with pytest.raises(ValueError, match="order type"):
+        start(restarted, order_type=None, **common)
+    assert restarted.load_decision_record(decision.decision_id).effective_action_payload["order_type"] == "market"
 
 
 def test_scale_out_is_capped_by_the_actual_remaining_position_after_a_prior_exit(tmp_path):

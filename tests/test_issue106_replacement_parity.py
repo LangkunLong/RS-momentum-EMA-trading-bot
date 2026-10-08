@@ -3,6 +3,7 @@ from decimal import Decimal
 
 import pytest
 
+from core.pit_policy_parity import ActionParityDisposition, compare_action_parity_cases
 from core.policy_execution_state import DecisionCategory, DecisionIdentity, DecisionSubjectType
 from core.policy_execution_store import PolicyExecutionStateStore
 from core.policy_replacement import (
@@ -20,6 +21,7 @@ from tests.test_policy_replacement import (
     _record_fake_sell_fill,
     _refreshed_after_full_sale,
     _replacement_fixture,
+    _retire_fake_flat_stop,
     _submit_fake_sell,
 )
 
@@ -79,11 +81,18 @@ def _comparison_case():
             "fees": Decimal("0"),
             "valuation_time": "2025-02-05T14:31:00+00:00",
             "pending_state": "waiting_for_sell",
+            "order_status": "filled",
+            "filled_quantity": Decimal("6"),
+            "partial_fill": False,
+            "missed_fill": False,
+            "rejected": False,
+            "cancelled": False,
+            "liquidity_assumption": "recorded-full-fill-control",
         },
     }
 
 
-def _recorded_history_case(features, clock, deployment):
+def _recorded_history_case(features, clock, deployment, *, sell_order_type=None):
     decision_id = DecisionIdentity.build(
         deployment=deployment,
         clock=clock,
@@ -139,12 +148,19 @@ def _recorded_history_case(features, clock, deployment):
             "protective_stop": Decimal("100"),
             "risk_per_unit": Decimal("25"),
             "risk_basis": "fixed_candidate_limit_minus_stop",
-            "sell_order_type": None,
+            "sell_order_type": sell_order_type,
         },
         "execution": {
             "fill_price": None,
             "fees": None,
             "pending_state": "sell_due",
+            "order_status": "intended",
+            "filled_quantity": Decimal("0"),
+            "partial_fill": False,
+            "missed_fill": None,
+            "rejected": False,
+            "cancelled": False,
+            "liquidity_assumption": None,
         },
     }
 
@@ -202,18 +218,26 @@ def _paper_replacement_case(execution, pending_state):
             "protective_stop": plan.reservation_stop_price,
             "risk_per_unit": plan.risk_per_unit,
             "risk_basis": plan.risk_basis,
-            "sell_order_type": None,
+            "sell_order_type": plan.sell_order_type,
         },
         "execution": {
             "fill_price": None,
             "fees": None,
             "pending_state": pending_state,
+            "order_status": "intended",
+            "filled_quantity": Decimal("0"),
+            "partial_fill": False,
+            "missed_fill": None,
+            "rejected": False,
+            "cancelled": False,
+            "liquidity_assumption": None,
         },
     }
 
 
 def test_recorded_replacement_decision_and_durable_sell_intent_match_after_restart(tmp_path):
     store, plan, deployment, _, _, _ = _replacement_fixture(tmp_path)
+    plan = replace(plan, sell_order_type="market")
     first = start_replacement(store, plan)
     assert first.kind is ReplacementStepKind.SELL_DUE
 
@@ -228,17 +252,30 @@ def test_recorded_replacement_decision_and_durable_sell_intent_match_after_resta
     history_dir.mkdir()
     history_features = build_feature_fixture(history_dir)
     history_deployment, history_clock = build_chain_identity(history_features)
-    result = compare_replacement_cases(
-        _recorded_history_case(history_features, history_clock, history_deployment),
-        _paper_replacement_case(recovered, replay.kind.value),
+    history_case = _recorded_history_case(
+        history_features, history_clock, history_deployment,
+        sell_order_type=plan.sell_order_type,
     )
+    paper_case = _paper_replacement_case(recovered, replay.kind.value)
+    result = compare_replacement_cases(history_case, paper_case)
+    common_result = compare_action_parity_cases(history_case, paper_case)
+
+    assert common_result.disposition is ActionParityDisposition.INCOMPLETE
+    assert common_result.mismatches == ()
+    assert common_result.incompatible_fields == ()
+    assert "decision.snapshot_sha256" in common_result.matched_fields
+    assert "intent.sell_quantity" in common_result.matched_fields
+    assert "intent.sell_order_type" in common_result.matched_fields
+    assert "execution.fill_price" in common_result.unknowns
+    assert "execution.fees" in common_result.unknowns
 
     assert result.disposition is ParityDisposition.INCOMPLETE
     assert result.mismatches == ()
     assert set(result.unknowns) == {
-        "intent.sell_order_type",
         "execution.fill_price",
         "execution.fees",
+        "execution.missed_fill",
+        "execution.liquidity_assumption",
     }
     assert "decision.snapshot_sha256" in result.matched_fields
     assert "intent.sell_quantity" in result.matched_fields
@@ -249,8 +286,9 @@ def test_recorded_replacement_decision_and_durable_sell_intent_match_after_resta
         "intent.sell_side",
         "intent.sell_security_id",
         "intent.sell_symbol",
-        "intent.sell_quantity",
-        "intent.buy_candidate_security_id",
+            "intent.sell_quantity",
+            "intent.sell_order_type",
+            "intent.buy_candidate_security_id",
         "intent.buy_candidate_symbol",
         "intent.buy_quantity_cap",
         "intent.buy_price_limit",
@@ -311,18 +349,14 @@ def test_incompatible_policy_identity_is_not_compared_as_a_decision_match():
 def test_execution_variances_are_separate_from_fixed_decision_and_intent_comparison():
     history = _comparison_case()
     paper = _comparison_case()
-    history["execution"] = {
-        "fill_price": Decimal("100"),
-        "fees": Decimal("0"),
-        "valuation_time": "2025-02-05T14:31:00+00:00",
-        "pending_state": "waiting_for_sell",
-    }
-    paper["execution"] = {
-        "fill_price": Decimal("101.5"),
-        "fees": Decimal("2.25"),
-        "valuation_time": "2025-02-05T14:33:00+00:00",
-        "pending_state": "buy_due",
-    }
+    history["execution"].update(
+        fill_price=Decimal("100"), fees=Decimal("0"),
+        valuation_time="2025-02-05T14:31:00+00:00", pending_state="waiting_for_sell",
+    )
+    paper["execution"].update(
+        fill_price=Decimal("101.5"), fees=Decimal("2.25"),
+        valuation_time="2025-02-05T14:33:00+00:00", pending_state="buy_due",
+    )
 
     result = compare_replacement_cases(history, paper)
 
@@ -389,7 +423,7 @@ def test_missing_fresh_position_and_order_facts_keep_buy_unissued(tmp_path):
 
 
 def test_replay_after_fresh_reconciliation_returns_the_same_single_buy_intention(tmp_path):
-    store, plan, deployment, account, portfolio, _ = _replacement_fixture(tmp_path)
+    store, plan, deployment, account, portfolio, original_holding = _replacement_fixture(tmp_path)
     start_replacement(store, plan)
     _submit_fake_sell(store, plan, plan.decision.clock.account_valuation_at)
     _record_fake_sell_fill(
@@ -400,6 +434,9 @@ def test_replay_after_fresh_reconciliation_returns_the_same_single_buy_intention
     )
     refreshed_account, refreshed_portfolio = _refreshed_after_full_sale(
         store, account, portfolio, plan
+    )
+    _retire_fake_flat_stop(
+        store, plan, original_holding, refreshed_account.account_snapshot_id
     )
     after_sale = PolicyExecutionStateStore(store.db_path, store_identity=deployment.store_identity)
 

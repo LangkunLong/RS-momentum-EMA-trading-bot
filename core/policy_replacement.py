@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from enum import Enum, StrEnum
-from typing import Mapping
+from typing import Literal, Mapping
 
 from core.policy_execution_state import (
     ActionIntent,
@@ -76,8 +76,11 @@ class ReplacementPlan:
     expected_holding_version: int
     policy_payload: Mapping[str, object]
     guard_payload: Mapping[str, object]
+    sell_order_type: Literal["market"] | None = None
 
     def __post_init__(self) -> None:
+        if self.sell_order_type not in {None, "market"}:
+            raise ValueError("replacement sell order type must be market when selected")
         if self.decision.category is not DecisionCategory.REPLACEMENT:
             raise ValueError("replacement plan requires a replacement decision")
         if self.decision.subject_id != self.candidate_security_id:
@@ -220,7 +223,7 @@ def _ensure_action(
 
 
 def _parent_payload(plan: ReplacementPlan) -> dict[str, object]:
-    return {
+    payload = {
         "kind": _PARENT_KIND,
         "version": 1,
         "sell_action_id": plan.sell_action.logical_action_id,
@@ -240,11 +243,16 @@ def _parent_payload(plan: ReplacementPlan) -> dict[str, object]:
         "expected_holding_version": plan.expected_holding_version,
         "buy_execution_decision_slot_id": _expected_buy_slot(plan.decision),
     }
+    if plan.sell_order_type is not None:
+        payload["sell_order_type"] = plan.sell_order_type
+    return payload
 
 
 def _plan_from_record(decision, payload, policy_payload, guard_payload) -> ReplacementPlan:
     if payload.get("kind") != _PARENT_KIND or payload.get("version") != 1:
         raise ValueError("decision does not contain a supported durable replacement intention")
+    if payload.get("sell_order_type") not in {None, "market"}:
+        raise ValueError("replacement intention has an unsupported fixed sell order type")
     sell_payload = payload.get("sell_action")
     if not isinstance(sell_payload, Mapping):
         raise ValueError("replacement intention is missing its immutable sell action")
@@ -269,6 +277,7 @@ def _plan_from_record(decision, payload, policy_payload, guard_payload) -> Repla
         expected_holding_version=int(payload["expected_holding_version"]),
         policy_payload=policy_payload,
         guard_payload=guard_payload,
+        sell_order_type=payload.get("sell_order_type"),
     )
     if payload.get("buy_execution_decision_slot_id") != _expected_buy_slot(decision):
         raise ValueError("replacement buy authorization slot does not match its parent intention")

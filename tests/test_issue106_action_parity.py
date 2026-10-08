@@ -1,10 +1,17 @@
+import hashlib
+import json
+import sqlite3
 from decimal import Decimal
 
 import pytest
 from core.pit_policy_parity import ActionParityDisposition, compare_action_parity_cases
 from core.policy_addition import AdditionStepKind, start_addition
+from core.policy_execution_state import DecisionConflictError
 from core.policy_execution_store import PolicyExecutionStateStore
 from core.policy_exits import start_full_exit, start_scale_out
+from core.strategy_policy.contracts_v3 import EntrySnapshotV3
+from core.strategy_policy.frozen_bundle import inspect_frozen_policy_bundle
+from tests import test_issue_101_paper_policy as entry_fixture
 from tests.test_policy_addition import _addition_fixture
 from tests.test_policy_exits import _exit_decision, _fixture
 
@@ -55,11 +62,18 @@ def _case(decision, *, facts, decision_fields, intent, pending_state):
             "fill_price": None,
             "fees": None,
             "pending_state": pending_state,
+            "order_status": pending_state,
+            "filled_quantity": Decimal("0"),
+            "partial_fill": False,
+            "missed_fill": None,
+            "rejected": False,
+            "cancelled": False,
+            "liquidity_assumption": None,
         },
     }
 
 
-def _paper_intent(action, *, action_family):
+def _paper_intent(action, *, action_family, order_type=None):
     values = {
         "action_family": action_family,
         "role": action.role.value,
@@ -77,6 +91,7 @@ def _paper_intent(action, *, action_family):
         "fraction_of_original_quantity": action.fraction_of_original_quantity,
         "exit_tier": action.exit_tier,
         "rounding_rule_id": action.rounding_rule_id,
+        "order_type": order_type,
     }
     return {key: value for key, value in values.items() if value is not None}
 
@@ -99,6 +114,144 @@ def _holding_facts(holding):
     return {key: value for key, value in values.items() if value is not None}
 
 
+def test_recorded_entry_plan_matches_durable_paper_intent_after_restart(tmp_path, monkeypatch):
+    from auto_trader import run_auto_trader
+
+    api = entry_fixture._policy_api()
+    features = entry_fixture._feature_fixture(tmp_path / "inputs")
+    account = entry_fixture._account_reconciliation(
+        features, gross_exposure=0.0, pending_entries=0,
+    )
+    guard = entry_fixture._guard_profile(api, maximum_positions=1)
+    bundle_path = entry_fixture._write_policy_bundle(
+        tmp_path / "policy",
+        feature_contract_id=features.feature_contract_id,
+        feature_calculator_identity=features.feature_calculator_identity,
+        sources=entry_fixture._policy_sources(capacity=1),
+    )
+    descriptor = inspect_frozen_policy_bundle(bundle_path)
+    deployment = entry_fixture._identity(
+        descriptor, features, guard,
+        account_id="offline-paper-account-v1", store_id="issue106-entry-store",
+    )
+    store = entry_fixture._active_store(tmp_path, deployment, guard.guard_id)
+    consumer = entry_fixture._FakeEntryConsumer()
+    orchestrator = entry_fixture._orchestrator(
+        api, store=store, bundle_path=bundle_path, features=features,
+        account=account, guard=guard, consumer=consumer,
+    )
+    monkeypatch.setattr("auto_trader.require_paper_mode", lambda: None)
+    monkeypatch.setattr("auto_trader.settings.ENTRY_MARKET_HOURS_ONLY", True)
+    monkeypatch.setattr("auto_trader._is_market_open", lambda: True)
+    result = run_auto_trader(
+        dry_run=False, skip_exits=True, execution_ready=lambda: True,
+        policy_orchestrator=orchestrator,
+    )
+    assert result.entered == ("AAA",)
+    plan, action_id, dry_run = consumer.calls[0]
+    assert dry_run is False
+
+    restarted = PolicyExecutionStateStore(store.db_path, store_identity=deployment.store_identity)
+    action = restarted.load_action_intent(action_id)
+    allocation_record = restarted.load_decision_record(action.decision.decision_id)
+    selected_order_type = allocation_record.effective_action_payload["entry_plan"]["order_type"]
+    assert selected_order_type == "limit"
+    changed_plan = dict(allocation_record.effective_action_payload["entry_plan"])
+    changed_plan["order_type"] = "market"
+    with pytest.raises(DecisionConflictError, match="different immutable decision facts"):
+        restarted.record_decision(
+            allocation_record.decision,
+            policy_payload=allocation_record.policy_payload,
+            guard_payload=allocation_record.guard_payload,
+            effective_action_payload={
+                **allocation_record.effective_action_payload,
+                "entry_plan": changed_plan,
+            },
+        )
+    with sqlite3.connect(store.db_path) as connection:
+        entry_id = connection.execute(
+            "SELECT decision_id FROM policy_state_decisions WHERE decision_category='entry' AND subject_id=?",
+            (action.security_id,),
+        ).fetchone()[0]
+        capacity_id = connection.execute(
+            "SELECT decision_id FROM policy_state_decisions WHERE decision_category='capacity'",
+        ).fetchone()[0]
+    entry_record = restarted.load_decision_record(entry_id)
+    capacity_record = restarted.load_decision_record(capacity_id)
+    candidate = next(item for item in orchestrator.candidates if item.security_id == action.security_id)
+    expected_snapshot = EntrySnapshotV3(
+        base=candidate.base_snapshot,
+        features=features.entry_features[candidate.symbol],
+    )
+    assert entry_record.policy_payload["entry_snapshot"] == expected_snapshot.to_primitive()
+
+    def digest(value):
+        return hashlib.sha256(
+            json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    facts = {
+        "feature_manifest_sha256": features.recorded_input_manifest_sha256,
+        "account_snapshot_id": orchestrator.account.snapshot_id,
+        "entry_snapshot_sha256": digest(expected_snapshot.to_primitive()),
+        "capacity_snapshot_sha256": digest(capacity_record.policy_payload["capacity_snapshot"]),
+        "security_id": candidate.security_id,
+        "broker_symbol": candidate.symbol,
+        "reference_price": candidate.reference_price,
+        "price_source": candidate.price_source,
+        "tick_size": candidate.tick_size,
+        "lot_size": candidate.lot_size,
+        "pending_entry_count": account.pending_entry_count,
+        "open_position_count": orchestrator.open_position_count,
+        "effective_max_positions": capacity_record.effective_action_payload["maximum_positions"],
+        "new_entry_slots": capacity_record.effective_action_payload["new_entry_slots"],
+    }
+    entry_output = entry_record.policy_payload["entry_decision"]
+    allocation_output = allocation_record.policy_payload["allocation_decision"]
+    decision_fields = _decision_fields(
+        action.decision,
+        action_family="entry",
+        entry_qualified=entry_output["qualified"],
+        entry_market_permitted=entry_output["market_permitted"],
+        entry_rank_primary=Decimal(str(entry_output["rank"][0])),
+        capacity_max_positions=capacity_record.policy_payload["capacity_decision"]["max_positions"],
+        selected_under_capacity=entry_record.guard_payload["selected_under_capacity"],
+        allocation_risk_fraction=Decimal(str(allocation_output["risk_fraction"])),
+        allocation_stop_distance_fraction=Decimal(str(allocation_output["stop_distance_fraction"])),
+    )
+    expected_intent = {
+        "action_family": "entry",
+        "role": "entry",
+        "side": "buy",
+        "security_id": candidate.security_id,
+        "broker_symbol": candidate.symbol,
+        "requested_quantity": Decimal(str(plan.qty)),
+        "order_type": "limit",
+        "reservation_price": Decimal(str(plan.entry_price)),
+        "reservation_price_basis": "policy_entry_reference_price",
+        "reservation_stop_price": Decimal(str(plan.stop_price)),
+        "risk_per_unit": Decimal(str(plan.risk_per_share)),
+        "risk_basis": "policy_stop_distance_after_broker_precision",
+    }
+    compared = compare_action_parity_cases(
+        _case(
+            action.decision, facts=facts, decision_fields=decision_fields,
+            intent=expected_intent, pending_state="intended",
+        ),
+        _case(
+            action.decision, facts=facts, decision_fields=decision_fields,
+            intent=_paper_intent(action, action_family="entry", order_type=selected_order_type),
+            pending_state=action.status.value,
+        ),
+    )
+    assert compared.disposition is ActionParityDisposition.INCOMPLETE
+    assert compared.mismatches == ()
+    assert set(compared.unknowns) == {
+        "execution.fees", "execution.fill_price",
+        "execution.missed_fill", "execution.liquidity_assumption",
+    }
+
+
 def test_recorded_addition_decision_matches_persisted_paper_intent_after_restart(tmp_path):
     store, plan, deployment, account, portfolio, holding = _addition_fixture(tmp_path)
     first = start_addition(store, plan, account=account, portfolio_snapshot=portfolio)
@@ -110,6 +263,8 @@ def test_recorded_addition_decision_matches_persisted_paper_intent_after_restart
     assert replay.kind is AdditionStepKind.BUY_DUE
     assert replay.action is not None
     assert replay.action.logical_action_id == first.action.logical_action_id
+    selected_order_type = restarted.load_decision_record(plan.decision.decision_id).effective_action_payload["order_type"]
+    assert selected_order_type == "limit"
 
     snapshot = plan.add_on_snapshot
     features = snapshot.features
@@ -143,6 +298,7 @@ def test_recorded_addition_decision_matches_persisted_paper_intent_after_restart
         "security_id": holding.security_id,
         "broker_symbol": holding.broker_symbol,
         "requested_quantity": Decimal("2"),
+        "order_type": "limit",
         "holding_episode_id": holding.holding_episode_id,
         "reservation_price": Decimal("110"),
         "reservation_price_basis": f"decision_time_mark:{account.account_snapshot_id}",
@@ -163,14 +319,17 @@ def test_recorded_addition_decision_matches_persisted_paper_intent_after_restart
             plan.decision,
             facts=facts,
             decision_fields=decision_fields,
-            intent=_paper_intent(replay.action, action_family="addition"),
+            intent=_paper_intent(replay.action, action_family="addition", order_type=selected_order_type),
             pending_state=replay.kind.value,
         ),
     )
 
     assert result.disposition is ActionParityDisposition.INCOMPLETE
     assert result.mismatches == ()
-    assert result.unknowns == ("execution.fees", "execution.fill_price")
+    assert set(result.unknowns) == {
+        "execution.fees", "execution.fill_price",
+        "execution.missed_fill", "execution.liquidity_assumption",
+    }
 
 
 def test_recorded_partial_exit_matches_durable_scale_out_intent_after_restart(tmp_path):
@@ -194,6 +353,7 @@ def test_recorded_partial_exit_matches_durable_scale_out_intent_after_restart(tm
         expected_holding_version=holding.state_version,
         policy_payload={"tier": 1},
         guard_payload=guard_fields,
+        order_type="market",
     )
     restarted = PolicyExecutionStateStore(store.db_path, store_identity=deployment.store_identity)
     replay = start_scale_out(
@@ -206,6 +366,7 @@ def test_recorded_partial_exit_matches_durable_scale_out_intent_after_restart(tm
         expected_holding_version=holding.state_version,
         policy_payload={"tier": 1},
         guard_payload=guard_fields,
+        order_type="market",
     )
     assert replay.logical_action_id == action.logical_action_id
     facts = _holding_facts(holding)
@@ -217,6 +378,7 @@ def test_recorded_partial_exit_matches_durable_scale_out_intent_after_restart(tm
         "security_id": holding.security_id,
         "broker_symbol": holding.broker_symbol,
         "requested_quantity": Decimal("3"),
+        "order_type": "market",
         "holding_episode_id": holding.holding_episode_id,
         "snapshot_original_quantity": Decimal("6"),
         "fraction_of_original_quantity": Decimal("0.5"),
@@ -236,14 +398,20 @@ def test_recorded_partial_exit_matches_durable_scale_out_intent_after_restart(tm
             decision,
             facts=facts,
             decision_fields=decision_fields,
-            intent=_paper_intent(replay, action_family="scale_out"),
+            intent=_paper_intent(
+                replay, action_family="scale_out",
+                order_type=restarted.load_decision_record(decision.decision_id).effective_action_payload["order_type"],
+            ),
             pending_state=replay.status.value,
         ),
     )
 
     assert result.disposition is ActionParityDisposition.INCOMPLETE
     assert result.mismatches == ()
-    assert result.unknowns == ("execution.fees", "execution.fill_price")
+    assert set(result.unknowns) == {
+        "execution.fees", "execution.fill_price",
+        "execution.missed_fill", "execution.liquidity_assumption",
+    }
 
 
 def test_recorded_full_exit_matches_durable_close_intent_after_restart(tmp_path):
@@ -258,6 +426,7 @@ def test_recorded_full_exit_matches_durable_close_intent_after_restart(tmp_path)
         expected_holding_version=holding.state_version,
         policy_payload={"reason": "full_exit"},
         guard_payload=guard_fields,
+        order_type="market",
     )
     restarted = PolicyExecutionStateStore(store.db_path, store_identity=deployment.store_identity)
     replay = start_full_exit(
@@ -267,6 +436,7 @@ def test_recorded_full_exit_matches_durable_close_intent_after_restart(tmp_path)
         expected_holding_version=holding.state_version,
         policy_payload={"reason": "full_exit"},
         guard_payload=guard_fields,
+        order_type="market",
     )
     assert replay.logical_action_id == action.logical_action_id
     facts = _holding_facts(holding)
@@ -278,6 +448,7 @@ def test_recorded_full_exit_matches_durable_close_intent_after_restart(tmp_path)
         "security_id": holding.security_id,
         "broker_symbol": holding.broker_symbol,
         "requested_quantity": Decimal("6"),
+        "order_type": "market",
         "holding_episode_id": holding.holding_episode_id,
     }
 
@@ -293,14 +464,20 @@ def test_recorded_full_exit_matches_durable_close_intent_after_restart(tmp_path)
             decision,
             facts=facts,
             decision_fields=decision_fields,
-            intent=_paper_intent(replay, action_family="close"),
+            intent=_paper_intent(
+                replay, action_family="close",
+                order_type=restarted.load_decision_record(decision.decision_id).effective_action_payload["order_type"],
+            ),
             pending_state=replay.status.value,
         ),
     )
 
     assert result.disposition is ActionParityDisposition.INCOMPLETE
     assert result.mismatches == ()
-    assert result.unknowns == ("execution.fees", "execution.fill_price")
+    assert set(result.unknowns) == {
+        "execution.fees", "execution.fill_price",
+        "execution.missed_fill", "execution.liquidity_assumption",
+    }
 
 
 def _complete_addition_case():
@@ -362,6 +539,7 @@ def _complete_addition_case():
             "security_id": "security:ABC",
             "broker_symbol": "ABC",
             "requested_quantity": Decimal("2"),
+            "order_type": "limit",
             "holding_episode_id": "holding:1",
             "reservation_price": Decimal("110"),
             "reservation_price_basis": "decision_time_mark:snapshot:1",
@@ -373,8 +551,107 @@ def _complete_addition_case():
             "fill_price": Decimal("110"),
             "fees": Decimal("0"),
             "pending_state": "buy_due",
+            "order_status": "filled",
+            "filled_quantity": Decimal("2"),
+            "partial_fill": False,
+            "missed_fill": False,
+            "rejected": False,
+            "cancelled": False,
+            "liquidity_assumption": "recorded-full-fill-control",
         },
     }
+
+
+def _complete_entry_case():
+    case = _complete_addition_case()
+    case["facts"] = {
+        "feature_manifest_sha256": "c" * 64,
+        "account_snapshot_id": "snapshot:account:1",
+        "entry_snapshot_sha256": "d" * 64,
+        "capacity_snapshot_sha256": "e" * 64,
+        "security_id": "security:ABC",
+        "broker_symbol": "ABC",
+        "reference_price": Decimal("100"),
+        "price_source": "recorded-next-open",
+        "tick_size": Decimal("0.01"),
+        "lot_size": Decimal("1"),
+        "pending_entry_count": 0,
+        "open_position_count": 0,
+        "effective_max_positions": 1,
+        "new_entry_slots": 1,
+    }
+    case["decision"].update(
+        action_family="entry",
+        category="allocation",
+        entry_qualified=True,
+        entry_market_permitted=True,
+        entry_rank_primary=Decimal("85"),
+        capacity_max_positions=1,
+        selected_under_capacity=True,
+        allocation_risk_fraction=Decimal("0.01"),
+        allocation_stop_distance_fraction=Decimal("0.05"),
+    )
+    case["intent"] = {
+        "action_family": "entry",
+        "role": "entry",
+        "side": "buy",
+        "security_id": "security:ABC",
+        "broker_symbol": "ABC",
+        "requested_quantity": Decimal("10"),
+        "order_type": "limit",
+        "reservation_price": Decimal("100"),
+        "reservation_price_basis": "policy_entry_reference_price",
+        "reservation_stop_price": Decimal("95"),
+        "risk_per_unit": Decimal("5"),
+        "risk_basis": "policy_stop_distance_after_broker_precision",
+    }
+    case["execution"]["filled_quantity"] = Decimal("10")
+    return case
+
+
+def test_complete_recorded_entry_evidence_matches():
+    case = _complete_entry_case()
+
+    result = compare_action_parity_cases(case, case)
+
+    assert result.disposition is ActionParityDisposition.MATCHED
+    assert result.unknowns == ()
+    assert "facts.entry_snapshot_sha256" in result.matched_fields
+    assert "intent.reservation_stop_price" in result.matched_fields
+
+
+@pytest.mark.parametrize(
+    ("group", "field"),
+    [
+        ("facts", "entry_snapshot_sha256"),
+        ("facts", "capacity_snapshot_sha256"),
+        ("facts", "account_snapshot_id"),
+        ("decision", "allocation_risk_fraction"),
+        ("intent", "reservation_stop_price"),
+    ],
+)
+def test_missing_recorded_entry_field_is_incomplete(group, field):
+    historical = _complete_entry_case()
+    paper = _complete_entry_case()
+    historical[group].pop(field)
+    paper[group].pop(field)
+
+    result = compare_action_parity_cases(historical, paper)
+
+    assert result.disposition is ActionParityDisposition.INCOMPLETE
+    assert result.unknowns == (f"{group}.{field}",)
+
+
+def test_changed_entry_quantity_is_a_fixed_intent_mismatch():
+    historical = _complete_entry_case()
+    paper = _complete_entry_case()
+    paper["intent"]["requested_quantity"] = Decimal("9")
+
+    result = compare_action_parity_cases(historical, paper)
+
+    assert result.disposition is ActionParityDisposition.MISMATCH
+    assert result.mismatches == ("intent.requested_quantity",)
+    assert result.execution_variances == ()
 
 
 def test_equal_sparse_action_records_are_incomplete():

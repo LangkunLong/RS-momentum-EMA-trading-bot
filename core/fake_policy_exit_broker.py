@@ -464,10 +464,16 @@ class FakeProtectedExitBroker:
         confirmed_stop_client_order_id: str,
         confirmed_stop_broker_order_id: str,
         protected_position_quantity: Decimal,
+        order_type: Literal["market"] | None = None,
     ) -> PolicyExitSubmissionResult:
         """Atomically accept a sell only with its matching active stop and cap."""
+        if order_type not in {None, "market"}:
+            raise ValueError("fake protected exit requires an explicit market type or unknown legacy type")
         with self._lock:
             if client_order_id in self._groups:
+                existing = self._order(str(self._groups[client_order_id]["sell_broker_order_id"]))
+                if existing.order_type != order_type:
+                    raise ValueError("replayed fake protected exit changed its order type")
                 return self._group_result(self._groups[client_order_id])
             if (
                 not isinstance(quantity, Decimal)
@@ -510,6 +516,7 @@ class FakeProtectedExitBroker:
                 cumulative_filled_quantity=0,
                 purpose="strategy",
                 holding_episode_id=stop.holding_episode_id,
+                order_type=order_type,
             )
             group: dict[str, object] = {
                 "group_id": group_id,
@@ -528,6 +535,7 @@ class FakeProtectedExitBroker:
                 "confirmed_stop_client_order_id": confirmed_stop_client_order_id,
                 "confirmed_stop_broker_order_id": confirmed_stop_broker_order_id,
                 "protected_position_quantity": protected_position_quantity,
+                "order_type": order_type,
             })
             self._account = replace(
                 self._account,

@@ -64,13 +64,37 @@ class ActionParityComparison:
 
 _ACTION_PARITY_EXACT_GROUPS = ("policy_identity", "facts", "decision", "intent")
 _ACTION_PARITY_EXECUTION_VARIANCE_FIELDS = frozenset(
-    {"fill_price", "fees", "valuation_time", "pending_state"}
+    {
+        "fill_price", "fees", "valuation_time", "pending_state",
+        "order_status", "filled_quantity", "partial_fill", "missed_fill",
+        "rejected", "rejection_reason", "cancelled", "cancellation_reason",
+        "submitted_at", "observed_at", "provider_order_id", "client_order_id",
+        "liquidity_assumption",
+    }
+)
+_ACTION_PARITY_ONE_SIDED_VARIANCE_FIELDS = frozenset(
+    {"rejection_reason", "cancellation_reason"}
 )
 _ACTION_PARITY_TIMESTAMP_FIELDS = frozenset(
-    {"as_of_cutoff_at", "account_valuation_at", "valuation_time"}
+    {"as_of_cutoff_at", "account_valuation_at", "valuation_time", "submitted_at", "observed_at"}
 )
 _ACTION_PARITY_MISSING = object()
 _ACTION_PARITY_REQUIRED_INTENT_FIELDS = {
+    "entry": frozenset(
+        {
+            "role",
+            "side",
+            "security_id",
+            "broker_symbol",
+            "requested_quantity",
+            "order_type",
+            "reservation_price",
+            "reservation_price_basis",
+            "reservation_stop_price",
+            "risk_per_unit",
+            "risk_basis",
+        }
+    ),
     "replacement": frozenset(
         {
             "sell_role",
@@ -95,6 +119,7 @@ _ACTION_PARITY_REQUIRED_INTENT_FIELDS = {
             "security_id",
             "broker_symbol",
             "requested_quantity",
+            "order_type",
             "holding_episode_id",
             "reservation_price",
             "reservation_price_basis",
@@ -110,6 +135,7 @@ _ACTION_PARITY_REQUIRED_INTENT_FIELDS = {
             "security_id",
             "broker_symbol",
             "requested_quantity",
+            "order_type",
             "holding_episode_id",
             "snapshot_original_quantity",
             "fraction_of_original_quantity",
@@ -124,6 +150,7 @@ _ACTION_PARITY_REQUIRED_INTENT_FIELDS = {
             "security_id",
             "broker_symbol",
             "requested_quantity",
+            "order_type",
             "holding_episode_id",
         }
     ),
@@ -162,7 +189,38 @@ _ACTION_PARITY_REQUIRED_COMMON_FIELDS = {
         }
     ),
 }
+_ACTION_PARITY_REQUIRED_DECISION_FIELDS = {
+    "entry": frozenset(
+        {
+            "entry_qualified",
+            "entry_market_permitted",
+            "entry_rank_primary",
+            "capacity_max_positions",
+            "selected_under_capacity",
+            "allocation_risk_fraction",
+            "allocation_stop_distance_fraction",
+        }
+    ),
+}
 _ACTION_PARITY_REQUIRED_FACT_FIELDS = {
+    "entry": frozenset(
+        {
+            "feature_manifest_sha256",
+            "account_snapshot_id",
+            "entry_snapshot_sha256",
+            "capacity_snapshot_sha256",
+            "security_id",
+            "broker_symbol",
+            "reference_price",
+            "price_source",
+            "tick_size",
+            "lot_size",
+            "pending_entry_count",
+            "open_position_count",
+            "effective_max_positions",
+            "new_entry_slots",
+        }
+    ),
     "replacement": frozenset(
         {
             "evicted_security_id",
@@ -218,7 +276,11 @@ _ACTION_PARITY_REQUIRED_FACT_FIELDS = {
     ),
 }
 _ACTION_PARITY_REQUIRED_EXECUTION_FIELDS = frozenset(
-    {"fill_price", "fees", "pending_state"}
+    {
+        "fill_price", "fees", "pending_state", "order_status",
+        "filled_quantity", "partial_fill", "missed_fill", "rejected",
+        "cancelled", "liquidity_assumption",
+    }
 )
 
 
@@ -289,6 +351,8 @@ def compare_action_parity_cases(
     )
     required_fields_by_group = {
         **_ACTION_PARITY_REQUIRED_COMMON_FIELDS,
+        "decision": _ACTION_PARITY_REQUIRED_COMMON_FIELDS["decision"]
+        | _ACTION_PARITY_REQUIRED_DECISION_FIELDS.get(action_family, frozenset()),
         "facts": _ACTION_PARITY_REQUIRED_FACT_FIELDS.get(action_family, frozenset()),
         "intent": _ACTION_PARITY_REQUIRED_INTENT_FIELDS.get(action_family, frozenset()),
     }
@@ -375,7 +439,13 @@ def compare_action_parity_cases(
                     )
                 )
             ):
-                unknown.append(label)
+                if (
+                    field in _ACTION_PARITY_ONE_SIDED_VARIANCE_FIELDS
+                    and (expected_value is None) != (observed_value is None or observed_value is _ACTION_PARITY_MISSING)
+                ):
+                    execution_variances.append(label)
+                else:
+                    unknown.append(label)
             elif _action_parity_same_value(field, expected_value, observed_value):
                 matched.append(label)
             elif field in _ACTION_PARITY_EXECUTION_VARIANCE_FIELDS:
@@ -384,7 +454,14 @@ def compare_action_parity_cases(
                 mismatches.append(label)
         for field in observed_execution:
             if field not in expected_execution:
-                unknown.append(f"execution.{field}")
+                label = f"execution.{field}"
+                if (
+                    field in _ACTION_PARITY_ONE_SIDED_VARIANCE_FIELDS
+                    and observed_execution[field] is not None
+                ):
+                    execution_variances.append(label)
+                else:
+                    unknown.append(label)
 
     if action_family not in _ACTION_PARITY_REQUIRED_INTENT_FIELDS:
         unknown.append("decision.action_family")

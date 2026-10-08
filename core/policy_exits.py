@@ -58,6 +58,7 @@ def _action_payload(
     *,
     expected_holding_version: int,
     quantity_increment: Decimal | None = None,
+    order_type: Literal["market"] | None = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "kind": _EXIT_KIND,
@@ -68,6 +69,8 @@ def _action_payload(
     }
     if quantity_increment is not None:
         payload["quantity_increment"] = str(quantity_increment)
+    if order_type is not None:
+        payload["order_type"] = order_type
     return payload
 
 
@@ -182,6 +185,7 @@ def start_scale_out(
     expected_holding_version: int,
     policy_payload: Mapping[str, object],
     guard_payload: Mapping[str, object],
+    order_type: Literal["market"] | None = None,
 ) -> ActionIntent:
     """Persist one deterministic scale-out tier, capped by actual remaining shares."""
     fraction = _positive_decimal(fraction_of_original_quantity, "fraction_of_original_quantity")
@@ -192,6 +196,8 @@ def start_scale_out(
         raise ValueError("unsupported deterministic exit quantity rounding rule")
     if rounding_rule_id == "whole_share_floor_v1" and increment != Decimal("1"):
         raise ValueError("whole_share_floor_v1 requires a one-share quantity increment")
+    if order_type not in {None, "market"}:
+        raise ValueError("scale-out order type must be an explicit market order or unknown")
 
     def validate_replay(action: ActionIntent, payload: Mapping[str, object]) -> None:
         if (
@@ -200,8 +206,9 @@ def start_scale_out(
             or action.fraction_of_original_quantity != fraction
             or action.rounding_rule_id != rounding_rule_id
             or payload.get("quantity_increment") != str(increment)
+            or payload.get("order_type") != order_type
         ):
-            raise ValueError("replayed scale-out decision changed its holding, fraction, or rounding facts")
+            raise ValueError("replayed scale-out decision changed its holding, fraction, rounding, or order type")
 
     replayed = _replay_action(
         store,
@@ -246,6 +253,7 @@ def start_scale_out(
         action,
         expected_holding_version=expected_holding_version,
         quantity_increment=increment,
+        order_type=order_type,
     )
     return _ensure_action(
         store,
@@ -264,11 +272,19 @@ def start_full_exit(
     expected_holding_version: int,
     policy_payload: Mapping[str, object],
     guard_payload: Mapping[str, object],
+    order_type: Literal["market"] | None = None,
 ) -> ActionIntent:
     """Persist a full-exit action for exactly the shares currently remaining."""
-    def validate_replay(action: ActionIntent, _: Mapping[str, object]) -> None:
-        if action.role is not ActionRole.CLOSE or action.holding_episode_id != holding_episode_id:
-            raise ValueError("replayed full-exit decision changed its holding or action role")
+    if order_type not in {None, "market"}:
+        raise ValueError("full-exit order type must be an explicit market order or unknown")
+
+    def validate_replay(action: ActionIntent, payload: Mapping[str, object]) -> None:
+        if (
+            action.role is not ActionRole.CLOSE
+            or action.holding_episode_id != holding_episode_id
+            or payload.get("order_type") != order_type
+        ):
+            raise ValueError("replayed full-exit decision changed its holding, action role, or order type")
 
     replayed = _replay_action(
         store,
@@ -297,7 +313,9 @@ def start_full_exit(
         side=OrderSide.SELL,
         requested_quantity=holding.remaining_quantity,
     )
-    effective = _action_payload(action, expected_holding_version=expected_holding_version)
+    effective = _action_payload(
+        action, expected_holding_version=expected_holding_version, order_type=order_type,
+    )
     return _ensure_action(
         store,
         decision,

@@ -61,6 +61,36 @@ def test_public_replacement_sell_is_one_use_across_restart(tmp_path):
     assert len(broker.submissions) == 1
 
 
+def test_explicit_replacement_sell_type_is_durable_and_observed_after_restart(tmp_path):
+    store, plan, deployment, broker, ports, _ = _case(tmp_path)
+    selected = replace(plan, sell_order_type="market")
+    first = OrderManager(paper=True, policy_store=store).submit_replacement_sell(
+        selected, ports=ports,
+    )
+    assert first.dispatch is not None and first.dispatch.disposition == "submitted"
+    assert store.load_decision_record(plan.decision.decision_id).effective_action_payload["sell_order_type"] == "market"
+    assert broker.submissions[0]["order_type"] == "market"
+    sell_id = first.dispatch.action.order_attempts[0].broker_order_id
+    observed = next(row for row in broker.snapshot().open_orders if row.broker_order_id == sell_id)
+    assert observed.order_type == "market"
+
+    restarted = PolicyExecutionStateStore(store.db_path, store_identity=deployment.store_identity)
+    reopened_broker = FakeProtectedExitBroker(
+        broker.snapshot(), receipt_store_path=broker.receipt_store_path,
+    )
+    reopened = next(row for row in reopened_broker.snapshot().open_orders if row.broker_order_id == sell_id)
+    assert reopened.order_type == "market"
+    replay = OrderManager(paper=True, policy_store=restarted).submit_replacement_sell(
+        selected, ports=replace(ports, store=restarted, broker=reopened_broker),
+    )
+    assert replay.dispatch is None
+    assert len(reopened_broker.submissions) == 0
+    with pytest.raises(ValueError, match="different facts"):
+        OrderManager(paper=True, policy_store=restarted).submit_replacement_sell(
+            plan, ports=replace(ports, store=restarted, broker=reopened_broker),
+        )
+
+
 def test_partial_replacement_sale_keeps_buy_blocked_and_stop_owned(tmp_path):
     store, plan, _, broker, ports, holding = _case(tmp_path)
     manager = OrderManager(paper=True, policy_store=store)

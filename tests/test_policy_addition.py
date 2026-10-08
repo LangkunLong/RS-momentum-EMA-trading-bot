@@ -12,6 +12,7 @@ from core.policy_execution_state import (
     ActionRole,
     ActionStatus,
     DecisionCategory,
+    DecisionConflictError,
     DecisionIdentity,
     DecisionSubjectType,
     OrderSide,
@@ -623,6 +624,9 @@ def test_uncertain_addition_submission_keeps_reservation_and_is_not_reissued_aft
     )
     assert first.kind is AdditionStepKind.WAITING_FOR_BUY
     assert len(calls) == 1
+    assert calls[0]["order_type"] == "limit"
+    record = store.load_decision_record(plan.decision.decision_id)
+    assert record.effective_action_payload["order_type"] == "limit"
     assert step.action is not None
     action = store.load_action_projection(step.action.logical_action_id)
     assert action.status is ActionStatus.SUBMITTED
@@ -632,6 +636,13 @@ def test_uncertain_addition_submission_keeps_reservation_and_is_not_reissued_aft
     restarted = PolicyExecutionStateStore(store.db_path, store_identity=deployment.store_identity)
     replay = load_addition_intention(restarted, plan.decision.decision_id)
     assert replay.kind is AdditionStepKind.WAITING_FOR_BUY
+    with pytest.raises(DecisionConflictError, match="different immutable decision facts"):
+        restarted.record_decision(
+            record.decision,
+            policy_payload=record.policy_payload,
+            guard_payload=record.guard_payload,
+            effective_action_payload={**record.effective_action_payload, "order_type": "market"},
+        )
     again = submit_addition(
         restarted,
         plan.decision.decision_id,

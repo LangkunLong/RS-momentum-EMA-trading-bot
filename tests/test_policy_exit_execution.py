@@ -21,7 +21,7 @@ from tests.test_paper_policy_chain import read_chain, seed_pending_chain
 from tests.test_policy_exits import _exit_decision
 
 
-def _case(tmp_path, *, full_exit=False):
+def _case(tmp_path, *, full_exit=False, order_type=None):
     features, path, deployment, account, portfolio, _, _ = seed_pending_chain(tmp_path)
     store = PolicyExecutionStateStore(path, store_identity=deployment.store_identity)
     chain = read_chain(store, deployment, portfolio)
@@ -35,6 +35,7 @@ def _case(tmp_path, *, full_exit=False):
             expected_holding_version=holding.state_version,
             policy_payload={"reason": "fixed_full_exit"},
             guard_payload={"outcome": "allow_offline_fixture"},
+            order_type=order_type,
         )
     else:
         action = start_scale_out(
@@ -47,6 +48,7 @@ def _case(tmp_path, *, full_exit=False):
             expected_holding_version=holding.state_version,
             policy_payload={"tier": 1},
             guard_payload={"outcome": "allow_offline_fixture"},
+            order_type=order_type,
         )
     account = replace(
         account,
@@ -86,6 +88,7 @@ def test_public_policy_exit_submits_fixed_quantity_once(tmp_path, full_exit, exp
     assert submitted.action.status is ActionStatus.SUBMITTED
     assert len(broker.submissions) == 1
     assert broker.submissions[0]["quantity"] == expected_quantity
+    assert broker.submissions[0]["order_type"] is None
     assert broker.submissions[0]["confirmed_stop_client_order_id"] == holding.confirmed_stop_client_order_id
     assert broker.submissions[0]["confirmed_stop_broker_order_id"] == holding.confirmed_stop_broker_order_id
     assert submitted.action.order_attempts[0].client_order_id == broker.submissions[0]["client_order_id"]
@@ -100,6 +103,44 @@ def test_public_policy_exit_submits_fixed_quantity_once(tmp_path, full_exit, exp
     )
     assert replay.disposition == "reconcile"
     assert len(broker.submissions) == 1
+
+
+@pytest.mark.parametrize("full_exit", [False, True], ids=["scale-out", "close"])
+def test_explicit_market_exit_type_is_durable_and_observed_after_restart(tmp_path, full_exit):
+    store, account, decision, _, action = _case(
+        tmp_path, full_exit=full_exit, order_type="market",
+    )
+    durable = store.load_decision_record(decision.decision_id)
+    assert durable.effective_action_payload["order_type"] == "market"
+    broker = _broker(store, account)
+    manager = OrderManager(paper=True, policy_store=store)
+    dispatched = manager.submit_policy_exit(
+        action.logical_action_id, ports=_ports(store, broker, decision),
+    )
+    assert dispatched.disposition == "submitted"
+    assert len(broker.submissions) == 1
+    assert broker.submissions[0]["order_type"] == "market"
+    observed_sell = next(
+        item for item in broker.snapshot().open_orders
+        if item.broker_order_id == dispatched.action.order_attempts[0].broker_order_id
+    )
+    assert observed_sell.order_type == "market"
+
+    restarted = PolicyExecutionStateStore(store.db_path, store_identity=store.store_identity)
+    reopened_broker = FakeProtectedExitBroker(
+        broker.snapshot(), receipt_store_path=broker.receipt_store_path,
+    )
+    reopened_sell = next(
+        item for item in reopened_broker.snapshot().open_orders
+        if item.broker_order_id == observed_sell.broker_order_id
+    )
+    assert reopened_sell.order_type == "market"
+    replay = OrderManager(paper=True, policy_store=restarted).submit_policy_exit(
+        action.logical_action_id,
+        ports=_ports(restarted, reopened_broker, decision),
+    )
+    assert replay.disposition == "reconcile"
+    assert reopened_broker.submissions == []
 
 
 def test_uncertain_sell_result_never_dispatches_again_after_restart(tmp_path):
