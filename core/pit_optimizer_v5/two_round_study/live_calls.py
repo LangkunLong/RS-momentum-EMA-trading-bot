@@ -1595,6 +1595,7 @@ class StudyRoundCallAdmissionV1:
     slots: tuple[StudyRoundCallSlotV1 | StudyDevelopmentRoundCallSlotV1, ...]
     approval_reference: str
     schema_version: Literal[1] = 1
+    prior_admission_sha256: str | None = None
 
     def __post_init__(self) -> None:
         _identifier(self.study_id, "round-call admission study ID")
@@ -1604,8 +1605,6 @@ class StudyRoundCallAdmissionV1:
         _identifier(self.audit_domain, "round-call admission audit domain")
         if self.mode not in {"offline_fixture", "live_study"}:
             raise StudyContractError("round-call admission mode is invalid")
-        if self.mode != "offline_fixture":
-            raise StudyAuthorityError("round-call admission is offline-fixture only")
         if type(self.slots) is not tuple or not 1 <= len(self.slots) <= 2:
             raise StudyAdmissionError("round-call admission must contain one or two finite slots")
         identities: set[tuple[str, int]] = set()
@@ -1627,12 +1626,31 @@ class StudyRoundCallAdmissionV1:
         for slot in self.slots:
             if slot.round_index == 2 and (slot.arm, 1) not in identities:
                 raise StudyAdmissionError("round two requires an admitted round-one slot for the same arm")
+        if self.mode == "live_study":
+            if any(type(slot) is not StudyRoundCallSlotV1 for slot in self.slots):
+                raise StudyAdmissionError("live admission cannot contain a development round slot")
+            if len({slot.arm for slot in self.slots}) != 1 or tuple(
+                slot.round_index for slot in self.slots
+            ) not in {(1,), (1, 2)}:
+                raise StudyAdmissionError("live admission requires one same-arm staged round sequence")
+            if len(self.slots) == 1:
+                if self.prior_admission_sha256 is not None:
+                    raise StudyAdmissionError("first live admission cannot cite a prior admission")
+            else:
+                _digest(self.prior_admission_sha256, "prior live round-call admission")
+                if (
+                    self.slots[0].parent_request_sha256 != self.slots[1].parent_request_sha256
+                    or self.slots[1].evaluator_result.status != "succeeded"
+                ):
+                    raise StudyAdmissionError("second live admission lacks same-base successful feedback")
+        elif self.prior_admission_sha256 is not None:
+            raise StudyAdmissionError("offline round-call admission cannot cite a live predecessor")
         _text(self.approval_reference, "round-call approval reference", maximum=256)
         if type(self.schema_version) is not int or self.schema_version != 1:
             raise StudyContractError("round-call admission schema version is invalid")
 
     def to_primitive(self) -> dict[str, object]:
-        return {
+        value = {
             "study_id": self.study_id,
             "manifest_sha256": self.manifest_sha256,
             "grant_sha256": self.grant_sha256,
@@ -1643,6 +1661,9 @@ class StudyRoundCallAdmissionV1:
             "approval_reference": self.approval_reference,
             "schema_version": self.schema_version,
         }
+        if self.prior_admission_sha256 is not None:
+            value["prior_admission_sha256"] = self.prior_admission_sha256
+        return value
 
     def canonical_bytes(self) -> bytes:
         return canonical_json_bytes_v5(self.to_primitive())
@@ -1653,14 +1674,13 @@ class StudyRoundCallAdmissionV1:
 
     @classmethod
     def from_primitive(cls, value: object) -> "StudyRoundCallAdmissionV1":
-        raw = _strict_mapping(
-            value,
-            {
-                "study_id", "manifest_sha256", "grant_sha256", "repository_root_identity_sha256",
-                "audit_domain", "mode", "slots", "approval_reference", "schema_version",
-            },
-            "round-call admission",
-        )
+        fields = {
+            "study_id", "manifest_sha256", "grant_sha256", "repository_root_identity_sha256",
+            "audit_domain", "mode", "slots", "approval_reference", "schema_version",
+        }
+        if type(value) is dict and "prior_admission_sha256" in value:
+            fields.add("prior_admission_sha256")
+        raw = _strict_mapping(value, fields, "round-call admission")
         if type(raw["slots"]) is not list:
             raise StudyContractError("round-call admission slots are invalid")
         return cls(
@@ -1672,6 +1692,7 @@ class StudyRoundCallAdmissionV1:
             mode=raw["mode"],  # type: ignore[arg-type]
             slots=tuple(_round_call_slot_from_primitive(item) for item in raw["slots"]),
             approval_reference=raw["approval_reference"],  # type: ignore[arg-type]
+            prior_admission_sha256=raw.get("prior_admission_sha256"),  # type: ignore[arg-type]
             schema_version=raw["schema_version"],  # type: ignore[arg-type]
         )
 
@@ -1866,6 +1887,8 @@ def authorize_study_round_call_admission_v1(
     execution_approval: StudyExecutionApprovalV1,
     slots: tuple[StudyRoundCallSlotV1 | StudyDevelopmentRoundCallSlotV1, ...],
     approval_reference: str,
+    prior_admission: StudyRoundCallAdmissionV1 | None = None,
+    round_one_evaluation: AuthenticatedStudyRoundOneEvaluatorResultV1 | None = None,
 ) -> tuple[StudyRoundCallAdmissionV1, StudyRoundCallApprovalV1]:
     """Persist a finite round-slot supplement after separate explicit approval."""
 
@@ -1883,14 +1906,13 @@ def authorize_study_round_call_admission_v1(
         or execution_approval.manifest_sha256 != manifest.sha256
         or execution_approval.repository_root_identity_sha256 != store.repository.root_identity_sha256
         or execution_approval.approval_reference != grant.operator_approval_reference
+        or execution_approval.mode != grant.mode
         or grant.study_id != manifest.study_id
         or grant.manifest_sha256 != manifest.sha256
         or grant.repository_root_identity_sha256 != store.repository.root_identity_sha256
         or grant.mode != manifest.mode
     ):
         raise StudyAuthorityError("round-call admission does not bind the current execution approval")
-    if grant.mode != "offline_fixture":
-        raise StudyAdmissionError("round-call admission is offline-fixture only")
     _text(approval_reference, "round-call approval reference", maximum=256)
     if approval_reference == grant.operator_approval_reference:
         raise StudyAuthorityError("round-call admission requires separate explicit approval")
@@ -1912,6 +1934,52 @@ def authorize_study_round_call_admission_v1(
             or slot.grant_sha256 != grant.sha256
         ):
             raise StudyAuthorityError("round-call slot differs from the parent grant or manifest")
+    prior_sha256 = None
+    if grant.mode == "live_study":
+        if execution_approval.capability_kind != "live" or not approval_reference.startswith("live-study:"):
+            raise StudyAuthorityError("live round-call admission requires distinct explicit live approval")
+        if any(type(slot) is not StudyRoundCallSlotV1 for slot in slots):
+            raise StudyAdmissionError("live round-call admission cannot use a development slot")
+        existing = []
+        for reference in store.list_refs(kind="round-call-admissions"):
+            raw = store.read(reference)
+            previous = StudyRoundCallAdmissionV1.from_canonical_json(raw)
+            if (
+                reference.sha256 != hashlib.sha256(raw).hexdigest()
+                or reference.relative_path
+                != f"adapter-blobs/study-v1-round-call-admissions/{previous.sha256}.bin"
+            ):
+                raise StudyAuthorityError("persisted round-call admission identity differs")
+            if previous.study_id == grant.study_id and previous.grant_sha256 == grant.sha256:
+                existing.append(previous)
+        if len(slots) == 1:
+            if prior_admission is not None or round_one_evaluation is not None or existing:
+                raise StudyAdmissionError("first live admission must be the sole unspent stage")
+        elif len(slots) == 2:
+            if (
+                type(prior_admission) is not StudyRoundCallAdmissionV1
+                or len(existing) != 1
+                or existing[0] != prior_admission
+                or prior_admission.mode != "live_study"
+                or len(prior_admission.slots) != 1
+                or prior_admission.slots[0] != slots[0]
+                or prior_admission.approval_reference == approval_reference
+                or slots[0].arm != slots[1].arm
+                or slots[0].parent_request_sha256 != slots[1].parent_request_sha256
+                or type(round_one_evaluation) is not AuthenticatedStudyRoundOneEvaluatorResultV1
+                or not round_one_evaluation._is_controller_capability()
+                or slots[1].evaluator_result != round_one_evaluation.result
+                or slots[1].evaluator_result_ref != round_one_evaluation.reference
+                or round_one_evaluation.result.status != "succeeded"
+                or store.read(round_one_evaluation.reference)
+                != round_one_evaluation.result.canonical_bytes()
+            ):
+                raise StudyAdmissionError("second live admission lacks the exact settled first stage")
+            prior_sha256 = prior_admission.sha256
+        else:
+            raise StudyAdmissionError("live admission supports only one or two cumulative slots")
+    elif prior_admission is not None or round_one_evaluation is not None:
+        raise StudyAdmissionError("offline admission cannot consume live predecessor authority")
     admission = StudyRoundCallAdmissionV1(
         study_id=grant.study_id,
         manifest_sha256=manifest.sha256,
@@ -1921,6 +1989,7 @@ def authorize_study_round_call_admission_v1(
         mode=grant.mode,
         slots=slots,
         approval_reference=approval_reference,
+        prior_admission_sha256=prior_sha256,
     )
     store.put(kind="round-call-admissions", key=admission.sha256, content=admission.canonical_bytes())
     approval = StudyRoundCallApprovalV1._issue(
@@ -2103,7 +2172,7 @@ def build_study_round_call_slot_v1(
     round_index: int,
     round_one_evaluation: AuthenticatedStudyRoundOneEvaluatorResultV1 | None = None,
 ) -> StudyRoundCallSlotV1:
-    """Bind a base request to an offline slot and its authenticated prior evaluation."""
+    """Bind a base request to one typed slot and its authenticated prior evaluation."""
 
     if (
         type(request) is not StudyCallRequestV1
@@ -2118,10 +2187,9 @@ def build_study_round_call_slot_v1(
         or request.arm not in grant.arm_slots
         or manifest.study_id != grant.study_id
         or manifest.sha256 != grant.manifest_sha256
+        or manifest.mode != grant.mode
     ):
         raise StudyAuthorityError("round-call slot base request differs from its grant or manifest")
-    if grant.mode != "offline_fixture":
-        raise StudyAdmissionError("round-call slots are offline-fixture only")
     if round_index == 1:
         if round_one_evaluation is not None:
             raise StudyAdmissionError("round one cannot consume prior evaluator feedback")

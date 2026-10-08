@@ -13,7 +13,9 @@ from core.pit_optimizer_v5.two_round_study.contracts import StudyAdmissionError,
 from core.pit_optimizer_v5.two_round_study.ledger import StudyLedgerV1, run_study_call_v1
 from core.pit_optimizer_v5.two_round_study.live_calls import (
     StudyCallRequestV1,
+    StudyDevelopmentRoundCallSlotV1,
     StudyEvaluatorMetricV1,
+    StudyRoundCallAdmissionV1,
     StudyRoundOneEvaluatorResultV1,
     StudyRoundCallSlotV1,
     authorize_study_round_call_admission_v1,
@@ -189,6 +191,140 @@ def test_round_slots_bind_feedback_and_dispatch_distinct_ledger_slots(tmp_path: 
     assert len(reservations) <= min(2, len(grant.arm_slots))
     with pytest.raises(FrozenInstanceError):
         second_slot.round_index = 1
+
+
+def test_live_round_calls_require_two_staged_approvals_and_persisted_feedback(tmp_path: Path) -> None:
+    from tests.test_pit_optimizer_v5_study_ledger import _CountingFake, _completion, _response_for
+    from tests.test_pit_optimizer_v5_study_live_calls import _study_context
+
+    _, fixture_request, _, manifest, base_request, store, grant, approval, _, *_ = _study_context(
+        tmp_path, mode="live_study"
+    )
+    first_slot = build_study_round_call_slot_v1(
+        request=base_request, manifest=manifest, grant=grant, round_index=1
+    )
+    first_request = bind_study_call_to_round_slot_v1(request=base_request, slot=first_slot)
+    first_admission, first_approval = authorize_study_round_call_admission_v1(
+        store=store,
+        manifest=manifest,
+        grant=grant,
+        execution_approval=approval,
+        slots=(first_slot,),
+        approval_reference="live-study:round-one-test",
+    )
+    assert first_admission.prior_admission_sha256 is None
+    assert StudyRoundCallAdmissionV1.from_canonical_json(first_admission.canonical_bytes()) == first_admission
+    with pytest.raises(StudyAdmissionError):
+        authorize_study_round_call_admission_v1(
+            store=store, manifest=manifest, grant=grant, execution_approval=approval,
+            slots=(first_slot,), approval_reference="live-study:duplicate-first-test",
+        )
+    first_ledger = StudyLedgerV1(
+        store, manifest, grant, approval,
+        round_call_admission=first_admission, round_call_approval=first_approval,
+    )
+    response = _response_for(fixture_request)
+    response_text = response.canonical_bytes().decode("utf-8")
+    fake_first = _CountingFake(
+        {first_request.sha256: _completion(request=first_request, response_text=response_text)}
+    )
+    first_terminal = run_study_call_v1(
+        request=first_request, fixture_request=fixture_request, ledger=first_ledger,
+        gateway=fake_first, deadline_monotonic=time.monotonic() + 30,
+    )
+    assert first_terminal.terminal.failure_code is None
+    assert fake_first.calls == 1
+    evaluator_result, evaluator_ref = _persist_round_one_evaluation(
+        store=store, manifest=manifest, grant=grant, base_request=base_request,
+        first_request=first_request, first_terminal=first_terminal, response=response,
+    )
+    authenticated = first_ledger.authenticate_round_one_evaluator_result(
+        request=first_request, reference=evaluator_ref,
+    )
+    second_slot = build_study_round_call_slot_v1(
+        request=base_request, manifest=manifest, grant=grant, round_index=2,
+        round_one_evaluation=authenticated,
+    )
+    second_request = bind_study_call_to_round_slot_v1(request=base_request, slot=second_slot)
+    second_admission, second_approval = authorize_study_round_call_admission_v1(
+        store=store, manifest=manifest, grant=grant, execution_approval=approval,
+        slots=(first_slot, second_slot), approval_reference="live-study:round-two-test",
+        prior_admission=first_admission, round_one_evaluation=authenticated,
+    )
+    assert second_admission.prior_admission_sha256 == first_admission.sha256
+    assert second_admission.slots[1].evaluator_result == evaluator_result
+    assert StudyRoundCallAdmissionV1.from_canonical_json(second_admission.canonical_bytes()) == second_admission
+    with pytest.raises(StudyAdmissionError):
+        authorize_study_round_call_admission_v1(
+            store=store, manifest=manifest, grant=grant, execution_approval=approval,
+            slots=(first_slot, second_slot), approval_reference="live-study:duplicate-second-test",
+            prior_admission=first_admission, round_one_evaluation=authenticated,
+        )
+    restarted = StudyLedgerV1(
+        store, manifest, grant, approval,
+        round_call_admission=second_admission, round_call_approval=second_approval,
+    )
+    fake_second = _CountingFake(
+        {second_request.sha256: _completion(request=second_request, response_text=response_text)}
+    )
+    second_terminal = run_study_call_v1(
+        request=second_request, fixture_request=fixture_request, ledger=restarted,
+        gateway=fake_second, deadline_monotonic=time.monotonic() + 30,
+    )
+    assert second_terminal.terminal.failure_code is None
+    assert fake_second.calls == 1
+    assert len(restarted._reservations()) == 2
+    with pytest.raises(StudyAdmissionError):
+        restarted.reserve(first_request)
+    assert len(store.list_refs(kind="round-call-admissions")) == 2
+
+
+def test_live_round_call_rejects_unsettled_and_development_evidence(tmp_path: Path) -> None:
+    from tests.test_pit_optimizer_v5_study_live_calls import _study_context
+
+    _, _, _, manifest, base_request, store, grant, approval, _, *_ = _study_context(
+        tmp_path, mode="live_study"
+    )
+    first_slot = build_study_round_call_slot_v1(
+        request=base_request, manifest=manifest, grant=grant, round_index=1
+    )
+    first_admission, _ = authorize_study_round_call_admission_v1(
+        store=store, manifest=manifest, grant=grant, execution_approval=approval,
+        slots=(first_slot,), approval_reference="live-study:first-only-test",
+    )
+    with pytest.raises(StudyAdmissionError):
+        build_study_round_call_slot_v1(
+            request=base_request, manifest=manifest, grant=grant, round_index=2,
+        )
+    with pytest.raises(StudyAdmissionError):
+        authorize_study_round_call_admission_v1(
+            store=store, manifest=manifest, grant=grant, execution_approval=approval,
+            slots=(first_slot,), approval_reference="live-study:replay-test",
+            prior_admission=first_admission,
+        )
+    development_slot = StudyDevelopmentRoundCallSlotV1(
+        study_id=first_slot.study_id,
+        manifest_sha256=first_slot.manifest_sha256,
+        grant_sha256=first_slot.grant_sha256,
+        arm=first_slot.arm,
+        round_index=1,
+        parent_request_sha256=first_slot.parent_request_sha256,
+        feedback_sha256=None,
+        evaluator_result=None,
+        evaluator_result_ref=None,
+    )
+    with pytest.raises(StudyAdmissionError):
+        authorize_study_round_call_admission_v1(
+            store=store, manifest=manifest, grant=grant, execution_approval=approval,
+            slots=(development_slot,), approval_reference="live-study:development-test",
+        )
+    forged_fork = replace(first_admission, approval_reference="live-study:forged-first-test")
+    store.put(
+        kind="round-call-admissions", key=forged_fork.sha256,
+        content=forged_fork.canonical_bytes(),
+    )
+    with pytest.raises(StudyAuthorityError, match="successor does not cite its first stage"):
+        StudyLedgerV1(store, manifest, grant, approval, round_call_admission=first_admission)
 
 
 def test_round_two_requires_successful_parsed_round_one(tmp_path: Path) -> None:
@@ -379,7 +515,7 @@ def test_round_slot_without_admission_fails_before_credential_lookup(tmp_path: P
         parent_request_sha256=base_request.sha256,
         feedback_sha256=None,
     )
-    with pytest.raises(StudyAdmissionError, match="offline-fixture only"):
+    with pytest.raises(StudyAuthorityError, match="explicit live approval"):
         authorize_study_round_call_admission_v1(
             store=store,
             manifest=manifest,

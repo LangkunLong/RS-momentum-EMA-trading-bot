@@ -1192,6 +1192,52 @@ class StudyLedgerV1:
             raise StudyAuthorityError("persisted round-call admission is missing or differs")
         if matches[0].sha256 != _sha256(admission.canonical_bytes()):
             raise StudyAuthorityError("persisted round-call admission digest differs")
+        if admission.mode == "live_study":
+            related = []
+            for ref in refs:
+                raw = self.store.read(ref)
+                record = StudyRoundCallAdmissionV1.from_canonical_json(raw)
+                if (
+                    ref.sha256 != _sha256(raw)
+                    or ref.relative_path
+                    != f"adapter-blobs/study-v1-round-call-admissions/{record.sha256}.bin"
+                ):
+                    raise StudyAuthorityError("live round-call admission record identity differs")
+                if record.study_id == self.grant.study_id and record.grant_sha256 == self.grant.sha256:
+                    related.append(record)
+            if len(related) > 2 or admission not in related:
+                raise StudyAuthorityError("live round-call admission chain is forked or incomplete")
+            if admission.prior_admission_sha256 is None:
+                if any(
+                    record != admission and record.prior_admission_sha256 != admission.sha256
+                    for record in related
+                ):
+                    raise StudyAuthorityError("live round-call successor does not cite its first stage")
+            elif len(related) != 2:
+                raise StudyAuthorityError("second live admission lacks its unique first stage")
+        if admission.mode == "live_study" and admission.prior_admission_sha256 is not None:
+            prior_path = (
+                "adapter-blobs/study-v1-round-call-admissions/"
+                f"{admission.prior_admission_sha256}.bin"
+            )
+            prior_refs = [ref for ref in refs if ref.relative_path == prior_path]
+            if len(prior_refs) != 1:
+                raise StudyAuthorityError("prior live round-call admission is missing")
+            prior_raw = self.store.read(prior_refs[0])
+            prior = StudyRoundCallAdmissionV1.from_canonical_json(prior_raw)
+            if (
+                prior_refs[0].sha256 != _sha256(prior_raw)
+                or prior.sha256 != admission.prior_admission_sha256
+                or prior.mode != "live_study"
+                or prior.study_id != admission.study_id
+                or prior.grant_sha256 != admission.grant_sha256
+                or prior.manifest_sha256 != admission.manifest_sha256
+                or prior.repository_root_identity_sha256 != admission.repository_root_identity_sha256
+                or prior.audit_domain != admission.audit_domain
+                or prior.slots != admission.slots[:1]
+                or prior.approval_reference == admission.approval_reference
+            ):
+                raise StudyAuthorityError("second live admission does not extend its exact first stage")
 
     def _check_round_call_approval(self, approval: StudyRoundCallApprovalV1) -> None:
         admission = self.round_call_admission
