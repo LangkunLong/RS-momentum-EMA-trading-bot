@@ -117,11 +117,11 @@ class _PinnedReadinessFileV5:
         self.parent.assert_current()
 
 
-def _pin_inspection_file(stack, parent, name):
+def _pin_inspection_file(stack, parent, name, *, maximum_bytes=32 * 1024 * 1024):
     stream, info = open_regular_in_directory_v5(parent, name, writable=False)
     stack.enter_context(stream)
-    raw = stream.read(32 * 1024 * 1024 + 1)
-    if len(raw) > 32 * 1024 * 1024 or len(raw) != info.st_size:
+    raw = stream.read(maximum_bytes + 1)
+    if len(raw) > maximum_bytes or len(raw) != info.st_size:
         raise ValueError("inspection file exceeds its immutable bound")
     # The opener binds the same regular file in both views and denies writes
     # and deletes. Windows path stat and fstat may expose different ctime values;
@@ -194,6 +194,29 @@ def _open_trusted_git(authority, *, forbidden_roots=()):
         pin, _ = _pin_inspection_file(stack, parent, executable.name)
         if pin.sha256 != authority.sha256:
             raise ValueError("trusted Git bytes differ")
+        yield pin
+
+
+@contextmanager
+def pin_engineering_host_executable_v5(authority, *, forbidden_roots=()):
+    """Hold a digest-pinned engineering CLI and its ancestor directories.
+
+    This is for the explicitly scoped offline engineering baseline when Docker
+    Desktop is installed under the current user. The production trusted-tool
+    path above continues to require an unwritable executable and ancestors.
+    """
+    if os.name != "nt" or type(authority) is not ReadinessGitAuthorityV5:
+        raise ValueError("engineering host executable authority is invalid")
+    executable = Path(authority.executable)
+    if os.path.normcase(str(executable.resolve(strict=True))) != os.path.normcase(str(executable)):
+        raise ValueError("engineering host executable path must be canonical")
+    if any(executable.is_relative_to(Path(root)) for root in forbidden_roots):
+        raise ValueError("engineering host executable cannot reside inside source or artifact roots")
+    with ExitStack() as stack:
+        parent = stack.enter_context(acquire_absolute_directory_v5(executable.parent))
+        pin, _ = _pin_inspection_file(stack, parent, executable.name, maximum_bytes=64 * 1024 * 1024)
+        if pin.sha256 != authority.sha256:
+            raise ValueError("engineering host executable bytes differ")
         yield pin
 
 
