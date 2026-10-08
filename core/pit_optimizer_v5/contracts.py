@@ -1083,7 +1083,7 @@ class ResourceCapabilitiesV5:
 
 def validate_semantic_mode_v5(pit_data_scope: str, semantic_mode: str) -> None:
     """Authorize semantic absence only for explicitly scoped development."""
-    if pit_data_scope not in {"production", "development_sp500_v2"}:
+    if pit_data_scope not in {"production", "development_sp500_v2", "engineering_v3"}:
         raise ValueError("semantic PIT data scope is invalid")
     if semantic_mode not in {"required", "disabled_development"}:
         raise ValueError("semantic mode is invalid")
@@ -1111,7 +1111,7 @@ class CampaignManifestV5:
     apply: Literal[False]
     qualification_allowed: Literal[False]
     full_replay_allowed: Literal[False]
-    pit_data_scope: Literal["production", "development_sp500_v2"] = "production"
+    pit_data_scope: Literal["production", "development_sp500_v2", "engineering_v3"] = "production"
     semantic_mode: Literal["required", "disabled_development"] = "required"
 
     def __post_init__(self) -> None:
@@ -1125,8 +1125,10 @@ class CampaignManifestV5:
             raise ValueError("campaign search capabilities are invalid")
         if self.provider is not None and type(self.provider) is not ProviderCapabilitiesV5:
             raise ValueError("campaign provider capabilities are invalid")
-        if self.pit_data_scope not in {"production", "development_sp500_v2"}:
+        if self.pit_data_scope not in {"production", "development_sp500_v2", "engineering_v3"}:
             raise ValueError("campaign PIT data scope is invalid")
+        if self.pit_data_scope == "engineering_v3" and self.provider is not None:
+            raise ValueError("engineering PIT data scope cannot authorize a provider")
         if (
             self.pit_data_scope == "development_sp500_v2"
             and self.provider is not None

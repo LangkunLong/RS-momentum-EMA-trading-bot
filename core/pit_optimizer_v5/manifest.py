@@ -548,7 +548,7 @@ def _validate_precomposition_bindings_v5(
     sandbox_profile_ref: ArtifactRefV5,
     sandbox_profile: SandboxProfileV5,
     resources: ResourceCapabilitiesV5,
-    pit_data_scope: Literal["production", "development_sp500_v2"],
+    pit_data_scope: Literal["production", "development_sp500_v2", "engineering_v3"],
 ) -> None:
     if type(target) is not AnnualizedReturnTargetV5 or type(source_snapshot) is not PolicySourceSnapshotV5:
         raise ValueError("manifest target or source snapshot is invalid")
@@ -597,7 +597,7 @@ def build_campaign_manifest_v5(
     search: SearchCapabilitiesV5 | None = None,
     provider: ProviderCapabilitiesV5 | None = None,
     resources: ResourceCapabilitiesV5 | None = None,
-    pit_data_scope: Literal["production", "development_sp500_v2"] = "production",
+    pit_data_scope: Literal["production", "development_sp500_v2", "engineering_v3"] = "production",
     semantic_mode: Literal["required", "disabled_development"] = "required",
 ) -> AuthenticatedCampaignManifestV5:
     """Create and reauthenticate one discovery-only campaign manifest."""
@@ -612,8 +612,10 @@ def build_campaign_manifest_v5(
         raise ValueError("manifest search capabilities are invalid")
     if provider is not None and type(provider) is not ProviderCapabilitiesV5:
         raise ValueError("manifest provider capabilities are invalid")
-    if pit_data_scope not in {"production", "development_sp500_v2"}:
+    if pit_data_scope not in {"production", "development_sp500_v2", "engineering_v3"}:
         raise ValueError("manifest PIT data scope is invalid")
+    if pit_data_scope == "engineering_v3" and provider is not None:
+        raise ValueError("engineering PIT data scope cannot authorize a provider")
     if (
         pit_data_scope == "development_sp500_v2"
         and provider is not None

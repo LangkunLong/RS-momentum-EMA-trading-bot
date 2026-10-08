@@ -324,9 +324,9 @@ class PitPanelEvaluatorV5:
         candidate_policy_authority: PolicyRevisionIdentityV5 | None = None,
         baseline_worker_factory: BaselineWorkerFactoryV5 | None = None,
         simulator_factory: SimulatorFactoryV5 = PortfolioSimulator,
-        pit_data_scope: Literal["production", "development_sp500_v2"] = "production",
+        pit_data_scope: Literal["production", "development_sp500_v2", "engineering_v3"] = "production",
     ) -> None:
-        if pit_data_scope not in {"production", "development_sp500_v2"}:
+        if pit_data_scope not in {"production", "development_sp500_v2", "engineering_v3"}:
             raise ValueError("evaluator PIT data scope is invalid")
         if pit_data_scope == "production":
             require_v5_production_membership_admission(
@@ -491,8 +491,8 @@ class PitPanelEvaluatorV5:
     ) -> PanelEvaluationV5:
         if type(panel) is not EvaluationPanelSpec:
             raise ValueError("evaluation panel must use the authenticated panel schema")
-        if self._pit_data_scope == "development_sp500_v2" and panel.purpose not in {"quick", "discovery"}:
-            raise ValueError("development data cannot authorize held-out evaluation")
+        if self._pit_data_scope != "production" and panel.purpose not in {"quick", "discovery"}:
+            raise ValueError("non-production data cannot authorize held-out evaluation")
         if type(policy_revision) is not PolicyRevisionIdentityV5:
             raise ValueError("evaluation policy revision must use the V5 identity schema")
         if (

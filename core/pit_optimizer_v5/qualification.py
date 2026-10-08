@@ -296,6 +296,8 @@ def build_qualification_attempt(
     authorities = authenticate_campaign_manifest_v5(
         repository=repository, manifest_ref=original.attempt.discovery_manifest_ref
     )
+    if authorities.manifest.pit_data_scope != "production":
+        raise ValueError("qualification requires production discovery authority")
     champion, _ = repository.load_confirmation_champion(
         checkpoint_ref=original.selection.checkpoint_ref,
         archive_ref=original.selection.archive_ref,
@@ -341,6 +343,8 @@ def build_qualification_attempt(
 
 def _inputs(repository, attempt_ref, attempt):
     original, confirmation_plan = _confirmed_outcome(repository, attempt.confirmation_outcome_ref)
+    if original.manifest.pit_data_scope != "production":
+        raise ValueError("qualification requires production discovery authority")
     _bindings(attempt, original)
     selection = original.selection
     _walk(
@@ -482,6 +486,8 @@ def _recovery_inputs(repository, attempt_ref, attempt):
     outcome = _load(repository, attempt.confirmation_outcome_ref, ConfirmationOutcomeV5)
     prior = _load(repository, outcome.attempt_ref, ConfirmationAttemptCommitmentV5)
     manifest = _load(repository, prior.discovery_manifest_ref, CampaignManifestV5)
+    if manifest.pit_data_scope != "production":
+        raise ValueError("qualification requires production discovery authority")
     adapter = _load(repository, prior.execution_adapter_ref, confirmed.ConfirmationAdapterConfigV5)
     evaluator = _load(repository, attempt.evaluator_contract_ref, EvaluatorContractV5)
     sandbox = _load(repository, attempt.sandbox_profile_ref, SandboxProfileV5)

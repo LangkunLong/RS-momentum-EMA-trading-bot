@@ -298,8 +298,12 @@ def _campaign(inputs, evaluations):
     )
 
 
-def verify_baseline_v5(*, repository, authority_ref: ArtifactRefV5) -> dict[str, object]:
+def verify_baseline_v5(
+    *, repository, authority_ref: ArtifactRefV5, pit_data_scope: Literal["production", "engineering_v3"] = "production"
+) -> dict[str, object]:
     """Authenticate the complete baseline graph and return content-free identities."""
+    if pit_data_scope not in {"production", "engineering_v3"}:
+        raise ValueError("baseline verification PIT scope is invalid")
     item = repository.authenticate_exact(authority_ref)
     if item.reference != authority_ref or hashlib.sha256(item.content).hexdigest() != authority_ref.sha256:
         raise ValueError("baseline root identity differs")
@@ -354,6 +358,7 @@ def verify_baseline_v5(*, repository, authority_ref: ArtifactRefV5) -> dict[str,
         campaign,
         inputs.source,
         inputs.inputs.source_bundle_ref,
+        pit_data_scope=pit_data_scope,
     )
     if parent != expected:
         raise ValueError("baseline parent projection differs from full authority")
@@ -361,7 +366,7 @@ def verify_baseline_v5(*, repository, authority_ref: ArtifactRefV5) -> dict[str,
         authority=parent,
         discovery_plan=inputs.plan,
         evaluator_contract=inputs.evaluator,
-        pit_data_scope="production",
+        pit_data_scope=pit_data_scope,
     )
     return {
         "schema_version": 5,
@@ -379,12 +384,17 @@ def verify_baseline_v5(*, repository, authority_ref: ArtifactRefV5) -> dict[str,
     }
 
 
-def capture_baseline_v5(*, repository, inputs_ref, output_path, worker_factory=None):
+def capture_baseline_v5(
+    *, repository, inputs_ref, output_path, worker_factory=None,
+    pit_data_scope: Literal["production", "engineering_v3"] = "production",
+):
     """Capture two unchanged full-grid baseline runs, publishing authority last.
 
     All outputs are preflighted before allocation. Failure leaves no authority;
     exclusive persistence never overwrites a partial capture or an earlier run.
     """
+    if pit_data_scope not in {"production", "engineering_v3"}:
+        raise ValueError("baseline capture PIT scope is invalid")
     output = ArtifactRefV5(output_path, "0" * 64)
     parent_path = str(Path(output.relative_path).with_suffix("")).replace("\\", "/")
     paths = {
@@ -402,6 +412,8 @@ def capture_baseline_v5(*, repository, inputs_ref, output_path, worker_factory=N
     reports, fingerprints, workers = [], [], []
     for _ in (1, 2):
         worker = worker_factory(inputs)
+        if pit_data_scope == "engineering_v3" and getattr(worker, "pit_data_scope", None) != pit_data_scope:
+            raise ValueError("engineering baseline worker scope differs")
         if any(worker is previous for previous in workers):
             raise ValueError("baseline repeat reused a worker")
         workers.append(worker)
@@ -460,6 +472,7 @@ def capture_baseline_v5(*, repository, inputs_ref, output_path, worker_factory=N
         _campaign(inputs, tuple(value for _, value in reports[0][2:])),
         inputs.source,
         inputs.inputs.source_bundle_ref,
+        pit_data_scope=pit_data_scope,
     )
     parent_ref = repository.create_baseline_artifact(projection_path, parent)
     first = runs[0][1]
@@ -489,7 +502,9 @@ def capture_baseline_v5(*, repository, inputs_ref, output_path, worker_factory=N
         def __getattr__(self, name):
             return getattr(repository, name)
 
-    verify_baseline_v5(repository=PendingAuthorityRepository(), authority_ref=reference)
+    verify_baseline_v5(
+        repository=PendingAuthorityRepository(), authority_ref=reference, pit_data_scope=pit_data_scope
+    )
     if workers[-1].source_snapshot() != expected_snapshot:
         raise ValueError("baseline source changed before authority publication")
     created = repository.create_baseline_artifact(output_path, authority)
@@ -577,10 +592,16 @@ class BaselineSandboxTransportV5(Protocol):
 class BaselineSandboxWorkerV5:
     """Compose exact baseline requests independently of campaign/search authority."""
 
-    def __init__(self, *, repository, inputs, transport: BaselineSandboxTransportV5, ordinal: int):
+    def __init__(
+        self, *, repository, inputs, transport: BaselineSandboxTransportV5, ordinal: int,
+        pit_data_scope: Literal["production", "engineering_v3"] = "production",
+    ):
         if type(ordinal) is not int or ordinal not in (1, 2):
             raise ValueError("baseline worker ordinal is invalid")
+        if pit_data_scope not in {"production", "engineering_v3"}:
+            raise ValueError("baseline worker PIT scope is invalid")
         self.repository, self.inputs, self.transport, self.ordinal = repository, inputs, transport, ordinal
+        self.pit_data_scope = pit_data_scope
         self.evaluated = set()
 
     def bind(self, inputs):
@@ -611,6 +632,7 @@ class BaselineSandboxWorkerV5:
             worker_startup_timeout_seconds=self.inputs.resources.worker_startup_timeout_seconds,
             output_limit_bytes=self.inputs.sandbox.output_limit_bytes,
             baseline_capture_inputs_ref=self.inputs.reference,
+            pit_data_scope=self.pit_data_scope,
         )
         raw = self.transport.panel(request)
         if type(raw) is not bytes or len(raw) > self.inputs.sandbox.output_limit_bytes:
@@ -734,10 +756,16 @@ class LocalBaselineCaptureFactoryV5:
     campaign manifest, provider, Git materialization or image build is involved.
     """
 
-    def __init__(self, *, repository, host: BaselineHostAuthorityV5):
+    def __init__(
+        self, *, repository, host: BaselineHostAuthorityV5,
+        pit_data_scope: Literal["production", "engineering_v3"] = "production",
+    ):
         if type(host) is not BaselineHostAuthorityV5:
             raise ValueError("baseline capture host authority is absent")
+        if pit_data_scope not in {"production", "engineering_v3"}:
+            raise ValueError("baseline factory PIT scope is invalid")
         self.repository, self.host = repository, host
+        self.pit_data_scope = pit_data_scope
         self.stack = ExitStack()
         self.inputs = None
         self.ordinal = 0
@@ -810,6 +838,7 @@ class LocalBaselineCaptureFactoryV5:
             inputs=inputs,
             ordinal=self.ordinal,
             transport=_LocalBaselineTransportV5(self, inputs),
+            pit_data_scope=self.pit_data_scope,
         )
 
 

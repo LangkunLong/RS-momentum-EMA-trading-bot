@@ -141,11 +141,11 @@ class FileBackedControllerRoleInvokerV5:
         if (
             type(repository) is not LocalArtifactRepositoryV5
             or type(manifest) is not CampaignManifestV5
-            or manifest.pit_data_scope != "development_sp500_v2"
+            or manifest.pit_data_scope not in {"development_sp500_v2", "engineering_v3"}
             or manifest.provider is not None
             or not directory.is_absolute()
         ):
-            raise ValueError("controller role invoker requires provider-free development scope and an absolute directory")
+            raise ValueError("controller role invoker requires provider-free non-production scope and an absolute directory")
         self._repository = repository
         self._response_directory = directory
 

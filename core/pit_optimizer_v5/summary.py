@@ -77,7 +77,7 @@ class OptimizerSummaryV5:
     source_unchanged: bool | None = None
     qualification_started: bool = False
     replay_started: bool = False
-    evaluation_mode: Literal["synthetic_fixture", "production", "development_sp500_v2"] = "production"
+    evaluation_mode: Literal["synthetic_fixture", "production", "development_sp500_v2", "engineering_v3"] = "production"
     completed_lifecycle_rounds: int = 0
     evaluated_feedback_rounds: int = 0
     render_rejected_experiments: int = 0
@@ -126,7 +126,7 @@ class OptimizerSummaryV5:
             raise ValueError("optimizer summary source state is invalid")
         if type(self.qualification_started) is not bool or type(self.replay_started) is not bool:
             raise ValueError("optimizer summary stage state is invalid")
-        if self.evaluation_mode not in {"synthetic_fixture", "production", "development_sp500_v2"}:
+        if self.evaluation_mode not in {"synthetic_fixture", "production", "development_sp500_v2", "engineering_v3"}:
             raise ValueError("optimizer summary evaluation mode is invalid")
         if self.execution_profile_sha256 is not None and (
             type(self.execution_profile_sha256) is not str
@@ -280,6 +280,13 @@ def summarize_repository_v5(
         require_development_v5(manifest)
         if verification_scope == "current_runtime" and rounds_seen:
             authenticate_development_history_v5(repository, manifest)
+    elif manifest.pit_data_scope == "engineering_v3":
+        from core.pit_optimizer_v5.candidate_ir import SourceBundleV5
+
+        source_unchanged = (
+            repository.load_typed_artifact(baseline.source_bundle_ref, value_type=SourceBundleV5)
+            == baseline.source_bundle
+        )
     elif manifest.provider is None and rounds_seen:
         from core.pit_optimizer_v5.fixture_runtime import verify_fixture_run_v5
         from core.pit_optimizer_v5.candidate_ir import SourceBundleV5
@@ -331,8 +338,8 @@ def summarize_repository_v5(
         source_unchanged,
         False,
         False,
-        "development_sp500_v2"
-        if manifest.pit_data_scope == "development_sp500_v2"
+        manifest.pit_data_scope
+        if manifest.pit_data_scope in {"development_sp500_v2", "engineering_v3"}
         else "synthetic_fixture"
         if manifest.provider is None
         else "production",

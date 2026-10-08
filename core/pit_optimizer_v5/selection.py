@@ -120,7 +120,7 @@ class QuickScreenCandidateV5:
     semantic_fingerprint: SemanticFingerprintV5 | None
     parent_semantic_fingerprint_sha256: str | None
     quick_evidence: PanelEvaluationV5 | None
-    pit_data_scope: Literal["production", "development_sp500_v2"] = "production"
+    pit_data_scope: Literal["production", "development_sp500_v2", "engineering_v3"] = "production"
     semantic_mode: Literal["required", "disabled_development"] = "required"
 
     def __post_init__(self) -> None:

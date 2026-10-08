@@ -535,6 +535,8 @@ def _identities(repository, attempt, prior, confirmed_outcome):
     """Authenticate frozen source/evaluator ancestry without composing workers."""
     selection = _load(repository, prior.frozen_selection_ref, confirmation.FrozenConfirmationSelectionV5)
     manifest = _load(repository, prior.discovery_manifest_ref, CampaignManifestV5)
+    if manifest.pit_data_scope != "production":
+        raise ValueError("full replay requires production discovery authority")
     discovery = _load(repository, manifest.panel_plan_ref, CampaignPanelPlanV5)
     finalization = _load(repository, selection.finalized_campaign_ref, FinalizedDiscoveryCampaignV5)
     evaluator = _load(repository, attempt.evaluator_contract_ref, EvaluatorContractV5)

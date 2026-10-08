@@ -130,6 +130,7 @@ from core.pit_optimizer_v5.search import (
     SearchStateV5,
     PRIMARY_MECHANISMS_V5,
     expected_target_gap_pct_v5,
+    verified_campaign_cagr_pct,
 )
 from core.pit_optimizer_v5.selection import (
     ScheduledHypothesisV5,
@@ -1131,6 +1132,7 @@ class LocalRoleRequestFactoryV5:
         repository: LocalArtifactRepositoryV5,
         manifest: CampaignManifestV5,
         mechanism_adapter: MechanismRoleRequestAdapterV1 | None = None,
+        feedback_experiment_id: str | None = None,
     ) -> None:
         if type(repository) is not LocalArtifactRepositoryV5 or type(manifest) is not CampaignManifestV5:
             raise ValueError("local role-request factory authority is invalid")
@@ -1138,9 +1140,17 @@ class LocalRoleRequestFactoryV5:
             raise ValueError("local role-request mechanism adapter authority is invalid")
         if mechanism_adapter is not None and mechanism_adapter.authenticated_manifest is None:
             raise ValueError("local role-request mechanism adapter requires authenticated manifest authority")
+        if feedback_experiment_id is not None and (
+            manifest.pit_data_scope != "engineering_v3"
+            or manifest.provider is not None
+            or type(feedback_experiment_id) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", feedback_experiment_id) is None
+        ):
+            raise ValueError("engineering feedback experiment identity is invalid")
         self._repository = repository
         self._manifest = manifest
         self._mechanism_adapter = mechanism_adapter
+        self._feedback_experiment_id = feedback_experiment_id
 
     @property
     def maximum_output_tokens(self) -> int:
@@ -1197,6 +1207,111 @@ class LocalRoleRequestFactoryV5:
                 count += 1
         return count
 
+    def _prior_experiment_evidence(
+        self,
+        inputs: FeedbackRoundInputV5,
+        projection: SearchProjectionV5,
+        evidence: _EvidenceBuilderV5,
+    ) -> tuple[str, ...]:
+        if self._feedback_experiment_id is None:
+            if inputs.manifest.pit_data_scope == "engineering_v3" and inputs.round_index > 1:
+                raise ValueError("engineering feedback round lacks its measured experiment identity")
+            return ()
+        if inputs.round_index < 2:
+            raise ValueError("engineering feedback cannot precede its measured round")
+        matches = tuple(
+            item for item in projection.stored_records
+            if item.record.experiment_id == self._feedback_experiment_id
+        )
+        if len(matches) != 1:
+            raise ValueError("engineering feedback experiment is absent or ambiguous")
+        stored = matches[0]
+        record = self._repository.load_experiment(stored.reference)
+        if (
+            record != stored.record
+            or record.round_index != inputs.round_index - 1
+            or record.status not in {"evaluated", "zero_trade"}
+            or record.campaign_evidence is None
+            or record.policy_revision is None
+            or (record.pit_data_scope, record.semantic_mode)
+            != (inputs.manifest.pit_data_scope, inputs.manifest.semantic_mode)
+            or record.experiment_identity.discovery_plan_sha256
+            != inputs.panel_plan.discovery_plan_sha256
+        ):
+            raise ValueError("engineering feedback lacks an authenticated prior measurement")
+        source = self._repository.load_typed_state(
+            namespace="policy-source",
+            key=record.policy_revision.sha256,
+            value_type=SourceBundleV5,
+            repair=False,
+        )
+        if source is None:
+            raise ValueError("engineering feedback candidate source is unavailable or altered")
+        source_ref = ArtifactRefV5(
+            f"adapter-state/policy-source/{record.policy_revision.sha256}.json",
+            source.sha256,
+        )
+        if (
+            source_ref not in record.artifact_refs
+            or tuple((item.path, item.sha256) for item in source.files)
+            != record.policy_revision.editable_source_sha256
+        ):
+            raise ValueError("engineering feedback candidate source is unavailable or altered")
+        events = self._repository.load_round_events(
+            campaign_id=inputs.campaign_id, round_index=record.round_index
+        )
+        investigator_payloads = tuple(
+            payload for event in events
+            for payload in (self._repository.load_round_payload(
+                event.payload_ref, expected_kind=event.event_kind
+            ),)
+            if type(payload) is RoleCompletionPayloadV5 and payload.role == "investigator"
+        )
+        if len(investigator_payloads) != 1 or investigator_payloads[0].outcome != "accepted":
+            raise ValueError("engineering feedback lacks its accepted investigator request")
+        package = self._repository.load_role_invocation(investigator_payloads[0])
+        if (
+            not package.accepted
+            or type(package.artifact) is not InvestigatorArtifactV5
+            or record.hypothesis not in package.artifact.hypotheses
+            or package.request.sha256 != investigator_payloads[0].request_sha256
+        ):
+            raise ValueError("engineering feedback differs from its investigator request")
+        campaign_cagr = verified_campaign_cagr_pct(
+            campaign=record.campaign_evidence,
+            discovery_plan=inputs.panel_plan,
+            evaluator_contract=inputs.evaluator_contract,
+            policy_identity_sha256=record.policy_revision.sha256,
+        )
+        shared = (
+            ("experiment_id", record.experiment_id),
+            ("record_sha256", stored.reference.sha256),
+            ("investigator_request_sha256", package.request.sha256),
+            ("source_bundle_sha256", source.sha256),
+            ("policy_identity_sha256", record.policy_revision.sha256),
+            ("campaign_sha256", canonical_sha256_v5(record.campaign_evidence)),
+            ("evaluator_contract_sha256", inputs.evaluator_contract.sha256),
+            ("pit_bundle_sha256", inputs.panel_plan.pit_bundle_ref.sha256),
+            ("prices_provenance_sha256", inputs.panel_plan.prices_provenance_ref.sha256),
+        )
+        description = "prior measured experiment: " + "; ".join(
+            f"{name} {identity}" for name, identity in shared
+        )
+        result = [evidence.add("prior_experiment.campaign_cagr_pct", campaign_cagr, description=description)]
+        for episode in record.campaign_evidence.episodes:
+            evaluation = episode.evaluation
+            report = selected_scenario(evaluation).report
+            result.append(evidence.add(
+                f"prior_experiment.episode.{episode.episode_ordinal}.portfolio_annualized_return_pct",
+                report.portfolio_annualized_return_pct,
+                description=(
+                    description
+                    + f"; panel_evaluation_sha256 {canonical_sha256_v5(evaluation)}"
+                    + f"; report_sha256 {canonical_sha256_v5(report)}"
+                ),
+            ))
+        return tuple(result)
+
     def _investigator_parts(
         self,
         inputs: FeedbackRoundInputV5,
@@ -1209,8 +1324,23 @@ class LocalRoleRequestFactoryV5:
         evaluator_ids: list[str] = []
         campaign = _parent_campaign(inputs, projection, parent)
         for episode in campaign.episodes:
-            report = selected_scenario(episode.evaluation).report
+            panel_evaluation = episode.evaluation
+            report = selected_scenario(panel_evaluation).report
             prefix = f"episode.{episode.episode_ordinal}"
+            report_identity_bindings = (
+                ("report_sha256", canonical_sha256_v5(report)),
+                ("panel_evaluation_sha256", canonical_sha256_v5(panel_evaluation)),
+                ("policy_identity_sha256", parent.policy_identity_sha256),
+                ("source_bundle_sha256", parent.source_bundle_ref.sha256),
+                ("evaluator_contract_sha256", inputs.evaluator_contract.sha256),
+                ("sandbox_profile_sha256", panel_evaluation.sandbox_profile_sha256),
+                ("pit_bundle_sha256", inputs.panel_plan.pit_bundle_ref.sha256),
+                ("prices_provenance_sha256", inputs.panel_plan.prices_provenance_ref.sha256),
+                ("panel_sha256", panel_evaluation.panel_sha256),
+            )
+            report_identity_description = "measured report identity bindings: " + "; ".join(
+                f"{name} {identity}" for name, identity in report_identity_bindings
+            )
             metric_definitions = {
                 item.metric_id: item.definition
                 for item in report.metric_definitions
@@ -1220,6 +1350,7 @@ class LocalRoleRequestFactoryV5:
                     evidence.add(
                         f"{prefix}.portfolio_annualized_return_pct",
                         report.portfolio_annualized_return_pct,
+                        description=report_identity_description,
                     ),
                     evidence.add(f"{prefix}.max_drawdown_pct", report.max_drawdown_pct),
                     evidence.add(f"{prefix}.closed_trades", report.closed_trades),
@@ -1256,6 +1387,8 @@ class LocalRoleRequestFactoryV5:
             for metric_id in _INVESTIGATOR_ENTRY_COUNTS_V5:
                 if metric_id in counts:
                     evaluator_ids.append(evidence.add(f"{prefix}.entry.{metric_id}", counts[metric_id]))
+
+        evaluator_ids.extend(self._prior_experiment_evidence(inputs, projection, evidence))
 
         rejection_count = self._render_rejection_count(inputs, projection)
         if rejection_count:
