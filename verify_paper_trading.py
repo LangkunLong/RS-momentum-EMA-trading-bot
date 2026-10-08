@@ -1680,7 +1680,10 @@ def _wait_for_symbol_clear(
     while True:
         if budget is not None:
             budget.enforce_deadline("final_clear_wait_seconds", started)
-            budget.consume("final_clear_polls")
+            budget.consume_scaled(
+                "final_clear_polls",
+                multiplier=budget.manifest.dimensions["final_clear_invocations"],
+            )
         try:
             positions = get_open_positions(raise_on_error=True)
             orders = get_open_orders(symbol, raise_on_error=True)
