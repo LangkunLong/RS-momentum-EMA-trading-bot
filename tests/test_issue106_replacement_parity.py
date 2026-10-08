@@ -3,7 +3,7 @@ from decimal import Decimal
 
 import pytest
 
-from core.policy_execution_state import DecisionIdentity
+from core.policy_execution_state import DecisionCategory, DecisionIdentity, DecisionSubjectType
 from core.policy_execution_store import PolicyExecutionStateStore
 from core.policy_replacement import (
     ReplacementStepKind,
@@ -28,17 +28,36 @@ def _comparison_case():
     return {
         "policy_identity": {
             "policy_artifact_id": "recorded-policy:replacement-fixture-v1",
+            "capability_manifest_id": "manifest:replacement-fixture-v1",
+            "policy_interface_version": "3",
             "feature_contract_id": "recorded-feature-contract:v1",
+            "feature_calculator_id": "recorded-feature-calculator:v1",
+            "source_revision": "a" * 40,
+            "runtime_identity": "offline-test-only",
+            "execution_profile_id": "synthetic-paper-profile",
+            "paper_account_environment_id": "synthetic-account",
+            "store_identity": "synthetic-store",
         },
         "facts": {
             "evicted_security_id": "fixture:CCC",
+            "evicted_symbol": "CCC",
             "evicted_quantity": Decimal("6"),
             "candidate_security_id": "fixture:DDD",
+            "candidate_symbol": "DDD",
         },
         "decision": {
             "action_family": "replacement",
+            "decision_id": "fixture-decision:replacement-v1",
+            "exchange_id": "XNYS",
             "decision_session": "2025-02-04",
+            "as_of_cutoff_at": "2025-02-04T21:00:00+00:00",
+            "next_execution_session": "2025-02-05",
+            "account_valuation_session": "2025-02-05",
+            "account_valuation_at": "2025-02-05T14:30:00+00:00",
             "snapshot_sha256": "a" * 64,
+            "category": "replacement",
+            "subject_type": "security",
+            "subject_id": "fixture:DDD",
         },
         "intent": {
             "sell_role": "close",
@@ -64,7 +83,15 @@ def _comparison_case():
     }
 
 
-def _recorded_history_case(features, clock):
+def _recorded_history_case(features, clock, deployment):
+    decision_id = DecisionIdentity.build(
+        deployment=deployment,
+        clock=clock,
+        snapshot_sha256=features.recorded_input_manifest_sha256,
+        category=DecisionCategory.REPLACEMENT,
+        subject_type=DecisionSubjectType.SECURITY,
+        subject_id="fixture:DDD",
+    ).decision_id
     return {
         "policy_identity": {
             "policy_artifact_id": "fixed-policy:combined-offline-v1",
@@ -87,6 +114,7 @@ def _recorded_history_case(features, clock):
         },
         "decision": {
             "action_family": "replacement",
+            "decision_id": decision_id,
             "exchange_id": "XNYS",
             "decision_session": clock.decision_session.isoformat(),
             "as_of_cutoff_at": clock.as_of_cutoff_at.isoformat(),
@@ -149,6 +177,7 @@ def _paper_replacement_case(execution, pending_state):
         },
         "decision": {
             "action_family": "replacement",
+            "decision_id": decision.decision_id,
             "exchange_id": clock.exchange_id,
             "decision_session": clock.decision_session.isoformat(),
             "as_of_cutoff_at": clock.as_of_cutoff_at.isoformat(),
@@ -198,9 +227,9 @@ def test_recorded_replacement_decision_and_durable_sell_intent_match_after_resta
     history_dir = tmp_path / "history"
     history_dir.mkdir()
     history_features = build_feature_fixture(history_dir)
-    _, history_clock = build_chain_identity(history_features)
+    history_deployment, history_clock = build_chain_identity(history_features)
     result = compare_replacement_cases(
-        _recorded_history_case(history_features, history_clock),
+        _recorded_history_case(history_features, history_clock, history_deployment),
         _paper_replacement_case(recovered, replay.kind.value),
     )
 
