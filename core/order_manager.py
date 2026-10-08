@@ -8,7 +8,7 @@ under a single workflow id.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 import hashlib
 import math
@@ -33,6 +33,14 @@ from core.policy_addition import (
     submit_addition as submit_policy_addition,
 )
 
+from core.fake_policy_exit_broker import FakeProtectedExitBroker
+from core.policy_exit_execution import (
+    PolicyExitDispatch,
+    PolicyExitProtection,
+    confirm_policy_exit_protection as confirm_exit_protection,
+    dispatch_policy_exit,
+    replace_policy_exit_protection as replace_exit_protection,
+)
 from core.execution_store import (
     ConcurrentWorkflowTransitionError,
     get_execution_store,
@@ -69,7 +77,7 @@ from core.order_execution import (
     require_paper_mode,
     submit_bracket_buy,
 )
-from core.policy_execution_state import ActionRole, ActionStatus, OrderSide, PortfolioStateSnapshot
+from core.policy_execution_state import ActionRole, ActionStatus, DecisionIdentity, OrderSide, PortfolioStateSnapshot
 from core.policy_execution_store import PolicyExecutionStateStore
 from core.policy_protection_bridge import PolicyProtectionBridge
 
@@ -200,6 +208,33 @@ class AdditionExecutionPorts:
         ):
             if not callable(getattr(self, name)):
                 raise TypeError(f"addition execution {name} must be callable")
+
+
+@dataclass(frozen=True, slots=True)
+class ExitExecutionPorts:
+    """Explicit state and injected paper-broker operations for a fixed exit."""
+
+    store: PolicyExecutionStateStore
+    provider_id: str
+    broker: FakeProtectedExitBroker
+    execution_session: Callable[[], date]
+    observed_at: Callable[[], datetime]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.store, PolicyExecutionStateStore):
+            raise TypeError("exit execution requires an explicit PolicyExecutionStateStore")
+        if type(self.provider_id) is not str or not self.provider_id.strip():
+            raise ValueError("exit provider_id must be non-empty")
+        if type(self.broker) is not FakeProtectedExitBroker:
+            raise TypeError("public exit execution requires the atomic fake-paper broker")
+        if self.broker.receipt_store_path is None:
+            raise ValueError("public exit execution requires a durable fake-broker receipt store")
+        for name in (
+            "execution_session",
+            "observed_at",
+        ):
+            if not callable(getattr(self, name)):
+                raise TypeError(f"exit execution {name} must be callable")
 
 
 class PendingExitSafetyError(RuntimeError):
@@ -941,6 +976,76 @@ class OrderManager:
             dry_run=False,
             error=result.error,
         )
+
+    def submit_policy_exit(
+        self,
+        logical_action_id: str,
+        *,
+        ports: ExitExecutionPorts,
+    ) -> PolicyExitDispatch:
+        """Consume one fixed, durable policy sell through the public order owner."""
+        if type(ports) is not ExitExecutionPorts:
+            raise TypeError("OrderManager requires ExitExecutionPorts")
+        if self._policy_store is not None and self._policy_store is not ports.store:
+            raise ValueError("exit ports and OrderManager must use the same policy store")
+        with _FILL_HANDLING_LOCK:
+            return dispatch_policy_exit(
+                ports.store,
+                logical_action_id,
+                account=ports.broker.snapshot(),
+                execution_session=ports.execution_session(),
+                provider_id=ports.provider_id,
+                observed_at=ports.observed_at(),
+                broker=ports.broker,
+            )
+
+    def replace_policy_exit_protection(
+        self,
+        logical_action_id: str,
+        *,
+        decision: DecisionIdentity,
+        account: BrokerAccountSnapshot,
+        provider_id: str,
+        observed_at: datetime,
+        replace_stop: Callable[..., BrokerAccountSnapshot | None],
+    ) -> PolicyExitProtection:
+        """Resize a policy exit stop only after confirmed terminal sell facts."""
+        if self._policy_store is None:
+            raise RuntimeError("policy exit protection requires an explicit policy store")
+        with _FILL_HANDLING_LOCK:
+            return replace_exit_protection(
+                self._policy_store,
+                logical_action_id,
+                decision=decision,
+                account=account,
+                provider_id=provider_id,
+                observed_at=observed_at,
+                replace_stop=replace_stop,
+            )
+
+    def confirm_policy_exit_protection(
+        self,
+        logical_action_id: str,
+        *,
+        broker: FakeProtectedExitBroker,
+        provider_id: str,
+        observed_at: datetime,
+    ) -> PolicyExitProtection:
+        """Confirm stop exchange or flat cancellation from the same fake broker."""
+        if self._policy_store is None:
+            raise RuntimeError("policy exit protection requires an explicit policy store")
+        if type(broker) is not FakeProtectedExitBroker:
+            raise TypeError("policy exit confirmation requires the atomic fake-paper broker")
+        if broker.receipt_store_path is None:
+            raise ValueError("policy exit confirmation requires a durable fake-broker receipt store")
+        with _FILL_HANDLING_LOCK:
+            return confirm_exit_protection(
+                self._policy_store,
+                logical_action_id,
+                broker=broker,
+                provider_id=provider_id,
+                observed_at=observed_at,
+            )
 
     def submit_exit(self, symbol: str, *, exit_reason: str) -> OrderResult:
         """Cancel open orders and submit a market exit under the active workflow."""
