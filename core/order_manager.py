@@ -33,10 +33,10 @@ from core.policy_addition import (
     submit_addition as submit_policy_addition,
 )
 
+from core.fake_policy_exit_broker import FakeProtectedExitBroker
 from core.policy_exit_execution import (
     PolicyExitDispatch,
     PolicyExitProtection,
-    PolicyExitSubmissionResult,
     confirm_policy_exit_protection as confirm_exit_protection,
     dispatch_policy_exit,
     replace_policy_exit_protection as replace_exit_protection,
@@ -216,21 +216,20 @@ class ExitExecutionPorts:
 
     store: PolicyExecutionStateStore
     provider_id: str
-    get_account_snapshot: Callable[[], BrokerAccountSnapshot]
+    broker: FakeProtectedExitBroker
     execution_session: Callable[[], date]
     observed_at: Callable[[], datetime]
-    submit_order: Callable[..., PolicyExitSubmissionResult]
 
     def __post_init__(self) -> None:
         if not isinstance(self.store, PolicyExecutionStateStore):
             raise TypeError("exit execution requires an explicit PolicyExecutionStateStore")
         if type(self.provider_id) is not str or not self.provider_id.strip():
             raise ValueError("exit provider_id must be non-empty")
+        if type(self.broker) is not FakeProtectedExitBroker:
+            raise TypeError("public exit execution requires the atomic fake-paper broker")
         for name in (
-            "get_account_snapshot",
             "execution_session",
             "observed_at",
-            "submit_order",
         ):
             if not callable(getattr(self, name)):
                 raise TypeError(f"exit execution {name} must be callable")
@@ -991,11 +990,11 @@ class OrderManager:
             return dispatch_policy_exit(
                 ports.store,
                 logical_action_id,
-                account=ports.get_account_snapshot(),
+                account=ports.broker.snapshot(),
                 execution_session=ports.execution_session(),
                 provider_id=ports.provider_id,
                 observed_at=ports.observed_at(),
-                submit=ports.submit_order,
+                broker=ports.broker,
             )
 
     def replace_policy_exit_protection(

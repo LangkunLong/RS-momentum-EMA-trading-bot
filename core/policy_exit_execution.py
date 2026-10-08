@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Callable, Literal
+from typing import TYPE_CHECKING, Callable, Literal
 
 from core.policy_execution_state import (
     ActionAttemptStatus,
@@ -21,6 +21,9 @@ from core.policy_execution_state import (
 from core.policy_execution_store import PolicyExecutionStateStore
 from core.policy_exits import propose_protection_resize
 from core.strategy_policy.account_reconciliation import BrokerAccountSnapshot, BrokerOrderFact
+
+if TYPE_CHECKING:
+    from core.fake_policy_exit_broker import FakeProtectedExitBroker
 
 
 _WORKING_STATUSES = frozenset(
@@ -134,7 +137,7 @@ def dispatch_policy_exit(
     execution_session: date,
     provider_id: str,
     observed_at: datetime,
-    submit: Callable[..., PolicyExitSubmissionResult],
+    broker: FakeProtectedExitBroker,
 ) -> PolicyExitDispatch:
     """Persist a client reference before one fake-broker sell; replay reconciles.
 
@@ -151,8 +154,10 @@ def dispatch_policy_exit(
         raise ValueError("provider_id must be non-empty")
     if not isinstance(observed_at, datetime) or observed_at.tzinfo is None or observed_at.utcoffset() is None:
         raise ValueError("observed_at must be timezone-aware")
-    if not callable(submit):
-        raise TypeError("submit must be an explicit paper-broker callback")
+    from core.fake_policy_exit_broker import FakeProtectedExitBroker
+
+    if type(broker) is not FakeProtectedExitBroker:
+        raise TypeError("policy exit dispatch requires the atomic fake-paper broker")
 
     action = store.load_action_intent(logical_action_id)
     if action.role not in {ActionRole.SCALE_OUT, ActionRole.CLOSE} or action.side is not OrderSide.SELL:
@@ -190,7 +195,7 @@ def dispatch_policy_exit(
         observed_at=observed_at,
     )
     try:
-        outcome = submit(
+        outcome = broker.submit_protected_exit(
             symbol=action.broker_symbol,
             quantity=action.requested_quantity,
             client_order_id=client_id,
@@ -309,6 +314,34 @@ def _flat_exit_converged(account: BrokerAccountSnapshot, action: ActionIntent) -
     )
 
 
+def _retire_flat_protection(
+    store: PolicyExecutionStateStore,
+    action: ActionIntent,
+    holding,
+    account: BrokerAccountSnapshot,
+    observed_at: datetime,
+) -> PolicyExitProtection:
+    if not _flat_exit_converged(account, action):
+        return PolicyExitProtection("reconcile", action, "flat holding still requires broker stop cancellation evidence")
+    flags = dict(holding.policy_flags)
+    client = holding.confirmed_stop_client_order_id or flags.get("flat_stop_retired_client_order_id")
+    broker = holding.confirmed_stop_broker_order_id or flags.get("flat_stop_retired_broker_order_id")
+    if not client or not broker:
+        return PolicyExitProtection("blocked", action, "flat holding has no durable stop references to retire")
+    try:
+        store.retire_flat_holding_protection(
+            action.logical_action_id,
+            client_order_id=client,
+            broker_order_id=broker,
+            account_snapshot_id=account.account_snapshot_id,
+            expected_holding_version=holding.state_version,
+            observed_at=observed_at,
+        )
+    except ValueError as exc:
+        return PolicyExitProtection("reconcile", action, str(exc))
+    return PolicyExitProtection("flat", action, "broker confirms no position or working sell")
+
+
 def confirm_policy_exit_protection(
     store: PolicyExecutionStateStore,
     logical_action_id: str,
@@ -325,9 +358,7 @@ def confirm_policy_exit_protection(
         return PolicyExitProtection("reconcile", action, "source sell is not terminal with a confirmed fill")
     holding = store.load_holding_episode(action.holding_episode_id)
     if holding.remaining_quantity <= 0:
-        if _flat_exit_converged(account, action):
-            return PolicyExitProtection("flat", action, "broker confirms no position or working sell")
-        return PolicyExitProtection("reconcile", action, "flat holding still requires broker stop cancellation evidence")
+        return _retire_flat_protection(store, action, holding, account, observed_at)
     if (
         account.paper_account_environment_id
         != action.decision.deployment_identity.paper_account_environment_id
@@ -426,9 +457,7 @@ def replace_policy_exit_protection(
         return PolicyExitProtection("reconcile", action, "sell remainder is not terminal")
     holding = store.load_holding_episode(action.holding_episode_id)
     if holding.remaining_quantity <= 0:
-        if _flat_exit_converged(account, action):
-            return PolicyExitProtection("flat", action, "broker confirms no position or working sell")
-        return PolicyExitProtection("reconcile", action, "flat holding still requires broker stop cancellation evidence")
+        return _retire_flat_protection(store, action, holding, account, observed_at)
     if holding.pending_action_ids:
         return PolicyExitProtection("blocked", action, "another holding action is pending")
     if holding.proposed_stop_action_id != holding.confirmed_stop_action_id:

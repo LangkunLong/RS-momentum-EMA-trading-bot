@@ -1626,6 +1626,93 @@ class PolicyExecutionStateStore:
                 raise KeyError("action has no persisted holding episode")
             return _holding_from_row(row)
 
+    def retire_flat_holding_protection(
+        self,
+        logical_action_id: str,
+        *,
+        client_order_id: str,
+        broker_order_id: str,
+        account_snapshot_id: str,
+        expected_holding_version: int,
+        observed_at: datetime,
+    ) -> HoldingEpisode:
+        """Retire historical stop refs after a caller observes broker flat/absence.
+
+        The caller must independently check a complete broker position and order
+        snapshot. This transaction binds that observation to the terminal sell,
+        closes the holding's active stop pointer, and records the old references.
+        """
+        client = _required_text(client_order_id, "client_order_id")
+        broker = _required_text(broker_order_id, "broker_order_id")
+        snapshot = _required_text(account_snapshot_id, "account_snapshot_id")
+        _aware_iso(observed_at)
+        with self._transaction(write=True) as conn:
+            self._require_ready(conn)
+            action, _ = self._load_action(conn, logical_action_id)
+            if (
+                action.role not in {ActionRole.SCALE_OUT, ActionRole.CLOSE}
+                or action.side is not OrderSide.SELL
+                or action.status not in {ActionStatus.FILLED, ActionStatus.RESOLVED}
+                or action.confirmed_filled_quantity <= 0
+                or action.holding_episode_id is None
+            ):
+                raise ValueError("flat stop retirement requires a terminal filled policy sell")
+            row = self._holding_row(conn, action.holding_episode_id)
+            if row is None:
+                raise ValueError("flat stop retirement holding is missing")
+            holding = _holding_from_row(row)
+            flags = dict(holding.policy_flags)
+            if holding.remaining_quantity != 0:
+                raise ValueError("flat stop retirement requires zero durable shares")
+            retired_by = flags.get("flat_stop_retired_by_action_id")
+            if retired_by is not None:
+                if (
+                    retired_by == logical_action_id
+                    and flags.get("flat_stop_retired_client_order_id") == client
+                    and flags.get("flat_stop_retired_broker_order_id") == broker
+                ):
+                    return holding
+                raise IdentityConflictError("flat stop was retired under different source facts")
+            if int(row["state_version"]) != expected_holding_version:
+                raise ConcurrentStateUpdateError("holding changed since flat broker observation")
+            if (
+                holding.remaining_quantity != 0
+                or holding.pending_action_ids
+                or holding.proposed_stop_action_id != holding.confirmed_stop_action_id
+                or holding.confirmed_stop_client_order_id != client
+                or holding.confirmed_stop_broker_order_id != broker
+                or holding.deployment_generation_id != action.deployment_generation_id
+                or flags.get("position_reconciliation_required")
+            ):
+                raise ValueError("flat holding or confirmed stop differs from terminal sell")
+            flags.update({
+                "flat_stop_retired_by_action_id": logical_action_id,
+                "flat_stop_retired_client_order_id": client,
+                "flat_stop_retired_broker_order_id": broker,
+                "flat_stop_absence_snapshot_id": snapshot,
+            })
+            updated = replace(
+                holding,
+                proposed_stop_price=None,
+                proposed_stop_action_id=None,
+                confirmed_protective_stop_price=None,
+                confirmed_stop_action_id=None,
+                confirmed_stop_client_order_id=None,
+                confirmed_stop_broker_order_id=None,
+                confirmed_stop_observed_at=None,
+                policy_flags=tuple(flags.items()),
+            )
+            next_version = self._save_holding(
+                conn,
+                updated,
+                expected_version=expected_holding_version,
+                event_kind="flat_stop_absence_confirmed",
+                logical_action_id=logical_action_id,
+                evidence_ref=snapshot,
+                observed_at=observed_at,
+            )
+            return replace(updated, state_version=next_version)
+
     def update_holding_marks(
         self,
         holding_episode_id: str,

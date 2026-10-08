@@ -1,8 +1,10 @@
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from decimal import Decimal
 
 import pytest
 
+from core.fake_policy_exit_broker import FakeProtectedExitBroker
 from core.order_manager import ExitExecutionPorts, OrderManager
 from core.policy_execution_state import (
     ActionNotDueError,
@@ -12,7 +14,7 @@ from core.policy_execution_state import (
     DecisionSubjectType,
 )
 from core.policy_execution_store import PolicyExecutionStateStore
-from core.policy_exit_execution import PolicyExitSubmissionResult
+from core.policy_exit_execution import dispatch_policy_exit
 from core.policy_exits import start_full_exit, start_scale_out
 from tests.test_paper_policy_chain import read_chain, seed_pending_chain
 from tests.test_policy_exits import _exit_decision
@@ -53,120 +55,100 @@ def _case(tmp_path, *, full_exit=False):
     return store, account, decision, holding, action
 
 
-def _ports(store, account, decision, submit):
+def _ports(store, broker, decision):
     return ExitExecutionPorts(
         store=store,
         provider_id="offline-fake-broker",
-        get_account_snapshot=lambda: account,
+        broker=broker,
         execution_session=lambda: decision.clock.next_execution_session,
         observed_at=lambda: decision.clock.account_valuation_at,
-        submit_order=submit,
-    )
-
-
-def _linked_success(broker_order_id, **kwargs):
-    return PolicyExitSubmissionResult(
-        success=True,
-        broker_order_id=broker_order_id,
-        linked_stop_broker_order_id=kwargs["confirmed_stop_broker_order_id"],
-        shared_sell_quantity_limit=kwargs["protected_position_quantity"],
-        shared_sell_group_id="fake-paper-shared-position-cap",
     )
 
 
 @pytest.mark.parametrize("full_exit, expected_quantity", [(False, Decimal("3")), (True, Decimal("6"))])
 def test_public_policy_exit_submits_fixed_quantity_once(tmp_path, full_exit, expected_quantity):
     store, account, decision, holding, action = _case(tmp_path, full_exit=full_exit)
-    calls = []
-
-    def submit(**kwargs):
-        calls.append(kwargs)
-        return _linked_success("broker:policy-exit", **kwargs)
-
+    broker = FakeProtectedExitBroker(account)
     manager = OrderManager(paper=True, policy_store=store)
-    ports = _ports(store, account, decision, submit)
+    ports = _ports(store, broker, decision)
     submitted = manager.submit_policy_exit(action.logical_action_id, ports=ports)
 
     assert submitted.disposition == "submitted", submitted.reason
     assert submitted.action.status is ActionStatus.SUBMITTED
-    assert len(calls) == 1
-    assert calls[0]["quantity"] == expected_quantity
-    assert calls[0]["confirmed_stop_client_order_id"] == holding.confirmed_stop_client_order_id
-    assert calls[0]["confirmed_stop_broker_order_id"] == holding.confirmed_stop_broker_order_id
-    assert submitted.action.order_attempts[0].client_order_id == calls[0]["client_order_id"]
-    assert submitted.action.order_attempts[0].broker_order_id == "broker:policy-exit"
+    assert len(broker.submissions) == 1
+    assert broker.submissions[0]["quantity"] == expected_quantity
+    assert broker.submissions[0]["confirmed_stop_client_order_id"] == holding.confirmed_stop_client_order_id
+    assert broker.submissions[0]["confirmed_stop_broker_order_id"] == holding.confirmed_stop_broker_order_id
+    assert submitted.action.order_attempts[0].client_order_id == broker.submissions[0]["client_order_id"]
+    assert submitted.action.order_attempts[0].broker_order_id in {
+        row.broker_order_id for row in broker.snapshot().open_orders if row.purpose == "strategy" and row.side == "sell"
+    }
 
     restarted = PolicyExecutionStateStore(store.db_path, store_identity=store.store_identity)
     replay = OrderManager(paper=True, policy_store=restarted).submit_policy_exit(
         action.logical_action_id,
-        ports=_ports(restarted, account, decision, submit),
+        ports=_ports(restarted, broker, decision),
     )
     assert replay.disposition == "reconcile"
-    assert len(calls) == 1
+    assert len(broker.submissions) == 1
 
 
 def test_uncertain_sell_result_never_dispatches_again_after_restart(tmp_path):
     store, account, decision, _, action = _case(tmp_path)
-    calls = []
-
-    def submit(**kwargs):
-        calls.append(kwargs)
-        raise TimeoutError("response lost after submit")
-
+    broker = FakeProtectedExitBroker(account, response_mode="timeout_after_accept")
     manager = OrderManager(paper=True, policy_store=store)
-    first = manager.submit_policy_exit(action.logical_action_id, ports=_ports(store, account, decision, submit))
+    first = manager.submit_policy_exit(action.logical_action_id, ports=_ports(store, broker, decision))
     assert first.disposition == "reconcile"
     assert first.action.status is ActionStatus.SUBMITTED
-    assert first.action.order_attempts[0].client_order_id == calls[0]["client_order_id"]
+    assert first.action.order_attempts[0].client_order_id == broker.submissions[0]["client_order_id"]
 
     restarted = PolicyExecutionStateStore(store.db_path, store_identity=store.store_identity)
     again = OrderManager(paper=True, policy_store=restarted).submit_policy_exit(
         action.logical_action_id,
-        ports=_ports(restarted, account, decision, submit),
+        ports=_ports(restarted, broker, decision),
     )
     assert again.disposition == "reconcile"
-    assert len(calls) == 1
+    assert len(broker.submissions) == 1
 
 
-def test_sell_without_confirmed_shared_stop_cap_requires_reconciliation(tmp_path):
+def test_public_ports_reject_callback_only_broker(tmp_path):
     store, account, decision, _, action = _case(tmp_path)
-    calls = []
-
-    def submit(**kwargs):
-        calls.append(kwargs)
-        return PolicyExitSubmissionResult(success=True, broker_order_id="broker:unlinked-sell")
-
-    first = OrderManager(paper=True, policy_store=store).submit_policy_exit(
-        action.logical_action_id,
-        ports=_ports(store, account, decision, submit),
-    )
-    assert first.disposition == "reconcile"
-    assert "shared position cap" in first.reason
-    restarted = PolicyExecutionStateStore(store.db_path, store_identity=store.store_identity)
-    replay = OrderManager(paper=True, policy_store=restarted).submit_policy_exit(
-        action.logical_action_id,
-        ports=_ports(restarted, account, decision, submit),
-    )
-    assert replay.disposition == "reconcile"
-    assert len(calls) == 1
+    with pytest.raises(TypeError, match="atomic fake-paper broker"):
+        ExitExecutionPorts(
+            store=store,
+            provider_id="offline-fake-broker",
+            broker=lambda **_: None,
+            execution_session=lambda: decision.clock.next_execution_session,
+            observed_at=lambda: decision.clock.account_valuation_at,
+        )
+    assert store.load_action_intent(action.logical_action_id).status is ActionStatus.INTENDED
+    with pytest.raises(TypeError, match="atomic fake-paper broker"):
+        dispatch_policy_exit(
+            store,
+            action.logical_action_id,
+            account=account,
+            execution_session=decision.clock.next_execution_session,
+            provider_id="offline-fake-broker",
+            observed_at=decision.clock.account_valuation_at,
+            broker=lambda **_: None,
+        )
 
 
 def test_confirmed_partial_sell_reduces_only_remaining_holding_and_never_resubmits(tmp_path):
     store, account, decision, holding, action = _case(tmp_path)
-    calls = []
-
-    def submit(**kwargs):
-        calls.append(kwargs)
-        return _linked_success("broker:partial-sell", **kwargs)
-
+    broker = FakeProtectedExitBroker(account)
     manager = OrderManager(paper=True, policy_store=store)
-    dispatched = manager.submit_policy_exit(action.logical_action_id, ports=_ports(store, account, decision, submit))
+    dispatched = manager.submit_policy_exit(action.logical_action_id, ports=_ports(store, broker, decision))
     client_id = dispatched.action.order_attempts[0].client_order_id
+    broker_order_id = dispatched.action.order_attempts[0].broker_order_id
+    observed = broker.fill_order(broker_order_id, Decimal("2"))
+    assert next(row for row in observed.positions if row.symbol == "CCC").quantity == 4
+    assert any(row.broker_order_id == holding.confirmed_stop_broker_order_id for row in observed.open_orders)
     fill = manager.record_policy_cumulative_fill(
         action.logical_action_id,
         attempt_number=1,
         side="sell",
-        broker_order_id="broker:partial-sell",
+        broker_order_id=broker_order_id,
         client_order_id=client_id,
         cumulative_quantity=Decimal("2"),
         average_fill_price=Decimal("110"),
@@ -181,89 +163,135 @@ def test_confirmed_partial_sell_reduces_only_remaining_holding_and_never_resubmi
     restarted = PolicyExecutionStateStore(store.db_path, store_identity=store.store_identity)
     replay = OrderManager(paper=True, policy_store=restarted).submit_policy_exit(
         action.logical_action_id,
-        ports=_ports(restarted, account, decision, submit),
+        ports=_ports(restarted, broker, decision),
     )
     assert replay.disposition == "reconcile"
-    assert len(calls) == 1
+    assert len(broker.submissions) == 1
+
+
+def test_fake_broker_atomically_caps_simultaneous_stop_and_full_exit_fills(tmp_path):
+    store, account, decision, holding, action = _case(tmp_path, full_exit=True)
+    broker = FakeProtectedExitBroker(account)
+    result = OrderManager(paper=True, policy_store=store).submit_policy_exit(
+        action.logical_action_id,
+        ports=_ports(store, broker, decision),
+    )
+    assert result.disposition == "submitted"
+    sell_id = result.action.order_attempts[0].broker_order_id
+    stop_id = holding.confirmed_stop_broker_order_id
+    observed = broker.snapshot()
+    assert {row.broker_order_id for row in observed.open_orders if row.symbol == "CCC" and row.side == "sell"} == {
+        sell_id, stop_id
+    }
+
+    def fill(order_id):
+        try:
+            return ("filled", broker.fill_order(order_id, Decimal("4")))
+        except ValueError as exc:
+            return ("blocked", str(exc))
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(fill, (sell_id, stop_id)))
+    assert sorted(kind for kind, _ in outcomes) == ["blocked", "filled"]
+    remaining = broker.snapshot()
+    assert next(row for row in remaining.positions if row.symbol == "CCC").quantity == 2
+    stop = next(row for row in remaining.open_orders if row.broker_order_id == stop_id)
+    assert stop.status in {"submitted", "partially_filled"}
+    with pytest.raises(ValueError):
+        broker.fill_order(stop_id, Decimal("3"))
+    flat = broker.fill_order(stop_id, Decimal("2"))
+    assert all(row.symbol != "CCC" for row in flat.positions)
+    assert all(row.symbol != "CCC" or row.side != "sell" for row in flat.open_orders)
+
+
+def test_fake_broker_recovers_shared_cap_after_partial_sell_restart(tmp_path):
+    store, account, decision, holding, action = _case(tmp_path, full_exit=True)
+    broker = FakeProtectedExitBroker(account)
+    submitted = OrderManager(paper=True, policy_store=store).submit_policy_exit(
+        action.logical_action_id,
+        ports=_ports(store, broker, decision),
+    )
+    sell_id = submitted.action.order_attempts[0].broker_order_id
+    observed = broker.fill_order(sell_id, Decimal("2"))
+    restarted_broker = FakeProtectedExitBroker(observed)
+    with pytest.raises(ValueError, match="shared sell cap"):
+        restarted_broker.fill_order(holding.confirmed_stop_broker_order_id, Decimal("5"))
+    flat = restarted_broker.fill_order(holding.confirmed_stop_broker_order_id, Decimal("4"))
+    assert all(row.symbol != "CCC" for row in flat.positions)
+    assert all(row.symbol != "CCC" or row.side != "sell" for row in flat.open_orders)
 
 
 def test_definite_rejection_preserves_holding_and_confirmed_stop(tmp_path):
     store, account, decision, holding, action = _case(tmp_path)
+    broker = FakeProtectedExitBroker(account, response_mode="reject_before_accept")
     manager = OrderManager(paper=True, policy_store=store)
     result = manager.submit_policy_exit(
         action.logical_action_id,
-        ports=_ports(
-            store,
-            account,
-            decision,
-            lambda **_: PolicyExitSubmissionResult(success=False, error="definitively rejected"),
-        ),
+        ports=_ports(store, broker, decision),
     )
     assert result.disposition == "rejected"
     assert result.action.status is ActionStatus.RESOLVED
     current = store.load_holding_episode(holding.holding_episode_id)
     assert current.remaining_quantity == holding.remaining_quantity
     assert current.confirmed_stop_broker_order_id == holding.confirmed_stop_broker_order_id
+    assert broker.submissions == []
 
 
-def test_missing_position_or_stop_blocks_before_any_broker_call(tmp_path):
+def test_incomplete_broker_snapshot_blocks_before_any_broker_call(tmp_path):
     store, account, decision, _, action = _case(tmp_path)
-    calls = []
     account = replace(account, positions=None)
-    step = OrderManager(paper=True, policy_store=store).submit_policy_exit(
-        action.logical_action_id,
-        ports=_ports(store, account, decision, lambda **kwargs: calls.append(kwargs)),
-    )
-    assert step.disposition == "blocked"
+    with pytest.raises(ValueError, match="complete paper positions"):
+        FakeProtectedExitBroker(account)
     assert store.load_action_intent(action.logical_action_id).status is ActionStatus.INTENDED
-    assert calls == []
 
 
 def test_wrong_stop_quantity_blocks_before_any_broker_call(tmp_path):
     store, account, decision, _, action = _case(tmp_path)
-    calls = []
     wrong_stop = replace(account.open_orders[-1], requested_quantity=5)
     account = replace(account, open_orders=account.open_orders[:-1] + (wrong_stop,))
+    broker = FakeProtectedExitBroker(account)
     step = OrderManager(paper=True, policy_store=store).submit_policy_exit(
         action.logical_action_id,
-        ports=_ports(store, account, decision, lambda **kwargs: calls.append(kwargs)),
+        ports=_ports(store, broker, decision),
     )
     assert step.disposition == "blocked"
     assert "protective-stop facts" in step.reason
-    assert calls == []
+    assert broker.submissions == []
     assert store.load_action_intent(action.logical_action_id).status is ActionStatus.INTENDED
 
 
 def test_exit_cannot_move_to_an_unqualified_hourly_or_later_session(tmp_path):
     store, account, decision, _, action = _case(tmp_path)
-    calls = []
+    broker = FakeProtectedExitBroker(account)
     ports = ExitExecutionPorts(
         store=store,
         provider_id="offline-fake-broker",
-        get_account_snapshot=lambda: account,
+        broker=broker,
         execution_session=lambda: decision.clock.decision_session,
         observed_at=lambda: decision.clock.account_valuation_at,
-        submit_order=lambda **kwargs: calls.append(kwargs),
     )
     with pytest.raises(ActionNotDueError):
         OrderManager(paper=True, policy_store=store).submit_policy_exit(action.logical_action_id, ports=ports)
-    assert calls == []
+    assert broker.submissions == []
     assert store.load_action_intent(action.logical_action_id).status is ActionStatus.INTENDED
 
 
 @pytest.mark.parametrize("uncertain", [False, True])
 def test_completed_scale_out_replaces_exact_remaining_stop_once(tmp_path, uncertain):
     store, account, decision, holding, action = _case(tmp_path)
+    broker = FakeProtectedExitBroker(account)
     manager = OrderManager(paper=True, policy_store=store)
     submitted = manager.submit_policy_exit(
         action.logical_action_id,
-        ports=_ports(store, account, decision, lambda **kwargs: _linked_success("broker:scale-out", **kwargs)),
+        ports=_ports(store, broker, decision),
     )
+    broker_order_id = submitted.action.order_attempts[0].broker_order_id
+    broker.fill_order(broker_order_id, Decimal("3"))
     manager.record_policy_cumulative_fill(
         action.logical_action_id,
         attempt_number=1,
         side="sell",
-        broker_order_id="broker:scale-out",
+        broker_order_id=broker_order_id,
         client_order_id=submitted.action.order_attempts[0].client_order_id,
         cumulative_quantity=Decimal("3"),
         average_fill_price=Decimal("110"),
@@ -280,31 +308,13 @@ def test_completed_scale_out_replaces_exact_remaining_stop_once(tmp_path, uncert
         subject_id=holding.holding_episode_id,
         sequence=1,
     )
-    position = next(row for row in account.positions if row.symbol == "CCC")
-    post_fill = replace(
-        account,
-        decision_slot_id=resize_decision.decision_slot_id,
-        decision_id=resize_decision.decision_id,
-        account_snapshot_id="snapshot:confirmed-scale-out-fill",
-        positions=tuple(replace(row, quantity=3) if row is position else row for row in account.positions),
-    )
+    post_fill = broker.observe_for(resize_decision)
     calls = []
     refreshed_accounts = []
 
     def replace_stop(**kwargs):
         calls.append(kwargs)
-        old = kwargs["old_order"]
-        replacement = replace(
-            old,
-            requested_quantity=3,
-            client_order_id=kwargs["new_client_order_id"],
-            broker_order_id="broker:resized-stop",
-        )
-        refreshed = replace(
-            post_fill,
-            open_orders=tuple(row for row in post_fill.open_orders if row is not old) + (replacement,),
-            account_snapshot_id="snapshot:after-atomic-stop-replacement",
-        )
+        refreshed = broker.replace_stop(**kwargs)
         refreshed_accounts.append(refreshed)
         return None if uncertain else refreshed
 
@@ -335,7 +345,7 @@ def test_completed_scale_out_replaces_exact_remaining_stop_once(tmp_path, uncert
 
     confirmed = store.load_holding_episode(holding.holding_episode_id)
     assert confirmed.remaining_quantity == Decimal("3")
-    assert confirmed.confirmed_stop_broker_order_id == "broker:resized-stop"
+    assert confirmed.confirmed_stop_broker_order_id.startswith("fake-stop-order:")
     assert confirmed.confirmed_stop_client_order_id == calls[0]["new_client_order_id"]
 
     restarted = PolicyExecutionStateStore(store.db_path, store_identity=store.store_identity)
@@ -353,16 +363,18 @@ def test_completed_scale_out_replaces_exact_remaining_stop_once(tmp_path, uncert
 
 def test_full_exit_remains_unresolved_until_broker_confirms_stop_absent(tmp_path):
     store, account, decision, holding, action = _case(tmp_path, full_exit=True)
+    broker = FakeProtectedExitBroker(account)
     manager = OrderManager(paper=True, policy_store=store)
     submitted = manager.submit_policy_exit(
         action.logical_action_id,
-        ports=_ports(store, account, decision, lambda **kwargs: _linked_success("broker:full-exit", **kwargs)),
+        ports=_ports(store, broker, decision),
     )
+    broker_order_id = submitted.action.order_attempts[0].broker_order_id
     manager.record_policy_cumulative_fill(
         action.logical_action_id,
         attempt_number=1,
         side="sell",
-        broker_order_id="broker:full-exit",
+        broker_order_id=broker_order_id,
         client_order_id=submitted.action.order_attempts[0].client_order_id,
         cumulative_quantity=Decimal("6"),
         average_fill_price=Decimal("110"),
@@ -378,13 +390,7 @@ def test_full_exit_remains_unresolved_until_broker_confirms_stop_absent(tmp_path
         subject_id=holding.holding_episode_id,
         sequence=1,
     )
-    observation = replace(
-        account,
-        decision_slot_id=resize_decision.decision_slot_id,
-        decision_id=resize_decision.decision_id,
-        account_snapshot_id="snapshot:after-full-exit",
-        positions=tuple(row for row in account.positions if row.symbol != "CCC"),
-    )
+    observation = broker.observe_for(resize_decision)
     calls = []
     pending = manager.replace_policy_exit_protection(
         action.logical_action_id,
@@ -396,11 +402,7 @@ def test_full_exit_remains_unresolved_until_broker_confirms_stop_absent(tmp_path
     )
     assert pending.disposition == "reconcile"
     assert calls == []
-    cancelled = replace(
-        observation,
-        open_orders=tuple(row for row in observation.open_orders if row.symbol != "CCC"),
-        account_snapshot_id="snapshot:after-stop-cancel",
-    )
+    cancelled = broker.fill_order(broker_order_id, Decimal("6"))
     resolved = manager.confirm_policy_exit_protection(
         action.logical_action_id,
         account=cancelled,
@@ -409,3 +411,16 @@ def test_full_exit_remains_unresolved_until_broker_confirms_stop_absent(tmp_path
     )
     assert resolved.disposition == "flat"
     assert calls == []
+    retired = store.load_holding_episode(holding.holding_episode_id)
+    assert retired.confirmed_stop_broker_order_id is None
+    assert dict(retired.policy_flags)["flat_stop_retired_broker_order_id"] == holding.confirmed_stop_broker_order_id
+    version = retired.state_version
+    restarted = PolicyExecutionStateStore(store.db_path, store_identity=store.store_identity)
+    replay = OrderManager(paper=True, policy_store=restarted).confirm_policy_exit_protection(
+        action.logical_action_id,
+        account=broker.snapshot(),
+        provider_id="offline-fake-broker",
+        observed_at=decision.clock.account_valuation_at,
+    )
+    assert replay.disposition == "flat"
+    assert restarted.load_holding_episode(holding.holding_episode_id).state_version == version
