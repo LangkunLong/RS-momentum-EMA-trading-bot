@@ -8,12 +8,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, fields
 from contextlib import ExitStack
+import base64
 import hashlib
 import ntpath
 import os
 from pathlib import Path
 import re
 import subprocess
+import threading
 from typing import Literal, Protocol
 import uuid
 
@@ -854,6 +856,73 @@ class LocalBaselineCaptureFactoryV5:
         )
 
 
+def _bounded_attached_docker_v5(command, *, cwd, environment, timeout):
+    """Drain attached Docker output with fixed memory and emission limits."""
+    retained_limit, emitted_limit = 16 * 1024, 64 * 1024
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        shell=False,
+        cwd=cwd,
+        env=environment,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    captured = [bytearray(), bytearray()]
+    observed = [0, 0]
+    exceeded = [False, False]
+    errors = []
+
+    def drain(index, stream):
+        try:
+            while chunk := stream.read(4096):
+                observed[index] += len(chunk)
+                remaining = retained_limit - len(captured[index])
+                if remaining > 0:
+                    captured[index].extend(chunk[:remaining])
+                if observed[index] > emitted_limit:
+                    exceeded[index] = True
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+                    break
+        except (OSError, ValueError) as exc:
+            errors.append(exc)
+        finally:
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                pass
+
+    threads = [
+        threading.Thread(target=drain, args=(index, stream), daemon=True)
+        for index, stream in enumerate((process.stdout, process.stderr))
+    ]
+    for thread in threads:
+        thread.start()
+    timed_out = False
+    try:
+        returncode = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+        timed_out = True
+        returncode = process.returncode
+    finally:
+        for thread in threads:
+            thread.join(timeout=5)
+        if any(thread.is_alive() for thread in threads):
+            process.stdout.close()
+            process.stderr.close()
+            for thread in threads:
+                thread.join(timeout=1)
+    if (errors and not timed_out) or any(thread.is_alive() for thread in threads):
+        raise ValueError("bounded Docker diagnostic capture did not close")
+    return returncode, tuple(bytes(value) for value in captured), tuple(observed), tuple(exceeded), timed_out
+
+
 class _LocalBaselineTransportV5:
     def __init__(self, factory, inputs):
         self.factory, self.inputs = factory, inputs
@@ -867,15 +936,50 @@ class _LocalBaselineTransportV5:
         environment = {
             key: value for key, value in os.environ.items() if key.upper() in {"SYSTEMROOT", "WINDIR", "TEMP", "TMP"}
         }
+        command = (
+            self.factory.host.docker_executable,
+            "--host",
+            "npipe:////./pipe/docker_engine",
+            "--config",
+            str(config_root),
+            *args,
+        )
+        if self.factory.pit_data_scope == "engineering_v3" and args[:2] == ("start", "--attach"):
+            from .production_fs import write_new_regular_in_directory_v5
+
+            returncode, output, observed, exceeded, timed_out = _bounded_attached_docker_v5(
+                command, cwd=config_root, environment=environment, timeout=timeout
+            )
+            self.factory.docker_guard.revalidate()
+            if timed_out or returncode != 0 or any(exceeded):
+                name = config_root.parent.name
+                if re.fullmatch(r"pit-v5-baseline-[0-9a-f]{32}", name) is None:
+                    raise ValueError("baseline diagnostic owner is invalid")
+                diagnostic = canonical_json_bytes_v5(
+                    {
+                        "schema_version": 5,
+                        "stage": "start_attach",
+                        "container_name": name,
+                        "returncode": returncode,
+                        "timed_out": timed_out,
+                        "stdout_base64": base64.b64encode(output[0]).decode("ascii"),
+                        "stderr_base64": base64.b64encode(output[1]).decode("ascii"),
+                        "observed_bytes": observed,
+                        "retained_bytes": (len(output[0]), len(output[1])),
+                        "emission_limit_exceeded": exceeded,
+                    }
+                )
+                if len(diagnostic) > 64 * 1024:
+                    raise ValueError("baseline diagnostic exceeds its bound")
+                write_new_regular_in_directory_v5(
+                    self.factory.scratch, name + "-start-attach-failure.json", diagnostic
+                )
+                if timed_out:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                raise ValueError("baseline sandbox command failed; private diagnostic retained")
+            return b""
         result = subprocess.run(
-            (
-                self.factory.host.docker_executable,
-                "--host",
-                "npipe:////./pipe/docker_engine",
-                "--config",
-                str(config_root),
-                *args,
-            ),
+            command,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
