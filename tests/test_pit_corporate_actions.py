@@ -321,3 +321,34 @@ def test_timestamp_requires_preserved_timezone_when_time_is_supplied():
     )
     assert result.records == ()
     assert result.findings[0].code == "invalid_timestamp"
+
+
+def test_revision_cannot_precede_known_publication_without_losing_date_precision():
+    original = load_rows("split-known.jsonl")[0]
+    before_announcement = json.loads(json.dumps(original))
+    before_announcement["public_at"] = "2024-01-05"
+    before_announcement["revision_public_at"] = "2024-01-02"
+    result = validate_corporate_action_rows(
+        [before_announcement], authenticated_security_lineages=LINEAGES,
+    )
+    assert result.records == ()
+    assert [finding.code for finding in result.findings] == ["revision_before_publication"]
+
+    earlier_utc_instant = json.loads(json.dumps(original))
+    earlier_utc_instant["revision_public_at"] = "2024-01-03T08:00:00+00:00"
+    result = validate_corporate_action_rows(
+        [earlier_utc_instant], authenticated_security_lineages=LINEAGES,
+    )
+    assert result.records == ()
+    assert [finding.code for finding in result.findings] == ["revision_before_publication"]
+
+    same_day_date_only = json.loads(json.dumps(original))
+    same_day_date_only["public_at"] = "2024-01-03"
+    same_day_date_only["revision_public_at"] = "2024-01-03T08:00:00+00:00"
+    result = validate_corporate_action_rows(
+        [same_day_date_only], authenticated_security_lineages=LINEAGES,
+    )
+    assert result.findings == ()
+    [record] = result.records
+    assert record.public_at == "2024-01-03"
+    assert record.revision_public_at == "2024-01-03T08:00:00+00:00"

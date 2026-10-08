@@ -254,6 +254,18 @@ def _parse_record(
         if status.status != "known" and value is not None:
             _invalid("unknown_value_not_null", f"{name} has a value while its status is unknown")
 
+    if statuses["public_at"].status == "known" and statuses["revision_public_at"].status == "known":
+        announced = _public_time(row["public_at"], "public_at")
+        revised = _public_time(row["revision_public_at"], "revision_public_at")
+        if isinstance(announced, datetime) and isinstance(revised, datetime):
+            revision_is_early = revised.astimezone(timezone.utc) < announced.astimezone(timezone.utc)
+        else:
+            announcement_date = announced.date() if isinstance(announced, datetime) else announced
+            revision_date = revised.date() if isinstance(revised, datetime) else revised
+            revision_is_early = revision_date < announcement_date
+        if revision_is_early:
+            _invalid("revision_before_publication", "revision cannot predate the event's public announcement")
+
     for name, value in facts.items():
         status = statuses[name]
         if status.status != "known":
