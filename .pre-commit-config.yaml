@@ -15,6 +15,7 @@ repos:
     rev: v4.6.0
     hooks:
       - id: trailing-whitespace
+        entry: python -m pre_commit_hooks.trailing_whitespace_fixer
       - id: end-of-file-fixer
         # Module entry points also work when Windows blocks console-script launchers.
         entry: python -m pre_commit_hooks.end_of_file_fixer
