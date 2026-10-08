@@ -1951,3 +1951,227 @@ def test_late_fill_after_completed_scale_out_requires_explicit_resolution(tmp_pa
     restarted = PolicyExecutionStateStore(store.db_path, store_identity=deployment.store_identity)
     assert restarted.load_action_projection(scale_out.logical_action_id).status is ActionStatus.RESOLVED
     assert restarted.load_holding_episode(holding.holding_episode_id) == resolved_holding
+
+
+def test_protective_stop_fill_reuses_one_physical_leg_and_filters_only_that_leg(
+    tmp_path: Path,
+) -> None:
+    store = _open_store(tmp_path)
+    store.migrate()
+    deployment = _deployment()
+    store.register_deployment_identity(
+        deployment,
+        lifecycle="prepared",
+        handler_identity="fixture-handler",
+        guard_id="guard-v1",
+    )
+    entry = _entry_intent(deployment)
+    _record_decision(store, entry)
+    store.record_action_intent(entry, expected_version=None)
+    _record_fill(
+        store,
+        entry,
+        event_id="protective-stop-entry-fill",
+        cumulative_quantity="100",
+        cumulative_notional="5000",
+        expected_action_version=0,
+        expected_holding_version=None,
+    )
+    holding = store.load_holding_episode_for_action(entry.logical_action_id)
+
+    def confirm_stop(sequence: int, requested_quantity: Decimal):
+        current = store.load_holding_episode(holding.holding_episode_id)
+        stop_decision = DecisionIdentity.build(
+            deployment=deployment,
+            clock=entry.decision.clock,
+            snapshot_sha256=("c" if sequence == 1 else "d") * 64,
+            category=DecisionCategory.EXIT,
+            subject_type=DecisionSubjectType.HOLDING,
+            subject_id=holding.holding_episode_id,
+            sequence=sequence,
+        )
+        store.record_decision(
+            stop_decision,
+            policy_payload={"source_action_id": entry.logical_action_id},
+            guard_payload={"outcome": "allow_fixture"},
+            effective_action_payload={"holding_episode_id": holding.holding_episode_id},
+        )
+        intent = store.propose_stop_update(
+            holding.holding_episode_id,
+            decision=stop_decision,
+            stop_price=Decimal("45"),
+            expected_holding_version=current.state_version,
+            observed_at=datetime(2026, 10, 1, 14, sequence, tzinfo=UTC),
+        )
+        proposed = store.load_holding_episode(holding.holding_episode_id)
+        confirmed = store.confirm_protective_stop(
+            intent,
+            stop_price=Decimal("45"),
+            client_order_id="stop-client-original",
+            broker_order_id="stop-broker-physical",
+            observed_at=datetime(2026, 10, 1, 14, sequence, tzinfo=UTC),
+            expected_holding_version=proposed.state_version,
+            provider_id="recorded-fixture-provider",
+            requested_quantity=requested_quantity,
+        )
+        return intent, confirmed
+
+    first_stop, confirmed = confirm_stop(1, Decimal("100"))
+    first_fill = store.record_protective_sell_fill(
+        provider_id="recorded-fixture-provider",
+        broker_order_id="stop-broker-physical",
+        client_order_id="stop-callback-alias",
+        fill_event_id="protective-stop-partial-40",
+        cumulative_quantity=Decimal("40"),
+        cumulative_notional=Decimal("2000"),
+        cumulative_fees=None,
+        observed_at=datetime(2026, 10, 1, 14, 2, tzinfo=UTC),
+        expected_holding_version=confirmed.state_version,
+    )
+    assert first_fill.role is ActionRole.CLOSE
+    assert first_fill.side is OrderSide.SELL
+    assert first_fill.status is ActionStatus.PARTIALLY_FILLED
+    assert store.load_holding_episode(holding.holding_episode_id).remaining_quantity == Decimal("60")
+
+    replay = store.record_protective_sell_fill(
+        provider_id="recorded-fixture-provider",
+        broker_order_id="stop-broker-physical",
+        client_order_id="stop-callback-alias",
+        fill_event_id="protective-stop-partial-40",
+        cumulative_quantity=Decimal("40"),
+        cumulative_notional=Decimal("2000"),
+        cumulative_fees=None,
+        observed_at=datetime(2026, 10, 1, 14, 3, tzinfo=UTC),
+        expected_holding_version=confirmed.state_version,
+    )
+    assert replay.state_version == first_fill.state_version
+
+    second_stop, second_confirmed = confirm_stop(2, Decimal("60"))
+    assert second_confirmed.confirmed_stop_action_id == second_stop.logical_action_id
+    second_fill = store.record_protective_sell_fill(
+        provider_id="recorded-fixture-provider",
+        broker_order_id="stop-broker-physical",
+        client_order_id="stop-callback-alias",
+        fill_event_id="protective-stop-partial-60",
+        cumulative_quantity=Decimal("60"),
+        cumulative_notional=Decimal("3000"),
+        cumulative_fees=None,
+        observed_at=datetime(2026, 10, 1, 14, 4, tzinfo=UTC),
+        expected_holding_version=second_confirmed.state_version,
+    )
+    assert second_fill.logical_action_id == first_fill.logical_action_id
+    current_holding = store.load_holding_episode(holding.holding_episode_id)
+    assert current_holding.remaining_quantity == Decimal("40")
+    assert current_holding.confirmed_stop_action_id == second_stop.logical_action_id
+
+    stale_replay = store.record_protective_sell_fill(
+        provider_id="recorded-fixture-provider",
+        broker_order_id="stop-broker-physical",
+        client_order_id="stop-callback-alias",
+        fill_event_id="protective-stop-stale-40",
+        cumulative_quantity=Decimal("40"),
+        cumulative_notional=Decimal("2000"),
+        cumulative_fees=None,
+        observed_at=datetime(2026, 10, 1, 14, 5, tzinfo=UTC),
+        expected_holding_version=current_holding.state_version,
+    )
+    assert stale_replay.state_version == second_fill.state_version
+    assert store.load_holding_episode(holding.holding_episode_id).remaining_quantity == Decimal("40")
+
+    aliases = store.load_order_reference_aliases(second_fill.logical_action_id)
+    assert {
+        item["external_order_id"]
+        for item in aliases
+        if item["reference_kind"] == "client_order_id"
+    } == {"stop-client-original", "stop-callback-alias"}
+
+    genuine_close_decision = DecisionIdentity.build(
+        deployment=deployment,
+        clock=entry.decision.clock,
+        snapshot_sha256="e" * 64,
+        category=DecisionCategory.EXIT,
+        subject_type=DecisionSubjectType.HOLDING,
+        subject_id=f"{holding.holding_episode_id}:policy-close",
+        sequence=3,
+    )
+    store.record_decision(
+        genuine_close_decision,
+        policy_payload={"policy_authored": True},
+        guard_payload={"outcome": "allow_fixture"},
+        effective_action_payload={"role": ActionRole.CLOSE.value},
+    )
+    genuine_close = build_action_intent(
+        decision=genuine_close_decision,
+        security_id=entry.security_id,
+        broker_symbol=entry.broker_symbol,
+        role=ActionRole.CLOSE,
+        side=OrderSide.SELL,
+        requested_quantity=Decimal("1"),
+        holding_episode_id=holding.holding_episode_id,
+    )
+    store.record_action_intent(genuine_close, expected_version=None)
+
+    portfolio = PortfolioStateSnapshot(
+        deployment_identity=deployment,
+        clock=entry.decision.clock,
+        source_namespace="synthetic-account-source",
+        account_snapshot_id="protective-stop-account",
+        equity=Decimal("5000"),
+        cash=Decimal("3000"),
+        gross_exposure=Decimal("2000"),
+        open_risk=None,
+        portfolio_peak_equity=Decimal("5000"),
+        last_accepted_session=entry.decision.clock.decision_session,
+    )
+    store.record_portfolio_snapshot(portfolio)
+    snapshot = PolicyExecutionStateStore(
+        store.db_path, store_identity=deployment.store_identity
+    ).load_policy_execution_snapshot(
+        deployment_generation_id=deployment.deployment_generation_id,
+        portfolio_snapshot_id=portfolio.portfolio_snapshot_id,
+    )
+    projected_ids = {item.logical_action_id for item in snapshot.action_projections}
+    assert second_fill.logical_action_id not in projected_ids
+    assert genuine_close.logical_action_id in projected_ids
+
+    overfill = store.record_protective_sell_fill(
+        provider_id="recorded-fixture-provider",
+        broker_order_id="stop-broker-physical",
+        client_order_id="stop-callback-alias",
+        fill_event_id="protective-stop-overfill",
+        cumulative_quantity=Decimal("101"),
+        cumulative_notional=Decimal("5050"),
+        cumulative_fees=None,
+        observed_at=datetime(2026, 10, 1, 14, 6, tzinfo=UTC),
+        expected_holding_version=store.load_holding_episode(holding.holding_episode_id).state_version,
+    )
+    assert overfill.status is ActionStatus.RECONCILIATION_REQUIRED
+    flagged_holding = store.load_holding_episode(holding.holding_episode_id)
+    assert dict(flagged_holding.policy_flags).get("position_reconciliation_required")
+    assert flagged_holding.remaining_quantity == Decimal("40")
+    unfiltered = PolicyExecutionStateStore(
+        store.db_path,
+        store_identity=deployment.store_identity,
+    ).load_policy_execution_snapshot(
+        deployment_generation_id=deployment.deployment_generation_id,
+        portfolio_snapshot_id=portfolio.portfolio_snapshot_id,
+    )
+    assert overfill.logical_action_id in {
+        item.logical_action_id for item in unfiltered.action_projections
+    }
+    execution_decision_id = store.load_action_intent(
+        overfill.logical_action_id
+    ).decision.decision_id
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "UPDATE policy_state_decisions SET guard_payload_json=? WHERE decision_id=?",
+            ("{malformed-json", execution_decision_id),
+        )
+    with pytest.raises(ValueError, match="protective execution decision JSON is malformed"):
+        PolicyExecutionStateStore(
+            store.db_path,
+            store_identity=deployment.store_identity,
+        ).load_policy_execution_snapshot(
+            deployment_generation_id=deployment.deployment_generation_id,
+            portfolio_snapshot_id=portfolio.portfolio_snapshot_id,
+        )

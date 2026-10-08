@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import date, datetime
 from decimal import Decimal
@@ -26,8 +26,10 @@ from core.policy_execution_state import (
     ActionStateProjection,
     ActionStatus,
     DecisionClock,
+    DecisionCategory,
     DecisionConflictError,
     DecisionIdentity,
+    DecisionSubjectType,
     HoldingEpisode,
     IdentityConflictError,
     OrderSide,
@@ -35,6 +37,7 @@ from core.policy_execution_state import (
     PortfolioStateSnapshot,
     ProviderOrderReference,
     StopUpdateIntent,
+    build_action_intent,
     add_attempt_order_aliases,
     advance_holding_exit_tier,
     apply_action_fill_to_holding,
@@ -55,6 +58,8 @@ from core.policy_execution_state import (
 
 
 SCHEMA_VERSION = 1
+_PROTECTIVE_EXECUTION_RECORD_KIND = "execution_derived_protective_stop_order_v1"
+_GUARD_SELL_EXECUTION_RECORD_KIND = "execution_derived_guard_sell_order_v1"
 
 
 class ConcurrentStateUpdateError(ValueError):
@@ -1244,61 +1249,84 @@ class PolicyExecutionStateStore:
     ) -> str:
         deployment = decision.deployment_identity
         self._validate_deployment_scope(deployment)
+        with self._transaction(write=True) as conn:
+            self._require_ready(conn)
+            self._record_decision_in_transaction(
+                conn,
+                decision,
+                policy_payload=policy_payload,
+                guard_payload=guard_payload,
+                effective_action_payload=effective_action_payload,
+            )
+        return decision.decision_id
+
+    def _record_decision_in_transaction(
+        self,
+        conn: sqlite3.Connection,
+        decision: DecisionIdentity,
+        *,
+        policy_payload: Mapping[str, object],
+        guard_payload: Mapping[str, object],
+        effective_action_payload: Mapping[str, object],
+    ) -> str:
+        """Persist or validate an immutable decision on the caller's connection."""
+        deployment = decision.deployment_identity
+        self._validate_deployment_scope(deployment)
         account = deployment.paper_account_environment_id
+        self._require_deployment(conn, deployment.deployment_generation_id, account)
         decision_json = _canonical_json(_decision_payload(decision))
         policy_json = _canonical_json(policy_payload)
         guard_json = _canonical_json(guard_payload)
         effective_json = _canonical_json(effective_action_payload)
         clock = decision.clock
-        with self._transaction(write=True) as conn:
-            self._require_ready(conn)
-            self._require_deployment(conn, deployment.deployment_generation_id, account)
-            existing = conn.execute(
-                "SELECT decision_id, decision_json, policy_payload_json, guard_payload_json, effective_action_payload_json FROM policy_state_decisions WHERE decision_slot_id=?",
-                (decision.decision_slot_id,),
-            ).fetchone()
-            if existing is not None:
-                if (
-                    existing[0] != decision.decision_id
-                    or existing[1] != decision_json
-                    or existing[2] != policy_json
-                    or existing[3] != guard_json
-                    or existing[4] != effective_json
-                ):
-                    raise DecisionConflictError("decision slot already contains different immutable decision facts")
-                return decision.decision_id
-            conn.execute(
-                """INSERT INTO policy_state_decisions(
-                    decision_id, decision_slot_id, deployment_generation_id,
-                    paper_account_environment_id, store_identity, exchange_id, decision_session,
-                    decision_category, subject_type, subject_id, sequence, as_of_cutoff_at,
-                    next_execution_session, account_valuation_session, account_valuation_at,
-                    snapshot_sha256, decision_json, policy_payload_json, guard_payload_json,
-                    effective_action_payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    decision.decision_id,
-                    decision.decision_slot_id,
-                    deployment.deployment_generation_id,
-                    account,
-                    self.store_identity,
-                    clock.exchange_id,
-                    clock.decision_session.isoformat(),
-                    decision.category.value,
-                    decision.subject_type.value,
-                    decision.subject_id,
-                    decision.sequence or 0,
-                    _aware_iso(clock.as_of_cutoff_at),
-                    clock.next_execution_session.isoformat(),
-                    clock.account_valuation_session.isoformat(),
-                    _aware_iso(clock.account_valuation_at),
-                    decision.snapshot_sha256,
-                    decision_json,
-                    policy_json,
-                    guard_json,
-                    effective_json,
-                ),
-            )
+        existing = conn.execute(
+            "SELECT decision_id, decision_json, policy_payload_json, guard_payload_json, effective_action_payload_json FROM policy_state_decisions WHERE decision_slot_id=?",
+            (decision.decision_slot_id,),
+        ).fetchone()
+        if existing is not None:
+            if (
+                existing[0] != decision.decision_id
+                or existing[1] != decision_json
+                or existing[2] != policy_json
+                or existing[3] != guard_json
+                or existing[4] != effective_json
+            ):
+                raise DecisionConflictError(
+                    "decision slot already contains different immutable decision facts"
+                )
+            return decision.decision_id
+        conn.execute(
+            """INSERT INTO policy_state_decisions(
+                decision_id, decision_slot_id, deployment_generation_id,
+                paper_account_environment_id, store_identity, exchange_id, decision_session,
+                decision_category, subject_type, subject_id, sequence, as_of_cutoff_at,
+                next_execution_session, account_valuation_session, account_valuation_at,
+                snapshot_sha256, decision_json, policy_payload_json, guard_payload_json,
+                effective_action_payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                decision.decision_id,
+                decision.decision_slot_id,
+                deployment.deployment_generation_id,
+                account,
+                self.store_identity,
+                clock.exchange_id,
+                clock.decision_session.isoformat(),
+                decision.category.value,
+                decision.subject_type.value,
+                decision.subject_id,
+                decision.sequence or 0,
+                _aware_iso(clock.as_of_cutoff_at),
+                clock.next_execution_session.isoformat(),
+                clock.account_valuation_session.isoformat(),
+                _aware_iso(clock.account_valuation_at),
+                decision.snapshot_sha256,
+                decision_json,
+                policy_json,
+                guard_json,
+                effective_json,
+            ),
+        )
         return decision.decision_id
 
     def _validate_deployment_scope(self, identity: PolicyDeploymentIdentity) -> None:
@@ -1915,6 +1943,7 @@ class PolicyExecutionStateStore:
         return _action_from_row(conn, row), row
 
     def load_action_intent(self, logical_action_id: str) -> ActionIntent:
+        """Load the durable action with its complete decision identity."""
         with self._transaction(write=False) as conn:
             self._require_ready(conn)
             intent, _ = self._load_action(conn, logical_action_id)
@@ -1925,6 +1954,1095 @@ class PolicyExecutionStateStore:
             self._require_ready(conn)
             intent, row = self._load_action(conn, logical_action_id)
             return _action_projection_from_row(conn, intent, row)
+
+    def _load_protective_order_context_in_transaction(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        stop_row: sqlite3.Row,
+        provider_id: str,
+        client_order_id: str,
+        broker_order_id: str,
+    ) -> tuple[DecisionIdentity, dict[str, object], sqlite3.Row]:
+        """Resolve one confirmed physical STOP order to its frozen source facts."""
+        if stop_row["status"] != "confirmed":
+            raise ValueError("protective SELL fill has no confirmed durable STOP order")
+        if (
+            stop_row["client_order_id"] != client_order_id
+            or stop_row["broker_order_id"] != broker_order_id
+        ):
+            raise ValueError("protective SELL fill order references differ from the confirmed STOP")
+        holding_row = self._holding_row(conn, str(stop_row["holding_episode_id"]))
+        if holding_row is None:
+            raise ValueError("protective STOP references a missing holding episode")
+        if (
+            holding_row["deployment_generation_id"] != stop_row["deployment_generation_id"]
+            or holding_row["paper_account_environment_id"]
+            != stop_row["paper_account_environment_id"]
+            or holding_row["store_identity"] != self.store_identity
+            or holding_row["security_id"] != stop_row["security_id"]
+        ):
+            raise ValueError("protective STOP and holding generation/account identities disagree")
+
+        rows = conn.execute(
+            """SELECT decision_id, decision_json, policy_payload_json, guard_payload_json,
+                      effective_action_payload_json
+               FROM policy_state_decisions
+               WHERE deployment_generation_id=? AND paper_account_environment_id=?
+                 AND store_identity=? AND decision_category=? AND subject_type=?""",
+            (
+                stop_row["deployment_generation_id"],
+                stop_row["paper_account_environment_id"],
+                self.store_identity,
+                DecisionCategory.EXIT.value,
+                DecisionSubjectType.HOLDING.value,
+            ),
+        ).fetchall()
+        stop_action_id = str(stop_row["stop_update_action_id"])
+        candidates: list[tuple[DecisionIdentity, dict[str, object]]] = []
+        for row in rows:
+            try:
+                policy_payload = json.loads(row["policy_payload_json"])
+                guard_payload = json.loads(row["guard_payload_json"])
+                effective_payload = json.loads(row["effective_action_payload_json"])
+            except (TypeError, json.JSONDecodeError) as exc:
+                raw_payloads = " ".join(
+                    str(row[key] or "")
+                    for key in (
+                        "policy_payload_json",
+                        "guard_payload_json",
+                        "effective_action_payload_json",
+                    )
+                )
+                if (
+                    "protective_stop" in raw_payloads
+                    or "protective_stop_sell" in raw_payloads
+                    or "execution-derived:protective-stop:" in str(row["decision_json"] or "")
+                ):
+                    raise ValueError("protective execution provenance JSON is malformed") from exc
+                continue
+            source_stop_id = (
+                policy_payload.get("source_stop_update_action_id")
+                if isinstance(policy_payload, dict)
+                else None
+            )
+            if source_stop_id != stop_action_id:
+                origin_shaped = (
+                    isinstance(policy_payload, dict)
+                    and policy_payload.get("execution_record_kind")
+                    == _PROTECTIVE_EXECUTION_RECORD_KIND
+                ) or (
+                    isinstance(guard_payload, dict)
+                    and guard_payload.get("origin") == "protective_stop"
+                ) or (
+                    isinstance(effective_payload, dict)
+                    and effective_payload.get("execution_kind") == "protective_stop_sell"
+                )
+                if origin_shaped and (
+                    not isinstance(policy_payload, dict)
+                    or policy_payload.get("source_stop_update_action_id") is None
+                ):
+                    raise ValueError("protective execution decision has no stop-update origin")
+                continue
+            if (
+                not isinstance(policy_payload, dict)
+                or not isinstance(guard_payload, dict)
+                or not isinstance(effective_payload, dict)
+                or policy_payload.get("execution_record_kind")
+                != _PROTECTIVE_EXECUTION_RECORD_KIND
+                or policy_payload.get("policy_authored") is not False
+                or guard_payload.get("origin") != "protective_stop"
+                or guard_payload.get("execution_derived") is not True
+                or effective_payload.get("execution_kind") != "protective_stop_sell"
+            ):
+                raise ValueError("protective execution origin facts are malformed")
+            physical_facts = effective_payload.get("physical_order")
+            if not isinstance(physical_facts, dict):
+                raise ValueError("protective execution decision has no physical-order facts")
+            if policy_payload.get("physical_order") != physical_facts or guard_payload.get(
+                "physical_order"
+            ) != physical_facts:
+                raise ValueError("protective execution decision physical-order facts conflict")
+            if (
+                physical_facts.get("provider_id") != provider_id
+                or physical_facts.get("client_order_id") != client_order_id
+                or physical_facts.get("broker_order_id") != broker_order_id
+                or physical_facts.get("source_stop_update_action_id") != stop_action_id
+            ):
+                raise ValueError("protective execution facts do not authenticate this STOP order")
+            decision = _decision_from_payload(json.loads(row["decision_json"]))
+            if decision.decision_id != row["decision_id"]:
+                raise ValueError("protective execution decision identity is inconsistent")
+            target_text = physical_facts.get("requested_quantity")
+            price_text = physical_facts.get("confirmed_stop_price")
+            try:
+                target = Decimal(str(target_text))
+                confirmed_price = Decimal(str(price_text))
+            except Exception as exc:  # noqa: BLE001
+                raise ValueError("protective physical-order target is malformed") from exc
+            expected_decision, expected_policy, expected_guard, expected_effective = (
+                self._protective_order_decision_facts(
+                    conn,
+                    stop_row=stop_row,
+                    holding_row=holding_row,
+                    provider_id=provider_id,
+                    client_order_id=client_order_id,
+                    broker_order_id=broker_order_id,
+                    requested_quantity=target,
+                    confirmed_stop_price=confirmed_price,
+                )
+            )
+            if (
+                decision != expected_decision
+                or policy_payload != expected_policy
+                or guard_payload != expected_guard
+                or effective_payload != expected_effective
+                or physical_facts.get("paper_account_environment_id")
+                != stop_row["paper_account_environment_id"]
+                or physical_facts.get("store_identity") != self.store_identity
+                or physical_facts.get("deployment_generation_id")
+                != stop_row["deployment_generation_id"]
+                or physical_facts.get("security_id") != stop_row["security_id"]
+                or physical_facts.get("symbol") != holding_row["broker_symbol"]
+                or physical_facts.get("holding_episode_id")
+                != stop_row["holding_episode_id"]
+                or physical_facts.get("side") != OrderSide.SELL.value
+                or not target.is_finite()
+                or target <= 0
+                or not confirmed_price.is_finite()
+                or confirmed_price <= 0
+                or confirmed_price != Decimal(stop_row["confirmed_stop_price"])
+            ):
+                raise ValueError("protective execution decision disagrees with its durable STOP or holding")
+            candidates.append((decision, physical_facts))
+        if not candidates:
+            raise ValueError("protective STOP order target is missing; reconciliation is required")
+        if len(candidates) > 1:
+            raise ValueError("protective STOP order target is ambiguous; reconciliation is required")
+        return candidates[0][0], candidates[0][1], holding_row
+
+    def _is_confirmed_protective_execution_projection(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        intent: ActionIntent,
+        action_row: sqlite3.Row,
+        holding_by_id: Mapping[str, HoldingEpisode],
+    ) -> bool:
+        """Authenticate a mechanical STOP leg before omitting its action-owner projection."""
+        decision_row = conn.execute(
+            """SELECT decision_json, policy_payload_json, guard_payload_json,
+                      effective_action_payload_json
+               FROM policy_state_decisions
+               WHERE decision_id=? AND deployment_generation_id=?
+                 AND paper_account_environment_id=? AND store_identity=?""",
+            (
+                intent.decision.decision_id,
+                intent.deployment_generation_id,
+                intent.decision.deployment_identity.paper_account_environment_id,
+                self.store_identity,
+            ),
+        ).fetchone()
+        if decision_row is None:
+            raise ValueError("action decision identity is missing during protective projection")
+        try:
+            policy_payload = json.loads(decision_row["policy_payload_json"])
+            guard_payload = json.loads(decision_row["guard_payload_json"])
+            effective_payload = json.loads(decision_row["effective_action_payload_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            if intent.decision.subject_id.startswith("execution-derived:protective-stop:"):
+                raise ValueError("protective execution decision JSON is malformed") from exc
+            return False
+        origin_marked = (
+            intent.decision.subject_id.startswith("execution-derived:protective-stop:")
+            or (
+                isinstance(policy_payload, dict)
+                and "protective" in str(policy_payload.get("execution_record_kind", ""))
+            )
+            or (
+                isinstance(guard_payload, dict)
+                and guard_payload.get("origin") == "protective_stop"
+            )
+            or (
+                isinstance(effective_payload, dict)
+                and "protective" in str(effective_payload.get("execution_kind", ""))
+            )
+        )
+        if not origin_marked:
+            # Genuine policy-authored CLOSE actions remain account-visible. Mechanical
+            # STOP provenance is required only when an execution-derived origin marker
+            # identifies the action as a protective leg.
+            return False
+        if (
+            not isinstance(policy_payload, dict)
+            or not isinstance(guard_payload, dict)
+            or not isinstance(effective_payload, dict)
+            or policy_payload.get("execution_record_kind")
+            != _PROTECTIVE_EXECUTION_RECORD_KIND
+            or policy_payload.get("policy_authored") is not False
+            or guard_payload.get("origin") != "protective_stop"
+            or guard_payload.get("execution_derived") is not True
+            or effective_payload.get("execution_kind") != "protective_stop_sell"
+            or effective_payload.get("role") != ActionRole.CLOSE.value
+            or effective_payload.get("side") != OrderSide.SELL.value
+        ):
+            raise ValueError("execution-derived protective action origin is malformed")
+        facts = effective_payload.get("physical_order")
+        if not isinstance(facts, dict) or policy_payload.get("physical_order") != facts or guard_payload.get(
+            "physical_order"
+        ) != facts:
+            raise ValueError("execution-derived protective action has conflicting immutable order facts")
+        stop_action_id = _required_text(
+            facts.get("source_stop_update_action_id"), "source_stop_update_action_id"
+        )
+        stop_row = conn.execute(
+            """SELECT * FROM policy_state_stop_updates
+               WHERE stop_update_action_id=? AND deployment_generation_id=?
+                 AND paper_account_environment_id=? AND store_identity=?""",
+            (
+                stop_action_id,
+                intent.deployment_generation_id,
+                intent.decision.deployment_identity.paper_account_environment_id,
+                self.store_identity,
+            ),
+        ).fetchone()
+        if stop_row is None:
+            raise ValueError("execution-derived protective action refers to a missing STOP update")
+        holding = holding_by_id.get(str(intent.holding_episode_id or ""))
+        if holding is None:
+            raise ValueError("execution-derived protective action refers to a missing holding")
+        decision, expected_facts, holding_row = self._load_protective_order_context_in_transaction(
+            conn,
+            stop_row=stop_row,
+            provider_id=str(facts.get("provider_id", "")),
+            client_order_id=str(stop_row["client_order_id"] or ""),
+            broker_order_id=str(stop_row["broker_order_id"] or ""),
+        )
+        if (
+            decision != intent.decision
+            or facts != expected_facts
+            or str(holding_row["holding_episode_id"]) != holding.holding_episode_id
+            or str(action_row["holding_episode_id"] or "") != holding.holding_episode_id
+            or str(action_row["deployment_generation_id"]) != holding.deployment_generation_id
+            or str(action_row["paper_account_environment_id"])
+            != facts["paper_account_environment_id"]
+            or str(action_row["store_identity"]) != self.store_identity
+            or intent.role is not ActionRole.CLOSE
+            or intent.side is not OrderSide.SELL
+            or intent.requested_quantity != Decimal(str(facts["requested_quantity"]))
+            or str(facts["security_id"]) != holding.security_id
+            or str(facts["symbol"]) != holding.broker_symbol
+            or str(facts["holding_episode_id"]) != holding.holding_episode_id
+            or str(facts["deployment_generation_id"]) != holding.deployment_generation_id
+        ):
+            raise ValueError("execution-derived protective action disagrees with its generation, holding, or order")
+        references = _provider_order_references(conn, intent.logical_action_id)
+        attempt = intent.order_attempts[0] if len(intent.order_attempts) == 1 else None
+        if (
+            attempt is None
+            or attempt.attempt_number != 1
+            or attempt.requested_quantity != intent.requested_quantity
+            or attempt.client_order_id != facts["client_order_id"]
+            or attempt.broker_order_id != facts["broker_order_id"]
+            or not any(
+                item.provider_id == facts["provider_id"]
+                and item.paper_account_environment_id == facts["paper_account_environment_id"]
+                and item.store_identity == facts["store_identity"]
+                and item.reference_kind == "client_order_id"
+                and item.external_order_id == facts["client_order_id"]
+                and item.attempt_number == 1
+                for item in references
+            )
+            or not any(
+                item.provider_id == facts["provider_id"]
+                and item.paper_account_environment_id == facts["paper_account_environment_id"]
+                and item.store_identity == facts["store_identity"]
+                and item.reference_kind == "broker_order_id"
+                and item.external_order_id == facts["broker_order_id"]
+                and item.attempt_number == 1
+                for item in references
+            )
+        ):
+            raise ValueError("execution-derived protective action order aliases are incomplete or inconsistent")
+        if (
+            intent.confirmed_filled_quantity <= 0
+            or dict(holding.applied_action_fill_watermarks).get(intent.logical_action_id)
+            != intent.confirmed_filled_quantity
+        ):
+            raise ValueError("protective execution action and holding fill watermark disagree")
+        if (
+            dict(holding.policy_flags).get("position_reconciliation_required")
+            or intent.confirmed_filled_quantity > intent.requested_quantity
+            or intent.status is ActionStatus.RECONCILIATION_REQUIRED
+            or attempt.status is ActionAttemptStatus.RECONCILIATION_REQUIRED
+            or intent.status
+            not in {
+                ActionStatus.SUBMITTED,
+                ActionStatus.PARTIALLY_FILLED,
+                ActionStatus.FILLED,
+            }
+            or attempt.status
+            not in {
+                ActionAttemptStatus.SUBMITTED,
+                ActionAttemptStatus.PARTIALLY_FILLED,
+                ActionAttemptStatus.FILLED,
+            }
+        ):
+            return False
+        if holding.confirmed_stop_action_id is None:
+            return False
+        owning_stop = conn.execute(
+            """SELECT * FROM policy_state_stop_updates
+               WHERE stop_update_action_id=? AND deployment_generation_id=?
+                 AND paper_account_environment_id=? AND store_identity=?""",
+            (
+                holding.confirmed_stop_action_id,
+                holding.deployment_generation_id,
+                facts["paper_account_environment_id"],
+                self.store_identity,
+            ),
+        ).fetchone()
+        if owning_stop is None or owning_stop["status"] != "confirmed":
+            raise ValueError("holding protective-order owner is not a confirmed STOP update")
+        if (
+            owning_stop["holding_episode_id"] != holding.holding_episode_id
+            or owning_stop["security_id"] != holding.security_id
+            or owning_stop["broker_order_id"] != holding.confirmed_stop_broker_order_id
+            or owning_stop["client_order_id"] != holding.confirmed_stop_client_order_id
+        ):
+            raise ValueError("holding STOP owner references disagree with its confirmed update")
+        # The broker may keep one physical STOP while policy records a later update.
+        # Filter its execution leg only while that exact broker order still owns this
+        # holding; a superseded fill remains visible for reconciliation.
+        return (
+            owning_stop["broker_order_id"] == facts["broker_order_id"]
+            and holding.confirmed_stop_broker_order_id == facts["broker_order_id"]
+        )
+
+    def record_unresolved_execution_sell_fact(
+        self,
+        *,
+        source_action_id: str,
+        provider_id: str,
+        workflow_id: str,
+        broker_order_id: str,
+        client_order_id: str,
+        order_type: str,
+        cumulative_quantity: Decimal,
+        average_fill_price: Decimal,
+        unresolved_cause: str,
+        fill_event_id: str,
+        observed_at: datetime,
+        expected_holding_version: int,
+    ) -> HoldingEpisode:
+        """Retain a real SELL checkpoint when its physical guard association is incomplete."""
+        provider = _required_text(provider_id, "provider_id")
+        source_id = _required_text(source_action_id, "source_action_id")
+        workflow = _required_text(workflow_id, "workflow_id")
+        broker = _required_text(broker_order_id, "broker_order_id")
+        client = _required_text(client_order_id, "client_order_id")
+        normalized_type = _required_text(order_type, "order_type").lower()
+        cause = _required_text(unresolved_cause, "unresolved_cause")
+        event_id = _required_text(fill_event_id, "fill_event_id")
+        if normalized_type in {"stop", "stop_limit"}:
+            raise ValueError("protective STOP fills must use the authenticated STOP seam")
+        if (
+            not isinstance(cumulative_quantity, Decimal)
+            or not cumulative_quantity.is_finite()
+            or cumulative_quantity <= 0
+            or not isinstance(average_fill_price, Decimal)
+            or not average_fill_price.is_finite()
+            or average_fill_price <= 0
+        ):
+            raise ValueError("unresolved SELL fill facts must contain positive finite quantity and price")
+        if not isinstance(expected_holding_version, int) or isinstance(
+            expected_holding_version, bool
+        ) or expected_holding_version < 0:
+            raise ValueError("expected_holding_version must be a non-negative integer")
+        _aware_iso(observed_at)
+
+        with self._transaction(write=True) as conn:
+            self._require_ready(conn)
+            source_action, _ = self._load_action(conn, source_id)
+            if source_action.side is not OrderSide.BUY or source_action.holding_episode_id is None:
+                raise ValueError("unresolved SELL source is not a BUY action with a durable holding")
+            holding_row = self._holding_row(conn, source_action.holding_episode_id)
+            if holding_row is None:
+                raise ValueError("unresolved SELL has no durable holding target; reconciliation is required")
+            holding = _holding_from_row(holding_row)
+            if (
+                holding.opening_action_id != source_id
+                or holding.deployment_generation_id != source_action.deployment_generation_id
+                or holding.security_id != source_action.security_id
+                or holding.broker_symbol != source_action.broker_symbol
+                or holding.state_version is None
+            ):
+                raise ValueError("unresolved SELL source and holding provenance disagree")
+
+            fact = {
+                "provider_id": provider,
+                "store_identity": self.store_identity,
+                "deployment_generation_id": source_action.deployment_generation_id,
+                "source_action_id": source_id,
+                "source_decision_id": source_action.decision.decision_id,
+                "workflow_id": workflow,
+                "holding_episode_id": holding.holding_episode_id,
+                "security_id": holding.security_id,
+                "symbol": holding.broker_symbol,
+                "side": OrderSide.SELL.value,
+                "order_type": normalized_type,
+                "broker_order_id": broker,
+                "client_order_id": client,
+                "cumulative_quantity": str(cumulative_quantity),
+                "average_fill_price": str(average_fill_price),
+                "cause": cause,
+                "fill_event_id": event_id,
+                "observed_at": _aware_iso(observed_at),
+            }
+            digest = hashlib.sha256(_canonical_json(fact).encode("utf-8")).hexdigest()
+            flag_key = "unresolved_execution_sell_" + hashlib.sha256(
+                broker.encode("utf-8")
+            ).hexdigest()[:24]
+            flags = dict(holding.policy_flags)
+            prior_json = flags.get(flag_key)
+            if prior_json:
+                try:
+                    prior = json.loads(prior_json)
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise ValueError("unresolved SELL execution evidence is malformed") from exc
+                if not isinstance(prior, dict):
+                    raise ValueError("unresolved SELL execution evidence is malformed")
+                if prior.get("broker_order_id") != broker or prior.get("client_order_id") != client:
+                    raise IdentityConflictError("unresolved SELL physical order identity changed")
+                prior_quantity = Decimal(str(prior.get("cumulative_quantity", "0")))
+                if cumulative_quantity < prior_quantity:
+                    return holding
+                if cumulative_quantity == prior_quantity:
+                    if prior.get("fact_sha256") != digest:
+                        raise FillReceiptConflictError(
+                            "unresolved SELL replay changed immutable physical execution facts"
+                        )
+                    return holding
+            if int(holding_row["state_version"]) != expected_holding_version:
+                raise ConcurrentStateUpdateError("holding changed since unresolved SELL was observed")
+            fact["fact_sha256"] = digest
+            flags[flag_key] = _canonical_json(fact)
+            prior_cause = flags.get("position_reconciliation_required", "")
+            flags["position_reconciliation_required"] = (
+                cause
+                if not prior_cause or cause in prior_cause
+                else f"{prior_cause}; {cause}"
+            )
+            updated = replace(
+                holding,
+                policy_flags=tuple(flags.items()),
+                committed_risk=None,
+                committed_risk_basis=None,
+                realized_pnl=None,
+            )
+            self._save_holding(
+                conn,
+                updated,
+                expected_version=expected_holding_version,
+                event_kind="execution_sell_requires_reconciliation",
+                logical_action_id=source_id,
+                observed_at=observed_at,
+                evidence_ref=event_id,
+            )
+            return _holding_from_row(self._holding_row(conn, holding.holding_episode_id))
+
+    def record_execution_guard_sell_fill(
+        self,
+        *,
+        source_action_id: str,
+        provider_id: str,
+        workflow_id: str,
+        broker_order_id: str,
+        client_order_id: str,
+        order_type: str,
+        execution_cause: str,
+        requested_quantity: Decimal,
+        fill_event_id: str,
+        cumulative_quantity: Decimal,
+        cumulative_notional: Decimal | None,
+        cumulative_fees: Decimal | None,
+        observed_at: datetime,
+        expected_holding_version: int,
+    ) -> ActionStateProjection:
+        """Apply an authenticated execution-guard SELL on the source BUY holding."""
+        provider = _required_text(provider_id, "provider_id")
+        source_id = _required_text(source_action_id, "source_action_id")
+        workflow = _required_text(workflow_id, "workflow_id")
+        broker = _required_text(broker_order_id, "broker_order_id")
+        client = _required_text(client_order_id, "client_order_id")
+        normalized_type = _required_text(order_type, "order_type").lower()
+        cause = _required_text(execution_cause, "execution_cause")
+        event_id = _required_text(fill_event_id, "fill_event_id")
+        if normalized_type in {"stop", "stop_limit"}:
+            raise ValueError("protective STOP fills must use the authenticated STOP seam")
+        if not isinstance(requested_quantity, Decimal) or not requested_quantity.is_finite() or requested_quantity <= 0:
+            raise ValueError("requested_quantity must be a positive finite Decimal")
+        if not isinstance(cumulative_quantity, Decimal) or not cumulative_quantity.is_finite() or cumulative_quantity <= 0:
+            raise ValueError("cumulative_quantity must be a positive finite Decimal")
+        for value, name in ((cumulative_notional, "cumulative_notional"), (cumulative_fees, "cumulative_fees")):
+            if value is not None and (not isinstance(value, Decimal) or not value.is_finite() or value < 0):
+                raise ValueError(f"{name} must be a finite non-negative Decimal when known")
+        if not isinstance(expected_holding_version, int) or isinstance(expected_holding_version, bool) or expected_holding_version < 0:
+            raise ValueError("expected_holding_version must be a non-negative integer")
+        _aware_iso(observed_at)
+
+        with self._transaction(write=True) as conn:
+            self._require_ready(conn)
+            source_action, _ = self._load_action(conn, source_id)
+            if source_action.side is not OrderSide.BUY or source_action.holding_episode_id is None:
+                raise ValueError("guard SELL source is not a BUY action with a durable holding")
+            holding_row = self._holding_row(conn, source_action.holding_episode_id)
+            if holding_row is None:
+                raise ValueError("guard SELL has no durable holding target; reconciliation is required")
+            holding = _holding_from_row(holding_row)
+            if (
+                holding.opening_action_id != source_id
+                or holding.deployment_generation_id != source_action.deployment_generation_id
+                or holding.security_id != source_action.security_id
+                or holding.broker_symbol != source_action.broker_symbol
+                or holding.state_version is None
+            ):
+                raise ValueError("guard SELL source and holding provenance disagree")
+
+            facts: dict[str, object] = {
+                "origin": "legacy_execution_guard",
+                "provider_id": provider,
+                "paper_account_environment_id": source_action.decision.deployment_identity.paper_account_environment_id,
+                "store_identity": self.store_identity,
+                "deployment_generation_id": source_action.deployment_generation_id,
+                "security_id": holding.security_id,
+                "symbol": holding.broker_symbol,
+                "holding_episode_id": holding.holding_episode_id,
+                "source_policy_action_id": source_action.logical_action_id,
+                "source_policy_decision_id": source_action.decision.decision_id,
+                "workflow_id": workflow,
+                "side": OrderSide.SELL.value,
+                "order_type": normalized_type,
+                "execution_cause": cause,
+                "requested_quantity": str(requested_quantity),
+                "client_order_id": client,
+                "broker_order_id": broker,
+            }
+            decision = DecisionIdentity.build(
+                deployment=source_action.decision.deployment_identity,
+                clock=source_action.decision.clock,
+                snapshot_sha256=source_action.decision.snapshot_sha256,
+                category=DecisionCategory.EXIT,
+                subject_type=DecisionSubjectType.HOLDING,
+                subject_id="execution-derived:guard-sell:" + _canonical_json(facts),
+            )
+            policy_payload: dict[str, object] = {
+                "execution_record_kind": _GUARD_SELL_EXECUTION_RECORD_KIND,
+                "policy_authored": False,
+                "source_policy_action_id": source_action.logical_action_id,
+                "source_policy_decision_id": source_action.decision.decision_id,
+                "physical_order": facts,
+            }
+            guard_payload: dict[str, object] = {
+                "origin": "legacy_execution_guard",
+                "execution_derived": True,
+                "physical_order": facts,
+            }
+            effective_payload: dict[str, object] = {
+                "execution_kind": "guard_sell_execution",
+                "role": ActionRole.CLOSE.value,
+                "side": OrderSide.SELL.value,
+                "holding_episode_id": holding.holding_episode_id,
+                "physical_order": facts,
+            }
+            self._record_decision_in_transaction(
+                conn,
+                decision,
+                policy_payload=policy_payload,
+                guard_payload=guard_payload,
+                effective_action_payload=effective_payload,
+            )
+            action = build_action_intent(
+                decision=decision,
+                security_id=holding.security_id,
+                broker_symbol=holding.broker_symbol,
+                role=ActionRole.CLOSE,
+                side=OrderSide.SELL,
+                requested_quantity=requested_quantity,
+                holding_episode_id=holding.holding_episode_id,
+                status=ActionStatus.SUBMITTED,
+            )
+            attempt = ActionOrderAttempt(
+                attempt_number=1,
+                requested_quantity=requested_quantity,
+                status=ActionAttemptStatus.SUBMITTED,
+                client_order_id=client,
+                broker_order_id=broker,
+            )
+            action = replace(action, order_attempts=(attempt,))
+            action_row = conn.execute(
+                "SELECT * FROM policy_state_actions WHERE logical_action_id=?",
+                (action.logical_action_id,),
+            ).fetchone()
+            if action_row is None:
+                self._store_action(
+                    conn,
+                    action,
+                    version=0,
+                    event_kind="execution_guard_sell_order_associated",
+                    observed_at=observed_at,
+                )
+            else:
+                existing_action = _action_from_row(conn, action_row)
+                existing_attempt = (
+                    existing_action.order_attempts[0]
+                    if len(existing_action.order_attempts) == 1
+                    else None
+                )
+                if (
+                    existing_action.decision != decision
+                    or existing_action.role is not ActionRole.CLOSE
+                    or existing_action.side is not OrderSide.SELL
+                    or existing_action.holding_episode_id != holding.holding_episode_id
+                    or existing_action.requested_quantity != requested_quantity
+                    or existing_attempt is None
+                    or existing_attempt.requested_quantity != requested_quantity
+                    or broker not in existing_attempt.all_broker_order_ids
+                    or client not in existing_attempt.all_client_order_ids
+                ):
+                    raise IdentityConflictError("execution guard SELL conflicts with its immutable physical order")
+                action = existing_action
+
+            reference_facts = {
+                "provider_id": provider,
+                "paper_account_environment_id": source_action.decision.deployment_identity.paper_account_environment_id,
+                "store_identity": self.store_identity,
+                "logical_action_id": action.logical_action_id,
+                "attempt_number": 1,
+                "broker_order_id": broker,
+                "source_execution_decision_id": decision.decision_id,
+            }
+            source_digest = _sha256_text(_canonical_json(reference_facts))
+            for kind, external_id in (("broker_order_id", broker), ("client_order_id", client)):
+                existing_ref = conn.execute(
+                    """SELECT logical_action_id, attempt_number, source_payload_sha256
+                       FROM policy_state_order_reference_aliases
+                       WHERE provider_id=? AND paper_account_environment_id=? AND store_identity=?
+                         AND reference_kind=? AND external_order_id=?""",
+                    (provider, reference_facts["paper_account_environment_id"], self.store_identity, kind, external_id),
+                ).fetchone()
+                if existing_ref is None:
+                    conn.execute(
+                        """INSERT INTO policy_state_order_reference_aliases(
+                            provider_id, paper_account_environment_id, store_identity,
+                            reference_kind, external_order_id, logical_action_id, attempt_number,
+                            source_payload_sha256, first_seen_at_utc
+                        ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)""",
+                        (
+                            provider,
+                            reference_facts["paper_account_environment_id"],
+                            self.store_identity,
+                            kind,
+                            external_id,
+                            action.logical_action_id,
+                            source_digest,
+                            _aware_iso(observed_at),
+                        ),
+                    )
+                elif (
+                    existing_ref["logical_action_id"] != action.logical_action_id
+                    or int(existing_ref["attempt_number"]) != 1
+                    or existing_ref["source_payload_sha256"] != source_digest
+                ):
+                    raise OrderReferenceConflictError("guard SELL reference belongs to conflicting execution facts")
+
+            action_row = conn.execute(
+                "SELECT * FROM policy_state_actions WHERE logical_action_id=?",
+                (action.logical_action_id,),
+            ).fetchone()
+            receipt = conn.execute(
+                """SELECT logical_action_id, attempt_number FROM policy_state_fill_receipts
+                   WHERE provider_id=? AND paper_account_environment_id=? AND store_identity=?
+                     AND fill_event_id=?""",
+                (provider, reference_facts["paper_account_environment_id"], self.store_identity, event_id),
+            ).fetchone()
+            if receipt is None and int(holding_row["state_version"]) != expected_holding_version:
+                raise ConcurrentStateUpdateError("holding changed since the guard SELL caller read it")
+            if receipt is not None and (
+                receipt["logical_action_id"] != action.logical_action_id
+                or int(receipt["attempt_number"]) != 1
+            ):
+                raise FillReceiptConflictError("guard SELL fill event was reused for another action")
+            return self._record_cumulative_fill_in_transaction(
+                conn,
+                logical_action_id=action.logical_action_id,
+                attempt_number=1,
+                provider_id=provider,
+                fill_event_id=event_id,
+                cumulative_quantity=cumulative_quantity,
+                cumulative_notional=cumulative_notional,
+                cumulative_fees=cumulative_fees,
+                payload_sha256=None,
+                observed_at=observed_at,
+                expected_action_version=int(action_row["state_version"]),
+                expected_holding_version=(
+                    expected_holding_version if receipt is None else int(holding_row["state_version"])
+                ),
+                allow_stale_watermark=True,
+            )
+
+    def record_protective_sell_fill(
+        self,
+        *,
+        provider_id: str,
+        broker_order_id: str,
+        client_order_id: str,
+        fill_event_id: str,
+        cumulative_quantity: Decimal,
+        cumulative_notional: Decimal | None,
+        cumulative_fees: Decimal | None,
+        observed_at: datetime,
+        expected_holding_version: int,
+    ) -> ActionStateProjection:
+        """Record one execution-derived STOP SELL against its durable physical order."""
+        provider = _required_text(provider_id, "provider_id")
+        broker = _required_text(broker_order_id, "broker_order_id")
+        client = _required_text(client_order_id, "client_order_id")
+        event_id = _required_text(fill_event_id, "fill_event_id")
+        if (
+            not isinstance(cumulative_quantity, Decimal)
+            or not cumulative_quantity.is_finite()
+            or cumulative_quantity <= 0
+        ):
+            raise ValueError("protective SELL cumulative quantity must be positive and finite")
+        for value, name in (
+            (cumulative_notional, "cumulative_notional"),
+            (cumulative_fees, "cumulative_fees"),
+        ):
+            if value is not None and (
+                not isinstance(value, Decimal) or not value.is_finite() or value < 0
+            ):
+                raise ValueError(f"{name} must be a finite non-negative Decimal when known")
+        if not isinstance(expected_holding_version, int) or isinstance(
+            expected_holding_version, bool
+        ) or expected_holding_version < 0:
+            raise ValueError("expected_holding_version must be a non-negative integer")
+        _aware_iso(observed_at)
+
+        with self._transaction(write=True) as conn:
+            self._require_ready(conn)
+            stop_rows = conn.execute(
+                """SELECT * FROM policy_state_stop_updates
+                   WHERE store_identity=? AND broker_order_id=? AND status='confirmed'
+                   ORDER BY stop_update_action_id""",
+                (self.store_identity, broker),
+            ).fetchall()
+            contexts: dict[
+                str,
+                tuple[DecisionIdentity, dict[str, object], sqlite3.Row, sqlite3.Row],
+            ] = {}
+            for candidate_stop in stop_rows:
+                candidate_client = str(candidate_stop["client_order_id"] or "")
+                if not candidate_client:
+                    continue
+                try:
+                    context = self._load_protective_order_context_in_transaction(
+                        conn,
+                        stop_row=candidate_stop,
+                        provider_id=provider,
+                        client_order_id=candidate_client,
+                        broker_order_id=broker,
+                    )
+                except ValueError as exc:
+                    if "protective STOP order target is missing" in str(exc):
+                        # Reused STOP updates share the original physical-order record.
+                        continue
+                    if "do not authenticate this STOP order" in str(exc):
+                        # Provider-scoped broker identifiers may collide across providers.
+                        continue
+                    raise
+                decision, facts, context_holding = context
+                contexts[decision.decision_id] = (
+                    decision,
+                    facts,
+                    context_holding,
+                    candidate_stop,
+                )
+            if len(contexts) != 1:
+                raise ValueError(
+                    "protective SELL broker reference is missing or ambiguous; reconciliation is required"
+                )
+            decision, facts, holding_row, stop_row = next(iter(contexts.values()))
+            account = str(facts["paper_account_environment_id"])
+            generation = str(facts["deployment_generation_id"])
+            canonical_client = str(facts["client_order_id"])
+            holding = _holding_from_row(holding_row)
+            if holding.state_version is None:
+                raise ValueError("protective SELL holding has no durable state version")
+            action = build_action_intent(
+                decision=decision,
+                security_id=str(facts["security_id"]),
+                broker_symbol=str(facts["symbol"]),
+                role=ActionRole.CLOSE,
+                side=OrderSide.SELL,
+                requested_quantity=Decimal(str(facts["requested_quantity"])),
+                holding_episode_id=holding.holding_episode_id,
+                status=ActionStatus.SUBMITTED,
+            )
+            action_id = action.logical_action_id
+            action_row = conn.execute(
+                """SELECT * FROM policy_state_actions
+                   WHERE logical_action_id=? AND deployment_generation_id=?
+                     AND paper_account_environment_id=? AND store_identity=?""",
+                (action_id, generation, account, self.store_identity),
+            ).fetchone()
+            if action_row is None:
+                attempt = ActionOrderAttempt(
+                    attempt_number=1,
+                    requested_quantity=action.requested_quantity,
+                    status=ActionAttemptStatus.SUBMITTED,
+                    client_order_id=canonical_client,
+                    broker_order_id=broker,
+                )
+                action = replace(action, order_attempts=(attempt,))
+                self._store_action(
+                    conn,
+                    action,
+                    version=0,
+                    event_kind="protective_execution_order_associated",
+                    observed_at=observed_at,
+                )
+                action, action_row = self._load_action(conn, action_id)
+            else:
+                action = _action_from_row(conn, action_row)
+                attempt = action.order_attempts[0] if len(action.order_attempts) == 1 else None
+                if (
+                    action.decision != decision
+                    or action.role is not ActionRole.CLOSE
+                    or action.side is not OrderSide.SELL
+                    or action.holding_episode_id != holding.holding_episode_id
+                    or action.requested_quantity != Decimal(str(facts["requested_quantity"]))
+                    or attempt is None
+                    or attempt.attempt_number != 1
+                    or attempt.requested_quantity != action.requested_quantity
+                    or attempt.client_order_id != canonical_client
+                    or attempt.broker_order_id != broker
+                ):
+                    raise IdentityConflictError("protective execution leg conflicts with its immutable physical order")
+
+            reference_facts = {
+                "provider_id": provider,
+                "paper_account_environment_id": account,
+                "store_identity": self.store_identity,
+                "logical_action_id": action_id,
+                "attempt_number": 1,
+                "broker_order_id": broker,
+                "source_execution_decision_id": decision.decision_id,
+            }
+            source_digest = _sha256_text(_canonical_json(reference_facts))
+            proven_clients = {
+                canonical_client,
+                client,
+                *(
+                    str(alias_row["client_order_id"])
+                    for alias_row in stop_rows
+                    if alias_row["client_order_id"]
+                    and alias_row["deployment_generation_id"] == generation
+                    and alias_row["paper_account_environment_id"] == account
+                    and alias_row["holding_episode_id"] == holding.holding_episode_id
+                ),
+            }
+            reference_pairs = {
+                ("client_order_id", value) for value in proven_clients if value
+            } | {("broker_order_id", broker)}
+            for reference_kind, external_order_id in sorted(reference_pairs):
+                existing_reference = conn.execute(
+                    """SELECT logical_action_id, attempt_number, source_payload_sha256
+                       FROM policy_state_order_reference_aliases
+                       WHERE provider_id=? AND paper_account_environment_id=? AND store_identity=?
+                         AND reference_kind=? AND external_order_id=?""",
+                    (provider, account, self.store_identity, reference_kind, external_order_id),
+                ).fetchone()
+                if existing_reference is None:
+                    conn.execute(
+                        """INSERT INTO policy_state_order_reference_aliases(
+                            provider_id, paper_account_environment_id, store_identity,
+                            reference_kind, external_order_id, logical_action_id, attempt_number,
+                            source_payload_sha256, first_seen_at_utc
+                        ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)""",
+                        (
+                            provider,
+                            account,
+                            self.store_identity,
+                            reference_kind,
+                            external_order_id,
+                            action_id,
+                            source_digest,
+                            _aware_iso(observed_at),
+                        ),
+                    )
+                elif (
+                    existing_reference["logical_action_id"] != action_id
+                    or int(existing_reference["attempt_number"]) != 1
+                    or existing_reference["source_payload_sha256"] != source_digest
+                ):
+                    raise OrderReferenceConflictError(
+                        "protective physical order reference belongs to conflicting execution facts"
+                    )
+
+            existing_receipt = conn.execute(
+                """SELECT logical_action_id, attempt_number FROM policy_state_fill_receipts
+                   WHERE provider_id=? AND paper_account_environment_id=? AND store_identity=?
+                     AND fill_event_id=?""",
+                (provider, account, self.store_identity, event_id),
+            ).fetchone()
+            if existing_receipt is None:
+                if int(holding_row["state_version"]) != expected_holding_version:
+                    raise ConcurrentStateUpdateError(
+                        "holding changed since the protective fill caller read it"
+                    )
+                owning_stop = None
+                if holding.confirmed_stop_action_id is not None:
+                    owning_stop = conn.execute(
+                        """SELECT * FROM policy_state_stop_updates
+                           WHERE stop_update_action_id=? AND deployment_generation_id=?
+                             AND paper_account_environment_id=? AND store_identity=?""",
+                        (
+                            holding.confirmed_stop_action_id,
+                            generation,
+                            account,
+                            self.store_identity,
+                        ),
+                    ).fetchone()
+                if owning_stop is not None and (
+                    owning_stop["status"] != "confirmed"
+                    or owning_stop["holding_episode_id"] != holding.holding_episode_id
+                    or owning_stop["broker_order_id"] != holding.confirmed_stop_broker_order_id
+                    or owning_stop["client_order_id"] != holding.confirmed_stop_client_order_id
+                ):
+                    raise ValueError("holding protective STOP owner facts are inconsistent")
+                is_current_stop = bool(
+                    owning_stop is not None
+                    and owning_stop["broker_order_id"] == broker
+                    and holding.confirmed_stop_broker_order_id == broker
+                )
+                reconciliation_required = (
+                    not is_current_stop
+                    or bool(dict(holding.policy_flags).get("position_reconciliation_required"))
+                )
+                action_row = conn.execute(
+                    "SELECT * FROM policy_state_actions WHERE logical_action_id=?",
+                    (action_id,),
+                ).fetchone()
+                holding_version = int(holding_row["state_version"])
+                if reconciliation_required and not dict(holding.policy_flags).get(
+                    "position_reconciliation_required"
+                ):
+                    flags = dict(holding.policy_flags)
+                    flags["position_reconciliation_required"] = (
+                        "a protective STOP fill was reported for a superseded or unowned physical order"
+                    )
+                    reconciled = replace(
+                        holding,
+                        policy_flags=tuple(flags.items()),
+                        committed_risk=None,
+                        committed_risk_basis=None,
+                        realized_pnl=None,
+                    )
+                    holding_version = self._save_holding(
+                        conn,
+                        reconciled,
+                        expected_version=holding_version,
+                        event_kind="protective_stop_fill_requires_reconciliation",
+                        logical_action_id=action_id,
+                        observed_at=observed_at,
+                    )
+                if reconciliation_required and action.status is not ActionStatus.RECONCILIATION_REQUIRED:
+                    action = replace(
+                        action,
+                        status=ActionStatus.RECONCILIATION_REQUIRED,
+                        order_attempts=(
+                            replace(
+                                action.order_attempts[0],
+                                status=ActionAttemptStatus.RECONCILIATION_REQUIRED,
+                            ),
+                        ),
+                    )
+                    self._store_action(
+                        conn,
+                        action,
+                        version=int(action_row["state_version"]) + 1,
+                        event_kind="protective_execution_order_requires_reconciliation",
+                        observed_at=observed_at,
+                    )
+                    action_row = conn.execute(
+                        "SELECT * FROM policy_state_actions WHERE logical_action_id=?",
+                        (action_id,),
+                    ).fetchone()
+                return self._record_cumulative_fill_in_transaction(
+                    conn,
+                    logical_action_id=action_id,
+                    attempt_number=1,
+                    provider_id=provider,
+                    fill_event_id=event_id,
+                    cumulative_quantity=cumulative_quantity,
+                    cumulative_notional=cumulative_notional,
+                    cumulative_fees=cumulative_fees,
+                    payload_sha256=None,
+                    observed_at=observed_at,
+                    expected_action_version=int(action_row["state_version"]),
+                    expected_holding_version=holding_version,
+                    allow_stale_watermark=True,
+                )
+            return self._record_cumulative_fill_in_transaction(
+                conn,
+                logical_action_id=action_id,
+                attempt_number=1,
+                provider_id=provider,
+                fill_event_id=event_id,
+                cumulative_quantity=cumulative_quantity,
+                cumulative_notional=cumulative_notional,
+                cumulative_fees=cumulative_fees,
+                payload_sha256=None,
+                observed_at=observed_at,
+                expected_action_version=int(action_row["state_version"]),
+                expected_holding_version=expected_holding_version,
+                allow_stale_watermark=True,
+            )
+
+    def _record_cumulative_fill_in_transaction(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        logical_action_id: str,
+        attempt_number: int,
+        provider_id: str,
+        fill_event_id: str,
+        cumulative_quantity: Decimal,
+        cumulative_notional: Decimal | None,
+        cumulative_fees: Decimal | None,
+        payload_sha256: str | None,
+        observed_at: datetime,
+        expected_action_version: int,
+        expected_holding_version: int | None,
+        allow_stale_watermark: bool = False,
+    ) -> ActionStateProjection:
+        """Share canonical fill receipt, accounting and CAS logic on an open transaction."""
+        return self.record_cumulative_fill(
+            logical_action_id,
+            attempt_number,
+            provider_id=provider_id,
+            fill_event_id=fill_event_id,
+            cumulative_quantity=cumulative_quantity,
+            cumulative_notional=cumulative_notional,
+            cumulative_fees=cumulative_fees,
+            payload_sha256=payload_sha256,
+            observed_at=observed_at,
+            expected_action_version=expected_action_version,
+            expected_holding_version=expected_holding_version,
+            _connection=conn,
+            _allow_stale_watermark=allow_stale_watermark,
+        )
 
     def record_cumulative_fill(
         self,
@@ -1940,6 +3058,8 @@ class PolicyExecutionStateStore:
         observed_at: datetime,
         expected_action_version: int,
         expected_holding_version: int | None,
+        _connection: sqlite3.Connection | None = None,
+        _allow_stale_watermark: bool = False,
     ) -> ActionStateProjection:
         provider = _required_text(provider_id, "provider_id")
         event_id = _required_text(fill_event_id, "fill_event_id")
@@ -1953,7 +3073,12 @@ class PolicyExecutionStateStore:
                 raise ValueError(f"{name} must be a finite non-negative Decimal when known")
         _aware_iso(observed_at)
 
-        with self._transaction(write=True) as conn:
+        transaction = (
+            self._transaction(write=True)
+            if _connection is None
+            else nullcontext(_connection)
+        )
+        with transaction as conn:
             self._require_ready(conn)
             intent, action_row = self._load_action(conn, action_id)
             account = intent.decision.deployment_identity.paper_account_environment_id
@@ -2003,11 +3128,27 @@ class PolicyExecutionStateStore:
             previous_quantity = Decimal(attempt_row["confirmed_quantity"])
             previous_notional = _decimal_value(attempt_row["cumulative_notional"])
             previous_fees = _decimal_value(attempt_row["cumulative_fees"])
+            stale_watermark = cumulative_quantity < previous_quantity
+            if stale_watermark and not _allow_stale_watermark:
+                raise ValueError("attempt cumulative fill cannot decrease")
             if cumulative_quantity == previous_quantity:
                 if (
                     cumulative_notional is not None and previous_notional is not None and cumulative_notional != previous_notional
                 ) or (cumulative_fees is not None and previous_fees is not None and cumulative_fees != previous_fees):
                     raise FillReceiptConflictError("cumulative notional or fees changed without a quantity watermark change")
+            if stale_watermark:
+                if (
+                    cumulative_notional is not None
+                    and previous_notional is not None
+                    and cumulative_notional > previous_notional
+                ) or (
+                    cumulative_fees is not None
+                    and previous_fees is not None
+                    and cumulative_fees > previous_fees
+                ):
+                    raise FillReceiptConflictError(
+                        "an older cumulative fill checkpoint exceeds the latest known total"
+                    )
             if cumulative_quantity > previous_quantity:
                 if previous_notional is not None and cumulative_notional is not None and cumulative_notional < previous_notional:
                     raise ValueError("cumulative notional cannot decrease")
@@ -2022,7 +3163,10 @@ class PolicyExecutionStateStore:
                     raise ValueError("replacement holding episode must be its own opening holding")
                 if holding_row is not None:
                     _validate_replacement_holding(intent, _holding_from_row(holding_row))
-            if holding_row is None:
+            if stale_watermark:
+                if holding_row is None:
+                    raise ValueError("a stale protective fill has no durable holding episode")
+            elif holding_row is None:
                 if intent.role not in {ActionRole.ENTRY, ActionRole.REPLACEMENT} or cumulative_quantity == previous_quantity:
                     if expected_holding_version is not None:
                         raise ConcurrentStateUpdateError("action has no holding at the expected version")
@@ -2051,6 +3195,8 @@ class PolicyExecutionStateStore:
                     _aware_iso(observed_at),
                 ),
             )
+            if stale_watermark:
+                return _action_projection_from_row(conn, intent, action_row)
             if cumulative_quantity == previous_quantity:
                 return _action_projection_from_row(conn, intent, action_row)
 
@@ -2656,6 +3802,7 @@ class PolicyExecutionStateStore:
             ).fetchall()
             holdings = tuple(_holding_from_row(row) for row in holding_rows)
             holding_ids = {holding.holding_episode_id for holding in holdings}
+            holding_by_id = {holding.holding_episode_id: holding for holding in holdings}
             holding_action_ids = {
                 action_id
                 for holding in holdings
@@ -2675,10 +3822,20 @@ class PolicyExecutionStateStore:
             projections_list = []
             for row in action_rows:
                 intent = _action_from_row(conn, row)
-                if intent.is_open or intent.logical_action_id in holding_action_ids or intent.holding_episode_id in holding_ids:
-                    projections_list.append(
-                        _action_projection_from_row(conn, intent, row)
-                    )
+                if not (
+                    intent.is_open
+                    or intent.logical_action_id in holding_action_ids
+                    or intent.holding_episode_id in holding_ids
+                ):
+                    continue
+                if self._is_confirmed_protective_execution_projection(
+                    conn,
+                    intent=intent,
+                    action_row=row,
+                    holding_by_id=holding_by_id,
+                ):
+                    continue
+                projections_list.append(_action_projection_from_row(conn, intent, row))
             projections = tuple(projections_list)
             return PolicyExecutionReadSnapshot(identity, portfolio, projections, holdings)
 
@@ -2797,6 +3954,511 @@ class PolicyExecutionStateStore:
                 requested_stop_price=Decimal(row["requested_stop_price"]),
             )
 
+    def _protective_order_decision_facts(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        stop_row: sqlite3.Row,
+        holding_row: sqlite3.Row,
+        provider_id: str,
+        client_order_id: str,
+        broker_order_id: str,
+        requested_quantity: Decimal,
+        confirmed_stop_price: Decimal,
+    ) -> tuple[DecisionIdentity, dict[str, object], dict[str, object], dict[str, object]]:
+        """Build immutable execution provenance from an accepted stop and holding."""
+        stop_decision_row = conn.execute(
+            """SELECT decision_json FROM policy_state_decisions
+               WHERE decision_id=? AND deployment_generation_id=?
+                 AND paper_account_environment_id=? AND store_identity=?""",
+            (
+                stop_row["decision_id"],
+                stop_row["deployment_generation_id"],
+                stop_row["paper_account_environment_id"],
+                self.store_identity,
+            ),
+        ).fetchone()
+        if stop_decision_row is None:
+            raise ValueError("protective stop decision identity is missing")
+        stop_decision = _decision_from_payload(json.loads(stop_decision_row["decision_json"]))
+        source_policy_decision_row = conn.execute(
+            """SELECT policy_payload_json FROM policy_state_decisions
+               WHERE decision_id=? AND deployment_generation_id=?
+                 AND paper_account_environment_id=? AND store_identity=?""",
+            (
+                stop_decision.decision_id,
+                stop_decision.deployment_generation_id,
+                stop_decision.deployment_identity.paper_account_environment_id,
+                self.store_identity,
+            ),
+        ).fetchone()
+        if source_policy_decision_row is None:
+            raise ValueError("protective stop source decision is missing")
+        stop_payload = json.loads(source_policy_decision_row["policy_payload_json"])
+        if not isinstance(stop_payload, dict):
+            raise ValueError("protective stop source decision has malformed policy facts")
+        source_action_id = _required_text(
+            stop_payload.get("source_action_id"), "protective stop source action id"
+        )
+        source_action, source_action_row = self._load_action(conn, source_action_id)
+        if (
+            source_action.decision.deployment_generation_id != stop_decision.deployment_generation_id
+            or source_action.decision.deployment_identity.paper_account_environment_id
+            != stop_decision.deployment_identity.paper_account_environment_id
+            or source_action.decision.deployment_identity.store_identity != self.store_identity
+            or source_action.holding_episode_id != str(holding_row["holding_episode_id"])
+            or source_action.security_id != str(holding_row["security_id"])
+            or source_action.broker_symbol != str(holding_row["broker_symbol"])
+            or source_action_row["paper_account_environment_id"]
+            != stop_row["paper_account_environment_id"]
+            or source_action_row["store_identity"] != self.store_identity
+        ):
+            raise ValueError("protective stop source action does not match its durable holding")
+        if (
+            stop_decision.deployment_identity != source_action.decision.deployment_identity
+            or stop_decision.clock != source_action.decision.clock
+        ):
+            raise ValueError("protective stop decision changed its source generation or policy clock")
+
+        facts: dict[str, object] = {
+            "origin": "protective_stop",
+            "provider_id": provider_id,
+            "paper_account_environment_id": str(stop_row["paper_account_environment_id"]),
+            "store_identity": self.store_identity,
+            "deployment_generation_id": str(stop_row["deployment_generation_id"]),
+            "security_id": str(holding_row["security_id"]),
+            "symbol": str(holding_row["broker_symbol"]),
+            "holding_episode_id": str(holding_row["holding_episode_id"]),
+            "source_policy_action_id": source_action.logical_action_id,
+            "source_policy_decision_id": source_action.decision.decision_id,
+            "source_stop_update_action_id": str(stop_row["stop_update_action_id"]),
+            "source_stop_decision_id": stop_decision.decision_id,
+            "side": OrderSide.SELL.value,
+            "requested_quantity": str(requested_quantity),
+            "requested_stop_price": str(Decimal(str(stop_row["requested_stop_price"]))),
+            "confirmed_stop_price": str(confirmed_stop_price),
+            "client_order_id": client_order_id,
+            "broker_order_id": broker_order_id,
+        }
+        subject_id = "execution-derived:protective-stop:" + _canonical_json(facts)
+        decision = DecisionIdentity.build(
+            deployment=source_action.decision.deployment_identity,
+            clock=source_action.decision.clock,
+            snapshot_sha256=source_action.decision.snapshot_sha256,
+            category=DecisionCategory.EXIT,
+            subject_type=DecisionSubjectType.HOLDING,
+            subject_id=subject_id,
+        )
+        policy_payload: dict[str, object] = {
+            "execution_record_kind": _PROTECTIVE_EXECUTION_RECORD_KIND,
+            "policy_authored": False,
+            "source_policy_action_id": source_action.logical_action_id,
+            "source_policy_decision_id": source_action.decision.decision_id,
+            "source_stop_update_action_id": str(stop_row["stop_update_action_id"]),
+            "source_stop_decision_id": stop_decision.decision_id,
+            "physical_order": facts,
+        }
+        guard_payload: dict[str, object] = {
+            "origin": "protective_stop",
+            "execution_derived": True,
+            "physical_order": facts,
+        }
+        effective_action_payload: dict[str, object] = {
+            "execution_kind": "protective_stop_sell",
+            "role": ActionRole.CLOSE.value,
+            "side": OrderSide.SELL.value,
+            "holding_episode_id": str(holding_row["holding_episode_id"]),
+            "physical_order": facts,
+        }
+        return decision, policy_payload, guard_payload, effective_action_payload
+
+    def _existing_protective_order_contexts_in_transaction(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        holding_row: sqlite3.Row,
+        provider_id: str,
+        broker_order_id: str,
+    ) -> list[tuple[DecisionIdentity, dict[str, object], sqlite3.Row]]:
+        """Find existing immutable execution provenance for one physical broker order."""
+        stop_rows = conn.execute(
+            """SELECT * FROM policy_state_stop_updates
+               WHERE store_identity=? AND deployment_generation_id=?
+                 AND paper_account_environment_id=? AND holding_episode_id=?
+                 AND broker_order_id=? AND status='confirmed'
+               ORDER BY stop_update_action_id""",
+            (
+                self.store_identity,
+                holding_row["deployment_generation_id"],
+                holding_row["paper_account_environment_id"],
+                holding_row["holding_episode_id"],
+                broker_order_id,
+            ),
+        ).fetchall()
+        contexts_by_decision: dict[
+            str, tuple[DecisionIdentity, dict[str, object], sqlite3.Row]
+        ] = {}
+        for stop_row in stop_rows:
+            client = str(stop_row["client_order_id"] or "")
+            if not client:
+                continue
+            try:
+                decision, facts, context_holding = (
+                    self._load_protective_order_context_in_transaction(
+                        conn,
+                        stop_row=stop_row,
+                        provider_id=provider_id,
+                        client_order_id=client,
+                        broker_order_id=broker_order_id,
+                    )
+                )
+            except ValueError as exc:
+                if "protective STOP order target is missing" in str(exc):
+                    # A later confirmation may reuse the order without creating another
+                    # execution record. Only the original STOP update owns its context.
+                    continue
+                if "do not authenticate this STOP order" in str(exc):
+                    continue
+                raise
+            if (
+                facts.get("provider_id") != provider_id
+                or facts.get("broker_order_id") != broker_order_id
+                or context_holding["holding_episode_id"] != holding_row["holding_episode_id"]
+            ):
+                raise ValueError("protective physical-order identity conflicts with its holding")
+            contexts_by_decision[decision.decision_id] = (
+                decision,
+                facts,
+                context_holding,
+            )
+        return list(contexts_by_decision.values())
+
+    def _load_confirmed_protective_stop_recovery_targets(
+        self,
+    ) -> tuple[Mapping[str, object], ...]:
+        """Return exact current STOP identities for startup watermark recovery."""
+        with self._transaction(write=False) as conn:
+            self._require_ready(conn)
+            holding_rows = conn.execute(
+                """SELECT * FROM policy_state_holdings
+                   WHERE store_identity=? AND confirmed_stop_action_id IS NOT NULL
+                   ORDER BY holding_episode_id""",
+                (self.store_identity,),
+            ).fetchall()
+            targets: list[Mapping[str, object]] = []
+            for holding_row in holding_rows:
+                holding = _holding_from_row(holding_row)
+                if holding.remaining_quantity <= 0:
+                    continue
+                owner = conn.execute(
+                    """SELECT * FROM policy_state_stop_updates
+                       WHERE stop_update_action_id=? AND deployment_generation_id=?
+                         AND paper_account_environment_id=? AND store_identity=?""",
+                    (
+                        holding.confirmed_stop_action_id,
+                        holding.deployment_generation_id,
+                        holding_row["paper_account_environment_id"],
+                        self.store_identity,
+                    ),
+                ).fetchone()
+                if owner is None or owner["status"] != "confirmed":
+                    raise ValueError("holding startup STOP owner is not a confirmed update")
+                if (
+                    owner["holding_episode_id"] != holding.holding_episode_id
+                    or owner["security_id"] != holding.security_id
+                    or owner["client_order_id"] != holding.confirmed_stop_client_order_id
+                    or owner["broker_order_id"] != holding.confirmed_stop_broker_order_id
+                ):
+                    raise ValueError("holding startup STOP references disagree with its owner")
+
+                related_stops = conn.execute(
+                    """SELECT * FROM policy_state_stop_updates
+                       WHERE store_identity=? AND deployment_generation_id=?
+                         AND paper_account_environment_id=? AND holding_episode_id=?
+                         AND broker_order_id=? AND status='confirmed'
+                       ORDER BY stop_update_action_id""",
+                    (
+                        self.store_identity,
+                        holding.deployment_generation_id,
+                        holding_row["paper_account_environment_id"],
+                        holding.holding_episode_id,
+                        owner["broker_order_id"],
+                    ),
+                ).fetchall()
+                contexts: dict[str, tuple[DecisionIdentity, dict[str, object]]] = {}
+                for stop_row in related_stops:
+                    stop_client = str(stop_row["client_order_id"] or "")
+                    if not stop_client:
+                        continue
+                    decision_rows = conn.execute(
+                        """SELECT policy_payload_json, guard_payload_json,
+                                  effective_action_payload_json
+                           FROM policy_state_decisions
+                           WHERE deployment_generation_id=? AND paper_account_environment_id=?
+                             AND store_identity=? AND decision_category=? AND subject_type=?""",
+                        (
+                            stop_row["deployment_generation_id"],
+                            stop_row["paper_account_environment_id"],
+                            self.store_identity,
+                            DecisionCategory.EXIT.value,
+                            DecisionSubjectType.HOLDING.value,
+                        ),
+                    ).fetchall()
+                    providers: set[str] = set()
+                    for decision_row in decision_rows:
+                        try:
+                            policy_payload = json.loads(decision_row["policy_payload_json"])
+                            guard_payload = json.loads(decision_row["guard_payload_json"])
+                            effective_payload = json.loads(
+                                decision_row["effective_action_payload_json"]
+                            )
+                        except (TypeError, json.JSONDecodeError) as exc:
+                            raw = " ".join(str(decision_row[key] or "") for key in decision_row.keys())
+                            if "protective_stop" in raw or "protective_stop_sell" in raw:
+                                raise ValueError("protective STOP recovery provenance is malformed") from exc
+                            continue
+                        payloads = (policy_payload, guard_payload, effective_payload)
+                        physical = next(
+                            (
+                                payload.get("physical_order")
+                                for payload in payloads
+                                if isinstance(payload, dict)
+                                and isinstance(payload.get("physical_order"), dict)
+                            ),
+                            None,
+                        )
+                        source_matches = (
+                            isinstance(policy_payload, dict)
+                            and policy_payload.get("source_stop_update_action_id")
+                            == stop_row["stop_update_action_id"]
+                        )
+                        origin_shaped = (
+                            isinstance(policy_payload, dict)
+                            and policy_payload.get("execution_record_kind")
+                            == _PROTECTIVE_EXECUTION_RECORD_KIND
+                        ) or (
+                            isinstance(guard_payload, dict)
+                            and guard_payload.get("origin") == "protective_stop"
+                        ) or (
+                            isinstance(effective_payload, dict)
+                            and effective_payload.get("execution_kind")
+                            == "protective_stop_sell"
+                        )
+                        if source_matches and origin_shaped:
+                            if (
+                                not isinstance(physical, dict)
+                                or not physical.get("provider_id")
+                                or physical.get("broker_order_id") != owner["broker_order_id"]
+                            ):
+                                raise ValueError(
+                                    "protective STOP recovery physical-order identity is malformed"
+                                )
+                            providers.add(str(physical["provider_id"]))
+                    for provider in providers:
+                        try:
+                            decision, facts, _ = (
+                                self._load_protective_order_context_in_transaction(
+                                    conn,
+                                    stop_row=stop_row,
+                                    provider_id=provider,
+                                    client_order_id=stop_client,
+                                    broker_order_id=str(owner["broker_order_id"]),
+                                )
+                            )
+                        except ValueError as exc:
+                            if "protective STOP order target is missing" in str(exc):
+                                continue
+                            raise
+                        contexts[decision.decision_id] = (decision, facts)
+
+                if len(contexts) > 1:
+                    raise ValueError(
+                        "holding startup STOP owner has ambiguous execution provenance"
+                    )
+                if not contexts:
+                    # Legacy confirmed stops have no canonical frozen execution target.
+                    # They are not safe candidates for automatic fill recovery.
+                    continue
+                _, facts = next(iter(contexts.values()))
+                if (
+                    facts.get("broker_order_id") != owner["broker_order_id"]
+                    or facts.get("holding_episode_id") != holding.holding_episode_id
+                    or facts.get("deployment_generation_id") != holding.deployment_generation_id
+                    or facts.get("security_id") != holding.security_id
+                    or facts.get("symbol") != holding.broker_symbol
+                ):
+                    raise ValueError("startup STOP recovery facts disagree with their holding")
+                targets.append(
+                    {
+                        "provider_id": str(facts["provider_id"]),
+                        "logical_action_id": holding.opening_action_id,
+                        "holding_episode_id": holding.holding_episode_id,
+                        "symbol": holding.broker_symbol,
+                        "broker_order_id": str(owner["broker_order_id"]),
+                        "client_order_id": str(owner["client_order_id"]),
+                        "state_version": int(holding.state_version or 0),
+                    }
+                )
+            return tuple(targets)
+
+    def _ensure_protective_order_decision_in_transaction(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        stop_row: sqlite3.Row,
+        holding_row: sqlite3.Row,
+        provider_id: str,
+        client_order_id: str,
+        broker_order_id: str,
+        requested_quantity: Decimal,
+        confirmed_stop_price: Decimal,
+    ) -> DecisionIdentity:
+        other_holding_order = conn.execute(
+            """SELECT stop_update_action_id FROM policy_state_stop_updates
+               WHERE store_identity=? AND paper_account_environment_id=?
+                 AND broker_order_id=? AND status='confirmed'
+                 AND holding_episode_id<>? LIMIT 1""",
+            (
+                self.store_identity,
+                holding_row["paper_account_environment_id"],
+                broker_order_id,
+                holding_row["holding_episode_id"],
+            ),
+        ).fetchone()
+        if other_holding_order is not None:
+            raise IdentityConflictError(
+                "broker STOP reference is already associated with another holding"
+            )
+        existing_contexts = self._existing_protective_order_contexts_in_transaction(
+            conn,
+            holding_row=holding_row,
+            provider_id=provider_id,
+            broker_order_id=broker_order_id,
+        )
+        if len(existing_contexts) > 1:
+            raise ValueError(
+                "one broker STOP order has multiple durable execution contexts"
+            )
+        if existing_contexts:
+            existing_decision, existing_facts, existing_holding_row = existing_contexts[0]
+            if (
+                existing_facts.get("client_order_id") != client_order_id
+                or existing_facts.get("broker_order_id") != broker_order_id
+                or existing_facts.get("holding_episode_id")
+                != holding_row["holding_episode_id"]
+                or existing_facts.get("security_id") != holding_row["security_id"]
+                or existing_facts.get("symbol") != holding_row["broker_symbol"]
+                or existing_facts.get("deployment_generation_id")
+                != holding_row["deployment_generation_id"]
+                or existing_facts.get("paper_account_environment_id")
+                != holding_row["paper_account_environment_id"]
+                or existing_facts.get("store_identity") != self.store_identity
+                or Decimal(str(existing_facts["requested_quantity"])) < requested_quantity
+                or confirmed_stop_price
+                != Decimal(str(existing_facts["confirmed_stop_price"]))
+                or confirmed_stop_price < Decimal(stop_row["requested_stop_price"])
+                or existing_holding_row["holding_episode_id"]
+                != holding_row["holding_episode_id"]
+            ):
+                raise IdentityConflictError(
+                    "reused protective STOP does not preserve its original physical-order facts"
+                )
+            return existing_decision
+
+        prior_confirmed_order = conn.execute(
+            """SELECT stop_update_action_id FROM policy_state_stop_updates
+               WHERE store_identity=? AND deployment_generation_id=?
+                 AND paper_account_environment_id=? AND broker_order_id=?
+                 AND status='confirmed' LIMIT 1""",
+            (
+                self.store_identity,
+                holding_row["deployment_generation_id"],
+                holding_row["paper_account_environment_id"],
+                broker_order_id,
+            ),
+        ).fetchone()
+        if prior_confirmed_order is not None:
+            raise ValueError(
+                "confirmed physical STOP has no immutable target provenance; reconciliation is required"
+            )
+
+        # A first confirmation freezes the quantity submitted to the broker. If it no
+        # longer equals the durable holding, the caller cannot infer a safe target from
+        # this confirmation-time snapshot.
+        if requested_quantity != _holding_from_row(holding_row).remaining_quantity:
+            raise ValueError(
+                "new protective STOP target differs from the durable holding quantity"
+            )
+        decision, policy_payload, guard_payload, effective_action_payload = (
+            self._protective_order_decision_facts(
+                conn,
+                stop_row=stop_row,
+                holding_row=holding_row,
+                provider_id=provider_id,
+                client_order_id=client_order_id,
+                broker_order_id=broker_order_id,
+                requested_quantity=requested_quantity,
+                confirmed_stop_price=confirmed_stop_price,
+            )
+        )
+        related_rows = conn.execute(
+            """SELECT policy_payload_json, guard_payload_json, effective_action_payload_json
+               FROM policy_state_decisions
+               WHERE deployment_generation_id=? AND paper_account_environment_id=?
+                 AND store_identity=? AND decision_category=? AND subject_type=?""",
+            (
+                decision.deployment_generation_id,
+                decision.deployment_identity.paper_account_environment_id,
+                self.store_identity,
+                DecisionCategory.EXIT.value,
+                DecisionSubjectType.HOLDING.value,
+            ),
+        ).fetchall()
+        stop_action_id = str(stop_row["stop_update_action_id"])
+        for related in related_rows:
+            try:
+                related_policy = json.loads(related["policy_payload_json"])
+                related_guard = json.loads(related["guard_payload_json"])
+                related_effective = json.loads(related["effective_action_payload_json"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            related_source = (
+                related_policy.get("source_stop_update_action_id")
+                if isinstance(related_policy, dict)
+                else None
+            )
+            origin_shaped = (
+                isinstance(related_policy, dict)
+                and related_policy.get("execution_record_kind")
+                == _PROTECTIVE_EXECUTION_RECORD_KIND
+            ) or (
+                isinstance(related_guard, dict)
+                and related_guard.get("origin") == "protective_stop"
+            ) or (
+                isinstance(related_effective, dict)
+                and related_effective.get("execution_kind") == "protective_stop_sell"
+            )
+            if related_source == stop_action_id or origin_shaped and (
+                isinstance(related_policy, dict)
+                and related_policy.get("source_stop_update_action_id") == stop_action_id
+            ):
+                if (
+                    related_policy != policy_payload
+                    or related_guard != guard_payload
+                    or related_effective != effective_action_payload
+                ):
+                    raise IdentityConflictError(
+                        "protective physical order facts conflict with their immutable decision"
+                    )
+        self._record_decision_in_transaction(
+            conn,
+            decision,
+            policy_payload=policy_payload,
+            guard_payload=guard_payload,
+            effective_action_payload=effective_action_payload,
+        )
+        return decision
+
     def confirm_protective_stop(
         self,
         intent: StopUpdateIntent,
@@ -2806,10 +4468,21 @@ class PolicyExecutionStateStore:
         broker_order_id: str,
         observed_at: datetime,
         expected_holding_version: int,
+        provider_id: str | None = None,
+        requested_quantity: Decimal | None = None,
     ) -> HoldingEpisode:
         _aware_iso(observed_at)
         client = _required_text(client_order_id, "client_order_id")
         broker = _required_text(broker_order_id, "broker_order_id")
+        provider = None if provider_id is None else _required_text(provider_id, "provider_id")
+        if (provider is None) != (requested_quantity is None):
+            raise ValueError("provider_id and requested_quantity must be supplied together")
+        if requested_quantity is not None and (
+            not isinstance(requested_quantity, Decimal)
+            or not requested_quantity.is_finite()
+            or requested_quantity <= 0
+        ):
+            raise ValueError("requested_quantity must be a positive finite Decimal")
         with self._transaction(write=True) as conn:
             self._require_ready(conn)
             row = conn.execute(
@@ -2843,10 +4516,32 @@ class PolicyExecutionStateStore:
                     and row["broker_order_id"] == broker
                     and row["observed_at_utc"] == _aware_iso(observed_at)
                 ):
+                    if provider is not None and requested_quantity is not None:
+                        self._ensure_protective_order_decision_in_transaction(
+                            conn,
+                            stop_row=row,
+                            holding_row=holding_row,
+                            provider_id=provider,
+                            client_order_id=client,
+                            broker_order_id=broker,
+                            requested_quantity=requested_quantity,
+                            confirmed_stop_price=stop_price,
+                        )
                     return holding
                 raise IdentityConflictError("confirmed protective stop facts cannot change")
             if int(holding_row["state_version"]) != expected_holding_version:
                 raise ConcurrentStateUpdateError("holding changed since the caller read it")
+            if provider is not None and requested_quantity is not None:
+                self._ensure_protective_order_decision_in_transaction(
+                    conn,
+                    stop_row=row,
+                    holding_row=holding_row,
+                    provider_id=provider,
+                    client_order_id=client,
+                    broker_order_id=broker,
+                    requested_quantity=requested_quantity,
+                    confirmed_stop_price=stop_price,
+                )
             updated = confirm_stop_in_state(
                 holding,
                 intent=intent,

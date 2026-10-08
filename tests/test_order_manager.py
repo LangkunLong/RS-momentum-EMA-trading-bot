@@ -3274,6 +3274,7 @@ class TestSubmitExit:
         workflow.mark_exit_order_submitted.assert_called_once_with(
             exit_reason="hard stop triggered",
             broker_order_id="sell-1",
+            requested_quantity=20.0,
         )
 
     def test_submit_exit_fails_closed_when_open_orders_cannot_be_cleared(self) -> None:
