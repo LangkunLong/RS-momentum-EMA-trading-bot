@@ -788,6 +788,7 @@ class OrderManager:
             account=self._addition_account_snapshot(ports),
             observed_at=self._addition_observed_at(ports),
             replace_stop=ports.replace_stop,
+            provider_id=ports.provider_id,
         )
 
     def submit_addition(
@@ -913,6 +914,7 @@ class OrderManager:
                 decision_id,
                 account=self._addition_account_snapshot(ports),
                 observed_at=self._addition_observed_at(ports),
+                provider_id=ports.provider_id,
             )
 
     def submit_entry(
