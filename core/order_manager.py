@@ -34,7 +34,12 @@ from core.policy_addition import (
 )
 
 from core.fake_policy_exit_broker import FakeProtectedExitBroker
-from core.policy_exit_management import record_fixed_exit_management
+from core.policy_exit_management import (
+    FixedExitStopResult,
+    apply_fixed_exit_stop,
+    confirm_fixed_exit_stop,
+    record_fixed_exit_management,
+)
 from core.policy_exit_execution import (
     PolicyExitCancel,
     PolicyExitDispatch,
@@ -1049,6 +1054,40 @@ class OrderManager:
                 snapshot=snapshot,
                 outcome=outcome,
                 expected_holding_version=expected_holding_version,
+            )
+
+    def apply_policy_exit_selected_stop(
+        self,
+        *,
+        decision: DecisionIdentity,
+        broker: FakeProtectedExitBroker,
+        provider_id: str,
+        observed_at: datetime,
+    ) -> FixedExitStopResult:
+        """Claim and confirm one selected fake-paper stop replacement."""
+        if self._policy_store is None:
+            raise RuntimeError("selected stop requires an explicit policy store")
+        with _FILL_HANDLING_LOCK:
+            return apply_fixed_exit_stop(
+                self._policy_store, decision=decision, broker=broker,
+                provider_id=provider_id, observed_at=observed_at,
+            )
+
+    def confirm_policy_exit_selected_stop(
+        self,
+        *,
+        decision: DecisionIdentity,
+        broker: FakeProtectedExitBroker,
+        provider_id: str,
+        observed_at: datetime,
+    ) -> FixedExitStopResult:
+        """Recover a selected stop from current fake-broker physical facts."""
+        if self._policy_store is None:
+            raise RuntimeError("selected stop requires an explicit policy store")
+        with _FILL_HANDLING_LOCK:
+            return confirm_fixed_exit_stop(
+                self._policy_store, decision=decision, broker=broker,
+                provider_id=provider_id, observed_at=observed_at,
             )
 
     def cancel_policy_exit_remainder(

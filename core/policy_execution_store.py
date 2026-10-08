@@ -4212,7 +4212,7 @@ class PolicyExecutionStateStore:
             raise ValueError("protective stop decision identity is missing")
         stop_decision = _decision_from_payload(json.loads(stop_decision_row["decision_json"]))
         source_policy_decision_row = conn.execute(
-            """SELECT policy_payload_json FROM policy_state_decisions
+            """SELECT policy_payload_json, effective_action_payload_json FROM policy_state_decisions
                WHERE decision_id=? AND deployment_generation_id=?
                  AND paper_account_environment_id=? AND store_identity=?""",
             (
@@ -4227,28 +4227,49 @@ class PolicyExecutionStateStore:
         stop_payload = json.loads(source_policy_decision_row["policy_payload_json"])
         if not isinstance(stop_payload, dict):
             raise ValueError("protective stop source decision has malformed policy facts")
-        source_action_id = _required_text(
-            stop_payload.get("source_action_id"), "protective stop source action id"
-        )
-        source_action, source_action_row = self._load_action(conn, source_action_id)
-        if (
-            source_action.decision.deployment_generation_id != stop_decision.deployment_generation_id
-            or source_action.decision.deployment_identity.paper_account_environment_id
-            != stop_decision.deployment_identity.paper_account_environment_id
-            or source_action.decision.deployment_identity.store_identity != self.store_identity
-            or source_action.holding_episode_id != str(holding_row["holding_episode_id"])
-            or source_action.security_id != str(holding_row["security_id"])
-            or source_action.broker_symbol != str(holding_row["broker_symbol"])
-            or source_action_row["paper_account_environment_id"]
-            != stop_row["paper_account_environment_id"]
-            or source_action_row["store_identity"] != self.store_identity
-        ):
-            raise ValueError("protective stop source action does not match its durable holding")
-        if (
-            stop_decision.deployment_identity != source_action.decision.deployment_identity
-            or stop_decision.clock != source_action.decision.clock
-        ):
-            raise ValueError("protective stop decision changed its source generation or policy clock")
+        source_action_id = stop_payload.get("source_action_id")
+        if source_action_id is not None:
+            source_action, source_action_row = self._load_action(
+                conn, _required_text(source_action_id, "protective stop source action id")
+            )
+            if (
+                source_action.decision.deployment_generation_id != stop_decision.deployment_generation_id
+                or source_action.decision.deployment_identity.paper_account_environment_id
+                != stop_decision.deployment_identity.paper_account_environment_id
+                or source_action.decision.deployment_identity.store_identity != self.store_identity
+                or source_action.holding_episode_id != str(holding_row["holding_episode_id"])
+                or source_action.security_id != str(holding_row["security_id"])
+                or source_action.broker_symbol != str(holding_row["broker_symbol"])
+                or source_action_row["paper_account_environment_id"]
+                != stop_row["paper_account_environment_id"]
+                or source_action_row["store_identity"] != self.store_identity
+            ):
+                raise ValueError("protective stop source action does not match its durable holding")
+            if (
+                stop_decision.deployment_identity != source_action.decision.deployment_identity
+                or stop_decision.clock != source_action.decision.clock
+            ):
+                raise ValueError("protective stop decision changed its source generation or policy clock")
+            source_decision = source_action.decision
+            source_policy_action_id = source_action.logical_action_id
+        else:
+            selected_effective = json.loads(source_policy_decision_row["effective_action_payload_json"])
+            flags = dict(_holding_from_row(holding_row).policy_flags)
+            if (
+                stop_payload.get("kind") != "fixed_exit_policy_state_v1"
+                or not isinstance(selected_effective, dict)
+                or selected_effective.get("kind") != "exit_holding_management_state_v1"
+                or Decimal(str(selected_effective.get("next_stop_price", "-1")))
+                != Decimal(str(stop_row["requested_stop_price"]))
+                or stop_decision.category is not DecisionCategory.EXIT
+                or stop_decision.subject_type is not DecisionSubjectType.HOLDING
+                or stop_decision.subject_id != str(holding_row["holding_episode_id"])
+                or stop_decision.deployment_generation_id != str(holding_row["deployment_generation_id"])
+                or flags.get("exit_management_decision_id") != stop_decision.decision_id
+            ):
+                raise ValueError("protective stop has no bound fixed exit management source")
+            source_decision = stop_decision
+            source_policy_action_id = None
 
         facts: dict[str, object] = {
             "origin": "protective_stop",
@@ -4259,8 +4280,8 @@ class PolicyExecutionStateStore:
             "security_id": str(holding_row["security_id"]),
             "symbol": str(holding_row["broker_symbol"]),
             "holding_episode_id": str(holding_row["holding_episode_id"]),
-            "source_policy_action_id": source_action.logical_action_id,
-            "source_policy_decision_id": source_action.decision.decision_id,
+            "source_policy_action_id": source_policy_action_id,
+            "source_policy_decision_id": source_decision.decision_id,
             "source_stop_update_action_id": str(stop_row["stop_update_action_id"]),
             "source_stop_decision_id": stop_decision.decision_id,
             "side": OrderSide.SELL.value,
@@ -4272,9 +4293,9 @@ class PolicyExecutionStateStore:
         }
         subject_id = "execution-derived:protective-stop:" + _canonical_json(facts)
         decision = DecisionIdentity.build(
-            deployment=source_action.decision.deployment_identity,
-            clock=source_action.decision.clock,
-            snapshot_sha256=source_action.decision.snapshot_sha256,
+            deployment=source_decision.deployment_identity,
+            clock=source_decision.clock,
+            snapshot_sha256=source_decision.snapshot_sha256,
             category=DecisionCategory.EXIT,
             subject_type=DecisionSubjectType.HOLDING,
             subject_id=subject_id,
@@ -4282,8 +4303,8 @@ class PolicyExecutionStateStore:
         policy_payload: dict[str, object] = {
             "execution_record_kind": _PROTECTIVE_EXECUTION_RECORD_KIND,
             "policy_authored": False,
-            "source_policy_action_id": source_action.logical_action_id,
-            "source_policy_decision_id": source_action.decision.decision_id,
+            "source_policy_action_id": source_policy_action_id,
+            "source_policy_decision_id": source_decision.decision_id,
             "source_stop_update_action_id": str(stop_row["stop_update_action_id"]),
             "source_stop_decision_id": stop_decision.decision_id,
             "physical_order": facts,

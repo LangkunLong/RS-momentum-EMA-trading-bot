@@ -12,7 +12,7 @@ from threading import RLock
 from typing import Literal
 from uuid import uuid4
 
-from core.policy_execution_state import ActionIntent, DecisionIdentity
+from core.policy_execution_state import ActionIntent, DecisionIdentity, StopUpdateIntent
 from core.policy_exit_execution import PolicyExitSubmissionResult
 from core.strategy_policy.account_reconciliation import BrokerAccountSnapshot, BrokerOrderFact
 
@@ -33,11 +33,15 @@ class FakeProtectedExitBroker:
         account: BrokerAccountSnapshot,
         *,
         receipt_store_path: str | Path | None = None,
-        response_mode: Literal["accepted", "reject_before_accept", "timeout_after_accept", "timeout_after_cancel"] = "accepted",
+        response_mode: Literal[
+            "accepted", "reject_before_accept", "timeout_after_accept", "timeout_after_cancel", "timeout_after_stop_replace"
+        ] = "accepted",
     ) -> None:
         if type(account) is not BrokerAccountSnapshot or account.positions is None or account.open_orders is None:
             raise ValueError("fake broker needs complete paper positions and orders")
-        if response_mode not in {"accepted", "reject_before_accept", "timeout_after_accept", "timeout_after_cancel"}:
+        if response_mode not in {
+            "accepted", "reject_before_accept", "timeout_after_accept", "timeout_after_cancel", "timeout_after_stop_replace"
+        }:
             raise ValueError("unsupported fake broker response mode")
         self._lock = RLock()
         self._account = account
@@ -76,6 +80,22 @@ class FakeProtectedExitBroker:
                         requested_quantity TEXT NOT NULL,
                         cumulative_quantity TEXT NOT NULL,
                         remaining_position TEXT NOT NULL
+                    )"""
+                )
+                conn.execute(
+                    """CREATE TABLE IF NOT EXISTS fake_exit_stop_receipts (
+                        new_broker_order_id TEXT NOT NULL PRIMARY KEY,
+                        old_broker_order_id TEXT NOT NULL,
+                        new_client_order_id TEXT NOT NULL,
+                        account_snapshot_id TEXT NOT NULL,
+                        paper_account_environment_id TEXT NOT NULL,
+                        decision_slot_id TEXT NOT NULL,
+                        decision_id TEXT NOT NULL,
+                        completed_session TEXT NOT NULL,
+                        next_execution_session TEXT NOT NULL,
+                        symbol TEXT NOT NULL,
+                        quantity TEXT NOT NULL,
+                        stop_price TEXT NOT NULL
                     )"""
                 )
                 conn.commit()
@@ -285,6 +305,52 @@ class FakeProtectedExitBroker:
                 and account.decision_id == action.decision.decision_id
                 and account.clock.completed_session == action.decision.clock.decision_session
                 and account.clock.next_execution_session == action.decision.clock.next_execution_session
+            )
+
+    def confirms_stop_replacement(
+        self,
+        intent: StopUpdateIntent,
+        *,
+        old_broker_order_id: str | None,
+        new_client_order_id: str,
+        new_broker_order_id: str,
+        symbol: str,
+        quantity: Decimal,
+    ) -> bool:
+        """Require the fake broker's durable physical stop-swap receipt."""
+        with self._lock:
+            if self.receipt_store_path is None:
+                return False
+            with closing(sqlite3.connect(str(self.receipt_store_path))) as conn:
+                row = conn.execute(
+                    "SELECT * FROM fake_exit_stop_receipts WHERE new_broker_order_id=?",
+                    (new_broker_order_id,),
+                ).fetchone()
+            if row is None:
+                return False
+            account = self._account
+            stops = tuple(item for item in account.open_orders if item.broker_order_id == new_broker_order_id)
+            return (
+                len(stops) == 1
+                and row[0] == new_broker_order_id
+                and (old_broker_order_id is None or row[1] == old_broker_order_id)
+                and row[1] != new_broker_order_id
+                and row[2] == new_client_order_id
+                and row[3] == account.account_snapshot_id
+                and row[4] == account.paper_account_environment_id
+                and row[5] == account.decision_slot_id
+                and row[6] == account.decision_id == intent.decision_id
+                and row[7] == account.clock.completed_session.isoformat()
+                and row[8] == account.clock.next_execution_session.isoformat()
+                and row[9] == symbol
+                and Decimal(row[10]) == quantity
+                and Decimal(row[11]) == intent.requested_stop_price
+                and stops[0].purpose == "protective_stop"
+                and stops[0].client_order_id == new_client_order_id
+                and stops[0].symbol == symbol
+                and Decimal(str(stops[0].requested_quantity)) == quantity
+                and stops[0].stop_price is not None
+                and Decimal(str(stops[0].stop_price)) == intent.requested_stop_price
             )
 
     def confirms_flat_exit(self, action: ActionIntent, stop_broker_order_id: str) -> bool:
@@ -590,4 +656,28 @@ class FakeProtectedExitBroker:
             for group in self._groups.values():
                 if group["stop_broker_order_id"] == current.broker_order_id:
                     group["stop_broker_order_id"] = new_broker_id
+            self._persist_stop_receipt(current, new_order)
+            if self._response_mode == "timeout_after_stop_replace":
+                raise TimeoutError("fake broker response lost after atomic stop replacement")
             return self._account
+
+    def _persist_stop_receipt(self, old: BrokerOrderFact, new: BrokerOrderFact) -> None:
+        if self.receipt_store_path is None:
+            return
+        account = self._account
+        values = (
+            new.broker_order_id, old.broker_order_id, new.client_order_id,
+            account.account_snapshot_id, account.paper_account_environment_id,
+            account.decision_slot_id, account.decision_id,
+            account.clock.completed_session.isoformat(), account.clock.next_execution_session.isoformat(),
+            new.symbol, str(Decimal(str(new.requested_quantity))), str(Decimal(str(new.stop_price))),
+        )
+        with closing(sqlite3.connect(str(self.receipt_store_path))) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("INSERT OR IGNORE INTO fake_exit_stop_receipts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", values)
+            stored = conn.execute(
+                "SELECT * FROM fake_exit_stop_receipts WHERE new_broker_order_id=?", (new.broker_order_id,)
+            ).fetchone()
+            if stored != values:
+                raise ValueError("fake broker stop receipt conflicts with immutable source facts")
+            conn.commit()
