@@ -357,7 +357,7 @@ def capture_readiness_source_v5(
                     "text=auto eol=crlf",
                 }
                 normalize = normalize or (not attributes and autocrlf in {"true", "input"})
-                if flags[:2] != ["i/lf", "w/crlf"] or not normalize or b"\0" in raw:
+                if flags[:2] not in (["i/lf", "w/crlf"], ["i/lf", "w/mixed"]) or not normalize or b"\0" in raw:
                     raise ValueError("working source differs")
                 raw = raw.replace(b"\r\n", b"\n")
                 if blob_id(raw) != oid:
@@ -535,6 +535,8 @@ def _identities(repository, attempt, prior, confirmed_outcome):
     """Authenticate frozen source/evaluator ancestry without composing workers."""
     selection = _load(repository, prior.frozen_selection_ref, confirmation.FrozenConfirmationSelectionV5)
     manifest = _load(repository, prior.discovery_manifest_ref, CampaignManifestV5)
+    if manifest.pit_data_scope != "production":
+        raise ValueError("full replay requires production discovery authority")
     discovery = _load(repository, manifest.panel_plan_ref, CampaignPanelPlanV5)
     finalization = _load(repository, selection.finalized_campaign_ref, FinalizedDiscoveryCampaignV5)
     evaluator = _load(repository, attempt.evaluator_contract_ref, EvaluatorContractV5)

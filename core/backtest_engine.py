@@ -2182,9 +2182,9 @@ class PortfolioSimulator:
         policy_client_factory: StrategyPolicyClientFactory | None = None,
         execution_profile: ExecutionProfileV5 | None = None,
         friction_scenario: FrictionScenario | None = None,
-        pit_data_scope: Literal["production", "development_sp500_v2"] = "production",
+        pit_data_scope: Literal["production", "development_sp500_v2", "engineering_v3"] = "production",
     ) -> None:
-        if pit_data_scope not in {"production", "development_sp500_v2"}:
+        if pit_data_scope not in {"production", "development_sp500_v2", "engineering_v3"}:
             raise ValueError("simulator PIT data scope is invalid")
         if pit_data_scope == "development_sp500_v2" and (
             execution_profile is None
@@ -2193,6 +2193,13 @@ class PortfolioSimulator:
             or type(identity_transition_contract) is not PriceIdentityTransitionContract
         ):
             raise ValueError("development scope requires V5 execution and authenticated schema-V2 PIT data")
+        if pit_data_scope == "engineering_v3" and (
+            execution_profile is None
+            or pit_bundle is None
+            or pit_bundle.metadata.get("schema_version") != "3"
+            or type(identity_transition_contract) is not PriceIdentityTransitionContract
+        ):
+            raise ValueError("engineering scope requires V5 execution and authenticated schema-V3 PIT data")
         if (execution_profile is None) != (friction_scenario is None):
             raise ValueError(
                 "execution_profile and friction_scenario must be supplied together"

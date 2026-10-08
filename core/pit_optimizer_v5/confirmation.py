@@ -348,6 +348,8 @@ def build_confirmation_attempt(
 
     authorities = authenticate_campaign_manifest_v5(repository=repository, manifest_ref=discovery_manifest_ref)
     manifest, plan = authorities.manifest, authorities.panel_plan
+    if manifest.pit_data_scope != "production":
+        raise ValueError("confirmation requires production discovery authority")
     if confirmation_plan_ref.sha256 != plan.confirmation_plan_sha256:
         raise ValueError("confirmation plan is not the discovery commitment")
     adapter = _load(repository, execution_adapter_ref, ConfirmationAdapterConfigV5)
@@ -481,6 +483,8 @@ def _inputs(repository, attempt_ref, attempt):
     selection = _load(repository, attempt.frozen_selection_ref, FrozenConfirmationSelectionV5)
     finalization = _load(repository, selection.finalized_campaign_ref, FinalizedDiscoveryCampaignV5)
     manifest = _load(repository, attempt.discovery_manifest_ref, CampaignManifestV5)
+    if manifest.pit_data_scope != "production":
+        raise ValueError("confirmation requires production discovery authority")
     discovery = _load(repository, manifest.panel_plan_ref, CampaignPanelPlanV5)
     _walk(
         repository,

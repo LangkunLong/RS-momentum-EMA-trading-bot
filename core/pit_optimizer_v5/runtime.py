@@ -1272,7 +1272,7 @@ class _Runtime:
                 if type(reconciled) is RoleReconciliationFailureV5:
                     if (
                         reconciled.failure_code == "pending"
-                        and self.inputs.manifest.pit_data_scope == "development_sp500_v2"
+                        and self.inputs.manifest.pit_data_scope in {"development_sp500_v2", "engineering_v3"}
                         and self.inputs.manifest.provider is None
                     ):
                         raise ControllerRoleResponsePendingV5(call)
@@ -1311,7 +1311,7 @@ class _Runtime:
     def _valid_terminal_authority(self, package: RoleInvocationPackageV5) -> bool:
         authority_type = type(package.terminal_authority)
         if (
-            self.inputs.manifest.pit_data_scope == "development_sp500_v2"
+            self.inputs.manifest.pit_data_scope in {"development_sp500_v2", "engineering_v3"}
             and self.inputs.manifest.provider is None
         ):
             return authority_type is ControllerRoleTerminalAuthorityV5
@@ -3104,6 +3104,16 @@ class _Runtime:
         if not investigator_package.accepted or type(investigator_package.artifact) is not InvestigatorArtifactV5:
             raise _RuntimeAbort(RuntimeFailureV5("investigator", "role_rejected", role="investigator"))
         investigator = investigator_package.artifact
+        if self.inputs.manifest.pit_data_scope == "engineering_v3" and self.inputs.round_index > 1:
+            measured_ids = tuple(
+                item.evidence_id for item in investigator_request.role_evidence.items
+                if item.metric_id == "prior_experiment.campaign_cagr_pct"
+            )
+            if len(measured_ids) != 1 or any(
+                measured_ids[0] not in hypothesis.evidence_ids
+                for hypothesis in investigator.hypotheses
+            ):
+                raise _RuntimeAbort(RuntimeFailureV5("investigator", "invalid_dependency_result", role="investigator"))
 
         deadline = self._deadline("novelty", self.inputs.manifest.resources.round_wall_timeout_seconds)
         try:

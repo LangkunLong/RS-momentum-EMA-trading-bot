@@ -736,7 +736,7 @@ class CandidateArchiveReducerV5:
     target: AnnualizedReturnTargetV5
     authorities: tuple[ArchiveRecordAuthorityV5, ...]
     capacity: int = DEFAULT_ARCHIVE_CAPACITY_V5
-    pit_data_scope: Literal["production", "development_sp500_v2"] = "production"
+    pit_data_scope: Literal["production", "development_sp500_v2", "engineering_v3"] = "production"
     semantic_mode: Literal["required", "disabled_development"] = "required"
 
     def __post_init__(self) -> None:
@@ -820,7 +820,7 @@ class BaselineParentAuthorityV5:
     campaign: CampaignEvidenceV5
     source_bundle: SourceBundleV5
     source_bundle_ref: ArtifactRefV5
-    pit_data_scope: Literal["production", "development_sp500_v2"] = "production"
+    pit_data_scope: Literal["production", "development_sp500_v2", "engineering_v3"] = "production"
     semantic_mode: Literal["required", "disabled_development"] = "required"
 
     def __post_init__(self) -> None:
@@ -836,7 +836,7 @@ class BaselineParentAuthorityV5:
         validate_semantic_mode_v5(self.pit_data_scope, self.semantic_mode)
         if (self.semantic_fingerprint is None) != (self.semantic_mode == "disabled_development"):
             raise ValueError("baseline fingerprint differs from semantic mode")
-        if self.pit_data_scope not in {"production", "development_sp500_v2"}:
+        if self.pit_data_scope not in {"production", "development_sp500_v2", "engineering_v3"}:
             raise ValueError("baseline parent PIT data scope is invalid")
         if (
             self.policy_revision_ref.sha256 != self.policy_revision.sha256
@@ -865,7 +865,7 @@ class ParentCandidateV5:
     experiment_record_ref: ArtifactRefV5 | None
     primary_mechanism: PrimaryMechanismV5 | None
     admitted_round: int | None
-    pit_data_scope: Literal["production", "development_sp500_v2"] = "production"
+    pit_data_scope: Literal["production", "development_sp500_v2", "engineering_v3"] = "production"
     semantic_mode: Literal["required", "disabled_development"] = "required"
 
     def __post_init__(self) -> None:
@@ -931,7 +931,7 @@ def baseline_parent_candidate_v5(
     authority: BaselineParentAuthorityV5,
     discovery_plan: CampaignPanelPlanV5,
     evaluator_contract: EvaluatorContractV5,
-    pit_data_scope: Literal["production", "development_sp500_v2"],
+    pit_data_scope: Literal["production", "development_sp500_v2", "engineering_v3"],
 ) -> ParentCandidateV5:
     if type(authority) is not BaselineParentAuthorityV5:
         raise ValueError("baseline authority is invalid")

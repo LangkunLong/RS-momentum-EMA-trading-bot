@@ -365,7 +365,7 @@ class ExperimentRecordV5:
     critic_review: CriticReviewV5 | None
     artifact_refs: tuple[ArtifactRefV5, ...]
     critic_artifact_ref: ArtifactRefV5 | None = None
-    pit_data_scope: Literal["production", "development_sp500_v2"] = "production"
+    pit_data_scope: Literal["production", "development_sp500_v2", "engineering_v3"] = "production"
     semantic_mode: Literal["required", "disabled_development"] = "required"
 
     def __post_init__(self) -> None:
@@ -632,7 +632,7 @@ class RoundIntentPayloadV5:
     parent_semantic_fingerprint_sha256: str | None
     hypothesis: HypothesisV5
     discovery_plan_sha256: str
-    pit_data_scope: Literal["production", "development_sp500_v2"] = "production"
+    pit_data_scope: Literal["production", "development_sp500_v2", "engineering_v3"] = "production"
     semantic_mode: Literal["required", "disabled_development"] = "required"
 
     def __post_init__(self) -> None:
@@ -832,7 +832,7 @@ class QuickEvidencePayloadV5:
     experiment_id: str
     semantic_fingerprint: SemanticFingerprintV5 | None
     evaluation: PanelEvaluationV5
-    pit_data_scope: Literal["production", "development_sp500_v2"] = "production"
+    pit_data_scope: Literal["production", "development_sp500_v2", "engineering_v3"] = "production"
     semantic_mode: Literal["required", "disabled_development"] = "required"
 
     def __post_init__(self) -> None:

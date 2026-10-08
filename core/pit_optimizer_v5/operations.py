@@ -110,6 +110,10 @@ def _owner_token(value: str) -> str:
 
 
 def _authorities(authenticated: AuthenticatedCampaignManifestV5) -> CampaignAuthoritiesV5:
+    if authenticated.manifest.pit_data_scope == "engineering_v3":
+        raise ProductionOperationFailureV5(
+            "engineering_v3 requires its separate bounded research composition"
+        )
     return CampaignAuthoritiesV5(
         authenticated.manifest,
         authenticated.panel_plan,
