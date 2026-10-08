@@ -428,6 +428,8 @@ def run_scheduler(
     observe_health: bool = False,
     observation_stop_at: datetime | None = None,
     observation_hard_deadline_at: datetime | None = None,
+    selected_policy: bool = False,
+    policy_orchestrator: object | None = None,
 ) -> None:
     """Start the daily trading loop.
 
@@ -437,8 +439,19 @@ def run_scheduler(
             waiting for 09:31 ET.  Useful for manual testing during market hours.
         stop_after_session: Exit after the 16:05 ET monitoring window. Intended
             for one weekday invocation from Windows Task Scheduler.
+        selected_policy: Route this scheduler through the supplied policy
+            orchestrator and omit the legacy hourly exit monitor.
     """
     require_paper_mode()
+    if type(selected_policy) is not bool:
+        raise TypeError("selected_policy must be boolean")
+    if selected_policy:
+        if policy_orchestrator is None or not callable(getattr(policy_orchestrator, "run", None)):
+            raise ValueError("selected-policy scheduler requires an explicit valid policy orchestrator")
+        if observe_health:
+            raise ValueError("selected-policy scheduler cannot replace the read-only observer")
+    elif policy_orchestrator is not None:
+        raise ValueError("policy_orchestrator requires explicit selected-policy scheduler mode")
     if observe_health and (not dry_run or not run_now or not stop_after_session):
         raise ValueError(
             "Health observation requires dry-run, --now, and --session"
@@ -468,6 +481,8 @@ def run_scheduler(
             observe_health=observe_health,
             observation_stop_at=observation_stop_at,
             observation_hard_deadline_at=observation_hard_deadline_at,
+            selected_policy=selected_policy,
+            policy_orchestrator=policy_orchestrator,
         )
 
 
@@ -479,8 +494,12 @@ def _run_scheduler_locked(
     observe_health: bool = False,
     observation_stop_at: datetime | None = None,
     observation_hard_deadline_at: datetime | None = None,
+    selected_policy: bool = False,
+    policy_orchestrator: object | None = None,
 ) -> None:
     """Run one scheduler process after the singleton has been acquired."""
+    if selected_policy and (policy_orchestrator is None or not callable(getattr(policy_orchestrator, "run", None))):
+        raise ValueError("selected-policy scheduler requires an explicit valid policy orchestrator")
     mode = "DRY RUN" if dry_run else "paper"
     print(f"[SCHEDULER] Starting CANSLIM scheduler [{mode}]")
     print("[SCHEDULER] Press Ctrl-C to stop.")
@@ -622,12 +641,18 @@ def _run_scheduler_locked(
                             ),
                         )
                     else:
-                        _run_cycle(dry_run)
+                        if selected_policy:
+                            _run_cycle(dry_run, policy_orchestrator=policy_orchestrator)
+                        else:
+                            _run_cycle(dry_run)
                 else:
-                    _run_cycle(
-                        dry_run,
-                        execution_ready=live_execution_ready,
-                    )
+                    if selected_policy:
+                        _run_cycle(
+                            dry_run, execution_ready=live_execution_ready,
+                            policy_orchestrator=policy_orchestrator,
+                        )
+                    else:
+                        _run_cycle(dry_run, execution_ready=live_execution_ready)
             except Exception as exc:  # noqa: BLE001
                 print(f"[SCHEDULER ERROR] Immediate scan failed: {exc}")
             finally:
@@ -770,19 +795,25 @@ def _run_scheduler_locked(
                                     ),
                                 )
                             else:
-                                _run_cycle(dry_run)
+                                if selected_policy:
+                                    _run_cycle(dry_run, policy_orchestrator=policy_orchestrator)
+                                else:
+                                    _run_cycle(dry_run)
                         else:
-                            _run_cycle(
-                                dry_run,
-                                execution_ready=live_execution_ready,
-                            )
+                            if selected_policy:
+                                _run_cycle(
+                                    dry_run, execution_ready=live_execution_ready,
+                                    policy_orchestrator=policy_orchestrator,
+                                )
+                            else:
+                                _run_cycle(dry_run, execution_ready=live_execution_ready)
                     except Exception as exc:  # noqa: BLE001
                         print(f"[SCHEDULER ERROR] Daily scan failed: {exc}")
 
             # ── Hourly exit check (09:30–16:05 window) ────────────────────────
             # Runs once per clock hour at :01 past.  The extended window to
             # 16:05 ensures the 15:00–16:00 bar is always evaluated at 16:01.
-            if exit_session_live:
+            if exit_session_live and not selected_policy:
                 if observe_health:
                     now = _now_et()
                     today = now.date()
@@ -1031,6 +1062,7 @@ def _run_cycle(
     dry_run: bool,
     *,
     execution_ready: ExecutionReadinessCheck | None = None,
+    policy_orchestrator: object | None = None,
 ) -> None:
     """Run the full auto-trader cycle and send a cycle summary email.
 
@@ -1042,7 +1074,13 @@ def _run_cycle(
     # run_auto_trader handles its own market-clock guard and prints everything.
     # The cycle summary email is best-effort — notification failure must not
     # prevent the trading cycle from completing.
-    if execution_ready is None:
+    if policy_orchestrator is not None:
+        result = run_auto_trader(
+            dry_run=dry_run,
+            execution_ready=execution_ready,
+            policy_orchestrator=policy_orchestrator,
+        )
+    elif execution_ready is None:
         result = run_auto_trader(dry_run=dry_run)
     else:
         result = run_auto_trader(

@@ -160,6 +160,65 @@ def test_scheduled_cycle_receives_dynamic_monitor_readiness() -> None:
     assert observed == [False]
 
 
+@pytest.mark.parametrize("runtime_fails", [False, True])
+@pytest.mark.parametrize("run_now", [False, True])
+def test_selected_policy_scheduler_never_runs_legacy_exit_monitors(runtime_fails: bool, run_now: bool) -> None:
+    selected = MagicMock()
+    if runtime_fails:
+        selected.run.side_effect = RuntimeError("selected runtime unavailable")
+    else:
+        selected.run.return_value = SimpleNamespace(entered=(), exited=())
+    with (
+        patch("scheduler._now_et", return_value=datetime(2026, 8, 17, 10, 1, tzinfo=_ET)),
+        patch("scheduler._market_clock_is_open", return_value=True),
+        patch("scheduler.time.sleep", side_effect=KeyboardInterrupt),
+        patch("scheduler._run_startup_stop_reconciliation"),
+        patch("scheduler.notify_cycle_summary"),
+        patch("scheduler.monitor_exits_hourly") as hourly,
+        patch("auto_trader.monitor_and_exit_positions") as daily,
+    ):
+        scheduler.run_scheduler(
+            dry_run=True, run_now=run_now, selected_policy=True, policy_orchestrator=selected,
+        )
+    selected.run.assert_called_once()
+    hourly.assert_not_called()
+    daily.assert_not_called()
+
+
+def test_selected_policy_scheduler_requires_a_valid_explicit_runtime() -> None:
+    with patch("scheduler._run_scheduler_locked") as locked:
+        with pytest.raises(ValueError, match="explicit valid policy orchestrator"):
+            scheduler.run_scheduler(dry_run=True, selected_policy=True)
+        with pytest.raises(ValueError, match="explicit valid policy orchestrator"):
+            scheduler.run_scheduler(dry_run=True, selected_policy=True, policy_orchestrator=object())
+        with pytest.raises(ValueError, match="requires explicit selected-policy"):
+            scheduler.run_scheduler(dry_run=True, policy_orchestrator=MagicMock())
+    locked.assert_not_called()
+
+
+def test_order_enabled_selected_scheduler_keeps_legacy_exits_disabled() -> None:
+    selected = MagicMock()
+    selected.run.return_value = SimpleNamespace(entered=(), exited=())
+    monitor = MagicMock()
+    monitor.is_connected.return_value = True
+    with (
+        patch("scheduler._now_et", return_value=datetime(2026, 8, 17, 10, 1, tzinfo=_ET)),
+        patch("scheduler._market_clock_is_open", return_value=True),
+        patch("scheduler._run_startup_stop_reconciliation"),
+        patch("scheduler.FillMonitor", return_value=monitor),
+        patch("scheduler.time.sleep", side_effect=KeyboardInterrupt),
+        patch("scheduler.notify_cycle_summary"),
+        patch("scheduler.monitor_exits_hourly") as hourly,
+        patch("auto_trader.monitor_and_exit_positions") as daily,
+    ):
+        scheduler.run_scheduler(
+            dry_run=False, selected_policy=True, policy_orchestrator=selected,
+        )
+    selected.run.assert_called_once()
+    hourly.assert_not_called()
+    daily.assert_not_called()
+
+
 def test_session_mode_exits_after_monitoring_window_without_sleeping() -> None:
     with (
         patch(
