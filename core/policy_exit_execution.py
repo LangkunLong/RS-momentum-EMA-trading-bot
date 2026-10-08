@@ -262,6 +262,118 @@ def dispatch_policy_exit(
 
 
 @dataclass(frozen=True, slots=True)
+class PolicyExitCancel:
+    disposition: Literal["cancelled", "reconcile", "blocked"]
+    action: ActionIntent
+    reason: str = ""
+
+
+def confirm_policy_exit_cancel(
+    store: PolicyExecutionStateStore,
+    logical_action_id: str,
+    *,
+    broker: FakeProtectedExitBroker,
+    observed_at: datetime,
+) -> PolicyExitCancel:
+    """Resolve a partial sell only after exact terminal broker and position evidence."""
+    from core.fake_policy_exit_broker import FakeProtectedExitBroker
+
+    if type(broker) is not FakeProtectedExitBroker or broker.receipt_store_path is None:
+        raise TypeError("policy exit cancel requires a durable atomic fake-paper broker")
+    action = store.load_action_intent(logical_action_id)
+    if action.role not in {ActionRole.SCALE_OUT, ActionRole.CLOSE} or action.side is not OrderSide.SELL:
+        raise ValueError("policy exit cancel requires a fixed sell")
+    if action.status is ActionStatus.RESOLVED:
+        attempt = action.order_attempts[0]
+        if (
+            attempt.terminal_status is ActionAttemptStatus.CANCELLED
+            and action.confirmed_filled_quantity > 0
+            and broker.confirms_cancelled_remainder(action)
+        ):
+            return PolicyExitCancel("cancelled", action)
+        return PolicyExitCancel("blocked", action, "resolved sell has no matching partial-cancel receipt")
+    if action.status not in {ActionStatus.CANCEL_REQUESTED, ActionStatus.REMAINDER_READY}:
+        return PolicyExitCancel("blocked", action, "sell has no pending partial remainder cancel")
+    holding = store.load_holding_episode(action.holding_episode_id)
+    account = broker.snapshot()
+    if not broker.confirms_cancelled_remainder(action):
+        return PolicyExitCancel("reconcile", action, "exact terminal fake-broker cancel evidence is unavailable")
+    stops = tuple(
+        row for row in account.open_orders
+        if row.broker_order_id == holding.confirmed_stop_broker_order_id
+        and row.client_order_id == holding.confirmed_stop_client_order_id
+        and row.status in _WORKING_STATUSES
+    )
+    if (
+        len(stops) != 1
+        or stops[0].holding_episode_id != holding.holding_episode_id
+        or Decimal(str(stops[0].requested_quantity)) < holding.remaining_quantity
+        or action.logical_action_id not in holding.pending_action_ids
+        or any(item != action.logical_action_id for item in holding.pending_action_ids)
+        or _other_working_sell(account, action, stops[0])
+        or any(row.symbol == action.broker_symbol and Decimal(str(row.quantity)) != holding.remaining_quantity
+               for row in account.positions)
+        or len(tuple(row for row in account.positions if row.symbol == action.broker_symbol)) != 1
+    ):
+        return PolicyExitCancel("reconcile", action, "broker position or confirmed stop differs from partial sell")
+    if action.status is ActionStatus.CANCEL_REQUESTED:
+        projection = store.load_action_projection(logical_action_id)
+        store.confirm_order_terminal(
+            logical_action_id,
+            1,
+            terminal_status=ActionAttemptStatus.CANCELLED,
+            expected_action_version=projection.state_version,
+            expected_holding_version=holding.state_version,
+            observed_at=observed_at,
+        )
+        holding = store.load_holding_episode(action.holding_episode_id)
+    projection = store.load_action_projection(logical_action_id)
+    store.record_explicit_action_resolution(
+        logical_action_id,
+        resolution_reason=f"partial exit terminal cancel and position confirmed by {account.account_snapshot_id}",
+        expected_action_version=projection.state_version,
+        expected_holding_version=holding.state_version,
+        observed_at=observed_at,
+    )
+    return PolicyExitCancel("cancelled", store.load_action_intent(logical_action_id))
+
+
+def cancel_policy_exit_remainder(
+    store: PolicyExecutionStateStore,
+    logical_action_id: str,
+    *,
+    broker: FakeProtectedExitBroker,
+    observed_at: datetime,
+) -> PolicyExitCancel:
+    """Persist the cancel intent before a one-use fake-broker cancel call."""
+    from core.fake_policy_exit_broker import FakeProtectedExitBroker
+
+    if type(broker) is not FakeProtectedExitBroker or broker.receipt_store_path is None:
+        raise TypeError("policy exit cancel requires a durable atomic fake-paper broker")
+    action = store.load_action_intent(logical_action_id)
+    if action.role not in {ActionRole.SCALE_OUT, ActionRole.CLOSE} or action.side is not OrderSide.SELL:
+        raise ValueError("policy exit cancel requires a fixed sell")
+    if action.status in {ActionStatus.CANCEL_REQUESTED, ActionStatus.REMAINDER_READY, ActionStatus.RESOLVED}:
+        return confirm_policy_exit_cancel(store, logical_action_id, broker=broker, observed_at=observed_at)
+    if action.status is not ActionStatus.PARTIALLY_FILLED or action.confirmed_filled_quantity <= 0:
+        return PolicyExitCancel("blocked", action, "only a confirmed partial sell can cancel its remainder")
+    attempt = action.order_attempts[0]
+    if not attempt.broker_order_id or not attempt.client_order_id:
+        return PolicyExitCancel("blocked", action, "partial sell lacks fixed broker order references")
+    projection = store.load_action_projection(logical_action_id)
+    store.request_order_cancel(
+        logical_action_id, 1,
+        expected_action_version=projection.state_version,
+        observed_at=observed_at,
+    )
+    try:
+        broker.cancel_sell_remainder(attempt.broker_order_id)
+    except Exception as exc:
+        return PolicyExitCancel("reconcile", store.load_action_intent(logical_action_id), f"sell cancel outcome uncertain: {exc}")
+    return confirm_policy_exit_cancel(store, logical_action_id, broker=broker, observed_at=observed_at)
+
+
+@dataclass(frozen=True, slots=True)
 class PolicyExitProtection:
     disposition: Literal["protected", "reconcile", "blocked", "flat"]
     action: ActionIntent

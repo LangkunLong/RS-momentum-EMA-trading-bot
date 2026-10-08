@@ -35,8 +35,11 @@ from core.policy_addition import (
 
 from core.fake_policy_exit_broker import FakeProtectedExitBroker
 from core.policy_exit_execution import (
+    PolicyExitCancel,
     PolicyExitDispatch,
     PolicyExitProtection,
+    cancel_policy_exit_remainder,
+    confirm_policy_exit_cancel,
     confirm_policy_exit_protection as confirm_exit_protection,
     dispatch_policy_exit,
     replace_policy_exit_protection as replace_exit_protection,
@@ -1022,6 +1025,36 @@ class OrderManager:
                 provider_id=ports.provider_id,
                 observed_at=ports.observed_at(),
                 broker=ports.broker,
+            )
+
+    def cancel_policy_exit_remainder(
+        self,
+        logical_action_id: str,
+        *,
+        ports: ExitExecutionPorts,
+    ) -> PolicyExitCancel:
+        """Cancel a confirmed partial fake sell without risking a second request."""
+        if type(ports) is not ExitExecutionPorts or self._policy_store is not ports.store:
+            raise ValueError("exit ports and OrderManager must share one policy store")
+        with _FILL_HANDLING_LOCK:
+            return cancel_policy_exit_remainder(
+                ports.store, logical_action_id,
+                broker=ports.broker, observed_at=ports.observed_at(),
+            )
+
+    def confirm_policy_exit_cancel(
+        self,
+        logical_action_id: str,
+        *,
+        ports: ExitExecutionPorts,
+    ) -> PolicyExitCancel:
+        """Finish a previously uncertain partial cancel from current fake-broker facts."""
+        if type(ports) is not ExitExecutionPorts or self._policy_store is not ports.store:
+            raise ValueError("exit ports and OrderManager must share one policy store")
+        with _FILL_HANDLING_LOCK:
+            return confirm_policy_exit_cancel(
+                ports.store, logical_action_id,
+                broker=ports.broker, observed_at=ports.observed_at(),
             )
 
     def submit_replacement_sell(
