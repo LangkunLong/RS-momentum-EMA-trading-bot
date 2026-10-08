@@ -14,8 +14,11 @@ import pytest
 import pandas as pd
 
 import scheduler
+from core.order_manager import OrderManager
+from core.policy_execution_store import PolicyExecutionStateStore
 from core.scheduler_observation import SchedulerObservation, activate_scheduler_observation
 from config import settings
+from fill_monitor import FillMonitor
 
 
 _ET = ZoneInfo("America/New_York")
@@ -158,6 +161,121 @@ def test_scheduled_cycle_receives_dynamic_monitor_readiness() -> None:
         scheduler.run_scheduler(dry_run=False)
 
     assert observed == [False]
+
+
+@pytest.mark.parametrize("runtime_fails", [False, True])
+@pytest.mark.parametrize("run_now", [False, True])
+def test_selected_policy_scheduler_never_runs_legacy_exit_monitors(runtime_fails: bool, run_now: bool) -> None:
+    selected = MagicMock()
+    if runtime_fails:
+        selected.run.side_effect = RuntimeError("selected runtime unavailable")
+    else:
+        selected.run.return_value = SimpleNamespace(entered=(), exited=())
+    with (
+        patch("scheduler._now_et", return_value=datetime(2026, 8, 17, 10, 1, tzinfo=_ET)),
+        patch("scheduler._market_clock_is_open", return_value=True),
+        patch("scheduler.time.sleep", side_effect=KeyboardInterrupt),
+        patch("scheduler._run_startup_stop_reconciliation"),
+        patch("scheduler.notify_cycle_summary"),
+        patch("scheduler.monitor_exits_hourly") as hourly,
+        patch("auto_trader.monitor_and_exit_positions") as daily,
+    ):
+        scheduler.run_scheduler(
+            dry_run=True, run_now=run_now, selected_policy=True, policy_orchestrator=selected,
+        )
+    selected.run.assert_called_once()
+    hourly.assert_not_called()
+    daily.assert_not_called()
+
+
+def test_selected_policy_scheduler_requires_a_valid_explicit_runtime() -> None:
+    with patch("scheduler._run_scheduler_locked") as locked:
+        with pytest.raises(ValueError, match="explicit valid policy orchestrator"):
+            scheduler.run_scheduler(dry_run=True, selected_policy=True)
+        with pytest.raises(ValueError, match="explicit valid policy orchestrator"):
+            scheduler.run_scheduler(dry_run=True, selected_policy=True, policy_orchestrator=object())
+        with pytest.raises(ValueError, match="requires explicit selected-policy"):
+            scheduler.run_scheduler(dry_run=True, policy_orchestrator=MagicMock())
+    locked.assert_not_called()
+
+
+def test_order_enabled_selected_scheduler_rejects_unbound_manager(tmp_path) -> None:
+    store = PolicyExecutionStateStore(tmp_path / "selected.sqlite", store_identity="scheduler:selected")
+    selected = SimpleNamespace(policy_store=store, order_manager=OrderManager(paper=True), run=MagicMock())
+    with (
+        patch("scheduler._run_scheduler_locked") as locked,
+        patch("scheduler._run_startup_stop_reconciliation") as startup,
+        patch("scheduler.FillMonitor") as monitor,
+        patch("scheduler.monitor_exits_hourly") as hourly,
+        patch("auto_trader.monitor_and_exit_positions") as daily,
+    ):
+        with pytest.raises(ValueError, match="shared policy store and OrderManager"):
+            scheduler.run_scheduler(dry_run=False, selected_policy=True, policy_orchestrator=selected)
+    locked.assert_not_called()
+    startup.assert_not_called()
+    monitor.assert_not_called()
+    selected.run.assert_not_called()
+    hourly.assert_not_called()
+    daily.assert_not_called()
+
+
+def test_order_enabled_selected_scheduler_shares_policy_manager_with_monitor_and_startup(tmp_path) -> None:
+    store = PolicyExecutionStateStore(tmp_path / "selected.sqlite", store_identity="scheduler:selected")
+    manager = OrderManager(paper=True, policy_store=store)
+    manager.reconcile_startup_stops = MagicMock(return_value=[])
+    selected = SimpleNamespace(
+        policy_store=store,
+        order_manager=manager,
+        run=MagicMock(return_value=SimpleNamespace(entered=(), exited=())),
+    )
+    monitor = MagicMock()
+    monitor.is_connected.return_value = True
+    with (
+        patch("scheduler._now_et", return_value=datetime(2026, 8, 17, 10, 1, tzinfo=_ET)),
+        patch("scheduler._market_clock_is_open", return_value=True),
+        patch("scheduler.time.sleep", side_effect=KeyboardInterrupt),
+        patch("scheduler.notify_cycle_summary"),
+        patch("scheduler.FillMonitor", return_value=monitor) as monitor_factory,
+        patch("scheduler.monitor_exits_hourly") as hourly,
+        patch("auto_trader.monitor_and_exit_positions") as daily,
+    ):
+        scheduler.run_scheduler(
+            dry_run=False, run_now=True, selected_policy=True, policy_orchestrator=selected,
+        )
+    monitor_factory.assert_called_once_with(order_manager=manager)
+    manager.reconcile_startup_stops.assert_called_once_with()
+    selected.run.assert_called_once()
+    hourly.assert_not_called()
+    daily.assert_not_called()
+
+
+def test_selected_policy_reconnect_reuses_same_policy_manager(tmp_path) -> None:
+    store = PolicyExecutionStateStore(tmp_path / "selected.sqlite", store_identity="scheduler:selected")
+    manager = OrderManager(paper=True, policy_store=store)
+    manager.reconcile_startup_stops = MagicMock(return_value=[])
+    stale = MagicMock()
+    stale.is_connected.return_value = False
+    stale.stop.return_value = True
+    replacement = MagicMock()
+    replacement.is_connected.return_value = True
+    with patch("scheduler.FillMonitor", return_value=replacement) as monitor_factory:
+        recovered = scheduler._ensure_fill_monitor_running(
+            stale, dry_run=False, order_manager=manager,
+        )
+    assert recovered is replacement
+    monitor_factory.assert_called_once_with(order_manager=manager)
+    manager.reconcile_startup_stops.assert_called_once_with()
+
+
+def test_fill_monitor_retains_supplied_policy_manager(tmp_path) -> None:
+    store = PolicyExecutionStateStore(tmp_path / "selected.sqlite", store_identity="scheduler:selected")
+    manager = OrderManager(paper=True, policy_store=store)
+    with (
+        patch("fill_monitor.settings.load_runtime_credentials"),
+        patch("fill_monitor.TradingStream"),
+    ):
+        monitor = FillMonitor(order_manager=manager)
+    assert monitor._order_manager is manager
 
 
 def test_session_mode_exits_after_monitoring_window_without_sleeping() -> None:
