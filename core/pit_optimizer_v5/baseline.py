@@ -20,7 +20,12 @@ from typing import Literal, Protocol
 import uuid
 
 from core.backtest_fills import ExecutionProfileV5
-from core.pit_optimizer_v5.artifacts import _decode_dataclass, _extract_artifact_refs, _strict_json_object
+from core.pit_optimizer_v5.artifacts import (
+    _decode_dataclass,
+    _decode_semantic_fingerprint,
+    _extract_artifact_refs,
+    _strict_json_object,
+)
 from core.pit_optimizer_v5.candidate_ir import PolicyRevisionIdentityV5, SourceBundleV5
 from core.pit_optimizer_v5.contracts import (
     ArtifactRefV5,
@@ -653,7 +658,7 @@ class BaselineSandboxWorkerV5:
         primitive = _strict_json_object(raw, None)
         if set(primitive) != {"fingerprint", "policy_revision_sha256", "request_sha256", "suite_id"}:
             raise ValueError("baseline probe output schema is invalid")
-        fingerprint = _decode_dataclass(SemanticFingerprintV5, primitive["fingerprint"])
+        fingerprint = _decode_semantic_fingerprint(primitive["fingerprint"])
         if (
             primitive["request_sha256"] != request
             or primitive["policy_revision_sha256"] != self.inputs.policy.sha256
