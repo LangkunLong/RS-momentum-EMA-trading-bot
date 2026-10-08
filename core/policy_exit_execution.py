@@ -158,6 +158,8 @@ def dispatch_policy_exit(
 
     if type(broker) is not FakeProtectedExitBroker:
         raise TypeError("policy exit dispatch requires the atomic fake-paper broker")
+    if broker.receipt_store_path is None:
+        raise ValueError("policy exit dispatch requires a durable fake-broker receipt store")
 
     action = store.load_action_intent(logical_action_id)
     if action.role not in {ActionRole.SCALE_OUT, ActionRole.CLOSE} or action.side is not OrderSide.SELL:

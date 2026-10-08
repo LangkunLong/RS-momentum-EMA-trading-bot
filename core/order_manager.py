@@ -227,6 +227,8 @@ class ExitExecutionPorts:
             raise ValueError("exit provider_id must be non-empty")
         if type(self.broker) is not FakeProtectedExitBroker:
             raise TypeError("public exit execution requires the atomic fake-paper broker")
+        if self.broker.receipt_store_path is None:
+            raise ValueError("public exit execution requires a durable fake-broker receipt store")
         for name in (
             "execution_session",
             "observed_at",
@@ -1034,6 +1036,8 @@ class OrderManager:
             raise RuntimeError("policy exit protection requires an explicit policy store")
         if type(broker) is not FakeProtectedExitBroker:
             raise TypeError("policy exit confirmation requires the atomic fake-paper broker")
+        if broker.receipt_store_path is None:
+            raise ValueError("policy exit confirmation requires a durable fake-broker receipt store")
         with _FILL_HANDLING_LOCK:
             return confirm_exit_protection(
                 self._policy_store,

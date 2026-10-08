@@ -1,12 +1,16 @@
-"""In-memory paper-only broker for atomic shared-cap policy exits."""
+"""Paper-only broker with atomic shared-cap exits and explicit flat receipts."""
 
 from __future__ import annotations
 
+from contextlib import closing
 from dataclasses import replace
 from decimal import Decimal
 from hashlib import sha256
+from pathlib import Path
+import sqlite3
 from threading import RLock
 from typing import Literal
+from uuid import uuid4
 
 from core.policy_execution_state import ActionIntent, DecisionIdentity
 from core.policy_exit_execution import PolicyExitSubmissionResult
@@ -28,6 +32,7 @@ class FakeProtectedExitBroker:
         self,
         account: BrokerAccountSnapshot,
         *,
+        receipt_store_path: str | Path | None = None,
         response_mode: Literal["accepted", "reject_before_accept", "timeout_after_accept"] = "accepted",
     ) -> None:
         if type(account) is not BrokerAccountSnapshot or account.positions is None or account.open_orders is None:
@@ -37,10 +42,97 @@ class FakeProtectedExitBroker:
         self._lock = RLock()
         self._account = account
         self._response_mode = response_mode
-        self._sequence = 0
+        self.receipt_store_path = None if receipt_store_path is None else Path(receipt_store_path)
+        if self.receipt_store_path is not None:
+            if not self.receipt_store_path.parent.is_dir():
+                raise ValueError("fake broker receipt directory must already exist")
+            with closing(sqlite3.connect(str(self.receipt_store_path))) as conn:
+                conn.execute(
+                    """CREATE TABLE IF NOT EXISTS fake_exit_flat_receipts (
+                        sell_broker_order_id TEXT NOT NULL,
+                        initial_stop_broker_order_id TEXT NOT NULL,
+                        account_snapshot_id TEXT NOT NULL,
+                        paper_account_environment_id TEXT NOT NULL,
+                        decision_slot_id TEXT NOT NULL,
+                        decision_id TEXT NOT NULL,
+                        completed_session TEXT NOT NULL,
+                        next_execution_session TEXT NOT NULL,
+                        cap TEXT NOT NULL,
+                        used TEXT NOT NULL,
+                        PRIMARY KEY (sell_broker_order_id, account_snapshot_id)
+                    )"""
+                )
+                conn.commit()
         self._groups: dict[str, dict[str, object]] = {}
         self.submissions: list[dict[str, object]] = []
         self._recover_working_groups()
+
+    def _flat_receipt_values(self, group: dict[str, object], snapshot_id: str) -> tuple[str, ...]:
+        account = self._account
+        return (
+            str(group["sell_broker_order_id"]),
+            str(group["initial_stop_broker_order_id"]),
+            snapshot_id,
+            account.paper_account_environment_id,
+            account.decision_slot_id,
+            account.decision_id,
+            account.clock.completed_session.isoformat(),
+            account.clock.next_execution_session.isoformat(),
+            str(group["cap"]),
+            str(group["used"]),
+        )
+
+    def _persist_flat_receipt(self, group: dict[str, object], snapshot_id: str) -> None:
+        if self.receipt_store_path is None:
+            return
+        values = self._flat_receipt_values(group, snapshot_id)
+        with closing(sqlite3.connect(str(self.receipt_store_path))) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """INSERT OR IGNORE INTO fake_exit_flat_receipts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                values,
+            )
+            row = conn.execute(
+                """SELECT sell_broker_order_id, initial_stop_broker_order_id,
+                          account_snapshot_id, paper_account_environment_id,
+                          decision_slot_id, decision_id, completed_session,
+                          next_execution_session, cap, used
+                   FROM fake_exit_flat_receipts
+                   WHERE sell_broker_order_id=? AND account_snapshot_id=?""",
+                (values[0], values[2]),
+            ).fetchone()
+            if row != values:
+                raise ValueError("fake broker flat receipt conflicts with immutable source facts")
+            conn.commit()
+
+    def _read_flat_receipt(self, sell_id: str, snapshot_id: str) -> tuple[str, ...] | None:
+        if self.receipt_store_path is None:
+            return None
+        with closing(sqlite3.connect(str(self.receipt_store_path))) as conn:
+            row = conn.execute(
+                """SELECT sell_broker_order_id, initial_stop_broker_order_id,
+                          account_snapshot_id, paper_account_environment_id,
+                          decision_slot_id, decision_id, completed_session,
+                          next_execution_session, cap, used
+                   FROM fake_exit_flat_receipts
+                   WHERE sell_broker_order_id=? AND account_snapshot_id=?""",
+                (sell_id, snapshot_id),
+            ).fetchone()
+        return None if row is None else tuple(str(value) for value in row)
+
+    def _flat_receipts_for_snapshot(self, snapshot_id: str) -> tuple[tuple[str, ...], ...]:
+        if self.receipt_store_path is None:
+            return ()
+        with closing(sqlite3.connect(str(self.receipt_store_path))) as conn:
+            rows = conn.execute(
+                """SELECT sell_broker_order_id, initial_stop_broker_order_id,
+                          account_snapshot_id, paper_account_environment_id,
+                          decision_slot_id, decision_id, completed_session,
+                          next_execution_session, cap, used
+                   FROM fake_exit_flat_receipts WHERE account_snapshot_id=?""",
+                (snapshot_id,),
+            ).fetchall()
+        return tuple(tuple(str(value) for value in row) for row in rows)
 
     def _recover_working_groups(self) -> None:
         """Rebuild the cap from complete open orders and their cumulative fills."""
@@ -83,7 +175,7 @@ class FakeProtectedExitBroker:
             return self._account
 
     def confirms_flat_exit(self, action: ActionIntent, stop_broker_order_id: str) -> bool:
-        """Require this broker's own accepted group and terminal fill/cancel event."""
+        """Require a persisted terminal fill/cancel receipt for this exact snapshot."""
         with self._lock:
             if (
                 self._account.paper_account_environment_id
@@ -97,25 +189,30 @@ class FakeProtectedExitBroker:
                 or not action.order_attempts[0].broker_order_id
             ):
                 return False
-            groups = tuple(
-                group for group in self._groups.values()
-                if group["sell_broker_order_id"] == action.order_attempts[0].broker_order_id
-                and group["initial_stop_broker_order_id"] == stop_broker_order_id
-            )
-            if len(groups) != 1:
-                return False
-            group = groups[0]
             if (
-                not group.get("flat_completion_snapshot_id")
-                or Decimal(str(group["used"])) != Decimal(str(group["cap"]))
-                or any(row.symbol == action.broker_symbol for row in self._account.positions)
+                any(row.symbol == action.broker_symbol for row in self._account.positions)
                 or any(
                     row.symbol == action.broker_symbol and row.side == "sell" and row.status in _WORKING
                     for row in self._account.open_orders
                 )
             ):
                 return False
-            return True
+            sell_id = action.order_attempts[0].broker_order_id
+            receipt = self._read_flat_receipt(sell_id, self._account.account_snapshot_id)
+            if receipt is None:
+                return False
+            return (
+                receipt[0] == sell_id
+                and receipt[1] == stop_broker_order_id
+                and receipt[2] == self._account.account_snapshot_id
+                and receipt[3] == self._account.paper_account_environment_id
+                and receipt[4] == self._account.decision_slot_id
+                and receipt[5] == self._account.decision_id
+                and receipt[6] == self._account.clock.completed_session.isoformat()
+                and receipt[7] == self._account.clock.next_execution_session.isoformat()
+                and Decimal(receipt[8]) > 0
+                and Decimal(receipt[8]) == Decimal(receipt[9])
+            )
 
     def observe_for(self, decision: DecisionIdentity) -> BrokerAccountSnapshot:
         """Label the next paper observation with its fixed decision identity."""
@@ -127,17 +224,36 @@ class FakeProtectedExitBroker:
                 or decision.clock.next_execution_session != self._account.clock.next_execution_session
             ):
                 raise ValueError("fake broker observation decision differs from its account clock")
+            prior_receipts = self._flat_receipts_for_snapshot(self._account.account_snapshot_id)
             self._account = replace(
                 self._account,
                 decision_slot_id=decision.decision_slot_id,
                 decision_id=decision.decision_id,
                 account_snapshot_id=self._next_snapshot_id("decision"),
             )
+            for group in self._groups.values():
+                if group.get("flat_completion_snapshot_id"):
+                    self._persist_flat_receipt(group, self._account.account_snapshot_id)
+            for receipt in prior_receipts:
+                if (
+                    receipt[3] != self._account.paper_account_environment_id
+                    or receipt[6] != self._account.clock.completed_session.isoformat()
+                    or receipt[7] != self._account.clock.next_execution_session.isoformat()
+                ):
+                    raise ValueError("relabelled flat receipt differs from the account identity")
+                self._persist_flat_receipt(
+                    {
+                        "sell_broker_order_id": receipt[0],
+                        "initial_stop_broker_order_id": receipt[1],
+                        "cap": Decimal(receipt[8]),
+                        "used": Decimal(receipt[9]),
+                    },
+                    self._account.account_snapshot_id,
+                )
             return self._account
 
     def _next_snapshot_id(self, event: str) -> str:
-        self._sequence += 1
-        return f"fake-protected-exit:{event}:{self._sequence}"
+        return f"fake-protected-exit:{event}:{uuid4().hex}"
 
     def _position_quantity(self, symbol: str) -> Decimal:
         rows = tuple(row for row in self._account.positions if row.symbol == symbol)
@@ -296,6 +412,7 @@ class FakeProtectedExitBroker:
             )
             if next_quantity == 0:
                 group["flat_completion_snapshot_id"] = self._account.account_snapshot_id
+                self._persist_flat_receipt(group, self._account.account_snapshot_id)
             return self._account
 
     def replace_stop(
