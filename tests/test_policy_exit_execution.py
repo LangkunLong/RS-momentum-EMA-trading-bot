@@ -186,6 +186,99 @@ def test_confirmed_partial_sell_reduces_only_remaining_holding_and_never_resubmi
     assert len(broker.submissions) == 1
 
 
+def test_partial_exit_cancel_resizes_stop_then_allows_next_fixed_tier(tmp_path):
+    store, account, decision, holding, action = _case(tmp_path)
+    broker = _broker(store, account)
+    manager = OrderManager(paper=True, policy_store=store)
+    ports = _ports(store, broker, decision)
+    submitted = manager.submit_policy_exit(action.logical_action_id, ports=ports)
+    attempt = submitted.action.order_attempts[0]
+    broker.fill_order(attempt.broker_order_id, Decimal("2"))
+    manager.record_policy_cumulative_fill(
+        action.logical_action_id, attempt_number=1, side="sell",
+        broker_order_id=attempt.broker_order_id, client_order_id=attempt.client_order_id,
+        cumulative_quantity=Decimal("2"), average_fill_price=Decimal("110"),
+        observed_at=decision.clock.account_valuation_at,
+    )
+    cancelled = manager.cancel_policy_exit_remainder(action.logical_action_id, ports=ports)
+    assert cancelled.disposition == "cancelled", cancelled.reason
+    assert cancelled.action.status is ActionStatus.RESOLVED
+    assert store.load_holding_episode(holding.holding_episode_id).remaining_quantity == Decimal("4")
+    assert manager.cancel_policy_exit_remainder(action.logical_action_id, ports=ports).disposition == "cancelled"
+
+    resize_decision = DecisionIdentity.build(
+        deployment=decision.deployment_identity, clock=decision.clock,
+        snapshot_sha256=decision.snapshot_sha256, category=DecisionCategory.EXIT,
+        subject_type=DecisionSubjectType.HOLDING, subject_id=holding.holding_episode_id,
+        sequence=1,
+    )
+    observed = broker.observe_for(resize_decision)
+    resized = manager.replace_policy_exit_protection(
+        action.logical_action_id, decision=resize_decision, account=observed,
+        provider_id="offline-fake-broker", observed_at=decision.clock.account_valuation_at,
+        replace_stop=broker.replace_stop,
+    )
+    assert resized.disposition == "protected", resized.reason
+    protected = store.load_holding_episode(holding.holding_episode_id)
+    assert protected.confirmed_stop_broker_order_id != holding.confirmed_stop_broker_order_id
+
+    second_decision = DecisionIdentity.build(
+        deployment=decision.deployment_identity, clock=decision.clock,
+        snapshot_sha256=decision.snapshot_sha256, category=DecisionCategory.EXIT,
+        subject_type=DecisionSubjectType.HOLDING, subject_id=holding.holding_episode_id,
+        sequence=2,
+    )
+    second = start_scale_out(
+        store, decision=second_decision, holding_episode_id=holding.holding_episode_id,
+        fraction_of_original_quantity=Decimal("0.5"), quantity_increment=Decimal("1"),
+        rounding_rule_id="whole_share_floor_v1", expected_holding_version=protected.state_version,
+        policy_payload={"tier": 2}, guard_payload={"outcome": "allow_offline_fixture"},
+    )
+    assert second.exit_tier == 2
+    assert second.snapshot_original_quantity == Decimal("6")
+    assert second.requested_quantity == Decimal("3")
+    broker.observe_for(second_decision)
+    next_sell = manager.submit_policy_exit(second.logical_action_id, ports=_ports(store, broker, second_decision))
+    assert next_sell.disposition == "submitted", next_sell.reason
+    assert broker.submissions[-1]["quantity"] == Decimal("3")
+    assert broker.submissions[-1]["confirmed_stop_broker_order_id"] == protected.confirmed_stop_broker_order_id
+
+
+def test_uncertain_partial_cancel_recovers_only_from_exact_broker_receipt(tmp_path):
+    store, account, decision, holding, action = _case(tmp_path)
+    broker = _broker(store, account, response_mode="timeout_after_cancel")
+    manager = OrderManager(paper=True, policy_store=store)
+    ports = _ports(store, broker, decision)
+    attempt = manager.submit_policy_exit(action.logical_action_id, ports=ports).action.order_attempts[0]
+    broker.fill_order(attempt.broker_order_id, Decimal("2"))
+    manager.record_policy_cumulative_fill(
+        action.logical_action_id, attempt_number=1, side="sell",
+        broker_order_id=attempt.broker_order_id, client_order_id=attempt.client_order_id,
+        cumulative_quantity=Decimal("2"), average_fill_price=Decimal("110"),
+        observed_at=decision.clock.account_valuation_at,
+    )
+    uncertain = manager.cancel_policy_exit_remainder(action.logical_action_id, ports=ports)
+    assert uncertain.disposition == "reconcile"
+    assert uncertain.action.status is ActionStatus.CANCEL_REQUESTED
+    restarted_store = PolicyExecutionStateStore(store.db_path, store_identity=store.store_identity)
+    restarted_broker = _broker(restarted_store, broker.snapshot())
+    restarted = OrderManager(paper=True, policy_store=restarted_store)
+    forged = _broker(
+        restarted_store,
+        replace(broker.snapshot(), account_snapshot_id="forged:cancel-observation"),
+        label="forged",
+    )
+    assert restarted.confirm_policy_exit_cancel(
+        action.logical_action_id, ports=_ports(restarted_store, forged, decision)
+    ).disposition == "reconcile"
+    recovered = restarted.confirm_policy_exit_cancel(
+        action.logical_action_id, ports=_ports(restarted_store, restarted_broker, decision)
+    )
+    assert recovered.disposition == "cancelled", recovered.reason
+    assert recovered.action.status is ActionStatus.RESOLVED
+    assert restarted_store.load_holding_episode(holding.holding_episode_id).remaining_quantity == Decimal("4")
+
+
 def test_fake_broker_atomically_caps_simultaneous_stop_and_full_exit_fills(tmp_path):
     store, account, decision, holding, action = _case(tmp_path, full_exit=True)
     broker = _broker(store, account)

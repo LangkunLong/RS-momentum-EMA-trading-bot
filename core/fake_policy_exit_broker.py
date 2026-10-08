@@ -33,11 +33,11 @@ class FakeProtectedExitBroker:
         account: BrokerAccountSnapshot,
         *,
         receipt_store_path: str | Path | None = None,
-        response_mode: Literal["accepted", "reject_before_accept", "timeout_after_accept"] = "accepted",
+        response_mode: Literal["accepted", "reject_before_accept", "timeout_after_accept", "timeout_after_cancel"] = "accepted",
     ) -> None:
         if type(account) is not BrokerAccountSnapshot or account.positions is None or account.open_orders is None:
             raise ValueError("fake broker needs complete paper positions and orders")
-        if response_mode not in {"accepted", "reject_before_accept", "timeout_after_accept"}:
+        if response_mode not in {"accepted", "reject_before_accept", "timeout_after_accept", "timeout_after_cancel"}:
             raise ValueError("unsupported fake broker response mode")
         self._lock = RLock()
         self._account = account
@@ -60,6 +60,22 @@ class FakeProtectedExitBroker:
                         cap TEXT NOT NULL,
                         used TEXT NOT NULL,
                         PRIMARY KEY (sell_broker_order_id, account_snapshot_id)
+                    )"""
+                )
+                conn.execute(
+                    """CREATE TABLE IF NOT EXISTS fake_exit_cancel_receipts (
+                        sell_broker_order_id TEXT NOT NULL PRIMARY KEY,
+                        sell_client_order_id TEXT NOT NULL,
+                        stop_broker_order_id TEXT NOT NULL,
+                        account_snapshot_id TEXT NOT NULL,
+                        paper_account_environment_id TEXT NOT NULL,
+                        decision_slot_id TEXT NOT NULL,
+                        decision_id TEXT NOT NULL,
+                        completed_session TEXT NOT NULL,
+                        next_execution_session TEXT NOT NULL,
+                        requested_quantity TEXT NOT NULL,
+                        cumulative_quantity TEXT NOT NULL,
+                        remaining_position TEXT NOT NULL
                     )"""
                 )
                 conn.commit()
@@ -173,6 +189,103 @@ class FakeProtectedExitBroker:
     def snapshot(self) -> BrokerAccountSnapshot:
         with self._lock:
             return self._account
+
+    def cancel_sell_remainder(self, broker_order_id: str) -> BrokerAccountSnapshot:
+        """Terminally cancel one partially filled fake sell while retaining its stop."""
+        with self._lock:
+            order = self._order(broker_order_id)
+            groups = tuple(group for group in self._groups.values() if group["sell_broker_order_id"] == broker_order_id)
+            if len(groups) != 1 or order.purpose != "strategy" or order.side != "sell" or order.status != "partially_filled":
+                raise ValueError("only a uniquely protected partial sell can cancel its remainder")
+            group = groups[0]
+            stop = self._order(str(group["stop_broker_order_id"]))
+            remaining = self._position_quantity(order.symbol)
+            if (
+                stop.purpose != "protective_stop" or stop.status not in _WORKING
+                or stop.symbol != order.symbol or stop.holding_episode_id != order.holding_episode_id
+                or Decimal(str(stop.requested_quantity)) < remaining
+                or Decimal(str(stop.cumulative_filled_quantity)) != 0
+                or Decimal(str(group["cap"])) - Decimal(str(group["used"])) != remaining
+            ):
+                raise ValueError("partial sell has no consistent protected remainder")
+            cancelled = replace(order, status="cancelled")
+            self._account = replace(
+                self._account,
+                open_orders=tuple(cancelled if row is order else row for row in self._account.open_orders),
+                account_snapshot_id=self._next_snapshot_id("cancel"),
+            )
+            self._persist_cancel_receipt(cancelled, stop, remaining)
+            if self._response_mode == "timeout_after_cancel":
+                raise TimeoutError("fake broker response lost after terminal sell cancel")
+            return self._account
+
+    def _persist_cancel_receipt(self, sell: BrokerOrderFact, stop: BrokerOrderFact, remaining: Decimal) -> None:
+        if self.receipt_store_path is None:
+            return
+        account = self._account
+        values = (
+            sell.broker_order_id, sell.client_order_id, stop.broker_order_id,
+            account.account_snapshot_id, account.paper_account_environment_id,
+            account.decision_slot_id, account.decision_id,
+            account.clock.completed_session.isoformat(), account.clock.next_execution_session.isoformat(),
+            str(Decimal(str(sell.requested_quantity))),
+            str(Decimal(str(sell.cumulative_filled_quantity))), str(remaining),
+        )
+        with closing(sqlite3.connect(str(self.receipt_store_path))) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("INSERT OR IGNORE INTO fake_exit_cancel_receipts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", values)
+            stored = conn.execute(
+                "SELECT * FROM fake_exit_cancel_receipts WHERE sell_broker_order_id=?", (sell.broker_order_id,)
+            ).fetchone()
+            if stored != values:
+                raise ValueError("fake broker cancel receipt conflicts with immutable source facts")
+            conn.commit()
+
+    def confirms_cancelled_remainder(self, action: ActionIntent) -> bool:
+        """Match a persisted terminal cancel to this action and current broker facts."""
+        with self._lock:
+            if self.receipt_store_path is None or not action.order_attempts:
+                return False
+            attempt = action.order_attempts[0]
+            if not attempt.broker_order_id or not attempt.client_order_id:
+                return False
+            with closing(sqlite3.connect(str(self.receipt_store_path))) as conn:
+                row = conn.execute(
+                    "SELECT * FROM fake_exit_cancel_receipts WHERE sell_broker_order_id=?",
+                    (attempt.broker_order_id,),
+                ).fetchone()
+            if row is None:
+                return False
+            account = self._account
+            sells = tuple(item for item in account.open_orders if item.broker_order_id == attempt.broker_order_id)
+            stops = tuple(item for item in account.open_orders if item.broker_order_id == row[2])
+            positions = tuple(item for item in account.positions if item.symbol == action.broker_symbol)
+            return (
+                len(sells) == len(stops) == len(positions) == 1
+                and sells[0].status == "cancelled" and sells[0].purpose == "strategy"
+                and sells[0].client_order_id == attempt.client_order_id
+                and sells[0].symbol == action.broker_symbol
+                and Decimal(str(sells[0].requested_quantity)) == attempt.requested_quantity
+                and Decimal(str(sells[0].cumulative_filled_quantity)) == attempt.confirmed_filled_quantity
+                and stops[0].purpose == "protective_stop" and stops[0].status in _WORKING
+                and stops[0].symbol == action.broker_symbol
+                and Decimal(str(stops[0].requested_quantity)) >= Decimal(str(positions[0].quantity))
+                and Decimal(str(stops[0].cumulative_filled_quantity)) == 0
+                and row[:9] == (
+                    attempt.broker_order_id, attempt.client_order_id, stops[0].broker_order_id,
+                    account.account_snapshot_id, account.paper_account_environment_id,
+                    account.decision_slot_id, account.decision_id,
+                    account.clock.completed_session.isoformat(), account.clock.next_execution_session.isoformat(),
+                )
+                and Decimal(row[9]) == attempt.requested_quantity
+                and Decimal(row[10]) == attempt.confirmed_filled_quantity
+                and Decimal(row[11]) == Decimal(str(positions[0].quantity))
+                and account.paper_account_environment_id == action.decision.deployment_identity.paper_account_environment_id
+                and account.decision_slot_id == action.decision.decision_slot_id
+                and account.decision_id == action.decision.decision_id
+                and account.clock.completed_session == action.decision.clock.decision_session
+                and account.clock.next_execution_session == action.decision.clock.next_execution_session
+            )
 
     def confirms_flat_exit(self, action: ActionIntent, stop_broker_order_id: str) -> bool:
         """Require a persisted terminal fill/cancel receipt for this exact snapshot."""
