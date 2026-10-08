@@ -27,6 +27,7 @@ from core.pit_optimizer_v5.artifacts import (
     RepositoryCheckpointV5,
 )
 from core.pit_optimizer_v5.contracts import canonical_json_bytes_v5, canonical_primitive_v5
+from core.pit_optimizer_v5.development_evaluation import DevelopmentEvaluationContextV5
 from core.pit_optimizer_v5.provider import (
     RoleCallKeyV5,
     RoleRequestV5,
@@ -537,6 +538,545 @@ def authenticate_fixture_preflight_v1(
 
 
 @dataclass(frozen=True, slots=True)
+class StudyEvaluatorMetricV1:
+    """One measured, typed metric from the frozen round-one evaluator."""
+
+    metric_id: str
+    value: Decimal
+    unit: str
+
+    def __post_init__(self) -> None:
+        _identifier(self.metric_id, "evaluator metric ID")
+        _decimal(self.value, "evaluator metric value")
+        _text(self.unit, "evaluator metric unit", maximum=64)
+
+    def to_primitive(self) -> dict[str, object]:
+        return {
+            "metric_id": self.metric_id,
+            "value": canonical_primitive_v5(self.value),
+            "unit": self.unit,
+        }
+
+    @classmethod
+    def from_primitive(cls, value: object) -> "StudyEvaluatorMetricV1":
+        raw = _strict_mapping(value, {"metric_id", "value", "unit"}, "evaluator metric")
+        if type(raw["value"]) is not str:
+            raise StudyContractError("evaluator metric value is not canonical decimal text")
+        try:
+            parsed_value = Decimal(raw["value"])
+        except Exception as exc:
+            raise StudyContractError("evaluator metric value is invalid") from exc
+        if canonical_primitive_v5(parsed_value) != raw["value"]:
+            raise StudyContractError("evaluator metric value is not canonical")
+        return cls(
+            metric_id=raw["metric_id"],  # type: ignore[arg-type]
+            value=parsed_value,
+            unit=raw["unit"],  # type: ignore[arg-type]
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class StudyRoundOneEvaluatorResultV1:
+    """Content-addressed evaluator output bound to one exact round-one candidate."""
+
+    study_id: str
+    manifest_sha256: str
+    grant_sha256: str
+    arm: StudyArmV1
+    parent_request_sha256: str
+    round_one_request_sha256: str
+    round_one_terminal_sha256: str
+    parsed_response_sha256: str
+    candidate_sha256: str
+    evaluator_sha256: str
+    universe_sha256: str
+    status: Literal["succeeded", "failed"]
+    metrics: tuple[StudyEvaluatorMetricV1, ...]
+    failure_code: str | None
+    schema_version: Literal[1] = 1
+
+    def __post_init__(self) -> None:
+        _identifier(self.study_id, "evaluator result study ID")
+        for value, label in (
+            (self.manifest_sha256, "evaluator result manifest"),
+            (self.grant_sha256, "evaluator result grant"),
+            (self.parent_request_sha256, "evaluator result parent request"),
+            (self.round_one_request_sha256, "evaluator result round-one request"),
+            (self.round_one_terminal_sha256, "evaluator result round-one terminal"),
+            (self.parsed_response_sha256, "evaluator result parsed response"),
+            (self.candidate_sha256, "evaluator result candidate"),
+            (self.evaluator_sha256, "evaluator result evaluator"),
+            (self.universe_sha256, "evaluator result universe"),
+        ):
+            _digest(value, label)
+        if self.arm not in {"primary", "withheld"}:
+            raise StudyContractError("evaluator result arm is invalid")
+        if self.status not in {"succeeded", "failed"}:
+            raise StudyContractError("evaluator result status is invalid")
+        if type(self.metrics) is not tuple or len(self.metrics) > 64:
+            raise StudyContractError("evaluator result metrics are invalid")
+        if any(type(item) is not StudyEvaluatorMetricV1 for item in self.metrics):
+            raise StudyContractError("evaluator result metrics are invalid")
+        metric_ids = tuple(item.metric_id for item in self.metrics)
+        if len(set(metric_ids)) != len(metric_ids) or metric_ids != tuple(sorted(metric_ids)):
+            raise StudyContractError("evaluator result metrics are not uniquely ordered")
+        if self.status == "succeeded":
+            if not self.metrics or self.failure_code is not None:
+                raise StudyContractError("successful evaluator result must contain measurements only")
+        elif self.metrics or self.failure_code is None:
+            raise StudyContractError("failed evaluator result must contain a failure code only")
+        else:
+            _identifier(self.failure_code, "evaluator failure code")
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise StudyContractError("evaluator result schema version is invalid")
+
+    def to_primitive(self) -> dict[str, object]:
+        return {
+            "study_id": self.study_id,
+            "manifest_sha256": self.manifest_sha256,
+            "grant_sha256": self.grant_sha256,
+            "arm": self.arm,
+            "parent_request_sha256": self.parent_request_sha256,
+            "round_one_request_sha256": self.round_one_request_sha256,
+            "round_one_terminal_sha256": self.round_one_terminal_sha256,
+            "parsed_response_sha256": self.parsed_response_sha256,
+            "candidate_sha256": self.candidate_sha256,
+            "evaluator_sha256": self.evaluator_sha256,
+            "universe_sha256": self.universe_sha256,
+            "status": self.status,
+            "metrics": [item.to_primitive() for item in self.metrics],
+            "failure_code": self.failure_code,
+            "schema_version": self.schema_version,
+        }
+
+    def canonical_bytes(self) -> bytes:
+        return canonical_json_bytes_v5(self.to_primitive())
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(self.canonical_bytes()).hexdigest()
+
+    def feedback_message(self) -> Mapping[str, object]:
+        if self.status != "succeeded":
+            raise StudyAdmissionError("failed evaluator result cannot become round-two feedback")
+        return {
+            "role": "user",
+            "content": {
+                "study_round_feedback_v1": {
+                    "round_one_request_sha256": self.round_one_request_sha256,
+                    "candidate_sha256": self.candidate_sha256,
+                    "evaluator_sha256": self.evaluator_sha256,
+                    "universe_sha256": self.universe_sha256,
+                    "metrics": [item.to_primitive() for item in self.metrics],
+                }
+            },
+        }
+
+    @classmethod
+    def from_primitive(cls, value: object) -> "StudyRoundOneEvaluatorResultV1":
+        raw = _strict_mapping(
+            value,
+            {
+                "study_id", "manifest_sha256", "grant_sha256", "arm", "parent_request_sha256",
+                "round_one_request_sha256", "round_one_terminal_sha256", "parsed_response_sha256",
+                "candidate_sha256", "evaluator_sha256", "universe_sha256", "status", "metrics",
+                "failure_code", "schema_version",
+            },
+            "round-one evaluator result",
+        )
+        if type(raw["metrics"]) is not list:
+            raise StudyContractError("evaluator result metrics are invalid")
+        return cls(
+            study_id=raw["study_id"],  # type: ignore[arg-type]
+            manifest_sha256=raw["manifest_sha256"],  # type: ignore[arg-type]
+            grant_sha256=raw["grant_sha256"],  # type: ignore[arg-type]
+            arm=raw["arm"],  # type: ignore[arg-type]
+            parent_request_sha256=raw["parent_request_sha256"],  # type: ignore[arg-type]
+            round_one_request_sha256=raw["round_one_request_sha256"],  # type: ignore[arg-type]
+            round_one_terminal_sha256=raw["round_one_terminal_sha256"],  # type: ignore[arg-type]
+            parsed_response_sha256=raw["parsed_response_sha256"],  # type: ignore[arg-type]
+            candidate_sha256=raw["candidate_sha256"],  # type: ignore[arg-type]
+            evaluator_sha256=raw["evaluator_sha256"],  # type: ignore[arg-type]
+            universe_sha256=raw["universe_sha256"],  # type: ignore[arg-type]
+            status=raw["status"],  # type: ignore[arg-type]
+            metrics=tuple(StudyEvaluatorMetricV1.from_primitive(item) for item in raw["metrics"]),
+            failure_code=raw["failure_code"],  # type: ignore[arg-type]
+            schema_version=raw["schema_version"],  # type: ignore[arg-type]
+        )
+
+    @classmethod
+    def from_canonical_json(cls, raw: bytes | str) -> "StudyRoundOneEvaluatorResultV1":
+        return _canonical_decode(cls, raw, "round-one evaluator result")  # type: ignore[return-value]
+
+
+_ROUND_ONE_EVALUATION_TOKEN = object()
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class AuthenticatedStudyRoundOneEvaluatorResultV1:
+    result: StudyRoundOneEvaluatorResultV1
+    reference: ArtifactRefV5
+    _token: object
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        raise StudyAuthorityError("authenticated evaluator result is controller-issued")
+
+    @classmethod
+    def _issue(
+        cls,
+        *,
+        result: StudyRoundOneEvaluatorResultV1,
+        reference: ArtifactRefV5,
+        _controller_guard: object,
+    ) -> "AuthenticatedStudyRoundOneEvaluatorResultV1":
+        if _controller_guard is not _ROUND_ONE_EVALUATION_TOKEN:
+            raise StudyAuthorityError("evaluator result authentication is controller-only")
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "result", result)
+        object.__setattr__(instance, "reference", reference)
+        object.__setattr__(instance, "_token", _ROUND_ONE_EVALUATION_TOKEN)
+        return instance
+
+    def _is_controller_capability(self) -> bool:
+        return self._token is _ROUND_ONE_EVALUATION_TOKEN
+
+
+_DEVELOPMENT_ROUND_ONE_EVALUATION_TOKEN = object()
+
+
+def _development_context_primitive(context: DevelopmentEvaluationContextV5) -> dict[str, object]:
+    return {
+        "campaign_id": context.campaign_id,
+        "campaign_round_index": context.campaign_round_index,
+        "study_id": context.study_id,
+        "study_arm": context.study_arm,
+        "study_round_one_request_sha256": context.study_round_one_request_sha256,
+        "study_round_one_terminal_sha256": context.study_round_one_terminal_sha256,
+        "parsed_response_sha256": context.parsed_response_sha256,
+        "candidate_sha256": context.candidate_sha256,
+        "policy_identity_sha256": context.policy_identity_sha256,
+    }
+
+
+def _development_context_from_primitive(value: object) -> DevelopmentEvaluationContextV5:
+    raw = _strict_mapping(
+        value,
+        {
+            "campaign_id", "campaign_round_index", "study_id", "study_arm",
+            "study_round_one_request_sha256", "study_round_one_terminal_sha256",
+            "parsed_response_sha256", "candidate_sha256", "policy_identity_sha256",
+        },
+        "development evaluation context",
+    )
+    try:
+        return DevelopmentEvaluationContextV5(
+            campaign_id=raw["campaign_id"],  # type: ignore[arg-type]
+            campaign_round_index=raw["campaign_round_index"],  # type: ignore[arg-type]
+            study_id=raw["study_id"],  # type: ignore[arg-type]
+            study_arm=raw["study_arm"],  # type: ignore[arg-type]
+            study_round_one_request_sha256=raw["study_round_one_request_sha256"],  # type: ignore[arg-type]
+            study_round_one_terminal_sha256=raw["study_round_one_terminal_sha256"],  # type: ignore[arg-type]
+            parsed_response_sha256=raw["parsed_response_sha256"],  # type: ignore[arg-type]
+            candidate_sha256=raw["candidate_sha256"],  # type: ignore[arg-type]
+            policy_identity_sha256=raw["policy_identity_sha256"],  # type: ignore[arg-type]
+        )
+    except (TypeError, ValueError) as exc:
+        raise StudyContractError("development evaluation context is invalid") from exc
+
+
+@dataclass(frozen=True, slots=True)
+class StudyDevelopmentRoundOneEvaluatorResultV1:
+    """Development-only feedback derived from a retained PanelEvaluationV5."""
+
+    study_id: str
+    manifest_sha256: str
+    grant_sha256: str
+    arm: StudyArmV1
+    parent_request_sha256: str
+    round_one_request_sha256: str
+    round_one_terminal_sha256: str
+    parsed_response_sha256: str
+    candidate_sha256: str
+    context: DevelopmentEvaluationContextV5
+    development_receipt_ref: ArtifactRefV5
+    study_rubric_sha256: str
+    development_evaluator_contract_sha256: str
+    panel_sha256: str
+    universe_sha256: str
+    panel_evaluation_sha256: str
+    metrics: tuple[StudyEvaluatorMetricV1, ...]
+    schema_version: Literal[1] = 1
+
+    def __post_init__(self) -> None:
+        _identifier(self.study_id, "development evaluator result study ID")
+        for value, label in (
+            (self.manifest_sha256, "development evaluator result manifest"),
+            (self.grant_sha256, "development evaluator result grant"),
+            (self.parent_request_sha256, "development evaluator result parent request"),
+            (self.round_one_request_sha256, "development evaluator result request"),
+            (self.round_one_terminal_sha256, "development evaluator result terminal"),
+            (self.parsed_response_sha256, "development evaluator result parsed response"),
+            (self.candidate_sha256, "development evaluator result candidate"),
+            (self.study_rubric_sha256, "development evaluator result study rubric"),
+            (self.development_evaluator_contract_sha256, "development evaluator contract"),
+            (self.panel_sha256, "development evaluator panel"),
+            (self.universe_sha256, "development evaluator universe"),
+            (self.panel_evaluation_sha256, "development panel evaluation"),
+        ):
+            _digest(value, label)
+        if self.arm not in {"primary", "withheld"}:
+            raise StudyContractError("development evaluator result arm is invalid")
+        if type(self.context) is not DevelopmentEvaluationContextV5:
+            raise StudyContractError("development evaluator result context is invalid")
+        if type(self.development_receipt_ref) is not ArtifactRefV5:
+            raise StudyContractError("development evaluator receipt reference is invalid")
+        if (
+            self.development_receipt_ref.relative_path
+            != f"adapter-blobs/candidate-development-evaluation-receipts/{self.development_receipt_ref.sha256}.bin"
+        ):
+            raise StudyAuthorityError("development evaluator receipt reference is not deterministic")
+        if (
+            self.context.study_id != self.study_id
+            or self.context.study_arm != self.arm
+            or self.context.study_round_one_request_sha256 != self.round_one_request_sha256
+            or self.context.study_round_one_terminal_sha256 != self.round_one_terminal_sha256
+            or self.context.parsed_response_sha256 != self.parsed_response_sha256
+            or self.context.candidate_sha256 != self.candidate_sha256
+        ):
+            raise StudyAuthorityError("development evaluator result differs from its receipt context")
+        if type(self.metrics) is not tuple or not self.metrics or len(self.metrics) > 64:
+            raise StudyContractError("development evaluator result metrics are invalid")
+        if any(type(item) is not StudyEvaluatorMetricV1 for item in self.metrics):
+            raise StudyContractError("development evaluator result metrics are invalid")
+        metric_ids = tuple(item.metric_id for item in self.metrics)
+        if len(set(metric_ids)) != len(metric_ids) or metric_ids != tuple(sorted(metric_ids)):
+            raise StudyContractError("development evaluator result metrics are not uniquely ordered")
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise StudyContractError("development evaluator result schema version is invalid")
+
+    def to_primitive(self) -> dict[str, object]:
+        return {
+            "study_id": self.study_id,
+            "manifest_sha256": self.manifest_sha256,
+            "grant_sha256": self.grant_sha256,
+            "arm": self.arm,
+            "parent_request_sha256": self.parent_request_sha256,
+            "round_one_request_sha256": self.round_one_request_sha256,
+            "round_one_terminal_sha256": self.round_one_terminal_sha256,
+            "parsed_response_sha256": self.parsed_response_sha256,
+            "candidate_sha256": self.candidate_sha256,
+            "context": _development_context_primitive(self.context),
+            "development_receipt_ref": self.development_receipt_ref.to_primitive(),
+            "study_rubric_sha256": self.study_rubric_sha256,
+            "development_evaluator_contract_sha256": self.development_evaluator_contract_sha256,
+            "panel_sha256": self.panel_sha256,
+            "universe_sha256": self.universe_sha256,
+            "panel_evaluation_sha256": self.panel_evaluation_sha256,
+            "metrics": [item.to_primitive() for item in self.metrics],
+            "schema_version": self.schema_version,
+        }
+
+    def canonical_bytes(self) -> bytes:
+        return canonical_json_bytes_v5(self.to_primitive())
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(self.canonical_bytes()).hexdigest()
+
+    def feedback_message(self) -> Mapping[str, object]:
+        return {
+            "role": "user",
+            "content": {
+                "study_development_round_feedback_v1": {
+                    "round_one_request_sha256": self.round_one_request_sha256,
+                    "candidate_sha256": self.candidate_sha256,
+                    "study_rubric_sha256": self.study_rubric_sha256,
+                    "development_evaluator_contract_sha256": self.development_evaluator_contract_sha256,
+                    "panel_sha256": self.panel_sha256,
+                    "panel_evaluation_sha256": self.panel_evaluation_sha256,
+                    "metrics": [item.to_primitive() for item in self.metrics],
+                }
+            },
+        }
+
+    @classmethod
+    def from_primitive(cls, value: object) -> "StudyDevelopmentRoundOneEvaluatorResultV1":
+        raw = _strict_mapping(
+            value,
+            {
+                "study_id", "manifest_sha256", "grant_sha256", "arm", "parent_request_sha256",
+                "round_one_request_sha256", "round_one_terminal_sha256", "parsed_response_sha256",
+                "candidate_sha256", "context", "development_receipt_ref", "study_rubric_sha256",
+                "development_evaluator_contract_sha256", "panel_sha256", "universe_sha256",
+                "panel_evaluation_sha256", "metrics", "schema_version",
+            },
+            "development evaluator result",
+        )
+        if type(raw["metrics"]) is not list:
+            raise StudyContractError("development evaluator result metrics are invalid")
+        reference = _ref_from_primitive(raw["development_receipt_ref"], "development evaluation receipt ref")
+        return cls(
+            study_id=raw["study_id"],  # type: ignore[arg-type]
+            manifest_sha256=raw["manifest_sha256"],  # type: ignore[arg-type]
+            grant_sha256=raw["grant_sha256"],  # type: ignore[arg-type]
+            arm=raw["arm"],  # type: ignore[arg-type]
+            parent_request_sha256=raw["parent_request_sha256"],  # type: ignore[arg-type]
+            round_one_request_sha256=raw["round_one_request_sha256"],  # type: ignore[arg-type]
+            round_one_terminal_sha256=raw["round_one_terminal_sha256"],  # type: ignore[arg-type]
+            parsed_response_sha256=raw["parsed_response_sha256"],  # type: ignore[arg-type]
+            candidate_sha256=raw["candidate_sha256"],  # type: ignore[arg-type]
+            context=_development_context_from_primitive(raw["context"]),
+            development_receipt_ref=reference,
+            study_rubric_sha256=raw["study_rubric_sha256"],  # type: ignore[arg-type]
+            development_evaluator_contract_sha256=raw["development_evaluator_contract_sha256"],  # type: ignore[arg-type]
+            panel_sha256=raw["panel_sha256"],  # type: ignore[arg-type]
+            universe_sha256=raw["universe_sha256"],  # type: ignore[arg-type]
+            panel_evaluation_sha256=raw["panel_evaluation_sha256"],  # type: ignore[arg-type]
+            metrics=tuple(StudyEvaluatorMetricV1.from_primitive(item) for item in raw["metrics"]),
+            schema_version=raw["schema_version"],  # type: ignore[arg-type]
+        )
+
+    @classmethod
+    def from_canonical_json(cls, raw: bytes | str) -> "StudyDevelopmentRoundOneEvaluatorResultV1":
+        return _canonical_decode(cls, raw, "development evaluator result")  # type: ignore[return-value]
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class AuthenticatedStudyDevelopmentRoundOneEvaluatorResultV1:
+    result: StudyDevelopmentRoundOneEvaluatorResultV1
+    reference: ArtifactRefV5
+    _token: object
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        raise StudyAuthorityError("authenticated development evaluator result is controller-issued")
+
+    @classmethod
+    def _issue(
+        cls,
+        *,
+        result: StudyDevelopmentRoundOneEvaluatorResultV1,
+        reference: ArtifactRefV5,
+        _controller_guard: object,
+    ) -> "AuthenticatedStudyDevelopmentRoundOneEvaluatorResultV1":
+        if _controller_guard is not _DEVELOPMENT_ROUND_ONE_EVALUATION_TOKEN:
+            raise StudyAuthorityError("development evaluator result authentication is controller-only")
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "result", result)
+        object.__setattr__(instance, "reference", reference)
+        object.__setattr__(instance, "_token", _DEVELOPMENT_ROUND_ONE_EVALUATION_TOKEN)
+        return instance
+
+    def _is_controller_capability(self) -> bool:
+        return self._token is _DEVELOPMENT_ROUND_ONE_EVALUATION_TOKEN
+
+
+@dataclass(frozen=True, slots=True)
+class StudyDevelopmentRoundCallSlotV1:
+    """Development-only round slot; it cannot be decoded as a production slot."""
+
+    study_id: str
+    manifest_sha256: str
+    grant_sha256: str
+    arm: StudyArmV1
+    round_index: int
+    parent_request_sha256: str
+    feedback_sha256: str | None
+    evaluator_result: StudyDevelopmentRoundOneEvaluatorResultV1 | None = None
+    evaluator_result_ref: ArtifactRefV5 | None = None
+    schema_version: Literal[1] = 1
+
+    def __post_init__(self) -> None:
+        _identifier(self.study_id, "development round-call study ID")
+        _digest(self.manifest_sha256, "development round-call manifest")
+        _digest(self.grant_sha256, "development round-call grant")
+        if self.arm not in {"primary", "withheld"}:
+            raise StudyContractError("development round-call arm is invalid")
+        if type(self.round_index) is not int or self.round_index not in {1, 2}:
+            raise StudyContractError("development round-call index must be one or two")
+        _digest(self.parent_request_sha256, "development round-call parent request")
+        if self.round_index == 1:
+            if self.feedback_sha256 is not None or self.evaluator_result is not None or self.evaluator_result_ref is not None:
+                raise StudyContractError("development round one cannot bind prior feedback")
+        else:
+            _digest(self.feedback_sha256, "development round-call feedback")
+            if type(self.evaluator_result) is not StudyDevelopmentRoundOneEvaluatorResultV1:
+                raise StudyContractError("development round two requires its typed evaluator result")
+            if type(self.evaluator_result_ref) is not ArtifactRefV5:
+                raise StudyContractError("development round two requires its persisted evaluator result reference")
+            if (
+                self.feedback_sha256 != self.evaluator_result.sha256
+                or self.evaluator_result_ref.sha256 != self.evaluator_result.sha256
+                or self.evaluator_result_ref.relative_path
+                != f"adapter-blobs/study-v1-development-round-one-evaluations/{self.evaluator_result.sha256}.bin"
+                or self.evaluator_result.study_id != self.study_id
+                or self.evaluator_result.manifest_sha256 != self.manifest_sha256
+                or self.evaluator_result.grant_sha256 != self.grant_sha256
+                or self.evaluator_result.arm != self.arm
+                or self.evaluator_result.parent_request_sha256 != self.parent_request_sha256
+            ):
+                raise StudyAuthorityError("development round-two evaluator result differs from its slot authority")
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise StudyContractError("development round-call slot schema version is invalid")
+
+    @property
+    def slot_id(self) -> str:
+        return f"{self.study_id}:{self.arm}:round:{self.round_index}"
+
+    def to_primitive(self) -> dict[str, object]:
+        return {
+            "slot_kind": "development",
+            "study_id": self.study_id,
+            "manifest_sha256": self.manifest_sha256,
+            "grant_sha256": self.grant_sha256,
+            "arm": self.arm,
+            "round_index": self.round_index,
+            "parent_request_sha256": self.parent_request_sha256,
+            "feedback_sha256": self.feedback_sha256,
+            "evaluator_result": None if self.evaluator_result is None else self.evaluator_result.to_primitive(),
+            "evaluator_result_ref": None if self.evaluator_result_ref is None else self.evaluator_result_ref.to_primitive(),
+            "schema_version": self.schema_version,
+        }
+
+    @classmethod
+    def from_primitive(cls, value: object) -> "StudyDevelopmentRoundCallSlotV1":
+        raw = _strict_mapping(
+            value,
+            {
+                "slot_kind", "study_id", "manifest_sha256", "grant_sha256", "arm", "round_index",
+                "parent_request_sha256", "feedback_sha256", "evaluator_result", "evaluator_result_ref",
+                "schema_version",
+            },
+            "development round-call slot",
+        )
+        if raw["slot_kind"] != "development":
+            raise StudyContractError("development round-call slot discriminator is invalid")
+        return cls(
+            study_id=raw["study_id"],  # type: ignore[arg-type]
+            manifest_sha256=raw["manifest_sha256"],  # type: ignore[arg-type]
+            grant_sha256=raw["grant_sha256"],  # type: ignore[arg-type]
+            arm=raw["arm"],  # type: ignore[arg-type]
+            round_index=raw["round_index"],  # type: ignore[arg-type]
+            parent_request_sha256=raw["parent_request_sha256"],  # type: ignore[arg-type]
+            feedback_sha256=raw["feedback_sha256"],  # type: ignore[arg-type]
+            evaluator_result=(
+                None if raw["evaluator_result"] is None
+                else StudyDevelopmentRoundOneEvaluatorResultV1.from_primitive(raw["evaluator_result"])
+            ),
+            evaluator_result_ref=(
+                None if raw["evaluator_result_ref"] is None
+                else _ref_from_primitive(raw["evaluator_result_ref"], "development evaluator result ref")
+            ),
+            schema_version=raw["schema_version"],  # type: ignore[arg-type]
+        )
+
+
+def _round_call_slot_from_primitive(value: object) -> "StudyRoundCallSlotV1 | StudyDevelopmentRoundCallSlotV1":
+    if type(value) is dict and value.get("slot_kind") == "development":
+        return StudyDevelopmentRoundCallSlotV1.from_primitive(value)
+    return StudyRoundCallSlotV1.from_primitive(value)
+
+
+@dataclass(frozen=True, slots=True)
 class StudyRoundCallSlotV1:
     """Immutable round identity bound to one exact base request and grant."""
 
@@ -547,6 +1087,8 @@ class StudyRoundCallSlotV1:
     round_index: int
     parent_request_sha256: str
     feedback_sha256: str | None
+    evaluator_result: StudyRoundOneEvaluatorResultV1 | None = None
+    evaluator_result_ref: ArtifactRefV5 | None = None
     schema_version: Literal[1] = 1
 
     def __post_init__(self) -> None:
@@ -559,10 +1101,26 @@ class StudyRoundCallSlotV1:
             raise StudyContractError("round-call index must be one or two")
         _digest(self.parent_request_sha256, "round-call parent request")
         if self.round_index == 1:
-            if self.feedback_sha256 is not None:
+            if self.feedback_sha256 is not None or self.evaluator_result is not None or self.evaluator_result_ref is not None:
                 raise StudyContractError("round one cannot bind prior feedback")
-        else:
+        elif self.round_index == 2:
             _digest(self.feedback_sha256, "round-call feedback")
+            if type(self.evaluator_result) is not StudyRoundOneEvaluatorResultV1:
+                raise StudyContractError("round two requires its typed evaluator result")
+            if type(self.evaluator_result_ref) is not ArtifactRefV5:
+                raise StudyContractError("round two requires its persisted evaluator result reference")
+            if (
+                self.feedback_sha256 != self.evaluator_result.sha256
+                or self.evaluator_result_ref.sha256 != self.evaluator_result.sha256
+                or self.evaluator_result_ref.relative_path
+                != f"adapter-blobs/study-v1-round-one-evaluations/{self.evaluator_result.sha256}.bin"
+                or self.evaluator_result.study_id != self.study_id
+                or self.evaluator_result.manifest_sha256 != self.manifest_sha256
+                or self.evaluator_result.grant_sha256 != self.grant_sha256
+                or self.evaluator_result.arm != self.arm
+                or self.evaluator_result.parent_request_sha256 != self.parent_request_sha256
+            ):
+                raise StudyAuthorityError("round-two evaluator result differs from its slot authority")
         if type(self.schema_version) is not int or self.schema_version != 1:
             raise StudyContractError("round-call slot schema version is invalid")
 
@@ -579,6 +1137,10 @@ class StudyRoundCallSlotV1:
             "round_index": self.round_index,
             "parent_request_sha256": self.parent_request_sha256,
             "feedback_sha256": self.feedback_sha256,
+            "evaluator_result": None if self.evaluator_result is None else self.evaluator_result.to_primitive(),
+            "evaluator_result_ref": (
+                None if self.evaluator_result_ref is None else self.evaluator_result_ref.to_primitive()
+            ),
             "schema_version": self.schema_version,
         }
 
@@ -595,7 +1157,8 @@ class StudyRoundCallSlotV1:
             value,
             {
                 "study_id", "manifest_sha256", "grant_sha256", "arm", "round_index",
-                "parent_request_sha256", "feedback_sha256", "schema_version",
+                "parent_request_sha256", "feedback_sha256", "evaluator_result", "evaluator_result_ref",
+                "schema_version",
             },
             "round-call slot",
         )
@@ -607,6 +1170,16 @@ class StudyRoundCallSlotV1:
             round_index=raw["round_index"],  # type: ignore[arg-type]
             parent_request_sha256=raw["parent_request_sha256"],  # type: ignore[arg-type]
             feedback_sha256=raw["feedback_sha256"],  # type: ignore[arg-type]
+            evaluator_result=(
+                None
+                if raw["evaluator_result"] is None
+                else StudyRoundOneEvaluatorResultV1.from_primitive(raw["evaluator_result"])
+            ),
+            evaluator_result_ref=(
+                None if raw["evaluator_result_ref"] is None else _ref_from_primitive(
+                    raw["evaluator_result_ref"], "round-one evaluator result ref"
+                )
+            ),
             schema_version=raw["schema_version"],  # type: ignore[arg-type]
         )
 
@@ -634,7 +1207,7 @@ class StudyCallRequestV1:
     seed: int | None = None
     schema_version: Literal[1] = _STUDY_SCHEMA_VERSION
     transport_settings_sha256: str = _TRANSPORT_SETTINGS_SHA256
-    round_slot: StudyRoundCallSlotV1 | None = None
+    round_slot: StudyRoundCallSlotV1 | StudyDevelopmentRoundCallSlotV1 | None = None
 
     def __post_init__(self) -> None:
         _identifier(self.study_id, "study request ID")
@@ -675,7 +1248,7 @@ class StudyCallRequestV1:
         if self.input_bound_bytes > _MAX_REQUEST_BYTES:
             raise StudyAdmissionError("study request exceeds its frozen input byte bound")
         if self.round_slot is not None:
-            if type(self.round_slot) is not StudyRoundCallSlotV1:
+            if type(self.round_slot) not in {StudyRoundCallSlotV1, StudyDevelopmentRoundCallSlotV1}:
                 raise StudyContractError("study round-call slot is invalid")
             if (
                 self.round_slot.study_id != self.study_id
@@ -683,6 +1256,8 @@ class StudyCallRequestV1:
                 or self.round_slot.parent_request_sha256 != self.base_request_sha256
             ):
                 raise StudyAuthorityError("study round-call slot differs from its exact base request")
+            if self.round_slot.round_index == 2 and self.messages[-1] != self.round_slot.evaluator_result.feedback_message():
+                raise StudyAuthorityError("round-two request does not contain its authenticated evaluator feedback")
 
     @property
     def input_bound_bytes(self) -> int:
@@ -735,6 +1310,12 @@ class StudyCallRequestV1:
     def _base_primitive(self) -> dict[str, object]:
         result = self.to_primitive()
         result.pop("round_slot", None)
+        if self.round_slot is not None and self.round_slot.round_index == 2:
+            base_messages = self.messages[:-1]
+            result["messages"] = _messages_primitive(base_messages)
+            result["projected_wire_messages_utf8"] = canonical_json_bytes_v5(
+                wire_role_messages_v5(base_messages)
+            ).decode("utf-8")
         return result
 
     def canonical_bytes(self) -> bytes:
@@ -809,7 +1390,7 @@ class StudyCallRequestV1:
             round_slot=(
                 None
                 if "round_slot" not in raw
-                else StudyRoundCallSlotV1.from_primitive(raw["round_slot"])
+                else _round_call_slot_from_primitive(raw["round_slot"])
             ),
         )
 
@@ -1011,7 +1592,7 @@ class StudyRoundCallAdmissionV1:
     repository_root_identity_sha256: str
     audit_domain: str
     mode: StudyModeV1
-    slots: tuple[StudyRoundCallSlotV1, ...]
+    slots: tuple[StudyRoundCallSlotV1 | StudyDevelopmentRoundCallSlotV1, ...]
     approval_reference: str
     schema_version: Literal[1] = 1
 
@@ -1029,7 +1610,7 @@ class StudyRoundCallAdmissionV1:
             raise StudyAdmissionError("round-call admission must contain one or two finite slots")
         identities: set[tuple[str, int]] = set()
         for slot in self.slots:
-            if type(slot) is not StudyRoundCallSlotV1:
+            if type(slot) not in {StudyRoundCallSlotV1, StudyDevelopmentRoundCallSlotV1}:
                 raise StudyContractError("round-call admission slot is invalid")
             if (
                 slot.study_id != self.study_id
@@ -1089,7 +1670,7 @@ class StudyRoundCallAdmissionV1:
             repository_root_identity_sha256=raw["repository_root_identity_sha256"],  # type: ignore[arg-type]
             audit_domain=raw["audit_domain"],  # type: ignore[arg-type]
             mode=raw["mode"],  # type: ignore[arg-type]
-            slots=tuple(StudyRoundCallSlotV1.from_primitive(item) for item in raw["slots"]),
+            slots=tuple(_round_call_slot_from_primitive(item) for item in raw["slots"]),
             approval_reference=raw["approval_reference"],  # type: ignore[arg-type]
             schema_version=raw["schema_version"],  # type: ignore[arg-type]
         )
@@ -1283,7 +1864,7 @@ def authorize_study_round_call_admission_v1(
     manifest: StudyManifestV1,
     grant: StudyGrantV1,
     execution_approval: StudyExecutionApprovalV1,
-    slots: tuple[StudyRoundCallSlotV1, ...],
+    slots: tuple[StudyRoundCallSlotV1 | StudyDevelopmentRoundCallSlotV1, ...],
     approval_reference: str,
 ) -> tuple[StudyRoundCallAdmissionV1, StudyRoundCallApprovalV1]:
     """Persist a finite round-slot supplement after separate explicit approval."""
@@ -1320,7 +1901,10 @@ def authorize_study_round_call_admission_v1(
             "round-call slots must be nonempty and within the existing finite grant slot count"
         )
     for slot in slots:
-        if type(slot) is not StudyRoundCallSlotV1 or slot.arm not in grant.arm_slots:
+        if (
+            type(slot) not in {StudyRoundCallSlotV1, StudyDevelopmentRoundCallSlotV1}
+            or slot.arm not in grant.arm_slots
+        ):
             raise StudyAuthorityError("round-call slot is outside the parent grant")
         if (
             slot.study_id != grant.study_id
@@ -1517,9 +2101,9 @@ def build_study_round_call_slot_v1(
     manifest: StudyManifestV1,
     grant: StudyGrantV1,
     round_index: int,
-    feedback_sha256: str | None = None,
+    round_one_evaluation: AuthenticatedStudyRoundOneEvaluatorResultV1 | None = None,
 ) -> StudyRoundCallSlotV1:
-    """Bind an offline base request to a round slot and optional feedback digest."""
+    """Bind a base request to an offline slot and its authenticated prior evaluation."""
 
     if (
         type(request) is not StudyCallRequestV1
@@ -1538,6 +2122,33 @@ def build_study_round_call_slot_v1(
         raise StudyAuthorityError("round-call slot base request differs from its grant or manifest")
     if grant.mode != "offline_fixture":
         raise StudyAdmissionError("round-call slots are offline-fixture only")
+    if round_index == 1:
+        if round_one_evaluation is not None:
+            raise StudyAdmissionError("round one cannot consume prior evaluator feedback")
+        evaluator_result = None
+        evaluator_result_ref = None
+        feedback_sha256 = None
+    elif round_index == 2:
+        if (
+            type(round_one_evaluation) is not AuthenticatedStudyRoundOneEvaluatorResultV1
+            or not round_one_evaluation._is_controller_capability()
+        ):
+            raise StudyAdmissionError("round two requires an authenticated round-one evaluator result")
+        evaluator_result = round_one_evaluation.result
+        evaluator_result_ref = round_one_evaluation.reference
+        if evaluator_result.status != "succeeded":
+            raise StudyAdmissionError("failed evaluator result cannot authorize round two")
+        if (
+            evaluator_result.study_id != request.study_id
+            or evaluator_result.manifest_sha256 != manifest.sha256
+            or evaluator_result.grant_sha256 != grant.sha256
+            or evaluator_result.arm != request.arm
+            or evaluator_result.parent_request_sha256 != request.sha256
+        ):
+            raise StudyAuthorityError("round-one evaluator result differs from the round-two parent request")
+        feedback_sha256 = evaluator_result.sha256
+    else:
+        raise StudyContractError("round-call index must be one or two")
     return StudyRoundCallSlotV1(
         study_id=grant.study_id,
         manifest_sha256=manifest.sha256,
@@ -1546,6 +2157,8 @@ def build_study_round_call_slot_v1(
         round_index=round_index,
         parent_request_sha256=request.base_request_sha256,
         feedback_sha256=feedback_sha256,
+        evaluator_result=evaluator_result,
+        evaluator_result_ref=evaluator_result_ref,
     )
 
 
@@ -1554,7 +2167,7 @@ def bind_study_call_to_round_slot_v1(
     request: StudyCallRequestV1,
     slot: StudyRoundCallSlotV1,
 ) -> StudyCallRequestV1:
-    """Bind a slot digest to an immutable request without rewriting its messages."""
+    """Bind a slot and include its measured round-one feedback in round two."""
 
     if type(request) is not StudyCallRequestV1 or type(slot) is not StudyRoundCallSlotV1:
         raise StudyContractError("round-call binding inputs are invalid")
@@ -1562,24 +2175,136 @@ def bind_study_call_to_round_slot_v1(
         raise StudyAuthorityError("round-call slot does not bind an unbound exact base request")
     if request.study_id != slot.study_id or request.arm != slot.arm:
         raise StudyAuthorityError("round-call slot study or arm differs from the base request")
-    return replace(request, round_slot=slot)
+    messages = request.messages
+    if slot.round_index == 2:
+        if slot.evaluator_result is None:
+            raise StudyAdmissionError("round two requires an authenticated round-one evaluator result")
+        messages = (*messages, slot.evaluator_result.feedback_message())
+    projected_wire_messages = canonical_json_bytes_v5(wire_role_messages_v5(messages))
+    return replace(
+        request,
+        messages=messages,
+        projected_wire_messages=projected_wire_messages,
+        round_slot=slot,
+    )
+
+
+def build_study_development_round_call_slot_v1(
+    *,
+    request: StudyCallRequestV1,
+    manifest: StudyManifestV1,
+    grant: StudyGrantV1,
+    round_index: int,
+    round_one_evaluation: AuthenticatedStudyDevelopmentRoundOneEvaluatorResultV1 | None = None,
+) -> StudyDevelopmentRoundCallSlotV1:
+    """Bind an explicitly offline development slot to an authenticated V5 result."""
+
+    if (
+        type(request) is not StudyCallRequestV1
+        or type(manifest) is not StudyManifestV1
+        or type(grant) is not StudyGrantV1
+    ):
+        raise StudyContractError("development round-call slot construction inputs are invalid")
+    if (
+        request.round_slot is not None
+        or request.study_id != grant.study_id
+        or request.model != grant.model
+        or request.provider != grant.provider
+        or request.arm not in grant.arm_slots
+        or manifest.study_id != grant.study_id
+        or manifest.sha256 != grant.manifest_sha256
+    ):
+        raise StudyAuthorityError("development round-call slot base request differs from its grant or manifest")
+    if grant.mode != "offline_fixture" or manifest.mode != "offline_fixture":
+        raise StudyAdmissionError("development round-call slots are offline-fixture only")
+    if round_index == 1:
+        if round_one_evaluation is not None:
+            raise StudyAdmissionError("development round one cannot consume prior evaluator feedback")
+        evaluation = None
+        reference = None
+        feedback_sha256 = None
+    elif round_index == 2:
+        if (
+            type(round_one_evaluation) is not AuthenticatedStudyDevelopmentRoundOneEvaluatorResultV1
+            or not round_one_evaluation._is_controller_capability()
+        ):
+            raise StudyAdmissionError("development round two requires an authenticated V5 evaluator result")
+        evaluation = round_one_evaluation.result
+        reference = round_one_evaluation.reference
+        if (
+            evaluation.study_id != request.study_id
+            or evaluation.manifest_sha256 != manifest.sha256
+            or evaluation.grant_sha256 != grant.sha256
+            or evaluation.arm != request.arm
+            or evaluation.parent_request_sha256 != request.sha256
+        ):
+            raise StudyAuthorityError("development evaluator result differs from the round-two parent request")
+        feedback_sha256 = evaluation.sha256
+    else:
+        raise StudyContractError("development round-call index must be one or two")
+    return StudyDevelopmentRoundCallSlotV1(
+        study_id=grant.study_id,
+        manifest_sha256=manifest.sha256,
+        grant_sha256=grant.sha256,
+        arm=request.arm,
+        round_index=round_index,
+        parent_request_sha256=request.sha256,
+        feedback_sha256=feedback_sha256,
+        evaluator_result=evaluation,
+        evaluator_result_ref=reference,
+    )
+
+
+def bind_study_call_to_development_round_slot_v1(
+    *,
+    request: StudyCallRequestV1,
+    slot: StudyDevelopmentRoundCallSlotV1,
+) -> StudyCallRequestV1:
+    """Bind development feedback while preserving a separate slot discriminator."""
+
+    if type(request) is not StudyCallRequestV1 or type(slot) is not StudyDevelopmentRoundCallSlotV1:
+        raise StudyContractError("development round-call binding inputs are invalid")
+    if request.round_slot is not None or request.sha256 != slot.parent_request_sha256:
+        raise StudyAuthorityError("development slot does not bind an unbound exact base request")
+    if request.study_id != slot.study_id or request.arm != slot.arm:
+        raise StudyAuthorityError("development round-call slot study or arm differs from the base request")
+    messages = request.messages
+    if slot.round_index == 2:
+        if slot.evaluator_result is None:
+            raise StudyAdmissionError("development round two requires an authenticated V5 evaluation")
+        messages = (*messages, slot.evaluator_result.feedback_message())
+    projected_wire_messages = canonical_json_bytes_v5(wire_role_messages_v5(messages))
+    return replace(
+        request,
+        messages=messages,
+        projected_wire_messages=projected_wire_messages,
+        round_slot=slot,
+    )
 
 
 __all__ = [
     "FixturePreflightV1",
     "authenticate_fixture_preflight_v1",
+    "AuthenticatedStudyDevelopmentRoundOneEvaluatorResultV1",
+    "AuthenticatedStudyRoundOneEvaluatorResultV1",
     "StudyCallRequestV1",
+    "StudyDevelopmentRoundCallSlotV1",
+    "StudyDevelopmentRoundOneEvaluatorResultV1",
+    "StudyEvaluatorMetricV1",
     "StudyExecutionApprovalV1",
     "StudyGrantV1",
     "StudyRoundCallApprovalV1",
     "StudyRoundCallAdmissionV1",
     "StudyRoundCallSlotV1",
+    "StudyRoundOneEvaluatorResultV1",
     "authorize_offline_fixture_v1",
     "authorize_study_execution_v1",
     "authorize_study_round_call_admission_v1",
     "bind_study_call_to_round_slot_v1",
     "build_study_call_v1",
+    "build_study_development_round_call_slot_v1",
     "build_study_round_call_slot_v1",
+    "bind_study_call_to_development_round_slot_v1",
     "study_parser_authority_bytes_v1",
     "study_prompt_bytes_v1",
     "study_transport_settings_bytes_v1",
