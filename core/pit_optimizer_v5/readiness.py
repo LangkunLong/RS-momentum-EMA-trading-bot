@@ -357,7 +357,7 @@ def capture_readiness_source_v5(
                     "text=auto eol=crlf",
                 }
                 normalize = normalize or (not attributes and autocrlf in {"true", "input"})
-                if flags[:2] != ["i/lf", "w/crlf"] or not normalize or b"\0" in raw:
+                if flags[:2] not in (["i/lf", "w/crlf"], ["i/lf", "w/mixed"]) or not normalize or b"\0" in raw:
                     raise ValueError("working source differs")
                 raw = raw.replace(b"\r\n", b"\n")
                 if blob_id(raw) != oid:
