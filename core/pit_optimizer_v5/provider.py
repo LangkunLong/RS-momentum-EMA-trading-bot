@@ -313,6 +313,7 @@ _ALLOWED_EVIDENCE_METRIC_PREFIXES = (
     "exit.",
     "failure.",
     "policy.",
+    "prior_experiment.",
     "quick.",
     "report.",
     "rolling.",
