@@ -428,6 +428,12 @@ def compare_action_parity_cases(
             label = f"execution.{field}"
             observed_value = observed_execution.get(field, _ACTION_PARITY_MISSING)
             if (
+                field in _ACTION_PARITY_ONE_SIDED_VARIANCE_FIELDS
+                and expected_value is None
+                and observed_value is None
+            ):
+                matched.append(label)
+            elif (
                 expected_value is None
                 or observed_value is _ACTION_PARITY_MISSING
                 or observed_value is None
@@ -440,8 +446,9 @@ def compare_action_parity_cases(
                 )
             ):
                 if (
-                    field in _ACTION_PARITY_ONE_SIDED_VARIANCE_FIELDS
-                    and (expected_value is None) != (observed_value is None or observed_value is _ACTION_PARITY_MISSING)
+                    observed_value is not _ACTION_PARITY_MISSING
+                    and field in _ACTION_PARITY_ONE_SIDED_VARIANCE_FIELDS
+                    and (expected_value is None) != (observed_value is None)
                 ):
                     execution_variances.append(label)
                 else:
@@ -454,14 +461,7 @@ def compare_action_parity_cases(
                 mismatches.append(label)
         for field in observed_execution:
             if field not in expected_execution:
-                label = f"execution.{field}"
-                if (
-                    field in _ACTION_PARITY_ONE_SIDED_VARIANCE_FIELDS
-                    and observed_execution[field] is not None
-                ):
-                    execution_variances.append(label)
-                else:
-                    unknown.append(label)
+                unknown.append(f"execution.{field}")
 
     if action_family not in _ACTION_PARITY_REQUIRED_INTENT_FIELDS:
         unknown.append("decision.action_family")

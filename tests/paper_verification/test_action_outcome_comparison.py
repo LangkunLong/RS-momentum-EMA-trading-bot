@@ -13,9 +13,14 @@ from tests.test_issue106_replacement_parity import _comparison_case
 _FAMILIES = ("entry", "replacement", "addition", "scale_out", "close")
 
 
+def _known_no_reasons(case: dict[str, object]) -> dict[str, object]:
+    case["execution"].update(rejection_reason=None, cancellation_reason=None)
+    return case
+
+
 def _complete_case(family: str) -> dict[str, object]:
     if family == "entry":
-        return _complete_entry_case()
+        return _known_no_reasons(_complete_entry_case())
     if family == "replacement":
         case = _comparison_case()
         case["execution"].update(
@@ -23,10 +28,10 @@ def _complete_case(family: str) -> dict[str, object]:
             partial_fill=False, missed_fill=False, rejected=False,
             cancelled=False, liquidity_assumption="recorded-full-fill-control",
         )
-        return case
+        return _known_no_reasons(case)
     case = _complete_addition_case()
     if family == "addition":
-        return case
+        return _known_no_reasons(case)
     case["facts"] = {
         "holding_episode_id": "holding:1",
         "security_id": "security:ABC",
@@ -60,7 +65,7 @@ def _complete_case(family: str) -> dict[str, object]:
         filled_quantity=case["intent"]["requested_quantity"],
         order_status="filled",
     )
-    return case
+    return _known_no_reasons(case)
 
 
 @pytest.mark.parametrize("family", _FAMILIES)
@@ -79,11 +84,11 @@ def test_all_supported_action_families_have_a_complete_control(family):
     [
         (
             {"order_status": "rejected", "rejected": True, "rejection_reason": "broker-rejected"},
-            {"execution.order_status", "execution.rejected"},
+            {"execution.order_status", "execution.rejected", "execution.rejection_reason"},
         ),
         (
             {"order_status": "cancelled", "cancelled": True, "cancellation_reason": "remainder-cancelled"},
-            {"execution.order_status", "execution.cancelled"},
+            {"execution.order_status", "execution.cancelled", "execution.cancellation_reason"},
         ),
         (
             {"order_status": "partially_filled", "partial_fill": True, "filled_quantity": Decimal("1")},
@@ -180,6 +185,23 @@ def test_one_sided_execution_reference_or_time_is_unknown():
 
     assert result.disposition is ActionParityDisposition.INCOMPLETE
     assert result.unknowns == ("execution.provider_order_id", "execution.submitted_at")
+    assert result.execution_variances == ()
+
+
+@pytest.mark.parametrize("family", _FAMILIES)
+@pytest.mark.parametrize("field", ("rejection_reason", "cancellation_reason"))
+@pytest.mark.parametrize("missing_from", ("historical", "paper"))
+def test_missing_reason_key_is_unknown_in_either_direction(family, field, missing_from):
+    historical = _complete_case(family)
+    paper = deepcopy(historical)
+    historical["execution"][field] = "known-reason"
+    paper["execution"][field] = "known-reason"
+    (historical if missing_from == "historical" else paper)["execution"].pop(field)
+
+    result = compare_action_parity_cases(historical, paper)
+
+    assert result.disposition is ActionParityDisposition.INCOMPLETE
+    assert result.unknowns == (f"execution.{field}",)
     assert result.execution_variances == ()
 
 
