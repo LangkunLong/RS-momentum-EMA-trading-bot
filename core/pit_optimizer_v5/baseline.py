@@ -782,7 +782,12 @@ class LocalBaselineCaptureFactoryV5:
 
     def _bind(self, inputs):
         from .production_fs import acquire_absolute_directory_v5, open_regular_in_directory_v5
-        from .readiness import ReadinessGitAuthorityV5, _open_trusted_git, capture_readiness_source_v5
+        from .readiness import (
+            ReadinessGitAuthorityV5,
+            _open_trusted_git,
+            capture_readiness_source_v5,
+            pin_engineering_host_executable_v5,
+        )
 
         if self.inputs is not None:
             if self.inputs != inputs:
@@ -798,11 +803,18 @@ class LocalBaselineCaptureFactoryV5:
                 git_authority=ReadinessGitAuthorityV5(self.host.git_executable, self.host.git_sha256),
             )
         )
-        # The shared helper pins an exact protected Windows executable. Reuse
-        # its existing authority wrapper for the explicit Docker CLI as well.
+        docker_authority = ReadinessGitAuthorityV5(self.host.docker_executable, self.host.docker_sha256)
+        # Engineering fixtures may use Docker Desktop's per-user CLI.
+        # Hold its exact bytes and every ancestor identity through all calls;
+        # production retains the stricter unwritable-tool requirement.
+        docker_pin = (
+            pin_engineering_host_executable_v5
+            if self.pit_data_scope == "engineering_v3"
+            else _open_trusted_git
+        )
         self.docker_guard = self.stack.enter_context(
-            _open_trusted_git(
-                ReadinessGitAuthorityV5(self.host.docker_executable, self.host.docker_sha256),
+            docker_pin(
+                docker_authority,
                 forbidden_roots=(source_root, scratch_root, self.repository.root),
             )
         )
