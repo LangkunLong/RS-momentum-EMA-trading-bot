@@ -705,6 +705,26 @@ def advance_replacement(
             decision_id,
             reason="sell fill and durable holding quantity have not reached the same flat state",
         )
+    flags = dict(holding.policy_flags)
+    if (
+        flags.get("flat_stop_retired_by_action_id") != sell.logical_action_id
+        or not flags.get("flat_stop_absence_snapshot_id")
+        or any(
+            value is not None
+            for value in (
+                holding.proposed_stop_action_id,
+                holding.confirmed_stop_action_id,
+                holding.confirmed_stop_client_order_id,
+                holding.confirmed_stop_broker_order_id,
+                holding.confirmed_protective_stop_price,
+            )
+        )
+    ):
+        return ReplacementStep(
+            ReplacementStepKind.WAITING_FOR_RECONCILIATION,
+            decision_id,
+            reason="the sold holding's protective stop has not been durably retired",
+        )
     if account is None or portfolio_snapshot is None or candidate_price is None:
         return ReplacementStep(
             ReplacementStepKind.WAITING_FOR_RECONCILIATION,

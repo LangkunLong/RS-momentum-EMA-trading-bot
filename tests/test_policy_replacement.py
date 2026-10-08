@@ -137,6 +137,17 @@ def _confirm_fake_sell_terminal(store, plan, status, observed_at):
     )
 
 
+def _retire_fake_flat_stop(store, plan, holding, account_snapshot_id):
+    return store.retire_flat_holding_protection(
+        plan.sell_action.logical_action_id,
+        client_order_id=holding.confirmed_stop_client_order_id,
+        broker_order_id=holding.confirmed_stop_broker_order_id,
+        account_snapshot_id=account_snapshot_id,
+        expected_holding_version=store.load_holding_episode(holding.holding_episode_id).state_version,
+        observed_at=plan.decision.clock.account_valuation_at,
+    )
+
+
 def _refreshed_after_full_sale(store, account, portfolio, plan):
     value_time = account.clock.valuation_time + timedelta(minutes=2)
     account_clock = AccountValuationClock(
@@ -268,6 +279,17 @@ def test_restart_between_full_sale_and_buy_releases_one_cash_bounded_action(tmp_
     refreshed_account, refreshed_portfolio = _refreshed_after_full_sale(
         store, account, portfolio, plan
     )
+    stale_stop = advance_replacement(
+        store,
+        plan.decision.decision_id,
+        account=refreshed_account,
+        portfolio_snapshot=refreshed_portfolio,
+        candidate_price=Decimal("100"),
+    )
+    assert stale_stop.kind is ReplacementStepKind.WAITING_FOR_RECONCILIATION
+    assert "stop" in (stale_stop.reason or "")
+    assert load_replacement_intention(store, plan.decision.decision_id).buy_action is None
+    _retire_fake_flat_stop(store, plan, original_holding, refreshed_account.account_snapshot_id)
     next_store = PolicyExecutionStateStore(store.db_path, store_identity=deployment.store_identity)
     buy_step = advance_replacement(
         next_store,
@@ -338,6 +360,12 @@ def test_candidate_price_change_resolves_unsubmitted_buy_and_cannot_reopen(tmp_p
     )
     refreshed_account, refreshed_portfolio = _refreshed_after_full_sale(
         store, account, portfolio, plan
+    )
+    _retire_fake_flat_stop(
+        store,
+        plan,
+        store.load_holding_episode(plan.sell_action.holding_episode_id),
+        refreshed_account.account_snapshot_id,
     )
 
     buy_due = advance_replacement(
