@@ -126,6 +126,8 @@ _REVENUE_PRIORITY = (
     ("us-gaap", "RevenueFromContractWithCustomerExcludingAssessedTax", "USD"),
     ("us-gaap", "Revenues", "USD"),
 )
+_Q4_FLOW_METRICS = ("total_revenue", "net_income")
+_Q4_FLOW_RULE_ID = "sec-q4-flow-fy-minus-q3-ytd/v1"
 _BALANCE_CONCEPTS = {
     "common_stock": ("us-gaap", "CommonStockValue", "USD"),
     "total_stockholders_equity": ("us-gaap", "StockholdersEquity", "USD"),
@@ -297,6 +299,7 @@ class _Candidate:
     units: Mapping[str, str]
     metric_details: Mapping[str, Mapping[str, Any]]
     q4_kind: str | None = None
+    invalidated_metrics: tuple[str, ...] = ()
 
 
 def _regular_file(path: Path, label: str) -> Path:
@@ -1100,6 +1103,34 @@ def _fact_list(
     return raw
 
 
+def _fact_unit_entries(
+    facts: Mapping[str, Any],
+    namespace: str,
+    concept: str,
+    expected_unit: str,
+    *,
+    include_other_units: bool,
+) -> tuple[tuple[str, Mapping[str, Any]], ...]:
+    entries = [
+        (expected_unit, item)
+        for item in _fact_list(facts, namespace, concept, expected_unit)
+    ]
+    if not include_other_units:
+        return tuple(entries)
+    namespace_value = facts.get(namespace, {})
+    concept_value = namespace_value.get(concept) if isinstance(namespace_value, dict) else None
+    if concept_value is None:
+        return tuple(entries)
+    units = concept_value["units"]
+    for unit, raw in units.items():
+        if unit == expected_unit:
+            continue
+        if not isinstance(raw, list) or any(not isinstance(item, dict) for item in raw):
+            raise ValueError(f"companyfacts facts are malformed: {namespace}:{concept}:{unit}")
+        entries.extend((str(unit), item) for item in raw)
+    return tuple(entries)
+
+
 def _fact_number(value: object, *, concept: str) -> float:
     if isinstance(value, bool):
         raise ValueError(f"companyfacts concept has a boolean value: {concept}")
@@ -1300,9 +1331,16 @@ def _candidates_for_cik(
         dict[str, list[tuple[tuple[int, ...], float, str, str, Mapping[str, Any]]]],
     ] = defaultdict(lambda: defaultdict(list))
     q4_kinds: dict[tuple[Any, ...], str] = {}
+    flow_input_candidates: list[_Candidate] = []
 
     for metric, namespace, concept, unit, concept_rank, balance_metric in definitions:
-        for raw in _fact_list(facts, namespace, concept, unit):
+        for fact_unit, raw in _fact_unit_entries(
+            facts,
+            namespace,
+            concept,
+            unit,
+            include_other_units=metric in _Q4_FLOW_METRICS,
+        ):
             metadata = _candidate_metadata(
                 raw,
                 cik=cik,
@@ -1355,6 +1393,23 @@ def _candidates_for_cik(
                         or fy_labeled_quarter_interval
                     )
                 )
+                q3_ytd_input = (
+                    metric in _Q4_FLOW_METRICS
+                    and income_type == "quarterly"
+                    and str(fp).upper() == "Q3"
+                    and duration_days is not None
+                    and duration_days > 115
+                )
+                fy_flow_input = (
+                    metric in _Q4_FLOW_METRICS
+                    and income_type == "annual"
+                    and (
+                        fact_unit != unit
+                        or duration_days is None
+                        or not 300 <= duration_days <= 430
+                        or str(fp).upper() != "FY"
+                    )
+                )
                 if direct_q4:
                     statement_type = "quarterly"
                     q4_kind = "direct"
@@ -1371,6 +1426,15 @@ def _candidates_for_cik(
                     context_score = (
                         int(str(fp).upper() in {"Q1", "Q2", "Q3"}),
                         -abs(duration_days - 91),
+                    )
+                elif q3_ytd_input:
+                    q4_kind = "q3_ytd_input"
+                    context_score = (1, -abs(duration_days - 274))
+                elif fy_flow_input:
+                    q4_kind = "fy_flow_input"
+                    context_score = (
+                        1,
+                        -abs(duration_days - 365) if duration_days is not None else 0,
                     )
                 else:
                     duration_score = _duration_score(raw, statement_type=statement_type, counters=counters)
@@ -1396,8 +1460,8 @@ def _candidates_for_cik(
                 "public_date": public_date.isoformat(),
                 "source_concept": concept_id,
                 "source_value": number,
-                "unit": unit,
-                "currency": unit if unit in {"USD", "CAD", "EUR", "GBP"} else "",
+                "unit": fact_unit,
+                "currency": fact_unit if fact_unit in {"USD", "CAD", "EUR", "GBP"} else "",
                 "value_scale_multiplier": 1,
                 "value_scale_basis": "SEC CompanyFacts numeric value in base unit",
                 "decimals": str(raw.get("decimals", "") or ""),
@@ -1415,7 +1479,7 @@ def _candidates_for_cik(
                 metric,
                 namespace,
                 concept,
-                unit,
+                fact_unit,
                 accession,
                 form,
                 str(raw.get("start", "")),
@@ -1430,6 +1494,36 @@ def _candidates_for_cik(
                 counters["exact_duplicate_fact_count"] += 1
                 continue
             seen_facts.add(duplicate_key)
+            if metric in _Q4_FLOW_METRICS and q4_kind in {
+                "q3_ytd_input",
+                "fy_flow_input",
+            }:
+                flow_input_candidates.append(
+                    _Candidate(
+                        cik=cik,
+                        accession=accession,
+                        form=form,
+                        statement_type=statement_type,
+                        period_end=period_end,
+                        filed=filed,
+                        fiscal_year=fy,
+                        fiscal_period=candidate_fp,
+                        acceptance=acceptance,
+                        public_date=public_date,
+                        public_date_basis=basis,
+                        values=MappingProxyType({metric: number}),
+                        concepts=MappingProxyType({metric: concept_id}),
+                        units=MappingProxyType({metric: fact_unit}),
+                        metric_details=MappingProxyType(
+                            {metric: MappingProxyType(metric_detail)}
+                        ),
+                        q4_kind=q4_kind,
+                    )
+                )
+                counters["q4_flow_input_candidate_count"] += 1
+                continue
+            if fact_unit != unit:
+                continue
             key = (
                 accession,
                 form,
@@ -1447,7 +1541,7 @@ def _candidates_for_cik(
             if q4_kind is not None:
                 q4_kinds[key] = q4_kind
 
-    candidates: list[_Candidate] = []
+    candidates: list[_Candidate] = list(flow_input_candidates)
     for key, metric_entries in groups.items():
         values: dict[str, float] = {}
         concepts: dict[str, str] = {}
@@ -1497,6 +1591,420 @@ def _candidates_for_cik(
     return tuple(candidates)
 
 
+def _q4_flow_incompatibilities(
+    annual: _Candidate | None,
+    q3_ytd: _Candidate | None,
+    metric: str,
+) -> tuple[str, ...]:
+    reasons: set[str] = set()
+    if annual is None:
+        reasons.add("missing_fy")
+    if q3_ytd is None:
+        reasons.add("missing_q3_ytd")
+    if annual is None or q3_ytd is None:
+        return tuple(sorted(reasons))
+
+    annual_detail = annual.metric_details[metric]
+    q3_detail = q3_ytd.metric_details[metric]
+    if annual.cik != q3_ytd.cik:
+        reasons.add("cik_mismatch")
+    if annual.concepts.get(metric) != q3_ytd.concepts.get(metric):
+        reasons.add("tag_mismatch")
+    if (
+        annual.units.get(metric) != "USD"
+        or q3_ytd.units.get(metric) != "USD"
+        or annual_detail.get("unit") != "USD"
+        or q3_detail.get("unit") != "USD"
+    ):
+        reasons.add("unit_mismatch")
+    if not annual.fiscal_year or annual.fiscal_year != q3_ytd.fiscal_year:
+        reasons.add("fiscal_year_mismatch")
+    if annual.fiscal_period.upper() != "FY":
+        reasons.add("fy_period_mismatch")
+    if q3_ytd.fiscal_period.upper() != "Q3":
+        reasons.add("q3_ytd_period_mismatch")
+    if (
+        annual_detail.get("value_scale_multiplier") != 1
+        or q3_detail.get("value_scale_multiplier") != 1
+    ):
+        reasons.add("value_scale_mismatch")
+
+    try:
+        annual_start = _iso_date(annual_detail.get("period_start"), "FY period start")
+        q3_start = _iso_date(q3_detail.get("period_start"), "Q3-YTD period start")
+    except (TypeError, ValueError):
+        reasons.add("start_mismatch")
+        annual_start = None
+        q3_start = None
+    if annual_start is not None and q3_start is not None and annual_start != q3_start:
+        reasons.add("start_mismatch")
+    if (
+        annual_detail.get("period_end") != annual.period_end.isoformat()
+        or q3_detail.get("period_end") != q3_ytd.period_end.isoformat()
+    ):
+        reasons.add("period_end_mismatch")
+    if annual_start is None or not 300 <= (annual.period_end - annual_start).days + 1 <= 430:
+        reasons.add("fy_duration_out_of_range")
+    if q3_start is None or not 240 <= (q3_ytd.period_end - q3_start).days + 1 <= 320:
+        reasons.add("q3_ytd_duration_out_of_range")
+    if not 70 <= (annual.period_end - q3_ytd.period_end).days <= 115:
+        reasons.add("q4_residual_duration_out_of_range")
+    return tuple(sorted(reasons))
+
+
+def _q4_flow_version_key(candidate: _Candidate, metric: str) -> tuple[Any, ...]:
+    configured = _REVENUE_PRIORITY if metric == "total_revenue" else _INCOME_CONCEPTS[metric]
+    ranks = {f"{namespace}:{concept}": rank for rank, (namespace, concept, _unit) in enumerate(configured)}
+    concept_rank = ranks.get(candidate.concepts.get(metric, ""), len(ranks))
+    return (
+        candidate.public_date,
+        _candidate_timestamp(candidate),
+        candidate.units.get(metric) == "USD",
+        -concept_rank,
+        candidate.accession,
+    )
+
+
+def _q4_flow_inputs(
+    annual: _Candidate | None,
+    q3_ytd: _Candidate | None,
+    metric: str,
+) -> list[dict[str, Any]]:
+    inputs: list[dict[str, Any]] = []
+    for candidate, source_role in ((annual, "FY"), (q3_ytd, "Q3_YTD")):
+        if candidate is None:
+            continue
+        input_detail = dict(candidate.metric_details[metric])
+        input_detail.update(
+            {
+                "cik": candidate.cik,
+                "accession_number": _display_accession(candidate.accession),
+                "form": candidate.form,
+                "filed_date": candidate.filed.isoformat(),
+                "fiscal_year": candidate.fiscal_year,
+                "fiscal_period": candidate.fiscal_period,
+                "period_start": str(
+                    candidate.metric_details[metric].get("period_start", "")
+                ),
+                "period_end": candidate.period_end.isoformat(),
+                "source_concept": candidate.concepts[metric],
+                "source_value": candidate.values[metric],
+                "unit": candidate.units[metric],
+                "source_role": source_role,
+            }
+        )
+        inputs.append(input_detail)
+    return inputs
+
+
+def _derived_q4_flow_candidate(
+    annual: _Candidate,
+    q3_ytd: _Candidate,
+    metric: str,
+    *,
+    public_date: date,
+) -> _Candidate:
+    value = annual.values[metric] - q3_ytd.values[metric]
+    q4_start = q3_ytd.period_end + timedelta(days=1)
+    residual_days = (annual.period_end - q3_ytd.period_end).days
+    detail = {
+        "kind": "derived",
+        "schema_version": 1,
+        "rule_id": _Q4_FLOW_RULE_ID,
+        "derivation": "fy_minus_q3_ytd",
+        "formula": "FY - Q3_YTD",
+        "source_value": value,
+        "unit": "USD",
+        "currency": "USD",
+        "value_scale_multiplier": 1,
+        "available_from": max(annual.public_date, q3_ytd.public_date).isoformat(),
+        "q4_residual_period_start": q4_start.isoformat(),
+        "q4_residual_period_end": annual.period_end.isoformat(),
+        "q4_residual_duration_days": residual_days,
+        "inputs": _q4_flow_inputs(annual, q3_ytd, metric),
+    }
+    trigger = max(
+        (annual, q3_ytd),
+        key=lambda item: (
+            item.public_date,
+            _candidate_timestamp(item),
+            item.accession,
+        ),
+    )
+    return _Candidate(
+        cik=annual.cik,
+        accession="",
+        form="DERIVED_Q4",
+        statement_type="quarterly",
+        period_end=annual.period_end,
+        filed=trigger.filed,
+        fiscal_year=annual.fiscal_year,
+        fiscal_period="Q4",
+        acceptance=None,
+        public_date=public_date,
+        public_date_basis="later_of_input_public_dates",
+        values=MappingProxyType({metric: value}),
+        concepts=MappingProxyType({metric: f"derived:{annual.concepts[metric]}"}),
+        units=MappingProxyType({metric: "USD"}),
+        metric_details=MappingProxyType({metric: MappingProxyType(detail)}),
+        q4_kind="derived",
+    )
+
+
+def _q4_direct_snapshot(
+    direct: _Candidate,
+    metric: str,
+    public_date: date,
+    *,
+    public_date_basis: str = "later_of_input_public_dates",
+) -> _Candidate:
+    return _Candidate(
+        cik=direct.cik,
+        accession=direct.accession,
+        form=direct.form,
+        statement_type="quarterly",
+        period_end=direct.period_end,
+        filed=direct.filed,
+        fiscal_year=direct.fiscal_year,
+        fiscal_period="Q4",
+        acceptance=direct.acceptance,
+        public_date=public_date,
+        public_date_basis=public_date_basis,
+        values=MappingProxyType({metric: direct.values[metric]}),
+        concepts=MappingProxyType({metric: direct.concepts[metric]}),
+        units=MappingProxyType({metric: direct.units[metric]}),
+        metric_details=MappingProxyType({metric: direct.metric_details[metric]}),
+        q4_kind="direct",
+    )
+
+
+def _q4_invalidation_candidate(
+    annual: _Candidate | None,
+    q3_ytd: _Candidate | None,
+    metric: str,
+    *,
+    public_date: date,
+    reason_codes: Sequence[str],
+) -> _Candidate | None:
+    source_candidates = [item for item in (annual, q3_ytd) if item is not None]
+    if not source_candidates:
+        return None
+    trigger = max(
+        source_candidates,
+        key=lambda item: (
+            item.public_date,
+            _candidate_timestamp(item),
+            item.accession,
+        ),
+    )
+    inputs = _q4_flow_inputs(annual, q3_ytd, metric)
+    detail = {
+        "kind": "unavailable",
+        "schema_version": 1,
+        "rule_id": _Q4_FLOW_RULE_ID,
+        "reason_codes": list(reason_codes),
+        "inputs": inputs,
+    }
+    return _Candidate(
+        cik=trigger.cik,
+        accession=trigger.accession,
+        form=trigger.form,
+        statement_type="quarterly",
+        period_end=(annual.period_end if annual is not None else trigger.period_end),
+        filed=trigger.filed,
+        fiscal_year=(annual.fiscal_year if annual is not None else trigger.fiscal_year),
+        fiscal_period="Q4",
+        acceptance=trigger.acceptance,
+        public_date=public_date,
+        public_date_basis=trigger.public_date_basis,
+        values=MappingProxyType({}),
+        concepts=MappingProxyType({}),
+        units=MappingProxyType({}),
+        metric_details=MappingProxyType({metric: MappingProxyType(detail)}),
+        invalidated_metrics=(metric,),
+    )
+
+
+def _derive_q4_flow_candidates(
+    candidates: Sequence[_Candidate], counters: Counter[str]
+) -> tuple[_Candidate, ...]:
+    """Derive revenue and net-income Q4 using compatible FY and Q3-YTD facts."""
+    derived: list[_Candidate] = []
+    for metric in _Q4_FLOW_METRICS:
+        annual_groups: dict[tuple[str, str], list[_Candidate]] = defaultdict(list)
+        for candidate in candidates:
+            if (
+                metric in candidate.values
+                and candidate.statement_type == "annual"
+                and (
+                    candidate.q4_kind == "fy_flow_input"
+                    or candidate.fiscal_period.upper() == "FY"
+                    and candidate.q4_kind is None
+                )
+            ):
+                annual_groups[(candidate.cik, candidate.fiscal_year)].append(candidate)
+        q3_ytd_inputs = [
+            candidate
+            for candidate in candidates
+            if metric in candidate.values and candidate.q4_kind == "q3_ytd_input"
+        ]
+        direct_q4 = [
+            candidate
+            for candidate in candidates
+            if metric in candidate.values
+            and candidate.statement_type == "quarterly"
+            and candidate.q4_kind == "direct"
+        ]
+
+        for (cik, fiscal_year), annual_versions in annual_groups.items():
+            annual_starts = {
+                str(candidate.metric_details[metric].get("period_start", ""))
+                for candidate in annual_versions
+            }
+            annual_ends = {candidate.period_end for candidate in annual_versions}
+            related_ytd = [
+                candidate
+                for candidate in q3_ytd_inputs
+                if candidate.cik == cik
+                and (
+                    candidate.fiscal_year == fiscal_year
+                    or str(candidate.metric_details[metric].get("period_start", ""))
+                    in annual_starts
+                    or any(
+                        70 <= (annual_end - candidate.period_end).days <= 115
+                        for annual_end in annual_ends
+                    )
+                )
+            ]
+            direct_versions = [
+                candidate
+                for candidate in direct_q4
+                if candidate.cik == cik and candidate.period_end in annual_ends
+            ]
+            event_dates = sorted(
+                {
+                    candidate.public_date
+                    for candidate in (*annual_versions, *related_ytd, *direct_versions)
+                }
+            )
+            derived_is_visible = False
+            last_pair_signature: tuple[Any, ...] | None = None
+            last_comparison_signature: tuple[Any, ...] | None = None
+
+            for event_date in event_dates:
+                annual_visible = [
+                    candidate for candidate in annual_versions if candidate.public_date <= event_date
+                ]
+                ytd_visible = [
+                    candidate for candidate in related_ytd if candidate.public_date <= event_date
+                ]
+                direct_visible = [
+                    candidate for candidate in direct_versions if candidate.public_date <= event_date
+                ]
+                annual = (
+                    max(annual_visible, key=lambda item: _q4_flow_version_key(item, metric))
+                    if annual_visible
+                    else None
+                )
+                q3_ytd = (
+                    max(ytd_visible, key=lambda item: _q4_flow_version_key(item, metric))
+                    if ytd_visible
+                    else None
+                )
+                direct = (
+                    max(direct_visible, key=lambda item: _q4_flow_version_key(item, metric))
+                    if direct_visible
+                    else None
+                )
+                incompatibilities = _q4_flow_incompatibilities(annual, q3_ytd, metric)
+
+                if not incompatibilities and annual is not None and q3_ytd is not None:
+                    pair_signature = (
+                        annual.accession,
+                        annual.public_date,
+                        annual.concepts[metric],
+                        annual.units[metric],
+                        annual.values[metric],
+                        q3_ytd.accession,
+                        q3_ytd.public_date,
+                        q3_ytd.concepts[metric],
+                        q3_ytd.units[metric],
+                        q3_ytd.values[metric],
+                    )
+                    available_from = max(annual.public_date, q3_ytd.public_date)
+                    if direct is not None:
+                        comparison_signature = (
+                            pair_signature,
+                            direct.accession,
+                            direct.public_date,
+                            direct.values[metric],
+                        )
+                        comparison_date = max(available_from, direct.public_date)
+                        if comparison_signature != last_comparison_signature:
+                            if direct.public_date < comparison_date:
+                                derived.append(
+                                    _q4_direct_snapshot(direct, metric, comparison_date)
+                                )
+                            derived.append(
+                                _derived_q4_flow_candidate(
+                                    annual,
+                                    q3_ytd,
+                                    metric,
+                                    public_date=comparison_date,
+                                )
+                            )
+                            last_comparison_signature = comparison_signature
+                        last_pair_signature = pair_signature
+                        derived_is_visible = False
+                    else:
+                        if pair_signature != last_pair_signature:
+                            derived.append(
+                                _derived_q4_flow_candidate(
+                                    annual,
+                                    q3_ytd,
+                                    metric,
+                                    public_date=available_from,
+                                )
+                            )
+                            counters["q4_flow_derived_candidate_count"] += 1
+                        last_pair_signature = pair_signature
+                        last_comparison_signature = None
+                        derived_is_visible = True
+                    continue
+
+                if direct is not None:
+                    if last_comparison_signature is not None and direct.public_date < event_date:
+                        derived.append(
+                            _q4_direct_snapshot(
+                                direct,
+                                metric,
+                                event_date,
+                                public_date_basis=(
+                                    q3_ytd.public_date_basis
+                                    if q3_ytd is not None
+                                    else annual.public_date_basis if annual is not None else direct.public_date_basis
+                                ),
+                            )
+                        )
+                    last_comparison_signature = None
+                    derived_is_visible = False
+                elif derived_is_visible:
+                    invalidation = _q4_invalidation_candidate(
+                        annual,
+                        q3_ytd,
+                        metric,
+                        public_date=event_date,
+                        reason_codes=incompatibilities,
+                    )
+                    if invalidation is not None:
+                        derived.append(invalidation)
+                        counters["q4_flow_invalidated_candidate_count"] += 1
+                    derived_is_visible = False
+                last_pair_signature = None
+
+    return tuple(derived)
+
+
 def _derive_q4_revenue_candidates(
     candidates: Sequence[_Candidate], counters: Counter[str]
 ) -> tuple[_Candidate, ...]:
@@ -1510,7 +2018,11 @@ def _derive_q4_revenue_candidates(
         and "total_revenue" in candidate.values
     ]
     for candidate in candidates:
-        if candidate.statement_type == "annual" and candidate.fiscal_period == "FY":
+        if (
+            candidate.q4_kind is None
+            and candidate.statement_type == "annual"
+            and candidate.fiscal_period == "FY"
+        ):
             if "total_revenue" in candidate.values:
                 annual_groups[
                     (candidate.cik, candidate.fiscal_year, candidate.period_end)
@@ -1838,9 +2350,9 @@ def _merge_q4_candidates(candidates: Sequence[_Candidate]) -> tuple[_Candidate, 
         primary = max(
             versions,
             key=lambda item: (
+                item.q4_kind == "direct",
                 _candidate_timestamp(item),
                 item.accession,
-                item.q4_kind == "direct",
             ),
         )
         values: dict[str, float] = {}
@@ -1853,18 +2365,53 @@ def _merge_q4_candidates(candidates: Sequence[_Candidate]) -> tuple[_Candidate, 
                 for item in versions
                 if metric in item.values
             ]
+            direct_sources = [item for item in sources if item.q4_kind == "direct"]
+            derived_sources = [item for item in sources if item.q4_kind == "derived"]
+            approved_derived_sources = [
+                item
+                for item in derived_sources
+                if item.metric_details[metric].get("rule_id") == _Q4_FLOW_RULE_ID
+            ]
             selected = max(
-                sources,
-                key=lambda item: (
-                    _candidate_timestamp(item),
-                    item.accession,
-                    item.q4_kind == "direct",
-                ),
+                direct_sources or approved_derived_sources or sources,
+                key=lambda item: (_candidate_timestamp(item), item.accession),
             )
             values[metric] = selected.values[metric]
             concepts[metric] = selected.concepts[metric]
             units[metric] = selected.units[metric]
-            details[metric] = selected.metric_details[metric]
+            if direct_sources and derived_sources:
+                comparison_candidate = max(
+                    derived_sources,
+                    key=lambda item: (
+                        item.metric_details[metric].get("rule_id") == _Q4_FLOW_RULE_ID,
+                        _candidate_timestamp(item),
+                        item.accession,
+                    ),
+                )
+                direct_value = selected.values[metric]
+                derived_detail = dict(comparison_candidate.metric_details[metric])
+                derived_value = comparison_candidate.values[metric]
+                derived_detail.update(
+                    {
+                        "direct_value": direct_value,
+                        "difference": direct_value - derived_value,
+                        "conflict": not math.isclose(
+                            direct_value,
+                            derived_value,
+                            rel_tol=0.0,
+                            abs_tol=1e-9,
+                        ),
+                    }
+                )
+                details[metric] = MappingProxyType(
+                    {
+                        "kind": "direct_with_derived_comparison",
+                        "direct_source": dict(selected.metric_details[metric]),
+                        "derived_comparison": derived_detail,
+                    }
+                )
+            else:
+                details[metric] = selected.metric_details[metric]
         merged.append(
             _Candidate(
                 cik=primary.cik,
@@ -1924,15 +2471,25 @@ def _materialize_ticker(
 
     visible: dict[tuple[str, str, date, date], tuple[FundamentalRow, FundamentalAuditRow]] = {}
     for (statement_type, period_end), period_candidates in by_period.items():
-        state: dict[str, float] = {}
+        state: dict[str, float | None] = {}
         state_concepts: dict[str, str] = {}
         state_origins: dict[str, Mapping[str, Any]] = {}
         previous_public: date | None = None
         for candidate in period_candidates:
-            inherited = sorted(metric for metric in state if metric not in candidate.values)
+            inherited = sorted(
+                metric
+                for metric in state
+                if metric not in candidate.values
+                and metric not in candidate.invalidated_metrics
+                and state[metric] is not None
+            )
             state.update(candidate.values)
             state_concepts.update(candidate.concepts)
             for metric in candidate.values:
+                state_origins[metric] = dict(candidate.metric_details[metric])
+            for metric in candidate.invalidated_metrics:
+                state[metric] = None
+                state_concepts.pop(metric, None)
                 state_origins[metric] = dict(candidate.metric_details[metric])
             if not state:
                 continue
@@ -2133,6 +2690,12 @@ def extract_fundamentals(
                         continue
                     selected.append(candidate)
         selected.extend(_derive_q4_revenue_candidates(selected, counters))
+        selected.extend(_derive_q4_flow_candidates(selected, counters))
+        selected = [
+            candidate
+            for candidate in selected
+            if candidate.q4_kind not in {"q3_ytd_input", "fy_flow_input"}
+        ]
         selected = list(_merge_q4_candidates(selected))
         ticker_rows, ticker_audit = _materialize_ticker(ticker, selected, counters)
         if not ticker_rows:
