@@ -75,9 +75,12 @@ def prepare_d1_engineering_inputs_v5(
     if (
         not source_root.is_absolute() or not source_root.is_dir() or source_root.is_symlink()
         or not destination.is_absolute() or not destination.is_dir() or destination.is_symlink()
-        or source_root == destination
     ):
         raise ValueError("engineering fixture and artifact roots must be distinct absolute directories")
+    canonical_source = source_root.resolve(strict=True)
+    canonical_destination = destination.resolve(strict=True)
+    if canonical_source.is_relative_to(canonical_destination) or canonical_destination.is_relative_to(canonical_source):
+        raise ValueError("engineering fixture and artifact roots must not overlap")
     manifest_path = source_root / "fixture_manifest.json"
     if not manifest_path.is_file() or manifest_path.is_symlink():
         raise ValueError("accepted D1 fixture manifest is unavailable")
