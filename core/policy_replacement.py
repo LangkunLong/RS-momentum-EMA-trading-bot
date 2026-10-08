@@ -625,12 +625,12 @@ def advance_replacement(
                 ReplacementStepKind.BLOCKED, decision_id, reason="buy decision has no recoverable action"
             )
         if buy.status is ActionStatus.INTENDED:
-            if account is None or candidate_price is None:
+            if account is None or portfolio_snapshot is None or candidate_price is None:
                 return ReplacementStep(
                     ReplacementStepKind.WAITING_FOR_RECONCILIATION,
                     decision_id,
                     buy,
-                    reason="account snapshot and candidate price are required to release the authorized buy",
+                    reason="account, portfolio, and candidate price are required to release the authorized buy",
                 )
             if account.account_snapshot_id is None or account.positions is None or account.open_orders is None:
                 return ReplacementStep(
@@ -648,19 +648,28 @@ def advance_replacement(
             authorized_price = (
                 None if authorized_price_raw is None else Decimal(str(authorized_price_raw))
             )
-            portfolio_matches = (
-                portfolio_snapshot is None
-                or portfolio_snapshot.portfolio_snapshot_id == authorized_portfolio
-            )
+            try:
+                current_decision = _child_decision(
+                    execution.plan,
+                    account,
+                    portfolio_snapshot,
+                    current_price,
+                    execution.sell_action,
+                    store.load_action_projection(execution.sell_action.logical_action_id).state_version,
+                )
+                source_matches = current_decision.decision_id == execution.buy_decision.decision_id
+            except (ValueError, KeyError):
+                source_matches = False
             if (
                 account.account_snapshot_id != authorized_snapshot
                 or account.paper_account_environment_id != authorized_environment
                 or account.source_namespace != authorized_source
-                or not portfolio_matches
+                or portfolio_snapshot.portfolio_snapshot_id != authorized_portfolio
                 or current_price != authorized_price
+                or not source_matches
             ):
                 reason = (
-                    "account snapshot or candidate price changed after buy authorization; "
+                    "account, portfolio, sale, or candidate price changed after buy authorization; "
                     "the unsubmitted buy was resolved and requires a new replacement decision"
                 )
                 projection = store.load_action_projection(buy.logical_action_id)
@@ -701,6 +710,20 @@ def advance_replacement(
                 )
             return ReplacementStep(ReplacementStepKind.BUY_DUE, decision_id, buy)
         if buy.status is ActionStatus.FILLED:
+            holding = store.load_holding_episode_for_action(buy.logical_action_id)
+            if (
+                holding.remaining_quantity != buy.confirmed_filled_quantity
+                or holding.proposed_stop_action_id != holding.confirmed_stop_action_id
+                or holding.confirmed_stop_client_order_id is None
+                or holding.confirmed_stop_broker_order_id is None
+                or holding.confirmed_protective_stop_price != buy.reservation_stop_price
+            ):
+                return ReplacementStep(
+                    ReplacementStepKind.WAITING_FOR_RECONCILIATION,
+                    decision_id,
+                    buy,
+                    reason="filled replacement buy awaits confirmed protective stop coverage",
+                )
             return ReplacementStep(ReplacementStepKind.COMPLETE, decision_id, buy)
         if buy.status in {
             ActionStatus.SUBMITTED, ActionStatus.PARTIALLY_FILLED, ActionStatus.CANCEL_REQUESTED,
