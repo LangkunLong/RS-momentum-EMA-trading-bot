@@ -120,6 +120,21 @@ def _check_market_open() -> bool:
         return False
 
 
+def _get_complete_closed_orders(symbol: str) -> list[object]:
+    """Reject a full lifecycle page before treating closed history as complete."""
+    budget = current_operation_budget()
+    page_limit = 50
+    if budget is not None and budget.manifest.operation == "lifecycle":
+        page_limit = min(page_limit, budget.manifest.dimensions["order_page_size"])
+    orders = get_closed_orders(symbol, limit=page_limit, raise_on_error=True)
+    if len(orders) >= page_limit:
+        detail = f"closed order page reached its effective {page_limit}-row limit"
+        if budget is not None:
+            budget.reject_incomplete("closed_order_read", detail)
+        raise RuntimeError(detail)
+    return orders
+
+
 def main(
     *, execute: bool = False, operation_manifest_path: str | None = None
 ) -> int:
@@ -1062,7 +1077,7 @@ def _repair_flat_pending_exit_intent(
             "pending exit lacks durable entry-fill coverage"
         )
 
-    closed_orders = get_closed_orders(symbol, limit=50, raise_on_error=True)
+    closed_orders = _get_complete_closed_orders(symbol)
     final_order_id = _trusted_recorded_sell_coverage(
         symbol,
         workflow_id,
@@ -1144,7 +1159,7 @@ def _reconcile_restart_gap(
     except (TypeError, ValueError) as exc:
         raise RuntimeError("durable active quantity is invalid") from exc
 
-    closed_orders = get_closed_orders(symbol, limit=50, raise_on_error=True)
+    closed_orders = _get_complete_closed_orders(symbol)
     snapshot = store.load_workflow(workflow_id)
     if snapshot is None:
         raise RuntimeError("durable workflow is missing during restart recovery")
@@ -1665,7 +1680,10 @@ def _wait_for_symbol_clear(
     while True:
         if budget is not None:
             budget.enforce_deadline("final_clear_wait_seconds", started)
-            budget.consume("final_clear_polls")
+            budget.consume_scaled(
+                "final_clear_polls",
+                multiplier=budget.manifest.dimensions["final_clear_invocations"],
+            )
         try:
             positions = get_open_positions(raise_on_error=True)
             orders = get_open_orders(symbol, raise_on_error=True)
@@ -1713,7 +1731,7 @@ def _entry_order_is_terminal(symbol: str, workflow_id: str) -> bool:
     """Confirm terminal entry state cannot leave unaccounted filled exposure."""
     if not workflow_id:
         return True
-    closed_orders = get_closed_orders(symbol, limit=50, raise_on_error=True)
+    closed_orders = _get_complete_closed_orders(symbol)
     buy_orders = [
         order
         for order in closed_orders
