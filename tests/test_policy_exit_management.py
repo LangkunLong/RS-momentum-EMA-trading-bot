@@ -57,10 +57,11 @@ def test_fixed_winner_and_trailing_state_survives_restart_and_release(tmp_path):
         snapshot=snapshot, outcome=outcome, expected_holding_version=holding.state_version,
     )
     assert replay == saved
+    changed_snapshot = replace(snapshot, current_close=124.0)
     with pytest.raises(DecisionConflictError, match="different immutable decision facts"):
         restarted.record_policy_exit_management(
             decision=decision, holding_episode_id=holding.holding_episode_id,
-            snapshot=snapshot, outcome=replace(outcome, ema_trailing_active=False),
+            snapshot=changed_snapshot, outcome=evaluate_exit(changed_snapshot),
             expected_holding_version=holding.state_version,
         )
 
@@ -123,6 +124,19 @@ def test_fixed_exit_management_rejects_stale_holding_facts(tmp_path):
         manager.record_policy_exit_management(
             decision=decision, holding_episode_id=holding.holding_episode_id,
             snapshot=stale, outcome=evaluate_exit(stale),
+            expected_holding_version=holding.state_version,
+        )
+    assert store.load_holding_episode(holding.holding_episode_id) == holding
+
+
+def test_fixed_exit_management_rejects_forged_policy_flags(tmp_path):
+    _, store, _, _, holding, decision, snapshot = _case(tmp_path)
+    evaluated = evaluate_exit(snapshot)
+    forged = replace(evaluated, early_winner_hold=False)
+    with pytest.raises(ValueError, match="selected baseline evaluator"):
+        OrderManager(paper=True, policy_store=store).record_policy_exit_management(
+            decision=decision, holding_episode_id=holding.holding_episode_id,
+            snapshot=snapshot, outcome=forged,
             expected_holding_version=holding.state_version,
         )
     assert store.load_holding_episode(holding.holding_episode_id) == holding

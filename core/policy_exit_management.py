@@ -8,6 +8,7 @@ from hashlib import sha256
 from core.policy_execution_state import DecisionCategory, DecisionIdentity, DecisionSubjectType, HoldingEpisode
 from core.policy_execution_store import PolicyExecutionStateStore
 from core.strategy_policy.contracts import ExitDecision, ExitSnapshot, validate_exit_decision
+from core.strategy_policy.exit import evaluate_exit
 
 
 def _flag(holding: HoldingEpisode, name: str) -> bool:
@@ -34,6 +35,8 @@ def record_fixed_exit_management(
     if type(snapshot) is not ExitSnapshot or type(outcome) is not ExitDecision:
         raise TypeError("fixed exit management requires typed policy facts")
     validate_exit_decision(snapshot, outcome)
+    if evaluate_exit(snapshot) != outcome:
+        raise ValueError("fixed exit outcome differs from the selected baseline evaluator")
     if (
         decision.category is not DecisionCategory.EXIT
         or decision.subject_type is not DecisionSubjectType.HOLDING
