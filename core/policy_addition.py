@@ -8,10 +8,11 @@ terminally reconciled before the accepted stop-update API can resize protection.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import timedelta
 from decimal import Decimal, ROUND_DOWN
 from enum import StrEnum
+from hashlib import sha256
 from typing import Callable, Mapping
 
 from core.policy_execution_state import (
@@ -48,6 +49,19 @@ _MAXIMUM_ADD_ONS_PER_HOLDING = 2
 _MAX_POSITION_RISK_FRACTION = Decimal("0.01")
 _ACTIVE_ORDER_STATUSES = frozenset({"submitted", "partially_filled", "cancel_requested"})
 _TERMINAL_ORDER_STATUSES = frozenset({"cancelled", "canceled", "rejected", "filled"})
+
+
+def _source_fingerprint(account: BrokerAccountSnapshot, portfolio_snapshot) -> str:
+    """Bind an intended addition to complete authorization-time paper facts."""
+    canonical = json.dumps(
+        {"account": asdict(account), "portfolio": asdict(portfolio_snapshot)},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+        default=str,
+    )
+    return sha256(canonical.encode("utf-8")).hexdigest()
 
 
 class AdditionStepKind(StrEnum):
@@ -209,13 +223,24 @@ def _confirmed_protection_matches_addition(
         return False
     guard = decision.guard_payload
     effective = decision.effective_action_payload
-    return (
+    matches = (
         effective.get("kind") == _PROTECTION_KIND
         and effective.get("parent_decision_id") == plan.decision.decision_id
         and stop.holding_episode_id == plan.holding_episode_id
         and stop.requested_stop_price == stop_price
         and Decimal(str(guard.get("holding_quantity", "-1"))) == quantity
     )
+    if not matches:
+        return False
+    provider_id = guard.get("provider_id")
+    if not isinstance(provider_id, str) or not provider_id:
+        return False
+    try:
+        return store.confirmed_protective_order_quantity(
+            action_id, provider_id=provider_id
+        ) == quantity
+    except (KeyError, ValueError):
+        return False
 
 
 def _step_for_action(store: PolicyExecutionStateStore, plan: AdditionPlan, action: ActionIntent) -> AdditionStep:
@@ -242,6 +267,11 @@ def _step_for_action(store: PolicyExecutionStateStore, plan: AdditionPlan, actio
             return AdditionStep(AdditionStepKind.PROTECTED, plan.decision.decision_id, action)
         return AdditionStep(AdditionStepKind.PROTECTION_DUE, plan.decision.decision_id, action)
     if action.status is ActionStatus.RESOLVED and action.confirmed_filled_quantity == 0:
+        if all(
+            attempt.client_order_id is None and attempt.broker_order_id is None
+            for attempt in action.order_attempts
+        ):
+            return AdditionStep(AdditionStepKind.BLOCKED, plan.decision.decision_id, action)
         return AdditionStep(AdditionStepKind.REJECTED, plan.decision.decision_id, action)
     return AdditionStep(
         AdditionStepKind.WAITING_FOR_BUY,
@@ -403,7 +433,22 @@ def start_addition(
         recorded_plan, _ = _plan_from_record(existing)
         if recorded_plan != plan:
             raise ValueError("fixed addition decision was replayed with different policy or source facts")
-        return load_addition_intention(store, plan.decision.decision_id)
+        step = load_addition_intention(store, plan.decision.decision_id)
+        if step.kind is AdditionStepKind.BUY_DUE and step.action is not None:
+            if existing.guard_payload.get("source_fingerprint_sha256") != _source_fingerprint(
+                account, portfolio_snapshot
+            ):
+                projection = store.load_action_projection(step.action.logical_action_id)
+                holding = store.load_holding_episode(plan.holding_episode_id)
+                store.record_explicit_action_resolution(
+                    step.action.logical_action_id,
+                    resolution_reason="account or portfolio facts changed after addition authorization",
+                    expected_action_version=projection.state_version,
+                    expected_holding_version=holding.state_version,
+                    observed_at=account.clock.valuation_time,
+                )
+                return load_addition_intention(store, plan.decision.decision_id)
+        return step
 
     if plan.policy_decision != validate_add_on_decision(plan.add_on_snapshot, plan.policy_decision):
         return _blocked(store, plan, "add-on decision failed canonical host validation")
@@ -552,6 +597,7 @@ def start_addition(
             "whole_share_quantity": str(whole_shares),
             "reserved_buy_cash": str(whole_shares * price),
             "reserved_buy_risk": str(whole_shares * risk_per_share),
+            "source_fingerprint_sha256": _source_fingerprint(account, portfolio_snapshot),
         }
         if whole_shares <= 0:
             persistence_started = True
@@ -974,8 +1020,11 @@ def confirm_addition_protection(
     *,
     account: BrokerAccountSnapshot,
     observed_at,
+    provider_id: str,
 ) -> AdditionStep:
     """Confirm a replacement only from exact broker position and stop-order facts."""
+    if type(provider_id) is not str or not provider_id.strip():
+        raise ValueError("addition protection requires a provider identity")
     plan, action, step = _execution_context(store, decision_id)
     if action is None or action.confirmed_filled_quantity <= 0:
         return step
@@ -986,6 +1035,7 @@ def confirm_addition_protection(
     intent = store.load_stop_update_intent(stop_action_id)
     decision_record = store.load_decision_record(intent.decision_id)
     effective = decision_record.effective_action_payload
+    guarded_provider = decision_record.guard_payload.get("provider_id")
     expected_quantity = Decimal(str(decision_record.guard_payload.get("holding_quantity", "-1")))
     if (
         effective.get("kind") != _PROTECTION_KIND
@@ -993,6 +1043,7 @@ def confirm_addition_protection(
         or expected_quantity != holding.remaining_quantity
         or intent.holding_episode_id != holding.holding_episode_id
         or intent.requested_stop_price != holding.confirmed_protective_stop_price
+        or guarded_provider != provider_id
     ):
         return AdditionStep(AdditionStepKind.WAITING_FOR_PROTECTION, decision_id, action, reason="proposed stop does not match this addition and current quantity")
     if account.positions is None or account.open_orders is None or not _position_quantity_matches(account, holding):
@@ -1026,8 +1077,10 @@ def confirm_addition_protection(
         broker_order_id=order.broker_order_id,
         observed_at=observed_at,
         expected_holding_version=holding.state_version,
+        provider_id=provider_id,
+        requested_quantity=holding.remaining_quantity,
     )
-    return AdditionStep(AdditionStepKind.PROTECTED, decision_id, store.load_action_intent(action.logical_action_id))
+    return _step_for_action(store, plan, store.load_action_intent(action.logical_action_id))
 
 
 def replace_addition_protection(
@@ -1037,6 +1090,7 @@ def replace_addition_protection(
     account: BrokerAccountSnapshot,
     observed_at,
     replace_stop: Callable[..., BrokerAccountSnapshot | None],
+    provider_id: str,
 ) -> AdditionStep:
     """Replace protection atomically and confirm it from a fresh account snapshot.
 
@@ -1045,6 +1099,8 @@ def replace_addition_protection(
     is confirmed; exceptions or ``None`` leave the durable old stop unchanged and
     freeze the holding until ``confirm_addition_protection`` receives later facts.
     """
+    if type(provider_id) is not str or not provider_id.strip():
+        raise ValueError("addition protection requires a provider identity")
     plan, action, step = _execution_context(store, decision_id)
     if action is None or action.confirmed_filled_quantity <= 0:
         return step
@@ -1067,11 +1123,16 @@ def replace_addition_protection(
         decision = _protection_decision(plan, holding)
         store.record_decision(
             decision,
-            policy_payload={"parent_decision_id": decision_id, "action_id": action.logical_action_id},
+            policy_payload={
+                "parent_decision_id": decision_id,
+                "action_id": action.logical_action_id,
+                "source_action_id": action.logical_action_id,
+            },
             guard_payload={
                 "holding_quantity": str(holding.remaining_quantity),
                 "stop_price": str(holding.confirmed_protective_stop_price),
                 "account_snapshot_id": account.account_snapshot_id,
+                "provider_id": provider_id,
             },
             effective_action_payload={
                 "kind": _PROTECTION_KIND,
@@ -1101,7 +1162,10 @@ def replace_addition_protection(
         return AdditionStep(AdditionStepKind.WAITING_FOR_PROTECTION, decision_id, action, reason=f"protective-stop replacement outcome is uncertain: {exc}")
     if refreshed is None:
         return AdditionStep(AdditionStepKind.WAITING_FOR_PROTECTION, decision_id, action, reason="protective-stop replacement outcome is uncertain")
-    return confirm_addition_protection(store, decision_id, account=refreshed, observed_at=observed_at)
+    return confirm_addition_protection(
+        store, decision_id, account=refreshed, observed_at=observed_at,
+        provider_id=provider_id,
+    )
 
 
 __all__ = (

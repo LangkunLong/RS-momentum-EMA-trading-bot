@@ -774,6 +774,7 @@ def test_partial_and_duplicate_fill_resolves_once_then_resizes_protection_to_exa
         account=after_fill_account,
         observed_at=after_fill_account.clock.valuation_time,
         replace_stop=uncertain_stop_replace,
+        provider_id=_ADD_PROVIDER,
     )
     assert waiting.kind is AdditionStepKind.WAITING_FOR_PROTECTION
     assert len(calls) == 1
@@ -788,6 +789,7 @@ def test_partial_and_duplicate_fill_resolves_once_then_resizes_protection_to_exa
         account=after_fill_account,
         observed_at=after_fill_account.clock.valuation_time,
         replace_stop=uncertain_stop_replace,
+        provider_id=_ADD_PROVIDER,
     )
     assert replay.kind is AdditionStepKind.WAITING_FOR_PROTECTION
     assert len(calls) == 1
@@ -795,11 +797,21 @@ def test_partial_and_duplicate_fill_resolves_once_then_resizes_protection_to_exa
     refreshed_account = _account_after_stop_replacement(
         after_fill_account, plan, holding_quantity=7
     )
+    with pytest.raises(ValueError, match="provider identity"):
+        confirm_addition_protection(
+            store,
+            plan.decision.decision_id,
+            account=refreshed_account,
+            observed_at=refreshed_account.clock.valuation_time,
+            provider_id="",
+        )
+    assert load_addition_intention(store, plan.decision.decision_id).kind is AdditionStepKind.WAITING_FOR_PROTECTION
     protected = confirm_addition_protection(
         store,
         plan.decision.decision_id,
         account=refreshed_account,
         observed_at=refreshed_account.clock.valuation_time,
+        provider_id=_ADD_PROVIDER,
     )
     assert protected.kind is AdditionStepKind.PROTECTED
     final_holding = store.load_holding_episode(original_holding.holding_episode_id)
@@ -810,6 +822,15 @@ def test_partial_and_duplicate_fill_resolves_once_then_resizes_protection_to_exa
     assert final_holding.confirmed_stop_broker_order_id == _STOP_BROKER_ID
     assert final_holding.completed_additions_quantity == original_holding.completed_additions_quantity + 1
     assert final_holding.addition_count == original_holding.addition_count + 1
+    assert store.confirmed_protective_order_quantity(
+        final_holding.confirmed_stop_action_id, provider_id=_ADD_PROVIDER
+    ) == Decimal("7")
+    after_protection_restart = PolicyExecutionStateStore(
+        store.db_path, store_identity=deployment.store_identity
+    )
+    assert load_addition_intention(
+        after_protection_restart, plan.decision.decision_id
+    ).kind is AdditionStepKind.PROTECTED
 
     refreshed_account = _account_after_stop_replacement(
         after_fill_account, plan, holding_quantity=7
@@ -937,6 +958,32 @@ def test_order_manager_addition_route_blocks_a_plan_bound_to_another_portfolio(t
     assert submissions == []
 
 
+def test_order_manager_addition_replay_resolves_same_id_changed_cash_before_submit(tmp_path):
+    store, plan, _, account, portfolio, _ = _addition_fixture(tmp_path)
+    authorized = start_addition(store, plan, account=account, portfolio_snapshot=portfolio)
+    assert authorized.kind is AdditionStepKind.BUY_DUE
+    assert authorized.action is not None
+    changed = replace(account, cash=account.cash - 1)
+    submissions = []
+    ports = AdditionExecutionPorts(
+        store=store,
+        provider_id=_ADD_PROVIDER,
+        get_account_snapshot=lambda: changed,
+        get_portfolio_snapshot=lambda _plan, _account: portfolio,
+        observed_at=lambda: changed.clock.valuation_time,
+        submit_order=lambda **request: submissions.append(request)
+        or AdditionSubmissionResult(success=True, broker_order_id=_ADD_BROKER_ID),
+        cancel_order=lambda **_request: pytest.fail("stale addition must not cancel"),
+        replace_stop=lambda **_request: pytest.fail("stale addition must not replace protection"),
+    )
+
+    result = OrderManager(paper=True).submit_addition(plan, ports=ports)
+
+    assert result.kind is AdditionStepKind.BLOCKED
+    assert submissions == []
+    assert store.load_action_intent(authorized.action.logical_action_id).status is ActionStatus.RESOLVED
+
+
 def test_order_manager_addition_route_does_not_reissue_uncertain_submission(tmp_path):
     store, plan, _, account, portfolio, _ = _addition_fixture(tmp_path)
     submissions = []
@@ -973,7 +1020,7 @@ def test_order_manager_addition_route_does_not_reissue_uncertain_submission(tmp_
 
 
 def test_order_manager_addition_route_reconciles_partial_fill_and_protective_stop(tmp_path):
-    store, plan, _, account, portfolio, original_holding = _addition_fixture(tmp_path)
+    store, plan, deployment, account, portfolio, original_holding = _addition_fixture(tmp_path)
     after_fill_account = _addition_account_after_fill(
         account, plan, quantity=7, cash=8890, order_status="cancelled", cumulative=1
     )
@@ -1084,5 +1131,17 @@ def test_order_manager_addition_route_reconciles_partial_fill_and_protective_sto
     assert len(broker.stop_replacements) == 1
     holding = store.load_holding_episode(original_holding.holding_episode_id)
     assert holding.remaining_quantity == Decimal("7")
+    assert holding.initial_filled_quantity == original_holding.initial_filled_quantity
+    assert holding.cost_basis == Decimal("710") / Decimal("7")
+    assert holding.completed_additions_quantity == original_holding.completed_additions_quantity + 1
+    assert holding.addition_count == original_holding.addition_count + 1
     assert holding.confirmed_stop_client_order_id == _STOP_CLIENT_ID
     assert holding.confirmed_stop_broker_order_id == _STOP_BROKER_ID
+    projection = store.load_action_projection(submitted.action.logical_action_id)
+    assert projection.reservation_amount == Decimal("0")
+    assert projection.residual_committed_risk == Decimal("0")
+    assert store.confirmed_protective_order_quantity(
+        holding.confirmed_stop_action_id, provider_id=_ADD_PROVIDER
+    ) == Decimal("7")
+    restarted = PolicyExecutionStateStore(store.db_path, store_identity=deployment.store_identity)
+    assert load_addition_intention(restarted, plan.decision.decision_id).kind is AdditionStepKind.PROTECTED
