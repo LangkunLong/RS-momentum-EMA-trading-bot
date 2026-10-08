@@ -1,10 +1,12 @@
 from dataclasses import replace
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
+from core.fake_policy_exit_broker import FakeProtectedExitBroker
 from core.order_manager import OrderManager
-from core.policy_execution_state import DecisionCategory, DecisionIdentity, DecisionSubjectType
+from core.policy_execution_state import ActionStatus, DecisionCategory, DecisionIdentity, DecisionSubjectType
 from core.policy_execution_store import DecisionConflictError, PolicyExecutionStateStore
 from core.policy_exits import start_scale_out
 from core.strategy_policy.exit import evaluate_exit
@@ -14,7 +16,7 @@ from tests.test_strategy_policy import _exit_snapshot
 
 
 def _case(tmp_path):
-    features, path, deployment, _, portfolio, _, _ = seed_pending_chain(tmp_path)
+    features, path, deployment, account, portfolio, _, _ = seed_pending_chain(tmp_path)
     store = PolicyExecutionStateStore(path, store_identity=deployment.store_identity)
     chain = read_chain(store, deployment, portfolio)
     holding = next(item for item in chain.holding_episodes if item.broker_symbol == "CCC")
@@ -29,11 +31,19 @@ def _case(tmp_path):
         current_high=125.0,
         protective_stop_candidates=(90.0, 100.0, 106.0),
     )
-    return features, store, deployment, portfolio, holding, decision, snapshot
+    return features, store, deployment, account, portfolio, holding, decision, snapshot
+
+
+def _broker(store, account, *, response_mode="accepted", label="main"):
+    return FakeProtectedExitBroker(
+        account,
+        receipt_store_path=Path(str(store.db_path) + f".{label}.fake-exit-receipts.sqlite"),
+        response_mode=response_mode,
+    )
 
 
 def test_fixed_winner_and_trailing_state_survives_restart_and_release(tmp_path):
-    features, store, deployment, portfolio, holding, decision, snapshot = _case(tmp_path)
+    features, store, deployment, _, portfolio, holding, decision, snapshot = _case(tmp_path)
     outcome = evaluate_exit(snapshot)
     assert outcome.actions == ()
     assert outcome.early_winner_hold and outcome.breakeven_armed and outcome.ema_trailing_active
@@ -117,7 +127,7 @@ def test_fixed_winner_and_trailing_state_survives_restart_and_release(tmp_path):
 
 
 def test_fixed_exit_management_rejects_stale_holding_facts(tmp_path):
-    _, store, _, _, holding, decision, snapshot = _case(tmp_path)
+    _, store, _, _, _, holding, decision, snapshot = _case(tmp_path)
     manager = OrderManager(paper=True, policy_store=store)
     stale = replace(snapshot, remaining_qty=5.0)
     with pytest.raises(ValueError, match="durable holding facts"):
@@ -130,7 +140,7 @@ def test_fixed_exit_management_rejects_stale_holding_facts(tmp_path):
 
 
 def test_fixed_exit_management_rejects_forged_policy_flags(tmp_path):
-    _, store, _, _, holding, decision, snapshot = _case(tmp_path)
+    _, store, _, _, _, holding, decision, snapshot = _case(tmp_path)
     evaluated = evaluate_exit(snapshot)
     forged = replace(evaluated, early_winner_hold=False)
     with pytest.raises(ValueError, match="selected baseline evaluator"):
@@ -140,3 +150,102 @@ def test_fixed_exit_management_rejects_forged_policy_flags(tmp_path):
             expected_holding_version=holding.state_version,
         )
     assert store.load_holding_episode(holding.holding_episode_id) == holding
+
+
+@pytest.mark.parametrize("uncertain", [False, True])
+def test_selected_stop_requires_fake_broker_swap_and_recovers_after_restart(tmp_path, uncertain):
+    _, store, _, account, _, holding, decision, snapshot = _case(tmp_path)
+    manager = OrderManager(paper=True, policy_store=store)
+    outcome = evaluate_exit(snapshot)
+    manager.record_policy_exit_management(
+        decision=decision, holding_episode_id=holding.holding_episode_id,
+        snapshot=snapshot, outcome=outcome, expected_holding_version=holding.state_version,
+    )
+    broker = _broker(
+        store, account, response_mode="timeout_after_stop_replace" if uncertain else "accepted"
+    )
+    broker.observe_for(decision)
+    first = manager.apply_policy_exit_selected_stop(
+        decision=decision, broker=broker, provider_id="offline-fake-broker",
+        observed_at=decision.clock.account_valuation_at,
+    )
+    assert first.disposition == ("reconcile" if uncertain else "protected"), first.reason
+    selected = Decimal(str(outcome.next_stop_price))
+    if uncertain:
+        pending = store.load_holding_episode(holding.holding_episode_id)
+        assert pending.confirmed_protective_stop_price == holding.confirmed_protective_stop_price
+        assert pending.proposed_stop_action_id != pending.confirmed_stop_action_id
+        restarted_store = PolicyExecutionStateStore(store.db_path, store_identity=store.store_identity)
+        restarted = OrderManager(paper=True, policy_store=restarted_store)
+        forged = _broker(restarted_store, broker.snapshot(), label="forged")
+        without_receipt = restarted.confirm_policy_exit_selected_stop(
+            decision=decision, broker=forged, provider_id="offline-fake-broker",
+            observed_at=decision.clock.account_valuation_at,
+        )
+        assert without_receipt.disposition == "reconcile"
+        assert restarted_store.load_holding_episode(holding.holding_episode_id).confirmed_protective_stop_price == Decimal("90")
+        broker = _broker(restarted_store, broker.snapshot())
+        confirmed = restarted.confirm_policy_exit_selected_stop(
+            decision=decision, broker=broker, provider_id="offline-fake-broker",
+            observed_at=decision.clock.account_valuation_at,
+        )
+        assert confirmed.disposition == "protected", confirmed.reason
+        manager = restarted
+        store = restarted_store
+
+    protected = store.load_holding_episode(holding.holding_episode_id)
+    assert protected.confirmed_protective_stop_price == selected
+    assert protected.confirmed_stop_broker_order_id != holding.confirmed_stop_broker_order_id
+    assert protected.proposed_stop_action_id == protected.confirmed_stop_action_id
+    assert sum(row.purpose == "protective_stop" for row in broker.snapshot().open_orders) == 2
+    replay = manager.apply_policy_exit_selected_stop(
+        decision=decision, broker=broker, provider_id="offline-fake-broker",
+        observed_at=decision.clock.account_valuation_at,
+    )
+    assert replay.disposition == "protected", replay.reason
+    stop_fill = store.record_protective_sell_fill(
+        provider_id="offline-fake-broker",
+        broker_order_id=protected.confirmed_stop_broker_order_id,
+        client_order_id=protected.confirmed_stop_client_order_id,
+        fill_event_id="selected-stop-fill:2",
+        cumulative_quantity=Decimal("2"),
+        cumulative_notional=Decimal("212"),
+        cumulative_fees=Decimal("0"),
+        observed_at=decision.clock.account_valuation_at,
+        expected_holding_version=protected.state_version,
+    )
+    assert stop_fill.status is ActionStatus.PARTIALLY_FILLED
+    assert store.load_holding_episode(holding.holding_episode_id).remaining_quantity == Decimal("4")
+
+
+def test_selected_stop_rejects_second_working_protective_sell_for_symbol(tmp_path):
+    _, store, _, account, _, holding, decision, snapshot = _case(tmp_path)
+    manager = OrderManager(paper=True, policy_store=store)
+    saved = manager.record_policy_exit_management(
+        decision=decision, holding_episode_id=holding.holding_episode_id,
+        snapshot=snapshot, outcome=evaluate_exit(snapshot),
+        expected_holding_version=holding.state_version,
+    )
+    old = next(
+        row for row in account.open_orders
+        if row.broker_order_id == holding.confirmed_stop_broker_order_id
+    )
+    duplicate = replace(
+        old, broker_order_id="fake:other-stop", client_order_id="fake:other-stop-client",
+        holding_episode_id="holding:another-episode",
+    )
+    broker = _broker(store, replace(account, open_orders=account.open_orders + (duplicate,)))
+    broker.observe_for(decision)
+    blocked = manager.apply_policy_exit_selected_stop(
+        decision=decision, broker=broker, provider_id="offline-fake-broker",
+        observed_at=decision.clock.account_valuation_at,
+    )
+    assert blocked.disposition == "blocked"
+    assert store.load_holding_episode(holding.holding_episode_id) == saved
+    assert saved.proposed_stop_action_id == saved.confirmed_stop_action_id
+    with pytest.raises(ValueError, match="another working sell"):
+        broker.replace_stop(
+            old_order=old, symbol=holding.broker_symbol,
+            quantity=holding.remaining_quantity, stop_price=Decimal("106"),
+            new_client_order_id="fake:blocked-replacement",
+        )
