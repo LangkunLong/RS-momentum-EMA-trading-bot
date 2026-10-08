@@ -359,11 +359,20 @@ class FakeProtectedExitBroker:
                 raise TimeoutError("fake broker response lost after atomic accept")
             return self._group_result(group)
 
-    def fill_order(self, broker_order_id: str, delta: Decimal) -> BrokerAccountSnapshot:
+    def fill_order(
+        self, broker_order_id: str, delta: Decimal, *, fill_price: Decimal | None = None
+    ) -> BrokerAccountSnapshot:
         """Apply one sell or stop fill without exceeding the shared position cap."""
         with self._lock:
             if not isinstance(delta, Decimal) or not delta.is_finite() or delta <= 0:
                 raise ValueError("fake broker fill delta must be positive")
+            if fill_price is not None and (
+                not isinstance(fill_price, Decimal)
+                or not fill_price.is_finite()
+                or fill_price <= 0
+                or self._account.cash is None
+            ):
+                raise ValueError("priced fake sell requires positive price and known cash")
             matches = tuple(
                 group for group in self._groups.values()
                 if broker_order_id in {group["sell_broker_order_id"], group["stop_broker_order_id"]}
@@ -406,6 +415,16 @@ class FakeProtectedExitBroker:
             group["used"] = Decimal(str(group["used"])) + delta
             self._account = replace(
                 self._account,
+                cash=(
+                    self._account.cash
+                    if fill_price is None
+                    else float(Decimal(str(self._account.cash)) + delta * fill_price)
+                ),
+                balance_observed_at=(
+                    self._account.balance_observed_at
+                    if fill_price is None
+                    else self._account.clock.valuation_time
+                ),
                 positions=positions,
                 open_orders=orders,
                 account_snapshot_id=self._next_snapshot_id("fill"),

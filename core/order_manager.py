@@ -41,6 +41,13 @@ from core.policy_exit_execution import (
     dispatch_policy_exit,
     replace_policy_exit_protection as replace_exit_protection,
 )
+from core.policy_replacement_execution import (
+    ReplacementBuyDispatch,
+    ReplacementBuyPorts,
+    reconcile_replacement_buy as reconcile_fixed_replacement_buy,
+    record_replacement_buy_fill as record_fixed_replacement_buy_fill,
+    submit_replacement_buy as submit_fixed_replacement_buy,
+)
 from core.policy_replacement import (
     ReplacementPlan,
     ReplacementStep,
@@ -1047,6 +1054,45 @@ class OrderManager:
                 advance_replacement(ports.store, plan.decision.decision_id),
                 dispatch,
             )
+
+    def submit_replacement_buy(
+        self,
+        decision_id: str,
+        *,
+        portfolio_snapshot: PortfolioStateSnapshot,
+        ports: ReplacementBuyPorts,
+    ) -> ReplacementBuyDispatch:
+        """Consume one revalidated replacement buy through the fake-paper owner."""
+        if type(ports) is not ReplacementBuyPorts or self._policy_store is not ports.store:
+            raise ValueError("replacement buy ports and OrderManager must share one policy store")
+        with _FILL_HANDLING_LOCK:
+            return submit_fixed_replacement_buy(
+                decision_id, portfolio_snapshot=portfolio_snapshot, ports=ports
+            )
+
+    def reconcile_replacement_buy(
+        self,
+        decision_id: str,
+        *,
+        ports: ReplacementBuyPorts,
+    ) -> ReplacementStep:
+        """Recover an issued fake buy without submitting another order."""
+        if type(ports) is not ReplacementBuyPorts or self._policy_store is not ports.store:
+            raise ValueError("replacement buy ports and OrderManager must share one policy store")
+        with _FILL_HANDLING_LOCK:
+            return reconcile_fixed_replacement_buy(decision_id, ports=ports)
+
+    def record_replacement_buy_fill(
+        self,
+        decision_id: str,
+        *,
+        ports: ReplacementBuyPorts,
+    ) -> ReplacementStep:
+        """Persist a fake buy watermark and confirm exact new-holding stop coverage."""
+        if type(ports) is not ReplacementBuyPorts or self._policy_store is not ports.store:
+            raise ValueError("replacement buy ports and OrderManager must share one policy store")
+        with _FILL_HANDLING_LOCK:
+            return record_fixed_replacement_buy_fill(decision_id, ports=ports)
 
     def replace_policy_exit_protection(
         self,

@@ -4041,6 +4041,37 @@ class PolicyExecutionStateStore:
                 requested_stop_price=Decimal(row["requested_stop_price"]),
             )
 
+    def confirmed_protective_order_quantity(
+        self, stop_update_action_id: str, *, provider_id: str
+    ) -> Decimal:
+        """Read the frozen physical STOP target only while it owns its holding."""
+        action_id = _required_text(stop_update_action_id, "stop_update_action_id")
+        provider = _required_text(provider_id, "provider_id")
+        with self._transaction(write=False) as conn:
+            self._require_ready(conn)
+            stop_row = conn.execute(
+                "SELECT * FROM policy_state_stop_updates WHERE stop_update_action_id=? AND store_identity=?",
+                (action_id, self.store_identity),
+            ).fetchone()
+            if stop_row is None or stop_row["status"] != "confirmed":
+                raise ValueError("protective STOP has no confirmed physical target")
+            holding_row = self._holding_row(conn, str(stop_row["holding_episode_id"]))
+            if (
+                holding_row is None
+                or holding_row["confirmed_stop_action_id"] != action_id
+                or holding_row["confirmed_stop_client_order_id"] != stop_row["client_order_id"]
+                or holding_row["confirmed_stop_broker_order_id"] != stop_row["broker_order_id"]
+            ):
+                raise ValueError("protective STOP no longer owns the holding")
+            _, facts, _ = self._load_protective_order_context_in_transaction(
+                conn,
+                stop_row=stop_row,
+                provider_id=provider,
+                client_order_id=str(stop_row["client_order_id"]),
+                broker_order_id=str(stop_row["broker_order_id"]),
+            )
+            return Decimal(str(facts["requested_quantity"]))
+
     def _protective_order_decision_facts(
         self,
         conn: sqlite3.Connection,
