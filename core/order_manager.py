@@ -41,6 +41,14 @@ from core.policy_exit_execution import (
     dispatch_policy_exit,
     replace_policy_exit_protection as replace_exit_protection,
 )
+from core.policy_replacement import (
+    ReplacementPlan,
+    ReplacementStep,
+    ReplacementStepKind,
+    advance_replacement,
+    load_replacement_intention,
+    start_replacement,
+)
 from core.execution_store import (
     ConcurrentWorkflowTransitionError,
     get_execution_store,
@@ -235,6 +243,14 @@ class ExitExecutionPorts:
         ):
             if not callable(getattr(self, name)):
                 raise TypeError(f"exit execution {name} must be callable")
+
+
+@dataclass(frozen=True, slots=True)
+class ReplacementSellResult:
+    """Public replacement sell handoff and its durable next step."""
+
+    step: ReplacementStep
+    dispatch: PolicyExitDispatch | None = None
 
 
 class PendingExitSafetyError(RuntimeError):
@@ -997,6 +1013,39 @@ class OrderManager:
                 provider_id=ports.provider_id,
                 observed_at=ports.observed_at(),
                 broker=ports.broker,
+            )
+
+    def submit_replacement_sell(
+        self,
+        plan: ReplacementPlan,
+        *,
+        ports: ExitExecutionPorts,
+    ) -> ReplacementSellResult:
+        """Persist a fixed replacement and issue its protected sell at most once."""
+        if type(plan) is not ReplacementPlan:
+            raise TypeError("replacement sell requires a fixed ReplacementPlan")
+        if type(ports) is not ExitExecutionPorts:
+            raise TypeError("replacement sell requires ExitExecutionPorts")
+        if self._policy_store is not ports.store:
+            raise ValueError("replacement and OrderManager must use the same policy store")
+        with _FILL_HANDLING_LOCK:
+            try:
+                ports.store.load_decision_record(plan.decision.decision_id)
+            except KeyError:
+                step = start_replacement(ports.store, plan)
+            else:
+                execution = load_replacement_intention(ports.store, plan.decision.decision_id)
+                if execution.plan != plan:
+                    raise ValueError("fixed replacement decision was replayed with different facts")
+                step = advance_replacement(ports.store, plan.decision.decision_id)
+            if step.kind is not ReplacementStepKind.SELL_DUE:
+                return ReplacementSellResult(step)
+            if step.action is None or step.action.logical_action_id != plan.sell_action.logical_action_id:
+                raise ValueError("replacement sell step differs from the persisted fixed action")
+            dispatch = self.submit_policy_exit(step.action.logical_action_id, ports=ports)
+            return ReplacementSellResult(
+                advance_replacement(ports.store, plan.decision.decision_id),
+                dispatch,
             )
 
     def replace_policy_exit_protection(
