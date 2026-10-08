@@ -29,13 +29,20 @@ _STOP_JOIN_TIMEOUT_SECS = 5.0
 class FillMonitor:
     """Wrap Alpaca's TradingStream and forward meaningful events to OrderManager."""
 
-    def __init__(self, budget: OperationBudget | None = None) -> None:
+    def __init__(
+        self,
+        budget: OperationBudget | None = None,
+        *,
+        order_manager: OrderManager | None = None,
+    ) -> None:
         require_paper_mode()
+        if order_manager is not None and type(order_manager) is not OrderManager:
+            raise TypeError("order_manager must be an OrderManager")
         settings.load_runtime_credentials()
         budget = budget or current_operation_budget()
         self._budget = budget
         self._paper = True
-        self._order_manager = OrderManager(paper=self._paper)
+        self._order_manager = order_manager or OrderManager(paper=self._paper)
         stream_kwargs = {
             "api_key": settings.ALPACA_API_KEY,
             "secret_key": settings.ALPACA_SECRET_KEY,

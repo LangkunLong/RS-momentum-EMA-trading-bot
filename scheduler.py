@@ -56,6 +56,7 @@ from core.data_client import (
 )
 from core.order_execution import _get_trading_client, _is_paper_mode, require_paper_mode
 from core.order_manager import OrderManager
+from core.policy_execution_store import PolicyExecutionStateStore
 from core.bounded_trading_stream import ReadOnlyTradeUpdateObserver
 from core.operation_limits import (
     OperationBudget,
@@ -448,6 +449,8 @@ def run_scheduler(
     if selected_policy:
         if policy_orchestrator is None or not callable(getattr(policy_orchestrator, "run", None)):
             raise ValueError("selected-policy scheduler requires an explicit valid policy orchestrator")
+        if not dry_run:
+            _selected_policy_order_manager(policy_orchestrator)
         if observe_health:
             raise ValueError("selected-policy scheduler cannot replace the read-only observer")
     elif policy_orchestrator is not None:
@@ -498,8 +501,12 @@ def _run_scheduler_locked(
     policy_orchestrator: object | None = None,
 ) -> None:
     """Run one scheduler process after the singleton has been acquired."""
-    if selected_policy and (policy_orchestrator is None or not callable(getattr(policy_orchestrator, "run", None))):
-        raise ValueError("selected-policy scheduler requires an explicit valid policy orchestrator")
+    policy_order_manager = None
+    if selected_policy:
+        if policy_orchestrator is None or not callable(getattr(policy_orchestrator, "run", None)):
+            raise ValueError("selected-policy scheduler requires an explicit valid policy orchestrator")
+        if not dry_run:
+            policy_order_manager = _selected_policy_order_manager(policy_orchestrator)
     mode = "DRY RUN" if dry_run else "paper"
     print(f"[SCHEDULER] Starting CANSLIM scheduler [{mode}]")
     print("[SCHEDULER] Press Ctrl-C to stop.")
@@ -594,7 +601,10 @@ def _run_scheduler_locked(
         elif dry_run:
             print("[SCHEDULER] Fill monitor disabled in dry-run mode.")
         else:
-            monitor = _start_live_monitor()
+            monitor = (
+                _start_live_monitor(order_manager=policy_order_manager)
+                if selected_policy else _start_live_monitor()
+            )
 
         last_scan_date: date | None = None
         last_daily_exit: datetime = datetime.min.replace(tzinfo=_ET)
@@ -680,7 +690,13 @@ def _run_scheduler_locked(
                         raise RuntimeError("Read-only trade-update observer disconnected")
                 else:
                     try:
-                        monitor = _ensure_fill_monitor_running(monitor, dry_run=False)
+                        monitor = (
+                            _ensure_fill_monitor_running(
+                                monitor, dry_run=False, order_manager=policy_order_manager,
+                            )
+                            if selected_policy
+                            else _ensure_fill_monitor_running(monitor, dry_run=False)
+                        )
                         execution_armed = True
                     except Exception as exc:  # noqa: BLE001
                         execution_armed = False
@@ -988,20 +1004,38 @@ def _wait_for_fill_monitor_connection(
         time.sleep(max(0.0, poll_seconds))
 
 
-def _start_live_monitor() -> FillMonitor:
+def _selected_policy_order_manager(policy_orchestrator: object) -> OrderManager:
+    """Require one policy store for selected decisions, fills and reconciliation."""
+    store = getattr(policy_orchestrator, "policy_store", None)
+    manager = getattr(policy_orchestrator, "order_manager", None)
+    if (
+        type(store) is not PolicyExecutionStateStore
+        or type(manager) is not OrderManager
+        or manager._policy_store is not store
+    ):
+        raise ValueError("order-enabled selected-policy scheduler requires a shared policy store and OrderManager")
+    return manager
+
+
+def _start_live_monitor(*, order_manager: OrderManager | None = None) -> FillMonitor:
     """Start a healthy monitor and reconcile broker safety before returning."""
-    monitor = FillMonitor()
+    monitor = FillMonitor(order_manager=order_manager) if order_manager is not None else FillMonitor()
     monitor.start()
     try:
         _wait_for_fill_monitor_connection(monitor)
-        _run_startup_stop_reconciliation()
+        if order_manager is not None:
+            _run_startup_stop_reconciliation(order_manager=order_manager)
+        else:
+            _run_startup_stop_reconciliation()
     except BaseException:
         monitor.stop()
         raise
     return monitor
 
 
-def _ensure_fill_monitor_running(monitor: FillMonitor, *, dry_run: bool) -> FillMonitor:
+def _ensure_fill_monitor_running(
+    monitor: FillMonitor, *, dry_run: bool, order_manager: OrderManager | None = None,
+) -> FillMonitor:
     """Return a connected monitor, or replace and reconcile it before use."""
     if dry_run or monitor.is_connected():
         return monitor
@@ -1012,11 +1046,14 @@ def _ensure_fill_monitor_running(monitor: FillMonitor, *, dry_run: bool) -> Fill
             "Unhealthy fill monitor did not terminate; refusing replacement"
         )
 
-    replacement = FillMonitor()
+    replacement = FillMonitor(order_manager=order_manager) if order_manager is not None else FillMonitor()
     replacement.start()
     try:
         _wait_for_fill_monitor_connection(replacement)
-        _run_startup_stop_reconciliation()
+        if order_manager is not None:
+            _run_startup_stop_reconciliation(order_manager=order_manager)
+        else:
+            _run_startup_stop_reconciliation()
     except BaseException:
         replacement.stop()
         raise
@@ -1024,10 +1061,11 @@ def _ensure_fill_monitor_running(monitor: FillMonitor, *, dry_run: bool) -> Fill
     return replacement
 
 
-def _run_startup_stop_reconciliation() -> None:
+def _run_startup_stop_reconciliation(*, order_manager: OrderManager | None = None) -> None:
     """Repair missing protective stops for existing positions at process startup."""
     try:
-        results = OrderManager(paper=_is_paper_mode()).reconcile_startup_stops()
+        manager = order_manager if order_manager is not None else OrderManager(paper=_is_paper_mode())
+        results = manager.reconcile_startup_stops()
     except Exception as exc:  # noqa: BLE001
         print(f"[SCHEDULER ERROR] Startup stop reconciliation failed: {exc}")
         raise RuntimeError("Startup stop reconciliation failed") from exc
