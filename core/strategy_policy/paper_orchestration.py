@@ -784,6 +784,8 @@ class PaperPolicyOrchestrator:
             plan_payload = payload["entry_plan"]
             if not isinstance(plan_payload, dict):
                 raise ValueError("original entry plan is missing")
+            if "order_type" in plan_payload and plan_payload["order_type"] != "limit":
+                raise ValueError("original entry plan has an unsupported fixed order type")
             symbol = plan_payload["symbol"]
             price_source = plan_payload["price_source"]
             if type(symbol) is not str or not symbol or type(price_source) is not str or not price_source:
@@ -1368,6 +1370,7 @@ class PaperPolicyOrchestrator:
             }
             effective = {
                 "entry_plan": None if plan is None else {
+                    "order_type": "limit",
                     "symbol": plan.symbol,
                     "entry_price": plan.entry_price,
                     "stop_price": plan.stop_price,

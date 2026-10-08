@@ -385,6 +385,9 @@ def test_real_simulator_current_paper_parity_and_public_lifecycle(
         action_id = next(item.details["signal"]["logical_action_id"] for item in workflow.transitions
                          if item.event == "signal_accepted")
         action = store.load_action_intent(action_id)
+        linked = store.load_decision_record(action.decision.decision_id)
+        assert linked.effective_action_payload["entry_plan"]["order_type"] == "limit"
+        assert row["limit_price"] == float(action.reservation_price)
         assert action.requested_quantity == Decimal(quantity)
         assert action.reservation_price == 100 and action.reservation_stop_price == 95
         assert action.risk_per_unit == 5

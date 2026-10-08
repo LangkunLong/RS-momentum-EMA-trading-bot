@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
-from typing import TYPE_CHECKING, Callable, Literal
+from typing import TYPE_CHECKING, Callable, Literal, Mapping
 
 from core.policy_execution_state import (
     ActionAttemptStatus,
@@ -164,6 +164,26 @@ def dispatch_policy_exit(
     action = store.load_action_intent(logical_action_id)
     if action.role not in {ActionRole.SCALE_OUT, ActionRole.CLOSE} or action.side is not OrderSide.SELL:
         raise ValueError("policy exit dispatch requires a durable scale-out or close sell")
+    decision_record = store.load_decision_record(action.decision.decision_id)
+    effective = decision_record.effective_action_payload
+    selected_action_id = (
+        effective.get("sell_action_id")
+        if effective.get("kind") == "policy_portfolio_replacement_v1"
+        else effective.get("action_id")
+    ) if isinstance(effective, Mapping) else None
+    if (
+        decision_record.decision != action.decision
+        or not isinstance(effective, Mapping)
+        or selected_action_id != action.logical_action_id
+    ):
+        raise ValueError("policy exit order type has no matching durable decision")
+    order_type = (
+        effective.get("sell_order_type")
+        if effective.get("kind") == "policy_portfolio_replacement_v1"
+        else effective.get("order_type")
+    )
+    if order_type not in {None, "market"}:
+        raise ValueError("policy exit has an unsupported durable order type")
     assert_execution_session(action, execution_session)
     if action.status is ActionStatus.FILLED:
         return PolicyExitDispatch("complete", action)
@@ -197,7 +217,7 @@ def dispatch_policy_exit(
         observed_at=observed_at,
     )
     try:
-        outcome = broker.submit_protected_exit(
+        submission = dict(
             symbol=action.broker_symbol,
             quantity=action.requested_quantity,
             client_order_id=client_id,
@@ -205,6 +225,9 @@ def dispatch_policy_exit(
             confirmed_stop_broker_order_id=holding.confirmed_stop_broker_order_id,
             protected_position_quantity=holding.remaining_quantity,
         )
+        if order_type is not None:
+            submission["order_type"] = order_type
+        outcome = broker.submit_protected_exit(**submission)
     except Exception as exc:  # Broker call may have happened; never resubmit this attempt.
         return PolicyExitDispatch(
             "reconcile", store.load_action_intent(logical_action_id), f"sell outcome uncertain: {exc}"

@@ -182,6 +182,8 @@ def _plan_from_record(record) -> tuple[AdditionPlan, dict[str, object]]:
     payload = record.effective_action_payload
     if payload.get("kind") != _ACTION_KIND or payload.get("version") != 1:
         raise ValueError("decision does not contain a supported durable addition intention")
+    if "order_type" in payload and payload["order_type"] != "limit":
+        raise ValueError("addition intention has an unsupported fixed order type")
     policy = record.policy_payload
     snapshot_payload = policy.get("add_on_snapshot")
     decision_payload = policy.get("add_on_decision")
@@ -382,6 +384,8 @@ def _persist_outcome(
         "action_id": None if action is None else action.logical_action_id,
         "action": None if action is None else _action_payload(action),
     }
+    if action is not None:
+        payload["order_type"] = "limit"
     store.record_decision(
         plan.decision,
         policy_payload=_decision_payload(plan),
@@ -653,6 +657,12 @@ def submit_addition(
     plan, action, step = _execution_context(store, decision_id)
     if action is None or action.status is not ActionStatus.INTENDED:
         return step
+    effective = store.load_decision_record(decision_id).effective_action_payload
+    if effective.get("action_id") != action.logical_action_id:
+        raise ValueError("addition submission differs from its durable action")
+    order_type = effective.get("order_type")
+    if order_type not in {None, "limit"}:
+        raise ValueError("addition submission has an unsupported fixed order type")
     current = store.load_action_projection(action.logical_action_id)
     client_id = _client_order_id(action)
     bound = store.bind_attempt_order_refs(
@@ -664,12 +674,15 @@ def submit_addition(
         observed_at=observed_at,
     )
     try:
-        outcome = submit(
+        request = dict(
             symbol=action.broker_symbol,
             quantity=action.requested_quantity,
             limit_price=action.reservation_price,
             client_order_id=client_id,
         )
+        if order_type is not None:
+            request["order_type"] = order_type
+        outcome = submit(**request)
     except Exception as exc:
         return AdditionStep(
             AdditionStepKind.WAITING_FOR_BUY,

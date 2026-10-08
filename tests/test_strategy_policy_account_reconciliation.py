@@ -2428,8 +2428,9 @@ def test_registered_attempt_alias_rows_reserve_once(
         ("status", "cancelled"),
         ("symbol", "ABC"),
         ("side", "sell"),
+        ("order_type", "market"),
     ),
-    ids=("quantity", "status", "symbol", "side"),
+    ids=("quantity", "status", "symbol", "side", "order-type"),
 )
 def test_registered_attempt_alias_rows_with_conflicting_facts_block_reservations(
     field: str,
@@ -2674,6 +2675,23 @@ def test_conflicting_duplicate_broker_order_reference_blocks_reservations() -> N
     assert result.ready is False
     assert result.reserved_buy_cash is None
     assert result.pending_entry_count is None
+    assert any(finding.state == "conflicting" for finding in result.findings)
+
+
+def test_same_broker_reference_with_conflicting_order_type_blocks_reservations() -> None:
+    original = replace(_account().open_orders[0], order_type="limit")  # type: ignore[index]
+    conflict = replace(original, order_type="market")
+    account = replace(_account(), open_orders=(original, conflict))
+
+    result = reconcile_account_snapshot(
+        account=account,
+        projection=_projection(),
+        maximum_balance_age=timedelta(minutes=15),
+        maximum_mark_age=timedelta(minutes=15),
+    )
+
+    assert result.ready is False
+    assert result.reserved_buy_cash is None
     assert any(finding.state == "conflicting" for finding in result.findings)
 
 

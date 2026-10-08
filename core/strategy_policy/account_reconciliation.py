@@ -515,6 +515,7 @@ class BrokerOrderFact:
     purpose: str = "strategy"
     holding_episode_id: str | None = None
     stop_price: float | None = None
+    order_type: Literal["market", "limit", "stop", "stop_limit"] | None = None
 
     def __post_init__(self) -> None:
         OrderReference(self.broker_order_id, self.client_order_id)
@@ -527,6 +528,8 @@ class BrokerOrderFact:
             raise ValueError("broker order stop_price must be positive")
         if self.side not in {"buy", "sell"}:
             raise ValueError("broker order side must be buy or sell")
+        if self.order_type not in {None, "market", "limit", "stop", "stop_limit"}:
+            raise ValueError("broker order type is unsupported")
         _amount(self.requested_quantity, "broker requested_quantity", minimum=0.0)
         if self.requested_quantity == 0:
             raise ValueError("broker requested_quantity must be positive")
@@ -1114,6 +1117,7 @@ def _merge_duplicate_broker_orders(
             and record.side == existing.side
             and record.status == existing.status
             and record.purpose == existing.purpose
+            and record.order_type == existing.order_type
             and record.holding_episode_id == existing.holding_episode_id
             and _close(record.requested_quantity, existing.requested_quantity)
             and _close(record.cumulative_filled_quantity, existing.cumulative_filled_quantity)
@@ -1179,6 +1183,7 @@ def _merge_duplicate_broker_orders(
             record.symbol == existing.symbol
             and record.side == existing.side
             and record.purpose == existing.purpose
+            and record.order_type == existing.order_type
             and record.holding_episode_id == existing.holding_episode_id
             and record.status == existing.status
             and _close(record.requested_quantity, existing.requested_quantity)
@@ -1209,6 +1214,7 @@ def _merge_duplicate_broker_orders(
             purpose=existing.purpose,
             holding_episode_id=existing.holding_episode_id or record.holding_episode_id,
             stop_price=existing.stop_price if existing.stop_price is not None else record.stop_price,
+            order_type=existing.order_type,
         )
         orders[orders.index(existing)] = merged
     return orders

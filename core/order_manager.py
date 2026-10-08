@@ -14,7 +14,7 @@ import hashlib
 import math
 import threading
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from config import settings
 from core.policy_addition import (
@@ -101,7 +101,7 @@ from core.order_execution import (
     require_paper_mode,
     submit_bracket_buy,
 )
-from core.policy_execution_state import ActionRole, ActionStatus, DecisionIdentity, HoldingEpisode, OrderSide, PortfolioStateSnapshot
+from core.policy_execution_state import ActionRole, ActionStatus, DecisionCategory, DecisionIdentity, HoldingEpisode, OrderSide, PortfolioStateSnapshot
 from core.policy_execution_store import PolicyExecutionStateStore
 from core.policy_protection_bridge import PolicyProtectionBridge
 from core.strategy_policy.contracts import ExitDecision, ExitSnapshot
@@ -394,6 +394,21 @@ class OrderManager:
             raise ValueError("policy entry action requires a durable reservation price and stop")
         if projection.risk_per_unit is None:
             raise ValueError("policy entry action requires a durable per-unit risk")
+        if projection.role is ActionRole.ENTRY:
+            linked = self._policy_store.load_decision_record(projection.decision_id)
+            if linked.decision.category is DecisionCategory.ALLOCATION:
+                effective = linked.effective_action_payload
+                stored_plan = effective.get("entry_plan") if isinstance(effective, Mapping) else None
+                if (
+                    linked.decision.decision_id != projection.decision_id
+                    or not isinstance(stored_plan, Mapping)
+                    or stored_plan.get("symbol") != plan.symbol
+                    or Decimal(str(stored_plan.get("quantity"))) != projection.requested_quantity
+                    or Decimal(str(stored_plan.get("entry_price"))) != projection.reservation_price
+                ):
+                    raise ValueError("policy entry submission differs from its durable allocation plan")
+                if "order_type" in stored_plan and stored_plan["order_type"] != "limit":
+                    raise ValueError("policy entry order type differs from its durable allocation plan")
 
         target_symbol = projection.broker_symbol.strip().upper()
         expected = (
