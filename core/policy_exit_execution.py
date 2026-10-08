@@ -320,19 +320,22 @@ def _retire_flat_protection(
     holding,
     account: BrokerAccountSnapshot,
     observed_at: datetime,
+    broker: FakeProtectedExitBroker | None,
 ) -> PolicyExitProtection:
     if not _flat_exit_converged(account, action):
         return PolicyExitProtection("reconcile", action, "flat holding still requires broker stop cancellation evidence")
     flags = dict(holding.policy_flags)
     client = holding.confirmed_stop_client_order_id or flags.get("flat_stop_retired_client_order_id")
-    broker = holding.confirmed_stop_broker_order_id or flags.get("flat_stop_retired_broker_order_id")
-    if not client or not broker:
+    stop_broker_id = holding.confirmed_stop_broker_order_id or flags.get("flat_stop_retired_broker_order_id")
+    if not client or not stop_broker_id:
         return PolicyExitProtection("blocked", action, "flat holding has no durable stop references to retire")
+    if broker is None or not broker.confirms_flat_exit(action, stop_broker_id):
+        return PolicyExitProtection("reconcile", action, "flat account lacks this broker's terminal sell/stop evidence")
     try:
         store.retire_flat_holding_protection(
             action.logical_action_id,
             client_order_id=client,
-            broker_order_id=broker,
+            broker_order_id=stop_broker_id,
             account_snapshot_id=account.account_snapshot_id,
             expected_holding_version=holding.state_version,
             observed_at=observed_at,
@@ -346,11 +349,20 @@ def confirm_policy_exit_protection(
     store: PolicyExecutionStateStore,
     logical_action_id: str,
     *,
-    account: BrokerAccountSnapshot,
+    account: BrokerAccountSnapshot | None = None,
+    broker: FakeProtectedExitBroker | None = None,
     provider_id: str,
     observed_at: datetime,
 ) -> PolicyExitProtection:
     """Confirm a proposed resized stop only from a unique current broker order."""
+    if broker is not None:
+        from core.fake_policy_exit_broker import FakeProtectedExitBroker
+
+        if type(broker) is not FakeProtectedExitBroker:
+            raise TypeError("flat policy exit confirmation requires the atomic fake-paper broker")
+        account = broker.snapshot()
+    if type(account) is not BrokerAccountSnapshot:
+        raise TypeError("protection confirmation requires a typed broker account observation")
     action = store.load_action_intent(logical_action_id)
     if action.role not in {ActionRole.SCALE_OUT, ActionRole.CLOSE} or action.side is not OrderSide.SELL:
         raise ValueError("protection confirmation requires a durable policy sell")
@@ -358,7 +370,7 @@ def confirm_policy_exit_protection(
         return PolicyExitProtection("reconcile", action, "source sell is not terminal with a confirmed fill")
     holding = store.load_holding_episode(action.holding_episode_id)
     if holding.remaining_quantity <= 0:
-        return _retire_flat_protection(store, action, holding, account, observed_at)
+        return _retire_flat_protection(store, action, holding, account, observed_at, broker)
     if (
         account.paper_account_environment_id
         != action.decision.deployment_identity.paper_account_environment_id
@@ -457,7 +469,7 @@ def replace_policy_exit_protection(
         return PolicyExitProtection("reconcile", action, "sell remainder is not terminal")
     holding = store.load_holding_episode(action.holding_episode_id)
     if holding.remaining_quantity <= 0:
-        return _retire_flat_protection(store, action, holding, account, observed_at)
+        return _retire_flat_protection(store, action, holding, account, observed_at, None)
     if holding.pending_action_ids:
         return PolicyExitProtection("blocked", action, "another holding action is pending")
     if holding.proposed_stop_action_id != holding.confirmed_stop_action_id:

@@ -14,7 +14,7 @@ from core.policy_execution_state import (
     DecisionSubjectType,
 )
 from core.policy_execution_store import PolicyExecutionStateStore
-from core.policy_exit_execution import dispatch_policy_exit
+from core.policy_exit_execution import confirm_policy_exit_protection, dispatch_policy_exit
 from core.policy_exits import start_full_exit, start_scale_out
 from tests.test_paper_policy_chain import read_chain, seed_pending_chain
 from tests.test_policy_exits import _exit_decision
@@ -337,7 +337,7 @@ def test_completed_scale_out_replaces_exact_remaining_stop_once(tmp_path, uncert
         restarted = PolicyExecutionStateStore(store.db_path, store_identity=store.store_identity)
         confirmed_later = OrderManager(paper=True, policy_store=restarted).confirm_policy_exit_protection(
             action.logical_action_id,
-            account=refreshed_accounts[0],
+            broker=broker,
             provider_id="offline-fake-broker",
             observed_at=decision.clock.account_valuation_at,
         )
@@ -402,10 +402,38 @@ def test_full_exit_remains_unresolved_until_broker_confirms_stop_absent(tmp_path
     )
     assert pending.disposition == "reconcile"
     assert calls == []
+    stale_empty = replace(
+        observation,
+        positions=tuple(row for row in observation.positions if row.symbol != "CCC"),
+        open_orders=tuple(row for row in observation.open_orders if row.symbol != "CCC"),
+        account_snapshot_id="snapshot:stale-pre-entry-empty",
+    )
+    stale_broker = FakeProtectedExitBroker(stale_empty)
+    stale = manager.confirm_policy_exit_protection(
+        action.logical_action_id,
+        broker=stale_broker,
+        provider_id="offline-fake-broker",
+        observed_at=decision.clock.account_valuation_at,
+    )
+    assert stale.disposition == "reconcile"
+    direct_stale = confirm_policy_exit_protection(
+        store,
+        action.logical_action_id,
+        account=stale_empty,
+        provider_id="offline-fake-broker",
+        observed_at=decision.clock.account_valuation_at,
+    )
+    assert direct_stale.disposition == "reconcile"
+    assert store.load_holding_episode(holding.holding_episode_id).confirmed_stop_broker_order_id == (
+        holding.confirmed_stop_broker_order_id
+    )
+    assert any(row.broker_order_id == holding.confirmed_stop_broker_order_id for row in broker.snapshot().open_orders)
     cancelled = broker.fill_order(broker_order_id, Decimal("6"))
+    assert all(row.symbol != "CCC" for row in cancelled.positions)
+    assert all(row.symbol != "CCC" or row.side != "sell" for row in cancelled.open_orders)
     resolved = manager.confirm_policy_exit_protection(
         action.logical_action_id,
-        account=cancelled,
+        broker=broker,
         provider_id="offline-fake-broker",
         observed_at=decision.clock.account_valuation_at,
     )
@@ -418,7 +446,7 @@ def test_full_exit_remains_unresolved_until_broker_confirms_stop_absent(tmp_path
     restarted = PolicyExecutionStateStore(store.db_path, store_identity=store.store_identity)
     replay = OrderManager(paper=True, policy_store=restarted).confirm_policy_exit_protection(
         action.logical_action_id,
-        account=broker.snapshot(),
+        broker=broker,
         provider_id="offline-fake-broker",
         observed_at=decision.clock.account_valuation_at,
     )

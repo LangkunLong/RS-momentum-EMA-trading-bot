@@ -8,7 +8,7 @@ from hashlib import sha256
 from threading import RLock
 from typing import Literal
 
-from core.policy_execution_state import DecisionIdentity
+from core.policy_execution_state import ActionIntent, DecisionIdentity
 from core.policy_exit_execution import PolicyExitSubmissionResult
 from core.strategy_policy.account_reconciliation import BrokerAccountSnapshot, BrokerOrderFact
 
@@ -75,15 +75,58 @@ class FakeProtectedExitBroker:
                 "used": used,
                 "sell_broker_order_id": sell.broker_order_id,
                 "stop_broker_order_id": stops[0].broker_order_id,
+                "initial_stop_broker_order_id": stops[0].broker_order_id,
             }
 
     def snapshot(self) -> BrokerAccountSnapshot:
         with self._lock:
             return self._account
 
+    def confirms_flat_exit(self, action: ActionIntent, stop_broker_order_id: str) -> bool:
+        """Require this broker's own accepted group and terminal fill/cancel event."""
+        with self._lock:
+            if (
+                self._account.paper_account_environment_id
+                != action.decision.deployment_identity.paper_account_environment_id
+                or self._account.clock.completed_session != action.decision.clock.decision_session
+                or self._account.clock.next_execution_session != action.decision.clock.next_execution_session
+                or self._account.positions is None
+                or self._account.open_orders is None
+                or not self._account.account_snapshot_id
+                or not action.order_attempts
+                or not action.order_attempts[0].broker_order_id
+            ):
+                return False
+            groups = tuple(
+                group for group in self._groups.values()
+                if group["sell_broker_order_id"] == action.order_attempts[0].broker_order_id
+                and group["initial_stop_broker_order_id"] == stop_broker_order_id
+            )
+            if len(groups) != 1:
+                return False
+            group = groups[0]
+            if (
+                not group.get("flat_completion_snapshot_id")
+                or Decimal(str(group["used"])) != Decimal(str(group["cap"]))
+                or any(row.symbol == action.broker_symbol for row in self._account.positions)
+                or any(
+                    row.symbol == action.broker_symbol and row.side == "sell" and row.status in _WORKING
+                    for row in self._account.open_orders
+                )
+            ):
+                return False
+            return True
+
     def observe_for(self, decision: DecisionIdentity) -> BrokerAccountSnapshot:
         """Label the next paper observation with its fixed decision identity."""
         with self._lock:
+            if (
+                decision.deployment_identity.paper_account_environment_id
+                != self._account.paper_account_environment_id
+                or decision.clock.decision_session != self._account.clock.completed_session
+                or decision.clock.next_execution_session != self._account.clock.next_execution_session
+            ):
+                raise ValueError("fake broker observation decision differs from its account clock")
             self._account = replace(
                 self._account,
                 decision_slot_id=decision.decision_slot_id,
@@ -180,6 +223,7 @@ class FakeProtectedExitBroker:
                 "used": Decimal("0"),
                 "sell_broker_order_id": broker_order_id,
                 "stop_broker_order_id": stop.broker_order_id,
+                "initial_stop_broker_order_id": stop.broker_order_id,
             }
             self._groups[client_order_id] = group
             self.submissions.append({
@@ -250,6 +294,8 @@ class FakeProtectedExitBroker:
                 open_orders=orders,
                 account_snapshot_id=self._next_snapshot_id("fill"),
             )
+            if next_quantity == 0:
+                group["flat_completion_snapshot_id"] = self._account.account_snapshot_id
             return self._account
 
     def replace_stop(

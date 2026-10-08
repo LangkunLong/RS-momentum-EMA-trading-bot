@@ -1025,18 +1025,20 @@ class OrderManager:
         self,
         logical_action_id: str,
         *,
-        account: BrokerAccountSnapshot,
+        broker: FakeProtectedExitBroker,
         provider_id: str,
         observed_at: datetime,
     ) -> PolicyExitProtection:
-        """Confirm an earlier uncertain stop exchange from broker order facts."""
+        """Confirm stop exchange or flat cancellation from the same fake broker."""
         if self._policy_store is None:
             raise RuntimeError("policy exit protection requires an explicit policy store")
+        if type(broker) is not FakeProtectedExitBroker:
+            raise TypeError("policy exit confirmation requires the atomic fake-paper broker")
         with _FILL_HANDLING_LOCK:
             return confirm_exit_protection(
                 self._policy_store,
                 logical_action_id,
-                account=account,
+                broker=broker,
                 provider_id=provider_id,
                 observed_at=observed_at,
             )
