@@ -46,6 +46,9 @@ from .live_calls import (
     StudyCallRequestV1,
     StudyExecutionApprovalV1,
     StudyGrantV1,
+    StudyRoundCallApprovalV1,
+    StudyRoundCallAdmissionV1,
+    StudyRoundCallSlotV1,
     authenticate_fixture_preflight_v1,
     study_parser_authority_bytes_v1,
     study_transport_settings_sha256_v1,
@@ -1103,6 +1106,8 @@ class StudyLedgerV1:
         manifest: StudyManifestV1,
         grant: StudyGrantV1,
         approval: StudyExecutionApprovalV1 | None = None,
+        round_call_admission: StudyRoundCallAdmissionV1 | None = None,
+        round_call_approval: StudyRoundCallApprovalV1 | None = None,
     ) -> None:
         if type(store) is not StudyStoreV1 or type(manifest) is not StudyManifestV1 or type(grant) is not StudyGrantV1:
             raise StudyContractError("study ledger inputs are invalid")
@@ -1116,11 +1121,19 @@ class StudyLedgerV1:
         self.manifest = manifest
         self.grant = grant
         self.approval = approval
+        self.round_call_admission = round_call_admission
+        self.round_call_approval = round_call_approval
         self._lock = threading.RLock()
         self._owner_prefix = f"{os.getpid()}:{threading.get_ident()}"
         self._owner_capabilities: dict[str, object] = {}
         if approval is not None:
             self._check_approval(approval)
+        if round_call_admission is not None:
+            self._check_round_call_admission(round_call_admission)
+        elif round_call_approval is not None:
+            raise StudyAuthorityError("round-call approval lacks its persisted admission")
+        if round_call_approval is not None:
+            self._check_round_call_approval(round_call_approval)
         self._authenticate_authority_records(publish=approval is not None)
         self._authenticate_setup_graph()
         self._authenticate_graph_orphans(self._reservations(), self._terminals())
@@ -1145,6 +1158,51 @@ class StudyLedgerV1:
             raise StudyAuthorityError("live study requires a live execution capability")
         if self.grant.mode == "offline_fixture" and approval.capability_kind != "offline_fixture":
             raise StudyAuthorityError("offline study requires an explicit fixture capability")
+
+    def _check_round_call_admission(self, admission: StudyRoundCallAdmissionV1) -> None:
+        if type(admission) is not StudyRoundCallAdmissionV1:
+            raise StudyAuthorityError("round-call admission is invalid")
+        if (
+            admission.study_id != self.grant.study_id
+            or admission.grant_sha256 != self.grant.sha256
+            or admission.manifest_sha256 != self.manifest.sha256
+            or admission.repository_root_identity_sha256 != self.store.repository.root_identity_sha256
+            or admission.audit_domain != self.grant.audit_domain
+            or admission.mode != self.grant.mode
+            or len(admission.slots) > len(self.grant.arm_slots)
+        ):
+            raise StudyAuthorityError("round-call admission does not bind the current grant")
+        refs = self.store.list_refs(kind="round-call-admissions", maximum_entries=_MAX_RECORDS)
+        expected_path = f"adapter-blobs/study-v1-round-call-admissions/{admission.sha256}.bin"
+        matches = [ref for ref in refs if ref.relative_path == expected_path]
+        if len(matches) != 1 or self.store.read(matches[0]) != admission.canonical_bytes():
+            raise StudyAuthorityError("persisted round-call admission is missing or differs")
+        if matches[0].sha256 != _sha256(admission.canonical_bytes()):
+            raise StudyAuthorityError("persisted round-call admission digest differs")
+
+    def _check_round_call_approval(self, approval: StudyRoundCallApprovalV1) -> None:
+        admission = self.round_call_admission
+        if (
+            type(approval) is not StudyRoundCallApprovalV1
+            or not approval._is_controller_capability()
+            or type(admission) is not StudyRoundCallAdmissionV1
+            or approval.study_id != self.grant.study_id
+            or approval.grant_sha256 != self.grant.sha256
+            or approval.manifest_sha256 != self.manifest.sha256
+            or approval.repository_root_identity_sha256 != self.store.repository.root_identity_sha256
+            or approval.admission_sha256 != admission.sha256
+            or approval.approval_reference != admission.approval_reference
+        ):
+            raise StudyAuthorityError("round-call approval does not match the current admission")
+
+    def _ensure_round_call_authorized(self, slot: StudyRoundCallSlotV1) -> None:
+        if type(slot) is not StudyRoundCallSlotV1 or self.round_call_admission is None:
+            raise StudyAuthorityError("round-call admission is missing")
+        if self.round_call_approval is None:
+            raise StudyAuthorityError("new round-call reservations require current explicit approval")
+        self._check_round_call_approval(self.round_call_approval)
+        if slot not in self.round_call_admission.slots:
+            raise StudyAuthorityError("round-call slot is not covered by the admitted scope")
 
     def _authenticate_authority_records(self, *, publish: bool) -> None:
         """Read the persisted grant/manifest, publishing only with approval."""
@@ -1280,7 +1338,7 @@ class StudyLedgerV1:
                 or reservation.manifest_sha256 != self.manifest.sha256
                 or reservation.repository_root_identity_sha256 != self.store.repository.root_identity_sha256
                 or reservation.audit_domain != self.grant.audit_domain
-                or reservation.slot_id != f"{self.study_id}:{reservation.arm}"
+                or reservation.slot_id != self._slot_id_for_request(publication.request)
             ):
                 raise StudyAuthorityError("study reservation publication reservation authority differs")
             if publication.request_sha256 in seen_requests or publication.reservation_sha256 in seen_reservations:
@@ -1305,7 +1363,6 @@ class StudyLedgerV1:
                 or reservation.repository_root_identity_sha256 != self.store.repository.root_identity_sha256
                 or reservation.audit_domain != self.grant.audit_domain
                 or reservation.arm not in self.grant.arm_slots
-                or reservation.slot_id != f"{self.study_id}:{reservation.arm}"
             ):
                 raise StudyAuthorityError("reservation authority identity differs")
             result.append((ref, reservation))
@@ -1314,10 +1371,29 @@ class StudyLedgerV1:
             raise StudyAuthorityError("study reservation sequence has a gap or duplicate")
         if len({item.request_sha256 for _ref_value, item in ordered}) != len(ordered):
             raise StudyAuthorityError("study reservations contain a duplicate request")
-        if len({item.arm for _ref_value, item in ordered}) != len(ordered):
+        if self.round_call_admission is None and len({item.arm for _ref_value, item in ordered}) != len(ordered):
             raise StudyAuthorityError("study reservations contain a duplicate arm slot")
-        if len({item.slot_id for _ref_value, item in ordered}) > 2:
-            raise StudyAuthorityError("study reservations exceed the two shared arm slots")
+        if len({item.slot_id for _ref_value, item in ordered}) > min(2, len(self.grant.arm_slots)):
+            raise StudyAuthorityError("study reservations exceed the existing finite grant slot count")
+        if self.round_call_admission is not None and len(ordered) > len(self.round_call_admission.slots):
+            raise StudyAuthorityError("study reservations exceed the admitted round-call slots")
+        if len({item.slot_id for _ref_value, item in ordered}) != len(ordered):
+            raise StudyAuthorityError("study reservations contain a duplicate call slot")
+        publication_by_reservation = {
+            publication.reservation_sha256: publication
+            for _ref_value, publication in self._reservation_publications()
+        }
+        for _ref_value, reservation in ordered:
+            publication = publication_by_reservation.get(reservation.reservation_sha256)
+            if publication is not None:
+                request = publication.request
+            else:
+                request = self._stored_request(reservation.request_sha256)
+            if (
+                request.sha256 != reservation.request_sha256
+                or reservation.slot_id != self._slot_id_for_request(request)
+            ):
+                raise StudyAuthorityError("reservation slot differs from its exact request")
         return ordered
 
     def read_only_reservation_projection(
@@ -1365,6 +1441,7 @@ class StudyLedgerV1:
         requests: set[str] = set()
         reservations: set[str] = set()
         arms: set[StudyArmV1] = set()
+        slots: set[str] = set()
         for item in ordered:
             record = item.terminal
             if record.study_id != self.study_id:
@@ -1383,11 +1460,14 @@ class StudyLedgerV1:
                 raise StudyAuthorityError("study terminal journal chain is forked")
             if record.request_sha256 in requests or record.reservation_sha256 in reservations:
                 raise StudyAuthorityError("study terminal journal contains a duplicate slot settlement")
-            if record.arm in arms:
+            if record.arm in arms and self.round_call_admission is None:
                 raise StudyAuthorityError("study terminal journal contains a duplicate arm settlement")
+            if record.receipt.slot_id in slots:
+                raise StudyAuthorityError("study terminal journal contains a duplicate call-slot settlement")
             requests.add(record.request_sha256)
             reservations.add(record.reservation_sha256)
             arms.add(record.arm)
+            slots.add(record.receipt.slot_id)
             previous = record.terminal_sha256
             expected_sequence += 1
         return ordered
@@ -1869,9 +1949,14 @@ class StudyLedgerV1:
             reservation.study_id != self.study_id
             or reservation.request_sha256 != request.sha256
             or reservation.arm != request.arm
+            or reservation.slot_id != self._slot_id_for_request(request)
             or request.study_id != self.study_id
         ):
             raise StudyAuthorityError("study reservation does not bind its stored request study and arm")
+
+    @staticmethod
+    def _slot_id_for_request(request: StudyCallRequestV1) -> str:
+        return request.round_slot.slot_id if request.round_slot is not None else f"{request.study_id}:{request.arm}"
 
     def _stored_preflight(self, request: StudyCallRequestV1) -> FixturePreflightV1:
         raw = self.store.read(request.preflight_ref)
@@ -1928,6 +2013,14 @@ class StudyLedgerV1:
             raise StudyAuthorityError("study request does not belong to this ledger")
         if request.arm not in self.grant.arm_slots:
             raise StudyAdmissionError("study request arm is not granted")
+        if request.round_slot is not None:
+            if self.round_call_admission is None:
+                raise StudyAuthorityError("round-call admission is missing")
+            self._check_round_call_admission(self.round_call_admission)
+            if request.round_slot not in self.round_call_admission.slots:
+                raise StudyAuthorityError("round-call slot is not covered by the admitted scope")
+        elif self.round_call_admission is not None:
+            raise StudyAuthorityError("round-call admission requires a round-indexed request")
         if request.model != self.grant.model or request.provider != self.grant.provider:
             raise StudyAuthorityError("study request provider/model differs from the grant")
         if (
@@ -2085,6 +2178,8 @@ class StudyLedgerV1:
             raise StudyContractError("dispatch request shape is invalid")
         request = self._stored_request(request_sha256)
         self._validate_request(request, require_current=True)
+        if request.round_slot is not None:
+            self._ensure_round_call_authorized(request.round_slot)
         try:
             wire_messages = canonical_json_bytes_v5(wire_role_messages_v5(messages))
         except (TypeError, ValueError, StudyContractError) as exc:
@@ -2183,6 +2278,8 @@ class StudyLedgerV1:
     def reserve(self, request: StudyCallRequestV1) -> StudyReservationV1:
         self._validate_request(request, require_current=True)
         self._ensure_new_call_authorized()
+        if request.round_slot is not None:
+            self._ensure_round_call_authorized(request.round_slot)
         with self._lock, self._transition():
             terminals = self._terminals()
             if terminals:
@@ -2220,8 +2317,49 @@ class StudyLedgerV1:
                 if item.request_sha256 not in {term.request_sha256 for term in terminals}
             ):
                 raise StudyPendingAccounting("an unresolved study arm reservation blocks the other arm")
-            if any(item.arm == request.arm for _ref_value, item in reservations):
-                raise StudyAdmissionError("study arm slot has already been consumed")
+            if request.round_slot is None:
+                if any(item.arm == request.arm for _ref_value, item in reservations):
+                    raise StudyAdmissionError("study arm slot has already been consumed")
+            else:
+                slot = request.round_slot
+                assert self.round_call_admission is not None
+                slot_limit = min(len(self.round_call_admission.slots), len(self.grant.arm_slots))
+                if len(reservations) >= slot_limit:
+                    raise StudyAdmissionError("the existing finite grant slot count is exhausted")
+                if any(item.slot_id == slot.slot_id for _ref_value, item in reservations):
+                    raise StudyAdmissionError("round-call slot has already been consumed")
+                if any(
+                    item.request_sha256 not in {term.request_sha256 for term in terminals}
+                    for _ref_value, item in reservations
+                ):
+                    raise StudyPendingAccounting("an unresolved round-call reservation blocks the next round")
+                if slot.round_index > 1:
+                    previous_slot_id = f"{self.study_id}:{slot.arm}:round:{slot.round_index - 1}"
+                    prior = next((item for _ref_value, item in reservations if item.slot_id == previous_slot_id), None)
+                    prior_terminal = (
+                        None
+                        if prior is None
+                        else next(
+                            (
+                                item.terminal
+                                for item in terminals
+                                if item.terminal.reservation_sha256 == prior.reservation_sha256
+                            ),
+                            None,
+                        )
+                    )
+                    if (
+                        prior is None
+                        or prior_terminal is None
+                        or prior_terminal.request_sha256 != prior.request_sha256
+                        or prior_terminal.arm != slot.arm
+                        or prior_terminal.receipt.slot_id != previous_slot_id
+                        or prior_terminal.failure_code is not None
+                        or prior_terminal.parsed_ref is None
+                    ):
+                        raise StudyAdmissionError(
+                            "round-call slot requires a successful parsed round one"
+                        )
             prospective_input = request.input_bound_bytes
             prospective_output = request.max_output_tokens
             prospective_cost = self._prospective_cost(request)
@@ -2252,7 +2390,7 @@ class StudyLedgerV1:
                 "manifest_sha256": self.manifest.sha256,
                 "repository_root_identity_sha256": self.store.repository.root_identity_sha256,
                 "audit_domain": self.grant.audit_domain,
-                "slot_id": f"{self.study_id}:{request.arm}",
+                "slot_id": self._slot_id_for_request(request),
                 "invocation_owner": owner,
                 "prospective_input_tokens": prospective_input,
                 "prospective_output_tokens": prospective_output,
@@ -2267,7 +2405,7 @@ class StudyLedgerV1:
                 manifest_sha256=self.manifest.sha256,
                 repository_root_identity_sha256=self.store.repository.root_identity_sha256,
                 audit_domain=self.grant.audit_domain,
-                slot_id=f"{self.study_id}:{request.arm}",
+                slot_id=self._slot_id_for_request(request),
                 invocation_owner=owner,
                 prospective_input_tokens=prospective_input,
                 prospective_output_tokens=prospective_output,
@@ -3187,7 +3325,12 @@ class StudyLedgerV1:
             raise StudyAuthorityError("study terminal root or audit identity differs")
         reservations = self._reservations()
         reservation = next((item for _ref_value, item in reservations if item.reservation_sha256 == terminal.reservation_sha256), None)
-        if reservation is None or reservation.request_sha256 != terminal.request_sha256 or reservation.arm != terminal.arm:
+        if (
+            reservation is None
+            or reservation.request_sha256 != terminal.request_sha256
+            or reservation.arm != terminal.arm
+            or reservation.slot_id != terminal.receipt.slot_id
+        ):
             raise StudyAuthorityError("study terminal has no matching reservation")
         if reservation.invocation_owner != terminal.invocation_owner:
             raise StudyAuthorityError("study terminal invocation owner differs from its reservation")
@@ -3339,7 +3482,11 @@ class StudyLedgerV1:
             raise StudyAuthorityError("earlier terminal authority identity differs")
         request = self._stored_request(terminal.request_sha256)
         self._validate_request(request)
-        if terminal.invocation_owner != reservation.invocation_owner or terminal.arm != request.arm:
+        if (
+            terminal.invocation_owner != reservation.invocation_owner
+            or terminal.arm != request.arm
+            or terminal.receipt.slot_id != reservation.slot_id
+        ):
             raise StudyAuthorityError("earlier terminal identity differs from its reservation")
         failure_marker = terminal.response_ref.relative_path.startswith("adapter-blobs/study-v1-raw-response-failures/")
         if terminal.response_ref.relative_path != f"adapter-blobs/study-v1-raw-responses/{request.sha256}.bin" and not failure_marker:
@@ -3467,10 +3614,17 @@ class StudyLedgerV1:
             raise StudyAuthorityError("study reservation sequence has a gap or duplicate")
         if len({item.request_sha256 for item in combined_reservations}) != len(combined_reservations):
             raise StudyAuthorityError("study reservations contain a duplicate request")
-        if len({item.arm for item in combined_reservations}) != len(combined_reservations):
+        if (
+            self.round_call_admission is None
+            and len({item.arm for item in combined_reservations}) != len(combined_reservations)
+        ):
             raise StudyAuthorityError("study reservations contain a duplicate arm slot")
-        if len({item.slot_id for item in combined_reservations}) > 2:
-            raise StudyAuthorityError("study reservations exceed the two shared arm slots")
+        if len({item.slot_id for item in combined_reservations}) > min(2, len(self.grant.arm_slots)):
+            raise StudyAuthorityError("study reservations exceed the existing finite grant slot count")
+        if self.round_call_admission is not None and len(combined_reservations) > len(self.round_call_admission.slots):
+            raise StudyAuthorityError("study reservations exceed the admitted round-call slots")
+        if len({item.slot_id for item in combined_reservations}) != len(combined_reservations):
+            raise StudyAuthorityError("study reservations contain a duplicate call slot")
         request_refs = self._refs("requests")
         request_keys: set[str] = set()
         for ref in request_refs:

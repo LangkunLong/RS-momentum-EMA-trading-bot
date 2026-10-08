@@ -8,7 +8,7 @@ provider access lives in ``transport``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 import hashlib
 import inspect
@@ -537,6 +537,81 @@ def authenticate_fixture_preflight_v1(
 
 
 @dataclass(frozen=True, slots=True)
+class StudyRoundCallSlotV1:
+    """Immutable round identity bound to one exact base request and grant."""
+
+    study_id: str
+    manifest_sha256: str
+    grant_sha256: str
+    arm: StudyArmV1
+    round_index: int
+    parent_request_sha256: str
+    feedback_sha256: str | None
+    schema_version: Literal[1] = 1
+
+    def __post_init__(self) -> None:
+        _identifier(self.study_id, "round-call study ID")
+        _digest(self.manifest_sha256, "round-call manifest")
+        _digest(self.grant_sha256, "round-call grant")
+        if self.arm not in {"primary", "withheld"}:
+            raise StudyContractError("round-call arm is invalid")
+        if type(self.round_index) is not int or self.round_index not in {1, 2}:
+            raise StudyContractError("round-call index must be one or two")
+        _digest(self.parent_request_sha256, "round-call parent request")
+        if self.round_index == 1:
+            if self.feedback_sha256 is not None:
+                raise StudyContractError("round one cannot bind prior feedback")
+        else:
+            _digest(self.feedback_sha256, "round-call feedback")
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise StudyContractError("round-call slot schema version is invalid")
+
+    @property
+    def slot_id(self) -> str:
+        return f"{self.study_id}:{self.arm}:round:{self.round_index}"
+
+    def to_primitive(self) -> dict[str, object]:
+        return {
+            "study_id": self.study_id,
+            "manifest_sha256": self.manifest_sha256,
+            "grant_sha256": self.grant_sha256,
+            "arm": self.arm,
+            "round_index": self.round_index,
+            "parent_request_sha256": self.parent_request_sha256,
+            "feedback_sha256": self.feedback_sha256,
+            "schema_version": self.schema_version,
+        }
+
+    def canonical_bytes(self) -> bytes:
+        return canonical_json_bytes_v5(self.to_primitive())
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(self.canonical_bytes()).hexdigest()
+
+    @classmethod
+    def from_primitive(cls, value: object) -> "StudyRoundCallSlotV1":
+        raw = _strict_mapping(
+            value,
+            {
+                "study_id", "manifest_sha256", "grant_sha256", "arm", "round_index",
+                "parent_request_sha256", "feedback_sha256", "schema_version",
+            },
+            "round-call slot",
+        )
+        return cls(
+            study_id=raw["study_id"],  # type: ignore[arg-type]
+            manifest_sha256=raw["manifest_sha256"],  # type: ignore[arg-type]
+            grant_sha256=raw["grant_sha256"],  # type: ignore[arg-type]
+            arm=raw["arm"],  # type: ignore[arg-type]
+            round_index=raw["round_index"],  # type: ignore[arg-type]
+            parent_request_sha256=raw["parent_request_sha256"],  # type: ignore[arg-type]
+            feedback_sha256=raw["feedback_sha256"],  # type: ignore[arg-type]
+            schema_version=raw["schema_version"],  # type: ignore[arg-type]
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class StudyCallRequestV1:
     """The independent live-study request L."""
 
@@ -559,6 +634,7 @@ class StudyCallRequestV1:
     seed: int | None = None
     schema_version: Literal[1] = _STUDY_SCHEMA_VERSION
     transport_settings_sha256: str = _TRANSPORT_SETTINGS_SHA256
+    round_slot: StudyRoundCallSlotV1 | None = None
 
     def __post_init__(self) -> None:
         _identifier(self.study_id, "study request ID")
@@ -598,6 +674,15 @@ class StudyCallRequestV1:
             raise StudyAuthorityError("study request transport settings differ from the frozen adapter")
         if self.input_bound_bytes > _MAX_REQUEST_BYTES:
             raise StudyAdmissionError("study request exceeds its frozen input byte bound")
+        if self.round_slot is not None:
+            if type(self.round_slot) is not StudyRoundCallSlotV1:
+                raise StudyContractError("study round-call slot is invalid")
+            if (
+                self.round_slot.study_id != self.study_id
+                or self.round_slot.arm != self.arm
+                or self.round_slot.parent_request_sha256 != self.base_request_sha256
+            ):
+                raise StudyAuthorityError("study round-call slot differs from its exact base request")
 
     @property
     def input_bound_bytes(self) -> int:
@@ -616,7 +701,7 @@ class StudyCallRequestV1:
         return hashlib.sha256(self.projected_wire_schema).hexdigest()
 
     def to_primitive(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "study_id": self.study_id,
             "arm": self.arm,
             "attempt_index": self.attempt_index,
@@ -637,6 +722,20 @@ class StudyCallRequestV1:
             "schema_version": self.schema_version,
             "transport_settings_sha256": self.transport_settings_sha256,
         }
+        if self.round_slot is not None:
+            result["round_slot"] = self.round_slot.to_primitive()
+        return result
+
+    @property
+    def base_request_sha256(self) -> str:
+        if self.round_slot is None:
+            return self.sha256
+        return hashlib.sha256(canonical_json_bytes_v5(self._base_primitive())).hexdigest()
+
+    def _base_primitive(self) -> dict[str, object]:
+        result = self.to_primitive()
+        result.pop("round_slot", None)
+        return result
 
     def canonical_bytes(self) -> bytes:
         return canonical_json_bytes_v5(self.to_primitive())
@@ -647,31 +746,33 @@ class StudyCallRequestV1:
 
     @classmethod
     def from_primitive(cls, value: object) -> "StudyCallRequestV1":
-        raw = _strict_mapping(
-            value,
-            {
-                "study_id",
-                "arm",
-                "attempt_index",
-                "role",
-                "role_position",
-                "attempt_kind",
-                "preflight_ref",
-                "fixture_request_sha256",
-                "messages",
-                "schema_json_utf8",
-                "projected_wire_messages_utf8",
-                "projected_wire_schema_utf8",
-                "provider",
-                "model",
-                "max_output_tokens",
-                "temperature",
-                "seed",
-                "schema_version",
-                "transport_settings_sha256",
-            },
-            "study request",
-        )
+        fields = {
+            "study_id",
+            "arm",
+            "attempt_index",
+            "role",
+            "role_position",
+            "attempt_kind",
+            "preflight_ref",
+            "fixture_request_sha256",
+            "messages",
+            "schema_json_utf8",
+            "projected_wire_messages_utf8",
+            "projected_wire_schema_utf8",
+            "provider",
+            "model",
+            "max_output_tokens",
+            "temperature",
+            "seed",
+            "schema_version",
+            "transport_settings_sha256",
+        }
+        if type(value) is not dict or frozenset(value) not in {
+            frozenset(fields),
+            frozenset(fields | {"round_slot"}),
+        }:
+            raise StudyContractError("study request fields are invalid")
+        raw = value
         temperature = raw["temperature"]
         if temperature is not None:
             if type(temperature) is not str:
@@ -705,6 +806,11 @@ class StudyCallRequestV1:
             seed=raw["seed"],  # type: ignore[arg-type]
             schema_version=raw["schema_version"],  # type: ignore[arg-type]
             transport_settings_sha256=raw["transport_settings_sha256"],  # type: ignore[arg-type]
+            round_slot=(
+                None
+                if "round_slot" not in raw
+                else StudyRoundCallSlotV1.from_primitive(raw["round_slot"])
+            ),
         )
 
     @classmethod
@@ -895,8 +1001,107 @@ class StudyGrantV1:
         return _canonical_decode(cls, raw, "study grant")  # type: ignore[return-value]
 
 
+@dataclass(frozen=True, slots=True)
+class StudyRoundCallAdmissionV1:
+    """Finite supplement for round-indexed calls, bound to an unchanged grant."""
+
+    study_id: str
+    manifest_sha256: str
+    grant_sha256: str
+    repository_root_identity_sha256: str
+    audit_domain: str
+    mode: StudyModeV1
+    slots: tuple[StudyRoundCallSlotV1, ...]
+    approval_reference: str
+    schema_version: Literal[1] = 1
+
+    def __post_init__(self) -> None:
+        _identifier(self.study_id, "round-call admission study ID")
+        _digest(self.manifest_sha256, "round-call admission manifest")
+        _digest(self.grant_sha256, "round-call admission grant")
+        _digest(self.repository_root_identity_sha256, "round-call admission root")
+        _identifier(self.audit_domain, "round-call admission audit domain")
+        if self.mode not in {"offline_fixture", "live_study"}:
+            raise StudyContractError("round-call admission mode is invalid")
+        if self.mode != "offline_fixture":
+            raise StudyAuthorityError("round-call admission is offline-fixture only")
+        if type(self.slots) is not tuple or not 1 <= len(self.slots) <= 2:
+            raise StudyAdmissionError("round-call admission must contain one or two finite slots")
+        identities: set[tuple[str, int]] = set()
+        for slot in self.slots:
+            if type(slot) is not StudyRoundCallSlotV1:
+                raise StudyContractError("round-call admission slot is invalid")
+            if (
+                slot.study_id != self.study_id
+                or slot.manifest_sha256 != self.manifest_sha256
+                or slot.grant_sha256 != self.grant_sha256
+            ):
+                raise StudyAuthorityError("round-call admission slot authority differs")
+            identity = (slot.arm, slot.round_index)
+            if identity in identities:
+                raise StudyAdmissionError("round-call admission contains a duplicate slot")
+            identities.add(identity)
+        if tuple(sorted(self.slots, key=lambda item: (item.arm, item.round_index))) != self.slots:
+            raise StudyContractError("round-call admission slots are not in canonical order")
+        for slot in self.slots:
+            if slot.round_index == 2 and (slot.arm, 1) not in identities:
+                raise StudyAdmissionError("round two requires an admitted round-one slot for the same arm")
+        _text(self.approval_reference, "round-call approval reference", maximum=256)
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise StudyContractError("round-call admission schema version is invalid")
+
+    def to_primitive(self) -> dict[str, object]:
+        return {
+            "study_id": self.study_id,
+            "manifest_sha256": self.manifest_sha256,
+            "grant_sha256": self.grant_sha256,
+            "repository_root_identity_sha256": self.repository_root_identity_sha256,
+            "audit_domain": self.audit_domain,
+            "mode": self.mode,
+            "slots": [slot.to_primitive() for slot in self.slots],
+            "approval_reference": self.approval_reference,
+            "schema_version": self.schema_version,
+        }
+
+    def canonical_bytes(self) -> bytes:
+        return canonical_json_bytes_v5(self.to_primitive())
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(self.canonical_bytes()).hexdigest()
+
+    @classmethod
+    def from_primitive(cls, value: object) -> "StudyRoundCallAdmissionV1":
+        raw = _strict_mapping(
+            value,
+            {
+                "study_id", "manifest_sha256", "grant_sha256", "repository_root_identity_sha256",
+                "audit_domain", "mode", "slots", "approval_reference", "schema_version",
+            },
+            "round-call admission",
+        )
+        if type(raw["slots"]) is not list:
+            raise StudyContractError("round-call admission slots are invalid")
+        return cls(
+            study_id=raw["study_id"],  # type: ignore[arg-type]
+            manifest_sha256=raw["manifest_sha256"],  # type: ignore[arg-type]
+            grant_sha256=raw["grant_sha256"],  # type: ignore[arg-type]
+            repository_root_identity_sha256=raw["repository_root_identity_sha256"],  # type: ignore[arg-type]
+            audit_domain=raw["audit_domain"],  # type: ignore[arg-type]
+            mode=raw["mode"],  # type: ignore[arg-type]
+            slots=tuple(StudyRoundCallSlotV1.from_primitive(item) for item in raw["slots"]),
+            approval_reference=raw["approval_reference"],  # type: ignore[arg-type]
+            schema_version=raw["schema_version"],  # type: ignore[arg-type]
+        )
+
+    @classmethod
+    def from_canonical_json(cls, raw: bytes | str) -> "StudyRoundCallAdmissionV1":
+        return _canonical_decode(cls, raw, "round-call admission")  # type: ignore[return-value]
+
+
 _CAPABILITY_TOKEN = object()
 _CONTROLLER_ISSUANCE_TOKEN = object()
+_ROUND_CALL_APPROVAL_TOKEN = object()
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -956,6 +1161,44 @@ class StudyExecutionApprovalV1:
 
     def _is_controller_capability(self) -> bool:
         return self._token is _CAPABILITY_TOKEN
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class StudyRoundCallApprovalV1:
+    """Ephemeral controller approval for one finite round-call admission."""
+
+    study_id: str
+    grant_sha256: str
+    manifest_sha256: str
+    repository_root_identity_sha256: str
+    admission_sha256: str
+    approval_reference: str
+    _token: object
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        raise StudyAuthorityError("round-call approval is controller-issued and cannot be decoded")
+
+    @classmethod
+    def _issue(
+        cls,
+        *,
+        admission: StudyRoundCallAdmissionV1,
+        _controller_guard: object,
+    ) -> "StudyRoundCallApprovalV1":
+        if _controller_guard is not _CONTROLLER_ISSUANCE_TOKEN:
+            raise StudyAuthorityError("round-call approval issuance is controller-only")
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "study_id", admission.study_id)
+        object.__setattr__(instance, "grant_sha256", admission.grant_sha256)
+        object.__setattr__(instance, "manifest_sha256", admission.manifest_sha256)
+        object.__setattr__(instance, "repository_root_identity_sha256", admission.repository_root_identity_sha256)
+        object.__setattr__(instance, "admission_sha256", admission.sha256)
+        object.__setattr__(instance, "approval_reference", admission.approval_reference)
+        object.__setattr__(instance, "_token", _ROUND_CALL_APPROVAL_TOKEN)
+        return instance
+
+    def _is_controller_capability(self) -> bool:
+        return self._token is _ROUND_CALL_APPROVAL_TOKEN
 
 
 def authorize_study_execution_v1(
@@ -1032,6 +1275,75 @@ def authorize_offline_fixture_v1(
         grant=grant,
         approval_reference=approval_reference,
     )
+
+
+def authorize_study_round_call_admission_v1(
+    *,
+    store: StudyStoreV1,
+    manifest: StudyManifestV1,
+    grant: StudyGrantV1,
+    execution_approval: StudyExecutionApprovalV1,
+    slots: tuple[StudyRoundCallSlotV1, ...],
+    approval_reference: str,
+) -> tuple[StudyRoundCallAdmissionV1, StudyRoundCallApprovalV1]:
+    """Persist a finite round-slot supplement after separate explicit approval."""
+
+    if (
+        type(store) is not StudyStoreV1
+        or type(manifest) is not StudyManifestV1
+        or type(grant) is not StudyGrantV1
+        or type(execution_approval) is not StudyExecutionApprovalV1
+        or not execution_approval._is_controller_capability()
+    ):
+        raise StudyAuthorityError("round-call admission inputs lack controller authority")
+    if (
+        execution_approval.study_id != grant.study_id
+        or execution_approval.grant_sha256 != grant.sha256
+        or execution_approval.manifest_sha256 != manifest.sha256
+        or execution_approval.repository_root_identity_sha256 != store.repository.root_identity_sha256
+        or execution_approval.approval_reference != grant.operator_approval_reference
+        or grant.study_id != manifest.study_id
+        or grant.manifest_sha256 != manifest.sha256
+        or grant.repository_root_identity_sha256 != store.repository.root_identity_sha256
+        or grant.mode != manifest.mode
+    ):
+        raise StudyAuthorityError("round-call admission does not bind the current execution approval")
+    if grant.mode != "offline_fixture":
+        raise StudyAdmissionError("round-call admission is offline-fixture only")
+    _text(approval_reference, "round-call approval reference", maximum=256)
+    if approval_reference == grant.operator_approval_reference:
+        raise StudyAuthorityError("round-call admission requires separate explicit approval")
+    if grant.mode == "offline_fixture" and not approval_reference.startswith("offline-fixture:"):
+        raise StudyAuthorityError("offline round-call admission requires its explicit fixture tag")
+    if type(slots) is not tuple or not slots or len(slots) > len(grant.arm_slots):
+        raise StudyAdmissionError(
+            "round-call slots must be nonempty and within the existing finite grant slot count"
+        )
+    for slot in slots:
+        if type(slot) is not StudyRoundCallSlotV1 or slot.arm not in grant.arm_slots:
+            raise StudyAuthorityError("round-call slot is outside the parent grant")
+        if (
+            slot.study_id != grant.study_id
+            or slot.manifest_sha256 != manifest.sha256
+            or slot.grant_sha256 != grant.sha256
+        ):
+            raise StudyAuthorityError("round-call slot differs from the parent grant or manifest")
+    admission = StudyRoundCallAdmissionV1(
+        study_id=grant.study_id,
+        manifest_sha256=manifest.sha256,
+        grant_sha256=grant.sha256,
+        repository_root_identity_sha256=store.repository.root_identity_sha256,
+        audit_domain=grant.audit_domain,
+        mode=grant.mode,
+        slots=slots,
+        approval_reference=approval_reference,
+    )
+    store.put(kind="round-call-admissions", key=admission.sha256, content=admission.canonical_bytes())
+    approval = StudyRoundCallApprovalV1._issue(
+        admission=admission,
+        _controller_guard=_CONTROLLER_ISSUANCE_TOKEN,
+    )
+    return admission, approval
 
 
 def _study_prompt(*, registry: FrozenBehaviorRegistryV1) -> dict[str, object]:
@@ -1199,15 +1511,75 @@ def build_study_call_v1(
     )
 
 
+def build_study_round_call_slot_v1(
+    *,
+    request: StudyCallRequestV1,
+    manifest: StudyManifestV1,
+    grant: StudyGrantV1,
+    round_index: int,
+    feedback_sha256: str | None = None,
+) -> StudyRoundCallSlotV1:
+    """Bind an offline base request to a round slot and optional feedback digest."""
+
+    if (
+        type(request) is not StudyCallRequestV1
+        or type(manifest) is not StudyManifestV1
+        or type(grant) is not StudyGrantV1
+    ):
+        raise StudyContractError("round-call slot construction inputs are invalid")
+    if (
+        request.study_id != grant.study_id
+        or request.model != grant.model
+        or request.provider != grant.provider
+        or request.arm not in grant.arm_slots
+        or manifest.study_id != grant.study_id
+        or manifest.sha256 != grant.manifest_sha256
+    ):
+        raise StudyAuthorityError("round-call slot base request differs from its grant or manifest")
+    if grant.mode != "offline_fixture":
+        raise StudyAdmissionError("round-call slots are offline-fixture only")
+    return StudyRoundCallSlotV1(
+        study_id=grant.study_id,
+        manifest_sha256=manifest.sha256,
+        grant_sha256=grant.sha256,
+        arm=request.arm,
+        round_index=round_index,
+        parent_request_sha256=request.base_request_sha256,
+        feedback_sha256=feedback_sha256,
+    )
+
+
+def bind_study_call_to_round_slot_v1(
+    *,
+    request: StudyCallRequestV1,
+    slot: StudyRoundCallSlotV1,
+) -> StudyCallRequestV1:
+    """Bind a slot digest to an immutable request without rewriting its messages."""
+
+    if type(request) is not StudyCallRequestV1 or type(slot) is not StudyRoundCallSlotV1:
+        raise StudyContractError("round-call binding inputs are invalid")
+    if request.round_slot is not None or request.sha256 != slot.parent_request_sha256:
+        raise StudyAuthorityError("round-call slot does not bind an unbound exact base request")
+    if request.study_id != slot.study_id or request.arm != slot.arm:
+        raise StudyAuthorityError("round-call slot study or arm differs from the base request")
+    return replace(request, round_slot=slot)
+
+
 __all__ = [
     "FixturePreflightV1",
     "authenticate_fixture_preflight_v1",
     "StudyCallRequestV1",
     "StudyExecutionApprovalV1",
     "StudyGrantV1",
+    "StudyRoundCallApprovalV1",
+    "StudyRoundCallAdmissionV1",
+    "StudyRoundCallSlotV1",
     "authorize_offline_fixture_v1",
     "authorize_study_execution_v1",
+    "authorize_study_round_call_admission_v1",
+    "bind_study_call_to_round_slot_v1",
     "build_study_call_v1",
+    "build_study_round_call_slot_v1",
     "study_parser_authority_bytes_v1",
     "study_prompt_bytes_v1",
     "study_transport_settings_bytes_v1",
